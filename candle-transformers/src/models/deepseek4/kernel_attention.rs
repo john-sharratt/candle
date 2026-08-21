@@ -587,55 +587,90 @@ pub enum DecodeSel {
     None,
 }
 
-/// Corpus-push + selection-capture for ONE decode session's token, with the
-/// attention projections ALREADY batched across sessions by the caller — the
-/// counterpart to the batched prefill prep. `x` is the token's raw hidden
-/// `[1, 1, dim]` (f32) and `qr` its pre-projected, q-normed low-rank query
-/// `[1, 1, q_lora_rank]` (f32); the caller computed both in one GEMM over all
-/// decode rows and hands each session its slice. This runs only the STATEFUL
-/// per-session work: corpus maintenance (`push_raw`) and capturing the
-/// [`DecodeSel`] (the Indexer query space for a CSA layer). The two-stage
-/// selection itself is then batched over all sessions'
-/// galleries ([`super::gallery::two_stage_select_batched`]).
-#[allow(clippy::too_many_arguments)]
-pub fn kernel_attn_decode_capture(
-    a: &Attention,
+/// One decode row's ASSEMBLED-but-not-yet-pooled corpus contribution: the
+/// completed group's pool inputs for the attention compressor and, on a CSA
+/// layer, for the indexer compressor. Both `None` when the row only buffers
+/// (no group boundary); the two share group boundaries by construction.
+pub struct DecodeAssemble {
+    /// Attention entries' pool inputs (pooled pre-RoPE).
+    pub comp_gp: Option<GroupPool>,
+    /// Indexer keys' pool inputs (pooled and roped). `None` off a CSA layer.
+    pub icomp_gp: Option<GroupPool>,
+}
+
+/// Corpus ASSEMBLE for ONE decode session's token, with the compressor rows
+/// ALREADY projected in a batched GEMM by the caller — the counterpart to the
+/// batched prefill assemble. Advances this session's streaming compressor
+/// state and hands back the completed group's pool inputs WITHOUT pooling.
+///
+/// The state advance reads only the RAW group rows, never the pooled/normed
+/// entry, so the pool DEFERS and batches across the whole decode set: one
+/// [`super::compressor::Compressor::pool_and_norm`] per compressor family per
+/// layer instead of one per row. The per-row pool was a softmax + weighted
+/// reduction + norm — ~15 launches — multiplied by the wave's width and the
+/// layer count. Gated by `decode_pool_batched_across_sessions_matches_per_row`.
+///
+/// Absorbs through `assemble_row`, NOT the prefill-shaped `assemble_groups`:
+/// the latter rebuilds its combined stream with a `cat` plus two
+/// `force_contiguous` copies on every call, which on a per-token path is a
+/// hot-loop copy storm (measured: it halved decode) where `assemble_row` does
+/// no device work at all until a group closes.
+pub fn kernel_attn_decode_assemble(
     seq: &mut KernelLayerSeqState,
-    x: &Tensor,
     comp_row: Option<(&Tensor, &Tensor)>,
     icomp_row: Option<(&Tensor, &Tensor)>,
-    q_idx: Option<Tensor>,
-    weights: Option<Tensor>,
-    rope: &RotaryCache,
-) -> Result<DecodeSel> {
-    // Corpus maintenance — identical to the decode step, but fed the compressor
-    // rows already projected in a batched GEMM by the caller (bit-identical to
-    // `push_raw`/`push`, which differ only by the per-row projection).
-    let t_push = profile_now();
-    if let (Some(comp), Some(gallery), Some((ck, cs))) =
-        (seq.comp.as_mut(), seq.gallery.as_mut(), comp_row)
-    {
-        if let Some((entry, gpos)) = comp.push_projected(ck, cs)? {
-            let key = match (seq.icomp.as_mut(), icomp_row) {
-                (Some(ic), Some((ik, is))) => ic
-                    .push_projected_roped(ik, is, rope)?
-                    .expect("indexer compressor shares group boundaries")
-                    .reshape((1, ()))?,
-                _ => Tensor::zeros((1, 1), DType::F32, x.device())?,
-            };
-            gallery.append_batch(&entry.reshape((1, a.head_dim()))?, &key, &[gpos])?;
-        } else if let (Some(ic), Some((ik, is))) = (seq.icomp.as_mut(), icomp_row) {
-            let none = ic.push_projected_roped(ik, is, rope)?;
-            debug_assert!(none.is_none(), "compressor group boundaries diverged");
+) -> Result<DecodeAssemble> {
+    let t_asm = profile_now();
+    let mut out = DecodeAssemble {
+        comp_gp: None,
+        icomp_gp: None,
+    };
+    // The corpus only advances where this layer has a gallery to append into;
+    // the indexer compressor rides the attention compressor's boundaries.
+    if seq.gallery.is_some() {
+        if let (Some(comp), Some((ck, cs))) = (seq.comp.as_mut(), comp_row) {
+            out.comp_gp = comp.assemble_row(ck, cs)?;
+            if let (Some(ic), Some((ik, is))) = (seq.icomp.as_mut(), icomp_row) {
+                out.icomp_gp = ic.assemble_row(ik, is)?;
+                if out.comp_gp.is_some() != out.icomp_gp.is_some() {
+                    candle::bail!(
+                        "compressor group boundaries diverged: comp emitted {}, icomp emitted {}",
+                        out.comp_gp.is_some(),
+                        out.icomp_gp.is_some()
+                    );
+                }
+                debug_assert_eq!(
+                    out.comp_gp.as_ref().map(|g| &g.positions),
+                    out.icomp_gp.as_ref().map(|g| &g.positions),
+                    "comp/icomp group positions diverged"
+                );
+            }
         }
     }
-    pipeline_record("dprep:push", t_push);
+    pipeline_record("dprep:assemble", t_asm);
+    Ok(out)
+}
 
-    // Capture the selection intent (no gallery read here — the select is
-    // batched). The CSA query/weights were projected in a batched GEMM by the
-    // caller (`Indexer::query_gemm_batched` + per-session `rope_query`); this
-    // just tags the intent with the gallery's live size.
-    let n_entries = seq.gallery.as_ref().map_or(0, |g| g.len());
+/// Selection-capture for ONE decode session's token: tag the [`DecodeSel`]
+/// intent (the Indexer query space for a CSA layer) with this row's corpus
+/// size, without reading the gallery's contents. The CSA query/weights were
+/// projected in a batched GEMM by the caller
+/// (`Indexer::query_gemm_batched` + per-session `rope_query`), and the
+/// two-stage selection itself is then batched over all sessions' galleries
+/// ([`super::gallery::two_stage_select_batched`]).
+///
+/// `n_entries` is the number of corpus entries visible TO THIS ROW — its
+/// session's gallery length entering the wave plus the groups its own rows
+/// completed through this one. The caller counts it rather than reading
+/// `gallery.len()` back, because the wave appends every row's groups together:
+/// a length read after that would give an earlier row of a verify block the
+/// entries of a later draft token.
+pub fn kernel_attn_decode_capture(
+    a: &Attention,
+    n_entries: usize,
+    q_idx: Option<Tensor>,
+    weights: Option<Tensor>,
+) -> Result<DecodeSel> {
     let sel = if n_entries == 0 {
         DecodeSel::None
     } else {

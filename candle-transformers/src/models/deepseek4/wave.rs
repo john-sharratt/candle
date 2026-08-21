@@ -26,8 +26,8 @@ use super::attention::rms_norm;
 use super::engine::Dsv4Engine;
 use super::gallery::{gather_corpus_batched, two_stage_select_batched, FloatGallery};
 use super::kernel_attention::{
-    kernel_attn_decode_capture, shortlist_m, DecodeSel, KernelLayerSeqState, KernelLayerStatic,
-    PrefillPrep, PrefillSel,
+    kernel_attn_decode_assemble, kernel_attn_decode_capture, shortlist_m, DecodeAssemble,
+    DecodeSel, KernelLayerSeqState, KernelLayerStatic, PrefillPrep, PrefillSel,
 };
 use super::linear::shared_int8_pair;
 use super::paged::{HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
@@ -37,15 +37,18 @@ use crate::models::profile::{pipeline_record, profile_now, ProfileSnapshot};
 use super::compressor::{assemble_groups_batched, Compressor, GroupPool, SeqAssemble};
 use super::rope::RotaryCache;
 
-/// Pool EVERY prefill sequence's deferred compressor groups in ONE launch across
-/// the whole prompt fleet — the cross-sequence emit batch that replaces the
-/// per-sequence pool (the prefill hot spot). Concatenates the `Some`
-/// [`GroupPool`]s on the group axis, runs one [`Compressor::pool_and_norm`], and
-/// splits the pooled `[ΣG, d]` result back per sequence (`None` for a sequence
-/// that completed no group). Bit-identical per group to pooling each sequence
-/// separately (`pool_batched_across_seqs_matches_per_seq`). `rope` is `Some` for
-/// the roped indexer keys, `None` for the pre-RoPE attention entries.
-fn pool_prefill_across_seqs(
+/// Pool EVERY slot's deferred compressor groups in ONE launch across the whole
+/// wave — the cross-slot emit batch that replaces the per-slot pool. Prefill
+/// batches its prompt fleet's sequences through here, decode its decode rows;
+/// both were a per-slot pool (a softmax + weighted reduction + norm, ~15
+/// launches) multiplied by the wave's width and the layer count. Concatenates
+/// the `Some` [`GroupPool`]s on the group axis, runs one
+/// [`Compressor::pool_and_norm`], and splits the pooled `[ΣG, d]` result back
+/// per slot (`None` for a slot that completed no group). Bit-identical per
+/// group to pooling each slot separately
+/// (`pool_batched_across_seqs_matches_per_seq`). `rope` is `Some` for the roped
+/// indexer keys, `None` for the pre-RoPE attention entries.
+fn pool_across_seqs(
     c: &Compressor,
     gps: &[Option<&GroupPool>],
     rope: Option<&RotaryCache>,
@@ -1454,11 +1457,11 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 };
                 pipeline_record("dprep:proj", t_proj);
 
-                // Pass 1: per-session corpus push (mutates the gallery) + capture
-                // the selection intent WITHOUT selecting — using the pre-projected
-                // query/compressor slices — so the selection batches across all
-                // sessions.
-                let mut sels: Vec<DecodeSel> = Vec::with_capacity(n_dec);
+                // Pass 1a: per-session corpus ASSEMBLE — advance each session's
+                // streaming compressor state with its pre-projected row and keep
+                // the completed group's pool inputs, WITHOUT pooling. The pool
+                // then runs once across the whole decode set in pass 1b.
+                let mut asms: Vec<DecodeAssemble> = Vec::with_capacity(n_dec);
                 // Verify waves: this layer's streaming state at every ROW
                 // boundary (`Arc`-clone cheap), captured as the loop advances —
                 // the rollback installs one of these directly on a partial
@@ -1468,8 +1471,18 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     Option<super::compressor::CompressorState>,
                     usize,
                 )> = Vec::new();
+                // Each row's corpus size AS OF ITSELF: this session's gallery
+                // length entering the wave plus the groups its rows completed
+                // THROUGH this one. It has to be counted here rather than read
+                // back from the gallery, because pass 1b appends every row's
+                // groups at once — so a `gallery.len()` taken afterwards would
+                // hand an earlier row of a verify block the entries of a LATER
+                // draft token. This keeps each row's view causal, exactly as the
+                // per-row append it replaces did.
+                let mut appended: HashMap<usize, usize> = HashMap::new();
+                let mut row_entries: Vec<usize> = Vec::with_capacity(n_dec);
+                let t_dasm = profile_now();
                 for (i, &seq) in decode_seqs.iter().enumerate() {
-                    let xi = xs_dec.narrow(1, i, 1)?; // [1,1,dim]
                     let comp_row = match &comp_proj {
                         Some((k, s)) => Some((k.narrow(0, i, 1)?, s.narrow(0, i, 1)?)),
                         None => None,
@@ -1478,6 +1491,85 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         Some((k, s)) => Some((k.narrow(0, i, 1)?, s.narrow(0, i, 1)?)),
                         None => None,
                     };
+                    let entry = state.get_mut(&seq).expect("ensured above");
+                    let asm = kernel_attn_decode_assemble(
+                        &mut entry.layers[l],
+                        comp_row.as_ref().map(|(k, s)| (k, s)),
+                        icomp_row.as_ref().map(|(k, s)| (k, s)),
+                    )?;
+                    let n_new = asm.comp_gp.as_ref().map_or(0, |g| g.positions.len());
+                    let done = appended.entry(seq).or_insert(0);
+                    *done += n_new;
+                    let ls = &entry.layers[l];
+                    let n_entries = ls.gallery.as_ref().map_or(0, |g| g.len()) + *done;
+                    row_entries.push(n_entries);
+                    if is_verify_wave {
+                        row_snaps.push((
+                            ls.comp.as_ref().map(|c| c.state_snapshot()),
+                            ls.icomp.as_ref().map(|c| c.state_snapshot()),
+                            n_entries,
+                        ));
+                    }
+                    asms.push(asm);
+                    if l + 1 == n_layers {
+                        entry.absorbed = decode_pos[i] + 1;
+                    }
+                }
+                pipeline_record("dprep:assemble_all", t_dasm);
+
+                // Pass 1b: pool EVERY decode row's completed groups in ONE launch
+                // per compressor family, then append. `comp` = attention entries
+                // (pre-RoPE), `icomp` = indexer keys (roped); both share group
+                // boundaries. The decode twin of the prefill pool batch, and
+                // bit-identical per group to the per-row pool it replaces
+                // (`pool_batched_across_seqs_matches_per_seq`).
+                let t_dpool = profile_now();
+                let comp_refs: Vec<Option<&GroupPool>> =
+                    asms.iter().map(|m| m.comp_gp.as_ref()).collect();
+                let icomp_refs: Vec<Option<&GroupPool>> =
+                    asms.iter().map(|m| m.icomp_gp.as_ref()).collect();
+                let comp_entries = match a.compressor() {
+                    Some(c) => pool_across_seqs(c, &comp_refs, None)?,
+                    None => vec![None; n_dec],
+                };
+                let icomp_keys = match a.indexer() {
+                    Some(ix) => pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope))?,
+                    None => vec![None; n_dec],
+                };
+                for (i, &seq) in decode_seqs.iter().enumerate() {
+                    let Some(gp) = asms[i].comp_gp.as_ref() else {
+                        continue;
+                    };
+                    let entry_t = comp_entries[i]
+                        .as_ref()
+                        .expect("a completed comp group was pooled");
+                    let key_t = match icomp_keys[i].as_ref() {
+                        Some(k) => k.clone(),
+                        // An HCA layer has a compressor but no indexer: its
+                        // gallery carries the 1-wide key placeholder no selection
+                        // reads (HCA attends every causal entry).
+                        None => Tensor::zeros(
+                            (gp.positions.len(), 1),
+                            DType::F32,
+                            entry_t.device(),
+                        )?,
+                    };
+                    state
+                        .get_mut(&seq)
+                        .expect("ensured above")
+                        .layers[l]
+                        .gallery
+                        .as_mut()
+                        .expect("a completed comp group implies a gallery")
+                        .append_batch(entry_t, &key_t, &gp.positions)?;
+                }
+                pipeline_record("dprep:pool", t_dpool);
+
+                // Pass 1c: capture each row's selection intent against its OWN
+                // corpus size (the selection itself batches over all sessions
+                // below).
+                let mut sels: Vec<DecodeSel> = Vec::with_capacity(n_dec);
+                for i in 0..n_dec {
                     // This slot's row of the batched, already-roped indexer
                     // query — bare views into the batched tensors.
                     let (q_idx_i, w_i) = match &idx_query {
@@ -1490,29 +1582,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         }
                         None => (None, None),
                     };
-                    let entry = state.get_mut(&seq).expect("ensured above");
-                    let sel = kernel_attn_decode_capture(
-                        a,
-                        &mut entry.layers[l],
-                        &xi,
-                        comp_row.as_ref().map(|(k, s)| (k, s)),
-                        icomp_row.as_ref().map(|(k, s)| (k, s)),
-                        q_idx_i,
-                        w_i,
-                        rope,
-                    )?;
-                    sels.push(sel);
-                    if is_verify_wave {
-                        let ls = &entry.layers[l];
-                        row_snaps.push((
-                            ls.comp.as_ref().map(|c| c.state_snapshot()),
-                            ls.icomp.as_ref().map(|c| c.state_snapshot()),
-                            ls.gallery.as_ref().map_or(0, |g| g.len()),
-                        ));
-                    }
-                    if l + 1 == n_layers {
-                        entry.absorbed = decode_pos[i] + 1;
-                    }
+                    sels.push(kernel_attn_decode_capture(a, row_entries[i], q_idx_i, w_i)?);
                 }
                 // Distribute this layer's row-boundary states into each block's
                 // pre-verify snapshot (rows are grouped consecutively, in the
@@ -1574,10 +1644,34 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         }
                     }
                 }
+                // ONE arange per layer, shared by every all-entries session as a
+                // narrowed VIEW. Building it per session is an allocation plus a
+                // launch each for what is the same ascending run every time —
+                // with 16 sessions × 43 layers that is tens of thousands of
+                // launches per run to materialise `0..n` repeatedly. The values
+                // are identical, so the gather is bit-for-bit unchanged.
+                let all_n: Vec<usize> = sels
+                    .iter()
+                    .filter_map(|s| match s {
+                        DecodeSel::AllEntries(n) => Some(*n),
+                        _ => None,
+                    })
+                    .collect();
+                let all_ids = match all_n.iter().max() {
+                    // `max(1)` keeps the allocation legal when every all-entries
+                    // session is empty; the narrow below still yields 0 rows.
+                    Some(&m) => Some(Tensor::arange(0u32, m.max(1) as u32, &dev)?),
+                    None => None,
+                };
                 for (i, sel) in sels.iter().enumerate() {
                     if let DecodeSel::AllEntries(n) = *sel {
                         cnts[i] = n as u32;
-                        sel_gids[i] = Some(Tensor::arange(0u32, n as u32, &dev)?);
+                        sel_gids[i] = Some(
+                            all_ids
+                                .as_ref()
+                                .expect("an all-entries session implies the shared arange")
+                                .narrow(0, 0, n)?,
+                        );
                     }
                 }
                 pipeline_record("decode:select", t_dsel);
@@ -1899,11 +1993,11 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let icomp_refs: Vec<Option<&super::compressor::GroupPool>> =
                 preps.iter().map(|p| p.icomp_gp.as_ref()).collect();
             let comp_entries = match a.compressor() {
-                Some(c) => pool_prefill_across_seqs(c, &comp_refs, None)?,
+                Some(c) => pool_across_seqs(c, &comp_refs, None)?,
                 None => vec![None; preps.len()],
             };
             let icomp_keys = match a.indexer() {
-                Some(ix) => pool_prefill_across_seqs(ix.compressor(), &icomp_refs, Some(rope))?,
+                Some(ix) => pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope))?,
                 None => vec![None; preps.len()],
             };
             pipeline_record("prefill:pool", t_ppool);

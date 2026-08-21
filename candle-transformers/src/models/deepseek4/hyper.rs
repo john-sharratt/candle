@@ -57,11 +57,11 @@ impl HyperConnection {
     /// `hc_pre`: reduce `[b, s, hc, d]` to a block input `[b, s, d]` and return the
     /// `post`/`comb` mixing tensors needed by [`Self::post`].
     ///
-    /// On CUDA the rms-rsqrt, the sigmoid gate split, and the weighted residual
-    /// reduction fuse into two launches (+ the `fn_w` matmul + the sinkhorn
-    /// launch) — `hc_pre_gates`/`hc_pre_reduce`, bit-exact to the eager path
-    /// below which is the CPU reference. This kills ~25 tiny per-call launches
-    /// that pure launch-overhead dominated at decode.
+    /// On CUDA the rms-rsqrt, the sigmoid gate split, the Sinkhorn and the
+    /// weighted residual reduction all fuse into ONE `mhc_pre_gates` launch (+
+    /// the `fn_w` matmul), bit-exact to the eager path below which is the CPU
+    /// reference. This kills ~25 tiny per-call launches that pure
+    /// launch-overhead dominated at decode.
     pub fn pre(&self, x: &Tensor, p: &HyperParams) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, s, hc, d) = x.dims4()?;
         let x = x.to_dtype(candle::DType::F32)?;
@@ -70,9 +70,11 @@ impl HyperConnection {
         #[cfg(feature = "cuda")]
         if matches!(x.device(), candle::Device::Cuda(_)) {
             let mixes_raw = p.fn_w.forward(&xf)?; // [b,s,mix_hc] (rsqrt folded in the kernel)
-            let (pre, post, comb_raw) = cuda_fused::pre_gates(&xf, &mixes_raw, p, hc, d, self.eps)?;
-            let comb = self.sinkhorn(&comb_raw)?;
-            let y = cuda_fused::pre_reduce(&x, &pre, hc, d)?;
+            // The whole of `hc_pre` is ONE launch: gates, sinkhorn and the
+            // weighted residual reduction. `Self::sinkhorn` and the eager chain
+            // below stay as the CPU reference paths the tests compare against.
+            let (y, post, comb, _pre) =
+                cuda_fused::pre_gates(&xf, &mixes_raw, p, hc, d, self.eps, self.sinkhorn_iters)?;
             return Ok((y, post, comb));
         }
 
@@ -339,7 +341,7 @@ mod cuda_fused {
     use super::HyperParams;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::{DType, Device, Result, Storage, Tensor};
-    use candle_kernels::simple::hyper_mhc::{run_mhc_post, run_mhc_pre_gates, run_mhc_pre_reduce};
+    use candle_kernels::simple::hyper_mhc::{run_mhc_post, run_mhc_pre_gates};
 
     /// Device pointer of a contiguous f32 CUDA tensor (extracted inline so the
     /// storage-guard and pointer-guard both live to the launch — matching the
@@ -355,6 +357,11 @@ mod cuda_fused {
     }
 
     /// `hc_pre` stage 1 (rms-rsqrt · gate split): `(pre, post, comb_raw)`.
+    /// The whole of `hc_pre` in ONE launch: returns `(y, post, comb, pre)` with
+    /// **`comb` already sinkhorn-normalized** and **`y` already reduced**. Warp 0
+    /// runs the sinkhorn while warps 1+ run the reduction, so the two overlap
+    /// rather than costing two launches and two passes over the same row.
+    /// `pre` is returned for the eager/reference comparison only.
     pub(super) fn pre_gates(
         xf: &Tensor,
         mixes_raw: &Tensor,
@@ -362,7 +369,8 @@ mod cuda_fused {
         hc: usize,
         d: usize,
         eps: f64,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+        sink_iters: usize,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let (b, s, _) = xf.dims3()?;
         let n = (b * s) as i32;
         let dev = match xf.device() {
@@ -377,6 +385,9 @@ mod cuda_fused {
         let pre = Tensor::zeros((b, s, hc), DType::F32, xf.device())?;
         let post = Tensor::zeros((b, s, hc), DType::F32, xf.device())?;
         let comb_raw = Tensor::zeros((b, s, hc, hc), DType::F32, xf.device())?;
+        // Fully written by the kernel's fused reduction, so it is allocated
+        // uninitialised rather than zeroed (hot-path invariant 6).
+        let y = Tensor::empty((b, s, d), DType::F32, xf.device())?;
         {
             cuda_f32_ptr!(xf, &stream, s_xf, p_xf, _g0);
             cuda_f32_ptr!(mixes_raw, &stream, s_mx, p_mx, _g1);
@@ -385,6 +396,7 @@ mod cuda_fused {
             cuda_f32_ptr!(pre, &stream, s_pr, p_pr, _g4);
             cuda_f32_ptr!(post, &stream, s_po, p_po, _g5);
             cuda_f32_ptr!(comb_raw, &stream, s_cr, p_cr, _g6);
+            cuda_f32_ptr!(y, &stream, s_y, p_y, _g7);
             unsafe {
                 run_mhc_pre_gates(
                     p_xf as *const f32,
@@ -394,46 +406,18 @@ mod cuda_fused {
                     p_pr as *mut f32,
                     p_po as *mut f32,
                     p_cr as *mut f32,
+                    p_y as *mut f32,
                     n,
                     hc as i32,
                     d as i32,
+                    eps as f32,
+                    sink_iters as i32,
                     eps as f32,
                     stream.cu_stream() as *mut core::ffi::c_void,
                 );
             }
         }
-        Ok((pre, post, comb_raw))
-    }
-
-    /// `hc_pre` stage 2 (weighted residual reduction): `y [b,s,d]`.
-    pub(super) fn pre_reduce(x: &Tensor, pre: &Tensor, hc: usize, d: usize) -> Result<Tensor> {
-        let (b, s, _, _) = x.dims4()?;
-        let n = (b * s) as i32;
-        let dev = match x.device() {
-            Device::Cuda(dd) => dd.clone(),
-            _ => candle::bail!("mhc pre_reduce requires CUDA"),
-        };
-        let stream = dev.cuda_stream();
-        let x = x.contiguous()?;
-        let pre = pre.contiguous()?;
-        let y = Tensor::zeros((b, s, d), DType::F32, x.device())?;
-        {
-            cuda_f32_ptr!(x, &stream, s_x, p_x, _g0);
-            cuda_f32_ptr!(pre, &stream, s_p, p_p, _g1);
-            cuda_f32_ptr!(y, &stream, s_y, p_y, _g2);
-            unsafe {
-                run_mhc_pre_reduce(
-                    p_x as *const f32,
-                    p_p as *const f32,
-                    p_y as *mut f32,
-                    n,
-                    hc as i32,
-                    d as i32,
-                    stream.cu_stream() as *mut core::ffi::c_void,
-                );
-            }
-        }
-        Ok(y)
+        Ok((y, post, comb_raw, pre))
     }
 
     /// `hc_post` recombination: `new [b,s,hc,d]`.
@@ -614,6 +598,106 @@ mod tests {
         let new_r = hcx.post(&block_out, &x, &post_r, &comb_r)?;
         let new_c = hcx.post(&block_out.to_device(&cuda)?, &x_cuda, &post_c, &comb_c)?;
         assert!(maxdiff(&new_r, &new_c)? < 2e-3, "post recombine mismatch");
+        Ok(())
+    }
+
+    /// **Isolation harness for the fused `mhc_pre_gates` (+ sinkhorn).**
+    ///
+    /// nsys put the mHC chain at 13% of decode GPU time, with `sinkhorn` alone
+    /// at 5.4% — a one-thread-per-matrix kernel costing ~30 us for a few dozen
+    /// flops, i.e. almost pure launch overhead. That launch is now folded into
+    /// this kernel, and this harness is where the result gets profiled and tuned
+    /// without a 152 GB model in the way.
+    ///
+    /// Shapes are the real decode ones: `n = b*s` is the wave width (16
+    /// sessions × 1 token) and `hc*d` is the model dim.
+    ///
+    /// Run under Nsight Compute:
+    /// ```text
+    /// ncu --set full --kernel-name mhc_pre_gates_kernel \
+    ///   target/release/deps/candle_transformers-*.exe \
+    ///   --exact models::deepseek4::hyper::tests::bench_fused_pre_gates --ignored --nocapture
+    /// ```
+    /// **Isolation harness for `mhc_post`.** Same role as
+    /// [`bench_fused_pre_gates`]: profile and tune without a 152 GB model in the
+    /// way. nsys put this kernel at 24.7 us / 4.5% of decode GPU time, moving
+    /// only ~1 MB at n=16 — i.e. ~40 GB/s against ~1.3 TB/s of HBM, so it is
+    /// latency- and occupancy-bound rather than bandwidth-bound.
+    ///
+    /// ```text
+    /// ncu --set full --kernel-name mhc_post_kernel \
+    ///   target/release/deps/candle_transformers-*.exe bench_mhc_post --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_mhc_post() -> Result<()> {
+        const ITERS: usize = 500;
+        let Ok(cuda) = Device::new_cuda(0) else {
+            eprintln!("[skip] no CUDA device");
+            return Ok(());
+        };
+        let (hc, d, n) = (4usize, 1792usize, 16usize);
+        let hcx = HyperConnection::new(hc, 20, 1e-6);
+        let block_out = Tensor::randn(0f32, 1.0, (1usize, n, d), &cuda)?;
+        let residual = Tensor::randn(0f32, 1.0, (1usize, n, hc, d), &cuda)?;
+        let post = Tensor::randn(0f32, 1.0, (1usize, n, hc), &cuda)?;
+        let comb = Tensor::randn(0f32, 1.0, (1usize, n, hc, hc), &cuda)?;
+
+        for _ in 0..20 {
+            let _ = hcx.post(&block_out, &residual, &post, &comb)?;
+        }
+        cuda.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            let _ = hcx.post(&block_out, &residual, &post, &comb)?;
+        }
+        cuda.synchronize()?;
+        eprintln!(
+            "[mhc] post: {:.1} us/call (n={n}, hc={hc}, d={d})",
+            t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_fused_pre_gates() -> Result<()> {
+        const ITERS: usize = 500;
+        let Ok(cuda) = Device::new_cuda(0) else {
+            eprintln!("[skip] no CUDA device");
+            return Ok(());
+        };
+        // hc*d = 7168 (model dim); n = 16 decode rows; 20 sinkhorn iterations.
+        let (hc, d, n) = (4usize, 1792usize, 16usize);
+        let mix_hc = (2 + hc) * hc;
+        let hcx = HyperConnection::new(hc, 20, 1e-6);
+
+        let p = HyperParams {
+            fn_w: Tensor::randn(0f32, 1.0, (mix_hc, hc * d), &cuda)?.into(),
+            base: Tensor::randn(0f32, 0.5, mix_hc, &cuda)?,
+            scale: Tensor::from_vec(vec![0.7f32, 1.1, 0.9], 3, &cuda)?,
+        };
+        let x = Tensor::randn(0f32, 1.0, (1usize, n, hc, d), &cuda)?;
+        let xf = x.reshape((1usize, n, hc * d))?;
+        let mixes_raw = p.fn_w.forward(&xf)?;
+
+        // Warm-up: first launch pays one-off module load and allocation.
+        for _ in 0..20 {
+            let _ = cuda_fused::pre_gates(&xf, &mixes_raw, &p, hc, d, hcx.eps, hcx.sinkhorn_iters)?;
+        }
+        cuda.synchronize()?;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            let _ = cuda_fused::pre_gates(&xf, &mixes_raw, &p, hc, d, hcx.eps, hcx.sinkhorn_iters)?;
+        }
+        cuda.synchronize()?;
+        let per_call_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+        eprintln!(
+            "[mhc] fused pre_gates+sinkhorn: {per_call_us:.1} us/call \
+             (n={n}, hc={hc}, d={d}, iters={})",
+            hcx.sinkhorn_iters
+        );
         Ok(())
     }
 }

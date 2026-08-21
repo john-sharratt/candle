@@ -452,6 +452,8 @@ unsafe impl Sync for WarmPool {}
 #[cfg(test)]
 mod tests {
     use super::stratified_membership;
+    use super::WarmPool;
+    use cudarc::driver::DevicePtr;
     use std::collections::HashSet;
 
     fn per_layer_counts(m: &[(usize, usize)], num_layers: usize) -> Vec<usize> {
@@ -591,5 +593,134 @@ mod tests {
             assert!(layer * 8 + expert >= 10, "L{layer}E{expert} is inside");
         }
         assert_eq!(per_layer_counts(&m, 4)[1], 6);
+    }
+
+    /// **The bandwidth denominator for the expert streamer.**
+    ///
+    /// Whether prefetching can help at all depends on which side of saturation
+    /// the warm→VRAM path runs on, and that cannot be read off the load counts
+    /// alone — it needs the achievable ceiling on THIS machine. Measures the
+    /// real path: `cuMemAllocHost_v2` pinned source, one whole expert slot per
+    /// copy, issued on a stream exactly as `build_slot_from_record_on_stream`
+    /// does.
+    ///
+    /// Reports three numbers, because they answer different questions:
+    ///  * **pinned, back-to-back** — the ceiling a perfectly-pipelined streamer
+    ///    could reach.
+    ///  * **pinned, one-at-a-time (sync per copy)** — what a demand load that
+    ///    something is waiting on actually gets, latency included.
+    ///  * **pageable** — the penalty for missing the pinned tier.
+    ///
+    /// Prints rather than asserts a threshold: this is a property of the host's
+    /// PCIe link, not of our code, and a hard number here would just encode one
+    /// machine's bus into the test suite.
+    #[test]
+    #[ignore]
+    fn measure_h2d_bandwidth_at_expert_slot_size() {
+        use candle::{DType, Device, Tensor};
+
+        // The real geometry: 14.2 MB per expert slot on DeepSeek-V4-Flash.
+        const SLOT_BYTES: usize = 14_200_000;
+        const COPIES: usize = 64;
+
+        let Ok(device) = Device::new_cuda(0) else {
+            eprintln!("[skip] no CUDA device");
+            return;
+        };
+        let Device::Cuda(cuda) = &device else {
+            unreachable!("new_cuda yields a cuda device")
+        };
+
+        let Some(pool) = WarmPool::try_alloc(1, SLOT_BYTES) else {
+            eprintln!("[skip] could not pin {SLOT_BYTES} bytes");
+            return;
+        };
+        // Touch the source so the pages are resident and the first copy is not
+        // paying for a fault that belongs to setup rather than to the link.
+        let src = unsafe { std::slice::from_raw_parts_mut(pool.base, SLOT_BYTES) };
+        src.fill(0xA5);
+
+        let elems = SLOT_BYTES / 4;
+        let dst = Tensor::zeros(elems, DType::F32, &device).expect("device buffer");
+        let stream = cuda.cuda_stream();
+        let (storage, _) = dst.storage_and_layout();
+        // `_guard` keeps the device pointer valid for every copy below.
+        let (dst_ptr, _guard) = match &*storage {
+            candle::Storage::Cuda(s) => s
+                .as_cuda_slice::<f32>()
+                .expect("f32 device buffer")
+                .device_ptr(&stream),
+            _ => unreachable!("cuda tensor"),
+        };
+
+        let copy = |n: usize, sync_each: bool| -> f64 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        dst_ptr,
+                        pool.base as *const std::ffi::c_void,
+                        SLOT_BYTES,
+                        stream.cu_stream(),
+                    );
+                }
+                if sync_each {
+                    stream.synchronize().expect("sync");
+                }
+            }
+            if !sync_each {
+                stream.synchronize().expect("sync");
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            (n * SLOT_BYTES) as f64 / secs / 1e9
+        };
+
+        // Warm up: the first transfer on a fresh context pays one-off setup.
+        let _ = copy(4, false);
+        let streamed = copy(COPIES, false);
+        let per_copy = copy(COPIES, true);
+
+        let mut pageable_src = vec![0xA5u8; SLOT_BYTES];
+        pageable_src[0] = 1;
+        let t0 = std::time::Instant::now();
+        for _ in 0..COPIES {
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    dst_ptr,
+                    pageable_src.as_ptr() as *const std::ffi::c_void,
+                    SLOT_BYTES,
+                    stream.cu_stream(),
+                );
+            }
+        }
+        stream.synchronize().expect("sync");
+        let pageable = (COPIES * SLOT_BYTES) as f64 / t0.elapsed().as_secs_f64() / 1e9;
+
+        // ── The other half of the question: what does a synchronous D2H COST,
+        // independent of how much data it moves or what the GPU is doing? ──
+        //
+        // The MoE routing readback is 3.3 ms per layer, 43 times per token, and
+        // whether that is recoverable depends entirely on which it is: GPU
+        // catch-up (real work, only fixable by making the work cheaper) or WDDM
+        // round-trip latency (pure overhead, fixable only by removing the sync).
+        // Draining the queue first and then timing a 512-byte readback isolates
+        // the latency with certainty — there is nothing left to catch up on.
+        let tiny = Tensor::zeros(128, DType::F32, &device).expect("tiny buffer");
+        stream.synchronize().expect("drain");
+        let t0 = std::time::Instant::now();
+        const READBACKS: usize = 200;
+        for _ in 0..READBACKS {
+            let _ = tiny.to_vec1::<f32>().expect("readback");
+        }
+        let per_readback_us = t0.elapsed().as_secs_f64() * 1e6 / READBACKS as f64;
+
+        eprintln!("[h2d] slot={:.1} MB, {COPIES} copies", SLOT_BYTES as f64 / 1e6);
+        eprintln!(
+            "[d2h] empty-queue sync readback (512 B) = {per_readback_us:.0} us \
+             — the floor under the per-layer routing readback"
+        );
+        eprintln!("[h2d] pinned, back-to-back   = {streamed:.1} GB/s");
+        eprintln!("[h2d] pinned, sync per copy  = {per_copy:.1} GB/s  ({:.2} ms per expert)", SLOT_BYTES as f64 / per_copy / 1e6);
+        eprintln!("[h2d] pageable, back-to-back = {pageable:.1} GB/s");
     }
 }

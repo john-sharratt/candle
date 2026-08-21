@@ -510,7 +510,16 @@ impl Dsv4Engine {
         // saving — the readback is a genuine per-layer GPU-catch-up wait, not a hideable flush.
         let t_sort = profile_now();
         super::readback::note_readback();
+        // Split out the readback itself: it is a synchronous D2H, so it does not
+        // just transfer 4 bytes per routed token — it blocks until every kernel
+        // issued this layer has retired. Timing it apart from the counting sort
+        // is what separates "the host sort is slow" (fixable by moving it to the
+        // GPU) from "the pipeline drains 43 times per token" (fixable only by
+        // removing the sync). The sort below is O(A+E) over ~128 assignments, so
+        // any large number here is the drain.
+        let t_rb = profile_now();
         let idx_cpu: Vec<Vec<u32>> = indices.to_vec2::<u32>()?;
+        pipeline_record("moe:sort_readback", t_rb);
         let weights_flat = weights.flatten_all()?; // [nt*k]
         let (k, ne) = (self.cfg.n_activated_experts, self.cfg.n_routed_experts);
         let mut counts = vec![0u32; ne];

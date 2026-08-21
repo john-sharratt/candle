@@ -39,34 +39,64 @@ extern "C" __global__ void mhc_pre_gates_kernel(
     const float* __restrict__ scale,     // [3]
     float* __restrict__ pre,             // [n, hc]
     float* __restrict__ post,            // [n, hc]
-    float* __restrict__ comb_raw,        // [n, hc, hc]
+    float* __restrict__ comb_raw,        // [n, hc, hc] — IN PLACE: emitted sinkhorn-normalized
+    float* __restrict__ y,               // [n, d] — the hc_pre weighted residual reduction
     int n,
     int hc,
     int d,
-    float eps)
+    float eps,
+    int sink_iters,
+    float sink_eps)
 {
     int row = blockIdx.x;
     if (row >= n) return;
     const int hcd = hc * d;
     const int mix_hc = (2 + hc) * hc;
 
-    // ── Parallel reduction of Σ xf^2 over the row (block-stride) ──
+    // ── Σ xf^2 over the row: float4 loads + a warp-shuffle reduction ──
+    //
+    // Two things the scalar/shared-tree version paid for needlessly. The loads
+    // were one float at a time over `hc*d` (7168) elements — `float4` quarters
+    // the load instructions and hits the full 128-bit path. And the reduction
+    // was a shared-memory tree with `log2(blockDim)` = 8 `__syncthreads`; a warp
+    // does its own 32 lanes with shuffles (no barrier at all), leaving ONE
+    // barrier to combine the per-warp partials. On a 16-block grid this kernel
+    // is latency-bound, so barrier count on the critical path is what matters.
+    //
+    // This DOES re-associate the sum (different lane→element assignment), so the
+    // rsqrt can differ in the last ULPs from the previous kernel. That is sound
+    // here — this reduction was never bit-matched to the CPU reference, which
+    // computes it through candle's own `sum`; `fused_pre_post_matches_eager`
+    // gates it at 2e-3. It stays fully deterministic: fixed order, no atomics.
     const float* xrow = xf + (size_t)row * hcd;
     float local = 0.0f;
-    for (int k = threadIdx.x; k < hcd; k += blockDim.x) {
+    const int hcd4 = hcd >> 2;
+    const float4* xrow4 = reinterpret_cast<const float4*>(xrow);
+    for (int k = threadIdx.x; k < hcd4; k += blockDim.x) {
+        float4 v = xrow4[k];
+        local += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    for (int k = (hcd4 << 2) + threadIdx.x; k < hcd; k += blockDim.x) {
         float v = xrow[k];
         local += v * v;
     }
-    __shared__ float red[256];
-    red[threadIdx.x] = local;
+
+    const unsigned full_mask = 0xffffffffu;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) local += __shfl_down_sync(full_mask, local, o);
+
+    __shared__ float warp_sum[32];
+    const int warp_id = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    if (lane_id == 0) warp_sum[warp_id] = local;
     __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
-        __syncthreads();
-    }
+
     __shared__ float rsqrt_sh;
     if (threadIdx.x == 0) {
-        float ms = red[0] / (float)hcd;
+        const int n_warps = (blockDim.x + 31) >> 5;
+        float tot = 0.0f;
+        for (int w = 0; w < n_warps; ++w) tot += warp_sum[w];
+        float ms = tot / (float)hcd;
         rsqrt_sh = 1.0f / sqrtf(ms + eps);
     }
     __syncthreads();
@@ -90,29 +120,138 @@ extern "C" __global__ void mhc_pre_gates_kernel(
         float mc = mrow[2 * hc + e] * rsqrt;
         comb_row[e] = mc * s2 + base[2 * hc + e];
     }
-}
 
-// ---- hc_pre stage 2: weighted residual reduction --------------------------
-//   y[row, k] = Σ_c pre[row, c] * x[row, c, k]     (c over hc copies)
-// x is the pre-reshape residual [n, hc, d] in F32. One block per row, threads
-// over the d axis.
-extern "C" __global__ void mhc_pre_reduce_kernel(
-    const float* __restrict__ x,   // [n, hc, d]
-    const float* __restrict__ pre, // [n, hc]
-    float* __restrict__ y,         // [n, d]
-    int n,
-    int hc,
-    int d)
-{
-    int row = blockIdx.x;
-    if (row >= n) return;
-    const float* xrow = x + (size_t)row * hc * d;
-    const float* prow = pre + (size_t)row * hc;
-    float* yrow = y + (size_t)row * d;
-    for (int k = threadIdx.x; k < d; k += blockDim.x) {
-        float acc = 0.0f;
-        for (int c = 0; c < hc; ++c) acc += prow[c] * xrow[(size_t)c * d + k];
-        yrow[k] = acc;
+    // ── Sinkhorn, in the block that produced the matrix ──
+    //
+    // This was a separate launch (`sinkhorn_f32_kernel`), and it is ONE THREAD
+    // PER MATRIX — at decode `n` is a handful of matrices, so it was a ~1-thread
+    // kernel costing ~30 us for a few dozen flops on a tiny [hc, hc]. nsys put
+    // it at 5.4% of decode GPU time, essentially all launch overhead. This block
+    // already wrote the whole row, so the normalization belongs here.
+    //
+    // The body below is `sinkhorn.cu` VERBATIM — same operations, same order,
+    // same eps placement — so the result is bit-identical to the two-launch
+    // form; only the launch is gone. `hyper.rs::HyperConnection::sinkhorn`
+    // remains the CPU reference for both.
+    __syncthreads(); // comb_row is written by the whole block, read below
+    if (sink_iters > 0) {
+        // The matrix lives in SHARED memory and one WARP owns it: lane i drives
+        // row i for row-phases and column i for column-phases.
+        //
+        // The obvious transcription — one thread running the scalar loop over a
+        // `float c[MHC_MAX_HC*MHC_MAX_HC]` local array — measured 45.2 us at
+        // 0.66% SM throughput, WORSE than the separate launch it replaced. Two
+        // reasons, both fixed here: a 256-float dynamically-indexed local array
+        // spills to local memory, so every one of the ~640 divides became a
+        // memory op; and 255 threads sat blocked at the barrier while one
+        // worked, so the block could not retire.
+        //
+        // **Bit-exactness is preserved by the ownership split**: the reference
+        // sums each row serially over `j` and each column serially over `i`, so
+        // giving one lane the whole row (and one lane the whole column) keeps
+        // those accumulations in the reference's order. Nothing is reassociated
+        // and no atomics are involved. `__syncwarp` — not `__syncthreads` — is
+        // what orders the phases, since a single warp does all of it.
+        // The matrix lives in SHARED memory and one WARP owns it: lane i drives
+        // row i for row-phases and column i for column-phases.
+        //
+        // **Bit-exactness comes from the ownership split**: the reference sums
+        // each row serially over `j` and each column serially over `i`, so
+        // giving one lane the whole row (and one lane the whole column) keeps
+        // those accumulations in the reference's order. No reassociation, no
+        // atomics. `__syncwarp` — not `__syncthreads` — orders the phases, since
+        // a single warp does all of it.
+        //
+        // Measured alternatives on this exact kernel (ncu, n=16, hc=4, iters=20):
+        //   one thread over a local `float[MHC_MAX_HC*MHC_MAX_HC]`  45.2 us
+        //   registers + `__shfl_sync` column sums                   29.0 us
+        //   this (shared memory + one warp)                         22.4 us
+        // Both losers share one cause: `hc` is a RUNTIME value, so a per-thread
+        // `float[MHC_MAX_HC]`/`[MHC_MAX_HC*MHC_MAX_HC]` cannot stay in registers
+        // and spills to local memory, turning every divide into a memory op.
+        // Shared memory keeps the matrix addressable without that spill.
+        extern __shared__ float smem_dyn[]; // hc*hc floats, one matrix per block
+        float* c = smem_dyn;
+        const unsigned lane = threadIdx.x;
+        // Warp 0 runs the sinkhorn; warps 1+ run the hc_pre reduction below at
+        // the SAME time. The two are independent given `pre`/`comb_raw` (both
+        // published by the barrier above), so the long serial sinkhorn overlaps
+        // real bandwidth work instead of leaving the rest of the block parked.
+        if (lane < 32) {
+            // All 32 lanes of warp 0 reach here unconditionally, so the mask is
+            // known-full; `__activemask()` would return the same value but reads
+            // as though divergence were possible.
+            const unsigned active = 0xffffffffu;
+            // 1. softmax over j (row-wise), then + eps — lane i owns row i.
+            if (lane < (unsigned)hc) {
+                const int i = lane;
+                float m = -1e30f;
+                for (int j = 0; j < hc; ++j) m = fmaxf(m, comb_row[i * hc + j]);
+                float s = 0.0f;
+                for (int j = 0; j < hc; ++j) {
+                    float e = expf(comb_row[i * hc + j] - m);
+                    c[i * hc + j] = e;
+                    s += e;
+                }
+                for (int j = 0; j < hc; ++j) c[i * hc + j] = c[i * hc + j] / s + sink_eps;
+            }
+            __syncwarp(active);
+
+            // 2. column-normalize: / (sum_i + eps) — lane j owns column j.
+            if (lane < (unsigned)hc) {
+                const int j = lane;
+                float s = sink_eps;
+                for (int i = 0; i < hc; ++i) s += c[i * hc + j];
+                for (int i = 0; i < hc; ++i) c[i * hc + j] /= s;
+            }
+            __syncwarp(active);
+
+            // 3. (iters-1) x [row-normalize / (sum_j + eps), column-normalize].
+            for (int it = 0; it < sink_iters - 1; ++it) {
+                if (lane < (unsigned)hc) {
+                    const int i = lane;
+                    float s = sink_eps;
+                    for (int j = 0; j < hc; ++j) s += c[i * hc + j];
+                    for (int j = 0; j < hc; ++j) c[i * hc + j] /= s;
+                }
+                __syncwarp(active);
+                if (lane < (unsigned)hc) {
+                    const int j = lane;
+                    float s = sink_eps;
+                    for (int i = 0; i < hc; ++i) s += c[i * hc + j];
+                    for (int i = 0; i < hc; ++i) c[i * hc + j] /= s;
+                }
+                __syncwarp(active);
+            }
+
+            for (int k = lane; k < hc * hc; k += 32) comb_row[k] = c[k];
+        } else {
+            // ── hc_pre stage 2, fused: y[k] = Σ_c pre[c] · x[c, k] ──
+            //
+            // Was `mhc_pre_reduce_kernel`, a separate launch over the same grid
+            // (one block per row) reading the same `[hc*d]` row this block has
+            // already streamed for the rsqrt — so folding it in saves both the
+            // launch and a second pass over a row that is now warm in L2.
+            //
+            // `x` is `xf` reshaped: [n, hc, d] and [n, hc*d] are the same
+            // storage, so `xrow` above already points at this row's `x`.
+            const int rwork = blockDim.x - 32;
+            float* yrow = y + (size_t)row * d;
+            for (int k = threadIdx.x - 32; k < d; k += rwork) {
+                float acc = 0.0f;
+                for (int cc = 0; cc < hc; ++cc) acc += pre_row[cc] * xrow[(size_t)cc * d + k];
+                yrow[k] = acc;
+            }
+        }
+    } else {
+        // Sinkhorn disabled: the reduction still has to happen, and with no
+        // warp-0 work to overlap it every thread takes part.
+        float* yrow = y + (size_t)row * d;
+        for (int k = threadIdx.x; k < d; k += blockDim.x) {
+            float acc = 0.0f;
+            for (int cc = 0; cc < hc; ++cc) acc += pre_row[cc] * xrow[(size_t)cc * d + k];
+            yrow[k] = acc;
+        }
     }
 }
 
@@ -131,49 +270,93 @@ extern "C" __global__ void mhc_post_kernel(
     int hc,
     int d)
 {
-    int row = blockIdx.x;
-    if (row >= n) return;
+    const int row = blockIdx.x;
+    const int j = blockIdx.y;
+    if (row >= n || j >= hc) return;
     const float* bo = block_out + (size_t)row * d;
     const float* res = residual + (size_t)row * hc * d;
     const float* prow = post + (size_t)row * hc;
     const float* crow = comb + (size_t)row * hc * hc;
-    float* orow = out + (size_t)row * hc * d;
+    float* orow_j = out + ((size_t)row * hc + j) * d;
 
-    const int total = hc * d;
-    for (int e = threadIdx.x; e < total; e += blockDim.x) {
-        int j = e / d;
-        int k = e - j * d;
-        float acc = prow[j] * bo[k];
-        for (int i = 0; i < hc; ++i) acc += crow[i * hc + j] * res[(size_t)i * d + k];
-        orow[e] = acc;
+    // **`j` is a block index, not `e / d`.** The flat form paid an integer
+    // divide AND modulo per output element — tens of cycles each on a kernel
+    // whose real work is one FMA chain — and it launched only `n` blocks, which
+    // on a 16-row decode wave left most of the GPU idle. Indexing by (row, j)
+    // removes both divides and multiplies the grid by `hc`.
+    //
+    // `comb`'s column j and `post[j]` are loop-invariant across the whole block
+    // but were re-read from global for every element; they are staged once here.
+    extern __shared__ float cj[]; // hc floats: comb[i][j] for i in 0..hc
+    __shared__ float pj_sh;
+    for (int i = threadIdx.x; i < hc; i += blockDim.x) cj[i] = crow[i * hc + j];
+    if (threadIdx.x == 0) pj_sh = prow[j];
+    __syncthreads();
+    const float pj = pj_sh;
+
+    // Vectorized main pass. The accumulation order is unchanged — `post·out`
+    // first, then `comb[i]·res[i]` for ascending i, each output element
+    // independent — so results are bit-identical to the scalar form.
+    // `float4` requires 16-byte alignment, which holds only when `d` is a
+    // multiple of 4 (every row base is then 4-float aligned); otherwise the
+    // scalar path below covers everything.
+    const int d4 = (d & 3) == 0 ? (d >> 2) : 0;
+    for (int k4 = threadIdx.x; k4 < d4; k4 += blockDim.x) {
+        const float4 b = reinterpret_cast<const float4*>(bo)[k4];
+        float4 acc;
+        acc.x = pj * b.x;
+        acc.y = pj * b.y;
+        acc.z = pj * b.z;
+        acc.w = pj * b.w;
+        for (int i = 0; i < hc; ++i) {
+            const float c = cj[i];
+            const float4 r = reinterpret_cast<const float4*>(res + (size_t)i * d)[k4];
+            acc.x += c * r.x;
+            acc.y += c * r.y;
+            acc.z += c * r.z;
+            acc.w += c * r.w;
+        }
+        reinterpret_cast<float4*>(orow_j)[k4] = acc;
+    }
+    for (int k = (d4 << 2) + threadIdx.x; k < d; k += blockDim.x) {
+        float acc = pj * bo[k];
+        for (int i = 0; i < hc; ++i) acc += cj[i] * res[(size_t)i * d + k];
+        orow_j[k] = acc;
     }
 }
 
 // ---- launchers ------------------------------------------------------------
 extern "C" void run_mhc_pre_gates(
     const float* xf, const float* mixes_raw, const float* base, const float* scale,
-    float* pre, float* post, float* comb_raw,
-    int n, int hc, int d, float eps, void* stream)
+    float* pre, float* post, float* comb_raw, float* y,
+    int n, int hc, int d, float eps, int sink_iters, float sink_eps, void* stream)
 {
     if (n <= 0) return;
-    mhc_pre_gates_kernel<<<n, 256, 0, (cudaStream_t)stream>>>(
-        xf, mixes_raw, base, scale, pre, post, comb_raw, n, hc, d, eps);
-}
-
-extern "C" void run_mhc_pre_reduce(
-    const float* x, const float* pre, float* y, int n, int hc, int d, void* stream)
-{
-    if (n <= 0) return;
-    int threads = d < 256 ? ((d + 31) / 32) * 32 : 256;
-    if (threads <= 0) threads = 32;
-    mhc_pre_reduce_kernel<<<n, threads, 0, (cudaStream_t)stream>>>(x, pre, y, n, hc, d);
+    // **The block size is load-bearing, not a tuning knob.** It must be a whole
+    // number of warps: the rsqrt reduction uses a full-mask `__shfl_down_sync`,
+    // which is undefined if the last warp is partial. It must also be > 32, so
+    // warps 1+ exist to run the fused reduction while warp 0 sinkhorns.
+    constexpr int PRE_GATES_THREADS = 256;
+    static_assert(PRE_GATES_THREADS % 32 == 0 && PRE_GATES_THREADS > 32,
+                  "whole warps, and at least one warp beyond the sinkhorn warp");
+    // Dynamic shared memory holds this block's [hc, hc] combine matrix for the
+    // in-kernel sinkhorn (16 floats at hc=4 — trivial, and it keeps the matrix
+    // out of local memory, which is what made the first version slow).
+    size_t shmem = (size_t)hc * (size_t)hc * sizeof(float);
+    mhc_pre_gates_kernel<<<n, PRE_GATES_THREADS, shmem, (cudaStream_t)stream>>>(
+        xf, mixes_raw, base, scale, pre, post, comb_raw, y, n, hc, d, eps,
+        sink_iters, sink_eps);
 }
 
 extern "C" void run_mhc_post(
     const float* block_out, const float* residual, const float* post, const float* comb,
     float* out, int n, int hc, int d, void* stream)
 {
-    if (n <= 0) return;
-    mhc_post_kernel<<<n, 256, 0, (cudaStream_t)stream>>>(
+    if (n <= 0 || hc <= 0) return;
+    // One block per (row, output-copy j): `hc`x the grid of the flat form, and
+    // `j` becomes a block index so the kernel does no integer division.
+    dim3 grid(n, hc, 1);
+    size_t shmem = (size_t)hc * sizeof(float); // comb's column j
+    mhc_post_kernel<<<grid, 256, shmem, (cudaStream_t)stream>>>(
         block_out, residual, post, comb, out, n, hc, d);
 }

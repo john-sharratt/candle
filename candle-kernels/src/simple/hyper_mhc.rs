@@ -22,22 +22,18 @@ extern "C" {
         pre: *mut f32,
         post: *mut f32,
         comb_raw: *mut f32,
-        n: i32,
-        hc: i32,
-        d: i32,
-        eps: f32,
-        stream: *mut c_void,
-    );
-
-    /// `hc_pre` stage 2: `y[k] = Σ_c pre[c] · x[c,k]`.
-    ///   x: device f32[n * hc * d]; pre: device f32[n * hc]; y: device f32[n * d] (out)
-    pub fn run_mhc_pre_reduce(
-        x: *const f32,
-        pre: *const f32,
+        // `hc_pre` stage 2 is fused in too: y[n, d] = sum_c pre[c] * x[c, k],
+        // computed by warps 1+ while warp 0 runs the sinkhorn.
         y: *mut f32,
         n: i32,
         hc: i32,
         d: i32,
+        eps: f32,
+        // Sinkhorn is folded into this kernel: `comb_raw` comes back NORMALIZED,
+        // so no separate `run_sinkhorn_f32` launch is needed. `sink_iters <= 0`
+        // leaves the raw affine result in place.
+        sink_iters: i32,
+        sink_eps: f32,
         stream: *mut c_void,
     );
 

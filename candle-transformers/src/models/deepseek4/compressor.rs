@@ -687,22 +687,50 @@ impl IncrementalCompressor {
         }))
     }
 
-    /// Pool → RMSNorm (NO RoPE): the position-free entry `[1, 1, d]` and its
-    /// group-start position.
-    fn emit_group_raw(&mut self) -> Result<(Tensor, u32)> {
+    /// Absorb ONE pre-projected row (`[1, cd]`) and, when it completes a group,
+    /// return that group's pool INPUTS without pooling — the deferred-pool twin
+    /// of [`Self::push_projected`], and what the decode wave absorbs each step.
+    /// The completed groups from every decode session then pool together in a
+    /// single [`Compressor::pool_and_norm`].
+    ///
+    /// Distinct from [`Self::assemble_groups`], which combines a whole RUN of
+    /// new rows with the carried buffer and is the prefill form: that rebuild
+    /// costs a `cat` plus two `force_contiguous` copies EVERY call, which is the
+    /// right trade when it amortises over a prompt but not when it runs per
+    /// token. Here a step that completes no group costs nothing on the device —
+    /// an `Arc` bump onto the row buffer — and at `ratio` 4 that is three decode
+    /// steps in four.
+    pub fn assemble_row(&mut self, kv: &Tensor, score: &Tensor) -> Result<Option<GroupPool>> {
+        self.kv_rows.push(kv.clone());
+        self.score_rows.push(score.clone());
+        if self.kv_rows.len() < self.c.ratio {
+            return Ok(None);
+        }
+        Some(self.assemble_group_raw()).transpose()
+    }
+
+    /// The buffered complete group's pool inputs `[1, P, d]` (`P = 2r` overlap /
+    /// `r` non-overlap) + its start position, advancing the streaming state
+    /// (`prev_*_group`, buffer, `group_idx`). The caller must have checked the
+    /// group is full.
+    ///
+    /// Reads only the RAW group rows, never a pooled result, which is what lets
+    /// the pool defer and batch across sessions.
+    fn assemble_group_raw(&mut self) -> Result<GroupPool> {
         let d = self.c.head_dim;
         let r = self.c.ratio;
+        let cd = self.c.cd();
         let dev = self.c.device().clone();
 
         let kv_rows: Vec<&Tensor> = self.kv_rows.iter().collect();
         let score_rows: Vec<&Tensor> = self.score_rows.iter().collect();
         let kv_group = Tensor::cat(&kv_rows, 0)?; // [r, cd]
                                                   // ape is added to the score BEFORE pooling / the overlap split (matches `pool`).
-        let ape = self.c.ape.to_dtype(DType::F32)?.reshape((r, self.c.cd()))?;
+        let ape = self.c.ape.to_dtype(DType::F32)?.reshape((r, cd))?;
         let score_group = (Tensor::cat(&score_rows, 0)? + ape)?; // [r, cd]
 
-        // Pool over the group's rows (overlap: prev-half ‖ curr-half over 2·r rows).
-        let entry = if self.c.overlap {
+        // Pool inputs over the group's rows (overlap: prev-half ‖ curr-half over 2·r rows).
+        let (pool_kv, pool_score) = if self.c.overlap {
             let curr_kv = kv_group.narrow(D::Minus1, d, d)?; // [r, d] second-half dims
             let curr_score = score_group.narrow(D::Minus1, d, d)?;
             let (prev_kv, prev_score) = match (&self.prev_kv_group, &self.prev_score_group) {
@@ -713,13 +741,16 @@ impl IncrementalCompressor {
                     Tensor::full(f32::NEG_INFINITY, (r, d), &dev)?,
                 ),
             };
-            let kv_pool = Tensor::cat(&[&prev_kv, &curr_kv], 0)?; // [2r, d]
-            let score_pool = Tensor::cat(&[&prev_score, &curr_score], 0)?;
-            let w = softmax(&score_pool, 0)?;
-            kv_pool.broadcast_mul(&w)?.sum(0)? // [d]
+            (
+                Tensor::cat(&[&prev_kv, &curr_kv], 0)?.reshape((1, 2 * r, d))?,
+                Tensor::cat(&[&prev_score, &curr_score], 0)?.reshape((1, 2 * r, d))?,
+            )
         } else {
-            let w = softmax(&score_group, 0)?;
-            kv_group.broadcast_mul(&w)?.sum(0)? // cd == d
+            // Non-overlap pools the group rows directly (cd == d).
+            (
+                kv_group.reshape((1, r, cd))?,
+                score_group.reshape((1, r, cd))?,
+            )
         };
 
         // Retain this group as the next group's "prev" half, then reset the current buffer.
@@ -728,14 +759,28 @@ impl IncrementalCompressor {
         self.kv_rows.clear();
         self.score_rows.clear();
 
-        // RMSNorm, position carried alongside (RoPE is the caller's concern:
-        // `emit_group` applies it here on the reference path; the kernel path
-        // stores pre-RoPE and rotates at read).
         let g = self.group_idx;
         self.group_idx += 1;
-        let entry = entry.reshape((1, 1, d))?;
-        let entry = self.rms_norm_entry(&entry)?;
-        Ok((entry, (g * r) as u32))
+        Ok(GroupPool {
+            pool_kv,
+            pool_score,
+            positions: vec![(g * r) as u32],
+        })
+    }
+
+    /// Pool → RMSNorm (NO RoPE): the position-free entry `[1, 1, d]` and its
+    /// group-start position. Assemble + pool, so the streamed reference and the
+    /// deferred-pool decode path share ONE pool implementation
+    /// ([`Compressor::pool_and_norm`]) rather than two that must be kept in
+    /// step. RoPE is the caller's concern: `emit_group` applies it, while the
+    /// kernel path stores pre-RoPE and rotates at read.
+    fn emit_group_raw(&mut self) -> Result<(Tensor, u32)> {
+        let d = self.c.head_dim;
+        let gp = self.assemble_group_raw()?;
+        let entry = self
+            .c
+            .pool_and_norm(&gp.pool_kv, &gp.pool_score, &gp.positions, None)?;
+        Ok((entry.reshape((1, 1, d))?, gp.positions[0]))
     }
 
     /// Finalize the trailing partial group at a **turn seal**: pool the
@@ -773,7 +818,7 @@ impl IncrementalCompressor {
             .narrow(0, 0, n)?;
         let score_group = (Tensor::cat(&score_rows, 0)? + ape)?; // [n, cd]
 
-        let entry = if self.c.overlap {
+        let (pool_kv, pool_score) = if self.c.overlap {
             let curr_kv = kv_group.narrow(D::Minus1, d, d)?; // [n, d] second-half dims
             let curr_score = score_group.narrow(D::Minus1, d, d)?;
             let (prev_kv, prev_score) = match (&self.prev_kv_group, &self.prev_score_group) {
@@ -785,13 +830,15 @@ impl IncrementalCompressor {
                     Tensor::full(f32::NEG_INFINITY, (r, d), &dev)?,
                 ),
             };
-            let kv_pool = Tensor::cat(&[&prev_kv, &curr_kv], 0)?; // [r+n, d]
-            let score_pool = Tensor::cat(&[&prev_score, &curr_score], 0)?;
-            let w = softmax(&score_pool, 0)?;
-            kv_pool.broadcast_mul(&w)?.sum(0)? // [d]
+            (
+                Tensor::cat(&[&prev_kv, &curr_kv], 0)?.reshape((1, r + n, d))?,
+                Tensor::cat(&[&prev_score, &curr_score], 0)?.reshape((1, r + n, d))?,
+            )
         } else {
-            let w = softmax(&score_group, 0)?;
-            kv_group.broadcast_mul(&w)?.sum(0)? // cd == d
+            (
+                kv_group.reshape((1, n, self.c.cd()))?, // cd == d
+                score_group.reshape((1, n, self.c.cd()))?,
+            )
         };
 
         // Terminal: consume the buffer, but do NOT retain a new `prev_*` (nothing
@@ -801,28 +848,23 @@ impl IncrementalCompressor {
 
         let g = self.group_idx;
         self.group_idx += 1;
-        let entry = entry.reshape((1, 1, d))?;
-        let entry = self.rms_norm_entry(&entry)?;
-        Ok(Some((entry, (g * r) as u32)))
+        let positions = vec![(g * r) as u32];
+        // The same pool every other emit path runs — a closed partial is a
+        // softmax-weighted latent exactly like a full group, just over fewer rows.
+        let entry = self
+            .c
+            .pool_and_norm(&pool_kv, &pool_score, &positions, None)?;
+        Ok(Some((entry.reshape((1, 1, d))?, positions[0])))
     }
 
     fn emit_group(&mut self, rope: &RotaryCache) -> Result<Tensor> {
-        let (entry, pos) = self.emit_group_raw()?;
         let d = self.c.head_dim;
-        let rd = self.c.rope_head_dim;
-        let nope = entry.narrow(D::Minus1, 0, d - rd)?;
-        let rope_part = entry.narrow(D::Minus1, d - rd, rd)?;
-        let rope_part = rope.apply_positions(&rope_part, &[pos], false)?;
-        Tensor::cat(&[&nope, &rope_part], D::Minus1)
+        let gp = self.assemble_group_raw()?;
+        self.c
+            .pool_and_norm(&gp.pool_kv, &gp.pool_score, &gp.positions, Some(rope))?
+            .reshape((1, 1, d))
     }
 
-    fn rms_norm_entry(&self, x: &Tensor) -> Result<Tensor> {
-        // Single fused `rms_norm` launch, mirroring `Compressor::rms_norm`. `to_dtype(F32)`
-        // on an already-F32 `norm_w` is a no-op.
-        let x = x.to_dtype(DType::F32)?;
-        let w = self.c.norm_w.to_dtype(DType::F32)?;
-        candle_nn::ops::rms_norm(&x, &w, self.c.eps as f32)
-    }
 }
 
 /// One sequence's input to [`assemble_groups_batched`]: its carried
@@ -1894,6 +1936,145 @@ mod tests {
                             "seq {i} elem {j} (ratio={ratio}, roped={roped})"
                         );
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The DECODE wave's cross-session emit batch: every session absorbs ONE row
+    /// per step through [`IncrementalCompressor::assemble_groups`] and DEFERS its
+    /// pool, then the sessions that completed a group on that step are pooled
+    /// TOGETHER in a single [`Compressor::pool_and_norm`] — reproducing, per
+    /// session per step, the per-row `push_projected` / `push_projected_roped`
+    /// emit it replaces.
+    ///
+    /// Sessions are staggered so their group boundaries land on different steps —
+    /// the ragged case the batch must handle, where only some sessions contribute
+    /// a pool on any given step (and, at ratio 4, some steps contribute none).
+    /// Running many steps also proves the retained streaming state advanced
+    /// identically: a divergence in the carried buffer, the overlap `prev_*` or
+    /// `group_idx` would surface as a mismatched entry on a later step.
+    ///
+    /// Tolerance, not bit-exactness, and only for the reason
+    /// `emit_groups_batched_matches_streamed` already records: the per-row emit
+    /// softmaxes dim 0 of a `[P, d]` group while the pooled path softmaxes dim 1
+    /// of `[G, P, d]`, so the two reductions may differ in the last ULP. That the
+    /// BATCH WIDTH itself changes nothing — session `s`'s entry is identical
+    /// whether it pools alone or beside 15 others, so a wave's session mix cannot
+    /// perturb any session's corpus — is the bit-exact half, held by
+    /// `pool_batched_across_seqs_matches_per_seq`.
+    #[test]
+    fn decode_pool_batched_across_sessions_matches_per_row() -> Result<()> {
+        let dev = Device::Cpu;
+        let (d, rd, dim) = (6usize, 4usize, 8usize);
+        let n_sess = 3usize;
+        for &ratio in &[4usize, 3usize] {
+            let coff = if ratio == 4 { 2 } else { 1 };
+            let rope = RotaryCache::new(rd, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
+            let c = Compressor::new(
+                Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
+                Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
+                Tensor::randn(0f32, 1.0, (ratio, coff * d), &dev)?,
+                Tensor::randn(0f32, 1.0, d, &dev)?,
+                ratio,
+                d,
+                rd,
+                1e-6,
+            );
+            for roped in [false, true] {
+                let rope_arg = if roped { Some(&rope) } else { None };
+                // Stagger: session `s` enters the loop having already absorbed `s`
+                // rows, so the sessions' group boundaries fall on different steps.
+                let mut refs: Vec<IncrementalCompressor> = Vec::with_capacity(n_sess);
+                let mut bats: Vec<IncrementalCompressor> = Vec::with_capacity(n_sess);
+                for s in 0..n_sess {
+                    let mut inc = c.incremental();
+                    if s > 0 {
+                        let x = Tensor::randn(0f32, 1.0, (s, dim), &dev)?;
+                        let (kv, sc) = c.project_rows(&x)?;
+                        inc.emit_groups_projected(&kv, &sc, rope_arg)?;
+                    }
+                    let mut b = c.incremental();
+                    b.state_restore(inc.state_snapshot());
+                    bats.push(b);
+                    refs.push(inc);
+                }
+
+                let mut want: Vec<Vec<Tensor>> = vec![Vec::new(); n_sess];
+                let mut got: Vec<Vec<Tensor>> = vec![Vec::new(); n_sess];
+                for _ in 0..(3 * ratio + 2) {
+                    // One wave-batched projection, one row per session.
+                    let x = Tensor::randn(0f32, 1.0, (n_sess, dim), &dev)?;
+                    let (kv, sc) = c.project_rows(&x)?; // [n_sess, cd]
+
+                    // Reference: each row pools inside its own push.
+                    for (s, inc) in refs.iter_mut().enumerate() {
+                        let (k, v) = (kv.narrow(0, s, 1)?, sc.narrow(0, s, 1)?);
+                        if roped {
+                            if let Some(e) = inc.push_projected_roped(&k, &v, &rope)? {
+                                want[s].push(e.reshape((1, d))?);
+                            }
+                        } else if let Some((e, _)) = inc.push_projected(&k, &v)? {
+                            want[s].push(e.reshape((1, d))?);
+                        }
+                    }
+
+                    // Batched: assemble every session, then ONE pool over those
+                    // that completed a group — the wave's pass 1a / pass 1b.
+                    let mut pools: Vec<Option<GroupPool>> = Vec::with_capacity(n_sess);
+                    for (s, inc) in bats.iter_mut().enumerate() {
+                        pools.push(inc.assemble_row(&kv.narrow(0, s, 1)?, &sc.narrow(0, s, 1)?)?);
+                    }
+                    let live: Vec<(usize, &GroupPool)> = pools
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(s, g)| g.as_ref().map(|g| (s, g)))
+                        .collect();
+                    if live.is_empty() {
+                        continue;
+                    }
+                    let pool_kv =
+                        Tensor::cat(&live.iter().map(|(_, g)| &g.pool_kv).collect::<Vec<_>>(), 0)?;
+                    let pool_score = Tensor::cat(
+                        &live.iter().map(|(_, g)| &g.pool_score).collect::<Vec<_>>(),
+                        0,
+                    )?;
+                    let positions: Vec<u32> =
+                        live.iter().flat_map(|(_, g)| g.positions.clone()).collect();
+                    let pooled = c.pool_and_norm(&pool_kv, &pool_score, &positions, rope_arg)?;
+                    let mut off = 0usize;
+                    for (s, g) in &live {
+                        let n = g.positions.len();
+                        got[*s].push(pooled.narrow(0, off, n)?);
+                        off += n;
+                    }
+                }
+
+                for s in 0..n_sess {
+                    assert_eq!(
+                        want[s].len(),
+                        got[s].len(),
+                        "session {s} emitted a different number of groups \
+                         (ratio={ratio}, roped={roped})"
+                    );
+                    assert!(
+                        !want[s].is_empty(),
+                        "session {s} emitted nothing — the case proves nothing \
+                         (ratio={ratio}, roped={roped})"
+                    );
+                    let a = Tensor::cat(&want[s], 0)?.flatten_all()?.to_vec1::<f32>()?;
+                    let b = Tensor::cat(&got[s], 0)?.flatten_all()?.to_vec1::<f32>()?;
+                    let max_abs = a
+                        .iter()
+                        .zip(&b)
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        max_abs < 1e-6,
+                        "session {s}: batched decode pool vs per-row emit diverge \
+                         (ratio={ratio}, roped={roped}): max|Δ| = {max_abs}"
+                    );
                 }
             }
         }
