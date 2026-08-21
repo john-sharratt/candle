@@ -2091,54 +2091,6 @@ impl PipelineState {
         #[cfg(not(feature = "cuda"))]
         let MoeInput::Float(xs_float) = &req.input;
 
-        // ── Compute hit experts (overlaps with DMA for misses) ──
-        let t = profile_now();
-        #[cfg(feature = "cuda")]
-        {
-            let experts_data: Vec<(Vec<u32>, Vec<u32>)> = classified
-                .hits
-                .iter()
-                .map(|&(eidx, _)| expert_group(eidx))
-                .collect();
-            let experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> = classified
-                .hits
-                .iter()
-                .zip(experts_data.iter())
-                .filter_map(|(&(_, slot_idx), (toks, wids))| {
-                    let slot = self.inner.slots[slot_idx].as_ref()?;
-                    Some((slot, toks.as_slice(), wids.as_slice()))
-                })
-                .collect();
-            if !experts_vec.is_empty() {
-                compute_experts_grouped(
-                    &req.input,
-                    &mut ys,
-                    &experts_vec,
-                    &req.weights_flat,
-                    &mut self.profile,
-                    req.wave,
-                )?;
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            for &(eidx, slot_idx) in &classified.hits {
-                let slot = self.inner.slots[slot_idx].as_ref().ok_or_else(|| {
-                    candle::Error::Msg(format!("hit slot {slot_idx} unexpectedly empty"))
-                })?;
-                let (toks, w_ids) = expert_group(eidx);
-                compute_expert_contribution_gpu_weights(
-                    xs_float,
-                    &mut ys,
-                    slot,
-                    &toks,
-                    &req.weights_flat,
-                    &w_ids,
-                )?;
-            }
-        }
-        self.profile.record("pipe_compute_hits", t);
-
         // ── Wait for copy fence (current layer's misses) ──
         let t = profile_now();
         classified.fence.wait(&self.device)?;
@@ -2150,24 +2102,55 @@ impl PipelineState {
         }
         self.profile.record("pipe_fence_wait", t);
 
-        // ── Compute newly-loaded experts ──
+        // ── Compute EVERY routed expert, in one canonically-ordered pass ──
+        //
+        // Hits and newly-loaded experts are computed together and **ordered by
+        // expert id**, because that order decides the arithmetic. Each call
+        // reduces a token's contributions sequentially, and the scatter breaks
+        // ties by position within the call, so splitting the experts into two
+        // calls made a token's k terms sum in a grouping determined by which
+        // experts happened to be resident. Residency varies run to run, float
+        // addition is not associative, and the result was an engine that
+        // returned different text for the same prompt
+        // (`docs/deepseek_decode_reproducibility.md`). Expert id is a function
+        // of routing alone, so this order is the same on every run.
+        //
+        // The cost is the overlap this used to buy: hit experts were computed
+        // while the misses' DMA was still in flight. Correctness first — the
+        // overlap-preserving shape is to keep both GEMM phases writing into
+        // disjoint row ranges of one contribution buffer and scatter once.
         let t = profile_now();
+        let all: Vec<(usize, usize)> = {
+            let mut v: Vec<(usize, usize)> = classified
+                .hits
+                .iter()
+                .chain(classified.loaded.iter())
+                .copied()
+                .collect();
+            v.sort_by_key(|&(eidx, _)| eidx);
+            v
+        };
         #[cfg(feature = "cuda")]
         {
-            let experts_data: Vec<(Vec<u32>, Vec<u32>)> = classified
-                .loaded
-                .iter()
-                .map(|&(eidx, _)| expert_group(eidx))
-                .collect();
-            let experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> = classified
-                .loaded
-                .iter()
-                .zip(experts_data.iter())
-                .filter_map(|(&(_, slot_idx), (toks, wids))| {
-                    let slot = self.inner.slots[slot_idx].as_ref()?;
-                    Some((slot, toks.as_slice(), wids.as_slice()))
-                })
-                .collect();
+            let experts_data: Vec<(Vec<u32>, Vec<u32>)> =
+                all.iter().map(|&(eidx, _)| expert_group(eidx)).collect();
+            // **A missing slot is a dropped expert, not a skippable one.** The
+            // old `filter_map(… as_ref()?)` silently omitted any expert whose
+            // slot was empty at compute time, so its contribution vanished from
+            // `ys` and the layer returned an answer computed from fewer than k
+            // experts — indistinguishable, downstream, from a correct one.
+            let mut experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> =
+                Vec::with_capacity(all.len());
+            for (&(eidx, slot_idx), (toks, wids)) in all.iter().zip(experts_data.iter()) {
+                let Some(slot) = self.inner.slots[slot_idx].as_ref() else {
+                    candle::bail!(
+                        "expert {eidx} was classified resident in slot {slot_idx}, but that slot \
+                         is empty at compute time: its contribution would be dropped from this \
+                         layer's output"
+                    );
+                };
+                experts_vec.push((slot, toks.as_slice(), wids.as_slice()));
+            }
             if !experts_vec.is_empty() {
                 compute_experts_grouped(
                     &req.input,
@@ -2181,9 +2164,15 @@ impl PipelineState {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            for &(eidx, slot_idx) in &classified.loaded {
+            // Same canonical order as the CUDA arm: this path accumulates into
+            // `ys` one expert at a time, so it is subject to the identical
+            // residency-dependent reassociation.
+            for &(eidx, slot_idx) in &all {
                 let slot = self.inner.slots[slot_idx].as_ref().ok_or_else(|| {
-                    candle::Error::Msg(format!("loaded slot {slot_idx} unexpectedly empty"))
+                    candle::Error::Msg(format!(
+                        "expert {eidx} was classified resident in slot {slot_idx}, but that \
+                         slot is empty at compute time"
+                    ))
                 })?;
                 let (toks, w_ids) = expert_group(eidx);
                 compute_expert_contribution_gpu_weights(
@@ -2196,7 +2185,7 @@ impl PipelineState {
                 )?;
             }
         }
-        self.profile.record("pipe_compute_loaded", t);
+        self.profile.record("pipe_compute_experts", t);
 
         Ok(ys)
     }

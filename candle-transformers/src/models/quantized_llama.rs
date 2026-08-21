@@ -1615,6 +1615,56 @@ mod tests {
     #[allow(unused_imports)]
     use candle_nn::kv_cache::CacheIntegrityResult;
 
+    /// **Does Llama decode reproduce itself, run to run?**
+    ///
+    /// The DENSE arm of the reproducibility split. DeepSeek-V4-Flash is not
+    /// reproducible (`docs/deepseek_decode_reproducibility.md`), and the
+    /// question is where the fault lives. Llama has no experts and no
+    /// `expert_lre` cache at all, so a failure here would put the fault below
+    /// the MoE path entirely — in the shared attention/KV/quantized-matmul
+    /// machinery every model uses.
+    ///
+    /// Clean here **and** clean on the Qwen3-MoE arm (which does share the
+    /// expert cache) narrows the search to DeepSeek's own code.
+    #[test]
+    #[ignore]
+    fn llama_decode_is_reproducible() -> Result<()> {
+        use crate::models::batch_test::utils::decode_reproducibility;
+        use crate::models::batched_model::BatchedInference;
+
+        let Ok(device) = Device::new_cuda(0) else {
+            eprintln!("[skip] no CUDA device");
+            return Ok(());
+        };
+        let Ok(api) = crate::models::batch_test::test_helpers::api() else {
+            eprintln!("[skip] no HF api");
+            return Ok(());
+        };
+        let repo = api.model("bartowski/Llama-3.2-1B-Instruct-GGUF".to_string());
+        let model_path = match repo.get("Llama-3.2-1B-Instruct-Q4_K_M.gguf") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[skip] model unavailable: {e}");
+                return Ok(());
+            }
+        };
+        let weights = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let inv_freq = weights
+            .rope_inv_freq()
+            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 4096, &device)?;
+
+        // Fixed pseudo-token ids: only identical input across passes matters.
+        let ids: Vec<u32> = (0..24u32).map(|i| (i * 37 + 11) % 2000 + 5).collect();
+        let (agree, _) = decode_reproducibility(&model, &device, &ids, 32, 3, "llama")?;
+        assert!(
+            agree,
+            "Llama decode is not reproducible — a DENSE model with no expert \
+             cache, so the fault is below the MoE path entirely"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore] // Downloads model from HuggingFace. Run with: cargo test --release -- --ignored test_clone_with_independent_kv_cache
     fn test_clone_with_independent_kv_cache() -> Result<()> {

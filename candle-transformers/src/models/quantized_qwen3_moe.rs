@@ -2427,6 +2427,132 @@ mod tests {
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
 
+    /// **Does Qwen3-MoE decode reproduce itself, run to run?**
+    ///
+    /// DeepSeek-V4-Flash does not (`docs/deepseek_decode_reproducibility.md`).
+    /// This test answers the question that result cannot: is the fault in
+    /// shared infrastructure, or in DeepSeek-specific code?
+    ///
+    /// Qwen3-MoE routes through the **same `expert_lre` cache** as DeepSeek —
+    /// the same residency, load and eviction machinery a depth bisect
+    /// implicated (DeepSeek decode is bit-clean through the pinned layers 0–2
+    /// and first fails at layer 3, exactly where experts become evictable).
+    /// So: non-reproducible here ⇒ the fault is shared. Clean here, with the
+    /// dense Llama arm also clean, ⇒ it is DeepSeek's own code, which is a far
+    /// cheaper search.
+    #[test]
+    #[ignore]
+    fn qwen3_moe_decode_is_reproducible() -> Result<()> {
+        use crate::models::batch_test::test_helpers::hf_get;
+        use crate::models::batch_test::utils::decode_reproducibility;
+        use crate::models::batched_model::BatchedInference;
+
+        let Ok(device) = Device::new_cuda(0) else {
+            eprintln!("[skip] no CUDA device");
+            return Ok(());
+        };
+        let model_path = match hf_get(
+            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+            hf_hub::RepoType::Model,
+            "main",
+            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[skip] model unavailable: {e}");
+                return Ok(());
+            }
+        };
+        // Loaded exactly as `test_parallel_batched_forwarding` does, so this
+        // test differs from the established path in one variable only. The
+        // `expert_pack_dir` keeps the ~42 s expert repack down to a read.
+        let weights = ModelWeights::from_gguf_with_options(
+            &model_path,
+            &device,
+            None,
+            GgufLoadOptions {
+                int8mode: Some(Int8Mode::Performance),
+                expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+            },
+        )?;
+        let inv_freq = weights
+            .rope_inv_freq()
+            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 4096, &device)?;
+
+        // Fixed pseudo-token ids: the text is irrelevant, only that every pass
+        // sees the identical input, so no tokenizer download is needed.
+        let ids: Vec<u32> = (0..24u32).map(|i| (i * 37 + 11) % 2000 + 5).collect();
+        let (agree, _) = decode_reproducibility(&model, &device, &ids, 32, 3, "qwen3-moe")?;
+        assert!(
+            agree,
+            "Qwen3-MoE decode is not reproducible — it shares the expert_lre \
+             cache with DeepSeek, so the fault is in SHARED infrastructure"
+        );
+        Ok(())
+    }
+
+    /// **The harness control for DeepSeek's replay probe.**
+    ///
+    /// `decode_replay_probe` replays a decode step through
+    /// `truncate_sequence_to_tokens`, so it is only a measurement of the MODEL
+    /// if that rollback restores byte-identical state. If it does not, the probe
+    /// reports its own drift as non-determinism and every conclusion drawn from
+    /// it is worthless. Running the identical code here — on a model whose token
+    /// streams are reproducible — is what separates those two cases.
+    ///
+    /// Clean here ⇒ the harness is sound and DeepSeek's dirty depths are real.
+    /// Dirty here ⇒ the probe is measuring itself, and DeepSeek's numbers must
+    /// be thrown out rather than interpreted.
+    #[test]
+    #[ignore]
+    fn qwen3_moe_decode_replay_is_bitwise_repeatable() -> Result<()> {
+        use crate::models::batch_test::test_helpers::hf_get;
+        use crate::models::batch_test::utils::{decode_replay_probe, prefill_replay_probe};
+        use crate::models::batched_model::BatchedInference;
+
+        let Ok(device) = Device::new_cuda(0) else {
+            eprintln!("[skip] no CUDA device");
+            return Ok(());
+        };
+        let model_path = match hf_get(
+            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+            hf_hub::RepoType::Model,
+            "main",
+            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[skip] model unavailable: {e}");
+                return Ok(());
+            }
+        };
+        let weights = ModelWeights::from_gguf_with_options(
+            &model_path,
+            &device,
+            None,
+            GgufLoadOptions {
+                int8mode: Some(Int8Mode::Performance),
+                expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+            },
+        )?;
+        let inv_freq = weights
+            .rope_inv_freq()
+            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 4096, &device)?;
+
+        let ids: Vec<u32> = (0..24u32).map(|i| (i * 37 + 11) % 2000 + 5).collect();
+        let dirty_prefill = prefill_replay_probe(&model, &device, &ids, 6, "qwen3-moe")?;
+        let dirty = decode_replay_probe(&model, &device, &ids, 8, "qwen3-moe")?;
+        assert_eq!(
+            (dirty_prefill, dirty),
+            (0, 0),
+            "Qwen3-MoE is not bitwise repeatable: {dirty_prefill}/5 prefills and {dirty}/7 \
+             decode replays diverged"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore] // Run with: cargo test --release --features cuda --lib --package candle-transformers quantized_qwen3_moe::tests::test_parallel_batched_forwarding -- --ignored --nocapture
     fn test_parallel_batched_forwarding() -> Result<()> {

@@ -2872,6 +2872,110 @@ mod tests {
     /// equivalence) row by row.
     #[test]
     #[ignore]
+    /// **The prefill attention kernel must return the same bits twice.**
+    ///
+    /// Its QK band-collapse sums one contribution per band across NPAL warps
+    /// through shared-memory atomics, in an order the hardware does not define
+    /// — so a float accumulator there is non-deterministic *by construction*,
+    /// not by accident. The accumulator is int32 fixed-point for exactly this
+    /// reason, and this is the gate that holds it that way.
+    ///
+    /// Kernel-level on purpose. Judging this through the model's token streams
+    /// cannot separate "prefill wrote different KV" from "decode computed
+    /// differently", and mirror-vs-host gates compare one launch against a
+    /// reference rather than a launch against itself — neither can see a kernel
+    /// that is merely *inconsistent with itself*. This runs the identical launch
+    /// repeatedly and compares the outputs bitwise.
+    #[test]
+    #[ignore]
+    fn prefill_kernel_is_bitwise_repeatable() -> Result<()> {
+        const RUNS: usize = 8;
+        let softmax_scale = (HEAD_DIM as f64).powf(-0.5) as f32;
+        let n = 80usize;
+        let window_size = 128usize;
+        let mut s = 7u64;
+        let dev = Device::new_cuda(0)?;
+
+        let tokens: Vec<[f32; HEAD_DIM]> = (0..n)
+            .map(|_| std::array::from_fn(|_| fp8_exact(&mut s)))
+            .collect();
+        let qs: Vec<[f32; HEAD_DIM]> = (0..n * H)
+            .map(|_| std::array::from_fn(|_| bf16_exact(&mut s)))
+            .collect();
+        let sinks_v: Vec<f32> = (0..H).map(|_| bf16_exact(&mut s) * 0.5).collect();
+        let freqs_v: Vec<f32> =
+            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+                .into_iter()
+                .map(|f| f as f32)
+                .collect();
+        let sinks = Tensor::from_vec(sinks_v, H, &dev)?;
+        let freqs = Tensor::from_vec(freqs_v, ROPE_DIM / 2, &dev)?;
+        let rope_tab = build_rope_table(&freqs)?;
+        let ws = LatentWorkspace::build(&dev)?;
+        let slots = SyntheticSlots::build(&dev, std::slice::from_ref(&tokens.to_vec()))?;
+        let qf: Vec<f32> = qs.iter().flat_map(|h| h.iter().copied()).collect();
+        let q_all = Tensor::from_vec(qf, (n, H, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;
+        let q_pos = Tensor::from_vec((0..n as u32).collect::<Vec<_>>(), n, &dev)?;
+        let comp = Tensor::zeros((1, HEAD_DIM), DType::F32, &dev)?;
+        let comp_pos = Tensor::zeros(1, DType::U32, &dev)?;
+        let comp_idx = Tensor::full(u32::MAX, (n, 1), &dev)?;
+        let comp_cnt = Tensor::zeros(n, DType::U32, &dev)?;
+
+        // The corpus cache is built ONCE, outside the loop: rebuilding it per
+        // run would fold the quantize pre-pass's own behaviour into the result
+        // and leave "which half is it" unanswered.
+        let cache = CorpusCache::build(&comp, &comp_pos)?;
+
+        let mut base: Option<Vec<f32>> = None;
+        let mut dirty = 0usize;
+        for r in 0..RUNS {
+            let out = paged_latent_prefill(
+                &q_all,
+                &slots.headers,
+                &q_pos,
+                None,
+                &cache,
+                &comp_idx,
+                &comp_cnt,
+                &sinks,
+                &rope_tab,
+                &ws,
+                softmax_scale,
+                window_size,
+                1,
+                fp8_store_tag(),
+            )?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+            match &base {
+                None => base = Some(out),
+                Some(b) => {
+                    let n_diff = b.iter().zip(&out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                    let worst = b
+                        .iter()
+                        .zip(&out)
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0f32, f32::max);
+                    if n_diff > 0 {
+                        dirty += 1;
+                        eprintln!(
+                            "[prefill-kernel] run0 vs run{r}: {n_diff}/{} differ, max|Δ|={worst:.3e}",
+                            b.len()
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            dirty, 0,
+            "the prefill attention kernel returned different bits for identical inputs in \
+             {dirty}/{} repeats",
+            RUNS - 1
+        );
+        Ok(())
+    }
+
     fn prefill_rows_equal_decode_steps() -> Result<()> {
         let softmax_scale = (HEAD_DIM as f64).powf(-0.5) as f32;
         // n=80 spans THREE 32-token chunks (0..31 | 32..63 | 64..79), so the

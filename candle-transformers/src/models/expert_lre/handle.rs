@@ -939,14 +939,22 @@ impl ExpertCache {
         {
             let experts_data: Vec<(Vec<u32>, Vec<u32>)> =
                 hits.iter().map(|&(eidx, _)| expert_group(eidx)).collect();
-            let experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> = hits
-                .iter()
-                .zip(experts_data.iter())
-                .filter_map(|(&(_, slot_idx), (toks, wids))| {
-                    let slot = inner.slots[slot_idx].as_ref()?;
-                    Some((slot, toks.as_slice(), wids.as_slice()))
-                })
-                .collect();
+            // A missing slot is a DROPPED expert, not a skippable one: the old
+            // `filter_map(… as_ref()?)` silently omitted it, so its contribution
+            // vanished and the layer returned an answer computed from fewer than
+            // k experts, indistinguishable downstream from a correct one. Same
+            // hazard, same refusal, as the threaded pipeline's copy.
+            let mut experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> = Vec::with_capacity(hits.len());
+            for (&(eidx, slot_idx), (toks, wids)) in hits.iter().zip(experts_data.iter()) {
+                let Some(slot) = inner.slots[slot_idx].as_ref() else {
+                    candle::bail!(
+                        "expert {eidx} was classified resident in slot {slot_idx}, but that slot \
+                         is empty at compute time: its contribution would be dropped from this \
+                         layer's output"
+                    );
+                };
+                experts_vec.push((slot, toks.as_slice(), wids.as_slice()));
+            }
             if !experts_vec.is_empty() {
                 compute_experts_grouped(
                     &input,
