@@ -73,3 +73,8 @@ pub mod sinkhorn;
 // Fused compressed-corpus hot-cache gather: assembles a decode wave's selected
 // gallery rows into one contiguous block, replacing per-region index_select+cat
 pub mod corpus_gather;
+
+// Fused compressor group pool: per-channel softmax over the pooling axis plus
+// the weighted sum, replacing candle's seven-launch unfused softmax chain on
+// every compressor emit (prefill fleet, decode wave, reference and seal alike)
+pub mod compressor_pool;

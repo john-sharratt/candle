@@ -187,8 +187,7 @@ impl Compressor {
         let g = pool_kv.dim(0)?;
         let d = pool_kv.dim(2)?;
         // Pool over the group axis (P), then RMSNorm over the entries.
-        let w = softmax(pool_score, 1)?;
-        let entry = pool_kv.broadcast_mul(&w)?.sum(1)?; // [G, d]
+        let entry = pool_group(pool_kv, pool_score)?; // [G, d]
         let entry = self.rms_norm(&entry.reshape((1, g, d))?)?; // [1, G, d]
         let entry = match rope {
             Some(rope) => {
@@ -327,6 +326,107 @@ impl GroupPartial {
     pub fn finalize(&self) -> Result<Tensor> {
         &self.acc / &self.l
     }
+}
+
+/// `out[g, k] = Σ_p softmax_p(score[g, :, k]) · kv[g, p, k]` — the pooling half
+/// of [`Compressor::pool_and_norm`], where `pool_kv`/`pool_score` are
+/// `[G, P, d]`.
+///
+/// On CUDA this is ONE launch. Eagerly it is seven, because candle's `softmax`
+/// is unfused when the reduction is over a non-last dim (`max_keepdim`,
+/// `broadcast_sub`, `exp`, `sum_keepdim`, `broadcast_div`) and the weighted sum
+/// adds a `broadcast_mul` and a `sum` — and EVERY compressor emit in the model
+/// runs it: the prefill fleet's pool, the decode wave's per-layer pool, the
+/// streamed reference, and the seal `close`. The eager form below is the CPU
+/// path.
+///
+/// The fused result is NOT bit-equal to the eager device chain, because the
+/// eager chain is the less accurate of the two: under the archive's
+/// `--use_fast_math` it pays `__expf` plus an approximate division across five
+/// kernels, each rounding an intermediate out to memory, where the fused pass
+/// keeps them in registers. `pool_kernel_matches_eager` measures all three
+/// (kernel, eager, exact host f32) and holds the kernel to being at least as
+/// faithful to exact arithmetic as what it replaces.
+///
+/// Each input is read through its OWN strides. Producers legitimately hand this
+/// views — `assemble_groups_batched` slices per-sequence pools out of one
+/// fleet-wide block, and the overlap split narrows the channel axis — and
+/// flattening those with `contiguous()` would be an allocate-plus-copy of the
+/// whole plane on a per-layer path. Reading the layout that exists is the
+/// hot-path invariant; materialising the layout the kernel would prefer is the
+/// violation of it.
+fn pool_group(pool_kv: &Tensor, pool_score: &Tensor) -> Result<Tensor> {
+    let (g, p, d) = pool_kv.dims3()?;
+    if pool_score.dims3()? != (g, p, d) {
+        candle::bail!(
+            "pool_group: kv {:?} and score {:?} must have the same shape",
+            pool_kv.dims(),
+            pool_score.dims()
+        );
+    }
+    if p == 0 {
+        // A softmax over zero rows has no value to return, and the CUDA arm
+        // allocates `out` UNINITIALISED for the kernel to fill — so an empty
+        // pooling axis would hand back garbage rather than fail. Every producer
+        // pools at least one row (`2r`, `r`, or `r + n` for a sealed partial),
+        // so this is a guard on the invariant, not a reachable case.
+        candle::bail!("pool_group: empty pooling axis (g={g}, d={d})");
+    }
+
+    #[cfg(feature = "cuda")]
+    if matches!(pool_kv.device(), Device::Cuda(_)) {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::Storage;
+        use candle_kernels::simple::compressor_pool::run_compressor_pool;
+
+        let dev = match pool_kv.device() {
+            Device::Cuda(dd) => dd.clone(),
+            _ => unreachable!("guarded by the matches! above"),
+        };
+        let stream = dev.cuda_stream();
+        // The kernel writes every element of `out`, so it is allocated
+        // uninitialised — a `zeros` here would be a second full-width pass over
+        // the exact bytes the kernel is about to stamp (hot-path invariant 6).
+        let out = Tensor::empty((g, d), DType::F32, pool_kv.device())?;
+        {
+            let (s_kv, l_kv) = pool_kv.storage_and_layout();
+            let (s_sc, l_sc) = pool_score.storage_and_layout();
+            let (s_out, _) = out.storage_and_layout();
+            let ptr = |st: &Storage, off: usize| -> Result<u64> {
+                match st {
+                    Storage::Cuda(c) => Ok(c.as_cuda_slice::<f32>()?.slice(off..).device_ptr(&stream).0),
+                    _ => candle::bail!("pool_group: expected CUDA storage"),
+                }
+            };
+            let p_kv = ptr(&s_kv, l_kv.start_offset())?;
+            let p_sc = ptr(&s_sc, l_sc.start_offset())?;
+            let p_out = ptr(&s_out, 0)?;
+            // Each input is read through its OWN strides, so a caller's view is
+            // consumed where it lies instead of being copied flat first.
+            let (kv_s, sc_s) = (l_kv.stride(), l_sc.stride());
+            unsafe {
+                run_compressor_pool(
+                    p_kv as *const f32,
+                    p_sc as *const f32,
+                    p_out as *mut f32,
+                    g as i32,
+                    p as i32,
+                    d as i32,
+                    kv_s[0] as i64,
+                    kv_s[1] as i64,
+                    kv_s[2] as i64,
+                    sc_s[0] as i64,
+                    sc_s[1] as i64,
+                    sc_s[2] as i64,
+                    stream.cu_stream() as *mut core::ffi::c_void,
+                );
+            }
+        }
+        return Ok(out);
+    }
+
+    let w = softmax(pool_score, 1)?;
+    pool_kv.broadcast_mul(&w)?.sum(1)
 }
 
 /// Replace NaNs with `fill` (element-wise): `where(x == x, x, fill)`.
@@ -1938,6 +2038,218 @@ mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A group's pooled entry must not depend on how many OTHER groups were in
+    /// the launch — pooling alone and pooling beside 31 others must give the
+    /// same bytes.
+    ///
+    /// This is the property that keeps decode reproducible across session mixes:
+    /// a wave pools however many sessions happened to close a group that step,
+    /// so if batch width perturbed the result, the same session would get
+    /// different corpus entries depending on who it was batched with, and MoE
+    /// top-k would turn that into different tokens.
+    /// `pool_batched_across_seqs_matches_per_seq` holds the same property for the
+    /// eager path but runs on the CPU, so it never exercised the kernel; the
+    /// kernel earns it structurally (one block per group per channel tile, no
+    /// cross-group communication) and this pins that down.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn pool_kernel_is_batch_width_invariant() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        for &(g, p, d) in &[(32usize, 8usize, 512usize), (7, 128, 512), (5, 8, 128)] {
+            let kv = Tensor::randn(0f32, 1.0, (g, p, d), &dev)?;
+            let score = Tensor::randn(0f32, 2.0, (g, p, d), &dev)?;
+            let batched = pool_group(&kv, &score)?;
+            for i in 0..g {
+                let alone = pool_group(&kv.narrow(0, i, 1)?, &score.narrow(0, i, 1)?)?;
+                let a = batched.narrow(0, i, 1)?.flatten_all()?.to_vec1::<f32>()?;
+                let b = alone.flatten_all()?.to_vec1::<f32>()?;
+                for (j, (x, y)) in a.iter().zip(&b).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "group {i} elem {j} changed with batch width \
+                         (g={g}, p={p}, d={d}): batched {x} vs alone {y}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Isolation bench for the fused pool, at the two shapes the model actually
+    /// runs it at: the decode wave's per-layer pool (a handful of groups — one
+    /// per session that closed a group this step) and a prefill fleet's pool
+    /// (hundreds of groups at once). The decode shape is the interesting one,
+    /// because a grid of one block per group leaves most of the GPU idle there,
+    /// and that is invisible at the prefill shape.
+    ///
+    ///   cargo test -p candle-transformers --features cuda --release --lib \
+    ///     bench_compressor_pool -- --ignored --nocapture
+    ///   ncu --set full --kernel-name compressor_pool_kernel --launch-count 4 \
+    ///     -o pool_ncu target/release/deps/candle_transformers-<hash>.exe \
+    ///     bench_compressor_pool --ignored --nocapture
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_compressor_pool() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        for &(g, p, d, tag) in &[
+            (1usize, 8usize, 512usize, "decode ×1"),
+            (8, 8, 512, "decode ×8"),
+            (16, 8, 512, "decode ×16"),
+            (16, 8, 128, "decode ×16 idx"),
+            (256, 8, 512, "prefill fleet"),
+            (16, 128, 512, "hca"),
+        ] {
+            let kv = Tensor::randn(0f32, 1.0, (g, p, d), &dev)?;
+            let score = Tensor::randn(0f32, 1.0, (g, p, d), &dev)?;
+            // Warm the kernel + allocator, then time a run of launches so the
+            // per-launch cost is not swamped by one-off setup.
+            for _ in 0..8 {
+                let _ = pool_group(&kv, &score)?;
+            }
+            dev.synchronize()?;
+            let iters = 200;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = pool_group(&kv, &score)?;
+            }
+            dev.synchronize()?;
+            let fused = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+            // The eager chain, for the ratio this is all about.
+            for _ in 0..8 {
+                let w = softmax(&score, 1)?;
+                let _ = kv.broadcast_mul(&w)?.sum(1)?;
+            }
+            dev.synchronize()?;
+            let t1 = std::time::Instant::now();
+            for _ in 0..iters {
+                let w = softmax(&score, 1)?;
+                let _ = kv.broadcast_mul(&w)?.sum(1)?;
+            }
+            dev.synchronize()?;
+            let eager = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+            println!(
+                "[pool {tag:>14}] g={g:<4} p={p:<4} d={d:<4}  fused {fused:7.2} us  \
+                 eager {eager:7.2} us  {:.2}x",
+                eager / fused
+            );
+        }
+        Ok(())
+    }
+
+    /// The fused pool kernel versus the eager chain it replaces
+    /// (`softmax(score, 1)` → `broadcast_mul` → `sum(1)`), with the same
+    /// expression in plain host f32 as the tiebreaker.
+    ///
+    /// Bit-equality with the eager chain is deliberately NOT the bar, because
+    /// measurement says the eager chain is the inaccurate side: it tracks exact
+    /// arithmetic ~3 orders of magnitude worse than the fused kernel does (the
+    /// printed table shows it). Under `--use_fast_math` it pays `__expf` and an
+    /// approximate division across five kernels, each rounding an intermediate
+    /// out to memory and reading it back, while the fused pass keeps them in
+    /// registers. So the assertion is that the kernel is at least as faithful to
+    /// exact arithmetic as what it replaces — a strictly stronger property than
+    /// reproducing the eager chain's drift, and the one that matters given MoE
+    /// top-k turns small numerical differences into different tokens.
+    ///
+    /// Sweeps the shapes the model actually pools: `P` = 8 (overlapping CSA,
+    /// 2·ratio), `P` = 128 (HCA, non-overlap at ratio 128) and `P` = 5 (a partial
+    /// group closed at a turn seal), against both channel widths — 512 for the
+    /// attention compressor, 128 for the indexer. Scores include a fully `-inf`
+    /// row, the group-0 overlap pad, which must contribute exactly zero weight.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn pool_kernel_matches_eager() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        for &(g, p, d) in &[
+            (3usize, 8usize, 512usize),
+            (1, 8, 512),
+            (5, 128, 512),
+            (4, 8, 128),
+            (2, 5, 128),
+            (17, 8, 512),
+        ] {
+            let kv = Tensor::randn(0f32, 1.0, (g, p, d), &dev)?;
+            let score = Tensor::randn(0f32, 2.0, (g, p, d), &dev)?;
+            // Group 0's overlap pad: the first half of the pooling axis is
+            // -inf, fully masked. `expf(-inf - m)` must land on exactly 0.
+            let half = p / 2;
+            let masked = Tensor::cat(
+                &[
+                    &Tensor::full(f32::NEG_INFINITY, (1, half, d), &dev)?,
+                    &score.narrow(0, 0, 1)?.narrow(1, half, p - half)?,
+                ],
+                1,
+            )?;
+            let score = Tensor::cat(&[&masked, &score.narrow(0, 1, g - 1)?], 0)?;
+
+            // Half the shapes go through as NON-CONTIGUOUS views — the channel
+            // narrow the overlap split produces, and a dim-0 slice of a wider
+            // block, which is what `assemble_groups_batched` hands over. The
+            // first version of this kernel assumed packed inputs and the model
+            // gate caught it, not this one; these views are that gap closed.
+            let strided = d >= 128;
+            let (kv, score) = if strided {
+                let pad = Tensor::randn(0f32, 1.0, (g, p, d), &dev)?;
+                (
+                    Tensor::cat(&[&kv, &pad], D::Minus1)?.narrow(D::Minus1, 0, d)?,
+                    Tensor::cat(&[&score, &pad], D::Minus1)?.narrow(D::Minus1, 0, d)?,
+                )
+            } else {
+                (kv, score)
+            };
+            assert_eq!(
+                kv.is_contiguous(),
+                !strided,
+                "the strided cases must actually be strided (g={g}, p={p}, d={d})"
+            );
+
+            let got = pool_group(&kv, &score)?;
+            let w = softmax(&score, 1)?;
+            let want = kv.broadcast_mul(&w)?.sum(1)?;
+            // The same expression on the HOST, in plain IEEE f32 with no
+            // fast-math and no FMA contraction — the third opinion that says
+            // which of the two device paths the seam belongs to.
+            let cpu = {
+                let kc = kv.to_device(&Device::Cpu)?;
+                let sc = score.to_device(&Device::Cpu)?;
+                let wc = softmax(&sc, 1)?;
+                kc.broadcast_mul(&wc)?.sum(1)?
+            };
+
+            let a = want.flatten_all()?.to_vec1::<f32>()?;
+            let b = got.flatten_all()?.to_vec1::<f32>()?;
+            let c = cpu.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(a.len(), b.len(), "shape (g={g}, p={p}, d={d})");
+            let rel = |x: f32, y: f32| (x - y).abs() / x.abs().max(y.abs()).max(1e-30);
+            let (mut k_vs_e, mut k_vs_c, mut e_vs_c) = (0f32, 0f32, 0f32);
+            for ((x, y), z) in a.iter().zip(&b).zip(&c) {
+                k_vs_e = k_vs_e.max(rel(*x, *y));
+                k_vs_c = k_vs_c.max(rel(*y, *z));
+                e_vs_c = e_vs_c.max(rel(*x, *z));
+            }
+            println!(
+                "[pool g={g} p={p} d={d}] kernel-vs-eager {k_vs_e:.3e}  \
+                 kernel-vs-cpu {k_vs_c:.3e}  eager-vs-cpu {e_vs_c:.3e}"
+            );
+            // The kernel must be at least as faithful to exact arithmetic as the
+            // eager device chain it replaces — that is the property that matters,
+            // and it is stronger than agreeing with the eager chain's own drift.
+            assert!(
+                k_vs_c <= e_vs_c.max(1e-6),
+                "kernel drifts from exact arithmetic MORE than the eager chain it \
+                 replaces (g={g}, p={p}, d={d}): kernel-vs-cpu {k_vs_c:.3e} > \
+                 eager-vs-cpu {e_vs_c:.3e}"
+            );
         }
         Ok(())
     }
