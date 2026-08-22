@@ -4113,6 +4113,17 @@ pub fn repack_to_host(
     // Already the target format (a prepared / pre-repacked weight, e.g. MXFP4_KO on disk):
     // nothing to do — hand the bytes straight through so the staging path stays uniform and
     // pays no reorder. This is what lets the engine load a pre-KO GGUF with no runtime repack.
+    //
+    // **This must stay unconditional.** The dtype pair says what the bytes ARE, not whether they
+    // still need work: `(X, X)` means "the source is already in the target format". Narrowing
+    // this to `is_ko()` targets made the loader repack ALREADY-REPACKED weights a second time —
+    // per expert, that is an `alloc` + `alloc_zeros` + H2D + a kernel with an internal
+    // `cudaDeviceSynchronize` + D2H into a fresh host `Vec`, ~11,008 times. Measured: 157 GB of
+    // private commit on a 189 GB box, the GPU at 6%, and the model gate never finishing.
+    //
+    // A caller holding RAW GGML that wants the K/128 layout must say so by calling
+    // [`repack_gemx_to_host`] directly — the source's provenance (raw vs already-prepared) is
+    // the caller's knowledge and cannot be recovered from `(dtype, target_dtype)`.
     if dtype == target_dtype {
         return Ok(ggml_bytes.to_vec());
     }
@@ -4142,6 +4153,28 @@ pub fn repack_to_host(
         return Ok(host);
     }
 
+    repack_gemx_to_host(device, ggml_bytes, nrows, ncols, dtype)
+}
+
+/// Repack **raw GGML bytes** into the K/128 GEMX layout, keeping the dtype.
+///
+/// Split out of [`repack_to_host`] because the two cannot be distinguished by their arguments:
+/// a GEMX repack keeps the dtype and changes only the byte layout, so it and "the source is
+/// already in the target format" both present as `(X, X)`. Which one is meant depends on the
+/// **source's provenance** — raw out of a GGUF, or already prepared on disk — which only the
+/// caller knows. [`repack_to_host`] therefore treats `(X, X)` as already-prepared (the loader's
+/// case, where repacking twice is both wrong and ruinously expensive), and a caller holding raw
+/// bytes calls this instead.
+///
+/// Not performance-critical: one-time, one weight per call, and the underlying kernel carries an
+/// internal device sync. Do not use it to convert a whole expert set at load time.
+pub fn repack_gemx_to_host(
+    device: &CudaDevice,
+    ggml_bytes: &[u8],
+    nrows: usize,
+    ncols: usize,
+    dtype: GgmlDType,
+) -> Result<Vec<u8>> {
     let qtype = dtype_to_qtype(dtype)? as i32;
 
     let supported = unsafe { is_gemx_supported(qtype) };

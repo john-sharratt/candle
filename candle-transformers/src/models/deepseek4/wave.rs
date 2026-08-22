@@ -35,7 +35,7 @@ use super::kernel_attention::{
 use super::linear::shared_int8_pair;
 use super::paged::{GlueRun, HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
 use crate::models::expert_lre::PipelineStats;
-use crate::models::profile::{pipeline_record, profile_now, ProfileSnapshot};
+use crate::models::profile::{span, span_if, ProfileSnapshot};
 
 use super::compressor::{assemble_groups_batched, Compressor, GroupPool, SeqAssemble};
 use super::desc;
@@ -1246,7 +1246,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 }
             }
         }
-        let t_meta = profile_now();
+        let s_meta = span("deepseek:wave_metadata");
         // The wave's pinned-arena guard. Everything staged from it stays valid
         // until this drops (line ~2426), and the arena resets then — freeing is
         // by lifetime, and nothing here syncs.
@@ -1437,7 +1437,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // carries the chunk records the row scatter addresses through.
         let verify_scatter_hdr =
             |layer: usize, gi: usize| -> u64 { hdr_of(layer, verify_row_start[gi]) };
-        pipeline_record("deepseek:wave_metadata", t_meta);
+        s_meta.end();
 
         let mut state = self
             .seq_state
@@ -1495,14 +1495,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let dev = h.device().clone();
 
             // Attention sub-block.
-            let t_attn_pre = profile_now();
-            let t_hcpre = profile_now();
+            let s_attn_pre = span("deepseek:hc_pre_norm");
+            let s_hcpre = span("attn:hc_pre");
             let (x, post, comb) = hc.pre(&h, &layer.hc_attn)?;
-            pipeline_record("attn:hc_pre", t_hcpre);
-            let t_anorm = profile_now();
+            s_hcpre.end();
+            let s_anorm = span("attn:norm");
             let x = rms_norm(&x, &layer.attn_norm, cfg.norm_eps)?;
-            pipeline_record("attn:norm", t_anorm);
-            pipeline_record("deepseek:hc_pre_norm", t_attn_pre);
+            s_anorm.end();
+            s_attn_pre.end();
 
             // Phase A — glue scatter FIRST: every glue row's latent lands in
             // its reserved gap chunk before ANY attention pass of this layer
@@ -1510,7 +1510,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // window key — no double-source, no garbage gaps).
             let glue_row_base = decode_seqs.len() + prefill_lens.iter().sum::<usize>();
             let mut glue_proj: Vec<(Tensor, Tensor)> = Vec::with_capacity(glue_seqs.len());
-            let t_glue_scatter = profile_now();
+            let s_glue_scatter = span_if(!glue_seqs.is_empty(), "deepseek:glue_scatter");
             {
                 let mut cursor = glue_row_base;
                 // Every island's scatter collected first, then ONE launch: each
@@ -1534,9 +1534,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 }
                 super::paged::paged_latent_glue_scatter(&runs, &generation)?;
             }
-            if !glue_seqs.is_empty() {
-                pipeline_record("deepseek:glue_scatter", t_glue_scatter);
-            }
+            drop(s_glue_scatter);
 
             let mut attn_rows: Vec<Tensor> = Vec::with_capacity(total_rows);
             // Decode rows: one kernel step per sequence.
@@ -1547,9 +1545,9 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // gathered compressed blocks — each slot's selection is the dense
             // range `[offset, offset+k)` into the concat, so per-session galleries
             // stay isolated with no cross-bleed and no GID readback.
-            let t_decode = profile_now();
             if !decode_seqs.is_empty() {
-                let t_dprep = profile_now();
+                let s_decode = span("deepseek:decode_attn");
+                let s_dprep = span("decode:prep");
                 let n_dec = decode_seqs.len();
                 let (h, hd) = (a.n_heads(), a.head_dim());
 
@@ -1557,7 +1555,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // rows (the decode rows are the first `n_dec` of `x`), replacing
                 // the per-session projection GEMVs. Bit-identical per row (matmul
                 // + last-dim norms are row-independent).
-                let t_proj = profile_now();
+                let s_proj = span("dprep:proj");
                 let xs_dec = x.narrow(1, 0, n_dec)?.to_dtype(DType::F32)?; // [1,n_dec,dim]
                                                                            // wq_a and wkv share `xs_dec`; quantize the activation once for both.
                 let (qa_raw, kv_raw) = shared_int8_pair(&xs_dec, a.wq_a(), a.wkv())?;
@@ -1597,7 +1595,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     }
                     None => None,
                 };
-                pipeline_record("dprep:proj", t_proj);
+                s_proj.end();
 
                 // Pass 1a: per-session corpus ASSEMBLE — advance each session's
                 // streaming compressor state with its pre-projected row and keep
@@ -1623,7 +1621,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // per-row append it replaces did.
                 let mut appended: HashMap<usize, usize> = HashMap::new();
                 let mut row_entries: Vec<usize> = Vec::with_capacity(n_dec);
-                let t_dasm = profile_now();
+                let s_dasm = span("dprep:assemble_all");
                 for (i, &seq) in decode_seqs.iter().enumerate() {
                     let comp_row = match &comp_proj {
                         Some((k, s)) => Some((k.narrow(0, i, 1)?, s.narrow(0, i, 1)?)),
@@ -1657,7 +1655,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         entry.absorbed = decode_pos[i] + 1;
                     }
                 }
-                pipeline_record("dprep:assemble_all", t_dasm);
+                s_dasm.end();
 
                 // Pass 1b: pool EVERY decode row's completed groups in ONE launch
                 // per compressor family, then append. `comp` = attention entries
@@ -1665,7 +1663,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // boundaries. The decode twin of the prefill pool batch, and
                 // bit-identical per group to the per-row pool it replaces
                 // (`pool_batched_across_seqs_matches_per_seq`).
-                let t_dpool = profile_now();
+                let s_dpool = span("dprep:pool");
                 let comp_refs: Vec<Option<&GroupPool>> =
                     asms.iter().map(|m| m.comp_gp.as_ref()).collect();
                 let icomp_refs: Vec<Option<&GroupPool>> =
@@ -1696,7 +1694,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         &generation,
                     )?;
                 }
-                pipeline_record("dprep:pool", t_dpool);
+                s_dpool.end();
 
                 // Pass 1c: capture each row's selection intent against its OWN
                 // corpus size (the selection itself batches over all sessions
@@ -1734,14 +1732,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         }
                     }
                 }
-                pipeline_record("decode:prep", t_dprep);
+                s_dprep.end();
 
                 // Batched selection: ONE launch per Stage-1 kernel over EVERY CSA
                 // decode session's gallery, replacing the per-session two-stage
                 // selection loop (whose `topm_select` — a single-warp serial bin
                 // scan × sessions — dominated the decode selection cost). HCA
                 // sessions attend all causal entries; empty/SWA select nothing.
-                let t_dsel = profile_now();
+                let s_dsel = span("decode:select");
                 let mut csa_idx: Vec<usize> = Vec::new();
                 let mut csa_gals: Vec<&FloatGallery> = Vec::new();
                 let mut csa_q: Vec<Tensor> = Vec::new();
@@ -1808,13 +1806,13 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         );
                     }
                 }
-                pipeline_record("decode:select", t_dsel);
+                s_dsel.end();
 
                 // Pass 2: gather EVERY session's selected HOT two-region rows into
                 // one pre-allocated block in a SINGLE batched launch (each slot's
                 // rows at its dense range `[offset, offset+k)`) — no per-region
                 // `index_select`, no cross-session `cat`, no per-session launch.
-                let t_dgather = profile_now();
+                let s_dgather = span("decode:gather");
                 let mut offsets: Vec<u32> = Vec::with_capacity(n_dec);
                 let mut off = 0u32;
                 for i in 0..n_dec {
@@ -1860,8 +1858,8 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         out_nope, out_scale, out_rope, out_pos, total_k,
                     )?
                 };
-                pipeline_record("decode:gather", t_dgather);
-                let t_dcache = profile_now();
+                s_dgather.end();
+                let s_dcache = span("decode:cache");
                 // The batched projections already produced these contiguous
                 // `[n_dec, …]` tensors; use them directly (the per-session
                 // narrow-then-cat that rebuilt them was a redundant device copy).
@@ -1884,10 +1882,10 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let q_pos_dec = q_pos_dec_t
                     .as_ref()
                     .expect("decode branch runs only when the wave has decode rows");
-                pipeline_record("decode:cache", t_dcache);
+                s_dcache.end();
                 // `cache` is the gathered two-region hot cache (built above from
                 // the gallery's pre-built int8 — no per-wave rebuild).
-                let t_dkern = profile_now();
+                let s_dkern = span("decode:kernel");
                 // Speculative-verify tail rows are VIRTUAL decode slots: their
                 // rows are written to the arena FIRST (same `store_band_elem`
                 // encode the fused scatter uses → byte-identical read-back) so
@@ -1961,14 +1959,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     st.ws(),
                     None,
                 )?;
-                pipeline_record("decode:kernel", t_dkern);
+                s_dkern.end();
                 // Batched output projection: ONE `output_proj` over all decode
                 // rows (`b = n_dec`) instead of a per-session call. `output_proj`
                 // is already batch-parametrized — its inner loop is over the 8
                 // o_lora groups, not sessions — so this is bit-identical per row
                 // (the group GEMMs are row-independent) and collapses `8·n_dec`
                 // group-GEMM launches to 8.
-                let t_doutp = profile_now();
+                let s_doutp = span("decode:outproj");
                 // Kernel output is token-major [n_dec, h, hd]; `output_proj` takes
                 // [b, s, h, hd] (here b=n_dec, s=1).
                 let o = out.reshape((n_dec, 1, h, hd))?; // kernel emits F32
@@ -1977,19 +1975,19 @@ impl ManagedBatchedModel for DeepSeekBatched {
                                                          // concatenated along axis 1 below exactly as the prefill/glue rows are,
                                                          // so `[1, n_dec, dim]` is bit-identical and skips the narrow round-trip.
                 attn_rows.push(proj.reshape((1, n_dec, ()))?);
-                pipeline_record("decode:outproj", t_doutp);
-                pipeline_record("deepseek:decode_attn", t_decode);
+                s_doutp.end();
+                s_decode.end();
             }
             // Prefill rows: each prompt is absorbed in ONE batched
             // `paged_latent_prefill` launch per layer (argmax-equal to per-token
             // decode absorption, validated by `wave_prefill_state_matches_decode_steps`),
             // which replaced the per-token launch loop that dominated the profile.
-            let t_prefill = profile_now();
+            let s_prefill = span_if(!prefill_seqs.is_empty(), "deepseek:prefill_attn");
             // ── Prefill projections: ONE batched projection over the WHOLE prompt
             // span (all sequences' rows), exactly as decode's `dprep` batches over
             // all decode rows — one `shared_int8_pair`/`wq_b`/`project_rows` instead
             // of one set per sequence. Row-independent ⇒ bit-identical.
-            let t_pprep = profile_now();
+            let s_pprep = span("prefill:prep");
             let prefill_total: usize = prefill_lens.iter().sum();
             let proj = if prefill_total == 0 {
                 None
@@ -2008,7 +2006,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let mut preps: Vec<PrefillPrep> = Vec::with_capacity(prefill_seqs.len());
             if !prefill_seqs.is_empty() {
                 let p = proj.as_ref().expect("prefill rows imply a projection");
-                let t_asm = profile_now();
+                let s_asm = span("pprep:assemble");
                 // Phase 1 — collect. Compressor presence is LAYER-uniform
                 // (every seq's layer state is built from the same layer kind),
                 // so the fleet either all contribute or none do.
@@ -2117,9 +2115,9 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     });
                     off += s_len;
                 }
-                pipeline_record("pprep:assemble", t_asm);
+                s_asm.end();
             }
-            pipeline_record("prefill:prep", t_pprep);
+            s_pprep.end();
 
             // ── Prefill pool: pool every sequence's completed compressor groups
             // in ONE launch across the whole prompt fleet (`Compressor::pool_and_norm`)
@@ -2127,7 +2125,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // entries (pre-RoPE), `icomp` = indexer keys (roped); both share group
             // boundaries. Bit-identical per group to the per-seq pool
             // (`pool_batched_across_seqs_matches_per_seq`).
-            let t_ppool = profile_now();
+            let s_ppool = span("prefill:pool");
             let comp_refs: Vec<Option<&super::compressor::GroupPool>> =
                 preps.iter().map(|p| p.comp_gp.as_ref()).collect();
             let icomp_refs: Vec<Option<&super::compressor::GroupPool>> =
@@ -2140,14 +2138,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 Some(ix) => pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope), &generation)?,
                 None => None,
             };
-            pipeline_record("prefill:pool", t_ppool);
+            s_ppool.end();
 
             // Append the whole fleet's groups BEFORE part A, in one pass. The
             // appends are independent across sequences and part A's selection
             // reads each gallery only after its own append, so hoisting them out
             // of the loop is the same order of effects with one launch set
             // instead of one per sequence.
-            let t_pappend = profile_now();
+            let s_pappend = span("ppush:append");
             if let Some(entries) = comp_entries.as_ref() {
                 let mut by_seq: HashMap<usize, &mut FloatGallery> = state
                     .iter_mut()
@@ -2162,7 +2160,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     &generation,
                 )?;
             }
-            pipeline_record("ppush:append", t_pappend);
+            s_pappend.end();
 
             // ── Prefill pass 2 — FULLY BATCHED across sequences (invariant 5):
             // part A collects each seq's corpus gids + per-token (comp_idx,
@@ -2221,7 +2219,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     base,
                     q_rows,
                 )?;
-                let t_pgather = profile_now();
+                let s_pgather = span("prefill:gather");
                 // Build (gids, LOCAL comp_idx, comp_cnt, g) — same Device/Host
                 // arms as before, but WITHOUT gathering (the gather is batched in
                 // part B). Device: gather 0..n_corpus (absolute ids); Host: union
@@ -2279,7 +2277,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     let shifted = comp_idx.broadcast_add(&full_off)?;
                     comp_idx = comp_idx.lt(&sentinel)?.where_cond(&shifted, &comp_idx)?;
                 }
-                pipeline_record("prefill:gather", t_pgather);
+                s_pgather.end();
                 for _ in 0..s_len {
                     seq_of_host.push(pi as u32);
                 }
@@ -2301,7 +2299,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             if !prefill_seqs.is_empty() {
                 let projref = proj.as_ref().expect("prefill rows imply a projection");
                 let total_g = g_off as usize;
-                let t_pkern = profile_now();
+                let s_pkern = span("prefill:kernel");
                 let cache = if total_g == 0 {
                     st.empty_corpus_cache()?
                 } else {
@@ -2385,15 +2383,15 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     session.backings()[l].k_format().to_tag(),
                     st.ws(),
                 )?;
-                pipeline_record("prefill:kernel", t_pkern);
-                let t_poutp = profile_now();
+                s_pkern.end();
+                let s_poutp = span("prefill:outproj");
                 let o_all = out.reshape((1, prefill_total, a.n_heads(), a.head_dim()))?;
                 attn_rows.push(a.output_proj(&o_all, 1, prefill_total)?);
-                pipeline_record("prefill:outproj", t_poutp);
+                s_poutp.end();
 
                 // Part C: writeback each seq's prompt latents to its arena (deferred —
                 // set_len must run AFTER the batched kernel read the committed prefix).
-                let t_pwb = profile_now();
+                let s_pwb = span("prefill:writeback");
                 let mut runs: Vec<GlueRun> = Vec::with_capacity(prefill_seqs.len());
                 for (pi, &seq) in prefill_seqs.iter().enumerate() {
                     let s_len = prefill_lens[pi];
@@ -2417,15 +2415,15 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     }
                 }
                 super::paged::paged_latent_glue_scatter(&runs, &generation)?;
-                pipeline_record("prefill:writeback", t_pwb);
-                pipeline_record("deepseek:prefill_attn", t_prefill);
+                s_pwb.end();
             }
+            drop(s_prefill);
             // Phase D — glue attention: each glue row attends its causal
             // window at its TRUE position, keys read from the arena (its own
             // island included — scattered in phase A). Compressed selection
             // and the compression-seam fold are step-7 scope; the corpus
             // state does not absorb glue tokens.
-            let t_glue_attn = profile_now();
+            let s_glue_attn = span_if(!glue_seqs.is_empty(), "deepseek:glue_attn");
             for (gi, _seq) in glue_seqs.iter().enumerate() {
                 let g_len = glue_lens[gi];
                 let (xs, qr) = &glue_proj[gi];
@@ -2468,27 +2466,25 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let o = out.reshape((1, g_len, a.n_heads(), a.head_dim()))?;
                 attn_rows.push(a.output_proj(&o, 1, g_len)?);
             }
-            if !glue_seqs.is_empty() {
-                pipeline_record("deepseek:glue_attn", t_glue_attn);
-            }
-            let t_hc_post = profile_now();
+            drop(s_glue_attn);
+            let s_hc_post = span("deepseek:hc_post_attn");
             let x = Tensor::cat(&attn_rows, 1)?; // [1, rows, dim]
             let h1 = hc.post(&x, &h, &post, &comb)?;
-            pipeline_record("deepseek:hc_post_attn", t_hc_post);
+            s_hc_post.end();
 
             // MoE sub-block: one batched call — a single routing readback per
             // layer per wave, amortized over every row (the expert ids must be
             // host-visible to schedule the streaming cache's pinned→VRAM
             // uploads; it reaches zero only under full residency).
-            let t_moe = profile_now();
-            let t_moe_hcpre = profile_now();
+            let s_moe = span("deepseek:moe");
+            let s_moe_hcpre = span("moe:hc_pre");
             let (x, post, comb) = hc.pre(&h1, &layer.hc_ffn)?;
-            pipeline_record("moe:hc_pre", t_moe_hcpre);
+            s_moe_hcpre.end();
             let moe = e.moe_forward_batch(layer, &x, &flat_ids)?;
-            let t_moe_hcpost = profile_now();
+            let s_moe_hcpost = span("moe:hc_post");
             h = hc.post(&moe, &h1, &post, &comb)?;
-            pipeline_record("moe:hc_post", t_moe_hcpost);
-            pipeline_record("deepseek:moe", t_moe);
+            s_moe_hcpost.end();
+            s_moe.end();
 
             // Capture this layer's hidden for the drafter if it is a target layer. Per DeepSeek's
             // `inference/model.py` (`main_hiddens.append(h.mean(dim=2))`), the target feature is the
@@ -2526,7 +2522,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
         }
 
         // Head: decode rows + each prefill sequence's LAST row.
-        let t_head = profile_now();
+        let s_head = span("deepseek:head_lm");
         let reduced = hc.head_reduce(&h, e.hc_head())?; // [1, rows, dim]
         let normed = rms_norm(&reduced, e.output_norm(), cfg.norm_eps)?;
         // Rows to score: every decode row (the [0,n_dec) prefix) + each prefill
@@ -2615,7 +2611,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 }
             }
         }
-        pipeline_record("deepseek:head_lm", t_head);
+        s_head.end();
         Ok(WaveResult::owned(WaveStep {
             residual: None,
             logits: Some(logits_rows),
@@ -2647,7 +2643,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // compressors/galleries; the driver's `truncate_sequence` consumes each
         // snapshot to roll that state back to the accepted prefix — the KV
         // truncation alone cannot see it.
-        let t_snap = profile_now();
+        let s_snap = span("verify:snapshot");
         // ONE MIXED WAVE: the plain cohort's committed tokens lead as ordinary
         // decode rows (live slots, on-device commit, fused scatter), the
         // verify blocks trail as virtual rows — each block position one decode
@@ -2676,8 +2672,8 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 row_inputs.push(Tensor::from_vec(vec![tok], (1, 1), &Device::Cpu)?);
             }
         }
-        pipeline_record("verify:snapshot", t_snap);
-        let t_fwd = profile_now();
+        s_snap.end();
+        let s_fwd = span("verify:forward");
         *self
             .verify_all_rows
             .write()
@@ -2712,8 +2708,8 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 return Err(e);
             }
         };
-        pipeline_record("verify:forward", t_fwd);
-        let t_post = profile_now();
+        s_fwd.end();
+        let s_post = span("verify:post");
         for &(seq, _) in plain {
             session.advance_sequence(seq, 1)?;
         }
@@ -2741,7 +2737,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             out.push(logits[off..off + b.len()].to_vec());
             off += b.len();
         }
-        pipeline_record("verify:post", t_post);
+        s_post.end();
         Ok((plain_out, out))
     }
 

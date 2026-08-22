@@ -360,19 +360,33 @@ impl Attention {
     /// dense matmul on each block.
     #[cfg(feature = "cuda")]
     fn grouped_output_proj(&self, o: &Tensor, b: usize, s: usize) -> Result<Option<Tensor>> {
-        use candle::quantized::cuda::{grouped_qmatmul, to_dynamic};
+        // 64 Mi activation elements per chunk ⇒ a transient peak of
+        // `2 × 64 Mi × ~1.125 B` ≈ 150 MB regardless of span length.
+        const CHUNK_ELEMS: usize = 64 << 20;
+        self.grouped_output_proj_chunked(o, b, s, CHUNK_ELEMS)
+    }
+
+    /// [`Self::grouped_output_proj`] with the chunk budget injected, so the
+    /// multi-chunk path is reachable from a test at a shape that fits in one.
+    #[cfg(feature = "cuda")]
+    fn grouped_output_proj_chunked(
+        &self,
+        o: &Tensor,
+        b: usize,
+        s: usize,
+        chunk_elems: usize,
+    ) -> Result<Option<Tensor>> {
+        use candle::quantized::cuda::{
+            fused_moe_gather_q8a128, grouped_qmatmul, to_dynamic, DynamicActs, DynamicTensor,
+        };
         use candle::quantized::Int8Mode;
-        // Decode signature only (`s == 1`): each group sees few rows (`b` = the concurrent
-        // decode count), so the launch-bound path wins by collapsing `ng` launches into one.
-        // Prefill (`s > 1`) feeds each group many rows — those large per-group GEMMs run
-        // faster as separate dense matmuls than through the MoE grouped `gemx` kernel — so it
-        // keeps the per-group loop.
-        if s != 1 {
-            return Ok(None);
-        }
         let (ng, olr) = (self.n_groups, self.o_lora_rank);
         let per_group = (self.n_heads / ng) * self.head_dim;
-        if per_group % 128 != 0 || olr % 32 != 0 {
+        // `per_group % 1024` is the q8a1024 byte-row gather's token-contiguity
+        // requirement, and it implies the grouped GEMM's own `% 128`. Real
+        // geometry clears it with room: n_heads 64 / o_groups 8 × head_dim 512
+        // ⇒ per_group = 4096.
+        if !per_group.is_multiple_of(1024) || !olr.is_multiple_of(32) {
             return Ok(None);
         }
         let dev = match o.device() {
@@ -395,30 +409,90 @@ impl Attention {
             None => return Ok(None),
         };
         let bs = b * s;
-        // [b,s,ng,per_group] -> group-major [ng,b,s,per_group] -> [ng*b*s, per_group]
-        let o_g = o
-            .permute((2, 0, 1, 3))?
-            .contiguous()?
-            .reshape((ng * bs, per_group))?
-            .to_dtype(DType::F32)?;
-        let op = to_dynamic(&o_g, Int8Mode::Performance, &dev)?;
-        let offsets: Vec<i32> = (0..=ng).map(|g| (g * bs) as i32).collect();
-        let out = grouped_qmatmul(
-            op.as_dynamic(),
-            &ptrs,
-            wdtype,
-            olr,
-            &offsets,
-            &dev,
-            Backing::Owned,
-        )?; // [ng*bs, olr] f32
-            // [ng*bs, olr] -> [ng, bs, olr] -> [bs, ng, olr] -> [b, s, ng*olr]
-        let proj = out
-            .reshape((ng, bs, olr))?
-            .transpose(0, 1)?
-            .contiguous()?
-            .reshape((b, s, ng * olr))?;
-        Ok(Some(proj))
+        // ── QUANTIZE FIRST, THEN GATHER — never the reverse ──
+        //
+        // `o` is [b,s,ng,per_group] and contiguous, so [bs*ng, per_group] is the
+        // SAME storage: a free reshape, no copy. Row `t*ng + g` is token `t`'s
+        // group `g` — which is exactly the MoE layout (token × "expert"), and
+        // the grouped GEMM wants group-major, so the rows must be permuted.
+        //
+        // The tempting order is to pack f32 into group-major and then quantize
+        // (a `permute().contiguous()` here, `ng` strided `.contiguous()` calls
+        // in the per-group loop this replaces). That moves 4 B/elem, and it is
+        // what `fused_moe_gather_q8a128`'s contract warns against in as many
+        // words: "no gather-then-quantize". Quantizing first makes the permute a
+        // q8a1024 BYTE-ROW gather at ~1.125 B/elem — the same rows, ~3.5x less
+        // traffic, and one launch instead of `ng`.
+        //
+        // Bit-identical to packing first: q8a128 scales per 128 elements WITHIN a
+        // row, `per_group % 128 == 0` (implied by the `% 1024` check above) so a
+        // group never straddles rows, and the gather moves whole quantized rows.
+        // Every element keeps its group, its scale and its order.
+        let o_flat = o.reshape((bs * ng, per_group))?.to_dtype(DType::F32)?;
+
+        // ── Chunked over the token axis, to bound the transient peak ──
+        //
+        // The gather needs its source and its destination live simultaneously, and
+        // both are the full operand — so a whole-span pass costs TWO copies of it at
+        // once. The per-group loop this replaces peaked at one group (`1/ng`), so
+        // unbounded this would be a real peak regression on a long prefill span:
+        // ~302 MB at 4096 tokens against the old ~86 MB.
+        //
+        // Chunking caps that at `2 × chunk_elems × ~1.125 B` regardless of span.
+        // Rows are independent, so each chunk is an exact sub-problem: the token axis
+        // is the outer axis of `o_flat`, making a chunk a contiguous row range, and
+        // each chunk's gather/offsets are simply built at its own width. Decode and
+        // any span within the cap take a single pass, so the common path is unchanged
+        // and pays no concatenation.
+        let chunk_bs = (chunk_elems / (ng * per_group)).max(1);
+
+        let mut parts: Vec<Tensor> = Vec::with_capacity(bs.div_ceil(chunk_bs));
+        let mut t0 = 0usize;
+        while t0 < bs {
+            let ct = (bs - t0).min(chunk_bs);
+            // Contiguous row range: `o_flat` is token-major, so this chunk's rows are
+            // `[t0*ng, (t0+ct)*ng)`. `to_dynamic` honours the view's start offset.
+            let o_chunk = o_flat.narrow(0, t0 * ng, ct * ng)?;
+            // Group-major row order (`ids[g*ct + t] = t*ng + g`), memoized on the
+            // device by `(ct, ng)`: a pure function of that shape, so steady-state
+            // waves neither rebuild nor re-upload it.
+            let ids_dev = dev.group_major_ids(ct, ng)?;
+            // Scope the quantized source so it is released as soon as the gather is
+            // issued, rather than being held live through the matmul as well.
+            let stacked = {
+                let acts = to_dynamic(&o_chunk, Int8Mode::Performance, &dev)?;
+                let op = match &acts {
+                    DynamicActs::Int8(q) => q,
+                    // `Int8Mode::Performance` was requested and every weight is
+                    // int8-KO (checked above), so a float operand here means the mode
+                    // was not honoured — fall back rather than silently taking a
+                    // slower path.
+                    DynamicActs::Float(_) => return Ok(None),
+                };
+                fused_moe_gather_q8a128(op, &ids_dev, ng * ct, &dev, Backing::Owned)?
+            };
+            let offsets: Vec<i32> = (0..=ng).map(|g| (g * ct) as i32).collect();
+            let out = grouped_qmatmul(
+                DynamicTensor::Int8(&stacked),
+                &ptrs,
+                wdtype,
+                olr,
+                &offsets,
+                &dev,
+                Backing::Owned,
+            )?; // [ng*ct, olr] f32
+                // [ng*ct, olr] -> [ng, ct, olr] -> [ct, ng, olr] (token-major again)
+            parts.push(out.reshape((ng, ct, olr))?.transpose(0, 1)?.contiguous()?);
+            t0 += ct;
+        }
+
+        // One chunk is the common case (all of decode, and any span within the cap);
+        // concatenating a single tensor would be a pointless full copy.
+        let proj = match parts.len() {
+            1 => parts.pop().expect("checked len == 1"),
+            _ => Tensor::cat(&parts, 0)?,
+        };
+        Ok(Some(proj.reshape((b, s, ng * olr))?))
     }
 
     /// No grouped int8 path without CUDA — the caller runs the per-group loop.
@@ -667,18 +741,24 @@ mod tests {
         Ok(())
     }
 
-    /// The grouped int8-KO output projection (`grouped_output_proj`, decode `s == 1`)
-    /// reproduces the per-group loop it replaces: same permute/reshape/offset layout, and
-    /// `grouped_qmatmul` equals the per-weight dense matmul on each block. Guards the
-    /// reshape/offset logic that the full-model gate would otherwise be the only cover for.
+    /// The grouped int8-KO output projection reproduces the per-group loop it replaces:
+    /// same row order and offsets, and `grouped_qmatmul` equals the per-weight dense matmul
+    /// on each block. Guards the reshape/gather/offset logic that the full-model gate would
+    /// otherwise be the only cover for.
+    ///
+    /// Run at **both** `s == 1` (decode) and `s > 1` (prefill). Prefill used to bail to the
+    /// per-group loop because packing group-major in f32 cost more than the grouped GEMM
+    /// saved; quantizing first and gathering q8a1024 byte-rows removed that cost, so both
+    /// shapes now take this path and both need cover.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn grouped_output_proj_matches_per_group() -> Result<()> {
         use candle::quantized::{GgmlDType, Int8Mode, QMatMul, QTensor};
         let dev = Device::new_cuda(0)?;
-        let (h, hd, ng, olr) = (8usize, 128usize, 2usize, 64usize);
-        let per_group = (h / ng) * hd; // 512 (% 128 == 0)
+        // per_group must clear the q8a1024 gather's `% 1024`, not just the GEMM's `% 128`.
+        let (h, hd, ng, olr) = (16usize, 128usize, 2usize, 64usize);
+        let per_group = (h / ng) * hd; // 1024
         let dim = 256usize; // width of the dummy non-wo_a projections; unused by output_proj
 
         let mut cfg = Config::tiny();
@@ -711,26 +791,46 @@ mod tests {
         };
         let att = Attention::new(&cfg, 0, p)?;
 
-        // `grouped_output_proj` takes the reshaped `o` `[b, s, ng, per_group]` (s == 1 decode).
+        // `grouped_output_proj` takes the reshaped `o` `[b, s, ng, per_group]`.
         let b = 3usize;
-        let o = Tensor::randn(0f32, 1.0, (b, 1, ng, per_group), &dev)?;
-        let grouped = att
-            .grouped_output_proj(&o, b, 1)?
-            .expect("int8-KO wo_a + aligned shapes → grouped path");
+        for &s in &[1usize, 5] {
+            let o = Tensor::randn(0f32, 1.0, (b, s, ng, per_group), &dev)?;
+            let grouped = att
+                .grouped_output_proj(&o, b, s)?
+                .expect("int8-KO wo_a + aligned shapes → grouped path");
 
-        // Per-group reference (the loop the grouped path replaces).
-        let mut groups = Vec::with_capacity(ng);
-        for (g, wo_a_g) in att.wo_a.iter().enumerate() {
-            let og = o.narrow(2, g, 1)?.contiguous()?.reshape((b, per_group))?;
-            groups.push(wo_a_g.forward(&og)?.reshape((b, 1, olr))?);
+            // Per-group reference (the loop the grouped path replaces).
+            let mut groups = Vec::with_capacity(ng);
+            for (g, wo_a_g) in att.wo_a.iter().enumerate() {
+                let og = o.narrow(2, g, 1)?.contiguous()?.reshape((b * s, per_group))?;
+                groups.push(wo_a_g.forward(&og)?.reshape((b, s, 1, olr))?);
+            }
+            let reference = Tensor::cat(&groups, 2)?.reshape((b, s, ng * olr))?;
+
+            assert_eq!(grouped.dims(), reference.dims(), "s={s} shape");
+            let diff = (&grouped - &reference)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(diff < 1e-3, "s={s}: grouped vs per-group max abs diff {diff}");
+
+            // The chunked path must agree with the single-pass one it bounds. Budgets
+            // of 1, 2 and 3 tokens' worth of elements give uneven splits of `b*s`
+            // (including a short final chunk), which is where the row offsets and the
+            // per-chunk gather widths would go wrong.
+            for tokens_per_chunk in 1..=3usize {
+                let chunked = att
+                    .grouped_output_proj_chunked(&o, b, s, tokens_per_chunk * ng * per_group)?
+                    .expect("same shapes → grouped path");
+                assert_eq!(chunked.dims(), grouped.dims(), "s={s} chunked shape");
+                let d = (chunked - &grouped)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                assert_eq!(
+                    d, 0.0,
+                    "s={s} tokens_per_chunk={tokens_per_chunk}: chunked must be bit-identical \
+                     to the single pass (rows are independent)"
+                );
+            }
         }
-        let reference = Tensor::cat(&groups, 2)?.reshape((b, 1, ng * olr))?;
-
-        let diff = (grouped - reference)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
-        assert!(diff < 1e-3, "grouped vs per-group max abs diff {diff}");
         Ok(())
     }
 

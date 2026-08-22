@@ -143,7 +143,13 @@ fn load_expert(dev: &Device) -> Result<Option<(QMatMul, Tensor, usize)>> {
         Device::Cuda(d) => d,
         _ => candle::bail!("expert matmul baseline requires a CUDA device"),
     };
-    let repacked = candle::quantized::repack_to_host(cuda_dev, &fx.ggml, n, k, dtype, dtype)?;
+    // `repack_gemx_to_host`, NOT `repack_to_host(.., dtype, dtype)`: the fixture holds RAW GGML
+    // straight out of the GGUF, so it needs the K/128 repack. `repack_to_host` reads an equal
+    // dtype pair as "already in the target format" and passes the bytes through — correct for
+    // the loader (whose weights ARE pre-repacked; doing it twice is wrong and ruinous), wrong
+    // here. Passing through fed raw GGML to `forward_via_gemx` as if it were K/128 layout and
+    // every output element came back NaN.
+    let repacked = candle::quantized::repack_gemx_to_host(cuda_dev, &fx.ggml, n, k, dtype)?;
     let storage = candle::quantized::load_repacked(cuda_dev, &repacked, dtype)?;
     let qt = QTensor::new(storage, vec![n, k])?;
     let qmm = QMatMul::from_qtensor_repacked(qt)?;
@@ -155,6 +161,19 @@ fn rel_l2(a: &Tensor, b: &Tensor) -> Result<f32> {
     let num = (a - b)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
     let den = b.sqr()?.sum_all()?.to_scalar::<f32>()?.max(1e-12);
     Ok((num / den).sqrt())
+}
+
+/// Count non-finite elements, so a failure names the side that went bad.
+///
+/// A bare `rel L2 = NaN` says only that the arithmetic touched a NaN — it does
+/// not say whether the kernel produced one, the reference did, or both. That
+/// ambiguity is what let this failure sit unexplained.
+fn nonfinite(t: &Tensor) -> Result<(usize, usize)> {
+    let v = t.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    Ok((
+        v.iter().filter(|x| x.is_nan()).count(),
+        v.iter().filter(|x| x.is_infinite()).count(),
+    ))
 }
 
 #[test]
@@ -170,6 +189,14 @@ fn expert_matmul_matches_dequant_reference() -> Result<()> {
         let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?;
         let out = qmm.forward(&x)?; // [m, n] — quantized GEMX kernel
         let reference = x.matmul(&wt)?; // [m, n] — f32 dequant matmul
+        for (t, name) in [(&out, "kernel output"), (&reference, "dequant reference")] {
+            let (nan, inf) = nonfinite(t)?;
+            assert!(
+                nan == 0 && inf == 0,
+                "M={m}: {name} has {nan} NaN and {inf} Inf of {} elements",
+                t.elem_count()
+            );
+        }
         let err = rel_l2(&out, &reference)?;
         assert!(
             err < 0.03,

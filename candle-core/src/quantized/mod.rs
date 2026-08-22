@@ -53,7 +53,8 @@ pub use cuda::{
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{
-    load_repacked, load_repacked_into, load_repacked_on_stream, repack_to_host,
+    load_repacked, load_repacked_into, load_repacked_on_stream, repack_gemx_to_host,
+    repack_to_host,
     repacked_size_bytes, view_repacked,
 };
 

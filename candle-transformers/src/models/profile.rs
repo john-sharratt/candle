@@ -26,6 +26,11 @@
 #[cfg(feature = "profile")]
 use std::fmt;
 
+#[cfg(feature = "nvtx")]
+use candle_kernels::simple::nvtx::{candle_nvtx_range_end, candle_nvtx_range_start};
+#[cfg(feature = "nvtx")]
+use std::ffi::CString;
+
 // ── Timestamp mark ────────────────────────────────────────────────────
 
 /// Opaque timestamp.  `Instant` when `profile` is enabled, `()` otherwise.
@@ -317,6 +322,139 @@ pub fn pipeline_record(_name: &'static str, _start: ProfileMark) {}
 #[inline(always)]
 pub fn pipeline_record_duration(_name: &'static str, _elapsed: std::time::Duration, _count: u64) {}
 
+// ── Pipeline span guard ───────────────────────────────────────────────
+
+/// A named pipeline span: wall-clock timing under `profile`, an NVTX range
+/// under `nvtx`, and nothing at all under neither.
+///
+/// The two features are independent on purpose. `profile` costs an `Instant`
+/// plus a `RefCell` borrow per span and produces the summary table; `nvtx`
+/// costs a driver call and annotates the trace so
+/// `nsys stats --report nvtx_kern_sum` attributes every kernel to the span that
+/// launched it. A capture run wants the second without paying for the first.
+///
+/// # Why this exists rather than [`pipeline_record`] alone
+///
+/// [`pipeline_record`] receives the span name at the END of the span, which is
+/// enough to accumulate a duration but not to open an NVTX range — that needs
+/// the name at the start. `Span` captures both ends.
+///
+/// # Ordering
+///
+/// The span closes when the guard drops, so nested spans come out correctly
+/// without any bookkeeping: Rust drops in reverse declaration order, so an
+/// enclosing span declared first closes last. Spans that do NOT nest are also
+/// fine — the underlying `nvtxRangeStartEx`/`nvtxRangeEnd` pair is the
+/// overlapping-capable NVTX API, not the strictly-stacked push/pop one, so
+/// ending out of order is legal.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let s = span("decode:select");
+/// // ... work ...
+/// s.end();          // records here, exactly like `pipeline_record` did
+/// ```
+///
+/// Use [`Span::end`] rather than letting the guard fall out of scope wherever
+/// the span ends before its enclosing block does — most of the hot path records
+/// mid-block with more work following.
+pub struct Span {
+    name: &'static str,
+    mark: ProfileMark,
+    #[cfg(feature = "nvtx")]
+    range: u64,
+}
+
+/// The NUL-terminated form of a span name, interned per name.
+///
+/// Span names come from a closed set of `&'static str` literals — a few dozen
+/// across the wave — but a range is opened per layer per wave, so building the
+/// `CString` on every open would be an allocation on the hot path for no reason.
+/// Interning turns it into a pointer lookup. The cache is thread-local, matching
+/// the timing accumulator, so there is no lock.
+#[cfg(feature = "nvtx")]
+fn nvtx_name(name: &'static str) -> &'static CString {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static NAMES: RefCell<HashMap<&'static str, &'static CString>> =
+            RefCell::new(HashMap::new());
+    }
+    NAMES.with(|n| {
+        *n.borrow_mut().entry(name).or_insert_with(|| {
+            // Leaked deliberately: one allocation per distinct span name per
+            // thread, for the life of the process, so the pointer handed to NVTX
+            // stays valid without a borrow outliving the call.
+            let c = CString::new(name).expect("span names are literals without NUL bytes");
+            Box::leak(Box::new(c))
+        })
+    })
+}
+
+/// Open a named pipeline span. See [`Span`].
+#[inline(always)]
+pub fn span(name: &'static str) -> Span {
+    Span::new(name)
+}
+
+/// Open a span only when `cond` holds, for a phase that is skipped entirely on
+/// some waves (decode-only waves have no prefill rows, and vice versa).
+///
+/// Without this the guard would record a span for the phase that did not run,
+/// polluting both the timing table and the NVTX trace with zero-work entries.
+/// `drop` the returned value where the phase ends.
+#[inline(always)]
+pub fn span_if(cond: bool, name: &'static str) -> Option<Span> {
+    if cond {
+        Some(Span::new(name))
+    } else {
+        None
+    }
+}
+
+impl Span {
+    /// Open the span: capture the start mark and push the NVTX range.
+    #[inline(always)]
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            mark: profile_now(),
+            #[cfg(feature = "nvtx")]
+            range: {
+                // Span names are `&'static str` from a closed set, so the
+                // NUL-terminated copy is built once per name and reused rather
+                // than allocated on every open.
+                let c = nvtx_name(name);
+                unsafe { candle_nvtx_range_start(c.as_ptr()) }
+            },
+        }
+    }
+
+    /// Close the span at this exact point, rather than at end of scope.
+    #[inline(always)]
+    pub fn end(self) {
+        drop(self);
+    }
+}
+
+impl Drop for Span {
+    // `ProfileMark` is `()` when `profile` is off — that IS the zero-cost
+    // design, so passing it on is a unit arg by construction, not an oversight.
+    #[allow(clippy::unit_arg)]
+    #[inline(always)]
+    fn drop(&mut self) {
+        // Close the NVTX range before the host-side bookkeeping, so the
+        // accumulator's `RefCell` borrow is not attributed to the span.
+        #[cfg(feature = "nvtx")]
+        unsafe {
+            candle_nvtx_range_end(self.range)
+        };
+        pipeline_record(self.name, self.mark);
+    }
+}
+
 /// Snapshot and reset the pipeline profiler, returning a report string.
 #[cfg(feature = "profile")]
 pub fn pipeline_snapshot_and_reset() -> ProfileSnapshot {
@@ -347,3 +485,65 @@ pub fn profile_sync(device: &candle::Device) {
 #[cfg(not(feature = "profile"))]
 #[inline(always)]
 pub fn profile_sync(_device: &candle::Device) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The span must be usable — and cost nothing — regardless of which
+    /// features are on. This is the only assertion available when `profile` is
+    /// off, and it is the one that catches a broken cfg combination.
+    #[test]
+    fn a_span_opens_and_closes_under_any_feature_set() {
+        let s = span("probe:explicit_end");
+        s.end();
+        {
+            let _s = span("probe:scope_end");
+        }
+    }
+
+    /// `end()` must record at the call site, exactly as the
+    /// `profile_now`/`pipeline_record` pair it replaces did.
+    #[cfg(feature = "profile")]
+    #[test]
+    fn end_records_the_span_under_the_profile_feature() {
+        let _ = pipeline_snapshot_and_reset(); // isolate from other spans on this thread
+        let s = span("probe:recorded");
+        s.end();
+        let snap = pipeline_snapshot_and_reset();
+        let hit = snap.entries.iter().find(|(n, _, _)| n == "probe:recorded");
+        assert!(hit.is_some(), "span did not record: {:?}", snap.entries);
+        assert_eq!(hit.unwrap().2, 1, "span recorded the wrong count");
+    }
+
+    /// Nested spans both record, and the inner one is contained by the outer.
+    /// Drop order (reverse declaration) is what makes NVTX nesting come out
+    /// right, so it is worth pinning.
+    #[cfg(feature = "profile")]
+    #[test]
+    fn nested_spans_both_record_with_the_inner_contained() {
+        let _ = pipeline_snapshot_and_reset();
+        {
+            let _outer = span("probe:outer");
+            {
+                let _inner = span("probe:inner");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let snap = pipeline_snapshot_and_reset();
+        let ms = |name: &str| {
+            snap.entries
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .unwrap_or_else(|| panic!("missing {name}: {:?}", snap.entries))
+                .1
+        };
+        assert!(
+            ms("probe:outer") >= ms("probe:inner"),
+            "outer {} should contain inner {}",
+            ms("probe:outer"),
+            ms("probe:inner")
+        );
+    }
+}

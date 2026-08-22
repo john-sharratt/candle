@@ -42,6 +42,11 @@ pub struct CudaDevice {
     /// buffer instead of re-uploading per launch — the per-launch tiny H2D copies
     /// were a measured WDDM submission storm. See [`Self::info_table`].
     info_tables: Arc<Mutex<HashMap<Vec<usize>, Arc<Uploaded<usize>>>>>,
+    /// Memoized device copies of the token-major → group-major gather permutation.
+    /// Keyed by **shape** `(rows, groups)` rather than contents, because the table is
+    /// a pure function of that shape: a hit costs a two-word hash and does no host
+    /// build and no upload at all. See [`Self::group_major_ids`].
+    perm_tables: Arc<Mutex<HashMap<(usize, usize), Arc<Uploaded<u32>>>>>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -167,6 +172,49 @@ impl CudaDevice {
             backing: Backing::Owned,
         });
         cache.insert(info.to_vec(), t.clone());
+        Ok(t)
+    }
+
+    /// The token-major → group-major gather permutation, memoized per `(rows, groups)`:
+    ///
+    /// ```text
+    /// ids[g * rows + t] = t * groups + g        for g in 0..groups, t in 0..rows
+    /// ```
+    ///
+    /// This is the row order the grouped output projection needs. Its source `[rows, groups, w]`
+    /// activation is contiguous, so group `g`'s rows are interleaved with stride `groups`; the
+    /// grouped matmul wants each group's rows adjacent, and gathering with this table produces
+    /// that without ever materialising the permutation in f32.
+    ///
+    /// **Keyed by shape, not contents.** The table is a pure function of `(rows, groups)`, so a
+    /// hit is a two-word hash — no host build, no upload. Building it per call instead was the
+    /// same WDDM submission storm [`Self::info_table`] exists to prevent, except worse: it also
+    /// spent `O(rows·groups)` of host time per layer per wave.
+    ///
+    /// Entries are pool-owned (`Backing::Owned`) and outlive any single wave; kernels only read
+    /// them. Cleared wholesale past a bound, like the info-table cache — in-flight users hold
+    /// their own `Arc`, so clearing is safe and a rebuild is trivial.
+    pub fn group_major_ids(&self, rows: usize, groups: usize) -> Result<Arc<Uploaded<u32>>> {
+        let key = (rows, groups);
+        let mut cache = self.perm_tables.lock().unwrap();
+        if let Some(t) = cache.get(&key) {
+            return Ok(t.clone());
+        }
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        let mut ids: Vec<u32> = Vec::with_capacity(rows * groups);
+        for g in 0..groups {
+            for t in 0..rows {
+                ids.push((t * groups + g) as u32);
+            }
+        }
+        let slice = self.memcpy_stod(&ids)?;
+        let t = Arc::new(Uploaded {
+            slice: std::mem::ManuallyDrop::new(slice),
+            backing: Backing::Owned,
+        });
+        cache.insert(key, t.clone());
         Ok(t)
     }
 
@@ -455,6 +503,7 @@ impl CudaDevice {
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             info_tables: Arc::new(Mutex::new(HashMap::new())),
+            perm_tables: Arc::new(Mutex::new(HashMap::new())),
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory
@@ -621,6 +670,7 @@ impl BackendDevice for CudaDevice {
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             info_tables: Arc::new(Mutex::new(HashMap::new())),
+            perm_tables: Arc::new(Mutex::new(HashMap::new())),
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory

@@ -70,7 +70,13 @@ extern "C" __global__ void mhc_pre_gates_kernel(
     // gates it at 2e-3. It stays fully deterministic: fixed order, no atomics.
     const float* xrow = xf + (size_t)row * hcd;
     float local = 0.0f;
-    const int hcd4 = hcd >> 2;
+    // `float4` needs 16-byte alignment. Device allocations are 256-byte aligned,
+    // so the only risk is the per-row base `xf + row*hcd`: it stays 4-float
+    // aligned exactly when `hcd % 4 == 0`. Otherwise take `hcd4 = 0` and let the
+    // scalar tail below cover the whole row — the same guard `mhc_post_kernel`
+    // applies to its own `d`. Without it an odd `hc*d` faults with `misaligned
+    // address` on every row past the first.
+    const int hcd4 = (hcd & 3) == 0 ? (hcd >> 2) : 0;
     const float4* xrow4 = reinterpret_cast<const float4*>(xrow);
     for (int k = threadIdx.x; k < hcd4; k += blockDim.x) {
         float4 v = xrow4[k];
@@ -325,6 +331,124 @@ extern "C" __global__ void mhc_post_kernel(
     }
 }
 
+// ---- hc_head: the final residual-stream reduction -------------------------
+// `hc_head` is `hc_pre` WITHOUT the split: one gate vector, no post, no combine
+// matrix, no sinkhorn. `fn_w` is [hc, hc*d] so `mixes_raw` is [n, hc] (not
+// [n, (2+hc)*hc]) and `scale` is a single value rather than three.
+//   rsqrt  = 1 / sqrt(mean(xf^2, -1) + eps)          (per row)
+//   g[i]   = sigmoid(mixes_raw[i] * rsqrt * s + base[i]) + eps
+//   y[k]   = Σ_i g[i] * x[i, k]
+//
+// Eager, this was five full passes over [n, hc, d]: `sqr`, the mean reduction,
+// the `broadcast_mul` — which also MATERIALISES a whole [n, hc, d] temp, an
+// allocate-plus-copy under invariant 2 — and then `sum(2)`, which reduces the
+// SECOND-TO-LAST axis and so reads that temp with a `d`-element stride. That
+// last one is why the span measured ~75 GB/s on a card that does ~1 TB/s.
+// Here the row is streamed once for the rsqrt and once (warm in L2) for the
+// reduction, with no temp and one launch.
+//
+// The gate lives in shared memory rather than being published to global like
+// `mhc_pre_gates_kernel`'s `pre`: nothing downstream of `hc_head` needs it.
+//
+// ── Measured, and deliberately NOT tuned further ──
+// ncu at the decode shape (n=16, hc=4, d=1792) via `bench_fused_head_reduce`:
+//   duration 5.31 us      DRAM throughput 6.9%     compute (SM) 1.5%
+//   grid 16 blocks        waves/SM 0.02            achieved occupancy 16.6%
+//   39 registers/thread (block limit 6 — not the constraint)
+// Nothing is saturated: it is parallelism-starved, a 16-block grid on a ~100-SM
+// card, and wall-clock per call is 8.9 us so ~3.6 us of that is WDDM launch.
+// The levers that would help are known — tile `d` across `grid.y` (the extra
+// per-tile rms pass is free at 6.9% DRAM), fold the gate into the same thread-0
+// section as the rsqrt to drop one of the three `__syncthreads`, and `float4`
+// the reduction loop the way the rms loop above already is.
+//
+// None of them are worth taking. This kernel runs ONCE PER WAVE, not per layer:
+// 2.0 ms across an entire [1,4,8,16,1] sweep, ~0.05% of a decode step. Halving
+// it would return ~1 ms out of ~27,000. The win here was the fusion itself
+// (`fast_sum` 448 launches / 290.2 ms in `deepseek:head_lm` → zero); what is
+// left is noise, and tuning it would be optimising what is measurable rather
+// than what is costly. Re-open this only if a profile puts the kernel back on
+// the critical path — the harness is already there to measure it.
+extern "C" __global__ void mhc_head_reduce_kernel(
+    const float* __restrict__ xf,        // [n, hc*d]
+    const float* __restrict__ mixes_raw, // [n, hc]
+    const float* __restrict__ base,      // [hc]
+    const float* __restrict__ scale,     // [1]
+    float* __restrict__ y,               // [n, d] — fully written
+    int n,
+    int hc,
+    int d,
+    float eps)
+{
+    int row = blockIdx.x;
+    if (row >= n) return;
+    const int hcd = hc * d;
+
+    // ── Σ xf^2 over the row — float4 loads + a warp-shuffle reduction ──
+    // Identical in form to `mhc_pre_gates_kernel`'s, including the
+    // re-association: the lane→element assignment differs from candle's `sum`,
+    // so the rsqrt can differ in the last ULPs. That is the same latitude the
+    // sibling kernel documents, and `fused_head_reduce_matches_eager` gates it
+    // at the same 2e-3. Fully deterministic — fixed order, no atomics.
+    const float* xrow = xf + (size_t)row * hcd;
+    float local = 0.0f;
+    // `float4` needs 16-byte alignment; the per-row base `xf + row*hcd` is only
+    // 4-float aligned when `hcd % 4 == 0`. Otherwise `hcd4 = 0` hands the whole
+    // row to the scalar tail. See the identical guard in `mhc_post_kernel`.
+    const int hcd4 = (hcd & 3) == 0 ? (hcd >> 2) : 0;
+    const float4* xrow4 = reinterpret_cast<const float4*>(xrow);
+    for (int k = threadIdx.x; k < hcd4; k += blockDim.x) {
+        float4 v = xrow4[k];
+        local += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    for (int k = (hcd4 << 2) + threadIdx.x; k < hcd; k += blockDim.x) {
+        float v = xrow[k];
+        local += v * v;
+    }
+
+    const unsigned full_mask = 0xffffffffu;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) local += __shfl_down_sync(full_mask, local, o);
+
+    __shared__ float warp_sum[32];
+    const int warp_id = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    if (lane_id == 0) warp_sum[warp_id] = local;
+    __syncthreads();
+
+    __shared__ float rsqrt_sh;
+    if (threadIdx.x == 0) {
+        const int n_warps = (blockDim.x + 31) >> 5;
+        float tot = 0.0f;
+        for (int w = 0; w < n_warps; ++w) tot += warp_sum[w];
+        float ms = tot / (float)hcd;
+        rsqrt_sh = 1.0f / sqrtf(ms + eps);
+    }
+    __syncthreads();
+    const float rsqrt = rsqrt_sh;
+
+    // ── The gate, into shared: g[i] = sigmoid(m[i]·rsqrt·s + base[i]) + eps ──
+    __shared__ float g[MHC_MAX_HC];
+    const float s = scale[0];
+    const float* mrow = mixes_raw + (size_t)row * hc;
+    for (int i = threadIdx.x; i < hc; i += blockDim.x) {
+        float m = mrow[i] * rsqrt;
+        g[i] = 1.0f / (1.0f + expf(-(m * s + base[i]))) + eps;
+    }
+    __syncthreads();
+
+    // ── y[k] = Σ_i g[i] · x[i, k] ──
+    // `x` is `xf` reshaped: [n, hc, d] and [n, hc*d] are the same storage, so
+    // `xrow` already points at this row's `x`. Every thread participates —
+    // unlike the sibling kernel there is no warp-0 sinkhorn to overlap.
+    float* yrow = y + (size_t)row * d;
+    for (int k = threadIdx.x; k < d; k += blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < hc; ++i) acc += g[i] * xrow[(size_t)i * d + k];
+        yrow[k] = acc;
+    }
+}
+
 // ---- launchers ------------------------------------------------------------
 extern "C" void run_mhc_pre_gates(
     const float* xf, const float* mixes_raw, const float* base, const float* scale,
@@ -346,6 +470,21 @@ extern "C" void run_mhc_pre_gates(
     mhc_pre_gates_kernel<<<n, PRE_GATES_THREADS, shmem, (cudaStream_t)stream>>>(
         xf, mixes_raw, base, scale, pre, post, comb_raw, y, n, hc, d, eps,
         sink_iters, sink_eps);
+}
+
+extern "C" void run_mhc_head_reduce(
+    const float* xf, const float* mixes_raw, const float* base, const float* scale,
+    float* y, int n, int hc, int d, float eps, void* stream)
+{
+    if (n <= 0 || hc <= 0) return;
+    // Whole warps, for the same reason as `run_mhc_pre_gates`: the rsqrt
+    // reduction uses a full-mask `__shfl_down_sync`, undefined on a partial
+    // warp. No sinkhorn warp here, so there is no lower bound beyond that, and
+    // no dynamic shared memory — the [hc] gate is a fixed `MHC_MAX_HC` array.
+    constexpr int HEAD_REDUCE_THREADS = 256;
+    static_assert(HEAD_REDUCE_THREADS % 32 == 0, "whole warps for the shuffle reduction");
+    mhc_head_reduce_kernel<<<n, HEAD_REDUCE_THREADS, 0, (cudaStream_t)stream>>>(
+        xf, mixes_raw, base, scale, y, n, hc, d, eps);
 }
 
 extern "C" void run_mhc_post(

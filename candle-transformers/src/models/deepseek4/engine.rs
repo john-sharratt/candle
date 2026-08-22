@@ -25,7 +25,7 @@ use crate::models::expert_lre::{
     layer_geometries, minimum_resident_slots, slot_bytes_for, ExpertCache, ExpertCacheSetup,
     MmapExpertRef, MoeInput,
 };
-use crate::models::profile::{pipeline_record, profile_now};
+use crate::models::profile::span;
 use candle_nn::kv_cache::WeightZone;
 
 use super::config::Config;
@@ -476,7 +476,7 @@ impl Dsv4Engine {
         let dim = self.cfg.dim;
         let nt = token_ids.len();
         let x2 = x.reshape((nt, dim))?;
-        let t_route = profile_now();
+        let s_route = span("moe:route");
         // Float-normalized input for routing + the shared expert.
         let normed = rms_norm(&x2, &layer.ffn_norm, self.cfg.norm_eps)?;
         let ids = Tensor::from_vec(token_ids.to_vec(), nt, &self.device)?;
@@ -497,7 +497,7 @@ impl Dsv4Engine {
                 candle::bail!("q8a128 activation quantize returned a non-int8 operand")
             }
         };
-        pipeline_record("moe:route", t_route);
+        s_route.end();
 
         // Counting-sort the (token, expert) assignments by ascending expert id (O(A+E)),
         // matching the grouped-GEMM dispatch contract (see `SparseMoeBlock::forward_with_indices`).
@@ -508,7 +508,7 @@ impl Dsv4Engine {
         // speculative but −8% on the cfg8 batched gate (589.9→541.0), because the per-layer
         // event/side-stream/sync overhead over 44 layers × N sessions outweighs the pinned-copy
         // saving — the readback is a genuine per-layer GPU-catch-up wait, not a hideable flush.
-        let t_sort = profile_now();
+        let s_sort = span("moe:sort");
         super::readback::note_readback();
         // Split out the readback itself: it is a synchronous D2H, so it does not
         // just transfer 4 bytes per routed token — it blocks until every kernel
@@ -517,9 +517,9 @@ impl Dsv4Engine {
         // GPU) from "the pipeline drains 43 times per token" (fixable only by
         // removing the sync). The sort below is O(A+E) over ~128 assignments, so
         // any large number here is the drain.
-        let t_rb = profile_now();
+        let s_rb = span("moe:sort_readback");
         let idx_cpu: Vec<Vec<u32>> = indices.to_vec2::<u32>()?;
-        pipeline_record("moe:sort_readback", t_rb);
+        s_rb.end();
         let weights_flat = weights.flatten_all()?; // [nt*k]
         let (k, ne) = (self.cfg.n_activated_experts, self.cfg.n_routed_experts);
         let mut counts = vec![0u32; ne];
@@ -552,8 +552,8 @@ impl Dsv4Engine {
             }
         }
 
-        pipeline_record("moe:sort", t_sort);
-        let t_submit = profile_now();
+        s_sort.end();
+        let s_submit = span("moe:submit");
         let routed = self.experts.submit_moe_work(
             layer.moe_layer_idx,
             expert_ids,
@@ -563,11 +563,11 @@ impl Dsv4Engine {
             assignments,
             None,
         )?; // [nt, dim] F32
-        pipeline_record("moe:submit", t_submit);
-        let t_shared = profile_now();
+        s_submit.end();
+        let s_shared = span("moe:shared");
         let shared = layer.shared.forward(&normed)?; // [nt, dim] F32
         let out = (routed + shared)?.reshape((1, nt, dim));
-        pipeline_record("moe:shared", t_shared);
+        s_shared.end();
         out
     }
 

@@ -6,9 +6,10 @@
 //! Sinkhorn-normalized combination matrix re-expands the block output back to `hc_mult`
 //! copies. All math is done in f32, matching the reference.
 
-use candle::{Result, Tensor, D};
+use candle::{DType, Result, Tensor, D};
 use candle_nn::ops::sigmoid;
 
+use super::guard::expect_dtype;
 use super::linear::QLinear;
 
 /// The learned per-block hyper-connection parameters for one sub-block (attention or
@@ -64,7 +65,8 @@ impl HyperConnection {
     /// launch-overhead dominated at decode.
     pub fn pre(&self, x: &Tensor, p: &HyperParams) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, s, hc, d) = x.dims4()?;
-        let x = x.to_dtype(candle::DType::F32)?;
+        // Validated, not converted — see `Self::post`.
+        expect_dtype(x, DType::F32, "mhc pre: residual stream")?;
         let xf = x.reshape((b, s, hc * d))?;
 
         #[cfg(feature = "cuda")]
@@ -96,14 +98,19 @@ impl HyperConnection {
         post: &Tensor,
         comb: &Tensor,
     ) -> Result<Tensor> {
-        let block_out = block_out.to_dtype(candle::DType::F32)?;
-        let residual = residual.to_dtype(candle::DType::F32)?;
+        // VALIDATED, not converted (invariant 1). The residual stream is F32
+        // the whole way round the loop — `Self::post` returns F32, the attention
+        // kernels emit F32 and the MoE emits F32 — so casting here only hid the
+        // requirement; a producer that ever changed type would have bought a
+        // silent full-tensor pass per layer instead of an error.
+        expect_dtype(block_out, DType::F32, "mhc post: block output")?;
+        expect_dtype(residual, DType::F32, "mhc post: residual stream")?;
 
         #[cfg(feature = "cuda")]
         if matches!(block_out.device(), candle::Device::Cuda(_)) {
             // Fused: `new[j,k] = post[j]·out[k] + Σ_i comb[i,j]·res[i,k]` in one
             // launch (was ~10 eager broadcast/sum ops). Bit-exact to the path below.
-            return cuda_fused::post(&block_out, &residual, post, comb);
+            return cuda_fused::post(block_out, residual, post, comb);
         }
 
         // post term: post[...,hc,1] * out[...,1,d] -> [b,s,hc,d]
@@ -124,8 +131,20 @@ impl HyperConnection {
     /// `base` is `[hc_mult]`, `scale` is `[1]`.
     pub fn head_reduce(&self, x: &Tensor, p: &HyperParams) -> Result<Tensor> {
         let (b, s, hc, d) = x.dims4()?;
-        let x = x.to_dtype(candle::DType::F32)?;
+        // Validated, not converted — see `Self::post`.
+        expect_dtype(x, DType::F32, "mhc head_reduce: residual stream")?;
         let xf = x.reshape((b, s, hc * d))?;
+
+        #[cfg(feature = "cuda")]
+        if matches!(x.device(), candle::Device::Cuda(_)) {
+            // ONE launch for the whole of `hc_head` — rms-rsqrt, the sigmoid
+            // gate and the weighted reduction (+ the `fn_w` matmul), matching
+            // what `pre`/`post` already do. The eager chain below stays as the
+            // CPU reference the parity test compares against.
+            let mixes_raw = p.fn_w.forward(&xf)?; // [b,s,hc] (rsqrt folded in the kernel)
+            return cuda_fused::head_reduce(&xf, &mixes_raw, p, hc, d, self.eps);
+        }
+
         let rsqrt = self.rms_rsqrt(&xf)?;
         let mixes = p.fn_w.forward(&xf)?.broadcast_mul(&rsqrt)?; // [b,s,hc]
         let scale = p.scale.to_dtype(candle::DType::F32)?;
@@ -338,10 +357,13 @@ impl candle::CustomOp1 for SinkhornOp {
 /// oracle for `fused_pre_post_matches_eager`.
 #[cfg(feature = "cuda")]
 mod cuda_fused {
+    use super::super::guard::expect_dense_dtype;
     use super::HyperParams;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::{DType, Device, Result, Storage, Tensor};
-    use candle_kernels::simple::hyper_mhc::{run_mhc_post, run_mhc_pre_gates};
+    use candle_kernels::simple::hyper_mhc::{
+        run_mhc_head_reduce, run_mhc_post, run_mhc_pre_gates, MHC_MAX_HC,
+    };
 
     /// Device pointer of a contiguous f32 CUDA tensor (extracted inline so the
     /// storage-guard and pointer-guard both live to the launch — matching the
@@ -378,15 +400,27 @@ mod cuda_fused {
             _ => candle::bail!("mhc pre_gates requires CUDA"),
         };
         let stream = dev.cuda_stream();
-        let xf = xf.contiguous()?;
-        let mixes_raw = mixes_raw.contiguous()?;
-        let base = p.base.to_dtype(DType::F32)?.contiguous()?;
-        let scale = p.scale.to_dtype(DType::F32)?.contiguous()?;
-        let pre = Tensor::zeros((b, s, hc), DType::F32, xf.device())?;
-        let post = Tensor::zeros((b, s, hc), DType::F32, xf.device())?;
-        let comb_raw = Tensor::zeros((b, s, hc, hc), DType::F32, xf.device())?;
-        // Fully written by the kernel's fused reduction, so it is allocated
-        // uninitialised rather than zeroed (hot-path invariant 6).
+        // Operands are VALIDATED, not rewritten (invariants 1 and 2). The kernel
+        // indexes every one of these as `base + row * row_len`, so it needs a
+        // dense f32 buffer — and it already gets one: `xf` is a reshape of the
+        // F32 residual stream, `mixes_raw` is the `fn_w` matmul's output, and
+        // `base`/`scale` are loaded through `dequant_f32`. Converting here bought
+        // nothing and would have quietly absorbed a producer that changed.
+        expect_dense_dtype(xf, DType::F32, "mhc pre_gates: xf")?;
+        expect_dense_dtype(mixes_raw, DType::F32, "mhc pre_gates: mixes_raw")?;
+        expect_dense_dtype(&p.base, DType::F32, "mhc pre_gates: base")?;
+        expect_dense_dtype(&p.scale, DType::F32, "mhc pre_gates: scale")?;
+        let (base, scale) = (&p.base, &p.scale);
+        // All four are pure kernel outputs, so they are allocated uninitialised
+        // rather than zeroed (hot-path invariant 6): the kernel writes every
+        // element of `pre` and `post` (`for i in 0..hc`), every element of
+        // `comb_raw` (`for e in 0..hc*hc`, then again from the sinkhorn), and
+        // every element of `y` from the fused reduction. Zeroing them was a
+        // second full-width memset on the exact bytes the kernel then stamps —
+        // four per call, and this runs once per layer per step.
+        let pre = Tensor::empty((b, s, hc), DType::F32, xf.device())?;
+        let post = Tensor::empty((b, s, hc), DType::F32, xf.device())?;
+        let comb_raw = Tensor::empty((b, s, hc, hc), DType::F32, xf.device())?;
         let y = Tensor::empty((b, s, d), DType::F32, xf.device())?;
         {
             cuda_f32_ptr!(xf, &stream, s_xf, p_xf, _g0);
@@ -420,6 +454,68 @@ mod cuda_fused {
         Ok((y, post, comb_raw, pre))
     }
 
+    /// `hc_head`: the whole final residual reduction in ONE launch → `[b,s,d]`.
+    ///
+    /// The eager form is five full passes over `[b,s,hc,d]` — `sqr`, the mean
+    /// reduction, a `broadcast_mul` that also materialises a whole temp of that
+    /// shape, and `sum(2)`, which reduces the second-to-last axis and therefore
+    /// walks the temp with a `d`-element stride. Here the row is streamed once
+    /// for the rsqrt and once (warm in L2) for the reduction, with no temp.
+    pub(super) fn head_reduce(
+        xf: &Tensor,
+        mixes_raw: &Tensor,
+        p: &HyperParams,
+        hc: usize,
+        d: usize,
+        eps: f64,
+    ) -> Result<Tensor> {
+        let (b, s, _) = xf.dims3()?;
+        let n = (b * s) as i32;
+        let dev = match xf.device() {
+            Device::Cuda(dd) => dd.clone(),
+            _ => candle::bail!("mhc head_reduce requires CUDA"),
+        };
+        let stream = dev.cuda_stream();
+        // The gate is held in a fixed `MHC_MAX_HC` shared array, and the
+        // launcher returns `void` so it cannot report the overflow itself.
+        if hc > MHC_MAX_HC {
+            candle::bail!("mhc head_reduce: hc={hc} exceeds MHC_MAX_HC={MHC_MAX_HC}");
+        }
+        // Validated, not rewritten (invariants 1 and 2) — same reasoning as
+        // `pre_gates`: every one of these is already dense F32 on the engine
+        // path, so a conversion here would only have hidden a changed producer.
+        expect_dense_dtype(xf, DType::F32, "mhc head_reduce: xf")?;
+        expect_dense_dtype(mixes_raw, DType::F32, "mhc head_reduce: mixes_raw")?;
+        expect_dense_dtype(&p.base, DType::F32, "mhc head_reduce: base")?;
+        expect_dense_dtype(&p.scale, DType::F32, "mhc head_reduce: scale")?;
+        let (base, scale) = (&p.base, &p.scale);
+        // Pure kernel output — every element of `y` is stamped by the reduction
+        // loop, so allocate uninitialised (invariant 6).
+        let y = Tensor::empty((b, s, d), DType::F32, xf.device())?;
+        {
+            cuda_f32_ptr!(xf, &stream, s_xf, p_xf, _g0);
+            cuda_f32_ptr!(mixes_raw, &stream, s_mx, p_mx, _g1);
+            cuda_f32_ptr!(base, &stream, s_ba, p_ba, _g2);
+            cuda_f32_ptr!(scale, &stream, s_sc, p_sc, _g3);
+            cuda_f32_ptr!(y, &stream, s_y, p_y, _g4);
+            unsafe {
+                run_mhc_head_reduce(
+                    p_xf as *const f32,
+                    p_mx as *const f32,
+                    p_ba as *const f32,
+                    p_sc as *const f32,
+                    p_y as *mut f32,
+                    n,
+                    hc as i32,
+                    d as i32,
+                    eps as f32,
+                    stream.cu_stream() as *mut core::ffi::c_void,
+                );
+            }
+        }
+        Ok(y)
+    }
+
     /// `hc_post` recombination: `new [b,s,hc,d]`.
     pub(super) fn post(
         block_out: &Tensor,
@@ -434,11 +530,16 @@ mod cuda_fused {
             _ => candle::bail!("mhc post requires CUDA"),
         };
         let stream = dev.cuda_stream();
-        let block_out = block_out.contiguous()?;
-        let residual = residual.contiguous()?;
-        let post = post.contiguous()?;
-        let comb = comb.contiguous()?;
-        let out = Tensor::zeros((b, s, hc, d), DType::F32, residual.device())?;
+        // Validated, not rewritten — `post` and `comb` come straight from
+        // `pre_gates`, which produced them dense, and the other two are kernel
+        // outputs of the attention/MoE block.
+        expect_dense_dtype(block_out, DType::F32, "mhc post: block_out")?;
+        expect_dense_dtype(residual, DType::F32, "mhc post: residual")?;
+        expect_dense_dtype(post, DType::F32, "mhc post: post gates")?;
+        expect_dense_dtype(comb, DType::F32, "mhc post: comb")?;
+        // Pure kernel output: the grid is (n, hc) and each block writes its
+        // whole `orow_j` row, so every element is stamped (invariant 6).
+        let out = Tensor::empty((b, s, hc, d), DType::F32, residual.device())?;
         {
             cuda_f32_ptr!(block_out, &stream, s_bo, p_bo, _g0);
             cuda_f32_ptr!(residual, &stream, s_re, p_re, _g1);
@@ -601,6 +702,54 @@ mod tests {
         Ok(())
     }
 
+    /// The fused CUDA `hc_head` reproduces the eager (CPU) reference within
+    /// reduction-order tolerance.
+    ///
+    /// `hc_head` is `hc_pre` without the split, so its parameter shapes are the
+    /// unsplit ones — `fn_w` is `[hc, hc*d]`, `base` is `[hc]` and `scale` is a
+    /// single value — which is exactly what makes it a separate kernel rather
+    /// than a mode of `mhc_pre_gates_kernel`.
+    ///
+    /// Tolerance matches the sibling gate at 2e-3: the kernel's rsqrt uses a
+    /// float4 + warp-shuffle reduction whose lane→element assignment differs
+    /// from candle's `sum`, so the last ULPs may differ. It stays deterministic
+    /// (fixed order, no atomics).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fused_head_reduce_matches_eager() -> Result<()> {
+        let cpu = Device::Cpu;
+        let cuda = Device::new_cuda(0)?;
+        let (hc, d, b, s) = (4usize, 48usize, 1usize, 3usize);
+        let hcx = HyperConnection::new(hc, 20, 1e-6);
+
+        let fn_w = Tensor::randn(0f32, 1.0, (hc, hc * d), &cpu)?;
+        let base = Tensor::randn(0f32, 0.5, hc, &cpu)?;
+        let scale = Tensor::from_vec(vec![0.7f32], 1, &cpu)?;
+        let x = Tensor::randn(0f32, 1.0, (b, s, hc, d), &cpu)?;
+
+        let p_cpu = HyperParams {
+            fn_w: fn_w.clone().into(),
+            base: base.clone(),
+            scale: scale.clone(),
+        };
+        let p_cuda = HyperParams {
+            fn_w: fn_w.to_device(&cuda)?.into(),
+            base: base.to_device(&cuda)?,
+            scale: scale.to_device(&cuda)?,
+        };
+
+        let y_r = hcx.head_reduce(&x, &p_cpu)?; // eager CPU reference
+        let y_c = hcx.head_reduce(&x.to_device(&cuda)?, &p_cuda)?; // fused kernel
+        assert_eq!(y_r.dims(), &[b, s, d], "eager shape");
+        assert_eq!(y_c.dims(), &[b, s, d], "fused shape");
+
+        let a = y_r.flatten_all()?;
+        let bb = y_c.to_device(&cpu)?.flatten_all()?;
+        let diff = (a - bb)?.abs()?.max(0)?.to_scalar::<f32>()?;
+        assert!(diff < 2e-3, "head reduce mismatch: {diff}");
+        Ok(())
+    }
+
     /// **Isolation harness for the fused `mhc_pre_gates` (+ sinkhorn).**
     ///
     /// nsys put the mHC chain at 13% of decode GPU time, with `sinkhorn` alone
@@ -698,6 +847,72 @@ mod tests {
              (n={n}, hc={hc}, d={d}, iters={})",
             hcx.sinkhorn_iters
         );
+        Ok(())
+    }
+
+    /// **Isolation harness for the fused `mhc_head_reduce`.** Same role as
+    /// [`bench_fused_pre_gates`] and [`bench_mhc_post`]: profile and tune
+    /// without a 152 GB model in the way.
+    ///
+    /// Shapes are the real ones — `hc*d = 7168` is the model dim, and `n` is
+    /// the wave width. Unlike its siblings this kernel runs ONCE PER WAVE
+    /// rather than once per layer, so `n` spans a much wider range: 16 at a
+    /// decode wave, hundreds-to-thousands of rows on a bulk prefill. Both ends
+    /// matter and they are different regimes — at n=16 the grid is 16 blocks on
+    /// a ~100-SM card (occupancy-bound), while at large n it should approach
+    /// bandwidth.
+    ///
+    /// ```text
+    /// ncu --set full --kernel-name mhc_head_reduce_kernel \
+    ///   target/release/deps/candle_transformers-*.exe \
+    ///   --exact models::deepseek4::hyper::tests::bench_fused_head_reduce --ignored --nocapture
+    /// ```
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_fused_head_reduce() -> Result<()> {
+        const ITERS: usize = 500;
+        let Ok(cuda) = Device::new_cuda(0) else {
+            eprintln!("[skip] no CUDA device");
+            return Ok(());
+        };
+        let (hc, d) = (4usize, 1792usize); // hc*d = 7168 = model dim
+        let hcx = HyperConnection::new(hc, 20, 1e-6);
+
+        // `hc_head`'s unsplit parameter shapes: fn_w [hc, hc*d], base [hc], scale [1].
+        let p = HyperParams {
+            fn_w: Tensor::randn(0f32, 1.0, (hc, hc * d), &cuda)?.into(),
+            base: Tensor::randn(0f32, 0.5, hc, &cuda)?,
+            scale: Tensor::from_vec(vec![0.7f32], 1, &cuda)?,
+        };
+
+        for &n in &[16usize, 256, 2048] {
+            let x = Tensor::randn(0f32, 1.0, (1usize, n, hc, d), &cuda)?;
+            let xf = x.reshape((1usize, n, hc * d))?;
+            let mixes_raw = p.fn_w.forward(&xf)?;
+
+            // Warm-up: the first launch pays one-off module load and allocation.
+            for _ in 0..20 {
+                let _ = cuda_fused::head_reduce(&xf, &mixes_raw, &p, hc, d, hcx.eps)?;
+            }
+            cuda.synchronize()?;
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let _ = cuda_fused::head_reduce(&xf, &mixes_raw, &p, hc, d, hcx.eps)?;
+            }
+            cuda.synchronize()?;
+            let per_call_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+            // Traffic: the row is read twice (rms, then the reduction) and `d`
+            // floats are written per row. Reporting the implied bandwidth is
+            // what separates "occupancy-bound" from "at the memory wall".
+            let bytes = (2.0 * (n * hc * d) as f64 + (n * d) as f64) * 4.0;
+            let gbs = bytes / (per_call_us * 1e-6) / 1e9;
+            eprintln!(
+                "[mhc] fused head_reduce: n={n:<5} {per_call_us:>7.1} us/call  \
+                 {gbs:>7.1} GB/s  (hc={hc}, d={d})"
+            );
+        }
         Ok(())
     }
 }

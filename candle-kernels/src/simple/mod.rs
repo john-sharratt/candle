@@ -83,8 +83,15 @@ pub mod compressor_pool;
 // padding mask, for both batched two-stage selectors (decode and prefill)
 pub mod indexer_score;
 
+// Compressed-index expansion: each slot's {offset, count} broadcast into its row
+// of the decode path's comp_idx matrix, in one descriptor-driven launch
+pub mod comp_idx;
+
 // Batched row scatter: many (source run → destination offset) copies in one
 // launch, driven by a descriptor table — the corpus-gallery append across every
 // session of a wave
-pub mod comp_idx;
 pub mod rows_scatter;
+
+// NVTX3 range shim, so an nsys trace names the pipeline span that launched each
+// kernel (header-only NVTX3; nothing to link against)
+pub mod nvtx;

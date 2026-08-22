@@ -32,6 +32,7 @@ mod engine;
 pub use engine::Dsv4Engine;
 mod footprint;
 mod gallery;
+mod guard;
 mod hyper;
 mod indexer;
 #[cfg(feature = "cuda")]

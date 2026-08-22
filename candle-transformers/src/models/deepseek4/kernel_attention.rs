@@ -12,7 +12,7 @@
 
 use candle::{DType, Result, Tensor};
 
-use crate::models::profile::{pipeline_record, profile_now};
+use crate::models::profile::span;
 
 use super::attention::{rms_norm, Attention};
 use super::compressor::{GroupPool, IncrementalCompressor};
@@ -501,7 +501,7 @@ pub fn kernel_attn_prefill_select(
     // per-seq here. Required on in-regime CSA layers; ignored otherwise.
     q_batched: Option<(Tensor, Tensor)>,
 ) -> Result<PrefillSel> {
-    let t_sel = profile_now();
+    let s_sel = span("pprep:select");
     let s = prep.xs.dim(1)?;
     let n_visible = &prep.n_visible;
     let (base_entries, g_total) = (prep.base_entries, prep.g_total);
@@ -518,20 +518,20 @@ pub fn kernel_attn_prefill_select(
                 // the wave-batched query GEMM rows + one rescore + one argsort,
                 // kept FULLY ON-DEVICE (bit-identical selection to the
                 // per-token loop by `batched_causal_select_matches_per_token`).
-                let t_q = profile_now();
+                let s_q = span("psel:query");
                 let (q_raw, weights) =
                     q_batched.expect("in-regime CSA prefill select needs the batched query rows");
                 let q_idx = ix.rope_query_batched(&q_raw, rope, base)?; // [s,h,ih]
-                pipeline_record("psel:query", t_q);
+                s_q.end();
                 let gallery = gallery.expect("CSA layer has a gallery");
-                let t_bcs = profile_now();
+                let s_bcs = span("psel:bcs");
                 let (comp_idx, comp_cnt, n_corpus) = gallery.batched_causal_select_device(
                     &q_idx,
                     &weights,
                     n_visible,
                     ix.top_k(),
                 )?;
-                pipeline_record("psel:bcs", t_bcs);
+                s_bcs.end();
                 PrefillSel::Device {
                     comp_idx,
                     comp_cnt,
@@ -568,7 +568,7 @@ pub fn kernel_attn_prefill_select(
         }
         LayerKind::SlidingWindow => PrefillSel::Host(vec![Vec::new(); s]),
     };
-    pipeline_record("pprep:select", t_sel);
+    s_sel.end();
     Ok(sel)
 }
 
@@ -620,7 +620,7 @@ pub fn kernel_attn_decode_assemble(
     comp_row: Option<(&Tensor, &Tensor)>,
     icomp_row: Option<(&Tensor, &Tensor)>,
 ) -> Result<DecodeAssemble> {
-    let t_asm = profile_now();
+    let s_asm = span("dprep:assemble");
     let mut out = DecodeAssemble {
         comp_gp: None,
         icomp_gp: None,
@@ -647,7 +647,7 @@ pub fn kernel_attn_decode_assemble(
             }
         }
     }
-    pipeline_record("dprep:assemble", t_asm);
+    s_asm.end();
     Ok(out)
 }
 
