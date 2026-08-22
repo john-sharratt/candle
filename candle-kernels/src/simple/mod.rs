@@ -78,3 +78,7 @@ pub mod corpus_gather;
 // the weighted sum, replacing candle's seven-launch unfused softmax chain on
 // every compressor emit (prefill fleet, decode wave, reference and seal alike)
 pub mod compressor_pool;
+
+// Fused Indexer score reduction: relu + per-head weight + sum over heads + the
+// padding mask, for both batched two-stage selectors (decode and prefill)
+pub mod indexer_score;
