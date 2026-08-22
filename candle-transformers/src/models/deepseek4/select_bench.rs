@@ -247,26 +247,31 @@ pub fn validate_kernels(dev: &Device, cfg: SelectCfg) -> Result<(bool, f32)> {
         .collect::<Result<_>>()?;
     let off: Vec<u32> = (0..n).map(|s| (s * cfg.entries) as u32).collect();
     let cnt: Vec<u32> = vec![cfg.entries as u32; n];
-    let off_t = Tensor::from_vec(off, n, dev)?;
-    let cnt_t = Tensor::from_vec(cnt, n, dev)?;
+    // Segment tables as device addresses. The bench has no wave, so it opens its
+    // own staging scope around the work — the same thing the wave does, at the
+    // scale it is doing.
+    let scope = crate::models::deepseek4::desc::scope(dev)?;
+    let off_t = crate::models::deepseek4::desc::stage_slice(&off, &scope)?;
+    let cnt_t = crate::models::deepseek4::desc::stage_slice(&cnt, &scope)?;
 
     let counts_b = bdp_recall_batched(
         &q_signs,
         &g_signs,
-        &off_t,
-        &cnt_t,
+        off_t.ptr(),
+        cnt_t.ptr(),
         n,
         INDEX_N_HEADS,
         cfg.entries,
         INDEX_HEAD_DIM,
+        &scope,
     )?
     .to_vec1::<u32>()?;
 
     // Per-session counts (the trusted reference) + validity of the batched topm.
     let short_b = topm_select_batched(
         &Tensor::from_vec(counts_b.clone(), counts_b.len(), dev)?,
-        &off_t,
-        &cnt_t,
+        off_t.ptr(),
+        cnt_t.ptr(),
         n,
         cfg.entries,
         max_m,
@@ -434,14 +439,15 @@ pub fn run_select(dev: &Device, cfg: SelectCfg) -> Result<SelectReport> {
 
     // ── Batched path: one launch per Stage-1 kernel over the whole wave ──
     let gref: Vec<&FloatGallery> = galleries.iter().collect();
+    let scope = crate::models::deepseek4::desc::scope(dev)?;
     let batched_ms = time_batch(dev, cfg, || {
-        let _ = two_stage_select_batched(&gref, &queries, &weights, m, cfg.top_k)?;
+        let _ = two_stage_select_batched(&gref, &queries, &weights, m, cfg.top_k, &scope)?;
         Ok(())
     })?;
 
     // Correctness gate: per-session selected-gid SET equals the loop.
     let reference = reference_gids(&galleries, &queries, &weights, cfg.top_k)?;
-    let batched = two_stage_select_batched(&gref, &queries, &weights, m, cfg.top_k)?;
+    let batched = two_stage_select_batched(&gref, &queries, &weights, m, cfg.top_k, &scope)?;
     let batched_gids: Vec<Vec<u32>> = batched
         .iter()
         .map(|(g, k)| Ok(g.narrow(0, 0, *k)?.to_vec1::<u32>()?))
@@ -510,9 +516,10 @@ pub fn run_corpus_gather_kernels(dev: &Device, cfg: SelectCfg, iters: usize) -> 
     let out_pos = Tensor::zeros(total, DType::U32, dev)?;
     let gref: Vec<&FloatGallery> = galleries.iter().collect();
     let offs: Vec<u32> = (0..n).map(|i| (i * k) as u32).collect();
+    let scope = crate::models::deepseek4::desc::scope(dev)?;
     let one = |_: usize| -> Result<()> {
         gather_corpus_batched(
-            &gref, &gids, &offs, &out_nope, &out_scale, &out_rope, &out_pos,
+            &gref, &gids, &offs, &out_nope, &out_scale, &out_rope, &out_pos, &scope,
         )
     };
     for i in 0..cfg.warmup {
@@ -550,24 +557,25 @@ pub fn run_select_kernels(dev: &Device, cfg: SelectCfg, iters: usize) -> Result<
         .iter()
         .map(|g| g.packed_signs())
         .collect::<Result<_>>()?;
-    let off = Tensor::from_vec(
-        (0..n).map(|s| (s * cfg.entries) as u32).collect::<Vec<_>>(),
-        n,
-        dev,
+    let scope = crate::models::deepseek4::desc::scope(dev)?;
+    let off = crate::models::deepseek4::desc::stage_slice(
+        &(0..n).map(|s| (s * cfg.entries) as u32).collect::<Vec<_>>(),
+        &scope,
     )?;
-    let cnt = Tensor::from_vec(vec![cfg.entries as u32; n], n, dev)?;
+    let cnt = crate::models::deepseek4::desc::stage_slice(&vec![cfg.entries as u32; n], &scope)?;
     let one = |_: usize| -> Result<()> {
         let counts = bdp_recall_batched(
             &q_signs,
             &g_signs,
-            &off,
-            &cnt,
+            off.ptr(),
+            cnt.ptr(),
             n,
             INDEX_N_HEADS,
             cfg.entries,
             INDEX_HEAD_DIM,
+            &scope,
         )?;
-        let _ = topm_select_batched(&counts, &off, &cnt, n, cfg.entries, max_m, BINS)?;
+        let _ = topm_select_batched(&counts, off.ptr(), cnt.ptr(), n, cfg.entries, max_m, BINS)?;
         Ok(())
     };
     for i in 0..cfg.warmup {

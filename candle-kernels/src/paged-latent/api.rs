@@ -11,6 +11,12 @@
 
 use core::ffi::c_void;
 
+/// i64 words per run in the glue scatter's descriptor table, mirroring
+/// `GLUE_SCATTER_WORDS` in `paged-latent/latent_common.cuh`. Array-of-structs:
+/// run `i` occupies `GLUE_SCATTER_WORDS` consecutive words holding
+/// `{kv, headers, slices, in_blk, rows}`.
+pub const GLUE_SCATTER_WORDS: usize = 5;
+
 extern "C" {
     /// BF16 latent decode. Layouts:
     ///   `q_ptr`    : `[slots, n_q_head, 512]` bf16, **pre-RoPE** (roped in-kernel
@@ -158,15 +164,20 @@ extern "C" {
         stream: *mut c_void,
     );
 
-    /// Glue latent scatter: write `rows` bf16 latents into their RESERVED gap
-    /// chunks (per-row block index + in-block offset from the reprojection's
-    /// glue descriptors). Launch BEFORE the attention pass on the same stream.
+    /// Glue latent scatter: write bf16 latents into their RESERVED gap chunks
+    /// (per-row block index + in-block offset from the reprojection's glue
+    /// descriptors). Launch BEFORE the attention pass on the same stream.
+    ///
+    /// Batched over runs: each run names its own destination slot, so the whole
+    /// wave's scatters — glue islands, prefill writeback, verify writeback —
+    /// go in one launch.
+    ///   desc:     device i64 `[GLUE_SCATTER_WORDS * n_runs]`, `{kv, headers,
+    ///             slices, in_blk, rows}` per run (see `latent_common.cuh`)
+    ///   max_rows: the widest run's row count, for grid sizing
     pub fn run_paged_latent_glue_scatter_bf16(
-        kv: *const c_void,
-        headers_ptr: *const u8,
-        slices: *const u32,
-        in_blk: *const u32,
-        rows: i32,
+        desc: *const i64,
+        n_runs: i32,
+        max_rows: i32,
         stream: *mut c_void,
     );
 

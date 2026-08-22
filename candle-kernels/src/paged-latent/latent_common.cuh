@@ -253,20 +253,44 @@ __global__ void latent_rope_table_kernel(
 }
 
 // =============================================================================
-// Glue latent scatter: write `rows` latents into their RESERVED gap chunks
-// (block index + in-block offset per row, from the reprojection's PendingGlue
-// descriptors). Launched stream-ordered BEFORE the attention pass, so glue
-// keys read from the arena like any window key — no double-source, no
-// intra-launch race. One warp per row.
+// Glue latent scatter: write latents into their RESERVED gap chunks (block index
+// + in-block offset per row, from the reprojection's PendingGlue descriptors).
+// Launched stream-ordered BEFORE the attention pass, so glue keys read from the
+// arena like any window key — no double-source, no intra-launch race. One warp
+// per row.
 // =============================================================================
+// BATCHED over runs (hot-path invariant 2b). Three separate wave phases scatter
+// this way — the glue islands, the prefill prompt writeback, and the speculative
+// verify writeback — and each ran one launch per SEQUENCE, plus two pageable
+// uploads per sequence for its slice/offset arrays. Every run names its own
+// destination slot by address, so there is nothing to concatenate: the whole
+// fleet goes in one launch off a descriptor table.
+//
+// Table layout, array-of-structs, GLUE_SCATTER_WORDS i64 per run:
+//     [0] kv base pointer, [rows, HEAD_DIM] pre-RoPE latents
+//     [1] headers pointer — the run's SlotHeader[1]
+//     [2] slices pointer, [rows] u32 gap block index
+//     [3] in-block offset pointer, [rows] u32
+//     [4] rows
+//
+// grid.y indexes the run, grid.x covers the widest run's warps; shorter runs
+// exit on the row bound.
+#define GLUE_SCATTER_WORDS 5
+
 template <typename T, int HEAD_DIM>
 __global__ void latent_glue_scatter_kernel(
-    const T* __restrict__ kv,             // [rows, HEAD_DIM] pre-RoPE latents
-    const uint8_t* __restrict__ headers,  // SlotHeader[1] — the slot
-    const uint32_t* __restrict__ slices,  // [rows] gap block index
-    const uint32_t* __restrict__ in_blk,  // [rows] in-block offset
-    int rows
+    const long long* __restrict__ desc,
+    int n_runs
 ) {
+    const int e = blockIdx.y;
+    if (e >= n_runs) return;
+    const long long* __restrict__ dsc = desc + (long long)e * GLUE_SCATTER_WORDS;
+    const T* __restrict__ kv = (const T*)dsc[0];
+    const uint8_t* __restrict__ headers = (const uint8_t*)dsc[1];
+    const uint32_t* __restrict__ slices = (const uint32_t*)dsc[2];
+    const uint32_t* __restrict__ in_blk = (const uint32_t*)dsc[3];
+    const int rows = (int)dsc[4];
+
     constexpr int SUB = HEAD_DIM / NPAL;
     constexpr int DPT = HEAD_DIM / 32;
     int row = (int)(blockIdx.x * blockDim.x + threadIdx.x) / 32;

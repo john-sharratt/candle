@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
+use candle::quantized::pinned_staging::Generation;
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::batched_inference::{
@@ -24,36 +25,61 @@ use candle_nn::kv_cache::CHUNK_SIZE;
 
 use super::attention::rms_norm;
 use super::engine::Dsv4Engine;
-use super::gallery::{gather_corpus_batched, two_stage_select_batched, FloatGallery};
+use super::gallery::{
+    append_batch_all, gather_corpus_batched, two_stage_select_batched, AppendSlice, FloatGallery,
+};
 use super::kernel_attention::{
     kernel_attn_decode_assemble, kernel_attn_decode_capture, shortlist_m, DecodeAssemble,
     DecodeSel, KernelLayerSeqState, KernelLayerStatic, PrefillPrep, PrefillSel,
 };
 use super::linear::shared_int8_pair;
-use super::paged::{HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
+use super::paged::{GlueRun, HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
 use crate::models::expert_lre::PipelineStats;
 use crate::models::profile::{pipeline_record, profile_now, ProfileSnapshot};
 
 use super::compressor::{assemble_groups_batched, Compressor, GroupPool, SeqAssemble};
+use super::desc;
 use super::rope::RotaryCache;
+
+/// A wave's pooled compressor entries: ONE `[ΣG, d]` block holding every slot's
+/// completed groups in slot order, plus where each slot's run sits in it.
+///
+/// The block is kept WHOLE rather than split into per-slot tensors because the
+/// gallery append consumes it whole — `append_batch_all` scatters the slots'
+/// runs to their galleries from this one source (hot-path invariant 2b).
+struct PooledGroups {
+    /// `[ΣG, d]`, contiguous, slots in order.
+    rows: Tensor,
+    /// Per slot: `(first row, rows)`, or `None` if it completed no group.
+    spans: Vec<Option<(usize, usize)>>,
+}
+
+impl PooledGroups {
+    /// Total pooled groups across the wave.
+    fn total(&self) -> usize {
+        self.spans.iter().flatten().map(|(_, n)| n).sum()
+    }
+}
 
 /// Pool EVERY slot's deferred compressor groups in ONE launch across the whole
 /// wave — the cross-slot emit batch that replaces the per-slot pool. Prefill
 /// batches its prompt fleet's sequences through here, decode its decode rows;
 /// both were a per-slot pool (a softmax + weighted reduction + norm, ~15
-/// launches) multiplied by the wave's width and the layer count. Concatenates
-/// the `Some` [`GroupPool`]s on the group axis, runs one
-/// [`Compressor::pool_and_norm`], and splits the pooled `[ΣG, d]` result back
-/// per slot (`None` for a slot that completed no group). Bit-identical per
-/// group to pooling each slot separately
+/// launches) multiplied by the wave's width and the layer count.
+///
+/// The slots' [`GroupPool`]s go to [`Compressor::pool_and_norm`] AS THEY ARE —
+/// each describes its own rows by address, so batching them widens the pool's
+/// descriptor table instead of concatenating their pooling rows into one block.
+/// Bit-identical per group to pooling each slot separately
 /// (`pool_batched_across_seqs_matches_per_seq`). `rope` is `Some` for the roped
-/// indexer keys, `None` for the pre-RoPE attention entries.
+/// indexer keys, `None` for the pre-RoPE attention entries. `None` when no slot
+/// completed a group.
 fn pool_across_seqs(
     c: &Compressor,
     gps: &[Option<&GroupPool>],
     rope: Option<&RotaryCache>,
-) -> Result<Vec<Option<Tensor>>> {
-    let mut out: Vec<Option<Tensor>> = (0..gps.len()).map(|_| None).collect();
+    generation: &Generation,
+) -> Result<Option<PooledGroups>> {
     let some: Vec<(usize, &GroupPool)> = gps
         .iter()
         .copied()
@@ -61,24 +87,96 @@ fn pool_across_seqs(
         .filter_map(|(i, g)| g.map(|g| (i, g)))
         .collect();
     if some.is_empty() {
-        return Ok(out);
+        return Ok(None);
     }
-    let pool_kv = Tensor::cat(&some.iter().map(|(_, g)| &g.pool_kv).collect::<Vec<_>>(), 0)?;
-    let pool_score = Tensor::cat(
-        &some.iter().map(|(_, g)| &g.pool_score).collect::<Vec<_>>(),
-        0,
-    )?;
-    let positions: Vec<u32> = some.iter().flat_map(|(_, g)| g.positions.clone()).collect();
-    let pooled = c.pool_and_norm(&pool_kv, &pool_score, &positions, rope)?; // [ΣG, d]
+    let pools: Vec<&GroupPool> = some.iter().map(|(_, g)| *g).collect();
+    let rows = c.pool_and_norm(&pools, rope, generation)?; // [ΣG, d]
+    let mut spans: Vec<Option<(usize, usize)>> = vec![None; gps.len()];
     let mut off = 0usize;
     for (i, g) in &some {
-        let n = g.positions.len();
-        // Dim-0 slice of the contiguous pooled block — a bare view (its
-        // `contiguous()` was a runtime no-op); `append_batch` reads it directly.
-        out[*i] = Some(pooled.narrow(0, off, n)?);
+        let n = g.groups();
+        spans[*i] = Some((off, n));
         off += n;
     }
-    Ok(out)
+    Ok(Some(PooledGroups { rows, spans }))
+}
+
+/// Append a wave's pooled groups to every slot's gallery in one pass —
+/// [`append_batch_all`] over the whole `PooledGroups` block.
+///
+/// `keys` is the roped Indexer-key pool when the layer has an indexer. An HCA
+/// layer has a compressor but no indexer, so its galleries carry a 1-wide
+/// placeholder no selection ever reads (HCA attends every causal entry); that
+/// placeholder is built once for the whole wave rather than per slot.
+/// `gps` supplies each slot's group-start positions and `slot_seq` its sequence
+/// id; `galleries` must hold one entry per sequence that pooled a group.
+///
+/// Slots are grouped BY SEQUENCE, not taken one-for-one: a speculative verify
+/// wave carries a whole drafted block as consecutive decode rows of the same
+/// sequence, so one gallery can receive several slots' groups in a single wave.
+/// They append back to back, in slot order — the same order, and the same
+/// resulting rows, as the per-slot loop this replaced.
+fn append_pooled(
+    entries: &PooledGroups,
+    keys: Option<&PooledGroups>,
+    gps: &[Option<&GroupPool>],
+    slot_seq: &[usize],
+    galleries: &mut HashMap<usize, &mut FloatGallery>,
+    generation: &Generation,
+) -> Result<()> {
+    let total = entries.total();
+    if total == 0 {
+        return Ok(());
+    }
+    let key_rows = match keys {
+        Some(k) => {
+            if k.spans != entries.spans {
+                candle::bail!(
+                    "append_pooled: indexer keys and attention entries disagree on which \
+                     slots closed a group — they share a ratio and a token stream, so this \
+                     is a state divergence, not a shape difference"
+                );
+            }
+            k.rows.clone()
+        }
+        None => Tensor::zeros((total, 1), DType::F32, entries.rows.device())?,
+    };
+    // `pos` is built in span order, so it stays parallel to the pooled block and
+    // every run's slice of it is the same narrow as its rows'.
+    let mut pos: Vec<u32> = Vec::with_capacity(total);
+    let mut order: Vec<usize> = Vec::new();
+    let mut runs: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (i, span) in entries.spans.iter().enumerate() {
+        let Some((off, n)) = *span else { continue };
+        let gp = gps[i].expect("a pooled span implies the slot had a group");
+        pos.extend_from_slice(&gp.positions);
+        let seq = slot_seq[i];
+        runs.entry(seq)
+            .or_insert_with(|| {
+                order.push(seq);
+                Vec::new()
+            })
+            .push((off, n));
+    }
+    let mut slices: Vec<AppendSlice<'_>> = Vec::with_capacity(order.len());
+    for seq in order {
+        let gallery = galleries
+            .remove(&seq)
+            .ok_or_else(|| candle::Error::Msg(format!(
+                "append_pooled: sequence {seq} pooled a group but has no gallery on this layer"
+            )))?;
+        slices.push(AppendSlice {
+            gallery,
+            runs: runs.remove(&seq).expect("inserted with the order entry"),
+        });
+    }
+    append_batch_all(
+        &mut slices,
+        &entries.rows,
+        &key_rows,
+        &pos,
+        generation,
+    )
 }
 
 /// One layer's resident sliding-window ring, captured for turn-seal
@@ -1149,6 +1247,49 @@ impl ManagedBatchedModel for DeepSeekBatched {
             }
         }
         let t_meta = profile_now();
+        // The wave's pinned-arena guard. Everything staged from it stays valid
+        // until this drops (line ~2426), and the arena resets then — freeing is
+        // by lifetime, and nothing here syncs.
+        //
+        // ARENA BUDGET. Two draws, both bump-allocated:
+        //   * the paged metadata below (slice + header snapshots), the original
+        //     consumer;
+        //   * the descriptor tables every batched kernel of a compression layer
+        //     reads — the two compressor pools, the gallery-append scatter, the
+        //     corpus gather, the BDP recall, the selector, the compressed-index
+        //     expansion, the arena writeback and the prefill slot metadata —
+        //     sized by `desc::wave_desc_bytes` for THIS wave's width.
+        // The second is the addition this campaign makes, so it is computed and
+        // checked against the arena rather than assumed: at 64 slots × 43 layers
+        // it is a few hundred kilobytes against a 128 MB arena, but a future
+        // width, ratio or prompt length should trip the assert rather than
+        // silently start allocating overflow arenas mid-wave.
+        let desc_bytes = desc::wave_desc_bytes(
+            decode_seqs.len() + prefill_seqs.len(),
+            self.num_layers(),
+            self.engine
+                .cfg()
+                .compress_ratios
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(1),
+            // The per-token draws are sized by the LONGEST slot in the wave —
+            // a decode slot contributes one token, a prompt its whole length.
+            prefill_lens
+                .iter()
+                .chain(glue_lens.iter())
+                .copied()
+                .max()
+                .unwrap_or(1)
+                .max(1),
+        );
+        debug_assert!(
+            desc_bytes < desc::STAGER_ARENA_BYTES / 2,
+            "wave descriptor tables draw {desc_bytes} B of the {} B stager arena — the paged \
+             metadata shares it, so re-check the arena size",
+            desc::STAGER_ARENA_BYTES
+        );
         let generation = session.begin_stager_generation();
         // Glue-only sequences never decode-write (their latents scatter into
         // reserved gap chunks) — excluding them from the metadata build's
@@ -1372,6 +1513,9 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let t_glue_scatter = profile_now();
             {
                 let mut cursor = glue_row_base;
+                // Every island's scatter collected first, then ONE launch: each
+                // run names its own slot, so there is nothing to serialise.
+                let mut runs: Vec<GlueRun> = Vec::with_capacity(glue_seqs.len());
                 for (gi, _seq) in glue_seqs.iter().enumerate() {
                     let g_len = glue_lens[gi];
                     let xs = x.narrow(1, cursor, g_len)?.to_dtype(DType::F32)?;
@@ -1379,18 +1523,16 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     let kv = rms_norm(&a.wkv().forward(&xs)?, a.kv_norm(), a.eps())?;
                     let kv_bf = kv.reshape((g_len, a.head_dim()))?.to_dtype(DType::BF16)?;
                     let d = &glue_desc[gi];
-                    let dev = xs.device();
-                    let sl = Tensor::from_vec(d.write_slice.clone(), g_len, dev)?;
-                    let ib = Tensor::from_vec(d.write_in_blk.clone(), g_len, dev)?;
-                    super::paged::paged_latent_glue_scatter(
-                        &kv_bf,
-                        hdr_of(l, decode_seqs.len() + prefill_seqs.len() + gi),
-                        &sl,
-                        &ib,
-                    )?;
+                    runs.push(GlueRun {
+                        kv: kv_bf,
+                        headers_ptr: hdr_of(l, decode_seqs.len() + prefill_seqs.len() + gi),
+                        slices: d.write_slice.clone(),
+                        in_blk: d.write_in_blk.clone(),
+                    });
                     glue_proj.push((xs, qr));
                     cursor += g_len;
                 }
+                super::paged::paged_latent_glue_scatter(&runs, &generation)?;
             }
             if !glue_seqs.is_empty() {
                 pipeline_record("deepseek:glue_scatter", t_glue_scatter);
@@ -1529,39 +1671,30 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let icomp_refs: Vec<Option<&GroupPool>> =
                     asms.iter().map(|m| m.icomp_gp.as_ref()).collect();
                 let comp_entries = match a.compressor() {
-                    Some(c) => pool_across_seqs(c, &comp_refs, None)?,
-                    None => vec![None; n_dec],
+                    Some(c) => pool_across_seqs(c, &comp_refs, None, &generation)?,
+                    None => None,
                 };
                 let icomp_keys = match a.indexer() {
-                    Some(ix) => pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope))?,
-                    None => vec![None; n_dec],
+                    Some(ix) => pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope), &generation)?,
+                    None => None,
                 };
-                for (i, &seq) in decode_seqs.iter().enumerate() {
-                    let Some(gp) = asms[i].comp_gp.as_ref() else {
-                        continue;
-                    };
-                    let entry_t = comp_entries[i]
-                        .as_ref()
-                        .expect("a completed comp group was pooled");
-                    let key_t = match icomp_keys[i].as_ref() {
-                        Some(k) => k.clone(),
-                        // An HCA layer has a compressor but no indexer: its
-                        // gallery carries the 1-wide key placeholder no selection
-                        // reads (HCA attends every causal entry).
-                        None => Tensor::zeros(
-                            (gp.positions.len(), 1),
-                            DType::F32,
-                            entry_t.device(),
-                        )?,
-                    };
-                    state
-                        .get_mut(&seq)
-                        .expect("ensured above")
-                        .layers[l]
-                        .gallery
-                        .as_mut()
-                        .expect("a completed comp group implies a gallery")
-                        .append_batch(entry_t, &key_t, &gp.positions)?;
+                // Append every session's groups in ONE pass. The galleries are
+                // pulled out of the state map together (they are distinct
+                // sessions, so the borrows are disjoint) and handed over in slot
+                // order.
+                if let Some(entries) = comp_entries.as_ref() {
+                    let mut by_seq: HashMap<usize, &mut FloatGallery> = state
+                        .iter_mut()
+                        .filter_map(|(s, e)| e.layers[l].gallery.as_mut().map(|g| (*s, g)))
+                        .collect();
+                    append_pooled(
+                        entries,
+                        icomp_keys.as_ref(),
+                        &comp_refs,
+                        decode_seqs,
+                        &mut by_seq,
+                        &generation,
+                    )?;
                 }
                 pipeline_record("dprep:pool", t_dpool);
 
@@ -1635,6 +1768,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         &csa_w,
                         shortlist_m(ix.top_k()),
                         ix.top_k(),
+                        &generation,
                     )?;
                     for (j, (gids, k)) in batched.into_iter().enumerate() {
                         let i = csa_idx[j];
@@ -1713,7 +1847,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         }
                     }
                     gather_corpus_batched(
-                        &gg, &ggids, &goff, &out_nope, &out_scale, &out_rope, &out_pos,
+                        &gg,
+                        &ggids,
+                        &goff,
+                        &out_nope,
+                        &out_scale,
+                        &out_rope,
+                        &out_pos,
+                        &generation,
                     )?;
                     super::paged::CorpusCache::from_gathered(
                         out_nope, out_scale, out_rope, out_pos, total_k,
@@ -1729,20 +1870,17 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let max_sel = cnts.iter().map(|&c| c as usize).max().unwrap_or(0).max(1);
                 // Each slot's selection is the dense range [offset, offset+k) —
                 // strictly ascending, the compressed-index contract the kernel
-                // documents. Built ON-DEVICE by broadcast: comp_idx[i,k] =
-                // offsets[i]+k for k<cnt[i], else u32::MAX. Only the tiny per-slot
-                // `offsets`/`cnts` metadata (n_dec entries) is uploaded — no host
-                // O(n_dec·max_sel) idx_flat loop.
-                let offsets_t = Tensor::from_vec(offsets, n_dec, &dev)?; // [n_dec]
-                let comp_cnt = Tensor::from_vec(cnts, n_dec, &dev)?; // [n_dec]
-                let colk = Tensor::arange(0u32, max_sel as u32, &dev)?.reshape((1, max_sel))?;
-                let base = offsets_t.reshape((n_dec, 1))?.broadcast_add(&colk)?; // [n_dec,max_sel]
-                let keep = colk.broadcast_lt(&comp_cnt.reshape((n_dec, 1))?)?; // [n_dec,max_sel]
-                let maxpad = Tensor::full(u32::MAX, (n_dec, max_sel), &dev)?;
-                let comp_idx = keep.where_cond(&base, &maxpad)?; // [n_dec,max_sel] u32
-                                                                 // Explicit per-slot query position (the decode kernel no longer derives it
-                                                                 // from the writer slice, so the windowless slot works and the compressed
-                                                                 // causal guard has a reference). Hoisted above the layer loop — wave-fixed.
+                // documents — so the whole [n_dec, max_sel] matrix follows from
+                // two numbers per slot. ONE launch expands them, reading the
+                // table straight out of the wave's pinned arena; `comp_cnt`
+                // falls out of the same pass because the decode kernel wants the
+                // counts as a device array too.
+                let (comp_idx, comp_cnt) =
+                    super::comp_idx::build(&offsets, &cnts, max_sel, &dev, &generation)?;
+                // Explicit per-slot query position (the decode kernel no longer
+                // derives it from the writer slice, so the windowless slot works
+                // and the compressed causal guard has a reference). Hoisted
+                // above the layer loop — wave-fixed.
                 let q_pos_dec = q_pos_dec_t
                     .as_ref()
                     .expect("decode branch runs only when the wave has decode rows");
@@ -1760,6 +1898,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // the chunk table — positional `off/32` math shears once the
                 // sliding ring has slid.
                 if is_verify_wave {
+                    let mut runs: Vec<GlueRun> = Vec::with_capacity(verify_groups.len());
                     for (gi, &(vseq, base_resident, s_len)) in verify_groups.iter().enumerate() {
                         let row0 = verify_row_start[gi];
                         let (wslice, wblk): (Vec<u32>, Vec<u32>) = {
@@ -1789,13 +1928,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
                             }
                             map.into_iter().unzip()
                         };
-                        super::paged::paged_latent_glue_scatter(
-                            &kv_all.narrow(0, row0, s_len)?,
-                            verify_scatter_hdr(l, gi),
-                            &Tensor::from_vec(wslice, s_len, &dev)?,
-                            &Tensor::from_vec(wblk, s_len, &dev)?,
-                        )?;
+                        runs.push(GlueRun {
+                            kv: kv_all.narrow(0, row0, s_len)?,
+                            headers_ptr: verify_scatter_hdr(l, gi),
+                            slices: wslice,
+                            in_blk: wblk,
+                        });
                     }
+                    super::paged::paged_latent_glue_scatter(&runs, &generation)?;
                 }
                 // ONE launch over plain AND verify rows. The plain prefix
                 // (`n_plain_rows`) uses live persistent slot buffers — the
@@ -1993,14 +2133,36 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let icomp_refs: Vec<Option<&super::compressor::GroupPool>> =
                 preps.iter().map(|p| p.icomp_gp.as_ref()).collect();
             let comp_entries = match a.compressor() {
-                Some(c) => pool_across_seqs(c, &comp_refs, None)?,
-                None => vec![None; preps.len()],
+                Some(c) => pool_across_seqs(c, &comp_refs, None, &generation)?,
+                None => None,
             };
             let icomp_keys = match a.indexer() {
-                Some(ix) => pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope))?,
-                None => vec![None; preps.len()],
+                Some(ix) => pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope), &generation)?,
+                None => None,
             };
             pipeline_record("prefill:pool", t_ppool);
+
+            // Append the whole fleet's groups BEFORE part A, in one pass. The
+            // appends are independent across sequences and part A's selection
+            // reads each gallery only after its own append, so hoisting them out
+            // of the loop is the same order of effects with one launch set
+            // instead of one per sequence.
+            let t_pappend = profile_now();
+            if let Some(entries) = comp_entries.as_ref() {
+                let mut by_seq: HashMap<usize, &mut FloatGallery> = state
+                    .iter_mut()
+                    .filter_map(|(s, e)| e.layers[l].gallery.as_mut().map(|g| (*s, g)))
+                    .collect();
+                append_pooled(
+                    entries,
+                    icomp_keys.as_ref(),
+                    &comp_refs,
+                    prefill_seqs,
+                    &mut by_seq,
+                    &generation,
+                )?;
+            }
+            pipeline_record("ppush:append", t_pappend);
 
             // ── Prefill pass 2 — FULLY BATCHED across sequences (invariant 5):
             // part A collects each seq's corpus gids + per-token (comp_idx,
@@ -2036,28 +2198,13 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let mut new_meta_host: Vec<u32> = Vec::with_capacity(prefill_seqs.len() * 4);
             let mut g_off = 0u32; // running packed-corpus row offset
             let mut new_off = 0u32; // running packed kv_new row offset
-                                    // Part A: append + select + build (per seq); NO gather/kernel yet.
+            // Part A: select + build (per seq); the appends ran above, and NO
+            // gather/kernel yet.
             for (pi, &seq) in prefill_seqs.iter().enumerate() {
                 let s_len = prefill_lens[pi];
                 let base = prefill_base[pi];
                 let prep = &preps[pi];
                 let entry = state.get_mut(&seq).expect("ensured above");
-                let t_pappend = profile_now();
-                if let Some(gp) = prep.comp_gp.as_ref() {
-                    let entry_t = comp_entries[pi]
-                        .as_ref()
-                        .expect("a completed comp group was pooled");
-                    let key_t = match icomp_keys[pi].as_ref() {
-                        Some(k) => k.clone(),
-                        None => Tensor::zeros((prep.g_total, 1), DType::F32, entry_t.device())?,
-                    };
-                    entry.layers[l]
-                        .gallery
-                        .as_mut()
-                        .expect("a completed comp group implies a gallery")
-                        .append_batch(entry_t, &key_t, &gp.positions)?;
-                }
-                pipeline_record("ppush:append", t_pappend);
                 let q_rows = match &idx_q_all {
                     Some((q_raw, weights)) => Some((
                         q_raw.narrow(0, row_off, s_len)?,
@@ -2180,7 +2327,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         }
                     }
                     gather_corpus_batched(
-                        &gg, &ggids, &goff, &out_nope, &out_scale, &out_rope, &out_pos,
+                        &gg,
+                        &ggids,
+                        &goff,
+                        &out_nope,
+                        &out_scale,
+                        &out_rope,
+                        &out_pos,
+                        &generation,
                     )?;
                     super::paged::CorpusCache::from_gathered(
                         out_nope, out_scale, out_rope, out_pos, total_g,
@@ -2206,16 +2360,20 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 }
                 let comp_idx = Tensor::cat(&idx_parts.iter().collect::<Vec<_>>(), 0)?;
                 let comp_cnt = Tensor::cat(&pf.iter().map(|p| &p.comp_cnt).collect::<Vec<_>>(), 0)?;
-                let seq_of = Tensor::from_vec(seq_of_host, prefill_total, &dev)?;
-                let new_meta = Tensor::from_vec(new_meta_host, (pf.len(), 4), &dev)?;
+                // Per-query slot selector and per-seq diagonal metadata: read
+                // once by the kernel and never by a tensor op, so they go
+                // straight into the wave's pinned arena instead of costing a
+                // device allocation plus a pageable upload each.
+                let seq_of = desc::stage_slice(&seq_of_host, &generation)?;
+                let new_meta = desc::stage_slice(&new_meta_host, &generation)?;
                 let q_pos_all = Tensor::cat(&prefill_q_pos.iter().collect::<Vec<_>>(), 0)?;
                 let out = super::paged::paged_latent_prefill_raw(
                     &projref.q_bf,
                     hdr_of(l, decode_seqs.len()),
                     &q_pos_all,
-                    &seq_of,
+                    seq_of.ptr(),
                     &projref.kv_bf,
-                    &new_meta,
+                    new_meta.ptr(),
                     &cache,
                     &comp_idx,
                     &comp_cnt,
@@ -2236,6 +2394,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // Part C: writeback each seq's prompt latents to its arena (deferred —
                 // set_len must run AFTER the batched kernel read the committed prefix).
                 let t_pwb = profile_now();
+                let mut runs: Vec<GlueRun> = Vec::with_capacity(prefill_seqs.len());
                 for (pi, &seq) in prefill_seqs.iter().enumerate() {
                     let s_len = prefill_lens[pi];
                     let base = prefill_base[pi];
@@ -2246,17 +2405,18 @@ impl ManagedBatchedModel for DeepSeekBatched {
                             ((off / CHUNK_SIZE) as u32, (off % CHUNK_SIZE) as u32)
                         })
                         .unzip();
-                    super::paged::paged_latent_glue_scatter(
-                        &preps[pi].kv_bf,
-                        hdr_of(l, decode_seqs.len() + pi),
-                        &Tensor::from_vec(wslice, s_len, &dev)?,
-                        &Tensor::from_vec(wblk, s_len, &dev)?,
-                    )?;
+                    runs.push(GlueRun {
+                        kv: preps[pi].kv_bf.clone(),
+                        headers_ptr: hdr_of(l, decode_seqs.len() + pi),
+                        slices: wslice,
+                        in_blk: wblk,
+                    });
                     session.backings()[l].set_len(seq, base_resident + s_len);
                     if l + 1 == n_layers {
                         state.get_mut(&seq).expect("ensured above").absorbed = base + s_len;
                     }
                 }
+                super::paged::paged_latent_glue_scatter(&runs, &generation)?;
                 pipeline_record("prefill:writeback", t_pwb);
                 pipeline_record("deepseek:prefill_attn", t_prefill);
             }
@@ -2283,16 +2443,16 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let empty_cnt = Tensor::zeros(g_len, DType::U32, dev)?;
                 // Glue rows read only their arena window — one slot, no new-token
                 // diagonal (rows=0), no corpus.
-                let seq_of = Tensor::zeros(g_len, DType::U32, dev)?;
+                let seq_of = desc::stage_slice(&vec![0u32; g_len], &generation)?;
                 let kv_dummy = Tensor::zeros((1, HEAD_DIM), DType::BF16, dev)?;
-                let new_meta = Tensor::from_vec(vec![0u32, 0, 0, 0], (1, 4), dev)?;
+                let new_meta = desc::stage_slice(&[0u32, 0, 0, 0], &generation)?;
                 let out = super::paged::paged_latent_prefill_raw(
                     &q_bf,
                     hdr_of(l, decode_seqs.len() + prefill_seqs.len() + gi),
                     &q_pos_t,
-                    &seq_of,
+                    seq_of.ptr(),
                     &kv_dummy,
-                    &new_meta,
+                    new_meta.ptr(),
                     &st.empty_corpus_cache()?,
                     &empty_idx,
                     &empty_cnt,

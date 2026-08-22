@@ -571,6 +571,10 @@ pub fn run_prefill(dev: &Device, cfg: PrefillCfg) -> Result<Report> {
     // only for the host reference gate.
     let (ni8, nsc, rbf, cpos) = gallery.gather_corpus(&all)?;
     let cache = CorpusCache::from_gathered(ni8, nsc, rbf, cpos, g_total)?;
+    // One scope for the whole timed loop: the 1-seq slot tables are staged from
+    // it, and opening a scope per iteration would reset the arena — and
+    // synchronise — inside the measurement.
+    let scope = super::desc::scope(&dev)?;
     let launch = || -> Result<Tensor> {
         paged_latent_prefill(
             &q,
@@ -587,6 +591,7 @@ pub fn run_prefill(dev: &Device, cfg: PrefillCfg) -> Result<Report> {
             WINDOW,
             0,
             fp8_store_tag(),
+            &scope,
         )
     };
 

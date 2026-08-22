@@ -43,6 +43,12 @@ mod paged;
 pub mod readback;
 mod rope;
 #[cfg(feature = "cuda")]
+mod comp_idx;
+#[cfg(feature = "cuda")]
+mod desc;
+#[cfg(feature = "cuda")]
+mod scatter;
+#[cfg(feature = "cuda")]
 pub mod select_bench;
 mod streaming;
 mod transformer;

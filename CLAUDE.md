@@ -106,9 +106,23 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
    the hot path is a full-tensor memory pass a kernel could have avoided by writing its
    output in the type the next consumer wants. Norms emit the kernel's input type; attention
    kernels emit the out-proj's input type.
-2. **No `contiguous` / `force_contiguous` in the loop.** A `contiguous()` is an allocate-plus-copy
-   of the whole tensor. If a consumer needs a layout, teach it to read the layout that exists
-   (offset + stride), or produce that layout directly from the kernel that made the data.
+2. **No allocate-plus-copy to materialise a layout, by any spelling.** `contiguous()`,
+   `force_contiguous()`, `Tensor::cat`, and `slice_set` are the SAME operation as far as this
+   invariant is concerned — each allocates and copies so a consumer can be handed the layout it
+   prefers, and `cat`/`slice_set` cost **one launch per argument**. If a consumer needs a layout,
+   teach it to read the layout that exists (offset + stride, or a descriptor table — see 2b), or
+   produce that layout directly from the kernel that made the data.
+   > This invariant was originally worded as "no `contiguous` / `force_contiguous`", naming two
+   > functions rather than the operation. `cat` and `slice_set` matched neither name and were
+   > never audited: a measured 892,104 of 1,079,568 copy launches per sweep — 2.5% of GPU — sat
+   > entirely outside the rule. Police the operation, not the spelling.
+2b. **A kernel consuming per-session or per-row data takes a DESCRIPTOR TABLE, not a packed block.**
+   Requiring one dense base pointer is what forces the caller to `cat`/`slice_set` rows together,
+   so the copy is the kernel's API bug, not the caller's. Pass a device table of
+   `{ptr, offset, stride, len}` per row/session and read in place. The pattern already exists here:
+   `candle-kernels/src/arena_table.cuh` (`ArenaTableEntry`/`PerHeadTableEntry`) for the paged
+   attention kernels, the gallery's `region_ptr_cache`, and `bdp_recall_batched`'s per-gallery
+   sign-pointer table (which replaced an O(Σ len × words) concatenation).
 3. **No unnecessary GPU→CPU transfers.** Exactly two sanctioned readbacks: (a) MoE expert
    routing (`indices` → host), because the streaming `ExpertCache` schedules pinned→VRAM
    uploads by expert id; and (b) the embedding lookup (token ids → host, CPU `index_select`,

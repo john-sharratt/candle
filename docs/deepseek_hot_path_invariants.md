@@ -14,6 +14,200 @@ prompt slots) and **decode** (one token per session, batched across sessions).
 
 ---
 
+## Copy-elimination pass (invariant 2 / 2b)
+
+Invariant 2 was originally worded as "no `contiguous` / `force_contiguous`", naming two
+functions rather than the operation. `Tensor::cat` and `slice_set` matched neither name
+and were therefore never audited, even though each allocates and copies for exactly the
+same reason and costs **one launch per argument**. A profile of the post-fusion sweep
+found **1,079,568 copy launches (6.1 % of GPU, ~120 per layer-step)** sitting entirely
+outside the rule — `copy2d_f32` 746 k, `ucopy_f32` 186 k, `copy2d_u32` 146 k — with every
+median at the WDDM launch floor (~0.9–1.9 µs), i.e. launch overhead rather than bandwidth.
+For scale, the three fused kernels of the preceding campaign total 0.2 % of GPU.
+
+The invariant is now worded against the OPERATION, and gains a corollary — **2b: a kernel
+consuming per-session or per-row data takes a DESCRIPTOR TABLE, not a packed block**.
+Requiring one dense base pointer is what forced callers to concatenate, so the copy was
+the kernel's API bug, not the caller's.
+
+Three sites were converted:
+
+1. **Compressor pool** (`simple/compressor_pool.cu`). The kernel now takes a per-group
+   list of SEGMENTS — `{kv, score, ape} × {ptr, row stride, rows}` — walked in order, and
+   folds the `ape` bias in as it reads. Consequences: the overlapping compressor's two
+   column windows need no join; a decode group's `ratio` independently-allocated rows are
+   read where they lie and retained as the next group's previous half by moving a `Vec`;
+   ragged groups (a turn-sealed partial) need no pad; a group 0 with no previous group
+   omits the segment instead of pooling an all-`−∞` pad; and several sessions pool
+   together by widening the table. `assemble_group_raw` went from ~13 launches per group
+   to **zero device work at all**. The batched prefill assemble lost its prev-source
+   concatenation, its `pi_t` gather and its pad rows — the prev-group shift is just the
+   same block read one group earlier — which also removed `cd`, `overlap` and
+   prev-presence from the geometry cache key.
+2. **Gallery append** (`simple/rows_scatter.cu`, new). Appending a wave's groups is a
+   scatter: six arrays × one destination per session per compression layer, i.e. six
+   `slice_set` launches × width × layers, each moving a few kilobytes. It is now one
+   sign-pack, one position upload, one latent seal and ONE scatter whose descriptor table
+   names every destination by address — a fixed handful of launches for the whole wave,
+   independent of session count. Each gallery's tier is settled (`grow_to`, `maybe_spill`)
+   *before* any row is written, so every row is written once to its final home.
+3. **Warm-tier re-heat** (`FloatGallery::gather_corpus_into`). The spilled float pair lives
+   in **pageable** host RAM, which no kernel can address, so the row gather itself must
+   stay on the host — the one place invariant 4 does not reach, because there is no kernel
+   that could do it. What it no longer is, is a copy per region: all three regions pack
+   into one staging buffer, so the re-heat is a single transfer plus a single scatter
+   instead of three uploads and four `slice_set`s. `gather_corpus` now routes through the
+   same function, so the tier logic exists once. Making the kernel read this tier in place
+   needs the **pinned warm pool** of `kv_tier_migration.md`; that is deliberately a bounded
+   *pool*, because page-locking every spilled arena wholesale would make an unbounded
+   amount of host memory unswappable.
+
+`keys.t()?.contiguous()?` (four `gallery.rs` sites) was **measured out**, not fixed:
+candle's matmul accepts the strided transpose and all gates pass without the copy, but the
+model A/B lands inside run-to-run variance (~2 % same-code spread), which points at cuBLAS
+selecting a slower kernel for the strided operand and roughly cancelling the saved traffic.
+It belongs with the GEMM work, under `nsys` attribution — not with deletion.
+
+Measured: model sweep `[1,4,8,16,1]` 5/5 valid throughout; **decode cfg16 56.6 → 61.2 t/s
+(+8.1 %), cfg8 41.3 → 43.8 (+6.1 %)**, bulk flat at ~1000 t/s. The decode gain is entirely
+site 1 — sites 2 and 3 measured flat on this benchmark, because the sweep's galleries never
+reach the spill threshold and an append fires only on a group close. They are structural
+fixes whose payoff is at production depth and width.
+
+One trap worth recording: the batched append first assumed one wave slot per sequence. A
+**speculative verify wave carries a whole drafted block as consecutive decode rows of the
+SAME sequence**, so one gallery legitimately receives several slots' groups in one wave.
+Only `wave_paris_speculative_dspark` caught it — the unit gates and the non-speculative
+sweep both passed. Slots are now grouped by sequence and appended back to back.
+
+### `ncu` on the two new kernels — the bottleneck is the TABLE, not the kernels
+
+Both kernels got an isolation harness (`bench_compressor_pool`, `bench_rows_scatter`,
+min-of-five-rounds) and an `ncu` pass. The result redirected the whole optimisation:
+
+| shape                              | kernel  | wall    | SM %  | DRAM % | warps % |
+|------------------------------------|---------|---------|-------|--------|---------|
+| `compressor_pool` decode ×1        | 5.2 us  | 15.6 us | 0.13  | 0.65   | 8.1     |
+| `compressor_pool` prefill (g = 256)| 11.4 us | 22.4 us | 15.6  | 58.0   | 52      |
+| `rows_scatter` 64 sessions         | 2.9 us  | 26.8 us | 6.1   | 2.8    | 32      |
+
+At every shape but one the kernel is a minority of the wall, and at the decode and
+scatter shapes it is doing essentially nothing (0.13 % / 6.1 % SM). Occupancy, register
+pressure and vector width cannot move a kernel that is 0.13 % SM-busy — **the wall is the
+descriptor upload**. Measured directly: `Tensor::from_vec` of a 928-word table costs
+**7.6 us**, against a 5.2 us kernel, because it allocates a fresh device buffer per call
+and copies from pageable host memory. `desc.rs` now stages both kernels' tables through a
+persistent per-device buffer; the per-call allocation is gone (prefill 22.4 → ~20.5 us,
+scatter 26.8 → 25.5 us) and the remaining ~7 us is the pageable H2D itself, which is
+irreducible without either shrinking the table into kernel parameters (32 KB limit, the
+prefill table is 22–33 KB) or batching the whole wave's uploads into one — both open.
+
+**The table now rides the wave's pinned arena.** `PinnedStager` — a bump arena mapped
+`DEVICEMAP | WRITECOMBINED`, already used by the paged-attention path for its slice and
+header metadata — was already open for the whole layer loop (`begin_stager_generation`,
+`wave.rs`). Staging the descriptor from it is a pointer increment, and `submit` on a bump
+buffer hands back a device address into the SAME pinned pages: **the GPU reads the table
+in place over PCIe, so there is no copy, no allocation and no driver call**, and freeing
+is by lifetime when the generation drops. Isolated:
+
+| shape                        | arena   | upload  | vs `slice_set` |
+|------------------------------|---------|---------|----------------|
+| scatter, 1 session           | 8.1 us  | 13.2 us | 5.0x           |
+| scatter, 16 sessions         | 10.2 us | 16.6 us | 68.0x          |
+| scatter, 64 sessions         | 17.1 us | 25.2 us | 159.8x         |
+| pool, 64 streaming pools     | 22.2 us | 30.1 us | —              |
+| pool, 16 streaming pools     | 16.9 us | 17.7 us | —              |
+
+The win scales with table size — 1.5–1.7x for the scatter at every width, 1.36x for the
+pool at 64 pools — and vanishes below ~16 pools, where `submit`'s arena lookup costs about
+what the copy did.
+
+There is NO second staging path. A caller outside a wave — the streamed reference, a
+turn-seal `close`, the gates — does not LACK an arena, it simply has not opened a SCOPE
+yet, so it opens one with `desc::scope`. Generations are refcounted, so a scope opened
+inside a wave nests harmlessly and a standalone one resets at its own end. The alternative
+was an `Option<&Generation>` with a copy-based fallback, and a shared fallback buffer is
+only sound when at most ONE table is staged per launch — which stopped being true the
+moment `gather_corpus_batched` staged its pointer table and its metadata before a single
+kernel. The second overwrote the first (`CUDA_ERROR_ILLEGAL_ADDRESS`, half the gallery
+gates). **Staging lifetime cannot be inferred from call order**; the arena gives every
+`alloc` a distinct region, so the hazard cannot arise.
+
+The wave's arena draw is now COMPUTED (`desc::wave_desc_bytes`) from its own width, layer
+count and ratio, and `debug_assert`ed against half the 128 MB arena at
+`begin_stager_generation` — the paged metadata shares it, so a future width or ratio trips
+the assert instead of silently allocating overflow arenas mid-wave.
+
+**Two optimisations were tried and MEASURED WORSE. Do not re-attempt either.**
+
+- **Pinned write-combined staging for the table: 15 → 80 us, a 5× regression.**
+  `PinnedHostSlice::as_mut_slice` calls `event.synchronize()`, and with one reusable
+  buffer that drains the entire queued stream on every call, throttling the host to GPU
+  rate. A ring deep enough to avoid it cannot be bounded, because the host legitimately
+  runs hundreds of iterations ahead.
+- **`float4` in the pool: prefill 20.1 → 21.1 us, HCA 19.1 → 33.5 us.** `d` is fixed at
+  512, so four channels per thread means a quarter of the lanes and the channel tiling
+  collapses from 4 blocks per group to 1. Narrowing the block to win the blocks back made
+  it far worse — `ncu` measured block size 32, grid 64, **2.08 % of warps active**, 62 us —
+  because an SM seats a bounded number of resident BLOCKS, so one warp per block caps
+  occupancy. The general rule: vectorising a loop whose trip count is fixed by the data
+  trades parallel work items for per-thread work, and on a kernel short of warps rather
+  than short of bandwidth that trade is always backwards. It would need `d` ≥ 2048.
+
+What the harness DID confirm is the batching itself: against the `slice_set` storm it
+replaced, `rows_scatter` is **3.0× at one session, 41.6× at sixteen and 105.7× at
+sixty-four** — the launch count stops scaling with width, which is the whole point.
+
+### Second pass — the remaining per-sequence uploads
+
+An audit of every per-call pageable H2D on the hot path found ~14 `Tensor::from_vec` sites
+inside the layer loop plus 6 in the gallery helpers. The corpus gather's pointer table and
+metadata, the BDP recall's per-gallery sign table and the two-stage selector's `off`/`cnt`
+segments were converted to arena staging directly (the selector's pair is now staged ONCE
+and shared by the recall and the top-M, which also removed a duplicated upload). Three
+further sites needed structural changes rather than a staging swap:
+
+1. **`comp_idx` expansion** (`simple/comp_idx.cu`, new). Every decode slot's selection is
+   the dense range `[offset, offset+k)`, so the whole `[n_dec, max_sel]` matrix follows
+   from two numbers per slot — yet it was built with two uploads plus a five-launch tensor
+   chain (`arange`, `broadcast_add`, `broadcast_lt`, `full`, `where_cond`), every layer,
+   every step, around about thirty words of input. One kernel now expands a staged
+   `{offset, count}` table and emits `comp_cnt` in the same pass, because the decode kernel
+   wants the counts as a device array anyway. Seven launches and two uploads → one launch,
+   no upload. **This is the site my first framing got wrong**: `offsets_t`/`comp_cnt` were
+   filed as "consumed as tensors by the paged wrappers, same conversion as the rest", but
+   they never reach a kernel pointer at all — they feed candle ops. A staging swap would
+   not have compiled, let alone helped. Check what actually consumes a tensor before
+   classifying it.
+2. **Prefill slot metadata** (`paged_latent_prefill_raw`). `seq_of` (one u32 per query) and
+   `new_meta` (four per seq) are read once by the kernel and never by a tensor op, so the
+   wrapper now takes them as device addresses alongside the `headers_ptr` that already was
+   one. The single-seq convenience wrapper stages its own 1-seq tables — notably `seq_of`,
+   which as a tensor was an allocation plus a memset for a block of zeros.
+3. **Arena writeback** (`latent_glue_scatter_kernel`, now batched). Three separate wave
+   phases scatter latents into reserved chunks — glue islands, prefill prompt writeback and
+   speculative-verify writeback — and each ran one launch per SEQUENCE plus two uploads for
+   its `{slice, in_blk}` arrays. Every run names its own destination slot by address, so
+   there was nothing to serialise: the kernel now takes a run table (`{kv, headers, slices,
+   in_blk, rows}`, `grid.y` = run) and the whole wave's writeback is one launch. The index
+   arrays stay HOST vectors and go straight into the arena rather than becoming tensors.
+
+The budget (`desc::wave_desc_bytes`) now covers all of it and takes a `max_tokens`
+argument, because the writeback and prefill metadata are the first draws that scale with
+TOKENS rather than slots — a long prompt stages two words per prompt token.
+
+Measured: sweep `[1,4,8,16,1]` 5/5 valid, **cfg16 decode 61.8 t/s, bulk 1002.4** against
+61.7 / 1000.1 before — i.e. **flat, inside run-to-run variance**. The launches are
+genuinely gone, so the honest reading is that they were not on the critical path at these
+shapes: the decode step is ~16 ms and these sites were order 2–3 ms of *driver* overhead
+that evidently overlapped with GPU work rather than gating it. The value banked here is
+structural (invariant 2b holds across the whole wave now, and the writeback stops scaling
+with sequence count), not a rate win. **Where the remaining time goes is now an open
+question that only the re-profile can answer** — which is the next task, not more
+conversions.
+
+---
+
 ## Campaign status (measured)
 
 The invariant campaign landed **every** structural fix; only three residuals remain,

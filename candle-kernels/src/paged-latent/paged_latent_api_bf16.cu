@@ -56,20 +56,18 @@ extern "C" void run_paged_latent_prefill_bf16(
 }
 
 extern "C" void run_paged_latent_glue_scatter_bf16(
-    const void* kv,             // [rows, 512] bf16 pre-RoPE latents
-    const uint8_t* headers_ptr, // SlotHeader[1]
-    const uint32_t* slices,     // [rows] gap block index
-    const uint32_t* in_blk,     // [rows] in-block offset
-    int32_t rows,
+    const long long* desc, // [GLUE_SCATTER_WORDS * n_runs], see latent_common.cuh
+    int32_t n_runs,
+    int32_t max_rows,      // widest run's row count, for grid sizing
     void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
-    if (rows <= 0) return;
+    if (n_runs <= 0 || max_rows <= 0) return;
     int threads = 256;
-    int blocks = (rows * 32 + threads - 1) / threads;
+    int blocks = (max_rows * 32 + threads - 1) / threads;
+    dim3 grid(blocks, n_runs, 1);
     latent_attn::latent_glue_scatter_kernel<__nv_bfloat16, 512>
-        <<<blocks, threads, 0, stream>>>(
-            (const __nv_bfloat16*)kv, headers_ptr, slices, in_blk, rows);
+        <<<grid, threads, 0, stream>>>(desc, n_runs);
 }
 
 // Regression probe: evaluates the kernel-side `ds_exp` on a device array so

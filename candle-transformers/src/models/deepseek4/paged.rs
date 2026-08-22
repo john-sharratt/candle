@@ -22,6 +22,14 @@
 use candle::quantized::k_quants;
 use candle::{DType, Result, Tensor};
 
+#[cfg(feature = "cuda")]
+use candle::quantized::pinned_staging::Generation;
+#[cfg(feature = "cuda")]
+use candle_kernels::paged_latent::GLUE_SCATTER_WORDS;
+
+#[cfg(feature = "cuda")]
+use super::desc;
+
 pub const HEAD_DIM: usize = 512;
 pub const ROPE_DIM: usize = 64;
 pub const NOPE_DIM: usize = HEAD_DIM - ROPE_DIM;
@@ -503,6 +511,10 @@ pub fn paged_latent_prefill(
     num_splits_override: usize,
     // Writer-chunk float format tag: the new-token diagonal fake-quants to it.
     store_fmt: u8,
+    // Staging scope for the 1-seq `seq_of`/`new_meta` tables this builds. A
+    // caller outside a wave opens its own with `desc::scope` — the arena is
+    // refcounted, so a scope taken inside one nests for free.
+    generation: &Generation,
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::Storage;
@@ -522,10 +534,12 @@ pub fn paged_latent_prefill(
             _ => candle::bail!("expected CUDA storage for headers"),
         }
     };
-    // Single-seq convenience: build the 1-seq batched arrays (all queries → seq 0)
-    // and dispatch to the batched `_raw`.
+    // Single-seq convenience: build the 1-seq batched tables (all queries → seq 0)
+    // and dispatch to the batched `_raw`. Both are staged in the arena rather
+    // than uploaded — `seq_of` is `total_q` zeros, which as a tensor would be an
+    // allocation plus a memset for a table the kernel only reads.
     let total_q = q.dim(0)?;
-    let seq_of = Tensor::zeros(total_q, DType::U32, q.device())?;
+    let seq_of = desc::stage_slice(&vec![0u32; total_q], generation)?;
     let (kv_t, rows, base) = match kv_new {
         Some((t, base)) => (t.clone(), t.dim(0)? as u32, base as u32),
         None => (
@@ -535,14 +549,14 @@ pub fn paged_latent_prefill(
         ),
     };
     // 1-seq new-token metadata: {rows, base, start=0, -}.
-    let new_meta = Tensor::from_vec(vec![rows, base, 0u32, 0u32], (1, 4), q.device())?;
+    let new_meta = desc::stage_slice(&[rows, base, 0u32, 0u32], generation)?;
     paged_latent_prefill_raw(
         q,
         hdr_ptr,
         q_pos,
-        &seq_of,
+        seq_of.ptr(),
         &kv_t,
-        &new_meta,
+        new_meta.ptr(),
         cache,
         comp_idx,
         comp_cnt,
@@ -566,13 +580,17 @@ pub fn paged_latent_prefill_raw(
     headers_ptr: u64,
     q_pos: &Tensor,
     // `[total_q]` u32 — which prefill seq each query belongs to (selects its
-    // arena slot + new-token diagonal slice; the whole prefill fleet in one launch).
-    seq_of: &Tensor,
+    // arena slot + new-token diagonal slice; the whole prefill fleet in one
+    // launch). A raw device address: the wave builds this host-side and stages
+    // it in its pinned arena, so it never round-trips through a device
+    // allocation and an upload (see `desc.rs`).
+    seq_of_ptr: u64,
     // All prefill seqs' just-computed latents packed `[total_new, 512]` bf16;
     // seq `s`'s rows start at `new_meta[s].start`, keyed at `new_meta[s].base + j`.
     kv_new: &Tensor,
-    // `[n_seq, 4]` u32 per-seq new-token diagonal metadata: {rows, base, start, -}.
-    new_meta: &Tensor,
+    // `[n_seq, 4]` u32 per-seq new-token diagonal metadata: {rows, base, start, -},
+    // staged like `seq_of_ptr`.
+    new_meta_ptr: u64,
     cache: &CorpusCache,
     comp_idx: &Tensor,
     comp_cnt: &Tensor,
@@ -636,9 +654,9 @@ pub fn paged_latent_prefill_raw(
     let hdr_ptr = headers_ptr;
     let out_ptr = cuda_ptr!(&out, f32); // kernel emits F32
     let pos_ptr = cuda_ptr!(q_pos, u32);
-    let seq_ptr = cuda_ptr!(seq_of, u32);
+    let seq_ptr = seq_of_ptr;
     let new_ptr = cuda_ptr!(kv_new, half::bf16);
-    let meta_ptr = cuda_ptr!(new_meta, u32);
+    let meta_ptr = new_meta_ptr;
     // Two-region corpus cache (the same the decode reads) — no per-prefill
     // rebuild from f32; the pre-pass dequantizes, ropes, then bakes into the int8
     // QK/PV scratch below.
@@ -719,48 +737,103 @@ pub fn paged_latent_prefill_raw(
     Ok(out)
 }
 
-/// Scatter glue latents into their RESERVED gap chunks (per-row block index +
-/// in-block offset from the reprojection's descriptors). Launch BEFORE any
-/// attention pass of the same layer on the same stream.
+/// One sequence's scatter: `kv`'s rows into the gap chunks named by `slices`
+/// (block index) and `in_blk` (in-block offset), in the slot at `headers_ptr`.
+///
+/// The two index arrays are HOST vectors, not tensors: they are computed
+/// host-side from the reprojection's descriptors and read once by the kernel, so
+/// they go straight into the wave's pinned arena. Materialising them as tensors
+/// was an allocation and a pageable upload each, per sequence, per layer.
 #[cfg(feature = "cuda")]
-pub fn paged_latent_glue_scatter(
-    kv: &Tensor,      // [rows, 512] bf16 pre-RoPE latents
-    headers_ptr: u64, // this layer's SlotHeader (single slot)
-    slices: &Tensor,  // [rows] u32 gap block index
-    in_blk: &Tensor,  // [rows] u32 in-block offset
-) -> Result<()> {
+pub struct GlueRun {
+    pub kv: Tensor,
+    pub headers_ptr: u64,
+    pub slices: Vec<u32>,
+    pub in_blk: Vec<u32>,
+}
+
+/// Scatter glue latents into their RESERVED gap chunks. Launch BEFORE any
+/// attention pass of the same layer on the same stream.
+///
+/// Batched over runs (invariant 2b): each run names its own destination slot by
+/// address, so the wave's whole scatter — every glue island, every prefill
+/// writeback, every speculative-verify writeback — is ONE launch. A run with no
+/// rows is skipped; an empty batch is a no-op.
+#[cfg(feature = "cuda")]
+pub fn paged_latent_glue_scatter(runs: &[GlueRun], generation: &Generation) -> Result<()> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::Storage;
-    let rows = kv.dim(0)?;
-    let dev = match kv.device() {
+    // Skip on ROW COUNT, not on the index arrays: a run with rows but no slices
+    // is a caller bug, and filtering on `slices` would drop it silently instead
+    // of reaching the length check below.
+    let live: Vec<&GlueRun> = runs
+        .iter()
+        .filter(|r| r.kv.dims().first().copied().unwrap_or(0) > 0)
+        .collect();
+    if live.is_empty() {
+        return Ok(());
+    }
+    let dev = match live[0].kv.device() {
         candle::Device::Cuda(d) => d.clone(),
         _ => candle::bail!("glue scatter requires CUDA tensors"),
     };
     let stream = dev.cuda_stream();
-    macro_rules! cuda_ptr {
-        ($t:expr, $ty:ty) => {{
-            let (storage, layout) = $t.storage_and_layout();
-            let ptr = match &*storage {
+
+    let mut table = vec![0i64; GLUE_SCATTER_WORDS * live.len()];
+    // The per-run index tables are staged individually; hold them so the arena
+    // regions stay live until the launch below is enqueued.
+    let mut staged_idx = Vec::with_capacity(2 * live.len());
+    let mut max_rows = 0usize;
+    for (i, run) in live.iter().enumerate() {
+        let (rows, width) = run.kv.dims2()?;
+        if run.slices.len() != rows || run.in_blk.len() != rows {
+            candle::bail!(
+                "glue scatter: {rows} latent rows against {} slices / {} offsets",
+                run.slices.len(),
+                run.in_blk.len()
+            );
+        }
+        // The kernel addresses row `r` as `kv + r*HEAD_DIM`, so a run must be a
+        // dense `[rows, HEAD_DIM]` block. A dim-0 narrow of one satisfies this;
+        // a transpose or a dim-1 narrow does not, and would scatter garbage
+        // into the arena rather than fail. Cheap to check, and the single-run
+        // API this replaced only had one caller to reason about.
+        if width != HEAD_DIM || run.kv.stride()[0] != HEAD_DIM || run.kv.stride()[1] != 1 {
+            candle::bail!(
+                "glue scatter: run {i} is [{rows}, {width}] stride {:?}, not a dense \
+                 [rows, {HEAD_DIM}] block",
+                run.kv.stride()
+            );
+        }
+        let kv_p = {
+            let (storage, layout) = run.kv.storage_and_layout();
+            match &*storage {
                 Storage::Cuda(c) => {
-                    let slice = c.as_cuda_slice::<$ty>()?;
+                    let slice = c.as_cuda_slice::<half::bf16>()?;
                     let (p, _guard) = slice.device_ptr(&stream);
-                    p + (layout.start_offset() * std::mem::size_of::<$ty>()) as u64
+                    p + (layout.start_offset() * std::mem::size_of::<half::bf16>()) as u64
                 }
-                _ => candle::bail!("expected CUDA storage"),
-            };
-            ptr
-        }};
+                _ => candle::bail!("expected CUDA storage for glue latents"),
+            }
+        };
+        let sl = desc::stage_slice(&run.slices, generation)?;
+        let ib = desc::stage_slice(&run.in_blk, generation)?;
+        let w = &mut table[i * GLUE_SCATTER_WORDS..][..GLUE_SCATTER_WORDS];
+        w[0] = kv_p as i64;
+        w[1] = run.headers_ptr as i64;
+        w[2] = sl.ptr() as i64;
+        w[3] = ib.ptr() as i64;
+        w[4] = rows as i64;
+        staged_idx.push(sl);
+        staged_idx.push(ib);
+        max_rows = max_rows.max(rows);
     }
-    let kv_p = cuda_ptr!(kv, half::bf16);
-    let sl_p = cuda_ptr!(slices, u32);
-    let ib_p = cuda_ptr!(in_blk, u32);
+    let staged = desc::stage(&table, generation)?;
     unsafe {
         candle_kernels::paged_latent::run_paged_latent_glue_scatter_bf16(
-            kv_p as *const core::ffi::c_void,
-            headers_ptr as *const u8,
-            sl_p as *const u32,
-            ib_p as *const u32,
-            rows as i32,
+            staged.ptr() as *const i64,
+            live.len() as i32,
+            max_rows as i32,
             stream.cu_stream() as *mut core::ffi::c_void,
         );
     }
@@ -2942,6 +3015,7 @@ mod tests {
                 window_size,
                 1,
                 fp8_store_tag(),
+                &desc::scope(&dev)?,
             )?
             .to_dtype(DType::F32)?
             .flatten_all()?
@@ -3028,6 +3102,7 @@ mod tests {
             window_size,
             1,
             fp8_store_tag(),
+            &desc::scope(&dev)?,
         )?
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -3076,6 +3151,7 @@ mod tests {
             window_size,
             1,
             fp8_store_tag(),
+            &desc::scope(&dev)?,
         )?
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -3262,6 +3338,7 @@ mod tests {
             window_size,
             1,
             fp8_store_tag(),
+            &desc::scope(&dev)?,
         )?
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -3351,6 +3428,7 @@ mod tests {
             window_size,
             1,
             fp8_store_tag(),
+            &desc::scope(&dev)?,
         )?
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -4852,6 +4930,7 @@ mod tests {
             window_size,
             1,
             fp8_store_tag(),
+            &desc::scope(&dev)?,
         )?
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -5026,9 +5105,15 @@ mod tests {
                     .to_dtype(DType::BF16)?;
                 let slices: Vec<u32> = glue_slots.iter().map(|&g| (g / CHUNK) as u32).collect();
                 let in_blk: Vec<u32> = glue_slots.iter().map(|&g| (g % CHUNK) as u32).collect();
-                let slices = Tensor::from_vec(slices, glue_slots.len(), &dev)?;
-                let in_blk = Tensor::from_vec(in_blk, glue_slots.len(), &dev)?;
-                paged_latent_glue_scatter(&kv, headers_addr, &slices, &in_blk)?;
+                paged_latent_glue_scatter(
+                    &[GlueRun {
+                        kv,
+                        headers_ptr: headers_addr,
+                        slices,
+                        in_blk,
+                    }],
+                    &desc::scope(&dev)?,
+                )?;
             }
             let qf: Vec<f32> = q.iter().flat_map(|h| h.iter().copied()).collect();
             let qt = Tensor::from_vec(qf, (1, H, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;

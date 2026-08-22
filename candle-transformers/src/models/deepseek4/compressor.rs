@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use candle::quantized::pinned_staging::Generation;
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::ops::softmax;
 
@@ -160,6 +161,107 @@ impl Compressor {
         Ok(Some(Tensor::cat(&[&nope, &rope_part], D::Minus1)?))
     }
 
+    /// The absolute positional encoding as `[ratio, cd]` — one bias row per
+    /// within-group position. A view: `ape` is stored F32 at load, so the
+    /// `to_dtype` is a proven no-op and the reshape is free.
+    fn ape_rows(&self) -> Result<Tensor> {
+        self.ape.to_dtype(DType::F32)?.reshape((self.ratio, self.cd()))
+    }
+
+    /// The channel window a pooling row occupies: an overlapping compressor
+    /// pools half a row at a time (a previous group's first half, then the
+    /// current group's second half), a non-overlapping one pools the whole row.
+    fn pool_width(&self) -> usize {
+        if self.overlap {
+            self.head_dim
+        } else {
+            self.cd()
+        }
+    }
+
+    /// Pool segments for a run of loose per-token projection rows (`[1, cd]`
+    /// each) starting at within-group position 0 — ONE segment per row, because
+    /// each row arrived on its own decode step from its own batched projection
+    /// and consecutive rows share no stride. `off` picks the channel window
+    /// ([`Self::pool_width`] wide): 0 for a previous group's first half or for
+    /// the non-overlapping compressor, `head_dim` for a current group's second
+    /// half.
+    ///
+    /// Nothing here touches the device — a segment is a narrow of a row that
+    /// already exists, and `ape` rides along as a bias the pool kernel applies
+    /// as it reads. This is what makes a decode step that closes a group cost
+    /// zero copies.
+    fn row_segs(&self, kv_rows: &[Tensor], sc_rows: &[Tensor], off: usize) -> Result<Vec<PoolSegs>> {
+        let w = self.pool_width();
+        let ape = self.ape_rows()?;
+        kv_rows
+            .iter()
+            .zip(sc_rows.iter())
+            .enumerate()
+            .map(|(i, (kv, sc))| {
+                Ok(PoolSegs {
+                    kv: kv.narrow(1, off, w)?.unsqueeze(0)?,
+                    score: sc.narrow(1, off, w)?.unsqueeze(0)?,
+                    ape: Some(ape.narrow(0, i, 1)?.narrow(1, off, w)?),
+                })
+            })
+            .collect()
+    }
+
+    /// One wide pool segment over a `[groups, ratio, cd]` block of assembled
+    /// group rows: `ng` groups starting at `g0`, taking the `off` channel
+    /// window of each row. The bulk counterpart to [`Self::row_segs`] — the
+    /// rows are already strided, so one segment covers all of them.
+    fn block_seg(&self, kv_g: &Tensor, sc_g: &Tensor, g0: usize, ng: usize, off: usize) -> Result<PoolSegs> {
+        let w = self.pool_width();
+        Ok(PoolSegs {
+            kv: kv_g.narrow(0, g0, ng)?.narrow(D::Minus1, off, w)?,
+            score: sc_g.narrow(0, g0, ng)?.narrow(D::Minus1, off, w)?,
+            ape: Some(self.ape_rows()?.narrow(1, off, w)?),
+        })
+    }
+
+    /// Spans covering `ng` groups starting at `g0` of a `[G, ratio, cd]` block
+    /// of assembled group rows, with `prev` the carried previous group's rows
+    /// (`None` for a true group 0).
+    ///
+    /// An overlapping compressor needs TWO spans because group `g0`'s previous
+    /// half comes from carried state while every later group's comes from the
+    /// group before it — and "the group before it" is the same block read one
+    /// group earlier, so the shift the reference does with a gather is just a
+    /// different narrow offset here. A true group 0 omits the previous segment
+    /// entirely: the all-`−∞` pad it stands for contributes nothing.
+    fn group_spans(
+        &self,
+        kv_g: &Tensor,
+        sc_g: &Tensor,
+        g0: usize,
+        ng: usize,
+        prev: Option<(&[Tensor], &[Tensor])>,
+    ) -> Result<Vec<PoolSpan>> {
+        if !self.overlap {
+            return Ok(vec![PoolSpan {
+                segs: vec![self.block_seg(kv_g, sc_g, g0, ng, 0)?],
+            }]);
+        }
+        let d = self.head_dim;
+        let mut first: Vec<PoolSegs> = Vec::with_capacity(self.ratio + 1);
+        if let Some((pk, ps)) = prev {
+            first.extend(self.row_segs(pk, ps, 0)?);
+        }
+        first.push(self.block_seg(kv_g, sc_g, g0, 1, d)?);
+        let mut spans = vec![PoolSpan { segs: first }];
+        if ng > 1 {
+            spans.push(PoolSpan {
+                segs: vec![
+                    self.block_seg(kv_g, sc_g, g0, ng - 1, 0)?,
+                    self.block_seg(kv_g, sc_g, g0 + 1, ng - 1, d)?,
+                ],
+            });
+        }
+        Ok(spans)
+    }
+
     fn rms_norm(&self, x: &Tensor) -> Result<Tensor> {
         // Single fused `rms_norm` launch (`x·rsqrt(mean(x²)+eps)·w`) instead of the
         // eager sqr/mean/add/sqrt/div/mul chain. `to_dtype(F32)` on an already-F32
@@ -171,23 +273,32 @@ impl Compressor {
 
     /// Pool the assembled group inputs into normed (and optionally roped) corpus
     /// entries — the stateless second half of the compressor emit, factored out so
-    /// MANY sequences' [`GroupPool`]s can be concatenated on the group axis and
-    /// pooled in ONE launch (the prefill wave batches the whole prompt fleet's
-    /// pools this way). `pool_kv`/`pool_score` are `[G, P, d]` (`P = 2r` overlap /
-    /// `r` non-overlap); `positions[g]` is group `g`'s start position for the RoPE.
-    /// Bit-identical, per group, to pooling each sequence's groups separately (the
-    /// softmax/weighted-sum/RMSNorm/RoPE are all per-group-independent).
+    /// MANY sequences' [`GroupPool`]s can be pooled in ONE launch (the prefill
+    /// wave batches the whole prompt fleet's pools this way, the decode wave every
+    /// session that closed a group). The pools are consumed as descriptor
+    /// segments, so batching them costs a wider table rather than a concatenation
+    /// of their rows. Bit-identical, per group, to pooling each sequence's groups
+    /// separately (the softmax/weighted-sum/RMSNorm/RoPE are all
+    /// per-group-independent).
+    ///
+    /// Returns `[ΣG, d]` — every pool's groups in order, so a caller splits the
+    /// result back per sequence by its group count.
+    /// `generation` is the wave's pinned-arena guard, which the descriptor table
+    /// is bump-allocated from and read in place; `None` outside a wave (the
+    /// streamed reference, a turn-seal `close`, the gates) stages through a
+    /// persistent buffer instead. See `desc.rs`.
     pub fn pool_and_norm(
         &self,
-        pool_kv: &Tensor,
-        pool_score: &Tensor,
-        positions: &[u32],
+        pools: &[&GroupPool],
         rope: Option<&RotaryCache>,
+        generation: &Generation,
     ) -> Result<Tensor> {
-        let g = pool_kv.dim(0)?;
-        let d = pool_kv.dim(2)?;
-        // Pool over the group axis (P), then RMSNorm over the entries.
-        let entry = pool_group(pool_kv, pool_score)?; // [G, d]
+        let positions: Vec<u32> = pools.iter().flat_map(|p| p.positions.iter().copied()).collect();
+        let positions = positions.as_slice();
+        let g: usize = pools.iter().map(|p| p.groups()).sum();
+        let d = self.head_dim;
+        // Pool over each group's rows, then RMSNorm over the entries.
+        let entry = pool_group(pools, d, generation)?; // [ΣG, d]
         let entry = self.rms_norm(&entry.reshape((1, g, d))?)?; // [1, G, d]
         let entry = match rope {
             Some(rope) => {
@@ -328,17 +439,28 @@ impl GroupPartial {
     }
 }
 
-/// `out[g, k] = Σ_p softmax_p(score[g, :, k]) · kv[g, p, k]` — the pooling half
-/// of [`Compressor::pool_and_norm`], where `pool_kv`/`pool_score` are
-/// `[G, P, d]`.
+/// `out[g, k] = Σ_p softmax_p(score_g[p, k] + ape[p, k]) · kv_g[p, k]` — the
+/// pooling half of [`Compressor::pool_and_norm`], over every group of every
+/// [`GroupPool`] in `pools`, in order, into one `[ΣG, d]` result.
 ///
-/// On CUDA this is ONE launch. Eagerly it is seven, because candle's `softmax`
-/// is unfused when the reduction is over a non-last dim (`max_keepdim`,
-/// `broadcast_sub`, `exp`, `sum_keepdim`, `broadcast_div`) and the weighted sum
-/// adds a `broadcast_mul` and a `sum` — and EVERY compressor emit in the model
-/// runs it: the prefill fleet's pool, the decode wave's per-layer pool, the
-/// streamed reference, and the seal `close`. The eager form below is the CPU
-/// path.
+/// On CUDA this is ONE launch **for the whole batch**, because the kernel takes
+/// the pooling rows as a descriptor table rather than a dense block: each group
+/// contributes its segments' base addresses and row strides, and the rows are
+/// read where they already lie. That is what lets several sessions — each with
+/// its own base pointers — pool together without a `cat`, what lets the
+/// overlapping compressor pool a previous group's first-half channels alongside
+/// the current group's second-half channels without materialising the join, and
+/// what lets the decode streamer hold a group as `ratio` independent one-row
+/// tensors that are never copied at all.
+///
+/// Eagerly the pool is eight launches per call, because candle's `softmax` is
+/// unfused when the reduction is over a non-last dim (`max_keepdim`,
+/// `broadcast_sub`, `exp`, `sum_keepdim`, `broadcast_div`), the weighted sum
+/// adds a `broadcast_mul` and a `sum`, and `ape` adds a `broadcast_add` — and
+/// EVERY compressor emit in the model runs it: the prefill fleet's pool, the
+/// decode wave's per-layer pool, the streamed reference, and the seal `close`.
+/// The eager form below is the CPU path, one group at a time (`G` is small
+/// wherever it runs — the CPU arm is the reference, never the wave).
 ///
 /// The fused result is NOT bit-equal to the eager device chain, because the
 /// eager chain is the less accurate of the two: under the archive's
@@ -347,77 +469,121 @@ impl GroupPartial {
 /// keeps them in registers. `pool_kernel_matches_eager` measures all three
 /// (kernel, eager, exact host f32) and holds the kernel to being at least as
 /// faithful to exact arithmetic as what it replaces.
-///
-/// Each input is read through its OWN strides. Producers legitimately hand this
-/// views — `assemble_groups_batched` slices per-sequence pools out of one
-/// fleet-wide block, and the overlap split narrows the channel axis — and
-/// flattening those with `contiguous()` would be an allocate-plus-copy of the
-/// whole plane on a per-layer path. Reading the layout that exists is the
-/// hot-path invariant; materialising the layout the kernel would prefer is the
-/// violation of it.
-fn pool_group(pool_kv: &Tensor, pool_score: &Tensor) -> Result<Tensor> {
-    let (g, p, d) = pool_kv.dims3()?;
-    if pool_score.dims3()? != (g, p, d) {
-        candle::bail!(
-            "pool_group: kv {:?} and score {:?} must have the same shape",
-            pool_kv.dims(),
-            pool_score.dims()
-        );
+fn pool_group(
+    pools: &[&GroupPool],
+    d: usize,
+    generation: &Generation,
+) -> Result<Tensor> {
+    let g_total: usize = pools.iter().map(|p| p.groups()).sum();
+    if g_total == 0 {
+        candle::bail!("pool_group: no groups to pool");
     }
-    if p == 0 {
-        // A softmax over zero rows has no value to return, and the CUDA arm
-        // allocates `out` UNINITIALISED for the kernel to fill — so an empty
-        // pooling axis would hand back garbage rather than fail. Every producer
-        // pools at least one row (`2r`, `r`, or `r + n` for a sealed partial),
-        // so this is a guard on the invariant, not a reachable case.
-        candle::bail!("pool_group: empty pooling axis (g={g}, d={d})");
+    for gp in pools {
+        gp.validate(d)?;
     }
 
     #[cfg(feature = "cuda")]
-    if matches!(pool_kv.device(), Device::Cuda(_)) {
+    if let Device::Cuda(dev) = pools
+        .iter()
+        .find(|p| p.groups() > 0)
+        .expect("g_total > 0 implies a non-empty pool")
+        .device()
+    {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::Storage;
-        use candle_kernels::simple::compressor_pool::run_compressor_pool;
-
-        let dev = match pool_kv.device() {
-            Device::Cuda(dd) => dd.clone(),
-            _ => unreachable!("guarded by the matches! above"),
+        use candle_kernels::simple::compressor_pool::{
+            run_compressor_pool, POOL_GROUP_WORDS, POOL_SEG_WORDS,
         };
+
+        let dev = dev.clone();
+        let device = Device::Cuda(dev.clone());
         let stream = dev.cuda_stream();
+
+        // Part 1 is `POOL_GROUP_WORDS` per group, struct-of-arrays with stride
+        // `g_total`; part 2 is `POOL_SEG_WORDS` per segment, array-of-structs,
+        // appended after it. Both parts ride in one upload.
+        let n_segs: usize = pools
+            .iter()
+            .flat_map(|p| p.spans.iter())
+            .map(|s| s.groups() * s.segs.len())
+            .sum();
+        let mut desc = vec![0i64; POOL_GROUP_WORDS * g_total + POOL_SEG_WORDS * n_segs];
+        let (head, tail) = desc.split_at_mut(POOL_GROUP_WORDS * g_total);
+
+        // A segment's address arithmetic: the group index is baked into the
+        // base pointer, so the kernel walks only the row axis.
+        let seg_ptr = |t: &Tensor, g: usize| -> Result<(i64, i64)> {
+            let (st, lay) = t.storage_and_layout();
+            let off = lay.start_offset() + g * lay.stride()[0];
+            let p = match &*st {
+                Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.slice(off..).device_ptr(&stream).0,
+                _ => candle::bail!("pool_group: expected CUDA storage"),
+            };
+            Ok((p as i64, lay.stride()[1] as i64))
+        };
+
+        let mut col = 0usize;
+        let mut seg_idx = 0usize;
+        for gp in pools {
+            for span in &gp.spans {
+                for g in 0..span.groups() {
+                    head[col] = seg_idx as i64;
+                    head[g_total + col] = span.segs.len() as i64;
+                    for seg in &span.segs {
+                        let w = &mut tail[seg_idx * POOL_SEG_WORDS..][..POOL_SEG_WORDS];
+                        let (p_kv, s_kv) = seg_ptr(&seg.kv, g)?;
+                        let (p_sc, s_sc) = seg_ptr(&seg.score, g)?;
+                        w[0] = p_kv;
+                        w[1] = s_kv;
+                        w[2] = p_sc;
+                        w[3] = s_sc;
+                        if let Some(ape) = &seg.ape {
+                            // `ape` is `[rows, d]` — a bias per row OF THE GROUP,
+                            // shared by every group, so it has no group axis to
+                            // index and its row stride is its outer stride.
+                            let (st, lay) = ape.storage_and_layout();
+                            w[4] = match &*st {
+                                Storage::Cuda(c) => c
+                                    .as_cuda_slice::<f32>()?
+                                    .slice(lay.start_offset()..)
+                                    .device_ptr(&stream)
+                                    .0,
+                                _ => candle::bail!("pool_group: expected CUDA storage"),
+                            } as i64;
+                            w[5] = lay.stride()[0] as i64;
+                        }
+                        w[6] = seg.rows()? as i64;
+                        seg_idx += 1;
+                    }
+                    col += 1;
+                }
+            }
+        }
+        debug_assert_eq!(col, g_total);
+        debug_assert_eq!(seg_idx, n_segs);
+
+        // Staged into the wave's pinned arena and read in place, not uploaded —
+        // a fresh `Tensor::from_vec` measured 7.6 us against a 5.2 us kernel
+        // (see `desc.rs`). Held until the launch below is enqueued.
+        let staged = crate::models::deepseek4::desc::stage(&desc, generation)?;
+        let p_desc = staged.ptr();
+
         // The kernel writes every element of `out`, so it is allocated
         // uninitialised — a `zeros` here would be a second full-width pass over
         // the exact bytes the kernel is about to stamp (hot-path invariant 6).
-        let out = Tensor::empty((g, d), DType::F32, pool_kv.device())?;
+        let out = Tensor::empty((g_total, d), DType::F32, &device)?;
         {
-            let (s_kv, l_kv) = pool_kv.storage_and_layout();
-            let (s_sc, l_sc) = pool_score.storage_and_layout();
             let (s_out, _) = out.storage_and_layout();
-            let ptr = |st: &Storage, off: usize| -> Result<u64> {
-                match st {
-                    Storage::Cuda(c) => Ok(c.as_cuda_slice::<f32>()?.slice(off..).device_ptr(&stream).0),
-                    _ => candle::bail!("pool_group: expected CUDA storage"),
-                }
+            let p_out = match &*s_out {
+                Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.device_ptr(&stream).0,
+                _ => candle::bail!("pool_group: expected CUDA storage"),
             };
-            let p_kv = ptr(&s_kv, l_kv.start_offset())?;
-            let p_sc = ptr(&s_sc, l_sc.start_offset())?;
-            let p_out = ptr(&s_out, 0)?;
-            // Each input is read through its OWN strides, so a caller's view is
-            // consumed where it lies instead of being copied flat first.
-            let (kv_s, sc_s) = (l_kv.stride(), l_sc.stride());
             unsafe {
                 run_compressor_pool(
-                    p_kv as *const f32,
-                    p_sc as *const f32,
+                    p_desc as *const i64,
                     p_out as *mut f32,
-                    g as i32,
-                    p as i32,
+                    g_total as i32,
                     d as i32,
-                    kv_s[0] as i64,
-                    kv_s[1] as i64,
-                    kv_s[2] as i64,
-                    sc_s[0] as i64,
-                    sc_s[1] as i64,
-                    sc_s[2] as i64,
                     stream.cu_stream() as *mut core::ffi::c_void,
                 );
             }
@@ -425,8 +591,51 @@ fn pool_group(pool_kv: &Tensor, pool_score: &Tensor) -> Result<Tensor> {
         return Ok(out);
     }
 
-    let w = softmax(pool_score, 1)?;
-    pool_kv.broadcast_mul(&w)?.sum(1)
+    // CPU reference: pool each group on its own, so ragged groups need no pad.
+    let mut rows: Vec<Tensor> = Vec::with_capacity(g_total);
+    for gp in pools {
+        for span in &gp.spans {
+            for g in 0..span.groups() {
+                let mut kv_parts: Vec<Tensor> = Vec::with_capacity(span.segs.len());
+                let mut sc_parts: Vec<Tensor> = Vec::with_capacity(span.segs.len());
+                for seg in &span.segs {
+                    kv_parts.push(seg.kv.narrow(0, g, 1)?.squeeze(0)?);
+                    let sc = seg.score.narrow(0, g, 1)?.squeeze(0)?;
+                    sc_parts.push(match &seg.ape {
+                        Some(ape) => (sc + ape)?,
+                        None => sc,
+                    });
+                }
+                let kv = Tensor::cat(&kv_parts, 0)?; // [P_g, d]
+                let sc = Tensor::cat(&sc_parts, 0)?;
+                let w = softmax(&sc, 0)?;
+                rows.push((kv * w)?.sum(0)?.reshape((1, d))?);
+            }
+        }
+    }
+    Tensor::cat(&rows, 0)
+}
+
+/// Split a `[rows, cd]` block into per-row views. Free — every row is a `narrow`
+/// of the block, which stays alive behind them.
+///
+/// Rows rather than the block itself, because rows are what the pool descriptor
+/// consumes: the streaming path's per-token rows and a bulk path's retained
+/// group both arrive at the pool as one segment each, so neither needs the other
+/// shape and neither pays to build it.
+fn row_views(block: &Tensor) -> Result<Vec<Tensor>> {
+    (0..block.dim(0)?).map(|i| block.narrow(0, i, 1)).collect()
+}
+
+/// [`row_views`] of a window that must OUTLIVE the buffer it came from: ONE
+/// forced copy of the small block first, breaking a pin that would otherwise
+/// keep a whole batched projection or fleet-wide stream alive for as long as the
+/// streaming state does.
+fn retain_rows(block: &Tensor) -> Result<Vec<Tensor>> {
+    if block.dim(0)? == 0 {
+        return Ok(Vec::new());
+    }
+    row_views(&block.force_contiguous()?)
 }
 
 /// Replace NaNs with `fill` (element-wise): `where(x == x, x, fill)`.
@@ -435,6 +644,190 @@ fn replace_nan(x: &Tensor, fill: f64) -> Result<Tensor> {
     let is_nan = x.ne(x)?; // NaN != NaN → 1
     let fill_t = Tensor::full(fill as f32, x.shape(), x.device())?;
     is_nan.where_cond(&fill_t, x)
+}
+
+/// One run of pooling rows shared by every group of a [`PoolSpan`]: group `g`'s
+/// contribution is row block `g` — a `[rows, d]` slice — of each tensor, read in
+/// place. `kv`/`score` are `[groups, rows, d]` views whose channel stride is 1;
+/// no other stride is constrained, which is what lets a producer hand over a
+/// channel-axis narrow (the overlap split), a row-axis narrow (a sequence's
+/// slice of a fleet-wide block), or a single loose row without flattening it.
+pub struct PoolSegs {
+    /// Pool input values `[groups, rows, d]`.
+    pub kv: Tensor,
+    /// Pool input scores `[groups, rows, d]`, RAW — `ape` is applied as the
+    /// kernel reads them, so the producer never has to keep a biased copy.
+    pub score: Tensor,
+    /// `[rows, d]` absolute positional bias added to `score`, broadcast over
+    /// groups. `None` where the rows take none (the overlap pad).
+    pub ape: Option<Tensor>,
+}
+
+impl PoolSegs {
+    /// Rows this segment contributes to each group's pooling axis.
+    fn rows(&self) -> Result<usize> {
+        self.kv.dim(1)
+    }
+}
+
+/// A run of consecutive groups described by one set of segments. Most producers
+/// emit a single span; the streamed multi-group assemble emits two, because its
+/// first group's previous half comes from carried state while the rest take the
+/// group before them.
+pub struct PoolSpan {
+    /// The row runs the pool walks per group, in order.
+    pub segs: Vec<PoolSegs>,
+}
+
+impl PoolSpan {
+    /// Groups this span covers.
+    fn groups(&self) -> usize {
+        self.segs
+            .first()
+            .and_then(|s| s.kv.dims3().ok())
+            .map(|(g, _, _)| g)
+            .unwrap_or(0)
+    }
+}
+
+/// The assembled-but-not-yet-pooled output of [`IncrementalCompressor::assemble_groups`]:
+/// the completed groups' pool inputs and their start positions.
+///
+/// The pool inputs are **segments, not a dense block**. A group's pooling axis is
+/// its segments' rows in order: two wide segments for the overlapping compressor
+/// assembled in bulk (the previous group's first-half channels, then this group's
+/// second-half channels), one for the non-overlapping one, and `2·ratio` one-row
+/// segments for the decode streamer, which holds a group as that many
+/// independently-allocated rows. A group whose previous group does not exist
+/// simply omits that segment — the all-`−∞` pad it would contribute is discarded
+/// by the softmax either way.
+///
+/// Handing [`Compressor::pool_and_norm`] the segments instead of their
+/// concatenation is what removes the per-group allocate-plus-copy, and passing it
+/// SEVERAL `GroupPool`s is what pools the whole fleet — each session with its own
+/// base addresses — in one launch (hot-path invariants 2 and 2b).
+pub struct GroupPool {
+    /// Group runs, in group order; together they cover `positions`.
+    pub spans: Vec<PoolSpan>,
+    /// Each group's start position `group_idx·ratio`, for the RoPE.
+    pub positions: Vec<u32>,
+}
+
+impl GroupPool {
+    /// Groups assembled here — one pooled corpus entry each.
+    pub fn groups(&self) -> usize {
+        self.positions.len()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn device(&self) -> &Device {
+        self.spans
+            .first()
+            .and_then(|s| s.segs.first())
+            .map(|s| s.kv.device())
+            .expect("a non-empty GroupPool always carries a segment")
+    }
+
+    /// A pool over one already-dense `[groups, P, d]` pair — the trivial single
+    /// span, single segment, no `ape` case. What a caller holding a materialised
+    /// pooling block hands the pool; also what the pool's own gates are written
+    /// against, since it exercises the descriptor path with the simplest
+    /// possible table.
+    pub fn dense(kv: Tensor, score: Tensor, positions: Vec<u32>) -> Self {
+        Self {
+            spans: vec![PoolSpan {
+                segs: vec![PoolSegs {
+                    kv,
+                    score,
+                    ape: None,
+                }],
+            }],
+            positions,
+        }
+    }
+
+    /// Each group's pooling rows as one dense `[P_g, d]` pair, `ape` applied —
+    /// the block this pool WOULD have been concatenated into. Reference only:
+    /// it is what lets a gate compare two assemble paths' pool inputs directly,
+    /// and nothing on the hot path builds it. `P_g` varies between groups when
+    /// one of them has no previous group.
+    pub fn materialize(&self) -> Result<Vec<(Tensor, Tensor)>> {
+        let mut out = Vec::with_capacity(self.groups());
+        for span in &self.spans {
+            for g in 0..span.groups() {
+                let mut kv_parts = Vec::with_capacity(span.segs.len());
+                let mut sc_parts = Vec::with_capacity(span.segs.len());
+                for seg in &span.segs {
+                    kv_parts.push(seg.kv.narrow(0, g, 1)?.squeeze(0)?);
+                    let sc = seg.score.narrow(0, g, 1)?.squeeze(0)?;
+                    sc_parts.push(match &seg.ape {
+                        Some(ape) => (sc + ape)?,
+                        None => sc,
+                    });
+                }
+                out.push((Tensor::cat(&kv_parts, 0)?, Tensor::cat(&sc_parts, 0)?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Check the invariants `pool_group`'s descriptor table depends on: spans
+    /// that cover exactly `positions`, matching `[groups, rows, d]` shapes, and
+    /// unit channel stride (the kernel adds a channel index straight to a row
+    /// address).
+    fn validate(&self, d: usize) -> Result<()> {
+        let mut covered = 0usize;
+        for span in &self.spans {
+            if span.segs.is_empty() {
+                candle::bail!("GroupPool: span with no segments");
+            }
+            let g = span.groups();
+            covered += g;
+            for seg in &span.segs {
+                let (gk, rk, dk) = seg.kv.dims3()?;
+                if seg.score.dims3()? != (gk, rk, dk) {
+                    candle::bail!(
+                        "GroupPool: segment kv {:?} and score {:?} must have the same shape",
+                        seg.kv.dims(),
+                        seg.score.dims()
+                    );
+                }
+                if gk != g || dk != d {
+                    candle::bail!(
+                        "GroupPool: segment {:?} does not match groups={g} d={d}",
+                        seg.kv.dims()
+                    );
+                }
+                if rk == 0 {
+                    candle::bail!("GroupPool: empty segment (groups={g}, d={d})");
+                }
+                if let Some(ape) = &seg.ape {
+                    if ape.dims2()? != (rk, dk) {
+                        candle::bail!(
+                            "GroupPool: ape {:?} does not match segment {:?}",
+                            ape.dims(),
+                            seg.kv.dims()
+                        );
+                    }
+                    if ape.stride()[1] != 1 {
+                        candle::bail!("GroupPool: ape channel stride {} != 1", ape.stride()[1]);
+                    }
+                }
+                for t in [&seg.kv, &seg.score] {
+                    if t.stride()[2] != 1 {
+                        candle::bail!("GroupPool: segment channel stride {} != 1", t.stride()[2]);
+                    }
+                }
+            }
+        }
+        if covered != self.groups() {
+            candle::bail!(
+                "GroupPool: spans cover {covered} groups, positions has {}",
+                self.groups()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Streaming (decode-time) counterpart to [`Compressor`]. The prefill `Compressor::forward`
@@ -446,28 +839,18 @@ fn replace_nan(x: &Tensor, fill: f64) -> Result<Tensor> {
 /// half — exactly the `overlap_transform` shift `prev[g] = prev_src[g-1]` done batch-wise in
 /// prefill. The emitted entry is `pool → RMSNorm → RoPE(at group-start position g·ratio)`,
 /// numerically equal to the prefill entry (proven by `incremental_matches_prefill`).
-/// The assembled-but-not-yet-pooled output of [`IncrementalCompressor::assemble_groups`]:
-/// the completed groups' pool inputs `[groups, P, d]` and their start positions.
-/// Concatenating several sequences' `GroupPool`s on the group axis and running one
-/// [`Compressor::pool_and_norm`] pools the whole prefill fleet in a single launch.
-pub struct GroupPool {
-    /// Pool input values `[groups, P, d]` (`P = 2r` overlap / `r` non-overlap).
-    pub pool_kv: Tensor,
-    /// Pool input scores `[groups, P, d]` (`ape` already added).
-    pub pool_score: Tensor,
-    /// Each group's start position `group_idx·ratio`, for the RoPE.
-    pub positions: Vec<u32>,
-}
-
 pub struct IncrementalCompressor {
     c: Compressor,
     /// Current (incomplete) group's per-token projections, each `[1, cd]` F32.
     kv_rows: Vec<Tensor>,
     score_rows: Vec<Tensor>,
-    /// Last completed group's `kv` (`[ratio, cd]`) and `score+ape` (`[ratio, cd]`), retained
-    /// as the overlapping compressor's "prev" half. `None` before the first group completes.
-    prev_kv_group: Option<Tensor>,
-    prev_score_group: Option<Tensor>,
+    /// Last completed group's RAW `kv` and `score` rows (`ratio` × `[1, cd]`),
+    /// retained as the overlapping compressor's "prev" half. Rows, not a
+    /// `[ratio, cd]` block, because rows are what the pool descriptor consumes —
+    /// a completed group is retained by moving the `Vec`, with no copy at all.
+    /// `None` before the first group completes.
+    prev_kv_group: Option<Vec<Tensor>>,
+    prev_score_group: Option<Vec<Tensor>>,
     /// Index of the next group to emit (its RoPE position is `group_idx · ratio`).
     group_idx: usize,
 }
@@ -482,8 +865,8 @@ pub struct IncrementalCompressor {
 pub struct CompressorState {
     kv_rows: Vec<Tensor>,
     score_rows: Vec<Tensor>,
-    prev_kv_group: Option<Tensor>,
-    prev_score_group: Option<Tensor>,
+    prev_kv_group: Option<Vec<Tensor>>,
+    prev_score_group: Option<Vec<Tensor>>,
     group_idx: usize,
 }
 
@@ -642,9 +1025,8 @@ impl IncrementalCompressor {
         match self.assemble_groups(kv, score)? {
             None => Ok(None),
             Some(gp) => {
-                let entry =
-                    self.c
-                        .pool_and_norm(&gp.pool_kv, &gp.pool_score, &gp.positions, rope)?;
+                let scope = crate::models::deepseek4::desc::scope(self.c.device())?;
+                let entry = self.c.pool_and_norm(&[&gp], rope, &scope)?;
                 Ok(Some((entry, gp.positions)))
             }
         }
@@ -663,9 +1045,7 @@ impl IncrementalCompressor {
     /// all prompt sequences this way. `None` when no group completes (all buffered).
     pub fn assemble_groups(&mut self, kv: &Tensor, score: &Tensor) -> Result<Option<GroupPool>> {
         let r = self.c.ratio;
-        let d = self.c.head_dim;
         let cd = self.c.cd();
-        let dev = self.c.device().clone();
         let n = kv.dim(0)?;
 
         // Combined stream = carried partial-group rows ++ the new rows, so a
@@ -687,62 +1067,26 @@ impl IncrementalCompressor {
             // which plain `contiguous` would NOT copy); the per-row entries are
             // then free views into that small owned buffer. Replaces the former
             // per-row `force_contiguous` storm (2·n_tot copies → 2).
-            let kv_buf = kv_comb.force_contiguous()?;
-            let sc_buf = score_comb.force_contiguous()?;
-            self.kv_rows = (0..n_tot)
-                .map(|i| kv_buf.narrow(0, i, 1))
-                .collect::<Result<_>>()?;
-            self.score_rows = (0..n_tot)
-                .map(|i| sc_buf.narrow(0, i, 1))
-                .collect::<Result<_>>()?;
+            self.kv_rows = retain_rows(&kv_comb)?;
+            self.score_rows = retain_rows(&score_comb)?;
             return Ok(None);
         }
         let cutoff = groups * r;
 
-        // [groups, r, cd] group rows; `ape` is added to the score BEFORE the
-        // overlap split (matches `pool` / `emit_group_raw`).
+        // [groups, r, cd] RAW group rows — `ape` rides in the pool descriptor,
+        // so no biased copy is made here or retained.
         let kv_g = kv_comb.narrow(0, 0, cutoff)?.reshape((groups, r, cd))?;
-        let ape = self.c.ape.to_dtype(DType::F32)?.reshape((1, r, cd))?;
-        let score_g = score_comb
-            .narrow(0, 0, cutoff)?
-            .reshape((groups, r, cd))?
-            .broadcast_add(&ape)?;
+        let score_g = score_comb.narrow(0, 0, cutoff)?.reshape((groups, r, cd))?;
 
-        let (pool_kv, pool_score) = if self.c.overlap {
-            let curr_kv = kv_g.narrow(D::Minus1, d, d)?; // [groups, r, d]
-            let curr_score = score_g.narrow(D::Minus1, d, d)?;
-            let prev_src_kv = kv_g.narrow(D::Minus1, 0, d)?; // [groups, r, d]
-            let prev_src_score = score_g.narrow(D::Minus1, 0, d)?;
-            // prev[0] = carried prev group's first-half (pad kv=0 / score=−inf for
-            // a true group 0), prev[j>0] = group j−1's first-half — the batch-wise
-            // form of `overlap_transform`'s `prev[g] = prev_src[g−1]` shift.
-            let (p0_kv, p0_score) = match (&self.prev_kv_group, &self.prev_score_group) {
-                (Some(pk), Some(ps)) => (
-                    pk.narrow(D::Minus1, 0, d)?.reshape((1, r, d))?,
-                    ps.narrow(D::Minus1, 0, d)?.reshape((1, r, d))?,
-                ),
-                _ => (
-                    Tensor::zeros((1, r, d), DType::F32, &dev)?,
-                    Tensor::full(f32::NEG_INFINITY, (1, r, d), &dev)?,
-                ),
-            };
-            let prev_kv = if groups > 1 {
-                Tensor::cat(&[&p0_kv, &prev_src_kv.narrow(0, 0, groups - 1)?], 0)?
-            } else {
-                p0_kv
-            };
-            let prev_score = if groups > 1 {
-                Tensor::cat(&[&p0_score, &prev_src_score.narrow(0, 0, groups - 1)?], 0)?
-            } else {
-                p0_score
-            };
-            let pool_kv = Tensor::cat(&[&prev_kv, &curr_kv], 1)?; // [groups, 2r, d]
-            let pool_score = Tensor::cat(&[&prev_score, &curr_score], 1)?;
-            (pool_kv, pool_score)
-        } else {
-            // Non-overlap pools the group rows directly (cd == d).
-            (kv_g.clone(), score_g.clone()) // [groups, r, cd]
+        // prev[0] = the carried previous group's rows (absent for a true group
+        // 0), prev[j>0] = group j−1's first half — which is this same block read
+        // one group earlier, so the shift `overlap_transform` does with a gather
+        // is a narrow offset here.
+        let prev = match (&self.prev_kv_group, &self.prev_score_group) {
+            (Some(pk), Some(ps)) => Some((pk.as_slice(), ps.as_slice())),
+            _ => None,
         };
+        let spans = self.c.group_spans(&kv_g, &score_g, 0, groups, prev)?;
 
         let positions: Vec<u32> = (0..groups)
             .map(|j| ((self.group_idx + j) * r) as u32)
@@ -750,41 +1094,24 @@ impl IncrementalCompressor {
 
         // Retain state: the last complete group as the next overlap prev, the
         // trailing rows as the next partial buffer, and advance the group index.
-        // Each retained tensor is materialised with a SINGLE forced copy out of
-        // the combined-stream buffer (a dim-0 narrow that plain `contiguous`
-        // would not copy — leaving the big batched-projection buffer pinned), so
-        // the stream buffer frees while the retained state stays bounded to ≤2·r
-        // rows. The `rem` trailing rows are held as free views into one small
-        // owned tail buffer, replacing the former per-row `force_contiguous`
-        // storm (2·rem copies → 2). Reads only the RAW group rows —
-        // pooling-independent, so the pool can be deferred + batched across seqs.
-        self.prev_kv_group = Some(
-            kv_g.narrow(0, groups - 1, 1)?
-                .reshape((r, cd))?
-                .force_contiguous()?,
-        );
-        self.prev_score_group = Some(
-            score_g
-                .narrow(0, groups - 1, 1)?
-                .reshape((r, cd))?
-                .force_contiguous()?,
-        );
+        // Each retained run costs a SINGLE forced copy out of the combined-stream
+        // buffer (a dim-0 narrow that plain `contiguous` would not copy — leaving
+        // the big batched-projection buffer pinned), so the stream buffer frees
+        // while the retained state stays bounded to ≤2·r rows. Reads only the RAW
+        // group rows — pooling-independent, so the pool can be deferred and
+        // batched across sequences.
         let rem = n_tot - cutoff;
-        let kv_tail = kv_comb.narrow(0, cutoff, rem)?.force_contiguous()?;
-        let sc_tail = score_comb.narrow(0, cutoff, rem)?.force_contiguous()?;
-        self.kv_rows = (0..rem)
-            .map(|i| kv_tail.narrow(0, i, 1))
-            .collect::<Result<_>>()?;
-        self.score_rows = (0..rem)
-            .map(|i| sc_tail.narrow(0, i, 1))
-            .collect::<Result<_>>()?;
+        self.prev_kv_group = Some(retain_rows(
+            &kv_g.narrow(0, groups - 1, 1)?.reshape((r, cd))?,
+        )?);
+        self.prev_score_group = Some(retain_rows(
+            &score_g.narrow(0, groups - 1, 1)?.reshape((r, cd))?,
+        )?);
+        self.kv_rows = retain_rows(&kv_comb.narrow(0, cutoff, rem)?)?;
+        self.score_rows = retain_rows(&score_comb.narrow(0, cutoff, rem)?)?;
         self.group_idx += groups;
 
-        Ok(Some(GroupPool {
-            pool_kv,
-            pool_score,
-            positions,
-        }))
+        Ok(Some(GroupPool { spans, positions }))
     }
 
     /// Absorb ONE pre-projected row (`[1, cd]`) and, when it completes a group,
@@ -809,61 +1136,41 @@ impl IncrementalCompressor {
         Some(self.assemble_group_raw()).transpose()
     }
 
-    /// The buffered complete group's pool inputs `[1, P, d]` (`P = 2r` overlap /
-    /// `r` non-overlap) + its start position, advancing the streaming state
-    /// (`prev_*_group`, buffer, `group_idx`). The caller must have checked the
-    /// group is full.
+    /// The buffered complete group's pool inputs + its start position, advancing
+    /// the streaming state (`prev_*_group`, buffer, `group_idx`). The caller must
+    /// have checked the group is full.
     ///
-    /// Reads only the RAW group rows, never a pooled result, which is what lets
-    /// the pool defer and batch across sessions.
+    /// Costs NOTHING on the device. The group's rows are handed to the pool as
+    /// one segment each, read where they lie, and retained as the next group's
+    /// previous half by moving the row `Vec` — no concatenation into a `[r, cd]`
+    /// block, no channel-window copy for the overlap split, no `ape` add. Reads
+    /// only the RAW rows, never a pooled result, which is what lets the pool
+    /// defer and batch across sessions.
     fn assemble_group_raw(&mut self) -> Result<GroupPool> {
         let d = self.c.head_dim;
         let r = self.c.ratio;
-        let cd = self.c.cd();
-        let dev = self.c.device().clone();
 
-        let kv_rows: Vec<&Tensor> = self.kv_rows.iter().collect();
-        let score_rows: Vec<&Tensor> = self.score_rows.iter().collect();
-        let kv_group = Tensor::cat(&kv_rows, 0)?; // [r, cd]
-                                                  // ape is added to the score BEFORE pooling / the overlap split (matches `pool`).
-        let ape = self.c.ape.to_dtype(DType::F32)?.reshape((r, cd))?;
-        let score_group = (Tensor::cat(&score_rows, 0)? + ape)?; // [r, cd]
-
-        // Pool inputs over the group's rows (overlap: prev-half ‖ curr-half over 2·r rows).
-        let (pool_kv, pool_score) = if self.c.overlap {
-            let curr_kv = kv_group.narrow(D::Minus1, d, d)?; // [r, d] second-half dims
-            let curr_score = score_group.narrow(D::Minus1, d, d)?;
-            let (prev_kv, prev_score) = match (&self.prev_kv_group, &self.prev_score_group) {
-                (Some(pk), Some(ps)) => (pk.narrow(D::Minus1, 0, d)?, ps.narrow(D::Minus1, 0, d)?),
-                // Group 0 has no previous group: `pool`'s pad is kv=0, score=-inf (fully masked).
-                _ => (
-                    Tensor::zeros((r, d), DType::F32, &dev)?,
-                    Tensor::full(f32::NEG_INFINITY, (r, d), &dev)?,
-                ),
-            };
-            (
-                Tensor::cat(&[&prev_kv, &curr_kv], 0)?.reshape((1, 2 * r, d))?,
-                Tensor::cat(&[&prev_score, &curr_score], 0)?.reshape((1, 2 * r, d))?,
-            )
+        let mut segs: Vec<PoolSegs> = Vec::with_capacity(2 * r);
+        if self.c.overlap {
+            // Group 0 has no previous group; its `−∞` pad pools to nothing, so
+            // the segment is simply absent.
+            if let (Some(pk), Some(ps)) = (&self.prev_kv_group, &self.prev_score_group) {
+                segs.extend(self.c.row_segs(pk, ps, 0)?);
+            }
+            segs.extend(self.c.row_segs(&self.kv_rows, &self.score_rows, d)?);
         } else {
-            // Non-overlap pools the group rows directly (cd == d).
-            (
-                kv_group.reshape((1, r, cd))?,
-                score_group.reshape((1, r, cd))?,
-            )
-        };
+            segs.extend(self.c.row_segs(&self.kv_rows, &self.score_rows, 0)?);
+        }
 
-        // Retain this group as the next group's "prev" half, then reset the current buffer.
-        self.prev_kv_group = Some(kv_group);
-        self.prev_score_group = Some(score_group);
-        self.kv_rows.clear();
-        self.score_rows.clear();
+        // Retain this group as the next group's "prev" half, then reset the
+        // current buffer — a `Vec` move, not a copy.
+        self.prev_kv_group = Some(std::mem::take(&mut self.kv_rows));
+        self.prev_score_group = Some(std::mem::take(&mut self.score_rows));
 
         let g = self.group_idx;
         self.group_idx += 1;
         Ok(GroupPool {
-            pool_kv,
-            pool_score,
+            spans: vec![PoolSpan { segs }],
             positions: vec![(g * r) as u32],
         })
     }
@@ -877,9 +1184,8 @@ impl IncrementalCompressor {
     fn emit_group_raw(&mut self) -> Result<(Tensor, u32)> {
         let d = self.c.head_dim;
         let gp = self.assemble_group_raw()?;
-        let entry = self
-            .c
-            .pool_and_norm(&gp.pool_kv, &gp.pool_score, &gp.positions, None)?;
+        let scope = crate::models::deepseek4::desc::scope(self.c.device())?;
+        let entry = self.c.pool_and_norm(&[&gp], None, &scope)?;
         Ok((entry.reshape((1, 1, d))?, gp.positions[0]))
     }
 
@@ -903,43 +1209,20 @@ impl IncrementalCompressor {
         }
         let d = self.c.head_dim;
         let r = self.c.ratio;
-        let dev = self.c.device().clone();
 
-        let kv_rows: Vec<&Tensor> = self.kv_rows.iter().collect();
-        let score_rows: Vec<&Tensor> = self.score_rows.iter().collect();
-        let kv_group = Tensor::cat(&kv_rows, 0)?; // [n, cd]
-                                                  // ape rows for the buffered within-group positions 0..n (added BEFORE
-                                                  // the overlap split, matching `pool` / `emit_group_raw`).
-        let ape = self
-            .c
-            .ape
-            .to_dtype(DType::F32)?
-            .reshape((r, self.c.cd()))?
-            .narrow(0, 0, n)?;
-        let score_group = (Tensor::cat(&score_rows, 0)? + ape)?; // [n, cd]
-
-        let (pool_kv, pool_score) = if self.c.overlap {
-            let curr_kv = kv_group.narrow(D::Minus1, d, d)?; // [n, d] second-half dims
-            let curr_score = score_group.narrow(D::Minus1, d, d)?;
-            let (prev_kv, prev_score) = match (&self.prev_kv_group, &self.prev_score_group) {
-                (Some(pk), Some(ps)) => (pk.narrow(D::Minus1, 0, d)?, ps.narrow(D::Minus1, 0, d)?),
-                // The partial group is itself group 0: no previous group, so the
-                // `-inf` prev-half is fully masked (pools only the buffered rows).
-                _ => (
-                    Tensor::zeros((r, d), DType::F32, &dev)?,
-                    Tensor::full(f32::NEG_INFINITY, (r, d), &dev)?,
-                ),
-            };
-            (
-                Tensor::cat(&[&prev_kv, &curr_kv], 0)?.reshape((1, r + n, d))?,
-                Tensor::cat(&[&prev_score, &curr_score], 0)?.reshape((1, r + n, d))?,
-            )
+        // Ragged by construction — `r` previous rows and only `n` current ones —
+        // which the segment table carries with no special case at all.
+        let mut segs: Vec<PoolSegs> = Vec::with_capacity(r + n);
+        if self.c.overlap {
+            // The partial group may itself be group 0: no previous group, so
+            // there is no previous segment (the `−∞` pad pools to nothing).
+            if let (Some(pk), Some(ps)) = (&self.prev_kv_group, &self.prev_score_group) {
+                segs.extend(self.c.row_segs(pk, ps, 0)?);
+            }
+            segs.extend(self.c.row_segs(&self.kv_rows, &self.score_rows, d)?);
         } else {
-            (
-                kv_group.reshape((1, n, self.c.cd()))?, // cd == d
-                score_group.reshape((1, n, self.c.cd()))?,
-            )
-        };
+            segs.extend(self.c.row_segs(&self.kv_rows, &self.score_rows, 0)?);
+        }
 
         // Terminal: consume the buffer, but do NOT retain a new `prev_*` (nothing
         // follows a seal-close in this compressor's lifetime).
@@ -948,23 +1231,25 @@ impl IncrementalCompressor {
 
         let g = self.group_idx;
         self.group_idx += 1;
-        let positions = vec![(g * r) as u32];
+        let gp = GroupPool {
+            spans: vec![PoolSpan { segs }],
+            positions: vec![(g * r) as u32],
+        };
         // The same pool every other emit path runs — a closed partial is a
         // softmax-weighted latent exactly like a full group, just over fewer rows.
-        let entry = self
-            .c
-            .pool_and_norm(&pool_kv, &pool_score, &positions, None)?;
-        Ok(Some((entry.reshape((1, 1, d))?, positions[0])))
+        let scope = crate::models::deepseek4::desc::scope(self.c.device())?;
+        let entry = self.c.pool_and_norm(&[&gp], None, &scope)?;
+        Ok(Some((entry.reshape((1, 1, d))?, gp.positions[0])))
     }
 
     fn emit_group(&mut self, rope: &RotaryCache) -> Result<Tensor> {
         let d = self.c.head_dim;
         let gp = self.assemble_group_raw()?;
+        let scope = crate::models::deepseek4::desc::scope(self.c.device())?;
         self.c
-            .pool_and_norm(&gp.pool_kv, &gp.pool_score, &gp.positions, Some(rope))?
+            .pool_and_norm(&[&gp], Some(rope), &scope)?
             .reshape((1, 1, d))
     }
-
 }
 
 /// One sequence's input to [`assemble_groups_batched`]: its carried
@@ -976,8 +1261,8 @@ pub struct SeqAssemble {
     sc_pieces: Vec<Tensor>,
     l0: usize,
     n: usize,
-    prev_kv: Option<Tensor>,
-    prev_sc: Option<Tensor>,
+    prev_kv: Option<Vec<Tensor>>,
+    prev_sc: Option<Vec<Tensor>>,
     group_idx: usize,
 }
 
@@ -987,22 +1272,21 @@ pub struct SeqAssemble {
 pub struct AssembleUpdate {
     kv_rows: Vec<Tensor>,
     score_rows: Vec<Tensor>,
-    prev_kv: Option<Tensor>,
-    prev_sc: Option<Tensor>,
+    prev_kv: Option<Vec<Tensor>>,
+    prev_sc: Option<Vec<Tensor>>,
     group_add: usize,
 }
 
 /// The fleet's assemble GEOMETRY — every host-side quantity and device index
-/// tensor derivable from the per-seq `(carried, new, has_prev)` shape alone,
+/// tensor derivable from `ratio` and the per-seq `(carried, new)` shape alone,
 /// independent of the layer's actual data.
 ///
 /// The same wave calls [`assemble_groups_batched`] once per LAYER, and the
 /// geometry is layer-invariant by construction: every layer's compressor has
-/// consumed the same token stream, so carried-tail lengths, group counts and
-/// prev-presence match across the wave's layers. Building the indices per call
-/// cost 4 host-vec builds + 4 tiny H2D uploads + 2 pad fills, × layers ×
-/// compressor families; the cache pays that once per wave shape and every
-/// other layer-call hits.
+/// consumed the same token stream, so carried-tail lengths and group counts
+/// match across the wave's layers. Building the indices per call cost 2
+/// host-vec builds and 2 tiny H2D uploads × layers × compressor families; the
+/// cache pays that once per wave shape and every other layer-call hits.
 struct AssembleGeom {
     groups: Vec<usize>,
     cutoff: Vec<usize>,
@@ -1015,18 +1299,16 @@ struct AssembleGeom {
     tail_it: Option<Tensor>,
     /// Combined-stream index of every group row (`None`: no completed groups).
     gi_t: Option<Tensor>,
-    /// Overlap only: each group's prev-source slot in `[pad | prevs | kv_g]`.
-    pi_t: Option<Tensor>,
     /// Pool index of each group-completing seq's LAST group (its next prev).
     li_t: Option<Tensor>,
-    /// Overlap only: the group-0 pad rows (kv 0 / score −inf), `[1, r, cd]`.
-    pad_kv: Option<Tensor>,
-    pad_sc: Option<Tensor>,
 }
 
-/// Cache key: the template's `(ratio, cd, overlap)` plus every seq's
-/// `(carried, new, has_prev)` — equal keys imply identical geometry.
-type AssembleGeomKey = (usize, usize, bool, Vec<(usize, usize, bool)>);
+/// Cache key: the template's `ratio` plus every seq's `(carried, new)` — equal
+/// keys imply identical geometry. Neither `cd`, `overlap` nor prev-presence
+/// appears, because the descriptor-table pool expresses the overlap shift as a
+/// narrow offset and an absent prev as an absent segment, so none of the three
+/// reaches the index tensors any more.
+type AssembleGeomKey = (usize, Vec<(usize, usize)>);
 
 /// Process-wide geometry cache, bounded like `CudaDevice::info_table`
 /// (cleared wholesale past the cap — entries are a handful of tiny device
@@ -1040,9 +1322,7 @@ fn assemble_geom_cache() -> &'static Mutex<HashMap<AssembleGeomKey, Arc<Assemble
 
 fn build_assemble_geom(
     r: usize,
-    cd: usize,
-    overlap: bool,
-    seqs: &[(usize, usize, bool)],
+    seqs: &[(usize, usize)],
     dev: &Device,
 ) -> Result<AssembleGeom> {
     let n_seq = seqs.len();
@@ -1053,7 +1333,7 @@ fn build_assemble_geom(
     let mut g_off = Vec::with_capacity(n_seq);
     let mut off = 0usize;
     let mut goff = 0usize;
-    for &(l0, n, _) in seqs {
+    for &(l0, n) in seqs {
         let nt = l0 + n;
         let g = nt / r;
         c_off.push(off);
@@ -1082,8 +1362,12 @@ fn build_assemble_geom(
         Some(Tensor::from_vec(tail_idx, n_tail, dev)?)
     };
 
-    let (gi_t, pi_t, li_t, pad_kv, pad_sc) = if total_groups == 0 {
-        (None, None, None, None, None)
+    // The prev-group shift needs no geometry: a group's previous half is the
+    // group block read one group earlier, which the pool descriptor expresses as
+    // a narrow offset, and a group 0 with no carried prev simply omits the
+    // segment. That is why there is no prev-source index or pad here.
+    let (gi_t, li_t) = if total_groups == 0 {
+        (None, None)
     } else {
         let mut grp_idx: Vec<u32> = Vec::with_capacity(total_groups * r);
         for i in 0..n_seq {
@@ -1093,44 +1377,13 @@ fn build_assemble_geom(
         }
         let gi_t = Tensor::from_vec(grp_idx, total_groups * r, dev)?;
 
-        let (pi_t, pad_kv, pad_sc) = if overlap {
-            // Prev-source slot per group over `[pad | each seq's carried prev
-            // | kv_g]`: group j>0 takes its group j−1; group 0 takes the seq's
-            // carried prev, or slot 0 (the pad) when it has none.
-            let mut prev_slot = vec![0u32; n_seq];
-            let mut next = 1u32;
-            for (i, &(_, _, has_prev)) in seqs.iter().enumerate() {
-                if has_prev {
-                    prev_slot[i] = next;
-                    next += 1;
-                }
-            }
-            let base = next;
-            let mut pidx: Vec<u32> = Vec::with_capacity(total_groups);
-            for i in 0..n_seq {
-                for j in 0..groups[i] {
-                    pidx.push(if j == 0 {
-                        prev_slot[i]
-                    } else {
-                        base + (g_off[i] + j - 1) as u32
-                    });
-                }
-            }
-            let pi_t = Tensor::from_vec(pidx, total_groups, dev)?;
-            let pad_kv = Tensor::zeros((1, r, cd), DType::F32, dev)?;
-            let pad_sc = Tensor::full(f32::NEG_INFINITY, (1, r, cd), dev)?;
-            (Some(pi_t), Some(pad_kv), Some(pad_sc))
-        } else {
-            (None, None, None)
-        };
-
         let last_idx: Vec<u32> = (0..n_seq)
             .filter(|&i| groups[i] > 0)
             .map(|i| (g_off[i] + groups[i] - 1) as u32)
             .collect();
         let n_active = last_idx.len();
         let li_t = Tensor::from_vec(last_idx, n_active, dev)?;
-        (Some(gi_t), pi_t, Some(li_t), pad_kv, pad_sc)
+        (Some(gi_t), Some(li_t))
     };
 
     Ok(AssembleGeom {
@@ -1143,10 +1396,7 @@ fn build_assemble_geom(
         tail_off,
         tail_it,
         gi_t,
-        pi_t,
         li_t,
-        pad_kv,
-        pad_sc,
     })
 }
 
@@ -1178,21 +1428,12 @@ pub fn assemble_groups_batched(
     let c = &template.c;
     let r = c.ratio;
     let cd = c.cd();
-    let d = c.head_dim;
     let dev = c.device().clone();
     let n_seq = inputs.len();
 
     // Geometry + index tensors from the per-shape cache (layer-invariant
     // within a wave — the key IS the verification that the shape matches).
-    let key: AssembleGeomKey = (
-        r,
-        cd,
-        c.overlap,
-        inputs
-            .iter()
-            .map(|i| (i.l0, i.n, i.prev_kv.is_some()))
-            .collect(),
-    );
+    let key: AssembleGeomKey = (r, inputs.iter().map(|i| (i.l0, i.n)).collect());
     let geom = {
         let mut cache = assemble_geom_cache().lock().unwrap();
         if let Some(g) = cache.get(&key) {
@@ -1201,7 +1442,7 @@ pub fn assemble_groups_batched(
             if cache.len() >= 4096 {
                 cache.clear();
             }
-            let g = Arc::new(build_assemble_geom(r, cd, c.overlap, &key.3, &dev)?);
+            let g = Arc::new(build_assemble_geom(r, &key.1, &dev)?);
             cache.insert(key, g.clone());
             g
         }
@@ -1263,8 +1504,9 @@ pub fn assemble_groups_batched(
         return Ok(out);
     }
 
-    // 2. Group rows for the whole fleet: [total_groups, r, cd], `ape` added to
-    // the scores before the overlap split (matches `assemble_groups`).
+    // 2. RAW group rows for the whole fleet: [total_groups, r, cd]. `ape` is not
+    // applied here — it rides in the pool descriptor, so the retained rows stay
+    // raw and match what the streaming path retains.
     let gi_t = geom
         .gi_t
         .as_ref()
@@ -1272,50 +1514,12 @@ pub fn assemble_groups_batched(
     let kv_g = comb_kv
         .index_select(gi_t, 0)?
         .reshape((total_groups, r, cd))?;
-    let ape = c.ape.to_dtype(DType::F32)?.reshape((1, r, cd))?;
     let sc_g = comb_sc
         .index_select(gi_t, 0)?
-        .reshape((total_groups, r, cd))?
-        .broadcast_add(&ape)?;
+        .reshape((total_groups, r, cd))?;
 
-    // 3. Fleet-wide pool.
-    let (pool_kv_all, pool_sc_all) = if c.overlap {
-        // Prev source pool along dim 0: [pad | each seq's carried prev | kv_g].
-        // Group j>0 of a seq takes its group j−1's rows; group 0 takes the
-        // seq's carried prev, or the pad (kv 0 / score −inf) when it has none —
-        // the batch-wise form of `assemble_groups`' prev shift. Full-cd rows
-        // are selected and the halves split after (same bytes, one select).
-        // The slot indices (`pi_t`) come from the geometry cache; the source
-        // rows are per-call data, ordered to match the cached slot numbering.
-        let pad_kv = geom.pad_kv.as_ref().expect("overlap implies pads");
-        let pad_sc = geom.pad_sc.as_ref().expect("overlap implies pads");
-        let mut src_kv: Vec<Tensor> = vec![pad_kv.clone()];
-        let mut src_sc: Vec<Tensor> = vec![pad_sc.clone()];
-        for inp in inputs.iter() {
-            if let (Some(pk), Some(ps)) = (&inp.prev_kv, &inp.prev_sc) {
-                src_kv.push(pk.reshape((1, r, cd))?);
-                src_sc.push(ps.reshape((1, r, cd))?);
-            }
-        }
-        let src_kv_refs: Vec<&Tensor> = src_kv.iter().chain(std::iter::once(&kv_g)).collect();
-        let src_sc_refs: Vec<&Tensor> = src_sc.iter().chain(std::iter::once(&sc_g)).collect();
-        let prev_src_kv = Tensor::cat(&src_kv_refs, 0)?;
-        let prev_src_sc = Tensor::cat(&src_sc_refs, 0)?;
-        let pi_t = geom.pi_t.as_ref().expect("overlap implies prev indices");
-        let prev_kv = prev_src_kv.index_select(pi_t, 0)?.narrow(D::Minus1, 0, d)?;
-        let prev_sc = prev_src_sc.index_select(pi_t, 0)?.narrow(D::Minus1, 0, d)?;
-        let curr_kv = kv_g.narrow(D::Minus1, d, d)?;
-        let curr_sc = sc_g.narrow(D::Minus1, d, d)?;
-        (
-            Tensor::cat(&[&prev_kv, &curr_kv], 1)?, // [total_groups, 2r, d]
-            Tensor::cat(&[&prev_sc, &curr_sc], 1)?,
-        )
-    } else {
-        (kv_g.clone(), sc_g.clone())
-    };
-
-    // 4. Retained last-group rows (the next call's overlap prev) for every
-    // seq that completed a group: one select, per-seq views.
+    // 3. Retained last-group rows (the next call's overlap prev) for every seq
+    // that completed a group: one select, then per-seq row views.
     let li_t = geom
         .li_t
         .as_ref()
@@ -1323,7 +1527,11 @@ pub fn assemble_groups_batched(
     let last_kv = kv_g.index_select(li_t, 0)?; // [n_active, r, cd]
     let last_sc = sc_g.index_select(li_t, 0)?;
 
-    // 5. Per-seq outputs: pool views + state advance.
+    // 4. Per-seq outputs: pool spans + state advance. Each sequence describes
+    // its own groups against the shared `kv_g`/`sc_g` block — the prev-group
+    // shift is that block read one group earlier, so the pad row, the prev
+    // source concatenation and the `pi_t` gather the reference form needed are
+    // all gone, and so is the join of the two halves.
     let mut out = Vec::with_capacity(n_seq);
     let mut a_slot = 0usize;
     for i in 0..n_seq {
@@ -1331,17 +1539,22 @@ pub fn assemble_groups_batched(
             let positions: Vec<u32> = (0..groups[i])
                 .map(|j| ((inputs[i].group_idx + j) * r) as u32)
                 .collect();
+            let prev = match (&inputs[i].prev_kv, &inputs[i].prev_sc) {
+                (Some(pk), Some(ps)) => Some((pk.as_slice(), ps.as_slice())),
+                _ => None,
+            };
             Some(GroupPool {
-                pool_kv: pool_kv_all.narrow(0, g_off[i], groups[i])?,
-                pool_score: pool_sc_all.narrow(0, g_off[i], groups[i])?,
+                spans: c.group_spans(&kv_g, &sc_g, g_off[i], groups[i], prev)?,
                 positions,
             })
         } else {
             None
         };
         let (prev_kv, prev_sc) = if groups[i] > 0 {
-            let pk = last_kv.narrow(0, a_slot, 1)?.reshape((r, cd))?;
-            let ps = last_sc.narrow(0, a_slot, 1)?.reshape((r, cd))?;
+            // Views into the small `last_*` select output, which is already off
+            // the fleet-wide stream — no copy needed to break a pin.
+            let pk = row_views(&last_kv.narrow(0, a_slot, 1)?.reshape((r, cd))?)?;
+            let ps = row_views(&last_sc.narrow(0, a_slot, 1)?.reshape((r, cd))?)?;
             a_slot += 1;
             (Some(pk), Some(ps))
         } else {
@@ -1368,6 +1581,15 @@ mod tests {
 
     fn lin(x: &Tensor, w: &Tensor) -> Result<Tensor> {
         x.broadcast_matmul(&w.t()?)
+    }
+
+    /// [`pool_group`] over one already-dense `[G, P, d]` pair — the shape the
+    /// pool's own gates are written against.
+    fn pool_dense(kv: &Tensor, score: &Tensor) -> Result<Tensor> {
+        let (g, _, d) = kv.dims3()?;
+        let gp = GroupPool::dense(kv.clone(), score.clone(), vec![0u32; g]);
+        let scope = crate::models::deepseek4::desc::scope(kv.device())?;
+        pool_group(&[&gp], d, &scope)
     }
 
     /// Non-overlapping pooling (`ratio != 4`) equals a scalar softmax-weighted average
@@ -1739,26 +1961,22 @@ mod tests {
             inc_a.push(i);
         }
 
+        // The two paths describe the same rows with DIFFERENT segment shapes —
+        // the streamer one segment per row, the batched form two wide ones — so
+        // the comparison is over the pooling rows themselves (`materialize`),
+        // which is exactly the block both used to concatenate.
         let assert_pools = |a: &Option<GroupPool>, b: &Option<GroupPool>, tag: &str| match (a, b) {
             (None, None) => {}
             (Some(ga), Some(gb)) => {
                 assert_eq!(ga.positions, gb.positions, "{tag}: positions");
-                let ka = ga.pool_kv.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                let kb = gb.pool_kv.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                assert_eq!(ka, kb, "{tag}: pool_kv bytes");
-                let sa = ga
-                    .pool_score
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap();
-                let sb = gb
-                    .pool_score
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap();
-                assert_eq!(sa, sb, "{tag}: pool_score bytes");
+                let ma = ga.materialize().unwrap();
+                let mb = gb.materialize().unwrap();
+                assert_eq!(ma.len(), mb.len(), "{tag}: group count");
+                for (g, ((ka, sa), (kb, sb))) in ma.iter().zip(mb.iter()).enumerate() {
+                    let f = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert_eq!(f(ka), f(kb), "{tag}: group {g} pool_kv bytes");
+                    assert_eq!(f(sa), f(sb), "{tag}: group {g} pool_score bytes");
+                }
             }
             _ => panic!("{tag}: one path emitted a pool, the other did not"),
         };
@@ -1996,6 +2214,7 @@ mod tests {
             );
             for roped in [false, true] {
                 let rope_arg = if roped { Some(&rope) } else { None };
+                let scope = crate::models::deepseek4::desc::scope(&dev)?;
                 // Ragged: two sequences of different lengths, each completing ≥1 group.
                 let lens = [ratio * 3 + 2, ratio * 2 + 1];
                 let mut per_seq: Vec<Tensor> = Vec::new();
@@ -2007,21 +2226,13 @@ mod tests {
                         .incremental()
                         .assemble_groups(&kv, &sc)?
                         .expect("completes a group");
-                    per_seq.push(c.pool_and_norm(
-                        &gp.pool_kv,
-                        &gp.pool_score,
-                        &gp.positions,
-                        rope_arg,
-                    )?);
+                    per_seq.push(c.pool_and_norm(&[&gp], rope_arg, &scope)?);
                     pools.push(gp);
                 }
-                // Batched: concat on the group axis + one pool.
-                let pool_kv =
-                    Tensor::cat(&pools.iter().map(|g| &g.pool_kv).collect::<Vec<_>>(), 0)?;
-                let pool_score =
-                    Tensor::cat(&pools.iter().map(|g| &g.pool_score).collect::<Vec<_>>(), 0)?;
-                let positions: Vec<u32> = pools.iter().flat_map(|g| g.positions.clone()).collect();
-                let batched = c.pool_and_norm(&pool_kv, &pool_score, &positions, rope_arg)?;
+                // Batched: every sequence's pool in ONE call — a wider descriptor
+                // table, not a concatenation of their rows.
+                let refs: Vec<&GroupPool> = pools.iter().collect();
+                let batched = c.pool_and_norm(&refs, rope_arg, &scope)?;
                 // Split back per sequence and compare bit-for-bit.
                 let mut off = 0usize;
                 for (i, gp) in pools.iter().enumerate() {
@@ -2063,9 +2274,9 @@ mod tests {
         for &(g, p, d) in &[(32usize, 8usize, 512usize), (7, 128, 512), (5, 8, 128)] {
             let kv = Tensor::randn(0f32, 1.0, (g, p, d), &dev)?;
             let score = Tensor::randn(0f32, 2.0, (g, p, d), &dev)?;
-            let batched = pool_group(&kv, &score)?;
+            let batched = pool_dense(&kv, &score)?;
             for i in 0..g {
-                let alone = pool_group(&kv.narrow(0, i, 1)?, &score.narrow(0, i, 1)?)?;
+                let alone = pool_dense(&kv.narrow(0, i, 1)?, &score.narrow(0, i, 1)?)?;
                 let a = batched.narrow(0, i, 1)?.flatten_all()?.to_vec1::<f32>()?;
                 let b = alone.flatten_all()?.to_vec1::<f32>()?;
                 for (j, (x, y)) in a.iter().zip(&b).enumerate() {
@@ -2093,11 +2304,69 @@ mod tests {
     ///   ncu --set full --kernel-name compressor_pool_kernel --launch-count 4 \
     ///     -o pool_ncu target/release/deps/candle_transformers-<hash>.exe \
     ///     bench_compressor_pool --ignored --nocapture
+    /// Time `f` as the MINIMUM of five rounds. This box lands an intermittent
+    /// ~60 us WDDM stall on one random shape per run; a single timed mean folds
+    /// it in and makes an unrelated shape look like a regression. Applies to
+    /// every microbench in this repo.
+    #[cfg(feature = "cuda")]
+    fn best_us(dev: &Device, iters: usize, f: &mut dyn FnMut() -> Result<()>) -> Result<f64> {
+        for _ in 0..8 {
+            f()?;
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            dev.synchronize()?;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                f()?;
+            }
+            dev.synchronize()?;
+            best = best.min(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+        }
+        Ok(best)
+    }
+
+    /// `n_pool` pools of one group each, described the way the DECODE streamer
+    /// describes them: `p` separate one-row segments, because each row arrived
+    /// on its own step from its own batched projection. This is the shape the
+    /// wave actually pools at width — the dense `[G, P, d]` block is what
+    /// prefill produces — and it is the one that stresses the descriptor table.
+    #[cfg(feature = "cuda")]
+    fn streaming_pools(
+        n_pool: usize,
+        p: usize,
+        d: usize,
+        dev: &Device,
+    ) -> Result<(Vec<GroupPool>, Vec<Tensor>)> {
+        let mut keep: Vec<Tensor> = Vec::new();
+        let mut pools = Vec::with_capacity(n_pool);
+        for _ in 0..n_pool {
+            let mut segs = Vec::with_capacity(p);
+            for _ in 0..p {
+                let kv = Tensor::randn(0f32, 1.0, (1, 1, d), dev)?;
+                let sc = Tensor::randn(0f32, 1.0, (1, 1, d), dev)?;
+                keep.push(kv.clone());
+                keep.push(sc.clone());
+                segs.push(PoolSegs {
+                    kv,
+                    score: sc,
+                    ape: None,
+                });
+            }
+            pools.push(GroupPool {
+                spans: vec![PoolSpan { segs }],
+                positions: vec![0],
+            });
+        }
+        Ok((pools, keep))
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn bench_compressor_pool() -> Result<()> {
         let dev = Device::new_cuda(0)?;
+        println!("--- dense segments (one wide segment per group: the prefill shape) ---");
         for &(g, p, d, tag) in &[
             (1usize, 8usize, 512usize, "decode ×1"),
             (8, 8, 512, "decode ×8"),
@@ -2108,38 +2377,53 @@ mod tests {
         ] {
             let kv = Tensor::randn(0f32, 1.0, (g, p, d), &dev)?;
             let score = Tensor::randn(0f32, 1.0, (g, p, d), &dev)?;
-            // Warm the kernel + allocator, then time a run of launches so the
-            // per-launch cost is not swamped by one-off setup.
-            for _ in 0..8 {
-                let _ = pool_group(&kv, &score)?;
-            }
-            dev.synchronize()?;
-            let iters = 200;
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                let _ = pool_group(&kv, &score)?;
-            }
-            dev.synchronize()?;
-            let fused = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-
-            // The eager chain, for the ratio this is all about.
-            for _ in 0..8 {
+            let fused = best_us(&dev, 200, &mut || pool_dense(&kv, &score).map(|_| ()))?;
+            let eager = best_us(&dev, 200, &mut || {
                 let w = softmax(&score, 1)?;
-                let _ = kv.broadcast_mul(&w)?.sum(1)?;
-            }
-            dev.synchronize()?;
-            let t1 = std::time::Instant::now();
-            for _ in 0..iters {
-                let w = softmax(&score, 1)?;
-                let _ = kv.broadcast_mul(&w)?.sum(1)?;
-            }
-            dev.synchronize()?;
-            let eager = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
-
+                kv.broadcast_mul(&w)?.sum(1).map(|_| ())
+            })?;
             println!(
                 "[pool {tag:>14}] g={g:<4} p={p:<4} d={d:<4}  fused {fused:7.2} us  \
                  eager {eager:7.2} us  {:.2}x",
                 eager / fused
+            );
+        }
+
+        // Where the wall actually goes. `ncu` puts the kernel at ~5 us on the
+        // decode shape while the wall is ~15, so the majority is NOT the kernel:
+        // it is the per-call device allocations and the descriptor upload. Print
+        // them separately so an optimisation attempt aims at the right one.
+        println!("--- per-call overhead (everything the launch is wrapped in) ---");
+        {
+            let words = 2 * 16 + 7 * 16 * 8; // 16 streaming pools, 8 segments each
+            let upload = best_us(&dev, 200, &mut || {
+                Tensor::from_vec(vec![0i64; words], words, &dev).map(|_| ())
+            })?;
+            let alloc = best_us(&dev, 200, &mut || {
+                Tensor::empty((16, 512), DType::F32, &dev).map(|_| ())
+            })?;
+            println!(
+                "[pool       overhead] desc upload ({words} i64) {upload:7.2} us   \
+                 out alloc [16,512] {alloc:7.2} us"
+            );
+        }
+
+        println!("--- one-row segments (the decode streamer's shape) ---");
+        for &(n, p, d, tag) in &[
+            (1usize, 8usize, 512usize, "stream ×1"),
+            (8, 8, 512, "stream ×8"),
+            (16, 8, 512, "stream ×16"),
+            (16, 8, 128, "stream ×16 idx"),
+            (64, 8, 512, "stream ×64"),
+        ] {
+            let (pools, _keep) = streaming_pools(n, p, d, &dev)?;
+            let refs: Vec<&GroupPool> = pools.iter().collect();
+            // Both staging paths, side by side: the wave's bump arena (the table
+            // read in place over PCIe, no copy) against the fallback upload.
+            let gen = crate::models::deepseek4::desc::scope(&dev)?;
+            let arena = best_us(&dev, 200, &mut || pool_group(&refs, d, &gen).map(|_| ()))?;
+            println!(
+                "[pool {tag:>14}] pools={n:<4} segs/group={p:<4} d={d:<4}  arena {arena:7.2} us"
             );
         }
         Ok(())
@@ -2213,7 +2497,7 @@ mod tests {
                 "the strided cases must actually be strided (g={g}, p={p}, d={d})"
             );
 
-            let got = pool_group(&kv, &score)?;
+            let got = pool_dense(&kv, &score)?;
             let w = softmax(&score, 1)?;
             let want = kv.broadcast_mul(&w)?.sum(1)?;
             // The same expression on the HOST, in plain IEEE f32 with no
@@ -2296,6 +2580,7 @@ mod tests {
             );
             for roped in [false, true] {
                 let rope_arg = if roped { Some(&rope) } else { None };
+                let scope = crate::models::deepseek4::desc::scope(&dev)?;
                 // Stagger: session `s` enters the loop having already absorbed `s`
                 // rows, so the sessions' group boundaries fall on different steps.
                 let mut refs: Vec<IncrementalCompressor> = Vec::with_capacity(n_sess);
@@ -2346,18 +2631,11 @@ mod tests {
                     if live.is_empty() {
                         continue;
                     }
-                    let pool_kv =
-                        Tensor::cat(&live.iter().map(|(_, g)| &g.pool_kv).collect::<Vec<_>>(), 0)?;
-                    let pool_score = Tensor::cat(
-                        &live.iter().map(|(_, g)| &g.pool_score).collect::<Vec<_>>(),
-                        0,
-                    )?;
-                    let positions: Vec<u32> =
-                        live.iter().flat_map(|(_, g)| g.positions.clone()).collect();
-                    let pooled = c.pool_and_norm(&pool_kv, &pool_score, &positions, rope_arg)?;
+                    let refs: Vec<&GroupPool> = live.iter().map(|(_, g)| *g).collect();
+                    let pooled = c.pool_and_norm(&refs, rope_arg, &scope)?;
                     let mut off = 0usize;
                     for (s, g) in &live {
-                        let n = g.positions.len();
+                        let n = g.groups();
                         got[*s].push(pooled.narrow(0, off, n)?);
                         off += n;
                     }

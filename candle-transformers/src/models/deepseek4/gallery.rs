@@ -12,6 +12,11 @@
 
 use candle::{DType, Device, Result, Tensor};
 
+#[cfg(feature = "cuda")]
+use super::scatter::{rows_scatter, RowRun};
+#[cfg(feature = "cuda")]
+use candle::quantized::pinned_staging::Generation;
+
 /// Words per packed sign row.
 fn sign_words(dim: usize) -> usize {
     dim.div_ceil(32)
@@ -706,6 +711,9 @@ impl FloatGallery {
     /// Append `n` completed groups: attended rows `[n, head_dim]` f32, scoring
     /// keys `[n, index_head_dim]` f32 (both pre-RoPE, device), and their
     /// group-start positions. Sign bits are packed on-device.
+    ///
+    /// One gallery's [`append_batch_all`] — the reference/streamed form. The
+    /// wave never calls this: it appends every session's groups at once.
     #[cfg(feature = "cuda")]
     pub fn append_batch(
         &mut self,
@@ -713,66 +721,21 @@ impl FloatGallery {
         key_rows: &Tensor,
         positions: &[u32],
     ) -> Result<()> {
-        let (n, hd) = attn_rows.dims2()?;
+        let n = attn_rows.dim(0)?;
         if n == 0 {
             return Ok(());
         }
-        let (kn, kd) = key_rows.dims2()?;
-        if hd != self.head_dim || kd != self.index_head_dim || kn != n || positions.len() != n {
-            candle::bail!(
-                "append_batch shape mismatch: attn {:?}, keys {:?}, pos {}",
-                attn_rows.dims(),
-                key_rows.dims(),
-                positions.len()
-            );
-        }
-        // Sign-pack the new keys on the GPU (the incoming rows are GPU) BEFORE
-        // any spill moves the float pair — the sign index stays GPU-resident.
-        let new_signs = sign_pack(key_rows)?;
-        let pos_t = Tensor::from_vec(positions.to_vec(), n, &self.device)?;
-
-        self.grow_to(self.len + n)?;
-        // Build the HOT two-region cache from the incoming GPU rows (the build
-        // kernel is GPU-only). While the cache is hot its buffers are GPU, so
-        // build straight into the destination rows; once spilled they are CPU,
-        // so build into GPU scratch and copy the int8/bf16 rows down to RAM.
-        let attn_gpu = attn_rows.to_device(&self.device)?;
-        if self.spilled {
-            // build_corpus_cache_into writes all n rows (n≥1 — append bails on 0):
-            // uninit scratch, the seal kernel is the initialisation.
-            let nope_tmp = Tensor::empty((n, NOPE_DIM), DType::U8, &self.device)?;
-            let scale_tmp = Tensor::empty((n, NOPE_BANDS), DType::F32, &self.device)?;
-            let rope_tmp = Tensor::empty((n, ROPE_DIM), DType::BF16, &self.device)?;
-            build_corpus_cache_into(&attn_gpu, &nope_tmp, &scale_tmp, &rope_tmp, 0, n)?;
-            self.nope_i8
-                .slice_set(&nope_tmp.to_device(&Device::Cpu)?, 0, self.len)?;
-            self.nope_scale
-                .slice_set(&scale_tmp.to_device(&Device::Cpu)?, 0, self.len)?;
-            self.rope_bf
-                .slice_set(&rope_tmp.to_device(&Device::Cpu)?, 0, self.len)?;
-        } else {
-            build_corpus_cache_into(
-                &attn_gpu,
-                &self.nope_i8,
-                &self.nope_scale,
-                &self.rope_bf,
-                self.len,
-                n,
-            )?;
-        }
-        // Cross the spill threshold AFTER the hot build (so the just-built rows
-        // move down with the rest of the tier on the crossing append).
-        self.maybe_spill(self.len + n)?;
-        // The two-region cache built above IS the stored latent — no separate
-        // f32 archive (the old canonical-f32 CPU copy was reference-only and its
-        // blocking D2H drained the prefill/decode pipeline every append). Place
-        // the Indexer keys on their current tier (GPU until the spill).
-        let key_rows = key_rows.to_device(&self.float_device())?;
-        self.keys.slice_set(&key_rows, 0, self.len)?;
-        self.pos.slice_set(&pos_t, 0, self.len)?;
-        self.signs.slice_set(&new_signs, 0, self.len)?;
-        self.len += n;
-        Ok(())
+        let scope = crate::models::deepseek4::desc::scope(&self.device)?;
+        append_batch_all(
+            &mut [AppendSlice {
+                gallery: self,
+                runs: vec![(0, n)],
+            }],
+            attn_rows,
+            key_rows,
+            positions,
+            &scope,
+        )
     }
 
     /// Gather the dense f32 rows and positions for `gids` (absolute entry ids,
@@ -838,33 +801,26 @@ impl FloatGallery {
     /// is always GPU-resident and gathered in place.
     #[cfg(feature = "cuda")]
     pub fn gather_corpus(&self, gids: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        let live = self.len.max(1);
-        // `index_select` / `to_device` already produce fresh contiguous buffers,
-        // so no trailing `contiguous()` copy is needed (it was a runtime no-op).
-        let pos = self.pos.narrow(0, 0, live)?.index_select(gids, 0)?;
-        if self.spilled {
-            let gids_cpu = gids.to_device(&Device::Cpu)?;
-            let sel = |t: &Tensor| -> Result<Tensor> {
-                t.narrow(0, 0, live)?
-                    .index_select(&gids_cpu, 0)?
-                    .to_device(&self.device)
-            };
-            Ok((
-                sel(&self.nope_i8)?,
-                sel(&self.nope_scale)?,
-                sel(&self.rope_bf)?,
-                pos,
-            ))
-        } else {
-            let sel =
-                |t: &Tensor| -> Result<Tensor> { t.narrow(0, 0, live)?.index_select(gids, 0) };
-            Ok((
-                sel(&self.nope_i8)?,
-                sel(&self.nope_scale)?,
-                sel(&self.rope_bf)?,
-                pos,
-            ))
+        let k = gids.dim(0)?;
+        // Fresh destinations, then the SAME gather that fills a shared block —
+        // one implementation of the tier logic, not two that must be kept in
+        // step. The kernel (or, when spilled, the scatter) writes every row, so
+        // these are uninitialised (hot-path invariant 6).
+        let out_nope = Tensor::empty((k.max(1), NOPE_DIM), DType::U8, &self.device)?;
+        let out_scale = Tensor::empty((k.max(1), NOPE_BANDS), DType::F32, &self.device)?;
+        let out_rope = Tensor::empty((k.max(1), ROPE_DIM), DType::BF16, &self.device)?;
+        let out_pos = Tensor::empty(k.max(1), DType::U32, &self.device)?;
+        let scope = crate::models::deepseek4::desc::scope(&self.device)?;
+        self.gather_corpus_into(gids, &out_nope, &out_scale, &out_rope, &out_pos, 0, &scope)?;
+        if k == 0 {
+            return Ok((
+                out_nope.narrow(0, 0, 0)?,
+                out_scale.narrow(0, 0, 0)?,
+                out_rope.narrow(0, 0, 0)?,
+                out_pos.narrow(0, 0, 0)?,
+            ));
         }
+        Ok((out_nope, out_scale, out_rope, out_pos))
     }
 
     /// Gather this session's `k` selected hot-cache rows (`gids`) DIRECTLY into a
@@ -876,6 +832,7 @@ impl FloatGallery {
     /// hot galleries; a spilled gallery re-heats its `k` rows from CPU RAM and
     /// `slice_set`s them in (bounded transfer, as before).
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     pub fn gather_corpus_into(
         &self,
         gids: &Tensor,
@@ -884,6 +841,7 @@ impl FloatGallery {
         out_rope: &Tensor,
         out_pos: &Tensor,
         row_offset: usize,
+        generation: &Generation,
     ) -> Result<()> {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::Storage;
@@ -893,18 +851,52 @@ impl FloatGallery {
         }
         let live = self.len.max(1);
         if self.spilled {
-            // Warm tier: re-heat the k rows on CPU, upload, place at the offset.
-            let gids_cpu = gids.to_device(&Device::Cpu)?;
-            let sel = |t: &Tensor| -> Result<Tensor> {
-                t.narrow(0, 0, live)?
-                    .index_select(&gids_cpu, 0)?
-                    .to_device(&self.device)
-            };
-            out_nope.slice_set(&sel(&self.nope_i8)?, 0, row_offset)?;
-            out_scale.slice_set(&sel(&self.nope_scale)?, 0, row_offset)?;
-            out_rope.slice_set(&sel(&self.rope_bf)?, 0, row_offset)?;
+            // Warm tier. The float pair lives in PAGEABLE host RAM, which no
+            // kernel can address, so the row gather itself must run on the host —
+            // the one place invariant 4's "no host compute" does not reach,
+            // because there is no kernel that could do it. (What would change
+            // that is the pinned warm pool of docs/kv_tier_migration.md: page-
+            // locked and device-mapped, the hot path's fused gather would read
+            // this tier in place. It is a bounded POOL by design — page-locking
+            // every spilled arena wholesale would make an unbounded amount of
+            // host memory unswappable.)
+            //
+            // What the host gather does NOT have to be is a copy per region. It
+            // packs all three regions into ONE staging buffer, so the re-heat is
+            // a single transfer and a single scatter instead of three uploads and
+            // four `slice_set` launches. `pos` never spills, so its rows are
+            // gathered on the device and ride the same scatter.
+            let ids: Vec<u32> = gids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+            let regions = [&self.nope_i8, &self.nope_scale, &self.rope_bf];
+            let widths: Vec<usize> = regions
+                .iter()
+                .map(|t| Ok(t.dim(1)? * t.dtype().size_in_bytes()))
+                .collect::<Result<_>>()?;
+            let mut staged: Vec<u8> = Vec::with_capacity(k * widths.iter().sum::<usize>());
+            for (t, w) in regions.iter().zip(&widths) {
+                pack_rows(t, &ids, live, *w, &mut staged)?;
+            }
+            let n_bytes = staged.len();
+            let staged = Tensor::from_vec(staged, n_bytes, &Device::Cpu)?.to_device(&self.device)?;
+
             let pos = self.pos.narrow(0, 0, live)?.index_select(gids, 0)?;
-            out_pos.slice_set(&pos, 0, row_offset)?;
+            let mut runs = vec![RowRun::new(pos, out_pos, row_offset)];
+            let mut off = 0usize;
+            for ((w, dst), _) in widths
+                .iter()
+                .zip([out_nope, out_scale, out_rope])
+                .zip(regions.iter())
+            {
+                // A byte block reshaped to this region's row width — the scatter
+                // matches rows by BYTE width, not element type.
+                runs.push(RowRun::new(
+                    staged.narrow(0, off, k * w)?.reshape((k, *w))?,
+                    dst,
+                    row_offset,
+                ));
+                off += k * w;
+            }
+            rows_scatter(&runs, generation)?;
             return Ok(());
         }
         // Hot tier: one fused gather launch. The four source regions and the four
@@ -1449,6 +1441,208 @@ impl FloatGallery {
 /// pointer, so the kernel (gid `0..n`, reading `attn_gpu[gid]`) writes exactly
 /// those rows.
 #[cfg(feature = "cuda")]
+/// Append the raw bytes of `ids`' rows of a CPU-resident `[rows, w]` tensor to
+/// `out` — the host-side row gather for the warm tier, straight into the packed
+/// staging buffer so the re-heat never materialises a per-region tensor.
+///
+/// `live` bounds the gather to the tensor's occupied prefix, matching the
+/// `narrow(0, 0, live)` the device path applies.
+#[cfg(feature = "cuda")]
+fn pack_rows(t: &Tensor, ids: &[u32], live: usize, row_bytes: usize, out: &mut Vec<u8>) -> Result<()> {
+    use candle::{CpuStorage, Storage};
+    let (storage, layout) = t.storage_and_layout();
+    let cols = t.dim(1)?;
+    let stride = layout.stride()[0];
+    let base = layout.start_offset();
+    // Row `id` of a CPU tensor as bytes, in the tensor's own element type.
+    macro_rules! rows {
+        ($v:expr, $to_bytes:expr) => {{
+            let data = $v;
+            for &id in ids {
+                let id = id as usize;
+                if id >= live {
+                    candle::bail!("pack_rows: entry {id} past the live prefix ({live})");
+                }
+                let row = &data[base + id * stride..][..cols];
+                for x in row {
+                    out.extend_from_slice(&$to_bytes(*x));
+                }
+            }
+        }};
+    }
+    let before = out.len();
+    match &*storage {
+        Storage::Cpu(CpuStorage::U8(v)) => {
+            for &id in ids {
+                let id = id as usize;
+                if id >= live {
+                    candle::bail!("pack_rows: entry {id} past the live prefix ({live})");
+                }
+                out.extend_from_slice(&v[base + id * stride..][..cols]);
+            }
+        }
+        Storage::Cpu(CpuStorage::F32(v)) => rows!(v, |x: f32| x.to_ne_bytes()),
+        Storage::Cpu(CpuStorage::BF16(v)) => rows!(v, |x: half::bf16| x.to_bits().to_ne_bytes()),
+        Storage::Cpu(CpuStorage::U32(v)) => rows!(v, |x: u32| x.to_ne_bytes()),
+        _ => candle::bail!(
+            "pack_rows: unsupported warm-tier element type {:?}",
+            t.dtype()
+        ),
+    }
+    debug_assert_eq!(out.len() - before, ids.len() * row_bytes);
+    Ok(())
+}
+
+/// One session's share of a wave's fleet-wide pooled block, for
+/// [`append_batch_all`]: the gallery to append to, and which rows of the block
+/// are its groups.
+#[cfg(feature = "cuda")]
+pub struct AppendSlice<'a> {
+    pub gallery: &'a mut FloatGallery,
+    /// `(first row of the block, rows)` runs, in the order they must land.
+    ///
+    /// Usually one. A SPECULATIVE VERIFY wave carries a whole drafted block as
+    /// several consecutive decode rows of the SAME sequence, so that sequence
+    /// occupies several wave slots and closes a group in more than one of them;
+    /// every such run appends to this one gallery, back to back, exactly as the
+    /// per-slot loop did.
+    pub runs: Vec<(usize, usize)>,
+}
+
+#[cfg(feature = "cuda")]
+impl AppendSlice<'_> {
+    fn rows(&self) -> usize {
+        self.runs.iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// Append EVERY session's completed groups in one pass over the wave.
+///
+/// A wave's compressor pool already emits one fleet-wide `[ΣG, d]` block with
+/// each session's groups as a contiguous run of it, so the append is a scatter:
+/// six arrays × one destination per session. Done per session that is six
+/// `slice_set` launches times the wave's width times the compression layers,
+/// each moving a few kilobytes — pure launch overhead, and exactly the
+/// allocate-plus-copy-per-consumer shape hot-path invariant 2 forbids.
+///
+/// Here it is a fixed handful of launches for the WHOLE wave, independent of
+/// session count: one sign-pack, one position upload, one latent seal, and one
+/// [`rows_scatter`] whose descriptor table names every destination by address.
+///
+/// Each gallery's tier is settled BEFORE anything is written (`grow_to` then
+/// `maybe_spill` over the post-append length), so every row is written once, to
+/// its final home. That is the same bytes as building hot and spilling after —
+/// a spill moves whole regions and does not care whether the new rows are in
+/// them yet — and it removes the need to scatter twice around the crossing.
+#[cfg(feature = "cuda")]
+pub fn append_batch_all(
+    slices: &mut [AppendSlice<'_>],
+    attn_rows: &Tensor,
+    key_rows: &Tensor,
+    positions: &[u32],
+    generation: &Generation,
+) -> Result<()> {
+    let (total, hd) = attn_rows.dims2()?;
+    if total == 0 || slices.is_empty() {
+        return Ok(());
+    }
+    // Every gallery of a wave shares one device; the seal and the scatter both
+    // run there, so the incoming rows are placed on it once (a no-op when they
+    // already are, which is the case for the wave's own pooled block).
+    let device = slices[0].gallery.device.clone();
+    let attn_rows = &attn_rows.to_device(&device)?;
+    let key_rows = &key_rows.to_device(&device)?;
+    let (kn, kd) = key_rows.dims2()?;
+    if kn != total || positions.len() != total {
+        candle::bail!(
+            "append_batch_all: attn {:?}, keys {:?}, pos {} disagree on the row count",
+            attn_rows.dims(),
+            key_rows.dims(),
+            positions.len()
+        );
+    }
+    let covered: usize = slices.iter().map(|s| s.rows()).sum();
+    if covered != total {
+        candle::bail!("append_batch_all: slices cover {covered} rows of a {total}-row block");
+    }
+    for s in slices.iter() {
+        for &(src_row, rows) in &s.runs {
+            if src_row + rows > total {
+                candle::bail!(
+                    "append_batch_all: slice rows {src_row}..{} of a {total}-row block",
+                    src_row + rows
+                );
+            }
+        }
+        if hd != s.gallery.head_dim || kd != s.gallery.index_head_dim {
+            candle::bail!(
+                "append_batch_all: attn {:?} / keys {:?} do not match the gallery \
+                 (head_dim {}, index_head_dim {})",
+                attn_rows.dims(),
+                key_rows.dims(),
+                s.gallery.head_dim,
+                s.gallery.index_head_dim
+            );
+        }
+    }
+
+    // Sign-pack the new keys and upload their positions ONCE for the whole wave.
+    // Both indexes are permanently GPU-resident (only the float pair spills), so
+    // neither depends on any gallery's tier.
+    let all_signs = sign_pack(key_rows)?;
+    let all_pos = Tensor::from_vec(positions.to_vec(), total, &device)?;
+
+    // ONE seal over the whole block. The two-region cache it builds IS the
+    // stored latent — there is no separate f32 archive (the old canonical-f32
+    // CPU copy was reference-only and its blocking D2H drained the pipeline on
+    // every append). The kernel writes every row, so the scratch is
+    // uninitialised (hot-path invariant 6).
+    let all_nope = Tensor::empty((total, NOPE_DIM), DType::U8, &device)?;
+    let all_scale = Tensor::empty((total, NOPE_BANDS), DType::F32, &device)?;
+    let all_rope = Tensor::empty((total, ROPE_DIM), DType::BF16, &device)?;
+    build_corpus_cache_into(attn_rows, &all_nope, &all_scale, &all_rope, 0, total)?;
+
+    // Settle every gallery's capacity and tier before writing a single row.
+    for s in slices.iter_mut() {
+        let end = s.gallery.len + s.rows();
+        s.gallery.grow_to(end)?;
+        s.gallery.maybe_spill(end)?;
+    }
+
+    let mut runs: Vec<RowRun> = Vec::with_capacity(6 * slices.len());
+    for s in slices.iter() {
+        let g = &*s.gallery;
+        let mut dst = g.len;
+        for &(src_row, rows) in &s.runs {
+            let take = |t: &Tensor| -> Result<Tensor> { t.narrow(0, src_row, rows) };
+            runs.push(RowRun::new(take(&all_pos)?, &g.pos, dst));
+            runs.push(RowRun::new(take(&all_signs)?, &g.signs, dst));
+            if g.spilled {
+                // Warm tier: the float pair lives in RAM, which the scatter
+                // kernel cannot reach, so those four arrays take a
+                // device-to-host copy each.
+                let cpu = |t: &Tensor| -> Result<Tensor> { take(t)?.to_device(&Device::Cpu) };
+                g.keys.slice_set(&cpu(key_rows)?, 0, dst)?;
+                g.nope_i8.slice_set(&cpu(&all_nope)?, 0, dst)?;
+                g.nope_scale.slice_set(&cpu(&all_scale)?, 0, dst)?;
+                g.rope_bf.slice_set(&cpu(&all_rope)?, 0, dst)?;
+            } else {
+                runs.push(RowRun::new(take(key_rows)?, &g.keys, dst));
+                runs.push(RowRun::new(take(&all_nope)?, &g.nope_i8, dst));
+                runs.push(RowRun::new(take(&all_scale)?, &g.nope_scale, dst));
+                runs.push(RowRun::new(take(&all_rope)?, &g.rope_bf, dst));
+            }
+            dst += rows;
+        }
+    }
+    rows_scatter(&runs, generation)?;
+
+    for s in slices.iter_mut() {
+        s.gallery.len += s.rows();
+    }
+    Ok(())
+}
+
 fn build_corpus_cache_into(
     attn_gpu: &Tensor,
     nope_i8: &Tensor,
@@ -1659,15 +1853,17 @@ pub fn bdp_recall(q_signs: &Tensor, signs: &Tensor, dim: usize) -> Result<Tensor
 /// output. Returns `counts` `[total_g]` — byte-identical per session to the
 /// per-session [`bdp_recall`]. `max_g` = the largest `cnt[s]`.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn bdp_recall_batched(
     q_signs: &Tensor,
     sign_tensors: &[Tensor],
-    off: &Tensor,
-    cnt: &Tensor,
+    off: u64,
+    cnt: u64,
     n_sess: usize,
     n_heads: usize,
     max_g: usize,
     dim: usize,
+    generation: &Generation,
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::Storage;
@@ -1698,29 +1894,21 @@ pub fn bdp_recall_batched(
         };
         sign_ptrs.push(p as i64);
     }
-    let sign_ptrs_t = Tensor::from_vec(sign_ptrs, n_sess, q_signs.device())?;
+    // The per-gallery sign-pointer table rides the wave arena; it is read once
+    // per block, which is what the bump arena is for.
+    let sign_ptrs_t =
+        crate::models::deepseek4::desc::stage(&sign_ptrs, generation)?;
     {
         let (sq, _) = q_signs.storage_and_layout();
-        let (soff, _) = off.storage_and_layout();
-        let (scnt, _) = cnt.storage_and_layout();
         let (sc, _) = counts.storage_and_layout();
-        let (sp, _) = sign_ptrs_t.storage_and_layout();
         let ptr_u32 = |st: &Storage| -> Result<u64> {
             match st {
                 Storage::Cuda(c) => Ok(c.as_cuda_slice::<u32>()?.device_ptr(&stream).0),
                 _ => unreachable!(),
             }
         };
-        let table = match &*sp {
-            Storage::Cuda(c) => c.as_cuda_slice::<i64>()?.device_ptr(&stream).0,
-            _ => unreachable!(),
-        };
-        let (qp, op, cp, outp) = (
-            ptr_u32(&sq)?,
-            ptr_u32(&soff)?,
-            ptr_u32(&scnt)?,
-            ptr_u32(&sc)?,
-        );
+        let table = sign_ptrs_t.ptr();
+        let (qp, op, cp, outp) = (ptr_u32(&sq)?, off, cnt, ptr_u32(&sc)?);
         let code = unsafe {
             candle_kernels::simple::bdp::run_bdp_recall_batched(
                 qp as *const u32,
@@ -1750,10 +1938,15 @@ pub fn bdp_recall_batched(
 /// shortlist (remaining columns undefined). Byte-identical per session to
 /// [`topm_select`]. `bins` = the agreement range (`n_heads·dim + 1`).
 #[cfg(feature = "cuda")]
+/// `off`/`cnt` are DEVICE ADDRESSES of `[n_sess]` u32 segment tables, not
+/// tensors: the caller stages them once (from the wave arena where it has one)
+/// and hands the same pair to this and to [`bdp_recall_batched`], instead of
+/// each helper re-uploading its own copy.
+#[allow(clippy::too_many_arguments)]
 pub fn topm_select_batched(
     counts: &Tensor,
-    off: &Tensor,
-    cnt: &Tensor,
+    off: u64,
+    cnt: u64,
     n_sess: usize,
     max_g: usize,
     max_m: usize,
@@ -1771,8 +1964,6 @@ pub fn topm_select_batched(
     let out = Tensor::zeros((n_sess, max_m), DType::U32, counts.device())?;
     {
         let (sc, _) = counts.storage_and_layout();
-        let (soff, _) = off.storage_and_layout();
-        let (scnt, _) = cnt.storage_and_layout();
         let (sh, _) = hist.storage_and_layout();
         let (sm, _) = meta.storage_and_layout();
         let (so, _) = out.storage_and_layout();
@@ -1782,14 +1973,8 @@ pub fn topm_select_batched(
                 _ => unreachable!(),
             }
         };
-        let (cp, offp, cntp, hp, mp, outp) = (
-            ptr(&sc)?,
-            ptr(&soff)?,
-            ptr(&scnt)?,
-            ptr(&sh)?,
-            ptr(&sm)?,
-            ptr(&so)?,
-        );
+        let (cp, offp, cntp, hp, mp, outp) =
+            (ptr(&sc)?, off, cnt, ptr(&sh)?, ptr(&sm)?, ptr(&so)?);
         let code = unsafe {
             candle_kernels::simple::bdp::run_topm_select_batched(
                 cp as *const u32,
@@ -1829,6 +2014,7 @@ pub fn two_stage_select_batched(
     weights: &[Tensor],
     top_m: usize,
     top_k: usize,
+    generation: &Generation,
 ) -> Result<Vec<(Tensor, usize)>> {
     let n_sess = galleries.len();
     if n_sess == 0 {
@@ -1876,21 +2062,30 @@ pub fn two_stage_select_batched(
             running += len as u32;
             max_g = max_g.max(len);
         }
-        let off_t = Tensor::from_vec(off, nd, &dev)?;
-        let cnt_t = Tensor::from_vec(cnt, nd, &dev)?;
+        // Staged ONCE and shared by the recall and the top-M below, rather than
+        // each helper uploading its own copy of the same segment table.
+        let off_t = crate::models::deepseek4::desc::stage_slice(&off, generation)?;
+        let cnt_t = crate::models::deepseek4::desc::stage_slice(&cnt, generation)?;
         let bins = n_heads * ihd + 1;
         let counts = bdp_recall_batched(
             &q_signs_cat,
             &sign_tensors,
-            &off_t,
-            &cnt_t,
+            off_t.ptr(),
+            cnt_t.ptr(),
             nd,
             n_heads,
             max_g,
             ihd,
+            generation,
         )?;
         Some(topm_select_batched(
-            &counts, &off_t, &cnt_t, nd, max_g, max_m, bins,
+            &counts,
+            off_t.ptr(),
+            cnt_t.ptr(),
+            nd,
+            max_g,
+            max_m,
+            bins,
         )?) // [nd, max_m]
     };
 
@@ -2039,6 +2234,7 @@ pub fn two_stage_select_batched(
 /// rows on CPU and `slice_set`s them in (the bounded warm-tier path). Byte-
 /// identical per row to [`FloatGallery::gather_corpus_into`].
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn gather_corpus_batched(
     galleries: &[&FloatGallery],
     gids: &[Tensor],
@@ -2047,6 +2243,7 @@ pub fn gather_corpus_batched(
     out_scale: &Tensor,
     out_rope: &Tensor,
     out_pos: &Tensor,
+    generation: &Generation,
 ) -> Result<()> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::Storage;
@@ -2069,6 +2266,7 @@ pub fn gather_corpus_batched(
                 out_rope,
                 out_pos,
                 row_offsets[i] as usize,
+                generation,
             )?;
         } else {
             hot.push(i);
@@ -2118,13 +2316,16 @@ pub fn gather_corpus_batched(
         max_k = max_k.max(gk.dim(0)?);
         gid_keep.push(gk);
     }
-    let ptrs_t = Tensor::from_vec(ptrs, 5 * n_hot, &device)?;
-    let meta_t = Tensor::from_vec(meta, 2 * n_hot, &device)?;
+    // Both tables ride the wave arena — they are read once per block and never
+    // touched again, which is exactly what the bump arena is for. Uploading them
+    // per call cost more than this kernel does (see `desc.rs`).
+    let ptrs_t = crate::models::deepseek4::desc::stage(&ptrs, generation)?;
+    let meta_t = crate::models::deepseek4::desc::stage_slice(&meta, generation)?;
 
     let code = unsafe {
         candle_kernels::simple::corpus_gather::run_corpus_gather_rows_batched(
-            dp!(ptrs_t, i64) as *const i64,
-            dp!(meta_t, u32) as *const u32,
+            ptrs_t.ptr() as *const i64,
+            meta_t.ptr() as *const u32,
             dp!(out_nope, u8) as *mut u32,
             dp!(out_scale, f32) as *mut u32,
             dp!(out_rope, half::bf16) as *mut u32,
@@ -2192,7 +2393,8 @@ mod tests {
         let os = Tensor::zeros((total, NOPE_BANDS), DType::F32, &dev)?;
         let or_ = Tensor::zeros((total, ROPE_DIM), DType::BF16, &dev)?;
         let op = Tensor::zeros(total, DType::U32, &dev)?;
-        g.gather_corpus_into(&gids, &on, &os, &or_, &op, off)?;
+        let scope = crate::models::deepseek4::desc::scope(&dev)?;
+        g.gather_corpus_into(&gids, &on, &os, &or_, &op, off, &scope)?;
 
         let got_n = on.narrow(0, off, k)?;
         let got_s = os.narrow(0, off, k)?;
@@ -2255,7 +2457,8 @@ mod tests {
         let or_ = Tensor::zeros((total, ROPE_DIM), DType::BF16, &dev)?;
         let op = Tensor::zeros(total, DType::U32, &dev)?;
         let grefs: Vec<&FloatGallery> = galleries.iter().collect();
-        gather_corpus_batched(&grefs, &gids, &offsets, &on, &os, &or_, &op)?;
+        let scope = crate::models::deepseek4::desc::scope(&dev)?;
+        gather_corpus_batched(&grefs, &gids, &offsets, &on, &os, &or_, &op, &scope)?;
 
         let bits_u8 = |t: &Tensor| -> Result<Vec<u8>> { t.flatten_all()?.to_vec1::<u8>() };
         let bits_u32 = |t: &Tensor| -> Result<Vec<u32>> {

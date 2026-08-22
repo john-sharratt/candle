@@ -82,3 +82,9 @@ pub mod compressor_pool;
 // Fused Indexer score reduction: relu + per-head weight + sum over heads + the
 // padding mask, for both batched two-stage selectors (decode and prefill)
 pub mod indexer_score;
+
+// Batched row scatter: many (source run → destination offset) copies in one
+// launch, driven by a descriptor table — the corpus-gallery append across every
+// session of a wave
+pub mod comp_idx;
+pub mod rows_scatter;
