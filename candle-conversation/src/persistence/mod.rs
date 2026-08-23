@@ -802,7 +802,8 @@ impl SubstratePersistence {
         // this tombstone skips relocating the (now dead) snapshot record —
         // the same removal the substrate index performs in `apply_tombstone`,
         // and the same one `record_snapshot_loc` replays on reload.
-        self.snapshot_locs.remove(&snapshot_stream_id(timeline_id).0);
+        self.snapshot_locs
+            .remove(&snapshot_stream_id(timeline_id).0);
         Ok(())
     }
 

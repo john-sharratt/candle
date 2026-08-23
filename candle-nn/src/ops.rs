@@ -542,6 +542,10 @@ struct RmsNorm {
     /// head, whose operand is the residual stream and therefore pool-backed.
     /// `None` is the ordinary case and means "inherit or fall back to the pool",
     /// which is what plain [`rms_norm`] does.
+    ///
+    /// Only the CUDA path reads it — there are no wave arenas to name without a
+    /// device — but the field stays so both builds construct the same struct.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     root: Option<WaveTicket>,
 }
 

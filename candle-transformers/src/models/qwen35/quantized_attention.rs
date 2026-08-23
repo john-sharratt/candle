@@ -20,9 +20,9 @@ use candle::{DType, LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 
 use super::quantized_weights::{QuantFfn, QuantLayer};
-use crate::models::rotary_layout::RotaryLayout;
 use crate::models::batched_layer::{BatchedAttentionLayer, QkvProjection, WaveRef};
 use crate::models::quantized_matmul::QMatMul;
+use crate::models::rotary_layout::RotaryLayout;
 use crate::models::wave_buffers::wave_root;
 
 /// One full-attention layer of the hybrid stack, bound to the geometry it
@@ -97,7 +97,9 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
         mode: Int8Mode,
         wave: WaveRef<'w>,
     ) -> Result<DynamicActs<'w>> {
-        self.layer.attn_norm.forward_dynamic(x, mode, wave_root(wave))
+        self.layer
+            .attn_norm
+            .forward_dynamic(x, mode, wave_root(wave))
     }
 
     #[cfg(feature = "cuda")]

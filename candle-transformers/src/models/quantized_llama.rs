@@ -24,7 +24,7 @@ use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
 use super::llama_rope::llama_inv_freq;
-use super::profile::{pipeline_record, profile_now, profile_sync};
+use super::profile::gpu_span_phase;
 use super::quantized_mlp::QuantizedMlp;
 use super::rope_tables::CisPrecomputations;
 use super::{decode_utils, quantized_matmul::QMatMul};
@@ -61,6 +61,9 @@ pub const ROPE_EXTEND_CHUNK: usize = 1024;
 
 type SharedCis = Arc<RwLock<CisPrecomputations>>;
 
+// One per layer for the model's lifetime, and matched on in the forward path —
+// a `Box` would add a pointer chase to every FFN to save a few hundred bytes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum MlpOrMoe {
     Mlp(QuantizedMlp),
@@ -330,7 +333,11 @@ impl LayerWeights {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, n_embd) = x.dims3()?;
 
-        let t_qkv = profile_now();
+        // The phase is known before the span opens (`seq_len == 1` is decode), so
+        // the name is chosen up front rather than at the record, as the
+        // host-timed version could.
+        let dec = seq_len == 1;
+        let g_qkv = gpu_span_phase(dec, "decode:qkv_proj", "prefill:qkv_proj", x.device());
         let q = self.attention_wq.forward(x)?;
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;
@@ -350,25 +357,15 @@ impl LayerWeights {
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
-        profile_sync(q.device());
-        if seq_len == 1 {
-            pipeline_record("decode:qkv_proj", t_qkv);
-        } else {
-            pipeline_record("prefill:qkv_proj", t_qkv);
-        }
+        g_qkv.end();
 
         // Reset KV cache if we're at the first position
-        let t_alloc = profile_now();
+        let g_alloc = gpu_span_phase(dec, "decode:alloc", "prefill:alloc", x.device());
         if index_pos == 0 {
             cache.reset();
         }
         let (k, v) = cache.append(&k, &v)?;
-        profile_sync(q.device());
-        if seq_len == 1 {
-            pipeline_record("decode:alloc", t_alloc);
-        } else {
-            pipeline_record("prefill:alloc", t_alloc);
-        }
+        g_alloc.end();
 
         // Use optimized attention kernels when available
         let cache_dtype = cache.dtype();
@@ -402,7 +399,7 @@ impl LayerWeights {
             att.matmul(&v)
         };
 
-        let t_kernel = profile_now();
+        let g_kernel = gpu_span_phase(dec, "decode:kernel", "prefill:kernel", x.device());
         let y = if seq_len == 1 && q.device().is_metal() {
             candle_nn::ops::sdpa(&q, &k, &v, 1. / (self.head_dim as f32).sqrt(), 1.)?
         } else if seq_len > 1 && matches!(q.device(), Device::Cuda(_)) {
@@ -422,22 +419,12 @@ impl LayerWeights {
         } else {
             standard_attention()?
         };
-        profile_sync(x.device());
-        if seq_len == 1 {
-            pipeline_record("decode:kernel", t_kernel);
-        } else {
-            pipeline_record("prefill:kernel", t_kernel);
-        }
+        g_kernel.end();
 
-        let t_out_proj = profile_now();
+        let g_out_proj = gpu_span_phase(dec, "decode:out_proj", "prefill:out_proj", x.device());
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
         let y = self.attention_wo.forward(&y)?;
-        profile_sync(x.device());
-        if seq_len == 1 {
-            pipeline_record("decode:out_proj", t_out_proj);
-        } else {
-            pipeline_record("prefill:out_proj", t_out_proj);
-        }
+        g_out_proj.end();
         Ok(y)
     }
 }
@@ -1283,118 +1270,91 @@ impl ModelWeights {
             let x = layer_in;
             let residual = &x;
 
-            let t_attn_total = profile_now();
-            let t_attn_norm = profile_now();
-            let x = layer.attention_norm.forward(&x)?;
-            profile_sync(x.device());
-            pipeline_record(
-                if stage_prefix == "decode" {
-                    "decode:model:attn:norm"
-                } else {
-                    "prefill:model:attn:norm"
-                },
-                t_attn_norm,
+            let dec = stage_prefix == "decode";
+            let dv = x.device().clone();
+            let g_attn_total = gpu_span_phase(
+                dec,
+                "decode:model:attn:total",
+                "prefill:model:attn:total",
+                &dv,
             );
+            let g_attn_norm = gpu_span_phase(
+                dec,
+                "decode:model:attn:norm",
+                "prefill:model:attn:norm",
+                &dv,
+            );
+            let x = layer.attention_norm.forward(&x)?;
+            g_attn_norm.end();
 
-            let t_attn_core = profile_now();
+            let g_attn_core = gpu_span_phase(
+                dec,
+                "decode:model:attn:core",
+                "prefill:model:attn:core",
+                &dv,
+            );
             let attn = layer
                 .forward_attn(cache, &x, ctx.offset)?
                 .to_dtype(embed_dtype)?;
-            profile_sync(attn.device());
-            pipeline_record(
-                if stage_prefix == "decode" {
-                    "decode:model:attn:core"
-                } else {
-                    "prefill:model:attn:core"
-                },
-                t_attn_core,
-            );
+            g_attn_core.end();
 
-            let t_attn_residual = profile_now();
+            let g_attn_resid = gpu_span_phase(
+                dec,
+                "decode:model:attn:resid",
+                "prefill:model:attn:resid",
+                &dv,
+            );
             let x = (attn + residual)?;
-            profile_sync(x.device());
-            pipeline_record(
-                if stage_prefix == "decode" {
-                    "decode:model:attn:resid"
-                } else {
-                    "prefill:model:attn:resid"
-                },
-                t_attn_residual,
-            );
-            pipeline_record(
-                if stage_prefix == "decode" {
-                    "decode:model:attn:total"
-                } else {
-                    "prefill:model:attn:total"
-                },
-                t_attn_total,
-            );
+            g_attn_resid.end();
+            g_attn_total.end();
 
             // MLP
-            let t_mlp_total = profile_now();
+            let g_mlp_total = gpu_span_phase(
+                dec,
+                "decode:model:mlp:total",
+                "prefill:model:mlp:total",
+                &dv,
+            );
             let _enter = layer.span_mlp.enter();
             let residual = &x;
 
-            let t_mlp_norm = profile_now();
+            let g_mlp_norm =
+                gpu_span_phase(dec, "decode:model:mlp:norm", "prefill:model:mlp:norm", &dv);
             let x = layer.ffn_norm.forward(&x)?;
-            profile_sync(x.device());
-            pipeline_record(
-                if stage_prefix == "decode" {
-                    "decode:model:mlp:norm"
-                } else {
-                    "prefill:model:mlp:norm"
-                },
-                t_mlp_norm,
-            );
+            g_mlp_norm.end();
 
-            let t_mlp_ffn = profile_now();
+            let g_ffn = gpu_span_phase(
+                dec,
+                "decode:model:ffn:total",
+                "prefill:model:ffn:total",
+                &dv,
+            );
             let x = layer.mlp_or_moe.forward(&x)?;
-            profile_sync(x.device());
-            pipeline_record(
-                if stage_prefix == "decode" {
-                    "decode:model:ffn:total"
-                } else {
-                    "prefill:model:ffn:total"
-                },
-                t_mlp_ffn,
-            );
+            g_ffn.end();
 
-            let t_mlp_residual = profile_now();
+            let g_mlp_resid = gpu_span_phase(
+                dec,
+                "decode:model:mlp:resid",
+                "prefill:model:mlp:resid",
+                &dv,
+            );
             let x = (x + residual)?;
-            profile_sync(x.device());
-            pipeline_record(
-                if stage_prefix == "decode" {
-                    "decode:model:mlp:resid"
-                } else {
-                    "prefill:model:mlp:resid"
-                },
-                t_mlp_residual,
-            );
-            pipeline_record(
-                if stage_prefix == "decode" {
-                    "decode:model:mlp:total"
-                } else {
-                    "prefill:model:mlp:total"
-                },
-                t_mlp_total,
-            );
+            g_mlp_resid.end();
+            g_mlp_total.end();
 
             layer_in = x
         }
-        let t_norm = profile_now();
+        let g_norm = gpu_span_phase(
+            stage_prefix == "decode",
+            "decode:model:norm+proj",
+            "prefill:model:norm+proj",
+            layer_in.device(),
+        );
         let x = self.norm.forward(&layer_in)?;
         let x = x.i((.., seq_len - 1, ..))?.contiguous()?;
         let _enter = self.span_output.enter();
         let out = self.output.forward(&x)?;
-        profile_sync(out.device());
-        pipeline_record(
-            if stage_prefix == "decode" {
-                "decode:model:norm+proj"
-            } else {
-                "prefill:model:norm+proj"
-            },
-            t_norm,
-        );
+        g_norm.end();
         Ok(out)
     }
 

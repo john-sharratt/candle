@@ -194,8 +194,7 @@ impl ChunkedKvBacking {
                     return Ok(None);
                 };
                 let dst = slot as i64 + (in_blk * sub * elem) as i64;
-                let src =
-                    base_addr + (((h * len + src_pos) * head_dim + p * sub) * elem) as i64;
+                let src = base_addr + (((h * len + src_pos) * head_dim + p * sub) * elem) as i64;
                 plan.push_strided(src, dst, row_bytes, seg as i64, src_stride, dst_stride);
             }
 

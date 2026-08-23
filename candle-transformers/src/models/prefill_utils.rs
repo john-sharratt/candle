@@ -1,5 +1,5 @@
 #[cfg(feature = "cuda")]
-use crate::models::profile::{pipeline_record, profile_now, profile_sync};
+use crate::models::profile::{gpu_span, pipeline_record, profile_now};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
@@ -541,13 +541,10 @@ fn paged_prefill_batched_impl<'w>(
         candle::bail!("chunked backing unavailable");
     }
 
-    // Entry drain: attributes GPU work still in flight when the prefill
-    // call begins (enqueued by the caller) separately from this call's own
-    // spans — without it the first sync'd span absorbs the caller's tail.
-    let t_entry = profile_now();
-    profile_sync(q.device());
-    pipeline_record("prefill:entry", t_entry);
-
+    // No entry drain. The span that used to sit here existed only to absorb the
+    // caller's in-flight tail so the first host-synced span did not inherit it —
+    // an artefact of timing by synchronisation. GPU spans bracket their own work
+    // with stream-ordered events, so a caller's tail is simply not inside them.
     let t_meta = profile_now();
     let (compute_dtype, _chunk_size) = {
         let first = caches
@@ -583,7 +580,7 @@ fn paged_prefill_batched_impl<'w>(
 
     pipeline_record("prefill:metadata", t_meta);
 
-    let t_pack = profile_now();
+    let g_pack = gpu_span("prefill:pack", q.device());
     // --- prefill:pack spans tensor packing, chunk_meta, head_gids construction ---
     // Some model paths provide non-contiguous K/V; ensure contiguity once.
     let k = if k.is_contiguous() {
@@ -675,8 +672,7 @@ fn paged_prefill_batched_impl<'w>(
     )?;
     let headers_ptr = header_upload.headers_ptr;
 
-    profile_sync(q.device());
-    pipeline_record("prefill:pack", t_pack);
+    g_pack.end();
 
     // Optional kernel-replay capture: dumps this call's packed Q/K/V + cached KV
     // chunks + geometry to a fixture. No-op unless `ZEND_PREFILL_CAPTURE` is set;
@@ -696,7 +692,7 @@ fn paged_prefill_batched_impl<'w>(
         rope_interleaved,
     );
 
-    let t_kernel = profile_now();
+    let g_kernel = gpu_span("prefill:kernel", q.device());
     let out_packed = paged_prefill_attn_varlen_chunks(
         wave,
         &q_packed,
@@ -716,8 +712,7 @@ fn paged_prefill_batched_impl<'w>(
         rope_interleaved,
         max_add,
     )?;
-    profile_sync(q.device());
-    pipeline_record("prefill:kernel", t_kernel);
+    g_kernel.end();
     // Per-sequence written length (each sequence advanced by its own q_lens[i],
     // not the over-allocated max_add).
     for ((cache, &off), &add) in caches.iter_mut().zip(offsets.iter()).zip(q_lens.iter()) {
@@ -1615,7 +1610,7 @@ pub fn paged_glue_attn<'w>(
         device,
     )?;
 
-    let t_hdr = profile_now();
+    let g_hdr = gpu_span("glue:hdr_meta", device);
     // The gaps are real chunks already (no trailing write region), so the slot
     // headers cover exactly `[0, kv_len)`; pass zero glue so build_slot_headers
     // does not extend a write region. `shared_pm` is the forward's glue-group
@@ -1627,10 +1622,9 @@ pub fn paged_glue_attn<'w>(
     let header_upload = build_slot_headers(
         caches, &zero_q, n_kv_head, head_dim, generation, shared_pm, None,
     )?;
-    profile_sync(device);
-    pipeline_record("glue:hdr_meta", t_hdr);
+    g_hdr.end();
 
-    let t_kernel = profile_now();
+    let g_kernel = gpu_span("glue:kernel", device);
     let softmax_scale = 1f32 / (head_dim as f32).sqrt();
     let op = PagedGlueChunks {
         softmax_scale,
@@ -1656,8 +1650,7 @@ pub fn paged_glue_attn<'w>(
     };
     let q_compute = q_packed.to_dtype(compute_dtype)?;
     let out = with_q_storage(&q_compute, |s, l| op.run(s, l, wave))?;
-    profile_sync(device);
-    pipeline_record("glue:kernel", t_kernel);
+    g_kernel.end();
 
     // NO advance here: the glue tokens are reserved IN PLACE as gap chunks whose
     // `usage` is already counted in each slot's length (`reserve_glue_gap`). This

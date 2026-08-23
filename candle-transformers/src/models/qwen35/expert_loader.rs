@@ -31,10 +31,7 @@ use crate::models::expert_lre::{
 /// every layer. A checkpoint that split experts into 2-D per-expert tensors
 /// would need the other branch; these do not, and are refused explicitly
 /// rather than silently mis-read.
-pub fn expert_host_refs(
-    content: &Content,
-    cfg: &Qwen35Config,
-) -> Result<Vec<Vec<MmapExpertRef>>> {
+pub fn expert_host_refs(content: &Content, cfg: &Qwen35Config) -> Result<Vec<Vec<MmapExpertRef>>> {
     let moe = cfg
         .moe
         .ok_or_else(|| candle::Error::Msg("expert_host_refs: model declares no experts".into()))?;
@@ -48,10 +45,7 @@ pub fn expert_host_refs(
             format!("{p}.ffn_up_exps.weight"),
             format!("{p}.ffn_down_exps.weight"),
         ];
-        let infos: Vec<_> = names
-            .iter()
-            .map(|n| content.tensor_infos.get(n))
-            .collect();
+        let infos: Vec<_> = names.iter().map(|n| content.tensor_infos.get(n)).collect();
         let (gate, up, down) = match (infos[0], infos[1], infos[2]) {
             (Some(g), Some(u), Some(d)) => (g, u, d),
             // Not a MoE layer at all — a mixed stack is legal, and its dense
@@ -161,11 +155,9 @@ pub fn build_expert_cache(
     // measured cold-boot peak — and may grow to `limit` once the KV side has
     // shown what it actually uses.
     let slots_in = |bytes: usize| {
-        if slot_bytes > 0 {
-            (bytes / slot_bytes).min(total_experts)
-        } else {
-            0
-        }
+        bytes
+            .checked_div(slot_bytes)
+            .map_or(0, |n| n.min(total_experts))
     };
     let measured = slots_in(initial_weight_bytes(&stream)?);
     let limit = slots_in(weight_capacity_bytes(&stream)?);

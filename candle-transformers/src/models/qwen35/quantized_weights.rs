@@ -334,9 +334,7 @@ where
         let ffn = if g.has(&format!("{p}.ffn_gate_inp.weight")) {
             #[cfg(not(feature = "cuda"))]
             {
-                candle::bail!(
-                    "blk.{li} is a MoE layer — the expert cache is a CUDA-only path"
-                );
+                candle::bail!("blk.{li} is a MoE layer — the expert cache is a CUDA-only path");
             }
             #[cfg(feature = "cuda")]
             {
@@ -394,8 +392,7 @@ where
         };
         pending_layers.push(PendingLayer {
             attn_norm: g.norm(&format!("{p}.attn_norm.weight"), cfg.rms_norm_eps)?,
-            post_attn_norm: g
-                .norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_norm_eps)?,
+            post_attn_norm: g.norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_norm_eps)?,
             mix,
             ffn,
         });

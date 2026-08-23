@@ -229,9 +229,10 @@ impl Model {
                     ModelArch::Qwen2 => Ok(Model::Qwen2(quantized_qwen2::ModelWeights::from_gguf(
                         content, &mut file, device,
                     )?)),
-                    ModelArch::Llama => Ok(Model::Llama(quantized_llama::ModelWeights::from_gguf(
-                        content, &mut file, device,
-                    )?)),
+                    // The only Llama variant here is Llama-3.2-3B.
+                    ModelArch::Llama => Ok(Model::Llama(
+                        quantized_llama::ModelWeights::from_gguf_v3(content, &mut file, device)?,
+                    )),
                     ModelArch::Qwen3Moe => unreachable!(),
                 }
             }

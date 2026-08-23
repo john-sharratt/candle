@@ -146,10 +146,14 @@ mod tests {
 
     fn lcg_tensor(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
         let n: usize = shape.iter().product();
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let vals: Vec<f32> = (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
             })
             .collect();
@@ -184,8 +188,7 @@ mod tests {
     fn routing_selects_topk_renormalizes_and_scales() {
         let dev = dev();
         // One token, 4 experts, logits chosen so softmax order is 2 > 0 > 3 > 1.
-        let logits =
-            Tensor::from_vec(vec![1.0f32, -2.0, 3.0, 0.5], (1, 4), &dev).unwrap();
+        let logits = Tensor::from_vec(vec![1.0f32, -2.0, 3.0, 0.5], (1, 4), &dev).unwrap();
         let r = route(&logits, 2, true, 1.5).unwrap();
         assert_eq!(r[0].experts, vec![2, 0]);
         // Renormalized pair sums to 1, then scaled by 1.5.
@@ -200,8 +203,9 @@ mod tests {
         // softmax-weighted mixture of every expert — computed here explicitly.
         let dev = dev();
         let (hidden, ffn, e, t) = (4usize, 6usize, 3usize, 5usize);
-        let experts: Vec<FfnWeights> =
-            (0..e).map(|i| tiny_ffn(hidden, ffn, 100 + 10 * i as u64, &dev)).collect();
+        let experts: Vec<FfnWeights> = (0..e)
+            .map(|i| tiny_ffn(hidden, ffn, 100 + 10 * i as u64, &dev))
+            .collect();
         let moe = MoeWeights {
             router: lcg_tensor(&[e, hidden], 71, &dev),
             experts: experts.clone(),
@@ -214,10 +218,8 @@ mod tests {
         let x = lcg_tensor(&[t, hidden], 73, &dev);
         let got = moe.forward(&x).unwrap();
 
-        let probs = candle_nn::ops::softmax_last_dim(
-            &x.matmul(&moe.router.t().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let probs =
+            candle_nn::ops::softmax_last_dim(&x.matmul(&moe.router.t().unwrap()).unwrap()).unwrap();
         let mut expect = Tensor::zeros((t, hidden), DType::F32, &dev).unwrap();
         for (i, ex) in experts.iter().enumerate() {
             let w = probs.narrow(1, i, 1).unwrap();
@@ -225,10 +227,8 @@ mod tests {
                 .add(&ex.forward(&x).unwrap().broadcast_mul(&w).unwrap())
                 .unwrap();
         }
-        let gate = candle_nn::ops::sigmoid(
-            &x.matmul(&moe.shared_gate.t().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let gate =
+            candle_nn::ops::sigmoid(&x.matmul(&moe.shared_gate.t().unwrap()).unwrap()).unwrap();
         expect = expect
             .add(
                 &moe.shared
@@ -261,10 +261,8 @@ mod tests {
         };
         let x = lcg_tensor(&[3, hidden], 83, &dev);
         let got = moe.forward(&x).unwrap();
-        let gate = candle_nn::ops::sigmoid(
-            &x.matmul(&moe.shared_gate.t().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let gate =
+            candle_nn::ops::sigmoid(&x.matmul(&moe.shared_gate.t().unwrap()).unwrap()).unwrap();
         let expect = moe
             .shared
             .forward(&x)

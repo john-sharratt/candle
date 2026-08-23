@@ -487,9 +487,7 @@ impl WaveBuffer {
             Self::GateSplit | Self::GateSigmoid | Self::GatedContext if g.gated_qkv => {
                 dense(rows, g.attn_cols(), g.act_dtype)
             }
-            Self::GateSplit | Self::GateSigmoid | Self::GatedContext => {
-                dense(0, 0, g.act_dtype)
-            }
+            Self::GateSplit | Self::GateSigmoid | Self::GatedContext => dense(0, 0, g.act_dtype),
             Self::QRotaryPermute if g.partial_rotary => dense(rows, g.attn_cols(), g.act_dtype),
             Self::KRotaryPermute if g.partial_rotary => dense(rows, g.kv_cols(), g.act_dtype),
             Self::QRotaryPermute | Self::KRotaryPermute => dense(0, 0, g.act_dtype),
@@ -792,10 +790,8 @@ mod tests {
                                 | WaveBuffer::GateSigmoid
                                 | WaveBuffer::GatedContext
                         ) && !g.gated_qkv)
-                        || (matches!(
-                            b,
-                            WaveBuffer::QRotaryPermute | WaveBuffer::KRotaryPermute
-                        ) && !g.partial_rotary);
+                        || (matches!(b, WaveBuffer::QRotaryPermute | WaveBuffer::KRotaryPermute)
+                            && !g.partial_rotary);
                     let s = b.shape(&g, rows);
                     if conditional {
                         assert_eq!(b.bytes(&g, rows), 0, "{b:?} priced while disabled");

@@ -80,8 +80,7 @@ impl Qwen35MoeBlock {
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         // Shared expert first — see the module note on ownership.
-        let gated =
-            shared_expert_contribution(&self.shared, &self.shared_gate, &acts, out_dtype)?;
+        let gated = shared_expert_contribution(&self.shared, &self.shared_gate, &acts, out_dtype)?;
         let routed = self.routed.forward_dynamic(acts, out_dtype, wave)?;
         &routed + &gated
     }

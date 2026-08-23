@@ -738,8 +738,7 @@ mod tests {
     /// allowed to be, so the count is set directly here and
     /// [`pinning_never_consumes_the_whole_cache`] covers the sizing rule.
     fn cache(n: usize) -> ExpertCacheInner {
-        let mut inner =
-            ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, n, n, 0), 48, 128);
+        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, n, n, 0), 48, 128);
         inner.pinned_layers = PINNED_LAYERS;
         inner
     }

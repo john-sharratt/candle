@@ -30,20 +30,20 @@
 use std::cell::RefCell;
 
 use candle::{DType, Device, Result, Tensor};
+use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
     begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, WavePlan,
     REGION_BYTES, WAVE_FORWARD_BYTES,
 };
-use candle_nn::kv_cache::KvCache;
 
 use super::batched::HybridBatched;
 use super::quantized_attention::Qwen35AttentionLayer;
 use super::quantized_delta_net::quantized_delta_net_ffn;
 use super::quantized_weights::{QuantLayerMix, QuantModel};
-use crate::models::delta_net::RecurrentStateStore;
 use super::wave::delta_net_mix_wave;
 use crate::models::delta_net::seq_spans;
+use crate::models::delta_net::RecurrentStateStore;
 use candle_nn::kv_cache::ModelGeometry;
 
 use crate::models::batched_inference::{
@@ -52,8 +52,8 @@ use crate::models::batched_inference::{
 use crate::models::batched_layer::{
     forward_layer_batched_mixed, BatchedAttentionParams, WaveAttnGroup,
 };
-use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use crate::models::batched_model::{activation_dtype, WaveGuard, WavePhase};
+use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
@@ -345,7 +345,9 @@ fn sweep_layers(
     let q = model.model();
     let num_layers = q.cfg.num_layers;
     if layer_start > layer_end || layer_end > num_layers {
-        candle::bail!("qwen35 wave: bad layer range [{layer_start}, {layer_end}) over {num_layers} layers");
+        candle::bail!(
+            "qwen35 wave: bad layer range [{layer_start}, {layer_end}) over {num_layers} layers"
+        );
     }
     let n_glue = contexts
         .len()
@@ -426,7 +428,7 @@ fn sweep_layers(
         Some(resume) => resume,
         None => {
             let ids: Vec<Tensor> = contexts.iter().map(|c| c.input_ids.clone()).collect();
-            let packed = TensorCat::from_tensors(1, ids.into_iter())?;
+            let packed = TensorCat::from_tensors(1, ids)?;
             TensorCat::from_cat_tensor(embed_rows(q, &packed.to_tensor(), embed_dtype)?, 0)?
         }
     };
@@ -436,12 +438,17 @@ fn sweep_layers(
     // rotate all 256 dims where only 64 turn.
     let max_blocks = contexts
         .first()
-        .and_then(|c| c.kv_caches.caches.first().map(|k| k.k_cache().chunked_max_blocks()))
+        .and_then(|c| {
+            c.kv_caches
+                .caches
+                .first()
+                .map(|k| k.k_cache().chunked_max_blocks())
+        })
         .unwrap_or(0);
     let rope_cs = model.rope_cs(max_blocks)?;
 
     // Per-group split cos/sin over this wave's own positions.
-    let theta = q.cfg.rope_theta as f32;
+    let theta = q.cfg.rope_theta;
     let rot = model.rotary();
     let dec_pos: Vec<u32> = dec_off.iter().map(|&o| o as u32).collect();
     let mut pre_pos: Vec<u32> = Vec::with_capacity(pre_rows);
@@ -610,7 +617,8 @@ fn sweep_layers(
                 q.lm_head.int8mode(),
                 wave_root(head_span.as_ref()),
             )?;
-            q.lm_head.forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?
+            q.lm_head
+                .forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -624,6 +632,23 @@ fn sweep_layers(
     ))
 }
 
+/// Embed token ids through the host-resident table.
+///
+/// One of the two sanctioned GPU→CPU touches on the hot path (CLAUDE.md
+/// invariant 3): the ids come back, a CPU `index_select` gathers the rows, and
+/// one upload carries them in — which keeps a `vocab × hidden` table (4 GB at
+/// the 9B's geometry) out of VRAM entirely.
+fn embed_rows(model: &QuantModel, ids: &Tensor, dtype: DType) -> Result<Tensor> {
+    let flat = ids.flatten_all()?;
+    let n = flat.elem_count();
+    let host_ids = flat.to_dtype(DType::U32)?.to_device(&Device::Cpu)?;
+    let rows = model.embed.index_select(&host_ids, 0)?;
+    let hidden = model.cfg.hidden_size;
+    rows.reshape((1, n, hidden))?
+        .to_dtype(dtype)?
+        .to_device(&model.device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,8 +656,8 @@ mod tests {
     use crate::models::batch_test::utils::TestParams;
     use crate::models::batched_inference::BatchedConfig;
     use crate::models::dialect::Dialect;
-    use crate::models::qwen35::loader::load_reference_model;
     use crate::models::quantized_qwen35::from_gguf_path;
+    use crate::models::qwen35::loader::load_reference_model;
     use crate::models::qwen35::quantized_loader::Qwen35LoadOptions;
     use candle::quantized::gguf_file::Content;
     use candle::quantized::Int8Mode;
@@ -726,7 +751,10 @@ mod tests {
             let mut st = reference.new_session()?;
             let full = reference.forward(ids, &mut st)?;
             if finite(&full)? {
-                println!("  reference [{label}]: finite over all {} tokens", ids.len());
+                println!(
+                    "  reference [{label}]: finite over all {} tokens",
+                    ids.len()
+                );
                 continue;
             }
             let mut first_bad = None;
@@ -818,7 +846,8 @@ mod tests {
         println!("logit cosine {cos:.6}");
 
         assert_eq!(
-            ref_argmax, wave_argmax,
+            ref_argmax,
+            wave_argmax,
             "the wave and the reference disagree on the next token \
              ({ref_argmax} {:?} vs {wave_argmax} {:?}, cosine {cos:.4})",
             name(ref_argmax),
@@ -907,9 +936,11 @@ mod tests {
             .to_scalar::<u32>()?;
         drop(step);
         assert_eq!(
-            ref_tok, wave_tok,
+            ref_tok,
+            wave_tok,
             "first sampled token already differs ({:?} vs {:?})",
-            name(ref_tok), name(wave_tok)
+            name(ref_tok),
+            name(wave_tok)
         );
 
         for i in 0..8 {
@@ -939,10 +970,15 @@ mod tests {
                 "  decode {i}: reference {:?}   wave {:?}{}",
                 name(ref_tok),
                 name(wave_tok),
-                if ref_tok == wave_tok { "" } else { "   ← DIVERGED" }
+                if ref_tok == wave_tok {
+                    ""
+                } else {
+                    "   ← DIVERGED"
+                }
             );
             assert_eq!(
-                ref_tok, wave_tok,
+                ref_tok,
+                wave_tok,
                 "decode step {i} diverged: reference {:?}, wave {:?}",
                 name(ref_tok),
                 name(wave_tok)
@@ -1131,7 +1167,7 @@ mod tests {
             let mut session =
                 model.create_batched_session(BatchedConfig::default().with_dtype(kv_dtype))?;
             let seq = session.create_sequence()?;
-            let ids = Tensor::from_vec(ids_host.to_vec(), (1, n), &device)?;
+            let ids = Tensor::from_vec(ids_host.to_vec(), (1, n), device)?;
             let step = model.forward_wave(
                 &mut session,
                 &[],
@@ -1174,21 +1210,4 @@ mod tests {
         }
         Ok(worst)
     }
-}
-
-/// Embed token ids through the host-resident table.
-///
-/// One of the two sanctioned GPU→CPU touches on the hot path (CLAUDE.md
-/// invariant 3): the ids come back, a CPU `index_select` gathers the rows, and
-/// one upload carries them in — which keeps a `vocab × hidden` table (4 GB at
-/// the 9B's geometry) out of VRAM entirely.
-fn embed_rows(model: &QuantModel, ids: &Tensor, dtype: DType) -> Result<Tensor> {
-    let flat = ids.flatten_all()?;
-    let n = flat.elem_count();
-    let host_ids = flat.to_dtype(DType::U32)?.to_device(&Device::Cpu)?;
-    let rows = model.embed.index_select(&host_ids, 0)?;
-    let hidden = model.cfg.hidden_size;
-    rows.reshape((1, n, hidden))?
-        .to_dtype(dtype)?
-        .to_device(&model.device)
 }

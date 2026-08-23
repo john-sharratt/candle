@@ -570,7 +570,7 @@ impl ChunkedKvBacking {
                     let mut swept = 0usize;
                     if self.inner.pool.has_reclaimable() {
                         for k in self.inner.pool.format_keys() {
-                            while let Some(idx) = self.inner.pool.next_tombstone(k.clone()) {
+                            while let Some(idx) = self.inner.pool.next_tombstone(k) {
                                 arena_state.release_arena(idx);
                                 swept += 1;
                             }

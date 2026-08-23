@@ -264,8 +264,11 @@ impl Model {
                         Ok(Model::Qwen2(m))
                     }
                     ModelArch::Llama => {
-                        let m =
-                            quantized_llama::ModelWeights::from_gguf(content, &mut file, device)?;
+                        // Every `ModelArch::Llama` variant here is a Llama 3.x
+                        // checkpoint, so it takes the 3.x KV calibration.
+                        let m = quantized_llama::ModelWeights::from_gguf_v3(
+                            content, &mut file, device,
+                        )?;
                         Ok(Model::Llama(m))
                     }
                     ModelArch::Qwen3Moe => unreachable!(),

@@ -18,11 +18,11 @@ use candle::DType;
 use candle_nn::kv_cache::ModelGeometry;
 
 use super::config::Qwen35Config;
-use crate::models::delta_net::KvLayerMap;
 use super::quantized_weights::QuantModel;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ProvenanceLayerIndices,
 };
+use crate::models::delta_net::KvLayerMap;
 
 /// The widest per-row intermediate activation a layer of this model produces.
 ///
@@ -157,13 +157,12 @@ impl QuantModel {
     pub fn kv_map(&self) -> KvLayerMap {
         KvLayerMap::new(&self.cfg.layer_kinds)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::{DeltaNetDims, LayerKind, MoeConfig};
+    use super::*;
 
     /// The 9B's real geometry.
     fn nine_b() -> Qwen35Config {

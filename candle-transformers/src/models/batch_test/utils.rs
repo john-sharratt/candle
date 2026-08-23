@@ -21,8 +21,9 @@ use crate::models::batched_inference::{
 };
 use crate::models::dialect::Dialect;
 use crate::models::expert_lre::PipelineStats;
-use crate::models::profile::ProfileSnapshot;
-use crate::models::profile::{pipeline_record, pipeline_snapshot_and_reset, profile_now};
+use crate::models::profile::{
+    gpu_drain_blocking, pipeline_record, pipeline_snapshot_and_reset, profile_now, ProfileSnapshot,
+};
 
 /// Determines the validation strategy for the test harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1243,6 +1244,11 @@ impl TestParams {
         // attributed separately from decode — the final `pipeline_snapshot_and_reset`
         // below then contains only the generate (decode) phase. Without this split
         // the MoE / mHC spans (which run in both phases) are un-attributable.
+        // Harvest the GPU spans before snapshotting: their elapsed times are read
+        // from CUDA events, so an unharvested pair contributes nothing and the
+        // phase silently under-reports. This boundary already synchronises
+        // (quantize + seal follows), so the blocking drain costs nothing extra.
+        gpu_drain_blocking();
         let pipeline_bulk_profile = pipeline_snapshot_and_reset();
 
         // Quantize + seal the prefilled history, mirroring the substrate
@@ -1445,7 +1451,10 @@ impl TestParams {
             bulk_profile,
             single_profile,
             pipeline_bulk_profile,
-            pipeline_profile: pipeline_snapshot_and_reset(),
+            pipeline_profile: {
+                gpu_drain_blocking();
+                pipeline_snapshot_and_reset()
+            },
             effective_test_mode: effective_mode,
         })
     }

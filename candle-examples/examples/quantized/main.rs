@@ -500,7 +500,10 @@ fn main() -> anyhow::Result<()> {
                 &format_size(total_size_in_bytes),
                 start.elapsed().as_secs_f32(),
             );
-            ModelWeights::from_gguf(model, &mut file, &device)?
+            // This example loads whatever GGUF it is pointed at, and its own
+            // `Which` list is dominated by Llama-2-era checkpoints, so it takes
+            // the identity KV factor rather than 3.x's tighter one.
+            ModelWeights::from_gguf_v2(model, &mut file, &device)?
         }
         Some("ggml" | "bin") | Some(_) | None => {
             let model = ggml_file::Content::read(&mut file, &device)

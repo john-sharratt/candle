@@ -48,6 +48,7 @@ pub mod dac;
 pub mod debertav2;
 pub mod decode_utils;
 pub mod deepseek2;
+pub mod delta_net;
 // The DeepSeek-V4 arch descriptor names `latent_moe`'s geometry and weights, so
 // it shares that engine's gating.
 #[cfg(feature = "cuda")]
@@ -132,21 +133,20 @@ pub mod quantized_gemma3;
 pub mod quantized_llama;
 pub mod quantized_llama2_c;
 pub mod quantized_matmul;
-pub mod quantized_mlp;
 pub mod quantized_metavoice;
 pub mod quantized_mistral;
 pub mod quantized_mixformer;
+// Reads `DynamicActs` from the CUDA int8 path.
+#[cfg(feature = "cuda")]
+pub mod quantized_mlp;
 pub mod quantized_moondream;
 pub mod quantized_mpt;
 pub mod quantized_phi;
 pub mod quantized_phi3;
 #[cfg(feature = "cuda")]
 pub mod quantized_qwen2;
-pub mod delta_net;
 #[cfg(feature = "cuda")]
 pub mod quantized_qwen3;
-#[cfg(feature = "cuda")]
-pub mod quantized_qwen3_moe;
 #[cfg(feature = "cuda")]
 pub mod quantized_qwen35;
 #[cfg(feature = "cuda")]
@@ -155,7 +155,8 @@ pub mod quantized_qwen35_moe;
 pub mod quantized_qwen36_moe;
 #[cfg(feature = "cuda")]
 pub mod quantized_qwen38;
-pub mod rotary_layout;
+#[cfg(feature = "cuda")]
+pub mod quantized_qwen3_moe;
 pub mod quantized_recurrent_gemma;
 pub mod quantized_rwkv_v5;
 pub mod quantized_rwkv_v6;
@@ -164,9 +165,14 @@ pub mod quantized_t5;
 pub mod qwen2;
 pub mod qwen2_moe;
 pub mod qwen3;
+// The hybrid DeltaNet/attention lineage: it drives the batched wave engine and
+// the streaming expert cache, both CUDA-only. `delta_net` itself stays
+// unconditional — its reference recurrence runs anywhere.
+#[cfg(feature = "cuda")]
 pub mod qwen35;
 pub mod qwen3_moe;
 pub mod rope_tables;
+pub mod rotary_layout;
 pub mod routing_capture;
 
 // The batched-test harness drives the cuda-only batched/paged inference path (batched_inference,
@@ -197,9 +203,11 @@ pub mod voxtral;
 // the CUDA batched path.
 #[cfg(feature = "cuda")]
 mod wave_admit;
-pub mod wave_driver;
 #[cfg(feature = "cuda")]
 pub mod wave_buffers;
+// Drives the batched wave loop over `batched_inference` / `batched_layer`.
+#[cfg(feature = "cuda")]
+pub mod wave_driver;
 pub mod whisper;
 pub mod with_tracing;
 pub mod wuerstchen;

@@ -237,7 +237,9 @@ impl RotaryLayout {
     }
 }
 
-#[cfg(test)]
+// The oracle these compare against is `qwen35::attention::RopeTables`, which
+// lives in the CUDA-gated hybrid lineage.
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use crate::models::qwen35::attention::RopeTables;
@@ -311,7 +313,9 @@ mod tests {
         let reference = RopeTables::new(rope_dim, theta, 8, &dev()).unwrap();
 
         for pos in [0usize, 1, 5, 7] {
-            let x: Vec<f32> = (0..head_dim).map(|i| ((i * 37 % 101) as f32) - 50.0).collect();
+            let x: Vec<f32> = (0..head_dim)
+                .map(|i| ((i * 37 % 101) as f32) - 50.0)
+                .collect();
 
             // Reference path: partial rotary in model order.
             let xt = Tensor::from_vec(x.clone(), (1, 1, head_dim), &dev()).unwrap();
@@ -394,9 +398,12 @@ mod tests {
     #[test]
     fn identity_layout_returns_the_input_untouched() {
         let l = RotaryLayout::new(64, 64, &dev()).unwrap();
-        let x =
-            Tensor::from_vec((0..128).map(|r| r as f32).collect::<Vec<_>>(), (2, 64), &dev())
-                .unwrap();
+        let x = Tensor::from_vec(
+            (0..128).map(|r| r as f32).collect::<Vec<_>>(),
+            (2, 64),
+            &dev(),
+        )
+        .unwrap();
         let p = l.permute_last_dim(&x).unwrap();
         assert_eq!(
             x.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
