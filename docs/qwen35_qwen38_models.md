@@ -215,10 +215,20 @@ projection.
   module): per-session, per-layer `[n_v_heads, d_k, d_v]` FP32/BF16 state +
   conv tail. Constant-size → lives in a small dedicated arena class, not the
   chunked KV system. Wave rules apply unchanged: states are pre-allocated
-  before the wave; the wave mutates in place; **wave failure atomicity**
-  requires the same rollback discipline as KV — snapshot the entering state
-  per row (30 MB/session makes a per-wave double-buffer affordable) and
-  restore on `rollback_wave_kv`.
+  before the wave. **Wave failure atomicity** follows KV's discipline, which
+  is *never destroying the entering value* — KV gets that free by being
+  append-only, so its rollback is a truncation. The recurrent state has no
+  such structure (`s` is a fixed-size accumulator every token rewrites), so
+  each slot holds **two `s` buffers** and a wave reads one and writes the
+  other: `begin_wave` costs nothing, `commit_wave` swaps the pair for every
+  layer the sweep advanced, rollback is doing nothing. Only `s` ping-pongs —
+  the conv tail advances in place, so a commit swaps `s` alone.
+
+  *This replaces "snapshot the entering state per row … and restore on
+  `rollback_wave_kv`". Read literally, that produced a device copy of every
+  layer's state on every wave — ~2 MB and two launches per layer, ~60 MB per
+  wave — insuring against a rollback that almost never fires. The wording had
+  named KV's words rather than its mechanism.*
 - **Fork/branch semantics (substrate)**: KV is append-only, so forks share
   prefixes for free; recurrent state is destructive. Every **sealed turn
   boundary** snapshots the state alongside the sealed KV — the full record

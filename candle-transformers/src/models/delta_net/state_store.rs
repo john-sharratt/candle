@@ -1,5 +1,5 @@
 //! The recurrent state store: one sequence's DeltaNet memory across all
-//! recurrent layers, with wave-atomic snapshot/rollback and the export/import
+//! recurrent layers, with wave-atomic advance/rollback and the export/import
 //! bridge the turn-seal snapshot record is built from.
 //!
 //! # Wave atomicity
@@ -9,30 +9,46 @@
 //! recurrent analogue). The contract:
 //!
 //! ```text
-//!   begin_wave()      device copy of every layer's state + conv tail
-//!   … decode steps mutate the live tensors in place …
-//!   commit_wave()     the wave's writes stand
-//!   rollback_wave()   restore the entry state — the wave never happened
+//!   begin_wave()      nothing on the device — mark the slots un-advanced
+//!   … the wave READS each layer's live `s` and WRITES the other buffer …
+//!   commit_wave()     swap the two buffers of every layer that advanced
+//!   rollback_wave()   nothing — the entering state was never written
 //! ```
 //!
 //! A second `begin_wave` without a commit/rollback is refused — an overlapping
 //! wave on one session is the bug wave atomicity exists to catch.
 //!
-//! # The backup is a buffer, not a value
+//! # Why there is no snapshot
 //!
-//! Every slot owns its entry copy for the store's whole life, and `begin_wave`
-//! *writes into* it. The obvious implementation — allocate a copy per wave,
-//! drop it on commit — costs an allocate/free pair per layer per session per
-//! wave, and at decode a wave is one token: it was the single largest device
-//! allocator in the loop, 679 MB across one measured window on the 0.8B at
-//! batch 4, more than half of everything the decode loop allocated. Holding the
-//! buffer costs nothing extra at the peak either, since every session in a wave
-//! has a backup live at once regardless.
+//! The KV side gets its rollback free by being append-only: the pre-wave bytes
+//! are still there, below the offset, so undoing a wave is `truncate_to_offset`
+//! and costs nothing. The recurrent state has no such structure — `s` is a
+//! fixed-size accumulator every token rewrites — so the first implementation
+//! took the instruction "the same rollback discipline as KV" to mean copying the
+//! entering state aside: ~2 MB and two `slice_set` launches per layer per wave,
+//! on every wave, to insure against a rollback that almost never fires.
 //!
-//! Committing therefore drops nothing, and rollback copies back rather than
-//! swapping tensors in. Both follow from the same rule the live state obeys:
-//! **a slot's buffers are allocated once and keep their identity**, because the
-//! fused decode kernels write them in place.
+//! Copying is not what makes KV's rollback free, though; *not destroying the old
+//! value* is. So each slot holds two `s` buffers and the wave writes the one it
+//! is not reading — the ping-pong `TableRing` and the expert staging ring
+//! already use in this tree. Commit is a host `mem::swap`, rollback is nothing
+//! at all, and a wave that fails at layer 7 leaves layers 0–6 correct because
+//! their entering buffers were never written.
+//!
+//! Two consequences worth stating:
+//!
+//! - **`advanced` is per slot**, not per store. A sweep may cover part of the
+//!   stack, and swapping a layer the wave never ran would install whatever its
+//!   write buffer held two waves ago.
+//! - **Only `s` ping-pongs.** The conv tail is advanced in place — the decode
+//!   kernel shifts it through the pointer table, the prefill path writes it back
+//!   — so commit swaps `live.s` alone. Swapping the whole state would file the
+//!   freshly advanced tail into the backup and install a stale one.
+//!
+//! A slot's buffers are still allocated once for its whole life; what a commit
+//! changes is which of the two is live, so a device address resolved from the
+//! store is good for the wave that resolved it. That is already how the engine
+//! works — `build_wave_table` resolves the pointer table once per forward.
 //!
 //! # Export / import
 //!
@@ -90,16 +106,23 @@ pub fn schedule_hash(layer_kinds: &[LayerKind], dims: &DeltaNetDims) -> u64 {
     h
 }
 
-/// Per-layer slot: the live state and the buffer its entry copy is written to.
+/// Per-layer slot: the two halves of the state's ping-pong.
 struct LayerSlot {
     /// Trunk layer index (recurrent layers only — attention layers have no
     /// slot here).
     layer_index: usize,
+    /// The state as it stands. A wave READS this and never writes it.
     live: DeltaNetState,
-    /// The wave-entry copy. Meaningful only while [`RecurrentStateStore::open`]
-    /// is set; allocated with the slot either way, so a wave boundary never
-    /// reaches the allocator.
+    /// Where a wave WRITES the advanced state. Fully overwritten by the
+    /// kernels, so it carries nothing forward from whatever it last held.
     backup: DeltaNetState,
+    /// Whether this wave handed the layer its write buffer, i.e. whether
+    /// `backup` holds an advanced state that commit should install.
+    ///
+    /// Per slot, not per store, because a sweep may cover only part of the
+    /// stack: swapping a layer the wave never ran would install whatever its
+    /// write buffer held two waves ago.
+    advanced: bool,
 }
 
 /// One sequence's recurrent memory across every DeltaNet layer.
@@ -126,6 +149,7 @@ impl RecurrentStateStore {
                     layer_index: i,
                     live: DeltaNetState::zeros(dims, device)?,
                     backup: DeltaNetState::zeros(dims, device)?,
+                    advanced: false,
                 });
             }
         }
@@ -166,14 +190,21 @@ impl RecurrentStateStore {
             })
     }
 
-    /// Trunk layer `layer_index`'s live state, to be **written into**.
+    /// Trunk layer `layer_index`'s live state, to be **written into** —
+    /// **outside a wave only**.
     ///
-    /// The state is a fixed-size buffer owned by the sequence for its whole
-    /// life, not a value the layer returns a replacement for — so the mixer
-    /// takes this and mutates it. There is deliberately no setter: a store that
-    /// could be handed a *different* tensor is one where the buffer identity
-    /// can change under the wave snapshot, and where prefill and decode end up
-    /// advancing the state two different ways.
+    /// This is the in-place form, and a wave must not use it: a wave advances a
+    /// layer by writing the buffer it is *not* reading
+    /// ([`Self::layer_state_pair_mut`]), and writing `live` instead destroys the
+    /// entering state that a rollback returns to, while `commit_wave` then swaps
+    /// the untouched other buffer in and discards the work. Both failures are
+    /// silent. What legitimately uses this is code holding a store no wave is
+    /// open on — the verification path builds a fresh single-sequence store per
+    /// block and advances it directly.
+    ///
+    /// There is deliberately no setter: a store that could be handed a
+    /// *different* tensor is one where prefill and decode end up advancing the
+    /// state two different ways.
     pub fn layer_state_mut(&mut self, layer_index: usize) -> Result<&mut DeltaNetState> {
         self.slots
             .iter_mut()
@@ -186,10 +217,62 @@ impl RecurrentStateStore {
             })
     }
 
-    /// Copy every layer's entry state aside. Refuses while a wave is open.
+    /// The layer's `(entering, advanced)` buffers **without** recording that it
+    /// advanced.
     ///
-    /// The copies go into buffers the slots already hold, so this is device
-    /// copies and nothing else — see the module header.
+    /// For resolving addresses ahead of the work: the decode pointer table is
+    /// built once per forward over every recurrent layer, including ones a
+    /// partial sweep will never reach, so building it must not be what decides
+    /// a layer gets swapped at commit. The layer records itself when it runs,
+    /// through [`Self::layer_state_pair_mut`].
+    pub fn layer_state_pair(&self, layer_index: usize) -> Result<(&DeltaNetState, Tensor)> {
+        let slot = self
+            .slots
+            .iter()
+            .find(|s| s.layer_index == layer_index)
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "recurrent store: layer {layer_index} holds no recurrent state"
+                ))
+            })?;
+        Ok((&slot.live, slot.backup.s.clone()))
+    }
+
+    /// The layer's `(entering, advanced)` buffers — what a wave reads and what
+    /// it writes — and the record that this layer advanced.
+    ///
+    /// Taking this pair is what marks the slot for the swap at
+    /// [`Self::commit_wave`], so a caller asks for it exactly when it is about
+    /// to run the layer, never to peek.
+    pub fn layer_state_pair_mut(
+        &mut self,
+        layer_index: usize,
+    ) -> Result<(&mut DeltaNetState, Tensor)> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|s| s.layer_index == layer_index)
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "recurrent store: layer {layer_index} holds no recurrent state"
+                ))
+            })?;
+        slot.advanced = true;
+        let s_out = slot.backup.s.clone();
+        Ok((&mut slot.live, s_out))
+    }
+
+    /// Open a wave. Refuses while one is already open.
+    ///
+    /// **Costs nothing on the device.** The entering state is preserved by not
+    /// being written: a wave reads `live` and writes `backup`, so opening a wave
+    /// is bookkeeping and rolling one back is doing nothing at all. This is the
+    /// same trick the KV side gets for free by being append-only — its rollback
+    /// is `truncate_to_offset`, because the pre-wave bytes were never touched.
+    ///
+    /// It replaces a copy of every layer's state into its backup: ~2 MB per
+    /// layer per wave, two `slice_set` launches each, paid on every wave to
+    /// insure against a rollback that almost never happens.
     pub fn begin_wave(&mut self) -> Result<()> {
         if self.open {
             candle::bail!(
@@ -198,31 +281,47 @@ impl RecurrentStateStore {
             );
         }
         for slot in &mut self.slots {
-            let LayerSlot { live, backup, .. } = slot;
-            backup.copy_from(live)?;
+            slot.advanced = false;
         }
         self.open = true;
         Ok(())
     }
 
-    /// The wave's writes stand.
+    /// The wave's writes stand: every layer the wave advanced exchanges its two
+    /// buffers, so what the wave wrote becomes the state and what the state was
+    /// becomes the next wave's write buffer.
     ///
-    /// Nothing is freed: the backups are the slots' own buffers, and what makes
-    /// them stale is the flag, not their contents.
+    /// A host pointer swap per advanced layer, and no device work at all. Layers
+    /// the sweep did not reach keep their buffers as they are — their write
+    /// buffer holds an older wave's output, which is exactly why the flag is per
+    /// slot.
     pub fn commit_wave(&mut self) {
+        for slot in &mut self.slots {
+            if slot.advanced {
+                // **`s` only.** The conv tail is advanced IN PLACE in `live` —
+                // the decode kernel shifts it through the pointer table and the
+                // prefill path writes it back — so it is already correct where
+                // it stands. Swapping the whole state would file the advanced
+                // tail away in the backup and install a stale one as live.
+                std::mem::swap(&mut slot.live.s, &mut slot.backup.s);
+                slot.advanced = false;
+            }
+        }
         self.open = false;
     }
 
-    /// The wave never happened: every layer's state reverts to its entry copy.
-    /// Refuses when no wave is open (a rollback with nothing to roll back to
-    /// is a sequencing bug, not a no-op).
+    /// The wave never happened.
+    ///
+    /// Nothing to undo: a wave writes only into the buffers `commit_wave` would
+    /// have swapped in, so declining to swap *is* the rollback. Refuses when no
+    /// wave is open (a rollback with nothing to roll back to is a sequencing
+    /// bug, not a no-op).
     pub fn rollback_wave(&mut self) -> Result<()> {
         if !self.open {
             candle::bail!("recurrent store: rollback_wave with no wave open");
         }
         for slot in &mut self.slots {
-            let LayerSlot { live, backup, .. } = slot;
-            live.copy_from(backup)?;
+            slot.advanced = false;
         }
         self.open = false;
         Ok(())
@@ -406,13 +505,14 @@ mod tests {
         let mut store = filled_store();
         let entry = store.export().unwrap();
 
-        // A failed wave: write *into* the buffer, then roll back. The write is
-        // in place, which is exactly why the snapshot has to exist — nothing
-        // else holds the entry value once the mixer has run.
+        // A wave writes into the slot's OTHER buffer — the half `commit_wave`
+        // swaps in — so the entering state survives by never being written.
         let bump = |store: &mut RecurrentStateStore| {
-            let live = store.layer_state_mut(0).unwrap();
+            let (live, s_out) = store.layer_state_pair_mut(0).unwrap();
             let ones = Tensor::ones(live.s.shape(), live.s.dtype(), &Device::Cpu).unwrap();
-            live.s.add_mut(&ones).unwrap();
+            let advanced = live.s.add(&ones).unwrap();
+            // Stands in for the kernel's write into the destination buffer.
+            s_out.slice_set(&advanced, 0, 0).unwrap();
         };
         store.begin_wave().unwrap();
         bump(&mut store);
@@ -430,45 +530,64 @@ mod tests {
         assert_ne!(store.export().unwrap(), entry);
     }
 
-    /// **Rollback must restore the buffer, not replace it.**
+    /// **A wave never writes the buffer it read, so an entering alias is never
+    /// disturbed by a wave that fails.**
     ///
-    /// The mixer and the fused decode kernels write `s` and the conv tail in
-    /// place, so the store's tensors are addresses other code has already
-    /// resolved. Rolling back by swapping a *different* tensor into the slot
-    /// reads correct through `layer_state`, and leaves everything holding the
-    /// old buffer looking at the wave's writes — the failure this pins.
+    /// This replaces the inverse contract — that rollback must copy the entry
+    /// values back into the same allocation, because an alias resolved before
+    /// the wave would otherwise still see the failed wave's writes. Under the
+    /// ping-pong there are no writes to undo: the wave's output went to the
+    /// other buffer, so the alias holds the entry values throughout and a
+    /// rollback is doing nothing.
     ///
-    /// Checked through a shallow `clone`, which shares storage: after a
-    /// rollback it must show the entry values, which is only true if the entry
-    /// values were copied back into the same allocation.
+    /// The price is that `commit_wave` DOES change which tensor is live, so a
+    /// resolved address is valid for one wave only. That is what the engine
+    /// already does — `build_wave_table` resolves the pointers once per forward
+    /// (`qwen35/forward.rs`), inside the wave that uses them.
     #[test]
-    fn rollback_writes_back_into_the_live_buffer() {
+    fn a_wave_leaves_the_entering_buffer_untouched() {
         let mut store = filled_store();
-        // Shares storage with the slot's live state — the same view the decode
-        // kernel holds.
+        // Shares storage with the slot's entering state — the same view the
+        // decode kernel's pointer table holds for this wave.
         let alias = store.layer_state(0).unwrap().s.clone();
         let entry: Vec<f32> = alias.flatten_all().unwrap().to_vec1().unwrap();
 
         store.begin_wave().unwrap();
         {
-            let live = store.layer_state_mut(0).unwrap();
+            let (live, s_out) = store.layer_state_pair_mut(0).unwrap();
             let ones = Tensor::ones(live.s.shape(), live.s.dtype(), &Device::Cpu).unwrap();
-            live.s.add_mut(&ones).unwrap();
+            let advanced = live.s.add(&ones).unwrap();
+            s_out.slice_set(&advanced, 0, 0).unwrap();
         }
         let during: Vec<f32> = alias.flatten_all().unwrap().to_vec1().unwrap();
-        assert_ne!(
+        assert_eq!(
             during, entry,
-            "the alias must see the wave's in-place writes"
+            "the wave wrote into the buffer it was reading — the entering state \
+             is gone and a rollback has nothing to return to"
         );
 
         store.rollback_wave().unwrap();
         let after: Vec<f32> = alias.flatten_all().unwrap().to_vec1().unwrap();
-        assert_eq!(
-            after, entry,
-            "rollback replaced the slot's tensor instead of writing into it — \
-             everything already holding the old buffer still sees the failed \
-             wave's state"
-        );
+        assert_eq!(after, entry, "rollback must leave the entering state alone");
+
+        // And on the committing path the swap installs the wave's output.
+        store.begin_wave().unwrap();
+        {
+            let (live, s_out) = store.layer_state_pair_mut(0).unwrap();
+            let ones = Tensor::ones(live.s.shape(), live.s.dtype(), &Device::Cpu).unwrap();
+            let advanced = live.s.add(&ones).unwrap();
+            s_out.slice_set(&advanced, 0, 0).unwrap();
+        }
+        store.commit_wave();
+        let committed: Vec<f32> = store
+            .layer_state(0)
+            .unwrap()
+            .s
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_ne!(committed, entry, "commit must install the wave's output");
     }
 
     #[test]

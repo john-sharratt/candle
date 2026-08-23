@@ -444,26 +444,27 @@ mod tests {
         }
     }
 
-    /// A wave that advances state in place must be able to undo it — the
-    /// store is opened, written, and rolled back, and the entry state has to
-    /// come back exactly.
+    /// A wave writes the buffer it is NOT reading, so the entry state is intact
+    /// whether the wave commits or fails — and a commit installs the wave's
+    /// output.
     #[test]
     fn recurrent_state_rolls_back_to_the_entry_value() -> Result<()> {
         let c = cfg();
         let dev = Device::Cpu;
         let mut store = RecurrentStateStore::new(&c.layer_kinds, &c.delta_net, &dev)?;
         // Layer 0 is DeltaNet under the 3:1 schedule.
-        // `copy`, not `clone`: a clone shares storage, and against a state that
-        // is now written in place it would track the mutation instead of
-        // recording what preceded it.
         let entry = store.layer_state(0)?.s.copy()?;
-        store.begin_wave()?;
-        {
-            // The mutating form the mixer uses.
-            let live = store.layer_state_mut(0)?;
+
+        // The form the mixer uses: read `live`, write the other buffer.
+        let advance = |store: &mut RecurrentStateStore| -> Result<()> {
+            let (live, s_out) = store.layer_state_pair_mut(0)?;
             let bump = Tensor::full(3f32, live.s.shape(), &dev)?;
-            live.s.add_mut(&bump)?;
-        }
+            s_out.slice_set(&live.s.add(&bump)?, 0, 0)?;
+            Ok(())
+        };
+
+        store.begin_wave()?;
+        advance(&mut store)?;
         let during = store.layer_state(0)?.s.copy()?;
         store.rollback_wave()?;
         let after = store.layer_state(0)?.s.copy()?;
@@ -471,11 +472,24 @@ mod tests {
         let max = |t: &candle::Tensor| -> Result<f32> {
             t.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()
         };
-        assert!(max(&during.sub(&entry)?)? > 1.0, "the wave did write");
+        assert_eq!(
+            max(&during.sub(&entry)?)?,
+            0.0,
+            "a wave must not write the buffer it is reading"
+        );
         assert_eq!(
             max(&after.sub(&entry)?)?,
             0.0,
-            "rollback must restore the entry state exactly"
+            "rollback must leave the entry state exactly as it was"
+        );
+
+        store.begin_wave()?;
+        advance(&mut store)?;
+        store.commit_wave();
+        let committed = store.layer_state(0)?.s.copy()?;
+        assert!(
+            max(&committed.sub(&entry)?)? > 1.0,
+            "commit must install the wave's output"
         );
         Ok(())
     }

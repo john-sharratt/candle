@@ -63,8 +63,9 @@ pub struct DeltaNetState {
 impl DeltaNetState {
     /// An independent copy of both buffers — what a snapshot has to be.
     ///
-    /// Allocates, which is why it is not what the wave boundary uses: see
-    /// [`Self::copy_from`].
+    /// Allocates, so it belongs to the reference model's per-layer state
+    /// bookkeeping, not to anything on the wave path (a wave preserves the
+    /// entering state by not writing it — see `RecurrentStateStore`).
     pub fn snapshot(&self) -> Result<Self> {
         Ok(Self {
             s: self.s.copy()?,
@@ -75,17 +76,19 @@ impl DeltaNetState {
     /// Overwrite both buffers with `src`'s, in place.
     ///
     /// The same *arithmetic* as [`Self::snapshot`] into a destination that
-    /// already exists — and that difference is the whole point. A wave boundary
-    /// has to preserve the entry state somewhere, but it does not have to
-    /// *allocate* somewhere to preserve it. Snapshotting by allocation made the
-    /// store the largest device allocator in the decode loop: 679 MB across one
-    /// measured window on the 0.8B at batch 4, more than half of everything the
-    /// loop allocated, in an allocate/free pair per layer per session per token.
+    /// already exists, which is what a **restore** wants: `import` has bytes
+    /// from a sealed snapshot and a live buffer whose address other code has
+    /// already resolved, so it fills that buffer rather than replacing it.
+    /// Snapshotting by allocation made the store the largest device allocator in
+    /// the decode loop: 679 MB across one measured window on the 0.8B at batch
+    /// 4, more than half of everything the loop allocated, in an allocate/free
+    /// pair per layer per session per token.
     ///
-    /// It also keeps buffer identity fixed, which the rest of the store depends
-    /// on — the fused decode kernels write `s` and the conv tail in place, so a
-    /// rollback that swapped in a *different* tensor would leave the live state
-    /// at an address nothing else agreed on.
+    /// **The wave path does not use this.** It used to: every wave copied every
+    /// layer's state aside so a failure could restore it, ~2 MB and two launches
+    /// per layer per wave. A wave now reads one buffer and writes the other, so
+    /// the entering state is preserved by not being touched and `commit_wave`
+    /// installs the result with a pointer swap.
     pub fn copy_from(&mut self, src: &Self) -> Result<()> {
         self.s.slice_set(&src.s, 0, 0)?;
         self.conv_tail.slice_set(&src.conv_tail, 0, 0)
@@ -626,8 +629,14 @@ pub struct DeltaNetSeq<'a> {
     pub start: usize,
     /// How many rows it contributes.
     pub len: usize,
-    /// The recurrent state this sequence advances.
+    /// The recurrent state this sequence advances. Read by the scan; its conv
+    /// tail is still advanced in place.
     pub state: &'a mut DeltaNetState,
+    /// Where the advanced `S` is written — the store's other half, which
+    /// `commit_wave` swaps in. A handle rather than a borrow because the
+    /// reference paths, which have only one buffer, name the same tensor here
+    /// and in `state`, and the kernels take addresses either way.
+    pub s_out: Tensor,
 }
 
 /// Where one sequence's rows sit in the wave's packed activation buffer.
@@ -830,10 +839,14 @@ pub fn delta_net_mix<'w>(
     rms_eps: f64,
 ) -> Result<LiveTensor<'w>> {
     let (t, _) = p.qkv.dims2()?;
+    // One buffer, so the scan reads and writes the same tensor: this
+    // single-span entry point has no wave to roll back.
+    let s_out = state.s.clone();
     let mut one = [DeltaNetSeq {
         start: 0,
         len: t,
         state,
+        s_out,
     }];
     delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None)
 }
@@ -952,7 +965,13 @@ pub fn delta_net_mix_spans<'w>(
         }
         for s in seqs.iter_mut() {
             if s.len > 1 {
-                super::cuda::delta_net_prefill_scan(&fused, &s.state.s, s.start, s.len)?;
+                super::cuda::delta_net_prefill_scan(
+                    &fused,
+                    &s.state.s,
+                    &s.s_out,
+                    s.start,
+                    s.len,
+                )?;
             }
         }
         return super::cuda::delta_net_norm_gate(&o, &p.z, c.norm, d, rms_eps as f32);
@@ -1050,6 +1069,21 @@ pub fn delta_net_mix_spans<'w>(
             &rows(&beta)?,
             DELTA_CHUNK,
         )?);
+        // This path advances `s` IN PLACE, but the caller has already told the
+        // store the layer advanced, and `commit_wave` installs `s_out` — so the
+        // advance has to reach it or the swap would discard the wave's work and
+        // reinstate a two-waves-old state, silently. Mirroring here keeps the
+        // fallback's in-place arithmetic (which the parity oracle is written
+        // against) and still honours the store's contract; the fused path,
+        // which is what production runs, writes `s_out` directly and copies
+        // nothing.
+        //
+        // Nothing to mirror when the two are one buffer: the single-span entry
+        // points and the reference tests hand the same tensor in twice, and
+        // `slice_set` refuses a source that shares its destination's storage.
+        if !s.s_out.same_storage(&s.state.s) {
+            s.s_out.slice_set(&s.state.s, 0, 0)?;
+        }
     }
     let o = LiveTensor::cat(&o_parts, 0)?;
     drop(o_parts);
@@ -1465,16 +1499,19 @@ mod tests {
         let mut st_a = DeltaNetState::zeros(&dims, &dev).unwrap();
         let mut st_b = DeltaNetState::zeros(&dims, &dev).unwrap();
         let got = {
+            let (out_a, out_b) = (st_a.s.clone(), st_b.s.clone());
             let mut seqs = [
                 DeltaNetSeq {
                     start: 0,
                     len: len_a,
                     state: &mut st_a,
+                    s_out: out_a,
                 },
                 DeltaNetSeq {
                     start: len_a,
                     len: len_b,
                     state: &mut st_b,
+                    s_out: out_b,
                 },
             ];
             delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None).unwrap()
@@ -1532,16 +1569,19 @@ mod tests {
         let mut st_b = DeltaNetState::zeros(&dims, &dev).unwrap();
 
         let run = |spans: [(usize, usize); 2], sa: &mut DeltaNetState, sb: &mut DeltaNetState| {
+            let (out_a, out_b) = (sa.s.clone(), sb.s.clone());
             let mut seqs = [
                 DeltaNetSeq {
                     start: spans[0].0,
                     len: spans[0].1,
                     state: sa,
+                    s_out: out_a,
                 },
                 DeltaNetSeq {
                     start: spans[1].0,
                     len: spans[1].1,
                     state: sb,
+                    s_out: out_b,
                 },
             ];
             delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None).map(|_| ())

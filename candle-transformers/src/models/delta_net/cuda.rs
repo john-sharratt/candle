@@ -204,7 +204,7 @@ impl DeltaNetWaveTable {
         Ok(DeltaNetLayerTable {
             // A narrow on the leading axis of a contiguous tensor is itself
             // contiguous, so the reshape is a view — no copy per layer.
-            ptrs: self.ptrs.narrow(0, ord, 1)?.reshape((2, n))?,
+            ptrs: self.ptrs.narrow(0, ord, 1)?.reshape((3, n))?,
             rows: self.rows.clone(),
         })
     }
@@ -226,21 +226,34 @@ pub fn build_wave_table(
     };
     let layers: Vec<usize> = first.recurrent_layer_indices().collect();
     let n = decode.len();
-    let mut ptrs: Vec<i64> = Vec::with_capacity(layers.len() * 2 * n);
+    // Three rows per layer: the conv tail (advanced in place), then the state's
+    // entering and advanced buffers. The state's two are distinct allocations —
+    // the wave reads one and writes the other, and `commit_wave` exchanges them
+    // — so the kernel needs both addresses.
+    //
+    // Resolved through the NON-marking accessor: this table covers every
+    // recurrent layer, but a sweep may run only part of the stack, and a layer
+    // that never ran must not be swapped at commit (its write buffer still holds
+    // an older wave's output). Each layer records itself when it actually runs.
+    let mut ptrs: Vec<i64> = Vec::with_capacity(layers.len() * 3 * n);
     for &li in &layers {
         for &i in &decode {
             let st = stores[i].layer_state(li)?;
             ptrs.push(f32_ptr(&st.conv_tail, "conv tail")? as i64);
         }
         for &i in &decode {
-            let st = stores[i].layer_state(li)?;
-            ptrs.push(f32_ptr(&st.s, "state")? as i64);
+            let (live, _) = stores[i].layer_state_pair(li)?;
+            ptrs.push(f32_ptr(&live.s, "state in")? as i64);
+        }
+        for &i in &decode {
+            let (_, s_out) = stores[i].layer_state_pair(li)?;
+            ptrs.push(f32_ptr(&s_out, "state out")? as i64);
         }
     }
     let rows: Vec<u32> = decode.iter().map(|&i| spans[i].start as u32).collect();
     let dev = stores[decode[0]].layer_state(layers[0])?.s.device().clone();
     Ok(Some(DeltaNetWaveTable {
-        ptrs: Tensor::from_vec(ptrs, (layers.len(), 2, n), &dev)?,
+        ptrs: Tensor::from_vec(ptrs, (layers.len(), 3, n), &dev)?,
         rows: Tensor::from_vec(rows, n, &dev)?,
         layers,
     }))
@@ -255,17 +268,23 @@ pub fn build_layer_table(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetLayerTable>
         candle::bail!("delta_net cuda: no decode spans to table");
     }
     let n = decode.len();
-    let mut ptrs: Vec<i64> = Vec::with_capacity(2 * n);
+    // The reference/test path carries one state per span rather than the store's
+    // pair, so the entering and advanced rows name the same buffer: the kernels
+    // accept that (each element is read before it is written) and the span
+    // advances in place, as this path always has.
+    let mut ptrs: Vec<i64> = Vec::with_capacity(3 * n);
     for s in &decode {
         ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail")? as i64);
     }
-    for s in &decode {
-        ptrs.push(f32_ptr(&s.state.s, "state")? as i64);
+    for _ in 0..2 {
+        for s in &decode {
+            ptrs.push(f32_ptr(&s.state.s, "state")? as i64);
+        }
     }
     let rows: Vec<u32> = decode.iter().map(|s| s.start as u32).collect();
     let dev = decode[0].state.s.device().clone();
     Ok(DeltaNetLayerTable {
-        ptrs: Tensor::from_vec(ptrs, (2, n), &dev)?,
+        ptrs: Tensor::from_vec(ptrs, (3, n), &dev)?,
         rows: Tensor::from_vec(rows, n, &dev)?,
     })
 }
@@ -299,8 +318,8 @@ pub fn delta_net_decode_batch(
         candle::bail!("delta_net cuda: conv row {conv_dim} does not split into Q and K");
     }
     let h_k = qk_heads / 2;
-    let (two, n_decode) = table.ptrs.dims2()?;
-    if two != 2 || table.rows.dims1()? != n_decode {
+    let (table_rows, n_decode) = table.ptrs.dims2()?;
+    if table_rows != 3 || table.rows.dims1()? != n_decode {
         candle::bail!("delta_net cuda: malformed decode table");
     }
     let dev = match fused.conved.device() {
@@ -308,8 +327,9 @@ pub fn delta_net_decode_batch(
         _ => candle::bail!("delta_net cuda: conved must live on a CUDA device"),
     };
     let stream = dev.cuda_stream();
-    // Row 1 of the table holds the state pointers.
+    // Row 1 holds the entering state pointers, row 2 the advanced ones.
     let states_p = typed_ptr(&table.ptrs.narrow(0, 1, 1)?, DType::I64, "state table")?;
+    let states_out_p = typed_ptr(&table.ptrs.narrow(0, 2, 1)?, DType::I64, "state out table")?;
     let rows_p = typed_ptr(&table.rows, DType::U32, "row table")?;
     let conved_p = f32_ptr(fused.conved, "conved")?;
     let alpha_p = f32_ptr(fused.alpha, "alpha")?;
@@ -320,6 +340,7 @@ pub fn delta_net_decode_batch(
     unsafe {
         run_delta_net_decode_step_f32(
             states_p as *const i64,
+            states_out_p as *const i64,
             conved_p as *const f32,
             rows_p as *const u32,
             alpha_p as *const f32,
@@ -364,8 +385,8 @@ pub fn delta_net_conv_decode(
         );
     }
     check_qk_channels(qk_channels, channels)?;
-    let (two, n_decode) = table.ptrs.dims2()?;
-    if two != 2 || table.rows.dims1()? != n_decode {
+    let (table_rows, n_decode) = table.ptrs.dims2()?;
+    if table_rows != 3 || table.rows.dims1()? != n_decode {
         candle::bail!("delta_net cuda: malformed decode table");
     }
     let dev = match qkv.device() {
@@ -585,6 +606,7 @@ pub fn delta_net_conv_prefill<'w>(
 pub fn delta_net_prefill_scan(
     fused: &DeltaNetFused<'_, '_>,
     state: &Tensor,
+    state_out: &Tensor,
     start: usize,
     len: usize,
 ) -> Result<()> {
@@ -614,6 +636,7 @@ pub fn delta_net_prefill_scan(
     {
         let stream = dev.cuda_stream();
         let state_p = f32_ptr(state, "state")?;
+        let state_out_p = f32_ptr(state_out, "state out")?;
         let u_p = f32_ptr(&u, "u")?;
         let w_p = f32_ptr(&w, "w")?;
         let kq_p = f32_ptr(&kq, "kq")?;
@@ -639,7 +662,8 @@ pub fn delta_net_prefill_scan(
                 raw,
             );
             run_delta_net_prefill_state_f32(
-                state_p as *mut f32,
+                state_p as *const f32,
+                state_out_p as *mut f32,
                 p.qk_p as *const f32,
                 u_p as *const f32,
                 w_p as *const f32,
@@ -1004,14 +1028,18 @@ mod tests {
         let o = Tensor::zeros((t_wave, h_v * d), DType::F32, &gpu).unwrap();
         let fused = case.fused(&o);
         for i in 0..steps {
+            // Entering and advanced rows name the same buffers: this test
+            // advances its states in place, as the reference path does.
             let ptrs: Vec<i64> = vec![
                 f32_ptr(&tails[0], "tail").unwrap() as i64,
                 f32_ptr(&tails[1], "tail").unwrap() as i64,
                 f32_ptr(&states[0], "state").unwrap() as i64,
                 f32_ptr(&states[1], "state").unwrap() as i64,
+                f32_ptr(&states[0], "state").unwrap() as i64,
+                f32_ptr(&states[1], "state").unwrap() as i64,
             ];
             let table = DeltaNetLayerTable {
-                ptrs: Tensor::from_vec(ptrs, (2, 2), &gpu).unwrap(),
+                ptrs: Tensor::from_vec(ptrs, (3, 2), &gpu).unwrap(),
                 rows: Tensor::from_vec(vec![2 * i as u32, 2 * i as u32 + 1], 2, &gpu).unwrap(),
             };
             delta_net_decode_batch(&fused, &table).unwrap();
@@ -1138,14 +1166,18 @@ mod tests {
         let qkv = Tensor::from_vec(xw, (t_wave, c), &gpu).unwrap();
         let conved = Tensor::zeros((t_wave, c), DType::F32, &gpu).unwrap();
         for i in 0..steps {
+            // Entering and advanced rows name the same buffers: this test
+            // advances its states in place, as the reference path does.
             let ptrs: Vec<i64> = vec![
                 f32_ptr(&tails[0], "tail").unwrap() as i64,
                 f32_ptr(&tails[1], "tail").unwrap() as i64,
                 f32_ptr(&states[0], "state").unwrap() as i64,
                 f32_ptr(&states[1], "state").unwrap() as i64,
+                f32_ptr(&states[0], "state").unwrap() as i64,
+                f32_ptr(&states[1], "state").unwrap() as i64,
             ];
             let table = DeltaNetLayerTable {
-                ptrs: Tensor::from_vec(ptrs, (2, 2), &gpu).unwrap(),
+                ptrs: Tensor::from_vec(ptrs, (3, 2), &gpu).unwrap(),
                 rows: Tensor::from_vec(vec![2 * i as u32, 2 * i as u32 + 1], 2, &gpu).unwrap(),
             };
             delta_net_conv_decode(&qkv, &kern_g, &table, &conved, qkc, eps as f32).unwrap();
@@ -1257,7 +1289,7 @@ mod tests {
 
         let s_gpu = s0.to_device(&gpu).unwrap().contiguous().unwrap();
         let o = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
-        delta_net_prefill_scan(&case.fused(&o), &s_gpu, 0, t).unwrap();
+        delta_net_prefill_scan(&case.fused(&o), &s_gpu, &s_gpu, 0, t).unwrap();
 
         let o_gpu = o.reshape((t, h_v, d)).unwrap().to_device(&cpu).unwrap();
         let od = max_diff(&o_gpu, &o_ref);
@@ -1283,14 +1315,14 @@ mod tests {
 
         let s_one = Tensor::zeros((h_v, d, d), DType::F32, &gpu).unwrap();
         let o_one = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
-        delta_net_prefill_scan(&case.fused(&o_one), &s_one, 0, t).unwrap();
+        delta_net_prefill_scan(&case.fused(&o_one), &s_one, &s_one, 0, t).unwrap();
 
         // 70 + 60: neither boundary is a multiple of the 64-token chunk.
         let s_seg = Tensor::zeros((h_v, d, d), DType::F32, &gpu).unwrap();
         let o_seg = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
         let fused = case.fused(&o_seg);
-        delta_net_prefill_scan(&fused, &s_seg, 0, 70).unwrap();
-        delta_net_prefill_scan(&fused, &s_seg, 70, 60).unwrap();
+        delta_net_prefill_scan(&fused, &s_seg, &s_seg, 0, 70).unwrap();
+        delta_net_prefill_scan(&fused, &s_seg, &s_seg, 70, 60).unwrap();
 
         // The chunk grouping differs (the second call re-chunks from its own
         // origin), so this is numerical closeness, not bitwise identity.
@@ -1355,7 +1387,7 @@ mod tests {
                 delta_net_conv_prefill(&qkv, &kern, &tail, qk_channels, 1e-6, &conved, 0).unwrap();
         });
         let s_us = time("scan (intra + state)", &mut || {
-            delta_net_prefill_scan(&fused, &state, 0, t).unwrap();
+            delta_net_prefill_scan(&fused, &state, &state, 0, t).unwrap();
         });
         let g_us = time("norm_gate", &mut || {
             let _ = delta_net_norm_gate(&o, &z, &gain, d, 1e-6).unwrap();

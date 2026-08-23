@@ -102,17 +102,23 @@ pub fn delta_net_mix_wave(
     // ops run once; `DeltaNetSeq` is how the two carried steps still find their
     // own rows and their own state.
     //
-    // The states are advanced **in place**: the store hands out the buffer and
-    // the layer writes into it. There is no read-out-and-write-back, which is
-    // what used to make the state look like a value that could be replaced —
-    // and made the prefill path allocate a fresh one per chunk while decode
-    // mutated the old one, two ways of doing the same thing.
+    // The store hands out the layer's PAIR: the buffer the wave reads and the
+    // one it writes. Nothing is read out and written back, and nothing is
+    // replaced — what changes at `commit_wave` is which of the two is live,
+    // which is what makes a failed wave free to undo. Taking the pair here is
+    // also what records that this layer advanced, so a sweep that covers part
+    // of the stack commits only the layers it actually ran.
+    //
+    // The conv tail inside `state` is still advanced in place; only `s` has two
+    // buffers.
     let mut seqs: Vec<DeltaNetSeq<'_>> = Vec::with_capacity(spans.len());
     for (span, store) in spans.iter().zip(stores.iter_mut()) {
+        let (state, s_out) = store.layer_state_pair_mut(layer_idx)?;
         seqs.push(DeltaNetSeq {
             start: span.start,
             len: span.len,
-            state: store.layer_state_mut(layer_idx)?,
+            state,
+            s_out,
         });
     }
     let mixed =
