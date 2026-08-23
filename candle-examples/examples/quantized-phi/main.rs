@@ -257,7 +257,11 @@ fn main() -> anyhow::Result<()> {
                 &mut file,
                 &device,
             )?),
-            Which::Phi3b => Model::Phi3b(Phi3b::from_gguf(model, &mut file, &device)?),
+            // Phi-3-mini in the llama GGUF layout. It is neither Llama 2 nor
+            // Llama 3, so it takes the identity KV factor (`from_gguf_v2`)
+            // rather than 3.x's 10%-tighter calibration, which was never
+            // derived for this checkpoint.
+            Which::Phi3b => Model::Phi3b(Phi3b::from_gguf_v2(model, &mut file, &device)?),
         }
     };
     println!("model built");

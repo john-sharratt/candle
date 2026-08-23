@@ -98,11 +98,7 @@ impl DeltaNetState {
                 DType::F32,
                 dev,
             )?,
-            conv_tail: Tensor::zeros(
-                (dims.conv_dim(), dims.conv_kernel - 1),
-                DType::F32,
-                dev,
-            )?,
+            conv_tail: Tensor::zeros((dims.conv_dim(), dims.conv_kernel - 1), DType::F32, dev)?,
         })
     }
 }
@@ -356,6 +352,10 @@ pub fn delta_chunked<'w>(
 /// dtype — it falls back to forming `T` with [`unit_lower_inverse`] and
 /// multiplying, which is the same arithmetic and is what the solve is checked
 /// against (`solve_matches_the_explicit_inverse`).
+// `d_v`/`d_k` split the concatenated right-hand side that only the CUDA arm
+// forms; the fallback multiplies `v_b` and `kg` separately and reads their own
+// shapes.
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 fn solve_pseudo_values<'w>(
     a: &LiveTensor<'w>,
     v_b: &LiveTensor<'w>,
@@ -371,10 +371,7 @@ fn solve_pseudo_values<'w>(
         // axis leaves a gap between rows. `kcd` is a matmul operand and must be
         // materialised; `u` is only ever the left side of a subtraction, which
         // reads strides, so it stays a view.
-        return Ok((
-            x.narrow(2, 0, d_v)?,
-            x.narrow(2, d_v, d_k)?.contiguous()?,
-        ));
+        return Ok((x.narrow(2, 0, d_v)?, x.narrow(2, d_v, d_k)?.contiguous()?));
     }
     let t_inv = unit_lower_inverse(a)?;
     Ok((t_inv.matmul(v_b)?, t_inv.matmul(kg)?))
@@ -860,6 +857,9 @@ pub fn delta_net_mix<'w>(
 ///
 /// So the row-wise majority runs once over all `T` rows and the two carried
 /// steps run per sequence, each writing its slice of a shared buffer.
+// `table` is the pre-uploaded per-sequence pointer table the batched decode
+// kernel reads; without `cuda` there is no kernel to hand it to.
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 pub fn delta_net_mix_spans<'w>(
     p: &DeltaNetProjections<'w>,
     c: &DeltaNetConstants<'_>,
@@ -890,9 +890,7 @@ pub fn delta_net_mix_spans<'w>(
         cursor += s.len;
     }
     if cursor != t {
-        candle::bail!(
-            "delta_net_mix_spans: spans cover {cursor} rows but the buffer holds {t}"
-        );
+        candle::bail!("delta_net_mix_spans: spans cover {cursor} rows but the buffer holds {t}");
     }
 
     let (qkv, w) = (&p.qkv, c);
@@ -931,9 +929,7 @@ pub fn delta_net_mix_spans<'w>(
         // the upload merely happens closer to the launch.
         let local = match table {
             Some(_) => None,
-            None if seqs.iter().any(|s| s.len == 1) => {
-                Some(super::cuda::build_layer_table(seqs)?)
-            }
+            None if seqs.iter().any(|s| s.len == 1) => Some(super::cuda::build_layer_table(seqs)?),
             None => None,
         };
         let table = table.or(local.as_ref());
@@ -982,6 +978,7 @@ pub fn delta_net_mix_spans<'w>(
     )?;
 
     let beta = candle_nn::ops::sigmoid(&p.beta_lin)?; // [T, H_v]
+
     // g = a ⊙ softplus(α + dt_bias): per-head log-decay, ≤ 0 since a < 0.
     let g_log = softplus(&p.alpha_lin.broadcast_add(c.dt_bias)?)?.broadcast_mul(c.a)?;
 
@@ -1105,10 +1102,14 @@ mod tests {
     /// must be reproducible byte-for-byte).
     fn lcg_tensor(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
         let n: usize = shape.iter().product();
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let vals: Vec<f32> = (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 // Map the top bits to (-0.5, 0.5).
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
             })
@@ -1243,11 +1244,9 @@ mod tests {
         let pre_v = lcg_tensor(&[2, h, d], 68, &dev);
         let pre_g = lcg_tensor(&[2, h], 69, &dev).abs().unwrap().neg().unwrap();
         let pre_b = candle_nn::ops::sigmoid(&lcg_tensor(&[2, h], 70, &dev)).unwrap();
-        let (_, s0) =
-            delta_recurrence(s_seed, &pre_q, &pre_k, &pre_v, &pre_g, &pre_b).unwrap();
+        let (_, s0) = delta_recurrence(s_seed, &pre_q, &pre_k, &pre_v, &pre_g, &pre_b).unwrap();
 
-        let (o_ref, s_ref) =
-            delta_recurrence(s0.clone(), &q, &k, &v, &g, &beta).unwrap();
+        let (o_ref, s_ref) = delta_recurrence(s0.clone(), &q, &k, &v, &g, &beta).unwrap();
 
         for chunk in [1usize, 4, 5, 13, 64] {
             let mut s_ch = s0.copy().unwrap();
@@ -1356,10 +1355,12 @@ mod tests {
                 let want = (j % h_k) as f32;
                 let at = (tt * h_v + j) * d;
                 assert_eq!(
-                    got[at], want,
+                    got[at],
+                    want,
                     "V head {j} read K head {} (t={tt}); ggml tiles, so it must \
                      read {}",
-                    got[at] as usize, j % h_k
+                    got[at] as usize,
+                    j % h_k
                 );
             }
         }
@@ -1387,7 +1388,11 @@ mod tests {
     }
 
     /// Projections over `t` rows, deterministic.
-    fn span_projections(t: usize, dims: &DeltaNetDims, dev: &Device) -> DeltaNetProjections<'static> {
+    fn span_projections(
+        t: usize,
+        dims: &DeltaNetDims,
+        dev: &Device,
+    ) -> DeltaNetProjections<'static> {
         DeltaNetProjections {
             qkv: lcg_tensor(&[t, dims.conv_dim()], 91, dev),
             z: lcg_tensor(&[t, dims.value_dim()], 92, dev),
@@ -1586,19 +1591,13 @@ mod tests {
         let tail0 = Tensor::zeros((1, 2), DType::F32, &dev).unwrap();
         let (y, tail) = causal_conv1d(&x, &kern, &tail0).unwrap();
         // y[t] = 1·x[t−2] + 2·x[t−1] + 3·x[t]  (zeros left of the start)
-        let expect =
-            Tensor::from_vec(vec![30f32, 80., 140., 200.], (1, 4), &dev).unwrap();
+        let expect = Tensor::from_vec(vec![30f32, 80., 140., 200.], (1, 4), &dev).unwrap();
         assert_close(&y, &expect, 1e-6, "conv values");
         let expect_tail = Tensor::from_vec(vec![30f32, 40.], (1, 2), &dev).unwrap();
         assert_close(&tail, &expect_tail, 1e-6, "conv tail");
 
         // Split invocation equals one-shot — same property as the recurrence.
-        let (y1, tmid) = causal_conv1d(
-            &x.narrow(1, 0, 2).unwrap(),
-            &kern,
-            &tail0,
-        )
-        .unwrap();
+        let (y1, tmid) = causal_conv1d(&x.narrow(1, 0, 2).unwrap(), &kern, &tail0).unwrap();
         let (y2, tend) = causal_conv1d(&x.narrow(1, 2, 2).unwrap(), &kern, &tmid).unwrap();
         let y_seg = Tensor::cat(&[y1, y2], 1).unwrap();
         assert_close(&y, &y_seg, 1e-6, "segmented conv outputs");
@@ -1644,7 +1643,9 @@ mod tests {
                 .affine(-1.0, -0.05)
                 .unwrap(),
             conv: scale(lcg_tensor(&[dims.conv_dim(), dims.conv_kernel], 17, dev)),
-            norm: lcg_tensor(&[dims.head_dim], 18, dev).affine(0.3, 1.0).unwrap(),
+            norm: lcg_tensor(&[dims.head_dim], 18, dev)
+                .affine(0.3, 1.0)
+                .unwrap(),
             w_out: scale(lcg_tensor(&[hidden, dims.value_dim()], 19, dev)),
         }
     }
@@ -1669,22 +1670,11 @@ mod tests {
         // that the buffer is advanced rather than replaced.
         let a = 4usize;
         let mut s_seg = DeltaNetState::zeros(&dims, &dev).unwrap();
-        let y1 = delta_net_layer_forward(
-            &x.narrow(0, 0, a).unwrap(),
-            &w,
-            &dims,
-            &mut s_seg,
-            1e-6,
-        )
-        .unwrap();
-        let y2 = delta_net_layer_forward(
-            &x.narrow(0, a, t - a).unwrap(),
-            &w,
-            &dims,
-            &mut s_seg,
-            1e-6,
-        )
-        .unwrap();
+        let y1 = delta_net_layer_forward(&x.narrow(0, 0, a).unwrap(), &w, &dims, &mut s_seg, 1e-6)
+            .unwrap();
+        let y2 =
+            delta_net_layer_forward(&x.narrow(0, a, t - a).unwrap(), &w, &dims, &mut s_seg, 1e-6)
+                .unwrap();
         let y_seg = Tensor::cat(&[y1, y2], 0).unwrap();
         assert_close(&y_full, &y_seg, 1e-5, "layer segmented outputs");
         assert_close(&s_full.s, &s_seg.s, 1e-5, "layer segmented state");
@@ -1774,8 +1764,7 @@ mod tests {
         // decays a state that is still zero.
         let q_hat = (&q * (1.0 / (d as f64).sqrt())).unwrap();
         let kq = k.mul(&q_hat).unwrap().sum(candle::D::Minus1).unwrap();
-        let beta =
-            candle_nn::ops::sigmoid(&x.matmul(&w.w_beta.t().unwrap()).unwrap()).unwrap();
+        let beta = candle_nn::ops::sigmoid(&x.matmul(&w.w_beta.t().unwrap()).unwrap()).unwrap();
         let o = v
             .broadcast_mul(&beta.mul(&kq).unwrap().unsqueeze(2).unwrap())
             .unwrap();
@@ -1833,7 +1822,11 @@ mod tests {
         let y = softplus(&x).unwrap().to_vec1::<f32>().unwrap();
         assert!(y[0].abs() < 1e-6, "softplus(-100) ≈ 0, got {}", y[0]);
         assert!((y[2] - std::f32::consts::LN_2).abs() < 1e-6);
-        assert!((y[4] - 100.0).abs() < 1e-4, "softplus(100) ≈ 100, got {}", y[4]);
+        assert!(
+            (y[4] - 100.0).abs() < 1e-4,
+            "softplus(100) ≈ 100, got {}",
+            y[4]
+        );
         assert!((y[1] - 0.313_261_7).abs() < 1e-5);
         assert!((y[3] - 1.313_261_7).abs() < 1e-5);
     }

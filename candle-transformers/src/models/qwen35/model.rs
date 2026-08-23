@@ -20,8 +20,8 @@ use candle::{Result, Tensor};
 
 use super::attention::{attention_layer_forward, AttentionState, AttentionWeights, RopeTables};
 use super::config::{LayerKind, Qwen35Config};
-use crate::models::delta_net::{delta_net_layer_forward, DeltaNetState, DeltaNetWeights};
 use super::moe::{FfnWeights, MoeWeights};
+use crate::models::delta_net::{delta_net_layer_forward, DeltaNetState, DeltaNetWeights};
 
 /// The token-mixing half of a layer.
 #[derive(Debug, Clone)]
@@ -196,9 +196,9 @@ impl Qwen35Model {
 
 #[cfg(test)]
 mod tests {
+    use super::super::moe::MoeWeights;
     use super::*;
     use crate::models::delta_net::DeltaNetDims;
-    use super::super::moe::MoeWeights;
     use candle::Device;
 
     fn dev() -> Device {
@@ -207,10 +207,14 @@ mod tests {
 
     fn lcg_tensor(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
         let n: usize = shape.iter().product();
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let vals: Vec<f32> = (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
             })
             .collect();
@@ -247,24 +251,26 @@ mod tests {
         let sc = |t: Tensor| t.affine(0.15, 0.).unwrap();
         let norm1 = |seed: u64| lcg_tensor(&[hidden], seed, dev).affine(0.2, 1.0).unwrap();
 
-        let dn = |seed: u64| {
-            crate::models::delta_net::DeltaNetWeights {
-                wqkv: sc(lcg_tensor(&[dims.conv_dim(), hidden], seed, dev)),
-                wz: sc(lcg_tensor(&[dims.value_dim(), hidden], seed + 1, dev)),
-                w_beta: sc(lcg_tensor(&[dims.n_v_heads, hidden], seed + 2, dev)),
-                w_alpha: sc(lcg_tensor(&[dims.n_v_heads, hidden], seed + 3, dev)),
-                dt_bias: sc(lcg_tensor(&[dims.n_v_heads], seed + 4, dev)),
-                a: lcg_tensor(&[dims.n_v_heads], seed + 5, dev)
-                    .abs()
-                    .unwrap()
-                    .affine(-1.0, -0.05)
-                    .unwrap(),
-                conv: sc(lcg_tensor(&[dims.conv_dim(), dims.conv_kernel], seed + 6, dev)),
-                norm: lcg_tensor(&[dims.head_dim], seed + 7, dev)
-                    .affine(0.2, 1.0)
-                    .unwrap(),
-                w_out: sc(lcg_tensor(&[hidden, dims.value_dim()], seed + 8, dev)),
-            }
+        let dn = |seed: u64| crate::models::delta_net::DeltaNetWeights {
+            wqkv: sc(lcg_tensor(&[dims.conv_dim(), hidden], seed, dev)),
+            wz: sc(lcg_tensor(&[dims.value_dim(), hidden], seed + 1, dev)),
+            w_beta: sc(lcg_tensor(&[dims.n_v_heads, hidden], seed + 2, dev)),
+            w_alpha: sc(lcg_tensor(&[dims.n_v_heads, hidden], seed + 3, dev)),
+            dt_bias: sc(lcg_tensor(&[dims.n_v_heads], seed + 4, dev)),
+            a: lcg_tensor(&[dims.n_v_heads], seed + 5, dev)
+                .abs()
+                .unwrap()
+                .affine(-1.0, -0.05)
+                .unwrap(),
+            conv: sc(lcg_tensor(
+                &[dims.conv_dim(), dims.conv_kernel],
+                seed + 6,
+                dev,
+            )),
+            norm: lcg_tensor(&[dims.head_dim], seed + 7, dev)
+                .affine(0.2, 1.0)
+                .unwrap(),
+            w_out: sc(lcg_tensor(&[hidden, dims.value_dim()], seed + 8, dev)),
         };
         let ffn_w = |seed: u64| super::super::moe::FfnWeights {
             gate: sc(lcg_tensor(&[ffn, hidden], seed, dev)),
@@ -321,16 +327,28 @@ mod tests {
             num_mtp_layers: 0,
             max_position_embeddings: 64,
         };
-        let embed = lcg_tensor(&[vocab, hidden], 800, dev).affine(0.4, 0.).unwrap();
+        let embed = lcg_tensor(&[vocab, hidden], 800, dev)
+            .affine(0.4, 0.)
+            .unwrap();
         Qwen35Model {
             layers: vec![
-                layer(LayerMix::DeltaNet(dn(100)), LayerFfn::Dense(ffn_w(110)), 120),
+                layer(
+                    LayerMix::DeltaNet(dn(100)),
+                    LayerFfn::Dense(ffn_w(110)),
+                    120,
+                ),
                 layer(LayerMix::DeltaNet(dn(200)), LayerFfn::Moe(moe), 220),
-                layer(LayerMix::DeltaNet(dn(300)), LayerFfn::Dense(ffn_w(310)), 320),
+                layer(
+                    LayerMix::DeltaNet(dn(300)),
+                    LayerFfn::Dense(ffn_w(310)),
+                    320,
+                ),
                 layer(LayerMix::Attention(attn), LayerFfn::Dense(ffn_w(410)), 420),
             ],
             final_norm: norm1(500),
-            lm_head: lcg_tensor(&[vocab, hidden], 810, dev).affine(0.4, 0.).unwrap(),
+            lm_head: lcg_tensor(&[vocab, hidden], 810, dev)
+                .affine(0.4, 0.)
+                .unwrap(),
             rope: RopeTables::new(d_attn / 2, 1e6, 64, dev).unwrap(),
             embed,
             cfg,

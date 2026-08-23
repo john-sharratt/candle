@@ -19,13 +19,13 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{KvErrorThresholdFactors, ModelGeometry};
 
 use super::engine::{create_session, provenance_layer_indices, wave_geometry};
-use crate::models::delta_net::KvLayerMap;
 use super::quantized_weights::{QuantLayerMix, QuantModel};
-use crate::models::delta_net::RecurrentStateStore;
-use crate::models::rotary_layout::RotaryLayout;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ModelCoreProperties, ProvenanceLayerIndices,
 };
+use crate::models::delta_net::KvLayerMap;
+use crate::models::delta_net::RecurrentStateStore;
+use crate::models::rotary_layout::RotaryLayout;
 
 /// A loaded hybrid model of this lineage, ready to be driven by the scheduler.
 ///
@@ -76,12 +76,8 @@ impl HybridBatched {
                  the engine has nothing to schedule against"
             );
         }
-        let rotary = RotaryLayout::new(
-            model.cfg.attn_head_dim,
-            model.cfg.rope_dim,
-            &model.device,
-        )?;
-        let theta = model.cfg.rope_theta as f32;
+        let rotary = RotaryLayout::new(model.cfg.attn_head_dim, model.cfg.rope_dim, &model.device)?;
+        let theta = model.cfg.rope_theta;
         let rope_dim = model.cfg.rope_dim;
         let inv: Vec<f32> = (0..rope_dim / 2)
             .map(|j| 1f32 / theta.powf(2.0 * j as f32 / rope_dim as f32))
@@ -123,7 +119,7 @@ impl HybridBatched {
         }
         let table = self.rotary.rope_table(
             max_blocks * candle_nn::CHUNK_SIZE,
-            self.model.cfg.rope_theta as f32,
+            self.model.cfg.rope_theta,
             DType::F32,
             &self.model.device,
         )?;
@@ -362,10 +358,7 @@ impl HybridBatched {
     /// transformer depth on a hybrid), so it must also replace the factor
     /// fold, or the per-model calibration silently never reaches the
     /// compression policy.
-    pub fn create_batched_session(
-        &self,
-        config: BatchedConfig,
-    ) -> Result<BatchedInferenceSession> {
+    pub fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
         let mut config = config;
         config.k_hi_error_threshold_factor *= self.kv_factors.k_hi;
         config.k_low_error_threshold_factor *= self.kv_factors.k_low;

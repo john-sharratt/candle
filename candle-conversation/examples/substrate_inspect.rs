@@ -5173,10 +5173,7 @@ fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let (entries, _) = walker::collect_filtered(log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |rt| {
         !matches!(
             rt,
-            RecordType::Chunk
-                | RecordType::Tokens
-                | RecordType::Snapshot
-                | RecordType::HeaderIndex
+            RecordType::Chunk | RecordType::Tokens | RecordType::Snapshot | RecordType::HeaderIndex
         )
     })?;
     for e in &entries {

@@ -78,7 +78,12 @@ fn pseudo(i: usize, j: usize, k: usize, seed: u64) -> f32 {
 
 /// Flat `[n_tokens, n_head, head_dim]` Q and `[n_tokens, n_kv_head, head_dim]`
 /// K/V — the ragged prefill's layout, BF16.
-fn make_qkv(g: Geom, n_tokens: usize, seed: u64, device: &Device) -> Result<(Tensor, Tensor, Tensor)> {
+fn make_qkv(
+    g: Geom,
+    n_tokens: usize,
+    seed: u64,
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor)> {
     let mut q = Vec::with_capacity(n_tokens * g.n_head * g.head_dim);
     let mut k = Vec::with_capacity(n_tokens * g.n_kv_head * g.head_dim);
     let mut v = Vec::with_capacity(n_tokens * g.n_kv_head * g.head_dim);
@@ -109,7 +114,8 @@ fn build_history_slot(
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<(ChunkedKvBacking, KvCache)> {
-    let backing = ChunkedKvBacking::new(4, g.n_kv_head, g.head_dim, DType::BF16, device, MAX_BLOCKS)?;
+    let backing =
+        ChunkedKvBacking::new(4, g.n_kv_head, g.head_dim, DType::BF16, device, MAX_BLOCKS)?;
     let mut cache = KvCache::new(2, 64);
     cache.force_dtype(DType::BF16);
     cache.set_chunked_backing(&backing, 0, None)?;
@@ -160,6 +166,8 @@ enum DecodeEmit<'a> {
 /// `build_decode_metadata` does and runs one decode step. Header state is
 /// rebuilt per call, so FP and q8 runs over the same slot see identical
 /// metadata and identical split partials.
+// Mirrors the production decode launch's own argument list.
+#[allow(clippy::too_many_arguments)]
 fn decode_one_slot(
     g: Geom,
     backing: &ChunkedKvBacking,
@@ -174,7 +182,9 @@ fn decode_one_slot(
 ) -> Result<Tensor> {
     use candle::backend::BackendStorage;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    use candle_transformers::models::slot_state::{tensor_u8_device_ptr, SlotStateHost, TokenSliceHost};
+    use candle_transformers::models::slot_state::{
+        tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
+    };
 
     let seq_offset = cache.current_seq_len();
     let arena_info = backing.resolve_arena_info()?;
@@ -321,10 +331,16 @@ fn warp_butterfly(vals: &[f32]) -> (f32, f32) {
 /// `{amax/127, Σx}` as f16.
 fn expected_tile_bytes(vr: &[f32]) -> ([u8; 128], [u8; 4]) {
     assert_eq!(vr.len(), 128);
-    let w: Vec<(f32, f32)> = (0..4).map(|i| warp_butterfly(&vr[i * 32..(i + 1) * 32])).collect();
+    let w: Vec<(f32, f32)> = (0..4)
+        .map(|i| warp_butterfly(&vr[i * 32..(i + 1) * 32]))
+        .collect();
     let tile_amax = (w[0].0.max(w[2].0)).max(w[1].0.max(w[3].0));
     let tile_sum = (w[0].1 + w[2].1) + (w[1].1 + w[3].1);
-    let id = if tile_amax != 0.0 { 127.0f32 / tile_amax } else { 0.0 };
+    let id = if tile_amax != 0.0 {
+        127.0f32 / tile_amax
+    } else {
+        0.0
+    };
     let mut qs = [0u8; 128];
     for (i, &x) in vr.iter().enumerate() {
         qs[i] = ((x * id).round_ties_even() as i32 as i8) as u8;
@@ -409,7 +425,16 @@ fn check_q8_parity(g: Geom, seed: u64) -> Result<()> {
 
     // FP context — the source of the expected bytes (already O-rounded).
     let fp = decode_one_slot(
-        g, &backing, &cache, &q_dec, &k_new, &v_new, &rope_cs, DecodeEmit::Float, &stager, &device,
+        g,
+        &backing,
+        &cache,
+        &q_dec,
+        &k_new,
+        &v_new,
+        &rope_cs,
+        DecodeEmit::Float,
+        &stager,
+        &device,
     )?;
     let ctx: Vec<f32> = fp.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
     let gate_f32: Vec<f32> = gate.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -430,7 +455,11 @@ fn check_q8_parity(g: Geom, seed: u64) -> Result<()> {
             &device,
         )?;
         let bytes = q8.flatten_all()?.to_vec1::<u8>()?;
-        assert_eq!(bytes.len(), total_tiles.div_ceil(8) * 1152, "{label}: q8 byte size");
+        assert_eq!(
+            bytes.len(),
+            total_tiles.div_ceil(8) * 1152,
+            "{label}: q8 byte size"
+        );
 
         for row in 0..g.n_head {
             for t in 0..tiles_per_row {

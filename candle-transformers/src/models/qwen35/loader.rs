@@ -12,9 +12,9 @@ use std::io::{Read, Seek};
 
 use super::attention::{AttentionWeights, RopeTables};
 use super::config::{LayerKind, Qwen35Config};
-use crate::models::delta_net::DeltaNetWeights;
 use super::model::{LayerFfn, LayerMix, Qwen35Layer, Qwen35Model};
 use super::moe::{FfnWeights, MoeWeights};
+use crate::models::delta_net::DeltaNetWeights;
 
 /// The architecture prefix, from `general.architecture` with a probe
 /// fallback over the known names (mirroring `quantized_qwen3_moe`'s loader
@@ -330,7 +330,10 @@ mod tests {
             model.cfg.vocab_size
         );
         for id in [1u32, 100, 1_000, 10_000, 100_000, 248_000] {
-            assert!(id < tok_vocab as u32, "sample id {id} is past the tokenizer");
+            assert!(
+                id < tok_vocab as u32,
+                "sample id {id} is past the tokenizer"
+            );
             let from_gguf = match &gguf_tokens[id as usize] {
                 Value::String(s) => s.clone(),
                 other => candle::bail!("gguf token {id} is not a string: {other:?}"),
@@ -357,11 +360,7 @@ mod tests {
         let mut s_full = model.new_session()?;
         let logits_full = model.forward(&prompt, &mut s_full)?;
         let last_full = logits_full.narrow(0, prompt.len() - 1, 1)?;
-        let max_abs = last_full
-            .abs()?
-            .flatten_all()?
-            .max(0)?
-            .to_scalar::<f32>()?;
+        let max_abs = last_full.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         assert!(max_abs.is_finite(), "non-finite logits: {max_abs}");
 
         let mut s_seg = model.new_session()?;
@@ -384,21 +383,17 @@ mod tests {
         // sessions, ≥ 4 distinct ids, "Paris" in the decode (the argmax after
         // the prompt is already " Paris") — discriminates just as well at 8,
         // and each extra token is a full single-token CPU forward, twice.
-        let greedy = |state: &mut super::super::model::SessionState,
-                      first: u32|
-         -> Result<Vec<u32>> {
-            let mut ids = Vec::with_capacity(8);
-            let mut tok = first;
-            for _ in 0..8 {
-                let l = model.forward(&[tok], state)?;
-                tok = l
-                    .get(0)?
-                    .argmax(0)?
-                    .to_scalar::<u32>()? ;
-                ids.push(tok);
-            }
-            Ok(ids)
-        };
+        let greedy =
+            |state: &mut super::super::model::SessionState, first: u32| -> Result<Vec<u32>> {
+                let mut ids = Vec::with_capacity(8);
+                let mut tok = first;
+                for _ in 0..8 {
+                    let l = model.forward(&[tok], state)?;
+                    tok = l.get(0)?.argmax(0)?.to_scalar::<u32>()?;
+                    ids.push(tok);
+                }
+                Ok(ids)
+            };
         let first = last_full.get(0)?.argmax(0)?.to_scalar::<u32>()?;
         let cont_a = greedy(&mut s_full, first)?;
         let mut s_b = model.new_session()?;

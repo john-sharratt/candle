@@ -13,9 +13,9 @@
 //! layer's FFN sees — so rather than reshape the shared trait around a hybrid,
 //! the ten lines that drive it live here.
 
+use candle::Result;
 #[cfg(feature = "cuda")]
 use candle::{DType, Device};
-use candle::Result;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
 

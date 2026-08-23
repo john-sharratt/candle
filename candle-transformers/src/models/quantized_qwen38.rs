@@ -64,7 +64,12 @@ mod tests {
     use hf_hub::RepoType;
 
     fn tokenizer_json() -> Result<String> {
-        let p = hf_get(TOKENIZER_REPO, RepoType::Model, TOKENIZER_REV, "tokenizer.json")?;
+        let p = hf_get(
+            TOKENIZER_REPO,
+            RepoType::Model,
+            TOKENIZER_REV,
+            "tokenizer.json",
+        )?;
         std::fs::read_to_string(&p).map_err(|e| candle::Error::Msg(format!("read {p:?}: {e}")))
     }
 

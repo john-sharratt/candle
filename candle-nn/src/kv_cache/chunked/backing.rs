@@ -2489,6 +2489,10 @@ pub fn global_arena_memory_report() -> Vec<(usize, String, usize, usize)> {
 /// measured on the Llama-2 MHA gate, 238 empty arenas stood between a 4-region
 /// tier and its ground. An arena release is a free-list push, so this is safe
 /// wherever a claim is.
+///
+/// Called from `region_pool`, which is CUDA-only — there is no transient tier
+/// to place against without a device.
+#[cfg(feature = "cuda")]
 pub(super) fn global_release_empty_arenas() -> usize {
     let mut freed = 0;
     if let Ok(registry) = BACKING_REGISTRY.lock() {

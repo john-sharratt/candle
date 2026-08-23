@@ -183,7 +183,13 @@ pub fn attention_layer_forward(
     let scores = (q_h.matmul(&k_exp.transpose(1, 2)?)? * scale)?;
     let mask_vals: Vec<f32> = (0..t)
         .flat_map(|i| {
-            (0..total).map(move |j| if j <= past + i { 0f32 } else { f32::NEG_INFINITY })
+            (0..total).map(move |j| {
+                if j <= past + i {
+                    0f32
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
         })
         .collect();
     let mask = Tensor::from_vec(mask_vals, (1, t, total), x.device())?;
@@ -220,10 +226,14 @@ mod tests {
 
     fn lcg_tensor(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
         let n: usize = shape.iter().product();
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let vals: Vec<f32> = (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
             })
             .collect();
@@ -245,7 +255,13 @@ mod tests {
         assert!(d <= tol, "{what}: max abs diff {d} > {tol}");
     }
 
-    fn tiny_weights(hidden: usize, n_head: usize, n_kv: usize, d: usize, dev: &Device) -> AttentionWeights {
+    fn tiny_weights(
+        hidden: usize,
+        n_head: usize,
+        n_kv: usize,
+        d: usize,
+        dev: &Device,
+    ) -> AttentionWeights {
         let scale = |t: Tensor| t.affine(0.15, 0.).unwrap();
         AttentionWeights {
             wq: scale(lcg_tensor(&[2 * d * n_head, hidden], 31, dev)),
@@ -335,7 +351,10 @@ mod tests {
         // Perturb the last token only.
         let bump = Tensor::from_vec(vec![10f32; hidden], (1, hidden), &dev).unwrap();
         let x2 = Tensor::cat(
-            &[x.narrow(0, 0, 4).unwrap(), x.narrow(0, 4, 1).unwrap().add(&bump).unwrap()],
+            &[
+                x.narrow(0, 0, 4).unwrap(),
+                x.narrow(0, 4, 1).unwrap().add(&bump).unwrap(),
+            ],
             0,
         )
         .unwrap();
@@ -394,7 +413,9 @@ mod tests {
         // A narrower rotary width than the head is still a valid full-width
         // rotation of its own leading block.
         let full = RopeTables::new(rot, 1e6, 8, &dev).unwrap();
-        let head_only = full.apply(&x.narrow(2, 0, rot).unwrap().contiguous().unwrap(), 5).unwrap();
+        let head_only = full
+            .apply(&x.narrow(2, 0, rot).unwrap().contiguous().unwrap(), 5)
+            .unwrap();
         assert_close(
             &head_only,
             &y.narrow(2, 0, rot).unwrap().contiguous().unwrap(),

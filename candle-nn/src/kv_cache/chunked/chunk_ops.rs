@@ -2323,12 +2323,9 @@ mod tests {
                 // Distinct, exactly representable in F32, and ordered so the
                 // failure message names the first wrong element usefully.
                 let kv: Vec<f32> = (0..n).map(|i| i as f32).collect();
-                let k = Tensor::from_vec(
-                    kv.clone(),
-                    (1, n_kv_head, n_tokens, head_dim),
-                    &Device::Cpu,
-                )
-                .unwrap();
+                let k =
+                    Tensor::from_vec(kv.clone(), (1, n_kv_head, n_tokens, head_dim), &Device::Cpu)
+                        .unwrap();
                 let v = Tensor::from_vec(
                     kv.iter().map(|x| -x).collect::<Vec<f32>>(),
                     (1, n_kv_head, n_tokens, head_dim),
@@ -2384,9 +2381,13 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn gpu_plan_and_walk_writes_agree_at_every_head_dim() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => {
+        // Through `cuda_device_or_skip`, not `Device::new_cuda`: this builds
+        // `ChunkedKvBacking`s, so it must hold the crate's GPU lock for the
+        // duration or it races whatever else is mid-wave — see that helper's
+        // note.
+        let (device, _gpu) = match cuda_device_or_skip() {
+            Some(v) => v,
+            None => {
                 eprintln!("skipping: CUDA device required");
                 return;
             }
@@ -2396,12 +2397,8 @@ mod tests {
             for n_tokens in [1usize, 31, 32, 33, 64, 100] {
                 let n = n_kv_head * n_tokens * head_dim;
                 let kv: Vec<f32> = (0..n).map(|i| i as f32).collect();
-                let k = Tensor::from_vec(
-                    kv.clone(),
-                    (1, n_kv_head, n_tokens, head_dim),
-                    &device,
-                )
-                .unwrap();
+                let k = Tensor::from_vec(kv.clone(), (1, n_kv_head, n_tokens, head_dim), &device)
+                    .unwrap();
                 let v = Tensor::from_vec(
                     kv.iter().map(|x| -x).collect::<Vec<f32>>(),
                     (1, n_kv_head, n_tokens, head_dim),
@@ -2420,14 +2417,11 @@ mod tests {
                         perm.extend_from_slice(&kv[base..base + head_dim]);
                     }
                 }
-                let k_walk = Tensor::from_vec(
-                    perm.clone(),
-                    (1, n_tokens, n_kv_head, head_dim),
-                    &device,
-                )
-                .unwrap()
-                .transpose(1, 2)
-                .unwrap();
+                let k_walk =
+                    Tensor::from_vec(perm.clone(), (1, n_tokens, n_kv_head, head_dim), &device)
+                        .unwrap()
+                        .transpose(1, 2)
+                        .unwrap();
                 let v_walk = Tensor::from_vec(
                     perm.iter().map(|x| -x).collect::<Vec<f32>>(),
                     (1, n_tokens, n_kv_head, head_dim),
@@ -2469,10 +2463,7 @@ mod tests {
                         .to_scalar::<f32>()
                         .unwrap()
                 };
-                for (label, got) in [
-                    ("plan K", &k_plan_out),
-                    ("walk K", &k_walk_out),
-                ] {
+                for (label, got) in [("plan K", &k_plan_out), ("walk K", &k_walk_out)] {
                     assert_eq!(
                         same(got, &k),
                         0.0,
@@ -2480,10 +2471,7 @@ mod tests {
                          {n_tokens} tokens"
                     );
                 }
-                for (label, got) in [
-                    ("plan V", &v_plan_out),
-                    ("walk V", &v_walk_out),
-                ] {
+                for (label, got) in [("plan V", &v_plan_out), ("walk V", &v_walk_out)] {
                     assert_eq!(
                         same(got, &v),
                         0.0,

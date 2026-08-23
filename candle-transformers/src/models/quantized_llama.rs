@@ -61,6 +61,9 @@ pub const ROPE_EXTEND_CHUNK: usize = 1024;
 
 type SharedCis = Arc<RwLock<CisPrecomputations>>;
 
+// One per layer for the model's lifetime, and matched on in the forward path —
+// a `Box` would add a pointer chase to every FFN to save a few hundred bytes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum MlpOrMoe {
     Mlp(QuantizedMlp),

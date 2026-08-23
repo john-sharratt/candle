@@ -9,12 +9,12 @@
 use candle::cuda_backend::cudarc::cublas::sys as cublas;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::{DType, Device, LiveTensor, Result, Storage, Tensor};
+pub use candle_kernels::delta_net::DELTA_NET_PREFILL_DIM;
 use candle_kernels::delta_net::{
     run_delta_net_batch_ptrs, run_delta_net_conv_decode_f32, run_delta_net_conv_prefill_f32,
     run_delta_net_decode_step_f32, run_delta_net_norm_gate_f32, run_delta_net_prefill_intra_f32,
     run_delta_net_prefill_state_f32, DELTA_NET_PREFILL_CHUNK,
 };
-pub use candle_kernels::delta_net::DELTA_NET_PREFILL_DIM;
 
 use super::mix::{DeltaNetLayerTable, DeltaNetSeq, SeqSpan};
 use super::state_store::RecurrentStateStore;
@@ -358,7 +358,10 @@ pub fn delta_net_conv_decode(
         candle::bail!("delta_net cuda: kernel channels {kc} != x channels {channels}");
     }
     if conved.dims2()? != (t, channels) {
-        candle::bail!("delta_net cuda: conved must match qkv, got {:?}", conved.dims());
+        candle::bail!(
+            "delta_net cuda: conved must match qkv, got {:?}",
+            conved.dims()
+        );
     }
     check_qk_channels(qk_channels, channels)?;
     let (two, n_decode) = table.ptrs.dims2()?;
@@ -406,7 +409,6 @@ fn check_qk_channels(qk_channels: usize, channels: usize) -> Result<()> {
     }
     Ok(())
 }
-
 
 /// Solve `(I + A) X = B` for every head, where `a [H, c, c]` is **strictly**
 /// lower triangular (its diagonal is ignored — the identity supplies it) and
@@ -548,8 +550,8 @@ pub fn delta_net_conv_prefill<'w>(
         let x_p = f32_ptr(x, "x")?;
         let k_p = f32_ptr(kernel, "kernel")?;
         let t_p = f32_ptr(tail, "tail")?;
-        let y_p = f32_ptr(conved, "conved")?
-            + (start * channels * std::mem::size_of::<f32>()) as u64;
+        let y_p =
+            f32_ptr(conved, "conved")? + (start * channels * std::mem::size_of::<f32>()) as u64;
         let to_p = f32_ptr(&tail_out, "tail_out")?;
         unsafe {
             run_delta_net_conv_prefill_f32(
@@ -669,10 +671,16 @@ pub fn delta_net_norm_gate<'w>(
 ) -> Result<LiveTensor<'w>> {
     let (t, cols) = o.dims2()?;
     if z.dims2()? != (t, cols) {
-        candle::bail!("delta_net cuda: z must match o, got {:?} vs {:?}", z.dims(), o.dims());
+        candle::bail!(
+            "delta_net cuda: z must match o, got {:?} vs {:?}",
+            z.dims(),
+            o.dims()
+        );
     }
     if gain.dims1()? != d || !cols.is_multiple_of(d) || d > MAX_HEAD_DIM {
-        candle::bail!("delta_net cuda: gain [{d}] must divide {cols} rows-wise (cap {MAX_HEAD_DIM})");
+        candle::bail!(
+            "delta_net cuda: gain [{d}] must divide {cols} rows-wise (cap {MAX_HEAD_DIM})"
+        );
     }
     let dev = match o.device() {
         Device::Cuda(dv) => dv.clone(),
@@ -710,10 +718,14 @@ mod tests {
 
     fn lcg_tensor(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
         let n: usize = shape.iter().product();
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let vals: Vec<f32> = (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
             })
             .collect();
@@ -759,16 +771,14 @@ mod tests {
             use super::super::mix::softplus;
             let d = 128usize;
             let conv_dim = (2 * h_k + h_v) * d; // Q | K | V column layout
+
             // The scan kernels read a post-epilogue buffer: Q|K columns
             // l2-normed, V columns arbitrary (post-SiLU values — random works,
             // the reference reads the same buffer).
             let qk = l2_norm(&lcg_tensor(&[t, 2 * h_k, d], seed, cpu), 1e-6).unwrap();
             let v_cols = lcg_tensor(&[t, h_v * d], seed + 1, cpu);
-            let conved = Tensor::cat(
-                &[&qk.reshape((t, 2 * h_k * d)).unwrap(), &v_cols],
-                1,
-            )
-            .unwrap();
+            let conved =
+                Tensor::cat(&[&qk.reshape((t, 2 * h_k * d)).unwrap(), &v_cols], 1).unwrap();
             let alpha = lcg_tensor(&[t, h_v], seed + 2, cpu);
             let blin = lcg_tensor(&[t, h_v], seed + 3, cpu);
             let dt_bias = lcg_tensor(&[h_v], seed + 4, cpu);
@@ -871,7 +881,10 @@ mod tests {
         let a = Tensor::from_vec(vals, (h, c, c), &gpu).unwrap();
         let rhs = lcg_tensor(&[h, c, n], 22, &gpu);
 
-        let want = unit_lower_inverse_for_test(&a).unwrap().matmul(&rhs).unwrap();
+        let want = unit_lower_inverse_for_test(&a)
+            .unwrap()
+            .matmul(&rhs)
+            .unwrap();
         let got = solve_unit_lower(&a, rhs.clone()).unwrap();
 
         let d = max_diff(&got, &want);
@@ -1004,14 +1017,24 @@ mod tests {
             delta_net_decode_batch(&fused, &table).unwrap();
         }
 
-        let o_cpu = o.reshape((t_wave, h_v, d)).unwrap().to_device(&cpu).unwrap();
+        let o_cpu = o
+            .reshape((t_wave, h_v, d))
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
         for (first, (o_ref, s_ref)) in o_refs.iter().zip(s_refs.iter()).enumerate() {
             let o_gpu = gather(&o_cpu, &seq_rows(first));
             let s_gpu = states[first].to_device(&cpu).unwrap();
             let od = max_diff(o_ref, &o_gpu);
             let sd = max_diff(s_ref, &s_gpu);
-            assert!(od <= 2e-5, "seq {first}: outputs diverged from reference: {od}");
-            assert!(sd <= 2e-5, "seq {first}: state diverged from reference: {sd}");
+            assert!(
+                od <= 2e-5,
+                "seq {first}: outputs diverged from reference: {od}"
+            );
+            assert!(
+                sd <= 2e-5,
+                "seq {first}: state diverged from reference: {sd}"
+            );
         }
     }
 
@@ -1039,7 +1062,11 @@ mod tests {
             .unwrap()
             .contiguous()
             .unwrap();
-        Tensor::cat(&[&qk, &s.narrow(0, qk_channels, c - qk_channels).unwrap()], 0).unwrap()
+        Tensor::cat(
+            &[&qk, &s.narrow(0, qk_channels, c - qk_channels).unwrap()],
+            0,
+        )
+        .unwrap()
     }
 
     /// The batched decode conv vs the CPU conv + epilogue, column by column,
@@ -1087,8 +1114,22 @@ mod tests {
         // The wave's raw QKV rows: row 2i = A's token i, row 2i+1 = B's.
         let mut xw = Vec::with_capacity(t_wave * c);
         let (va, vb) = (
-            xa.t().unwrap().contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            xb.t().unwrap().contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            xa.t()
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            xb.t()
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
         );
         for i in 0..steps {
             xw.extend_from_slice(&va[i * c..(i + 1) * c]);
@@ -1174,7 +1215,13 @@ mod tests {
                     .unwrap();
             tail_gpu.slice_set(&tail_out, 1, 0).unwrap();
 
-            let y_cm = conved.t().unwrap().contiguous().unwrap().to_device(&cpu).unwrap();
+            let y_cm = conved
+                .t()
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap();
             let yd = max_diff(&y_ref, &y_cm);
             let td = max_diff(&tail_cpu, &tail_gpu.to_device(&cpu).unwrap());
             assert!(yd <= 1e-5, "segment {seg}: conv outputs diverged: {yd}");
@@ -1344,7 +1391,11 @@ mod tests {
         let dc = time("conv_decode (batch of 4)", &mut || {
             delta_net_conv_decode(&qkv, &kern, &dec_table, &conved, qk_channels, 1e-6).unwrap();
         });
-        eprintln!("  {:<26} {:9.1} µs/layer (4-seq decode)", "TOTAL", d_us + dc);
+        eprintln!(
+            "  {:<26} {:9.1} µs/layer (4-seq decode)",
+            "TOTAL",
+            d_us + dc
+        );
     }
 
     /// The fused epilogue against the op forms it replaced: per-head RMS norm
@@ -1375,11 +1426,7 @@ mod tests {
         let silu_z = z3
             .broadcast_mul(&candle_nn::ops::sigmoid(&z3).unwrap())
             .unwrap();
-        let want = normed
-            .mul(&silu_z)
-            .unwrap()
-            .reshape((t, h_v * d))
-            .unwrap();
+        let want = normed.mul(&silu_z).unwrap().reshape((t, h_v * d)).unwrap();
 
         let to = |x: &Tensor| x.to_device(&gpu).unwrap().contiguous().unwrap();
         let got = delta_net_norm_gate(&to(&o), &to(&z), &to(&gain), d, eps as f32)

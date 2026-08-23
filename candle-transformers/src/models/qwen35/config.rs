@@ -113,9 +113,8 @@ impl Qwen35Config {
             md.get(&format!("{arch}.{key}"))
                 .ok_or_else(|| candle::Error::Msg(format!("gguf: missing {arch}.{key}")))
         };
-        let get_usize = |key: &str| -> Result<usize> {
-            get(key).and_then(|v| value_to_usize(v, key))
-        };
+        let get_usize =
+            |key: &str| -> Result<usize> { get(key).and_then(|v| value_to_usize(v, key)) };
         let opt_usize = |key: &str| -> Option<usize> {
             md.get(&format!("{arch}.{key}"))
                 .and_then(|v| value_to_usize(v, key).ok())
@@ -134,8 +133,8 @@ impl Qwen35Config {
         let hidden_size = get_usize("embedding_length")?;
         let num_attention_heads = get_usize("attention.head_count")?;
         let num_kv_heads = get_usize("attention.head_count_kv")?;
-        let attn_head_dim = opt_usize("attention.key_length")
-            .unwrap_or(hidden_size / num_attention_heads);
+        let attn_head_dim =
+            opt_usize("attention.key_length").unwrap_or(hidden_size / num_attention_heads);
 
         // The layer schedule: an explicit per-layer recurrent flag array wins;
         // otherwise the interval rule (default 4).
@@ -271,9 +270,8 @@ impl Qwen35Config {
         } else {
             None
         };
-        let intermediate_size = opt_usize("feed_forward_length").unwrap_or_else(|| {
-            moe.map(|m| m.expert_ffn_size).unwrap_or(0)
-        });
+        let intermediate_size = opt_usize("feed_forward_length")
+            .unwrap_or_else(|| moe.map(|m| m.expert_ffn_size).unwrap_or(0));
         if intermediate_size == 0 && moe.is_none() {
             candle::bail!("gguf: {arch}.feed_forward_length missing on a dense model");
         }

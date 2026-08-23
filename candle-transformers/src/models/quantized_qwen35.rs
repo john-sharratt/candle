@@ -201,7 +201,7 @@ mod tests {
         let mut residual: Option<Tensor> = None;
         let (mut attn_ms, mut delta_ms) = (0f64, 0f64);
         let (mut attn_n, mut delta_n) = (0usize, 0usize);
-        for li in 0..n {
+        for (li, kind) in kinds.iter().enumerate().take(n) {
             device.synchronize()?;
             let t = Instant::now();
             let step = model.forward_wave(
@@ -209,7 +209,7 @@ mod tests {
                 &[],
                 &[],
                 &[seq],
-                &[ids.clone()],
+                std::slice::from_ref(&ids),
                 &[],
                 &[],
                 li,
@@ -220,7 +220,7 @@ mod tests {
             drop(step);
             device.synchronize()?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
-            match kinds[li] {
+            match kind {
                 LayerKind::Attention => {
                     attn_ms += ms;
                     attn_n += 1;
@@ -245,7 +245,7 @@ mod tests {
         let mut tok = 1000u32;
         let mut residual: Option<Tensor> = None;
         let (mut a_ms, mut d_ms) = (0f64, 0f64);
-        for li in 0..n {
+        for (li, kind) in kinds.iter().enumerate().take(n) {
             let ids = Tensor::from_vec(vec![tok], (1, 1), &device)?;
             device.synchronize()?;
             let t = Instant::now();
@@ -268,7 +268,7 @@ mod tests {
             drop(step);
             device.synchronize()?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
-            match kinds[li] {
+            match kind {
                 LayerKind::Attention => a_ms += ms,
                 LayerKind::DeltaNet => d_ms += ms,
             }

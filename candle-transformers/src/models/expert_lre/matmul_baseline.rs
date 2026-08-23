@@ -152,8 +152,7 @@ fn load_expert(
     if !dev.is_cuda() {
         candle::bail!("expert matmul baseline requires a CUDA device");
     }
-    let gpu_qt =
-        candle::quantized::ggml_file::qtensor_from_ggml(dtype, &fx.ggml, vec![n, k], dev)?;
+    let gpu_qt = candle::quantized::ggml_file::qtensor_from_ggml(dtype, &fx.ggml, vec![n, k], dev)?;
     let qmm = QMatMul::from_qtensor_with_mode(gpu_qt, mode)?;
     Ok(Some((qmm, w_deq, weight_bytes)))
 }

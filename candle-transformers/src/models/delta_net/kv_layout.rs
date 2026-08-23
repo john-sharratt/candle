@@ -82,9 +82,7 @@ impl KvLayerMap {
     /// enumerating layers. An empty window (a range containing no attention
     /// layers) returns an empty range rather than a reversed one.
     pub fn kv_range(&self, start: usize, end: usize) -> (usize, usize) {
-        let count_before = |bound: usize| {
-            self.to_layer.partition_point(|&l| l < bound)
-        };
+        let count_before = |bound: usize| self.to_layer.partition_point(|&l| l < bound);
         let lo = count_before(start.min(end));
         let hi = count_before(end.max(start));
         (lo, hi.max(lo))
@@ -112,7 +110,9 @@ impl KvLayerMap {
     }
 }
 
-#[cfg(test)]
+// The schedules under test come from `qwen35::config`, which lives in the
+// CUDA-gated hybrid lineage; the map itself is pure and builds either way.
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 

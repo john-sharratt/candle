@@ -1085,7 +1085,10 @@ mod tests {
         });
         assert!(substrate.recurrent_snapshot_loc(sid).is_none());
         let (_, _, snapshots, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
-        assert!(snapshots.is_empty(), "tombstoned snapshot must not relocate");
+        assert!(
+            snapshots.is_empty(),
+            "tombstoned snapshot must not relocate"
+        );
     }
 
     fn sealed_log(dir: &std::path::Path, id: u64) -> PathBuf {
@@ -1159,7 +1162,10 @@ mod tests {
         assert_eq!(usid, sid);
         assert_eq!(old, loc_b);
         assert_eq!(new.segment, SegmentId(2), "relocated into the active");
-        assert_eq!(new.record_size, loc_b.record_size, "verbatim copy, same size");
+        assert_eq!(
+            new.record_size, loc_b.record_size,
+            "verbatim copy, same size"
+        );
         assert_eq!(
             sp.accounting.dead_bytes(),
             loc_a.record_size + loc_b.record_size,
@@ -1170,8 +1176,7 @@ mod tests {
         assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(new));
         sp.finish_maintenance(&plan).unwrap();
         assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
-        let decoded =
-            SnapshotPayload::decode(&sp.read_record_payload(&new).unwrap()).unwrap();
+        let decoded = SnapshotPayload::decode(&sp.read_record_payload(&new).unwrap()).unwrap();
         assert_eq!(decoded.turn_index, 2);
         drop(sp);
 
@@ -1228,7 +1233,11 @@ mod tests {
             .unwrap();
         substrate.apply_snapshot_loc(sid, loc_c);
         sp.commit().unwrap();
-        assert_eq!(loc_c.segment, SegmentId(2), "the newer tail lands in the active");
+        assert_eq!(
+            loc_c.segment,
+            SegmentId(2),
+            "the newer tail lands in the active"
+        );
         let dead_before = sp.accounting.dead_bytes();
         assert_eq!(
             dead_before,
@@ -1279,7 +1288,10 @@ mod tests {
             "the persistence-side live-tail map is rebuilt by the walk"
         );
         let decoded = SnapshotPayload::decode(&sp.read_record_payload(&tail).unwrap()).unwrap();
-        assert_eq!(decoded.turn_index, 3, "reload sees the NEWER snapshot as the tail");
+        assert_eq!(
+            decoded.turn_index, 3,
+            "reload sees the NEWER snapshot as the tail"
+        );
         assert_eq!(decoded.layers[0].state[0], 0x33);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1348,7 +1360,7 @@ mod tests {
             substrate.recurrent_snapshot_loc(sid).is_none(),
             "no tail resurrected after the tombstone"
         );
-        assert!(sp.snapshot_locs.get(&sid.0).is_none());
+        assert!(!sp.snapshot_locs.contains_key(&sid.0));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1604,7 +1616,8 @@ mod tests {
             "the stream is an orphan: chunk present, no decl",
         );
         // gather_relocations must NOT relocate the orphan's chunk.
-        let (chunks, _tokens, _snapshots, _singletons) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (chunks, _tokens, _snapshots, _singletons) =
+            sp.gather_relocations(&substrate, &[SegmentId(1)]);
         assert!(
             chunks.is_empty(),
             "orphan chunks must not be relocated (would perpetuate the bloat + churn)",

@@ -46,7 +46,7 @@ fn main() -> Result<()> {
 
     println!("Loading model...");
     let t0 = std::time::Instant::now();
-    let inner = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+    let inner = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
     let inv_freq = inner
         .rope_inv_freq()
         .ok_or_else(|| candle::Error::Msg("model has no RoPE inv_freq".into()))?;

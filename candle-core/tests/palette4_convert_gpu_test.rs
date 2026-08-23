@@ -32,7 +32,7 @@ const CHUNK_SIZE: usize = 32;
 // R16 block size: half d[32] + uint16_t q[32] = 128 bytes
 const R16_BLOCK_BYTES: usize = 128;
 
-//// Widen a test-local `[u8; HD/4]` pal map to the API's max-width buffer.
+/// Widen a test-local `[u8; HD/4]` pal map to the API's max-width buffer.
 fn widen_pal(map: &[u8; HD / 4]) -> candle_core::quantized::cuda::PalMapBytes {
     let mut out = [0u8; 64];
     out[..HD / 4].copy_from_slice(map);
@@ -527,7 +527,7 @@ fn palette4_convert_batched_matches_per_chunk() -> Result<()> {
         let start = layer * num_kv_heads;
         let end = start + num_kv_heads;
         quantize_palette4_convert_buffered(
-        128,
+            128,
             &descs_a[start..end],
             num_kv_heads,
             1,
@@ -597,7 +597,7 @@ fn palette4_convert_r16_identity_copy_check() -> Result<()> {
         use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
         let ident = identity_pal_map_local();
         quantize_palette4_convert_buffered(
-        128,
+            128,
             &[PalHeadDesc {
                 k_src_arena_ptrs: src_arena_ptrs,
                 v_src_arena_ptrs: src_arena_ptrs,
@@ -819,7 +819,11 @@ fn pmg(pal_map: &candle_core::quantized::cuda::PalMapBytes, d: usize) -> usize {
 }
 
 /// Rust mirror of CUDA find_nth_dim_in_pal.
-fn nth_dim_in_pal(pal_map: &candle_core::quantized::cuda::PalMapBytes, p: usize, n: usize) -> usize {
+fn nth_dim_in_pal(
+    pal_map: &candle_core::quantized::cuda::PalMapBytes,
+    p: usize,
+    n: usize,
+) -> usize {
     let mut count = 0usize;
     for g in 0..HD {
         if pmg(pal_map, g) == p {
@@ -2528,7 +2532,10 @@ fn buffered_api_identity_pal_map() -> Result<()> {
     let map = identity_pal_map(128);
     // Max-width buffer: only the first head_dim/4 = 32 bytes are live at 128.
     assert_eq!(map.len(), 64);
-    assert!(map[32..].iter().all(|&b| b == 0), "tail bytes must stay zero");
+    assert!(
+        map[32..].iter().all(|&b| b == 0),
+        "tail bytes must stay zero"
+    );
     for d in 0..128usize {
         let byte_idx = d / 4;
         let bit_shift = 2 * (d % 4);
@@ -3132,7 +3139,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
         let stager = PinnedStager::new(cuda_dev);
         let generation = stager.begin_generation();
         candle_core::quantized::cuda::quantize_palette4_convert_buffered(
-        128,
+            128,
             &descs_fwd,
             num_kv_heads,
             num_layers,
@@ -3141,7 +3148,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
             &stream,
         )?;
         candle_core::quantized::cuda::quantize_palette4_convert_buffered(
-        128,
+            128,
             &descs_bwd,
             num_kv_heads,
             num_layers,
@@ -3155,7 +3162,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
         let t0 = Instant::now();
         while t0.elapsed() < target_duration {
             candle_core::quantized::cuda::quantize_palette4_convert_buffered(
-        128,
+                128,
                 &descs_fwd,
                 num_kv_heads,
                 num_layers,
@@ -3164,7 +3171,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
                 &stream,
             )?;
             candle_core::quantized::cuda::quantize_palette4_convert_buffered(
-        128,
+                128,
                 &descs_bwd,
                 num_kv_heads,
                 num_layers,

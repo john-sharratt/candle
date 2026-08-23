@@ -69,7 +69,11 @@ impl QuantizedMlp {
                     );
                 }
                 let fused = QTensor::concat_rows_cuda(&[&gate_w, &up_w])?;
-                (Some(QMatMul::from_qtensor_with_mode(fused, mode)?), None, None)
+                (
+                    Some(QMatMul::from_qtensor_with_mode(fused, mode)?),
+                    None,
+                    None,
+                )
             }
             #[cfg(not(feature = "cuda"))]
             {

@@ -1244,7 +1244,13 @@ pub fn convert_deferred_descs(
     };
     let stager = backing.begin_stager_generation_required();
     let primary_stream = cuda_dev.cuda_stream();
-    convert_descs_batched(backing.head_dim(), descs, n_kv_head, &stager, &primary_stream)?;
+    convert_descs_batched(
+        backing.head_dim(),
+        descs,
+        n_kv_head,
+        &stager,
+        &primary_stream,
+    )?;
     drop(stager);
     Ok(())
 }

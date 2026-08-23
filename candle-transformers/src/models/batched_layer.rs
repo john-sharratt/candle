@@ -1407,9 +1407,7 @@ fn paged_decode_attention<'w>(
             // arena-mismatch sessions whose Q/K/V were converted above — the
             // same off-nominal sessions, paying one more pass of the same kind.
             let gate_kernel = match gate {
-                Some(g) if g.dtype() != q_kernel.dtype() => {
-                    Some(g.to_dtype(q_kernel.dtype())?)
-                }
+                Some(g) if g.dtype() != q_kernel.dtype() => Some(g.to_dtype(q_kernel.dtype())?),
                 Some(g) => Some(g.clone()),
                 None => None,
             };
@@ -1634,9 +1632,9 @@ mod tests {
         let inv_freq_t = Tensor::from_vec(inv_freq, (head_dim / 2,), &device)?;
         let rope_cs = compute_rope_cs(&inv_freq_t, 4, head_dim, &device)?;
 
-        let q_live = LiveTensor::from(q.clone());
-        let k_live = LiveTensor::from(k.clone());
-        let v_live = LiveTensor::from(v.clone());
+        let q_live = q.clone();
+        let k_live = k.clone();
+        let v_live = v.clone();
         let out = paged_prefill_float_fallback(
             &mut cache_refs,
             &offsets,
@@ -1674,7 +1672,10 @@ mod tests {
         let mut row_start = 0usize;
         for &len in &q_lens {
             let take = |x: &Tensor| -> Result<Tensor> {
-                x.narrow(0, row_start, len)?.transpose(0, 1)?.unsqueeze(0)?.contiguous()
+                x.narrow(0, row_start, len)?
+                    .transpose(0, 1)?
+                    .unsqueeze(0)?
+                    .contiguous()
             };
             let q_r = rot_ref(&take(&q)?, len)?.to_dtype(DType::F32)?;
             let k_r = rot_ref(&take(&k)?, len)?.to_dtype(DType::F32)?;

@@ -240,10 +240,10 @@ mod tests {
     #[test]
     #[ignore = "reads the pinned Qwen3.5-9B GGUF from the HF cache (7.5 GB) and needs a GPU"]
     fn batched_mixing_equals_mixing_each_sequence_alone() -> Result<()> {
-        use crate::models::delta_net::quantized_delta_net_layer_forward;
         use super::super::quantized_weights::load_quantized_model;
-        use crate::models::delta_net::RecurrentStateStore;
         use crate::models::batch_test::test_helpers::hf_get;
+        use crate::models::delta_net::quantized_delta_net_layer_forward;
+        use crate::models::delta_net::RecurrentStateStore;
         use candle::quantized::{gguf_file::Content, Int8Mode};
         use candle::{Module, Tensor};
         use std::io::{BufReader, Seek, SeekFrom};
@@ -259,8 +259,9 @@ mod tests {
         let content = Content::read(&mut reader)?;
         reader.seek(SeekFrom::Start(0))?;
         // The 9B is dense, so it needs no expert cache.
-        let model =
-            load_quantized_model(&content, &mut reader, &device, Int8Mode::Off, |_, _| Ok(None))?;
+        let model = load_quantized_model(&content, &mut reader, &device, Int8Mode::Off, |_, _| {
+            Ok(None)
+        })?;
 
         let li = 0usize; // DeltaNet under the 3:1 schedule
         let hidden = model.cfg.hidden_size;
