@@ -97,21 +97,24 @@ range and assume.
 | file | lines | why |
 |---|---|---|
 | `CLAUDE.md` (repo root) | — | the standing rules this work is bound by: no back-compat shims, no env flags, no TODOs/stubs, one concern per file, TDD, **only Edit/Write may modify files**, never commit without permission |
-| `candle-transformers/src/models/delta_net/state_store.rs` | 496 | `RecurrentStateStore` — the thing being persisted, forked and restored. `export`/`import`, wave atomicity, the buffer-not-value rule. **P1, P2, P4, P7 all edit this.** |
+| `candle-transformers/src/models/delta_net/state_store.rs` | 615 | `RecurrentStateStore` — the thing being persisted, forked and restored. `export`/`import`, and the **ping-pong** wave discipline (two `s` buffers per layer; commit is a `mem::swap`, rollback is nothing). **P1, P2, P4, P7 all edit this.** |
 | `candle-transformers/src/models/delta_net/types.rs` | 58 | `DeltaNetDims`, `LayerKind` — the geometry every size calculation uses |
 | `candle-transformers/src/models/delta_net/kv_layout.rs` | 220 | `KvLayerMap` — why `session.num_layers()` is 10 and `model.num_layers()` is 40; `snap_to_attention` |
-| `candle-transformers/src/models/qwen35/batched.rs` | 497 | the recurrent map, `ensure_recurrent` (the `offset == 0` reset), `take/put_recurrent`, `release_recurrent`, the wave begin/commit/rollback |
+| `candle-transformers/src/models/qwen35/batched.rs` | 511 | the recurrent map, `ensure_recurrent` (the `offset == 0` reset, `:175`), `take/put_recurrent`, `release_recurrent` (`:214`), the wave begin/commit/rollback |
 | `candle-transformers/src/models/qwen35/engine.rs` | 303 | `provenance_layer_indices` (already hybrid-correct), `create_session` |
 | `candle-conversation/src/turn_layout.rs` | 873 | `TurnSegment` / `GlueKind` / `KvSpan` / `from_flat_grid` — **the whole of §4.7 lives here**, including the already-tested `user_content_start > 0` path |
 | `candle-conversation/src/provenance/mod.rs` | 50 | the pipeline in one page: index side at seal, query side in decode |
 | `candle-conversation/src/persistence/streams.rs` | 293 | `TurnDecl` — a turn IS a stream; `segments` is the persisted layout |
 
-Also read, from `mix.rs` (do **not** read all 1,833 lines):
+Also read, from `mix.rs` (do **not** read all 1,873 lines):
 
 - **`mix.rs:1-40`** — the recurrence in three lines, and the layer around it.
-- **`mix.rs:45-104`** — `DeltaNetState`, `snapshot()`, `copy_from()`, and the
+- **`mix.rs:45-110`** — `DeltaNetState`, `snapshot()`, `copy_from()`, and the
   comment explaining why it is deliberately not `Clone`. P1's `fork_from` is
-  built directly on `snapshot()`.
+  built directly on `snapshot()`. Read both doc comments carefully: since the
+  ping-pong landed, **neither is on the wave path any more** — `snapshot` serves
+  the reference model's bookkeeping and `copy_from` is explicitly labelled "the
+  wave path does not use this." A fork is now their only hot caller.
 - **`mix.rs:165-345`** — `delta_chunked`, for the `v_new = u − w·Sᵀ` line that
   §4.6 uses to prove state does not compose.
 
@@ -389,8 +392,16 @@ Export refuses mid-wave; import refuses mid-wave and on hash mismatch.
 **The device-copy primitive.** `DeltaNetState::snapshot()` is
 `Tensor::copy()` on both buffers, which resolves to `CudaStorage::try_clone` —
 a device-to-device copy that never touches the host. This is already exactly
-the fast VRAM fork the brief asks for; it just has no caller outside the wave
-backup.
+the fast VRAM fork the brief asks for, and it survives; what changed under it is
+that it now has **no caller at all** on the hot path.
+
+> **The ping-pong commit moved this ground.** The wave used to preserve its entry
+> state by copying every layer aside, so a fork's copy was the same operation the
+> engine already ran every wave. It no longer is: each slot holds two `s` buffers,
+> a wave reads one and writes the other, commit is a host `mem::swap` and rollback
+> is nothing. `copy_from`'s own doc comment now says "the wave path does not use
+> this." The primitive is intact and correct, but §4.4's cost argument has to be
+> re-derived rather than inherited — see there.
 
 **The seal site.** The turn seal writes `WideQSig` then `Tokens` then fires the
 persistence trigger ([scheduler/mod.rs:6388-6407](../candle-conversation/src/scheduler/mod.rs#L6388-L6407)).
@@ -596,8 +607,27 @@ RecurrentStateStore::fork_from(&parent) -> Self
 ```
 
 No host round trip, no encode, no disk. On the 35B this is ~63 MiB of device
-copy per fork — sub-millisecond at PCIe-free device bandwidth, and it is the
-same primitive the wave backup already uses every wave.
+copy per fork — sub-millisecond at PCIe-free device bandwidth.
+
+**This cost is no longer amortised, and that is a change since the ping-pong
+landed.** The original argument here was that a fork costs the same operation the
+wave already ran every wave, so it was free in the sense of adding no new *kind*
+of work. The wave stopped copying: it preserves the entering state by not writing
+it, commit is a `mem::swap`, and the ~60 MiB per wave the store used to move is
+gone. A fork's copy is now genuinely new device traffic, and §5.3a puts one on
+**every dialogue turn** rather than only on an explicit `fork()`.
+
+Two consequences to carry into P1 and P2:
+
+- A forked slot needs **both** halves of the ping-pong: `live` is a real
+  `snapshot()` of the parent's live buffer, while the write buffer can be
+  allocated without initialising (the kernels fully overwrite it), so the copy is
+  ~63 MiB against ~123 MiB of allocation. `advanced` starts `false`.
+- Per-turn fork traffic is a number to measure, not to assume, and it is the
+  first thing to look at if turn latency regresses after P2. It is also the
+  reason to check whether a view's fork can be deferred to the first layer that
+  actually advances, since a turn that reprojects before decoding anything has
+  paid for a copy nothing read.
 
 **Parent not resident** (daemon restart, or the parent was freed). Fall back to
 §4.3's snapshot read.
@@ -1433,7 +1463,7 @@ More than expected. These are harnesses to extend, not to build:
 
 | area | existing tests | file |
 |---|---|---|
-| recurrent store | export/import round-trip, hash + geometry refusal, wave rollback/commit, write-back into the live buffer, wave sequencing, `schedule_hash` pins layout | `delta_net/state_store.rs` (6) |
+| recurrent store | export/import round-trip, hash + geometry refusal, wave rollback/commit, **`a_wave_leaves_the_entering_buffer_untouched`** (the ping-pong contract — this replaced the old write-back-into-the-live-buffer test, which pinned the inverse), wave sequencing, `schedule_hash` pins layout | `delta_net/state_store.rs` (6) |
 | snapshot codec | round-trip, exact header bytes, unknown-version rejection | `persistence/record.rs` |
 | snapshot lifecycle | single tail survives reload + relocation, exact dead-byte credit, superseded not relocated, tombstoned not relocated | `persistence/maintenance.rs` (4) |
 | turn layout | tiling + realisation, ethereal segments add no K/V, **`leading_boundary_offsets_user_body`**, thinking split, tool-exchange split, tiling rejects gaps | `turn_layout.rs` (10) |
@@ -1715,6 +1745,12 @@ per layer                                 ≈ 2.09 MiB
 × 30 recurrent layers                     ≈ 62.8 MiB per snapshot
 ```
 
+That is the **snapshot** size and it is unchanged by the ping-pong: `export`
+reads each slot's `live` buffer only. The *resident* figure is not the same
+number — since the ping-pong landed, every slot holds two `s` buffers, so a live
+sequence carries ≈123 MiB (2 × 2.00 MiB + 0.09 MiB per layer × 30) rather than
+63. Size VRAM from the resident number and the log from the snapshot one.
+
 **~63 MiB per turn seal per conversation**, in a log whose other per-turn
 records are kilobytes. Compaction reclaims all but the tail, so steady-state
 *storage* is ~63 MiB per live conversation — acceptable. The cost is **write
@@ -1905,19 +1941,39 @@ symbol name is authoritative.
 ### P1 — `fork_from`  *(the primitive P2/P7 need)*
 
 **Changes**
-- [ ] **P1.1.** `candle-transformers/src/models/delta_net/state_store.rs`: add
-      `pub fn fork_from(&self) -> Result<Self>` — new slots, each
-      `DeltaNetState::snapshot()` (device-to-device), same `dims`/`hash`/
-      `layer_index` order, `open: false`.
+- [ ] **P1.1.** `candle-transformers/src/models/delta_net/state_store.rs`
+      (`RecurrentStateStore`, `:129`): add
+      `pub fn fork_from(&self) -> Result<Self>` — new slots, same `dims`/`hash`/
+      `layer_index` order, `open: false`. Per slot: `live` is a
+      `DeltaNetState::snapshot()` of the parent's `live` (device-to-device);
+      `backup` is a fresh allocation the kernels fully overwrite, so it needs no
+      copy; `advanced: false`.
 - [ ] **P1.2.** Refuse `fork_from` while `self.open` (mid-wave) — same rule as
-      `export`.
+      `export`. Sharper than it was before the ping-pong: mid-wave, the parent's
+      *advanced* state lives in `backup` and its `live` is one wave stale, so a
+      mid-wave fork would silently copy the wrong buffer rather than merely
+      copying a moving one.
+- [ ] **P1.3.** Build the fork through `layer_state` / the slot fields directly,
+      **never** `layer_state_pair_mut` — that accessor sets `advanced`, and a
+      fork that trips it makes the parent's next `commit_wave` swap in a buffer
+      no wave wrote.
 
 **Tests** (tier 1 for shape, tier 2 for device)
 - [ ] **T1.1.** Child's `s` and `conv_tail` are bit-identical to the parent's.
 - [ ] **T1.2.** Buffers are **distinct allocations**: mutate the child, re-read
       the parent, assert unchanged. This is the test that catches a `Clone`
       sharing storage — the hazard `DeltaNetState`'s missing `Clone` prevents.
+      Assert it on **both** halves of the ping-pong: `layer_state_pair` hands out
+      a `Tensor` clone of the write buffer, so a fork that shares that one looks
+      correct until the child's first commit swaps it into the parent's view.
 - [ ] **T1.3.** `fork_from` mid-wave errors.
+- [ ] **T1.5.** Forking does not disturb the parent's wave bookkeeping: fork a
+      parent whose slots are all `advanced: false`, then commit a wave on the
+      parent and assert the state it installs is the one its own wave wrote
+      (P1.3's hazard).
+- [ ] **T1.6.** A child forked from a parent mid-*turn but between waves* carries
+      the parent's committed state, not its write buffer — i.e. the fork reads
+      `live` after the swap, never `backup`.
 - [ ] **T1.4.** *(tier 2)* On CUDA, the copy never touches host memory —
       assert via device pointers differing and no H2D/D2H in the span.
 
@@ -1934,8 +1990,9 @@ symbol name is authoritative.
       `fork_recurrent` inserts `parent.fork_from()` under `child`;
       `move_recurrent` removes `child`'s store and inserts it under `parent`.
 - [ ] **P2.3.** `candle-transformers/src/models/delta_net/state_store.rs`
-      (`RecurrentStateStore`, :106 — **not** `batched.rs`, which holds only the
-      map): add `seeded: bool` with `mark_seeded()` / `take_seeded()`. Set by
+      (`RecurrentStateStore`, `:129` — **not** `batched.rs`, which holds only the
+      map): add `seeded: bool` with `mark_seeded()` / `take_seeded()`. It is a
+      store-level flag like `open`, not a per-slot one like `advanced`. Set by
       `fork_recurrent` and by restore; `ensure_recurrent`
       (`qwen35/batched.rs:175`) **skips the `offset == 0` reset exactly once**
       when it is set, then clears it. (§10 decision 2.)
