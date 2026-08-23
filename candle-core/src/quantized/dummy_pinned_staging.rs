@@ -59,6 +59,12 @@ impl GpuBuf {
         0
     }
 
+    /// Always empty on non-CUDA builds; mirrors the CUDA `GpuBuf`'s API so
+    /// callers need no `cfg` of their own.
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+
     /// No-op constructor for non-CUDA builds.
     pub fn from_borrowed(_dev_ptr: u64, _len: usize) -> Self {
         Self { _private: () }

@@ -599,7 +599,7 @@ fn escaped_token_bails_and_terminates() {
     let bad = b'Z' as u32;
     assert!(!mask.contains(bad), "'Z' should be masked at the name");
     out.push(bad);
-    assert_eq!(session.observe(bad, &[b'Z']).unwrap(), Observe::Bailed);
+    assert_eq!(session.observe(bad, b"Z").unwrap(), Observe::Bailed);
 
     // The remaining actions emit the bail tokens (the envelope close) then exit.
     loop {

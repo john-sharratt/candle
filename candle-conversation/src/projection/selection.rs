@@ -346,9 +346,15 @@ mod tests {
     fn zero_score_is_never_selectable_by_evidence_rules() {
         let turns = vec![(t(0), 0.0), (t(1), 0.0), (t(2), 0.0)];
         let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.0, &turns, None, &tc);
-        assert!(r.is_empty(), "TopK over all-zero scores must select nothing");
+        assert!(
+            r.is_empty(),
+            "TopK over all-zero scores must select nothing"
+        );
         let r = apply_selection(&SelectionRule::Single, 0.0, &turns, None, &tc);
-        assert!(r.is_empty(), "Single over all-zero scores must select nothing");
+        assert!(
+            r.is_empty(),
+            "Single over all-zero scores must select nothing"
+        );
 
         // Mixed: only the evidenced member seats.
         let turns = vec![(t(0), 0.0), (t(1), 0.4), (t(2), 0.0)];

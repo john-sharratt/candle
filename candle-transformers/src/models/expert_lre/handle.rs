@@ -160,6 +160,10 @@ fn warm_slots_for(stride: usize, total_experts: usize) -> usize {
 // ============================================================================
 
 /// The two operating modes of the expert cache.
+// Exactly one `PipelineMode` exists per `ExpertCache`, and an `ExpertCache` is
+// per-model. Boxing `Inline` to even the variants out would buy back a few
+// hundred bytes once and pay an indirection on every expert dispatch.
+#[allow(clippy::large_enum_variant)]
 enum PipelineMode {
     /// Background thread owns all mutable state.  Used for the mmap path
     /// where DMA overlap is active and experts cycle through VRAM.
@@ -944,7 +948,8 @@ impl ExpertCache {
             // vanished and the layer returned an answer computed from fewer than
             // k experts, indistinguishable downstream from a correct one. Same
             // hazard, same refusal, as the threaded pipeline's copy.
-            let mut experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> = Vec::with_capacity(hits.len());
+            let mut experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> =
+                Vec::with_capacity(hits.len());
             for (&(eidx, slot_idx), (toks, wids)) in hits.iter().zip(experts_data.iter()) {
                 let Some(slot) = inner.slots[slot_idx].as_ref() else {
                     candle::bail!(

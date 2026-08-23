@@ -222,8 +222,6 @@ impl BatchedPrefillMeta {
     }
 }
 
-/// Precomputed decode metadata for the paged-decode attention path.
-///
 // ============================================================================
 // Layer-Level Trait
 // ============================================================================
@@ -894,7 +892,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     pipeline_record("prefill:out_proj", t_out_proj);
     // Restore the flat-packed [1, total_q, hidden_out] activation.
     let hidden_out = output.dim(1)?;
-    Ok(output.reshape((1, total_q, hidden_out))?)
+    output.reshape((1, total_q, hidden_out))
 }
 
 /// Simple per-sequence prefill attention fallback.

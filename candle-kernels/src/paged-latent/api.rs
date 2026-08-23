@@ -1,6 +1,6 @@
 //! FFI bindings for the paged latent-attention decode/prefill kernels.
 //!
-//! Single-latent K≡V attention (HEAD_DIM=512, MQA): the kernel walks the FP8
+//! Single-latent K≡V attention (MQA): the kernel walks the FP8
 //! window slot (arena bands via `SlotHeader`) plus an index-driven selection of
 //! f32 compressed entries, runs one online softmax over both sources, and the
 //! combine folds splits + the per-head sink, normalizes, and de-rotates the
@@ -17,7 +17,25 @@ use core::ffi::c_void;
 /// `{kv, headers, slices, in_blk, rows}`.
 pub const GLUE_SCATTER_WORDS: usize = 5;
 
+/// The `(head_dim, rope_dim, n_bands)` triple this build's kernels were
+/// instantiated at, read straight from the compiled object.
+///
+/// The kernels are templates over that triple, and the `extern "C"` entry points
+/// pin it to one value (`LM_HEAD_DIM`/`LM_ROPE_DIM`/`LM_NPAL` in
+/// `paged_latent_api_bf16.cu`). A host that launches against a different
+/// geometry would write `KvHead` records the kernel reads at other offsets —
+/// silent corruption, not a crash — so callers check this once at load and
+/// refuse the mismatch.
+pub fn latent_geometry() -> (usize, usize, usize) {
+    let (mut head_dim, mut rope_dim, mut n_bands) = (0i32, 0i32, 0i32);
+    unsafe { run_latent_geometry(&mut head_dim, &mut rope_dim, &mut n_bands) };
+    (head_dim as usize, rope_dim as usize, n_bands as usize)
+}
+
 extern "C" {
+    /// Writes the compiled geometry triple. Prefer [`latent_geometry`].
+    pub fn run_latent_geometry(head_dim: *mut i32, rope_dim: *mut i32, n_bands: *mut i32);
+
     /// BF16 latent decode. Layouts:
     ///   `q_ptr`    : `[slots, n_q_head, 512]` bf16, **pre-RoPE** (roped in-kernel
     ///                at the explicit `q_pos`).

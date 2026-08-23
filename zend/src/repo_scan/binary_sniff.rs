@@ -123,7 +123,7 @@ mod tests {
     fn a_couple_stray_nuls_are_tolerated() {
         // A long ASCII file with two stray NULs (e.g. trailing pad) stays text.
         let mut s = b"perfectly normal text file, mostly ascii\n".to_vec();
-        s.extend(std::iter::repeat(b'x').take(500));
+        s.extend(std::iter::repeat_n(b'x', 500));
         s.push(0);
         s.push(0);
         assert!(!is_binary_sample(&s));
@@ -133,7 +133,7 @@ mod tests {
     fn many_nuls_are_binary() {
         // Three NULs exceeds NUL_TOLERANCE even without a high overall ratio.
         let mut s = b"header text".to_vec();
-        s.extend(std::iter::repeat(b'a').take(500));
+        s.extend(std::iter::repeat_n(b'a', 500));
         s.extend_from_slice(&[0, 0, 0]);
         assert!(is_binary_sample(&s));
     }
@@ -188,7 +188,7 @@ mod tests {
         for _ in 0..5 {
             s.push(0xE9); // lone e-acute, invalid UTF-8
             s.extend_from_slice(b" cafe was busy. ");
-            s.extend(std::iter::repeat(b'x').take(40));
+            s.extend(std::iter::repeat_n(b'x', 40));
         }
         assert!(!is_binary_sample(&s));
     }

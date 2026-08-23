@@ -27,6 +27,9 @@
 //! - **E7** self-match sanity + structure-gallery anatomy: gallery-side health
 //!   and where the workspace-root cluster ranks for the tour probe
 
+// Offline experiment battery over the replay fixture.
+#![allow(clippy::print_literal, clippy::needless_lifetimes)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 

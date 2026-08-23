@@ -1292,7 +1292,7 @@ impl ChunkGidPool {
     pub fn force_release_arena(&self, arena_idx: usize) {
         let key = {
             let mut state = self.inner.metadata.lock().unwrap();
-            let key = state.arena_registry.get(arena_idx).and_then(|k| k.clone());
+            let key = state.arena_registry.get(arena_idx).and_then(|k| *k);
             if key.is_some() {
                 state.arena_registry[arena_idx] = None;
                 state.free_arenas.push_back(arena_idx);
@@ -1345,7 +1345,7 @@ impl ChunkGidPool {
     pub(crate) fn arena_free_count(&self, arena_idx: usize) -> u32 {
         let state = self.inner.metadata.lock().unwrap();
         let key = match state.arena_registry.get(arena_idx) {
-            Some(Some(k)) => k.clone(),
+            Some(Some(k)) => *k,
             _ => return 0,
         };
         drop(state);
@@ -1765,7 +1765,6 @@ mod tests {
         let handles: Vec<_> = (0..n_threads)
             .map(|_| {
                 let pool = Arc::clone(&pool);
-                let key = key;
                 thread::spawn(move || {
                     for _ in 0..rounds {
                         let mut held = Vec::with_capacity(batch);

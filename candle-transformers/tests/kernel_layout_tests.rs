@@ -34,6 +34,8 @@
 //! kernel, not the host.
 
 #![cfg(feature = "cuda")]
+// Kernel-gate harness: the launch wrappers take the kernel's flat argument list.
+#![allow(clippy::clone_on_copy, clippy::too_many_arguments)]
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::{PinnedBuf, PinnedStager};
@@ -65,6 +67,10 @@ const N_HEAD: usize = 4; // No GQA — keeps the test simple
 const HEAD_DIM: usize = 128;
 const MAX_BLOCKS: usize = 256; // Headroom for the larger layouts + quant candidate arenas
 const EXTRA_PREFILL_TOKENS: usize = 8;
+
+/// Tokens the write-region hoist test reserves. A partial chunk (< `CHUNK_SIZE`)
+/// so the extended `position_map` covers a writer chunk that is not full.
+const WRITE_REGION_TOKENS: usize = 7;
 
 /// fp16 attention has ~1e-3 numeric error per dot; the partial-chunk
 /// layout shouldn't add anything visible on top.  Treat anything
@@ -264,6 +270,13 @@ fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
         &device,
     )?;
 
+    // `build_segmented_slot` deliberately truncates the trailing empty writer
+    // chunk so it cannot bleed into slot B's layout, which leaves slot 0 holding
+    // sealed chunks only. `extend_for_write_region` below needs a writer chunk
+    // to extend INTO, so allocate one first — the same
+    // allocate-before-you-write contract the production prefill path follows.
+    backing.ensure_for_batch_entries(&[(0, total)], WRITE_REGION_TOKENS)?;
+
     let arena_info = backing.resolve_arena_info()?;
     let chunks = cache
         .k_cache()
@@ -329,8 +342,8 @@ fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
         a.position_map, b.position_map,
         "position_map must be deterministic across builds",
     );
-    a.extend_for_write_region(7, CHUNK_SIZE);
-    b.extend_for_write_region(7, CHUNK_SIZE);
+    a.extend_for_write_region(WRITE_REGION_TOKENS, CHUNK_SIZE);
+    b.extend_for_write_region(WRITE_REGION_TOKENS, CHUNK_SIZE);
     assert_eq!(
         a.position_map, b.position_map,
         "write-region-extended position_map must be deterministic",
@@ -655,6 +668,15 @@ fn run_prefill(
     device: &Device,
 ) -> Result<Tensor> {
     let offset = cache.current_seq_len();
+    // The writer chunk must exist BEFORE the kernel runs — `paged_prefill_batched`
+    // writes into it and does not allocate. The production path does this in
+    // `ensure_for_batch_entries_all` (batched_inference.rs) / per-seq in the wave
+    // engine; a harness that skips it trips `extend_for_write_region: no writer
+    // chunk`, which is what every test in this file used to do.
+    let kc = cache.k_cache();
+    if let (Some(backing), Some(slot)) = (kc.chunked_backing(), kc.chunked_slot()) {
+        backing.ensure_for_batch_entries(&[(slot, offset)], seq_len)?;
+    }
     let (qf, kf, vf) = flatten_qkv(q, k, v)?;
     let generation = stager.begin_generation();
     let mut caches_arr: [&mut KvCache; 1] = [cache];
@@ -1372,10 +1394,33 @@ const GLUE_TOKENS: usize = 8;
 /// (`fwd_ahead`). Both tests are `#[ignore]`d pending a rewrite of their KV
 /// setup to reserve gap chunks and derive real descriptors, and GPU
 /// re-verification. This keeps the calls compiling in the meantime.
-fn glue_descriptors(n_glue: usize, device: &Device) -> Result<(Tensor, Tensor, Tensor)> {
-    let z = Tensor::zeros(n_glue, DType::U32, device)?;
+/// Per-glue-token write descriptors: which slice each token lands in and its
+/// offset within that slice's block.
+///
+/// This mirrors what the scheduler's gap-fill planning supplies in production
+/// (`build_glue_meta`'s `write_slice`/`write_in_blk`). All-zeros — what this
+/// returned before — pointed every glue token at slice 0 offset 0, so `g` tokens
+/// overwrote a single cell inside SEALED segment A and the result could not
+/// match a fresh prefill by construction.
+///
+/// Valid while the gap fits one chunk (`n_glue <= CHUNK_SIZE`), which every
+/// interspersed case satisfies; a wider gap would need to walk chunk boundaries
+/// the way the production planner does.
+fn glue_descriptors(
+    cache: &KvCache,
+    n_glue: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    assert!(
+        n_glue <= CHUNK_SIZE,
+        "glue_descriptors covers a single writer chunk; {n_glue} > {CHUNK_SIZE} needs the \
+         production planner's chunk walk"
+    );
+    let writer = cache.k_cache().chunked_writer_start_idx().unwrap_or(0) as u32;
+    let slice = Tensor::from_vec(vec![writer; n_glue], n_glue, device)?;
+    let in_blk = Tensor::from_vec((0..n_glue as u32).collect::<Vec<_>>(), n_glue, device)?;
     let fwd = Tensor::zeros(n_glue, DType::U32, device)?; // backward-only
-    Ok((z.clone(), z, fwd))
+    Ok((slice, in_blk, fwd))
 }
 
 #[test]
@@ -1479,7 +1524,7 @@ fn run_offset_window_glue_case(
     // positions [0, win_len) then glue [win_len, win_len+GLUE_TOKENS).
     let (qg, kg, vg) = make_qkv(GLUE_TOKENS, device, hash_str(case_name) ^ 0x6C0E_u64)?;
     let (qgf, kgf, vgf) = flatten_qkv(&qg, &kg, &vg)?;
-    let (gw_slice, gw_in_blk, fwd_ahead) = glue_descriptors(GLUE_TOKENS, device)?;
+    let (gw_slice, gw_in_blk, fwd_ahead) = glue_descriptors(&cache_b, GLUE_TOKENS, device)?;
 
     let gen_c = stager.begin_generation();
     let out_c = paged_glue_attn(
@@ -1562,7 +1607,7 @@ fn glue_over(
     backing.push_empty_writer_chunk(slot)?;
     let win_len = sealed.token_count;
     cache.set_current_seq_len(win_len)?;
-    let (gw_slice, gw_in_blk, fwd_ahead) = glue_descriptors(GLUE_TOKENS, device)?;
+    let (gw_slice, gw_in_blk, fwd_ahead) = glue_descriptors(&cache, GLUE_TOKENS, device)?;
     let gen = stager.begin_generation();
     let out = paged_glue_attn(
         None,
@@ -1935,6 +1980,10 @@ fn run_glue_interspersed_case(
     backing.inject_sealed_at_tail(0, &seg_a)?;
     backing.inject_sealed_at_tail(0, &seg_b)?;
     cache.set_current_seq_len(la + lb)?;
+    // Injection leaves slot 0 holding sealed chunks only. The glue forward WRITES
+    // its `g` tokens, so it needs a writer chunk to write into — allocated here,
+    // before the descriptors below are read off the resulting layout.
+    backing.ensure_for_batch_entries(&[(0, la + lb)], g)?;
 
     // Glue tokens = master[la, la+g); col_actual_pos = A logical, B logical,
     // glue logical (prefix in inject/physical order, then glue).
@@ -1942,7 +1991,7 @@ fn run_glue_interspersed_case(
     let kg = km.narrow(2, la, g)?.contiguous()?;
     let vg = vm.narrow(2, la, g)?.contiguous()?;
     let (qgf, kgf, vgf) = flatten_qkv(&qg, &kg, &vg)?;
-    let (gw_slice, gw_in_blk, fwd_ahead) = glue_descriptors(g, device)?;
+    let (gw_slice, gw_in_blk, fwd_ahead) = glue_descriptors(&cache, g, device)?;
     let gen = stager.begin_generation();
     let _ = paged_glue_attn(
         None,

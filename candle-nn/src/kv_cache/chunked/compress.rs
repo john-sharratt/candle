@@ -122,7 +122,10 @@ fn pack_head_palette_maps(
 ) -> Result<Vec<Vec<u8>>> {
     let packed_bytes = head_dim / 4;
     let expected_packed_bytes = identity_pal_map_128().len();
-    if head_dim % 4 != 0 || head_dim % N_PALETTE != 0 || packed_bytes != expected_packed_bytes {
+    if !head_dim.is_multiple_of(4)
+        || !head_dim.is_multiple_of(N_PALETTE)
+        || packed_bytes != expected_packed_bytes
+    {
         candle::bail!(
             "quantize_sealed_to_cpu: palette4 conversion requires head_dim={}, got {}",
             expected_packed_bytes * 4,
@@ -834,7 +837,7 @@ fn quantize_sealed_in_place_impl(
                     // Float or R16.
                     let k_src = src_gids.k_gid_pal(h, p);
                     k_src_fmts[p] = band_ggml_dtype(src_bands.band_tags(h, p).0)?;
-                    k_src_ptrs[p] = band_ptr(storage, &k_src, "k src")?;
+                    k_src_ptrs[p] = band_ptr(storage, k_src, "k src")?;
 
                     // K destination — `policy.override_k_quant` decides
                     // between uniform override format and selection's
@@ -851,7 +854,7 @@ fn quantize_sealed_in_place_impl(
                     // V source — same shape as the K side above.
                     let v_src = src_gids.v_gid_pal(h, p);
                     v_src_fmts[p] = band_ggml_dtype(src_bands.band_tags(h, p).1)?;
-                    v_src_ptrs[p] = band_ptr(storage, &v_src, "v src")?;
+                    v_src_ptrs[p] = band_ptr(storage, v_src, "v src")?;
 
                     // V destination — `policy.override_v_quant` decides
                     // between uniform override format and selection's
@@ -1378,10 +1381,10 @@ pub fn dequantize_sealed_in_place(
                     let v_tag = src_chunk.v_fmt.get(bidx).copied().ok_or_else(|| {
                         candle::Error::Msg(format!("src chunk has no V format tag for band {bidx}"))
                     })?;
-                    let (kp, kf) = resolve_src(&*storage, &src_gids.k_gid_pal(h, p), k_tag)?;
+                    let (kp, kf) = resolve_src(&*storage, src_gids.k_gid_pal(h, p), k_tag)?;
                     k_src_ptrs[p] = kp;
                     k_src_fmts[p] = kf;
-                    let (vp, vf) = resolve_src(&*storage, &src_gids.v_gid_pal(h, p), v_tag)?;
+                    let (vp, vf) = resolve_src(&*storage, src_gids.v_gid_pal(h, p), v_tag)?;
                     v_src_ptrs[p] = vp;
                     v_src_fmts[p] = vf;
 

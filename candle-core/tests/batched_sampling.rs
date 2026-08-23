@@ -6,6 +6,9 @@
 //! See also: sampling_penalties.rs, sampling_dtypes.rs, sampling_edge_cases.rs
 
 #![cfg(feature = "cuda")]
+// Test code: loop indices are token/batch COORDINATES used in expected-value
+// arithmetic, and pointer widths are spelled out to match the kernel ABI.
+#![allow(clippy::needless_range_loop, clippy::unnecessary_cast)]
 
 #[allow(dead_code)]
 mod sampling_harness;

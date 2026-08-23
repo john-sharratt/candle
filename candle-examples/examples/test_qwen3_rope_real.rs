@@ -231,7 +231,7 @@ fn main() -> Result<()> {
 
     if !has_repetition && word_count > 5 && avg_word_len > 2.0 && avg_word_len < 15.0 {
         println!("      ✓ Text appears coherent");
-    } else if avg_word_len < 2.0 || avg_word_len > 15.0 {
+    } else if !(2.0..=15.0).contains(&avg_word_len) {
         println!("      ⚠️  WARNING: Unusual word length - possible gibberish!");
     }
 

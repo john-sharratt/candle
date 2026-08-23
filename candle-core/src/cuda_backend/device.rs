@@ -41,13 +41,20 @@ pub struct CudaDevice {
     /// strided kernels read). Keyed by contents: identical tables share one device
     /// buffer instead of re-uploading per launch — the per-launch tiny H2D copies
     /// were a measured WDDM submission storm. See [`Self::info_table`].
-    info_tables: Arc<Mutex<HashMap<Vec<usize>, Arc<Uploaded<usize>>>>>,
+    info_tables: InfoTables,
     /// Memoized device copies of the token-major → group-major gather permutation.
     /// Keyed by **shape** `(rows, groups)` rather than contents, because the table is
     /// a pure function of that shape: a hit costs a two-word hash and does no host
     /// build and no upload at all. See [`Self::group_major_ids`].
-    perm_tables: Arc<Mutex<HashMap<(usize, usize), Arc<Uploaded<u32>>>>>,
+    perm_tables: PermTables,
 }
+
+/// Memoized `ArenaTableEntry` uploads, keyed by the shape vector that produced
+/// them.
+type InfoTables = Arc<Mutex<HashMap<Vec<usize>, Arc<Uploaded<usize>>>>>;
+
+/// Memoized gather permutations, keyed by `(rows, groups)`.
+type PermTables = Arc<Mutex<HashMap<(usize, usize), Arc<Uploaded<u32>>>>>;
 
 impl std::fmt::Debug for CudaDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

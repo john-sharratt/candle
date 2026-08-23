@@ -3,6 +3,17 @@
 //! Provides reusable functions for testing GEMX tensor-core kernels
 //! against baseline dequantize+matmul.
 
+// Reference implementations for the GEMX kernels: the `* 1` / `+ 0` terms and
+// the explicit row/col index loops spell out the addressing the kernel does, so
+// a layout bug reads as an index rather than an opaque iterator chain.
+#![allow(
+    clippy::identity_op,
+    clippy::missing_const_for_thread_local,
+    clippy::needless_range_loop,
+    clippy::single_match,
+    clippy::unnecessary_sort_by
+)]
+
 use candle::quantized::GgmlDType;
 #[cfg(feature = "cuda")]
 use candle::quantized::QTensor;
@@ -27,6 +38,9 @@ use candle::{DType, Device, Result, Tensor};
 // Nested acquisitions reuse the outer watchdog.
 // ============================================================================
 
+// Serialises the GPU tests in this directory; without `cuda` none of them are
+// compiled, so nothing acquires it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 static CUDA_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 std::thread_local! {
@@ -37,6 +51,7 @@ std::thread_local! {
 ///
 /// On drop it cancels the watchdog (if this is the outermost guard), decrements
 /// the per-thread depth counter, and releases the global Mutex.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub struct CudaTestGuard {
     #[allow(dead_code)]
     mutex_guard: Option<std::sync::MutexGuard<'static, ()>>,
@@ -66,6 +81,7 @@ impl Drop for CudaTestGuard {
 ///
 /// Nested calls on the *same* thread return immediately (reentrant); they share
 /// the outer watchdog and do not reset its timer.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub fn acquire_cuda_test_lock() -> CudaTestGuard {
     LOCK_DEPTH.with(|d| {
         let depth = d.get();

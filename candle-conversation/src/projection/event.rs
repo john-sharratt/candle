@@ -1637,7 +1637,7 @@ layers:
         };
         let s = serde_json::to_string(&full).unwrap();
         let back: SelectedTurn = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.selected, true);
+        assert!(back.selected);
         assert_eq!(back.score, 900.0);
     }
 
@@ -1668,7 +1668,7 @@ layers:
         assert_eq!(ev.buckets[0].tokens, 120 + 400 + 500);
         assert_eq!(ev.materialized_tokens, 1020);
 
-        let decoded = decode_events(&encode_events(&[ev.clone()]));
+        let decoded = decode_events(&encode_events(std::slice::from_ref(&ev)));
         assert_eq!(decoded, vec![ev]);
     }
 }

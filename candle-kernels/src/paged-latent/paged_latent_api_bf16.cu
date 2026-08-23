@@ -1,16 +1,46 @@
 // =============================================================================
 // paged_latent_api_bf16.cu — BF16 entry for the paged latent-attention decode
 // (single translation unit for the fork's kernels + probes).
-//
-// Latent geometry: HEAD_DIM=512 (single latent, K≡V, MQA), ROPE_DIM=64
-// (nope‖rope split). One instantiation — there is exactly one attention
-// geometry, and each extra instantiation is real compile time.
 // =============================================================================
 
 #include "latent_decode_kernel.cuh"
 #include "latent_prefill_kernel.cuh"
 
 #include <cuda_bf16.h>
+
+// ---- Active latent geometry -------------------------------------------------
+// The kernels are templates over <HEAD_DIM, ROPE_DIM, NPAL>; these three macros
+// are the geometry THIS translation unit instantiates them at. Every
+// geometry-dependent launch below takes the triple from here, so the numbers
+// appear exactly once.
+//
+// DeepSeek-V4-Flash: 512-dim single latent (K≡V, MQA), a 64-dim RoPE tail, cut
+// into 16 bands of 32 dims — one m16n8k32 tile per band, rope isolated in bands
+// 14-15.
+//
+// Adding a geometry: the C ABI has no templates, so a *simultaneously* live
+// second geometry needs its own `extern "C"` entry points forwarding to the same
+// launchers with a different triple — plus a `LatentGeometry` const added to
+// `SUPPORTED` in candle-transformers' geometry.rs, which lists the full
+// checklist. Each instantiation is real compile time, which is why only live
+// geometries are built. `run_latent_geometry` below lets the host verify at
+// startup that the geometry it plans to launch is the one that was compiled.
+#define LM_HEAD_DIM 512
+#define LM_ROPE_DIM 64
+#define LM_NPAL 16
+
+// Report the compiled geometry so the host can reject a mismatch at load time
+// instead of corrupting arena records at launch time. Packed one field per
+// out-param rather than a struct, to keep the C ABI trivial.
+extern "C" void run_latent_geometry(
+    int32_t* head_dim, int32_t* rope_dim, int32_t* n_bands
+) {
+    static_assert(latent_attn::geometry_ok(LM_HEAD_DIM, LM_ROPE_DIM, LM_NPAL),
+                  "the active geometry violates the kernel tiling rules");
+    *head_dim = LM_HEAD_DIM;
+    *rope_dim = LM_ROPE_DIM;
+    *n_bands = LM_NPAL;
+}
 
 extern "C" void run_paged_latent_prefill_bf16(
     const void* q_ptr,          // [total_q, H, 512] bf16, pre-RoPE
@@ -45,7 +75,7 @@ extern "C" void run_paged_latent_prefill_bf16(
     void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
-    latent_attn::launch_latent_prefill<__nv_bfloat16, 512, 64>(
+    latent_attn::launch_latent_prefill<__nv_bfloat16, LM_HEAD_DIM, LM_ROPE_DIM, LM_NPAL>(
         (const __nv_bfloat16*)q_ptr, headers_ptr, (float*)o_ptr, q_pos, seq_of,
         (const __nv_bfloat16*)kv_new, (const int8_t*)nope_i8, nope_scale,
         (const __nv_bfloat16*)rope_bf, comp_pos, comp_idx, comp_cnt,
@@ -66,7 +96,7 @@ extern "C" void run_paged_latent_glue_scatter_bf16(
     int threads = 256;
     int blocks = (max_rows * 32 + threads - 1) / threads;
     dim3 grid(blocks, n_runs, 1);
-    latent_attn::latent_glue_scatter_kernel<__nv_bfloat16, 512>
+    latent_attn::latent_glue_scatter_kernel<__nv_bfloat16, LM_HEAD_DIM, LM_NPAL>
         <<<grid, threads, 0, stream>>>(desc, n_runs);
 }
 
@@ -142,8 +172,8 @@ extern "C" void run_latent_build_corpus_cache(
     if (g_hi <= g_lo) return;
     const int n = g_hi - g_lo;
     const int blocks = n < 2048 ? n : 2048;  // grid-stride caps the launch
-    latent_attn::latent_build_corpus_cache_kernel<512, 64>
-        <<<blocks, latent_attn::NPAL * 32, 0, stream>>>(
+    latent_attn::latent_build_corpus_cache_kernel<LM_HEAD_DIM, LM_ROPE_DIM, LM_NPAL>
+        <<<blocks, LM_NPAL * 32, 0, stream>>>(
             comp, (int8_t*)nope_i8, nope_scale, (__nv_bfloat16*)rope_bf, g_lo, g_hi);
 }
 
@@ -175,7 +205,7 @@ extern "C" void run_paged_latent_decode_bf16(
     void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
-    latent_attn::launch_latent_decode<__nv_bfloat16, 512, 64>(
+    latent_attn::launch_latent_decode<__nv_bfloat16, LM_HEAD_DIM, LM_ROPE_DIM, LM_NPAL>(
         (const __nv_bfloat16*)q_ptr, headers_ptr, (float*)o_ptr,
         (const __nv_bfloat16*)kv_new, (const int8_t*)nope_i8, nope_scale,
         (const __nv_bfloat16*)comp_rope, comp_idx, comp_cnt, comp_pos, q_pos,

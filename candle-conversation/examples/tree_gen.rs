@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     let skip = args.skip_entries.min(flat.len());
-    let take = args.days.max(1).min(3);
+    let take = args.days.clamp(1, 3);
     let selected: Vec<&(String, u32, String)> = flat.iter().skip(skip).take(take).collect();
 
     if selected.is_empty() {
@@ -134,11 +134,17 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     //  Build engine
-    let mut builder = if args.model.is_none() && args.model_dir.is_some() {
-        // Auto-detect from the GGUF file in the directory.
-        ModelBuilder::from_gguf_dir(args.model_dir.as_ref().unwrap())?
-            .max_response_tokens(args.max_tokens)
-            .compression_level(0)
+    let auto_detect = args
+        .model_dir
+        .as_ref()
+        .filter(|_| args.model.is_none())
+        .map(|dir| {
+            // Auto-detect from the GGUF file in the directory.
+            ModelBuilder::from_gguf_dir(dir)
+        })
+        .transpose()?;
+    let mut builder = if let Some(b) = auto_detect {
+        b.max_response_tokens(args.max_tokens).compression_level(0)
     } else {
         let model = if let Some(ref name) = args.model {
             parse_model(name)?
@@ -1138,7 +1144,7 @@ fn truncate_to_chars(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
     } else {
-        format!("{}", s.chars().take(n).collect::<String>())
+        s.chars().take(n).collect::<String>()
     }
 }
 

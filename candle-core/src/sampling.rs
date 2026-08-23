@@ -535,17 +535,17 @@ impl CustomOp1 for BatchedSampling {
             match &storage.slice {
                 CudaStorageSlice::F32(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
-                    let logits_ptr = ptr as u64 + (layout.start_offset() as u64 * 4);
+                    let logits_ptr = ptr + (layout.start_offset() as u64 * 4);
                     call_kernel(logits_ptr);
                 }
                 CudaStorageSlice::F16(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
-                    let logits_ptr = ptr as u64 + (layout.start_offset() as u64 * 2);
+                    let logits_ptr = ptr + (layout.start_offset() as u64 * 2);
                     call_kernel(logits_ptr);
                 }
                 CudaStorageSlice::BF16(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
-                    let logits_ptr = ptr as u64 + (layout.start_offset() as u64 * 2);
+                    let logits_ptr = ptr + (layout.start_offset() as u64 * 2);
                     call_kernel(logits_ptr);
                 }
                 _ => unreachable!(),

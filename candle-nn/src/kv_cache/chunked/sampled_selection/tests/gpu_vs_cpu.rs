@@ -1,5 +1,9 @@
+// Test code: expressions are kept in the shape of the formula under comparison.
+#![allow(clippy::identity_op, clippy::map_flatten)]
+
 #[allow(unused_imports)]
 use super::*;
+#[cfg(feature = "cuda")]
 use crate::kv_cache::arena_table::N_PALETTE;
 #[allow(unused_imports)]
 use candle::quantized::pinned_staging::GpuBuf;

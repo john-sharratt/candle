@@ -214,15 +214,11 @@ pub(crate) fn stratified_membership(
     for pass in 0..2 {
         loop {
             let mut handed_out = 0usize;
-            for layer in 0..num_layers {
+            for (layer, pair) in decks.iter_mut().enumerate().take(num_layers) {
                 if remaining == 0 {
                     break;
                 }
-                let deck = if pass == 0 {
-                    &mut decks[layer].0
-                } else {
-                    &mut decks[layer].1
-                };
+                let deck = if pass == 0 { &mut pair.0 } else { &mut pair.1 };
                 if deck.is_empty() {
                     continue;
                 }
@@ -714,13 +710,19 @@ mod tests {
         }
         let per_readback_us = t0.elapsed().as_secs_f64() * 1e6 / READBACKS as f64;
 
-        eprintln!("[h2d] slot={:.1} MB, {COPIES} copies", SLOT_BYTES as f64 / 1e6);
+        eprintln!(
+            "[h2d] slot={:.1} MB, {COPIES} copies",
+            SLOT_BYTES as f64 / 1e6
+        );
         eprintln!(
             "[d2h] empty-queue sync readback (512 B) = {per_readback_us:.0} us \
              — the floor under the per-layer routing readback"
         );
         eprintln!("[h2d] pinned, back-to-back   = {streamed:.1} GB/s");
-        eprintln!("[h2d] pinned, sync per copy  = {per_copy:.1} GB/s  ({:.2} ms per expert)", SLOT_BYTES as f64 / per_copy / 1e6);
+        eprintln!(
+            "[h2d] pinned, sync per copy  = {per_copy:.1} GB/s  ({:.2} ms per expert)",
+            SLOT_BYTES as f64 / per_copy / 1e6
+        );
         eprintln!("[h2d] pageable, back-to-back = {pageable:.1} GB/s");
     }
 }

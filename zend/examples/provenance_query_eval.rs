@@ -377,7 +377,7 @@ fn distractor_confusion(
     }
     let mut rows: Vec<(String, usize, usize)> =
         fam.into_iter().map(|(g, (m, s))| (g, m, s)).collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     rows
 }
 

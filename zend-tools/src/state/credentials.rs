@@ -80,7 +80,7 @@ impl CredentialStore {
         let guard = self.inner.read().unwrap();
         let mut creds: Vec<Credential> = guard
             .values()
-            .filter(|c| type_filter.map_or(true, |t| c.cred_type == t))
+            .filter(|c| type_filter.is_none_or(|t| c.cred_type == t))
             .cloned()
             .collect();
         creds.sort_by(|a, b| a.name.cmp(&b.name));

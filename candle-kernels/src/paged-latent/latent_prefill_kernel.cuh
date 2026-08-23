@@ -73,13 +73,22 @@ constexpr int PF_SCR_LD = PF_KEYS + 1;           // 33
 constexpr int PF_ROW_TILES = 2;                  // m16 row-tiles per head-pass
 constexpr int PF_PASS_HEADS = PF_ROW_TILES * 16; // 32 heads processed per pass
 constexpr int PF_PASSES = PF_HEADS / PF_PASS_HEADS; // 2 head-passes
-constexpr int PF_DGROUPS = 8;                    // output-dim groups (512/64)
-constexpr int PF_GDIMS = 512 / PF_DGROUPS;       // 64 dims per group (HEAD_DIM=512)
+constexpr int PF_DGROUPS = 8;                    // output-dim groups
+// Dims per output-dim group. Geometry-derived, so it is a per-kernel constant
+// rather than a namespace one: `pf_gdims<HEAD_DIM>()` is 64 at HEAD_DIM=512.
+// The PV accumulator is `o_acc[pf_gdims/8][4]`, so a group must be a whole
+// number of m16n8k8 output tiles.
+template <int HEAD_DIM>
+__host__ __device__ constexpr int pf_gdims() {
+    static_assert(HEAD_DIM % (PF_DGROUPS * 8) == 0,
+                  "output-dim groups must be a whole number of m16n8 output tiles");
+    return HEAD_DIM / PF_DGROUPS;
+}
 
 // Dynamic-smem byte size for the staging region, given the value type. s_p8,
 // scores and s_alpha are sized for one head-pass (PF_PASS_HEADS) since the two
 // passes reuse them sequentially.
-template <typename T, int HEAD_DIM>
+template <typename T, int HEAD_DIM, int NPAL>
 __host__ __device__ constexpr int prefill_smem_bytes() {
     (void)sizeof(T);
     // No sQ: the QK A-fragment is built per head-pass straight from L2 (Q is
@@ -100,7 +109,7 @@ __host__ __device__ constexpr int prefill_smem_bytes() {
 }
 
 // Identity band layout only (dim d → band d/SUB). No palette-map routing.
-template <typename T, int HEAD_DIM, int ROPE_DIM>
+template <typename T, int HEAD_DIM, int ROPE_DIM, int NPAL>
 __global__ void __launch_bounds__(PF_WARPS * 32, 2)
 latent_prefill_kernel(
     const T* __restrict__ q,               // [total_q, H, HEAD_DIM] pre-RoPE
@@ -130,9 +139,11 @@ latent_prefill_kernel(
     const uint4* __restrict__ new_meta,
     int store_fmt   // writer-chunk float format tag (new-diagonal fake-quant)
 ) {
+    STATIC_ASSERT_GEOMETRY(HEAD_DIM, ROPE_DIM, NPAL);
     constexpr int SUB = HEAD_DIM / NPAL;
     constexpr int NOPE_DIM = HEAD_DIM - ROPE_DIM;
     constexpr int DPT = HEAD_DIM / 32;
+    constexpr int PF_GDIMS = pf_gdims<HEAD_DIM>();
 
     const int qi = (int)blockIdx.x;
     const int split_idx = (int)blockIdx.z;
@@ -875,7 +886,7 @@ __global__ void latent_prefill_combine_kernel(
 // thread's dims are fixed and the per-dim max accumulates in registers, hitting
 // global memory with ONE atomicMax per (thread, dim) at the end. The canonical
 // gallery (`comp`) stays f32/pre-RoPE and position-free (§C).
-template <int HEAD_DIM, int ROPE_DIM>
+template <int HEAD_DIM, int ROPE_DIM, int NPAL>
 __global__ void latent_rope_quant_corpus_kernel(
     const int8_t* __restrict__ nope_i8,    // [G, NOPE_DIM] two-region: nope int8
     const float* __restrict__ nope_scale,  // [G, NOPE_BANDS] per-nope-band scale
@@ -976,7 +987,7 @@ __global__ void latent_rope_quant_corpus_kernel(
 // per-tile. With that scale constant, a comp tile's transposed V operand
 // becomes a pure byte gather — no per-tile max/requant — and the PV epilogue
 // scale is a per-kernel constant.
-template <int HEAD_DIM>
+template <int HEAD_DIM, int NPAL>
 __global__ void latent_quant_v_corpus_kernel(
     const int8_t* __restrict__ comp_i8,    // [G, HEAD_DIM] roped+per-band int8
     const float* __restrict__ comp_scale,  // [G, NPAL]
@@ -997,7 +1008,7 @@ __global__ void latent_quant_v_corpus_kernel(
     }
 }
 
-template <typename T, int HEAD_DIM, int ROPE_DIM>
+template <typename T, int HEAD_DIM, int ROPE_DIM, int NPAL>
 void launch_latent_prefill(
     const T* q,
     const uint8_t* headers,          // SlotHeader[n_seq]
@@ -1044,21 +1055,21 @@ void launch_latent_prefill(
     // later chunks share the scratch on the ordered stream.
     if (g_total > 0) {
         const int pre_blocks = g_total < 2048 ? g_total : 2048;
-        latent_rope_quant_corpus_kernel<HEAD_DIM, ROPE_DIM>
+        latent_rope_quant_corpus_kernel<HEAD_DIM, ROPE_DIM, NPAL>
             <<<pre_blocks, NPAL * 32, 0, stream>>>(
                 nope_i8, nope_scale, rope_bf, comp_pos, rope_tab, comp_i8,
                 comp_scale, comp_vmax, g_total);
         const int64_t n_elem = (int64_t)g_total * HEAD_DIM;
         int v8_blocks = (int)((n_elem + 255) / 256);
         if (v8_blocks > 65535) v8_blocks = 65535;
-        latent_quant_v_corpus_kernel<HEAD_DIM><<<v8_blocks, 256, 0, stream>>>(
+        latent_quant_v_corpus_kernel<HEAD_DIM, NPAL><<<v8_blocks, 256, 0, stream>>>(
             comp_i8, comp_scale, comp_vmax, comp_v8, g_total);
     }
 
-    constexpr int smem = prefill_smem_bytes<T, HEAD_DIM>();
+    constexpr int smem = prefill_smem_bytes<T, HEAD_DIM, NPAL>();
     static bool attr_set = false;
     if (!attr_set) {
-        const void* fn = (const void*)latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM>;
+        const void* fn = (const void*)latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM, NPAL>;
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         cudaFuncSetAttribute(
             fn, cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -1068,7 +1079,7 @@ void launch_latent_prefill(
 
     dim3 grid(total_q, 1, num_splits);
     dim3 block(PF_WARPS * 32);
-    latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM><<<grid, block, smem, stream>>>(
+    latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM, NPAL><<<grid, block, smem, stream>>>(
         q, headers, q_pos, seq_of, kv_new, comp_i8, comp_scale, comp_v8, comp_vmax,
         comp_idx, comp_cnt, comp_pos, rope_tab, pa, pm, total_q, n_q_head, softmax_scale,
         window_size, max_sel, new_meta, store_fmt);

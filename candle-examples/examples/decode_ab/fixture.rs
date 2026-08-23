@@ -108,7 +108,7 @@ impl Fixture {
                 KvFormat::Float(DType::F16),
                 device,
                 max_seq,
-                Some(pol.clone()),
+                Some(*pol),
             )?
         } else {
             match fmt.kv_format() {
@@ -338,10 +338,10 @@ pub fn golden_decode(sc: &Scenario, device: &Device) -> Result<Tensor> {
     let scale = 1.0f32 / (hd as f32).sqrt();
 
     let to_f16_vec = |t: &Tensor| -> Result<Vec<f32>> {
-        Ok(t.to_dtype(DType::F16)?
+        t.to_dtype(DType::F16)?
             .to_dtype(DType::F32)?
             .flatten_all()?
-            .to_vec1::<f32>()?)
+            .to_vec1::<f32>()
     };
     // Decode-step Q/k_new/v_new (num_slots, n_head, hd), F16-rounded.
     let (q_d, k_d, v_d) = make_decode_qkv(sc, DType::F16, device)?;
@@ -486,6 +486,8 @@ fn make_decode_qkv(
 }
 
 /// Prefill `seq_len` tokens into a single slot's cache.
+// Mirrors the kernel launch's own argument list.
+#[allow(clippy::too_many_arguments)]
 fn run_prefill(
     cache: &mut KvCache,
     q: &Tensor,

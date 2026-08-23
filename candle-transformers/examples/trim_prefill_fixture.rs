@@ -25,11 +25,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(&input)?;
     eprintln!("read {} bytes from {input}", bytes.len());
     let cap: PrefillCapture = bincode::deserialize(&bytes)?;
-    let total_q = if cap.n_head * cap.head_dim == 0 {
-        0
-    } else {
-        cap.q.len() / (cap.n_head * cap.head_dim)
-    };
+    let total_q = cap
+        .q
+        .len()
+        .checked_div(cap.n_head * cap.head_dim)
+        .unwrap_or(0);
     eprintln!(
         "loaded: slots={} n_head={} n_kv_head={} head_dim={} total_q={} rope_cs_rows={}",
         cap.slots.len(),

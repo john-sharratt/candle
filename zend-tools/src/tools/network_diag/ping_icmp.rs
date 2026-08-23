@@ -125,7 +125,7 @@ fn parse_ping_output(output: &str) -> (u32, f64, f64, f64) {
         if l.contains("packets transmitted") {
             let parts: Vec<&str> = l.split(',').collect();
             if let Some(recv_part) = parts.get(1) {
-                if let Some(n) = recv_part.trim().split_whitespace().next() {
+                if let Some(n) = recv_part.split_whitespace().next() {
                     received = n.parse().unwrap_or(0);
                 }
             }
@@ -139,7 +139,7 @@ fn parse_ping_output(output: &str) -> (u32, f64, f64, f64) {
                 min = nums[0];
                 avg = nums[1];
                 max = nums[2];
-            } else if nums.len() >= 1 {
+            } else if !nums.is_empty() {
                 if l.contains("minimum") {
                     min = nums[0];
                 }

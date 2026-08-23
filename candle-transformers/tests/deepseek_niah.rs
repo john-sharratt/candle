@@ -1,5 +1,12 @@
 //! Step-6 needle-in-a-haystack recall for DeepSeek-V4-Flash.
 //!
+//! Requires `--features cuda,ruler-bench`. It drives the RULER generator from
+//! `models::batch_test`, which the library gates on
+//! `any(test, feature = "ruler-bench")` — and the library's `test` cfg is NOT
+//! active when building an integration test, so only the feature can reach it.
+//! Without the gate below this file fails to COMPILE under a plain
+//! `--features cuda`, taking the whole test target with it.
+//!
 //! Plants one "magic number" needle at a random depth inside a long filler
 //! haystack and checks the model recovers it — the retrieval gate for the
 //! provenance corpus (FloatGallery + BDP recall + Indexer top-k). The prompt
@@ -11,11 +18,14 @@
 //! Ignored (loads DeepSeek-V4-Flash on CUDA + per-token prefill is minutes at
 //! a few-thousand-token context).
 
+#![cfg(all(feature = "cuda", feature = "ruler-bench"))]
+
 use candle::Device;
 use candle_transformers::models::batch_test::ruler_gen::{
     generate_ruler_samples, run_ruler_eval, score_ruler_sample, RulerSample, RulerTask,
 };
-use candle_transformers::models::deepseek4::{DeepSeekBatched, Dsv4Engine};
+use candle_transformers::models::deepseek4::DEEPSEEK_V4;
+use candle_transformers::models::latent_moe::{BatchedEngine, Engine};
 
 fn ko_gguf() -> std::path::PathBuf {
     std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
@@ -82,8 +92,13 @@ fn deepseek_niah_single_recall() -> candle::Result<()> {
         })
         .collect();
 
-    let engine = Dsv4Engine::load(&gguf, &device, candle::quantized::Int8Mode::Performance)?;
-    let model = DeepSeekBatched::new(engine)?;
+    let engine = Engine::load(
+        &gguf,
+        &DEEPSEEK_V4,
+        &device,
+        candle::quantized::Int8Mode::Performance,
+    )?;
+    let model = BatchedEngine::new(engine)?;
 
     let t0 = std::time::Instant::now();
     let preds = run_ruler_eval(

@@ -678,7 +678,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         let mut x = match x_in {
             None => {
                 let inputs: Vec<Tensor> = contexts.iter().map(|c| c.input_ids.clone()).collect();
-                let packed = TensorCat::from_tensors(1, inputs.into_iter())?;
+                let packed = TensorCat::from_tensors(1, inputs)?;
                 let xt = packed.to_tensor();
                 // Prefer the host-served table when the model has one: the rows
                 // are gathered from the mmap over PCIe, so the embedding never

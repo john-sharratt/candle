@@ -336,6 +336,11 @@ pub fn host_ram_budget(total_ram: u64) -> HostRamBudget {
 
 #[cfg(test)]
 mod tests {
+    // `assert!(cfg!(not(windows)), …)` is the point: the probe is required to
+    // succeed on Windows and may legitimately return `None` elsewhere, so the
+    // platform constant is exactly what is being asserted.
+    #![allow(clippy::assertions_on_constants)]
+
     use super::*;
 
     /// On Windows the probe must return live, sane counters; elsewhere `None`.

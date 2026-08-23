@@ -63,6 +63,7 @@ impl Metrics {
         if n_q_head > 0 && head_dim > 0 && num_slots > 0 {
             let mut per_head_sum = vec![0f64; n_q_head];
             let stride_slot = n_q_head * head_dim;
+            #[allow(clippy::needless_range_loop)]
             for s in 0..num_slots {
                 for h in 0..n_q_head {
                     let base = s * stride_slot + h * head_dim;

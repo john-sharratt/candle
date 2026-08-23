@@ -54,8 +54,7 @@ pub use cuda::{
 #[cfg(feature = "cuda")]
 pub use cuda::{
     load_repacked, load_repacked_into, load_repacked_on_stream, repack_gemx_to_host,
-    repack_to_host,
-    repacked_size_bytes, view_repacked,
+    repack_to_host, repacked_size_bytes, view_repacked,
 };
 
 #[cfg(target_feature = "neon")]
@@ -616,6 +615,9 @@ impl Int8Mode {
     /// / non-int8 devices, or [`Int8Mode::Performance`] if VRAM can't be queried.
     ///
     /// `model_bytes` is the on-disk quantized weight size (e.g. the GGUF length).
+    // `model_bytes` is only weighed against free VRAM, which is a CUDA query;
+    // every other device answers `Off` without consulting it.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn auto_sized(device: &crate::Device, model_bytes: usize) -> Self {
         match device {
             #[cfg(feature = "cuda")]
@@ -1404,7 +1406,7 @@ impl QTensor {
             Device::Cuda(cuda_dev) => {
                 let elem_count: usize = dims.iter().product();
                 let block_size = ggml_dtype.block_size();
-                if elem_count % block_size != 0 {
+                if !elem_count.is_multiple_of(block_size) {
                     crate::bail!(
                         "element count {elem_count} not divisible by block size {block_size}"
                     );

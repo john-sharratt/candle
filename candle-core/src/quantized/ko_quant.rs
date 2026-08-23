@@ -347,9 +347,8 @@ pub fn quantize_ko(w: &[f32], nrows: usize, ncols: usize, dtype: GgmlDType) -> V
                         if crumb_bytes > 0 {
                             let (mut cr0, mut cr1) = (0u8, 0u8);
                             for j in 0..4 {
-                                cr0 |= (((q[sub * 32 + q3 * 4 + j] >> 4) & 0x3) << (2 * j)) as u8;
-                                cr1 |=
-                                    (((q[sub * 32 + 16 + q3 * 4 + j] >> 4) & 0x3) << (2 * j)) as u8;
+                                cr0 |= ((q[sub * 32 + q3 * 4 + j] >> 4) & 0x3) << (2 * j);
+                                cr1 |= ((q[sub * 32 + 16 + q3 * 4 + j] >> 4) & 0x3) << (2 * j);
                             }
                             ob[cbase + crumb_base + lane * 8 + sub * 2] = cr0;
                             ob[cbase + crumb_base + lane * 8 + sub * 2 + 1] = cr1;
@@ -357,8 +356,8 @@ pub fn quantize_ko(w: &[f32], nrows: usize, ncols: usize, dtype: GgmlDType) -> V
                         if hi_bytes > 0 {
                             let (mut hb0, mut hb1) = (0u8, 0u8);
                             for j in 0..4 {
-                                hb0 |= (((q[sub * 32 + q3 * 4 + j] >> 4) & 1) << j) as u8;
-                                hb1 |= (((q[sub * 32 + 16 + q3 * 4 + j] >> 4) & 1) << j) as u8;
+                                hb0 |= ((q[sub * 32 + q3 * 4 + j] >> 4) & 1) << j;
+                                hb1 |= ((q[sub * 32 + 16 + q3 * 4 + j] >> 4) & 1) << j;
                             }
                             ob[cbase + hi_base + lane * 4 + sub] = hb0 | (hb1 << 4);
                         }

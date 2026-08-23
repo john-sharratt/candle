@@ -158,7 +158,7 @@ pub fn pick_maintenance_op(stats: &[SegmentStat], force: bool) -> Option<Mainten
         } else {
             ratio >= SEGMENT_COMPACT_MIN_DEAD
         };
-        if qualifies && best.map_or(true, |(_, r)| ratio > r) {
+        if qualifies && best.is_none_or(|(_, r)| ratio > r) {
             best = Some((s.id, ratio));
         }
     }

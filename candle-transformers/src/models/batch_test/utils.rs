@@ -1,3 +1,15 @@
+// Test-harness code (the module is `cfg(any(test, feature = "ruler-bench"))`),
+// blanket-allowed rather than restyled: the fixtures spell shapes and indices
+// out to match the model configs they mirror.
+#![allow(
+    clippy::clone_on_copy,
+    clippy::collapsible_if,
+    clippy::manual_repeat_n,
+    clippy::redundant_closure,
+    clippy::type_complexity,
+    clippy::useless_conversion
+)]
+
 use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
@@ -411,7 +423,10 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
                 None,
             )?;
             session.advance_sequence(seq, prompt_ids.len())?;
-            step.logits_owned()?[0].i(0)?.argmax(0)?.to_scalar::<u32>()?
+            step.logits_owned()?[0]
+                .i(0)?
+                .argmax(0)?
+                .to_scalar::<u32>()?
         };
         let mut gen = vec![next];
         for _ in 1..decode_tokens {
@@ -430,7 +445,10 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
                     None,
                 )?;
                 session.advance_sequence(seq, 1)?;
-                step.logits_owned()?[0].i(0)?.argmax(0)?.to_scalar::<u32>()?
+                step.logits_owned()?[0]
+                    .i(0)?
+                    .argmax(0)?
+                    .to_scalar::<u32>()?
             };
             gen.push(next);
         }
@@ -525,7 +543,10 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
             None,
         )?;
         session.advance_sequence(seq, prompt_len)?;
-        step.logits_owned()?[0].i(0)?.argmax(0)?.to_scalar::<u32>()?
+        step.logits_owned()?[0]
+            .i(0)?
+            .argmax(0)?
+            .to_scalar::<u32>()?
     };
 
     // Run the decode row through `[0, d)` and roll the KV back. Each `WaveResult`
@@ -593,7 +614,10 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
         }
         prev = Some(s);
     }
-    eprintln!("[replay:{label}] dirty repeats = {dirty_repeats}/{}", repeats - 1);
+    eprintln!(
+        "[replay:{label}] dirty repeats = {dirty_repeats}/{}",
+        repeats - 1
+    );
 
     // A run with NO evictions never exercises the load/evict path, so a clean
     // verdict from it says nothing about that path. Print the counters so the
@@ -651,7 +675,11 @@ pub fn prefill_replay_probe<M: ManagedBatchedModel>(
                 .next()
                 .ok_or_else(|| candle::Error::msg("prefill produced no logits"))?
         };
-        let v = t.i(0)?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let v = t
+            .i(0)?
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
         Ok(v.iter().map(|x| x.to_bits()).collect())
     };
 

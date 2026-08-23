@@ -6,6 +6,9 @@
 //! - Various tensor sizes (small, large, odd sizes)
 //! - Broadcast operations
 
+// Test code: loop indices are element coordinates in the expected-value formula.
+#![allow(clippy::needless_range_loop)]
+
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 

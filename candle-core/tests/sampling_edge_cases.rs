@@ -4,6 +4,8 @@
 //! vocab size edge cases, and f32 numerical edge cases.
 
 #![cfg(feature = "cuda")]
+// Test code: loop indices are vocab/batch coordinates; casts match the kernel ABI.
+#![allow(clippy::needless_range_loop, clippy::unnecessary_cast)]
 
 #[allow(dead_code)]
 mod sampling_harness;

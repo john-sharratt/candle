@@ -280,7 +280,7 @@ impl Qwen3Attention {
             scores = scores.broadcast_add(m)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        probs.matmul(&v)
+        probs.matmul(v)
     }
 }
 

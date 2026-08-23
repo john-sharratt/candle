@@ -13,6 +13,14 @@
 //!   S78_KS=4,3,2 k-fold values to sweep (default 4)
 //! ```
 
+// Retrieval-evaluation harness; same shape as `calibrate_alignment` — index
+// loops mirror the fold / gallery / token grids the write-up describes.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::manual_checked_ops,
+    clippy::too_many_arguments
+)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;

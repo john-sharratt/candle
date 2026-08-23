@@ -300,6 +300,10 @@ impl Eq for HeadGids {}
 ///
 /// Cheap to clone: `HeadGids` is one `Arc` bump and the tags are `Arc`-shared
 /// per chunk, so a keepalive vector costs three ref-count bumps per chunk.
+// Without `cuda` the selection/convert kernels are compiled out and the
+// host-side table tests are the only consumers — which is what those tests are
+// for: the row layout is pinned from the host, GPU or not.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct ChunkBands {
     /// The chunk's `(head, palette, K/V)` gid grid.
@@ -311,6 +315,7 @@ pub struct ChunkBands {
     pub v_fmt: Arc<Vec<u8>>,
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl ChunkBands {
     /// Borrow a sealed chunk's bands without cloning its gid grid's contents.
     pub fn from_sealed(chunk: &crate::kv_cache::chunked::types::SealedChunk) -> Self {

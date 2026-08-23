@@ -891,7 +891,7 @@ mod tests {
     /// one is binding — a question that has no answer from either constant alone.
     #[test]
     fn the_ffn_span_admits_a_recorded_width() {
-        use super::super::bump_arena::WAVE_FFN_BYTES;
+        use super::super::wave_spans::WAVE_FFN_BYTES;
         let plan = WavePlan::new(moe());
         let rows = plan.max_rows_within(WAVE_FFN_BYTES);
         println!(

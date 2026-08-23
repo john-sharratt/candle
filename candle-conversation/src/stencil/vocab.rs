@@ -73,7 +73,7 @@ impl TestVocab {
     pub fn with_special(mut self, s: &str, id: TokenId) -> Self {
         assert!(id >= 256, "special token ids must be >= 256");
         self.specials.push((s.as_bytes().to_vec(), id));
-        self.specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        self.specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
         self
     }
 

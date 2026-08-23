@@ -38,6 +38,8 @@ enum ArgDType {
     Bf16,
 }
 
+// One per process — the example loads exactly one of the two model forms.
+#[allow(clippy::large_enum_variant)]
 enum Transformer {
     Normal(transformer::Model),
     Quantized(qtransformer::Model),

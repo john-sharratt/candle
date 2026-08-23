@@ -173,7 +173,12 @@ mod coherence {
     /// Greedy decode on the multi-section "tour of the codebase"
     /// prompt.  A healthy K/V projection produces a long, on-topic
     /// answer; the early-EOS failure mode emits 0–2 tokens.
+    ///
+    /// Loads the real model and decodes a full tour, so it runs for minutes and
+    /// is `#[ignore]`d out of the default sweep. Run it deliberately:
+    /// `cargo test -p zend --features cuda --release --test coherence_integration -- --ignored`
     #[test]
+    #[ignore]
     fn codebase_tour_produces_substantial_answer() {
         init_tracing();
         // Greedy / argmax — deterministic so a failure is reproducible

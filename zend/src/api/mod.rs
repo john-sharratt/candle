@@ -115,7 +115,7 @@ async fn embedded_asset(req: Request<Body>) -> Response {
     // `<name>.html`, so those pages get pretty URLs without a `.html` suffix.
     let name: String = if WEB.get_file(want).is_some() {
         want.to_string()
-    } else if !want.contains('.') && WEB.get_file(&format!("{want}.html")).is_some() {
+    } else if !want.contains('.') && WEB.get_file(format!("{want}.html")).is_some() {
         format!("{want}.html")
     } else {
         want.to_string()

@@ -208,6 +208,10 @@ pub fn score_packed(query: &[WideQSig], gallery: &PackedGallery) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    // Same fixture shape as `provenance::gpu`'s tests: a vec of per-tool token
+    // windows.
+    #![allow(clippy::useless_vec)]
+
     use super::*;
     use crate::provenance::{score_slots, WideQSig};
 

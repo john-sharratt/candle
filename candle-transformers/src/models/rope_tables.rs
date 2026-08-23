@@ -249,8 +249,7 @@ impl CisPrecomputations {
             .as_ref()
             .ok_or_else(|| candle::Error::Msg("rope tables are fixed-size".into()))?;
 
-        let new_len =
-            (required_len + self.extend_chunk - 1) / self.extend_chunk * self.extend_chunk;
+        let new_len = required_len.div_ceil(self.extend_chunk) * self.extend_chunk;
 
         // If the tables are logically empty (max_seq_len == 0), replace entirely
         if self.max_seq_len == 0 {

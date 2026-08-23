@@ -1733,11 +1733,10 @@ impl PipelineState {
         let n_experts = self.residency[target_layer].len();
         let mut misses: Vec<(usize, f32, Option<usize>)> = (0..n_experts)
             .filter(|&e| {
-                !self
-                    .inner
+                self.inner
                     .key_to_slot
                     .get(&(target_layer, e))
-                    .is_some_and(|&s| self.inner.slots[s].is_some())
+                    .is_none_or(|&s| self.inner.slots[s].is_none())
             })
             .filter_map(|e| {
                 let score = self.inner.score(target_layer, e);
@@ -2139,8 +2138,7 @@ impl PipelineState {
             // slot was empty at compute time, so its contribution vanished from
             // `ys` and the layer returned an answer computed from fewer than k
             // experts — indistinguishable, downstream, from a correct one.
-            let mut experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> =
-                Vec::with_capacity(all.len());
+            let mut experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> = Vec::with_capacity(all.len());
             for (&(eidx, slot_idx), (toks, wids)) in all.iter().zip(experts_data.iter()) {
                 let Some(slot) = self.inner.slots[slot_idx].as_ref() else {
                     candle::bail!(
@@ -2682,7 +2680,7 @@ impl PipelineState {
                 .inner
                 .key_to_slot
                 .get(&(layer_idx, expert_idx))
-                .map_or(false, |&s| self.inner.slots[s].is_some())
+                .is_some_and(|&s| self.inner.slots[s].is_some())
             {
                 continue;
             }
@@ -2852,11 +2850,10 @@ impl PipelineState {
             .iter()
             .copied()
             .filter(|&e| {
-                !self
-                    .inner
+                self.inner
                     .key_to_slot
                     .get(&(target_layer, e))
-                    .is_some_and(|&s| self.inner.slots[s].is_some())
+                    .is_none_or(|&s| self.inner.slots[s].is_none())
             })
             .collect();
         if misses.is_empty() {

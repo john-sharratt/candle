@@ -11,7 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use candle::cuda_backend::wave_provenance::LeaseOrigin;
+// `wave_provenance` lives at the candle-core root and is not CUDA-gated; only
+// the `cuda_backend` re-export of it is. Reaching it through that re-export
+// made this file unbuildable without the `cuda` feature.
+#[cfg(feature = "cuda")]
+use candle::wave_provenance::LeaseOrigin;
 use candle::{DType, Device, Result, Tensor};
 
 use super::arena::ArenaKey;
@@ -1586,29 +1590,6 @@ impl ChunkedKvBacking {
         ))
     }
 
-    /// Repair a divergence confined to the tail: truncate every layer to the
-    /// shortest layer's token count. Answers whether the layers agree afterwards.
-    ///
-    /// **A failed wave's signature, healed from its own properties.** The layer
-    /// sweep advances usage per layer, so a wave that dies mid-sweep leaves the
-    /// early layers up to one attention window ahead of the rest — tokens that
-    /// were never delivered, since the wave that wrote them never retired. The
-    /// rollback in `forward_wave` undoes that at the failure; this covers the
-    /// state that predates the rollback or arrived through the substrate, where
-    /// a sealed turn can persist the skew and reload it into a fresh sequence.
-    ///
-    /// Cutting to the shortest is sound precisely because the surplus is
-    /// undelivered: no sampled token, no turn, no summary refers to it. Two
-    /// guards keep this from ever being a destructive repair:
-    ///
-    /// - **Spread cap.** The layers may differ by at most `CHUNK_SIZE` tokens —
-    ///   the most one failed operation leaves behind. A wider spread is not a
-    ///   failed wave and gets no repair.
-    /// - **The sealed prefix is untouchable.** `truncate_sequence_to_tokens`
-    ///   clamps at the sealed boundary rather than cut Arc-shared ground, so a
-    ///   "tail" divergence that is actually deep history leaves those layers
-    ///   unchanged — and the verification below then reads the layers as still
-    ///   disagreeing and reports the heal as failed, which it is.
     /// Whether any two layers hold `batch_idx`'s **tokens** differently —
     /// per-chunk `(offset, usage)` with trailing empty chunks ignored, so
     /// trailing structure (which the writer-pad repair owns) does not count.
@@ -1633,6 +1614,29 @@ impl ChunkedKvBacking {
         }
     }
 
+    /// Repair a divergence confined to the tail: truncate every layer to the
+    /// shortest layer's token count. Answers whether the layers agree afterwards.
+    ///
+    /// **A failed wave's signature, healed from its own properties.** The layer
+    /// sweep advances usage per layer, so a wave that dies mid-sweep leaves the
+    /// early layers up to one attention window ahead of the rest — tokens that
+    /// were never delivered, since the wave that wrote them never retired. The
+    /// rollback in `forward_wave` undoes that at the failure; this covers the
+    /// state that predates the rollback or arrived through the substrate, where
+    /// a sealed turn can persist the skew and reload it into a fresh sequence.
+    ///
+    /// Cutting to the shortest is sound precisely because the surplus is
+    /// undelivered: no sampled token, no turn, no summary refers to it. Two
+    /// guards keep this from ever being a destructive repair:
+    ///
+    /// - **Spread cap.** The layers may differ by at most `CHUNK_SIZE` tokens —
+    ///   the most one failed operation leaves behind. A wider spread is not a
+    ///   failed wave and gets no repair.
+    /// - **The sealed prefix is untouchable.** `truncate_sequence_to_tokens`
+    ///   clamps at the sealed boundary rather than cut Arc-shared ground, so a
+    ///   "tail" divergence that is actually deep history leaves those layers
+    ///   unchanged — and the verification below then reads the layers as still
+    ///   disagreeing and reports the heal as failed, which it is.
     fn heal_tail_divergence(
         backings: &[ChunkedKvBacking],
         batch_idx: usize,
@@ -1853,7 +1857,7 @@ impl ChunkedKvBacking {
                         None => (0usize, 0usize),
                     };
                 let needed_extra = add.saturating_sub(available);
-                let additional_chunks = (needed_extra + chunk_size - 1) / chunk_size;
+                let additional_chunks = needed_extra.div_ceil(chunk_size);
                 let new_total_chunks = current_chunks + additional_chunks;
                 required_max_blocks = cmp::max(required_max_blocks, new_total_chunks.max(1));
                 alloc_plan.push((batch_idx, additional_chunks));

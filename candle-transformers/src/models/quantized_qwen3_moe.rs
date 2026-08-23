@@ -802,6 +802,10 @@ impl SparseMoeBlock {
 // FeedForward enum (dense MLP or MoE)
 // ============================================================================
 
+// One per layer for the model's lifetime, so the variant spread costs a few
+// hundred bytes per layer at most — and this is matched on in the forward path,
+// where a `Box` would add a pointer chase to every FFN.
+#[allow(clippy::large_enum_variant)]
 enum FeedForward {
     Mlp(MlpWeights),
     MoE(SparseMoeBlock),
@@ -819,6 +823,8 @@ enum FeedForward {
 ///
 /// Only the expert half is deferred. The router gate is a dense tensor and is
 /// loaded in the loop with the rest of them.
+// Load-time only, one per layer, consumed when the expert cache is grafted on.
+#[allow(clippy::large_enum_variant)]
 enum PendingFfn {
     Mlp(MlpWeights),
     MoE { gate: QMatMul, moe_layer_idx: usize },
@@ -1241,7 +1247,6 @@ pub fn read_hf_config(model_dir: &std::path::Path) -> HFModelConfig {
 ///
 /// Tries `qwen3moe`, `qwen2moe`, then falls back to whatever
 /// `general.architecture` says. Returns the prefix string (e.g. "qwen2moe").
-
 fn detect_arch_prefix(metadata: &HashMap<String, gguf_file::Value>) -> String {
     // Check general.architecture first
     if let Some(v) = metadata.get("general.architecture") {
@@ -1690,10 +1695,7 @@ impl ModelWeights {
 
         let p = detect_arch_prefix(&ct.metadata);
         // Read config.json from the same directory as the GGUF for fallback values.
-        let hf_cfg = file_path
-            .parent()
-            .map(|d| read_hf_config(d))
-            .unwrap_or_default();
+        let hf_cfg = file_path.parent().map(read_hf_config).unwrap_or_default();
 
         let num_attention_heads = md_get(&format!("{p}.attention.head_count"))?.to_u32()? as usize;
         let num_kv_heads = md_get(&format!("{p}.attention.head_count_kv"))?.to_u32()? as usize;
@@ -2231,11 +2233,9 @@ impl ModelWeights {
                 let limit_bytes = weight_capacity_bytes(&stream)?;
                 let initial_bytes = initial_weight_bytes(&stream)?;
                 let slots_in = |bytes: usize| {
-                    if slot_bytes > 0 {
-                        (bytes / slot_bytes).min(total_experts)
-                    } else {
-                        0
-                    }
+                    bytes
+                        .checked_div(slot_bytes)
+                        .map_or(0, |n| n.min(total_experts))
                 };
                 let capacity = slots_in(initial_bytes);
                 let limit = slots_in(limit_bytes);
@@ -2422,6 +2422,8 @@ impl ModelWeights {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::needless_question_mark, clippy::type_complexity)]
+
     use super::*;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;

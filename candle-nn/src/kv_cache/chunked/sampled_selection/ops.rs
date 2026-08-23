@@ -190,7 +190,7 @@ fn palette4_head_bits_from_needed(
             }
         } else {
             for pick in 0..slot_target {
-                let pos = (pick * eligible.len() + slot_target - 1) / slot_target;
+                let pos = (pick * eligible.len()).div_ceil(slot_target);
                 let i = eligible[pos];
                 if !claimed[i] {
                     claimed[i] = true;
@@ -479,8 +479,8 @@ pub fn batch_select_and_summarize(
             for d in 0..surface.n_dim {
                 // Load all quant costs for this (b, h, d) once.
                 let base = ((b * surface.n_dim + d) * n_q) * surface.n_head + h;
-                for q in 0..n_q {
-                    costs[q] = surface.data[base + q * surface.n_head];
+                for (q, cost) in costs.iter_mut().enumerate().take(n_q) {
+                    *cost = surface.data[base + q * surface.n_head];
                 }
 
                 let out_idx = bh * surface.n_dim + d;
@@ -627,11 +627,7 @@ pub fn cpu_palette4_reduce(
     let elems_per_block = SELECT_BLOCK as f64;
     let palette_overhead_bits = (blocks_per_head * 2 + 4 * 8) as f64;
     let max_quant_ti = SampleFormat::Q8KS.table_index();
-    let num_heads = if blocks_per_head > 0 {
-        fmts.len() / blocks_per_head
-    } else {
-        0
-    };
+    let num_heads = fmts.len().checked_div(blocks_per_head).unwrap_or(0);
 
     let mut total_bits = 0.0f64;
     let mut total_elems = 0.0f64;
@@ -736,7 +732,7 @@ pub fn cpu_palette4_reduce(
                 }
             } else {
                 for pick in 0..slot_target {
-                    let pos = (pick * eligible.len() + slot_target - 1) / slot_target;
+                    let pos = (pick * eligible.len()).div_ceil(slot_target);
                     let i = eligible[pos];
                     if !claimed[i] {
                         claimed[i] = true;
@@ -1189,8 +1185,7 @@ pub(super) fn round_trip_q0_m2(block: &[f32; SELECT_BLOCK]) -> [f32; SELECT_BLOC
     let mut c1 = decode_e4m3(encode_e4m3(max));
     for _ in 0..4 {
         let (mut s0, mut n0, mut s1, mut n1) = (0.0f32, 0, 0.0f32, 0);
-        for i in 0..SELECT_BLOCK {
-            let x = block[i];
+        for &x in block.iter() {
             if (x - c0).abs() <= (x - c1).abs() {
                 s0 += x;
                 n0 += 1;
@@ -1207,10 +1202,10 @@ pub(super) fn round_trip_q0_m2(block: &[f32; SELECT_BLOCK]) -> [f32; SELECT_BLOC
         }
     }
     let mut out = [0.0f32; SELECT_BLOCK];
-    for i in 0..SELECT_BLOCK {
+    for (i, o) in out.iter_mut().enumerate() {
         let quartet = i / 4;
         let x = block[quartet * 4];
-        out[i] = if (x - c0).abs() <= (x - c1).abs() {
+        *o = if (x - c0).abs() <= (x - c1).abs() {
             c0
         } else {
             c1
@@ -1231,8 +1226,7 @@ pub(super) fn round_trip_q0_m4(block: &[f32; SELECT_BLOCK]) -> [f32; SELECT_BLOC
     ];
     for _ in 0..5 {
         let (mut s, mut n) = ([0.0f32; 4], [0usize; 4]);
-        for i in 0..SELECT_BLOCK {
-            let x = block[i];
+        for &x in block.iter() {
             let best = (0..4)
                 .min_by(|&a, &b| (x - c[a]).abs().partial_cmp(&(x - c[b]).abs()).unwrap())
                 .unwrap();

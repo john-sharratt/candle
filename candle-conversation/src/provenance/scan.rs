@@ -374,7 +374,7 @@ mod tests {
         // Query = A. Per group: case-0 max = A·A = 512, case-1 max = A·B = 0.
         // mean=256, std=256, z=(512-256)/256 = 1.0; margin = 512 − 0 = 512; the
         // vote is z×margin = 512 per group → 3 groups → votes[0] = 1536.
-        let votes = score_provenance_late_fusion(&[a.clone()], &gallery, &cases, 2);
+        let votes = score_provenance_late_fusion(std::slice::from_ref(&a), &gallery, &cases, 2);
         assert!(
             (votes[0] - 1536.0).abs() < 1e-2,
             "case 0 exact match: {votes:?}"
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(votes[1], 0.0, "case 1 (complement) gets no vote");
 
         // Query = B → case 1 wins symmetrically.
-        let votes = score_provenance_late_fusion(&[b.clone()], &gallery, &cases, 2);
+        let votes = score_provenance_late_fusion(std::slice::from_ref(&b), &gallery, &cases, 2);
         assert!((votes[1] - 1536.0).abs() < 1e-2);
         assert_eq!(votes[0], 0.0);
     }
@@ -405,7 +405,13 @@ mod tests {
 
         let gallery = [&spike, &true_case];
         let cases = [0u32, 1];
-        let grouped = score_provenance_late_fusion_grouped(&[q.clone()], &gallery, &cases, 2, &[]);
+        let grouped = score_provenance_late_fusion_grouped(
+            std::slice::from_ref(&q),
+            &gallery,
+            &cases,
+            2,
+            &[],
+        );
         assert_eq!(grouped.len(), 3);
         // Group 0: spike 0, true 448 → leader true, margin 448, z = 1 → 448.
         assert!((grouped[0][1] - 448.0).abs() < 1e-2, "{grouped:?}");
@@ -419,7 +425,7 @@ mod tests {
         // Content-gated fusion on top: the spike (gate group 0 = 0) dies, the
         // true case keeps its gate-group score.
         let fused = score_provenance_late_fusion_fused(
-            &[q.clone()],
+            std::slice::from_ref(&q),
             &gallery,
             &cases,
             2,
@@ -431,7 +437,7 @@ mod tests {
 
         // Additive mode stays bit-identical to the shipped scorer.
         let additive = score_provenance_late_fusion_fused(
-            &[q.clone()],
+            std::slice::from_ref(&q),
             &gallery,
             &cases,
             2,

@@ -124,7 +124,7 @@ impl GalleryArena {
     /// (`wpt` words per token, `n_groups` layer-groups). For the production fold
     /// that is `wpt = 24`, `n_groups = 3`.
     pub fn new(device: &Device, wpt: usize, n_groups: usize) -> Result<Self> {
-        assert!(wpt > 0 && n_groups > 0 && wpt % n_groups == 0);
+        assert!(wpt > 0 && n_groups > 0 && wpt.is_multiple_of(n_groups));
         let pu64 = page_u64(wpt);
         let sp = slab_pages(pu64);
         let storage = GalleryStorage::new(device, pu64, sp)?;
@@ -573,7 +573,7 @@ mod tests {
         }
         assert_eq!(arena.resident_turns(), 4);
         // Pin turns 2 and 3 via a scan-style ensure (hit → pins; fp = t+1).
-        let dummy: Vec<WideQSig> = (0..32).map(|k| sig(k)).collect();
+        let dummy: Vec<WideQSig> = (0..32).map(sig).collect();
         arena.scan_ensure(sid(2), &dummy, 3).unwrap();
         arena.scan_ensure(sid(3), &dummy, 4).unwrap();
         // Evict everything possible — the pinned two must survive.

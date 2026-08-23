@@ -129,7 +129,7 @@ fn main() -> anyhow::Result<()> {
     let repo_tl = std::env::var("REPO_TL")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
-    let (used_tl, mut clusters) = if let Some(tl) = repo_tl {
+    let (_used_tl, mut clusters) = if let Some(tl) = repo_tl {
         let v = per_timeline
             .remove(&tl)
             .ok_or_else(|| anyhow::anyhow!("no repo_map timeline {tl}"))?;

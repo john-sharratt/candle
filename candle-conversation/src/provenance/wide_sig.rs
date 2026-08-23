@@ -35,11 +35,7 @@ impl WideQSig {
     /// `[layer][head][dim]` order). Bit set ⇔ value `>= 0`.
     pub fn from_band(band: &[f32], head_dim: usize) -> Self {
         let wph = words_per_head(head_dim);
-        let n_heads = if head_dim == 0 {
-            0
-        } else {
-            band.len() / head_dim
-        };
+        let n_heads = band.len().checked_div(head_dim).unwrap_or(0);
         let mut words = vec![0u64; n_heads * wph];
         for h in 0..n_heads {
             let base = h * head_dim;
@@ -243,6 +239,11 @@ pub fn decode_wide_sigs(bytes: &[u8]) -> Option<Vec<WideQSig>> {
 
 #[cfg(test)]
 mod tests {
+    // Word offsets are spelled `(group * HEADS + head) * WORDS_PER_HEAD` with the
+    // head written out even when it is 0, so the fold layout stays readable as
+    // an address rather than a constant.
+    #![allow(clippy::identity_op)]
+
     use super::*;
 
     #[test]
@@ -301,7 +302,13 @@ mod tests {
     fn wide_sigs_history_roundtrips() {
         let mk = |seed: usize| {
             let band: Vec<f32> = (0..4 * 128)
-                .map(|i| if (i + seed) % 3 == 0 { 1.0 } else { -1.0 })
+                .map(|i| {
+                    if (i + seed).is_multiple_of(3) {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
                 .collect();
             WideQSig::from_band(&band, 128)
         };

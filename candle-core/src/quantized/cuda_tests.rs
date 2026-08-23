@@ -1,3 +1,14 @@
+// Test code: loop indices are block/lane/expert coordinates in flat-buffer
+// offset arithmetic, and the tuple returns mirror the kernel's raw parameter
+// lists rather than modelling a domain type.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::manual_div_ceil,
+    clippy::needless_question_mark
+)]
+
 use super::*;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 use half::bf16;
@@ -875,9 +886,8 @@ fn cuda_mm_q6_k_gguf_debug() -> Result<()> {
 
     // Expected - just print what we get
     println!("\nResults via dequant f16 (first 8 rows):");
-    for i in 0..8.min(nrows) {
-        let val = f16::to_f32(result_dequant_vec[i]);
-        println!("Row {}: {:.4}", i, val);
+    for (i, &r) in result_dequant_vec.iter().enumerate().take(8.min(nrows)) {
+        println!("Row {}: {:.4}", i, f16::to_f32(r));
     }
 
     Ok(())
@@ -1292,7 +1302,7 @@ fn debug_q4_0_roundtrip() -> Result<()> {
     let dev = CudaDevice::new(0)?;
 
     // Test one block of Q4_0 = 32 elements
-    let elem_count = 32;
+    let elem_count = 32usize;
     let dtype = GgmlDType::Q4_0;
 
     // Simple ascending values
@@ -1303,7 +1313,7 @@ fn debug_q4_0_roundtrip() -> Result<()> {
 
     let block_size = dtype.block_size();
     let type_size = dtype.type_size();
-    let num_blocks = (elem_count + block_size - 1) / block_size;
+    let num_blocks = elem_count.div_ceil(block_size);
     let quant_size = num_blocks * type_size;
 
     println!(
@@ -1354,7 +1364,7 @@ fn quantize_dequantize_roundtrip_all_dtypes() -> Result<()> {
 
     // Test parameters - large enough to measure, small enough to be fast
     // 1M elements = 4MB f32 data, runs in ~1-10ms per dtype
-    let elem_count = 1024 * 1024; // 1M elements
+    let elem_count = 1024 * 1024usize; // 1M elements
     let num_warmup = 2;
     let num_iters = 5;
 
@@ -1409,7 +1419,7 @@ fn quantize_dequantize_roundtrip_all_dtypes() -> Result<()> {
         // Calculate buffer sizes
         let block_size = dtype.block_size();
         let type_size = dtype.type_size();
-        let num_blocks = (elem_count + block_size - 1) / block_size;
+        let num_blocks = elem_count.div_ceil(block_size);
         let quant_size = num_blocks * type_size;
 
         // Allocate quantized buffer
@@ -2805,8 +2815,8 @@ fn q8a128_edge_cases() -> Result<()> {
     // and the scale is exactly 0 rather than an inf/NaN from dividing by amax.
     assert_eq!(scale_at(1024).to_bits(), 0, "zero tile scale");
     assert_eq!(sum_at(1024).to_bits(), 0, "zero tile sum");
-    for i in 0..128 {
-        assert_eq!(raw[i], 0, "zero tile qs[{i}]");
+    for (i, &q) in raw.iter().enumerate().take(128) {
+        assert_eq!(q, 0, "zero tile qs[{i}]");
     }
 
     // Tile 1 — amax is the spike, so scale = 100/127 and Σx = 100 + 32×2 + Σ(i−16).
@@ -2825,11 +2835,11 @@ fn q8a128_edge_cases() -> Result<()> {
     // the constant run lands on 3 and the ramp spans −20..19.
     let qs = &raw[128..256];
     assert_eq!(qs[0] as i8, 127, "spike quantizes to full scale");
-    for i in 1..32 {
-        assert_eq!(qs[i] as i8, 0, "post-spike zeros qs[{i}]");
+    for (i, &q) in qs.iter().enumerate().take(32).skip(1) {
+        assert_eq!(q as i8, 0, "post-spike zeros qs[{i}]");
     }
-    for i in 32..64 {
-        assert_eq!(qs[i] as i8, 3, "constant run qs[{i}]");
+    for (i, &q) in qs.iter().enumerate().take(64).skip(32) {
+        assert_eq!(q as i8, 3, "constant run qs[{i}]");
     }
     for i in 64..96 {
         assert_eq!(qs[i] as i8, 0, "interior zeros qs[{i}]");
@@ -4797,9 +4807,9 @@ fn q4ko_submajor_dequant_correct() -> Result<()> {
                 let o = DM_OFF[sub];
                 let scale = f16::from_le_bytes([blk[o], blk[o + 1]]).to_f32();
                 let min = f16::from_le_bytes([blk[o + 2], blk[o + 3]]).to_f32();
-                for ki in 0..32 {
+                for (ki, &kq) in kk.iter().enumerate().take(32) {
                     let kcol = k_blk * 128 + sub * 32 + ki;
-                    let w = scale * (kk[ki] as f32) + min;
+                    let w = scale * (kq as f32) + min;
                     for t in 0..total_batch {
                         vref[t * nrows + row] += w * act_data[t * ncols + kcol];
                     }

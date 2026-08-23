@@ -1,3 +1,7 @@
+// Test code: loop indices are tensor coordinates in the expected-value formula,
+// and `vec![..]` literals stand in for the shapes under test.
+#![allow(clippy::needless_range_loop, clippy::useless_vec)]
+
 use candle_core::{test_device, test_utils, DType, Device, IndexOp, Result, Tensor, D};
 use float8::F8E4M3;
 

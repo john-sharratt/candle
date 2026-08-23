@@ -37,7 +37,7 @@ mod rotating;
 
 pub use arena_table::{
     ArenaFormatTag, ArenaLocation, PaletteSubEntry, PerHeadEntry, PerHeadTable, ResolvedArenaInfo,
-    N_PALETTE,
+    LATENT_NOPE_BANDS, LATENT_N_BANDS, N_PALETTE,
 };
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
 pub use chunked::class_promotion_count;
@@ -53,8 +53,7 @@ pub use chunked::wave_plan::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     begin_forward, begin_wave, end_wave_transient, plan_wave_transient, wave_domain_stats,
-    BumpRange, ForwardOpen, WaveGeneration, KV_ARENA_MID_WAVE, WAVE_ATTN_BYTES, WAVE_FFN_BYTES,
-    WAVE_FORWARD_BYTES,
+    BumpRange, ForwardOpen, WaveGeneration, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{expect_kv_range, span_layout, SpanLayout};
@@ -71,6 +70,9 @@ pub use chunked::{region_stats, RegionStats, REGION_BYTES};
 pub use chunked::{
     RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
 };
+/// The wave arena's phase spans. Measurements, so they are available whether or
+/// not the crate was built with a GPU backend.
+pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
 
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;
@@ -78,8 +80,6 @@ pub use chunked::migrate::HostSealedChunk;
 pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
-#[cfg(feature = "cuda")]
-#[cfg(feature = "cuda")]
 pub use chunked::vram_budget_available;
 pub(crate) use chunked::Arena; // Internal use only
 pub use chunked::MIGRATION_STAGING_CAP_BYTES;

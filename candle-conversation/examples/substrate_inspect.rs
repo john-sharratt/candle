@@ -27,6 +27,17 @@
 //! `<stream-id>` accepts decimal or `0x`-prefixed hex (as printed by
 //! `streams`).
 
+// Read-only inspector. Its renderers walk per-group / per-token index grids so
+// the printed tables line up with the on-disk record layout.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::manual_clamp,
+    clippy::manual_checked_ops,
+    clippy::manual_is_multiple_of,
+    clippy::unnecessary_sort_by,
+    clippy::unnecessary_map_or
+)]
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

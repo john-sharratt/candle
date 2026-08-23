@@ -516,7 +516,7 @@ pub(crate) fn effective_turn_policy(
         // Lossless capture: skip the quantize pass so turns keep native R16/F16.
         (_, Some(c)) if c.lossless => None,
         (Some(b), Some(c)) => {
-            let mut p = b.clone();
+            let mut p = *b;
             if let Some(level) = c.level {
                 p.compression_level = level;
             }
@@ -533,7 +533,7 @@ pub(crate) fn effective_turn_policy(
             }
             Some(p)
         }
-        (Some(b), None) => Some(b.clone()),
+        (Some(b), None) => Some(*b),
         (None, _) => None,
     }
 }

@@ -116,7 +116,7 @@ impl ConvFileStore {
     pub fn list(&self, conv: &str) -> Vec<FileMeta> {
         let guard = self.inner.lock().unwrap();
         let mut out: Vec<&FileRecord> = guard.files.iter().filter(|r| r.conv == conv).collect();
-        out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+        out.sort_by_key(|r| std::cmp::Reverse(r.created_ms));
         out.into_iter().map(meta_of).collect()
     }
 

@@ -16,7 +16,7 @@
 #[cfg(feature = "cuda")]
 fn main() -> candle::Result<()> {
     use candle::Device;
-    use candle_transformers::models::deepseek4::select_bench::{
+    use candle_transformers::models::latent_moe::select_bench::{
         run_corpus_gather_kernels, SelectCfg,
     };
 

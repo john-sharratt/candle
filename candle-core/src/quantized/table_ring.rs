@@ -36,9 +36,9 @@ use cudarc::driver::{CudaEvent, CudaStream};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Total slab bytes (two halves). A launch table is ≤ ~64 KB (256 experts × 8 B
-/// + 3 × num_tiles × 4 B), so each 2 MB half holds dozens-to-thousands of
-/// launches of runway before its fence is consulted.
+/// Total slab bytes (two halves). A launch table is ≤ ~64 KB
+/// (256 experts × 8 B + 3 × num_tiles × 4 B), so each 2 MB half holds
+/// dozens-to-thousands of launches of runway before its fence is consulted.
 const RING_BYTES: usize = 4 * 1024 * 1024;
 
 struct RingState {

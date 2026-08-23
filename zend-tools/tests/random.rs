@@ -9,7 +9,7 @@ fn random_integer_in_range() {
         json!({"kind": "integer", "min": 1.0, "max": 6.0}),
     ));
     let val = resp["result"].as_i64().unwrap();
-    assert!(val >= 1 && val <= 6, "got {val}");
+    assert!((1..=6).contains(&val), "got {val}");
 }
 
 #[test]
@@ -19,7 +19,7 @@ fn random_float_in_range() {
         json!({"kind": "float", "min": 0.0, "max": 1.0}),
     ));
     let f = resp["result"].as_f64().unwrap();
-    assert!(f >= 0.0 && f < 1.0, "got {f}");
+    assert!((0.0..1.0).contains(&f), "got {f}");
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn random_dice_2d6() {
     assert_eq!(arr.len(), 2);
     for v in arr {
         let n = v.as_u64().unwrap();
-        assert!(n >= 1 && n <= 6, "got {n}");
+        assert!((1..=6).contains(&n), "got {n}");
     }
 }
 
@@ -60,7 +60,7 @@ fn random_dice_2d6() {
 fn random_integer_default() {
     let resp = harness::expect_success(harness::invoke("random", json!({"kind": "integer"})));
     let val = resp["result"].as_i64().unwrap();
-    assert!(val >= 0 && val <= 100);
+    assert!((0..=100).contains(&val));
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn random_integer_range() {
     assert_eq!(arr.len(), 5);
     for v in arr {
         let n = v.as_i64().unwrap();
-        assert!(n >= 10 && n <= 20);
+        assert!((10..=20).contains(&n));
     }
 }
 
@@ -88,7 +88,7 @@ fn random_float() {
         }),
     ));
     let f = resp["result"].as_f64().unwrap();
-    assert!(f >= 0.0 && f < 1.0);
+    assert!((0.0..1.0).contains(&f));
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn random_dice() {
         }),
     ));
     let n = resp["result"].as_u64().unwrap();
-    assert!(n >= 1 && n <= 6);
+    assert!((1..=6).contains(&n));
 }
 
 #[test]

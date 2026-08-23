@@ -56,10 +56,10 @@ impl Tool for BytesXor {
 
         let len = a.len().max(b.len());
         let mut result = vec![0u8; len];
-        for i in 0..len {
+        for (i, out) in result.iter_mut().enumerate() {
             let av = a.get(i).copied().unwrap_or(0);
             let bv = b.get(i).copied().unwrap_or(0);
-            result[i] = av ^ bv;
+            *out = av ^ bv;
         }
 
         let encoded = encode_bytes(&result, out_enc)?;

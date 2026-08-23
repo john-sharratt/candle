@@ -427,6 +427,11 @@ fn build_slot_headers(
 /// 3) Running the paged prefill attention kernel that reads via `block_table`.
 ///
 /// Returns `Some(outputs_per_sequence)` on success, `None` if inapplicable or if the attempt fails.
+// A kernel-launch transcription: pointers, extents, per-sequence lengths, RoPE
+// tables, stream generation. Same reasoning as the arena layer in
+// `candle_nn::kv_cache::chunked` — the flat list IS the launch, and a struct
+// between it and the `.cu` is what makes a mismatch hard to audit.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "cuda")]
 fn paged_prefill_batched_impl<'w>(
     wave: Option<&'w WaveGeneration>,
@@ -457,7 +462,7 @@ fn paged_prefill_batched_impl<'w>(
     let max_add = q_lens.iter().copied().max().unwrap_or(0);
     if !(max_add >= 1
         && matches!(q.device(), Device::Cuda(_))
-        && head_dim % 32 == 0
+        && head_dim.is_multiple_of(32)
         && head_dim <= 256)
     {
         candle::bail!(
@@ -1842,7 +1847,7 @@ impl<'k> PagedDecode<'k> {
             unsafe {
                 ffi_fn(
                     q_ptr as *const core::ffi::c_void,
-                    headers_ptr as *const u8,
+                    headers_ptr,
                     dst_ptr as *mut core::ffi::c_void,
                     self.num_active_slots as i32,
                     self.n_q_head as i32,
@@ -1932,7 +1937,7 @@ impl<'k> PagedDecode<'k> {
             unsafe {
                 ffi_fn(
                     q_ptr as *const core::ffi::c_void,
-                    headers_ptr as *const u8,
+                    headers_ptr,
                     dst_ptr as *mut core::ffi::c_void,
                     self.num_active_slots as i32,
                     self.n_q_head as i32,
@@ -2006,6 +2011,8 @@ impl<'k> PagedDecode<'k> {
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
+    #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
     use super::paged_prefill_batched as paged_prefill_flat;
     use candle_nn::kv_cache::ChunkedKvBacking;
 

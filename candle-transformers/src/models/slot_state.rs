@@ -630,13 +630,11 @@ impl SlotStateHost {
         } else {
             let start = writer_start_idx;
             let mut wi = start;
-            for i in start..slices.len() {
-                let s = &slices[i];
+            for (i, s) in slices.iter().enumerate().skip(start) {
+                wi = i;
                 if (s.offset as usize + s.len as usize) < 32 {
-                    wi = i;
                     break;
                 }
-                wi = i;
             }
             wi as u32
         };

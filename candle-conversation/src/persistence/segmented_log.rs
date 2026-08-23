@@ -223,7 +223,7 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
     }
     let sealed = FIRST_SEGMENT;
     let active = sealed.next();
-    fs::rename(&legacy, &dir.join(segment_name(sealed)))?;
+    fs::rename(&legacy, dir.join(segment_name(sealed)))?;
     LogFile::create(&dir.join(segment_name(active)))?;
     tracing::info!(
         "migrated legacy {LEGACY_LOG_NAME} -> {} (sealed) + {} (active)",
@@ -556,7 +556,7 @@ impl SegmentedLog {
         //    compacted data is a real, highest-id segment. A crash here leaves
         //    old + new; recovery keeps new, maintenance reclaims old.
         let keep = segment_name(new_id);
-        fs::rename(scratch, &self.dir.join(&keep))?;
+        fs::rename(scratch, self.dir.join(&keep))?;
         self.active_id = new_id;
 
         // 2. Delete every OTHER segment file (the old ones). The just-renamed new
@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn compact_scratch_file_is_removed_on_open() {
         let dir = tmp_dir("scratch");
-        fs::write(&dir.join("substrate.log.compact"), b"garbage").unwrap();
+        fs::write(dir.join("substrate.log.compact"), b"garbage").unwrap();
         SegmentedLog::open_with_sink(&dir, |_| {}).unwrap();
         assert!(!dir.join("substrate.log.compact").exists());
         fs::remove_dir_all(&dir).ok();

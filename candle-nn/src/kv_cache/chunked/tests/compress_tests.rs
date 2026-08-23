@@ -11,6 +11,8 @@
 //! a CUDA device — the kernel path is GPU-specific.
 
 #![cfg(feature = "cuda")]
+// Test code: byte widths are spelled out to match the arena record layout.
+#![allow(clippy::unnecessary_cast)]
 
 use std::sync::Arc;
 
@@ -30,9 +32,20 @@ const N_KV_HEAD: usize = 2;
 const HEAD_DIM: usize = 128;
 const ARENA_CAPACITY: usize = 256;
 
-fn cuda_device_or_skip() -> Option<Device> {
+/// A CUDA device **and** the crate-wide GPU serialisation guard.
+///
+/// The guard is returned WITH the device rather than taken separately so it
+/// cannot be forgotten: every test here builds a `ChunkedKvBacking`, which
+/// claims from the process-global region pool, and none of them held the lock.
+/// Under a concurrent test that legitimately holds many regions, they failed
+/// with "no region is claimable ... all 31 of which are live" — the shared-state
+/// race `gpu_test_lock`'s own documentation was written about.
+///
+/// Bind it as `let Some((device, _gpu)) = cuda_device_or_skip() else { return };`
+/// — never to a bare `_`, which drops the guard immediately.
+fn cuda_device_or_skip() -> Option<(Device, std::sync::MutexGuard<'static, ()>)> {
     match Device::cuda_if_available(0) {
-        Ok(d @ Device::Cuda(_)) => Some(d),
+        Ok(d @ Device::Cuda(_)) => Some((d, super::super::gpu_test_lock::gpu_serial())),
         _ => None,
     }
 }
@@ -99,7 +112,7 @@ fn seed_f16_sealed(
 ///    (compression actually compressed something).
 #[test]
 fn quantize_to_cpu_basic_round_trip_shape() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(5);
@@ -165,7 +178,7 @@ fn quantize_to_cpu_basic_round_trip_shape() {
 /// Multi-sequence input batches map 1-to-1 to outputs in the same order.
 #[test]
 fn quantize_to_cpu_batches_two_sequences() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(3);
@@ -204,7 +217,7 @@ fn quantize_to_cpu_batches_two_sequences() {
 /// strongest possible functional-equivalence check for the persist-pass rewire.
 #[test]
 fn quantize_layers_deferred_matches_immediate_bytes() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(5);
@@ -292,7 +305,7 @@ fn quantize_layers_deferred_matches_immediate_bytes() {
 /// different formats/scales/maps and diverge the bytes here.
 #[test]
 fn quantize_layers_selection_batched_matches_per_layer_bytes() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(5);
@@ -387,7 +400,7 @@ fn quantize_layers_selection_batched_matches_per_layer_bytes() {
 /// blob would make a layer's warm bytes diverge and fail this.
 #[test]
 fn migrate_layers_batched_matches_per_layer_bytes() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(5);
@@ -474,7 +487,7 @@ fn migrate_layers_batched_matches_per_layer_bytes() {
 /// An empty input list is a clean no-op.
 #[test]
 fn quantize_to_cpu_empty_input_is_noop() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(5);
@@ -501,7 +514,7 @@ fn quantize_to_cpu_empty_input_is_noop() {
 /// exact CHUNK_SIZE boundaries.
 #[test]
 fn quantize_to_cpu_quantizes_partial_tail() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(5);
@@ -587,7 +600,7 @@ fn quantize_to_cpu_quantizes_partial_tail() {
 /// quantized storage with the live slot.)
 #[test]
 fn quantize_to_cpu_requantizes_filled_partials() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(5);
@@ -666,7 +679,7 @@ fn quantize_to_cpu_requantizes_filled_partials() {
 /// in one self-contained test.
 #[test]
 fn cold_load_partial_extend_then_requantize() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
         return;
     };
     let policy = CompressionPolicy::new(5);

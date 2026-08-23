@@ -29,6 +29,17 @@
 //!
 //! ```
 
+// Benchmark-harness code (the module is `cfg(any(test, feature = "ruler-bench"))`).
+// The scorers index task/length grids positionally, which is how the RULER
+// results table is laid out.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::redundant_closure,
+    clippy::too_many_arguments,
+    clippy::useless_conversion
+)]
+
 use candle::{Device, Result, Tensor};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use tokenizers::Tokenizer;

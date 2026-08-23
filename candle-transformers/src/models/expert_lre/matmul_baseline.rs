@@ -24,6 +24,10 @@
 //!   expert_lre::matmul_baseline::expert_matmul_baseline_bench -- --ignored --nocapture
 //! ```
 
+// Test-only fixture module; the reference matmul indexes [row][col] the way the
+// baseline it is checking does.
+#![allow(clippy::needless_range_loop)]
+
 use crate::models::quantized_matmul::QMatMul;
 use candle::quantized::{gguf_file, GgmlDType, QTensor};
 use candle::{Device, Module, Result, Tensor};

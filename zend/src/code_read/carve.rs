@@ -1184,11 +1184,11 @@ func main() {
             path: vec!["consts".into()],
             kind: ChunkKind::Constants,
             start_line: 1,
-            end_line: (MAX_SCOPE_LINES * 2) as u32,
+            end_line: MAX_SCOPE_LINES * 2,
         };
         let out = cap_scope_size(vec![scope], src.as_bytes());
         for p in &out {
-            assert!(p.end_line - p.start_line + 1 <= MAX_SCOPE_LINES);
+            assert!(p.end_line - p.start_line < MAX_SCOPE_LINES);
         }
         assert_eq!(
             out.first().unwrap().end_line,

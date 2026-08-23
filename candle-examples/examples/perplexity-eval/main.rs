@@ -273,18 +273,6 @@ impl Model {
             }
         }
     }
-
-    fn create_kv_caches(
-        &self,
-        capacity: usize,
-    ) -> candle_transformers::models::kv_cache_utils::KvCaches {
-        match self {
-            Model::Qwen3(m) => m.create_kv_caches(capacity),
-            Model::Qwen3Moe(m) => m.create_kv_caches(capacity),
-            Model::Qwen2(m) => m.create_kv_caches(capacity),
-            Model::Llama(m) => m.create_kv_caches(capacity),
-        }
-    }
 }
 
 /// Wraps all model types as BatchedInference for paged attention with compression.
@@ -342,20 +330,42 @@ impl BatchedModel {
         }
     }
 
+    fn num_layers(&self) -> usize {
+        match self {
+            Self::Qwen3(bi) => bi.num_layers(),
+            Self::Qwen3Moe(bi) => bi.num_layers(),
+            Self::Qwen2(bi) => bi.num_layers(),
+            Self::Llama(bi) => bi.num_layers(),
+        }
+    }
+
     /// Forward pass returning logits for ALL positions via paged attention.
+    ///
+    /// Perplexity scores every position, so the whole window goes in as a single
+    /// PREFILL row of `forward_wave` — the decode/glue row lists stay empty.
     fn forward_all_logits_batched(
         &self,
         session: &mut BatchedInferenceSession,
         seq_idx: usize,
         input: &Tensor,
     ) -> Result<Tensor> {
-        let mut logits = match self {
-            Self::Qwen3(bi) => bi.forward_batched(session, &[seq_idx], &[input.clone()])?,
-            Self::Qwen3Moe(bi) => bi.forward_batched(session, &[seq_idx], &[input.clone()])?,
-            Self::Qwen2(bi) => bi.forward_batched(session, &[seq_idx], &[input.clone()])?,
-            Self::Llama(bi) => bi.forward_batched(session, &[seq_idx], &[input.clone()])?,
-        };
-        logits
+        let nl = self.num_layers();
+        let (seqs, inputs) = ([seq_idx], [input.clone()]);
+        let step = match self {
+            Self::Qwen3(bi) => {
+                bi.forward_wave(session, &[], &[], &seqs, &inputs, &[], &[], 0, nl, None)
+            }
+            Self::Qwen3Moe(bi) => {
+                bi.forward_wave(session, &[], &[], &seqs, &inputs, &[], &[], 0, nl, None)
+            }
+            Self::Qwen2(bi) => {
+                bi.forward_wave(session, &[], &[], &seqs, &inputs, &[], &[], 0, nl, None)
+            }
+            Self::Llama(bi) => {
+                bi.forward_wave(session, &[], &[], &seqs, &inputs, &[], &[], 0, nl, None)
+            }
+        }?;
+        step.logits_owned()?
             .pop()
             .ok_or_else(|| candle::Error::Msg("empty batched logits result".into()))
     }
@@ -569,10 +579,10 @@ fn eval_compressed(
 
         // Free the sequence to release KV memory
         session.free_sequence(seq_idx)?;
-        session.compact()?;
+        session.release_empty_arenas()?;
 
         chunk_idx += 1;
-        if chunk_idx % 10 == 0 || chunk_idx == n_chunks as u32 {
+        if chunk_idx.is_multiple_of(10) || chunk_idx == n_chunks as u32 {
             let running_ppl = (total_nll / total_count as f64).exp();
             println!(
                 "  Chunk {}/{}: loss={:.4}, running PPL={:.2} ({} tokens scored)",

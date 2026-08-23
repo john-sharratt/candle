@@ -111,7 +111,7 @@ impl QMatMul {
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
         let ws = vb.get((in_dim, out_dim), "weight")?;
-        let inner = super::quantized_matmul::QMatMul::from_weights(ws.into())?;
+        let inner = super::quantized_matmul::QMatMul::from_weights(ws)?;
         Ok(Self { inner })
     }
 

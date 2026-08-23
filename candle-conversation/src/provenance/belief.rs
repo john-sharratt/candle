@@ -101,8 +101,8 @@ impl ToolBelief {
     pub fn update(&mut self, scores: &[f32]) {
         debug_assert_eq!(scores.len(), self.acc.len(), "score/slot count mismatch");
         let m = self.acc.iter().copied().fold(0.0f32, f32::max);
-        for i in 0..self.acc.len() {
-            self.acc[i] = (self.acc[i] - self.beta[i] * m).max(0.0) + scores[i];
+        for ((acc, &beta), &score) in self.acc.iter_mut().zip(self.beta.iter()).zip(scores) {
+            *acc = (*acc - beta * m).max(0.0) + score;
         }
     }
 

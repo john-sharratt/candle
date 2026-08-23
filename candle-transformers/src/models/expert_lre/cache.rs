@@ -408,6 +408,7 @@ impl ExpertCacheInner {
     /// 4. **Pinned layers** — experts in layers 0..PINNED_LAYERS-1 are
     ///    never evicted.  They run first every pass with zero compute
     ///    overlap to hide DMA latency.
+    ///
     /// Returns `(slot_idx, evicted_key)`. `evicted_key` is `None` when a free
     /// slot was available and nothing was displaced.
     ///
@@ -464,7 +465,7 @@ impl ExpertCacheInner {
             .iter()
             .enumerate()
             .filter(|(idx, k)| {
-                k.map_or(false, |(layer, _)| layer >= PINNED_LAYERS) && !protect.contains(idx)
+                k.is_some_and(|(layer, _)| layer >= PINNED_LAYERS) && !protect.contains(idx)
             })
             .min_by(|(idx_a, _), (idx_b, _)| {
                 let sa = self.slot_eviction_score(*idx_a, current_layer);

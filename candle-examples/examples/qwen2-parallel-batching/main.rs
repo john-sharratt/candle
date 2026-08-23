@@ -1,392 +1,217 @@
-//! Demonstrates GPU continuous-batching decode for GGUF-quantized Qwen2 (0.5B
-//! Instruct) using `BatchedInference`/`SequenceContext`/`BatchedPrefillMeta`
-//! from `candle_transformers::models::batched_{model,layer}` — the same
-//! machinery the daemon's scheduler uses to step many sessions through a
-//! shared `ChunkedKvBacking` together.
+//! Continuous-batching demo for quantized Qwen2-0.5B via `BatchedInference`.
 //!
-//! Runs two prompts of different lengths through a padded shared prefill, then
-//! 100 decode steps via `forward_batch`, then re-measures the same 100 steps
-//! sequentially (separate `forward` calls) vs. batched to report the speedup.
-//! No CLI arguments; uses `PinnedStager` for host-pinned staging buffers.
+//! Two sequences with independent KV state are prefilled to **deliberately
+//! different lengths**, then decoded together — one `forward_wave` per step
+//! covering both — and the same work is re-timed one sequence at a time. The
+//! ratio is what batching buys on this model: the weights are read once per
+//! wave instead of once per sequence, so a second sequence costs far less than
+//! a second pass.
+//!
+//! Misaligned prefill lengths are the point, not an accident: they put the two
+//! sequences at different positions in their KV arenas, which is the case a
+//! batched decode has to get right and a uniform-length demo never exercises.
+//!
+//! Not a CLI — a fixed harness. Downloads `Qwen/Qwen2-0.5B-Instruct-GGUF` and
+//! runs. For throughput across many sessions with output-validity checking, see
+//! `quantized_qwen2`'s `test_parallel_batched_forwarding` instead; this is a
+//! usage example, not a benchmark gate.
 
-/// Parallel Continuous Batching Example for Qwen2
-use candle::quantized::pinned_staging::PinnedStager;
 use candle::{Device, Result, Tensor};
-use candle_transformers::models::batched_layer::{BatchedPrefillMeta, DecodeHeaders};
+use candle_transformers::models::batched_inference::{
+    BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
+};
 use candle_transformers::models::batched_model::BatchedInference;
-use candle_transformers::models::kv_cache_utils::SequenceContext;
 use candle_transformers::models::quantized_qwen2::ModelWeights;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 
-fn main() -> Result<()> {
-    println!("\n=== Qwen2 Parallel Continuous Batching Example ===\n");
+/// Generation steps timed in each of the two decode regimes.
+const DECODE_STEPS: usize = 32;
 
-    // Download model
-    let api = Api::new().map_err(|e| candle::Error::Msg(format!("HF API error: {}", e)))?;
+fn main() -> Result<()> {
+    println!("\n=== Qwen2 Parallel Continuous Batching ===\n");
+
+    let api = Api::new().map_err(|e| candle::Error::Msg(format!("HF API error: {e}")))?;
     let repo = api.repo(Repo::with_revision(
         "Qwen/Qwen2-0.5B-Instruct-GGUF".to_string(),
         RepoType::Model,
         "main".to_string(),
     ));
-
-    println!("Downloading Qwen2-0.5B-Instruct model...");
+    println!("Downloading Qwen2-0.5B-Instruct...");
     let model_path = repo
         .get("qwen2-0_5b-instruct-q4_0.gguf")
-        .map_err(|e| candle::Error::Msg(format!("Download failed: {}", e)))?;
+        .map_err(|e| candle::Error::Msg(format!("Download failed: {e}")))?;
 
     let device = Device::cuda_if_available(0)?;
-    let stager = PinnedStager::new_from_device(&device);
-    println!("Using device: {:?}\n", device);
+    println!("Device: {device:?}\n");
 
-    // Load model
     println!("Loading model...");
-    let start = std::time::Instant::now();
-    let inner_model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
-
-    // Wrap in BatchedInference for parallel batching support
-    let inv_freq = inner_model
+    let t0 = std::time::Instant::now();
+    let inner = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+    let inv_freq = inner
         .rope_inv_freq()
-        .ok_or_else(|| candle::Error::Msg("Model has no RoPE inv_freq".into()))?;
-    let model = BatchedInference::new_with_inv_freq(inner_model, inv_freq, 4096, &device)?;
-    println!("Model loaded in {:.2}s\n", start.elapsed().as_secs_f64());
+        .ok_or_else(|| candle::Error::Msg("model has no RoPE inv_freq".into()))?;
+    let model = BatchedInference::new_with_inv_freq(inner, inv_freq, 4096, &device)?;
+    println!("Loaded in {:.2}s\n", t0.elapsed().as_secs_f64());
 
-    // Load tokenizer
-    println!("Loading tokenizer...");
-    let tokenizer_repo = api.repo(Repo::with_revision(
-        "Qwen/Qwen2-0.5B-Instruct".to_string(),
-        RepoType::Model,
-        "main".to_string(),
-    ));
-    let tokenizer_path = tokenizer_repo
+    let tok_path = api
+        .repo(Repo::with_revision(
+            "Qwen/Qwen2-0.5B-Instruct".to_string(),
+            RepoType::Model,
+            "main".to_string(),
+        ))
         .get("tokenizer.json")
-        .map_err(|e| candle::Error::Msg(format!("Failed to download tokenizer: {}", e)))?;
-    let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-        .map_err(|e| candle::Error::Msg(format!("Failed to load tokenizer: {}", e)))?;
+        .map_err(|e| candle::Error::Msg(format!("tokenizer download failed: {e}")))?;
+    let tokenizer = tokenizers::Tokenizer::from_file(tok_path)
+        .map_err(|e| candle::Error::Msg(format!("tokenizer load failed: {e}")))?;
 
-    // Create KV caches for two independent sequences using the inner model
-    let mut seq1_caches = model.model().create_kv_caches(512);
-    let mut seq2_caches = model.model().create_kv_caches(512);
+    let prompt =
+        |body: &str| format!("<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n");
+    // Different lengths on purpose — see the module docs.
+    let prompts = [
+        prompt("Provide a comprehensive explanation of quantum computing. What are quantum bits? How do quantum gates work? What are the potential applications?"),
+        prompt("Explain natural selection."),
+    ];
 
-    // Phase 1: Prefill with real questions (different lengths)
-    println!("\nPhase 1: Prefill (processing longer prompts for better performance metrics)");
+    let toks: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| -> Result<Vec<u32>> {
+            Ok(tokenizer
+                .encode(p.as_str(), true)
+                .map_err(|e| candle::Error::Msg(format!("tokenization failed: {e}")))?
+                .get_ids()
+                .to_vec())
+        })
+        .collect::<Result<_>>()?;
+    println!(
+        "Prompt lengths: seq0 = {}, seq1 = {} (misaligned by {})\n",
+        toks[0].len(),
+        toks[1].len(),
+        toks[0].len().abs_diff(toks[1].len())
+    );
 
-    // Qwen2 chat format with longer, more complex prompts
-    let prompt1 = "<|im_start|>user\nYou are a helpful AI assistant. Please provide a comprehensive explanation of quantum computing. What are quantum bits? How do quantum gates work? What are the potential applications?<|im_end|>\n<|im_start|>assistant\n";
-    let seq1_prompt = tokenizer
-        .encode(prompt1, true)
-        .map_err(|e| candle::Error::Msg(format!("Tokenization failed: {}", e)))?
-        .get_ids()
-        .to_vec();
+    let (batched, batched_time) = run(&model, &device, &toks, true)?;
+    let (sequential, sequential_time) = run(&model, &device, &toks, false)?;
 
-    let prompt2 = "<|im_start|>user\nExplain the theory of evolution in detail. Include information about natural selection, adaptation, and the evidence for evolution. How has this theory shaped our understanding of biology?<|im_end|>\n<|im_start|>assistant\n";
-    let seq2_prompt = tokenizer
-        .encode(prompt2, true)
-        .map_err(|e| candle::Error::Msg(format!("Tokenization failed: {}", e)))?
-        .get_ids()
-        .to_vec();
-
-    println!("  Seq 1: \"{}\" ({} tokens)", prompt1, seq1_prompt.len());
-    println!("  Seq 2: \"{}\" ({} tokens)\n", prompt2, seq2_prompt.len());
-
-    // Prefill: Pad both sequences to the same length and process together in ONE batch
-    // This ensures they share the same ChunkedKvBacking for efficient batched decode later
-    let max_prompt_len = seq1_prompt.len().max(seq2_prompt.len());
-
-    // Pad seq1 to max length (pad with zeros on the left, but we'll use the actual lengths)
-    let seq1_padded: Vec<u32> = {
-        let mut v = vec![0u32; max_prompt_len - seq1_prompt.len()];
-        v.extend(seq1_prompt.iter().copied());
-        v
-    };
-    let seq2_padded: Vec<u32> = {
-        let mut v = vec![0u32; max_prompt_len - seq2_prompt.len()];
-        v.extend(seq2_prompt.iter().copied());
-        v
-    };
-
-    // Create input tensors
-    let seq1_input = Tensor::new(&seq1_padded[..], &device)?
-        .unsqueeze(0)?
-        .contiguous()?;
-    let seq2_input = Tensor::new(&seq2_padded[..], &device)?
-        .unsqueeze(0)?
-        .contiguous()?;
-
-    // Process BOTH sequences together in a single batched prefill
-    // This creates a shared ChunkedKvBacking for both caches
-    let (seq1_first_token, seq2_first_token) = {
-        let seq1_offset = seq1_caches.current_seq_len();
-        let seq2_offset = seq2_caches.current_seq_len();
-        let mut contexts = vec![
-            SequenceContext {
-                kv_caches: &mut seq1_caches,
-                offset: seq1_offset,
-                input_ids: &seq1_input,
-                input_len: max_prompt_len,
-            },
-            SequenceContext {
-                kv_caches: &mut seq2_caches,
-                offset: seq2_offset,
-                input_ids: &seq2_input,
-                input_len: max_prompt_len,
-            },
-        ];
-        let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
-        let meta = BatchedPrefillMeta::new(&offsets, max_prompt_len, &device)?;
-        let generation = stager.begin_generation();
-        let outputs =
-            model.forward_batch(&mut contexts, &generation, DecodeHeaders::Prefill(meta))?;
-        // Sample from prefill output (last position gives next token prediction)
-        let token1 = sample_token(&outputs.get(0)?)?;
-        let token2 = sample_token(&outputs.get(1)?)?;
-        (token1, token2)
-    };
-    println!("  Seq 1: cached with input_len={}", seq1_prompt.len());
-    println!("  Seq 2: cached with input_len={}\n", seq2_prompt.len());
-
-    // Track generated tokens
-    let seq1_prompt_len = seq1_prompt.len();
-    let seq2_prompt_len = seq2_prompt.len();
-
-    let mut seq1_tokens = seq1_prompt.clone();
-    seq1_tokens.push(seq1_first_token);
-    let mut seq2_tokens = seq2_prompt.clone();
-    seq2_tokens.push(seq2_first_token);
-
-    // Phase 2: Parallel generation with BATCHED single-token processing
-    println!("Phase 2: Parallel generation with BATCHED single-token processing (100 steps)");
-    println!("  This phase uses forward_batch for each step instead of individual forwards\n");
-
-    let num_steps = 100;
-    let mut phase2_tokens1 = vec![seq1_first_token];
-    let mut phase2_tokens2 = vec![seq2_first_token];
-
-    let start = std::time::Instant::now();
-    for step in 0..num_steps {
-        let seq1_offset = seq1_caches.current_seq_len();
-        let seq2_offset = seq2_caches.current_seq_len();
-
-        let seq1_input = Tensor::new(&[phase2_tokens1[step]], &device)?.unsqueeze(0)?;
-        let seq2_input = Tensor::new(&[phase2_tokens2[step]], &device)?.unsqueeze(0)?;
-
-        // Use SequenceContext for batched forward
-        let mut contexts = vec![
-            SequenceContext {
-                kv_caches: &mut seq1_caches,
-                offset: seq1_offset,
-                input_ids: &seq1_input,
-                input_len: 1,
-            },
-            SequenceContext {
-                kv_caches: &mut seq2_caches,
-                offset: seq2_offset,
-                input_ids: &seq2_input,
-                input_len: 1,
-            },
-        ];
-        let generation = stager.begin_generation();
-        let outputs = model.forward_batch(
-            &mut contexts,
-            &generation,
-            DecodeHeaders::Decode {
-                buf: None,
-                stride: 0,
-            },
-        )?;
-
-        let next_token1 = sample_token(&outputs.get(0)?)?;
-        let next_token2 = sample_token(&outputs.get(1)?)?;
-
-        phase2_tokens1.push(next_token1);
-        phase2_tokens2.push(next_token2);
-        seq1_tokens.push(next_token1);
-        seq2_tokens.push(next_token2);
-
-        if (step + 1) % 25 == 0 {
-            println!(
-                "  Step {:3}: Seq1 offset={:3} token={:5} | Seq2 offset={:3} token={:5}",
-                step + 1,
-                seq1_offset,
-                next_token1,
-                seq2_offset,
-                next_token2
-            );
-        }
+    for (i, ids) in batched.iter().enumerate() {
+        let text = tokenizer
+            .decode(ids, false)
+            .map_err(|e| candle::Error::Msg(format!("decode failed: {e}")))?;
+        println!("Sequence {i} ({} tokens): {}\n", ids.len(), text.trim());
     }
-    let batched_time = start.elapsed();
-    println!(
-        "  Batched processing time: {:.2}ms\n",
-        batched_time.as_secs_f64() * 1000.0
-    );
 
-    // Keep copies of generated tokens for Phase 3 replay
-    let generated_seq1 = seq1_tokens.clone();
-    let generated_seq2 = seq2_tokens.clone();
-
-    // Phase 3: Performance comparison
-    println!("Phase 3: Performance comparison");
-    println!("  Sequential: individual forward() calls for each sequence");
-    println!("  Parallel:   forward_batch() for both sequences together\n");
-
-    let mut seq1_caches_seq = model.model().create_kv_caches(512);
-    let mut seq2_caches_seq = model.model().create_kv_caches(512);
-
-    let seq1_input = Tensor::new(&seq1_prompt[..], &device)?.unsqueeze(0)?;
-    let seq2_input = Tensor::new(&seq2_prompt[..], &device)?.unsqueeze(0)?;
-    // Use inner model for sequential single-sequence calls
-    let _ = model
-        .model()
-        .forward(&mut seq1_caches_seq, &seq1_input, 0)?;
-    let _ = model
-        .model()
-        .forward(&mut seq2_caches_seq, &seq2_input, 0)?;
-
-    // Sequential single-token generation for num_steps
-    let start = std::time::Instant::now();
-    for step in 0..num_steps {
-        let seq1_offset = seq1_caches_seq.current_seq_len();
-        let seq2_offset = seq2_caches_seq.current_seq_len();
-
-        let seq1_input =
-            Tensor::new(&[generated_seq1[seq1_prompt_len + step]], &device)?.unsqueeze(0)?;
-        let seq2_input =
-            Tensor::new(&[generated_seq2[seq2_prompt_len + step]], &device)?.unsqueeze(0)?;
-
-        let _ = model
-            .model()
-            .forward(&mut seq1_caches_seq, &seq1_input, seq1_offset)?;
-        let _ = model
-            .model()
-            .forward(&mut seq2_caches_seq, &seq2_input, seq2_offset)?;
-    }
-    let sequential_time = start.elapsed();
-
-    // Parallel implementation
-    let mut seq1_caches_par = model.model().create_kv_caches(512);
-    let mut seq2_caches_par = model.model().create_kv_caches(512);
-    let _ = model
-        .model()
-        .forward(&mut seq1_caches_par, &seq1_input, 0)?;
-    let _ = model
-        .model()
-        .forward(&mut seq2_caches_par, &seq2_input, 0)?;
-
-    // Parallel single-token batched generation for num_steps
-    let start = std::time::Instant::now();
-    for step in 0..num_steps {
-        let seq1_offset = seq1_caches_par.current_seq_len();
-        let seq2_offset = seq2_caches_par.current_seq_len();
-
-        let seq1_input =
-            Tensor::new(&[generated_seq1[seq1_prompt_len + step]], &device)?.unsqueeze(0)?;
-        let seq2_input =
-            Tensor::new(&[generated_seq2[seq2_prompt_len + step]], &device)?.unsqueeze(0)?;
-
-        let mut contexts = vec![
-            SequenceContext {
-                kv_caches: &mut seq1_caches_par,
-                offset: seq1_offset,
-                input_ids: &seq1_input,
-                input_len: 1,
-            },
-            SequenceContext {
-                kv_caches: &mut seq2_caches_par,
-                offset: seq2_offset,
-                input_ids: &seq2_input,
-                input_len: 1,
-            },
-        ];
-        let generation = stager.begin_generation();
-        let _ = model.forward_batch(
-            &mut contexts,
-            &generation,
-            DecodeHeaders::Decode {
-                buf: None,
-                stride: 0,
-            },
-        )?;
-    }
-    let parallel_time = start.elapsed();
-
-    println!(
-        "  Sequential: {:.2}ms",
-        sequential_time.as_secs_f64() * 1000.0
-    );
-    println!(
-        "  Parallel:   {:.2}ms",
-        parallel_time.as_secs_f64() * 1000.0
-    );
-    println!(
-        "  Speedup:    {:.2}x\n",
-        sequential_time.as_secs_f64() / parallel_time.as_secs_f64()
-    );
-
-    // Summary with actual generated text
-    println!("=== Generated Output ===\n");
-
-    // Get the full decoded text
-    let full_response1 = tokenizer
-        .decode(&seq1_tokens, false)
-        .map_err(|e| candle::Error::Msg(format!("Decode failed: {}", e)))?;
-    let full_response2 = tokenizer
-        .decode(&seq2_tokens, false)
-        .map_err(|e| candle::Error::Msg(format!("Decode failed: {}", e)))?;
-
-    // Extract just the response part (after "<|im_start|>assistant\n")
-    let resp1 = if let Some(pos) = full_response1.rfind("<|im_start|>assistant") {
-        &full_response1[pos + 21..]
+    // The two regimes run the same model on the same inputs, so they must agree
+    // token for token. A divergence means batching changed the arithmetic —
+    // exactly the cross-sequence bleed this shape is meant to expose.
+    if batched == sequential {
+        println!("Batched and sequential streams are identical ✓");
     } else {
-        &full_response1
-    };
-
-    let resp2 = if let Some(pos) = full_response2.rfind("<|im_start|>assistant") {
-        &full_response2[pos + 21..]
-    } else {
-        &full_response2
-    };
-
-    println!("Sequence 1 ({} tokens):", seq1_tokens.len());
-    println!("{}", resp1.trim());
-
-    println!("\nSequence 2 ({} tokens):", seq2_tokens.len());
-    println!("{}", resp2.trim());
+        println!("WARNING: batched and sequential streams DIVERGED");
+    }
 
     println!("\n=== Summary ===");
+    println!("{DECODE_STEPS} decode steps × {} sequences", toks.len());
+    println!("  batched:    {:.3}s", batched_time.as_secs_f64());
+    println!("  sequential: {:.3}s", sequential_time.as_secs_f64());
     println!(
-        "Processed 2 sequences in parallel for {} generation steps",
-        num_steps
+        "  speedup:    {:.2}x",
+        sequential_time.as_secs_f64() / batched_time.as_secs_f64()
     );
-    println!("Sequence 1: {} total tokens", seq1_tokens.len());
-    println!("Sequence 2: {} total tokens", seq2_tokens.len());
-    println!(
-        "Speedup: {:.2}x (parallel vs sequential)",
-        sequential_time.as_secs_f64() / parallel_time.as_secs_f64()
-    );
-
     Ok(())
 }
 
-/// Simple greedy sampling - picks token with highest logit
-fn sample_token(logits: &Tensor) -> Result<u32> {
-    // Squeeze the batch dimension (assuming shape is [1, vocab_size])
-    let squeezed = if logits.rank() == 2 {
-        logits.squeeze(0)?
-    } else {
-        logits.clone()
-    };
+/// Prefill both prompts, then decode `DECODE_STEPS` tokens for each.
+///
+/// With `batched`, every step is ONE `forward_wave` naming both sequences; with
+/// `batched = false`, each step issues one wave per sequence. Same session
+/// shape, same inputs — only the grouping differs, which is what makes the two
+/// wall-clocks comparable.
+fn run(
+    model: &BatchedInference<ModelWeights>,
+    device: &Device,
+    prompts: &[Vec<u32>],
+    batched: bool,
+) -> Result<(Vec<Vec<u32>>, std::time::Duration)> {
+    let mut session = model.create_batched_session(BatchedConfig::default())?;
 
-    let logits_vec = squeezed.to_vec1::<f32>()?;
-
-    if logits_vec.is_empty() {
-        return Ok(0);
+    let mut seqs = Vec::with_capacity(prompts.len());
+    for _ in prompts {
+        seqs.push(session.create_sequence()?);
     }
 
-    let max_idx = logits_vec
+    let inputs: Vec<Tensor> = prompts
         .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
+        .map(|p| Tensor::new(&p[..], device))
+        .collect::<Result<_>>()?;
+    let logits = prefill_wave(model, &mut session, &seqs, &inputs)?;
+    for (i, &s) in seqs.iter().enumerate() {
+        session.advance_sequence(s, prompts[i].len())?;
+    }
 
-    Ok(max_idx as u32)
+    let mut next: Vec<u32> = logits.iter().map(argmax).collect::<Result<_>>()?;
+    let mut out: Vec<Vec<u32>> = next.iter().map(|&t| vec![t]).collect();
+
+    let t0 = std::time::Instant::now();
+    for _ in 1..DECODE_STEPS {
+        let step: Vec<Tensor> = next
+            .iter()
+            .map(|&t| Tensor::new(&[t], device))
+            .collect::<Result<_>>()?;
+        let logits = if batched {
+            decode_wave(model, &mut session, &seqs, &step)?
+        } else {
+            let mut per_seq = Vec::with_capacity(seqs.len());
+            for (i, &s) in seqs.iter().enumerate() {
+                let one = std::slice::from_ref(&step[i]);
+                let mut l = decode_wave(model, &mut session, &[s], one)?;
+                per_seq.push(l.pop().ok_or_else(no_logits)?);
+            }
+            per_seq
+        };
+        for (i, &s) in seqs.iter().enumerate() {
+            session.advance_sequence(s, 1)?;
+            next[i] = argmax(&logits[i])?;
+            out[i].push(next[i]);
+        }
+    }
+    let elapsed = t0.elapsed();
+
+    for &s in &seqs {
+        session.free_sequence(s)?;
+    }
+    Ok((out, elapsed))
+}
+
+/// One wave whose rows are PREFILL rows (multi-token prompts).
+fn prefill_wave(
+    model: &BatchedInference<ModelWeights>,
+    session: &mut BatchedInferenceSession,
+    seqs: &[usize],
+    inputs: &[Tensor],
+) -> Result<Vec<Tensor>> {
+    let nl = model.num_layers();
+    model
+        .forward_wave(session, &[], &[], seqs, inputs, &[], &[], 0, nl, None)?
+        .logits_owned()
+}
+
+/// One wave whose rows are DECODE rows (a single token each).
+fn decode_wave(
+    model: &BatchedInference<ModelWeights>,
+    session: &mut BatchedInferenceSession,
+    seqs: &[usize],
+    inputs: &[Tensor],
+) -> Result<Vec<Tensor>> {
+    let nl = model.num_layers();
+    model
+        .forward_wave(session, seqs, inputs, &[], &[], &[], &[], 0, nl, None)?
+        .logits_owned()
+}
+
+fn no_logits() -> candle::Error {
+    candle::Error::Msg("forward_wave returned no logits".into())
+}
+
+fn argmax(logits: &Tensor) -> Result<u32> {
+    let flat = logits.flatten_all()?;
+    flat.argmax(flat.rank() - 1)?.to_scalar::<u32>()
 }

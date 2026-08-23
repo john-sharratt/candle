@@ -32,6 +32,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use zend::api;
 use zend::config::DaemonConfig;
+use zend::download;
 use zend::log_broadcast::{BusWriter, LogBus};
 use zend::session::ZendSession;
 

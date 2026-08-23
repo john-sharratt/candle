@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(carry_run(&vec![1u8; f]), Some(0));
         // A full run preceded by a higher peak carries from the run's start.
         let mut with_prefix = vec![2u8];
-        with_prefix.extend(std::iter::repeat(1u8).take(f));
+        with_prefix.extend(std::iter::repeat_n(1u8, f));
         assert_eq!(carry_run(&with_prefix), Some(1));
         // A trailing peak of a different level breaks the run.
         let mut broken = vec![1u8; f];

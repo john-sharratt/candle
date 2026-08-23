@@ -12,6 +12,14 @@
 //!     --output-jsonl ruler_preds_c5_32k.jsonl \
 //!     --batch-size 8 --max-gen-tokens 50
 
+// Batch-evaluation harness; the runner takes the batched-session argument list.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_question_mark,
+    clippy::redundant_closure,
+    clippy::useless_conversion
+)]
+
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 #[cfg(feature = "mkl")]
@@ -287,19 +295,49 @@ impl BatchedModel {
         }
     }
 
-    /// Forward pass returning one logit tensor per sequence.
-    fn forward_batched(
+    fn num_layers(&self) -> usize {
+        match self {
+            Self::Qwen3(bi) => bi.num_layers(),
+            Self::Qwen3Moe(bi) => bi.num_layers(),
+            Self::Qwen2(bi) => bi.num_layers(),
+            Self::Llama(bi) => bi.num_layers(),
+        }
+    }
+
+    /// One wave over `seqs`, returning a logit tensor per sequence.
+    ///
+    /// Prefill and decode rows are separate arguments to `forward_wave` — the
+    /// engine batches multi-token prompt rows and single-token decode rows in
+    /// the same launch — so the caller says which it has rather than the model
+    /// inferring it from input length.
+    fn wave(
         &self,
         session: &mut BatchedInferenceSession,
-        seq_indices: &[usize],
+        seqs: &[usize],
         inputs: &[Tensor],
+        prefill: bool,
     ) -> Result<Vec<Tensor>> {
-        match self {
-            Self::Qwen3(bi) => bi.forward_batched(session, seq_indices, inputs),
-            Self::Qwen3Moe(bi) => bi.forward_batched(session, seq_indices, inputs),
-            Self::Qwen2(bi) => bi.forward_batched(session, seq_indices, inputs),
-            Self::Llama(bi) => bi.forward_batched(session, seq_indices, inputs),
-        }
+        let nl = self.num_layers();
+        let (dec_s, dec_i, pre_s, pre_i): (&[usize], &[Tensor], &[usize], &[Tensor]) = if prefill {
+            (&[], &[], seqs, inputs)
+        } else {
+            (seqs, inputs, &[], &[])
+        };
+        let step = match self {
+            Self::Qwen3(bi) => {
+                bi.forward_wave(session, dec_s, dec_i, pre_s, pre_i, &[], &[], 0, nl, None)
+            }
+            Self::Qwen3Moe(bi) => {
+                bi.forward_wave(session, dec_s, dec_i, pre_s, pre_i, &[], &[], 0, nl, None)
+            }
+            Self::Qwen2(bi) => {
+                bi.forward_wave(session, dec_s, dec_i, pre_s, pre_i, &[], &[], 0, nl, None)
+            }
+            Self::Llama(bi) => {
+                bi.forward_wave(session, dec_s, dec_i, pre_s, pre_i, &[], &[], 0, nl, None)
+            }
+        }?;
+        step.logits_owned()
     }
 }
 
@@ -468,7 +506,7 @@ fn run_batch(
         }
 
         for (chunk_len, (group_seq_idxs, group_inputs)) in by_chunk_len {
-            let logits_vec = model.forward_batched(&mut session, &group_seq_idxs, &group_inputs)?;
+            let logits_vec = model.wave(&mut session, &group_seq_idxs, &group_inputs, true)?;
             // Advance each sequence and save its logits.
             for ((&seq_idx, logits), orig_i) in group_seq_idxs
                 .iter()
@@ -523,7 +561,7 @@ fn run_batch(
             .map(|&i| Ok(Tensor::new(&[current_tokens[i]], device)?))
             .collect::<Result<_>>()?;
 
-        let logits_vec = model.forward_batched(&mut session, &active_seq_idxs, &active_inputs)?;
+        let logits_vec = model.wave(&mut session, &active_seq_idxs, &active_inputs, false)?;
 
         // Advance all active sequences.
         for &seq_idx in &active_seq_idxs {
@@ -540,7 +578,7 @@ fn run_batch(
     for &seq_idx in &seq_indices {
         session.free_sequence(seq_idx)?;
     }
-    session.compact()?;
+    session.release_empty_arenas()?;
 
     // Decode token IDs to strings.
     let predictions = generated

@@ -1293,12 +1293,24 @@ mod tests {
     /// stale-copy bug — is rejected, naming what is missing.
     #[test]
     fn a_schema_missing_a_branch_option_is_rejected() {
-        let yaml = include_str!("../prompts/projection.yaml").replace(
-            "            - id: folder
-",
-            "            - id: renamed_away
-",
+        // `include_str!` hands back the checkout's own line endings, while Rust
+        // normalizes the CRLF in THIS file's string literals to LF. On a CRLF
+        // checkout (`core.autocrlf=true`, the Windows default) an exact-line
+        // pattern therefore matches nothing, and `replace` reports success
+        // having changed nothing — leaving the schema intact and this test
+        // asserting that a VALID schema is rejected. Normalize first, then prove
+        // the edit actually landed.
+        let yaml = include_str!("../prompts/projection.yaml").replace("\r\n", "\n");
+        let mutated = yaml.replace(
+            "            - id: folder\n",
+            "            - id: renamed_away\n",
         );
+        assert_ne!(
+            mutated, yaml,
+            "the `- id: folder` option moved or was re-indented — this test's \
+             pattern is stale and was silently mutating nothing"
+        );
+        let yaml = mutated;
         let dialect = candle_conversation::models::Dialect::chat_ml();
         let builder = projection::Builder::from_yaml_with_vars_and_dialect(
             &yaml,

@@ -29,7 +29,7 @@ namespace latent_attn {
 //                (out accumulator = 32 f32/thread).
 // =============================================================================
 // Identity band layout only (dim d → band d/SUB). No palette-map routing.
-template <typename T, int HEAD_DIM, int ROPE_DIM>
+template <typename T, int HEAD_DIM, int ROPE_DIM, int NPAL>
 __global__ void __launch_bounds__(WARPS * 32, 4)
 latent_decode_kernel(
     const T* __restrict__ q,           // [slots, H, HEAD_DIM] pre-RoPE
@@ -68,10 +68,9 @@ latent_decode_kernel(
     //   | kv_f[8][512] (roped, staged) | summed logits[16][8]
     float* __restrict__ dbg
 ) {
+    STATIC_ASSERT_GEOMETRY(HEAD_DIM, ROPE_DIM, NPAL);
     constexpr int SUB = HEAD_DIM / NPAL;
     constexpr int NOPE_DIM = HEAD_DIM - ROPE_DIM;
-    static_assert(HEAD_DIM % NPAL == 0 && SUB % 32 == 0, "bands must be 32-dim MMA chunks");
-    static_assert(ROPE_DIM % 2 == 0, "interleaved RoPE needs even rope dim");
 
     // Stage-dump section offsets (NPAL-parameterized so the mirror oracle's
     // read offsets track the band count). The dump is always 16-head-sized.
@@ -585,7 +584,7 @@ __global__ void latent_combine_kernel(
     out[(int64_t)row * HEAD_DIM + d] = from_f32<O>(val);
 }
 
-template <typename T, int HEAD_DIM, int ROPE_DIM>
+template <typename T, int HEAD_DIM, int ROPE_DIM, int NPAL>
 void launch_latent_decode(
     const T* q,
     const uint8_t* headers,
@@ -631,7 +630,7 @@ void launch_latent_decode(
     static bool carveout_set = false;
     if (!carveout_set) {
         cudaFuncSetAttribute(
-            (const void*)latent_decode_kernel<T, HEAD_DIM, ROPE_DIM>,
+            (const void*)latent_decode_kernel<T, HEAD_DIM, ROPE_DIM, NPAL>,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             cudaSharedmemCarveoutMaxShared);
         carveout_set = true;
@@ -639,7 +638,7 @@ void launch_latent_decode(
 
     dim3 grid(num_slots, head_tiles, num_splits);
     dim3 block(WARPS * 32);
-    latent_decode_kernel<T, HEAD_DIM, ROPE_DIM><<<grid, block, 0, stream>>>(
+    latent_decode_kernel<T, HEAD_DIM, ROPE_DIM, NPAL><<<grid, block, 0, stream>>>(
         q, headers, kv_new, nope_i8, nope_scale, comp_rope, comp_idx, comp_cnt,
         comp_pos, q_pos, rope_tab, pa, pm, num_slots, n_q_head, softmax_scale,
         window_size, max_sel, scatter_rows, dbg);

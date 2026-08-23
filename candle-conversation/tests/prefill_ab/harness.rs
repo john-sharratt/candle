@@ -469,6 +469,28 @@ pub fn run_prefill(case: &mut BuiltCase) -> Result<Tensor> {
         offsets.push(case.caches[si].current_seq_len());
     }
 
+    // Allocate every sequence's writer chunk BEFORE the kernel runs.
+    // `paged_prefill_batched` writes into the write region and does not create
+    // it; production does this up front in `ensure_for_batch_entries_all`.
+    // Skipping it trips `extend_for_write_region: no writer chunk`.
+    //
+    // ONE batched call over all slots rather than a per-slot loop, matching
+    // production's own shape. (Measured: the two forms give bit-identical
+    // kernel-vs-golden numbers on every case here, so this is about staying on
+    // the production path, not about the metrics.)
+    let entries: Vec<(usize, usize)> = case
+        .caches
+        .iter()
+        .enumerate()
+        .map(|(si, c)| (c.k_cache().chunked_slot().unwrap_or(si), offsets[si]))
+        .collect();
+    let max_q = q_lens.iter().copied().max().unwrap_or(0);
+    ChunkedKvBacking::ensure_for_batch_entries_all(
+        std::slice::from_ref(&case.backing),
+        &entries,
+        max_q,
+    )?;
+
     let mut cache_refs: Vec<&mut KvCache> = case.caches.iter_mut().collect();
     let out = paged_prefill_batched(
         None,

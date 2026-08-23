@@ -799,11 +799,9 @@ impl ModelWeights {
         let max_position_embeddings = md_opt_u32("qwen3.context_length")
             .or_else(|| md_opt_u32("qwen3.max_position_embeddings"))
             .or_else(|| md_opt_u32("max_position_embeddings"))
-            .unwrap_or_else(|| {
-                // Keep existing behavior of failing fast if we can't determine context.
-                // (We only hit this closure if all md_opt_u32 calls returned None.)
-                0
-            }) as usize;
+            // 0 means "no key found"; the check below turns that into the
+            // original hard failure rather than silently accepting it.
+            .unwrap_or(0) as usize;
         if max_position_embeddings == 0 {
             let _ = md_get("qwen3.context_length")?;
         }
@@ -1066,7 +1064,7 @@ impl ModelWeights {
                 q_norm,
                 k_norm,
                 num_heads: num_attention_heads,
-                num_kv_heads: num_kv_heads,
+                num_kv_heads,
                 num_kv_groups: num_attention_heads / num_kv_heads,
                 head_dim,
                 rotary_emb: rotary.clone(),

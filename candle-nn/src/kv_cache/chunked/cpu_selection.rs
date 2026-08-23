@@ -52,6 +52,7 @@ use candle::quantized::GgmlDType;
 use half::f16;
 
 use crate::kv_cache::QuantFormat;
+use std::cmp::Ordering;
 
 const CHUNK_SIZE: usize = 32;
 const HEAD_DIM: usize = 128;
@@ -278,7 +279,11 @@ pub fn q_relevance_quantiles(k_block: &[f32], q_block_f16: &[u16]) -> (f32, f32)
             head_max = s;
         }
     }
-    if !(head_max > head_min) || head_max <= 0.0 {
+    // Not `head_max <= head_min`: the samples are ratios, so a NaN can reach
+    // here, and it must take this early return rather than flow into
+    // `inv_range`. `partial_cmp != Greater` rejects the unordered case the way
+    // the negated `>` did.
+    if head_max.partial_cmp(&head_min) != Some(Ordering::Greater) || head_max <= 0.0 {
         return (0.0, 0.0);
     }
 
@@ -306,8 +311,8 @@ pub fn q_relevance_quantiles(k_block: &[f32], q_block_f16: &[u16]) -> (f32, f32)
     let mut q3_bin = HIST_BINS as i32 - 1;
     let mut found_q1 = false;
     let mut found_m = false;
-    for b in 0..HIST_BINS {
-        accum += hist[b];
+    for (b, &count) in hist.iter().enumerate() {
+        accum += count;
         if !found_q1 && accum > target_q1 {
             q1_bin = b as i32;
             found_q1 = true;
@@ -530,8 +535,8 @@ pub fn slot_stats(amax: &[f32; HEAD_DIM], idx_compact: &[u16]) -> SlotStats {
     let mut p95_val = slot_amax_raw;
     let mut p80_val = slot_amax_raw;
     let mut p25_val = slot_amax_raw;
-    let p95_tgt = 1.max((lc + 19) / 20) as i32;
-    let p80_tgt = 1.max((lc + 4) / 5) as i32;
+    let p95_tgt = 1.max(lc.div_ceil(20)) as i32;
+    let p80_tgt = 1.max(lc.div_ceil(5)) as i32;
     let p25_tgt = 1.max((3 * lc) / 4) as i32;
     let mut cnt = 0i32;
     for &b in idx_compact {
@@ -901,9 +906,9 @@ pub fn process_side(
         }
     }
 
-    for d in 0..HEAD_DIM {
-        if assignments[d] == 255 {
-            assignments[d] = (N_PALETTE - 1) as u8;
+    for a in assignments.iter_mut() {
+        if *a == 255 {
+            *a = (N_PALETTE - 1) as u8;
         }
     }
     (slot_fmt, slot_scale, assignments)
@@ -968,6 +973,11 @@ fn select_one_head(
 
 #[cfg(test)]
 mod tests {
+    // These fixtures fill and compare fixed-size K/V/assignment arrays by index
+    // on both sides, mirroring the kernel's own indexing so a divergence reads
+    // as an index. Iterator rewrites would hide exactly what is being asserted.
+    #![allow(clippy::needless_range_loop)]
+
     use super::*;
     use crate::kv_cache::chunked::sampled_selection::params::{
         production_adaptive_candidates, PRODUCTION_K_QREL_HIGH_THRESHOLDS,

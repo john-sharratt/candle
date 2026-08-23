@@ -54,12 +54,31 @@ namespace latent_attn {
 constexpr int HEADS_TILE = 16;  // MMA M dimension: query heads per block
 constexpr int KEYS_TILE = 8;    // MMA N dimension: keys per tile
 constexpr int WARPS = 8;        // block = 256 threads
-constexpr int NPAL = 16;        // 32-dim bands (SUB = HEAD_DIM / NPAL); the last
-                                // two bands ([448,480),[480,512)) are the
-                                // RoPE-only bands. The shared KvHead accessors
-                                // take <HEAD_DIM, NPAL> so the 16-band record
-                                // offsets match the host. SUB=32 = one m16n8k32
-                                // tile per band; the pal_map is 4-bit (names 16).
+
+// LATENT GEOMETRY is a template parameter triple <HEAD_DIM, ROPE_DIM, NPAL>,
+// threaded through every kernel and launcher in this directory. NPAL is the
+// band count: the latent splits into NPAL equal bands of SUB = HEAD_DIM / NPAL
+// dims, the trailing ROPE_DIM dims occupy whole bands at the top, and the shared
+// KvHead accessors take <HEAD_DIM, NPAL> so the record offsets match the host.
+//
+// `geometry_ok` states every rule the tiling depends on; each kernel asserts it,
+// so an illegal triple fails to compile rather than launching. The Rust mirror
+// of these rules is `LatentGeometry::new` in
+// candle-transformers/src/models/latent_moe/geometry.rs — keep the two in step.
+//
+// Instantiations live in paged_latent_api_bf16.cu; DeepSeek-V4-Flash is
+// <512, 64, 16> (SUB = 32, one m16n8k32 tile per band, rope in bands 14-15).
+constexpr bool geometry_ok(int HEAD_DIM, int ROPE_DIM, int NPAL) {
+    return NPAL > 0 && HEAD_DIM % NPAL == 0        // equal-width bands
+        && (HEAD_DIM / NPAL) % 32 == 0             // a band is whole m16n8k32 k-steps
+        && ROPE_DIM > 0 && ROPE_DIM < HEAD_DIM
+        && (HEAD_DIM - ROPE_DIM) % (HEAD_DIM / NPAL) == 0  // split on a band boundary
+        && ROPE_DIM % 2 == 0                       // interleaved rotation pairs
+        && (NPAL & (NPAL - 1)) == 0 && NPAL <= 32; // band reduction is a warp shuffle
+}
+#define STATIC_ASSERT_GEOMETRY(HEAD_DIM, ROPE_DIM, NPAL)                    \
+    static_assert(geometry_ok((HEAD_DIM), (ROPE_DIM), (NPAL)),              \
+                  "illegal latent geometry: see geometry_ok in latent_common.cuh")
 
 __device__ __forceinline__ float ds_exp(float x) {
     // fast_exp cubic e^x (Softmax mode: lower clamp only). Bit-reproducible.
@@ -277,7 +296,7 @@ __global__ void latent_rope_table_kernel(
 // exit on the row bound.
 #define GLUE_SCATTER_WORDS 5
 
-template <typename T, int HEAD_DIM>
+template <typename T, int HEAD_DIM, int NPAL>
 __global__ void latent_glue_scatter_kernel(
     const long long* __restrict__ desc,
     int n_runs
@@ -332,7 +351,7 @@ __global__ void latent_glue_scatter_kernel(
 //     mantissa, matches the window ring's BF16 rope tail — no √2 pair-magnitude
 //     margin, no clip). Readers rotate these at read time from `comp_pos`.
 // Same NPAL*32 launch contract + grid-stride as `latent_quant_corpus_range_kernel`.
-template <int HEAD_DIM, int ROPE_DIM>
+template <int HEAD_DIM, int ROPE_DIM, int NPAL>
 __global__ void latent_build_corpus_cache_kernel(
     const float* __restrict__ comp,        // [G, HEAD_DIM] f32 pre-RoPE (canonical)
     int8_t* __restrict__ nope_i8,          // [G, NOPE_DIM] out (nope int8)
@@ -341,11 +360,11 @@ __global__ void latent_build_corpus_cache_kernel(
     int g_lo,
     int g_hi
 ) {
+    STATIC_ASSERT_GEOMETRY(HEAD_DIM, ROPE_DIM, NPAL);
     constexpr int SUB = HEAD_DIM / NPAL;
     constexpr int NOPE_DIM = HEAD_DIM - ROPE_DIM;
     constexpr int NOPE_BANDS = NOPE_DIM / SUB;
     constexpr int DPL = SUB / 32;
-    static_assert(NOPE_DIM % SUB == 0, "rope/nope split must fall on a band boundary");
     const int band = (int)threadIdx.x / 32;
     const int lane = (int)threadIdx.x % 32;
     const bool rope_band = band >= NOPE_BANDS;

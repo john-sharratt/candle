@@ -486,6 +486,10 @@ pub fn score_batched_gpu(
 
 #[cfg(test)]
 mod tests {
+    // Fixture galleries are written as `vec![vec![…], …]` so each row reads as
+    // one tool's token window; an array of vecs would obscure that.
+    #![allow(clippy::useless_vec)]
+
     use super::*;
     use crate::provenance::{score_packed, score_provenance_late_fusion_weighted, PackedGallery};
 

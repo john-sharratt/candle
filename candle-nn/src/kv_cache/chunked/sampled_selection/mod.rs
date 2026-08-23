@@ -14,6 +14,13 @@
 //! full sweep across a paged arena; `profile` and `types` are support.
 
 #![allow(dead_code)]
+// `benchmark_result: Option<&mut _>` threads through every stage of a sweep and
+// is forwarded MORE THAN ONCE per function, so `.as_deref_mut()` is a
+// reborrow, not a no-op. Clippy reads only the type and suggests passing the
+// value bare, which moves it — `cargo check` rejects that with E0382. The lint
+// is a false positive here, verified by making the change and watching it fail
+// to compile.
+#![allow(clippy::needless_option_as_deref)]
 
 mod cpu; // CPU sampling kernel — mirrors GPU algorithm
 #[cfg(feature = "cuda")]

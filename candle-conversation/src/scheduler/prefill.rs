@@ -419,7 +419,7 @@ impl Scheduler {
             || evicted.count > 0
             || conceded > 0;
         if acted {
-            relief_trace::note("sched", "relieve", want, evicted.bytes as u64);
+            relief_trace::note("sched", "relieve", want, evicted.bytes);
         }
         let (free, setpoint) = self.kv_region_state(phase).unwrap_or((0, 0));
         // INFO when the pass actually shed something — that is a real event.
@@ -591,37 +591,38 @@ impl Scheduler {
         // conversation's KV in VRAM, so under pressure we shed hot KV to the
         // substrate rather than piling on more concurrent prefills; if that
         // doesn't clear it, leave the rest queued this pass.
-        if in_flight > 0 && self.vram_under_pressure() {
-            if self.relieve_vram_pressure("promote", VramPhase::Load) {
-                // Pressure survived eviction — stop piling on this pass (the
-                // `in_flight > 0` guard keeps ≥1 in flight). The budget halves
-                // only on a genuine THROUGHPUT STALL, never on the mere presence
-                // of nominal pressure: multiplicative decrease is failure
-                // evidence, and a card whose steady state sits just under the
-                // pressure band would otherwise pin every bulk-prefill phase at
-                // the floor.
-                //
-                // Stall detection is time-aware because this branch runs many
-                // times a second while `PREFILL_OK_TOKENS` advances only when a
-                // forward completes (seconds apart for wide forwards): a stall is
-                // real only when NO forward has completed for a full
-                // [`PROMOTE_STALL_GRACE`]. Each elapsed grace period backs off one
-                // halving and re-arms; a device-OOM still cuts instantly at its
-                // own site.
-                let ok = super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
-                if ok > self.promote_ok_tokens_seen {
-                    self.promote_ok_tokens_seen = ok;
-                    self.promote_last_progress = Some(std::time::Instant::now());
-                }
-                let stalled = self
-                    .promote_last_progress
-                    .is_some_and(|t| t.elapsed() >= PROMOTE_STALL_GRACE);
-                if stalled {
-                    self.cut_admit_budget(ThrottleReason::ReliefSurvived);
-                    self.promote_last_progress = Some(std::time::Instant::now());
-                }
-                return;
+        if in_flight > 0
+            && self.vram_under_pressure()
+            && self.relieve_vram_pressure("promote", VramPhase::Load)
+        {
+            // Pressure survived eviction — stop piling on this pass (the
+            // `in_flight > 0` guard keeps ≥1 in flight). The budget halves
+            // only on a genuine THROUGHPUT STALL, never on the mere presence
+            // of nominal pressure: multiplicative decrease is failure
+            // evidence, and a card whose steady state sits just under the
+            // pressure band would otherwise pin every bulk-prefill phase at
+            // the floor.
+            //
+            // Stall detection is time-aware because this branch runs many
+            // times a second while `PREFILL_OK_TOKENS` advances only when a
+            // forward completes (seconds apart for wide forwards): a stall is
+            // real only when NO forward has completed for a full
+            // [`PROMOTE_STALL_GRACE`]. Each elapsed grace period backs off one
+            // halving and re-arms; a device-OOM still cuts instantly at its
+            // own site.
+            let ok = super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+            if ok > self.promote_ok_tokens_seen {
+                self.promote_ok_tokens_seen = ok;
+                self.promote_last_progress = Some(std::time::Instant::now());
             }
+            let stalled = self
+                .promote_last_progress
+                .is_some_and(|t| t.elapsed() >= PROMOTE_STALL_GRACE);
+            if stalled {
+                self.cut_admit_budget(ThrottleReason::ReliefSurvived);
+                self.promote_last_progress = Some(std::time::Instant::now());
+            }
+            return;
         }
 
         let per_block = self.per_block_kv_bytes();
@@ -777,7 +778,10 @@ impl Scheduler {
     /// under pressure about.
     fn kv_region_state(&self, phase: VramPhase) -> Option<(usize, usize)> {
         let stats = self.kv_regions()?;
-        Some((stats.free + stats.blocked, setpoint_regions(phase, stats.total)))
+        Some((
+            stats.free + stats.blocked,
+            setpoint_regions(phase, stats.total),
+        ))
     }
 
     /// The KV side's region counters, or `None` before the reservation exists.

@@ -154,9 +154,7 @@ impl ChunkedKvBacking {
             let mut k_slices = Vec::with_capacity(len);
             let mut v_slices = Vec::with_capacity(len);
 
-            for tok in 0..len {
-                let (blk, in_blk) = positions[tok];
-
+            for &(blk, in_blk) in positions.iter() {
                 let cw = state.sequences[batch_idx]
                     .as_ref()
                     .and_then(|s| s.chunk_at(blk))
@@ -367,12 +365,10 @@ impl ChunkedKvBacking {
         let _device = &self.inner.device;
 
         self.inner.storage.write(|arena_state| {
-            // COW any shared blocks in the write range
-            let cow_occurred =
-                self.ensure_blocks_writable_locked(&mut state, batch_idx, start_block, end_block)?;
-
-            // Only sync block table to GPU if COW actually occurred
-            if cow_occurred {}
+            // COW any shared blocks in the write range. Whether a copy happened is
+            // not interesting here: kernel block tables are built per launch from
+            // the slot's current chunk list, so there is nothing to re-sync.
+            self.ensure_blocks_writable_locked(&mut state, batch_idx, start_block, end_block)?;
 
             // Now write the data (still holding locks)
             let mut remaining = len;

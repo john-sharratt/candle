@@ -1,5 +1,8 @@
 //! Tests for allocation methods in ChunkedKvBacking.
 
+// Test code: loop indices are slot/chunk coordinates in the layout under test.
+#![allow(clippy::needless_range_loop, clippy::err_expect)]
+
 use candle::{DType, Device, Tensor};
 
 use crate::kv_cache::chunked::ChunkedKvBacking;

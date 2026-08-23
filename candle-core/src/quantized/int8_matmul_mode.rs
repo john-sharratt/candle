@@ -112,7 +112,7 @@ fn mode2_blocks_per_sm(sm_count: usize) -> (usize, usize) {
 
 #[inline]
 fn ceil_div(x: usize, b: usize) -> usize {
-    (x + b - 1) / b
+    x.div_ceil(b)
 }
 
 /// Decide the q8a128 dense matmul tiling: `false` → mode-1 (`Bm=16`), `true` → mode-2 (`Bm=32`,
@@ -192,13 +192,21 @@ mod tests {
     fn blackwell_anchor_matches_measured_crossovers() {
         assert_eq!(mode2_blocks_per_sm(SM_BW), (7, 3));
         let (num, den) = mode2_blocks_per_sm(SM_BW);
-        assert_eq!(SM_BW * num / den, 256, "blk2 target at the measured crossover");
+        assert_eq!(
+            SM_BW * num / den,
+            256,
+            "blk2 target at the measured crossover"
+        );
 
         // Each N flips to mode-2 within the benchmark grid step containing its measured M*.
         // Every `below` here must sit ABOVE the 17..=32 trap, or the assertion passes for any
         // anchor value and tests nothing. (A first cut used below=32 for N=8192 and was exactly
         // that vacuous.)
-        for &(n, below, at) in &[(2048usize, 192usize, 256usize), (4096, 96, 128), (8192, 16, 33)] {
+        for &(n, below, at) in &[
+            (2048usize, 192usize, 256usize),
+            (4096, 96, 128),
+            (8192, 16, 33),
+        ] {
             assert!(
                 below <= M_TILE_MODE1 || below > M_TILE_MODE2,
                 "N={n}: below={below} is inside the trap, so this cell proves nothing"
@@ -242,15 +250,27 @@ mod tests {
     fn mechanism_holds_on_both_anchors() {
         for &sm in &[SM, SM_BW] {
             for m in (M_TILE_MODE1 + 1)..=M_TILE_MODE2 {
-                assert!(!q8a128_dense_use_mode2(m, 200_000, 4096, sm), "trap sm={sm} m={m}");
+                assert!(
+                    !q8a128_dense_use_mode2(m, 200_000, 4096, sm),
+                    "trap sm={sm} m={m}"
+                );
             }
             // Tiny N (kv_proj / router) never fills the GPU across any real batch.
             for m in [1usize, 16, 64, 128, 256] {
-                assert!(!q8a128_dense_use_mode2(m, 512, 2048, sm), "tiny-N sm={sm} m={m}");
+                assert!(
+                    !q8a128_dense_use_mode2(m, 512, 2048, sm),
+                    "tiny-N sm={sm} m={m}"
+                );
             }
             // Huge N (lm_head) fills it immediately, outside the trap.
-            assert!(q8a128_dense_use_mode2(1, 151_936, 2048, sm), "lm_head sm={sm}");
-            assert!(q8a128_dense_use_mode2(16, 151_936, 2048, sm), "lm_head sm={sm}");
+            assert!(
+                q8a128_dense_use_mode2(1, 151_936, 2048, sm),
+                "lm_head sm={sm}"
+            );
+            assert!(
+                q8a128_dense_use_mode2(16, 151_936, 2048, sm),
+                "lm_head sm={sm}"
+            );
         }
     }
 

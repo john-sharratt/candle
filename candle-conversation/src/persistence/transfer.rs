@@ -476,11 +476,11 @@ mod cuda_impl {
         > = std::collections::HashMap::new();
         for batch in &plan.chunks {
             if let crate::persistence::chunk_plan::SourceLog::Sealed(id) = batch.source {
-                if !sealed_handles.contains_key(&id) {
+                if let std::collections::hash_map::Entry::Vacant(e) = sealed_handles.entry(id) {
                     let handle = persistence.open_sealed_direct(id).map_err(|e| {
                         candle::Error::Msg(format!("cold-load: open sealed segment {id}: {e}"))
                     })?;
-                    sealed_handles.insert(id, handle);
+                    e.insert(handle);
                 }
             }
         }
@@ -650,7 +650,7 @@ mod cuda_impl {
             let storage = QStorage::Cpu(blocks);
             let qt = QTensor::new(storage, vec![chunk_size, sub_head_dim])?;
             let t = qt.dequantize(&candle::Device::Cpu)?;
-            Ok(t.flatten_all()?.to_vec1::<f32>()?)
+            t.flatten_all()?.to_vec1::<f32>()
         }
 
         /// Reassemble one block from its `ChunkPayload`, walking `kv_bytes`
@@ -823,7 +823,7 @@ mod cuda_impl {
                 KvFormat::Float(DType::F16),
                 &device,
                 FZ_ARENA_CAPACITY,
-                Some(policy.clone()),
+                Some(policy),
             )
             .expect("create chunked backing with warmed candidate arenas");
 
@@ -1009,7 +1009,7 @@ mod cuda_impl {
                 KvFormat::Float(DType::F16),
                 &device,
                 FZ_ARENA_CAPACITY,
-                Some(policy.clone()),
+                Some(policy),
             )
             .expect("create chunked backing with R16 K + F16 V arenas");
 

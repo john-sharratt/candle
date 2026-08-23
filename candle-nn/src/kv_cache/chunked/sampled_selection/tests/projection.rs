@@ -23,6 +23,30 @@
 //!   cargo test --release --features cuda --lib --package candle-transformers \
 //!     quantized_llama::tests::kv_dump::test_dump_kv_cache_data -- --ignored --nocapture
 
+// Offline analysis harness: loop indices are compression LEVELS and histogram
+// buckets fed to scoring functions, report strings are assembled by hand to a
+// fixed column layout, and the tuple returns mirror the raw stat vectors rather
+// than modelling a domain type. Rewriting any of it to iterator/format idiom
+// would obscure the tabulation this file exists to produce.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::identity_op,
+    clippy::useless_vec,
+    clippy::useless_format,
+    clippy::print_literal,
+    clippy::manual_is_multiple_of,
+    clippy::manual_repeat_n,
+    clippy::same_item_push,
+    clippy::iter_cloned_collect,
+    clippy::filter_next,
+    clippy::map_flatten,
+    clippy::len_zero,
+    clippy::empty_line_after_doc_comments
+)]
+
+#[cfg(feature = "cuda")]
 use crate::kv_cache::arena_table::N_PALETTE;
 
 use super::{candidate_formats, make_synthetic_batch, CHUNK_SIZE};

@@ -19,7 +19,7 @@
 #[cfg(feature = "cuda")]
 fn main() -> candle::Result<()> {
     use candle::Device;
-    use candle_transformers::models::deepseek4::bench::{run_decode, DecodeCfg};
+    use candle_transformers::models::latent_moe::bench::{run_decode, DecodeCfg};
 
     let a: Vec<String> = std::env::args().collect();
     let parse = |i: usize, d: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);

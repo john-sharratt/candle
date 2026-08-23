@@ -128,13 +128,9 @@ impl TerminatorState {
                     }
                     self.depth -= 1;
                 }
-                b',' => {
-                    // A `,` at depth 0 separates this field from the next —
-                    // lookahead, not consumed.
-                    if self.depth == 0 {
-                        return Feed::Close { consumed: i };
-                    }
-                }
+                // A `,` at depth 0 separates this field from the next —
+                // lookahead, not consumed.
+                b',' if self.depth == 0 => return Feed::Close { consumed: i },
                 _ => {}
             }
         }

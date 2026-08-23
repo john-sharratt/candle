@@ -415,8 +415,8 @@ impl ChunkedKvBacking {
     ///
     /// # Arguments
     /// * `batch_idx` - Target slot (must already be allocated)
-    /// * `chunk_ids` - Per-block GID vectors to append to the block table, in order.
-    ///                 Each `HeadGids` has length `2 * n_kv_head`.
+    /// * `chunk_ids` - Per-block GID vectors to append to the block table, in
+    ///   order. Each `HeadGids` has length `2 * n_kv_head`.
     /// * `token_count` - Logical token count of the appended boundary
     pub fn append_borrowed_chunks_cow(
         &self,
@@ -621,8 +621,12 @@ impl ChunkedKvBacking {
             None => return vec![0i32; max_blocks],
         };
         let mut positions = vec![0i32; max_blocks];
-        for i in 0..slot.block_count().min(max_blocks) {
-            positions[i] = slot.rope_pos(i);
+        for (i, pos) in positions
+            .iter_mut()
+            .enumerate()
+            .take(slot.block_count().min(max_blocks))
+        {
+            *pos = slot.rope_pos(i);
         }
         positions
     }
@@ -675,8 +679,8 @@ impl ChunkedKvBacking {
     ///
     /// # Arguments
     /// * `batch_idx` - Target slot (must already be allocated)
-    /// * `chunk_ids` - Per-block GID vectors to write into block table, in order.
-    ///                 Each `HeadGids` has length `2 * n_kv_head`.
+    /// * `chunk_ids` - Per-block GID vectors to write into block table, in
+    ///   order. Each `HeadGids` has length `2 * n_kv_head`.
     /// * `seq_len` - Real token count of the injected prefix
     pub fn inject_prefix_chunks(
         &self,
@@ -789,8 +793,7 @@ impl ChunkedKvBacking {
         // All blocks go into the flat chunks vec.
         // Full blocks 0..n-2 get usage = chunk_size.
         // Last block (n-1) gets the partial usage derived from seq_len.
-        for i in 0..need_blocks.saturating_sub(1) {
-            let rb = &resolved_blocks[i];
+        for rb in resolved_blocks.iter().take(need_blocks.saturating_sub(1)) {
             slot.push_chunk(ChunkWindow {
                 gids: rb.gids.clone(),
                 usage: chunk_size as u32,
@@ -1901,25 +1904,15 @@ impl ChunkedKvBacking {
         })
     }
 
-    /// Truncate the sequence at `batch_idx` to keep only the first
-    /// `block_count` chunks; everything beyond is dropped (their
-    /// `ChunkGid`s fall and physical chunks return to the pool when
-    /// their refcount reaches zero).
-    ///
-    /// Resets the sequence's logical token offset to the sum of
-    /// usages of the retained chunks.  Used by the SubmitTurn handler
-    /// to reset a persistent conversation sequence to its
-    /// system-prompt baseline before injecting the next turn's
-    /// projection.
     /// Snapshot the slot's writer-owned tail chunks (`[writer_start_idx..end)`)
     /// and remove them from the slot.
     ///
-    /// Used by the stateless-slot rebuild path: the scheduler takes
-    /// this snapshot before calling [`Self::truncate_sequence_to_blocks`]
-    /// + [`Self::inject_sealed_at_tail`] to refresh the prefix, then
-    /// restores the tail via [`Self::extend_writer_tail`]. The returned
-    /// [`WriterTail`] holds RAII refs that keep the underlying arena
-    /// chunks alive across the truncate, so no bytes are copied.
+    /// Used by the stateless-slot rebuild path: the scheduler takes this
+    /// snapshot before calling [`Self::truncate_sequence_to_blocks`] and
+    /// [`Self::inject_sealed_at_tail`] to refresh the prefix, then restores the
+    /// tail via [`Self::extend_writer_tail`]. The returned [`WriterTail`] holds
+    /// RAII refs that keep the underlying arena chunks alive across the
+    /// truncate, so no bytes are copied.
     ///
     /// At turn-boundary projection (the common case) the tail is empty
     /// and this is effectively a no-op.
@@ -1996,6 +1989,16 @@ impl ChunkedKvBacking {
         Ok(())
     }
 
+    /// Truncate the sequence at `batch_idx` to keep only the first
+    /// `block_count` chunks; everything beyond is dropped (their
+    /// `ChunkGid`s fall and physical chunks return to the pool when
+    /// their refcount reaches zero).
+    ///
+    /// Resets the sequence's logical token offset to the sum of
+    /// usages of the retained chunks.  Used by the SubmitTurn handler
+    /// to reset a persistent conversation sequence to its
+    /// system-prompt baseline before injecting the next turn's
+    /// projection.
     pub fn truncate_sequence_to_blocks(
         &self,
         batch_idx: usize,

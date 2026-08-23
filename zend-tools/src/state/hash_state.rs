@@ -6,6 +6,9 @@ use std::sync::RwLock;
 use chrono::Utc;
 use digest::Digest;
 
+// One live hasher per in-flight hash operation; the variants differ by the
+// digest state size, which is exactly what the caller asked for.
+#[allow(clippy::large_enum_variant)]
 enum HashInner {
     Sha256(sha2::Sha256),
     Sha512(sha2::Sha512),
