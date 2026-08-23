@@ -457,11 +457,18 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// at the top of the ladder — the highest rungs' V candidate floors
 /// (Q0/Q1) are strictly worse than the rungs below (which keep Q4
 /// fallbacks), so V-loosening moves C10 differentially while C9 holds.
+///
+/// **V retuned 2026-08-23, 2.3 → 2.0.** At 2.3 the C10×10 rung sat *on* the
+/// edge rather than under it: one session's name token flipped in 11 of 11
+/// runs at 7.93x, and the same rung passed 3 of 4 runs on the parent commit,
+/// so the rung was marginal rather than broken. 2.0 holds it at 7.39x across
+/// three alternating runs (six with the 3.6 gate, 6/6), with the C10 ratio
+/// identical run to run — a stable selection rather than a coin flip.
 pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 1.5,
     k_low: 1.5,
-    v_hi: 2.3,
-    v_low: 2.3,
+    v_hi: 2.0,
+    v_low: 2.0,
 };
 
 /// Qwen3.6-35B-A3B (routed hybrid point release).
@@ -469,17 +476,25 @@ pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// **Derived 2026-08-23** on the 3.6 C-ladder gate
 /// (`quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b`)
 /// to the lineage target: C0–C10 all pass, C10×10 just under the breaking
-/// edge. The point release shares its base model's quantization-error
-/// profile (the 3.5-35B row transferred within one notch on first
-/// derivation), and the two rows are currently identical. Derivation
-/// caution that remains true: wave-width changes (e.g. the VRAM-governor
-/// fix widening the spans) shift accumulation order and move marginal edge
-/// sessions — re-verify this row after any admission or width change.
+/// edge. Derivation caution that remains true: wave-width changes (e.g. the
+/// VRAM-governor fix widening the spans) shift accumulation order and move
+/// marginal edge sessions — re-verify this row after any admission or width
+/// change.
+///
+/// **Retuned 2026-08-23, k 1.5 → 1.2 and v 2.2 → 2.0**, holding C10×10 at
+/// 6.80x across three alternating runs (six with the 3.5 gate, 6/6).
+///
+/// The two rows are no longer identical, because the point release does not
+/// share its base model's edge axis: **3.5 is V-limited, 3.6 is K-limited.**
+/// 3.6's failing session is inert to V — 2.2, 2.0 and 1.9 all fail it at the
+/// same session and character while costing ratio — and inert to a one-notch
+/// K step (1.4 fails). K at 1.2 is what clears it. Probe K first on this
+/// model; a V sweep here measures nothing but lost compression.
 pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.5,
-    k_low: 1.5,
-    v_hi: 2.2,
-    v_low: 2.2,
+    k_hi: 1.2,
+    k_low: 1.2,
+    v_hi: 2.0,
+    v_low: 2.0,
 };
 
 /// Qwen3.8-27B (dense flagship hybrid). **Extrapolated, not derived**: the
