@@ -95,6 +95,12 @@ enum Which {
 }
 
 impl Which {
+    /// Llama-3-lineage checkpoints, which take the tighter `LLAMA3_KV_FACTOR`
+    /// calibration rather than Llama 2's identity one.
+    fn is_llama3(&self) -> bool {
+        matches!(self, Self::L8b | Self::DeepseekR1Llama8b)
+    }
+
     fn is_mistral(&self) -> bool {
         match self {
             Self::L7b
@@ -500,10 +506,15 @@ fn main() -> anyhow::Result<()> {
                 &format_size(total_size_in_bytes),
                 start.elapsed().as_secs_f32(),
             );
-            // This example loads whatever GGUF it is pointed at, and its own
-            // `Which` list is dominated by Llama-2-era checkpoints, so it takes
-            // the identity KV factor rather than 3.x's tighter one.
-            ModelWeights::from_gguf_v2(model, &mut file, &device)?
+            // The KV calibration is per generation, so the loader is picked from
+            // the checkpoint rather than fixed: this `Which` list is dominated
+            // by Llama-2-era models, which take the identity factor, but the
+            // Llama-3 entries need 3.x's tighter one.
+            if args.which.is_llama3() {
+                ModelWeights::from_gguf_v3(model, &mut file, &device)?
+            } else {
+                ModelWeights::from_gguf_v2(model, &mut file, &device)?
+            }
         }
         Some("ggml" | "bin") | Some(_) | None => {
             let model = ggml_file::Content::read(&mut file, &device)
