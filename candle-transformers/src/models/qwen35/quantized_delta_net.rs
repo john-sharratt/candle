@@ -22,7 +22,7 @@ use candle_nn::kv_cache::{begin_wave, LayerPhase};
 #[cfg(feature = "cuda")]
 use super::quantized_weights::{QuantFfn, QuantLayer};
 #[cfg(feature = "cuda")]
-use crate::models::profile::{pipeline_record, profile_now, profile_sync};
+use crate::models::profile::gpu_span;
 #[cfg(feature = "cuda")]
 use crate::models::tensor_cat::TensorCat;
 #[cfg(feature = "cuda")]
@@ -49,7 +49,7 @@ pub fn quantized_delta_net_ffn(
         Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Ffn)?),
         _ => None,
     };
-    let t_ffn = profile_now();
+    let g_ffn = gpu_span("dn:ffn", x.as_cat_tensor().device());
     let mut h = {
         let mode = layer.ffn_int8mode();
         let acts = layer.post_attn_norm.forward_dynamic(
@@ -65,8 +65,7 @@ pub fn quantized_delta_net_ffn(
     h.to_dtype_mut(orig_dtype)?;
     x.to_dtype_mut(orig_dtype)?;
     x.add_mut(&h)?;
-    profile_sync(x.as_cat_tensor().device());
-    pipeline_record("dn:ffn", t_ffn);
+    g_ffn.end();
     // `h` borrows `ffn_wave`, so the compiler already refuses any drop order
     // but this one; both die at the end of the function.
     Ok(())

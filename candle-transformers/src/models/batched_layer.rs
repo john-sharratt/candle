@@ -24,7 +24,7 @@ use crate::models::prefill_utils::{
     int8_prefill_act_dtype, int8_prefill_head_dim, paged_decode_q8_head_dim, paged_glue_attn,
     paged_prefill_batched, SharedPm,
 };
-use crate::models::profile::{pipeline_record, profile_now, profile_sync};
+use crate::models::profile::{gpu_span, pipeline_record, profile_now, span};
 use crate::models::quantized_matmul::QMatMul;
 use crate::utils::repeat_kv;
 
@@ -641,7 +641,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     let _act_dtype = x_tensor.dtype();
 
     // Project Q/K/V over the fused attention_norm (q8a128 on int8, FP on Off / non-CUDA).
-    let t_qkv = profile_now();
+    let g_qkv = gpu_span("decode:qkv_proj", x_tensor.device());
     let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
         layer.project_qkv(&acts, x_tensor.dtype())?
@@ -660,8 +660,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     let q = ensure_contiguous(&q)?;
     let k = ensure_contiguous(&k)?;
     let v = ensure_contiguous(&v)?;
-    profile_sync(q.device());
-    pipeline_record("decode:qkv_proj", t_qkv);
+    g_qkv.end();
 
     // Check for chunked (paged) KV cache BEFORE applying model-side RoPE.
     // For the paged path the decode kernel handles RoPE internally (via zeros rope_offsets
@@ -750,7 +749,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     // B2: o_proj over the attention context. On CUDA, `want_q8` → `outputs` is the flat U8 q8a1024
     // context wrapped (no copy) into an int8 operand; otherwise the FP context (the int8 override,
     // if any, quantizes it at the matmul). Non-CUDA never sets `want_q8` and has no dynamic o_proj.
-    let t_out_proj = profile_now();
+    let g_out_proj = gpu_span("decode:out_proj", x_tensor.device());
     let attn_out = if want_q8 {
         // The gate, if any, was folded into the decode kernel's combine pass
         // (`sigmoid(g) ⊙ ctx` before the quantize), so the q8a1024 bytes are
@@ -763,8 +762,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
         let out = apply_attention_gate(out, gate)?;
         layer.output_projection(DynamicActs::Float(out), x_tensor.dtype())?
     };
-    profile_sync(attn_out.device());
-    pipeline_record("decode:out_proj", t_out_proj);
+    g_out_proj.end();
 
     // Bounded by the caller's generation, not wrapped and copied off it: the
     // layer consumes this into the residual add while that generation is still
@@ -805,12 +803,13 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // Project Q/K/V over the fused attention_norm (B1). Prefill is high-M (compute-bound), so
     // the fused ln1→q8a128 still saves a launch; the per-matmul cost dominates.
     //
-    // Drain before marking. `profile_now` is a bare `Instant::now()`, and this is
-    // the first *synced* span of an attention layer — without this, everything
-    // queued and not yet awaited (on a hybrid stack, whole DeltaNet layers) drains
-    // inside the span below and is reported as Q/K/V projection time.
-    profile_sync(x_tensor.device());
-    let t_qkv = profile_now();
+    // No drain before the mark. The old host-synced timer needed one here: it was
+    // the first synced span of an attention layer, so without it everything
+    // queued and not yet awaited — on a hybrid stack, whole DeltaNet layers —
+    // drained inside this span and was reported as Q/K/V projection time. Events
+    // are stream-ordered, so the span measures the work between its own two
+    // records and nothing earlier.
+    let g_qkv = gpu_span("prefill:qkv_proj", x_tensor.device());
     let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
         layer.project_qkv(&acts, x_tensor.dtype())?
@@ -826,8 +825,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     let v = v.reshape((total_q, n_kv_head, head_dim))?.contiguous()?;
     let q = ensure_contiguous(&q)?;
     let k = ensure_contiguous(&k)?;
-    profile_sync(q.device());
-    pipeline_record("prefill:qkv_proj", t_qkv);
+    g_qkv.end();
 
     // Check for paged (chunked) CUDA path BEFORE applying model-side RoPE.
     // The paged prefill kernel applies RoPE internally; applying it here first
@@ -986,14 +984,13 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
         .reshape((total_q, n_head * head_dim))?;
     // B2: prefill/glue feed the FP context as `Float`; the int8 override quantizes at the matmul
     // (launch amortized against the large prefill GEMM).
-    let t_out_proj = profile_now();
+    let g_out_proj = gpu_span("prefill:out_proj", reshaped_ctx.device());
     let output = {
         let gated = apply_attention_gate(reshaped_ctx, gate)?;
         let dt = gated.dtype();
         layer.output_projection(DynamicActs::Float(gated), dt)?
     };
-    profile_sync(output.device());
-    pipeline_record("prefill:out_proj", t_out_proj);
+    g_out_proj.end();
     // Restore the flat-packed [1, total_q, hidden_out] activation.
     let hidden_out = output.dim(1)?;
     output.reshape((1, total_q, hidden_out))
@@ -1300,12 +1297,18 @@ fn paged_decode_attention<'w>(
     // Only meaningful with `emit_q8`; the FP path applies its gate on the FP context instead.
     gate: Option<&LiveTensor<'_>>,
 ) -> Result<LiveTensor<'w>> {
-    let t_alloc = profile_now();
+    // Host spans, not GPU ones: both regions are pure host work in the common
+    // path — validation, then metadata assembly whose only possible launches are
+    // dtype casts that do not fire when Q already matches the arena. An event
+    // pair around a region that enqueues nothing measures the host gap when the
+    // stream is idle and the outstanding backlog when it is not, which is the
+    // ambiguity the event timer exists to remove. Host time is also the answer
+    // that matters here: this is launch-side cost.
+    let s_alloc = span("decode:alloc");
     KvCache::validate_chunked_decode_batch(caches, offsets)?;
-    profile_sync(q.device());
-    pipeline_record("decode:alloc", t_alloc);
+    s_alloc.end();
 
-    let t_meta = profile_now();
+    let s_meta = span("decode:meta");
     let _batch_indices: Vec<usize> = caches
         .iter()
         .map(|c| c.k_cache().chunked_batch_idx().unwrap_or(0))
@@ -1393,10 +1396,9 @@ fn paged_decode_attention<'w>(
     let softmax_scale = 1.0 / (head_dim as f32).sqrt();
 
     let out = {
-        profile_sync(q_kernel.device());
-        pipeline_record("decode:meta", t_meta);
+        s_meta.end();
 
-        let t_kernel = profile_now();
+        let g_kernel = gpu_span("decode:kernel", q_kernel.device());
         // B2: emit q8a1024 (flat U8 tensor) instead of the FP context when requested. The U8
         // bytes are the operand for o_proj's int8 matmul — never dtype-converted.
         let raw_out = if emit_q8 {
@@ -1442,8 +1444,7 @@ fn paged_decode_attention<'w>(
                 rope_interleaved,
             )?
         };
-        profile_sync(q_kernel.device());
-        pipeline_record("decode:kernel", t_kernel);
+        g_kernel.end();
 
         if !emit_q8 && q_dtype != arena_dtype {
             raw_out.to_dtype(q_dtype)?

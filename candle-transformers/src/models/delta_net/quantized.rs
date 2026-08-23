@@ -15,8 +15,10 @@
 
 use candle::{LiveTensor, Result, Tensor};
 
-#[cfg(feature = "cuda")]
-use crate::models::profile::{pipeline_record, profile_now, profile_sync};
+// Not CUDA-gated: `gpu_span` is defined in both configurations and is a
+// zero-sized no-op without `profile` + `cuda`, so the call sites need no `cfg`
+// of their own.
+use crate::models::profile::gpu_span;
 use crate::models::quantized_matmul::QMatMul;
 
 use super::mix::{
@@ -111,46 +113,32 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     // wave-scoped activation, and the projections' outputs belong in the same
     // arena. `Module` takes `&Tensor` on purpose — a module may retain what it
     // is given — so it cannot be the one to see this.
-    #[cfg(feature = "cuda")]
-    let t_proj = profile_now();
+    let g_proj = gpu_span("dn:proj", x.device());
     let p = DeltaNetProjections {
         qkv: wide(w.wqkv.forward_live(x)?)?,
         z: wide(w.wz.forward_live(x)?)?,
         beta_lin: wide(w.w_beta.forward_live(x)?)?,
         alpha_lin: wide(w.w_alpha.forward_live(x)?)?,
     };
-    #[cfg(feature = "cuda")]
-    {
-        profile_sync(x.device());
-        pipeline_record("dn:proj", t_proj);
-    }
+    g_proj.end();
     let c = DeltaNetConstants {
         dt_bias: &w.dt_bias,
         a: &w.a,
         conv: &w.conv,
         norm: &w.norm,
     };
-    #[cfg(feature = "cuda")]
-    let t_mix = profile_now();
+    let g_mix = gpu_span("dn:mix", x.device());
     let gated = delta_net_mix_spans(&p, &c, dims, seqs, rms_eps, table)?;
     let gated = if gated.dtype() == act {
         gated
     } else {
         gated.to_dtype(act)?
     };
-    #[cfg(feature = "cuda")]
-    {
-        profile_sync(x.device());
-        pipeline_record("dn:mix", t_mix);
-    }
-    #[cfg(feature = "cuda")]
-    let t_out = profile_now();
+    g_mix.end();
+
+    let g_out = gpu_span("dn:out_proj", x.device());
     let out = w.w_out.forward_live(&gated)?;
-    #[cfg(feature = "cuda")]
-    {
-        profile_sync(x.device());
-        pipeline_record("dn:out_proj", t_out);
-    }
+    g_out.end();
     Ok(out)
 }
 
