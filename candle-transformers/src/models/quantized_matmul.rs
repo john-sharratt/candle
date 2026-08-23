@@ -174,12 +174,26 @@ impl QMatMul {
     /// the output is allocated from whichever arena `xs` came from. The
     /// `Module` impl below is this at `'static`, where the bound is vacuous.
     pub fn forward_live<'w>(&self, xs: &candle::LiveTensor<'w>) -> Result<candle::LiveTensor<'w>> {
+        self.forward_live_as(xs, xs.dtype())
+    }
+
+    /// [`Self::forward_live`] with the output width named by the caller.
+    ///
+    /// The int8 kernel accumulates in F32 registers and converts on the store, so `out_dtype` costs
+    /// nothing to honour — it selects which of the dense KO kernel's three output variants runs.
+    /// A consumer that needs a width other than the activation's must ask here: widening the result
+    /// afterwards rounds through the narrow store and back, which is both a full-tensor launch and
+    /// a loss of the accumulator's own precision.
+    pub fn forward_live_as<'w>(
+        &self,
+        xs: &candle::LiveTensor<'w>,
+        out_dtype: DType,
+    ) -> Result<candle::LiveTensor<'w>> {
         let _enter = self.span.enter();
         // Tag the profile entry with the format the matmul actually ran in (`_q8` int8 tensor-core,
         // `_f16`/`_f32` FP) so a perf-vs-off run shows at a glance whether int8 engaged.
         let t_mm = profile_now();
 
-        let in_dtype = xs.dtype();
         let (xs2, reshape_back, _m) = if xs.rank() == 3 {
             let (b, s, k) = xs.dims3()?;
             (xs.reshape((b * s, k))?, Some((b, s)), b * s)
@@ -188,11 +202,11 @@ impl QMatMul {
             (xs.clone(), None, m)
         };
 
-        // int8 tensor-core path: q8a128 activations × the KO-twin weight, stored back at the input
-        // dtype. The weight twin was baked in at load by `from_*_with_mode`.
+        // int8 tensor-core path: q8a128 activations × the KO-twin weight, stored at `out_dtype`.
+        // The weight twin was baked in at load by `from_*_with_mode`.
         #[cfg(feature = "cuda")]
         if self.int8mode.is_int8() {
-            let out2 = self.inner.forward_via_int8(&xs2, self.int8mode)?;
+            let out2 = self.inner.forward_via_int8(&xs2, self.int8mode, out_dtype)?;
             pipeline_record("qmatmul_q8", t_mm);
             return if let Some((b, s)) = reshape_back {
                 let n = out2.dim(1)?;
@@ -209,7 +223,11 @@ impl QMatMul {
             let xs_f32 = xs2.to_dtype(DType::F32)?;
             let out_f32 = self.inner.forward_live(&xs_f32)?;
             pipeline_record("qmatmul_f32", t_mm);
-            out_f32.to_dtype(in_dtype)?
+            if out_dtype == DType::F32 {
+                out_f32
+            } else {
+                out_f32.to_dtype(out_dtype)?
+            }
         };
 
         if let Some((b, s)) = reshape_back {

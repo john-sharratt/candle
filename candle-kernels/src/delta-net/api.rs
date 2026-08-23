@@ -33,6 +33,7 @@ extern "C" {
     /// callers validate dims at model load.
     pub fn run_delta_net_decode_step_f32(
         states: *const i64,
+        states_out: *const i64,
         conved: *const f32,
         rows: *const u32,
         alpha: *const f32,
@@ -150,7 +151,8 @@ extern "C" {
     /// 128]` in place in the stored orientation. `qk`/`tok_stride` as in the
     /// intra kernel.
     pub fn run_delta_net_prefill_state_f32(
-        state: *mut f32,
+        state: *const f32,
+        state_out: *mut f32,
         qk: *const f32,
         u: *const f32,
         w: *const f32,

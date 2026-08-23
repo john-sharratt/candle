@@ -3808,7 +3808,13 @@ impl<'w> LiveTensor<'w> {
         (storage, &self.layout)
     }
 
-    pub(crate) fn same_storage(&self, rhs: &LiveTensor<'_>) -> bool {
+    /// Whether both tensors are views of the same allocation.
+    ///
+    /// Public because aliasing decides which operations are legal — `slice_set`
+    /// refuses a source that shares its destination's storage — so a caller that
+    /// may hold either two buffers or one handed to it twice has to be able to
+    /// ask before it copies.
+    pub fn same_storage(&self, rhs: &LiveTensor<'_>) -> bool {
         let lhs: &RwLock<Storage> = self.storage.as_ref();
         let rhs: &RwLock<Storage> = rhs.storage.as_ref();
         std::ptr::eq(lhs, rhs)

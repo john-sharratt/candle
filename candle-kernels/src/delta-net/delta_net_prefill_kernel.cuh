@@ -292,7 +292,8 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
 // vnew [C][TV+1], and the chunk's decay vectors.
 // ============================================================================
 static __global__ void delta_net_prefill_state_f32_kernel(
-        float*       __restrict__ state,  // [h_v, D, D] in place
+        const float* __restrict__ state,     // [h_v, D, D] entering
+        float*       __restrict__ state_out, // [h_v, D, D] advanced
         const float* __restrict__ qk,     // Q|K columns of the conv output
         const float* __restrict__ u,      // [h_v, T, D]
         const float* __restrict__ w,      // [h_v, T, D]
@@ -476,12 +477,19 @@ static __global__ void delta_net_prefill_state_f32_kernel(
         }
     }
 
-    // The tile goes back where it came from — the state is updated in place.
+    // The advanced tile goes to `state_out`, which the wave points at the slot's
+    // OTHER buffer. Every element this block loaded is written back, and the grid
+    // covers every (head, d_v-tile), so the destination is fully written and
+    // carries nothing forward from whatever it last held — which is what lets a
+    // failed wave roll back by not swapping the two buffers rather than by
+    // copying the entering state aside first. `state_out == state` is also legal
+    // (the reference path passes one buffer twice): the tile is already resident
+    // in shared memory by the time it is stored.
     __syncthreads();
     for (int idx = tid; idx < DNP_TV * DNP_DIM; idx += (int)blockDim.x) {
         const int r = idx / DNP_DIM;
         const int d = idx % DNP_DIM;
-        state[((size_t)h * DNP_DIM + (i_base + r)) * DNP_DIM + d] =
+        state_out[((size_t)h * DNP_DIM + (i_base + r)) * DNP_DIM + d] =
             s_tile[r * DNP_LD + d];
     }
 }
@@ -546,7 +554,8 @@ static inline void launch_prefill_intra_f32(
 }
 
 static inline void launch_prefill_state_f32(
-        float* state,
+        const float* state,
+        float* state_out,
         const float* qk,
         const float* u,
         const float* w,
@@ -566,8 +575,8 @@ static inline void launch_prefill_state_f32(
                            (int)sizeof(float);
     dim3 grid(n_v_heads, DNP_DIM / DNP_TV);
     delta_net_prefill_state_f32_kernel<<<grid, 256, smem_bytes, stream>>>(
-        state, qk, u, w, kq, g_cs, o, t_len, n_v_heads, n_k_heads, tok_stride,
-        q_scale);
+        state, state_out, qk, u, w, kq, g_cs, o, t_len, n_v_heads, n_k_heads,
+        tok_stride, q_scale);
 }
 
 } // namespace delta_net

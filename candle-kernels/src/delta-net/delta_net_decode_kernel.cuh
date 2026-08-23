@@ -44,7 +44,8 @@ namespace delta_net {
 // the table one host upload per FORWARD builds (never per layer: a mid-sweep
 // upload would serialise the launch pipeline).
 static __global__ void delta_net_decode_step_f32_kernel(
-        const long long*     __restrict__ states, // [n_decode] f32* as i64
+        const long long*     __restrict__ states,     // [n_decode] entering f32* as i64
+        const long long*     __restrict__ states_out, // [n_decode] advanced f32* as i64
         const float*         __restrict__ conved, // [T_wave, tok_stride]
         const unsigned int*  __restrict__ rows,   // [n_decode] wave rows
         const float*         __restrict__ alpha,  // [T_wave, n_v_heads] raw
@@ -62,7 +63,8 @@ static __global__ void delta_net_decode_step_f32_kernel(
     const int seq = blockIdx.y; // decode sequence
     const int kh = h % n_k_heads;
     const int row = (int)rows[seq];
-    float* state = (float*)states[seq];
+    const float* state_in = (const float*)states[seq];
+    float* state_out = (float*)states_out[seq];
     const float* qk = conved + (size_t)row * tok_stride;
     const float* v = qk + ((size_t)tok_stride - (size_t)n_v_heads * d_v);
     const float* gates_a = alpha + (size_t)row * n_v_heads;
@@ -82,19 +84,28 @@ static __global__ void delta_net_decode_step_f32_kernel(
     const float decay = expf(g);
     const float b     = dn_sigmoid(gates_b[h]);
 
+    // The entering state is read from `state_in`, the advanced state written to
+    // `state_out` — the wave points the latter at the slot's OTHER buffer. Every
+    // element of the row is written below, so the destination needs no
+    // initialisation and carries nothing forward from whatever it last held.
+    // That is what lets a failed wave roll back by simply not swapping the two
+    // buffers, instead of copying the entering state aside before every wave.
+    // The two may also be the same pointer (the reference path passes one buffer
+    // twice): each `j` is read before it is written, so in-place stays correct.
     for (int i = threadIdx.x; i < d_v; i += blockDim.x) {
-        float* srow = state + ((size_t)h * d_v + i) * d_k;
+        const float* srow_in = state_in + ((size_t)h * d_v + i) * d_k;
+        float* srow_out = state_out + ((size_t)h * d_v + i) * d_k;
         // Decayed prediction the state makes for k.
         float pred = 0.f;
         for (int j = 0; j < d_k; ++j) {
-            pred += srow[j] * decay * sh_k[j];
+            pred += srow_in[j] * decay * sh_k[j];
         }
         const float err = b * (v[(size_t)h * d_v + i] - pred);
         // Update the row and read the output with the post-update state.
         float out = 0.f;
         for (int j = 0; j < d_k; ++j) {
-            const float s_new = srow[j] * decay + err * sh_k[j];
-            srow[j] = s_new;
+            const float s_new = srow_in[j] * decay + err * sh_k[j];
+            srow_out[j] = s_new;
             out += s_new * sh_q[j];
         }
         orow[(size_t)h * d_v + i] = out;
@@ -173,6 +184,7 @@ static __global__ void delta_net_batch_ptrs_kernel(
 
 static inline void launch_decode_step_f32(
         const long long* states,
+        const long long* states_out,
         const float* conved,
         const unsigned int* rows,
         const float* alpha,
@@ -193,7 +205,7 @@ static inline void launch_decode_step_f32(
     const int threads = d_v < 128 ? ((d_v + 31) / 32) * 32 : 128;
     dim3 grid(n_v_heads, n_decode);
     delta_net_decode_step_f32_kernel<<<grid, threads, 0, stream>>>(
-        states, conved, rows, alpha, beta_lin, dt_bias, a_neg, o,
+        states, states_out, conved, rows, alpha, beta_lin, dt_bias, a_neg, o,
         d_k, d_v, n_v_heads, n_k_heads, tok_stride, q_scale);
 }
 

@@ -146,11 +146,21 @@ pub fn gpu_span(name: &'static str, device: &candle::Device) -> GpuSpan {
     let candle::Device::Cuda(dev) = device else {
         return GpuSpan { inner: None };
     };
-    // Recycle before borrowing. Non-blocking, so a pair whose work is still in
-    // flight stays pending and this costs a few `cuEventQuery` calls once every
-    // HIGH_WATER spans — not per span, and never a stall.
+    // Recycle before borrowing. The non-blocking pass is the common case and
+    // costs a few `cuEventQuery` calls once every HIGH_WATER spans.
+    //
+    // It is not on its own a bound, though: when the device is far enough behind
+    // that nothing has completed, it recycles nothing, `pending` keeps growing,
+    // and every later span pays an O(pending) query scan plus an allocation of
+    // the same size — the cap silently becoming a floor. So if the cheap pass
+    // did not get back under the cap, block once. That is a stall, but it is the
+    // one that keeps a profiling build's overhead proportional to the work
+    // rather than to how far behind the queue has drifted.
     if gpu_pool::pending_len() >= gpu_pool::HIGH_WATER {
         drain_inner(false);
+        if gpu_pool::pending_len() >= gpu_pool::HIGH_WATER {
+            drain_inner(true);
+        }
     }
     let stream = dev.cuda_stream();
     let inner = gpu_pool::open(&stream).map(|slot| GpuSpanInner { name, slot, stream });

@@ -14,6 +14,12 @@
 
 ## Summary
 
+**Scope: this diagnosis is for a fully resident model.** It was measured on the
+72 GB card where the 22 GB checkpoint never touches the expert cache. On the
+16 GB card the same build is bound by expert cold reads instead, and the ranking
+below does not apply as written — see §8, and §8d for the part that holds on
+both.
+
 **Prefill on this model is launch-bound, not compute-bound.** In a matched BF16
 window the GPU runs at **47–50% utilisation** against Qwen3-30B-A3B's 59–72%, and
 the idle is not a few large syncs — it is **199,703 inter-operation gaps
@@ -344,11 +350,13 @@ dim.
 
 ## 5. Ruled out
 
-- **Expert streaming.** All expert-pipeline counters are zero across all 14
-  configs. The 22 GB checkpoint is fully resident in 72 GB; the cache never
-  engages. (The `quantized_qwen36_moe` doc comment about "the 16 GB dev card"
-  describes the old RTX 4090 Mobile. The "100.0%" hit rate in that table is a
-  divide-by-zero artifact of zero traffic, not a measurement.)
+- **Expert streaming — on this card only.** All expert-pipeline counters are zero
+  across all 14 configs. The 22 GB checkpoint is fully resident in 72 GB; the
+  cache never engages. (The `quantized_qwen36_moe` doc comment about "the 16 GB
+  dev card" describes the old RTX 4090 Mobile. The "100.0%" hit rate in that
+  table is a divide-by-zero artifact of zero traffic, not a measurement.)
+  **On the 16 GB card this is the dominant cost, not a ruled-out one** — it
+  inverts the whole diagnosis. See §8.
 - **Post-selection readback serialisation.** Four `memcpy_dtov` calls follow each
   selection launch (`sampled_selection/gpu.rs:1272-1275`). Measured GPU idle
   immediately after all 520 selection launches: **0.025 s total**, mean 48.7 µs.
@@ -405,17 +413,112 @@ directly.
    it is 88.5% of GPU time in the compressed configs zend will run.
 5. **Chase `fwd_routing_wait`** — **79.0 ms/config at BF16×1, 937.6 ms at
    C10×10**, larger than the worker time it waits on, with `pipe_fence_wait`
-   at ~0. Experts are resident, so this is the forward thread blocking on the MoE
-   routing round-trip, not DMA. Same shape as the documented MoE-routing readback
-   wall; worth checking whether the routing readback can be deferred or made
-   device-resident as it was for DeepSeek-V4's `moe_bucketize`. **This is now the
-   largest single span in prefill** and was invisible until the profiler stopped
-   synchronising.
+   at ~0. Experts are resident *on this card* — verified by the zero expert
+   counters of §5, not by the fence, which reads ~0 under streaming too (§8b) —
+   so this is the forward thread blocking on the MoE routing round-trip, not DMA.
+   Same shape as the documented MoE-routing readback wall; worth checking whether
+   the routing readback can be deferred or made device-resident as it was for
+   DeepSeek-V4's `moe_bucketize`. **This is now the largest single span in
+   prefill** and was invisible until the profiler stopped synchronising. It is
+   also the one item on this list that pays off on both machines (§8d).
 6. **Add NVTX spans to the qwen35 wave** (§6) — makes 1–5 measurable per phase,
    and would let launches be attributed to source sites.
 
 *(The former item 6 — convert the profiler to CUDA-event timing — is done; see
 §3b.)*
+
+## 8. The same code on a 16 GB card: cold-read bound
+
+Everything above was measured with the 22 GB checkpoint **fully resident** in
+72 GB. Re-running the identical profiler build on the RTX 4090 Mobile 16 GB —
+where the expert cache genuinely streams — moves the bottleneck somewhere else
+entirely. Same commit, same gate, same configs.
+
+`cargo test --release --features cuda,profile --lib -p candle-transformers
+quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b --
+--ignored --nocapture --test-threads=1`
+
+Prefill, BF16×1, host-timed spans (the trustworthy ones here — see 8c):
+
+| host span | 16 GB, streaming | 72 GB, resident |
+|---|---|---|
+| bulk t/s | **300.5** | 4433.9 |
+| `pipe_worker_total` | **2561.3 ms** | 47.2 ms |
+| `pipe_classify_load` | 2256.3 ms | — |
+| `cold_read` | **2048.5 ms** (×89) | — |
+| `pipe_compute_experts` | 269.4 ms | — |
+| `fwd_routing_wait` | 1206.8 ms (×80) | 79.0 ms (×80) |
+| `pipe_fence_wait` | 0.4 ms | ~0 |
+
+`cold_read` is **91% of classify-load and ~80% of the whole expert pipeline**.
+Actual expert compute is 269 ms — a tenth of it. Every launch-side item in §7
+would be invisible behind this on a card of this size.
+
+### 8a. The first config pays a page-cache warm-up
+
+Cost per cold read, by config:
+
+| config | `cold_read` | reads | per read |
+|---|---|---|---|
+| #1 BF16×1 | 2048.5 ms | 89 | **23.0 ms** |
+| #2 BF16×4 | 1072.0 ms | 234 | 4.6 ms |
+| #3 Q8_0×1 | 271.8 ms | 81 | 3.4 ms |
+| #4 C0×1 | 267.3 ms | 74 | 3.6 ms |
+| #5 C1×1 | 269.5 ms | 72 | 3.7 ms |
+| #14 C10×10 | 2485.5 ms | 474 | 5.2 ms |
+
+The first config reads the pack file cold from disk; everything after hits the OS
+page cache. That is ~1.7 s of one-time cost inside config #1 alone, and it is a
+direct measurement of the "first wide config is slow to set up" effect that had
+only ever been observed as wall-clock before.
+
+### 8b. `pipe_fence_wait ≈ 0` does NOT prove experts are resident
+
+§3b and §7 item 5 argue that `fwd_routing_wait` is not expert DMA *because*
+`pipe_fence_wait` is ~0. On this card `pipe_fence_wait` is **0.4 ms** while every
+expert is streaming from disk — the DMA cost lands in `cold_read`, a synchronous
+host-side read on the worker thread that never reaches the fence. The conclusion
+is correct for the 72 GB box (the counters really are zero there), but the test
+is not valid in general. **Read `cold_read` / `pipe_classify_load` to decide
+whether streaming is in play, not the fence.**
+
+The two boxes are also in different *waiting regimes*. Resident:
+`fwd_routing_wait` (79 ms) exceeds `pipe_worker_total` (47 ms) — the forward
+thread waits longer than the work it waits on, the signature of pure latency.
+Streaming: the wait (1207 ms) is half the worker total (2561 ms) — it is blocking
+on genuinely outstanding I/O.
+
+### 8c. GPU event spans absorb streaming backlog
+
+The placement caveat in §3b — an event span measures the *stream* interval, so it
+attributes any in-flight backlog to itself — bites hard once the stream carries
+expert loads. `decode:kernel` reads 444.9 ms at BF16×1 and 9.9 ms at C0×1 for the
+same 100 invocations; that swing is backlog attribution, not kernel cost.
+
+So the instrument's trustworthy half flips with residency: **host spans on a
+streaming card, GPU spans on a resident one.** A number from the wrong half is
+not merely noisy, it is attributed to the wrong phase.
+
+### 8d. What is common to both machines
+
+The differences are residency artefacts. What survives both is one subsystem:
+
+- **The MoE hand-off blocks the forward thread on both.** `fwd_routing_wait` is
+  79.0 ms/config resident and 1206.8 ms/config streaming — the largest pipeline
+  span in each case, for different underlying reasons (latency there, I/O here).
+- **The GEMM fragmentation is architectural, not hardware.** `qmatmul_q8` fires
+  **exactly 3,510 times per decode config on both machines**. Identical count,
+  wildly different hardware; only the per-launch cost differs (11.6 µs resident,
+  33.5 µs streaming). This raises §3c's fragmentation finding from "measured on
+  one box" to a property of the model.
+- **`dn:ffn` is the largest span in both profiles** — 95.3 ms (×300) resident,
+  538.0 ms (×300) streaming in decode — and it is the DeltaNet layer's MoE FFN,
+  i.e. the same expert path the two points above describe.
+
+All three name the **MoE expert path**: routing readback → submit round-trip →
+fragmented expert GEMMs. On the resident card that path is latency- and
+launch-bound; on the streaming card it is I/O-bound. It is the one area where
+work pays off on both, and it is where §7 item 5 already points.
 
 ## Reproduction
 

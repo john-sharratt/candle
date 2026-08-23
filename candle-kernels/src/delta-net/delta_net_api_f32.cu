@@ -16,6 +16,7 @@
 
 extern "C" void run_delta_net_decode_step_f32(
         const long long* states,
+        const long long* states_out,
         const float* conved,
         const unsigned int* rows,
         const float* alpha,
@@ -32,7 +33,7 @@ extern "C" void run_delta_net_decode_step_f32(
         float q_scale,
         void* stream) {
     delta_net::launch_decode_step_f32(
-        states, conved, rows, alpha, beta_lin, dt_bias, a_neg, o,
+        states, states_out, conved, rows, alpha, beta_lin, dt_bias, a_neg, o,
         n_decode, n_v_heads, n_k_heads, d_k, d_v, tok_stride, q_scale,
         (cudaStream_t)stream);
 }
@@ -109,7 +110,8 @@ extern "C" void run_delta_net_prefill_intra_f32(
 }
 
 extern "C" void run_delta_net_prefill_state_f32(
-        float* state,
+        const float* state,
+        float* state_out,
         const float* qk,
         const float* u,
         const float* w,
@@ -123,7 +125,7 @@ extern "C" void run_delta_net_prefill_state_f32(
         float q_scale,
         void* stream) {
     delta_net::launch_prefill_state_f32(
-        state, qk, u, w, kq, g_cs, o, t_len, n_v_heads, n_k_heads,
+        state, state_out, qk, u, w, kq, g_cs, o, t_len, n_v_heads, n_k_heads,
         tok_stride, q_scale, (cudaStream_t)stream);
 }
 
