@@ -2538,8 +2538,13 @@ impl QMatMul {
     /// activation form (q8a128 for any non-`Off` mode). Quantizes the activation here (the
     /// **unfused** path, one standalone launch) then runs [`QMatMul::forward_dynamic`]; the fused
     /// producers bypass this by emitting q8a128 themselves and calling `forward_dynamic` directly.
-    /// The result comes back in `xs`'s dtype — quantizing the activation is not meant to change the
-    /// width the caller sees.
+    ///
+    /// `out_dtype` is the width the result is **stored** at, not a cast applied after: the MMA
+    /// accumulates in F32 registers and converts on the store, so asking for F32 here is the same
+    /// number the kernel already had, and asking for a narrow type is bit-identical to the F32
+    /// kernel followed by a cast, minus the cast. A consumer that wants F32 — the DeltaNet
+    /// projections, whose recurrence carries state in F32 — must say so here rather than widen
+    /// afterwards, which would round through the narrow type and back for nothing.
     ///
     /// Non-CUDA build: the q8a128 × KO int8 matmul is a CUDA tensor-core path — always
     /// errors (the `dummy_cuda` convention).
@@ -2548,6 +2553,7 @@ impl QMatMul {
         &self,
         _xs: &LiveTensor<'w>,
         _mode: Int8Mode,
+        _out_dtype: crate::DType,
     ) -> Result<LiveTensor<'w>> {
         crate::bail!("forward_via_int8 requires the cuda feature")
     }
@@ -2557,6 +2563,7 @@ impl QMatMul {
         &self,
         xs: &LiveTensor<'w>,
         mode: Int8Mode,
+        out_dtype: crate::DType,
     ) -> Result<LiveTensor<'w>> {
         let device = match self {
             Self::QTensor(t) => match &t.storage {
@@ -2565,7 +2572,6 @@ impl QMatMul {
             },
             _ => crate::bail!("forward_via_int8 requires a KO QTensor weight"),
         };
-        let out_dtype = xs.dtype();
         let acts = cuda::to_dynamic(xs, mode, &device)?;
         self.forward_dynamic(acts.as_dynamic(), out_dtype)
     }

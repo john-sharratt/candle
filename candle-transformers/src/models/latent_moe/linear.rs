@@ -158,11 +158,11 @@ impl QLinear {
             }
             Self::Int8(q) => {
                 let in_dtype = x.dtype();
-                let y = q.forward_via_int8(
+                q.forward_via_int8(
                     &x.to_dtype(DType::F32)?.contiguous()?,
                     Int8Mode::Performance,
-                )?;
-                y.to_dtype(in_dtype)
+                    in_dtype,
+                )
             }
         }
     }

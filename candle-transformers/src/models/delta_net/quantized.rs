@@ -64,10 +64,14 @@ pub fn quantized_delta_net_layer_forward<'w>(
     rms_eps: f64,
 ) -> Result<LiveTensor<'w>> {
     let t = x.dim(0)?;
+    // One buffer, as in the float single-span path: read and write the same
+    // tensor, since there is no wave to roll back here.
+    let s_out = state.s.clone();
     let mut one = [DeltaNetSeq {
         start: 0,
         len: t,
         state,
+        s_out,
     }];
     quantized_delta_net_layer_forward_spans(x, w, dims, &mut one, rms_eps, None)
 }
@@ -102,23 +106,22 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     table: Option<&DeltaNetLayerTable>,
 ) -> Result<LiveTensor<'w>> {
     let act = x.dtype();
-    let wide = |t: LiveTensor<'w>| -> Result<LiveTensor<'w>> {
-        if t.dtype() == candle::DType::F32 {
-            Ok(t)
-        } else {
-            t.to_dtype(candle::DType::F32)
-        }
-    };
     // `forward_live`, not `Module::forward`: the input is the layer's own
     // wave-scoped activation, and the projections' outputs belong in the same
     // arena. `Module` takes `&Tensor` on purpose — a module may retain what it
     // is given — so it cannot be the one to see this.
     let g_proj = gpu_span("dn:proj", x.device());
+    // F32 out of the matmul itself, not a cast after it. The recurrence carries
+    // `S` in F32, so these four have always been consumed wide — but asking the
+    // KO kernel to store narrow and widening afterwards spent a full-tensor pass
+    // per projection (four launches per DeltaNet layer, the single largest
+    // source of `cast_f16_f32` in a prefill sweep) to recover a number the F32
+    // accumulator had already computed and thrown away on the store.
     let p = DeltaNetProjections {
-        qkv: wide(w.wqkv.forward_live(x)?)?,
-        z: wide(w.wz.forward_live(x)?)?,
-        beta_lin: wide(w.w_beta.forward_live(x)?)?,
-        alpha_lin: wide(w.w_alpha.forward_live(x)?)?,
+        qkv: w.wqkv.forward_live_as(x, candle::DType::F32)?,
+        z: w.wz.forward_live_as(x, candle::DType::F32)?,
+        beta_lin: w.w_beta.forward_live_as(x, candle::DType::F32)?,
+        alpha_lin: w.w_alpha.forward_live_as(x, candle::DType::F32)?,
     };
     g_proj.end();
     let c = DeltaNetConstants {

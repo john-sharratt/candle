@@ -4127,7 +4127,7 @@ fn ko_offline_load_forward_matches_gpu_repack() -> Result<()> {
     let q8 = QMatMul::from_qtensor(QTensor::quantize(&w_t, GgmlDType::Q8_0)?)?;
     let opt_a = q8.repack_for_optimization(Int8Mode::Performance)?;
     let y_a: Vec<f32> = opt_a
-        .forward_via_int8(&act_t, Int8Mode::Performance)?
+        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype())?
         .flatten_all()?
         .to_vec1::<f32>()?;
 
@@ -4139,7 +4139,7 @@ fn ko_offline_load_forward_matches_gpu_repack() -> Result<()> {
     let qt_b = QTensor::new(storage_b, vec![nrows, ncols])?;
     let mm_b = QMatMul::from_qtensor(qt_b)?;
     let y_b: Vec<f32> = mm_b
-        .forward_via_int8(&act_t, Int8Mode::Performance)?
+        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype())?
         .flatten_all()?
         .to_vec1::<f32>()?;
 
