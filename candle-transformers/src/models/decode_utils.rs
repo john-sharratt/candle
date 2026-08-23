@@ -80,6 +80,8 @@ pub fn gather_rope_cos_sin(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::needless_range_loop)]
+
     use super::*;
 
     #[test]
@@ -189,6 +191,8 @@ mod tests {
 // ============================================================================
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests {
+    #![allow(clippy::needless_range_loop)]
+
     use crate::models::prefill_utils::{compute_rope_cs, paged_decode_attn};
     use candle::quantized::pinned_staging::PinnedStager;
     use candle::{DType, Device, Result, Tensor};

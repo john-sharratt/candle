@@ -1561,6 +1561,11 @@ fn config_to_sampling(config: &SamplingConfig) -> candle_transformers::generatio
 // ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    // Several tests pin a tuning constant inside a range. The assertion IS the
+    // contract — it fires the moment someone retunes the constant out of band —
+    // even though it is constant-valued at any given commit.
+    #![allow(clippy::assertions_on_constants)]
+
     use super::*;
     use crate::config::SamplingConfig;
 

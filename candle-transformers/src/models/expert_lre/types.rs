@@ -61,6 +61,20 @@ pub struct PipelineStats {
     pub predicted_total: usize,
     /// Number of times `fence_wait` blocked (non-zero wait).
     pub fence_stalls: usize,
+    /// In-flight prefetched experts whose DMA fence had not signalled when
+    /// their target layer's request arrived — the prefetch was issued but did
+    /// NOT land in time. The direct latency-bound signal for the dynamic
+    /// load-ahead controller: late > 0 with bandwidth slack means the
+    /// prefetcher should issue earlier (deepen N); late ≈ 0 with falling
+    /// precision means it should shallow back.
+    pub late_loads: usize,
+    /// **Gauge**: the dynamic load-ahead depth `N` as of the last pass
+    /// boundary — how many layers ahead the speculative prefetcher currently
+    /// issues for.
+    pub prefetch_depth: usize,
+    /// Experts loaded by the off-thread whole-layer streamer (their bytes
+    /// also count in `warm_loads` / `cold_loads` / `dma_loads` by source).
+    pub stream_loads: usize,
     /// Total MoE work requests processed.
     pub work_requests: usize,
     /// **Live** VRAM bytes held by resident expert slots — `occupied_slots ×
@@ -94,9 +108,10 @@ impl PipelineStats {
 
     /// Reset the per-interval tallies. The **gauges** —
     /// `resident_vram_bytes`, `zone_cedeable_bytes`, `warm_slots`,
-    /// `total_experts` — survive it: they describe the cache's shape rather
-    /// than what it did since the last reset, and an inline-mode cache (which
-    /// never re-seeds them via a classify) would otherwise read 0 forever.
+    /// `total_experts`, `prefetch_depth` — survive it: they describe the
+    /// cache's shape rather than what it did since the last reset, and an
+    /// inline-mode cache (which never re-seeds them via a classify) would
+    /// otherwise read 0 forever.
     pub fn reset(shared: &Arc<Mutex<Self>>) {
         if let Ok(mut s) = shared.lock() {
             let gauges = (
@@ -104,6 +119,7 @@ impl PipelineStats {
                 s.zone_cedeable_bytes,
                 s.warm_slots,
                 s.total_experts,
+                s.prefetch_depth,
             );
             *s = Self::default();
             (
@@ -111,6 +127,7 @@ impl PipelineStats {
                 s.zone_cedeable_bytes,
                 s.warm_slots,
                 s.total_experts,
+                s.prefetch_depth,
             ) = gauges;
         }
     }
@@ -215,6 +232,34 @@ impl CopyBatchFence {
             }
         }
         Ok(())
+    }
+
+    /// Whether the fenced DMA batch has already completed (CPU-side event
+    /// query, non-blocking). A no-op fence is always complete. This is the
+    /// deadline probe behind the late-load counter: queried at the moment a
+    /// layer's request arrives, it answers "did the prefetch land in time?"
+    /// without perturbing the stream.
+    pub(crate) fn is_complete(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.event.as_ref().is_none_or(|e| e.is_complete())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            true
+        }
+    }
+
+    /// Whether this fence actually covers an in-flight batch (has an event).
+    pub(crate) fn is_real(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.event.is_some()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
     }
 }
 

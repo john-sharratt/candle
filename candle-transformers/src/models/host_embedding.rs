@@ -115,7 +115,7 @@ impl RowLayout {
         map_len: usize,
     ) -> Result<Self> {
         let block = dtype.block_size();
-        if block == 0 || ncols % block != 0 {
+        if block == 0 || !ncols.is_multiple_of(block) {
             candle::bail!(
                 "host embedding: {ncols} columns is not a whole number of {dtype:?} blocks ({block})"
             );

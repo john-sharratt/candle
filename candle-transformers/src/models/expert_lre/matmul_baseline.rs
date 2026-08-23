@@ -24,6 +24,10 @@
 //!   expert_lre::matmul_baseline::expert_matmul_baseline_bench -- --ignored --nocapture
 //! ```
 
+// Test-only fixture module; the reference matmul indexes [row][col] the way the
+// baseline it is checking does.
+#![allow(clippy::needless_range_loop)]
+
 use crate::models::quantized_matmul::QMatMul;
 use candle::quantized::{gguf_file, GgmlDType};
 use candle::{Device, Module, Result, Tensor};
@@ -161,6 +165,19 @@ fn rel_l2(a: &Tensor, b: &Tensor) -> Result<f32> {
     Ok((num / den).sqrt())
 }
 
+/// Count non-finite elements, so a failure names the side that went bad.
+///
+/// A bare `rel L2 = NaN` says only that the arithmetic touched a NaN — it does
+/// not say whether the kernel produced one, the reference did, or both. That
+/// ambiguity is what let this failure sit unexplained.
+fn nonfinite(t: &Tensor) -> Result<(usize, usize)> {
+    let v = t.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    Ok((
+        v.iter().filter(|x| x.is_nan()).count(),
+        v.iter().filter(|x| x.is_infinite()).count(),
+    ))
+}
+
 #[test]
 fn expert_matmul_matches_dequant_reference() -> Result<()> {
     use candle::quantized::Int8Mode;
@@ -185,6 +202,14 @@ fn expert_matmul_matches_dequant_reference() -> Result<()> {
             let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?;
             let out = qmm.forward(&x)?; // [m, n] — int8 tensor-core matmul
             let reference = x.matmul(&wt)?; // [m, n] — f32 dequant matmul
+            for (t, name) in [(&out, "kernel output"), (&reference, "dequant reference")] {
+                let (nan, inf) = nonfinite(t)?;
+                assert!(
+                    nan == 0 && inf == 0,
+                    "{mode:?} M={m}: {name} has {nan} NaN and {inf} Inf of {} elements",
+                    t.elem_count()
+                );
+            }
             let err = rel_l2(&out, &reference)?;
             println!("[expert matmul] {mode:?} M={m}: rel L2 = {err:.4}");
             assert!(

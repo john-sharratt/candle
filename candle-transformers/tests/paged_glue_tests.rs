@@ -13,6 +13,14 @@
 //! causal structure); the quantized-arena variant layers on after this passes.
 
 #![cfg(feature = "cuda")]
+// Kernel-gate harness: launch wrappers take the kernel's flat argument list, and
+// the comparisons keep `!(a > b)` so a NaN fails the gate instead of passing it.
+#![allow(
+    clippy::clone_on_copy,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
@@ -276,7 +284,6 @@ fn dev_ptr_f16(t: &Tensor) -> Result<u64> {
 /// staged into this slot's `position_map` at `[kv_len, kv_len+b_len)` so the glue
 /// rows attend `min(fwd_window, b_len)` B columns. `(0, None)` is the
 /// backward-only path (bit-identical to the pre-window kernel).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn run_glue(
     backing: &ChunkedKvBacking,

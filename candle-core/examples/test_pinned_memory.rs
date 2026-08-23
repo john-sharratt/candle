@@ -54,8 +54,8 @@ fn main() -> anyhow::Result<()> {
             // Initialize the data
             {
                 let slice = pinned.as_mut_slice()?;
-                for i in 0..test_size {
-                    slice[i] = 1.0;
+                for v in slice.iter_mut().take(test_size) {
+                    *v = 1.0;
                 }
             }
 

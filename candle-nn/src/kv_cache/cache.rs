@@ -73,7 +73,7 @@ impl ChunkedCache {
         Ok(Self {
             backing: self.backing.clone(),
             batch_idx: new_batch_idx,
-            compression_policy: self.compression_policy.clone(),
+            compression_policy: self.compression_policy,
         })
     }
 
@@ -162,6 +162,19 @@ impl Cache {
     pub fn chunked_backing(&self) -> Option<&ChunkedKvBacking> {
         match &self.storage {
             CacheStorage::Chunked(c) => Some(&c.backing),
+            CacheStorage::Contiguous { .. } => None,
+        }
+    }
+
+    /// The arena slot this cache is bound to, if it is chunked.
+    ///
+    /// The companion to [`Self::chunked_backing`]: the pair `(backing, slot)`
+    /// is what every arena call is keyed on — allocation, sealing, layout — so
+    /// exposing one without the other forces callers to carry the slot
+    /// alongside a cache that already knows it.
+    pub fn chunked_slot(&self) -> Option<usize> {
+        match &self.storage {
+            CacheStorage::Chunked(c) => Some(c.batch_idx),
             CacheStorage::Contiguous { .. } => None,
         }
     }
@@ -290,7 +303,7 @@ impl Cache {
         match &self.storage {
             CacheStorage::Chunked(c) => {
                 let (bpe, n) = c.backing.compression_bpe(batch_idx).unwrap();
-                Some((bpe as f64, n))
+                Some((bpe, n))
             }
             CacheStorage::Contiguous { .. } => None,
         }

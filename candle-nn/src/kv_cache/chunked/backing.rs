@@ -10,7 +10,9 @@ use std::cmp;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use candle::quantized::pinned_staging::{Generation, PinnedStager};
-#[cfg(feature = "cuda")]
+// Core tensor types, needed on every build — the CPU one included. (These were
+// gated on `cuda`, which is why a non-cuda build could not resolve `Device`,
+// `DType`, or the crate's own `Result` anywhere in this file.)
 use candle::{DType, Device, Result};
 
 use super::head_gids::ChunkBands;
@@ -23,10 +25,12 @@ use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
 #[cfg(feature = "cuda")]
 use super::SealedSequence;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, PerHeadEntry};
+// `N_PALETTE` is referenced by the intra-doc links throughout this file and by
+// the CUDA table builders; without `cuda` only the doc links are left, and they
+// still need it in scope to resolve.
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 use crate::kv_cache::{HeadGids, KvFormat, QuantFormat, ResolvedArenaInfo, N_PALETTE};
 use crate::{CHUNK_SIZE, GID_STRIDE};
-
-/// Default fraction of reclaimable arenas that triggers pack-down.
 
 /// Substring embedded in the error returned when a GPU KV arena cannot be
 /// allocated within the VRAM budget (even after a forced compaction). The
@@ -185,6 +189,9 @@ pub(crate) struct BackingInner {
     ///
     /// A `Vec` rather than a set because `ArenaKey` is two small enums and the
     /// ladder has eight classes — membership is a linear scan over single digits.
+    // Drained by `create_deferred_arenas`, which only has work to do when there
+    // are device arenas to create.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) deferred_arenas: Mutex<Vec<super::arena::ArenaKey>>,
 }
 
@@ -264,7 +271,7 @@ impl BackingInner {
         // For each format key, repeatedly call next_tombstone until exhausted.
         let keys = self.pool.format_keys();
         for key in keys {
-            while let Some(arena_idx) = self.pool.next_tombstone(key.clone()) {
+            while let Some(arena_idx) = self.pool.next_tombstone(key) {
                 self.storage.release_arena(arena_idx)?;
                 // Paired with the recycle log in `ChunkGidPool::register_arena`:
                 // a fault correlated between a free here and a re-registration
@@ -1308,8 +1315,10 @@ impl BackingInner {
     ///     different-capacity format between gid mint and table build, so
     ///     `old_chunk_idx × new_stride` walks past the slab (the sanitizer-
     ///     confirmed read at exactly slab end).
+    ///
     /// Failing here converts the corrupt launch into a named, recoverable
     /// error carrying both sides of the mismatch.
+    #[cfg(feature = "cuda")]
     pub fn validate_selection_gids(&self, chunks: &[ChunkBands], label: &str) -> Result<()> {
         let stride = GID_STRIDE;
         let n_kv_head = self.n_kv_head;
@@ -1390,6 +1399,9 @@ impl BackingInner {
     /// a pinned gid — the gid keeps its chunk's arena alive for the window — and
     /// the reservation makes an arena base permanently valid for the process,
     /// so there is no relocation to race with in the first place.
+    // Host-side table builder: the selection kernels consume it under `cuda`,
+    // and `selection_table_tests` pins its row layout with or without one.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub fn per_head_table_host(&self, chunks: &[ChunkBands]) -> Result<Vec<i64>> {
         use crate::kv_cache::arena_table::{PaletteSubEntry, N_PALETTE};
 
@@ -1820,10 +1832,13 @@ impl ChunkedKvBacking {
     /// `dump_sequence_float_chunks`: `[head][palette][token][sub_dim]`.
     ///
     /// R16 block layout (per (head, palette) sub-arena chunk):
-    ///   - sub_head_dim = head_dim / N_PALETTE blocks of 128 bytes each
-    ///   - block[d] = { F16 d[32]  // K values for tokens 0..32 at dim d
-    ///                , u16 q[32]  // F16 Q values for tokens 0..32 at dim d
-    ///                }
+    ///
+    /// ```text
+    /// sub_head_dim = head_dim / N_PALETTE blocks of 128 bytes each
+    /// block[d] = { F16 d[32]  // K values for tokens 0..32 at dim d
+    ///            , u16 q[32]  // F16 Q values for tokens 0..32 at dim d
+    ///            }
+    /// ```
     ///
     /// Chunks where K is not R16 (e.g., a partial unsealed tail in float, or
     /// already-migrated quantized chunks) are skipped.
@@ -2258,7 +2273,7 @@ impl ChunkedKvBacking {
             .map_err(|_| candle::Error::Msg("prov_sign_scratch mutex poisoned".into()))?;
         let grow = guard
             .as_ref()
-            .map_or(true, |s| s.ptrs.len() < n_warps || s.out.len() < out_len);
+            .is_none_or(|s| s.ptrs.len() < n_warps || s.out.len() < out_len);
         if grow {
             let ptrs_cap = guard
                 .as_ref()

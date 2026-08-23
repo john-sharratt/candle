@@ -1,3 +1,9 @@
+// Kernel-launch wrappers mirror their CUDA signatures argument for argument —
+// pointers, extents, strides, scales, stream. Grouping them into structs would
+// put a shape between the call site and the kernel it is a transcription of,
+// which is the opposite of what makes these auditable against the `.cu`.
+#![allow(clippy::too_many_arguments)]
+
 use super::{GgmlDType, Int8Mode, QStorage};
 use crate::backend::{BackendDevice, BackendStorage};
 
@@ -147,7 +153,7 @@ pub fn register_mmap_cuda(mmap: &memmap2::Mmap) -> Option<MmapRegistration> {
         sys::cuMemHostRegister_v2(
             ptr,
             len,
-            (sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_READ_ONLY) as u32,
+            sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_READ_ONLY,
         )
     };
     match register_result.result() {
@@ -365,7 +371,7 @@ impl QCudaStorage {
         device: &CudaDevice,
         origin: LeaseOrigin,
     ) -> Result<Self> {
-        if elem_count % dtype.block_size() != 0 {
+        if !elem_count.is_multiple_of(dtype.block_size()) {
             crate::bail!(
                 "leased quantized view of {elem_count} elements is not a whole number of \
                  {dtype:?} blocks ({})",
@@ -1482,7 +1488,22 @@ pub fn select_kv_format_paged_batched_raw(
 /// `(k_palette_tags, v_palette_tags, k_pal_scale, v_pal_scale,
 ///   k_palette_map, v_palette_map, k_head_amax, v_head_amax,
 ///   k_eff_block_tags, v_eff_block_tags, k_head_tags, v_head_tags, q_rel_out)`
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+///
+/// # Safety
+///
+/// `per_head_table_ptr` and `head_gids_ptr` are raw DEVICE addresses, passed
+/// straight to the kernel without validation. The caller guarantees that both:
+///
+/// * point into live allocations on the same device and stream this call uses,
+///   and stay live for the duration of the launch;
+/// * are laid out as the kernel expects — `PerHeadEntry[n_chunks]` and the
+///   matching `HeadGids` block — since a wrong stride reads neighbouring memory
+///   rather than faulting;
+/// * are correctly aligned for those element types.
+///
+/// Passing a host pointer, a freed allocation, or a buffer from another device
+/// is undefined behaviour and will not necessarily fault.
+#[allow(clippy::type_complexity)]
 pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
     per_head_table_ptr: u64,
     head_gids_ptr: u64,
@@ -2150,7 +2171,6 @@ pub fn select_kv_winners_paged_staged(
 /// # Returns
 /// `(k_sums, v_sums)` where each `Vec<f32>` has length `n_thresholds * 3`:
 ///   `sums[t * 3 + 0]` = ideal_bits,  `[t * 3 + 1]` = head_bits,  `[t * 3 + 2]` = pal4_bits
-#[allow(clippy::too_many_arguments)]
 /// Like [`select_and_summarize_kv_winners_paged_staged`] but accepts pre-allocated
 /// scratch buffers to eliminate per-call device allocation overhead, and performs
 /// an **asynchronous** DtoH copy on a dedicated `dtoh_stream` into a caller-supplied
@@ -2158,21 +2178,20 @@ pub fn select_kv_winners_paged_staged(
 ///
 /// * `k_winners_scratch` — device buffer of at least `n_k_thresholds × n_cells` bytes.
 /// * `v_winners_scratch` — device buffer of at least `n_v_thresholds × n_cells` bytes.
-/// * `kv_sums`           — device buffer of exactly `(n_k_thresholds + n_v_thresholds) × 3`
-///                         `f32` values. **Must be zeroed by the caller** (the kernel uses
-///                         `atomicAdd`). The K sums occupy the first `n_k_thresholds × 3`
-///                         elements and the V sums the remainder.
-/// * `dtoh_stream`       — secondary stream used exclusively for the DtoH transfer.
-///                         The function records an event on the compute stream, makes
-///                         `dtoh_stream` GPU-wait on it, then enqueues the DMA.
-/// * `pinned_dst`        — pre-allocated pinned host slice of length
-///                         `(n_k_thresholds + n_v_thresholds) × 3`.  The DMA is enqueued
-///                         but **not waited on** — the caller must `synchronize()` the
-///                         returned `CudaEvent` before reading the data.
+/// * `kv_sums` — device buffer of exactly `(n_k_thresholds + n_v_thresholds) × 3`
+///   `f32` values. **Must be zeroed by the caller** (the kernel uses
+///   `atomicAdd`). The K sums occupy the first `n_k_thresholds × 3`
+///   elements and the V sums the remainder.
+/// * `dtoh_stream` — secondary stream used exclusively for the DtoH transfer.
+///   The function records an event on the compute stream, makes
+///   `dtoh_stream` GPU-wait on it, then enqueues the DMA.
+/// * `pinned_dst` — pre-allocated pinned host slice of length
+///   `(n_k_thresholds + n_v_thresholds) × 3`.  The DMA is enqueued
+///   but **not waited on** — the caller must `synchronize()` the
+///   returned `CudaEvent` before reading the data.
 ///
 /// Returns a `CudaEvent` recorded on `dtoh_stream` after the DMA.  Call
 /// `event.synchronize()` to block until the data is available in `pinned_dst`.
-#[allow(clippy::too_many_arguments)]
 pub fn select_and_summarize_kv_winners_paged_staged(
     k_errors: &CudaSlice<f32>,
     v_errors: &CudaSlice<f32>,
@@ -4189,6 +4208,17 @@ pub fn repack_to_host(
     // Already the target format (a prepared / pre-repacked weight, e.g. MXFP4_KO on disk):
     // nothing to do — hand the bytes straight through so the staging path stays uniform and
     // pays no reorder. This is what lets the engine load a pre-KO GGUF with no runtime repack.
+    //
+    // **This must stay unconditional.** The dtype pair says what the bytes ARE, not whether they
+    // still need work: `(X, X)` means "the source is already in the target format". Narrowing
+    // this to `is_ko()` targets made the loader repack ALREADY-REPACKED weights a second time —
+    // per expert, that is an `alloc` + `alloc_zeros` + H2D + a kernel with an internal
+    // `cudaDeviceSynchronize` + D2H into a fresh host `Vec`, ~11,008 times. Measured: 157 GB of
+    // private commit on a 189 GB box, the GPU at 6%, and the model gate never finishing.
+    //
+    // A caller holding RAW GGML that wants the K/128 layout must say so by calling
+    // [`repack_gemx_to_host`] directly — the source's provenance (raw vs already-prepared) is
+    // the caller's knowledge and cannot be recovered from `(dtype, target_dtype)`.
     if dtype == target_dtype {
         return Ok(ggml_bytes.to_vec());
     }
@@ -4218,6 +4248,28 @@ pub fn repack_to_host(
         return Ok(host);
     }
 
+    repack_gemx_to_host(device, ggml_bytes, nrows, ncols, dtype)
+}
+
+/// Repack **raw GGML bytes** into the K/128 GEMX layout, keeping the dtype.
+///
+/// Split out of [`repack_to_host`] because the two cannot be distinguished by their arguments:
+/// a GEMX repack keeps the dtype and changes only the byte layout, so it and "the source is
+/// already in the target format" both present as `(X, X)`. Which one is meant depends on the
+/// **source's provenance** — raw out of a GGUF, or already prepared on disk — which only the
+/// caller knows. [`repack_to_host`] therefore treats `(X, X)` as already-prepared (the loader's
+/// case, where repacking twice is both wrong and ruinously expensive), and a caller holding raw
+/// bytes calls this instead.
+///
+/// Not performance-critical: one-time, one weight per call, and the underlying kernel carries an
+/// internal device sync. Do not use it to convert a whole expert set at load time.
+pub fn repack_gemx_to_host(
+    device: &CudaDevice,
+    ggml_bytes: &[u8],
+    nrows: usize,
+    ncols: usize,
+    dtype: GgmlDType,
+) -> Result<Vec<u8>> {
     let qtype = dtype_to_qtype(dtype)? as i32;
 
     let supported = unsafe { is_gemx_supported(qtype) };
@@ -4273,7 +4325,7 @@ pub fn repack_to_host(
 pub fn repacked_size_bytes(nrows: usize, ncols: usize, dtype: GgmlDType) -> Result<usize> {
     // KO target: per-128 chunk bytes (the format the expert pinned pool caches for int8 experts).
     if dtype.is_ko() {
-        if nrows % 8 != 0 || ncols % 128 != 0 {
+        if !nrows.is_multiple_of(8) || !ncols.is_multiple_of(128) {
             crate::bail!("repacked_size_bytes(KO): nrows={nrows} %8, ncols={ncols} %128 required");
         }
         return Ok((nrows / 8) * (ncols / 128) * crate::quantized::ko_quant::ko_chunk_bytes(dtype));
@@ -4328,7 +4380,7 @@ fn grouped_matmul_gemx_impl<'w>(
     }
     // The grouped kernel writes full 32-row (N_TILE) blocks with no partial-row
     // guard, so nrows must be a multiple of 32 (all MoE expert dims are).
-    if nrows % 32 != 0 {
+    if !nrows.is_multiple_of(32) {
         crate::bail!("grouped_matmul_gemx: nrows={nrows} must be a multiple of 32");
     }
     if expert_offsets.len() != num_experts + 1 {
@@ -5335,7 +5387,7 @@ pub fn quantize_ko_weights(
     dtype: GgmlDType,
     device: &CudaDevice,
 ) -> Result<CudaSlice<u8>> {
-    if nrows % 8 != 0 || ncols % 128 != 0 || data.len() != nrows * ncols {
+    if !nrows.is_multiple_of(8) || !ncols.is_multiple_of(128) || data.len() != nrows * ncols {
         crate::bail!(
             "quantize_ko_weights: bad shape nrows={nrows} ncols={ncols} len={}",
             data.len()
@@ -5469,7 +5521,7 @@ fn grouped_matmul_gemx_q8a128<'w>(
     let active: usize = (0..num_experts)
         .filter(|&e| expert_offsets[e + 1] > expert_offsets[e])
         .count();
-    let avg_rows = if active == 0 { 0 } else { total_batch / active };
+    let avg_rows = total_batch.checked_div(active).unwrap_or(0);
     // Mode choice is BENCH-derived (`moe_layer_gemm_bench`, real shapes:
     // 256 experts, gate/up [2048,7168] / down [7168,2048] MXFP4_KO): at
     // ~91 rows/expert Bm-128 wins (29.3 vs 36.3 ms), but at ~192 rows/expert
@@ -5525,10 +5577,10 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
     if num_experts == 0 {
         crate::bail!("grouped_matmul_gemx_q8a128: no experts provided");
     }
-    if nrows % 32 != 0 {
+    if !nrows.is_multiple_of(32) {
         crate::bail!("grouped_matmul_gemx_q8a128: nrows={nrows} must be a multiple of 32");
     }
-    if ncols % 128 != 0 {
+    if !ncols.is_multiple_of(128) {
         crate::bail!("grouped_matmul_gemx_q8a128: ncols={ncols} must be a multiple of 128");
     }
     if !matches!(n_sub, 2 | 4 | 8) || (n_sub > 2 && !weight_dtype.is_ko()) {
@@ -5725,10 +5777,10 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
     ensure_qmatmul_pairing(&DynamicTensor::Int8(op), weight_dtype)?;
-    if nrows % 32 != 0 {
+    if !nrows.is_multiple_of(32) {
         crate::bail!("grouped_qmatmul_dev_q8a128: nrows={nrows} must be a multiple of 32");
     }
-    if op.cols % 128 != 0 {
+    if !op.cols.is_multiple_of(128) {
         crate::bail!(
             "grouped_qmatmul_dev_q8a128: ncols={} must be a multiple of 128",
             op.cols
@@ -5840,7 +5892,7 @@ pub(crate) fn qkv_segmented_matmul<'w>(
     out_dtype: crate::DType,
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
-    if op.cols % 128 != 0 {
+    if !op.cols.is_multiple_of(128) {
         crate::bail!(
             "qkv_segmented_matmul: K={} must be a multiple of 128",
             op.cols
@@ -5868,7 +5920,7 @@ pub(crate) fn qkv_segmented_matmul<'w>(
         bytes.extend_from_slice(&tile_start.to_le_bytes());
         bytes.extend_from_slice(&(n as i32).to_le_bytes());
         bytes.extend_from_slice(&col_off.to_le_bytes());
-        tile_start += ((n + 31) / 32) as i32;
+        tile_start += n.div_ceil(32) as i32;
         col_off += n as i32;
         n_total += n;
     }
@@ -5922,10 +5974,10 @@ pub(crate) fn q8a128_dense_matmul<'w>(
     out_dtype: crate::DType,
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
-    if nrows % 32 != 0 {
+    if !nrows.is_multiple_of(32) {
         crate::bail!("q8a128_dense_matmul: nrows={nrows} must be a multiple of 32");
     }
-    if op.cols % 128 != 0 {
+    if !op.cols.is_multiple_of(128) {
         crate::bail!(
             "q8a128_dense_matmul: K={} must be a multiple of 128",
             op.cols
@@ -6231,7 +6283,7 @@ pub fn fused_moe_gather_q8a128<'w>(
     origin: Backing,
 ) -> Result<Q8a128Operand<'w>> {
     let hidden = xs_q8.cols;
-    if hidden % 1024 != 0 {
+    if !hidden.is_multiple_of(1024) {
         crate::bail!(
             "fused_moe_gather_q8a128: hidden={hidden} must be a multiple of 1024 (token-contiguous \
              q8a1024)"

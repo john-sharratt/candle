@@ -49,7 +49,7 @@ impl SampledSelectionBenchmarkResult {
         }
 
         let mut entries = self.entries.clone();
-        entries.sort_by(|a, b| a.first_seen.cmp(&b.first_seen));
+        entries.sort_by_key(|e| e.first_seen);
         let total_ms_by_name = entries
             .iter()
             .map(|entry| (entry.name, entry.total.as_secs_f64() * 1000.0))

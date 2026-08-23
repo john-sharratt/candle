@@ -757,14 +757,15 @@ impl ModelBuilder {
             }
             ModelArch::DeepSeekV4 => {
                 use candle::quantized::Int8Mode;
-                use candle_transformers::models::deepseek4::{DeepSeekBatched, Dsv4Engine};
+                use candle_transformers::models::deepseek4::DEEPSEEK_V4;
+                use candle_transformers::models::latent_moe::{BatchedEngine, Engine};
                 // Per-layer progress not yet wired for this arch.
                 let _ = progress;
                 let _ = max_seq; // window/corpus budgets are model-derived
-                let engine = Dsv4Engine::load(model_path, device, Int8Mode::Performance)
+                let engine = Engine::load(model_path, &DEEPSEEK_V4, device, Int8Mode::Performance)
                     .map_err(ConversationError::Model)?;
                 Ok(Box::new(
-                    DeepSeekBatched::new(engine).map_err(ConversationError::Model)?,
+                    BatchedEngine::new(engine).map_err(ConversationError::Model)?,
                 ))
             }
         }

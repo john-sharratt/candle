@@ -3839,9 +3839,7 @@ impl Substrate {
             // summaries into garbage. Restored turns are NOT pushed onto the
             // pending queue: that captures only fresh turns the live summariser
             // hasn't seen yet.
-            tl.tree_meta
-                .entry(idx)
-                .or_insert_with(TreeNodeMeta::default);
+            tl.tree_meta.entry(idx).or_default();
         }
         *self.timeline_token_totals.entry(timeline).or_default() += token_count;
         if let Some(cold_seqs) = cold {
@@ -4120,7 +4118,7 @@ impl Substrate {
             (d.timeline_id == timeline.raw()
                 && !self.is_turn_tombstoned(timeline, d.turn_index)
                 && d.tags.iter().any(|t| t == tag))
-            .then(|| TurnIndex(d.turn_index))
+            .then_some(TurnIndex(d.turn_index))
         })
     }
 
@@ -4426,7 +4424,7 @@ impl Substrate {
                 hi = hi.max(kv.end() as usize);
             }
         }
-        (hi > lo && lo != usize::MAX).then(|| lo..hi)
+        (hi > lo && lo != usize::MAX).then_some(lo..hi)
     }
 
     // ── Section accessors ────────────────────────────────────────────────────

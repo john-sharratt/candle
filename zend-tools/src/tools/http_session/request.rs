@@ -170,16 +170,12 @@ impl Tool for HttpSessionRequest {
             || content_type.contains("+json")
             || content_type.contains("+xml");
 
-        let (body, body_b64) = if is_text_type {
-            match std::str::from_utf8(body_slice) {
-                Ok(s) => (Some(s.to_string()), None),
-                Err(_) => (None, Some(base64_encode(body_slice))),
-            }
-        } else {
-            match std::str::from_utf8(body_slice) {
-                Ok(s) => (Some(s.to_string()), None),
-                Err(_) => (None, Some(base64_encode(body_slice))),
-            }
+        let (body, body_b64) = match std::str::from_utf8(body_slice) {
+            Ok(s) if is_text_type => (Some(s.to_string()), None),
+            // Either the declared type is binary or the bytes aren't UTF-8. A
+            // binary body that happens to decode as UTF-8 is still binary, so
+            // `is_text_type` decides, not the decode.
+            _ => (None, Some(base64_encode(body_slice))),
         };
 
         Ok(ReqResponse {
@@ -198,7 +194,7 @@ impl Tool for HttpSessionRequest {
 fn base64_encode(data: &[u8]) -> String {
     use std::fmt::Write;
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
         let b1 = if chunk.len() > 1 {

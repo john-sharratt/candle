@@ -23,10 +23,9 @@ fn main() -> anyhow::Result<()> {
                 }
                 SystemPromptItem::Collection(c) => {
                     println!(
-                        "-- collection {} ({} members) in {} --",
+                        "-- collection {} ({} members) in system_prompt --",
                         c.name,
-                        c.sections.len(),
-                        "system_prompt"
+                        c.sections.len()
                     );
                     for s in &c.sections {
                         println!("{:?}\tsystem_prompt\tcoll\t{}", s.id, s.name);

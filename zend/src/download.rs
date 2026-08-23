@@ -192,8 +192,7 @@ async fn fetch(
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
 
-        if total > 0 {
-            let pct = downloaded * 100 / total;
+        if let Some(pct) = (downloaded * 100).checked_div(total) {
             if pct >= last_pct + 5 {
                 last_pct = pct;
                 let msg = format!(

@@ -152,6 +152,11 @@ impl GpuBuf {
         self.len
     }
 
+    /// A zero-length staging buffer — nothing was reserved.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Wrap a pre-existing device pointer owned by something else (e.g. a `Tensor`).
     /// The caller must ensure the owning allocation outlives this `GpuBuf`.
     pub fn from_borrowed(dev_ptr: u64, len: usize) -> Self {
@@ -273,6 +278,11 @@ impl PinnedBuf {
             ptr: host_ptr as *mut u8,
             len,
         })
+    }
+
+    /// A zero-length buffer — nothing was reserved.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn len(&self) -> usize {

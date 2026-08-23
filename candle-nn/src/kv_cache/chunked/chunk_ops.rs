@@ -14,20 +14,26 @@
 use super::arena::ArenaStorageState;
 #[cfg(feature = "cuda")]
 use super::bump_arena;
+#[cfg(feature = "cuda")]
 use super::bump_arena::NOT_A_WAVE;
 use super::gid_pool::ChunkGid;
 use super::head_gids::{HeadGids, GIDS_PER_HEAD};
 use super::meta_pool::ChunkRecordSrc;
+#[cfg(feature = "cuda")]
 use super::size_class::payload_bytes_for_tag;
 use super::types::{SealedChunk, SealedSequence};
 use super::{Arena, ArenaKey, ChunkedKvBacking};
 use super::{CHUNK_SIZE, GID_STRIDE};
 // Import from kv_cache module (grandparent)
-use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, N_PALETTE};
+#[cfg(feature = "cuda")]
+use crate::kv_cache::arena_table::ArenaFormatTag;
+use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
 use crate::kv_cache::KvFormat;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::SELECT_FMT_F16;
-use candle::{Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle::Device;
+use candle::{Result, Tensor};
 
 /// The arena keys a run of per-band formats allocates from.
 ///
@@ -92,6 +98,9 @@ pub const MIGRATION_STAGING_CAP_BYTES: usize = 64 * 1024 * 1024;
 /// Shared by both staging sites so the two cannot drift, and pure so the
 /// boundary arithmetic is testable without a GPU
 /// ([`staging_groups_respect_the_cap`](tests)).
+// Without `cuda` the migration paths that call this are compiled out, so the
+// test above is its only consumer — which is the point of keeping it pure.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(super) fn staging_groups(lens: &[usize], cap: usize) -> Vec<(usize, usize, usize)> {
     let mut groups = Vec::new();
     let mut i = 0usize;
@@ -1122,7 +1131,7 @@ impl ChunkedKvBacking {
                          while its chunk is still referenced — arena freed with live KV"
                     )));
                 }
-                let src_key = src_keys[&raw].clone();
+                let src_key = src_keys[&raw];
                 let cpu_key = ArenaKey {
                     class: src_key.class,
                     location: ArenaLocation::Cpu,
@@ -2215,6 +2224,7 @@ impl ChunkedKvBacking {
 mod tests {
     use super::*;
     use crate::kv_cache::chunked::ChunkedKvBacking;
+    #[cfg(feature = "cuda")]
     use crate::kv_cache::QuantFormat;
 
     /// The staging batcher must never hand a group larger than the persistence
@@ -2504,7 +2514,7 @@ mod tests {
         // Token t's whole row is the scalar t (bf16-exact for t < 256), so a
         // restored row can be checked against its ABSOLUTE position.
         let vals: Vec<f32> = (0..n)
-            .flat_map(|t| std::iter::repeat(t as f32).take(head_dim))
+            .flat_map(|t| std::iter::repeat_n(t as f32, head_dim))
             .collect();
         let k = Tensor::from_vec(vals, (1, n_kv_head, n, head_dim), &Device::Cpu)
             .unwrap()

@@ -185,6 +185,8 @@ fn dial_selection(
 
 // ── Streaming path ────────────────────────────────────────────────────────────
 
+// The submit parameter list — see `ZendSession::submit`.
+#[allow(clippy::too_many_arguments)]
 async fn stream_sse(
     session: Arc<ZendSession>,
     messages: Vec<ChatMessage>,
@@ -296,6 +298,8 @@ async fn stream_sse(
 
 // ── Non-streaming path ────────────────────────────────────────────────────────
 
+// The submit parameter list — see `ZendSession::submit`.
+#[allow(clippy::too_many_arguments)]
 async fn collect_completion(
     session: Arc<ZendSession>,
     messages: Vec<ChatMessage>,

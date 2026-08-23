@@ -44,6 +44,9 @@ pub mod scatter_op;
 pub mod moe_bucketize;
 pub mod moe_scatter;
 
+// Fused MoE router epilogue: score → +bias → top-k → normalize in one launch
+pub mod router_topk;
+
 // R16 KV gather: single-kernel replacement for per-chunk memcpy_dtov
 pub mod gather_r16_kv;
 
@@ -70,3 +73,25 @@ pub mod sinkhorn;
 // Fused compressed-corpus hot-cache gather: assembles a decode wave's selected
 // gallery rows into one contiguous block, replacing per-region index_select+cat
 pub mod corpus_gather;
+
+// Fused compressor group pool: per-channel softmax over the pooling axis plus
+// the weighted sum, replacing candle's seven-launch unfused softmax chain on
+// every compressor emit (prefill fleet, decode wave, reference and seal alike)
+pub mod compressor_pool;
+
+// Fused Indexer score reduction: relu + per-head weight + sum over heads + the
+// padding mask, for both batched two-stage selectors (decode and prefill)
+pub mod indexer_score;
+
+// Compressed-index expansion: each slot's {offset, count} broadcast into its row
+// of the decode path's comp_idx matrix, in one descriptor-driven launch
+pub mod comp_idx;
+
+// Batched row scatter: many (source run → destination offset) copies in one
+// launch, driven by a descriptor table — the corpus-gallery append across every
+// session of a wave
+pub mod rows_scatter;
+
+// NVTX3 range shim, so an nsys trace names the pipeline span that launched each
+// kernel (header-only NVTX3; nothing to link against)
+pub mod nvtx;

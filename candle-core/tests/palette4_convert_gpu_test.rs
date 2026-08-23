@@ -4,6 +4,18 @@
 //! memory for arenas, fill src arenas with known data, invoke the kernel
 //! via FFI, and verify the output matches the CPU reference.
 #![cfg(feature = "cuda")]
+// The loops here walk `(dim, chunk, token)` COORDINATES of a flat device buffer
+// and compute byte offsets from all three at once — e.g.
+// `(c * CHUNK_SIZE * num_dims + t * num_dims + ld) * 2`. The indices are the
+// subject, not an artifact of iterating a slice, so `iter().enumerate()` over a
+// triple nest would obscure the very layout arithmetic these tests exist to
+// pin down.
+#![allow(clippy::needless_range_loop)]
+// The kernel-pass helpers mirror the FFI signature argument for argument, for the
+// same reason `quantized::cuda` does.
+#![allow(clippy::too_many_arguments)]
+// Pointer widths are spelled out to match the kernel ABI.
+#![allow(clippy::unnecessary_cast)]
 
 use candle_core::quantized::pinned_staging::PinnedStager;
 use candle_core::quantized::GgmlDType;
@@ -939,8 +951,8 @@ fn run_kernel_pass(
         Device::Cuda(d) => d,
         _ => unreachable!("run_kernel_pass requires a CUDA device"),
     };
-    let src_ptrs: [u64; N_PAL] = std::array::from_fn(|p| src_arenas[p].device_ptr(stream).0 as u64);
-    let dst_ptrs: [u64; N_PAL] = std::array::from_fn(|p| dst_arenas[p].device_ptr(stream).0 as u64);
+    let src_ptrs: [u64; N_PAL] = std::array::from_fn(|p| src_arenas[p].device_ptr(stream).0);
+    let dst_ptrs: [u64; N_PAL] = std::array::from_fn(|p| dst_arenas[p].device_ptr(stream).0);
     let sg: [GgmlDType; N_PAL] = std::array::from_fn(|i| fmt_code_to_ggml_dtype(src_fmts[i]));
     let dg: [GgmlDType; N_PAL] = std::array::from_fn(|i| fmt_code_to_ggml_dtype(dst_fmts[i]));
     let desc = PalHeadDesc {
@@ -1423,6 +1435,9 @@ fn palette4_convert_f16_to_r16_single_fmt_sweep_diag() -> Result<()> {
 }
 
 /// Two-pass roundtrip: src_fmt arenas → mid_fmt arenas → R16 arenas.
+/// R16 sweep output, indexed `[fmt][pal][dim][chunk][token]`.
+type SweepR16 = Vec<Vec<Vec<Vec<Vec<f32>>>>>;
+
 /// Returns R16 output values [pal][dim][chunk][token].
 fn multi_format_sweep(
     cuda_dev: &candle_core::CudaDevice,
@@ -1431,7 +1446,7 @@ fn multi_format_sweep(
     // Shared src arenas [N_PAL]: same data reused for all format heads (src is read-only).
     src_arenas_cpu: &[Vec<u8>],
     num_chunks: usize,
-) -> Result<Vec<Vec<Vec<Vec<Vec<f32>>>>>> {
+) -> Result<SweepR16> {
     // Returns [n_fmts][N_PAL][dim][chunk][token] R16 values.
     // Two calls to quantize_palette4_convert_buffered: each with N_FMTS heads.
     let n_fmts = ALL_QUANT_FMTS.len();
@@ -1469,10 +1484,10 @@ fn multi_format_sweep(
 
     // Compute per-format ptr arrays.
     let mid_ptrs: Vec<[u64; N_PAL]> = (0..n_fmts)
-        .map(|fi| std::array::from_fn(|p| mid_gpu[fi][p].device_ptr(&stream).0 as u64))
+        .map(|fi| std::array::from_fn(|p| mid_gpu[fi][p].device_ptr(&stream).0))
         .collect();
     let out_ptrs: Vec<[u64; N_PAL]> = (0..n_fmts)
-        .map(|fi| std::array::from_fn(|p| out_gpu[fi][p].device_ptr(&stream).0 as u64))
+        .map(|fi| std::array::from_fn(|p| out_gpu[fi][p].device_ptr(&stream).0))
         .collect();
 
     // Build one PalHeadDesc per format for each pass then issue 2 batched calls.
@@ -3018,12 +3033,11 @@ fn palette4_convert_throughput_bench() -> Result<()> {
     let src_r16_arenas: Vec<_> = (0..total_heads)
         .flat_map(|job| {
             (0..N_PAL).map(move |p| {
-                let cpu = fill_r16_arena(
+                fill_r16_arena(
                     PAL_DIM,
                     num_chunks,
                     10000.0 + (job * N_PAL + p) as f32 * 100.0,
-                );
-                cpu
+                )
             })
         })
         .collect();

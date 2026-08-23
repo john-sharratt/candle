@@ -4,6 +4,13 @@
 //! repeat_last_n windowing, cross_turn_penalty, and their interactions.
 
 #![cfg(feature = "cuda")]
+// Test code: loop indices are vocab coordinates; `x + 0` / `x * 1` forms are
+// kept where they spell out the penalty formula being checked.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::identity_op,
+    clippy::doc_lazy_continuation
+)]
 
 #[allow(dead_code)]
 mod sampling_harness;

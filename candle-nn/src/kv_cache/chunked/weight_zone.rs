@@ -920,9 +920,7 @@ mod tests {
             }
             // Full: evict the coldest resident, which is the policy's job and is
             // modelled here as "any cold tenant".
-            let victim = (0..z.capacity())
-                .filter(|&i| tenant[i].is_some_and(|t| t >= HOT))
-                .next_back();
+            let victim = (0..z.capacity()).rfind(|&i| tenant[i].is_some_and(|t| t >= HOT));
             if let Some(v) = victim {
                 tenant[v] = None;
                 z.release(v);

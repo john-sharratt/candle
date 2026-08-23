@@ -3,6 +3,10 @@
 //! These are CUDA-required tests.  Run with:
 //!   cargo test -p candle-core --features cuda --test pinned_staging_test --release -- --nocapture
 
+// Test code: alignment checks are written as the `% n == 0` the staging
+// contract is stated in.
+#![allow(clippy::manual_is_multiple_of)]
+
 #[cfg(feature = "cuda")]
 mod tests {
     use candle_core::backend::BackendDevice;

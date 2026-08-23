@@ -14,6 +14,24 @@
 //! cargo run -p zend --example calibrate_alignment --release -- .
 //! ```
 
+// Offline calibration harness. The numerical passes walk layer × head × dim
+// index grids to mirror the shapes in the write-up, and several report structs
+// exist only so a stage can be re-run in isolation — so the index loops and the
+// unconstructed variants are deliberate here, not leftovers.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::unnecessary_sort_by,
+    clippy::useless_vec,
+    clippy::for_kv_map,
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::doc_lazy_continuation,
+    clippy::print_literal,
+    clippy::repeat_vec_with_capacity,
+    dead_code
+)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

@@ -4714,8 +4714,8 @@ impl BackendStorage for CudaStorage {
                 out_backing = resolved;
                 // Check 16-byte alignment: bf16 is 2 bytes, so offset must be multiple of 8 elements
                 // CUDA malloc guarantees 256-byte aligned base, output is fresh allocation
-                let known_aligned =
-                    (lhs_l.start_offset() * 2) % 16 == 0 && (rhs_l.start_offset() * 2) % 16 == 0;
+                let known_aligned = (lhs_l.start_offset() * 2).is_multiple_of(16)
+                    && (rhs_l.start_offset() * 2).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_bf16(
                         &self.device.blas,
@@ -4737,8 +4737,8 @@ impl BackendStorage for CudaStorage {
                     unsafe { alloc_inheriting::<f16>(dev, elem_count, inherit)? };
                 out_backing = resolved;
                 // Check 16-byte alignment: f16 is 2 bytes, so offset must be multiple of 8 elements
-                let known_aligned =
-                    (lhs_l.start_offset() * 2) % 16 == 0 && (rhs_l.start_offset() * 2) % 16 == 0;
+                let known_aligned = (lhs_l.start_offset() * 2).is_multiple_of(16)
+                    && (rhs_l.start_offset() * 2).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_f16(
                         &self.device.blas,
@@ -4760,8 +4760,8 @@ impl BackendStorage for CudaStorage {
                     unsafe { alloc_inheriting::<f32>(dev, elem_count, inherit)? };
                 out_backing = resolved;
                 // Check 16-byte alignment: f32 is 4 bytes, so offset must be multiple of 4 elements
-                let known_aligned =
-                    (lhs_l.start_offset() * 4) % 16 == 0 && (rhs_l.start_offset() * 4) % 16 == 0;
+                let known_aligned = (lhs_l.start_offset() * 4).is_multiple_of(16)
+                    && (rhs_l.start_offset() * 4).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_f32(
                         &self.device.blas,
@@ -5123,9 +5123,9 @@ unsafe fn gemm_strided_batched_f32(
     // CUDA guarantees 256-byte alignment, so skip the runtime pointer checks.
     // Slow path: check 16-byte alignment at runtime for sliced/narrowed tensors.
     let all_aligned = known_aligned || {
-        let a_aligned = (a as usize) % 16 == 0;
-        let b_aligned = (b as usize) % 16 == 0;
-        let c_aligned = (c as usize) % 16 == 0;
+        let a_aligned = (a as usize).is_multiple_of(16);
+        let b_aligned = (b as usize).is_multiple_of(16);
+        let c_aligned = (c as usize).is_multiple_of(16);
         a_aligned && b_aligned && c_aligned
     };
 
@@ -5208,9 +5208,9 @@ unsafe fn gemm_strided_batched_f16(
     // CUDA guarantees 256-byte alignment, so skip the runtime pointer checks.
     // Slow path: check 16-byte alignment at runtime for sliced/narrowed tensors.
     let all_aligned = known_aligned || {
-        let a_aligned = (a as usize) % 16 == 0;
-        let b_aligned = (b as usize) % 16 == 0;
-        let c_aligned = (c as usize) % 16 == 0;
+        let a_aligned = (a as usize).is_multiple_of(16);
+        let b_aligned = (b as usize).is_multiple_of(16);
+        let c_aligned = (c as usize).is_multiple_of(16);
         a_aligned && b_aligned && c_aligned
     };
 
@@ -5286,9 +5286,9 @@ unsafe fn gemm_strided_batched_bf16(
     // CUDA guarantees 256-byte alignment, so skip the runtime pointer checks.
     // Slow path: check 16-byte alignment at runtime for sliced/narrowed tensors.
     let all_aligned = known_aligned || {
-        let a_aligned = (a as usize) % 16 == 0;
-        let b_aligned = (b as usize) % 16 == 0;
-        let c_aligned = (c as usize) % 16 == 0;
+        let a_aligned = (a as usize).is_multiple_of(16);
+        let b_aligned = (b as usize).is_multiple_of(16);
+        let c_aligned = (c as usize).is_multiple_of(16);
         a_aligned && b_aligned && c_aligned
     };
 

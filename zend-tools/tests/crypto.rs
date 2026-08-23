@@ -1,12 +1,6 @@
 mod harness;
 
 use serde_json::json;
-use zend_tools::ToolContext;
-
-fn ctx() -> ToolContext {
-    ToolContext::new()
-}
-
 const KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const NONCE_HEX: &str = "000000000000000000000000";
 
@@ -171,7 +165,7 @@ fn signature_sign_verify_ed25519() {
         MC4CAQAwBQYDK2VdBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
         -----END PRIVATE KEY-----\n";
 
-    let saved = harness::expect_success(harness::invoke_with_ctx(
+    harness::expect_success(harness::invoke_with_ctx(
         "credential_save",
         json!({
             "name": "ed25519-test",

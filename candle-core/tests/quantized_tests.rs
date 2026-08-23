@@ -1,3 +1,7 @@
+// Test code: loop indices are block/element coordinates in the expected-value
+// formula for each quantization format.
+#![allow(clippy::needless_range_loop)]
+
 use candle_core::{
     bail,
     quantized::{self, GgmlDType},
@@ -95,6 +99,16 @@ fn test_matmul_mm() -> Result<()> {
 }
 
 fn quantized_matmul(device: &Device) -> Result<()> {
+    // Its device matmuls READ `FORCE_DMMV`, so it takes the lock exactly like
+    // `qmm_batch` does. Without it, the dmmv tests flip the flag from another
+    // thread mid-run and this picks the dmmv path at a shape it was not built
+    // for — "unexpected y size 192, ncols 64 4", reproducible only under the
+    // full suite and never in isolation.
+    let _dmmv_guard = if device.is_cuda() {
+        Some(crate::DMMV_LOCK.lock().unwrap())
+    } else {
+        None
+    };
     let (m, k, n) = (3, 64, 4);
     let lhs_s = (0..(m * k)).map(|v| v as f32).collect::<Vec<_>>();
     let lhs = Tensor::from_slice(&lhs_s, (m, k), device)?;
@@ -161,6 +175,12 @@ fn quantized_matmul(device: &Device) -> Result<()> {
 }
 
 fn quantized_matmul_neg(device: &Device) -> Result<()> {
+    // Same `FORCE_DMMV` exposure as `quantized_matmul` — same lock.
+    let _dmmv_guard = if device.is_cuda() {
+        Some(crate::DMMV_LOCK.lock().unwrap())
+    } else {
+        None
+    };
     let (m, k, n) = (3, 64, 4);
     let lhs_s = (0..(m * k))
         .map(|v| v as f32 - (m * k) as f32 / 2.0)
@@ -1082,7 +1102,9 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         // AWQ types - these use specialized matmul kernels (GEMX)
         GgmlDType::QAWQ | GgmlDType::QAWQ_G64 => 0.001,
 
-        // Candle-specific types not in GGML matmul benchmarks
+        // Candle-specific types not in GGML matmul benchmarks. The KO variants
+        // and MXFP4 run through their own repacked/grouped kernels, gated by
+        // their own bit-exactness tests rather than this error table.
         GgmlDType::Q4_KS
         | GgmlDType::Q8_KS
         | GgmlDType::Q2_0

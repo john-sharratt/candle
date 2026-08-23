@@ -31,13 +31,9 @@ fn cast_f32_to_f32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert!(approx_eq(
-                result[i][j] as f64,
-                data[i * 10 + j] as f64,
-                1e-5
-            ));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert!(approx_eq(v as f64, data[i * 10 + j] as f64, 1e-5));
         }
     }
     Ok(())
@@ -48,9 +44,9 @@ fn cast_f32_to_f64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert!(approx_eq(result[i][j], data[i * 10 + j] as f64, 1e-5));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert!(approx_eq(v, data[i * 10 + j] as f64, 1e-5));
         }
     }
     Ok(())
@@ -61,10 +57,10 @@ fn cast_f32_to_f16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F16)?;
     let result = t2.to_vec2::<f16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = f16::from_f32(data[i * 10 + j]);
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -75,10 +71,10 @@ fn cast_f32_to_bf16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::BF16)?;
     let result = t2.to_vec2::<bf16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = bf16::from_f32(data[i * 10 + j]);
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -89,9 +85,9 @@ fn cast_f32_to_u8(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::U8)?;
     let result = t2.to_vec2::<u8>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u8);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u8);
         }
     }
     Ok(())
@@ -102,9 +98,9 @@ fn cast_f32_to_u32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::U32)?;
     let result = t2.to_vec2::<u32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u32);
         }
     }
     Ok(())
@@ -115,9 +111,9 @@ fn cast_f32_to_i64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::I64)?;
     let result = t2.to_vec2::<i64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as i64);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as i64);
         }
     }
     Ok(())
@@ -131,10 +127,10 @@ fn cast_f32_to_f8e4m3(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (8, 8), device)?;
     let t2 = t.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..8 {
-        for j in 0..8 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = F8E4M3::from_f32(data[i * 8 + j]);
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -152,9 +148,9 @@ fn cast_f64_to_f32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert!(approx_eq(result[i][j] as f64, data[i * 10 + j], 1e-5));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert!(approx_eq(v as f64, data[i * 10 + j], 1e-5));
         }
     }
     Ok(())
@@ -168,9 +164,9 @@ fn cast_f64_to_f64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert!(approx_eq(result[i][j], data[i * 10 + j], 1e-10));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert!(approx_eq(v, data[i * 10 + j], 1e-10));
         }
     }
     Ok(())
@@ -184,10 +180,10 @@ fn cast_f64_to_f16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F16)?;
     let result = t2.to_vec2::<f16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = f16::from_f64(data[i * 10 + j]);
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -201,10 +197,10 @@ fn cast_f64_to_bf16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::BF16)?;
     let result = t2.to_vec2::<bf16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = bf16::from_f64(data[i * 10 + j]);
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -218,9 +214,9 @@ fn cast_f64_to_u8(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::U8)?;
     let result = t2.to_vec2::<u8>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u8);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u8);
         }
     }
     Ok(())
@@ -234,9 +230,9 @@ fn cast_f64_to_u32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::U32)?;
     let result = t2.to_vec2::<u32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u32);
         }
     }
     Ok(())
@@ -250,9 +246,9 @@ fn cast_f64_to_i64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::I64)?;
     let result = t2.to_vec2::<i64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as i64);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as i64);
         }
     }
     Ok(())
@@ -266,10 +262,10 @@ fn cast_f64_to_f8e4m3(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (8, 8), device)?;
     let t2 = t.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..8 {
-        for j in 0..8 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = F8E4M3::from_f32(data[i * 8 + j] as f32);
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -386,10 +382,10 @@ fn cast_f16_to_f32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::F16)?;
     let t2 = t.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = f16::from_f32(data[i * 10 + j]).to_f32();
-            assert!(approx_eq(result[i][j] as f64, expected as f64, 0.01));
+            assert!(approx_eq(v as f64, expected as f64, 0.01));
         }
     }
     Ok(())
@@ -403,10 +399,10 @@ fn cast_f16_to_f64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::F16)?;
     let t2 = t.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = f16::from_f32(data[i * 10 + j]).to_f64();
-            assert!(approx_eq(result[i][j], expected, 0.01));
+            assert!(approx_eq(v, expected, 0.01));
         }
     }
     Ok(())
@@ -417,10 +413,10 @@ fn cast_f16_to_bf16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::F16)?;
     let t2 = t.to_dtype(DType::BF16)?;
     let result = t2.to_vec2::<bf16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = bf16::from_f32(f16::from_f32(data[i * 10 + j]).to_f32());
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -431,9 +427,9 @@ fn cast_f16_to_u8(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::F16)?;
     let t2 = t.to_dtype(DType::U8)?;
     let result = t2.to_vec2::<u8>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u8);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u8);
         }
     }
     Ok(())
@@ -444,9 +440,9 @@ fn cast_f16_to_u32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::F16)?;
     let t2 = t.to_dtype(DType::U32)?;
     let result = t2.to_vec2::<u32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u32);
         }
     }
     Ok(())
@@ -461,10 +457,10 @@ fn cast_bf16_to_f32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::BF16)?;
     let t2 = t.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = bf16::from_f32(data[i * 10 + j]).to_f32();
-            assert!(approx_eq(result[i][j] as f64, expected as f64, 0.1));
+            assert!(approx_eq(v as f64, expected as f64, 0.1));
         }
     }
     Ok(())
@@ -478,10 +474,10 @@ fn cast_bf16_to_f64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::BF16)?;
     let t2 = t.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = bf16::from_f32(data[i * 10 + j]).to_f64();
-            assert!(approx_eq(result[i][j], expected, 0.1));
+            assert!(approx_eq(v, expected, 0.1));
         }
     }
     Ok(())
@@ -492,10 +488,10 @@ fn cast_bf16_to_f16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::BF16)?;
     let t2 = t.to_dtype(DType::F16)?;
     let result = t2.to_vec2::<f16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = f16::from_f32(bf16::from_f32(data[i * 10 + j]).to_f32());
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -506,9 +502,9 @@ fn cast_bf16_to_u8(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::BF16)?;
     let t2 = t.to_dtype(DType::U8)?;
     let result = t2.to_vec2::<u8>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u8);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u8);
         }
     }
     Ok(())
@@ -519,9 +515,9 @@ fn cast_bf16_to_u32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?.to_dtype(DType::BF16)?;
     let t2 = t.to_dtype(DType::U32)?;
     let result = t2.to_vec2::<u32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u32);
         }
     }
     Ok(())
@@ -602,9 +598,9 @@ fn cast_u8_to_f32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as f32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as f32);
         }
     }
     Ok(())
@@ -618,9 +614,9 @@ fn cast_u8_to_f64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as f64);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as f64);
         }
     }
     Ok(())
@@ -631,9 +627,9 @@ fn cast_u8_to_f16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F16)?;
     let result = t2.to_vec2::<f16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], f16::from_f32((i * 10 + j) as f32));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, f16::from_f32((i * 10 + j) as f32));
         }
     }
     Ok(())
@@ -644,9 +640,9 @@ fn cast_u8_to_bf16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::BF16)?;
     let result = t2.to_vec2::<bf16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], bf16::from_f32((i * 10 + j) as f32));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, bf16::from_f32((i * 10 + j) as f32));
         }
     }
     Ok(())
@@ -657,9 +653,9 @@ fn cast_u8_to_u32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::U32)?;
     let result = t2.to_vec2::<u32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u32);
         }
     }
     Ok(())
@@ -673,9 +669,9 @@ fn cast_u8_to_i64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::I64)?;
     let result = t2.to_vec2::<i64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as i64);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as i64);
         }
     }
     Ok(())
@@ -690,9 +686,9 @@ fn cast_u32_to_f32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as f32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as f32);
         }
     }
     Ok(())
@@ -706,9 +702,9 @@ fn cast_u32_to_f64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as f64);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as f64);
         }
     }
     Ok(())
@@ -719,9 +715,9 @@ fn cast_u32_to_f16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F16)?;
     let result = t2.to_vec2::<f16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], f16::from_f32((i * 10 + j) as f32));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, f16::from_f32((i * 10 + j) as f32));
         }
     }
     Ok(())
@@ -732,9 +728,9 @@ fn cast_u32_to_bf16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::BF16)?;
     let result = t2.to_vec2::<bf16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], bf16::from_f32((i * 10 + j) as f32));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, bf16::from_f32((i * 10 + j) as f32));
         }
     }
     Ok(())
@@ -745,9 +741,9 @@ fn cast_u32_to_u8(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::U8)?;
     let result = t2.to_vec2::<u8>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u8);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u8);
         }
     }
     Ok(())
@@ -761,9 +757,9 @@ fn cast_u32_to_i64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::I64)?;
     let result = t2.to_vec2::<i64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as i64);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as i64);
         }
     }
     Ok(())
@@ -859,9 +855,9 @@ fn cast_i64_to_f32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as f32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as f32);
         }
     }
     Ok(())
@@ -875,9 +871,9 @@ fn cast_i64_to_f64(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as f64);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as f64);
         }
     }
     Ok(())
@@ -891,9 +887,9 @@ fn cast_i64_to_f16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::F16)?;
     let result = t2.to_vec2::<f16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], f16::from_f32((i * 10 + j) as f32));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, f16::from_f32((i * 10 + j) as f32));
         }
     }
     Ok(())
@@ -907,9 +903,9 @@ fn cast_i64_to_bf16(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::BF16)?;
     let result = t2.to_vec2::<bf16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], bf16::from_f32((i * 10 + j) as f32));
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, bf16::from_f32((i * 10 + j) as f32));
         }
     }
     Ok(())
@@ -923,9 +919,9 @@ fn cast_i64_to_u8(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::U8)?;
     let result = t2.to_vec2::<u8>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u8);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u8);
         }
     }
     Ok(())
@@ -939,9 +935,9 @@ fn cast_i64_to_u32(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (10, 10), device)?;
     let t2 = t.to_dtype(DType::U32)?;
     let result = t2.to_vec2::<u32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (i * 10 + j) as u32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (i * 10 + j) as u32);
         }
     }
     Ok(())
@@ -956,10 +952,10 @@ fn cast_i64_to_f8e4m3(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (8, 8), device)?;
     let t2 = t.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..8 {
-        for j in 0..8 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = F8E4M3::from_f32((i * 8 + j) as f32);
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -974,11 +970,11 @@ fn cast_f8e4m3_to_i64(device: &Device) -> Result<()> {
     let t_f8 = t.to_dtype(DType::F8E4M3)?;
     let t2 = t_f8.to_dtype(DType::I64)?;
     let result = t2.to_vec2::<i64>()?;
-    for i in 0..8 {
-        for j in 0..8 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let f8_val = F8E4M3::from_f32((i * 8 + j) as f32);
             let expected = f8_val.to_f32() as i64;
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -993,10 +989,10 @@ fn cast_u32_to_f8e4m3(device: &Device) -> Result<()> {
     let t = Tensor::from_slice(&data, (8, 8), device)?;
     let t2 = t.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..8 {
-        for j in 0..8 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = F8E4M3::from_f32((i * 8 + j) as f32);
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1011,11 +1007,11 @@ fn cast_f8e4m3_to_u32(device: &Device) -> Result<()> {
     let t_f8 = t.to_dtype(DType::F8E4M3)?;
     let t2 = t_f8.to_dtype(DType::U32)?;
     let result = t2.to_vec2::<u32>()?;
-    for i in 0..8 {
-        for j in 0..8 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let f8_val = F8E4M3::from_f32((i * 8 + j) as f32);
             let expected = f8_val.to_f32() as u32;
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1100,11 +1096,11 @@ fn cast_strided_f32_to_f64(device: &Device) -> Result<()> {
     let t_transposed = t.t()?; // Now non-contiguous
     let t2 = t_transposed.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            // Transposed: result[i][j] = original[j][i]
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            // Transposed: v = original[j][i]
             let expected = (j * 10 + i) as f64 * 0.5;
-            assert!(approx_eq(result[i][j], expected, 1e-6));
+            assert!(approx_eq(v, expected, 1e-6));
         }
     }
     Ok(())
@@ -1119,10 +1115,10 @@ fn cast_strided_f64_to_f32(device: &Device) -> Result<()> {
     let t_transposed = t.t()?;
     let t2 = t_transposed.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = (j * 10 + i) as f32 * 0.5;
-            assert!(approx_eq(result[i][j] as f64, expected as f64, 1e-6));
+            assert!(approx_eq(v as f64, expected as f64, 1e-6));
         }
     }
     Ok(())
@@ -1134,10 +1130,10 @@ fn cast_strided_f32_to_f16(device: &Device) -> Result<()> {
     let t_transposed = t.t()?;
     let t2 = t_transposed.to_dtype(DType::F16)?;
     let result = t2.to_vec2::<f16>()?;
-    for i in 0..10 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = f16::from_f32((j * 10 + i) as f32 * 0.5);
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -1149,9 +1145,9 @@ fn cast_strided_u8_to_f32(device: &Device) -> Result<()> {
     let t_transposed = t.t()?;
     let t2 = t_transposed.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..10 {
-        for j in 0..10 {
-            assert_eq!(result[i][j], (j * 10 + i) as f32);
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            assert_eq!(v, (j * 10 + i) as f32);
         }
     }
     Ok(())
@@ -1171,10 +1167,10 @@ fn cast_narrow_f32_to_f64(device: &Device) -> Result<()> {
     let t_narrow = t.narrow(1, 2, 5)?; // columns 2-6
     let t2 = t_narrow.to_dtype(DType::F64)?;
     let result = t2.to_vec2::<f64>()?;
-    for i in 0..10 {
-        for j in 0..5 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = (i * 10 + j + 2) as f64;
-            assert_eq!(result[i][j], expected);
+            assert_eq!(v, expected);
         }
     }
     Ok(())
@@ -1186,10 +1182,10 @@ fn cast_narrow_bf16_to_f32(device: &Device) -> Result<()> {
     let t_narrow = t.narrow(0, 3, 4)?; // rows 3-6
     let t2 = t_narrow.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..4 {
-        for j in 0..10 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = bf16::from_f32(((i + 3) * 10 + j) as f32).to_f32();
-            assert!(approx_eq(result[i][j] as f64, expected as f64, 0.1));
+            assert!(approx_eq(v as f64, expected as f64, 0.1));
         }
     }
     Ok(())
@@ -1210,11 +1206,11 @@ fn cast_strided_f32_to_f8e4m3(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..6 {
-        for j in 0..6 {
-            // Transposed: result[i][j] = original[j][i]
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            // Transposed: v = original[j][i]
             let expected = F8E4M3::from_f32((j * 6 + i) as f32 * 0.25);
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1231,15 +1227,15 @@ fn cast_strided_f8e4m3_to_f32(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::F32)?;
     let result = t2.to_vec2::<f32>()?;
-    for i in 0..6 {
-        for j in 0..6 {
-            // Transposed: result[i][j] = original[j][i]
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            // Transposed: v = original[j][i]
             let original_f8 = F8E4M3::from_f32((j * 6 + i) as f32 * 0.25);
             let expected = original_f8.to_f32();
             assert!(
-                (result[i][j] - expected).abs() < 0.01,
+                (v - expected).abs() < 0.01,
                 "Mismatch at [{i}][{j}]: got {}, expected {}",
-                result[i][j],
+                v,
                 expected
             );
         }
@@ -1258,11 +1254,11 @@ fn cast_strided_f8e4m3_to_f16(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::F16)?;
     let result = t2.to_vec2::<f16>()?;
-    for i in 0..6 {
-        for j in 0..6 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let original_f8 = F8E4M3::from_f32((j * 6 + i) as f32 * 0.25);
             let expected = f16::from_f32(original_f8.to_f32());
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1279,11 +1275,11 @@ fn cast_strided_f8e4m3_to_bf16(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::BF16)?;
     let result = t2.to_vec2::<bf16>()?;
-    for i in 0..6 {
-        for j in 0..6 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let original_f8 = F8E4M3::from_f32((j * 6 + i) as f32 * 0.25);
             let expected = bf16::from_f32(original_f8.to_f32());
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1300,11 +1296,11 @@ fn cast_strided_bf16_to_f8e4m3(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..6 {
-        for j in 0..6 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let original_bf16 = bf16::from_f32((j * 6 + i) as f32 * 0.25);
             let expected = F8E4M3::from_f32(original_bf16.to_f32());
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1321,11 +1317,11 @@ fn cast_strided_f16_to_f8e4m3(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..6 {
-        for j in 0..6 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let original_f16 = f16::from_f32((j * 6 + i) as f32 * 0.25);
             let expected = F8E4M3::from_f32(original_f16.to_f32());
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1341,10 +1337,10 @@ fn cast_strided_u32_to_f8e4m3(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..6 {
-        for j in 0..6 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = F8E4M3::from_f32((j * 6 + i) as f32);
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1361,11 +1357,11 @@ fn cast_strided_f8e4m3_to_u32(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::U32)?;
     let result = t2.to_vec2::<u32>()?;
-    for i in 0..6 {
-        for j in 0..6 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let f8_val = F8E4M3::from_f32((j * 6 + i) as f32);
             let expected = f8_val.to_f32() as u32;
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1381,10 +1377,10 @@ fn cast_strided_i64_to_f8e4m3(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::F8E4M3)?;
     let result = t2.to_vec2::<F8E4M3>()?;
-    for i in 0..6 {
-        for j in 0..6 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let expected = F8E4M3::from_f32((j * 6 + i) as f32);
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())
@@ -1401,11 +1397,11 @@ fn cast_strided_f8e4m3_to_i64(device: &Device) -> Result<()> {
     assert!(!t_transposed.is_contiguous());
     let t2 = t_transposed.to_dtype(DType::I64)?;
     let result = t2.to_vec2::<i64>()?;
-    for i in 0..6 {
-        for j in 0..6 {
+    for (i, row) in result.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
             let f8_val = F8E4M3::from_f32((j * 6 + i) as f32);
             let expected = f8_val.to_f32() as i64;
-            assert_eq!(result[i][j], expected, "Mismatch at [{i}][{j}]");
+            assert_eq!(v, expected, "Mismatch at [{i}][{j}]");
         }
     }
     Ok(())

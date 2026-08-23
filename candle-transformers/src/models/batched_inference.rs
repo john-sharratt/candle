@@ -45,6 +45,13 @@ use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::pipeline_record_duration;
 
+/// One R16 chunk's unpacked contents: `(block_idx, k_flat, v_flat, q_flat)`.
+///
+/// Each flat vec holds `n_kv_head × N_PALETTE × CHUNK_SIZE × sub_head_dim`
+/// values in `[head][palette][token][sub_dim]` order. `block_idx` is absolute,
+/// so a caller can place the chunk even though non-R16 chunks leave gaps.
+pub type R16ChunkDump = (usize, Vec<f32>, Vec<f32>, Vec<f32>);
+
 /// Inference mode specifying both compute dtype and KV cache storage format.
 ///
 /// This enum provides a high-level way to configure inference:
@@ -660,7 +667,7 @@ impl BatchedInferenceSession {
     pub fn active_sequence_count(&self) -> usize {
         self.sequences
             .iter()
-            .filter(|s| s.as_ref().map_or(false, |s| s.active))
+            .filter(|s| s.as_ref().is_some_and(|s| s.active))
             .count()
     }
 
@@ -670,7 +677,7 @@ impl BatchedInferenceSession {
             .iter()
             .enumerate()
             .filter_map(|(idx, s)| {
-                if s.as_ref().map_or(false, |s| s.active) {
+                if s.as_ref().is_some_and(|s| s.active) {
                     Some(idx)
                 } else {
                     None
@@ -758,7 +765,7 @@ impl BatchedInferenceSession {
                 cache.force_dtype(dtype);
             }
             if let Some(backing) = self.backings.get(layer_idx) {
-                cache.set_chunked_backing(backing, seq_idx, compression.clone())?;
+                cache.set_chunked_backing(backing, seq_idx, compression)?;
             }
             caches.push(cache);
         }
@@ -1844,7 +1851,7 @@ impl BatchedInferenceSession {
         seq_idx: usize,
         layer_idx: usize,
         block_range: Option<(usize, usize)>,
-    ) -> candle::Result<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    ) -> candle::Result<Vec<R16ChunkDump>> {
         match self.backings.get(layer_idx) {
             Some(backing) => backing.dump_sequence_r16_kv_chunks(seq_idx, block_range),
             None => Ok(vec![]),
@@ -1862,7 +1869,7 @@ impl BatchedInferenceSession {
         seq_idx: usize,
         layer_idx: usize,
         block_range: Option<(usize, usize)>,
-    ) -> candle::Result<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    ) -> candle::Result<Vec<R16ChunkDump>> {
         match self.backings.get(layer_idx) {
             Some(backing) => backing.gather_r16_kv_probe(seq_idx, block_range),
             None => Ok(vec![]),
@@ -1885,7 +1892,7 @@ impl BatchedInferenceSession {
         seq_idx: usize,
         layer_indices: &[usize],
         block_range: Option<(usize, usize)>,
-    ) -> candle::Result<Vec<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>>> {
+    ) -> candle::Result<Vec<Vec<R16ChunkDump>>> {
         layer_indices
             .iter()
             .map(|&layer_idx| match self.backings.get(layer_idx) {
@@ -1898,8 +1905,8 @@ impl BatchedInferenceSession {
     /// GPU-side wide-Q provenance capture: one kernel launch across ALL layers
     /// reads the R16 Q, signs it, and bit-packs it — only the packed bits come
     /// back to the host. Replaces the per-layer f16 K/Q/V D2H + CPU sign pass
-    /// (~48 blocking round-trips per scope) with one HtoD (pointers) + one launch
-    /// + one DtoH (a few KB). The caller (`gather_wide_sigs`) assembles the raw
+    /// (~48 blocking round-trips per scope) with one HtoD (pointers), one launch
+    /// and one DtoH (a few KB). The caller (`gather_wide_sigs`) assembles the raw
     /// per-token `WideQSig` from `packed` and folds it — bit-identical to the CPU
     /// path. Returns `None` (caller falls back to the CPU gather) when not CUDA,
     /// when any layer has no R16 blocks, when the layers' block sets disagree, or
@@ -2658,7 +2665,7 @@ impl BatchedInferenceSession {
         }
 
         if total_elements > 1 {
-            let bpe = total_actual as f64 / total_elements as f64;
+            let bpe = total_actual / total_elements as f64;
             Some(16.0f64 / bpe)
         } else {
             None
@@ -3526,7 +3533,7 @@ pub trait ManagedBatchedModel {
         config.k_low_error_threshold_factor *= props.k_low_error_threshold_factor;
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
-        let backings = source.backings().iter().cloned().collect();
+        let backings = source.backings().to_vec();
         let session = BatchedInferenceSession::new_with_backings(backings, config, source.device());
         // The other way a session comes into being, and it decides an activation
         // dtype just as `create_batched_session` does — so it materialises the

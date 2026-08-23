@@ -1470,10 +1470,11 @@ impl SubstratePersistence {
             &mut self.manifest.model_spec,
             &mut self.manifest.template,
             &mut self.manifest.tokenizer,
-        ] {
-            if let Some(loc) = loc {
-                loc.segment = adopted;
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            loc.segment = adopted;
         }
         self.model_spec = self
             .manifest

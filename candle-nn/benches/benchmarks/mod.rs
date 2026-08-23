@@ -28,7 +28,7 @@ impl BenchDevice for Device {
                 #[cfg(feature = "cuda")]
                 {
                     use candle::backend::BackendDevice;
-                    return Ok(device.synchronize()?);
+                    device.synchronize()
                 }
                 #[cfg(not(feature = "cuda"))]
                 panic!("Cuda device without cuda feature enabled: {:?}", device)

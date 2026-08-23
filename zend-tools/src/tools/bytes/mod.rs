@@ -178,7 +178,7 @@ pub fn parse_format(fmt: &str) -> Result<(bool, Vec<FormatField>), BytesError> {
     let mut fields = Vec::new();
     let mut num_str = String::new();
 
-    while let Some(c) = chars.next() {
+    for c in chars {
         if c.is_ascii_digit() {
             num_str.push(c);
             continue;

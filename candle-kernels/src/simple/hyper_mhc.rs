@@ -8,6 +8,10 @@
 
 use std::ffi::c_void;
 
+/// Largest residual-stream copy count the kernels hold in fixed-size shared
+/// arrays, mirroring `MHC_MAX_HC` in `simple/hyper_mhc.cu`.
+pub const MHC_MAX_HC: usize = 16;
+
 extern "C" {
     /// `hc_pre` stage 1: rms-rsqrt · sigmoid gate split.
     ///   xf:        device f32[n * hc * d]   (pre-reshape input, for the rms scale)
@@ -22,22 +26,42 @@ extern "C" {
         pre: *mut f32,
         post: *mut f32,
         comb_raw: *mut f32,
-        n: i32,
-        hc: i32,
-        d: i32,
-        eps: f32,
-        stream: *mut c_void,
-    );
-
-    /// `hc_pre` stage 2: `y[k] = Σ_c pre[c] · x[c,k]`.
-    ///   x: device f32[n * hc * d]; pre: device f32[n * hc]; y: device f32[n * d] (out)
-    pub fn run_mhc_pre_reduce(
-        x: *const f32,
-        pre: *const f32,
+        // `hc_pre` stage 2 is fused in too: y[n, d] = sum_c pre[c] * x[c, k],
+        // computed by warps 1+ while warp 0 runs the sinkhorn.
         y: *mut f32,
         n: i32,
         hc: i32,
         d: i32,
+        eps: f32,
+        // Sinkhorn is folded into this kernel: `comb_raw` comes back NORMALIZED,
+        // so no separate `run_sinkhorn_f32` launch is needed. `sink_iters <= 0`
+        // leaves the raw affine result in place.
+        sink_iters: i32,
+        sink_eps: f32,
+        stream: *mut c_void,
+    );
+
+    /// `hc_head`: rms-rsqrt · one sigmoid gate · the weighted residual reduction.
+    ///
+    /// `hc_pre` without the split — no post, no combine matrix, no sinkhorn — so
+    /// `fn_w` is `[hc, hc*d]` and `scale` is a single value.
+    ///   xf:        device f32[n * hc * d]  (the residual stream; also read as [n, hc, d])
+    ///   mixes_raw: device f32[n * hc]      (fn_w(xf))
+    ///   base:      device f32[hc]; scale: device f32[1]
+    ///   y:         device f32[n * d] (out, fully written)
+    ///
+    /// `hc` must be ≤ [`MHC_MAX_HC`] — the gate is held in a fixed-size shared
+    /// array. Callers check it; the launcher cannot report an error.
+    pub fn run_mhc_head_reduce(
+        xf: *const f32,
+        mixes_raw: *const f32,
+        base: *const f32,
+        scale: *const f32,
+        y: *mut f32,
+        n: i32,
+        hc: i32,
+        d: i32,
+        eps: f32,
         stream: *mut c_void,
     );
 

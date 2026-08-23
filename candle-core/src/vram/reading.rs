@@ -137,12 +137,25 @@ pub mod fake {
             self.reads.load(Ordering::Relaxed)
         }
         pub fn probe(&self) -> FakeProbe {
-            FakeProbe { vram: self.clone() }
+            FakeProbe {
+                vram: self.clone(),
+                kind: ProbeKind::Fake,
+            }
+        }
+        /// A probe that reports itself as the given kind — for tests modelling
+        /// kind-dependent behaviour (the WDDM wobble margin applies only to
+        /// [`ProbeKind::Dxgi`] readings).
+        pub fn probe_as(&self, kind: ProbeKind) -> FakeProbe {
+            FakeProbe {
+                vram: self.clone(),
+                kind,
+            }
         }
     }
 
     pub struct FakeProbe {
         vram: FakeVram,
+        kind: ProbeKind,
     }
 
     impl VramProbe for FakeProbe {
@@ -151,7 +164,7 @@ pub mod fake {
             Ok(VramReading::new(
                 self.vram.headroom(),
                 self.vram.total,
-                ProbeKind::Fake,
+                self.kind,
             ))
         }
     }

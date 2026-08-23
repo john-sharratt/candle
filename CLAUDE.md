@@ -120,9 +120,23 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
    the hot path is a full-tensor memory pass a kernel could have avoided by writing its
    output in the type the next consumer wants. Norms emit the kernel's input type; attention
    kernels emit the out-proj's input type.
-2. **No `contiguous` / `force_contiguous` in the loop.** A `contiguous()` is an allocate-plus-copy
-   of the whole tensor. If a consumer needs a layout, teach it to read the layout that exists
-   (offset + stride), or produce that layout directly from the kernel that made the data.
+2. **No allocate-plus-copy to materialise a layout, by any spelling.** `contiguous()`,
+   `force_contiguous()`, `Tensor::cat`, and `slice_set` are the SAME operation as far as this
+   invariant is concerned — each allocates and copies so a consumer can be handed the layout it
+   prefers, and `cat`/`slice_set` cost **one launch per argument**. If a consumer needs a layout,
+   teach it to read the layout that exists (offset + stride, or a descriptor table — see 2b), or
+   produce that layout directly from the kernel that made the data.
+   > This invariant was originally worded as "no `contiguous` / `force_contiguous`", naming two
+   > functions rather than the operation. `cat` and `slice_set` matched neither name and were
+   > never audited: a measured 892,104 of 1,079,568 copy launches per sweep — 2.5% of GPU — sat
+   > entirely outside the rule. Police the operation, not the spelling.
+2b. **A kernel consuming per-session or per-row data takes a DESCRIPTOR TABLE, not a packed block.**
+   Requiring one dense base pointer is what forces the caller to `cat`/`slice_set` rows together,
+   so the copy is the kernel's API bug, not the caller's. Pass a device table of
+   `{ptr, offset, stride, len}` per row/session and read in place. The pattern already exists here:
+   `candle-kernels/src/arena_table.cuh` (`ArenaTableEntry`/`PerHeadTableEntry`) for the paged
+   attention kernels, the gallery's `region_ptr_cache`, and `bdp_recall_batched`'s per-gallery
+   sign-pointer table (which replaced an O(Σ len × words) concatenation).
 3. **No unnecessary GPU→CPU transfers.** Exactly two sanctioned readbacks: (a) MoE expert
    routing (`indices` → host), because the streaming `ExpertCache` schedules pinned→VRAM
    uploads by expert id; and (b) the embedding lookup (token ids → host, CPU `index_select`,
@@ -192,6 +206,31 @@ candle-kernels        (AOT CUDA kernels: paged-decode/, paged-prefill/, quantize
 **candle-nn** — The most actively developed crate. `kv_cache/` is where all the compression/paging/arena work lives.
 
 **candle-transformers** — `batched_inference.rs` + `batched_model.rs` are the high-level batched inference API. `batch_test/` has story/system prompt fixtures for integration tests.
+
+---
+
+## Sparse-Latent MoE Engine (`candle-transformers/src/models/latent_moe/`)
+
+The DeepSeek-V4-Flash inference stack. It is split so that **no machinery names a
+model version**: `latent_moe/` is the architecture *family* — layers, paged/batched
+kernel path, provenance gallery, wave engine — and each concrete model is one file
+beside it supplying only what is genuinely its own.
+
+| Where | What |
+|-------|------|
+| `models/deepseek4.rs` | **The model.** `impl Arch for DeepSeekV4` — config defaults, GGUF metadata keys, tensor names, latent geometry, and the `dflash` drafter arch. Its tests assert the released checkpoint's identity against the real GGUF. |
+| `latent_moe/arch.rs` | The `Arch` trait + the `Weight` / `Global` / `Meta` enums naming every tensor and hyperparameter the engine asks for. Exhaustive matches, so a new engine tensor breaks every model at compile time. Also `test_arch`, a synthetic architecture with deliberately *unlike* naming that the engine's own tests run against. |
+| `latent_moe/geometry.rs` | `LatentGeometry` — `(head_dim, rope_dim, n_bands)` plus the divisibility rules the kernel tiling depends on. `SUPPORTED` lists the geometries the kernels are built for. |
+| `latent_moe/config.rs` | `Config` (carries its `&'static dyn Arch`), `LayerKind`. |
+| `latent_moe/loader.rs` | GGUF → weights. Names every tensor through the arch. |
+| `latent_moe/{paged,gallery,wave,engine}.rs` | Kernel wrappers, provenance corpus, wave batching, resident model. Model-agnostic. |
+
+**Adding a model in this family** is a sibling of `deepseek4.rs`: a unit struct
+implementing `Arch`. If it changes the *latent geometry*, `geometry::SUPPORTED`
+documents the three extra kernel-side steps. The kernels are templates over
+`<HEAD_DIM, ROPE_DIM, NPAL>`; `paged_latent_api_bf16.cu` pins the live triple, and
+`paged::assert_kernel_geometry` refuses a host/kernel mismatch at load — a
+divergence there is wrong attention, not a fault.
 
 ---
 

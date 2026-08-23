@@ -124,6 +124,12 @@ const DEFAULT_SCRATCH_MARGIN_MB: u64 = 512;
 /// (`the_balloon_reserve_does_not_double_book_the_scratch_cushion`) was pinning
 /// a relationship that only existed because the old term was documented as "a
 /// cap on what the balloon may try" rather than as a reserve.
+///
+/// This absolute reserve is NOT the WDDM residency margin — that is the OS's
+/// per-process budget, which the balloon reads from the probe and applies as
+/// a cap on every path (see `balloon::capacity_target`'s `headroom` cap). A
+/// fixed number cannot stand in for the budget: 5 GiB was measured right on
+/// the 73 GiB card and would take a third of a 16 GiB one.
 const DEFAULT_CAPACITY_RESERVE_MB: u64 = 512;
 const DEFAULT_BALLOON_CHUNK_MB: u64 = 256;
 /// One VMM allocation granule on every device this runs on. `Reservation`

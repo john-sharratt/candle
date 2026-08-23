@@ -154,7 +154,7 @@ pub fn encode_token_ids(ids: &[u32]) -> Vec<u8> {
 
 /// Decode a `Tokens` record payload back into token ids.
 pub fn decode_token_ids(bytes: &[u8]) -> Result<Vec<u32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(PersistenceError::Corrupt(format!(
             "Tokens payload is {} bytes, not a multiple of 4",
             bytes.len()

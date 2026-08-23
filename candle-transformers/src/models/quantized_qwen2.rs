@@ -997,6 +997,8 @@ impl ModelWeights {
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
+    #![allow(clippy::useless_vec)]
+
     use super::*;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;

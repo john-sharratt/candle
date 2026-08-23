@@ -5,6 +5,10 @@
 //! resolver (not the builder), so tests use `resolver.append(group)` rather
 //! than `builder.append(group)`.
 
+// The fixture builders are consuming (`fn as_x(mut self) -> Self`) so they chain
+// at the call site; `as_` reads better than `with_` for the flag-setting ones.
+#![allow(clippy::wrong_self_convention)]
+
 use std::collections::{HashMap, HashSet};
 
 use super::builder::Builder;

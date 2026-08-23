@@ -298,13 +298,14 @@ fn file_content_hash(path: &str, bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Carve `map`'s files into `(file, scopes, bytes, content_hash)` tuples,
-/// recording each file's hash into a fresh [`CodeReadState`]. Each file is
-/// hashed exactly once. Files that carve to no scopes are skipped.
-fn carve_workspace(
-    workspace: &Path,
-    map: &RepoMap,
-) -> (Vec<(FileEntry, Vec<Scope>, Vec<u8>, String)>, CodeReadState) {
+/// One carved file: its repo-map entry, the scopes carved out of it, its raw
+/// bytes, and its content hash.
+type CarvedFile = (FileEntry, Vec<Scope>, Vec<u8>, String);
+
+/// Carve `map`'s files into [`CarvedFile`] tuples, recording each file's hash
+/// into a fresh [`CodeReadState`]. Each file is hashed exactly once. Files that
+/// carve to no scopes are skipped.
+fn carve_workspace(workspace: &Path, map: &RepoMap) -> (Vec<CarvedFile>, CodeReadState) {
     let mut per_file = Vec::with_capacity(map.files.len());
     let mut state = CodeReadState::default();
     for file in &map.files {

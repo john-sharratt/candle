@@ -1,5 +1,10 @@
 //! Unit tests for the normalization module — std-only, deterministic.
 
+// The raw-score comparison is asserted alongside the normalized one so the
+// before/after pair reads as a single claim, even though the raw half is
+// constant.
+#![allow(clippy::assertions_on_constants)]
+
 use super::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
 
 fn approx(got: f32, want: f32, tol: f32) {

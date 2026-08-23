@@ -382,7 +382,22 @@ const CALIBRATION_BATCH: usize = 16;
 /// regenerate automatically.
 const CALIB_MARKER_KEY: &str = "calib";
 
+/// The last maintenance operation the redo log ran: `(op_name, unix_millis)`.
+/// `None` when nothing has run since the log was opened.
+pub type LastMaintenanceOp = Option<(String, u64)>;
+
+/// Redo-log maintenance state for `/v1/status`:
+/// `(segment_count, last_op, compaction_in_progress)`.
+pub type MaintenanceStatus = (usize, LastMaintenanceOp, bool);
+
+/// Result of a forced maintenance pass: `(ran, segment_count, last_op)`.
+pub type ForcedMaintenance = (bool, usize, LastMaintenanceOp);
+
 impl InferenceState {
+    // Every argument is a distinct piece of deployment config read from the CLI
+    // / config file at startup, used once here and never carried together
+    // afterwards, so there is no struct for them to already belong to.
+    #[allow(clippy::too_many_arguments)]
     fn load(
         mut proj_builder: Builder,
         model_path: PathBuf,
@@ -730,7 +745,7 @@ impl InferenceState {
         // two phases compose into one continuous bar.
         let section_progress = Arc::clone(&progress);
         let section_hook = move |done: u64, total: u64| {
-            let scaled = if total == 0 { 0 } else { done * 5_000 / total };
+            let scaled = (done * 5_000).checked_div(total).unwrap_or(0);
             section_progress.set_step_progress(scaled, 10_000);
         };
         // A clone of the (tools-installed + templates-tokenised) projection
@@ -2080,6 +2095,10 @@ fn build_hires_projection(
     Ok(Arc::new(b))
 }
 
+// The submit parameter list, threaded from the HTTP handler through
+// `submit`/`submit_with_sampling` to here. Bundling it into a request struct is
+// worth doing, but it is a change to the request path rather than a lint fix.
+#[allow(clippy::too_many_arguments)]
 fn run_inference_stream(
     state: Arc<InferenceState>,
     conv_id: String,
@@ -3062,7 +3081,7 @@ impl ZendSession {
     /// The segmented redo log's maintenance state — `(segment_count, last_op)`
     /// — for the `/v1/status` compaction indicator. `None` until the engine is
     /// loaded.
-    pub fn substrate_maintenance(&self) -> Option<(usize, Option<(String, u64)>, bool)> {
+    pub fn substrate_maintenance(&self) -> Option<MaintenanceStatus> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let engine = state.engine.lock().unwrap();
         Some(engine.substrate_maintenance_status())
@@ -3077,7 +3096,7 @@ impl ZendSession {
     /// handle **without** holding the engine lock, so the user's in-flight chat
     /// (per-turn group-commits) isn't blocked. Returns `(ran, segments, last_op)`,
     /// or `None` if the model isn't loaded.
-    pub fn force_maintenance(&self) -> Option<(bool, usize, Option<(String, u64)>)> {
+    pub fn force_maintenance(&self) -> Option<ForcedMaintenance> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let conv = { state.engine.lock().unwrap().conversation() };
         let ran = match conv.force_compact_persistence() {
@@ -3595,7 +3614,7 @@ impl ZendSession {
             })
             .collect();
         // Newest-created first.
-        entries.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.updated_ms));
         entries
     }
 
@@ -4216,6 +4235,8 @@ impl ZendSession {
     }
 
     /// Submit the latest user message and return a stream of status + token items.
+    // See the note on `run_inference_stream`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit(
         &self,
         messages: Vec<ChatMessage>,
@@ -4251,6 +4272,8 @@ impl ZendSession {
     /// Used by tests that want deterministic generation (e.g.
     /// `SamplingConfig::argmax()` for greedy decoding) so the
     /// pass/fail signal isn't subject to top-k/top-p sampling noise.
+    // See the note on `run_inference_stream`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_with_sampling(
         &self,
         messages: Vec<ChatMessage>,
@@ -4530,7 +4553,7 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
         }
     }
     // Largest first — the most substantial timelines lead each layer.
-    conversations.sort_by(|a, b| b.turns.cmp(&a.turns));
+    conversations.sort_by_key(|c| std::cmp::Reverse(c.turns));
     conversations
 }
 

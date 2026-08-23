@@ -14,6 +14,13 @@
 //! dtypes the kernel also supports.
 
 #![allow(dead_code)]
+// Mirrors the sampling kernel's signature and its branchless float compares
+// argument for argument — that correspondence is the point of the harness.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::duplicated_attributes
+)]
 
 use candle_core::cuda_backend::cudarc;
 use candle_kernels::sampling::run_batched_sampling;

@@ -420,6 +420,20 @@ fn allocator_worker(
     dispatch_tx: Sender<UnitWork>,
 ) -> candle::Result<AllocBreakdown> {
     let n_layers = backings.len();
+
+    // A CUDA context is CURRENT PER THREAD, and this runs on a spawned worker.
+    // `alloc_sealed_blocks_bulk` → `build_meta_records` → `MetaPool::write_records_batched`
+    // issues driver calls, which fail `CUDA_ERROR_INVALID_CONTEXT` on a thread
+    // that never bound one — the same binding `persistence::thread` and the
+    // scheduler do at their worker entry points.
+    if let Some(backing) = backings.first() {
+        if let candle::Device::Cuda(d) = backing.device() {
+            d.cuda_context()
+                .bind_to_thread()
+                .map_err(|e| candle::Error::Msg(format!("allocator_worker bind_to_thread: {e}")))?;
+        }
+    }
+
     // SAFETY: pinned scratch is alive for the whole pipeline run.
     let buf: &[u8] = unsafe { pinned_ptr.slice(0, chunk_batch.total_bytes) };
 
@@ -590,9 +604,7 @@ fn allocator_worker(
                 resolve_ptrs_us += t_resolve.elapsed().as_micros() as u64;
                 n_resolve_calls += 1;
 
-                for ((_, _, src_offset), dst_ptrs) in
-                    layer_recs.iter().zip(dst_ptrs_per_rec.into_iter())
-                {
+                for ((_, _, src_offset), dst_ptrs) in layer_recs.iter().zip(dst_ptrs_per_rec) {
                     records_to_dispatch.push(RecordMigrate {
                         src_offset: *src_offset,
                         dst_ptrs,

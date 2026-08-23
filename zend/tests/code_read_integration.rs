@@ -42,7 +42,7 @@ fn write(root: &Path, rel: &str, body: &[u8]) {
 /// The recorded turns split into (call, response) pairs — even indices are call
 /// turns, odd indices are their response turns.
 fn is_call_turn(i: usize) -> bool {
-    i % 2 == 0
+    i.is_multiple_of(2)
 }
 
 #[test]

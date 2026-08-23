@@ -217,14 +217,10 @@ impl ArenaFormatTag {
 
     /// Is this a quantized format?
     pub fn is_quantized(self) -> bool {
-        match self {
-            Self::F32 => false,
-            Self::F16 => false,
-            Self::BF16 => false,
-            Self::F8E4M3 => false,
-            Self::F8E5M2 => false,
-            _ => true,
-        }
+        !matches!(
+            self,
+            Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2
+        )
     }
 }
 

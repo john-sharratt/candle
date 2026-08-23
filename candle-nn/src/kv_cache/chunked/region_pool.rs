@@ -99,9 +99,9 @@ pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
 /// constant survives so [`MIN_ELASTIC_RESERVE`] can be checked against it: the
 /// floor has to leave room for the widest wave, even though no wave but the
 /// widest will use it.
-const MAX_WAVE_TRANSIENT_BYTES: usize = super::bump_arena::WAVE_ATTN_BYTES
-    + super::bump_arena::WAVE_FFN_BYTES
-    + super::bump_arena::WAVE_FORWARD_BYTES;
+const MAX_WAVE_TRANSIENT_BYTES: usize = super::wave_spans::WAVE_ATTN_BYTES
+    + super::wave_spans::WAVE_FFN_BYTES
+    + super::wave_spans::WAVE_FORWARD_BYTES;
 
 /// The persistence thread's staging block, at the far **left** of the span.
 ///
@@ -112,7 +112,8 @@ const MAX_WAVE_TRANSIENT_BYTES: usize = super::bump_arena::WAVE_ATTN_BYTES
 const PERSIST_SPAN_BYTES: usize = MIGRATION_STAGING_CAP_BYTES;
 
 const _: () = assert!(
-    MAX_WAVE_TRANSIENT_BYTES % REGION_BYTES == 0 && PERSIST_SPAN_BYTES % REGION_BYTES == 0,
+    MAX_WAVE_TRANSIENT_BYTES.is_multiple_of(REGION_BYTES)
+        && PERSIST_SPAN_BYTES.is_multiple_of(REGION_BYTES),
     "every fixed block must be region-aligned so region carving stays exact"
 );
 
@@ -1954,8 +1955,32 @@ mod tests {
             .map_err(|e| candle::Error::Msg(format!("sync: {e}")))?;
         drop(region);
 
-        let again = claim_region(&s)?.expect("the recycled region");
-        assert_eq!(again.base(), base, "the same region should come back");
+        // The free list is shared with every other test in this binary, so the
+        // NEXT claim is not necessarily the region just released — whichever
+        // tests ran earlier may have left their own queued ahead of it. Claim
+        // until the dirtied one comes back, holding the others so they cannot be
+        // handed out again, and check THAT one.
+        //
+        // Asserting identity on the first claim made this test depend on
+        // execution order (it failed with two bases exactly one region apart),
+        // and on the failing path it went on to read from `base` after the pool
+        // had handed that region to someone else.
+        // Small on purpose: each iteration HOLDS a region, and the pool's
+        // sub-tier class is only a few dozen deep, so a large scan would starve
+        // whatever runs next instead of skipping a couple of stale entries.
+        const MAX_SCAN: usize = 8;
+        let mut held = Vec::new();
+        let mut recycled = None;
+        for _ in 0..MAX_SCAN {
+            let Some(r) = claim_region(&s)? else { break };
+            if r.base() == base {
+                recycled = Some(r);
+                break;
+            }
+            held.push(r);
+        }
+        let again = recycled.expect("the dirtied region is returned to the pool");
+        assert_eq!(again.base(), base);
         let mut back = vec![0xFFu8; 8192];
         // SAFETY: as above, reading the region this test holds.
         unsafe {

@@ -9,9 +9,11 @@
 
 use crate::kv_cache::{arena_table::ArenaLocation, KvFormat, QuantFormat};
 use ahash::AHashMap;
-use candle::cuda_backend::wave_provenance::LeaseOrigin;
 #[cfg(feature = "cuda")]
 use candle::quantized::LiveQTensor;
+// Root path, not the CUDA-gated `cuda_backend` re-export — see alloc.rs.
+#[cfg(feature = "cuda")]
+use candle::wave_provenance::LeaseOrigin;
 use candle::LiveTensor;
 use candle::{DType, Result, Tensor};
 use std::hash::{Hash, Hasher};
@@ -582,7 +584,7 @@ impl Arena {
         #[cfg(feature = "cuda")]
         {
             let mut view = self.qslot_view(chunk_idx, format, elems)?;
-            return view.quantize_into(src, elem_offset);
+            view.quantize_into(src, elem_offset)
         }
         #[cfg(not(feature = "cuda"))]
         {

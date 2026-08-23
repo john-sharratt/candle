@@ -159,7 +159,7 @@ fn hash_compute_base64_output() {
     ));
     assert_eq!(resp["output_encoding"], "base64");
     // Should be valid base64
-    assert!(resp["digest"].as_str().unwrap().len() > 0);
+    assert!(!resp["digest"].as_str().unwrap().is_empty());
 }
 
 #[test]

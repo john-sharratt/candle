@@ -24,7 +24,8 @@
 //               from sK with a per-tile per-dim scale.
 //   QK        : warps 0-15 own band p = warp (one band each), covering BOTH
 //               row-tiles of the pass's 32 heads; SUB/32 = 1 m16n8k32 per band,
-//               atomic-summed into scores[head][key].
+//               atomic-summed into scores[head][key] as INT32 fixed-point, so
+//               the cross-warp band collapse is order-independent.
 //   softmax   : warp w owns pass-heads {2w,2w+1}; lane l owns key l; online m/l
 //               and P=exp(sc-m) quantized ×127 into s_p8[head][key]; alpha→smem.
 //   PV        : warp = (row_tile w>>3, dim_group w&7) → 16 heads × 64 dims;
@@ -72,13 +73,22 @@ constexpr int PF_SCR_LD = PF_KEYS + 1;           // 33
 constexpr int PF_ROW_TILES = 2;                  // m16 row-tiles per head-pass
 constexpr int PF_PASS_HEADS = PF_ROW_TILES * 16; // 32 heads processed per pass
 constexpr int PF_PASSES = PF_HEADS / PF_PASS_HEADS; // 2 head-passes
-constexpr int PF_DGROUPS = 8;                    // output-dim groups (512/64)
-constexpr int PF_GDIMS = 512 / PF_DGROUPS;       // 64 dims per group (HEAD_DIM=512)
+constexpr int PF_DGROUPS = 8;                    // output-dim groups
+// Dims per output-dim group. Geometry-derived, so it is a per-kernel constant
+// rather than a namespace one: `pf_gdims<HEAD_DIM>()` is 64 at HEAD_DIM=512.
+// The PV accumulator is `o_acc[pf_gdims/8][4]`, so a group must be a whole
+// number of m16n8k8 output tiles.
+template <int HEAD_DIM>
+__host__ __device__ constexpr int pf_gdims() {
+    static_assert(HEAD_DIM % (PF_DGROUPS * 8) == 0,
+                  "output-dim groups must be a whole number of m16n8 output tiles");
+    return HEAD_DIM / PF_DGROUPS;
+}
 
 // Dynamic-smem byte size for the staging region, given the value type. s_p8,
 // scores and s_alpha are sized for one head-pass (PF_PASS_HEADS) since the two
 // passes reuse them sequentially.
-template <typename T, int HEAD_DIM>
+template <typename T, int HEAD_DIM, int NPAL>
 __host__ __device__ constexpr int prefill_smem_bytes() {
     (void)sizeof(T);
     // No sQ: the QK A-fragment is built per head-pass straight from L2 (Q is
@@ -86,17 +96,20 @@ __host__ __device__ constexpr int prefill_smem_bytes() {
     return PF_KEYS * (HEAD_DIM + 16)    // sK        int8 (padded for ldmatrix)
          + HEAD_DIM * PF_VPAD           // sVt       int8 (transposed, padded)
          + PF_PASS_HEADS * PF_KPAD      // s_p8      int8 (padded, per pass)
-         + PF_PASS_HEADS * PF_SCR_LD * 4 // scores   f32 (band-collapsed, +1 word
-                                          //          row stagger for the atomics)
+         + PF_PASS_HEADS * PF_SCR_LD * 4 // scores   i32 (band-collapsed fixed
+                                          //          point, +1 word row stagger
+                                          //          for the atomics)
          + PF_PASS_HEADS * NPAL * 4     // scaleQ    f32 (per pass — recomputed)
          + PF_KEYS * NPAL * 4           // scaleK    f32
          + PF_PASS_HEADS * 4            // s_alpha   f32 (per pass)
          + PF_KEYS * 4                  // key_valid int
+         + PF_PASS_HEADS * 4            // s_fx      f32 (per-head fixed-point scale)
+         + PF_PASS_HEADS * 4            // s_ifx     f32 (its reciprocal)
          + HEAD_DIM * 4;                // s_vscale  f32 (per-dim V scale)
 }
 
 // Identity band layout only (dim d → band d/SUB). No palette-map routing.
-template <typename T, int HEAD_DIM, int ROPE_DIM>
+template <typename T, int HEAD_DIM, int ROPE_DIM, int NPAL>
 __global__ void __launch_bounds__(PF_WARPS * 32, 2)
 latent_prefill_kernel(
     const T* __restrict__ q,               // [total_q, H, HEAD_DIM] pre-RoPE
@@ -126,9 +139,11 @@ latent_prefill_kernel(
     const uint4* __restrict__ new_meta,
     int store_fmt   // writer-chunk float format tag (new-diagonal fake-quant)
 ) {
+    STATIC_ASSERT_GEOMETRY(HEAD_DIM, ROPE_DIM, NPAL);
     constexpr int SUB = HEAD_DIM / NPAL;
     constexpr int NOPE_DIM = HEAD_DIM - ROPE_DIM;
     constexpr int DPT = HEAD_DIM / 32;
+    constexpr int PF_GDIMS = pf_gdims<HEAD_DIM>();
 
     const int qi = (int)blockIdx.x;
     const int split_idx = (int)blockIdx.z;
@@ -218,15 +233,28 @@ latent_prefill_kernel(
     constexpr int OFF_SCK = OFF_SCQ + PF_PASS_HEADS * NPAL * 4;
     constexpr int OFF_ALP = OFF_SCK + PF_KEYS * NPAL * 4;
     constexpr int OFF_VAL = OFF_ALP + PF_PASS_HEADS * 4;
-    constexpr int OFF_VSC = OFF_VAL + PF_KEYS * 4;
+    constexpr int OFF_FX = OFF_VAL + PF_KEYS * 4;
+    constexpr int OFF_IFX = OFF_FX + PF_PASS_HEADS * 4;
+    constexpr int OFF_VSC = OFF_IFX + PF_PASS_HEADS * 4;
     int8_t (*sK)[QLD] = reinterpret_cast<int8_t (*)[QLD]>(smem_raw + OFF_SK);
     int8_t (*sVt)[PF_VPAD] = reinterpret_cast<int8_t (*)[PF_VPAD]>(smem_raw + OFF_VT);
     int8_t (*s_p8)[PF_KPAD] = reinterpret_cast<int8_t (*)[PF_KPAD]>(smem_raw + OFF_P8);
-    float (*scores)[PF_SCR_LD] = reinterpret_cast<float (*)[PF_SCR_LD]>(smem_raw + OFF_SCR);
+    // The band-collapse accumulator is INT32 fixed-point, not float: the NPAL
+    // band terms are summed by atomics across warps, in an order the hardware
+    // does not define, and float addition is not associative — so a float
+    // accumulator makes this kernel's output differ run to run by construction.
+    // Integer addition IS associative, so the same set of terms yields the same
+    // sum whatever order the warps arrive in.
+    int (*scores)[PF_SCR_LD] = reinterpret_cast<int (*)[PF_SCR_LD]>(smem_raw + OFF_SCR);
     float (*scaleQ)[NPAL] = reinterpret_cast<float (*)[NPAL]>(smem_raw + OFF_SCQ);
     float (*scaleK)[NPAL] = reinterpret_cast<float (*)[NPAL]>(smem_raw + OFF_SCK);
     float* s_alpha = reinterpret_cast<float*>(smem_raw + OFF_ALP);
     int* key_valid = reinterpret_cast<int*>(smem_raw + OFF_VAL);
+    // Per-head fixed-point scale for this key tile, and its reciprocal. Derived
+    // from a bound (below) rather than a constant, so overflow is impossible by
+    // construction instead of by assumption about activation magnitudes.
+    float* s_fx = reinterpret_cast<float*>(smem_raw + OFF_FX);
+    float* s_ifx = reinterpret_cast<float*>(smem_raw + OFF_IFX);
     float* s_vscale = reinterpret_cast<float*>(smem_raw + OFF_VSC);
 
     // scaleQ (per head-band max) is computed per pass inside the head-pass loop
@@ -585,7 +613,8 @@ latent_prefill_kernel(
             // extent — flat indexing walks the staggered rows).
             #pragma unroll
             for (int c = tid; c < PF_PASS_HEADS * PF_SCR_LD; c += PF_WARPS * 32)
-                reinterpret_cast<float*>(scores)[c] = 0.f;
+                reinterpret_cast<int*>(scores)[c] = 0;
+
             __syncthreads();
 
             if (!comp_tile) {
@@ -599,9 +628,23 @@ latent_prefill_kernel(
                 for (int d = tid; d < HEAD_DIM; d += PF_WARPS * 32) {
                     int bnd = d / SUB;
                     float vmax = 0.f;
+                    // **Valid keys only — hardening, not the reproducibility fix.**
+                    // A partial tile leaves the unstaged key slots holding
+                    // whatever the previous launch put there, and shared memory
+                    // is not cleared between launches, so folding them into the
+                    // per-dim max lets unrelated prior work set this tile's
+                    // quantisation scale. Measured: masking them is NOT required
+                    // for bitwise repeatability (ablated — the kernel stays
+                    // deterministic without it, because a repeated launch leaves
+                    // the same residue). It is still wrong to read them: the
+                    // residue is only stable while the surrounding schedule is,
+                    // and the keys contribute nothing legitimate — their softmax
+                    // weight is exactly zero, so only the SCALE they inflate
+                    // reaches the output.
                     #pragma unroll
                     for (int k = 0; k < PF_KEYS; ++k)
-                        vmax = fmaxf(vmax, fabsf((float)sK[k][d] * scaleK[k][bnd]));
+                        if (key_valid[k])
+                            vmax = fmaxf(vmax, fabsf((float)sK[k][d] * scaleK[k][bnd]));
                     s_vscale[d] = vmax;
                     float inv = (vmax > 0.f) ? (127.f / vmax) : 0.f;
                     #pragma unroll
@@ -612,6 +655,50 @@ latent_prefill_kernel(
                 }
                 __syncthreads();
             }
+
+            // ── Fixed-point scale for this tile's band-collapse ──
+            //
+            // The accumulated score for head h is Σ_p c_p·scaleQ[h][p]·scaleK[k][p],
+            // and an m16n8k32 int8 MMA bounds |c_p| by NKS·32·127². So
+            //     |Σ_p| ≤ NKS·32·127² · Σ_p |scaleQ[h][p]|·max_k|scaleK[k][p]|
+            // is a true upper bound computed entirely from values already in
+            // shared memory. Scaling by 2³⁰/bound puts the largest representable
+            // sum just inside int32 — **no input can overflow it**, which is what
+            // makes a fixed-point accumulator safe here rather than a gamble on
+            // a hand-picked constant and the activation statistics of the day.
+            //
+            // Placed HERE, after both staging barriers, because it reads
+            // `scaleK` and `key_valid` that OTHER warps wrote: computed before
+            // them it races the staging and reintroduces exactly the
+            // non-determinism the fixed point exists to remove.
+            //
+            // Thread t owns (head t/NPAL, band t%NPAL) — exactly PF_PASS_HEADS ×
+            // NPAL = one thread per element, reduced across the NPAL lanes that
+            // share a head.
+            {
+                static_assert(PF_PASS_HEADS * NPAL == PF_WARPS * 32,
+                              "one thread per (head, band) for the fixed-point bound");
+                const int fh = tid / NPAL, fp = tid % NPAL;
+                float kmax = 0.f;
+                // Valid keys only: an unstaged key slot holds a stale `scaleK`
+                // from an unrelated launch, and letting it into the bound would
+                // make the scale — and every score quantised through it — depend
+                // on that leftover.
+                #pragma unroll
+                for (int k = 0; k < PF_KEYS; ++k)
+                    if (key_valid[k]) kmax = fmaxf(kmax, fabsf(scaleK[k][fp]));
+                float part = fabsf(scaleQ[fh][fp]) * kmax;
+                #pragma unroll
+                for (int o = NPAL / 2; o > 0; o >>= 1)
+                    part += __shfl_down_sync(0xffffffff, part, o, NPAL);
+                if (fp == 0) {
+                    const float bound = (float)(NKS * 32 * 127 * 127) * part;
+                    const float fx = (bound > 0.f) ? __fdiv_rn(1073741824.f, bound) : 1.f;
+                    s_fx[fh] = fx;
+                    s_ifx[fh] = __frcp_rn(fx);
+                }
+            }
+            __syncthreads();
 
             // QK: warp = band; each warp does BOTH row-tiles of the pass's 32
             // heads. m16n8k32 per band; the band's scaled score is atomic-summed
@@ -638,11 +725,16 @@ latent_prefill_kernel(
                             fused_attn::mma_int8_m16n8k32(c, qa_frag[rt][ks], b_cur, c);
                             b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1];
                         }
-                        float qA = scaleQ[hbase + r0][p], qB = scaleQ[hbase + r0 + 8][p];
-                        atomicAdd(&scores[hbase + r0][kb + c0], (float)c[0] * qA * scaleK[kb + c0][p]);
-                        atomicAdd(&scores[hbase + r0][kb + c0 + 1], (float)c[1] * qA * scaleK[kb + c0 + 1][p]);
-                        atomicAdd(&scores[hbase + r0 + 8][kb + c0], (float)c[2] * qB * scaleK[kb + c0][p]);
-                        atomicAdd(&scores[hbase + r0 + 8][kb + c0 + 1], (float)c[3] * qB * scaleK[kb + c0 + 1][p]);
+                        const int hA = hbase + r0, hB = hbase + r0 + 8;
+                        // Scale into the head's fixed-point grid before the
+                        // atomic: the ROUNDING is per-term and order-free, and
+                        // the integer sum that follows is exact.
+                        const float qA = scaleQ[hA][p] * s_fx[hA];
+                        const float qB = scaleQ[hB][p] * s_fx[hB];
+                        atomicAdd(&scores[hA][kb + c0], __float2int_rn((float)c[0] * qA * scaleK[kb + c0][p]));
+                        atomicAdd(&scores[hA][kb + c0 + 1], __float2int_rn((float)c[1] * qA * scaleK[kb + c0 + 1][p]));
+                        atomicAdd(&scores[hB][kb + c0], __float2int_rn((float)c[2] * qB * scaleK[kb + c0][p]));
+                        atomicAdd(&scores[hB][kb + c0 + 1], __float2int_rn((float)c[3] * qB * scaleK[kb + c0 + 1][p]));
                     }
                 }
             }
@@ -654,7 +746,9 @@ latent_prefill_kernel(
             for (int h = 0; h < 2; ++h) {
                 const int lh = 2 * warp + h;               // pass-local head 0..31
                 const bool live = head_base + lh < n_q_head;
-                float sc = (live && key_valid[lane]) ? scores[lh][lane] * softmax_scale : -1e38f;
+                float sc = (live && key_valid[lane])
+                    ? (float)scores[lh][lane] * s_ifx[lh] * softmax_scale
+                    : -1e38f;
                 float m_tile = sc;
                 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, o));
@@ -792,7 +886,7 @@ __global__ void latent_prefill_combine_kernel(
 // thread's dims are fixed and the per-dim max accumulates in registers, hitting
 // global memory with ONE atomicMax per (thread, dim) at the end. The canonical
 // gallery (`comp`) stays f32/pre-RoPE and position-free (§C).
-template <int HEAD_DIM, int ROPE_DIM>
+template <int HEAD_DIM, int ROPE_DIM, int NPAL>
 __global__ void latent_rope_quant_corpus_kernel(
     const int8_t* __restrict__ nope_i8,    // [G, NOPE_DIM] two-region: nope int8
     const float* __restrict__ nope_scale,  // [G, NOPE_BANDS] per-nope-band scale
@@ -893,7 +987,7 @@ __global__ void latent_rope_quant_corpus_kernel(
 // per-tile. With that scale constant, a comp tile's transposed V operand
 // becomes a pure byte gather — no per-tile max/requant — and the PV epilogue
 // scale is a per-kernel constant.
-template <int HEAD_DIM>
+template <int HEAD_DIM, int NPAL>
 __global__ void latent_quant_v_corpus_kernel(
     const int8_t* __restrict__ comp_i8,    // [G, HEAD_DIM] roped+per-band int8
     const float* __restrict__ comp_scale,  // [G, NPAL]
@@ -914,7 +1008,7 @@ __global__ void latent_quant_v_corpus_kernel(
     }
 }
 
-template <typename T, int HEAD_DIM, int ROPE_DIM>
+template <typename T, int HEAD_DIM, int ROPE_DIM, int NPAL>
 void launch_latent_prefill(
     const T* q,
     const uint8_t* headers,          // SlotHeader[n_seq]
@@ -961,21 +1055,21 @@ void launch_latent_prefill(
     // later chunks share the scratch on the ordered stream.
     if (g_total > 0) {
         const int pre_blocks = g_total < 2048 ? g_total : 2048;
-        latent_rope_quant_corpus_kernel<HEAD_DIM, ROPE_DIM>
+        latent_rope_quant_corpus_kernel<HEAD_DIM, ROPE_DIM, NPAL>
             <<<pre_blocks, NPAL * 32, 0, stream>>>(
                 nope_i8, nope_scale, rope_bf, comp_pos, rope_tab, comp_i8,
                 comp_scale, comp_vmax, g_total);
         const int64_t n_elem = (int64_t)g_total * HEAD_DIM;
         int v8_blocks = (int)((n_elem + 255) / 256);
         if (v8_blocks > 65535) v8_blocks = 65535;
-        latent_quant_v_corpus_kernel<HEAD_DIM><<<v8_blocks, 256, 0, stream>>>(
+        latent_quant_v_corpus_kernel<HEAD_DIM, NPAL><<<v8_blocks, 256, 0, stream>>>(
             comp_i8, comp_scale, comp_vmax, comp_v8, g_total);
     }
 
-    constexpr int smem = prefill_smem_bytes<T, HEAD_DIM>();
+    constexpr int smem = prefill_smem_bytes<T, HEAD_DIM, NPAL>();
     static bool attr_set = false;
     if (!attr_set) {
-        const void* fn = (const void*)latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM>;
+        const void* fn = (const void*)latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM, NPAL>;
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         cudaFuncSetAttribute(
             fn, cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -985,7 +1079,7 @@ void launch_latent_prefill(
 
     dim3 grid(total_q, 1, num_splits);
     dim3 block(PF_WARPS * 32);
-    latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM><<<grid, block, smem, stream>>>(
+    latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM, NPAL><<<grid, block, smem, stream>>>(
         q, headers, q_pos, seq_of, kv_new, comp_i8, comp_scale, comp_v8, comp_vmax,
         comp_idx, comp_cnt, comp_pos, rope_tab, pa, pm, total_q, n_q_head, softmax_scale,
         window_size, max_sel, new_meta, store_fmt);

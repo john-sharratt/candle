@@ -129,7 +129,7 @@ mod bench {
                     .collect();
                 // Pad to even length if needed
                 let mut padded = f16_data;
-                if padded.len() % 2 != 0 {
+                if !padded.len().is_multiple_of(2) {
                     padded.push(0);
                 }
                 let u32_data: Vec<u32> = padded
@@ -145,7 +145,7 @@ mod bench {
                     .map(|v| half::bf16::from_f32(*v).to_bits())
                     .collect();
                 let mut padded = bf16_data;
-                if padded.len() % 2 != 0 {
+                if !padded.len().is_multiple_of(2) {
                     padded.push(0);
                 }
                 let u32_data: Vec<u32> = padded

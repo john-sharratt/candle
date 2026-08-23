@@ -307,7 +307,7 @@ impl LogFile {
     pub fn stage(&mut self, record_bytes: &[u8]) -> u64 {
         assert!(!self.read_only, "stage on a read-only LogFile");
         assert!(
-            record_bytes.len() % ALIGN == 0,
+            record_bytes.len().is_multiple_of(ALIGN),
             "record bytes must be 4 KB-aligned"
         );
         let offset = self.write_offset + self.pending.len() as u64;

@@ -91,24 +91,21 @@ impl Tool for SshSessionExecAsync {
 
         let session = &entry.conn.session;
         let command = req.command.clone();
-        match session.channel_session() {
-            Ok(mut channel) => {
-                if channel.exec(&command).is_ok() {
-                    let mut stdout_data = Vec::new();
-                    let mut stderr_data = Vec::new();
-                    channel.read_to_end(&mut stdout_data).ok();
-                    {
-                        let mut s = channel.stderr();
-                        s.read_to_end(&mut stderr_data).ok();
-                    }
-                    channel.wait_close().ok();
-                    let code = channel.exit_status().unwrap_or(-1);
-                    *stdout_buf.lock().unwrap() = stdout_data;
-                    *stderr_buf.lock().unwrap() = stderr_data;
-                    *exit_code.lock().unwrap() = Some(code);
+        if let Ok(mut channel) = session.channel_session() {
+            if channel.exec(&command).is_ok() {
+                let mut stdout_data = Vec::new();
+                let mut stderr_data = Vec::new();
+                channel.read_to_end(&mut stdout_data).ok();
+                {
+                    let mut s = channel.stderr();
+                    s.read_to_end(&mut stderr_data).ok();
                 }
+                channel.wait_close().ok();
+                let code = channel.exit_status().unwrap_or(-1);
+                *stdout_buf.lock().unwrap() = stdout_data;
+                *stderr_buf.lock().unwrap() = stderr_data;
+                *exit_code.lock().unwrap() = Some(code);
             }
-            Err(_) => {}
         }
         *running.lock().unwrap() = false;
 

@@ -41,8 +41,20 @@ pub struct CudaDevice {
     /// strided kernels read). Keyed by contents: identical tables share one device
     /// buffer instead of re-uploading per launch — the per-launch tiny H2D copies
     /// were a measured WDDM submission storm. See [`Self::info_table`].
-    info_tables: Arc<Mutex<HashMap<Vec<usize>, Arc<Uploaded<usize>>>>>,
+    info_tables: InfoTables,
+    /// Memoized device copies of the token-major → group-major gather permutation.
+    /// Keyed by **shape** `(rows, groups)` rather than contents, because the table is
+    /// a pure function of that shape: a hit costs a two-word hash and does no host
+    /// build and no upload at all. See [`Self::group_major_ids`].
+    perm_tables: PermTables,
 }
+
+/// Memoized `ArenaTableEntry` uploads, keyed by the shape vector that produced
+/// them.
+type InfoTables = Arc<Mutex<HashMap<Vec<usize>, Arc<Uploaded<usize>>>>>;
+
+/// Memoized gather permutations, keyed by `(rows, groups)`.
+type PermTables = Arc<Mutex<HashMap<(usize, usize), Arc<Uploaded<u32>>>>>;
 
 impl std::fmt::Debug for CudaDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -167,6 +179,49 @@ impl CudaDevice {
             backing: Backing::Owned,
         });
         cache.insert(info.to_vec(), t.clone());
+        Ok(t)
+    }
+
+    /// The token-major → group-major gather permutation, memoized per `(rows, groups)`:
+    ///
+    /// ```text
+    /// ids[g * rows + t] = t * groups + g        for g in 0..groups, t in 0..rows
+    /// ```
+    ///
+    /// This is the row order the grouped output projection needs. Its source `[rows, groups, w]`
+    /// activation is contiguous, so group `g`'s rows are interleaved with stride `groups`; the
+    /// grouped matmul wants each group's rows adjacent, and gathering with this table produces
+    /// that without ever materialising the permutation in f32.
+    ///
+    /// **Keyed by shape, not contents.** The table is a pure function of `(rows, groups)`, so a
+    /// hit is a two-word hash — no host build, no upload. Building it per call instead was the
+    /// same WDDM submission storm [`Self::info_table`] exists to prevent, except worse: it also
+    /// spent `O(rows·groups)` of host time per layer per wave.
+    ///
+    /// Entries are pool-owned (`Backing::Owned`) and outlive any single wave; kernels only read
+    /// them. Cleared wholesale past a bound, like the info-table cache — in-flight users hold
+    /// their own `Arc`, so clearing is safe and a rebuild is trivial.
+    pub fn group_major_ids(&self, rows: usize, groups: usize) -> Result<Arc<Uploaded<u32>>> {
+        let key = (rows, groups);
+        let mut cache = self.perm_tables.lock().unwrap();
+        if let Some(t) = cache.get(&key) {
+            return Ok(t.clone());
+        }
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        let mut ids: Vec<u32> = Vec::with_capacity(rows * groups);
+        for g in 0..groups {
+            for t in 0..rows {
+                ids.push((t * groups + g) as u32);
+            }
+        }
+        let slice = self.memcpy_stod(&ids)?;
+        let t = Arc::new(Uploaded {
+            slice: std::mem::ManuallyDrop::new(slice),
+            backing: Backing::Owned,
+        });
+        cache.insert(key, t.clone());
         Ok(t)
     }
 
@@ -423,9 +478,39 @@ impl CudaDevice {
         Ok(())
     }
 
+    /// Turn off cudarc's per-argument cross-stream event tracking, BEFORE the
+    /// first allocation (only slices created after the call are affected).
+    ///
+    /// With tracking on, EVERY `device_ptr`/`device_ptr_mut` extraction —
+    /// several per kernel launch — records a `CudaEvent` on drop and stream-
+    /// waits the slice's prior read/write events once the process is in
+    /// multi-stream mode. Measured over one decode-heavy gate: 1.54M
+    /// `cuEventRecord` + 2.69M `cuStreamWaitEvent` + 1M `cuEventDestroy`
+    /// (~3.6 events per kernel, ~4.5s of host time) for 428k launches — on
+    /// WDDM, where host submission time IS the decode wall.
+    ///
+    /// Safety of turning it off: this engine orders every cross-stream
+    /// interaction EXPLICITLY at the producer/consumer pair — the expert
+    /// pipeline's `CopyBatchFence` ring and `order_copies_after_compute` /
+    /// `order_compute_after_copies`, the cold-staging ring's publish events,
+    /// the streamer's compute-order + plan fences, the DtoH readback events,
+    /// and the `TableRing` half fences. Compute itself runs on ONE stream per
+    /// device, where ordering is implicit. cudarc's per-argument events are a
+    /// second, redundant safety net over those explicit fences; a
+    /// cross-stream path added WITHOUT an explicit fence is a bug here by
+    /// design (and what the bit-exact gates + the Fletcher-32 golden
+    /// checksums exist to catch).
+    fn disable_per_arg_event_tracking(context: &std::sync::Arc<cudarc::driver::CudaContext>) {
+        // SAFETY: called before any allocation on this context, so no slice
+        // predates the setting (the documented hazard is mixing tracked and
+        // untracked slices).
+        unsafe { context.disable_event_tracking() };
+    }
+
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         Self::validate_compute_capability(&context)?;
+        Self::disable_per_arg_event_tracking(&context);
         let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
@@ -437,6 +522,7 @@ impl CudaDevice {
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             info_tables: Arc::new(Mutex::new(HashMap::new())),
+            perm_tables: Arc::new(Mutex::new(HashMap::new())),
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory
@@ -591,6 +677,7 @@ impl BackendDevice for CudaDevice {
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         Self::validate_compute_capability(&context)?;
+        Self::disable_per_arg_event_tracking(&context);
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
@@ -602,6 +689,7 @@ impl BackendDevice for CudaDevice {
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             info_tables: Arc::new(Mutex::new(HashMap::new())),
+            perm_tables: Arc::new(Mutex::new(HashMap::new())),
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory

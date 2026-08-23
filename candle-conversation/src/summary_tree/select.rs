@@ -172,7 +172,7 @@ pub fn select_dense(
     // Step 4 — fill coverage gaps largest first.
     let gaps = uncovered_ranges(tree, &selected_set, &parents);
     let mut gap_queue: Vec<Gap> = gaps;
-    gap_queue.sort_by(|a, b| b.normals.len().cmp(&a.normals.len()));
+    gap_queue.sort_by_key(|g| std::cmp::Reverse(g.normals.len()));
     for gap in gap_queue {
         // Smallest covering node = LCA of the gap's Normal sub-leaves
         // (mapped through normal_to_leaf to their SoT leaves).

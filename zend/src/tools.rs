@@ -262,6 +262,7 @@ fn balanced_object_spans(text: &str) -> Vec<(usize, usize)> {
 /// 3. Bare `{json}` objects (no tags) not already covered — but only when the
 ///    object names a real tool (or alias) via the registry, so prose JSON and
 ///    fabricated tool *responses* (`{"error": ...}`) aren't mistaken for calls.
+///
 /// Malformed blocks are silently skipped.
 pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
     use regex::Regex;

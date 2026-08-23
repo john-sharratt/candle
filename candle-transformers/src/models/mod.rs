@@ -14,6 +14,15 @@
 //! The implementations aim to be readable while maintaining good performance. For more information
 //! on each model see the model's module docs in the links below.
 
+// `profile::ProfileMark` is `Instant` under the `profile` feature and `()`
+// without it, so every `let t = profile_now();` on a hot path — 67 of them
+// across this tree — binds a unit value in the default build. That is the
+// point: the timestamp variable stays spelled the same in both configurations
+// and the no-op build compiles it away. Only `models::*` uses `profile_now`,
+// so the allow stops here rather than at the crate root. `unit_arg` is the same
+// mark reaching `ProfileAccumulator::record`, which takes it as the span start.
+#![allow(clippy::let_unit_value, clippy::unit_arg)]
+
 pub mod based;
 #[cfg(feature = "cuda")]
 pub mod batched_inference;
@@ -39,6 +48,9 @@ pub mod dac;
 pub mod debertav2;
 pub mod decode_utils;
 pub mod deepseek2;
+// The DeepSeek-V4 arch descriptor names `latent_moe`'s geometry and weights, so
+// it shares that engine's gating.
+#[cfg(feature = "cuda")]
 pub mod deepseek4;
 pub mod depth_anything_v2;
 pub mod dialect;
@@ -49,6 +61,9 @@ pub mod efficientnet;
 pub mod efficientvit;
 pub mod encodec;
 pub mod eva2;
+// Streams MoE expert weights pinned-host → VRAM on a copy stream; every layer
+// of it is CUDA.
+#[cfg(feature = "cuda")]
 pub mod expert_lre;
 pub mod falcon;
 pub mod fastvit;
@@ -70,6 +85,10 @@ pub mod host_embedding;
 pub mod jina_bert;
 pub mod kv_cache_utils;
 pub mod kv_collect_utils;
+// The sparse-latent MoE engine: paged latent attention, the provenance gallery
+// and the wave scheduler are all kernel wrappers.
+#[cfg(feature = "cuda")]
+pub mod latent_moe;
 pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;
@@ -100,11 +119,16 @@ pub mod phi;
 pub mod phi3;
 pub mod pixtral;
 pub mod prefill_capture;
+// Wraps the paged-prefill kernels and the wave buffers they read.
+#[cfg(feature = "cuda")]
 pub mod prefill_utils;
 pub mod profile;
 pub mod quantized_blip;
 pub mod quantized_blip_text;
 pub mod quantized_gemma3;
+// Batched/paged model implementations — they build on `batched_layer` and
+// `wave_buffers`, which are CUDA-only.
+#[cfg(feature = "cuda")]
 pub mod quantized_llama;
 pub mod quantized_llama2_c;
 pub mod quantized_matmul;
@@ -116,8 +140,10 @@ pub mod quantized_moondream;
 pub mod quantized_mpt;
 pub mod quantized_phi;
 pub mod quantized_phi3;
+#[cfg(feature = "cuda")]
 pub mod quantized_qwen2;
 pub mod delta_net;
+#[cfg(feature = "cuda")]
 pub mod quantized_qwen3;
 #[cfg(feature = "cuda")]
 pub mod quantized_qwen3_moe;
@@ -167,6 +193,9 @@ pub mod trocr;
 pub mod vgg;
 pub mod vit;
 pub mod voxtral;
+// Admits/rolls back a wave's KV across the batched forward — both callers are
+// the CUDA batched path.
+#[cfg(feature = "cuda")]
 mod wave_admit;
 pub mod wave_driver;
 #[cfg(feature = "cuda")]

@@ -160,6 +160,10 @@ fn warm_slots_for(stride: usize, total_experts: usize) -> usize {
 // ============================================================================
 
 /// The two operating modes of the expert cache.
+// Exactly one `PipelineMode` exists per `ExpertCache`, and an `ExpertCache` is
+// per-model. Boxing `Inline` to even the variants out would buy back a few
+// hundred bytes once and pay an indirection on every expert dispatch.
+#[allow(clippy::large_enum_variant)]
 enum PipelineMode {
     /// Background thread owns all mutable state.  Used for the mmap path
     /// where DMA overlap is active and experts cycle through VRAM.
@@ -635,6 +639,44 @@ impl ExpertCache {
             None
         };
 
+        // Arc-share the two source tiers and the geometry table with the
+        // off-thread expert streamer (both are immutable from here on), and
+        // spawn it — it owns its own staging ring and CUDA stream, so a
+        // whole-layer prefill stream never runs its reads on the pipeline
+        // thread. All-resident caches have nothing to stream.
+        #[cfg(feature = "cuda")]
+        let pack = Arc::new(pack);
+        #[cfg(feature = "cuda")]
+        let warm = Arc::new(warm);
+        #[cfg(feature = "cuda")]
+        let layer_geometries = Arc::new(layer_geometries);
+        #[cfg(feature = "cuda")]
+        let streamer = if all_resident {
+            None
+        } else if let Device::Cuda(cuda_dev) = device {
+            match cuda_dev.cuda_context().new_stream() {
+                Ok(stream) => {
+                    super::streamer::spawn_streamer_thread(super::streamer::StreamerCtx {
+                        pack: pack.clone(),
+                        warm: warm.clone(),
+                        layer_geometries: layer_geometries.clone(),
+                        cuda_dev: cuda_dev.clone(),
+                        stream,
+                        stats: stats.clone(),
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "candle_transformers::expert_lre",
+                        "streamer stream unavailable ({e}); expert streaming disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let state = PipelineState {
             inner,
             device: device.clone(),
@@ -656,7 +698,19 @@ impl ExpertCache {
             transition_matrix,
             last_moe_layer_idx: None,
             speculative_loads: HashSet::new(),
-            pending_prefetch_fence: CopyBatchFence::noop(),
+            #[cfg(feature = "cuda")]
+            streamer,
+            #[cfg(feature = "cuda")]
+            pending_streams: HashMap::new(),
+            #[cfg(feature = "cuda")]
+            stream_loads: HashSet::new(),
+            prefetch_fences: Vec::new(),
+            prefetch_depth: 1,
+            pass_started: None,
+            pass_dma_bytes: 0,
+            pass_late: 0,
+            pass_pred: (0, 0),
+            bw_ceiling_gbps: 0.0,
             hint_stats: (0, 0),
             profile: ProfileAccumulator::new(),
             stats: stats.clone(),
@@ -908,14 +962,23 @@ impl ExpertCache {
         {
             let experts_data: Vec<(Vec<u32>, Vec<u32>)> =
                 hits.iter().map(|&(eidx, _)| expert_group(eidx)).collect();
-            let experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> = hits
-                .iter()
-                .zip(experts_data.iter())
-                .filter_map(|(&(_, slot_idx), (toks, wids))| {
-                    let slot = inner.slots[slot_idx].as_ref()?;
-                    Some((slot, toks.as_slice(), wids.as_slice()))
-                })
-                .collect();
+            // A missing slot is a DROPPED expert, not a skippable one: the old
+            // `filter_map(… as_ref()?)` silently omitted it, so its contribution
+            // vanished and the layer returned an answer computed from fewer than
+            // k experts, indistinguishable downstream from a correct one. Same
+            // hazard, same refusal, as the threaded pipeline's copy.
+            let mut experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> =
+                Vec::with_capacity(hits.len());
+            for (&(eidx, slot_idx), (toks, wids)) in hits.iter().zip(experts_data.iter()) {
+                let Some(slot) = inner.slots[slot_idx].as_ref() else {
+                    candle::bail!(
+                        "expert {eidx} was classified resident in slot {slot_idx}, but that slot \
+                         is empty at compute time: its contribution would be dropped from this \
+                         layer's output"
+                    );
+                };
+                experts_vec.push((slot, toks.as_slice(), wids.as_slice()));
+            }
             if !experts_vec.is_empty() {
                 compute_experts_grouped(
                     &input,

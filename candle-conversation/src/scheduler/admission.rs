@@ -435,6 +435,10 @@ pub(super) fn plan_admission(
 
 #[cfg(test)]
 mod tests {
+    // Expected byte counts are written as the product they represent
+    // (`batch * heads * tokens * …`), so a `* 1` term names a real dimension.
+    #![allow(clippy::identity_op)]
+
     use super::*;
     use candle::DType;
     use candle_nn::kv_cache::QuantFormat;

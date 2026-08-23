@@ -136,7 +136,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── Pick one case with a healthy number of dead tokens ──────────────────────
-    let mut chosen: Option<(StreamId, Vec<u32>, usize, Vec<WideQSig>, usize)> = None;
+    // (stream, token ids, live token count, per-token sigs, dead token count)
+    type DeadSigCase = (StreamId, Vec<u32>, usize, Vec<WideQSig>, usize);
+    let mut chosen: Option<DeadSigCase> = None;
     for (sid, e) in substrate.all_streams() {
         let Some(StreamDecl::Turn(d)) = &e.decl else {
             continue;

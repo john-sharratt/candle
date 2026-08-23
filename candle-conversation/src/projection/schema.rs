@@ -943,13 +943,34 @@ impl GroupSchema {
     /// `apply_selection` would rank, just carried across reprojections.
     /// `n_candidates` bounds the unbounded `always_visible` case.
     ///
-    /// The score gates come from `score_threshold` **only when the group
-    /// declares one**. Most groups do, and it is their belief gate. A group that
-    /// instead declares a `policy:` band keeps it: overwriting with the `0.0`
-    /// default would make every candidate eligible at zero evidence, and
-    /// selection would then degenerate to the score-tie order (ascending turn
-    /// index) — picking the first turns in the group and presenting them as the
-    /// most relevant thing in the corpus.
+    /// The score gates resolve in this order:
+    ///
+    /// 1. **`score_threshold: 0.0`** — an explicit zero is a deliberate "no
+    ///    gate", not an absence, and disables the gate even against a declared
+    ///    band.
+    /// 2. **A declared `policy:` band** — the belief-specific knob, so it
+    ///    governs the belief gate.
+    /// 3. **A declared `score_threshold`** — the gate for the vast majority of
+    ///    groups, which declare a threshold and no band.
+    /// 4. **Neither** — no gate. An *inherited* default band must not become
+    ///    one; it is a tool-scope preset rather than this group's intent.
+    ///
+    /// # Why a band outranks a threshold
+    ///
+    /// The two gate different things. `score_threshold` gates SELECTION on
+    /// fresh per-turn scores — it is what stops a zero-evidence group (fork or
+    /// startup, before any probe) from seating arbitrary turns on a score tie.
+    /// A declared band gates ACCUMULATED belief, which is what this config
+    /// feeds.
+    ///
+    /// `repo_map/structure` is the only group in the bundled schema that
+    /// declares both, and it declares them for exactly that reason — its
+    /// `score_threshold: 1.0` comment says "the live belief loop is untouched
+    /// (its own min/evict of 250 governs there)". When the threshold outranked
+    /// the band, adding that line silently dropped the group's belief gate from
+    /// 250 to 1.0 — the entire accumulated-evidence range — which
+    /// `bundled_schema_belief_gates_resolve_from_the_right_source` has caught
+    /// since `4e762163` introduced it.
     pub fn belief_config(&self, n_candidates: usize) -> PolicyConfig {
         let mut cfg = self.policy.config;
         cfg.budget_min = 0;
@@ -963,13 +984,18 @@ impl GroupSchema {
             }
         };
         match (self.score_threshold, self.policy_band_declared) {
-            // Declared threshold: the group's own gate, as most groups configure it.
-            (Some(threshold), _) => {
+            // An explicit zero disables the gate outright, band or no band.
+            (Some(0.0), _) => {
+                cfg.min_score = 0.0;
+                cfg.evict_score = 0.0;
+            }
+            // A declared band is the belief gate, with or without a threshold.
+            (_, true) => {}
+            // No band: the group's threshold is its gate.
+            (Some(threshold), false) => {
                 cfg.min_score = threshold;
                 cfg.evict_score = threshold;
             }
-            // No threshold, but a declared policy band — keep it.
-            (None, true) => {}
             // Neither declared: no gate. (An inherited default band must not
             // become one; it is a tool-scope preset, not this group's intent.)
             (None, false) => {
@@ -1225,13 +1251,29 @@ mod belief_config_tests {
         }
     }
 
-    /// A declared threshold IS the group's belief gate — most groups configure
-    /// selection that way and must keep doing so.
+    /// A declared threshold IS the belief gate for a group with NO band of its
+    /// own — which is how most groups configure selection, and must keep
+    /// working. (The band values passed here are an inherited preset, flagged
+    /// undeclared; this test previously used the `group` helper, which hardcodes
+    /// `policy_band_declared = true`, and so was silently asserting the
+    /// both-declared case its own description does not describe.)
     #[test]
     fn a_declared_threshold_governs_the_belief_gate() {
-        let g = group(Some(250.0), 600.0, 400.0);
+        let g = group_with(Some(250.0), 600.0, 400.0, false);
         let cfg = g.belief_config(20);
         assert_eq!(cfg.min_score, 250.0);
+        assert_eq!(cfg.evict_score, 250.0);
+    }
+
+    /// A group that declares BOTH gives the band the belief gate: the threshold
+    /// governs selection on fresh scores, the band governs accumulated belief.
+    /// `repo_map/structure` is the bundled schema's only such group and relies
+    /// on exactly this.
+    #[test]
+    fn a_declared_band_outranks_a_threshold() {
+        let g = group_with(Some(1.0), 250.0, 250.0, true);
+        let cfg = g.belief_config(20);
+        assert_eq!(cfg.min_score, 250.0, "the declared band is the belief gate");
         assert_eq!(cfg.evict_score, 250.0);
     }
 

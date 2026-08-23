@@ -209,8 +209,8 @@ pub(crate) fn e8m0_to_f32_half(e: u8) -> f32 {
 fn best_index_mxfp4(x: f32, d: f32) -> u8 {
     let mut best = 0usize;
     let mut best_err = (MXFP4_KVALUES[0] as f32 * d - x).abs();
-    for i in 1..16 {
-        let err = (MXFP4_KVALUES[i] as f32 * d - x).abs();
+    for (i, &kv) in MXFP4_KVALUES.iter().enumerate().take(16).skip(1) {
+        let err = (kv as f32 * d - x).abs();
         if err < best_err {
             best = i;
             best_err = err;
@@ -634,9 +634,9 @@ impl GgmlType for BlockQ4_KO {
                 let (yd, ym) = (y.dm[2 * sub].to_f32(), y.dm[2 * sub + 1].to_f32());
                 let xp = x.qs[t];
                 let yp = y.qs[t];
-                for j in 0..8 {
-                    let xq = ((xp >> Q4_KO_SHIFTS[j]) & 0xF) as f32;
-                    let yq = ((yp >> Q4_KO_SHIFTS[j]) & 0xF) as f32;
+                for &sh in &Q4_KO_SHIFTS {
+                    let xq = ((xp >> sh) & 0xF) as f32;
+                    let yq = ((yp >> sh) & 0xF) as f32;
                     sumf += (xd * xq + xm) * (yd * yq + ym);
                 }
             }
@@ -769,8 +769,8 @@ impl GgmlType for BlockQ6_KO {
             for m in 0..16 {
                 let ql = x.ql[m];
                 let qh16 = (x.qh[m >> 1] >> ((m & 1) * 16)) & 0xFFFF;
-                for j in 0..8 {
-                    let nib = (ql >> Q4_KO_SHIFTS[j]) & 0xF;
+                for (j, &sh) in Q4_KO_SHIFTS.iter().enumerate() {
+                    let nib = (ql >> sh) & 0xF;
                     let crumb = (qh16 >> (2 * j as u32)) & 3;
                     let q6 = (nib | (crumb << 4)) as i32; // 0..63
                     let idx = m * 8 + j;
@@ -793,7 +793,7 @@ impl GgmlType for BlockQ6_KO {
             y.ql = [0; 16];
             y.qh = [0; 8];
             for m in 0..16 {
-                for j in 0..8 {
+                for (j, _) in Q4_KO_SHIFTS.iter().enumerate() {
                     let idx = m * 8 + j;
                     let scale = y.scales[idx / 16].to_f32();
                     let inv = if scale.abs() > 1e-10 {
@@ -861,8 +861,8 @@ impl GgmlType for BlockQ8_KO {
                 y.d[2 * k] = f16::from_f32(scale);
             }
             y._pad = [0; 4];
-            for j in 0..128 {
-                y.qs[j] = (block[j] * inv).round().clamp(-127.0, 127.0) as i8;
+            for (q, &b) in y.qs.iter_mut().zip(block.iter()) {
+                *q = (b * inv).round().clamp(-127.0, 127.0) as i8;
             }
         }
     }
@@ -1677,10 +1677,10 @@ impl GgmlType for BlockQ8_KS {
             }
             let da = d * ys.sa as f32 / 255.0;
             let db = d * ys.sb as f32 / 255.0;
-            for j in 0..QK_Q8_KS {
+            for (j, (q, &x)) in ys.qs.iter_mut().zip(xs.iter()).enumerate() {
                 let scale = if j < 4 { da } else { db };
                 let id = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-                ys.qs[j] = (xs[j] * id).round().clamp(-127.0, 127.0) as i8;
+                *q = (x * id).round().clamp(-127.0, 127.0) as i8;
             }
         }
     }
@@ -1743,8 +1743,8 @@ impl GgmlType for BlockQ2_0 {
             }
             ys.d = f16::from_f32(amax / 1.5);
             let id = 1.5 / amax;
-            for j in 0..QK2_0 {
-                let q = (xs[j] * id + 1.5).round().clamp(0.0, 3.0) as u8;
+            for (j, &x) in xs.iter().enumerate().take(QK2_0) {
+                let q = (x * id + 1.5).round().clamp(0.0, 3.0) as u8;
                 ys.qs[j / 4] |= q << ((j % 4) * 2);
             }
         }
@@ -1809,8 +1809,8 @@ impl GgmlType for BlockQ3_0 {
             ys.qh.fill(0);
             ys.qs.fill(0);
             let id = 3.5 / amax;
-            for j in 0..QK3_0 {
-                let q = (xs[j] * id + 3.5).round().clamp(0.0, 7.0) as u8;
+            for (j, &x) in xs.iter().enumerate().take(QK3_0) {
+                let q = (x * id + 3.5).round().clamp(0.0, 7.0) as u8;
                 let lo = q & 3;
                 let hi = (q >> 2) & 1;
                 ys.qs[j / 4] |= lo << ((j % 4) * 2);
@@ -1865,8 +1865,8 @@ impl GgmlType for BlockR16 {
         debug_assert_eq!(ys.len(), k / Self::BLCK_SIZE);
         for (i, ys) in ys.iter_mut().enumerate() {
             let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
-            for j in 0..QK_R16 {
-                ys.d[j] = f16::from_f32(xs[j]);
+            for (d, &x) in ys.d.iter_mut().zip(xs.iter()) {
+                *d = f16::from_f32(x);
             }
             ys.q = [0u16; QK_R16]; // Zero-fill Q space
         }
@@ -1901,11 +1901,8 @@ fn decode_e4m3(bits: u8) -> f32 {
             val
         }
     } else if exp == 15 && mantissa == 7.0 {
-        if sign == 1 {
-            f32::NAN
-        } else {
-            f32::NAN
-        }
+        // E4M3 encodes NaN with either sign bit; both decode to the same NaN.
+        f32::NAN
     } else {
         let val = (1.0 + mantissa / 8.0) * 2.0f32.powi(exp - 7);
         if sign == 1 {
@@ -2005,8 +2002,8 @@ impl GgmlType for BlockQ1S {
             let amax = block.iter().map(|x| x.abs()).fold(0f32, f32::max);
             y.scale = encode_e4m3(amax);
             y.qs.fill(0);
-            for j in 0..QK1_S {
-                if block[j] >= 0.0 {
+            for (j, &b) in block.iter().enumerate().take(QK1_S) {
+                if b >= 0.0 {
                     y.qs[j / 8] |= 1 << (j % 8);
                 }
             }
@@ -2050,8 +2047,8 @@ impl GgmlType for BlockQ2S {
             y.scale = encode_e4m3(d);
             y.qs.fill(0);
             let id = 1.5 / amax;
-            for j in 0..QK2_S {
-                let q = (block[j] * id + 1.5).round().clamp(0.0, 3.0) as u8;
+            for (j, &b) in block.iter().enumerate().take(QK2_S) {
+                let q = (b * id + 1.5).round().clamp(0.0, 3.0) as u8;
                 y.qs[j / 4] |= q << ((j % 4) * 2);
             }
         }
@@ -2099,8 +2096,8 @@ impl GgmlType for BlockQ2A {
             y.bias = encode_e4m3(vmin);
             y.qs.fill(0);
             let id = 3.0 / range;
-            for j in 0..QK2_A {
-                let q = ((block[j] - vmin) * id).round().clamp(0.0, 3.0) as u8;
+            for (j, &b) in block.iter().enumerate().take(QK2_A) {
+                let q = ((b - vmin) * id).round().clamp(0.0, 3.0) as u8;
                 y.qs[j / 4] |= q << ((j % 4) * 2);
             }
         }
@@ -2146,8 +2143,8 @@ impl GgmlType for BlockQ2_1 {
                 continue;
             }
             let id = 3.0 / range;
-            for j in 0..QK2_1 {
-                let q = ((block[j] - vmin) * id).round().clamp(0.0, 3.0) as u8;
+            for (j, &b) in block.iter().enumerate().take(QK2_1) {
+                let q = ((b - vmin) * id).round().clamp(0.0, 3.0) as u8;
                 y.qs[j / 4] |= q << ((j % 4) * 2);
             }
         }
@@ -2196,8 +2193,8 @@ impl GgmlType for BlockQ3_1 {
                 continue;
             }
             let id = 7.0 / range;
-            for j in 0..QK3_1 {
-                let q = ((block[j] - vmin) * id).round().clamp(0.0, 7.0) as u8;
+            for (j, &b) in block.iter().enumerate().take(QK3_1) {
+                let q = ((b - vmin) * id).round().clamp(0.0, 7.0) as u8;
                 y.qs[j / 4] |= (q & 3) << ((j % 4) * 2);
                 y.qh[j / 8] |= ((q >> 2) & 1) << (j % 8);
             }
@@ -2365,8 +2362,8 @@ pub fn encode_block_q0_v<const IS_K: bool>(block: &[f32]) -> BlockQ0V {
     // Stored value = scale_norm / 127, so multiply by 127 for comparison.
     let mut best_scale_idx = 0u8;
     let mut best_scale_err = f32::INFINITY;
-    for i in 0..32 {
-        let scale_baked = half::f16::from_bits(scale_table[i]).to_f32();
+    for (i, &raw) in scale_table.iter().enumerate().take(32) {
+        let scale_baked = half::f16::from_bits(raw).to_f32();
         let s = scale_baked * 127.0;
         let err = (actual_scale - s).abs();
         if err < best_scale_err {
@@ -2379,8 +2376,8 @@ pub fn encode_block_q0_v<const IS_K: bool>(block: &[f32]) -> BlockQ0V {
     // ── Step 3: pick centroid_idx within the chosen scale row (16 entries) ──
     let mut best_centroid_idx = 0u8;
     let mut best_centroid_err = f32::INFINITY;
-    for j in 0..16 {
-        let c = half::f16::from_bits(centroid_table[best_scale_idx as usize][j]).to_f32();
+    for (j, &raw) in centroid_table[best_scale_idx as usize].iter().enumerate() {
+        let c = half::f16::from_bits(raw).to_f32();
         let err = (actual_centroid - c).abs();
         if err < best_centroid_err {
             best_centroid_err = err;
@@ -2416,8 +2413,8 @@ pub fn encode_block_q0_v<const IS_K: bool>(block: &[f32]) -> BlockQ0V {
 
     let mut best_curve_idx = 0u8;
     let mut best_curve_err = f32::INFINITY;
-    for c in 0..128 {
-        let err = score_curve(&curve_table[c]);
+    for (c, curve) in curve_table.iter().enumerate().take(128) {
+        let err = score_curve(curve);
         if err < best_curve_err {
             best_curve_err = err;
             best_curve_idx = c as u8;
@@ -4715,8 +4712,7 @@ impl GgmlType for BlockQ0M4 {
             }
 
             let mut qmask = 0u32;
-            for p in 0..16usize {
-                let mean = pair_means[p];
+            for (p, &mean) in pair_means.iter().enumerate().take(16) {
                 let k = c
                     .iter()
                     .enumerate()
@@ -4725,8 +4721,8 @@ impl GgmlType for BlockQ0M4 {
                     .0 as u32;
                 qmask |= k << (2 * p);
             }
-            for k in 0..4 {
-                y.val_fp8[k] = encode_e4m3(c[k]);
+            for (dst, &v) in y.val_fp8.iter_mut().zip(c.iter()) {
+                *dst = encode_e4m3(v);
             }
             y.qmask = qmask;
         }

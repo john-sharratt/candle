@@ -13,6 +13,11 @@
 //! It is a no-op (prints a hint and returns) until the fixture has been
 //! captured via `quantized_qwen3_moe::tests::capture_routing_trace`.
 
+// Test-only module (`#[cfg(test)] mod eval;`). The replay walks layer/expert
+// index ranges the way the trace records them, so index loops are the shape of
+// the data rather than a style choice.
+#![allow(clippy::needless_range_loop, clippy::unnecessary_get_then_check)]
+
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 

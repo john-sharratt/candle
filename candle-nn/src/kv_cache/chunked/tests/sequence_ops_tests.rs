@@ -1,5 +1,8 @@
 //! Tests for sequence operations: alloc, free, share_prefix, fork.
 
+// Test code: loop indices are slot/chunk coordinates in the layout under test.
+#![allow(clippy::needless_range_loop)]
+
 use candle::{DType, Device, Tensor};
 
 use crate::kv_cache::chunked::ChunkedKvBacking;

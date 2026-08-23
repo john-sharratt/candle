@@ -312,7 +312,7 @@ impl TensorCat {
     /// Get the 1D dimensions of inner tensors at the specified batch index
     pub fn dims1(&self) -> Result<usize> {
         let dims = self.inner_shape.dims();
-        if dims.len() >= 1 {
+        if !dims.is_empty() {
             Ok(dims[0])
         } else {
             candle::bail!("Inner shape has no dimensions")

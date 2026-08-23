@@ -1,6 +1,6 @@
 //! FFI bindings for the paged latent-attention decode/prefill kernels.
 //!
-//! Single-latent K≡V attention (HEAD_DIM=512, MQA): the kernel walks the FP8
+//! Single-latent K≡V attention (MQA): the kernel walks the FP8
 //! window slot (arena bands via `SlotHeader`) plus an index-driven selection of
 //! f32 compressed entries, runs one online softmax over both sources, and the
 //! combine folds splits + the per-head sink, normalizes, and de-rotates the
@@ -11,7 +11,31 @@
 
 use core::ffi::c_void;
 
+/// i64 words per run in the glue scatter's descriptor table, mirroring
+/// `GLUE_SCATTER_WORDS` in `paged-latent/latent_common.cuh`. Array-of-structs:
+/// run `i` occupies `GLUE_SCATTER_WORDS` consecutive words holding
+/// `{kv, headers, slices, in_blk, rows}`.
+pub const GLUE_SCATTER_WORDS: usize = 5;
+
+/// The `(head_dim, rope_dim, n_bands)` triple this build's kernels were
+/// instantiated at, read straight from the compiled object.
+///
+/// The kernels are templates over that triple, and the `extern "C"` entry points
+/// pin it to one value (`LM_HEAD_DIM`/`LM_ROPE_DIM`/`LM_NPAL` in
+/// `paged_latent_api_bf16.cu`). A host that launches against a different
+/// geometry would write `KvHead` records the kernel reads at other offsets —
+/// silent corruption, not a crash — so callers check this once at load and
+/// refuse the mismatch.
+pub fn latent_geometry() -> (usize, usize, usize) {
+    let (mut head_dim, mut rope_dim, mut n_bands) = (0i32, 0i32, 0i32);
+    unsafe { run_latent_geometry(&mut head_dim, &mut rope_dim, &mut n_bands) };
+    (head_dim as usize, rope_dim as usize, n_bands as usize)
+}
+
 extern "C" {
+    /// Writes the compiled geometry triple. Prefer [`latent_geometry`].
+    pub fn run_latent_geometry(head_dim: *mut i32, rope_dim: *mut i32, n_bands: *mut i32);
+
     /// BF16 latent decode. Layouts:
     ///   `q_ptr`    : `[slots, n_q_head, 512]` bf16, **pre-RoPE** (roped in-kernel
     ///                at the explicit `q_pos`).
@@ -158,15 +182,20 @@ extern "C" {
         stream: *mut c_void,
     );
 
-    /// Glue latent scatter: write `rows` bf16 latents into their RESERVED gap
-    /// chunks (per-row block index + in-block offset from the reprojection's
-    /// glue descriptors). Launch BEFORE the attention pass on the same stream.
+    /// Glue latent scatter: write bf16 latents into their RESERVED gap chunks
+    /// (per-row block index + in-block offset from the reprojection's glue
+    /// descriptors). Launch BEFORE the attention pass on the same stream.
+    ///
+    /// Batched over runs: each run names its own destination slot, so the whole
+    /// wave's scatters — glue islands, prefill writeback, verify writeback —
+    /// go in one launch.
+    ///   desc:     device i64 `[GLUE_SCATTER_WORDS * n_runs]`, `{kv, headers,
+    ///             slices, in_blk, rows}` per run (see `latent_common.cuh`)
+    ///   max_rows: the widest run's row count, for grid sizing
     pub fn run_paged_latent_glue_scatter_bf16(
-        kv: *const c_void,
-        headers_ptr: *const u8,
-        slices: *const u32,
-        in_blk: *const u32,
-        rows: i32,
+        desc: *const i64,
+        n_runs: i32,
+        max_rows: i32,
         stream: *mut c_void,
     );
 

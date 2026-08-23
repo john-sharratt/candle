@@ -15,6 +15,7 @@ pub mod code_read;
 pub mod config;
 pub mod conv_file_store;
 pub mod conv_files;
+pub mod download;
 pub mod ingest;
 pub mod ingest_report;
 pub mod loading;
@@ -33,5 +34,3 @@ pub mod tools;
 pub mod turn_sink;
 pub mod types;
 pub mod watcher;
-
-pub mod download;

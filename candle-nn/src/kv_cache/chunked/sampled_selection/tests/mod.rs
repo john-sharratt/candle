@@ -6,6 +6,10 @@
 //! `projection`, `test_data`) — CPU-vs-GPU parity, threshold calibration
 //! sweeps, and format-selection correctness against real and synthetic K/V.
 
+// Test code: block alignment is written as the `% n == 0` the format contract
+// is stated in.
+#![allow(clippy::manual_is_multiple_of)]
+
 #[allow(unused_imports)]
 pub(super) use super::{
     model_compression_from_surface, sample_error_surface, sample_error_surface_cpu,

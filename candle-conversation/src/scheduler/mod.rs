@@ -1676,7 +1676,7 @@ impl WaveStats {
             + self.drain_prefill_tokens;
         let fwds = self.prefill.fwds + self.decode.fwds + self.section.fwds;
         let fwd_sum = self.prefill.ms_sum + self.decode.ms_sum + self.section.ms_sum;
-        let fwd_ms = if fwds > 0 { fwd_sum / fwds } else { 0 };
+        let fwd_ms = fwd_sum.checked_div(fwds).unwrap_or(0);
         let (budget_mib, used_mib) = kv_vram
             .map(|(b, u)| ((b / (1 << 20)) as u64, (u / (1 << 20)) as u64))
             .unwrap_or((0, 0));
@@ -6152,7 +6152,7 @@ impl Scheduler {
         {
             let mut view = conversation.write();
             for ((_, residence, _native, _in_collection), q_per_layer) in
-                pending.into_iter().zip(quantized_per_section.into_iter())
+                pending.into_iter().zip(quantized_per_section)
             {
                 if q_per_layer.len() != n_layers {
                     tracing::warn!(
@@ -6741,99 +6741,6 @@ impl Scheduler {
         Ok((view_id, borrowed))
     }
 
-    /// Run provenance scan + projection for the active view's policy, then
-    /// rebuild the parent + view around the freshly-projected
-    /// `(sections, turns)` selection, preserving the active turn's
-    /// in-flight tokens **without any data copies or forward-pass
-    /// work**.
-    ///
-    /// # The zero-copy rebuild
-    ///
-    /// The previous implementation tried to keep the same parent slot
-    /// and just narrow the view's borrow window onto it.  That assumed
-    /// the new projection's selection was already materialised on
-    /// parent in a contiguous prefix.  provenance-driven `top_k` swaps broke
-    /// that assumption: newly-picked sections only existed in the
-    /// substrate, not in parent, so they got filtered out of the new
-    /// borrow ranges, the view ended up borrowing a gappy subset,
-    /// `finalize_view`'s truncate-to-borrowed step then dropped the
-    /// in-parent sections the new selection didn't keep, and the
-    /// next reproject's range request landed past parent's now-
-    /// shrunken end.
-    ///
-    /// The rebuild is fully metadata-only.  The chunked backing's
-    /// primitives (`inject_sealed_at_tail`, `create_view_sequence`,
-    /// `extend_chunks`) all move chunks via `Arc<ChunkGid>` clones —
-    /// no DMA, no kernel work, no forward pass.  Steps:
-    ///
-    /// 1. **Probe + scan + project**: probe live Q from the recent
-    ///    decode window, run provenance against substrate sigs to refresh
-    ///    section / turn scores, project the new
-    ///    `(sections, turns)` selection.  Unchanged from the old
-    ///    code.
-    /// 2. **Capture the active turn's tail**: snapshot the view per
-    ///    layer as `SealedSequence`s and slice off
-    ///    `chunks[original_borrowed..]`.  Those chunks hold every
-    ///    K/V byte computed since the view was carved (user prefill +
-    ///    decoded-so-far).  The Q vectors and provenance signatures for the
-    ///    decoded tokens are already captured by provenance — nothing
-    ///    in the tail needs regenerating.
-    /// 3. **Free the old view**: drops its `ChunkGid` refs.  The
-    ///    captured tail Arc-refs keep the underlying chunks alive
-    ///    across the free, so the GPU bytes survive untouched.
-    /// 4. **Reset parent**: truncate to 0 chunks.  Substrate-pinned
-    ///    section chunks survive via the substrate's own Arc refs;
-    ///    parent just drops its metadata pointers.
-    /// 5. **Re-run `apply_projection`**: Arc-clones the new
-    ///    selection's sealed chunks onto parent and patches their
-    ///    `block_range` in the substrate to the new layout.
-    /// 6. **`inject_sealed_at_tail` the captured tail onto parent**:
-    ///    Arc-clones again, so parent now holds `[new prefix] +
-    ///    [active-turn tail]` with the tail's exact K/V bytes
-    ///    preserved.
-    /// 7. **Carve a fresh view borrowing all of parent**: the new
-    ///    view's writer-owned chunk is the standard CoW copy of
-    ///    parent's trailing partial chunk, ready for the next
-    ///    decoded token to extend.
-    /// 8. **Re-key per-view state** (`active_decodes`,
-    ///    `sampling_states`, `turn_views`) onto the new view id.
-    ///
-    /// # RoPE is recomputed transparently
-    ///
-    /// K bytes are stored un-rotated.  Per-chunk `rope_base` is
-    /// rederived every forward pass by
-    /// [`SlotStateHost::from_sealed_chunks`] from the destination
-    /// slot's cumulative chunk usage.  Moving chunks between slots
-    /// or shifting the prefix size automatically yields the right
-    /// rotated K when the kernel reads them.
-    ///
-    /// # The one real semantic compromise: stale K_raw
-    ///
-    /// The tail's stored K and V bytes were computed by the model
-    /// against the *old* prefix.  Under the new prefix, a fresh
-    /// forward pass would have produced slightly different K/V
-    /// because the residual stream at every layer absorbed
-    /// different attention output.  Re-prefilling would burn a
-    /// forward pass to "fix" this; the zero-copy path doesn't.
-    ///
-    /// For typical reproject use (small provenance-driven catalog swaps
-    /// of semantically-adjacent sections), the staleness is
-    /// negligible.  Compounded over many reprojects fired in quick
-    /// succession (e.g. every newline via `trigger_token_ids`),
-    /// the drift can degrade generation quality — set the
-    /// reproject cadence conservatively (`every_n_tokens` ~50+,
-    /// or trigger on semantic-paragraph boundaries) to keep K_raw
-    /// staleness within tolerance.
-    ///
-    /// No-op (returns the same view id) when:
-    /// - The view has no [`ReprojectionPolicy`] attached, **or**
-    /// - The R16 dump returns no sealed blocks (nothing to probe
-    ///   with), **or**
-    /// - The substrate corpus is empty.
-    ///
-    /// Errors propagate from the underlying session ops; the caller
-    /// (decode loop) marks the view as finished on failure.
-
     /// Budget-aware pre-elevate eviction (replaces the unconditional
     /// `evict_from_hot`). Frees only enough of **this** conversation's
     /// least-recently-promoted hot KV to fit the incoming cold-load within the
@@ -7098,6 +7005,77 @@ impl Scheduler {
     /// in-flight state for [`Self::reproject_view_complete`] (after the caller
     /// fires the batched gap-fill), or `None` if the view needs no reprojection.
     /// Removes the view's `DecodeState` into the in-flight on success.
+    ///
+    /// # The zero-copy rebuild
+    ///
+    /// Reprojection rebuilds the parent + view around the freshly-projected
+    /// `(sections, turns)` selection, preserving the active turn's in-flight
+    /// tokens **without any data copies or forward-pass work**. This function
+    /// runs steps 1–6; [`Self::reproject_view_complete`] runs 7–8.
+    ///
+    /// An earlier implementation kept the same parent slot and just narrowed the
+    /// view's borrow window onto it. That assumed the new selection was already
+    /// materialised on parent in a contiguous prefix. Provenance-driven `top_k`
+    /// swaps broke the assumption: newly-picked sections existed only in the
+    /// substrate, so they were filtered out of the new borrow ranges, the view
+    /// borrowed a gappy subset, `finalize_view`'s truncate-to-borrowed step then
+    /// dropped the in-parent sections the new selection didn't keep, and the next
+    /// reproject's range request landed past parent's now-shrunken end.
+    ///
+    /// The rebuild is fully metadata-only. The chunked backing's primitives
+    /// (`inject_sealed_at_tail`, `create_view_sequence`, `extend_chunks`) all
+    /// move chunks via `Arc<ChunkGid>` clones — no DMA, no kernel work, no
+    /// forward pass. Steps:
+    ///
+    /// 1. **Probe + scan + project**: probe live Q from the recent decode
+    ///    window, run provenance against substrate sigs to refresh section /
+    ///    turn scores, project the new `(sections, turns)` selection.
+    /// 2. **Capture the active turn's tail**: snapshot the view per layer as
+    ///    `SealedSequence`s and slice off `chunks[original_borrowed..]`. Those
+    ///    chunks hold every K/V byte computed since the view was carved (user
+    ///    prefill + decoded-so-far). The Q vectors and provenance signatures for
+    ///    the decoded tokens are already captured by provenance — nothing in the
+    ///    tail needs regenerating.
+    /// 3. **Free the old view**: drops its `ChunkGid` refs. The captured tail
+    ///    Arc-refs keep the underlying chunks alive across the free, so the GPU
+    ///    bytes survive untouched.
+    /// 4. **Reset parent**: truncate to 0 chunks. Substrate-pinned section
+    ///    chunks survive via the substrate's own Arc refs; parent just drops its
+    ///    metadata pointers.
+    /// 5. **Re-run `apply_projection`**: Arc-clones the new selection's sealed
+    ///    chunks onto parent and patches their `block_range` in the substrate to
+    ///    the new layout.
+    /// 6. **`inject_sealed_at_tail` the captured tail onto parent**: Arc-clones
+    ///    again, so parent now holds `[new prefix] + [active-turn tail]` with the
+    ///    tail's exact K/V bytes preserved.
+    /// 7. **Carve a fresh view borrowing all of parent**: the new view's
+    ///    writer-owned chunk is the standard CoW copy of parent's trailing
+    ///    partial chunk, ready for the next decoded token to extend.
+    /// 8. **Re-key per-view state** (`active_decodes`, `sampling_states`,
+    ///    `turn_views`) onto the new view id.
+    ///
+    /// # RoPE is recomputed transparently
+    ///
+    /// K bytes are stored un-rotated. Per-chunk `rope_base` is rederived every
+    /// forward pass by [`SlotStateHost::from_sealed_chunks`] from the
+    /// destination slot's cumulative chunk usage. Moving chunks between slots or
+    /// shifting the prefix size automatically yields the right rotated K when the
+    /// kernel reads them.
+    ///
+    /// # The one real semantic compromise: stale K_raw
+    ///
+    /// The tail's stored K and V bytes were computed by the model against the
+    /// *old* prefix. Under the new prefix, a fresh forward pass would have
+    /// produced slightly different K/V because the residual stream at every layer
+    /// absorbed different attention output. Re-prefilling would burn a forward
+    /// pass to "fix" this; the zero-copy path doesn't.
+    ///
+    /// For typical reproject use (small provenance-driven catalog swaps of
+    /// semantically-adjacent sections), the staleness is negligible. Compounded
+    /// over many reprojects fired in quick succession (e.g. every newline via
+    /// `trigger_token_ids`), the drift can degrade generation quality — set the
+    /// reproject cadence conservatively (`every_n_tokens` ~50+, or trigger on
+    /// semantic-paragraph boundaries) to keep K_raw staleness within tolerance.
     fn reproject_view_prepare(
         &mut self,
         view_id: SequenceId,
@@ -7820,6 +7798,11 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    // Expected token totals are written as the sum of the per-item terms they
+    // came from, including the zero ones, so the arithmetic under test is
+    // visible in the assertion.
+    #![allow(clippy::identity_op)]
+
     use super::*;
     use candle::{DType, Tensor};
 

@@ -39,11 +39,9 @@ impl RotaryEmbedding {
         let dim = cfg
             .head_dim
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
-        let rotary_dim = if cfg.partial_rotary_factor.is_some() {
-            (cfg.partial_rotary_factor.unwrap() * dim as f32) as usize
-        } else {
-            dim
-        };
+        let rotary_dim = cfg
+            .partial_rotary_factor
+            .map_or(dim, |f| (f * dim as f32) as usize);
         let max_seq_len = cfg.max_position_embeddings;
         let inv_freq: Vec<_> = (0..rotary_dim)
             .step_by(2)

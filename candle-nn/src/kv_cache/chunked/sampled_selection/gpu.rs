@@ -488,9 +488,7 @@ impl KvSamplerGpu {
 
             // Allocate (or reallocate if n_cells changed) without dropping old buffers
             // until after the new ones are ready.
-            let needs_realloc = scratch_guard
-                .as_ref()
-                .map_or(true, |c| c.n_cells != n_cells);
+            let needs_realloc = scratch_guard.as_ref().is_none_or(|c| c.n_cells != n_cells);
             if needs_realloc {
                 let k_winners = unsafe { self.dev.alloc::<u8>(self.n_k_thresholds * n_cells)? };
                 let v_winners = unsafe { self.dev.alloc::<u8>(self.n_v_thresholds * n_cells)? };
@@ -733,13 +731,13 @@ impl PagedSelectionGpuInputs {
         if blocks_per_chunk == 0 {
             candle::bail!("blocks_per_chunk must be > 0");
         }
-        if n_kv_head == 0 || blocks_per_chunk % n_kv_head != 0 {
+        if n_kv_head == 0 || !blocks_per_chunk.is_multiple_of(n_kv_head) {
             candle::bail!(
                 "blocks_per_chunk ({blocks_per_chunk}) must be divisible by n_kv_head ({n_kv_head})"
             );
         }
         let head_dim = blocks_per_chunk / n_kv_head;
-        if head_dim % N_PALETTE != 0 {
+        if !head_dim.is_multiple_of(N_PALETTE) {
             candle::bail!("head_dim ({head_dim}) must be divisible by N_PALETTE ({N_PALETTE})");
         }
         let chunk_size = SELECT_BLOCK;
@@ -827,13 +825,13 @@ impl PagedSelectionGpuInputs {
         if blocks_per_chunk == 0 {
             candle::bail!("blocks_per_chunk must be > 0");
         }
-        if n_kv_head == 0 || blocks_per_chunk % n_kv_head != 0 {
+        if n_kv_head == 0 || !blocks_per_chunk.is_multiple_of(n_kv_head) {
             candle::bail!(
                 "blocks_per_chunk ({blocks_per_chunk}) must be divisible by n_kv_head ({n_kv_head})"
             );
         }
         let head_dim = blocks_per_chunk / n_kv_head;
-        if head_dim % N_PALETTE != 0 {
+        if !head_dim.is_multiple_of(N_PALETTE) {
             candle::bail!("head_dim ({head_dim}) must be divisible by N_PALETTE ({N_PALETTE})");
         }
         let chunk_size = SELECT_BLOCK;

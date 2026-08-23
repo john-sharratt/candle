@@ -4,6 +4,8 @@
 //! and cross-dtype agreement tests.
 
 #![cfg(feature = "cuda")]
+// Test code: dtype widths are spelled out to match the kernel ABI.
+#![allow(clippy::unnecessary_cast)]
 
 #[allow(dead_code)]
 mod sampling_harness;

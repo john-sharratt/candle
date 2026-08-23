@@ -874,22 +874,22 @@ impl Sequence {
             // that don't register a session) we can't compute
             // `chunks_per_layer`, so we fall through to ingest.
             let stream_id = crate::persistence::content_hash::section_stream_id(address);
-            if n_layers > 0 && self.substrate.section_stream_is_persisted(stream_id) {
-                if self
+            if n_layers > 0
+                && self.substrate.section_stream_is_persisted(stream_id)
+                && self
                     .substrate
                     .section_stream_layout(stream_id, n_layers)
                     .is_some()
-                {
-                    to_restore.push(Pending {
-                        section_id,
-                        content,
-                        tokens,
-                        token_count,
-                        address,
-                        debug_name,
-                    });
-                    continue;
-                }
+            {
+                to_restore.push(Pending {
+                    section_id,
+                    content,
+                    tokens,
+                    token_count,
+                    address,
+                    debug_name,
+                });
+                continue;
             }
             to_ingest.push(Pending {
                 section_id,
@@ -986,7 +986,7 @@ impl Sequence {
             usize, // content_len for the progress callback
             crossbeam::channel::Receiver<crate::Result<SealResult>>,
         )> = Vec::with_capacity(to_ingest.len());
-        for (slot_id, item) in slot_ids.into_iter().zip(to_ingest.into_iter()) {
+        for (slot_id, item) in slot_ids.into_iter().zip(to_ingest) {
             let (tx, rx) = crossbeam::channel::bounded(1);
             let content_len = item.content.len();
             self.scheduler_tx

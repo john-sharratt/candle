@@ -269,9 +269,13 @@ pub fn run_pass(
         // must not abort the whole pass — it would starve every other
         // timeline, including freshly-started conversations. Log it and move
         // on; only a hard error propagates and stops the thread.
-        if let Err(e) =
-            absorb_pending_turns(conversation, runner, timeline, max_concurrent, RAW_TAIL_TURNS)
-        {
+        if let Err(e) = absorb_pending_turns(
+            conversation,
+            runner,
+            timeline,
+            max_concurrent,
+            RAW_TAIL_TURNS,
+        ) {
             match e {
                 ProbeError::Hard(_) => return Err(e),
                 ProbeError::Soft(msg) | ProbeError::Permanent(msg) => {
@@ -1075,7 +1079,10 @@ mod tests {
     /// digest. Measured before this gate: a four-question conversation had its
     /// first turn compressed 64 s after sealing, and by "what did I ask you?"
     /// the model answered that it had no access to the conversation history.
-    /// Archiving is the exemption — a terminal timeline compresses to the end.
+    ///
+    /// Archiving is the exemption: a live conversation defers its last exchange
+    /// (the frontier), but once archived a summariser pass seals that too, so an
+    /// archived conversation has no hole in its peak cover.
     #[test]
     fn the_recent_tail_stays_verbatim_until_the_conversation_outgrows_it() {
         let tmp = ephemeral_workspace();

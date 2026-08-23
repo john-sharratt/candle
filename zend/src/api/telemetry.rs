@@ -153,7 +153,7 @@ pub async fn promotes() -> Json<Promotes> {
         .into_iter()
         .map(|(name, count)| Promote { name, count })
         .collect();
-    items.sort_by(|a, b| b.count.cmp(&a.count));
+    items.sort_by_key(|p| std::cmp::Reverse(p.count));
     Json(Promotes { items })
 }
 

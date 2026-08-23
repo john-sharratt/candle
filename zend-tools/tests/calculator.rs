@@ -69,7 +69,7 @@ fn calculator_sqrt() {
         "calculator",
         json!({"expression": "sqrt(1872133)"}),
     ));
-    assert!((big["result"].as_f64().unwrap() - 1368.259_84).abs() < 1e-3);
+    assert!((big["result"].as_f64().unwrap() - 1_368.259_84).abs() < 1e-3);
 }
 
 #[test]

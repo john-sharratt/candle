@@ -41,6 +41,25 @@
 //!   q3_cos_mean   — mean cosine-distance Q3_0
 //!   q2_cos_mean   — mean cosine-distance Q2_0
 
+// The dump loaders and curve helpers feed the CUDA-gated stats tests; without
+// `cuda` the file still compiles, so the pure statistics code stays checked.
+#![cfg_attr(not(feature = "cuda"), allow(dead_code))]
+// Statistics generator: loop indices are per-format/per-band coordinates, the
+// tuple returns mirror the raw stat vectors, and the report strings are
+// assembled to a fixed column layout.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::identity_op,
+    clippy::excessive_precision,
+    clippy::manual_is_multiple_of,
+    clippy::manual_repeat_n,
+    clippy::manual_str_repeat,
+    clippy::unnecessary_sort_by,
+    clippy::wrong_self_convention
+)]
+
 use super::dump_reader::load_dump;
 use std::io::Write;
 

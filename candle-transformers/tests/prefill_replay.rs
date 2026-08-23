@@ -211,6 +211,16 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
 
     let stager = PinnedStager::new_from_device(&device);
     let run = |caches: &mut [KvCache]| -> Result<Tensor> {
+        // The write region must exist before the kernel runs — `paged_prefill_batched`
+        // writes into it and does not allocate it. Production does this up front via
+        // `ensure_for_batch_entries_all`; replaying the captured call without it trips
+        // `extend_for_write_region: no writer chunk`.
+        for (si, cache) in caches.iter().enumerate() {
+            let kc = cache.k_cache();
+            if let (Some(backing), Some(slot)) = (kc.chunked_backing(), kc.chunked_slot()) {
+                backing.ensure_for_batch_entries(&[(slot, offsets[si])], q_lens[si])?;
+            }
+        }
         let mut refs: Vec<&mut KvCache> = caches.iter_mut().collect();
         let generation = stager.begin_generation();
         paged_prefill_batched(

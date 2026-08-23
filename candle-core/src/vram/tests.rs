@@ -207,6 +207,36 @@ fn refinement_stops_at_the_minimum_chunk() -> Result<()> {
     Ok(())
 }
 
+/// WDDM's refusal never comes — the growth loop must stop at the probe's live
+/// headroom (the OS residency budget) instead of allocating past it.
+///
+/// Modeled by a card whose budget (initial headroom) is below `total − reserve`
+/// while the allocator accepts everything up to `total` — exactly the measured
+/// dev-box shape (budget 71,977 MiB on a 73,045 MiB card, zero refusals, the
+/// uncapped claim landing 600 MiB PAST the budget and the widest config then
+/// thrashing bimodally as WDDM demoted whichever pages it liked).
+#[test]
+fn balloon_stops_at_the_residency_budget_when_the_driver_never_refuses() -> Result<()> {
+    let cfg = test_config();
+    let total = 16 * GIB;
+    let budget = 14 * GIB; // OS keeps 2 GiB for itself + co-tenants
+    let vram = FakeVram::new(budget, total);
+    // The allocator commits to the full card without refusing — WDDM.
+    let mut alloc = FakeBalloonAllocator::new(vram.clone(), total);
+    let probe = vram.probe_as(super::ProbeKind::Dxgi);
+    let c = super::balloon::balloon_measure(&probe, &mut alloc, &cfg)?;
+    // The claim stops at budget − wobble margin (budget/16, ≥ the reserve),
+    // never at total − reserve.
+    let margin = (budget / 16).max(cfg.capacity_reserve);
+    let cap = budget - margin;
+    assert!(c <= cap, "claim {c} ran past budget − margin ({cap})");
+    assert!(
+        cap - c < cfg.balloon_chunk,
+        "claim {c} stopped more than one chunk short of budget − margin ({cap})"
+    );
+    Ok(())
+}
+
 /// A target above the card's real ceiling costs nothing: the balloon stops where
 /// the driver refuses, which is the honest capacity.
 #[test]
