@@ -7,6 +7,8 @@
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_var_builder::VarBuilder;
 use candle::quantized::{GgmlDType, QTensor};
+#[cfg(feature = "cuda")]
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, LiveTensor, Module, Result, Tensor};
 use std::sync::{Arc, RwLock};
 
@@ -223,6 +225,41 @@ impl RmsNorm {
         let weight = self.weight_for(x_dtype)?;
         candle_nn::ops::rms_norm(x, &weight, self.eps as f32)
     }
+
+    /// [`Self::forward_live`] as the **head** of a wave-scoped chain.
+    ///
+    /// A layer's first norm reads the residual stream, which lives on the pool
+    /// because it crosses layers — so there is no arena for it to inherit, and
+    /// this is where the layer names one. Everything computed from the result
+    /// follows it there under operand provenance, with no further mention of the
+    /// wave; the guard borrow on the result is what stops any of it outliving
+    /// the span.
+    ///
+    /// `wave` of `None` is the ordinary owned allocation, which is the right
+    /// answer outside a forward rather than a fallback.
+    #[cfg(feature = "cuda")]
+    pub fn forward_rooted<'w>(
+        &self,
+        x: &Tensor,
+        wave: Option<&'w candle_nn::kv_cache::WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
+        self.forward_with_ticket(x, wave.map(|g| g.ticket()))
+    }
+
+    /// The rooted FP norm shared by [`Self::forward_rooted`] and the float arm
+    /// of [`Self::forward_dynamic`]: the two entry points differ only in where
+    /// the provenance ticket comes from (a wave handle vs. a producer's
+    /// backing), so both resolve it and land here.
+    #[cfg(feature = "cuda")]
+    fn forward_with_ticket<'w>(
+        &self,
+        x: &Tensor,
+        root: Option<WaveTicket>,
+    ) -> Result<LiveTensor<'w>> {
+        let _enter = self.span.enter();
+        let weight = self.weight_for(x.dtype())?;
+        candle_nn::ops::rms_norm_rooted(x, &weight, self.eps as f32, root)
+    }
 }
 
 impl Module for RmsNorm {
@@ -246,7 +283,11 @@ impl RmsNorm {
     ) -> Result<candle::quantized::cuda::DynamicActs<'w>> {
         use candle::quantized::cuda::DynamicActs;
         if !mode.is_int8() {
-            return Ok(DynamicActs::Float(self.forward(x)?));
+            // `root` seeds this arm too: the FP norm writes into the arena the
+            // ticket names, so the float FFN chains onto the wave span instead
+            // of running off the pool while the span sits empty beside it.
+            let normed = self.forward_with_ticket(x, root.inherit_ticket())?;
+            return Ok(DynamicActs::Float(normed));
         }
         let _enter = self.span.enter();
         let weight = self.weight_for(x.dtype())?;

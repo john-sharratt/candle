@@ -483,6 +483,29 @@ impl<'w> LiveTensor<'w> {
         Ok(from_storage(storage, shape, BackpropOp::none(), false))
     }
 
+    /// [`Self::empty`], in whichever arena `self` came from.
+    ///
+    /// The operand-provenance rule spelled out for a **kernel wrapper**. The
+    /// generic ops get this for free — they allocate through
+    /// `alloc_uninit_from` and inherit their input's arena without knowing what
+    /// an arena is — but a hand-written launcher names its own output buffer,
+    /// and reaching for [`Self::empty`] there silently drops the chain onto the
+    /// pool. Allocating beside an operand keeps the chain intact, and `'w` comes
+    /// from that operand, so the result cannot outlive the span it may point
+    /// into.
+    ///
+    /// Carries the same write-before-read contract as [`Self::empty`].
+    pub fn empty_beside<S: Into<Shape>>(&self, shape: S, dtype: DType) -> Result<Self> {
+        let shape = shape.into();
+        // SAFETY: as `empty` — the caller's kernel writes every element before
+        // anything reads it.
+        let storage = unsafe {
+            self.device()
+                .alloc_uninit_from(&shape, dtype, self.wave_ticket())?
+        };
+        Ok(from_storage(storage, shape, BackpropOp::none(), false))
+    }
+
     pub(crate) fn rand_impl<S: Into<Shape>, T: crate::FloatDType>(
         lo: T,
         up: T,
@@ -836,8 +859,12 @@ impl<'w> LiveTensor<'w> {
     /// # Ok(())
     /// # }
     /// ```
-    /// `rhs` carries its own lifetime: accumulating a wave-scoped result into
-    /// an owned buffer is the residual add, and it only reads `rhs`.
+    /// **`rhs` carries its own lifetime, and every `*_mut` below does the same.**
+    /// An in-place op writes `self` and only *reads* `rhs`, so the two need no
+    /// relation: accumulating a wave-scoped result into an owned buffer is the
+    /// residual add, and decaying a sequence's carried state by a wave-scoped
+    /// factor is the DeltaNet chunk carry. Requiring `&Self` would make those
+    /// unwritable without a copy, for a borrow that ends when the call does.
     pub fn add_mut(&mut self, rhs: &LiveTensor<'_>) -> Result<()> {
         self.binary_inplace_op(rhs, crate::op::BinaryInplaceOp::Add)
     }
@@ -845,21 +872,21 @@ impl<'w> LiveTensor<'w> {
     /// In-place subtraction: `self -= rhs`.
     ///
     /// See [`add_mut`](Self::add_mut) for details on requirements.
-    pub fn sub_mut(&mut self, rhs: &Self) -> Result<()> {
+    pub fn sub_mut(&mut self, rhs: &LiveTensor<'_>) -> Result<()> {
         self.binary_inplace_op(rhs, crate::op::BinaryInplaceOp::Sub)
     }
 
     /// In-place multiplication: `self *= rhs`.
     ///
     /// See [`add_mut`](Self::add_mut) for details on requirements.
-    pub fn mul_mut(&mut self, rhs: &Self) -> Result<()> {
+    pub fn mul_mut(&mut self, rhs: &LiveTensor<'_>) -> Result<()> {
         self.binary_inplace_op(rhs, crate::op::BinaryInplaceOp::Mul)
     }
 
     /// In-place division: `self /= rhs`.
     ///
     /// See [`add_mut`](Self::add_mut) for details on requirements.
-    pub fn div_mut(&mut self, rhs: &Self) -> Result<()> {
+    pub fn div_mut(&mut self, rhs: &LiveTensor<'_>) -> Result<()> {
         self.binary_inplace_op(rhs, crate::op::BinaryInplaceOp::Div)
     }
 
@@ -867,7 +894,7 @@ impl<'w> LiveTensor<'w> {
     ///
     /// See [`add_mut`](Self::add_mut) for details on requirements.
     /// Note: Not supported for integer dtypes (U8, U32, I64).
-    pub fn minimum_mut(&mut self, rhs: &Self) -> Result<()> {
+    pub fn minimum_mut(&mut self, rhs: &LiveTensor<'_>) -> Result<()> {
         self.binary_inplace_op(rhs, crate::op::BinaryInplaceOp::Min)
     }
 
@@ -875,7 +902,7 @@ impl<'w> LiveTensor<'w> {
     ///
     /// See [`add_mut`](Self::add_mut) for details on requirements.
     /// Note: Not supported for integer dtypes (U8, U32, I64).
-    pub fn maximum_mut(&mut self, rhs: &Self) -> Result<()> {
+    pub fn maximum_mut(&mut self, rhs: &LiveTensor<'_>) -> Result<()> {
         self.binary_inplace_op(rhs, crate::op::BinaryInplaceOp::Max)
     }
 
@@ -3781,7 +3808,7 @@ impl<'w> LiveTensor<'w> {
         (storage, &self.layout)
     }
 
-    pub(crate) fn same_storage(&self, rhs: &Self) -> bool {
+    pub(crate) fn same_storage(&self, rhs: &LiveTensor<'_>) -> bool {
         let lhs: &RwLock<Storage> = self.storage.as_ref();
         let rhs: &RwLock<Storage> = rhs.storage.as_ref();
         std::ptr::eq(lhs, rhs)

@@ -34,7 +34,7 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::CudaStream;
 #[cfg(feature = "cuda")]
-use candle::quantized::cuda::{dtype_to_ggml_float, identity_pal_map_128, PalHeadDesc};
+use candle::quantized::cuda::{dtype_to_ggml_float, identity_pal_map, PalHeadDesc};
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::{Generation, PinnedBuf};
 #[cfg(feature = "cuda")]
@@ -121,11 +121,12 @@ fn pack_head_palette_maps(
     head_dim: usize,
 ) -> Result<Vec<Vec<u8>>> {
     let packed_bytes = head_dim / 4;
-    let expected_packed_bytes = identity_pal_map_128().len();
-    if head_dim % 4 != 0 || head_dim % N_PALETTE != 0 || packed_bytes != expected_packed_bytes {
+    if head_dim % 4 != 0
+        || head_dim % N_PALETTE != 0
+        || !candle::quantized::cuda::kvhead_supported_head_dim(head_dim)
+    {
         candle::bail!(
-            "quantize_sealed_to_cpu: palette4 conversion requires head_dim={}, got {}",
-            expected_packed_bytes * 4,
+            "quantize_sealed_to_cpu: palette4 conversion requires head_dim 128 or 256, got {}",
             head_dim,
         );
     }
@@ -594,9 +595,10 @@ fn quantize_sealed_in_place_impl(
     if backing.single_latent() {
         candle::bail!("single-latent KV is not adaptively compressed");
     }
-    if head_dim != identity_pal_map_128().len() * 4 {
+    if !candle::quantized::cuda::kvhead_supported_head_dim(head_dim) {
         candle::bail!(
-            "quantize_sealed_in_place: palette4 conversion requires head_dim=128, got {head_dim}"
+            "quantize_sealed_in_place: palette4 conversion requires head_dim 128 or 256, \
+             got {head_dim}"
         );
     }
     let sub_head_dim = head_dim / N_PALETTE;
@@ -811,7 +813,7 @@ fn quantize_sealed_in_place_impl(
     backing.inner.storage.try_write(|storage| {
         for (chunk_i, src_bands) in chunk_jobs.iter().enumerate() {
             let src_gids = &src_bands.gids;
-            let ident = identity_pal_map_128();
+            let ident = identity_pal_map(head_dim);
             // The source chunk's own band tags. `bucket_quant_chunks` already
             // proved every band is Float or R16, so the only question left per
             // band is *which* of the two.
@@ -866,7 +868,9 @@ fn quantize_sealed_in_place_impl(
                     v_dst_ptrs[p] = band_ptr(storage, v_dst, "v dst")?;
                 }
 
-                let pal_bytes = ident.len();
+                // Only the first head_dim/4 bytes of the (max-width) map are
+                // live; the per-head slices in *_palette_maps are that wide.
+                let pal_bytes = head_dim / 4;
                 let pal_start = h * pal_bytes;
                 let pal_end = pal_start + pal_bytes;
                 // K and V dst pal_maps: identity when the corresponding
@@ -875,14 +879,14 @@ fn quantize_sealed_in_place_impl(
                     ident
                 } else {
                     let mut m = ident;
-                    m.copy_from_slice(&k_palette_maps[chunk_i][pal_start..pal_end]);
+                    m[..pal_bytes].copy_from_slice(&k_palette_maps[chunk_i][pal_start..pal_end]);
                     m
                 };
                 let v_dst_pal_map = if policy.override_v_quant.is_some() {
                     ident
                 } else {
                     let mut m = ident;
-                    m.copy_from_slice(&v_palette_maps[chunk_i][pal_start..pal_end]);
+                    m[..pal_bytes].copy_from_slice(&v_palette_maps[chunk_i][pal_start..pal_end]);
                     m
                 };
 
@@ -959,7 +963,7 @@ fn quantize_sealed_in_place_impl(
                         .into(),
                 )
             })?;
-            convert_descs_batched(&descs, n_kv_head, sg, &primary_stream)?;
+            convert_descs_batched(head_dim, &descs, n_kv_head, sg, &primary_stream)?;
         }
     }
     let _ = copy_stream; // intentionally unused: convert runs on primary.
@@ -1003,11 +1007,11 @@ fn quantize_sealed_in_place_impl(
         let pal_bytes_per_head = head_dim / 4;
         let identity_head_bytes: Option<Vec<u8>> =
             if policy.override_k_quant.is_some() || policy.override_v_quant.is_some() {
-                let identity_head = identity_pal_map_128();
+                let identity_head = identity_pal_map(head_dim);
                 let mut buf = vec![0u8; n_kv_head * pal_bytes_per_head];
                 for h in 0..n_kv_head {
                     buf[h * pal_bytes_per_head..(h + 1) * pal_bytes_per_head]
-                        .copy_from_slice(&identity_head);
+                        .copy_from_slice(&identity_head[..pal_bytes_per_head]);
                 }
                 Some(buf)
             } else {
@@ -1183,6 +1187,7 @@ fn quantize_sealed_in_place_impl(
 /// and the deferred cross-layer path.
 #[cfg(feature = "cuda")]
 fn convert_descs_batched(
+    head_dim: usize,
     descs: &[PalHeadDesc],
     n_kv_head: usize,
     stager: &Generation,
@@ -1204,6 +1209,7 @@ fn convert_descs_batched(
         let start = base * n_kv_head;
         let end = (base + tile) * n_kv_head;
         candle::quantized::cuda::quantize_palette4_convert_buffered(
+            head_dim,
             &descs[start..end],
             n_kv_head,
             tile, // num_layers = job count in this tile (one chunk per block)
@@ -1238,7 +1244,7 @@ pub fn convert_deferred_descs(
     };
     let stager = backing.begin_stager_generation_required();
     let primary_stream = cuda_dev.cuda_stream();
-    convert_descs_batched(descs, n_kv_head, &stager, &primary_stream)?;
+    convert_descs_batched(backing.head_dim(), descs, n_kv_head, &stager, &primary_stream)?;
     drop(stager);
     Ok(())
 }
@@ -1263,9 +1269,10 @@ pub fn dequantize_sealed_in_place(
 
     let n_kv_head = backing.n_kv_head();
     let head_dim = backing.head_dim();
-    if head_dim != identity_pal_map_128().len() * 4 {
+    if !candle::quantized::cuda::kvhead_supported_head_dim(head_dim) {
         candle::bail!(
-            "dequantize_sealed_in_place: palette4 conversion requires head_dim=128, got {head_dim}"
+            "dequantize_sealed_in_place: palette4 conversion requires head_dim 128 or 256, \
+             got {head_dim}"
         );
     }
     let sub_head_dim = head_dim / N_PALETTE;
@@ -1341,7 +1348,7 @@ pub fn dequantize_sealed_in_place(
     }
 
     // ── Build PalHeadDesc structs (src quant → dst F16) ───────────────
-    let ident = identity_pal_map_128();
+    let ident = identity_pal_map(head_dim);
     let mut descs: Vec<PalHeadDesc> = Vec::with_capacity(n_chunks * n_kv_head);
     backing.inner.storage.try_write(|storage| {
         for (chunk_i, src_chunk) in chunk_jobs.iter().enumerate() {
@@ -1399,12 +1406,12 @@ pub fn dequantize_sealed_in_place(
 
                 // Source palette maps: the chunk's stored per-head slice (fall
                 // back to identity when absent). Dst is identity (logical order).
-                let head_pal = |pal: &[u8]| -> [u8; 32] {
+                let head_pal = |pal: &[u8]| -> candle::quantized::cuda::PalMapBytes {
                     let start = h * pal_bytes_per_head;
                     let end = start + pal_bytes_per_head;
                     if pal.len() >= end {
                         let mut m = ident;
-                        m.copy_from_slice(&pal[start..end]);
+                        m[..pal_bytes_per_head].copy_from_slice(&pal[start..end]);
                         m
                     } else {
                         ident
@@ -1442,6 +1449,7 @@ pub fn dequantize_sealed_in_place(
         let start = chunk_i * n_kv_head;
         let end = start + n_kv_head;
         candle::quantized::cuda::quantize_palette4_convert_buffered(
+            head_dim,
             &descs[start..end],
             n_kv_head,
             1,

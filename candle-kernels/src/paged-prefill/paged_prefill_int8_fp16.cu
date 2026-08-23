@@ -1,8 +1,8 @@
 #include "paged_prefill_int8_kernel.cuh"
 
 // INT8 prefix-attention prefill — FP16 Q/K/V/O.
-// HEAD_DIMs: 64, 128 (HEAD_DIM % 64 == 0 for in-thread RoPE pairing; 256
-// exceeds the 48 KB static-smem budget of the single-stage staging layout).
+// HEAD_DIMs: 64, 128, 256 (HEAD_DIM % 64 == 0 for in-thread RoPE pairing).
+// 256 runs at 2 blocks/SM on a 4-way output-dim split; see i8_dim_split.
 extern "C" void run_paged_prefill_int8_fp16(
     const void* q_ptr,
     const void* k_ptr,
@@ -34,6 +34,12 @@ extern "C" void run_paged_prefill_int8_fp16(
             break;
         case 128:
             launch_paged_prefill_int8<__half, 128>(
+                q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
+                o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
+                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream);
+            break;
+        case 256:
+            launch_paged_prefill_int8<__half, 256>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
                 softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream);

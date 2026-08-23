@@ -25,7 +25,7 @@
 //! ```
 
 use crate::models::quantized_matmul::QMatMul;
-use candle::quantized::{gguf_file, GgmlDType, QTensor};
+use candle::quantized::{gguf_file, GgmlDType};
 use candle::{Device, Module, Result, Tensor};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -116,9 +116,14 @@ fn extract_expert_weight_fixture() -> Result<()> {
 }
 
 /// Load the captured expert and reconstruct it the way the pipeline does:
-/// GEMX K/128 repack on the GPU.  Returns `(qmm, dequantised_weight, weight_bytes)`
-/// or `None` if the fixture has not been captured yet.
-fn load_expert(dev: &Device) -> Result<Option<(QMatMul, Tensor, usize)>> {
+/// the KO twin for the production int8 tensor-core path (`Int8Mode::Performance`,
+/// exactly what `from_gguf_with_mode` bakes for every expert weight).
+/// Returns `(qmm, dequantised_weight, weight_bytes)` or `None` if the fixture
+/// has not been captured yet.
+fn load_expert(
+    dev: &Device,
+    mode: candle::quantized::Int8Mode,
+) -> Result<Option<(QMatMul, Tensor, usize)>> {
     let path = fixture_path();
     let Ok(bytes) = std::fs::read(&path) else {
         println!(
@@ -138,15 +143,14 @@ fn load_expert(dev: &Device) -> Result<Option<(QMatMul, Tensor, usize)>> {
         candle::quantized::ggml_file::qtensor_from_ggml(dtype, &fx.ggml, vec![n, k], &Device::Cpu)?;
     let w_deq = cpu_qt.dequantize(&Device::Cpu)?.to_device(dev)?; // [n, k]
 
-    // Production reconstruction: repack to the GEMX K/128 format on the GPU.
-    let cuda_dev = match dev {
-        Device::Cuda(d) => d,
-        _ => candle::bail!("expert matmul baseline requires a CUDA device"),
-    };
-    let repacked = candle::quantized::repack_to_host(cuda_dev, &fx.ggml, n, k, dtype, dtype)?;
-    let storage = candle::quantized::load_repacked(cuda_dev, &repacked, dtype)?;
-    let qt = QTensor::new(storage, vec![n, k])?;
-    let qmm = QMatMul::from_qtensor_repacked(qt)?;
+    // Production reconstruction: the same GGML bytes on the device, KO-repacked
+    // by mode — the path every expert projection actually runs.
+    if !dev.is_cuda() {
+        candle::bail!("expert matmul baseline requires a CUDA device");
+    }
+    let gpu_qt =
+        candle::quantized::ggml_file::qtensor_from_ggml(dtype, &fx.ggml, vec![n, k], dev)?;
+    let qmm = QMatMul::from_qtensor_with_mode(gpu_qt, mode)?;
     Ok(Some((qmm, w_deq, weight_bytes)))
 }
 
@@ -159,22 +163,36 @@ fn rel_l2(a: &Tensor, b: &Tensor) -> Result<f32> {
 
 #[test]
 fn expert_matmul_matches_dequant_reference() -> Result<()> {
+    use candle::quantized::Int8Mode;
     let dev = Device::new_cuda(0)?;
-    let Some((qmm, w_deq, _)) = load_expert(&dev)? else {
-        return Ok(()); // fixture not captured — skip
-    };
-    let (_n, k) = w_deq.dims2()?;
-    let wt = w_deq.t()?.contiguous()?; // [k, n]
+    // Both production numeric modes, each against the same F32 dequant
+    // reference. The bounds pin the MEASURED operating points on this fixture
+    // (Performance ≈ 0.102 — the Q4_K → same-width Q4_KO per-128 collapse
+    // dominates; Precision ≈ 0.051 — the Q5_KO step-up halves it) with ~13%
+    // headroom: wider than the run-to-run wobble of the unseeded `randn`
+    // activations, narrower than a real numeric regression (a repack or
+    // q8a128-kernel fault moves the error by tens of percent, not units) —
+    // so a regression on the int8 tensor-core path trips this test instead
+    // of shipping as unexplained model-quality drift.
+    for (mode, bound) in [(Int8Mode::Performance, 0.115), (Int8Mode::Precision, 0.058)] {
+        let Some((qmm, w_deq, _)) = load_expert(&dev, mode)? else {
+            return Ok(()); // fixture not captured — skip
+        };
+        let (_n, k) = w_deq.dims2()?;
+        let wt = w_deq.t()?.contiguous()?; // [k, n]
 
-    for &m in &[1usize, 8, 64, 256] {
-        let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?;
-        let out = qmm.forward(&x)?; // [m, n] — quantized GEMX kernel
-        let reference = x.matmul(&wt)?; // [m, n] — f32 dequant matmul
-        let err = rel_l2(&out, &reference)?;
-        assert!(
-            err < 0.03,
-            "M={m}: expert matmul diverged from dequant reference (rel L2 = {err:.4})"
-        );
+        for &m in &[1usize, 8, 64, 256] {
+            let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?;
+            let out = qmm.forward(&x)?; // [m, n] — int8 tensor-core matmul
+            let reference = x.matmul(&wt)?; // [m, n] — f32 dequant matmul
+            let err = rel_l2(&out, &reference)?;
+            println!("[expert matmul] {mode:?} M={m}: rel L2 = {err:.4}");
+            assert!(
+                err < bound,
+                "{mode:?} M={m}: expert matmul diverged from dequant reference \
+                 (rel L2 = {err:.4}, bound {bound})"
+            );
+        }
     }
     Ok(())
 }
@@ -316,7 +334,9 @@ fn q4ko_q5ko_real_expert_precision() -> Result<()> {
 #[ignore = "GPU benchmark; run explicitly with --ignored --nocapture"]
 fn expert_matmul_baseline_bench() -> Result<()> {
     let dev = Device::new_cuda(0)?;
-    let Some((qmm, w_deq, weight_bytes)) = load_expert(&dev)? else {
+    let Some((qmm, w_deq, weight_bytes)) =
+        load_expert(&dev, candle::quantized::Int8Mode::Performance)?
+    else {
         return Ok(()); // fixture not captured — skip
     };
     let (n, k) = w_deq.dims2()?;

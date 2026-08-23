@@ -20,7 +20,10 @@ use candle_nn::kv_cache::{begin_wave, LayerPhase};
 use crate::models::prefill_utils::paged_decode_attn;
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn_q8;
-use crate::models::prefill_utils::{paged_glue_attn, paged_prefill_batched, SharedPm};
+use crate::models::prefill_utils::{
+    int8_prefill_act_dtype, int8_prefill_head_dim, paged_decode_q8_head_dim, paged_glue_attn,
+    paged_prefill_batched, SharedPm,
+};
 use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use crate::models::quantized_matmul::QMatMul;
 use crate::utils::repeat_kv;
@@ -240,6 +243,47 @@ pub struct QkvProjection<'w> {
     pub q: LiveTensor<'w>,
     pub k: LiveTensor<'w>,
     pub v: LiveTensor<'w>,
+    /// Output gate for a **gated-attention** layer, `[.., n_head·head_dim]`,
+    /// pre-sigmoid. `None` on the classic layers.
+    ///
+    /// The Qwen3-Next/Qwen3.5 lineage projects `2·head_dim` per head and
+    /// splits it into `[query | gate]`; the gate is neither normed nor
+    /// roped, and is applied as `sigmoid(gate) ⊙ context` after attention
+    /// and before the output projection. It is produced with q/k/v — same
+    /// weight, same fused activation — but consumed at the far end of the
+    /// attention block, so it rides along here rather than being recomputed
+    /// or stashed on the layer (which would not survive a layer being run
+    /// for several row-groups in one wave).
+    pub gate: Option<LiveTensor<'w>>,
+}
+
+/// Apply a gated-attention layer's output gate to the attention context.
+///
+/// `sigmoid(gate) ⊙ context`, matching `qwen35.cpp`'s
+/// `ggml_mul(cur, ggml_sigmoid(gate))` between attention and the output
+/// projection. A `None` gate returns the context untouched, which is every
+/// classic attention layer and costs nothing.
+///
+/// The gate is reshaped to the context's shape rather than assumed to match:
+/// decode carries `[b, 1, n_head·head_dim]` while prefill is flat
+/// `[total_q, n_head·head_dim]`, and the projection that produced the gate
+/// followed the activation's layout, not the context's.
+fn apply_attention_gate<'w>(
+    ctx: LiveTensor<'w>,
+    gate: Option<LiveTensor<'w>>,
+) -> Result<LiveTensor<'w>> {
+    let Some(gate) = gate else {
+        return Ok(ctx);
+    };
+    if gate.elem_count() != ctx.elem_count() {
+        candle::bail!(
+            "attention gate has {} elements against a {}-element context",
+            gate.elem_count(),
+            ctx.elem_count()
+        );
+    }
+    let gate = gate.reshape(ctx.shape())?.to_dtype(ctx.dtype())?;
+    &ctx * &candle_nn::ops::sigmoid(&gate)?
 }
 
 /// Trait for transformer layers that support batched attention processing.
@@ -600,7 +644,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
 
     // Project Q/K/V over the fused attention_norm (q8a128 on int8, FP on Off / non-CUDA).
     let t_qkv = profile_now();
-    let QkvProjection { q, k, v } = {
+    let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
         layer.project_qkv(&acts, x_tensor.dtype())?
     };
@@ -667,9 +711,14 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
 
     reset_caches_at_zero(caches, offsets);
 
-    // B2: emit the decode context directly as q8a1024 (head_dim 128 only) so o_proj runs int8
-    // with no standalone quantize. Only on the paged CUDA decode path; false → FP context.
-    let want_q8 = layer.int8mode().is_int8() && use_paged && seq_len == 1 && head_dim == 128;
+    // B2: emit the decode context directly as q8a1024 (head_dim 128 or 256 — whole q8a128
+    // tiles per head) so o_proj runs int8 with no standalone quantize. Only on the paged CUDA
+    // decode path; false → FP context. A gated layer folds its output gate into the same
+    // kernel pass, so the gate costs no launches either.
+    let want_q8 = layer.int8mode().is_int8()
+        && use_paged
+        && seq_len == 1
+        && paged_decode_q8_head_dim(head_dim);
 
     // Both the attention context and o_proj's result live on the wave's
     // transient half — o_proj allocates from whichever arena its operand came
@@ -693,6 +742,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
             generation,
             decode_headers_ptr,
             want_q8,
+            if want_q8 { gate.as_ref() } else { None },
         )?
     } else {
         // Non-chunked fallback: standard per-sequence attention
@@ -704,11 +754,15 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     // if any, quantizes it at the matmul). Non-CUDA never sets `want_q8` and has no dynamic o_proj.
     let t_out_proj = profile_now();
     let attn_out = if want_q8 {
+        // The gate, if any, was folded into the decode kernel's combine pass
+        // (`sigmoid(g) ⊙ ctx` before the quantize), so the q8a1024 bytes are
+        // already the gated context.
         let op = Q8a128Operand::from_tensor(outputs, b_sz, n_head * head_dim)
             .with_lead(vec![b_sz, seq_len]);
         layer.output_projection(DynamicActs::Int8(op), x_tensor.dtype())?
     } else {
         let out = outputs.reshape((b_sz, 1, n_head * head_dim))?;
+        let out = apply_attention_gate(out, gate)?;
         layer.output_projection(DynamicActs::Float(out), x_tensor.dtype())?
     };
     profile_sync(attn_out.device());
@@ -752,8 +806,14 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
 
     // Project Q/K/V over the fused attention_norm (B1). Prefill is high-M (compute-bound), so
     // the fused ln1→q8a128 still saves a launch; the per-matmul cost dominates.
+    //
+    // Drain before marking. `profile_now` is a bare `Instant::now()`, and this is
+    // the first *synced* span of an attention layer — without this, everything
+    // queued and not yet awaited (on a hybrid stack, whole DeltaNet layers) drains
+    // inside the span below and is reported as Q/K/V projection time.
+    profile_sync(x_tensor.device());
     let t_qkv = profile_now();
-    let QkvProjection { q, k, v } = {
+    let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
         layer.project_qkv(&acts, x_tensor.dtype())?
     };
@@ -828,8 +888,31 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // generation, opened in `forward_layer_batched_mixed` around every group's
     // attention *and* the residual add that consumes it. Opening it here instead
     // would end the scope one step before the value dies.
+    // The reprojection-glue kernel is 128-only, and no other prefill path
+    // carries its masking — a glue forward routed elsewhere would silently
+    // lose the forward-bridge window and the true-position columns rather
+    // than fail. Refuse it up front instead of falling through. The dtype
+    // that gates the route is the **cache compute dtype** (the glue kernel is
+    // compiled for the half types), not the activation dtype:
+    // `paged_glue_attn` casts Q and the new K/V to the cache's dtype itself,
+    // so an F32-activation reference session over a half-typed arena runs the
+    // glue kernel like any other.
+    if glue_meta.is_some() {
+        let glue_compute = caches.first().map(|c| c.k_cache().dtype());
+        let ok = is_cuda_paged
+            && head_dim == 128
+            && matches!(glue_compute, Some(DType::F16 | DType::BF16));
+        if !ok {
+            candle::bail!(
+                "glue prefill requires the paged head_dim-128 kernel (got head_dim \
+                 {head_dim}, paged {is_cuda_paged}, cache compute dtype {:?}) — no \
+                 other prefill path carries glue masking",
+                glue_compute
+            );
+        }
+    }
     let out_packed = match glue_meta {
-        Some(g) if is_cuda_paged && head_dim == 128 => paged_glue_attn(
+        Some(g) => paged_glue_attn(
             wave,
             caches,
             offsets,
@@ -850,14 +933,34 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             generation,
             shared_pm,
         )?,
+        // Shapes and dtypes the int8 prefix-attention kernel is not built for:
+        // the float fallback, which keeps the paged cache contract
+        // (unrotated K/V in the arena) and pays a per-sequence materialized
+        // score matrix instead of a fused kernel.
+        None if is_cuda_paged
+            && !(int8_prefill_head_dim(head_dim) && int8_prefill_act_dtype(q.dtype())) =>
+        {
+            paged_prefill_float_fallback(
+                caches,
+                offsets,
+                &q,
+                &k,
+                &v,
+                q_lens,
+                n_head,
+                n_kv_head,
+                head_dim,
+                rope_cs,
+                rope_interleaved,
+            )?
+        }
         // Ordinary prefill (fresh or over an existing prefix): the INT8
         // prefix-attention kernel (docs/archived/prefill_optimization.md) —
         // GQA-packed M, slice-aligned tiles, int8 MMA directly over the
         // quantized arena, split-KV for the short-q/long-prefix regime.
         // Both RoPE pairings are applied in-kernel (half-split and
-        // interleaved); head dims outside {64, 128} fail loudly in
-        // paged_prefill_attn_varlen_chunks.
-        _ => paged_prefill_batched(
+        // interleaved).
+        None => paged_prefill_batched(
             wave,
             caches,
             offsets,
@@ -887,14 +990,163 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // (launch amortized against the large prefill GEMM).
     let t_out_proj = profile_now();
     let output = {
-        let dt = reshaped_ctx.dtype();
-        layer.output_projection(DynamicActs::Float(reshaped_ctx), dt)?
+        let gated = apply_attention_gate(reshaped_ctx, gate)?;
+        let dt = gated.dtype();
+        layer.output_projection(DynamicActs::Float(gated), dt)?
     };
     profile_sync(output.device());
     pipeline_record("prefill:out_proj", t_out_proj);
     // Restore the flat-packed [1, total_q, hidden_out] activation.
     let hidden_out = output.dim(1)?;
     Ok(output.reshape((1, total_q, hidden_out))?)
+}
+
+/// Float prefill for head dims outside the int8 prefix-attention kernel's
+/// {64, 128, 256} instantiation set (see [`int8_prefill_head_dim`]).
+///
+/// Correct at any head width, and much slower than the kernel: it walks the
+/// batch one sequence at a time, expands K/V for GQA, and materializes the
+/// full `[1, H, T, T]` score matrix and causal mask per call.
+///
+/// The paged-path contract is kept exactly:
+/// - K/V are written to the chunked cache **unrotated** — the arena
+///   convention every paged reader (decode, glue, reprojection) depends on.
+///   Rotation happens locally, for this call's own attention only.
+/// - RoPE comes from the same shared `rope_cs` table the kernels read
+///   (cos/sin interleaved per frequency, rows indexed by absolute position).
+///
+/// Takes the flat-packed varlen operands (`q [total_q, n_head, head_dim]`,
+/// `k`/`v [total_q, n_kv_head, head_dim]`) and returns the flat-packed
+/// context `[total_q, n_head, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+fn paged_prefill_float_fallback(
+    caches: &mut [&mut KvCache],
+    offsets: &[usize],
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
+    q_lens: &[usize],
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    rope_cs: &Tensor,
+    rope_interleaved: bool,
+) -> Result<Tensor> {
+    // Pool copies: this path feeds `chunked_write_kv` and plain tensor math,
+    // none of which is wave-aware (same posture as the non-paged fallback).
+    let q = &q.to_owned_tensor()?;
+    let k = &k.to_owned_tensor()?;
+    let v = &v.to_owned_tensor()?;
+    let n_rep = n_head / n_kv_head;
+    let half = head_dim / 2;
+
+    // The cos/sin planes, split from the shared interleaved table once for the
+    // longest prefix any sequence here reaches — the table never changes
+    // within a forward, so deriving it per sequence (narrow → reshape →
+    // to_dtype → two contiguous copies, per call, per layer) was pure rework.
+    let max_total = q_lens
+        .iter()
+        .zip(offsets.iter())
+        .map(|(&l, &o)| o + l)
+        .max()
+        .unwrap_or(0);
+    let cs_full = rope_cs
+        .narrow(0, 0, max_total)?
+        .reshape((max_total, half, 2))?
+        .to_dtype(q.dtype())?;
+    let cos_full = cs_full.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?;
+    let sin_full = cs_full.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?;
+
+    // Rotate `x [1, h, len, d]` at absolute positions `start..start + len`.
+    //
+    // Full-width rotation on purpose: the table's row covers every frequency
+    // pair of the head, and on partial-rotary models `RotaryLayout::rope_table`
+    // fills the pass-through pairs with exact `(cos 1, sin 0)` — rotation by
+    // zero — so rotating all `head_dim/2` pairs is the identity on the
+    // non-rotary dims. That padding IS the contract this fallback relies on;
+    // a table with real frequencies in those rows would rotate dims the
+    // kernels leave alone.
+    let rot = |x: &Tensor, start: usize, len: usize| -> Result<Tensor> {
+        let cos = cos_full.narrow(0, start, len)?;
+        let sin = sin_full.narrow(0, start, len)?;
+        if rope_interleaved {
+            candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        } else {
+            candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+        }
+    };
+
+    let mut rows: Vec<Tensor> = Vec::with_capacity(q_lens.len());
+    let mut row_start = 0usize;
+    for (cache, (&len, &offset)) in caches.iter_mut().zip(q_lens.iter().zip(offsets.iter())) {
+        if len == 0 {
+            continue;
+        }
+        // Flat rows → [1, heads, len, d].
+        let take = |x: &Tensor| -> Result<Tensor> {
+            x.narrow(0, row_start, len)?
+                .transpose(0, 1)?
+                .unsqueeze(0)?
+                .contiguous()
+        };
+        let qs = take(q)?;
+        let ks = take(k)?;
+        let vs = take(v)?;
+
+        // Write UNROTATED K/V through the chunked cache. The head_dim-128
+        // kernel path scatters inside the attention kernel; this one cannot, so
+        // it goes through `write_contiguous`, which walks 32-token block ×
+        // KV head × palette band. That is the span this records: it is the
+        // candidate for the fallback's cost, and an attention layer here is
+        // ~45x its own arithmetic bound.
+        let t_kv = profile_now();
+        KvCache::ensure_chunked_capacity_batch(std::slice::from_mut(cache), &[offset], len)?;
+        cache.chunked_write_kv(offset, &ks, &vs)?;
+        cache.set_current_seq_len(offset + len)?;
+        pipeline_record("prefill_fb:kv_write", t_kv);
+
+        // Assemble the prefix to attend, **without re-reading what we just
+        // wrote**. `chunked_read_kv` gathers token by token — a paged sequence
+        // is not a flat grid, so each logical position resolves to its own
+        // `(chunk, slot)` and is copied individually. At 649 tokens that is
+        // thousands of tiny copies *per layer*, and it was 71–80% of prefill
+        // (147 ms per attention layer on the 0.8B, 294 ms on the 9B) for data
+        // already sitting in registers.
+        //
+        // A prefill at offset 0 — the whole-prompt case — needs no read at all:
+        // `ks`/`vs` are exactly the tokens the cache now holds. Only a prefill
+        // over an existing prefix reads, and then only the prefix.
+        //
+        // The values are the same either way: the arena stores at the cache
+        // dtype and the activations arrive at `activation_dtype` of it, so the
+        // round trip was returning what went in.
+        let total = offset + len;
+        let (k_all, v_all) = if offset == 0 {
+            (ks.clone(), vs.clone())
+        } else {
+            let (kp, vp) = cache.chunked_read_kv(0, offset)?;
+            (
+                Tensor::cat(&[kp.to_dtype(ks.dtype())?, ks.clone()], 2)?,
+                Tensor::cat(&[vp.to_dtype(vs.dtype())?, vs.clone()], 2)?,
+            )
+        };
+        let t_rope = profile_now();
+        let k_rot = rot(&k_all.to_dtype(qs.dtype())?, 0, total)?;
+        let q_rot = rot(&qs, offset, len)?;
+        let k_rep = repeat_kv(k_rot, n_rep)?;
+        let v_rep = repeat_kv(v_all.to_dtype(qs.dtype())?, n_rep)?;
+        pipeline_record("prefill_fb:rope_repeat", t_rope);
+
+        let t_attn = profile_now();
+        let out = standard_attention_prefill(&q_rot, &k_rep, &v_rep, head_dim)?;
+        rows.push(out.squeeze(0)?.transpose(0, 1)?.contiguous()?); // [len, H, d]
+        pipeline_record("prefill_fb:attention", t_attn);
+
+        row_start += len;
+    }
+
+    let refs: Vec<&Tensor> = rows.iter().collect();
+    Tensor::cat(&refs, 0)
 }
 
 /// Simple per-sequence prefill attention fallback.
@@ -1000,21 +1252,22 @@ fn standard_attention_prefill(
     let cache_len = kv_len; // Total KV length including prefix
     let prefix_len = cache_len - q_len; // How much prefix exists before this chunk
 
-    let mask: Vec<f32> = (0..q_len)
-        .flat_map(|i| {
-            (0..cache_len).map(move |j| {
-                // Position i in query corresponds to absolute position (prefix_len + i)
-                // It can attend to positions 0..=(prefix_len + i)
-                if j > prefix_len + i {
-                    f32::NEG_INFINITY
-                } else {
-                    0.0f32
-                }
-            })
-        })
-        .collect();
-    let mask = Tensor::from_vec(mask, (1, 1, q_len, cache_len), q.device())?;
-    let mask = mask.to_dtype(att.dtype())?;
+    // Built on the device from two index vectors. As a host `Vec` this is
+    // `q_len × cache_len` floats constructed one at a time in a Rust loop and
+    // uploaded — 421k elements per attention layer at a 649-token prefill, for
+    // a mask that is identical at every layer and derivable from two `arange`s.
+    let dev = q.device();
+    let idx_q = Tensor::arange(0u32, q_len as u32, dev)?
+        .reshape((q_len, 1))?
+        .broadcast_add(&Tensor::new(prefix_len as u32, dev)?)?;
+    let idx_k = Tensor::arange(0u32, cache_len as u32, dev)?.reshape((1, cache_len))?;
+    // Query at absolute position `prefix_len + i` may attend keys `0..=` it.
+    let allowed = idx_k.broadcast_le(&idx_q)?;
+    let keep = Tensor::zeros((q_len, cache_len), att.dtype(), dev)?;
+    let block = Tensor::full(f32::NEG_INFINITY, (q_len, cache_len), dev)?.to_dtype(att.dtype())?;
+    let mask = allowed
+        .where_cond(&keep, &block)?
+        .reshape((1, 1, q_len, cache_len))?;
     let att = att.broadcast_add(&mask)?;
 
     let att = candle_nn::ops::softmax_last_dim(&att)?;
@@ -1043,8 +1296,11 @@ fn paged_decode_attention<'w>(
     _generation: &Generation,
     decode_headers_ptr: u64,
     // B2: emit the attention context as q8a1024 (returns a flat U8 tensor) instead of an FP
-    // context, so o_proj runs int8 with no standalone quantize. Head_dim 128 only.
+    // context, so o_proj runs int8 with no standalone quantize. Head_dim 128 or 256.
     emit_q8: bool,
+    // Output gate folded into the q8 emit (`sigmoid(g) ⊙ ctx` inside the combine kernel).
+    // Only meaningful with `emit_q8`; the FP path applies its gate on the FP context instead.
+    gate: Option<&LiveTensor<'_>>,
 ) -> Result<LiveTensor<'w>> {
     let t_alloc = profile_now();
     KvCache::validate_chunked_decode_batch(caches, offsets)?;
@@ -1146,6 +1402,19 @@ fn paged_decode_attention<'w>(
         // B2: emit q8a1024 (flat U8 tensor) instead of the FP context when requested. The U8
         // bytes are the operand for o_proj's int8 matmul — never dtype-converted.
         let raw_out = if emit_q8 {
+            // The kernel reads the gate with the queries' element type. On the
+            // nominal gated decode the projection already emits it in that type
+            // (activation dtype == arena dtype) and the strided view passes
+            // through untouched; the conversion below runs only on the
+            // arena-mismatch sessions whose Q/K/V were converted above — the
+            // same off-nominal sessions, paying one more pass of the same kind.
+            let gate_kernel = match gate {
+                Some(g) if g.dtype() != q_kernel.dtype() => {
+                    Some(g.to_dtype(q_kernel.dtype())?)
+                }
+                Some(g) => Some(g.clone()),
+                None => None,
+            };
             paged_decode_attn_q8(
                 wave,
                 &q_kernel,
@@ -1159,6 +1428,7 @@ fn paged_decode_attention<'w>(
                 &v_kernel,
                 rope_cs,
                 rope_interleaved,
+                gate_kernel.as_ref(),
             )?
         } else {
             paged_decode_attn(
@@ -1322,5 +1592,134 @@ mod tests {
         assert_eq!(u.cu_seqlens_q.to_vec1::<u32>().unwrap(), vec![0, 4, 8, 12]);
         assert_eq!(u.q_lens.to_vec1::<u32>().unwrap(), vec![4, 4, 4]);
         assert_eq!(u.kv_lens.to_vec1::<u32>().unwrap(), vec![4, 4, 4]);
+    }
+
+    /// The head_dim-256 float prefill fallback (Qwen3.5/3.8 attention shape):
+    /// varlen sequences through the real chunked cache must match plain
+    /// rotated causal attention, and — the paged-cache interop invariant —
+    /// the arena must hold the UNROTATED keys.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn float_fallback_prefill_hd256_matches_reference() -> Result<()> {
+        use crate::models::prefill_utils::compute_rope_cs;
+        use candle::DType;
+        use candle_nn::kv_cache::ChunkedKvBacking;
+
+        let device = Device::new_cuda(0)?;
+        let (n_head, n_kv_head, head_dim) = (16usize, 2usize, 256usize);
+        let n_rep = n_head / n_kv_head;
+        // One short sequence and one that crosses a chunk boundary.
+        let q_lens = [7usize, 40usize];
+        let offsets = [0usize, 0usize];
+        let total_q: usize = q_lens.iter().sum();
+
+        let backing = ChunkedKvBacking::new(2, n_kv_head, head_dim, DType::BF16, &device, 64)?;
+        let mut caches: Vec<KvCache> = (0..2)
+            .map(|seq| {
+                let mut c = KvCache::new(2, 64);
+                c.force_dtype(DType::BF16);
+                c.set_chunked_backing(&backing, seq, None)?;
+                Ok(c)
+            })
+            .collect::<Result<_>>()?;
+        let mut cache_refs: Vec<&mut KvCache> = caches.iter_mut().collect();
+
+        let q = Tensor::randn(0f32, 1f32, (total_q, n_head, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
+        let k = Tensor::randn(0f32, 1f32, (total_q, n_kv_head, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
+        let v = Tensor::randn(0f32, 1f32, (total_q, n_kv_head, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
+        let inv_freq: Vec<f32> = (0..head_dim / 2)
+            .map(|i| 1f32 / 1e6f32.powf(2.0 * i as f32 / head_dim as f32))
+            .collect();
+        let inv_freq_t = Tensor::from_vec(inv_freq, (head_dim / 2,), &device)?;
+        let rope_cs = compute_rope_cs(&inv_freq_t, 4, head_dim, &device)?;
+
+        let q_live = LiveTensor::from(q.clone());
+        let k_live = LiveTensor::from(k.clone());
+        let v_live = LiveTensor::from(v.clone());
+        let out = paged_prefill_float_fallback(
+            &mut cache_refs,
+            &offsets,
+            &q_live,
+            &k_live,
+            &v_live,
+            &q_lens,
+            n_head,
+            n_kv_head,
+            head_dim,
+            &rope_cs,
+            false,
+        )?;
+        assert_eq!(out.dims(), &[total_q, n_head, head_dim]);
+
+        // Reference: per sequence, rotate q/k at absolute positions and run
+        // plain causal attention over bf16-rounded values.
+        let half = head_dim / 2;
+        let cs_ref = rope_cs.reshape((rope_cs.dim(0)?, half, 2))?;
+        let rot_ref = |x: &Tensor, len: usize| -> Result<Tensor> {
+            let cos = cs_ref
+                .narrow(0, 0, len)?
+                .narrow(2, 0, 1)?
+                .squeeze(2)?
+                .to_dtype(DType::BF16)?
+                .contiguous()?;
+            let sin = cs_ref
+                .narrow(0, 0, len)?
+                .narrow(2, 1, 1)?
+                .squeeze(2)?
+                .to_dtype(DType::BF16)?
+                .contiguous()?;
+            candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+        };
+        let mut row_start = 0usize;
+        for &len in &q_lens {
+            let take = |x: &Tensor| -> Result<Tensor> {
+                x.narrow(0, row_start, len)?.transpose(0, 1)?.unsqueeze(0)?.contiguous()
+            };
+            let q_r = rot_ref(&take(&q)?, len)?.to_dtype(DType::F32)?;
+            let k_r = rot_ref(&take(&k)?, len)?.to_dtype(DType::F32)?;
+            let v_s = take(&v)?.to_dtype(DType::F32)?;
+            let k_rep = repeat_kv(k_r, n_rep)?;
+            let v_rep = repeat_kv(v_s, n_rep)?;
+            let expect = standard_attention_prefill(&q_r, &k_rep, &v_rep, head_dim)?;
+            let got = out
+                .narrow(0, row_start, len)?
+                .transpose(0, 1)?
+                .unsqueeze(0)?
+                .to_dtype(DType::F32)?;
+            let diff = got
+                .sub(&expect)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .to_vec0::<f32>()?;
+            assert!(
+                diff < 5e-2,
+                "seq len {len}: fallback diverged from reference (max abs {diff})"
+            );
+            row_start += len;
+        }
+
+        // Interop invariant: the arena holds the UNROTATED keys.
+        let (k_stored, _v_stored) = cache_refs[1].chunked_read_kv(0, q_lens[1])?;
+        let k_expect = k
+            .narrow(0, q_lens[0], q_lens[1])?
+            .transpose(0, 1)?
+            .unsqueeze(0)?
+            .contiguous()?;
+        let sd = k_stored
+            .to_dtype(DType::F32)?
+            .sub(&k_expect.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_vec0::<f32>()?;
+        assert!(
+            sd < 1e-6,
+            "arena keys must be stored unrotated (max abs diff {sd})"
+        );
+        Ok(())
     }
 }

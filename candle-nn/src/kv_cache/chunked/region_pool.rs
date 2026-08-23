@@ -1082,6 +1082,20 @@ pub(crate) fn ensure(stream: &std::sync::Arc<CudaStream>) -> Result<()> {
 /// mapping touch, recycled ones from an explicit fill here, so a new tenant
 /// never reads the last one's data (invariant 4).
 pub(crate) fn claim_region(stream: &std::sync::Arc<CudaStream>) -> Result<Option<RegionHandle>> {
+    // **Keep the frontier honest before taking virgin ground.** Claims recycle
+    // the free list lowest-first, so the frontier only advances when the list
+    // is empty — and if chunk-empty arenas exist at that moment, "empty" is a
+    // bookkeeping artifact of churn, not real occupancy. Advancing anyway is
+    // what pushes long-lived arenas into the top regions, and the transient
+    // tier — anchored at the weight floor, measuring down — then loses that
+    // ground for as long as those arenas live (measured on the Llama-2 MHA
+    // gate: a span-end arena claimed at a churn-inflated 566/566 peak blocked
+    // a 4-region tier with only 205 regions genuinely live). Sweep first, so
+    // the frontier tracks the true live watermark.
+    let free_list_empty = with_pool(stream, |pool| Ok(pool.free.peek().is_none()))?;
+    if free_list_empty {
+        super::backing::global_release_empty_arenas();
+    }
     match with_pool(stream, |pool| try_claim(pool, stream))? {
         Claim::Got(handle) => return Ok(Some(handle)),
         // A tier is standing: the ground above it exists but belongs to a
@@ -1496,6 +1510,17 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
         Placed::Short(regions) => regions,
     };
     buy_ground(stream, short)?;
+    if let Placed::At(base) = try_place(stream, bytes)? {
+        return Ok(base);
+    }
+    // **Sweep the empties before declaring the partition dead.** The footprint
+    // check above counts *claimed* regions, and a region whose arena went
+    // chunk-empty since the last periodic sweep still reads as claimed — on a
+    // churn-heavy config (seal/requantize under repeats) hundreds of such
+    // arenas can stand in the tier's ground while holding nothing. Releasing
+    // them is a free-list push per arena, after which the retry re-measures
+    // against only the genuinely live arenas.
+    super::backing::global_release_empty_arenas();
     match try_place(stream, bytes)? {
         Placed::At(base) => Ok(base),
         Placed::Short(still_short) => {

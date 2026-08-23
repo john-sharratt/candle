@@ -340,6 +340,14 @@ fn bump<'a>(
         .checked_add(len)
         .ok_or_else(|| candle::Error::Msg(format!("{name}: bump allocation overflowed usize")))?;
     if end > inner.capacity {
+        // Itemise the generation that ran out, not just the carve that noticed.
+        // A span exhausts because the plan is short, and "short by what" is the
+        // only question worth asking here — the ordinary report fires when a
+        // generation *completes* and sets a new high-water mark, which this one
+        // never will.
+        if wave_census::enabled() {
+            wave_census::report(name, inner.cursor, inner.capacity, &inner.census);
+        }
         candle::bail!(
             "{}: transient span exhausted — {len} B at offset {start} exceeds the \
              {} B budget. The wave should have been gated to fit before assembly.",

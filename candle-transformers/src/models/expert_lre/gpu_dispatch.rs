@@ -261,6 +261,7 @@ mod tests {
             expert_scores: vec![],
             num_moe_layers: 0,
             experts_per_layer: 0,
+            pinned_layers: 0,
             warm_backed: vec![],
         }
     }
@@ -344,6 +345,7 @@ mod tests {
             expert_scores: vec![],
             num_moe_layers: 0,
             experts_per_layer: 0,
+            pinned_layers: 0,
             warm_backed: vec![],
         };
         assert!(

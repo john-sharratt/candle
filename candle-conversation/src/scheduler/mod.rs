@@ -8000,6 +8000,9 @@ mod tests {
                 n_experts: 1,
                 act_dtype,
                 accum_dtype: DType::F32,
+                projection_accum_roundtrip: false,
+                gated_qkv: false,
+                partial_rotary: false,
             }
         }
         fn device(&self) -> &candle::Device {

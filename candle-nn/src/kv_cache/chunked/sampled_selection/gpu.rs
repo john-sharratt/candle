@@ -1183,6 +1183,20 @@ impl PagedSelectionGpuInputs {
         self.blocks_per_chunk / self.n_kv_head.max(1)
     }
 
+    /// The fused selection kernel is instantiated per head_dim (`HB` template
+    /// parameter, dispatched by the CUDA launcher). Anything else would make
+    /// the kernel guard return without writing any selection output, so fail
+    /// loudly here instead.
+    fn checked_blocks_per_head(&self) -> Result<usize> {
+        let blocks_per_head = self.blocks_per_head();
+        if blocks_per_head != 128 && blocks_per_head != 256 {
+            candle::bail!(
+                "fused KV format selection supports head_dim (blocks_per_head) 128 or 256, got {blocks_per_head}"
+            );
+        }
+        Ok(blocks_per_head)
+    }
+
     pub fn n_chunks(&self) -> usize {
         self.chunk_gids_keepalive.len()
     }
@@ -1204,7 +1218,7 @@ impl PagedSelectionGpuInputs {
         Vec<f32>,
         Vec<f32>,
     )> {
-        let blocks_per_head = self.blocks_per_head();
+        let blocks_per_head = self.checked_blocks_per_head()?;
         let k_ggml: Vec<GgmlDType> = k_candidates
             .iter()
             .copied()
@@ -1414,7 +1428,7 @@ impl PagedSelectionGpuInputs {
         Vec<f32>,
         Vec<f32>,
     )> {
-        let blocks_per_head = self.blocks_per_head();
+        let blocks_per_head = self.checked_blocks_per_head()?;
         let n_chunks = self.chunk_gids_keepalive.len();
         let k_ggml: Vec<candle::quantized::GgmlDType> = k_candidates
             .iter()

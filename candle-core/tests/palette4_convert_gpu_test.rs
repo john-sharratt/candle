@@ -20,14 +20,20 @@ const CHUNK_SIZE: usize = 32;
 // R16 block size: half d[32] + uint16_t q[32] = 128 bytes
 const R16_BLOCK_BYTES: usize = 128;
 
-/// Build an identity pal_map: dims 0..31 → pal 0, 32..63 → pal 1, etc.
-fn identity_pal_map() -> [u8; HD / 4] {
-    let mut out = [0u8; HD / 4];
-    for d in 0..HD {
-        let p = (d / PAL_DIM) as u8;
-        out[d / 4] |= (p & 0x3) << (2 * (d % 4));
-    }
+//// Widen a test-local `[u8; HD/4]` pal map to the API's max-width buffer.
+fn widen_pal(map: &[u8; HD / 4]) -> candle_core::quantized::cuda::PalMapBytes {
+    let mut out = [0u8; 64];
+    out[..HD / 4].copy_from_slice(map);
     out
+}
+
+// The identity pal_map (dims 0..31 → pal 0, 32..63 → pal 1, …), taken from
+// the API under test rather than re-derived: a local re-derivation would
+// keep passing against itself if the packing convention ever moved, which
+// is exactly the divergence these tests exist to catch. `widen_pal` stays
+// for the genuinely custom (reversed/striped) maps below.
+fn identity_pal_map_local() -> candle_core::quantized::cuda::PalMapBytes {
+    candle_core::quantized::cuda::identity_pal_map(HD)
 }
 
 /// Fill R16 arena data for one palette: `num_dims` dims × `num_chunks` chunks.
@@ -124,7 +130,6 @@ fn palette4_convert_r16_identity_roundtrip() -> Result<()> {
         Device::Cuda(d) => d,
         _ => return Ok(()),
     };
-    let stream = cuda_dev.cuda_stream();
     use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
     let stream = cuda_dev.cuda_stream();
 
@@ -145,9 +150,10 @@ fn palette4_convert_r16_identity_roundtrip() -> Result<()> {
 
     let sptrs: [u64; N_PAL] = std::array::from_fn(|p| src_gpu[p].device_ptr(&stream).0 as u64);
     let dptrs: [u64; N_PAL] = std::array::from_fn(|p| dst_gpu[p].device_ptr(&stream).0 as u64);
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
 
     quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: sptrs,
             v_src_arena_ptrs: sptrs,
@@ -250,8 +256,9 @@ fn palette4_convert_f16_to_r16_identity() -> Result<()> {
     }
 
     use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: src_arena_ptrs,
             v_src_arena_ptrs: src_arena_ptrs,
@@ -359,7 +366,7 @@ fn palette4_convert_multi_layer_multi_head() -> Result<()> {
     }
 
     use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let mut descs: Vec<PalHeadDesc> = Vec::new();
     for job in 0..total_jobs {
         let sp: [u64; N_PAL] =
@@ -386,6 +393,7 @@ fn palette4_convert_multi_layer_multi_head() -> Result<()> {
         });
     }
     quantize_palette4_convert_buffered(
+        128,
         &descs,
         num_kv_heads,
         num_layers,
@@ -428,7 +436,7 @@ fn palette4_convert_multi_layer_multi_head() -> Result<()> {
 #[test]
 fn palette4_convert_batched_matches_per_chunk() -> Result<()> {
     use candle_core::quantized::cuda::{
-        quantize_palette4_convert_buffered, shuffled_pal_map_128, PalHeadDesc,
+        quantize_palette4_convert_buffered, shuffled_pal_map, PalHeadDesc,
     };
     let dev = match get_cuda_dev() {
         Ok(d) => d,
@@ -445,7 +453,7 @@ fn palette4_convert_batched_matches_per_chunk() -> Result<()> {
     let num_kv_heads = 2usize;
     let total_jobs = n_layers * num_kv_heads;
     let arena_size = PAL_DIM * num_chunks * R16_BLOCK_BYTES;
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
 
     // Shared src arenas; separate dst sets for A (per-chunk) and B (batched).
     let mut src_gpus = Vec::new();
@@ -477,7 +485,7 @@ fn palette4_convert_batched_matches_per_chunk() -> Result<()> {
                     std::array::from_fn(|p| src_gpus[job][p].device_ptr(&stream).0 as u64);
                 let dp: [u64; N_PAL] =
                     std::array::from_fn(|p| dst_gpus[job][p].device_ptr(&stream).0 as u64);
-                let dst_pal = shuffled_pal_map_128(job as u64 + 1);
+                let dst_pal = shuffled_pal_map(128, job as u64 + 1);
                 PalHeadDesc {
                     k_src_arena_ptrs: sp,
                     v_src_arena_ptrs: sp,
@@ -507,6 +515,7 @@ fn palette4_convert_batched_matches_per_chunk() -> Result<()> {
         let start = layer * num_kv_heads;
         let end = start + num_kv_heads;
         quantize_palette4_convert_buffered(
+        128,
             &descs_a[start..end],
             num_kv_heads,
             1,
@@ -517,6 +526,7 @@ fn palette4_convert_batched_matches_per_chunk() -> Result<()> {
     }
     // Mode B: one batched launch (num_layers=N), the new production path.
     quantize_palette4_convert_buffered(
+        128,
         &descs_b,
         num_kv_heads,
         n_layers,
@@ -573,8 +583,9 @@ fn palette4_convert_r16_identity_copy_check() -> Result<()> {
 
     {
         use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
-        let ident = identity_pal_map();
+        let ident = identity_pal_map_local();
         quantize_palette4_convert_buffered(
+        128,
             &[PalHeadDesc {
                 k_src_arena_ptrs: src_arena_ptrs,
                 v_src_arena_ptrs: src_arena_ptrs,
@@ -771,32 +782,32 @@ fn arena_bytes(fmt: u8, num_dims: usize, num_chunks: usize) -> usize {
 }
 
 /// Reversed-block pal_map: global dims 0..31→pal3, 32..63→pal2, 64..95→pal1, 96..127→pal0.
-fn reversed_block_pal_map() -> [u8; HD / 4] {
+fn reversed_block_pal_map() -> candle_core::quantized::cuda::PalMapBytes {
     let mut out = [0u8; HD / 4];
     for d in 0..HD {
         let p = (3 - d / PAL_DIM) as u8;
         out[d / 4] |= (p & 0x3) << (2 * (d % 4));
     }
-    out
+    widen_pal(&out)
 }
 
 /// Striped pal_map: dim d → palette d % 4.
-fn striped_pal_map() -> [u8; HD / 4] {
+fn striped_pal_map() -> candle_core::quantized::cuda::PalMapBytes {
     let mut out = [0u8; HD / 4];
     for d in 0..HD {
         let p = (d % N_PAL) as u8;
         out[d / 4] |= (p & 0x3) << (2 * (d % 4));
     }
-    out
+    widen_pal(&out)
 }
 
 /// Rust mirror of CUDA pal_map_get.
-fn pmg(pal_map: &[u8; HD / 4], d: usize) -> usize {
+fn pmg(pal_map: &candle_core::quantized::cuda::PalMapBytes, d: usize) -> usize {
     ((pal_map[d / 4] >> (2 * (d % 4))) & 0x3) as usize
 }
 
 /// Rust mirror of CUDA find_nth_dim_in_pal.
-fn nth_dim_in_pal(pal_map: &[u8; HD / 4], p: usize, n: usize) -> usize {
+fn nth_dim_in_pal(pal_map: &candle_core::quantized::cuda::PalMapBytes, p: usize, n: usize) -> usize {
     let mut count = 0usize;
     for g in 0..HD {
         if pmg(pal_map, g) == p {
@@ -810,7 +821,11 @@ fn nth_dim_in_pal(pal_map: &[u8; HD / 4], p: usize, n: usize) -> usize {
 }
 
 /// Rust mirror of CUDA rank_in_pal.
-fn rank_in_pal(pal_map: &[u8; HD / 4], p: usize, global_d: usize) -> usize {
+fn rank_in_pal(
+    pal_map: &candle_core::quantized::cuda::PalMapBytes,
+    p: usize,
+    global_d: usize,
+) -> usize {
     let mut rank = 0usize;
     for g in 0..global_d {
         if pmg(pal_map, g) == p {
@@ -912,8 +927,8 @@ fn run_kernel_pass(
     dst_arenas: &[cudarc::driver::CudaSlice<u8>],
     src_fmts: [u8; N_PAL],
     dst_fmts: [u8; N_PAL],
-    src_pal_map: &[u8; HD / 4],
-    dst_pal_map: &[u8; HD / 4],
+    src_pal_map: &candle_core::quantized::cuda::PalMapBytes,
+    dst_pal_map: &candle_core::quantized::cuda::PalMapBytes,
     num_chunks: usize,
     _is_k: bool,
 ) -> Result<()> {
@@ -947,6 +962,7 @@ fn run_kernel_pass(
         v_dst_scales: [1.0f32; N_PAL],
     };
     quantize_palette4_convert_buffered(
+        128,
         &[desc],
         1,
         1,
@@ -984,7 +1000,7 @@ fn palette4_convert_uniform_to_reversed_block_pal() -> Result<()> {
         src_cpu.push(data);
     }
 
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let rev = reversed_block_pal_map();
     run_kernel_pass(
         &stream,
@@ -1044,7 +1060,7 @@ fn palette4_convert_reversed_block_pal_to_uniform() -> Result<()> {
         src_cpu.push(data);
     }
 
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let rev = reversed_block_pal_map();
     run_kernel_pass(
         &stream,
@@ -1107,7 +1123,7 @@ fn palette4_convert_uniform_to_uniform_value_verification() -> Result<()> {
         src_cpu.push(data);
     }
 
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     run_kernel_pass(
         &stream,
         &dev,
@@ -1169,7 +1185,7 @@ fn palette4_convert_striped_identity_roundtrip() -> Result<()> {
         src_cpu.push(data);
     }
 
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let striped = striped_pal_map();
 
     // Pass 1: identity → striped
@@ -1301,9 +1317,8 @@ fn palette4_convert_f16_to_r16_single_fmt_sweep_diag() -> Result<()> {
         Device::Cuda(d) => d,
         _ => return Ok(()),
     };
-    let stream = cuda_dev.cuda_stream();
     let num_chunks = 1usize;
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let stream = cuda_dev.cuda_stream();
     let r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
 
@@ -1332,6 +1347,7 @@ fn palette4_convert_f16_to_r16_single_fmt_sweep_diag() -> Result<()> {
     use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
     eprintln!("[diag] pass 1 F16→R16");
     quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: src_ptrs_shared,
             v_src_arena_ptrs: src_ptrs_shared,
@@ -1359,6 +1375,7 @@ fn palette4_convert_f16_to_r16_single_fmt_sweep_diag() -> Result<()> {
     dev.synchronize()?;
     eprintln!("[diag] pass 2 R16→R16");
     quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: mid_ptrs,
             v_src_arena_ptrs: mid_ptrs,
@@ -1419,7 +1436,7 @@ fn multi_format_sweep(
     // Two calls to quantize_palette4_convert_buffered: each with N_FMTS heads.
     let n_fmts = ALL_QUANT_FMTS.len();
     use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let stream = cuda_dev.cuda_stream();
     let r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
 
@@ -1505,6 +1522,7 @@ fn multi_format_sweep(
 
     // Two kernel calls covering all N_FMTS heads in parallel.
     quantize_palette4_convert_buffered(
+        128,
         &p1_descs,
         n_fmts,
         1,
@@ -1514,6 +1532,7 @@ fn multi_format_sweep(
     )?;
     dev.synchronize()?;
     quantize_palette4_convert_buffered(
+        128,
         &p2_descs,
         n_fmts,
         1,
@@ -1546,7 +1565,6 @@ fn palette4_convert_f16_to_all_quant_formats() -> Result<()> {
         Device::Cuda(d) => d,
         _ => return Ok(()),
     };
-    let stream = cuda_dev.cuda_stream();
     let num_chunks = 1usize;
 
     // Values in [1.0, 1.032]: stable through all quantizers including 2-bit.
@@ -1594,7 +1612,6 @@ fn palette4_convert_r16_to_all_quant_formats() -> Result<()> {
         Device::Cuda(d) => d,
         _ => return Ok(()),
     };
-    let stream = cuda_dev.cuda_stream();
     let num_chunks = 1usize;
 
     let src_cpu: Vec<Vec<u8>> = (0..N_PAL)
@@ -1666,7 +1683,7 @@ fn palette4_convert_f32_source_to_r16() -> Result<()> {
     let stream = cuda_dev.cuda_stream();
     let num_chunks = 1usize;
     let r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
 
     let mut src_gpu = Vec::new();
     let mut dst_gpu = Vec::new();
@@ -1727,7 +1744,7 @@ fn palette4_convert_bf16_source_to_r16() -> Result<()> {
     let stream = cuda_dev.cuda_stream();
     let num_chunks = 1usize;
     let r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
 
     let mut src_gpu = Vec::new();
     let mut dst_gpu = Vec::new();
@@ -1790,7 +1807,7 @@ fn palette4_convert_r16_to_f32_dst() -> Result<()> {
     let num_chunks = 1usize;
     let _r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
     let f32_sz = arena_bytes(FMT_F32, PAL_DIM, num_chunks);
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
 
     let mut src_gpu = Vec::new();
     let mut dst_gpu = Vec::new();
@@ -1851,7 +1868,7 @@ fn palette4_convert_r16_to_bf16_dst() -> Result<()> {
     let num_chunks = 1usize;
     let _r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
     let bf16_sz = arena_bytes(FMT_BF16, PAL_DIM, num_chunks);
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
 
     let mut src_gpu = Vec::new();
     let mut dst_gpu = Vec::new();
@@ -1917,7 +1934,7 @@ fn palette4_convert_v_channel_identity_roundtrip() -> Result<()> {
     let stream = cuda_dev.cuda_stream();
     let num_chunks = 1usize;
     let arena_sz = PAL_DIM * num_chunks * R16_BLOCK_BYTES;
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
 
     let mut src_gpu = Vec::new();
     let mut dst_gpu = Vec::new();
@@ -1935,6 +1952,7 @@ fn palette4_convert_v_channel_identity_roundtrip() -> Result<()> {
 
     use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
     quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: src_v_ptrs,
             v_src_arena_ptrs: src_v_ptrs,
@@ -1993,7 +2011,7 @@ fn palette4_convert_v_channel_reversed_pal_map() -> Result<()> {
     let stream = cuda_dev.cuda_stream();
     let num_chunks = 1usize;
     let arena_sz = PAL_DIM * num_chunks * R16_BLOCK_BYTES;
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let rev = reversed_block_pal_map();
 
     let mut src_gpu = Vec::new();
@@ -2012,6 +2030,7 @@ fn palette4_convert_v_channel_reversed_pal_map() -> Result<()> {
     use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
     // K and V both use the rev→ident transform; K output is redundant but valid.
     quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: src_v_ptrs,
             v_src_arena_ptrs: src_v_ptrs,
@@ -2076,7 +2095,7 @@ fn palette4_convert_quant_multi_chunk() -> Result<()> {
     };
     let stream = cuda_dev.cuda_stream();
     let num_chunks = 4usize;
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
     let q8_sz = arena_bytes(FMT_Q8_0, PAL_DIM, num_chunks);
 
@@ -2155,7 +2174,7 @@ fn palette4_convert_quant_nonidentity_pal_map() -> Result<()> {
     };
     let stream = cuda_dev.cuda_stream();
     let num_chunks = 2usize;
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let rev = reversed_block_pal_map();
     let r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
     let q8_sz = arena_bytes(FMT_Q8_0, PAL_DIM, num_chunks);
@@ -2234,7 +2253,7 @@ fn palette4_convert_v_channel_quant() -> Result<()> {
     };
     let stream = cuda_dev.cuda_stream();
     let num_chunks = 2usize;
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
     let q8_sz = arena_bytes(FMT_Q8_0, PAL_DIM, num_chunks);
 
@@ -2258,6 +2277,7 @@ fn palette4_convert_v_channel_quant() -> Result<()> {
 
     // Pass 1: R16 → Q8_0
     quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: src_v_ptrs,
             v_src_arena_ptrs: src_v_ptrs,
@@ -2285,6 +2305,7 @@ fn palette4_convert_v_channel_quant() -> Result<()> {
     dev.synchronize()?;
     // Pass 2: Q8_0 → R16
     quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: mid_v_ptrs,
             v_src_arena_ptrs: mid_v_ptrs,
@@ -2345,7 +2366,7 @@ fn palette4_convert_multi_layer_quant() -> Result<()> {
     let num_layers = 2usize;
     let num_kv_heads = 2usize;
     let total_jobs = num_layers * num_kv_heads;
-    let ident = identity_pal_map();
+    let ident = identity_pal_map_local();
     let r16_sz = arena_bytes(FMT_R16, PAL_DIM, num_chunks);
     let q8_sz = arena_bytes(FMT_Q8_0, PAL_DIM, num_chunks);
 
@@ -2422,6 +2443,7 @@ fn palette4_convert_multi_layer_quant() -> Result<()> {
         });
     }
     quantize_palette4_convert_buffered(
+        128,
         &p1_descs,
         num_kv_heads,
         num_layers,
@@ -2431,6 +2453,7 @@ fn palette4_convert_multi_layer_quant() -> Result<()> {
     )?;
     dev.synchronize()?;
     quantize_palette4_convert_buffered(
+        128,
         &p2_descs,
         num_kv_heads,
         num_layers,
@@ -2461,7 +2484,7 @@ fn palette4_convert_multi_layer_quant() -> Result<()> {
 }
 
 // ============================================================================
-// Tests for the buffered API: ggml_dtype_to_arena_fmt_code, identity_pal_map_128,
+// Tests for the buffered API: ggml_dtype_to_arena_fmt_code, identity_pal_map,
 // build_kvhead_bytes_raw, quantize_palette4_convert_buffered,
 // and quantize_palette4_convert_identity.
 // ============================================================================
@@ -2482,13 +2505,15 @@ fn buffered_api_arena_fmt_codes() -> Result<()> {
     Ok(())
 }
 
-/// Verify identity_pal_map_128 bit-packing.
+/// Verify identity_pal_map bit-packing.
 /// For each dimension d (0..128), the 2-bit field at position d should equal d/32.
 #[test]
 fn buffered_api_identity_pal_map() -> Result<()> {
-    use candle_core::quantized::cuda::identity_pal_map_128;
-    let map = identity_pal_map_128();
-    assert_eq!(map.len(), 32);
+    use candle_core::quantized::cuda::identity_pal_map;
+    let map = identity_pal_map(128);
+    // Max-width buffer: only the first head_dim/4 = 32 bytes are live at 128.
+    assert_eq!(map.len(), 64);
+    assert!(map[32..].iter().all(|&b| b == 0), "tail bytes must stay zero");
     for d in 0..128usize {
         let byte_idx = d / 4;
         let bit_shift = 2 * (d % 4);
@@ -2507,17 +2532,18 @@ fn buffered_api_identity_pal_map() -> Result<()> {
 #[test]
 fn buffered_api_build_kvhead_bytes_raw_layout() -> Result<()> {
     use candle_core::quantized::cuda::{
-        build_kvhead_bytes_raw, ggml_dtype_to_arena_fmt_code, identity_pal_map_128,
+        build_kvhead_bytes_raw, ggml_dtype_to_arena_fmt_code, identity_pal_map,
     };
 
     let k_ptrs: [u64; 4] = [0x1000_0000, 0x2000_0000, 0x3000_0000, 0x4000_0000];
     let v_ptrs: [u64; 4] = [0x5000_0000, 0x6000_0000, 0x7000_0000, 0x8000_0000];
     let k_fmts = [GgmlDType::R16; 4];
     let v_fmts = [GgmlDType::Q8_0; 4];
-    let id = identity_pal_map_128();
+    let id = identity_pal_map(128);
 
     let unit_scales = [1.0f32; 4];
     let bytes = build_kvhead_bytes_raw(
+        128,
         &k_ptrs,
         &v_ptrs,
         &k_fmts,
@@ -2533,9 +2559,10 @@ fn buffered_api_build_kvhead_bytes_raw_layout() -> Result<()> {
         "KvHead must be 168 bytes (HD/2 + 104 for HD=128, f32 scales)"
     );
 
-    // Pal maps should be identity
-    assert_eq!(&bytes[0..32], &id[..], "k_pal_map mismatch");
-    assert_eq!(&bytes[32..64], &id[..], "v_pal_map mismatch");
+    // Pal maps should be identity — only the first head_dim/4 = 32 bytes of
+    // the max-width input buffer are live in the record.
+    assert_eq!(&bytes[0..32], &id[..32], "k_pal_map mismatch");
+    assert_eq!(&bytes[32..64], &id[..32], "v_pal_map mismatch");
 
     // k_ptr[p] at offset 64 + p*8
     for p in 0..4usize {
@@ -2571,14 +2598,16 @@ fn buffered_api_build_kvhead_bytes_raw_custom_pal_map() -> Result<()> {
     let v_ptrs = [0u64; 4];
     let fmts = [GgmlDType::F16; 4];
 
-    // All dims to palette 2 (0b10 packed × 4 per byte = 0xAA)
-    let mut custom_map = [0u8; 32];
-    for b in custom_map.iter_mut() {
+    // All dims to palette 2 (0b10 packed × 4 per byte = 0xAA); only the
+    // first head_dim/4 = 32 bytes of the max-width buffer are live.
+    let mut custom_map = [0u8; 64];
+    for b in custom_map.iter_mut().take(32) {
         *b = 0xAA;
     }
 
     let unit_scales = [1.0f32; 4];
     let bytes = build_kvhead_bytes_raw(
+        128,
         &k_ptrs,
         &v_ptrs,
         &fmts,
@@ -2588,8 +2617,8 @@ fn buffered_api_build_kvhead_bytes_raw_custom_pal_map() -> Result<()> {
         &unit_scales,
         &unit_scales,
     )?;
-    assert_eq!(&bytes[0..32], &custom_map[..], "k_pal_map not written");
-    assert_eq!(&bytes[32..64], &custom_map[..], "v_pal_map not written");
+    assert_eq!(&bytes[0..32], &custom_map[..32], "k_pal_map not written");
+    assert_eq!(&bytes[32..64], &custom_map[..32], "v_pal_map not written");
     Ok(())
 }
 
@@ -2629,9 +2658,9 @@ fn buffered_api_identity_r16_roundtrip() -> Result<()> {
     let k_dst_ptrs: [u64; 4] = std::array::from_fn(|p| dst_gpu[p].device_ptr(&stream).0 as u64);
 
     use candle_core::quantized::cuda::{
-        identity_pal_map_128, quantize_palette4_convert_buffered, PalHeadDesc,
+        identity_pal_map, quantize_palette4_convert_buffered, PalHeadDesc,
     };
-    let id = identity_pal_map_128();
+    let id = identity_pal_map(128);
     let descs = vec![PalHeadDesc {
         k_src_arena_ptrs: k_src_ptrs,
         v_src_arena_ptrs: k_src_ptrs, // V src same arenas
@@ -2652,6 +2681,7 @@ fn buffered_api_identity_r16_roundtrip() -> Result<()> {
     }];
     let generation = PinnedStager::new(cuda_dev).begin_generation();
     quantize_palette4_convert_buffered(
+        128,
         &descs,
         num_kv_heads,
         num_layers,
@@ -2686,7 +2716,7 @@ fn buffered_api_identity_r16_roundtrip() -> Result<()> {
 /// Verifies the full buffer-construction path including separate src/dst KvHead structs.
 #[test]
 fn buffered_api_r16_to_q8_roundtrip() -> Result<()> {
-    use candle_core::quantized::cuda::{identity_pal_map_128, PalHeadDesc};
+    use candle_core::quantized::cuda::{identity_pal_map, PalHeadDesc};
 
     let dev = match get_cuda_dev() {
         Ok(d) => d,
@@ -2729,8 +2759,9 @@ fn buffered_api_r16_to_q8_roundtrip() -> Result<()> {
     let q8_fmts = [GgmlDType::Q8_0; N_PAL];
 
     // Pass 1: R16 → Q8_0
-    let id = identity_pal_map_128();
+    let id = identity_pal_map(128);
     candle_core::quantized::cuda::quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: src_p,
             v_src_arena_ptrs: src_p,
@@ -2759,6 +2790,7 @@ fn buffered_api_r16_to_q8_roundtrip() -> Result<()> {
 
     // Pass 2: Q8_0 → R16
     candle_core::quantized::cuda::quantize_palette4_convert_buffered(
+        128,
         &[PalHeadDesc {
             k_src_arena_ptrs: mid_p,
             v_src_arena_ptrs: mid_p,
@@ -2857,9 +2889,9 @@ fn buffered_api_identity_multi_layer_multi_head() -> Result<()> {
     }
 
     use candle_core::quantized::cuda::{
-        identity_pal_map_128, quantize_palette4_convert_buffered, PalHeadDesc,
+        identity_pal_map, quantize_palette4_convert_buffered, PalHeadDesc,
     };
-    let id = identity_pal_map_128();
+    let id = identity_pal_map(128);
     let descs: Vec<PalHeadDesc> = (0..total_jobs)
         .map(|i| PalHeadDesc {
             k_src_arena_ptrs: k_src_all[i],
@@ -2882,6 +2914,7 @@ fn buffered_api_identity_multi_layer_multi_head() -> Result<()> {
         .collect();
     let generation = PinnedStager::new(cuda_dev).begin_generation();
     quantize_palette4_convert_buffered(
+        128,
         &descs,
         num_kv_heads,
         num_layers,
@@ -2926,7 +2959,7 @@ fn buffered_api_identity_multi_layer_multi_head() -> Result<()> {
 #[test]
 #[ignore]
 fn palette4_convert_throughput_bench() -> Result<()> {
-    use candle_core::quantized::cuda::{identity_pal_map_128, PalHeadDesc};
+    use candle_core::quantized::cuda::{identity_pal_map, PalHeadDesc};
     use std::time::{Duration, Instant};
 
     let dev = match get_cuda_dev() {
@@ -3004,7 +3037,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
         .map(|job| std::array::from_fn(|p| src_gpu[job * N_PAL + p].device_ptr(&stream).0 as u64))
         .collect();
 
-    let id = identity_pal_map_128();
+    let id = identity_pal_map(128);
     let r16_fmts = [GgmlDType::R16; N_PAL];
 
     println!(
@@ -3085,6 +3118,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
         let stager = PinnedStager::new(cuda_dev);
         let generation = stager.begin_generation();
         candle_core::quantized::cuda::quantize_palette4_convert_buffered(
+        128,
             &descs_fwd,
             num_kv_heads,
             num_layers,
@@ -3093,6 +3127,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
             &stream,
         )?;
         candle_core::quantized::cuda::quantize_palette4_convert_buffered(
+        128,
             &descs_bwd,
             num_kv_heads,
             num_layers,
@@ -3106,6 +3141,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
         let t0 = Instant::now();
         while t0.elapsed() < target_duration {
             candle_core::quantized::cuda::quantize_palette4_convert_buffered(
+        128,
                 &descs_fwd,
                 num_kv_heads,
                 num_layers,
@@ -3114,6 +3150,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
                 &stream,
             )?;
             candle_core::quantized::cuda::quantize_palette4_convert_buffered(
+        128,
                 &descs_bwd,
                 num_kv_heads,
                 num_layers,

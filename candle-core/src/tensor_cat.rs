@@ -248,8 +248,14 @@ impl<'w> LiveTensor<'w> {
     /// has to be greater than or equal to `offset` plus the `src` size.
     ///
     /// Note that this modifies `self` in place and as such is not compatible with
-    /// back-propagation.  
-    pub fn slice_set<D: Dim>(&self, src: &Self, dim: D, offset: usize) -> Result<()> {
+    /// back-propagation.
+    ///
+    /// `src` carries its own lifetime for the same reason the `*_mut` ops do:
+    /// this writes `self` and only reads `src`, so writing a wave-scoped result
+    /// into an owned buffer — a scan's chunk output into the segment buffer, a
+    /// conv's advanced tail into the carried state — needs no relation between
+    /// the two.
+    pub fn slice_set<D: Dim>(&self, src: &LiveTensor<'_>, dim: D, offset: usize) -> Result<()> {
         let dim = dim.to_index(self.shape(), "slice-set")?;
         if !self.is_contiguous() || !src.is_contiguous() {
             Err(Error::RequiresContiguous { op: "slice-set" }.bt())?

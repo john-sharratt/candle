@@ -56,12 +56,13 @@ use crate::substrate::Substrate;
 use accounting::RecordAccounting;
 use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
+use content_hash::snapshot_stream_id;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
     decode_record, encode_record, ChunkPayload, DebugIdPayload, Record, RecordHeader, RecordType,
-    TreeMetadataPayload,
+    TombstonePayload, TreeMetadataPayload,
 };
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -161,6 +162,17 @@ pub struct SubstratePersistence {
     /// maintenance pass. Counting them as live via this map is what actually
     /// halts that churn. Populated on every append and rebuilt on load / compact.
     metadata_locs: HashMap<(RecordType, u64), RecordLoc>,
+    /// On-disk location of each conversation's CURRENT recurrent-state
+    /// `Snapshot` record, keyed by snapshot stream id — last-writer-wins, the
+    /// persistence-side twin of the substrate's `recurrent_snapshots` index.
+    /// Snapshot records are superseded by append order, and the seal thread's
+    /// writer can append a newer tail between a maintenance plan and its
+    /// execute — so the execute phase (which runs WITHOUT the substrate lock)
+    /// consults this map to skip relocating a planned snapshot that is no
+    /// longer the stream's live tail. A timeline tombstone removes its entry
+    /// (a dead conversation has no live tail). Populated on every append
+    /// (both encode and verbatim paths) and rebuilt on load / compact.
+    snapshot_locs: HashMap<u64, RecordLoc>,
 }
 
 /// Whether a record type is a per-stream metadata record whose current-copy
@@ -168,6 +180,10 @@ pub struct SubstratePersistence {
 /// as live weight (see that field). These are the records the maintenance
 /// resident-set re-emits and that carry no location in the substrate index.
 fn is_tracked_metadata(rt: RecordType) -> bool {
+    // `Snapshot` is deliberately NOT here: its payload never lives in RAM, so
+    // the maintenance resident-set (which re-encodes from RAM) cannot carry
+    // it. It is tracked through the substrate index and relocated verbatim
+    // like `Tokens` — see `segment_liveness` and `gather_relocations`.
     matches!(
         rt,
         RecordType::StreamDecl
@@ -192,6 +208,38 @@ fn record_metadata_loc(map: &mut HashMap<(RecordType, u64), RecordLoc>, entry: &
                 record_size: entry.size,
             },
         );
+    }
+}
+
+/// Mirror one walked record into the snapshot-location map (LWW): a
+/// `Snapshot` record installs its location; a timeline-scoped `Tombstone`
+/// removes the timeline's entry, so a snapshot record replayed before its
+/// timeline's tombstone never reads as live. The load / compact walk uses
+/// this before the `SubstratePersistence` exists; the runtime append path
+/// uses [`SubstratePersistence::track_snapshot_loc`] plus the removal in
+/// [`SubstratePersistence::write_tombstone`].
+fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
+    let h = &entry.record.header;
+    match h.record_type {
+        RecordType::Snapshot => {
+            map.insert(
+                h.stream_id,
+                RecordLoc {
+                    segment: entry.segment,
+                    offset: entry.offset,
+                    payload_len: h.payload_len,
+                    record_size: entry.size,
+                },
+            );
+        }
+        RecordType::Tombstone => {
+            if let Ok(p) = TombstonePayload::decode(&entry.record.payload) {
+                if p.turn_index.is_none() {
+                    map.remove(&snapshot_stream_id(p.timeline_id).0);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -296,6 +344,7 @@ impl SubstratePersistence {
         // builds the combined singleton manifest.
         let mut accounting = RecordAccounting::new();
         let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
+        let mut snapshot_locs: HashMap<u64, RecordLoc> = HashMap::new();
         let segmented_log::OpenedSegments {
             mut segments,
             manifest,
@@ -305,6 +354,7 @@ impl SubstratePersistence {
         } = SegmentedLog::open_with_sink(dir, |entry| {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(&mut metadata_locs, entry);
+            record_snapshot_loc(&mut snapshot_locs, entry);
             sink(entry);
         })?;
 
@@ -346,6 +396,7 @@ impl SubstratePersistence {
             last_maintenance: None,
             resident_reemit_floor: None,
             metadata_locs,
+            snapshot_locs,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -462,6 +513,7 @@ impl SubstratePersistence {
         let size = bytes.len() as u64;
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
+        self.track_snapshot_loc(&header, segment, offset, size);
         let entry = WalkEntry {
             segment,
             offset,
@@ -502,6 +554,11 @@ impl SubstratePersistence {
         let (segment, offset) = self.segments.stage(raw);
         let size = raw.len() as u64;
         self.accounting.record(header, size);
+        // A relocated `Snapshot` becomes the stream's current on-disk tail —
+        // the persistence-side map must follow it, or the next maintenance
+        // pass would mis-read the relocated (live) copy as superseded and skip
+        // carrying it out of a segment about to be dropped.
+        self.track_snapshot_loc(header, segment, offset, size);
         // `Chunk` / `Tokens` are indexed on the substrate, not the manifest, so
         // no `manifest.ingest` — the caller repoints the substrate index.
         if header.record_type != RecordType::HeaderIndex {
@@ -595,6 +652,28 @@ impl SubstratePersistence {
         }
     }
 
+    /// Record the on-disk location of a `Snapshot` record in
+    /// [`snapshot_locs`](Self::snapshot_locs) — last-writer-wins per snapshot
+    /// stream, so the map always names the stream's current tail. A no-op for
+    /// every other record type. Called from both append paths
+    /// ([`append_record`](Self::append_record) and
+    /// [`append_raw_record`](Self::append_raw_record)) so runtime snapshot
+    /// writes AND maintenance relocations keep the map current; the load /
+    /// compact walk uses the free-function mirror [`record_snapshot_loc`].
+    fn track_snapshot_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
+        if h.record_type == RecordType::Snapshot {
+            self.snapshot_locs.insert(
+                h.stream_id,
+                RecordLoc {
+                    segment,
+                    offset,
+                    payload_len: h.payload_len,
+                    record_size: size,
+                },
+            );
+        }
+    }
+
     /// Append a stream's `Tokens` record, returning `(segment, offset,
     /// record_size)` of the written record. The caller MUST fold this location
     /// into the substrate index (`apply_tokens_loc`) — otherwise the in-RAM index
@@ -627,6 +706,22 @@ impl SubstratePersistence {
     pub fn append_wide_q_sigs(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
         self.append_record(RecordType::WideQSig, 0, stream_id.0, 0, 0, 0, payload)?;
         Ok(())
+    }
+
+    /// Append a conversation's recurrent-state snapshot under its snapshot
+    /// stream id. Single tail: the accounting layer credits the previous
+    /// snapshot as dead the moment this one lands, and `snapshot_locs` keeps
+    /// exactly this copy alive through segment maintenance. Returns the
+    /// record's location for the caller's in-RAM index.
+    pub fn write_snapshot(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<RecordLoc> {
+        let (segment, offset, size) =
+            self.append_record(RecordType::Snapshot, 0, stream_id.0, 0, 0, 0, payload)?;
+        Ok(RecordLoc {
+            segment,
+            offset,
+            payload_len: payload.len() as u64,
+            record_size: size,
+        })
     }
 
     /// Append a `Commit` record marking `stream_id` durable through
@@ -695,13 +790,19 @@ impl SubstratePersistence {
     /// note (e.g. the corrupt-reload detail) recorded in the payload; pass
     /// `None` for an ordinary deletion.
     pub fn write_tombstone(&mut self, timeline_id: u64, reason: Option<&str>) -> Result<()> {
-        let payload = record::TombstonePayload {
+        let payload = TombstonePayload {
             timeline_id,
             turn_index: None,
             reason: reason.map(str::to_string),
         };
         let bytes = payload.encode();
         self.append_record(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes)?;
+        // A dead conversation has no live snapshot tail: drop its entry from
+        // the persistence-side map so a maintenance execute planned before
+        // this tombstone skips relocating the (now dead) snapshot record —
+        // the same removal the substrate index performs in `apply_tombstone`,
+        // and the same one `record_snapshot_loc` replays on reload.
+        self.snapshot_locs.remove(&snapshot_stream_id(timeline_id).0);
         Ok(())
     }
 
@@ -715,7 +816,7 @@ impl SubstratePersistence {
         turn_index: u32,
         reason: Option<&str>,
     ) -> Result<()> {
-        let payload = record::TombstonePayload {
+        let payload = TombstonePayload {
             timeline_id,
             turn_index: Some(turn_index),
             reason: reason.map(str::to_string),
@@ -1085,6 +1186,15 @@ impl SubstratePersistence {
         Ok(None)
     }
 
+    /// Read one record's payload back by location — the snapshot-restore
+    /// read (the caller got `loc` from the substrate's snapshot index).
+    pub fn read_record_payload(&mut self, loc: &RecordLoc) -> Result<Vec<u8>> {
+        let record = self
+            .segments
+            .read_record_at(loc.segment, loc.offset, loc.record_size)?;
+        Ok(record.payload)
+    }
+
     /// Flush and `fsync` the active segment — the group-commit durability
     /// point. Seals + rotates the active if it has reached the size target.
     pub fn commit(&mut self) -> Result<()> {
@@ -1405,15 +1515,18 @@ impl SubstratePersistence {
         // single segment, so the previous drop-safety floor is meaningless. Clear
         // it — the next maintenance op re-establishes a floor with a fresh re-emit.
         self.resident_reemit_floor = None;
-        // Metadata locations point at the OLD segments; rebuild them from the
-        // freshly-compacted segment in the same recovery pass (mirrors the load
-        // walk in `from_dir_with_sink`).
+        // Metadata and snapshot locations point at the OLD segments; rebuild
+        // them from the freshly-compacted segment in the same recovery pass
+        // (mirrors the load walk in `from_dir_with_sink`).
         self.metadata_locs.clear();
+        self.snapshot_locs.clear();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
+        let snapshot_locs = &mut self.snapshot_locs;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(metadata_locs, entry);
+            record_snapshot_loc(snapshot_locs, entry);
             substrate.apply_walker_entry(entry);
         })?;
         // The compacted segment carries a fresh index chain; chain the next

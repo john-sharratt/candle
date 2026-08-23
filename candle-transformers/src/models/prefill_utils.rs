@@ -1154,6 +1154,52 @@ impl<'k> PagedPrefillInt8<'k> {
     }
 }
 
+/// Whether the INT8 prefix-attention prefill kernel is instantiated at this
+/// head dim.
+///
+/// The set is fixed by the dispatchers in `paged_prefill_int8_{fp16,bf16}.cu`:
+/// 64 and 128 run at 4 blocks/SM on a 2-way output-dim split, 256 at 2
+/// blocks/SM on a 4-way split (its staging slabs are ~41 KB, too wide for the
+/// 25.6 KB union arena the higher occupancy needs). Head dims outside the set
+/// take the float fallback, which is correct at any width but materializes
+/// the score matrix per sequence.
+pub(crate) fn int8_prefill_head_dim(head_dim: usize) -> bool {
+    matches!(head_dim, 64 | 128 | 256)
+}
+
+/// Whether the INT8 prefix-attention prefill kernel can serve a session whose
+/// activations are `act_dtype`.
+///
+/// The kernel is instantiated over F16 and BF16 only, and it emits the context
+/// in the dtype it computed in. A reference-mode session carrying F32
+/// activations would therefore get a BF16 context back, and the first RMSNorm
+/// downstream would meet an F32 weight against BF16 activations — the arena's
+/// `collapse_compute` maps F32/F64 to BF16 for the kernel's operands, but
+/// nothing maps the result back, and casting it per layer is a full-tensor pass
+/// on the hot path for a mode that exists to be exact rather than fast.
+///
+/// So an F32 session takes the float fallback, which computes at the session's
+/// own dtype throughout. This is the same kind of boundary as
+/// [`int8_prefill_head_dim`]: what the kernel is built for, not a toggle.
+pub(crate) fn int8_prefill_act_dtype(act_dtype: DType) -> bool {
+    matches!(act_dtype, DType::F16 | DType::BF16)
+}
+
+/// Whether the fused q8a128-emitting decode combine serves `head_dim`.
+///
+/// The set is fixed by the `LAUNCH_Q8` dispatchers in
+/// `paged_decode_api_{fp16,bf16}.cu` and by the combine kernel's tile
+/// arithmetic (`HEAD_DIM % 128 == 0` — a block is `head_dim/128` whole
+/// q8a1024 tiles). The `.cu` switches return without launching for any other
+/// width and rely on the Rust side bailing first, so **every** Rust-side
+/// check of this set must go through this predicate: a widened literal in
+/// one place but not the dispatcher would route `want_q8` to a launcher
+/// that silently emits nothing, and `o_proj` would consume uninitialized
+/// bytes. Same boundary discipline as [`int8_prefill_head_dim`].
+pub(crate) fn paged_decode_q8_head_dim(head_dim: usize) -> bool {
+    matches!(head_dim, 128 | 256)
+}
+
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 /// Paged prefill attention over chunked KV arenas (no KV materialization),
@@ -1183,11 +1229,9 @@ pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
     max_q_len: usize,
 ) -> Result<LiveTensor<'w>> {
     // The kernel handles both RoPE pairings (half-split in-thread; interleaved
-    // via a lane^1 partner shuffle — see `i8_apply_rope`). head_dim stays
-    // {64, 128}: 256's staging slabs exceed the 25.6 KB 4-blocks/SM
-    // union-arena budget.
-    if head_dim != 64 && head_dim != 128 {
-        candle::bail!("paged-prefill-int8 supports head_dim 64 or 128 (got {head_dim})")
+    // via a lane^1 partner shuffle — see `i8_apply_rope`).
+    if !int8_prefill_head_dim(head_dim) {
+        candle::bail!("paged-prefill-int8 supports head_dim 64, 128 or 256 (got {head_dim})")
     }
 
     let q = q.to_dtype(compute_dtype)?;
@@ -1696,14 +1740,20 @@ pub fn paged_decode_attn<'w>(
         rope_interleaved,
         num_active_slots,
         emit_q8: false,
+        gate: None,
+        gate_slot_stride: 0,
     };
     with_q_storage(q, |s, l| op.run(s, l, wave))
 }
 
 /// B2 decode: like [`paged_decode_attn`] but the combine kernel emits the attention context
-/// directly as q8a1024 blocks (head_dim 128 only). Returns a flat `[q8_bytes]` U8 tensor; the
+/// directly as q8a1024 blocks (head_dim 128 or 256). Returns a flat `[q8_bytes]` U8 tensor; the
 /// caller wraps it as a `Q8a128Operand` (`rows = num_active_slots`, `cols = n_q_head·head_dim`)
 /// and feeds `o_proj` via the int8 path — no FP store + standalone quantize.
+///
+/// `gate` (same dtype as `q`, `num_active_slots × n_q_head·head_dim` elements, model dim
+/// order) folds the output gate `sigmoid(g) ⊙ ctx` into the same emit — the gated lineages'
+/// post-attention gate with no extra launches and no FP context round-trip.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "cuda")]
 pub fn paged_decode_attn_q8<'w>(
@@ -1719,10 +1769,48 @@ pub fn paged_decode_attn_q8<'w>(
     v_new: &LiveTensor<'_>,
     rope_cs: &Tensor,
     rope_interleaved: bool,
+    gate: Option<&LiveTensor<'_>>,
 ) -> Result<LiveTensor<'w>> {
     let num_active_slots = q.dim(0)?;
     let k_new = k_new.contiguous()?;
     let v_new = v_new.contiguous()?;
+    let row_width = n_q_head * head_dim;
+    let (gate, gate_slot_stride) = match gate {
+        Some(g) => {
+            let want = num_active_slots * row_width;
+            if g.elem_count() != want {
+                candle::bail!(
+                    "paged-decode q8: gate has {} elements against a {want}-element context",
+                    g.elem_count()
+                );
+            }
+            // Read in place — no copy, no layout normalization. The nominal
+            // producer is the fused [q|gate] projection's narrow: rows sit the
+            // projection's row width apart with a unit inner stride, and the
+            // combine kernel takes that slot stride directly. Anything else must
+            // arrive contiguous.
+            let stride = if g.is_contiguous() {
+                row_width as i64
+            } else {
+                let (dims, strides) = (g.dims(), g.stride());
+                if dims.len() == 2
+                    && dims[0] == num_active_slots
+                    && dims[1] == row_width
+                    && strides[1] == 1
+                {
+                    strides[0] as i64
+                } else {
+                    candle::bail!(
+                        "paged-decode q8: gate must be contiguous or a \
+                         [slots, n_head·head_dim] row-strided view with a unit inner \
+                         stride; got dims {dims:?} strides {strides:?}"
+                    );
+                }
+            };
+            (Some(g.clone()), stride)
+        }
+        None => (None, 0),
+    };
     let op = PagedDecode {
         headers_ptr,
         arena_dtype,
@@ -1736,6 +1824,8 @@ pub fn paged_decode_attn_q8<'w>(
         rope_interleaved,
         num_active_slots,
         emit_q8: true,
+        gate,
+        gate_slot_stride,
     };
     with_q_storage(q, |s, l| op.run(s, l, wave))
 }
@@ -1754,9 +1844,16 @@ struct PagedDecode<'k> {
     rope_interleaved: bool,
     num_active_slots: usize,
     /// B2: when true the combine kernel emits the attention context as q8a1024 blocks (head_dim
-    /// 128 only) instead of an FP tensor, so `o_proj` consumes it via the int8 path with no
+    /// 128 or 256) instead of an FP tensor, so `o_proj` consumes it via the int8 path with no
     /// standalone quantize. The op then returns a flat `[q8_bytes]` U8 tensor of the operand bytes.
     emit_q8: bool,
+    /// Output gate folded into the q8 emit (`sigmoid(g) ⊙ ctx`):
+    /// `[num_active_slots × n_q_head·head_dim]` in the context's dim order, same dtype as `q`.
+    /// Read in place — a slot's row may sit `gate_slot_stride` elements from the previous
+    /// slot's, so the fused `[q | gate]` projection's narrow feeds the kernel with no copy.
+    gate: Option<LiveTensor<'k>>,
+    /// Elements between consecutive slots' gate rows (`n_q_head·head_dim` when contiguous).
+    gate_slot_stride: i64,
 }
 
 #[cfg(feature = "cuda")]
@@ -1791,7 +1888,7 @@ impl<'k> PagedDecode<'k> {
             *const f32,
             i32,
             *mut core::ffi::c_void,
-        ),
+        ) -> i32,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         let dev = q.device().clone();
@@ -1839,7 +1936,7 @@ impl<'k> PagedDecode<'k> {
             // can race with the non-blocking dedicated stream.
             candle::set_kernel_breadcrumb("run_paged_decode", file!(), line!());
             let raw_stream = stream.cu_stream() as *mut core::ffi::c_void;
-            unsafe {
+            let status = unsafe {
                 ffi_fn(
                     q_ptr as *const core::ffi::c_void,
                     headers_ptr as *const u8,
@@ -1854,6 +1951,14 @@ impl<'k> PagedDecode<'k> {
                     rcs_ptr as *const f32,
                     self.rope_interleaved as i32,
                     raw_stream,
+                )
+            };
+            if status != 0 {
+                candle::bail!(
+                    "paged-decode: the split-KV partial pool could not be allocated \
+                     (VRAM exhausted) — the requested split/stripe launch needs it, \
+                     so nothing was launched and this wave must fail rather than \
+                     read an unwritten context"
                 );
             }
         } // all guards dropped here, dst no longer borrowed
@@ -1864,6 +1969,7 @@ impl<'k> PagedDecode<'k> {
 
     /// B2 q8a1024-emitting variant: allocates the q8a1024 byte buffer and passes it as the
     /// kernel's `q8_out`, returning a flat `[q8_bytes]` U8 storage (no FP context store).
+    /// The optional output gate rides along as a nullable pointer, `Q`-typed like the queries.
     fn cuda_fwd_typed_q8<
         'w,
         Q: candle::cuda_backend::CudaDType + DeviceRepr + 'static,
@@ -1876,6 +1982,8 @@ impl<'k> PagedDecode<'k> {
             *const core::ffi::c_void,
             *const u8,
             *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            i64,
             i32,
             i32,
             i32,
@@ -1886,7 +1994,7 @@ impl<'k> PagedDecode<'k> {
             *const f32,
             i32,
             *mut core::ffi::c_void,
-        ),
+        ) -> i32,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         let dev = q.device().clone();
@@ -1925,15 +2033,38 @@ impl<'k> PagedDecode<'k> {
             .slice(rcs_l.start_offset()..);
             let (rcs_ptr, _rcs_g) = rcs_slice.device_ptr(&stream);
 
+            // Nullable gate: resolve the device pointer while holding the storage
+            // guard across the launch, exactly like the other operands.
+            let gate_bind = self.gate.as_ref().map(|g| g.storage_and_layout());
+            let gate_sl = match gate_bind.as_ref() {
+                Some((g_s, g_l)) => Some(
+                    match &**g_s {
+                        candle::Storage::Cuda(c) => c.as_cuda_slice::<Q>()?,
+                        _ => candle::bail!("paged-decode q8: gate must be CUDA"),
+                    }
+                    .slice(g_l.start_offset()..),
+                ),
+                None => None,
+            };
+            let (gate_ptr, _gate_g) = match gate_sl.as_ref() {
+                Some(s) => {
+                    let (p, g) = s.device_ptr(&stream);
+                    (p as *const core::ffi::c_void, Some(g))
+                }
+                None => (core::ptr::null(), None),
+            };
+
             let (dst_ptr, _dst_g) = dst.device_ptr(&stream);
 
             candle::set_kernel_breadcrumb("run_paged_decode_q8", file!(), line!());
             let raw_stream = stream.cu_stream() as *mut core::ffi::c_void;
-            unsafe {
+            let status = unsafe {
                 ffi_fn(
                     q_ptr as *const core::ffi::c_void,
                     headers_ptr as *const u8,
                     dst_ptr as *mut core::ffi::c_void,
+                    gate_ptr,
+                    self.gate_slot_stride,
                     self.num_active_slots as i32,
                     self.n_q_head as i32,
                     self.n_kv_head as i32,
@@ -1944,6 +2075,14 @@ impl<'k> PagedDecode<'k> {
                     rcs_ptr as *const f32,
                     self.rope_interleaved as i32,
                     raw_stream,
+                )
+            };
+            if status != 0 {
+                candle::bail!(
+                    "paged-decode q8: the split-KV partial pool could not be allocated \
+                     (VRAM exhausted) — every q8 emit routes through partials + combine, \
+                     so nothing was launched and this wave must fail rather than consume \
+                     an uninitialized context"
                 );
             }
         } // all guards dropped here, dst no longer borrowed
@@ -1968,14 +2107,15 @@ impl<'k> PagedDecode<'k> {
             ),
         }
 
-        // B2: emit the attention context as q8a1024 (head_dim 128 only) so o_proj runs int8.
+        // B2: emit the attention context as q8a1024 (head_dim 128 or 256 — whole
+        // q8a128 tiles per head) so o_proj runs int8.
         if self.emit_q8 {
             use candle_kernels::paged_decode::{
                 run_paged_decode_bf16_q8, run_paged_decode_fp16_q8,
             };
-            if self.head_dim != 128 {
+            if !paged_decode_q8_head_dim(self.head_dim) {
                 candle::bail!(
-                    "paged-decode q8: q8a1024 emit requires head_dim 128, got {}",
+                    "paged-decode q8: q8a1024 emit requires head_dim 128 or 256, got {}",
                     self.head_dim
                 );
             }

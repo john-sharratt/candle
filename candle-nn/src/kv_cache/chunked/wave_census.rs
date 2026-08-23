@@ -87,11 +87,17 @@ pub(crate) fn enabled() -> bool {
 /// backend's `alloc_inheriting`, the ticket resolver, the bump — and every one
 /// of them appears in every capture, so naming them once here is what makes the
 /// label the *caller*.
-const ALLOCATOR_FRAMES: [&str; 6] = [
+///
+/// `CudaStorage` is on the list because the matmul family allocates through
+/// inherent methods on it, and stopping there labels a third of the attention
+/// phase with one uninformative name. The frame below it is the op or the model
+/// function that wanted the buffer, which is what the inventory needs.
+const ALLOCATOR_FRAMES: [&str; 7] = [
     "wave_census",
     "bump_arena",
     "wave_provenance",
     "alloc_inheriting",
+    "CudaStorage",
     "backtrace",
     "Backtrace",
 ];

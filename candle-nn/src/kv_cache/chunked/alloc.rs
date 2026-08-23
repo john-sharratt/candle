@@ -544,11 +544,13 @@ impl ChunkedKvBacking {
             return Ok(gid);
         }
 
-        // The class is starved. Stamp a region for it; failing that, take a
-        // free slot from a wider class that already has one. Same gate and
-        // same order as `BackingInner::stamp_region_promoting`, open-coded
-        // because this path already holds the storage lock and so cannot call
-        // `ensure_arena_exists`.
+        // The class is starved. Stamp a region for it; failing that, sweep
+        // fully-empty arenas and retry; failing that, take a free slot from a
+        // wider class that already has one. Same gates and same order as
+        // `BackingInner::stamp_region_promoting`, open-coded because this path
+        // already holds the storage lock and so cannot call
+        // `ensure_arena_exists` or `release_empty_arenas` — the sweep runs
+        // inline against the `&mut ArenaStorageState` the caller lent us.
         let mut key = key;
         let arena_idx = self.inner.pool.register_arena(key);
         if !arena_state.has_arena(arena_idx) {
@@ -556,24 +558,51 @@ impl ChunkedKvBacking {
                 Ok(arena) => arena_state.push_arena(arena, arena_idx),
                 Err(e) => {
                     self.inner.pool.force_release_arena(arena_idx);
-                    let mut class = key.class;
-                    let mut placed = None;
-                    while let Some(next) = class.promote() {
-                        class = next;
-                        let wider = ArenaKey::new(class, key.location);
-                        if let Some(gid) = self.inner.pool.allocate_for(wider) {
-                            let ai = gid.arena_idx();
-                            drop(gid);
-                            if arena_state.has_arena(ai) {
-                                record_class_promotion(key.class, class);
-                                placed = Some(wider);
-                                break;
+                    // Reactive empty sweep, exactly as `stamp_region_promoting`
+                    // does before promoting: seal/requantize churn strands
+                    // empty arenas that each pin a region, and the periodic
+                    // sweeps run between waves/configs — not inside the churn
+                    // that is failing right now.
+                    let mut swept = 0usize;
+                    if self.inner.pool.has_reclaimable() {
+                        for k in self.inner.pool.format_keys() {
+                            while let Some(idx) = self.inner.pool.next_tombstone(k.clone()) {
+                                arena_state.release_arena(idx);
+                                swept += 1;
                             }
                         }
                     }
-                    match placed {
-                        Some(w) => key = w,
-                        None => return Err(e),
+                    let mut created = false;
+                    if swept > 0 {
+                        let retry_idx = self.inner.pool.register_arena(key);
+                        match self.create_arena(key, retry_idx) {
+                            Ok(arena) => {
+                                arena_state.push_arena(arena, retry_idx);
+                                created = true;
+                            }
+                            Err(_) => self.inner.pool.force_release_arena(retry_idx),
+                        }
+                    }
+                    if !created {
+                        let mut class = key.class;
+                        let mut placed = None;
+                        while let Some(next) = class.promote() {
+                            class = next;
+                            let wider = ArenaKey::new(class, key.location);
+                            if let Some(gid) = self.inner.pool.allocate_for(wider) {
+                                let ai = gid.arena_idx();
+                                drop(gid);
+                                if arena_state.has_arena(ai) {
+                                    record_class_promotion(key.class, class);
+                                    placed = Some(wider);
+                                    break;
+                                }
+                            }
+                        }
+                        match placed {
+                            Some(w) => key = w,
+                            None => return Err(e),
+                        }
                     }
                 }
             }
@@ -842,6 +871,21 @@ impl BackingInner {
             Err(e) if Self::is_wave_deferral(&e) => return Err(e),
             Err(e) => e,
         };
+        // **Reactive empty sweep before anything wasteful.** Seal and
+        // requantize churn strands fully-empty arenas that still pin a region
+        // each — measured on the Llama-2 MHA gate: 195 empty arenas holding
+        // 3 GiB while a class-4096 claim died on "every region occupied". The
+        // periodic sweeps (the scheduler's per-wave call, the harness's
+        // between-configs call) don't run inside a config's own churn, so the
+        // claim that would otherwise fail is exactly the place to pay for one.
+        if self.pool.has_reclaimable() && self.release_empty_arenas()? > 0 {
+            match self.claim_fresh_region(key) {
+                Ok(arena_idx) => return Ok((key, arena_idx)),
+                #[cfg(feature = "cuda")]
+                Err(e) if Self::is_wave_deferral(&e) => return Err(e),
+                Err(_) => {}
+            }
+        }
         // No region. Look for a wider class that already has one with room.
         let mut class = key.class;
         while let Some(next) = class.promote() {

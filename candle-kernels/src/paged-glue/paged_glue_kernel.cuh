@@ -515,8 +515,11 @@ inline void launch_paged_glue_attn(
     cudaError_t e3 = cudaSuccess;
     if (num_splits > 1) {
         const int num_rows = total_q * n_q_head;
+        // No q8 emit and no gate on the glue path; the gate stride/head args are
+        // read only when `gate` is non-null, so 1 keeps the row/head decompose
+        // well-defined.
         fused_attn::int8_decode_combine_kernel<O, HEAD_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
-            out, pa, pm, num_rows, num_splits, nullptr);
+            out, pa, pm, num_rows, num_splits, nullptr, nullptr, 0, 1);
         e3 = cudaGetLastError();
     }
     if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {

@@ -2284,6 +2284,207 @@ mod tests {
         backing.record_turn(slot).unwrap()
     }
 
+    /// **Write-then-read must be the identity, at every head dim the kernels
+    /// accept and across chunk boundaries.**
+    ///
+    /// The paged prefill path for head dims the int8 kernel does not
+    /// instantiate writes unrotated K/V through this backing and immediately
+    /// reads the whole prefix back to attend it. Every value it attends is
+    /// therefore whatever this round-trip returns, and a layout that is right
+    /// for `head_dim 128` but scrambles at 256 would surface as a model that
+    /// answers fluently and wrongly — not as a crash.
+    ///
+    /// Values are distinct per `(token, head, dim)` rather than constant, so a
+    /// transposition inside a chunk is caught and not just a dropped one; the
+    /// lengths straddle `CHUNK_SIZE` so the partial tail, the exact boundary
+    /// and the multi-chunk case are all covered.
+    #[test]
+    fn contiguous_round_trip_is_exact_at_every_head_dim() {
+        let n_kv_head = 2usize;
+        for head_dim in [64usize, 128, 256] {
+            for n_tokens in [1usize, 31, 32, 33, 64, 100] {
+                let backing =
+                    ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::F32, &Device::Cpu, 256)
+                        .unwrap();
+                let slot = backing.alloc_sequence().unwrap();
+                backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
+
+                let n = n_kv_head * n_tokens * head_dim;
+                // Distinct, exactly representable in F32, and ordered so the
+                // failure message names the first wrong element usefully.
+                let kv: Vec<f32> = (0..n).map(|i| i as f32).collect();
+                let k = Tensor::from_vec(
+                    kv.clone(),
+                    (1, n_kv_head, n_tokens, head_dim),
+                    &Device::Cpu,
+                )
+                .unwrap();
+                let v = Tensor::from_vec(
+                    kv.iter().map(|x| -x).collect::<Vec<f32>>(),
+                    (1, n_kv_head, n_tokens, head_dim),
+                    &Device::Cpu,
+                )
+                .unwrap();
+                backing.write_contiguous(slot, 0, &k, &v).unwrap();
+                backing.set_len(slot, n_tokens);
+
+                let (k_out, v_out) = backing.read_contiguous(slot, 0, n_tokens).unwrap();
+                let same = |a: &Tensor, b: &Tensor| -> f32 {
+                    a.sub(b)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .max(0)
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap()
+                };
+                assert_eq!(
+                    k_out.dims(),
+                    k.dims(),
+                    "K shape changed at head_dim {head_dim}, {n_tokens} tokens"
+                );
+                assert_eq!(
+                    same(&k_out, &k),
+                    0.0,
+                    "K round-trip differs at head_dim {head_dim}, {n_tokens} tokens"
+                );
+                assert_eq!(
+                    same(&v_out, &v),
+                    0.0,
+                    "V round-trip differs at head_dim {head_dim}, {n_tokens} tokens"
+                );
+            }
+        }
+    }
+
+    /// **The batched migration plan and the per-band walk must land identical
+    /// bytes — proven on the GPU, where the plan actually runs.**
+    ///
+    /// On CUDA, a contiguous float write takes the one-launch batched plan
+    /// (`try_plan_batched_write`), while a non-contiguous source falls back to
+    /// the per-band walk. The two are independent implementations of the same
+    /// band addressing, and a divergence writes plausible bytes — fluent,
+    /// wrong attention, no error. The CPU round-trip above can never reach the
+    /// plan path (it is `cfg(cuda)` + GPU-arena only), so this is the plan's
+    /// only write-then-read coverage: both write forms must read back as the
+    /// identity, at every kernel head dim, across chunk boundaries.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_plan_and_walk_writes_agree_at_every_head_dim() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping: CUDA device required");
+                return;
+            }
+        };
+        let n_kv_head = 2usize;
+        for head_dim in [64usize, 128, 256] {
+            for n_tokens in [1usize, 31, 32, 33, 64, 100] {
+                let n = n_kv_head * n_tokens * head_dim;
+                let kv: Vec<f32> = (0..n).map(|i| i as f32).collect();
+                let k = Tensor::from_vec(
+                    kv.clone(),
+                    (1, n_kv_head, n_tokens, head_dim),
+                    &device,
+                )
+                .unwrap();
+                let v = Tensor::from_vec(
+                    kv.iter().map(|x| -x).collect::<Vec<f32>>(),
+                    (1, n_kv_head, n_tokens, head_dim),
+                    &device,
+                )
+                .unwrap();
+
+                // The same logical K/V as a transposed view: `[1, len, heads,
+                // head_dim]` data seen through a `(1, heads, len, head_dim)`
+                // transpose is non-contiguous (for len > 1), which routes the
+                // write down the per-band walk instead of the plan.
+                let mut perm = Vec::with_capacity(n);
+                for t in 0..n_tokens {
+                    for h in 0..n_kv_head {
+                        let base = (h * n_tokens + t) * head_dim;
+                        perm.extend_from_slice(&kv[base..base + head_dim]);
+                    }
+                }
+                let k_walk = Tensor::from_vec(
+                    perm.clone(),
+                    (1, n_tokens, n_kv_head, head_dim),
+                    &device,
+                )
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+                let v_walk = Tensor::from_vec(
+                    perm.iter().map(|x| -x).collect::<Vec<f32>>(),
+                    (1, n_tokens, n_kv_head, head_dim),
+                    &device,
+                )
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+                if n_tokens > 1 {
+                    assert!(
+                        !k_walk.is_contiguous(),
+                        "the walk input must be non-contiguous or this test \
+                         exercises the plan twice"
+                    );
+                }
+
+                let write_and_read = |k_in: &Tensor, v_in: &Tensor| -> (Tensor, Tensor) {
+                    let backing =
+                        ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::F32, &device, 256)
+                            .unwrap();
+                    let slot = backing.alloc_sequence().unwrap();
+                    backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
+                    backing.write_contiguous(slot, 0, k_in, v_in).unwrap();
+                    backing.set_len(slot, n_tokens);
+                    backing.read_contiguous(slot, 0, n_tokens).unwrap()
+                };
+                let (k_plan_out, v_plan_out) = write_and_read(&k, &v);
+                let (k_walk_out, v_walk_out) = write_and_read(&k_walk, &v_walk);
+
+                let same = |a: &Tensor, b: &Tensor| -> f32 {
+                    a.sub(b)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .max(0)
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap()
+                };
+                for (label, got) in [
+                    ("plan K", &k_plan_out),
+                    ("walk K", &k_walk_out),
+                ] {
+                    assert_eq!(
+                        same(got, &k),
+                        0.0,
+                        "{label} round-trip differs at head_dim {head_dim}, \
+                         {n_tokens} tokens"
+                    );
+                }
+                for (label, got) in [
+                    ("plan V", &v_plan_out),
+                    ("walk V", &v_walk_out),
+                ] {
+                    assert_eq!(
+                        same(got, &v),
+                        0.0,
+                        "{label} round-trip differs at head_dim {head_dim}, \
+                         {n_tokens} tokens"
+                    );
+                }
+            }
+        }
+    }
+
     /// Turn-seal window-ring snapshot → restore (Artifact A of
     /// docs/deepseek_turn_seal_persistence.md): after the sliding-window ring
     /// evicts its front chunk, the resident window + `base_pos` — captured via

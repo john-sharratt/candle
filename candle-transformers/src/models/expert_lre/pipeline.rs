@@ -68,7 +68,7 @@
 //! when the mmap is *not* fully pinned (e.g. insufficient system RAM to
 //! pin the entire file).
 
-use super::cache::{ExpertCacheInner, PINNED_LAYERS};
+use super::cache::ExpertCacheInner;
 #[cfg(not(feature = "cuda"))]
 use super::compute::compute_expert_contribution_gpu_weights;
 #[cfg(feature = "cuda")]
@@ -2293,11 +2293,13 @@ impl PipelineState {
         }
 
         // Don't prefetch a pinned layer — its experts are always resident, so the
-        // load would be a NOOP. Layers 0..PINNED_LAYERS run first every pass with
-        // no compute to hide a reload, so they stay permanently pinned and are
-        // never prefetched. The first real prefetch is the pinned boundary: at
-        // layer PINNED_LAYERS-1 we prefetch layer PINNED_LAYERS.
-        if target_layer < PINNED_LAYERS {
+        // load would be a NOOP. The pinned head layers run first every pass with
+        // no compute to hide a reload, so they stay resident and are never
+        // prefetched; the first real prefetch is the pinned boundary. The count
+        // is the cache's own (`affordable_pinned_layers`), not the constant — on
+        // a cache too small to pin three layers it can be fewer, or zero, and
+        // then every layer is prefetchable.
+        if target_layer < self.inner.pinned_layers {
             return Ok(CopyBatchFence::noop());
         }
 

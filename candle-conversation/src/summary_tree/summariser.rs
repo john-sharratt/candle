@@ -1067,7 +1067,7 @@ mod tests {
     /// A live conversation defers its last exchange (frontier); once archived,
     /// a summariser pass seals it too, so an archived conversation has no hole in
     /// its peak cover.
-    #[test]
+    ///
     /// **A live conversation's recent turns are never compressed.** The
     /// summariser absorbs an exchange only once `RAW_TAIL_TURNS` newer turns
     /// exist — the working tail stays verbatim, because a model that needs to

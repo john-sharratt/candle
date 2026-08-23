@@ -43,3 +43,6 @@ pub mod paged_glue;
 
 #[path = "paged-latent/api.rs"]
 pub mod paged_latent;
+
+#[path = "delta-net/api.rs"]
+pub mod delta_net;

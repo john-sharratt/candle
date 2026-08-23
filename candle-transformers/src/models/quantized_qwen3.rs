@@ -13,6 +13,7 @@ use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
 use super::quantized_matmul::QMatMul;
+use super::quantized_mlp::QuantizedMlp;
 use super::rope_tables::CisPrecomputations;
 use crate::models::batched_layer::WaveRef;
 use crate::models::wave_buffers::wave_root;
@@ -21,12 +22,12 @@ use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::cuda::DynamicActs;
 #[cfg(feature = "cuda")]
 use candle::quantized::register_mmap_cuda;
-use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
+use candle::quantized::{gguf_file, Int8Mode, QTensor};
 use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::WaveGeneration;
-use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
+use candle_nn::{kv_cache::KvCache, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::{Arc, RwLock};
 
@@ -96,144 +97,6 @@ impl<R: Read + Seek> Gguf<R> {
 
     fn tensor(&mut self, name: &str) -> Result<QTensor> {
         self.ct.tensor(&mut self.reader, name, &self.device)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MlpWeights {
-    gate_up_proj: Option<QMatMul>,
-    gate_proj: Option<QMatMul>,
-    up_proj: Option<QMatMul>,
-    down_proj: QMatMul,
-    act_fn: Activation,
-    span: tracing::Span,
-}
-
-impl MlpWeights {
-    fn new<R: Read + Seek>(gg: &mut Gguf<R>, prefix: &str) -> Result<Self> {
-        let gate_w = gg.tensor(&format!("{prefix}.ffn_gate.weight"))?;
-        let up_w = gg.tensor(&format!("{prefix}.ffn_up.weight"))?;
-
-        let try_fuse = gg.device.is_cuda()
-            && gate_w.dtype() == up_w.dtype()
-            && !matches!(
-                gate_w.dtype(),
-                GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-            );
-
-        let (gate_up_proj, gate_proj, up_proj) = if try_fuse {
-            #[cfg(feature = "cuda")]
-            {
-                let (gate_n, gate_k) = gate_w.shape().dims2()?;
-                let (up_n, up_k) = up_w.shape().dims2()?;
-                if gate_n != up_n || gate_k != up_k {
-                    candle::bail!(
-                        "cannot fuse ffn_gate/ffn_up due to shape mismatch: gate=({}, {}) up=({}, {})",
-                        gate_n,
-                        gate_k,
-                        up_n,
-                        up_k
-                    );
-                }
-                let fused = QTensor::concat_rows_cuda(&[&gate_w, &up_w])?;
-                (Some(QMatMul::from_qtensor(fused)?), None, None)
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                candle::bail!("fused gate+up requires the cuda feature");
-            }
-        } else {
-            (
-                None,
-                Some(QMatMul::from_qtensor(gate_w)?),
-                Some(QMatMul::from_qtensor(up_w)?),
-            )
-        };
-
-        let down_proj = gg.qmatmul(&format!("{prefix}.ffn_down.weight"))?;
-        let act_fn = Activation::Silu;
-        let span = tracing::span!(tracing::Level::TRACE, "mlp");
-        Ok(Self {
-            gate_up_proj,
-            gate_proj,
-            up_proj,
-            down_proj,
-            act_fn,
-            span,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let (gate, up) = if let Some(w) = &self.gate_up_proj {
-            let gu = w.forward(x)?;
-            let (_, _, out_dim) = gu.dims3()?;
-            if out_dim % 2 != 0 {
-                candle::bail!("unexpected fused gate+up output dim {out_dim} (not even)");
-            }
-            let half = out_dim / 2;
-            let gate = gu.narrow(2, 0, half)?;
-            let up = gu.narrow(2, half, half)?;
-            (gate, up)
-        } else {
-            let gate_proj = self
-                .gate_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing gate_proj".into()))?;
-            let up_proj = self
-                .up_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing up_proj".into()))?;
-            (gate_proj.forward(x)?, up_proj.forward(x)?)
-        };
-        let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
-        self.down_proj.forward(&gated)
-    }
-
-    /// B3 consumer: gate/up over a producer-prepared (fused ln2) activation, shared across both
-    /// projections (no redundant ln2->q8a128). CUDA only.
-    #[cfg(feature = "cuda")]
-    fn forward_dynamic<'w>(
-        &self,
-        acts: &DynamicActs<'w>,
-        out_dtype: DType,
-    ) -> Result<LiveTensor<'w>> {
-        let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
-            let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
-            let (_, _, out_dim) = gu.dims3()?;
-            if out_dim % 2 != 0 {
-                candle::bail!("unexpected fused gate+up output dim {out_dim} (not even)");
-            }
-            // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
-            // gate/up views: `gu` is owned + contiguous here so the cast is allocation-free, whereas
-            // casting the two aliasing narrows separately forces two fallback allocations.
-            gu.to_dtype_mut(out_dtype)?;
-            let half = out_dim / 2;
-            (gu.narrow(2, 0, half)?, gu.narrow(2, half, half)?)
-        } else {
-            let gate_proj = self
-                .gate_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing gate_proj".into()))?;
-            let up_proj = self
-                .up_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing up_proj".into()))?;
-            (
-                gate_proj.forward_dynamic(acts.as_dynamic(), out_dtype)?,
-                up_proj.forward_dynamic(acts.as_dynamic(), out_dtype)?,
-            )
-        };
-        // Run silu/mul/down in out_dtype: the Float path returns the activation dtype (F16), but
-        // MLP intermediates can exceed F16's ~65504 range, so compute in out_dtype (BF16). The fused
-        // path already coerced `gu` above and the int8 path already returns out_dtype, so these are
-        // no-ops except on the separate-weight Float path.
-        gate.to_dtype_mut(out_dtype)?;
-        up.to_dtype_mut(out_dtype)?;
-        let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
-        let mut out = self.down_proj.forward_live(&gated)?;
-        out.to_dtype_mut(out_dtype)?;
-        Ok(out)
     }
 }
 
@@ -495,7 +358,7 @@ impl AttentionWeights {
 #[derive(Debug, Clone)]
 pub struct LayerWeights {
     self_attn: AttentionWeights,
-    mlp: MlpWeights,
+    mlp: QuantizedMlp,
     ln1: RmsNorm,
     ln2: RmsNorm,
 }
@@ -572,7 +435,12 @@ impl BatchedAttentionLayer for LayerWeights {
             .reshape((b_sz, n_kv_head, seq_len, head_dim))?
             .transpose(1, 2)?
             .reshape((b_sz, seq_len, n_kv_head * head_dim))?;
-        Ok(QkvProjection { q, k, v })
+        Ok(QkvProjection {
+            q,
+            k,
+            v,
+            gate: None,
+        })
     }
 
     /// B3 producer: fuse ln2 -> q8a128 (int8) or FP rms_norm (Off).
@@ -623,7 +491,12 @@ impl LayerWeights {
             rotary,
             &prefix,
         )?;
-        let mlp = MlpWeights::new(gg, &prefix)?;
+        let mlp = QuantizedMlp::from_weights(
+            gg.tensor(&format!("{prefix}.ffn_gate.weight"))?,
+            gg.tensor(&format!("{prefix}.ffn_up.weight"))?,
+            gg.tensor(&format!("{prefix}.ffn_down.weight"))?,
+            Int8Mode::Off,
+        )?;
         Ok(Self {
             self_attn,
             mlp,
@@ -676,15 +549,19 @@ impl BatchedModelCore for ModelWeights {
         self.norm.maybe_change_dtype(dtype)
     }
 
-    /// Recovered from the down-projection's own weight, whose shape is
-    /// `[hidden, intermediate]`. Reading the loaded weight rather than carrying
-    /// a copy of the config means the transient plan cannot drift from the
-    /// shapes the kernels actually see.
+    /// Recovered from the down-projection's own weight — see
+    /// [`QuantizedMlp::hidden_and_intermediate`].
     fn wave_shapes(&self) -> WaveShapes {
-        let dims = self.layers[0].mlp.down_proj.weight_dims();
+        // Panics on a non-2-D `ffn_down`, exactly as the direct indexing it
+        // replaced did: a zeroed shape would silently mis-size the transient
+        // plan, which is worse than failing where the weight is wrong.
+        let (hidden, intermediate) = self.layers[0]
+            .mlp
+            .hidden_and_intermediate()
+            .expect("ffn_down has a 2-D shape");
         WaveShapes {
-            hidden: dims[0],
-            intermediate: dims[1],
+            hidden,
+            intermediate,
             experts_per_tok: 1,
             n_experts: 1,
         }
@@ -1073,59 +950,12 @@ impl ModelWeights {
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
             };
 
-            // Load MLP weights
-            let gate_w = load_tensor(&format!("{prefix}.ffn_gate.weight"))?;
-            let up_w = load_tensor(&format!("{prefix}.ffn_up.weight"))?;
-            let down_proj = load_qmatmul(&format!("{prefix}.ffn_down.weight"))?;
-
-            let try_fuse = device.is_cuda()
-                && gate_w.dtype() == up_w.dtype()
-                && !matches!(
-                    gate_w.dtype(),
-                    GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                );
-
-            let (gate_up_proj, gate_proj, up_proj) = if try_fuse {
-                #[cfg(feature = "cuda")]
-                {
-                    let (gate_n, gate_k) = gate_w.shape().dims2()?;
-                    let (up_n, up_k) = up_w.shape().dims2()?;
-                    if gate_n != up_n || gate_k != up_k {
-                        candle::bail!(
-                            "cannot fuse ffn_gate/ffn_up due to shape mismatch: gate=({}, {}) up=({}, {})",
-                            gate_n,
-                            gate_k,
-                            up_n,
-                            up_k
-                        );
-                    }
-                    let fused = QTensor::concat_rows_cuda(&[&gate_w, &up_w])?;
-                    (
-                        Some(QMatMul::from_qtensor_with_mode(fused, int8mode)?),
-                        None,
-                        None,
-                    )
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    candle::bail!("fused gate+up requires the cuda feature");
-                }
-            } else {
-                (
-                    None,
-                    Some(QMatMul::from_weights_with_mode(gate_w.into(), int8mode)?),
-                    Some(QMatMul::from_weights_with_mode(up_w.into(), int8mode)?),
-                )
-            };
-
-            let mlp = MlpWeights {
-                gate_up_proj,
-                gate_proj,
-                up_proj,
-                down_proj,
-                act_fn: Activation::Silu,
-                span: tracing::span!(tracing::Level::TRACE, "mlp"),
-            };
+            let mlp = QuantizedMlp::from_weights(
+                load_tensor(&format!("{prefix}.ffn_gate.weight"))?,
+                load_tensor(&format!("{prefix}.ffn_up.weight"))?,
+                load_tensor(&format!("{prefix}.ffn_down.weight"))?,
+                int8mode,
+            )?;
 
             layers.push(LayerWeights {
                 self_attn,
@@ -1366,7 +1196,7 @@ mod tests {
         let content = gguf_file::Content::read(&mut file)?;
 
         use crate::models::quantized_llama::ModelWeights as LlamaModelWeights;
-        let _model = LlamaModelWeights::from_gguf(content, &mut file, &device)?;
+        let _model = LlamaModelWeights::from_gguf_v3(content, &mut file, &device)?;
         println!("Warmup complete.\n");
 
         // Actual benchmark - run 3 times
@@ -1377,7 +1207,7 @@ mod tests {
             let content = gguf_file::Content::read(&mut file)?;
 
             let start = std::time::Instant::now();
-            let _model = LlamaModelWeights::from_gguf(content, &mut file, &device)?;
+            let _model = LlamaModelWeights::from_gguf_v3(content, &mut file, &device)?;
             let duration = start.elapsed();
 
             println!("  Run {}: {:.3}s", i + 1, duration.as_secs_f64());
@@ -1435,7 +1265,7 @@ mod tests {
         // Warm up run
         println!("Warming up (loading once to populate OS cache)...");
         use crate::models::quantized_llama::ModelWeights as LlamaModelWeights;
-        let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let _model = LlamaModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
         println!("Warmup complete.\n");
 
         // Actual benchmark - run 3 times
@@ -1443,7 +1273,7 @@ mod tests {
         let mut durations = Vec::new();
         for i in 0..3 {
             let start = std::time::Instant::now();
-            let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device)?;
+            let _model = LlamaModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
             let duration = start.elapsed();
 
             println!("  Run {}: {:.3}s", i + 1, duration.as_secs_f64());

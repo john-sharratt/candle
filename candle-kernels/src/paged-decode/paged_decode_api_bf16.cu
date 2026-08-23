@@ -11,7 +11,9 @@
 
 #include <cuda_bf16.h>
 
-extern "C" void run_paged_decode_bf16(
+// Returns 0 on success, nonzero when the launch needed the split-KV partial
+// pool and its allocation failed (VRAM exhausted) — nothing was launched.
+extern "C" int32_t run_paged_decode_bf16(
     const void* q_ptr,
     const uint8_t* headers_ptr,
     void* o_ptr,
@@ -28,26 +30,35 @@ extern "C" void run_paged_decode_bf16(
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     #define LAUNCH_INT8(HD) \
-        fused_attn::launch_int8_decode_attn<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, HD>( \
+        return fused_attn::launch_int8_decode_attn<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, HD>( \
             (const __nv_bfloat16*)q_ptr, headers_ptr, (__nv_bfloat16*)o_ptr, \
             num_active_slots, n_q_head, n_kv_head, softmax_scale, \
             (const __nv_bfloat16*)k_new, (const __nv_bfloat16*)v_new, rope_cs, rope_interleaved, stream)
     switch (head_dim) {
-        case 64:  LAUNCH_INT8(64);  break;
-        case 96:  LAUNCH_INT8(96);  break;
-        case 128: LAUNCH_INT8(128); break;
-        case 256: LAUNCH_INT8(256); break;
-        default: break;
+        case 64:  LAUNCH_INT8(64);
+        case 96:  LAUNCH_INT8(96);
+        case 128: LAUNCH_INT8(128);
+        case 256: LAUNCH_INT8(256);
+        default: return 0; // rust dispatch bails before reaching an unsupported width
     }
     #undef LAUNCH_INT8
 }
 
 // B2: decode with fused q8a128 context output (feeds o_proj directly, no standalone
-// quantize). Only head_dim 128, where the combine block is exactly one q8a128 tile.
-extern "C" void run_paged_decode_bf16_q8(
+// quantize). head_dim 128 and 256 — a combine block covers head_dim/128 whole
+// q8a128 tiles. `gate` (nullable, bf16) folds the output gate sigmoid(g) ⊙ ctx
+// into the same pass (gated lineages, head_dim 256); a slot's n_q_head×head_dim
+// gate values are contiguous and consecutive slots are `gate_slot_stride`
+// elements apart, so the gate may be a strided view of the fused [q|gate]
+// projection (pass 0 for a fully contiguous gate).
+// Returns 0 on success, nonzero when the partial pool (which every q8 emit
+// requires) could not be allocated — nothing was launched.
+extern "C" int32_t run_paged_decode_bf16_q8(
     const void* q_ptr,
     const uint8_t* headers_ptr,
     void* q8_out,
+    const void* gate,
+    int64_t gate_slot_stride,
     int32_t num_active_slots,
     int32_t n_q_head,
     int32_t n_kv_head,
@@ -60,12 +71,20 @@ extern "C" void run_paged_decode_bf16_q8(
     void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
-    if (head_dim != 128) return; // q8a128 output supported only at head_dim 128
-    fused_attn::launch_int8_decode_attn<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, 128>(
-        (const __nv_bfloat16*)q_ptr, headers_ptr, (__nv_bfloat16*)nullptr,
-        num_active_slots, n_q_head, n_kv_head, softmax_scale,
-        (const __nv_bfloat16*)k_new, (const __nv_bfloat16*)v_new, rope_cs, rope_interleaved,
-        stream, (uint8_t*)q8_out);
+    #define LAUNCH_Q8(HD)                                                                  \
+        return fused_attn::launch_int8_decode_attn<__nv_bfloat16, __nv_bfloat16,           \
+                                                   __nv_bfloat16, HD>(                     \
+            (const __nv_bfloat16*)q_ptr, headers_ptr, (__nv_bfloat16*)nullptr,             \
+            num_active_slots, n_q_head, n_kv_head, softmax_scale,                          \
+            (const __nv_bfloat16*)k_new, (const __nv_bfloat16*)v_new, rope_cs,             \
+            rope_interleaved, stream, (uint8_t*)q8_out, (const __nv_bfloat16*)gate,        \
+            gate_slot_stride)
+    switch (head_dim) {
+        case 128: LAUNCH_Q8(128);
+        case 256: LAUNCH_Q8(256);
+        default: return 0; // rust dispatch bails before reaching an unsupported width
+    }
+    #undef LAUNCH_Q8
 }
 
 // =============================================================================

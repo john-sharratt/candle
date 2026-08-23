@@ -223,6 +223,21 @@ pub fn turn_stream_id(timeline_id: u64, turn_index: u32) -> StreamId {
     StreamId(if raw == 0 { 1 } else { raw })
 }
 
+/// Derive the [`StreamId`] of a timeline's recurrent-state snapshot stream.
+///
+/// One per conversation — no turn coordinate, because the snapshot record is
+/// a single tail: each seal's snapshot supersedes the previous one under this
+/// same key. Purity matters the same way it does for [`turn_stream_id`]: the
+/// resume path *computes* this from the timeline it is opening and looks the
+/// location up, so the id never needs to be inverted.
+pub fn snapshot_stream_id(timeline_id: u64) -> StreamId {
+    let mut h = ContentHasher::new();
+    h.update(b"recurrent-snapshot");
+    h.update(&timeline_id.to_le_bytes());
+    let raw = h.finish().lo;
+    StreamId(if raw == 0 { 1 } else { raw })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

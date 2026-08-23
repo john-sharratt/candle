@@ -274,21 +274,24 @@ impl TestParams {
     /// user's name is embedded directly in the user turn so that even tiny
     /// models (which may ignore the system prompt) receive unique input
     /// tokens in the high-attention region of the context.
+    /// How this dialect suppresses reasoning — see
+    /// [`Dialect::thinking_suppression`], which owns the one-mechanism split.
+    fn thinking_suppression(&self) -> (&'static str, &'static str) {
+        self.dialect.thinking_suppression(self.suppress_thinking)
+    }
+
     pub fn user_prompt_tokens(&self, index: usize) -> Vec<u32> {
         let name = &self.names[index % self.names.len()];
         let user_text = self.prompt_user.replace("{INSERT_NAME}", name);
-        let no_think = if self.suppress_thinking {
-            self.dialect.no_think
-        } else {
-            ""
-        };
+        let (no_think, closed_think) = self.thinking_suppression();
         let prompt = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             self.dialect.user_start,
             no_think,
             user_text,
             self.dialect.user_end,
-            self.dialect.assistant_start
+            self.dialect.assistant_start,
+            closed_think,
         );
         self.tokenizer
             .encode(prompt, true)
@@ -454,6 +457,19 @@ impl TestParams {
     where
         M: ManagedBatchedModel,
     {
+        // Under `verbose`, surface the engine's `tracing` events (expert-cache
+        // sizing, warm-tier decisions, elastic-boundary moves) in the gate's
+        // output — the sizing inputs are runtime facts of the machine and the
+        // moment, and a gate that hides them cannot be used to diagnose a
+        // mis-sized tier. `try_init` so a second `run` in one process is fine.
+        #[cfg(feature = "verbose")]
+        {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_target(false)
+                .compact()
+                .try_init();
+        }
         println!("✓ TestParams created successfully");
         println!("  - Dialect: {:?}", self.dialect.dialect_type);
         println!("  - Generate tokens: {}", self.generate_token_count);
@@ -699,7 +715,11 @@ impl TestParams {
         // pad tokens inside the user turn where they are harmless trailing
         // whitespace, rather than after <|im_start|>assistant where they
         // would cause the model to emit EOS immediately.
-        let suffix_str = format!("{}{}", self.dialect.user_end, self.dialect.assistant_start);
+        let (no_think, closed_think) = self.thinking_suppression();
+        let suffix_str = format!(
+            "{}{}{}",
+            self.dialect.user_end, self.dialect.assistant_start, closed_think
+        );
         let suffix_tokens: Vec<u32> = self
             .tokenizer
             .encode(suffix_str.as_str(), false)
@@ -714,11 +734,6 @@ impl TestParams {
             .map(|n| {
                 let name = &self.names[n % self.names.len()];
                 let user_text = self.prompt_user.replace("{INSERT_NAME}", name);
-                let no_think = if self.suppress_thinking {
-                    self.dialect.no_think
-                } else {
-                    ""
-                };
                 let content = format!("{}{}{}", self.dialect.user_start, no_think, user_text);
                 self.tokenizer
                     .encode(content.as_str(), true)

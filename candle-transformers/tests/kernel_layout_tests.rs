@@ -264,6 +264,10 @@ fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
         &device,
     )?;
 
+    // The write-region extension below mirrors the prefill path, whose caller
+    // (in production, wave admission) allocates the writer chunks first.
+    backing.ensure_for_batch_entries(&[(0, total)], 7)?;
+
     let arena_info = backing.resolve_arena_info()?;
     let chunks = cache
         .k_cache()
@@ -655,6 +659,13 @@ fn run_prefill(
     device: &Device,
 ) -> Result<Tensor> {
     let offset = cache.current_seq_len();
+    // Chunk allocation is the caller's job (in production, wave admission runs
+    // `ensure_for_batch_entries` for every layer before the forward begins;
+    // `paged_prefill_batched` deliberately neither resets nor allocates).
+    let batch_idx = cache.k_cache().chunked_batch_idx().unwrap_or(0);
+    if let Some(backing) = cache.k_cache().chunked_backing() {
+        backing.ensure_for_batch_entries(&[(batch_idx, offset)], seq_len)?;
+    }
     let (qf, kf, vf) = flatten_qkv(q, k, v)?;
     let generation = stager.begin_generation();
     let mut caches_arr: [&mut KvCache; 1] = [cache];

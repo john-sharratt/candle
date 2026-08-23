@@ -322,8 +322,18 @@ impl Arena {
         Self::extract_tensor_ptr(&self.data)
     }
 
-    /// Device pointer to slot `chunk_idx`.
+    /// Device pointer to slot `chunk_idx`, or `None` for a CPU arena or an
+    /// index past the arena's slots.
+    ///
+    /// The bounds check is load-bearing: callers hand this address to raw
+    /// strided-copy kernels, and an out-of-range index (a stale gid after an
+    /// arena release, a corrupted block table) would otherwise become a
+    /// silent write into the next arena's bytes — plausible KV, wrong
+    /// attention, no error.
     pub(super) fn slot_ptr(&self, chunk_idx: usize) -> Option<u64> {
+        if chunk_idx >= self.chunks() {
+            return None;
+        }
         let base = self.base_ptr()?;
         Some(base + (chunk_idx * self.slot_stride()) as u64)
     }

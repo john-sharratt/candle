@@ -11,9 +11,11 @@
  *
  *  - GQA-PACKED M: an MMA M-row is a (query-token, head-in-group) pair.
  *    One block serves ALL query heads of one KV head — the K/V tile is
- *    loaded once per group instead of once per head-block. M_ROWS = 64
- *    (4 m16 row-tiles, each served by a warp PAIR under the head-dim
- *    split), BLOCK_M_TOK = 64 / hpg tokens.
+ *    loaded once per group instead of once per head-block. The 8 warps
+ *    partition into (row-tile, dim-part): M_ROWS = 64 at HEAD_DIM ≤ 128
+ *    (4 m16 row-tiles, each served by a warp PAIR) and 32 at HEAD_DIM 256
+ *    (2 row-tiles, each served by a QUARTET), BLOCK_M_TOK = M_ROWS / hpg
+ *    tokens.
  *
  *  - SLICE-ALIGNED TILES: a KV tile is one TokenSlice run (≤ 32 tokens,
  *    never straddling a chunk). One palette table per tile; the straddle
@@ -45,7 +47,7 @@
  *  The O accumulator and V^T slab are NATURAL-dim indexed — palette rank
  *  space is per-slice and cannot host a cross-tile accumulator.
  *
- * v1 scope: HEAD_DIM % 64 == 0 (in-thread RoPE pairing). Read-through V
+ * Scope: HEAD_DIM % 64 == 0 in [64, 256] (in-thread RoPE pairing). Read-through V
  * engages whenever every V palette's format is an int8 passthrough family
  * (per-element extraction has no lane-width constraint); asymmetric or
  * dtype V palettes take the FP-fallback path.
@@ -76,18 +78,51 @@ using fused_attn::mma_int8_m16n8k32;
 
 constexpr int I8_WARPS = 8;
 constexpr int I8_THREADS = I8_WARPS * 32;
-// Head-dim-split warp pairing: warp = (row-tile, dim-half). Each PAIR of
-// warps serves one m16 row-tile — both duplicate the (cheap) QK + softmax
-// for those 16 rows, and each accumulates only HALF the output dims. That
-// halves the o_acc register hog (64 → 32 FP32/thread), which is what
-// makes the 64-register budget of the 4-blocks/SM max-occupancy
-// configuration reachable. Staging is unchanged — K and V^T are staged
-// once per block and shared through smem, so no global traffic is
-// duplicated. The known cost: compute-bound shapes (long q, short
-// prefix) pay for the duplicated QK (§13.3 rounds 6–9).
-constexpr int I8_ROW_TILES = I8_WARPS / 2;
-constexpr int I8_M_ROWS = I8_ROW_TILES * 16; // 64 M-rows per block
 constexpr int I8_TILE_TOK = 32;              // one chunk-slice per tile
+
+// Head-dim-split warp grouping: warp = (row-tile, dim-part). A GROUP of
+// `i8_dim_split` warps serves one m16 row-tile — all of them duplicate the
+// (cheap) QK + softmax for those 16 rows, and each accumulates only its
+// own 1/split of the output dims. That divides the o_acc register hog by
+// the split, which is what makes the register budget of the target
+// occupancy reachable. Staging is unchanged — K and V^T are staged once
+// per block and shared through smem, so no global traffic is duplicated.
+// The known cost: compute-bound shapes (long q, short prefix) pay for the
+// duplicated QK (§13.3 rounds 6–9).
+//
+// The split is chosen so a warp always owns at most 64 output dims, i.e.
+// `o_acc` never exceeds 32 FP32 registers:
+//   HEAD_DIM  64/128 → split 2 → 4 row-tiles, 64 M-rows, o_acc 16/32
+//   HEAD_DIM     256 → split 4 → 2 row-tiles, 32 M-rows, o_acc 32
+// `__host__ __device__` because both the launcher (host, for the grid) and
+// the kernel (device, for the warp partition) derive their shape from these.
+__host__ __device__ constexpr int i8_dim_split(int head_dim) {
+    return head_dim >= 256 ? 4 : 2;
+}
+__host__ __device__ constexpr int i8_row_tiles(int head_dim) {
+    return I8_WARPS / i8_dim_split(head_dim);
+}
+__host__ __device__ constexpr int i8_m_rows(int head_dim) {
+    return i8_row_tiles(head_dim) * 16;
+}
+
+// Target blocks/SM, and the per-block smem budget that follows from it at
+// the 102 KB SM limit.
+//
+// Through HEAD_DIM 128 the staging slabs fit 25.6 KB and the kernel runs at
+// the 4-blocks/SM max-occupancy point on a 64-register budget. At 256 both
+// halves of that break: the tile overlay is ~40 KB (s_v8t and the raw
+// staging scratch are linear in HEAD_DIM), and `q_frag` alone doubles to 32
+// registers, so 64 is unreachable no matter how the output dims are split.
+// 2 blocks/SM is the next residency point that fits — 42 KB of smem stays
+// under the 48 KB static-shared ceiling, and the 128-register budget clears
+// q_frag(32) + o_acc(32) with room for the working set.
+__host__ __device__ constexpr int i8_min_blocks(int head_dim) {
+    return head_dim >= 256 ? 2 : 4;
+}
+__host__ __device__ constexpr int i8_smem_budget(int head_dim) {
+    return head_dim >= 256 ? 47 * 1024 : 25600;
+}
 
 /// cos/sin lookup, same FREQUENCY-indexed table as the decode kernels:
 /// rope_cs[pos*HD + 2i] = cos_i, [.. + 2i + 1] = sin_i for frequency i in
@@ -278,15 +313,15 @@ __device__ __forceinline__ float i8_arena_elem(
 // The kernel
 // ============================================================================
 
-// minBlocks = 4 pins the register budget at 64/thread — 4 blocks × 256
-// threads is the max-occupancy configuration (67% theoretical; 6 blocks
-// would need ≤42 regs, unreachable past o_acc's 32). The Q-fragment
-// drain, the union smem arena, and the deliberately register-lean
-// staging (recompute lambdas, smem-resident Q scales, two-pass V
-// requant, serialized palette loops) are what make the budget close
-// with only a small residual spill.
+// minBlocks pins the register budget: 4 blocks × 256 threads at 64
+// regs/thread through HEAD_DIM 128 (the max-occupancy configuration, 67%
+// theoretical; 6 blocks would need ≤42 regs, unreachable past o_acc's 32),
+// 2 blocks × 128 regs at 256. The Q-fragment drain, the union smem arena,
+// and the deliberately register-lean staging (recompute lambdas,
+// smem-resident Q scales, two-pass V requant, serialized palette loops)
+// are what make the budget close with only a small residual spill.
 template <typename QT, int HEAD_DIM>
-__global__ void __launch_bounds__(I8_THREADS, 4)
+__global__ void __launch_bounds__(I8_THREADS, i8_min_blocks(HEAD_DIM))
 paged_prefill_int8_kernel(
     const QT* __restrict__ q,          // [total_q, n_head, HD] packed, unrotated
     const QT* __restrict__ k_packed,   // [total_q, n_kv_head, HD] packed, unrotated
@@ -324,11 +359,17 @@ paged_prefill_int8_kernel(
     static_assert(SUB >= 16 && SUB <= 64,
                   "rank needs 6 bits; raw spans copy in 16-byte units");
 
+    constexpr int DIM_SPLIT = i8_dim_split(HEAD_DIM);
+    constexpr int I8_ROW_TILES = i8_row_tiles(HEAD_DIM);
+    constexpr int I8_M_ROWS = i8_m_rows(HEAD_DIM);
+    static_assert(I8_ROW_TILES * DIM_SPLIT == I8_WARPS,
+                  "warps must partition exactly into (row-tile, dim-part)");
+
     const int tid = (int)threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int row_tile = warp >> 1; // which m16 row-tile this warp serves
-    const int dim_half = warp & 1;  // which output-dim half it accumulates
+    const int row_tile = warp / DIM_SPLIT; // which m16 row-tile this warp serves
+    const int dim_part = warp % DIM_SPLIT; // which output-dim slice it accumulates
     const int batch_idx = (int)blockIdx.z / num_splits;
     const int split_idx = (int)blockIdx.z % num_splits;
     const int kv_head_idx = (int)blockIdx.y;
@@ -410,8 +451,8 @@ paged_prefill_int8_kernel(
     // Prologue overlay (s_q8 only — the Q scales are RESIDENT, below).
     constexpr int PRO_BYTES = I8_M_ROWS * Q8_LD;
     constexpr int ARENA_BYTES = (TILE_BYTES > PRO_BYTES) ? TILE_BYTES : PRO_BYTES;
-    static_assert(ARENA_BYTES + 128 <= 25600,
-                  "arena must fit the 4-blocks/SM smem budget (25.6 KB)");
+    static_assert(ARENA_BYTES + 128 <= i8_smem_budget(HEAD_DIM),
+                  "arena must fit the target-residency smem budget");
 
     __shared__ __align__(16) uint8_t s_arena[ARENA_BYTES];
     __shared__ uint8_t s_pal_cache[HEAD_DIM / 2];
@@ -551,10 +592,11 @@ paged_prefill_int8_kernel(
 
     // ------------------------------------------------------------------
     // Per-warp softmax + output state (registers). PV_H slices = this
-    // warp's dim-half; its dims start at dim_half * (HEAD_DIM / 2).
+    // warp's share of the output dims; they start at
+    // dim_part * (HEAD_DIM / DIM_SPLIT).
     // ------------------------------------------------------------------
-    constexpr int PV_H = PV_SLICES / 2;
-    const int dim_base = dim_half * (HEAD_DIM / 2);
+    constexpr int PV_H = PV_SLICES / DIM_SPLIT;
+    const int dim_base = dim_part * (HEAD_DIM / DIM_SPLIT);
     float o_acc[PV_H][4];
     #pragma unroll
     for (int s = 0; s < PV_H; ++s)
@@ -1093,9 +1135,9 @@ paged_prefill_int8_kernel(
                 rec[dim] = o_acc[s][row * 2];
                 rec[dim + 1] = o_acc[s][row * 2 + 1];
             }
-            // Softmax state: both warps of a row-tile pair hold identical
-            // m/l (duplicated QK); the dim_half==0 warp's lane 0 writes it.
-            if (dim_half == 0 && (lane & 3) == 0) {
+            // Softmax state: every warp of a row-tile group holds identical
+            // m/l (duplicated QK); the dim_part==0 warp's lane 0 writes it.
+            if (dim_part == 0 && (lane & 3) == 0) {
                 rec[HEAD_DIM] = m_run[row];
                 rec[HEAD_DIM + 1] = l_run[row];
             }
@@ -1175,13 +1217,13 @@ inline void launch_paged_prefill_int8(
 ) {
     int hpg = (n_kv_head > 0) ? n_head / n_kv_head : 1;
     if (hpg <= 0) hpg = 1;
-    int block_m_tok = I8_M_ROWS / hpg;
+    int block_m_tok = i8_m_rows(HEAD_DIM) / hpg;
     if (block_m_tok <= 0) block_m_tok = 1;
     uint32_t grid_x = (uint32_t)((max_q_len + block_m_tok - 1) / block_m_tok);
     if (grid_x == 0) grid_x = 1;
 
-    // Split-KV factor: fan the tile walk across grid.z shards up to the
-    // 4-blocks/SM residency limit. The short-q/long-prefix regime otherwise
+    // Split-KV factor: fan the tile walk across grid.z shards up to this
+    // head dim's residency limit. The short-q/long-prefix regime otherwise
     // runs the whole prefix walk in grid_x × n_kv_head × batch blocks — as
     // few as 4 on the production shape — leaving the GPU idle.
     static int s_sm_count = 0;
@@ -1196,12 +1238,12 @@ inline void launch_paged_prefill_int8(
     // already covers the SMs loses more to partial-emit + combine traffic
     // than it gains from sharding the walk (measured: q256/prefix2k
     // regressed 2.8 → 3.2 ms when split unconditionally). Fill toward the
-    // residency limit (4 blocks/SM) but NEVER past it — floor, not ceil:
-    // one block over the slot count starts a second wave and near-doubles
-    // the makespan (measured: 320 blocks on 304 slots ran 1.69 → 2.36 ms).
+    // residency limit but NEVER past it — floor, not ceil: one block over
+    // the slot count starts a second wave and near-doubles the makespan
+    // (measured: 320 blocks on 304 slots ran 1.69 → 2.36 ms).
     int num_splits = 1;
     if (base_blocks < s_sm_count) {
-        num_splits = (4 * s_sm_count) / base_blocks;
+        num_splits = (i8_min_blocks(HEAD_DIM) * s_sm_count) / base_blocks;
         if (num_splits < 1) num_splits = 1;
         if (num_splits > 32) num_splits = 32;
     }

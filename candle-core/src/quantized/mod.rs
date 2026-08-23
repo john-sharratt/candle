@@ -1668,24 +1668,21 @@ impl<'w> LiveQTensor<'w> {
         }
     }
 
-    /// Repack quantized weights to K/128 format with embedded scales.
+    /// Repack the weight into the GEMX layout read by the dequant-weight float
+    /// matmul, as a standalone [`QTensor`].
     ///
-    /// The K/128 format stores 128 elements per block with scales embedded inline,
-    /// enabling efficient 16-thread cooperative loads in CUDA kernels.
-    ///
-    /// # Returns
-    /// A new QTensor with repacked storage
+    /// [`QMatMul::repack_for_optimization`] is the inference entry point and
+    /// hands back a `QMatMul`; this one keeps the repacked tensor addressable
+    /// so its bytes can be inspected, which is what the per-format layout
+    /// tests and the matmul benchmark need.
     #[cfg(feature = "cuda")]
     pub fn repack_gemx(&self) -> Result<QTensor> {
         match &self.storage {
-            QStorage::Cuda(s) => {
-                let new_storage = s.repack_gemx(&self.shape)?;
-                Ok(QTensor {
-                    storage: QStorage::Cuda(new_storage),
-                    shape: self.shape.clone(),
-                    lease: PhantomData,
-                })
-            }
+            QStorage::Cuda(s) => Ok(QTensor {
+                storage: QStorage::Cuda(s.repack_gemx(&self.shape)?),
+                shape: self.shape.clone(),
+                lease: PhantomData,
+            }),
             _ => crate::bail!("repack_gemx is only supported on CUDA"),
         }
     }
@@ -2413,43 +2410,44 @@ impl QMatMul {
         })
     }
 
+    /// Matmul against a GEMX-repacked weight (see [`QTensor::repack_gemx`]),
+    /// whose K/128 blocks carry embedded scales so no external scale tensor is
+    /// needed.
+    ///
+    /// This is the measurement entry point to `CudaStorage::fwd_via_gemx`, not
+    /// an inference path: the engine reaches the FP kernel through
+    /// [`Self::forward_dynamic`], and nothing in the model code calls this.
+    /// It exists so `candle-core/examples/quantized_matmul_benchmark.rs` can
+    /// time the kernel and check its numerics per quant format from outside
+    /// the crate, where the storage-level op is not reachable.
     #[allow(unused_variables)]
     pub fn forward_via_gemx<'w>(&self, xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
         match self {
-            Self::QTensor(t) => {
-                // For CUDA, we need to call the storage directly with compute_type
-                match &t.storage {
-                    #[cfg(feature = "cuda")]
-                    QStorage::Cuda(cuda_storage) => {
-                        let storage = xs.storage_and_layout().0;
-                        let layout = xs.layout();
-                        let cuda_xs = match &*storage {
-                            Storage::Cuda(s) => s,
-                            _ => crate::bail!("expected CUDA storage for quantized matmul"),
-                        };
-                        // K/128 blocks have embedded scales, no external scales needed
-                        let (out_storage, out_shape) =
-                            cuda_storage.fwd_via_gemx(&t.shape, cuda_xs, layout)?;
-                        let none = crate::op::BackpropOp::none();
-                        Ok(crate::tensor::from_storage(
-                            Storage::Cuda(out_storage),
-                            out_shape,
-                            none,
-                            false,
-                        ))
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    QStorage::Cuda(_) => {
-                        crate::bail!("CUDA support not compiled")
-                    }
-                    // For non-CUDA, fall back to standard forward
-                    _ => xs.apply_op1_no_bwd(t.as_ref()),
+            Self::QTensor(t) => match &t.storage {
+                #[cfg(feature = "cuda")]
+                QStorage::Cuda(cuda_storage) => {
+                    let storage = xs.storage_and_layout().0;
+                    let layout = xs.layout();
+                    let cuda_xs = match &*storage {
+                        Storage::Cuda(s) => s,
+                        _ => crate::bail!("expected CUDA storage for quantized matmul"),
+                    };
+                    let (out_storage, out_shape) =
+                        cuda_storage.fwd_via_gemx(&t.shape, cuda_xs, layout)?;
+                    Ok(crate::tensor::from_storage(
+                        Storage::Cuda(out_storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
                 }
-            }
-            // For dequantized tensors, use standard matmul. `matmul` records a
-            // graph edge and so returns its operand's lifetime; the copy is what
-            // makes the result owned. Only the `CANDLE_DEQUANTIZE_ALL` debug
-            // path reaches here, so it is not paid in production.
+                #[cfg(not(feature = "cuda"))]
+                QStorage::Cuda(_) => crate::bail!("CUDA support not compiled"),
+                _ => xs.apply_op1_no_bwd(t.as_ref()),
+            },
+            // Dequantized weights: plain matmul. `matmul` records a graph edge
+            // and so returns its operand's lifetime; the copy is what makes the
+            // result owned.
             Self::Tensor(w) => {
                 let xs = &xs.to_owned_tensor()?;
                 let w = match *xs.dims() {
@@ -2658,12 +2656,18 @@ impl QMatMul {
                 xs.matmul(&w)
             }
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
+            // The float-weight arms. Reached both by the `CANDLE_DEQUANTIZE_ALL`
+            // fallback and, unavoidably, by any checkpoint that simply stores a
+            // tensor unquantized — `from_arc` dequantizes F32/F16/BF16 weights
+            // whatever the setting, so an FP checkpoint runs entirely here.
+            //
+            // `matmul` allocates its output beside its operand, so the result is
+            // wave-backed when `xs` is, which is precisely what the `'w` on the
+            // return type says. Copying `xs` off the wave first would make it
+            // owned instead — permitted by the signature, and pure loss: a
+            // full-width copy per projection whose only effect is to move the
+            // output back onto the pool.
             Self::Tensor(w) => {
-                // The dequantized-weight fallback (`CANDLE_DEQUANTIZE_ALL`),
-                // not the production path. `matmul` records a graph edge and so
-                // returns the operand's lifetime; copying off the wave first is
-                // what makes the result owned, and this path can afford it.
-                let xs = &xs.to_owned_tensor()?;
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
                     [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
@@ -2672,8 +2676,6 @@ impl QMatMul {
                 xs.matmul(&w)
             }
             Self::TensorF16(w) => {
-                // As the `Tensor` arm: debug-only, so copy off the wave.
-                let xs = &xs.to_owned_tensor()?;
                 let in_dtype = xs.dtype();
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,

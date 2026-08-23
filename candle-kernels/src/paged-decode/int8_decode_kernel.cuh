@@ -1535,7 +1535,15 @@ __global__ void int8_decode_combine_kernel(
     const float* __restrict__ partial_ml,    // [row][split][2]
     int num_rows,
     int num_splits,
-    uint8_t* __restrict__ q8_out             // non-null → emit q8a128 (B2; HEAD_DIM==128 only)
+    uint8_t* __restrict__ q8_out,            // non-null → emit q8a128 (B2; HEAD_DIM % 128 == 0)
+    const O* __restrict__ gate,              // non-null → val ⊙ sigmoid(gate) before the emit.
+                                             // A slot's n_q_head·HEAD_DIM gate values are
+                                             // contiguous; consecutive slots are
+                                             // gate_slot_stride elements apart, so the gate can
+                                             // be a strided view of the fused [q|gate]
+                                             // projection with no copy.
+    int64_t gate_slot_stride,
+    int gate_heads                           // n_q_head — decomposes `row` into (slot, head)
 ) {
     int row = (int)blockIdx.x;
     if (row >= num_rows) return;
@@ -1560,12 +1568,16 @@ __global__ void int8_decode_combine_kernel(
     float inv = __fdividef(1.f, fmaxf(L, 1e-10f));
     float val = acc * inv;
 
-    // B2: fused attention → q8a128 context emit. At HEAD_DIM==128 one block (one
-    // query head, 128 threads) is exactly one q8a128 128-tile; the context row for
-    // a token is n_q_head heads × 128 = hidden, so flat_tile = row (= token*n_q_head
-    // + qh = token*tiles_per_row + qh). Block-reduce amax/Σx over the 128 dims, then
-    // thread d writes its quant byte and thread 0 the per-128 {scale,sum}. The value
-    // is rounded through O first to mirror the unfused FP store + re-quant.
+    // B2: fused attention → q8a128 context emit. One block is one query head =
+    // HEAD_DIM/128 whole q8a128 128-tiles (a context row for a token is n_q_head
+    // heads × HEAD_DIM = hidden, contiguous), so thread d's tile is
+    // flat_tile = row·(HEAD_DIM/128) + d/128. Reduce amax/Σx per 128-tile — a warp
+    // butterfly, then a pairwise combine of the tile's four warp results — then
+    // thread d writes its quant byte and the tile's first thread the per-128
+    // {scale,sum}. The value is rounded through O first to mirror the unfused FP
+    // store + re-quant; the optional output gate (gated lineages, head_dim 256)
+    // multiplies in as sigmoid(g) computed in F32, with a second O-rounding so the
+    // quantized value matches gating an O-stored context.
     //
     // These bytes are MODE-AGNOSTIC: the q8a1024 flat-grouped layout is byte-identical
     // for the matmul's V (mode-1, Bm=16) and X (mode-2, Bm=32) variants — the mode only
@@ -1573,9 +1585,27 @@ __global__ void int8_decode_combine_kernel(
     // That choice rides in the `Q8a128Operand.ytype`, derived from the token count M via
     // `q8a128_mode_for_m()` when the rust side wraps `q8_out` into the operand (M ≥ 64 →
     // X). Hard-coding a mode here would be wrong; it is carried in the DynamicTensor.
-    if constexpr (HEAD_DIM == 128) {
+    if constexpr (HEAD_DIM % 128 == 0) {
         if (q8_out != nullptr) {
-            const float vr = to_f32<O>(from_f32<O>(val));
+            float vr = to_f32<O>(from_f32<O>(val));
+            if (gate != nullptr) {
+                // Sigmoid rounded through O before the multiply — the exact
+                // arithmetic of the unfused chain (sigmoid(gate) stored in O,
+                // then an O-precision elementwise multiply on the O context).
+                // Computed in DOUBLE (this archive's `--use_fast_math` maps
+                // float expf to the approximate intrinsic, whose few-ulp wobble
+                // flips the O rounding exactly when the sigmoid lands on an
+                // O-dtype boundary; double exp's ≤1-ulp error survives the
+                // narrow to F32 only within ~2⁻²⁹ of an F32 boundary, which the
+                // O rounding then absorbs — the CPU byte oracle mirrors the
+                // same f64 chain).
+                const int64_t g_slot = (int64_t)(row / gate_heads) * gate_slot_stride;
+                const int64_t g_off = (int64_t)(row % gate_heads) * HEAD_DIM + d;
+                const float g = to_f32<O>(gate[g_slot + g_off]);
+                const float sig =
+                    to_f32<O>(from_f32<O>((float)(1.0 / (1.0 + exp((double)(-g))))));
+                vr = to_f32<O>(from_f32<O>(vr * sig));
+            }
             float amax = fabsf(vr);
             float s = vr;
             #pragma unroll
@@ -1589,26 +1619,25 @@ __global__ void int8_decode_combine_kernel(
             const int lane = d & 31;
             if (lane == 0) { sh_amax[warp] = amax; sh_sum[warp] = s; }
             __syncthreads();
-            if (warp == 0) {
-                float a = (lane < HEAD_DIM / 32) ? sh_amax[lane] : 0.f;
-                float ss = (lane < HEAD_DIM / 32) ? sh_sum[lane] : 0.f;
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off, 32));
-                    ss += __shfl_xor_sync(0xffffffff, ss, off, 32);
-                }
-                if (lane == 0) { sh_amax[0] = a; sh_sum[0] = ss; }
-            }
-            __syncthreads();
-            const float tile_amax = sh_amax[0];
-            const float tile_sum = sh_sum[0];
-            const float id = (tile_amax != 0.f) ? 127.f / tile_amax : 0.f;
+            // Combine the tile's four warp results pairwise — (w0,w2)+(w1,w3) is
+            // the butterfly's summation order, keeping the bytes identical to the
+            // former warp-shuffle combine at HEAD_DIM 128.
+            const int tb = (d >> 7) << 2;
+            const float tile_amax = fmaxf(fmaxf(sh_amax[tb], sh_amax[tb + 2]),
+                                          fmaxf(sh_amax[tb + 1], sh_amax[tb + 3]));
+            const float tile_sum = (sh_sum[tb] + sh_sum[tb + 2]) + (sh_sum[tb + 1] + sh_sum[tb + 3]);
+            // IEEE divisions (`__fdiv_rn`) despite the archive's fast math: the
+            // quant boundary sits at half a code, and the approximate division's
+            // ±2-ulp wobble is exactly what flips a byte there — the CPU byte
+            // oracle mirrors these two ops bit-for-bit.
+            const float id = (tile_amax != 0.f) ? __fdiv_rn(127.f, tile_amax) : 0.f;
             uint8_t* obytes = q8_out;
-            const int64_t flat = row;
-            obytes[q8a1024_qs_off(flat) + d] = (int8_t)__float2int_rn(vr * id);
-            if (d == 0) {
+            const int64_t flat = (int64_t)row * (HEAD_DIM / 128) + (d >> 7);
+            obytes[q8a1024_qs_off(flat) + (d & 127)] = (int8_t)__float2int_rn(vr * id);
+            if ((d & 127) == 0) {
                 half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(flat));
-                ds[0] = make_half2(__float2half_rn(tile_amax / 127.f), __float2half_rn(tile_sum));
+                ds[0] = make_half2(__float2half_rn(__fdiv_rn(tile_amax, 127.f)),
+                                   __float2half_rn(tile_sum));
             }
             return;
         }
@@ -1670,8 +1699,13 @@ inline void fused_attn_partial_pool(
     *ml_out  = g_ml;
 }
 
+// Returns 0 on success, 1 when the split-KV partial pool could not be
+// allocated for a launch that requires it (split accumulation, warp-stripe,
+// or a q8 emit — the combine kernel is the only q8 emitter and the stripe
+// kernels have no direct-write form). The caller must treat 1 as a failed
+// wave: nothing was launched, `out`/`q8_out` hold no result.
 template <typename Q_T, typename T, typename O, int HEAD_DIM>
-void launch_int8_decode_attn(
+int launch_int8_decode_attn(
     const Q_T* q,
     const uint8_t* headers_ptr,
     O* out,
@@ -1684,7 +1718,12 @@ void launch_int8_decode_attn(
     const float* rope_cs,
     int rope_interleaved,
     cudaStream_t stream = nullptr,
-    uint8_t* q8_out = nullptr   // non-null → B2 fused q8a128 context (combine path, HEAD_DIM==128)
+    uint8_t* q8_out = nullptr,  // non-null → B2 fused q8a128 context (combine path, HEAD_DIM % 128 == 0)
+    const O* gate = nullptr,    // non-null → combine applies sigmoid(gate) ⊙ val (requires q8_out)
+    int64_t gate_slot_stride = 0 // elements between consecutive slots' gate rows
+                                 // (n_q_head·HEAD_DIM when the gate is contiguous;
+                                 // the fused [q|gate] projection's row width when
+                                 // the gate is a strided view of it)
 ) {
     int heads_per_group = (n_kv_head > 0) ? (n_q_head / n_kv_head) : 1;
     if (heads_per_group < 1) heads_per_group = 1;
@@ -1704,7 +1743,7 @@ void launch_int8_decode_attn(
     if (num_splits < 1) num_splits = 1;
     if (num_splits > MAX_SPLITS) num_splits = MAX_SPLITS;
 
-    auto launch = [&](auto warps_const, auto rope_const) {
+    auto launch = [&](auto warps_const, auto rope_const) -> int {
         constexpr int WARPS_PER_BLOCK = decltype(warps_const)::value;
         constexpr bool ROPE_INTERLEAVED = decltype(rope_const)::value;
 
@@ -1717,17 +1756,27 @@ void launch_int8_decode_attn(
         const bool use_stripe = (heads_per_group >= 1 && heads_per_group <= 8
                                  && heads_per_group <= WARPS_PER_BLOCK);
         const int partials_per_row = use_stripe ? (num_splits * WARPS_PER_BLOCK) : num_splits;
-        const bool need_pool = use_stripe || (num_splits > 1);
+        // One predicate decides the whole route: split accumulation, the stripe
+        // kernels (which have no direct-write form), and a q8 emit (the combine
+        // kernel is the only emitter, and `out` is null on that path) all
+        // require the partial pool + combine. If the pool cannot be allocated,
+        // launching anything would either write through a null `out` or leave
+        // `q8_out` uninitialized while reporting success — so a required pool
+        // that fails to allocate fails the launch loudly instead.
+        const bool need_pool = use_stripe || (num_splits > 1) || (q8_out != nullptr);
         float* pa = nullptr;
         float* pm = nullptr;
         if (need_pool) {
             fused_attn_partial_pool((int64_t)num_active_slots * n_q_head, partials_per_row,
                                     HEAD_DIM, &pa, &pm, stream);
+            if (pa == nullptr || pm == nullptr) {
+                return 1;
+            }
         }
 
         dim3 grid(num_active_slots, n_kv_head, num_splits);
         dim3 block(WARP_SIZE * WARPS_PER_BLOCK);
-        if (use_stripe && pa != nullptr) {
+        if (use_stripe) {
             // HPG compile-time so the per-head flash-state arrays stay in registers.
             // hd128 uses the batched-M INT8 tensor-core MMA; other head dims (no
             // 32-wide palette) use the CUDA-core warp-stripe.
@@ -1775,43 +1824,43 @@ void launch_int8_decode_attn(
             #undef BMMA_LAUNCH
             #undef STRIPE_LAUNCH
         } else {
-            // Existing INT8-MMA kernel (warp=head). Direct write if no pool
-            // (single block) — also the fallback if the stripe pool alloc failed.
-            float* kpa = (pa != nullptr && num_splits > 1) ? pa : nullptr;
-            float* kpm = (pm != nullptr && num_splits > 1) ? pm : nullptr;
+            // Existing INT8-MMA kernel (warp=head). `pa` is non-null exactly
+            // when the route goes through partials + combine (need_pool held
+            // and the alloc succeeded — a failed alloc returned above); null
+            // `pa` is the single-block direct write.
             int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
                 <<<grid, block, 0, stream>>>(
                     q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
-                    softmax_scale, k_new, v_new, rope_cs, kpa, kpm);
+                    softmax_scale, k_new, v_new, rope_cs, pa, pm);
         }
 
-        if (pa != nullptr && (use_stripe || num_splits > 1)) {
+        if (pa != nullptr) {
             int num_rows = num_active_slots * n_q_head;
+            const int64_t g_stride =
+                (gate_slot_stride != 0) ? gate_slot_stride : (int64_t)n_q_head * HEAD_DIM;
             int8_decode_combine_kernel<O, HEAD_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
-                out, pa, pm, num_rows, partials_per_row, q8_out);
+                out, pa, pm, num_rows, partials_per_row, q8_out, gate, g_stride, n_q_head);
         }
 
         constexpr int COMMIT_THREADS = 128;
         dim3 commit_grid((num_active_slots + COMMIT_THREADS - 1) / COMMIT_THREADS);
         commit_decode_write_len_kernel<HEAD_DIM><<<commit_grid, COMMIT_THREADS, 0, stream>>>(
             headers_ptr, num_active_slots, n_kv_head);
+        return 0;
     };
 
     // 4-way dispatch over (use_wide, rope_interleaved). use_wide selects
     // WARPS_PER_BLOCK=16 for heads_per_group > 8 (e.g. Llama-3 70B class), else 8.
     if (use_wide) {
         if (rope_interleaved) {
-            launch(std::integral_constant<int, 16>{}, std::true_type{});
-        } else {
-            launch(std::integral_constant<int, 16>{}, std::false_type{});
+            return launch(std::integral_constant<int, 16>{}, std::true_type{});
         }
-    } else {
-        if (rope_interleaved) {
-            launch(std::integral_constant<int, 8>{}, std::true_type{});
-        } else {
-            launch(std::integral_constant<int, 8>{}, std::false_type{});
-        }
+        return launch(std::integral_constant<int, 16>{}, std::false_type{});
     }
+    if (rope_interleaved) {
+        return launch(std::integral_constant<int, 8>{}, std::true_type{});
+    }
+    return launch(std::integral_constant<int, 8>{}, std::false_type{});
 }
 
 } // namespace fused_attn

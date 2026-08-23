@@ -9,19 +9,19 @@ use crate::models::profile::{pipeline_record, profile_now};
 ///
 /// Key behavior:
 /// - Adds a tracing span around matmul.
-/// - On CUDA, [`Int8Mode::Off`]: Uses K/128 GEMX format with embedded scales for efficient matmul.
 /// - On CUDA, an int8 mode: repacks the weight to its KO twin at load and runs the q8a128 int8
 ///   tensor-core matmul (the weight twin is chosen by the mode; see [`Int8Mode`]).
-/// - On CPU/Metal: Uses standard GGML kernels (no repacking).
-/// - For BF16/F16 inputs, uses the dequantize+matmul fast paths and preserves input dtype.
-/// - For rank-3 BF16/F16 inputs, flattens (B,S,K) -> (B*S,K) to avoid broadcasting weights.
+/// - [`Int8Mode::Off`] and CPU/Metal: standard GGML kernels. Off is the
+///   diagnostic mode (`INT8MODE=off`) — correctness over speed; the FP-GEMX
+///   fast path it used to take was deleted when production went int8-only
+///   (nothing but Off-mode runs exercised it, and it had rotted to NaN).
+/// - For BF16/F16 inputs, casts through F32 for the standard kernels and restores the dtype.
+/// - For rank-3 inputs, flattens (B,S,K) -> (B*S,K) to avoid broadcasting weights.
 #[derive(Clone)]
 pub struct QMatMul {
     inner: candle::quantized::QMatMul,
     span: tracing::Span,
-    /// Whether GEMX path is safe to use for this tensor (CUDA with K/128 format)
-    use_gemx: bool,
-    /// Numeric mode of this weight: `Off` → FP GEMX/standard path; an int8 mode → the weight is
+    /// Numeric mode of this weight: `Off` → standard path; an int8 mode → the weight is
     /// the KO twin and forward runs the q8a128 int8 tensor-core matmul.
     int8mode: Int8Mode,
 }
@@ -70,50 +70,39 @@ impl QMatMul {
             return Ok(Self {
                 inner,
                 span,
-                use_gemx: false,
                 int8mode: mode,
             });
         }
 
-        // Off (or non-CUDA / unsupported): FP GEMX K/128 repack, or the standard path via Arc.
-        if ws.supports_gemx_repacking() {
-            let repacked = ws.repack_gemx()?;
-            let inner = candle::quantized::QMatMul::from_qtensor(repacked)?;
-            Ok(Self {
-                inner,
-                span,
-                use_gemx: true,
-                int8mode: Int8Mode::Off,
-            })
-        } else {
-            let inner = candle::quantized::QMatMul::from_arc(ws)?;
-            Ok(Self {
-                inner,
-                span,
-                use_gemx: false,
-                int8mode: Int8Mode::Off,
-            })
-        }
+        // Off (or non-CUDA): the standard GGML path, unmodified weights.
+        let inner = candle::quantized::QMatMul::from_arc(ws)?;
+        Ok(Self {
+            inner,
+            span,
+            int8mode: Int8Mode::Off,
+        })
     }
 
-    /// Create from an already-repacked QTensor. The weight may be either the FP GEMX K/128 form
-    /// (→ `use_gemx`, `Off`) or a KO twin (→ the int8 tensor-core path); the KO case is how expert
-    /// slots are wrapped from the pinned-pool's pre-repacked KO bytes, so they report int8 to
-    /// `compute_experts_grouped`. The KO twin is already baked into the dtype.
+    /// Create from an already-repacked KO twin — how expert slots are wrapped
+    /// from the pinned-pool's pre-repacked KO bytes, so they report int8 to
+    /// `compute_experts_grouped`. The KO twin is baked into the dtype, and it
+    /// is the only runnable repacked form: the FP GEMX K/128 kernel no longer
+    /// exists, so a non-KO tensor is refused here rather than constructed into
+    /// a matmul that cannot run.
     pub fn from_qtensor_repacked(repacked: QTensor) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
-        let is_ko = repacked.dtype().is_ko();
+        if !repacked.dtype().is_ko() {
+            candle::bail!(
+                "from_qtensor_repacked: only KO twins are runnable — the FP GEMX \
+                 K/128 form has no kernel any more (deleted with the float fast path)"
+            );
+        }
         let inner = candle::quantized::QMatMul::from_qtensor(repacked)?;
 
         Ok(Self {
             inner,
             span,
-            use_gemx: !is_ko,
-            int8mode: if is_ko {
-                Int8Mode::Precision
-            } else {
-                Int8Mode::Off
-            },
+            int8mode: Int8Mode::Precision,
         })
     }
 
@@ -213,25 +202,10 @@ impl QMatMul {
             };
         }
 
-        let use_native_gemx = self.use_gemx
-            && matches!(self.inner, candle::quantized::QMatMul::QTensor(_))
-            && [DType::F32, DType::BF16, DType::F16, DType::F8E4M3].contains(&in_dtype);
-
-        let out2 = if use_native_gemx {
-            // K/128 format has embedded scales; runs in the input dtype.
-            let o = self.inner.forward_via_gemx(&xs2)?;
-            pipeline_record(
-                if in_dtype == DType::F32 {
-                    "qmatmul_f32"
-                } else {
-                    "qmatmul_f16"
-                },
-                t_mm,
-            );
-            o
-        } else {
-            // Fall back to standard quantized matmul path for correctness.
-            // Quantized CUDA kernels expect F32 inputs, so cast and restore dtype.
+        // Non-int8 (the Off diagnostic mode, CPU, Metal): the standard
+        // quantized matmul path. The CUDA kernels expect F32 inputs, so cast
+        // and restore the dtype.
+        let out2 = {
             let xs_f32 = xs2.to_dtype(DType::F32)?;
             let out_f32 = self.inner.forward_live(&xs_f32)?;
             pipeline_record("qmatmul_f32", t_mm);

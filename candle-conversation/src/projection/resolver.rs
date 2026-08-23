@@ -15,7 +15,9 @@ use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, Tur
 use super::project::ProjectionTarget;
 use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::persistence::content_hash::snapshot_stream_id;
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
+use crate::persistence::manifest::RecordLoc;
 use crate::persistence::record::{DistillMode, TreeMetadataPayload};
 use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
@@ -2677,6 +2679,27 @@ impl Conversation {
             .set_wide_q_sigs_blob(stream_id, payload.clone());
         self.writer
             .enqueue(WriteJob::WideQSigs { stream_id, payload });
+    }
+
+    /// Enqueue a conversation's recurrent-state snapshot (the encoded
+    /// [`SnapshotPayload`]) under its snapshot stream id. Fire-and-forget from
+    /// the seal path: the writer thread appends it and registers the fresh
+    /// location, superseding every earlier snapshot for the conversation (the
+    /// single-tail contract). Nothing is mirrored in RAM here — the state that
+    /// produced the payload is still live on the device; the record exists for
+    /// restart and fork-resume.
+    pub fn enqueue_recurrent_snapshot(&self, timeline: TimelineId, payload: Vec<u8>) {
+        let stream_id = snapshot_stream_id(timeline.raw());
+        self.writer
+            .enqueue(WriteJob::Snapshot { stream_id, payload });
+    }
+
+    /// The live recurrent-state snapshot location for `timeline`, if one is
+    /// on disk. Resume reads the payload through the persistence handle and
+    /// validates `(schedule_hash, turn_index)` before scattering state.
+    pub fn recurrent_snapshot_loc(&self, timeline: TimelineId) -> Option<RecordLoc> {
+        self.read()
+            .recurrent_snapshot_loc(snapshot_stream_id(timeline.raw()))
     }
 
     /// Declare a section stream — appends a `StreamDecl::PromptSection`

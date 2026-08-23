@@ -152,6 +152,19 @@ pub enum RecordType {
     /// durable before the turn it points at exists, which is what lets the
     /// summariser group an exchange without ever racing its own record.
     TurnCoupling = 19,
+    /// A conversation's recurrent-state snapshot, taken at a turn seal —
+    /// the Gated DeltaNet matrices and conv tails of every recurrent layer
+    /// as they stood after the sealed turn (hybrid Qwen3.5/3.8 models;
+    /// `docs/qwen35_qwen38_models.md` §5).
+    ///
+    /// **Single tail per conversation**: keyed in the *header* by a synthetic
+    /// per-timeline stream id, so the newest snapshot supersedes every
+    /// previous one mechanically — [`super::accounting`] credits the old copy
+    /// as dead bytes and `snapshot_locs` keeps exactly the tail alive through
+    /// segment maintenance. No explicit tombstone is written for supersede;
+    /// the last-writer-wins accounting *is* the tombstone. Binary payload
+    /// [`SnapshotPayload`]; the header CRC covers it like any metadata record.
+    Snapshot = 20,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -189,6 +202,7 @@ impl RecordType {
             17 => RecordType::WideQSig,
             18 => RecordType::HeaderIndex,
             19 => RecordType::TurnCoupling,
+            20 => RecordType::Snapshot,
             _ => RecordType::Unknown,
         }
     }
@@ -988,6 +1002,195 @@ impl DistillPayload {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         serde_json::from_slice(buf)
             .map_err(|e| PersistenceError::Corrupt(format!("Distill JSON parse: {e}")))
+    }
+}
+
+/// One recurrent layer's state inside a [`SnapshotPayload`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotLayer {
+    /// Trunk layer index this state belongs to.
+    pub layer_index: u32,
+    /// `[n_v_heads × d_v × d_k]` F32 delta-rule matrices, LE bytes.
+    pub n_v_heads: u32,
+    pub d_v: u32,
+    pub d_k: u32,
+    pub state: Vec<u8>,
+    /// `[conv_channels × conv_tail_cols]` F32 conv tail, LE bytes.
+    pub conv_channels: u32,
+    pub conv_tail_cols: u32,
+    pub conv_tail: Vec<u8>,
+}
+
+/// Binary payload for a [`RecordType::Snapshot`] record — a conversation's
+/// full recurrent state at the seal of `turn_index`.
+///
+/// `schedule_hash` fingerprints the model's layer schedule + DeltaNet dims;
+/// restore refuses a snapshot whose hash disagrees with the loaded model
+/// (a resumed conversation must recompute instead of scattering a foreign
+/// layout into the state arena). `turn_index` binds the snapshot to the turn
+/// whose seal produced it: reload discards a snapshot newer than the last
+/// recovered turn (a torn shutdown between the turn's records and this one)
+/// and falls back to recompute.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotPayload {
+    pub timeline_id: u64,
+    pub turn_index: u32,
+    pub schedule_hash: u64,
+    pub layers: Vec<SnapshotLayer>,
+}
+
+/// Wire version of [`SnapshotPayload`]; bump on layout change, keep decode
+/// for every version ever written.
+const SNAPSHOT_PAYLOAD_VERSION: u32 = 1;
+
+impl SnapshotPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = ByteWriter::new();
+        w.put_u32(SNAPSHOT_PAYLOAD_VERSION);
+        w.put_u64(self.timeline_id);
+        w.put_u32(self.turn_index);
+        w.put_u64(self.schedule_hash);
+        w.put_u32(self.layers.len() as u32);
+        for l in &self.layers {
+            w.put_u32(l.layer_index);
+            w.put_u8(0); // dtype tag: 0 = F32 (the only state dtype)
+            w.put_u32(l.n_v_heads);
+            w.put_u32(l.d_v);
+            w.put_u32(l.d_k);
+            w.put_blob(&l.state);
+            w.put_u32(l.conv_channels);
+            w.put_u32(l.conv_tail_cols);
+            w.put_blob(&l.conv_tail);
+        }
+        w.into_bytes()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = ByteReader::new(buf);
+        let version = r.get_u32()?;
+        if version != SNAPSHOT_PAYLOAD_VERSION {
+            return Err(PersistenceError::Corrupt(format!(
+                "snapshot payload version {version} unknown (this build reads \
+                 {SNAPSHOT_PAYLOAD_VERSION})"
+            )));
+        }
+        let timeline_id = r.get_u64()?;
+        let turn_index = r.get_u32()?;
+        let schedule_hash = r.get_u64()?;
+        let n_layers = r.get_u32()? as usize;
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let layer_index = r.get_u32()?;
+            let dtype = r.get_u8()?;
+            if dtype != 0 {
+                return Err(PersistenceError::Corrupt(format!(
+                    "snapshot layer {layer_index}: unknown state dtype tag {dtype}"
+                )));
+            }
+            let n_v_heads = r.get_u32()?;
+            let d_v = r.get_u32()?;
+            let d_k = r.get_u32()?;
+            let state = r.get_blob()?.to_vec();
+            let expect = n_v_heads as usize * d_v as usize * d_k as usize * 4;
+            if state.len() != expect {
+                return Err(PersistenceError::Corrupt(format!(
+                    "snapshot layer {layer_index}: state blob {} bytes, dims say {expect}",
+                    state.len()
+                )));
+            }
+            let conv_channels = r.get_u32()?;
+            let conv_tail_cols = r.get_u32()?;
+            let conv_tail = r.get_blob()?.to_vec();
+            let expect_tail = conv_channels as usize * conv_tail_cols as usize * 4;
+            if conv_tail.len() != expect_tail {
+                return Err(PersistenceError::Corrupt(format!(
+                    "snapshot layer {layer_index}: conv tail {} bytes, dims say {expect_tail}",
+                    conv_tail.len()
+                )));
+            }
+            layers.push(SnapshotLayer {
+                layer_index,
+                n_v_heads,
+                d_v,
+                d_k,
+                state,
+                conv_channels,
+                conv_tail_cols,
+                conv_tail,
+            });
+        }
+        Ok(Self {
+            timeline_id,
+            turn_index,
+            schedule_hash,
+            layers,
+        })
+    }
+}
+
+#[cfg(test)]
+mod snapshot_payload_tests {
+    use super::*;
+
+    fn tiny() -> SnapshotPayload {
+        SnapshotPayload {
+            timeline_id: 7,
+            turn_index: 3,
+            schedule_hash: 0xDEAD_BEEF_CAFE_F00D,
+            layers: vec![SnapshotLayer {
+                layer_index: 1,
+                n_v_heads: 1,
+                d_v: 2,
+                d_k: 2,
+                state: vec![0u8; 16],
+                conv_channels: 3,
+                conv_tail_cols: 1,
+                conv_tail: vec![1u8; 12],
+            }],
+        }
+    }
+
+    /// Byte-exact pin: durable state must decode identically forever.
+    #[test]
+    fn encode_is_byte_stable() {
+        let bytes = tiny().encode();
+        let mut expect: Vec<u8> = Vec::new();
+        expect.extend_from_slice(&1u32.to_le_bytes()); // version
+        expect.extend_from_slice(&7u64.to_le_bytes()); // timeline
+        expect.extend_from_slice(&3u32.to_le_bytes()); // turn
+        expect.extend_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
+        expect.extend_from_slice(&1u32.to_le_bytes()); // n_layers
+        expect.extend_from_slice(&1u32.to_le_bytes()); // layer_index
+        expect.push(0); // dtype
+        expect.extend_from_slice(&1u32.to_le_bytes()); // n_v_heads
+        expect.extend_from_slice(&2u32.to_le_bytes()); // d_v
+        expect.extend_from_slice(&2u32.to_le_bytes()); // d_k
+        expect.extend_from_slice(&16u32.to_le_bytes()); // state blob len
+        expect.extend_from_slice(&[0u8; 16]);
+        expect.extend_from_slice(&3u32.to_le_bytes()); // conv_channels
+        expect.extend_from_slice(&1u32.to_le_bytes()); // conv_tail_cols
+        expect.extend_from_slice(&12u32.to_le_bytes()); // tail blob len
+        expect.extend_from_slice(&[1u8; 12]);
+        assert_eq!(bytes, expect);
+    }
+
+    #[test]
+    fn roundtrip_and_dim_validation() {
+        let p = tiny();
+        let back = SnapshotPayload::decode(&p.encode()).unwrap();
+        assert_eq!(p, back);
+
+        // A state blob that disagrees with its dims is corrupt, not clamped.
+        let mut bad = tiny();
+        bad.layers[0].state.pop();
+        let err = SnapshotPayload::decode(&bad.encode()).unwrap_err();
+        assert!(err.to_string().contains("state blob"));
+    }
+
+    #[test]
+    fn wire_tag_is_twenty() {
+        assert_eq!(RecordType::Snapshot as u8, 20);
+        assert_eq!(RecordType::from_tag(20), RecordType::Snapshot);
     }
 }
 

@@ -145,6 +145,28 @@ pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<C
             ));
         }
     }
+
+    // Recurrent-state snapshots: one live tail per conversation, staged
+    // verbatim (`Raw`, the `Tokens` shape — the payload is a multi-MB state
+    // blob nothing holds in RAM). The map only ever holds live conversations'
+    // snapshots — a timeline tombstone removes its entry on apply — so no
+    // gate is needed here.
+    for (stream_id, loc) in substrate.recurrent_snapshot_entries() {
+        out.push(CompactItem::raw(
+            RecordHeader {
+                record_type: RecordType::Snapshot,
+                format: 0,
+                payload_len: loc.payload_len,
+                crc: 0,
+                stream_id: stream_id.0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            loc.segment,
+            loc.offset,
+            loc.record_size,
+        ));
+    }
     // Tombstoned timelines drop out of the compacted log entirely
     // — their records are physically gone, not merely hidden.  This
     // is what reclaims disk after a refresh cycle replaces a

@@ -98,9 +98,12 @@ pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
     ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
-    KvErrorThresholdFactors, LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS,
+    KvErrorThresholdFactors, LLAMA2_KV_FACTOR, LLAMA3_KV_FACTOR, LLAMA_KV_FACTORS,
+    PRODUCTION_K_QREL_HIGH_THRESHOLDS,
     PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER, PRODUCTION_V_QREL_HIGH_THRESHOLDS,
-    PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS,
+    PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN35_0_8B_KV_FACTORS, QWEN35_9B_KV_FACTORS,
+    QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS, QWEN3_8B_KV_FACTORS,
+    QWEN3_MOE_KV_FACTORS,
 };
 pub use chunked::{ArenaKey, StoragePolicy};
 pub use chunked::{LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE};

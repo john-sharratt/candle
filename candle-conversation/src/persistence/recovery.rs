@@ -70,6 +70,9 @@ fn payload_needed(rt: RecordType) -> bool {
             | RecordType::Template
             | RecordType::Tokenizer
             | RecordType::HeaderIndex
+            // Snapshots are indexed by header key alone; the multi-MB state
+            // payload is read only when a conversation actually resumes.
+            | RecordType::Snapshot
     )
 }
 

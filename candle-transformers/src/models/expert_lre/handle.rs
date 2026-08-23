@@ -327,6 +327,22 @@ impl ExpertCache {
             progress,
             int8mode,
         } = setup;
+        // Experts run only on the KO int8 tensor-core path: the FP GEMX kernel
+        // was deleted with the float fast path, so an `Off` slot would repack
+        // to a layout no kernel can run and every slot construction downstream
+        // would fail one expert at a time (`from_qtensor_repacked: only KO
+        // twins are runnable`). Refuse here, at the one place every routed
+        // model passes through, so the load fails with the reason instead of
+        // the first MoE forward failing with the symptom. `Off` remains valid
+        // for dense projections, which never build this cache.
+        if int8mode == Int8Mode::Off {
+            candle::bail!(
+                "expert cache: Int8Mode::Off has no expert kernel — the FP GEMX \
+                 expert path was removed, so routed (MoE) models require an int8 \
+                 mode (Precision or Performance). This device/model combination \
+                 selected Off; pass an explicit int8 mode that this GPU supports."
+            );
+        }
         let num_moe_layers = host_refs.len();
         let num_slots = zone.capacity();
         let mut inner = ExpertCacheInner::new(zone, num_moe_layers, experts_per_layer);
@@ -703,6 +719,9 @@ impl ExpertCache {
             expert_scores: vec![],
             num_moe_layers: 0,
             experts_per_layer: 0,
+            // Nothing is ever evicted here, so nothing needs protecting from
+            // eviction either.
+            pinned_layers: 0,
             // Inline mode holds every expert in VRAM and never evicts, so no
             // reload cost is ever weighed.
             warm_backed: vec![],

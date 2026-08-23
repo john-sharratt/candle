@@ -43,13 +43,24 @@ fn band_payload(
         })
 }
 
-/// One copy in a migration plan: `byte_len` bytes from `src_ptr` to
-/// `dst_ptr`, both raw device addresses.
+/// One copy in a migration plan: `rows` runs of `byte_len` bytes, `src_stride`
+/// apart at the source and `dst_stride` apart at the destination, from
+/// `src_ptr` to `dst_ptr` — both raw device addresses.
+///
+/// A migration record is one contiguous block, i.e. `rows == 1`, and
+/// [`MigrationPlan::push`] builds exactly that. The strided form
+/// ([`MigrationPlan::push_strided`]) exists for the prefill KV write, where a
+/// band's destination is a contiguous run inside an arena chunk but its source
+/// is `head_dim / N_PALETTE` elements per token, `head_dim` apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MigrationRecord {
     pub src_ptr: i64,
     pub dst_ptr: i64,
+    /// Bytes per row.
     pub byte_len: i64,
+    pub rows: i64,
+    pub src_stride: i64,
+    pub dst_stride: i64,
 }
 
 /// A migration plan — the flat record list spanning every sub-chunk of a
@@ -57,6 +68,14 @@ pub struct MigrationRecord {
 #[derive(Clone, Debug, Default)]
 pub struct MigrationPlan {
     pub records: Vec<MigrationRecord>,
+    /// Whether any record is strided.
+    ///
+    /// Tracked so an all-contiguous plan — every migration plan — uploads the
+    /// three address arrays it always did and no more: the kernel takes null
+    /// for the stride arrays and reads one row per record. The generalisation
+    /// is meant to cost the migration path nothing, and this is where that is
+    /// enforced.
+    strided: bool,
 }
 
 impl MigrationPlan {
@@ -64,16 +83,45 @@ impl MigrationPlan {
     pub fn new() -> MigrationPlan {
         MigrationPlan {
             records: Vec::new(),
+            strided: false,
         }
     }
 
-    /// Append one copy record.
+    /// Append one contiguous copy record.
     pub fn push(&mut self, src_ptr: i64, dst_ptr: i64, byte_len: i64) {
         self.records.push(MigrationRecord {
             src_ptr,
             dst_ptr,
             byte_len,
+            rows: 1,
+            src_stride: byte_len,
+            dst_stride: byte_len,
         });
+    }
+
+    /// Append one strided copy record: `rows` runs of `byte_len` bytes.
+    ///
+    /// Marks the plan strided, so [`kv_migrate_on`] uploads the stride arrays.
+    /// A plan that mixes the two is fine — the contiguous records carry
+    /// `rows = 1` and are unaffected.
+    pub fn push_strided(
+        &mut self,
+        src_ptr: i64,
+        dst_ptr: i64,
+        byte_len: i64,
+        rows: i64,
+        src_stride: i64,
+        dst_stride: i64,
+    ) {
+        self.records.push(MigrationRecord {
+            src_ptr,
+            dst_ptr,
+            byte_len,
+            rows,
+            src_stride,
+            dst_stride,
+        });
+        self.strided = true;
     }
 
     /// Number of copy records.
@@ -88,7 +136,7 @@ impl MigrationPlan {
 
     /// Total bytes the plan moves.
     pub fn total_bytes(&self) -> i64 {
-        self.records.iter().map(|r| r.byte_len).sum()
+        self.records.iter().map(|r| r.byte_len * r.rows).sum()
     }
 }
 
@@ -144,6 +192,25 @@ pub fn kv_migrate_on(
         .memcpy_stod(&lens)
         .map_err(|e| candle::Error::Msg(format!("kv_migrate: len plan HtoD: {e}")))?;
 
+    // Uploaded only for a strided plan. Every migration plan is contiguous, so
+    // this is `None` there and the kernel takes null — the same three arrays,
+    // the same bytes on the wire, as before strided records existed.
+    let stride_gpu = if plan.strided {
+        let rows: Vec<i64> = plan.records.iter().map(|r| r.rows).collect();
+        let ss: Vec<i64> = plan.records.iter().map(|r| r.src_stride).collect();
+        let ds: Vec<i64> = plan.records.iter().map(|r| r.dst_stride).collect();
+        Some((
+            dev.memcpy_stod(&rows)
+                .map_err(|e| candle::Error::Msg(format!("kv_migrate: rows plan HtoD: {e}")))?,
+            dev.memcpy_stod(&ss)
+                .map_err(|e| candle::Error::Msg(format!("kv_migrate: src stride HtoD: {e}")))?,
+            dev.memcpy_stod(&ds)
+                .map_err(|e| candle::Error::Msg(format!("kv_migrate: dst stride HtoD: {e}")))?,
+        ))
+    } else {
+        None
+    };
+
     let default_stream = dev.cuda_stream();
     let used_stream = stream.unwrap_or(&default_stream);
     // Cross-stream ordering fence. The three plan uploads above — and the
@@ -166,12 +233,31 @@ pub fn kv_migrate_on(
     let (sp, _sg) = src_gpu.device_ptr(used_stream);
     let (dp, _dg) = dst_gpu.device_ptr(used_stream);
     let (lp, _lg) = len_gpu.device_ptr(used_stream);
+    // Guards live to the end of the launch scope, as the three above do.
+    let strided_ptrs = stride_gpu.as_ref().map(|(r, s, d)| {
+        (
+            r.device_ptr(used_stream),
+            s.device_ptr(used_stream),
+            d.device_ptr(used_stream),
+        )
+    });
+    let (rows_p, ss_p, ds_p) = match &strided_ptrs {
+        Some(((r, _), (s, _), (d, _))) => (*r as *const i64, *s as *const i64, *d as *const i64),
+        None => (
+            std::ptr::null::<i64>(),
+            std::ptr::null::<i64>(),
+            std::ptr::null::<i64>(),
+        ),
+    };
     unsafe {
         candle::set_kernel_breadcrumb("run_kv_migrate_copy", file!(), line!());
         kernels::simple::kv_migrate::run_kv_migrate_copy(
             sp as *const i64,
             dp as *const i64,
             lp as *const i64,
+            rows_p,
+            ss_p,
+            ds_p,
             plan.records.len() as i32,
             used_stream.cu_stream() as *mut std::ffi::c_void,
         );
@@ -587,14 +673,39 @@ mod tests {
         plan.push(0x4000, 0x2100, 512);
         assert_eq!(plan.len(), 2);
         assert_eq!(plan.total_bytes(), 768);
+        // A plain record is one row, and its strides are its own length — which
+        // is what makes the kernel's null-stride path identical to it.
         assert_eq!(
             plan.records[1],
             MigrationRecord {
                 src_ptr: 0x4000,
                 dst_ptr: 0x2100,
                 byte_len: 512,
+                rows: 1,
+                src_stride: 512,
+                dst_stride: 512,
             }
         );
+        assert!(
+            !plan.strided,
+            "a plan of plain records must not upload stride arrays"
+        );
+    }
+
+    /// A strided record counts every row, and marks the plan so the stride
+    /// arrays are uploaded. Mixing the two forms is allowed — the plain records
+    /// carry `rows = 1` and read the same either way.
+    #[test]
+    fn strided_records_mark_the_plan_and_count_every_row() {
+        let mut plan = MigrationPlan::new();
+        plan.push(0x1000, 0x2000, 128);
+        plan.push_strided(0x8000, 0x9000, 64, 32, 512, 64);
+        assert!(plan.strided);
+        // 128 for the plain record, 32 rows x 64 for the strided one.
+        assert_eq!(plan.total_bytes(), 128 + 32 * 64);
+        assert_eq!(plan.records[0].rows, 1);
+        assert_eq!(plan.records[1].rows, 32);
+        assert_eq!(plan.records[1].src_stride, 512);
     }
 
     #[cfg(feature = "cuda")]

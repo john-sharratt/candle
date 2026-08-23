@@ -47,11 +47,16 @@ impl RecordAccounting {
     pub fn record(&mut self, header: &RecordHeader, padded_size: u64) {
         let key = match header.record_type {
             RecordType::Chunk => (RecordType::Chunk, header.stream_id, header.chunk_index),
+            // `Snapshot` is header-keyed by a synthetic per-timeline stream
+            // id: the newest snapshot supersedes the previous one here — this
+            // insert-returning-old IS the single-tail tombstone (design doc
+            // `qwen35_qwen38_models.md` §5.2).
             RecordType::Tokens
             | RecordType::StreamDecl
             | RecordType::Commit
             | RecordType::ProjectionEvents
-            | RecordType::WideQSig => (header.record_type, header.stream_id, 0),
+            | RecordType::WideQSig
+            | RecordType::Snapshot => (header.record_type, header.stream_id, 0),
             RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => {
                 (header.record_type, 0, 0)
             }

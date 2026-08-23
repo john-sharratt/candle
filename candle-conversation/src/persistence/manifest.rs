@@ -173,6 +173,7 @@ impl Manifest {
             | RecordType::TurnCoupling
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
+            | RecordType::Snapshot
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }

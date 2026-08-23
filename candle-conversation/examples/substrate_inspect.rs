@@ -5088,7 +5088,7 @@ fn recover_view(log: &mut LogFile) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const ALL_TYPES: [RecordType; 17] = [
+const ALL_TYPES: [RecordType; 19] = [
     RecordType::ModelSpec,
     RecordType::Template,
     RecordType::StreamDecl,
@@ -5105,6 +5105,8 @@ const ALL_TYPES: [RecordType; 17] = [
     RecordType::Distilled,
     RecordType::WideQSig,
     RecordType::HeaderIndex,
+    RecordType::TurnCoupling,
+    RecordType::Snapshot,
     RecordType::Unknown,
 ];
 
@@ -5134,7 +5136,10 @@ fn build_substrate_merged(segs: &[(u64, PathBuf, bool)]) -> Result<Substrate> {
             walker::collect_filtered(&mut log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |rt| {
                 !matches!(
                     rt,
-                    RecordType::Chunk | RecordType::Tokens | RecordType::HeaderIndex
+                    RecordType::Chunk
+                        | RecordType::Tokens
+                        | RecordType::Snapshot
+                        | RecordType::HeaderIndex
                 )
             })?;
         for e in &entries {
@@ -5157,7 +5162,10 @@ fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let (entries, _) = walker::collect_filtered(log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |rt| {
         !matches!(
             rt,
-            RecordType::Chunk | RecordType::Tokens | RecordType::HeaderIndex
+            RecordType::Chunk
+                | RecordType::Tokens
+                | RecordType::Snapshot
+                | RecordType::HeaderIndex
         )
     })?;
     for e in &entries {

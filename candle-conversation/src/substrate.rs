@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
 
 use crate::conversation::window_sealed_tokens;
-use crate::persistence::content_hash::turn_stream_id;
+use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
@@ -235,6 +235,12 @@ pub struct Substrate {
     /// `StreamDecl::Turn`) — registration just observes them as
     /// already tombstoned, which is the correct behaviour.
     tombstoned_timelines: HashSet<TimelineId>,
+    /// The live recurrent-state snapshot per snapshot stream
+    /// (`snapshot_stream_id(timeline)` — the key is computed by the reader at
+    /// resume, never inverted from the id). Location only: the payload stays
+    /// on disk until a resume materializes it, exactly like `Tokens`.
+    /// Last-writer-wins by walk/append order — the single tail.
+    recurrent_snapshots: HashMap<StreamId, RecordLoc>,
     /// Timelines whose KV is transient scratch — code_read scope forks whose
     /// sealed turns are spliced by REFERENCE onto a file timeline and then
     /// tombstoned. Their residences are flagged [`SequenceResidence::no_cold_persist`]
@@ -3111,6 +3117,33 @@ impl Substrate {
         self.streams.entry(stream_id).or_default().tokens = Some(loc);
     }
 
+    /// Record the latest recurrent-state snapshot location for a snapshot
+    /// stream. Last-writer-wins: the previous location (if any) is simply
+    /// replaced — its bytes were already credited dead by the accounting
+    /// layer when the newer record appended.
+    pub fn apply_snapshot_loc(&mut self, stream_id: StreamId, loc: RecordLoc) {
+        self.recurrent_snapshots.insert(stream_id, loc);
+    }
+
+    /// The live snapshot for a snapshot stream, if one exists. The caller
+    /// derives `stream_id` from the timeline it is resuming
+    /// (`snapshot_stream_id`); payload validation — schedule hash, turn
+    /// index vs the recovered tail — happens at materialization.
+    pub fn recurrent_snapshot_loc(&self, stream_id: StreamId) -> Option<RecordLoc> {
+        self.recurrent_snapshots.get(&stream_id).copied()
+    }
+
+    /// Drop a timeline's snapshot entry (timeline tombstone path).
+    pub fn drop_snapshot_loc(&mut self, stream_id: StreamId) {
+        self.recurrent_snapshots.remove(&stream_id);
+    }
+
+    /// Every live snapshot `(stream id, location)` — the compactor's source
+    /// for carrying the tails forward.
+    pub fn recurrent_snapshot_entries(&self) -> impl Iterator<Item = (StreamId, RecordLoc)> + '_ {
+        self.recurrent_snapshots.iter().map(|(k, v)| (*k, *v))
+    }
+
     /// Record the highest chunk index the stream is durably committed
     /// through.  Last-writer-wins.
     pub fn apply_commit_through(&mut self, stream_id: StreamId, through_index: u64) {
@@ -3224,6 +3257,13 @@ impl Substrate {
             }
             None => {
                 self.tombstoned_timelines.insert(timeline);
+                // A dead conversation's recurrent-state snapshot dies with it:
+                // dropping the index entry here means compaction (which walks
+                // this map) never carries the record forward. A snapshot of a
+                // turn-tombstoned tail is handled at restore instead — the
+                // payload's turn_index is validated against the recovered
+                // timeline before any state is scattered.
+                self.drop_snapshot_loc(snapshot_stream_id(payload.timeline_id));
             }
         }
     }
@@ -3485,6 +3525,17 @@ impl Substrate {
             }
             RecordType::Commit => {
                 self.apply_commit_through(stream_id, h.chunk_index);
+            }
+            RecordType::Snapshot => {
+                self.apply_snapshot_loc(
+                    stream_id,
+                    RecordLoc {
+                        segment: entry.segment,
+                        offset: entry.offset,
+                        payload_len: h.payload_len,
+                        record_size: entry.size,
+                    },
+                );
             }
             RecordType::Label => {
                 if let Ok((tl, meta)) = decode_label_payload(&entry.record.payload) {

@@ -30,9 +30,14 @@
 //! 4. [`SubstratePersistence::finish_maintenance`] — unlink the drained sources
 //!    (persistence lock).
 //!
-//! Because maintenance runs only on the single persistence thread, no concurrent
-//! writer can append between phases; only reads interleave, and they always see
-//! a consistent index (the sources stay live until step 4).
+//! Maintenance runs only on the single persistence thread, but the substrate
+//! writer thread can still append between phases (it takes the persistence
+//! lock per job) — so a record planned for relocation may be superseded before
+//! execute. Two guards cover that window: execute re-validates each planned
+//! `Snapshot` against the persistence-side live-tail map (`snapshot_locs`) and
+//! skips superseded ones, and [`MaintenanceResult::apply_to_substrate`] only
+//! repoints index entries that still match their planned old location. Reads
+//! always see a consistent index (the sources stay live until step 4).
 //!
 //! ## Why relocation is safe (no resurrection, no lost metadata)
 //!
@@ -223,6 +228,8 @@ pub struct MaintenancePlan {
     chunk_relocs: Vec<(StreamId, u64, ChunkLoc)>,
     /// `(stream, source_loc)` `Tokens` records to relocate.
     token_relocs: Vec<(StreamId, RecordLoc)>,
+    /// `(snapshot stream, source_loc)` recurrent-state snapshots to relocate.
+    snapshot_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(type, source_loc)` singleton records to relocate.
     singleton_relocs: Vec<(RecordType, RecordLoc)>,
 }
@@ -242,6 +249,8 @@ pub struct MaintenanceResult {
     chunk_updates: Vec<(StreamId, u64, ChunkLoc, ChunkLoc)>,
     /// `(stream, old_loc, new_loc)`.
     token_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
+    /// `(snapshot stream, old_loc, new_loc)`.
+    snapshot_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
 }
 
 impl MaintenanceResult {
@@ -259,6 +268,14 @@ impl MaintenanceResult {
         for (sid, old, new) in &self.token_updates {
             if substrate.stream_of(*sid).and_then(|s| s.tokens.as_ref()) == Some(old) {
                 substrate.apply_tokens_loc(*sid, *new);
+            }
+        }
+        for (sid, old, new) in &self.snapshot_updates {
+            // Same supersession guard: a snapshot rewritten (a newer seal)
+            // since the plan was made keeps its newer location; the relocated
+            // copy of the old one is dead and reclaimed by a later pass.
+            if substrate.recurrent_snapshot_loc(*sid) == Some(*old) {
+                substrate.apply_snapshot_loc(*sid, *new);
             }
         }
         substrate.refresh_cold_refs();
@@ -478,13 +495,14 @@ impl SubstratePersistence {
         } else {
             Vec::new()
         };
-        let (chunk_relocs, token_relocs, singleton_relocs) =
+        let (chunk_relocs, token_relocs, snapshot_relocs, singleton_relocs) =
             self.gather_relocations(substrate, &op.targets());
         Ok(Some(MaintenancePlan {
             op,
             resident,
             chunk_relocs,
             token_relocs,
+            snapshot_relocs,
             singleton_relocs,
         }))
     }
@@ -596,42 +614,31 @@ impl SubstratePersistence {
         }
 
         // Tokens — same coalesced verbatim path.
-        let mut token_updates = Vec::with_capacity(plan.token_relocs.len());
-        let mut tok_by_seg: BTreeMap<SegmentId, Vec<(StreamId, RecordLoc)>> = BTreeMap::new();
-        for &(sid, old) in &plan.token_relocs {
-            tok_by_seg.entry(old.segment).or_default().push((sid, old));
-        }
-        for (source, recs) in tok_by_seg {
-            let items: Vec<RawReloc> = recs
-                .iter()
-                .map(|&(sid, old)| RawReloc {
-                    offset: old.offset,
-                    record_size: old.record_size,
-                    header: RecordHeader {
-                        record_type: RecordType::Tokens,
-                        format: 0,
-                        payload_len: old.payload_len,
-                        crc: 0,
-                        stream_id: sid.0,
-                        chunk_index: 0,
-                        token_count: 0,
-                    },
-                })
-                .collect();
-            let new = self.relocate_raw_from_segment(source, &items)?;
-            for ((sid, old), (segment, offset, record_size)) in recs.into_iter().zip(new) {
-                token_updates.push((
-                    sid,
-                    old,
-                    RecordLoc {
-                        segment,
-                        offset,
-                        payload_len: old.payload_len,
-                        record_size,
-                    },
-                ));
-            }
-        }
+        let token_updates = self.relocate_stream_records(RecordType::Tokens, &plan.token_relocs)?;
+
+        // Snapshots — the same verbatim path, behind a supersession check.
+        // Snapshot records are last-writer-wins by append order (keyed
+        // `(Snapshot, stream_id)`), and the seal thread's writer can append a
+        // NEWER tail for a planned stream between plan and execute (the plan
+        // holds no lock across that window). Relocating the planned — now
+        // stale — copy would append it physically AFTER the newer record, so
+        // the next reload's walk would install the stale copy as the tail
+        // (rolled-back recurrent state), and the accounting would credit the
+        // newer LIVE record's bytes as dead. So a planned snapshot whose
+        // location is no longer the stream's live tail (per `snapshot_locs`,
+        // the persistence-side twin of the substrate index — current under
+        // this thread's persistence lock, and also emptied by a timeline
+        // tombstone) is skipped entirely: it is dead in its source segment,
+        // produces no update for `apply_to_substrate`, and the segment drop
+        // reclaims it.
+        let live_snapshots: Vec<(StreamId, RecordLoc)> = plan
+            .snapshot_relocs
+            .iter()
+            .filter(|(sid, old)| self.snapshot_locs.get(&sid.0) == Some(old))
+            .copied()
+            .collect();
+        let snapshot_updates =
+            self.relocate_stream_records(RecordType::Snapshot, &live_snapshots)?;
 
         // Singletons — few (≤3); the encoding append repoints them via
         // `manifest.ingest`.
@@ -648,6 +655,7 @@ impl SubstratePersistence {
         Ok(MaintenanceResult {
             chunk_updates,
             token_updates,
+            snapshot_updates,
         })
     }
 
@@ -691,6 +699,55 @@ impl SubstratePersistence {
         Ok(new_locs)
     }
 
+    /// Relocate per-stream `RecordLoc`-shaped records (`Tokens` / `Snapshot`)
+    /// verbatim into the active segment — grouped by source segment for
+    /// coalesced stripe reads — returning `(stream, old_loc, new_loc)` per
+    /// input record. The two types share the same header shape (format 0,
+    /// chunk_index 0, token_count 0); only `record_type` differs.
+    fn relocate_stream_records(
+        &mut self,
+        record_type: RecordType,
+        relocs: &[(StreamId, RecordLoc)],
+    ) -> Result<Vec<(StreamId, RecordLoc, RecordLoc)>> {
+        let mut updates = Vec::with_capacity(relocs.len());
+        let mut by_seg: BTreeMap<SegmentId, Vec<(StreamId, RecordLoc)>> = BTreeMap::new();
+        for &(sid, old) in relocs {
+            by_seg.entry(old.segment).or_default().push((sid, old));
+        }
+        for (source, recs) in by_seg {
+            let items: Vec<RawReloc> = recs
+                .iter()
+                .map(|&(sid, old)| RawReloc {
+                    offset: old.offset,
+                    record_size: old.record_size,
+                    header: RecordHeader {
+                        record_type,
+                        format: 0,
+                        payload_len: old.payload_len,
+                        crc: 0,
+                        stream_id: sid.0,
+                        chunk_index: 0,
+                        token_count: 0,
+                    },
+                })
+                .collect();
+            let new = self.relocate_raw_from_segment(source, &items)?;
+            for ((sid, old), (segment, offset, record_size)) in recs.into_iter().zip(new) {
+                updates.push((
+                    sid,
+                    old,
+                    RecordLoc {
+                        segment,
+                        offset,
+                        payload_len: old.payload_len,
+                        record_size,
+                    },
+                ));
+            }
+        }
+        Ok(updates)
+    }
+
     /// **Phase 4** — unlink the drained source segments and record the op for
     /// the status indicator. Runs under the persistence lock, after the index
     /// apply. Safe because the index no longer points at any source (Phase 3
@@ -729,13 +786,14 @@ impl SubstratePersistence {
         } else {
             Vec::new()
         };
-        let (chunk_relocs, token_relocs, singleton_relocs) =
+        let (chunk_relocs, token_relocs, snapshot_relocs, singleton_relocs) =
             self.gather_relocations(substrate, &op.targets());
         let plan = MaintenancePlan {
             op: *op,
             resident,
             chunk_relocs,
             token_relocs,
+            snapshot_relocs,
             singleton_relocs,
         };
         let result = self.execute_maintenance(&plan)?;
@@ -752,6 +810,7 @@ impl SubstratePersistence {
         targets: &[SegmentId],
     ) -> (
         Vec<(StreamId, u64, ChunkLoc)>,
+        Vec<(StreamId, RecordLoc)>,
         Vec<(StreamId, RecordLoc)>,
         Vec<(RecordType, RecordLoc)>,
     ) {
@@ -802,6 +861,17 @@ impl SubstratePersistence {
                 }
             }
         }
+        // Live snapshot tails physically inside a target segment. No
+        // tombstone/distill gate: the substrate map only ever holds live
+        // conversations' tails. Execute re-validates each entry against the
+        // persistence-side `snapshot_locs` right before relocating, so a tail
+        // superseded (or tombstoned) after this plan is skipped, not copied.
+        let mut snapshots: Vec<(StreamId, RecordLoc)> = Vec::new();
+        for (sid, loc) in substrate.recurrent_snapshot_entries() {
+            if in_target(loc.segment) {
+                snapshots.push((sid, loc));
+            }
+        }
         let mut singletons: Vec<(RecordType, RecordLoc)> = Vec::new();
         for (rt, loc) in [
             (RecordType::ModelSpec, self.manifest.model_spec),
@@ -814,7 +884,7 @@ impl SubstratePersistence {
                 }
             }
         }
-        (chunks, tokens, singletons)
+        (chunks, tokens, snapshots, singletons)
     }
 
     /// Live read-back record bytes per segment — `Chunk` / `Tokens` /
@@ -895,6 +965,14 @@ impl SubstratePersistence {
             }
             *live.entry(loc.segment).or_default() += loc.record_size;
         }
+        // Recurrent-state snapshots: one live tail per conversation, tracked in
+        // the substrate index (the `Tokens` shape — no `StreamDecl` of their
+        // own, so the live_streams gate does not apply). The map holds only
+        // live conversations' tails — a timeline tombstone removes its entry —
+        // so every entry counts.
+        for (_sid, loc) in substrate.recurrent_snapshot_entries() {
+            *live.entry(loc.segment).or_default() += loc.record_size;
+        }
         live
     }
 }
@@ -932,8 +1010,346 @@ mod tests {
         }
     }
 
+    /// The single-tail contract end to end: a newer snapshot supersedes the
+    /// older one across reload, its dead bytes are credited, segment
+    /// maintenance relocates exactly the tail, and a timeline tombstone kills
+    /// the entry.
+    #[test]
+    fn snapshot_single_tail_survives_reload_and_relocation() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
+
+        let dir = tmp_dir("snapshot_tail");
+        let timeline: u64 = 42;
+        let sid = snapshot_stream_id(timeline);
+        let payload = |turn: u32, fill: u8| {
+            SnapshotPayload {
+                timeline_id: timeline,
+                turn_index: turn,
+                schedule_hash: 0xA5A5,
+                layers: vec![SnapshotLayer {
+                    layer_index: 0,
+                    n_v_heads: 1,
+                    d_v: 4,
+                    d_k: 4,
+                    state: vec![fill; 64],
+                    conv_channels: 2,
+                    conv_tail_cols: 2,
+                    conv_tail: vec![fill; 16],
+                }],
+            }
+            .encode()
+        };
+
+        // Write two snapshots for the same conversation; the second wins.
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let dead_before = sp.accounting.dead_bytes();
+            let loc_a = sp.write_snapshot(sid, &payload(1, 0x11)).unwrap();
+            substrate.apply_snapshot_loc(sid, loc_a);
+            let loc_b = sp.write_snapshot(sid, &payload(2, 0x22)).unwrap();
+            substrate.apply_snapshot_loc(sid, loc_b);
+            assert!(
+                sp.accounting.dead_bytes() > dead_before,
+                "the superseded snapshot must be credited as dead bytes"
+            );
+            sp.commit().unwrap();
+        }
+
+        // Reload: the walker replays both records in append order; the index
+        // must hold exactly the newer one, and its payload must decode to
+        // turn 2.
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let tail = substrate
+            .recurrent_snapshot_loc(sid)
+            .expect("tail snapshot survives reload");
+        let bytes = sp.read_record_payload(&tail).unwrap();
+        let decoded = SnapshotPayload::decode(&bytes).unwrap();
+        assert_eq!(decoded.turn_index, 2, "the newer snapshot is the tail");
+        assert_eq!(decoded.layers[0].state[0], 0x22);
+
+        // Relocation worklist contains exactly the tail (the dead copy is
+        // invisible to the index).
+        let (_, _, snapshots, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].0, sid);
+
+        // A timeline tombstone kills the entry.
+        substrate.apply_tombstone(&crate::persistence::record::TombstonePayload {
+            timeline_id: timeline,
+            turn_index: None,
+            reason: None,
+        });
+        assert!(substrate.recurrent_snapshot_loc(sid).is_none());
+        let (_, _, snapshots, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        assert!(snapshots.is_empty(), "tombstoned snapshot must not relocate");
+    }
+
     fn sealed_log(dir: &std::path::Path, id: u64) -> PathBuf {
         dir.join(SUBSTRATE_DIR).join(format!("seg-{id:010}.log"))
+    }
+
+    /// Encoded snapshot payload for `timeline` at `turn` with a recognisable
+    /// `fill` byte — the fixture shared by the snapshot-relocation tests.
+    fn snapshot_payload(timeline: u64, turn: u32, fill: u8) -> Vec<u8> {
+        use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
+        SnapshotPayload {
+            timeline_id: timeline,
+            turn_index: turn,
+            schedule_hash: 0xA5A5,
+            layers: vec![SnapshotLayer {
+                layer_index: 0,
+                n_v_heads: 1,
+                d_v: 4,
+                d_k: 4,
+                state: vec![fill; 64],
+                conv_channels: 2,
+                conv_tail_cols: 2,
+                conv_tail: vec![fill; 16],
+            }],
+        }
+        .encode()
+    }
+
+    /// Relocating a LIVE snapshot credits exactly the OLD copy's on-disk
+    /// bytes as dead (the relocated copy supersedes it in the accounting
+    /// map), repoints both indexes at the new location, and the relocated
+    /// tail decodes correctly across a reload.
+    #[test]
+    fn snapshot_relocation_credits_exact_dead_bytes() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::SnapshotPayload;
+
+        let dir = tmp_dir("snap_reloc_acct");
+        let timeline: u64 = 91;
+        let sid = snapshot_stream_id(timeline);
+
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        // Two tails in seg 1: turn 1 is superseded (the segment's dead
+        // weight), turn 2 is the live tail the compact must carry forward.
+        let loc_a = sp
+            .write_snapshot(sid, &snapshot_payload(timeline, 1, 0x11))
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_a);
+        let loc_b = sp
+            .write_snapshot(sid, &snapshot_payload(timeline, 2, 0x22))
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_b);
+        sp.commit().unwrap();
+        sp.seal_active().unwrap(); // seg 1 sealed; active is seg 2
+        assert_eq!(
+            sp.accounting.dead_bytes(),
+            loc_a.record_size,
+            "the superseded turn-1 copy is the only dead weight so far"
+        );
+
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("seg 1 carries dead weight, force-compact qualifies");
+        assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+
+        let result = sp.execute_maintenance(&plan).unwrap();
+        assert_eq!(result.snapshot_updates.len(), 1);
+        let (usid, old, new) = result.snapshot_updates[0];
+        assert_eq!(usid, sid);
+        assert_eq!(old, loc_b);
+        assert_eq!(new.segment, SegmentId(2), "relocated into the active");
+        assert_eq!(new.record_size, loc_b.record_size, "verbatim copy, same size");
+        assert_eq!(
+            sp.accounting.dead_bytes(),
+            loc_a.record_size + loc_b.record_size,
+            "relocation credits exactly the OLD live copy's bytes as dead"
+        );
+
+        result.apply_to_substrate(&mut substrate);
+        assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(new));
+        sp.finish_maintenance(&plan).unwrap();
+        assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
+        let decoded =
+            SnapshotPayload::decode(&sp.read_record_payload(&new).unwrap()).unwrap();
+        assert_eq!(decoded.turn_index, 2);
+        drop(sp);
+
+        // Reload: the relocated record is the tail the walk installs.
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let tail = substrate
+            .recurrent_snapshot_loc(sid)
+            .expect("tail survives reload");
+        let decoded = SnapshotPayload::decode(&sp.read_record_payload(&tail).unwrap()).unwrap();
+        assert_eq!(decoded.turn_index, 2);
+        assert_eq!(decoded.layers[0].state[0], 0x22);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The plan→execute supersession race: after a maintenance plan targets a
+    /// stream's snapshot tail, the seal thread's writer appends a NEWER tail
+    /// for the same stream. Execute must skip the planned (now stale) copy
+    /// entirely — no append, no accounting movement, no index update — and a
+    /// reload must still see the newer record as the tail.
+    #[test]
+    fn superseded_snapshot_is_not_relocated() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::SnapshotPayload;
+
+        let dir = tmp_dir("snap_reloc_race");
+        let timeline: u64 = 92;
+        let sid = snapshot_stream_id(timeline);
+
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let loc_a = sp
+            .write_snapshot(sid, &snapshot_payload(timeline, 1, 0x11))
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_a);
+        let loc_b = sp
+            .write_snapshot(sid, &snapshot_payload(timeline, 2, 0x22))
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_b);
+        sp.commit().unwrap();
+        sp.seal_active().unwrap(); // seg 1 sealed (turn-1 dead, turn-2 the tail)
+
+        // Phase 1 plans the relocation of the turn-2 tail out of seg 1.
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("compact planned");
+        assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+
+        // RACE: before execute, the writer appends a newer turn-3 tail into
+        // the active segment and installs it in the substrate index.
+        let loc_c = sp
+            .write_snapshot(sid, &snapshot_payload(timeline, 3, 0x33))
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_c);
+        sp.commit().unwrap();
+        assert_eq!(loc_c.segment, SegmentId(2), "the newer tail lands in the active");
+        let dead_before = sp.accounting.dead_bytes();
+        assert_eq!(
+            dead_before,
+            loc_a.record_size + loc_b.record_size,
+            "turn-1 and turn-2 are both dead the moment turn-3 lands"
+        );
+        let offset_before = sp.write_offset();
+
+        // Phase 2: the planned copy is stale — it must NOT be appended.
+        let result = sp.execute_maintenance(&plan).unwrap();
+        assert!(
+            result.snapshot_updates.is_empty(),
+            "a superseded snapshot produces no update"
+        );
+        assert_eq!(
+            sp.write_offset(),
+            offset_before,
+            "no bytes were appended for the stale copy"
+        );
+        assert_eq!(
+            sp.accounting.dead_bytes(),
+            dead_before,
+            "the live turn-3 record was not credited dead"
+        );
+
+        // Phase 3 + 4: the index keeps the newer tail; seg 1 still drops
+        // (the stale copy is dead there).
+        result.apply_to_substrate(&mut substrate);
+        assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(loc_c));
+        sp.finish_maintenance(&plan).unwrap();
+        assert!(
+            !sealed_log(&dir, 1).exists(),
+            "seg 1 dropped; the stale copy died with it"
+        );
+        drop(sp);
+
+        // Reload: the walk replays only the surviving turn-3 record — the
+        // tail is the newer state, not a rolled-back turn 2.
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let tail = substrate
+            .recurrent_snapshot_loc(sid)
+            .expect("tail survives reload");
+        assert_eq!(tail, loc_c);
+        assert_eq!(
+            sp.snapshot_locs.get(&sid.0),
+            Some(&loc_c),
+            "the persistence-side live-tail map is rebuilt by the walk"
+        );
+        let decoded = SnapshotPayload::decode(&sp.read_record_payload(&tail).unwrap()).unwrap();
+        assert_eq!(decoded.turn_index, 3, "reload sees the NEWER snapshot as the tail");
+        assert_eq!(decoded.layers[0].state[0], 0x33);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A timeline tombstone landing between plan and execute empties the
+    /// stream's live-tail entry, so the planned relocation is skipped and the
+    /// tombstoned snapshot dies with its segment instead of being appended
+    /// after the tombstone record (which a reload would resurrect as a tail).
+    #[test]
+    fn tombstoned_snapshot_is_not_relocated() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::TombstonePayload;
+
+        let dir = tmp_dir("snap_reloc_tomb");
+        let timeline: u64 = 93;
+        let sid = snapshot_stream_id(timeline);
+
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let loc_a = sp
+            .write_snapshot(sid, &snapshot_payload(timeline, 1, 0x11))
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_a);
+        let loc_b = sp
+            .write_snapshot(sid, &snapshot_payload(timeline, 2, 0x22))
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_b);
+        sp.commit().unwrap();
+        sp.seal_active().unwrap();
+
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("compact planned");
+
+        // RACE: the timeline is tombstoned between plan and execute — the
+        // durable record lands in the active segment, and both the substrate
+        // index and the persistence-side map drop their entries.
+        sp.write_tombstone(timeline, None).unwrap();
+        substrate.apply_tombstone(&TombstonePayload {
+            timeline_id: timeline,
+            turn_index: None,
+            reason: None,
+        });
+        sp.commit().unwrap();
+        let dead_before = sp.accounting.dead_bytes();
+        let offset_before = sp.write_offset();
+
+        let result = sp.execute_maintenance(&plan).unwrap();
+        assert!(
+            result.snapshot_updates.is_empty(),
+            "a tombstoned snapshot produces no update"
+        );
+        assert_eq!(sp.write_offset(), offset_before);
+        assert_eq!(sp.accounting.dead_bytes(), dead_before);
+        result.apply_to_substrate(&mut substrate);
+        sp.finish_maintenance(&plan).unwrap();
+        assert!(!sealed_log(&dir, 1).exists());
+        drop(sp);
+
+        // Reload: the tombstone record survives in the active segment and no
+        // snapshot record outlived seg 1 — nothing resurrects a tail.
+        let mut substrate = Substrate::new();
+        let sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        assert!(
+            substrate.recurrent_snapshot_loc(sid).is_none(),
+            "no tail resurrected after the tombstone"
+        );
+        assert!(sp.snapshot_locs.get(&sid.0).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A chunk payload with a caller-sized `kv_bytes` (constant fill — cheap to
@@ -1007,7 +1423,7 @@ mod tests {
 
         // Phase 1 — plan (snapshot).
         let t = Instant::now();
-        let (chunk_relocs, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (chunk_relocs, _, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
         let plan_el = t.elapsed();
 
         // Reference: the naive per-record read path (`read_chunk` decodes +
@@ -1188,7 +1604,7 @@ mod tests {
             "the stream is an orphan: chunk present, no decl",
         );
         // gather_relocations must NOT relocate the orphan's chunk.
-        let (chunks, _tokens, _singletons) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (chunks, _tokens, _snapshots, _singletons) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
         assert!(
             chunks.is_empty(),
             "orphan chunks must not be relocated (would perpetuate the bloat + churn)",

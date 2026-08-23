@@ -1087,10 +1087,13 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         | GgmlDType::Q8_KS
         | GgmlDType::Q2_0
         | GgmlDType::Q3_0
+        | GgmlDType::Q2_KO
         | GgmlDType::Q4_KO
         | GgmlDType::Q5_KO
         | GgmlDType::Q6_KO
-        | GgmlDType::Q8_KO => {
+        | GgmlDType::Q8_KO
+        | GgmlDType::MXFP4
+        | GgmlDType::MXFP4_KO => {
             panic!("matmul error not defined for this type")
         }
 
@@ -1109,7 +1112,6 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         | GgmlDType::Q0_X
         | GgmlDType::Q0_M2
         | GgmlDType::Q0_M4
-        | GgmlDType::Q0
         | GgmlDType::P2
         | GgmlDType::F8E4M3
         | GgmlDType::F8E5M2

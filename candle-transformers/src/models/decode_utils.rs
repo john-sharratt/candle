@@ -776,6 +776,48 @@ mod cuda_tests {
         Ok(())
     }
 
+    /// FP8 arena at head_dim 256 in the Qwen3.5 attention shape (16 Q / 2 KV,
+    /// hpg 8 → stripe path, 64-dim bands under NP=4). The arena stores
+    /// F8E4M3; finiteness + magnitude bound like the hd64/hd128 fp8 smokes.
+    #[test]
+    fn test_fp8_hd256_paged_decode() -> Result<()> {
+        let _gpu = gpu_guard();
+        let device = Device::new_cuda(0)?;
+        let (n_head, n_kv_head, head_dim) = (16, 2, 256);
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
+        let k_new =
+            Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(DType::BF16)?;
+        let v_new =
+            Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(DType::BF16)?;
+        // History past one chunk so the fp8 arena holds multi-chunk data.
+        let hk = Tensor::randn(0f32, 1f32, (1, n_kv_head, 40, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
+        let hv = Tensor::randn(0f32, 1f32, (1, n_kv_head, 40, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
+
+        let out = run_paged_decode(
+            Some((&hk, &hv)),
+            &k_new,
+            &v_new,
+            &q,
+            n_head,
+            n_kv_head,
+            head_dim,
+            DType::F8E4M3,
+            &make_zero_rope_cs(head_dim, 16, &device)?,
+        )?;
+        assert_eq!(out.dims(), &[1, n_head, head_dim]);
+        let max_abs = out
+            .to_dtype(DType::F32)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_vec0::<f32>()?;
+        assert!(max_abs.is_finite(), "fp8 hd256: not finite: {max_abs}");
+        assert!(max_abs < 100.0, "fp8 hd256: values too large: {max_abs}");
+        Ok(())
+    }
+
     #[test]
     fn test_fp8_hd64_paged_decode() -> Result<()> {
         let _gpu = gpu_guard();
@@ -958,6 +1000,14 @@ mod cuda_tests {
             (8, 8, 256, 10, "MHA hd256 hist=10 (stripe)"),
             (32, 8, 256, 10, "GQA 32/8 hd256 hist=10 (stripe)"),
             (16, 1, 256, 10, "GQA 16/1 hd256 hist=10 (wide)"),
+            // The Qwen3.5/3.8 attention-layer shapes (hybrid stacks: 1-in-4
+            // layers at head_dim 256 over tiny KV-head counts). History
+            // lengths straddle a chunk boundary so multi-chunk slot walks are
+            // exercised, not just the writer chunk.
+            (16, 2, 256, 10, "Qwen3.5 16/2 hd256 hist=10 (stripe)"),
+            (16, 2, 256, 40, "Qwen3.5 16/2 hd256 hist=40 (stripe)"),
+            (24, 4, 256, 10, "Qwen3.8 24/4 hd256 hist=10 (stripe)"),
+            (24, 4, 256, 40, "Qwen3.8 24/4 hd256 hist=40 (stripe)"),
         ] {
             let hk = Tensor::randn(0f32, 1f32, (1, n_kv_head, history_len, head_dim), &device)?
                 .to_dtype(dtype)?;

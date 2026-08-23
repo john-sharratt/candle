@@ -27,12 +27,13 @@ use candle::quantized::cuda::DynamicActs;
 #[cfg(feature = "cuda")]
 use candle::quantized::register_mmap_cuda;
 use candle::{
-    quantized::{gguf_file, GgmlDType, Int8Mode},
+    quantized::{gguf_file, Int8Mode},
     DType, Device, IndexOp, Result, Tensor,
 };
 use candle_nn::{kv_cache::KvCache, Embedding, Module};
 
 use super::quantized_matmul::QMatMul;
+use super::quantized_mlp::QuantizedMlp;
 use crate::models::batched_layer::WaveRef;
 use crate::models::wave_buffers::wave_root;
 use candle::LiveTensor;
@@ -83,125 +84,6 @@ fn qwen_inv_freq(head_dim: usize, rope_theta: f32, rope_scaling_factor: Option<f
 }
 
 #[derive(Debug, Clone)]
-struct Mlp {
-    feed_forward_gate_up: Option<QMatMul>,
-    feed_forward_w1: Option<QMatMul>,
-    feed_forward_w2: QMatMul,
-    feed_forward_w3: Option<QMatMul>,
-}
-
-impl Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
-            let gu = w.forward(xs)?;
-            let (_, _, out_dim) = gu.dims3()?;
-            if out_dim % 2 != 0 {
-                candle::bail!("unexpected fused gate+up output dim {out_dim} (not even)");
-            }
-            let half = out_dim / 2;
-            // Avoid forcing contiguity here: elementwise ops honor storage offsets.
-            let gate = gu.narrow(2, 0, half)?;
-            let up = gu.narrow(2, half, half)?;
-            (gate, up)
-        } else {
-            let w1 = self
-                .feed_forward_w1
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w1".into()))?;
-            let w3 = self
-                .feed_forward_w3
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w3".into()))?;
-            (w1.forward(xs)?, w3.forward(xs)?)
-        };
-        w1.to_dtype_mut(xs.dtype())?;
-        w3.to_dtype_mut(xs.dtype())?;
-        let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
-        let mut out = self.feed_forward_w2.forward_live(&intermediate)?;
-        out.to_dtype_mut(xs.dtype())?;
-        Ok(out)
-    }
-}
-
-impl Mlp {
-    /// B3 consumer: gate/up over a producer-prepared (fused ffn_norm) activation, shared across
-    /// both projections; Qwen2 down-proj closes the block. CUDA only.
-    #[cfg(feature = "cuda")]
-    fn forward_dynamic<'w>(
-        &self,
-        acts: &DynamicActs<'w>,
-        out_dtype: DType,
-    ) -> Result<LiveTensor<'w>> {
-        let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
-            let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
-            // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
-            // gate/up views: `gu` is owned + contiguous here so the cast is allocation-free, whereas
-            // casting the two aliasing narrows separately forces two fallback allocations.
-            gu.to_dtype_mut(out_dtype)?;
-            let last = gu.rank() - 1;
-            let half = gu.dim(last)? / 2;
-            (gu.narrow(last, 0, half)?, gu.narrow(last, half, half)?)
-        } else {
-            let w1 = self
-                .feed_forward_w1
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w1".into()))?;
-            let w3 = self
-                .feed_forward_w3
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w3".into()))?;
-            (
-                w1.forward_dynamic(acts.as_dynamic(), out_dtype)?,
-                w3.forward_dynamic(acts.as_dynamic(), out_dtype)?,
-            )
-        };
-        // Fused path already coerced `gu`; the separate path coerces here (no-op in int8 mode).
-        w1.to_dtype_mut(out_dtype)?;
-        w3.to_dtype_mut(out_dtype)?;
-        let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
-        let mut out = self.feed_forward_w2.forward_live(&intermediate)?;
-        out.to_dtype_mut(out_dtype)?;
-        Ok(out)
-    }
-}
-
-impl Module for Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
-            let gu = w.forward(xs)?;
-            let out_dim = gu.dim(gu.rank() - 1)?;
-            let half = out_dim / 2;
-            // Avoid forcing contiguity here: elementwise ops honor storage offsets.
-            let gate = gu.narrow(2, 0, half)?;
-            let up = gu.narrow(2, half, half)?;
-            (gate, up)
-        } else {
-            let w1 = self
-                .feed_forward_w1
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w1".into()))?;
-            let w3 = self
-                .feed_forward_w3
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w3".into()))?;
-            (w1.forward(xs)?, w3.forward(xs)?)
-        };
-        if w1.dtype() != xs.dtype() {
-            w1 = w1.to_dtype(xs.dtype())?;
-        }
-        if w3.dtype() != xs.dtype() {
-            w3 = w3.to_dtype(xs.dtype())?;
-        }
-        let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
-        let mut out = self.feed_forward_w2.forward_live(&intermediate)?;
-        if out.dtype() != xs.dtype() {
-            out = out.to_dtype(xs.dtype())?;
-        }
-        Ok(out)
-    }
-}
-
-#[derive(Debug, Clone)]
 struct BiasTensors {
     f32: Tensor,
     f16: Option<Tensor>,
@@ -243,7 +125,7 @@ pub struct LayerWeights {
     attention_bv: BiasTensors,
     attention_wo: QMatMul,
     attention_norm: RmsNorm,
-    mlp: Mlp,
+    mlp: QuantizedMlp,
     ffn_norm: RmsNorm,
     n_head: usize,
     n_kv_head: usize,
@@ -499,7 +381,12 @@ impl BatchedAttentionLayer for LayerWeights {
         let q = q.broadcast_add(self.attention_bq.get_for_dtype(act_dtype))?;
         let k = k.broadcast_add(self.attention_bk.get_for_dtype(act_dtype))?;
         let v = v.broadcast_add(self.attention_bv.get_for_dtype(act_dtype))?;
-        Ok(QkvProjection { q, k, v })
+        Ok(QkvProjection {
+            q,
+            k,
+            v,
+            gate: None,
+        })
     }
 }
 
@@ -540,10 +427,16 @@ impl BatchedModelCore for ModelWeights {
     /// a copy of the config means the transient plan cannot drift from the
     /// shapes the kernels actually see.
     fn wave_shapes(&self) -> WaveShapes {
-        let dims = self.layers[0].mlp.feed_forward_w2.weight_dims();
+        // Panics on a non-2-D `ffn_down`: a zeroed shape would silently
+        // mis-size the transient plan, which is worse than failing where the
+        // weight is wrong.
+        let (hidden, intermediate) = self.layers[0]
+            .mlp
+            .hidden_and_intermediate()
+            .expect("ffn_down has a 2-D shape");
         WaveShapes {
-            hidden: dims[0],
-            intermediate: dims[1],
+            hidden,
+            intermediate,
             experts_per_tok: 1,
             n_experts: 1,
         }
@@ -791,59 +684,12 @@ impl ModelWeights {
 
             let attention_wo = load_tensor(&format!("{prefix}.attn_output.weight"))?;
 
-            let mlp = {
-                let feed_forward_w2 = load_tensor(&format!("{prefix}.ffn_down.weight"))?;
-                let feed_forward_w1 = load_tensor(&format!("{prefix}.ffn_gate.weight"))?;
-                let feed_forward_w3 = load_tensor(&format!("{prefix}.ffn_up.weight"))?;
-
-                let try_fuse = device.is_cuda()
-                    && feed_forward_w1.dtype() == feed_forward_w3.dtype()
-                    && !matches!(
-                        feed_forward_w1.dtype(),
-                        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                    );
-
-                let (feed_forward_gate_up, feed_forward_w1, feed_forward_w3) = if try_fuse {
-                    #[cfg(feature = "cuda")]
-                    {
-                        let (gate_n, gate_k) = feed_forward_w1.shape().dims2()?;
-                        let (up_n, up_k) = feed_forward_w3.shape().dims2()?;
-                        if gate_n != up_n || gate_k != up_k {
-                            (
-                                None,
-                                Some(QMatMul::from_qtensor_with_mode(feed_forward_w1, int8mode)?),
-                                Some(QMatMul::from_qtensor_with_mode(feed_forward_w3, int8mode)?),
-                            )
-                        } else {
-                            let fused = candle::quantized::QTensor::concat_rows_cuda(&[
-                                &feed_forward_w1,
-                                &feed_forward_w3,
-                            ])?;
-                            (
-                                Some(QMatMul::from_qtensor_with_mode(fused, int8mode)?),
-                                None,
-                                None,
-                            )
-                        }
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        candle::bail!("fused gate+up requires the cuda feature");
-                    }
-                } else {
-                    (
-                        None,
-                        Some(QMatMul::from_qtensor_with_mode(feed_forward_w1, int8mode)?),
-                        Some(QMatMul::from_qtensor_with_mode(feed_forward_w3, int8mode)?),
-                    )
-                };
-                Mlp {
-                    feed_forward_gate_up,
-                    feed_forward_w1,
-                    feed_forward_w2: QMatMul::from_qtensor_with_mode(feed_forward_w2, int8mode)?,
-                    feed_forward_w3,
-                }
-            };
+            let mlp = QuantizedMlp::from_weights(
+                load_tensor(&format!("{prefix}.ffn_gate.weight"))?,
+                load_tensor(&format!("{prefix}.ffn_up.weight"))?,
+                load_tensor(&format!("{prefix}.ffn_down.weight"))?,
+                int8mode,
+            )?;
 
             let attention_norm = load_tensor(&format!("{prefix}.attn_norm.weight"))?;
             let ffn_norm = load_tensor(&format!("{prefix}.ffn_norm.weight"))?;
@@ -981,58 +827,12 @@ impl ModelWeights {
             let attention_wo =
                 ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
 
-            let mlp = {
-                let feed_forward_w2 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
-                let feed_forward_w1 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
-                let feed_forward_w3 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
-
-                let try_fuse = device.is_cuda()
-                    && feed_forward_w1.dtype() == feed_forward_w3.dtype()
-                    && !matches!(
-                        feed_forward_w1.dtype(),
-                        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                    );
-
-                let (feed_forward_gate_up, feed_forward_w1, feed_forward_w3) = if try_fuse {
-                    #[cfg(feature = "cuda")]
-                    {
-                        let (gate_n, gate_k) = feed_forward_w1.shape().dims2()?;
-                        let (up_n, up_k) = feed_forward_w3.shape().dims2()?;
-                        if gate_n != up_n || gate_k != up_k {
-                            (
-                                None,
-                                Some(QMatMul::from_qtensor(feed_forward_w1)?),
-                                Some(QMatMul::from_qtensor(feed_forward_w3)?),
-                            )
-                        } else {
-                            let fused = candle::quantized::QTensor::concat_rows_cuda(&[
-                                &feed_forward_w1,
-                                &feed_forward_w3,
-                            ])?;
-                            (Some(QMatMul::from_qtensor(fused)?), None, None)
-                        }
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        candle::bail!("fused gate+up requires the cuda feature");
-                    }
-                } else {
-                    (
-                        None,
-                        Some(QMatMul::from_qtensor(feed_forward_w1)?),
-                        Some(QMatMul::from_qtensor(feed_forward_w3)?),
-                    )
-                };
-                Mlp {
-                    feed_forward_gate_up,
-                    feed_forward_w1,
-                    feed_forward_w2: QMatMul::from_qtensor(feed_forward_w2)?,
-                    feed_forward_w3,
-                }
-            };
+            let mlp = QuantizedMlp::from_weights(
+                ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?,
+                ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?,
+                ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?,
+                Int8Mode::Off,
+            )?;
 
             let attention_norm =
                 ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;

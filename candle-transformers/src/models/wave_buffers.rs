@@ -33,14 +33,25 @@
 //! # Scope
 //!
 //! *Our* kernels take preallocated leased buffers, because each has an
-//! allocation site to redirect. Interior op outputs — the temporaries candle's
-//! own ops allocate, including the inter-layer hidden state, which is only ever
-//! the result of a residual add — have no such site and stay on the pool
-//! remnant. Redirecting those would need an allocator scope that captures
-//! `device.alloc` for the extent of a wave, so that every interior output lands
-//! in the wave plan with no call-site changes. No such scope exists: the
-//! remnant is bounded by `scratch_margin` and sits outside the reservation,
-//! where it costs address space rather than KV capacity.
+//! allocation site to redirect. **Interior op outputs — the temporaries candle's
+//! own ops allocate — land here too**, but by a different route: they inherit
+//! their arena from their operand
+//! (`candle::cuda_backend::wave_provenance`), so a chain of forty ops needs no
+//! call-site changes at all. What it needs is a *seed*, because the head of a
+//! chain reads the residual stream, which crosses layers and lives on the pool
+//! with no arena to inherit. [`wave_root`] is that seed, and the norm at the top
+//! of each layer half is where it is applied.
+//!
+//! Two consequences worth stating, both learned by measuring rather than
+//! reading. A chain is only on the span from its seed **down to the first op
+//! that does not inherit** — one non-inheriting allocation site silently drops
+//! everything downstream of it back onto the pool. And a phase whose generation
+//! opens but whose chain was never seeded reports a peak of zero while running
+//! entirely off the pool, which is indistinguishable from a phase that did
+//! nothing; the `wave arenas:` line in the gate is what tells the two apart.
+//!
+//! The inter-layer hidden state is the deliberate exception: it is the result of
+//! a residual add and outlives every layer generation, so it stays owned.
 //!
 //! The MoE combine target is here too, via [`wave_zeros`]. It is *returned*
 //! from the expert forward, so nothing inside the MoE code bounds it — the

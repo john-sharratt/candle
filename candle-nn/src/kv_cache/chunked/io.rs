@@ -86,6 +86,125 @@ fn write_band_chunk(
 }
 
 impl ChunkedKvBacking {
+    /// A single strided migration plan covering a whole `write_contiguous_float`,
+    /// or `None` when some band needs more than a copy.
+    ///
+    /// The destination of band `(blk, h, p)` is a contiguous run inside that
+    /// band's arena slot; the source is that band's columns of `k`/`v`, which
+    /// are `head_dim / n_palette` contiguous elements per token, `head_dim`
+    /// apart. One strided record each, so a layer's write is one launch instead
+    /// of a walk over block × head × band.
+    ///
+    /// Refuses — returning `None` for the caller's walk to handle — when a band
+    /// is quantized (`quantize_into_slot` computes scales; it is not a copy),
+    /// when a band's storage dtype differs from the source (the walk casts per
+    /// band), or when an arena is not on the GPU. Those are the cases the plan
+    /// cannot express, and getting them wrong would write plausible bytes.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_plan_batched_write(
+        &self,
+        state: &super::types::BlockTableState,
+        arena_state: &mut super::arena::ArenaStorageState,
+        batch_idx: usize,
+        offset: usize,
+        len: usize,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
+        single_latent: bool,
+    ) -> Result<Option<super::migrate::MigrationPlan>> {
+        use candle::backend::BackendStorage;
+
+        let dtype = k.dtype();
+        if v.dtype() != dtype || !k.is_contiguous() || !v.is_contiguous() {
+            return Ok(None);
+        }
+        let elem = dtype.size_in_bytes();
+        let head_dim = self.inner.head_dim;
+        let np = self.inner.n_palette();
+        let sub = (head_dim / np).max(1);
+        if sub * np != head_dim {
+            return Ok(None);
+        }
+
+        // Base addresses of the source tensors. `[1, n_kv_head, len, head_dim]`
+        // contiguous, so token `t` of head `h` starts at `(h·len + t)·head_dim`.
+        // Element-type-agnostic: `CudaStorageSlice::device_ptr` hands back the
+        // first element's address for any dtype, and the layout's element
+        // offset scales by the dtype width — so every float dtype the arena
+        // legitimately stores takes this fast path instead of a hand-rolled
+        // per-dtype match silently dropping back to the per-band walk.
+        let base_ptr = |t: &candle::LiveTensor<'_>| -> Option<i64> {
+            let (storage, layout) = t.storage_and_layout();
+            let cuda = match &*storage {
+                candle::Storage::Cuda(c) => c,
+                _ => return None,
+            };
+            let stream = cuda.device().cuda_stream();
+            let base = cuda.slice.device_ptr(&stream);
+            Some(base as i64 + (layout.start_offset() * elem) as i64)
+        };
+        let (Some(k_base), Some(v_base)) = (base_ptr(k), base_ptr(v)) else {
+            return Ok(None);
+        };
+
+        let mut plan = super::migrate::MigrationPlan::new();
+        let row_bytes = (sub * elem) as i64;
+        let src_stride = (head_dim * elem) as i64;
+        let dst_stride = row_bytes;
+
+        let mut remaining = len;
+        let mut pos = offset;
+        while remaining > 0 {
+            let blk = pos / CHUNK_SIZE;
+            let in_blk = pos % CHUNK_SIZE;
+            let seg = cmp::min(CHUNK_SIZE - in_blk, remaining);
+            let src_pos = pos - offset;
+
+            let Some(cw) = state.sequences[batch_idx]
+                .as_ref()
+                .and_then(|s| s.chunk_at(blk))
+            else {
+                return Ok(None);
+            };
+            let arenas = arena_state.arenas_mut();
+
+            // Bands arrive in `(head, palette, k|v)` order — the same
+            // `(h·np + p)·2 + which` flattening the walk uses — so the index
+            // decomposes back to `(h, p, which)` with no per-block collection.
+            for (i, (gid, tag)) in cw.bands().enumerate() {
+                let which = i & 1;
+                let hp = i >> 1;
+                let (h, p) = (hp / np, hp % np);
+                if which == 1 && single_latent {
+                    // K≡V: the V bands are never stored.
+                    continue;
+                }
+                let base_addr = if which == 0 { k_base } else { v_base };
+                // Only a plain float band of the source's own dtype is a
+                // copy; anything else the walk must handle.
+                match tag.to_kv_format() {
+                    Some(KvFormat::Float(dt)) if dt == dtype => {}
+                    _ => return Ok(None),
+                }
+                let Some(arena) = arenas.get(&gid.arena_idx()) else {
+                    return Ok(None);
+                };
+                let Some(slot) = arena.slot_ptr(gid.chunk_idx()) else {
+                    return Ok(None);
+                };
+                let dst = slot as i64 + (in_blk * sub * elem) as i64;
+                let src =
+                    base_addr + (((h * len + src_pos) * head_dim + p * sub) * elem) as i64;
+                plan.push_strided(src, dst, row_bytes, seg as i64, src_stride, dst_stride);
+            }
+
+            pos += seg;
+            remaining -= seg;
+        }
+        Ok(Some(plan))
+    }
+
     /// Read K/V data from the backing, dequantizing if necessary.
     ///
     /// Returns float tensors of shape (1, n_kv_head, len, head_dim).
@@ -373,6 +492,36 @@ impl ChunkedKvBacking {
 
             // Only sync block table to GPU if COW actually occurred
             if cow_occurred {}
+
+            // **One launch for the whole write, when the bands allow it.**
+            //
+            // The loop below walks 32-token block × KV head × palette band, and
+            // each step is a `narrow` + `contiguous` + a slot write: about 2,700
+            // tiny GPU ops for a 649-token prefill on the 9B, which measured as
+            // the single largest span in that prefill — more than the attention
+            // it feeds, and flat in token count, i.e. launch-bound. The paged
+            // prefill *kernel* never pays it because it scatters K/V itself;
+            // only the float fallback writes from Rust.
+            //
+            // Every one of those copies is the same shape — `head_dim/N_PALETTE`
+            // contiguous elements per token, `head_dim` apart at the source and
+            // packed at the destination — so the whole write is one strided
+            // migration plan. `try_plan_batched_write` returns `None` when a
+            // band needs real work rather than a copy (a quantized tag, a
+            // per-band dtype cast, a CPU arena), and then the walk below runs.
+            #[cfg(feature = "cuda")]
+            if let Some(plan) = self.try_plan_batched_write(
+                &state,
+                arena_state,
+                batch_idx,
+                offset,
+                len,
+                &k,
+                &v,
+                single_latent,
+            )? {
+                return super::migrate::kv_migrate_on(&self.inner.device, &plan, None);
+            }
 
             // Now write the data (still holding locks)
             let mut remaining = len;

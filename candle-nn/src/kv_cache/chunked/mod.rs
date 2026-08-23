@@ -76,9 +76,11 @@ pub use compress::{
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
 pub use compression_policy::{
-    production_adaptive_candidates, CompressionPolicy, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
-    PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
-    PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
+    production_adaptive_candidates, CompressionPolicy, KvErrorThresholdFactors, LLAMA2_KV_FACTOR,
+    LLAMA3_KV_FACTOR, LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS,
+    PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER, PRODUCTION_V_QREL_HIGH_THRESHOLDS,
+    PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN35_0_8B_KV_FACTORS, QWEN35_9B_KV_FACTORS,
+    QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS,
 };
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};

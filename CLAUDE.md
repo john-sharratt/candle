@@ -57,10 +57,24 @@ Qwen3 thresholds are model-specific and must be re-derived for each variant. Whe
 
 ## Hardware
 
-**Current dev machine** — RTX PRO 5000 Blackwell 72 GB (sm_120).
-- Reference benchmarks (measured on the previous RTX 4090 Mobile 16 GB): 509 t/s single-session, 2,446 t/s aggregate (64 sessions), Qwen3-30B-A3B.
+**Two dev machines, swapped between.** The framework must work on both, and
+neither is "the" target — check what you are actually on (`nvidia-smi`)
+rather than assuming, because sizing decisions differ between them:
 
-**Ordered production workstation** (~mid-2026):
+- **RTX 4090 Mobile 16 GB** (sm_89), 32 GB host RAM.
+- **RTX PRO 5000 Blackwell 72 GB** (sm_120).
+
+Reference benchmarks (measured on the 4090 Mobile 16 GB): 509 t/s
+single-session, 2,446 t/s aggregate (64 sessions), Qwen3-30B-A3B.
+
+**Model size is not bounded by VRAM.** The three-tier expert cache streams
+VRAM → pinned RAM → mmap, so a MoE model's resident footprint is its dense
+weights plus whatever expert working set fits — which is why a 30B-A3B runs
+on the 16 GB card. A bigger card buys speed, not feasibility. Never conclude
+a model "cannot run here" from parameter count alone.
+
+**Ordered production workstation** (~mid-2026) — a third target, not a
+prerequisite for any phase:
 - 2× RTX 5090 32 GB GDDR7 (Blackwell, water-cooled)
 - AMD Threadripper 7970X 32C/64T (AVX-512 for provenance scan)
 - 512 GB DDR5-5200 ECC (warm tier KV cache)

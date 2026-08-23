@@ -27,6 +27,7 @@ use super::expert_lre::{
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
+use super::quantized_mlp::QuantizedMlp;
 use super::rope_tables::CisPrecomputations;
 use crate::models::batched_layer::WaveRef;
 use crate::models::routing_capture;
@@ -42,7 +43,7 @@ use candle::quantized::cuda::{
 };
 #[cfg(feature = "cuda")]
 use candle::quantized::get_vram_info;
-use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
+use candle::quantized::{gguf_file, Int8Mode, QTensor};
 use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -52,7 +53,7 @@ use candle_nn::kv_cache::WeightZone;
 use candle_nn::kv_cache::{
     initial_weight_bytes, set_weight_floor, span_end, weight_capacity_bytes,
 };
-use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
+use candle_nn::{kv_cache::KvCache, Embedding, Module};
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::sync::OnceLock;
@@ -206,58 +207,23 @@ impl AttentionWeights {
 }
 
 // ============================================================================
-// MLP Weights (dense layers, copied from quantized_qwen3)
-// ============================================================================
-
-#[derive(Debug, Clone)]
-struct MlpWeights {
-    gate_up_proj: Option<QMatMul>,
-    gate_proj: Option<QMatMul>,
-    up_proj: Option<QMatMul>,
-    down_proj: QMatMul,
-    act_fn: Activation,
-    span: tracing::Span,
-}
-
-impl MlpWeights {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let (gate, up) = if let Some(w) = &self.gate_up_proj {
-            let gu = w.forward(x)?;
-            let (_, _, out_dim) = gu.dims3()?;
-            if out_dim % 2 != 0 {
-                candle::bail!("unexpected fused gate+up output dim {out_dim} (not even)");
-            }
-            let half = out_dim / 2;
-            let gate = gu.narrow(2, 0, half)?;
-            let up = gu.narrow(2, half, half)?;
-            (gate, up)
-        } else {
-            let gate_proj = self
-                .gate_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing gate_proj".into()))?;
-            let up_proj = self
-                .up_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing up_proj".into()))?;
-            (gate_proj.forward(x)?, up_proj.forward(x)?)
-        };
-        let gated = (&gate.apply(&self.act_fn)? * &up)?;
-        self.down_proj.forward(&gated)
-    }
-}
-
-// ============================================================================
 // Sparse MoE Block
 // ============================================================================
 
-struct SparseMoeBlock {
-    gate: QMatMul,
-    cache: Arc<ExpertCache>,
-    moe_layer_idx: usize,
-    num_experts_per_tok: usize,
-    norm_topk_prob: bool,
+/// The routed half of a sparse MoE layer: router → top-k → expert cache.
+///
+/// `pub(crate)` because Qwen3.5 routes over the same machinery — same
+/// `ExpertCache`, same GPU-native/host dispatch fork, same 256-expert
+/// bucketize — and differs only by adding an always-active shared expert
+/// alongside it (`qwen35::quantized_moe`). Exposing the existing block is
+/// deliberately all that is done for that: no fields move, no trait is
+/// reshaped, and this model is otherwise untouched.
+pub(crate) struct SparseMoeBlock {
+    pub(crate) gate: QMatMul,
+    pub(crate) cache: Arc<ExpertCache>,
+    pub(crate) moe_layer_idx: usize,
+    pub(crate) num_experts_per_tok: usize,
+    pub(crate) norm_topk_prob: bool,
 }
 
 impl SparseMoeBlock {
@@ -265,7 +231,7 @@ impl SparseMoeBlock {
     /// Float for Off). The router consumes it via `forward_dynamic`; the experts byte-gather the
     /// q8a128 directly (no gather-then-quantize). CUDA only.
     #[cfg(feature = "cuda")]
-    fn forward_dynamic<'w>(
+    pub(crate) fn forward_dynamic<'w>(
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
@@ -803,7 +769,7 @@ impl SparseMoeBlock {
 // ============================================================================
 
 enum FeedForward {
-    Mlp(MlpWeights),
+    Mlp(QuantizedMlp),
     MoE(SparseMoeBlock),
 }
 
@@ -820,7 +786,7 @@ enum FeedForward {
 /// Only the expert half is deferred. The router gate is a dense tensor and is
 /// loaded in the loop with the rest of them.
 enum PendingFfn {
-    Mlp(MlpWeights),
+    Mlp(QuantizedMlp),
     MoE { gate: QMatMul, moe_layer_idx: usize },
 }
 
@@ -959,7 +925,12 @@ impl BatchedAttentionLayer for LayerWeights {
             .transpose(1, 2)?
             .reshape((b_sz, seq_len, n_kv_head * head_dim))?;
 
-        Ok(QkvProjection { q, k, v })
+        Ok(QkvProjection {
+            q,
+            k,
+            v,
+            gate: None,
+        })
     }
 
     /// B3: ln2 as a producer epilogue. Only the MoE path emits q8a128 (its router + expert gather
@@ -978,7 +949,8 @@ impl BatchedAttentionLayer for LayerWeights {
     }
 
     /// B3 consumer: the MoE/MLP over the producer-fused ln2 activation. MoE routes the q8a128 (or
-    /// Float) through `forward_dynamic`; a dense MLP runs the FP path (with the stability cast).
+    /// Float) through `forward_dynamic`; a dense MLP runs [`QuantizedMlp::forward_dynamic`], which
+    /// runs silu/mul/down in `mlp_dtype` (the F16-overflow stability cast).
     #[cfg(feature = "cuda")]
     fn ffn_forward<'w>(
         &self,
@@ -995,12 +967,7 @@ impl BatchedAttentionLayer for LayerWeights {
                 };
                 m.forward_dynamic(acts, mlp_dtype, wave)
             }
-            FeedForward::Mlp(m) => match acts {
-                DynamicActs::Float(t) => m.forward(&t.to_owned_tensor()?.to_dtype(mlp_dtype)?),
-                DynamicActs::Int8(_) => candle::bail!(
-                    "dense MLP: int8 activation unsupported (ffn_norm emits Float for Mlp)"
-                ),
-            },
+            FeedForward::Mlp(m) => m.forward_dynamic(&acts, mlp_dtype),
         }
     }
 }
@@ -1329,12 +1296,16 @@ fn warm_mmap(mmap: &memmap2::Mmap) {
 /// goes.
 #[derive(Debug, Clone, Default)]
 pub struct GgufLoadOptions {
-    /// The numeric mode for dense projections *and* MoE experts. [`Int8Mode::Off`]
-    /// is the FP16 reference; an int8 mode repacks every dense weight (attention
-    /// q/k/v/o, MoE router gate, dense-MLP gate/up/down, lm_head) to its KO twin
-    /// so forward runs the q8a128 int8 tensor-core matmul, and stages each
-    /// expert's gate/up/down as their KO twins so the grouped expert matmul runs
-    /// int8 too.
+    /// The numeric mode for dense projections *and* MoE experts. An int8 mode
+    /// repacks every dense weight (attention q/k/v/o, MoE router gate,
+    /// dense-MLP gate/up/down, lm_head) to its KO twin so forward runs the
+    /// q8a128 int8 tensor-core matmul, and stages each expert's gate/up/down
+    /// as their KO twins so the grouped expert matmul runs int8 too.
+    ///
+    /// [`Int8Mode::Off`] is the FP16 reference for the *dense* projections
+    /// only: the FP GEMX expert kernel no longer exists, so a routed (MoE)
+    /// model refuses `Off` at expert-cache construction — MoE checkpoints
+    /// require Precision or Performance.
     ///
     /// `None` picks it from the device and the checkpoint's size.
     pub int8mode: Option<Int8Mode>,
@@ -1515,42 +1486,12 @@ impl ModelWeights {
                     norm_topk_prob,
                 })
             } else {
-                let gate_w = gg.tensor(&format!("{prefix}.ffn_gate.weight"))?;
-                let up_w = gg.tensor(&format!("{prefix}.ffn_up.weight"))?;
-                let down_proj = gg.qmatmul(&format!("{prefix}.ffn_down.weight"))?;
-
-                let try_fuse = device.is_cuda()
-                    && gate_w.dtype() == up_w.dtype()
-                    && !matches!(
-                        gate_w.dtype(),
-                        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                    );
-
-                let (gate_up_proj, gate_proj, up_proj) = if try_fuse {
-                    #[cfg(feature = "cuda")]
-                    {
-                        let fused = QTensor::concat_rows_cuda(&[&gate_w, &up_w])?;
-                        (Some(QMatMul::from_qtensor(fused)?), None, None)
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        candle::bail!("fused gate+up requires the cuda feature");
-                    }
-                } else {
-                    (
-                        None,
-                        Some(QMatMul::from_weights(gate_w.into())?),
-                        Some(QMatMul::from_weights(up_w.into())?),
-                    )
-                };
-                FeedForward::Mlp(MlpWeights {
-                    gate_up_proj,
-                    gate_proj,
-                    up_proj,
-                    down_proj,
-                    act_fn: Activation::Silu,
-                    span: tracing::span!(tracing::Level::TRACE, "mlp"),
-                })
+                FeedForward::Mlp(QuantizedMlp::from_weights(
+                    gg.tensor(&format!("{prefix}.ffn_gate.weight"))?,
+                    gg.tensor(&format!("{prefix}.ffn_up.weight"))?,
+                    gg.tensor(&format!("{prefix}.ffn_down.weight"))?,
+                    Int8Mode::Off,
+                )?)
             };
 
             layers.push(LayerWeights {
@@ -2109,49 +2050,12 @@ impl ModelWeights {
                 }
             } else {
                 // Dense MLP
-                let gate_w = load_tensor(&format!("{prefix}.ffn_gate.weight"))?;
-                let up_w = load_tensor(&format!("{prefix}.ffn_up.weight"))?;
-                let down_proj = QMatMul::from_weights_with_mode(
-                    load_tensor(&format!("{prefix}.ffn_down.weight"))?.into(),
+                PendingFfn::Mlp(QuantizedMlp::from_weights(
+                    load_tensor(&format!("{prefix}.ffn_gate.weight"))?,
+                    load_tensor(&format!("{prefix}.ffn_up.weight"))?,
+                    load_tensor(&format!("{prefix}.ffn_down.weight"))?,
                     int8mode,
-                )?;
-
-                let try_fuse = device.is_cuda()
-                    && gate_w.dtype() == up_w.dtype()
-                    && !matches!(
-                        gate_w.dtype(),
-                        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                    );
-
-                let (gate_up_proj, gate_proj, up_proj) = if try_fuse {
-                    #[cfg(feature = "cuda")]
-                    {
-                        let fused = QTensor::concat_rows_cuda(&[&gate_w, &up_w])?;
-                        (
-                            Some(QMatMul::from_qtensor_with_mode(fused, int8mode)?),
-                            None,
-                            None,
-                        )
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        candle::bail!("fused gate+up requires the cuda feature");
-                    }
-                } else {
-                    (
-                        None,
-                        Some(QMatMul::from_weights_with_mode(gate_w.into(), int8mode)?),
-                        Some(QMatMul::from_weights_with_mode(up_w.into(), int8mode)?),
-                    )
-                };
-                PendingFfn::Mlp(MlpWeights {
-                    gate_up_proj,
-                    gate_proj,
-                    up_proj,
-                    down_proj,
-                    act_fn: Activation::Silu,
-                    span: tracing::span!(tracing::Level::TRACE, "mlp"),
-                })
+                )?)
             };
 
             pending.push(PendingLayer {

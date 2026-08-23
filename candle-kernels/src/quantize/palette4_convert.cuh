@@ -140,12 +140,11 @@
 #include "../convert/convert_all.cuh"
 
 // Chunk = 32 tokens per quantization block (shared with Rust CHUNK_SIZE).
-// Head dim = 128.  Num palettes = 4.  Dims per palette = 32.
+// Num palettes = 4 always; the head dim is a template parameter (128 or 256),
+// so dims-per-palette is HD/4 — 32 at 128, 64 at 256. At 256 one palette
+// spans TWO warps: palette identity is `d / PAL_DIM`, never the warp id.
 #define P4C_CHUNK_SIZE 32
-#define P4C_HEAD_DIM   128
 #define P4C_NUM_PAL    4
-#define P4C_PAL_DIM    32
-#define P4C_KVHEAD_SIZE (kv_head_byte_size<P4C_HEAD_DIM>())
 
 // =============================================================================
 // FORMAT CLAMP
@@ -200,10 +199,12 @@ __device__ __forceinline__ int pal_map_get(const uint8_t* pal_map, int g) {
 }
 
 // Return the global head dimension that is the n-th member of palette p.
-// Used during xlat construction: for dst palette p, lane n → its global dim.
-__device__ __forceinline__ int find_nth_dim_in_pal(const uint8_t* pal_map, int p, int n) {
+// Used during xlat construction: for dst palette p, slot n → its global dim.
+__device__ __forceinline__ int find_nth_dim_in_pal(
+    const uint8_t* pal_map, int p, int n, int head_dim
+) {
     int count = 0;
-    for (int g = 0; g < P4C_HEAD_DIM; g++) {
+    for (int g = 0; g < head_dim; g++) {
         if (pal_map_get(pal_map, g) == p) {
             if (count == n) return g;
             count++;
@@ -395,18 +396,30 @@ __device__ __noinline__ void p4c_encode_quant_block(
 //   warp-cooperative encode calls, the chunk's quant arena is fully written.
 //   DMA overlap is preserved: encode reads r_buf throughout, never smem.
 
-template <bool IS_K>
-// __launch_bounds__(128, 8): target 8 blocks/SM.
-//   smem ceiling: floor(102400 / 8960) = 11 blocks/SM — not the binding limit.
-//   register budget: 65536 / (128 * 8) = 64 regs/thread.
-//   Achieved: REG=64, STACK=128 B (verified with cuobjdump).
-__global__ void __launch_bounds__(128, 8)
+// Blocks/SM target keeping the register budget at 64 regs/thread:
+// 65536 / (HD * blocks) = 64  →  8 blocks at HD 128, 4 at HD 256.
+__host__ __device__ constexpr int p4c_min_blocks(int hd) { return 1024 / hd; }
+
+template <int HD, bool IS_K>
+// __launch_bounds__(HD, p4c_min_blocks(HD)): 1024 resident threads/SM either
+// way, 64 regs/thread. smem is not the binding limit at either width
+// (~9 KB at 128, ~17.5 KB at 256 under the ~100 KB carveout).
+//   Achieved at 128: REG=64, STACK=128 B (verified with cuobjdump).
+__global__ void __launch_bounds__(HD, p4c_min_blocks(HD))
 palette4_convert_kernel(
     const uint8_t* __restrict__ heads_base,
     int32_t num_heads,
     int32_t num_kv_heads,
     int32_t num_chunks
 ) {
+    // Dims per palette: 32 at HD 128 (palette == warp, the historical shape),
+    // 64 at HD 256 (palette == two warps). PAL_DIM % 32 == 0 always, so a
+    // warp never straddles a palette boundary — which is what keeps the
+    // warp-cooperative encode below palette-pure.
+    constexpr int PAL_DIM = HD / P4C_NUM_PAL;
+    static_assert(PAL_DIM % 32 == 0, "a warp must not straddle palettes");
+    static_assert(3 * PAL_DIM + (PAL_DIM - 1) <= 255,
+                  "smem_xlat packs (palette, rank) into one byte");
     // -------------------------------------------------------------------------
     // SHARED MEMORY
     //
@@ -432,9 +445,9 @@ palette4_convert_kernel(
     //  smem_meta: cold per-palette metadata, written once in prologue and
     //    reloaded at use sites so it never needs a long-lived register.
     // -------------------------------------------------------------------------
-    __shared__ __half smem_f16_buf[P4C_CHUNK_SIZE][P4C_HEAD_DIM]; // 8192 B
-    __shared__ uint8_t smem_xlat[P4C_HEAD_DIM];                   //  128 B
-    __shared__ float smem_qscratch[P4C_NUM_PAL][32];              //  512 B
+    __shared__ __half smem_f16_buf[P4C_CHUNK_SIZE][HD];   // 8 KB @128, 16 KB @256
+    __shared__ uint8_t smem_xlat[HD];
+    __shared__ float smem_qscratch[HD / 32][32];          // one row per WARP
     __shared__ struct {
         int      src_fmt  [P4C_NUM_PAL];   //  16 B  — source arena format id
         uint64_t src_arena[P4C_NUM_PAL];   //  32 B  — source arena base pointer
@@ -444,10 +457,16 @@ palette4_convert_kernel(
         float    dst_outer[P4C_NUM_PAL];   //  16 B  — destination outer (head) scale
     } smem_meta;                            // 128 B
 
-    // Thread identity.  These three are the only identities used in the hot path.
-    const int d       = threadIdx.x;         // global thread index, 0..127
-    const int warp_id = d >> 5;              // palette index, 0..3
-    const int lane    = d & 31;              // dimension within palette, 0..31
+    // Thread identity. `pal` (not the warp id) indexes every per-palette
+    // structure; `pld` is the dim within the palette; `lane` keeps its two
+    // warp-local roles (token row in the float loads, shuffle lane in the
+    // quant encode). At HD 128 pal == warp and pld == lane — the historical
+    // identities — so the 128 instantiation is bit-identical to the old kernel.
+    const int d       = threadIdx.x;         // global thread index, 0..HD-1
+    const int warp_id = d >> 5;              // warp, 0..HD/32-1
+    const int lane    = d & 31;              // lane within the warp
+    const int pal     = d / PAL_DIM;         // palette index, 0..3
+    const int pld     = d % PAL_DIM;         // dimension within palette
 
     // =========================================================================
     // PROLOGUE — populate smem_meta and build smem_xlat.
@@ -466,15 +485,16 @@ palette4_convert_kernel(
         // (num_kv_heads is the number of distinct K/V heads, which may be
         // smaller than num_heads due to GQA).
         const int job = layer_idx * num_kv_heads + head_idx;
-        const uint8_t* src_head = heads_base + (size_t)job * P4C_KVHEAD_SIZE;
-        const uint8_t* dst_head = heads_base + (size_t)(num_heads + job) * P4C_KVHEAD_SIZE;
+        constexpr size_t KVHEAD_SIZE = kv_head_byte_size<HD>();
+        const uint8_t* src_head = heads_base + (size_t)job * KVHEAD_SIZE;
+        const uint8_t* dst_head = heads_base + (size_t)(num_heads + job) * KVHEAD_SIZE;
 
         const uint8_t* src_pal_map = IS_K
-            ? kvhead_k_pal_map<P4C_HEAD_DIM>(src_head)
-            : kvhead_v_pal_map<P4C_HEAD_DIM>(src_head);
+            ? kvhead_k_pal_map<HD>(src_head)
+            : kvhead_v_pal_map<HD>(src_head);
         const uint8_t* dst_pal_map = IS_K
-            ? kvhead_k_pal_map<P4C_HEAD_DIM>(dst_head)
-            : kvhead_v_pal_map<P4C_HEAD_DIM>(dst_head);
+            ? kvhead_k_pal_map<HD>(dst_head)
+            : kvhead_v_pal_map<HD>(dst_head);
 
         // Threads 0-3 each populate one palette's metadata row in smem_meta.
         // The remaining 124 threads idle here; the write cost is negligible
@@ -482,39 +502,39 @@ palette4_convert_kernel(
         if (d < P4C_NUM_PAL) {
             const int p = d;
             if constexpr (IS_K) {
-                smem_meta.src_fmt  [p] = kvhead_k_fmt  <P4C_HEAD_DIM>(src_head, p);
-                smem_meta.dst_fmt  [p] = kvhead_k_fmt  <P4C_HEAD_DIM>(dst_head, p);
-                smem_meta.src_arena[p] = kvhead_k_ptr  <P4C_HEAD_DIM>(src_head, p);
-                smem_meta.dst_arena[p] = kvhead_k_ptr  <P4C_HEAD_DIM>(dst_head, p);
-                smem_meta.src_outer[p] = kvhead_k_scale<P4C_HEAD_DIM>(src_head, p);
-                smem_meta.dst_outer[p] = kvhead_k_scale<P4C_HEAD_DIM>(dst_head, p);
+                smem_meta.src_fmt  [p] = kvhead_k_fmt  <HD>(src_head, p);
+                smem_meta.dst_fmt  [p] = kvhead_k_fmt  <HD>(dst_head, p);
+                smem_meta.src_arena[p] = kvhead_k_ptr  <HD>(src_head, p);
+                smem_meta.dst_arena[p] = kvhead_k_ptr  <HD>(dst_head, p);
+                smem_meta.src_outer[p] = kvhead_k_scale<HD>(src_head, p);
+                smem_meta.dst_outer[p] = kvhead_k_scale<HD>(dst_head, p);
             } else {
-                smem_meta.src_fmt  [p] = kvhead_v_fmt  <P4C_HEAD_DIM>(src_head, p);
-                smem_meta.dst_fmt  [p] = kvhead_v_fmt  <P4C_HEAD_DIM>(dst_head, p);
-                smem_meta.src_arena[p] = kvhead_v_ptr  <P4C_HEAD_DIM>(src_head, p);
-                smem_meta.dst_arena[p] = kvhead_v_ptr  <P4C_HEAD_DIM>(dst_head, p);
-                smem_meta.src_outer[p] = kvhead_v_scale<P4C_HEAD_DIM>(src_head, p);
-                smem_meta.dst_outer[p] = kvhead_v_scale<P4C_HEAD_DIM>(dst_head, p);
+                smem_meta.src_fmt  [p] = kvhead_v_fmt  <HD>(src_head, p);
+                smem_meta.dst_fmt  [p] = kvhead_v_fmt  <HD>(dst_head, p);
+                smem_meta.src_arena[p] = kvhead_v_ptr  <HD>(src_head, p);
+                smem_meta.dst_arena[p] = kvhead_v_ptr  <HD>(dst_head, p);
+                smem_meta.src_outer[p] = kvhead_v_scale<HD>(src_head, p);
+                smem_meta.dst_outer[p] = kvhead_v_scale<HD>(dst_head, p);
             }
         }
         __syncthreads();  // smem_meta visible to all before xlat build reads it
 
-        // Build smem_xlat[128] — one entry per dst thread d.
+        // Build smem_xlat[HD] — one entry per dst thread d.
         //
-        // Thread d owns dst palette warp_id, local dim lane.
-        //   global_d = the head dimension that is the lane-th member of dst
-        //              palette warp_id (find_nth_dim_in_pal scans the dst pal_map)
+        // Thread d owns dst palette `pal`, local dim `pld`.
+        //   global_d = the head dimension that is the pld-th member of dst
+        //              palette `pal` (find_nth_dim_in_pal scans the dst pal_map)
         //   sp       = which src palette global_d belongs to (src pal_map lookup)
         //   s_ld     = local rank of global_d within src palette sp
-        //   xlat[d]  = sp * 32 + s_ld  = smem column written by warp sp, slot s_ld
+        //   xlat[d]  = sp * PAL_DIM + s_ld = the smem column holding that dim
         //
         // After this, smem_xlat[d] is the smem_f16_buf column that holds the
         // src values for thread d's dst dimension — a fully resolved gather index.
         {
-            int global_d = find_nth_dim_in_pal(dst_pal_map, warp_id, lane);
+            int global_d = find_nth_dim_in_pal(dst_pal_map, pal, pld, HD);
             int sp       = pal_map_get(src_pal_map, global_d);
             int s_ld     = rank_in_pal(src_pal_map, sp, global_d);
-            smem_xlat[d] = (uint8_t)(sp * P4C_PAL_DIM + s_ld);
+            smem_xlat[d] = (uint8_t)(sp * PAL_DIM + s_ld);
         }
         __syncthreads();  // xlat visible to all warps before first copy_to_regs
     }
@@ -524,7 +544,7 @@ palette4_convert_kernel(
     // on every token in the hot encode path, so keeping it in a register saves
     // a smem load per token.  All other metadata is reloaded from smem_meta at
     // each use site (issue_load and encode entry) to avoid holding ~6 more regs.
-    const float r_dst_outer = smem_meta.dst_outer[warp_id];
+    const float r_dst_outer = smem_meta.dst_outer[pal];
 
     // =========================================================================
     // STAGE 1 ISSUER  (lambda, called from prologue and loop tail)
@@ -551,27 +571,30 @@ palette4_convert_kernel(
     // =========================================================================
     auto issue_load = [&](int c) {
         // Cold metadata: reload from smem_meta rather than keeping registers.
-        const int   fmt       = smem_meta.src_fmt  [warp_id];
-        const char* abase     = reinterpret_cast<const char*>(smem_meta.src_arena[warp_id]);
-        const float src_outer = smem_meta.src_outer[warp_id];
+        const int   fmt       = smem_meta.src_fmt  [pal];
+        const char* abase     = reinterpret_cast<const char*>(smem_meta.src_arena[pal]);
+        const float src_outer = smem_meta.src_outer[pal];
 
         int esz = ArenaFormat::float_elem_size(fmt);
         if (esz > 0) {
             // Float src: channel-oriented, chunk c starts at byte offset
             //   c × CHUNK_SIZE × PAL_DIM × elem_size
             const char* chunk_base = abase
-                + (int64_t)c * P4C_CHUNK_SIZE * P4C_PAL_DIM * esz;
+                + (int64_t)c * P4C_CHUNK_SIZE * PAL_DIM * esz;
 
             if (fmt == ArenaFormat::F16) {
-                // row_src: the token-`lane` row of this warp's 32-column slice.
-                // row_dst: smem row `lane` (token lane), columns warp_id*32+0..31.
+                // row_src: the token-`lane` row of this warp's 32-column slice
+                // of its palette (`warp_pd0` = the slice's first local dim; 0
+                // always at HD 128, 0 or 32 at HD 256).
+                // row_dst: smem row `lane` (token lane), columns d-lane..+31.
                 // Each thread transfers its own 64-byte row (32 F16 values).
                 // Issued as 4 × 16-byte cp.async on Ampere+ — async DMA that
                 // returns immediately and completes before cp.async.wait_group.
+                const int warp_pd0 = (warp_id * 32) % PAL_DIM;
                 const char* row_src = chunk_base
-                    + (int64_t)lane * P4C_PAL_DIM * sizeof(__half);
+                    + ((int64_t)lane * PAL_DIM + warp_pd0) * sizeof(__half);
                 char* row_dst = reinterpret_cast<char*>(
-                    &smem_f16_buf[lane][warp_id * P4C_PAL_DIM]);
+                    &smem_f16_buf[lane][warp_id * 32]);
 #if __CUDA_ARCH__ >= 800
                 bool aligned = ((reinterpret_cast<uintptr_t>(row_src) & 0xF) == 0);
                 if (aligned) {
@@ -586,33 +609,33 @@ palette4_convert_kernel(
                 } else {
                     const __half* p16 = reinterpret_cast<const __half*>(chunk_base);
                     for (int t = 0; t < P4C_CHUNK_SIZE; t++)
-                        smem_f16_buf[t][d] = p16[t * P4C_PAL_DIM + lane];
+                        smem_f16_buf[t][d] = p16[t * PAL_DIM + pld];
                 }
 #else
                 const __half* p16 = reinterpret_cast<const __half*>(chunk_base);
                 for (int t = 0; t < P4C_CHUNK_SIZE; t++)
-                    smem_f16_buf[t][d] = p16[t * P4C_PAL_DIM + lane];
+                    smem_f16_buf[t][d] = p16[t * PAL_DIM + pld];
 #endif
             } else if (fmt == ArenaFormat::F32) {
                 const float* p32 = reinterpret_cast<const float*>(chunk_base);
                 for (int t = 0; t < P4C_CHUNK_SIZE; t++)
-                    smem_f16_buf[t][d] = __float2half(p32[t * P4C_PAL_DIM + lane]);
+                    smem_f16_buf[t][d] = __float2half(p32[t * PAL_DIM + pld]);
             } else if (fmt == ArenaFormat::BF16) {
                 const __nv_bfloat16* pbf =
                     reinterpret_cast<const __nv_bfloat16*>(chunk_base);
                 for (int t = 0; t < P4C_CHUNK_SIZE; t++)
                     smem_f16_buf[t][d] = __float2half(
-                        __bfloat162float(pbf[t * P4C_PAL_DIM + lane]));
+                        __bfloat162float(pbf[t * PAL_DIM + pld]));
             }
         } else {
             // Quant src: token-oriented block layout.
-            // Thread d owns local dim `lane`; block(lane, c) is at:
-            //   abase + (lane * num_chunks + c) * block_bytes
+            // Thread d owns local dim `pld`; block(pld, c) is at:
+            //   abase + (pld * num_chunks + c) * block_bytes
             // dequant_element_inline reads element t from that block and
             // applies src_outer to recover the actual float value.
             int bb = p4c_quant_block_bytes(fmt);
             const char* blk_base = abase
-                + (int64_t)(lane * num_chunks + c) * bb;
+                + (int64_t)(pld * num_chunks + c) * bb;
 
             if (fmt == ArenaFormat::R16) {
                 // R16 is raw half-precision — no dequant needed.
@@ -703,8 +726,8 @@ palette4_convert_kernel(
         // rather than held in persistent registers.
         // =====================================================================
         {
-            const int   dst_fmt  = smem_meta.dst_fmt  [warp_id];
-            char* const dst_base = reinterpret_cast<char*>(smem_meta.dst_arena[warp_id]);
+            const int   dst_fmt  = smem_meta.dst_fmt  [pal];
+            char* const dst_base = reinterpret_cast<char*>(smem_meta.dst_arena[pal]);
 
             int esz = ArenaFormat::float_elem_size(dst_fmt);
             if (esz > 0) {
@@ -723,7 +746,7 @@ palette4_convert_kernel(
                 // r_buf values entered smem as actual floats (or F16 at scale 1)
                 // and r_dst_outer re-applies the head scale for the dst format.
                 char* chunk_base = dst_base
-                    + (int64_t)c * P4C_CHUNK_SIZE * P4C_PAL_DIM * esz;
+                    + (int64_t)c * P4C_CHUNK_SIZE * PAL_DIM * esz;
 
                 if (dst_fmt == ArenaFormat::F16) {
                     __half* p16 = reinterpret_cast<__half*>(chunk_base);
@@ -731,25 +754,25 @@ palette4_convert_kernel(
                     #pragma unroll
                     for (int k = 0; k < 16; k++) {
                         half2 sc = __hmul2(r_buf[k], scale2);
-                        p16[(2*k    ) * P4C_PAL_DIM + lane] = __low2half(sc);
-                        p16[(2*k + 1) * P4C_PAL_DIM + lane] = __high2half(sc);
+                        p16[(2*k    ) * PAL_DIM + pld] = __low2half(sc);
+                        p16[(2*k + 1) * PAL_DIM + pld] = __high2half(sc);
                     }
                 } else if (dst_fmt == ArenaFormat::F32) {
                     float* p32 = reinterpret_cast<float*>(chunk_base);
                     #pragma unroll
                     for (int k = 0; k < 16; k++) {
-                        p32[(2*k    ) * P4C_PAL_DIM + lane] =
+                        p32[(2*k    ) * PAL_DIM + pld] =
                             __half2float(__low2half (r_buf[k])) * r_dst_outer;
-                        p32[(2*k + 1) * P4C_PAL_DIM + lane] =
+                        p32[(2*k + 1) * PAL_DIM + pld] =
                             __half2float(__high2half(r_buf[k])) * r_dst_outer;
                     }
                 } else if (dst_fmt == ArenaFormat::BF16) {
                     __nv_bfloat16* pbf = reinterpret_cast<__nv_bfloat16*>(chunk_base);
                     #pragma unroll
                     for (int k = 0; k < 16; k++) {
-                        pbf[(2*k    ) * P4C_PAL_DIM + lane] =
+                        pbf[(2*k    ) * PAL_DIM + pld] =
                             __float2bfloat16(__half2float(__low2half (r_buf[k])) * r_dst_outer);
-                        pbf[(2*k + 1) * P4C_PAL_DIM + lane] =
+                        pbf[(2*k + 1) * PAL_DIM + pld] =
                             __float2bfloat16(__half2float(__high2half(r_buf[k])) * r_dst_outer);
                     }
                 }
@@ -788,14 +811,21 @@ palette4_convert_kernel(
                 // is preserved since encode never touches smem.
                 const int    bb      = p4c_quant_block_bytes(dst_fmt);
                 float* const scratch = smem_qscratch[warp_id];
+                // The warp's 32-column slice sits at local dims
+                // [warp_pd0, warp_pd0+32) of its palette — 0 always at HD 128,
+                // 0 or 32 at HD 256. Every column encodes independently (a
+                // quant block is one dim × 32 tokens), so each warp encoding
+                // only its own slice covers the palette exactly.
+                const int warp_pd0 = (warp_id * 32) % PAL_DIM;
 
-                for (int ld = 0; ld < P4C_PAL_DIM; ld++) {
-                    // Gather tok_lane for col ld from thread ld's r_buf.
+                for (int wl = 0; wl < 32; wl++) {
+                    // Gather tok_lane for the warp's wl-th column from the
+                    // in-warp thread that owns it.
                     unsigned h2u = 0;
                     #pragma unroll
                     for (int k = 0; k < 16; k++) {
                         unsigned tmp = __shfl_sync(0xffffffff,
-                            *reinterpret_cast<const unsigned*>(&r_buf[k]), ld);
+                            *reinterpret_cast<const unsigned*>(&r_buf[k]), wl);
                         if ((lane >> 1) == k) h2u = tmp;
                     }
                     const half2 pair = *reinterpret_cast<const half2*>(&h2u);
@@ -804,9 +834,10 @@ palette4_convert_kernel(
                     __syncwarp();  // scratch[0..31] all written before encode reads
 
                     // Dst quant layout: block(ld, c) = dst_base + (ld * num_chunks + c) * bb
+                    const int ld = warp_pd0 + wl;
                     char* blk_addr = dst_base + (int64_t)(ld * num_chunks + c) * bb;
                     p4c_encode_quant_block(scratch, blk_addr, dst_fmt);
-                    __syncwarp();  // encode complete before scratch is reused for ld+1
+                    __syncwarp();  // encode complete before scratch is reused for wl+1
                 }
             }
         }
@@ -864,27 +895,33 @@ extern "C" void run_quantize_palette4_convert(
     // paths go direct to L2, and quant-src scalar loads are too streaming for
     // L1 to help.  The attribute is idempotent at the driver level so calling
     // it per-invocation is safe.
-    if (is_k) {
-        cudaFuncSetAttribute(
-            palette4_convert_kernel<true>,
-            cudaFuncAttributePreferredSharedMemoryCarveout,
-            cudaSharedmemCarveoutMaxShared);
-    } else {
-        cudaFuncSetAttribute(
-            palette4_convert_kernel<false>,
-            cudaFuncAttributePreferredSharedMemoryCarveout,
-            cudaSharedmemCarveoutMaxShared);
-    }
-
-    // One block per (head, layer) pair.  block.x = head_dim = 128 threads.
+    // One block per (head, layer) pair.  block.x = head_dim threads.
     dim3 grid(num_kv_heads, num_layers);
     dim3 block(head_dim);
 
-    if (is_k) {
-        palette4_convert_kernel<true><<<grid, block, 0, stream>>>(
-            heads_base, num_heads, num_kv_heads, num_chunks);
-    } else {
-        palette4_convert_kernel<false><<<grid, block, 0, stream>>>(
-            heads_base, num_heads, num_kv_heads, num_chunks);
+    #define P4C_LAUNCH(HD)                                                       \
+        do {                                                                     \
+            if (is_k) {                                                          \
+                cudaFuncSetAttribute(                                            \
+                    palette4_convert_kernel<HD, true>,                           \
+                    cudaFuncAttributePreferredSharedMemoryCarveout,              \
+                    cudaSharedmemCarveoutMaxShared);                             \
+                palette4_convert_kernel<HD, true><<<grid, block, 0, stream>>>(   \
+                    heads_base, num_heads, num_kv_heads, num_chunks);            \
+            } else {                                                             \
+                cudaFuncSetAttribute(                                            \
+                    palette4_convert_kernel<HD, false>,                          \
+                    cudaFuncAttributePreferredSharedMemoryCarveout,              \
+                    cudaSharedmemCarveoutMaxShared);                             \
+                palette4_convert_kernel<HD, false><<<grid, block, 0, stream>>>(  \
+                    heads_base, num_heads, num_kv_heads, num_chunks);            \
+            }                                                                    \
+        } while (0)
+
+    switch (head_dim) {
+        case 128: P4C_LAUNCH(128); break;
+        case 256: P4C_LAUNCH(256); break;
+        default: break; // the Rust dispatch bails on unsupported widths first
     }
+    #undef P4C_LAUNCH
 }

@@ -312,6 +312,18 @@ impl CudaDevice {
         self.stream.clone()
     }
 
+    /// The cuBLAS handle, bound to [`Self::cuda_stream`].
+    ///
+    /// For the BLAS calls this backend does not wrap as tensor ops. `matmul`
+    /// covers GEMM; a model needing something else from the library — the
+    /// batched triangular solve the DeltaNet chunked scan uses in place of an
+    /// explicit matrix inverse — reaches it through here rather than opening a
+    /// second handle, which would carry its own stream and lose the ordering
+    /// every other op on this device relies on.
+    pub fn cublas(&self) -> &cudarc::cublas::CudaBlas {
+        &self.blas
+    }
+
     /// Returns the underlying CUDA context.
     ///
     /// Useful for creating secondary streams ([`CudaContext::new_stream`]) or
@@ -689,7 +701,10 @@ impl BackendDevice for CudaDevice {
             slice
         } else {
             let layout = Layout::contiguous(shape);
-            super::run_affine_ffi(&slice, self, &layout, up - lo, lo)?
+            // `Backing::Owned` in: the source is this function's own fresh
+            // allocation, so there is no arena to inherit and the rescale's
+            // output is owned like everything else here.
+            super::run_affine_ffi(&slice, self, &layout, up - lo, lo, Backing::Owned)?.0
         };
         Ok(CudaStorage {
             slice,

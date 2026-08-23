@@ -922,19 +922,46 @@ pub fn quantize_palette4_convert(
 // Palette4 buffered conversion API
 // ============================================================================
 
-/// KvHead byte layout constants for HD=128.
-const KVHEAD_HD: usize = 128;
-const KVHEAD_N_PAL: usize = 4;
-const KVHEAD_PAL_DIM: usize = KVHEAD_HD / KVHEAD_N_PAL; // 32
-const KVHEAD_K_PAL_OFF: usize = 0; // k_pal[32]: 32 bytes
-const KVHEAD_V_PAL_OFF: usize = KVHEAD_HD / 4; // v_pal[32]: offset 32
-const KVHEAD_K_PTR_OFF: usize = KVHEAD_HD / 2; // k_ptr[4 × u64]: offset 64
-const KVHEAD_V_PTR_OFF: usize = KVHEAD_HD / 2 + 32; // v_ptr[4 × u64]: offset 96
-const KVHEAD_K_FMT_OFF: usize = KVHEAD_HD / 2 + 64; // k_fmt[4 × u8]: offset 128
-const KVHEAD_V_FMT_OFF: usize = KVHEAD_HD / 2 + 68; // v_fmt[4 × u8]: offset 132
-const KVHEAD_K_SCALE_OFF: usize = KVHEAD_HD / 2 + 72; // k_scale[4 × f32]: offset 136
-const KVHEAD_V_SCALE_OFF: usize = KVHEAD_HD / 2 + 88; // v_scale[4 × f32]: offset 152
-const KVHEAD_SIZE: usize = KVHEAD_HD / 2 + 104; // 168 bytes total — must match kv_head_byte_size<HD>() in slot_types.cuh
+/// KvHead byte layout — parameterized by head_dim (128 or 256), mirroring
+/// `kv_head_byte_size<HD>()` and the accessors in slot_types.cuh. The record
+/// is `[k_pal hd/4][v_pal hd/4][k_ptr 4×u64][v_ptr 4×u64][k_fmt 4][v_fmt 4]
+/// [k_scale 4×f32][v_scale 4×f32]` = hd/2 + 104 bytes.
+pub const KVHEAD_N_PAL: usize = 4;
+/// The widest head the palette records support; pal-map buffers are sized for
+/// it and only the first `head_dim / 4` bytes are live.
+pub const KVHEAD_MAX_HD: usize = 256;
+/// A 2-bit-packed palette assignment map, sized for the widest head.
+pub type PalMapBytes = [u8; KVHEAD_MAX_HD / 4];
+
+const fn kvhead_size(hd: usize) -> usize {
+    hd / 2 + 104
+}
+const fn kvhead_v_pal_off(hd: usize) -> usize {
+    hd / 4
+}
+const fn kvhead_k_ptr_off(hd: usize) -> usize {
+    hd / 2
+}
+const fn kvhead_v_ptr_off(hd: usize) -> usize {
+    hd / 2 + 32
+}
+const fn kvhead_k_fmt_off(hd: usize) -> usize {
+    hd / 2 + 64
+}
+const fn kvhead_v_fmt_off(hd: usize) -> usize {
+    hd / 2 + 68
+}
+const fn kvhead_k_scale_off(hd: usize) -> usize {
+    hd / 2 + 72
+}
+const fn kvhead_v_scale_off(hd: usize) -> usize {
+    hd / 2 + 88
+}
+
+/// The head widths the palette4 convert kernel is instantiated for.
+pub fn kvhead_supported_head_dim(hd: usize) -> bool {
+    matches!(hd, 128 | 256)
+}
 
 /// Maps a `GgmlDType` to the 1-byte ArenaFormat code expected by the palette4
 /// convert kernel.  Returns an error for types that the kernel does not
@@ -996,10 +1023,11 @@ pub fn ggml_dtype_to_arena_fmt_code(dtype: GgmlDType) -> Result<u8> {
 /// `src_kvhead_ptrs` arena pointers and writes to `dst_kvhead_ptrs` arena
 /// pointers (different GPU memory regions, potentially different formats).
 ///
-/// `k_pal_map` / `v_pal_map` are 2-bit-packed arrays: 32 bytes covering 128
-/// dimensions.  Each 2-bit field selects which palette (0-3) owns that
-/// dimension.  Use `identity_pal_map_128()` to get the standard identity map
-/// (dims 0-31 → pal 0, …).  Src and dst may have independent pal_maps.
+/// `k_pal_map` / `v_pal_map` are 2-bit-packed arrays covering `head_dim`
+/// dimensions (the first `head_dim / 4` bytes are live). Each 2-bit field
+/// selects which palette (0-3) owns that dimension. Use
+/// `identity_pal_map(head_dim)` to get the standard identity map
+/// (dims 0..head_dim/4 → pal 0, …). Src and dst may have independent pal_maps.
 pub struct PalHeadDesc {
     /// Raw device pointers to source K arena data for palettes 0-3.
     pub k_src_arena_ptrs: [u64; KVHEAD_N_PAL],
@@ -1009,10 +1037,10 @@ pub struct PalHeadDesc {
     pub k_src_fmts: [GgmlDType; KVHEAD_N_PAL],
     /// GgmlDType format of each source V palette arena.
     pub v_src_fmts: [GgmlDType; KVHEAD_N_PAL],
-    /// 2-bit-packed source K palette assignment map (32 bytes).
-    pub k_src_pal_map: [u8; KVHEAD_HD / 4],
-    /// 2-bit-packed source V palette assignment map (32 bytes).
-    pub v_src_pal_map: [u8; KVHEAD_HD / 4],
+    /// 2-bit-packed source K palette assignment map.
+    pub k_src_pal_map: PalMapBytes,
+    /// 2-bit-packed source V palette assignment map.
+    pub v_src_pal_map: PalMapBytes,
     /// Outer scale baked into the source K arena per palette (f32, 1.0 for
     /// float-typed sources). The encoder kernel divides dequantized source
     /// values by this so a re-compression chain (quant → quant) round-trips
@@ -1030,10 +1058,10 @@ pub struct PalHeadDesc {
     pub k_dst_fmts: [GgmlDType; KVHEAD_N_PAL],
     /// GgmlDType format of each destination V palette arena.
     pub v_dst_fmts: [GgmlDType; KVHEAD_N_PAL],
-    /// 2-bit-packed destination K palette assignment map (32 bytes).
-    pub k_dst_pal_map: [u8; KVHEAD_HD / 4],
-    /// 2-bit-packed destination V palette assignment map (32 bytes).
-    pub v_dst_pal_map: [u8; KVHEAD_HD / 4],
+    /// 2-bit-packed destination K palette assignment map.
+    pub k_dst_pal_map: PalMapBytes,
+    /// 2-bit-packed destination V palette assignment map.
+    pub v_dst_pal_map: PalMapBytes,
     /// Post-dequant scale written into the dst KvHead for K (f32, default 1.0).
     /// The decode kernel multiplies dequantized K values by this scale per palette.
     pub k_dst_scales: [f32; KVHEAD_N_PAL],
@@ -1041,29 +1069,34 @@ pub struct PalHeadDesc {
     pub v_dst_scales: [f32; KVHEAD_N_PAL],
 }
 
-/// Build the identity 2-bit-packed palette map for HD=128.
-pub fn identity_pal_map_128() -> [u8; KVHEAD_HD / 4] {
-    let mut out = [0u8; KVHEAD_HD / 4];
-    for d in 0..KVHEAD_HD {
-        let p = (d / KVHEAD_PAL_DIM) as u8;
+/// Build the identity 2-bit-packed palette map for `head_dim` (only the first
+/// `head_dim / 4` bytes are live; the rest stay zero).
+pub fn identity_pal_map(head_dim: usize) -> PalMapBytes {
+    debug_assert!(kvhead_supported_head_dim(head_dim));
+    let pal_dim = head_dim / KVHEAD_N_PAL;
+    let mut out = [0u8; KVHEAD_MAX_HD / 4];
+    for d in 0..head_dim {
+        let p = (d / pal_dim) as u8;
         out[d / 4] |= (p & 0x3) << (2 * (d % 4));
     }
     out
 }
 
-/// Build a balanced pseudo-random 2-bit-packed palette map for HD=128.
+/// Build a balanced pseudo-random 2-bit-packed palette map for `head_dim`.
 ///
-/// Assigns each of the 128 dims to one of 4 palettes using a Fisher-Yates
-/// shuffle. Every palette is assigned exactly 32 dims but the assignment is
+/// Assigns each dim to one of 4 palettes using a Fisher-Yates shuffle. Every
+/// palette is assigned exactly `head_dim / 4` dims but the assignment is
 /// non-contiguous and pseudo-random. The caller supplies a seed/IV so different
 /// randomization events can generate different maps while remaining reproducible.
-pub fn shuffled_pal_map_128(seed: u64) -> [u8; KVHEAD_HD / 4] {
-    // Start with exactly 32 dims per palette (sequential assignment), then
+pub fn shuffled_pal_map(head_dim: usize, seed: u64) -> PalMapBytes {
+    debug_assert!(kvhead_supported_head_dim(head_dim));
+    let pal_dim = head_dim / KVHEAD_N_PAL;
+    // Start with exactly pal_dim dims per palette (sequential assignment), then
     // shuffle with a caller-provided seed so the palette sizes stay balanced
     // while the dim routing varies between randomization events.
-    let mut assign = [0u8; KVHEAD_HD];
-    for d in 0..KVHEAD_HD {
-        assign[d] = (d / KVHEAD_PAL_DIM) as u8;
+    let mut assign = [0u8; KVHEAD_MAX_HD];
+    for (d, a) in assign.iter_mut().enumerate().take(head_dim) {
+        *a = (d / pal_dim) as u8;
     }
 
     // Fisher-Yates with Knuth multiplicative LCG.
@@ -1071,7 +1104,7 @@ pub fn shuffled_pal_map_128(seed: u64) -> [u8; KVHEAD_HD / 4] {
     if rng == 0 {
         rng = 0x9e3779b97f4a7c15u64;
     }
-    for i in (1..KVHEAD_HD).rev() {
+    for i in (1..head_dim).rev() {
         rng = rng
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -1080,38 +1113,48 @@ pub fn shuffled_pal_map_128(seed: u64) -> [u8; KVHEAD_HD / 4] {
     }
 
     // Pack: 4 dims per byte, 2 bits per dim in little-endian order.
-    let mut out = [0u8; KVHEAD_HD / 4];
-    for d in 0..KVHEAD_HD {
+    let mut out = [0u8; KVHEAD_MAX_HD / 4];
+    for d in 0..head_dim {
         out[d / 4] |= (assign[d] & 0x3) << (2 * (d % 4));
     }
     out
 }
 
-/// Serialize arena pointers, formats, pal_map, and scales into a 168-byte KvHead struct.
+/// Serialize arena pointers, formats, pal_map, and scales into a KvHead byte
+/// record for `head_dim` (`head_dim / 2 + 104` bytes).
+#[allow(clippy::too_many_arguments)]
 pub fn build_kvhead_bytes_raw(
+    head_dim: usize,
     k_arena_ptrs: &[u64; KVHEAD_N_PAL],
     v_arena_ptrs: &[u64; KVHEAD_N_PAL],
     k_fmts: &[GgmlDType; KVHEAD_N_PAL],
     v_fmts: &[GgmlDType; KVHEAD_N_PAL],
-    k_pal_map: &[u8; KVHEAD_HD / 4],
-    v_pal_map: &[u8; KVHEAD_HD / 4],
+    k_pal_map: &PalMapBytes,
+    v_pal_map: &PalMapBytes,
     k_scales: &[f32; KVHEAD_N_PAL],
     v_scales: &[f32; KVHEAD_N_PAL],
 ) -> Result<Vec<u8>> {
-    let mut head = vec![0u8; KVHEAD_SIZE];
-    head[KVHEAD_K_PAL_OFF..KVHEAD_K_PAL_OFF + KVHEAD_HD / 4].copy_from_slice(k_pal_map);
-    head[KVHEAD_V_PAL_OFF..KVHEAD_V_PAL_OFF + KVHEAD_HD / 4].copy_from_slice(v_pal_map);
+    if !kvhead_supported_head_dim(head_dim) {
+        crate::bail!("build_kvhead_bytes_raw: unsupported head_dim {head_dim}");
+    }
+    let pal_bytes = head_dim / 4;
+    let mut head = vec![0u8; kvhead_size(head_dim)];
+    head[..pal_bytes].copy_from_slice(&k_pal_map[..pal_bytes]);
+    head[kvhead_v_pal_off(head_dim)..kvhead_v_pal_off(head_dim) + pal_bytes]
+        .copy_from_slice(&v_pal_map[..pal_bytes]);
     for p in 0..KVHEAD_N_PAL {
-        let k_ptr_off = KVHEAD_K_PTR_OFF + p * 8;
+        let k_ptr_off = kvhead_k_ptr_off(head_dim) + p * 8;
         head[k_ptr_off..k_ptr_off + 8].copy_from_slice(&k_arena_ptrs[p].to_le_bytes());
-        let v_ptr_off = KVHEAD_V_PTR_OFF + p * 8;
+        let v_ptr_off = kvhead_v_ptr_off(head_dim) + p * 8;
         head[v_ptr_off..v_ptr_off + 8].copy_from_slice(&v_arena_ptrs[p].to_le_bytes());
-        head[KVHEAD_K_FMT_OFF + p] = ggml_dtype_to_arena_fmt_code(k_fmts[p])?;
-        head[KVHEAD_V_FMT_OFF + p] = ggml_dtype_to_arena_fmt_code(v_fmts[p])?;
+        head[kvhead_k_fmt_off(head_dim) + p] = ggml_dtype_to_arena_fmt_code(k_fmts[p])?;
+        head[kvhead_v_fmt_off(head_dim) + p] = ggml_dtype_to_arena_fmt_code(v_fmts[p])?;
         let k_f32 = k_scales[p].to_le_bytes();
         let v_f32 = v_scales[p].to_le_bytes();
-        head[KVHEAD_K_SCALE_OFF + p * 4..KVHEAD_K_SCALE_OFF + p * 4 + 4].copy_from_slice(&k_f32);
-        head[KVHEAD_V_SCALE_OFF + p * 4..KVHEAD_V_SCALE_OFF + p * 4 + 4].copy_from_slice(&v_f32);
+        let ks = kvhead_k_scale_off(head_dim) + p * 4;
+        let vs = kvhead_v_scale_off(head_dim) + p * 4;
+        head[ks..ks + 4].copy_from_slice(&k_f32);
+        head[vs..vs + 4].copy_from_slice(&v_f32);
     }
     Ok(head)
 }
@@ -1133,6 +1176,7 @@ pub fn build_kvhead_bytes_raw(
 ///
 /// `descs.len()` must equal `num_layers * num_kv_heads`.
 pub fn quantize_palette4_convert_buffered(
+    head_dim: usize,
     descs: &[PalHeadDesc],
     num_kv_heads: usize,
     num_layers: usize,
@@ -1143,6 +1187,10 @@ pub fn quantize_palette4_convert_buffered(
     if num_kv_heads == 0 || num_layers == 0 || num_chunks == 0 {
         return Ok(());
     }
+    if !kvhead_supported_head_dim(head_dim) {
+        crate::bail!("quantize_palette4_convert_buffered: unsupported head_dim {head_dim}");
+    }
+    let kvhead_bytes = kvhead_size(head_dim);
 
     // Guard against i32 overflow in the kernel's grid/count parameters.
     for (name, val) in [
@@ -1170,12 +1218,12 @@ pub fn quantize_palette4_convert_buffered(
     for (i, desc) in descs.iter().enumerate() {
         // Determine which palettes are actually referenced by each pal_map.
         let check_ptrs = |ptrs: &[u64; KVHEAD_N_PAL],
-                          pal_map: &[u8; KVHEAD_HD / 4],
+                          pal_map: &PalMapBytes,
                           side: &str,
                           kv: &str|
          -> Result<()> {
             let mut used = [false; KVHEAD_N_PAL];
-            for d in 0..KVHEAD_HD {
+            for d in 0..head_dim {
                 let p = ((pal_map[d / 4] >> (2 * (d % 4))) & 0x3) as usize;
                 used[p] = true;
             }
@@ -1205,18 +1253,19 @@ pub fn quantize_palette4_convert_buffered(
     // so no pointer arrays are needed.
     let n = expected;
     let src_heads_off: usize = 0;
-    let dst_heads_off: usize = n * KVHEAD_SIZE;
+    let dst_heads_off: usize = n * kvhead_bytes;
     // Layout: [src KvHeads][dst KvHeads]. Per-palette outer scales live
     // inside each dst KvHead struct (f32 at HD/2+72 / HD/2+88), so the encoder
     // (multiply by outer) and decoder (divide by outer) share a single source
     // of truth.
-    let total_bytes = 2 * n * KVHEAD_SIZE;
+    let total_bytes = 2 * n * kvhead_bytes;
 
     // Build the CPU image directly in pinned memory (no intermediate Vec).
     let mut buf = generation.alloc(total_bytes)?;
 
     for (i, desc) in descs.iter().enumerate() {
         let src_bytes = build_kvhead_bytes_raw(
+            head_dim,
             &desc.k_src_arena_ptrs,
             &desc.v_src_arena_ptrs,
             &desc.k_src_fmts,
@@ -1227,6 +1276,7 @@ pub fn quantize_palette4_convert_buffered(
             &desc.v_src_scales,
         )?;
         let dst_bytes = build_kvhead_bytes_raw(
+            head_dim,
             &desc.k_dst_arena_ptrs,
             &desc.v_dst_arena_ptrs,
             &desc.k_dst_fmts,
@@ -1237,10 +1287,10 @@ pub fn quantize_palette4_convert_buffered(
             &desc.v_dst_scales,
         )?;
 
-        let src_off = src_heads_off + i * KVHEAD_SIZE;
-        let dst_off = dst_heads_off + i * KVHEAD_SIZE;
-        buf[src_off..src_off + KVHEAD_SIZE].copy_from_slice(&src_bytes);
-        buf[dst_off..dst_off + KVHEAD_SIZE].copy_from_slice(&dst_bytes);
+        let src_off = src_heads_off + i * kvhead_bytes;
+        let dst_off = dst_heads_off + i * kvhead_bytes;
+        buf[src_off..src_off + kvhead_bytes].copy_from_slice(&src_bytes);
+        buf[dst_off..dst_off + kvhead_bytes].copy_from_slice(&dst_bytes);
     }
 
     // Async H2D upload via stager (deferred cleanup).
@@ -1259,7 +1309,7 @@ pub fn quantize_palette4_convert_buffered(
             num_layers as i32,
             num_chunks as i32,
             1, // K
-            KVHEAD_HD as i32,
+            head_dim as i32,
             raw_stream,
         );
         crate::set_kernel_breadcrumb("run_quantize_palette4_convert (V)", file!(), line!());
@@ -1270,7 +1320,7 @@ pub fn quantize_palette4_convert_buffered(
             num_layers as i32,
             num_chunks as i32,
             0, // V
-            KVHEAD_HD as i32,
+            head_dim as i32,
             raw_stream,
         );
     }
@@ -2555,6 +2605,11 @@ fn dequantize_mul_mat_vec(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// `inherit` is the **activation's** arena. The weight is a model parameter and
+/// names none, so a quantized projection's output belongs wherever the value
+/// flowing through the layer came from — and so does the q8_1 staging buffer,
+/// which dies at the end of this call.
+#[allow(clippy::too_many_arguments)]
 fn mul_mat_vec_via_q8_1(
     data: &PaddedCudaSlice,
     y: &CudaView<f32>,
@@ -2563,6 +2618,7 @@ fn mul_mat_vec_via_q8_1(
     nrows: usize,
     b_size: usize,
     dev: &CudaDevice,
+    inherit: Backing,
 ) -> Result<CudaStorage> {
     let data_elems = data.len / dtype.type_size() * dtype.block_size();
     if data_elems < ncols * nrows {
@@ -2578,11 +2634,16 @@ fn mul_mat_vec_via_q8_1(
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+    // The staging buffer stays on the pool. It is a bare `CudaSlice` that this
+    // function drops, and dropping a lease means `cuMemFreeAsync` on an address
+    // inside the VMM reservation — which the driver rejects and cudarc records,
+    // once per call. Only `dst` inherits, because only `dst` is wrapped in a
+    // storage that carries its backing.
     let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
     quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
 
     let qtype = dtype_to_qtype(dtype)?;
-    let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+    let (dst, dst_backing) = unsafe { alloc_inheriting::<f32>(dev, nrows * b_size, inherit)? };
     {
         let stream = dev.cuda_stream();
         let (data_ptr, _data_guard) = data.inner.device_ptr(&stream);
@@ -2602,9 +2663,14 @@ fn mul_mat_vec_via_q8_1(
             );
         }
     }
-    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+    Ok(CudaStorage::wrap_cuda_slice_backed(
+        dst,
+        dev.clone(),
+        dst_backing,
+    ))
 }
 
+/// As [`mul_mat_vec_via_q8_1`], including what `inherit` means.
 #[allow(clippy::too_many_arguments)]
 fn mul_mat_via_q8_1(
     data: &PaddedCudaSlice,
@@ -2615,6 +2681,7 @@ fn mul_mat_via_q8_1(
     y_rows: usize,
     y_cols: usize,
     dev: &CudaDevice,
+    inherit: Backing,
 ) -> Result<CudaStorage> {
     let data_elems = data.len / dtype.type_size() * dtype.block_size();
     if data_elems < x_rows * x_cols {
@@ -2631,11 +2698,12 @@ fn mul_mat_via_q8_1(
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         k_padded * y_cols * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+    // Pool, for the reason given in [`mul_mat_vec_via_q8_1`].
     let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
     quantize_q8_1(y, &mut y_q8_1, k, y_cols, dev)?;
 
     let qtype = dtype_to_qtype(dtype)?;
-    let dst = unsafe { dev.alloc::<f32>(x_rows * y_cols)? };
+    let (dst, dst_backing) = unsafe { alloc_inheriting::<f32>(dev, x_rows * y_cols, inherit)? };
     {
         let stream = dev.cuda_stream();
         let (data_ptr, _data_guard) = data.inner.device_ptr(&stream);
@@ -2655,7 +2723,11 @@ fn mul_mat_via_q8_1(
             );
         }
     }
-    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+    Ok(CudaStorage::wrap_cuda_slice_backed(
+        dst,
+        dev.clone(),
+        dst_backing,
+    ))
 }
 
 /// Float dense quantized matmul shared by `QCudaStorage::matmul_gemx` and the `Float`
@@ -3670,6 +3742,7 @@ impl QCudaStorage {
         rhs_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
         let (nrows, ncols) = self_shape.dims2()?;
+        let inherit = rhs.backing;
         let rhs = rhs.as_cuda_slice::<f32>()?;
         let rhs = match rhs_l.contiguous_offsets() {
             Some((o1, o2)) => rhs.slice(o1..o2),
@@ -3695,6 +3768,7 @@ impl QCudaStorage {
                 nrows,
                 b_size,
                 self.device(),
+                inherit,
             )?
         };
         let mut out_shape = rhs_l.shape().dims().to_vec();
@@ -3725,6 +3799,7 @@ impl QCudaStorage {
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
             storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
         } else {
+            let inherit = storage.backing;
             let storage = storage.as_cuda_slice::<f32>()?;
             let storage = match layout.contiguous_offsets() {
                 Some((o1, o2)) => storage.slice(o1..o2),
@@ -3742,6 +3817,7 @@ impl QCudaStorage {
                 /* y_rows */ k,
                 /* y_cols */ b * m,
                 self.device(),
+                inherit,
             )?
         };
         let mut out_shape = layout.shape().dims().to_vec();

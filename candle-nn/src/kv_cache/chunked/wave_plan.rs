@@ -179,6 +179,34 @@ pub struct ModelGeometry {
     /// What the int8 tensor-core kernels emit before the cast back to
     /// `act_dtype`. Both are live at once, so both are planned.
     pub accum_dtype: DType,
+    /// Whether the Q/K/V projections round-trip through [`Self::accum_dtype`].
+    ///
+    /// A packed session's projections consume the norm's q8a128 output and the
+    /// tensor-core epilogue emits `act_dtype`, so the projection costs what
+    /// [`WaveBuffer::QkvProjection`] says and nothing more. A **float** session
+    /// runs the dequantized GEMM in `accum_dtype` instead: it upcasts its
+    /// operand, computes there, and casts the result back down — three extra
+    /// full-width buffers per projection, none of which the packed path
+    /// allocates.
+    ///
+    /// A flag rather than an unconditional charge because the two are
+    /// alternatives fixed at session creation, and charging both would price
+    /// every packed model for a round trip it never runs — on Qwen3-30B-A3B
+    /// that is a 95% over-bound on the attention span, against a chain whose
+    /// census shows no upcast at all.
+    pub projection_accum_roundtrip: bool,
+    /// The Q projection emits `2 × head_dim` per head — interleaved
+    /// `[q | gate]` — and the gate travels the whole attention block: split
+    /// out contiguously, sigmoided, and multiplied into the context. Widens
+    /// `qkv_cols` and charges the three gate-side buffers. Gated lineages
+    /// (Qwen3.5/3.8) set it; classic attention leaves it false and pays
+    /// nothing.
+    pub gated_qkv: bool,
+    /// Only part of the head width rotates, and the paged kernels only know
+    /// full-width RoPE, so Q and K are re-ordered through a gather
+    /// (`RotaryLayout::permute_last_dim_live`) — one `attn_cols`-wide and one
+    /// `kv_cols`-wide copy per layer. Full-width-rotary models leave it false.
+    pub partial_rotary: bool,
 }
 
 impl ModelGeometry {
@@ -189,9 +217,15 @@ impl ModelGeometry {
         rows * self.experts_per_tok
     }
 
-    /// Columns produced by the fused QKV projection.
+    /// Columns produced by the fused QKV projection. A gated lineage's Q
+    /// projection emits `[q | gate]` — twice the query width.
     pub const fn qkv_cols(&self) -> usize {
-        (self.n_head + 2 * self.n_kv_head) * self.head_dim
+        let q_cols = if self.gated_qkv {
+            2 * self.n_head
+        } else {
+            self.n_head
+        };
+        (q_cols + 2 * self.n_kv_head) * self.head_dim
     }
 
     /// Columns of the attention output, before `o_proj`.
@@ -232,11 +266,41 @@ const ROUTING_U32_PER_ASSIGNMENT: usize = 8;
 /// reader can check the list against the code that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub enum WaveBuffer {
-    /// Attention RMSNorm, quantized for the int8 QKV matmul. Both chains.
+    /// Attention RMSNorm, in whatever encoding the QKV matmul consumes. Both
+    /// chains.
+    ///
+    /// **Priced dense even though an int8 session's norm emits q8a128.** The
+    /// two encodings are alternatives — int8 mode is fixed when the session is
+    /// created — so a phase holds one or the other, and dense is the larger by
+    /// about 1.8×. Pricing the larger keeps the plan an upper bound for either
+    /// mode, which is what [`WavePlan::ensure_fits`] needs; pricing the smaller
+    /// would under-size a float session's span, and the buffer squeezed out at
+    /// the end of the phase is one a kernel wrapper allocates, which *refuses*
+    /// rather than falling back to the pool.
     AttnNorm,
     /// Fused Q/K/V projection output — one segmented launch over the three KO
     /// weights, narrowed into q/k/v afterwards. Both chains.
     QkvProjection,
+    /// The projection's operand, upcast to the GEMM's accumulate dtype.
+    ///
+    /// A float-path projection runs in `accum_dtype`: the norm's `act_dtype`
+    /// output is upcast, the GEMM emits in `accum_dtype`, and the result is
+    /// cast back down. Both ends stay live for the whole phase — the bump
+    /// cursor does not rewind — so both are priced, the same round trip
+    /// [`Self::GateGemm`] / [`Self::UpGemm`] / [`Self::DownGemm`] are priced
+    /// for on the FFN side.
+    ///
+    /// Charged for **three** `hidden`-wide operands, which is the upper bound
+    /// over both chains: a model that projects Q, K and V separately upcasts
+    /// the norm output once per projection, and a fused projection upcasts it
+    /// once.
+    QkvProjOperand,
+    /// The projection's result in `accum_dtype`, before the cast to
+    /// `act_dtype`.
+    ///
+    /// `qkv_cols` wide, which again bounds both chains: a fused projection
+    /// emits exactly that, and separate Q/K/V results sum to it.
+    QkvProjAccum,
     /// Q, copied out of the fused QKV buffer.
     ///
     /// The narrow is a strided view over a `qkv_cols`-wide row, so reshaping it
@@ -252,6 +316,31 @@ pub enum WaveBuffer {
     /// Q returned to `[batch, seq, heads · dim]` after the norm — a transpose
     /// then a reshape, so again a copy on prefill and free on decode.
     QHeadsPacked,
+    /// The gate, split out of the interleaved `[q | gate]` projection. The
+    /// narrow is strided over the `[.., heads, 2, dim]` view, so flattening it
+    /// copies. Gated lineages only.
+    GateSplit,
+    /// `sigmoid(gate)`, materialised before the context multiply. Gated
+    /// lineages only; the fused q8 decode context folds it into the kernel,
+    /// but prefill and the FP decode path allocate it, and the plan prices
+    /// the union.
+    GateSigmoid,
+    /// `context ⊙ sigmoid(gate)` — the gated context handed to `o_proj`.
+    /// Gated lineages only, same union rule as [`Self::GateSigmoid`].
+    GatedContext,
+    /// Q re-ordered into the kernels' full-width rotary pairing — a gather
+    /// copy (`RotaryLayout`). Partial-rotary models only.
+    QRotaryPermute,
+    /// K's half of the same re-ordering. Partial-rotary models only.
+    KRotaryPermute,
+    /// `o_proj`'s operand upcast to `accum_dtype` — the output projection's
+    /// half of the float-session round trip
+    /// ([`ModelGeometry::projection_accum_roundtrip`]), which the plan models
+    /// for Q/K/V and must model for O the same way.
+    OProjOperand,
+    /// `o_proj`'s result in `accum_dtype`, before the cast back to
+    /// `act_dtype`. Same condition as [`Self::OProjOperand`].
+    OProjAccum,
     /// K, copied out of the fused QKV buffer. Both chains.
     KSplit,
     /// K flattened for the head-wise RMSNorm. Prefill only, as [`Self::QNormIn`].
@@ -274,12 +363,16 @@ pub enum WaveBuffer {
     DecodeContext,
     /// `o_proj`'s result, in the compute dtype.
     ///
-    /// Decode only. On the prefill chain `o_proj` takes a `Float` context and the
-    /// int8 override quantizes it at the matmul, and that quantize breaks the
-    /// provenance chain — so prefill's `o_proj` output lands on the pool instead
-    /// of the span, and the census sees nothing here.
+    /// On an **int8** session prefill's `o_proj` takes a `Float` context, the
+    /// override quantizes it at the matmul, and that quantize breaks the
+    /// provenance chain — the output lands on the pool, and only decode
+    /// carves here. On a **float** session (`projection_accum_roundtrip`)
+    /// prefill's `o_proj` result rides the span like everything else, so the
+    /// charge covers both.
     OProjOutput,
-    /// FFN RMSNorm, quantized for the expert GEMMs. Both dispatch paths.
+    /// FFN RMSNorm, in whatever encoding the expert GEMMs consume. Both
+    /// dispatch paths, and priced dense for the reason given on
+    /// [`Self::AttnNorm`].
     FfnNorm,
     /// The router's per-token logits over every expert. Both paths.
     RouterLogits,
@@ -323,10 +416,17 @@ impl WaveBuffer {
         match self {
             Self::AttnNorm
             | Self::QkvProjection
+            | Self::QkvProjOperand
+            | Self::QkvProjAccum
             | Self::QSplit
             | Self::QNormIn
             | Self::QNormOut
             | Self::QHeadsPacked
+            | Self::GateSplit
+            | Self::GateSigmoid
+            | Self::GatedContext
+            | Self::QRotaryPermute
+            | Self::KRotaryPermute
             | Self::KSplit
             | Self::KNormIn
             | Self::KNormOut
@@ -334,6 +434,8 @@ impl WaveBuffer {
             | Self::VContiguous
             | Self::AttnOutput
             | Self::DecodeContext
+            | Self::OProjOperand
+            | Self::OProjAccum
             | Self::OProjOutput => LayerPhase::Attention,
             Self::FfnNorm
             | Self::RouterLogits
@@ -370,11 +472,27 @@ impl WaveBuffer {
         };
         let er = g.expert_rows(rows);
         match self {
-            Self::AttnNorm => q8(rows, g.hidden),
+            Self::AttnNorm => dense(rows, g.hidden, g.act_dtype),
             Self::QkvProjection => dense(rows, g.qkv_cols(), g.act_dtype),
+            Self::QkvProjOperand if g.projection_accum_roundtrip => {
+                dense(rows, 3 * g.hidden, g.accum_dtype)
+            }
+            Self::QkvProjAccum if g.projection_accum_roundtrip => {
+                dense(rows, g.qkv_cols(), g.accum_dtype)
+            }
+            Self::QkvProjOperand | Self::QkvProjAccum => dense(0, 0, g.accum_dtype),
             Self::QSplit | Self::QNormIn | Self::QNormOut | Self::QHeadsPacked => {
                 dense(rows, g.attn_cols(), g.act_dtype)
             }
+            Self::GateSplit | Self::GateSigmoid | Self::GatedContext if g.gated_qkv => {
+                dense(rows, g.attn_cols(), g.act_dtype)
+            }
+            Self::GateSplit | Self::GateSigmoid | Self::GatedContext => {
+                dense(0, 0, g.act_dtype)
+            }
+            Self::QRotaryPermute if g.partial_rotary => dense(rows, g.attn_cols(), g.act_dtype),
+            Self::KRotaryPermute if g.partial_rotary => dense(rows, g.kv_cols(), g.act_dtype),
+            Self::QRotaryPermute | Self::KRotaryPermute => dense(0, 0, g.act_dtype),
             Self::KSplit
             | Self::KNormIn
             | Self::KNormOut
@@ -382,8 +500,15 @@ impl WaveBuffer {
             | Self::VContiguous => dense(rows, g.kv_cols(), g.act_dtype),
             Self::AttnOutput => dense(rows, g.attn_cols(), g.act_dtype),
             Self::DecodeContext => q8(rows, g.attn_cols()),
+            Self::OProjOperand if g.projection_accum_roundtrip => {
+                dense(rows, g.attn_cols(), g.accum_dtype)
+            }
+            Self::OProjAccum if g.projection_accum_roundtrip => {
+                dense(rows, g.hidden, g.accum_dtype)
+            }
+            Self::OProjOperand | Self::OProjAccum => dense(0, 0, g.accum_dtype),
             Self::OProjOutput => dense(rows, g.hidden, g.act_dtype),
-            Self::FfnNorm => q8(rows, g.hidden),
+            Self::FfnNorm => dense(rows, g.hidden, g.act_dtype),
             Self::RouterLogits => dense(rows, g.n_experts, g.act_dtype),
             Self::RouteWeights => dense(rows, g.experts_per_tok, DType::F32),
             Self::RouteIndices => dense(rows, g.experts_per_tok, DType::U32),
@@ -561,6 +686,33 @@ mod tests {
             n_experts: 128,
             act_dtype: DType::BF16,
             accum_dtype: DType::F32,
+            // Its census shows packed projections — no upcast, no cast back.
+            projection_accum_roundtrip: false,
+            gated_qkv: false,
+            partial_rotary: false,
+        }
+    }
+
+    /// A float-projection stack: Qwen3.5-0.8B's real shapes, whose dequantized
+    /// Q/K/V GEMMs run in F32 and round-trip through it. Gated `[q | gate]`
+    /// projection and 64-of-256 partial rotary. The head count is 8, read off
+    /// the census (the q matmul emits `2 · 8 · 256` accum columns; an earlier
+    /// fixture said 16 ungated — which priced the same `qkv_cols` by accident
+    /// and hid the gate's whole downstream chain).
+    fn float_projection() -> ModelGeometry {
+        ModelGeometry {
+            hidden: 1024,
+            intermediate: 3072,
+            n_head: 8,
+            n_kv_head: 2,
+            head_dim: 256,
+            experts_per_tok: 1,
+            n_experts: 1,
+            act_dtype: DType::BF16,
+            accum_dtype: DType::F32,
+            projection_accum_roundtrip: true,
+            gated_qkv: true,
+            partial_rotary: true,
         }
     }
 
@@ -575,6 +727,9 @@ mod tests {
             n_experts: 1,
             act_dtype: DType::BF16,
             accum_dtype: DType::F32,
+            projection_accum_roundtrip: false,
+            gated_qkv: false,
+            partial_rotary: false,
         }
     }
 
@@ -615,15 +770,113 @@ mod tests {
     /// rather than lists, so a variant added later is covered untouched.
     #[test]
     fn every_buffer_has_a_phase_and_a_non_zero_size() {
-        for g in [moe(), dense()] {
+        for g in [float_projection(), moe(), dense()] {
             for rows in [1usize, 64, 4096] {
                 for b in WaveBuffer::iter() {
-                    assert!(b.bytes(&g, rows) > 0, "{b:?} sized zero at {rows} rows");
+                    // The projection round-trip pair is the one conditional
+                    // shape in the list: it prices zero exactly when the
+                    // geometry says the chain does not run it, and is charged
+                    // in full whenever it does. Every other variant is
+                    // unconditional, and a zero there is a variant nobody will
+                    // notice is wrong.
+                    let conditional = (matches!(
+                        b,
+                        WaveBuffer::QkvProjOperand
+                            | WaveBuffer::QkvProjAccum
+                            | WaveBuffer::OProjOperand
+                            | WaveBuffer::OProjAccum
+                    ) && !g.projection_accum_roundtrip)
+                        || (matches!(
+                            b,
+                            WaveBuffer::GateSplit
+                                | WaveBuffer::GateSigmoid
+                                | WaveBuffer::GatedContext
+                        ) && !g.gated_qkv)
+                        || (matches!(
+                            b,
+                            WaveBuffer::QRotaryPermute | WaveBuffer::KRotaryPermute
+                        ) && !g.partial_rotary);
                     let s = b.shape(&g, rows);
+                    if conditional {
+                        assert_eq!(b.bytes(&g, rows), 0, "{b:?} priced while disabled");
+                        continue;
+                    }
+                    assert!(b.bytes(&g, rows) > 0, "{b:?} sized zero at {rows} rows");
                     assert!(s.rows > 0 && s.cols > 0, "{b:?} has an empty shape");
                     let _ = b.phase();
                 }
             }
+        }
+    }
+
+    /// The float-session attention chain, pinned against the measured carve
+    /// sizes of the 0.8B census (a C8 ×10-context wave, 5190 rows) rather
+    /// than against itself. That census is the one that caught the span
+    /// exhaustion: the gate's projection width, the two rotary-permute
+    /// gathers, the gate split/sigmoid/apply, and `o_proj`'s round trip were
+    /// all carved and none were priced.
+    #[test]
+    fn the_projection_round_trip_prices_the_measured_carves() {
+        let g = float_projection();
+        let rows = 5190;
+        assert_eq!(
+            WaveBuffer::QkvProjOperand.bytes(&g, rows),
+            3 * 21_258_240,
+            "the three hidden-wide F32 upcasts"
+        );
+        assert_eq!(
+            WaveBuffer::QkvProjAccum.bytes(&g, rows),
+            85_032_960 + 10_629_120 + 10_629_120,
+            "the F32 [q|gate], K and V projection results"
+        );
+        assert_eq!(
+            WaveBuffer::QkvProjection.bytes(&g, rows),
+            42_516_480 + 5_314_560 + 5_314_560,
+            "the act-dtype casts back down, gate width included"
+        );
+        assert_eq!(
+            WaveBuffer::GateSplit.bytes(&g, rows),
+            21_258_240,
+            "the gate's contiguous copy off the strided narrow"
+        );
+        assert_eq!(WaveBuffer::GateSigmoid.bytes(&g, rows), 21_258_240);
+        assert_eq!(WaveBuffer::GatedContext.bytes(&g, rows), 21_258_240);
+        assert_eq!(
+            WaveBuffer::QRotaryPermute.bytes(&g, rows),
+            21_258_240,
+            "Q re-ordered for the full-width rotary kernels"
+        );
+        assert_eq!(WaveBuffer::KRotaryPermute.bytes(&g, rows), 5_314_560);
+        assert_eq!(
+            WaveBuffer::OProjOperand.bytes(&g, rows),
+            42_516_480,
+            "o_proj's F32 operand upcast"
+        );
+        assert_eq!(
+            WaveBuffer::OProjAccum.bytes(&g, rows),
+            21_258_240,
+            "o_proj's F32 result before the cast back"
+        );
+        // And a geometry with none of the flags is charged nothing for any of
+        // them, so no packed model's span moves.
+        let packed = ModelGeometry {
+            projection_accum_roundtrip: false,
+            gated_qkv: false,
+            partial_rotary: false,
+            ..g
+        };
+        for b in [
+            WaveBuffer::QkvProjOperand,
+            WaveBuffer::QkvProjAccum,
+            WaveBuffer::GateSplit,
+            WaveBuffer::GateSigmoid,
+            WaveBuffer::GatedContext,
+            WaveBuffer::QRotaryPermute,
+            WaveBuffer::KRotaryPermute,
+            WaveBuffer::OProjOperand,
+            WaveBuffer::OProjAccum,
+        ] {
+            assert_eq!(b.bytes(&packed, rows), 0, "{b:?} priced while disabled");
         }
     }
 
@@ -727,6 +980,12 @@ mod tests {
     /// allocates; a pure-decode wave pays for four reshape copies that `seq == 1`
     /// makes free. Both are the price of the plan being handed a total row count
     /// instead of a per-group split, and closing it means passing the split.
+    ///
+    /// The third contribution is [`WaveBuffer::AttnNorm`] priced dense against a
+    /// census taken on an int8 run, where it was q8a128: 1792 B/row of the
+    /// 58,624 the chain measured, or 3.1 points of the margin below. That one is
+    /// not closable by passing more context — the two encodings are alternatives
+    /// and the plan has to bound both.
     #[test]
     fn the_attention_union_costs_a_recorded_margin() {
         let plan = WavePlan::new(moe());
@@ -736,7 +995,7 @@ mod tests {
         let margin = (priced as f64 / widest as f64 - 1.0) * 100.0;
         println!("attention union over the prefill chain: {margin:.1}%");
         assert!(
-            (14.0..16.0).contains(&margin),
+            (17.0..19.0).contains(&margin),
             "the union's margin over the widest chain moved to {margin:.1}% — \
              either a buffer was added to one chain only, or the shapes changed"
         );

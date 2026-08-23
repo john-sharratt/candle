@@ -11,6 +11,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DialectType {
     ChatML,
+    /// Qwen3.5 / Qwen3.8 — ChatML's markers, but thinking is suppressed by
+    /// opening the assistant turn with an already-closed think block rather
+    /// than by a `/no_think` marker in the user turn. See [`Dialect::qwen35`].
+    Qwen35,
     Llama2,
     Llama3,
     DeepSeek,
@@ -20,6 +24,7 @@ impl std::fmt::Display for DialectType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DialectType::ChatML => write!(f, "ChatML"),
+            DialectType::Qwen35 => write!(f, "Qwen35"),
             DialectType::Llama2 => write!(f, "Llama2"),
             DialectType::Llama3 => write!(f, "Llama3"),
             DialectType::DeepSeek => write!(f, "DeepSeek"),
@@ -31,6 +36,7 @@ impl DialectType {
     pub fn dialect(&self) -> Dialect {
         match self {
             DialectType::ChatML => Dialect::chat_ml(),
+            DialectType::Qwen35 => Dialect::qwen35(),
             DialectType::Llama2 => Dialect::llama2(),
             DialectType::Llama3 => Dialect::llama3(),
             DialectType::DeepSeek => Dialect::deepseek(),
@@ -59,11 +65,24 @@ pub struct Dialect {
     pub assistant_end: &'static str,
     pub recent_start: &'static str,
     pub recent_end: &'static str,
-    /// The empty/closed reasoning block a thinking model emits under `/no_think`
-    /// (`"<think>\n\n</think>\n\n"` for Qwen3).  Descriptive only — never
-    /// force-prefilled into the assistant header (the model produces it itself,
-    /// or the `/no_think` text alone suppresses reasoning); retained as a
-    /// structural-noise seed for the BDP scan.
+    /// The empty/closed reasoning block (`"<think>\n\n</think>\n\n"`).
+    ///
+    /// **A dialect picks exactly one thinking-suppression mechanism**, and
+    /// which one is decided by whether [`Self::no_think`] is empty:
+    ///
+    /// * `no_think` non-empty (Qwen3, ChatML) — the marker in the user turn is
+    ///   what suppresses reasoning, the model emits its own closed block, and
+    ///   this field is descriptive: a structural-noise seed for the BDP scan,
+    ///   never force-prefilled.
+    /// * `no_think` empty (Qwen3.5 / Qwen3.8) — the chat template has no such
+    ///   marker; suppression *is* opening the assistant turn with this block
+    ///   already closed, exactly as the template renders it under
+    ///   `enable_thinking=false`. Here it is prefilled after
+    ///   [`Self::assistant_start`].
+    ///
+    /// Sending both would be harmless but is not a shape any published
+    /// template produces, so the empty/non-empty split keeps one mechanism
+    /// live per family rather than two overlapping ones.
     pub no_think_block: &'static str,
     /// The `/no_think` soft-switch text — emitted by the section tree's
     /// `no_think` node and prepended to prefilled (never-decoded) turns.
@@ -148,6 +167,27 @@ impl std::fmt::Display for DialectTemplate {
 }
 
 impl Dialect {
+    /// How this dialect suppresses reasoning, as
+    /// `(user-turn marker, block prefilled after the assistant header)`.
+    ///
+    /// The one place the "exactly one mechanism is live, decided by whether
+    /// [`Self::no_think`] is empty" convention (documented on
+    /// [`Self::no_think_block`]) is turned into strings — every prompt
+    /// assembler calls this rather than re-deriving the split, so a family
+    /// that suppresses by prefilled block (Qwen3.5/3.8) can never be sent a
+    /// `/no_think` marker it would read as ordinary text and answer past.
+    /// Both strings are empty when the caller wants the model to reason.
+    pub fn thinking_suppression(&self, suppress: bool) -> (&'static str, &'static str) {
+        if !suppress {
+            return ("", "");
+        }
+        if self.no_think.is_empty() {
+            ("", self.no_think_block)
+        } else {
+            (self.no_think, "")
+        }
+    }
+
     pub fn chat_ml() -> Self {
         Self {
             dialect_type: DialectType::ChatML,
@@ -173,6 +213,28 @@ impl Dialect {
             tool_block_close: "</tools>\n",
             tool_response_open: "<tool_response>\n",
             tool_response_close: "</tool_response>\n",
+        }
+    }
+
+    /// Qwen3.5 / Qwen3.8.
+    ///
+    /// ChatML's markers throughout — the published template is built from
+    /// `<|im_start|>` / `<|im_end|>` exactly as Qwen3's is. It differs in one
+    /// place, and only one: there is no `/no_think` soft switch. The template
+    /// renders `<think>\n\n</think>\n\n` straight after the assistant header
+    /// when `enable_thinking` is false, and reasons when it is true. A
+    /// `/no_think` marker in the user turn is ordinary text to this family, so
+    /// a caller that sends it gets a reasoning trace back and a truncated
+    /// generation looks like the model answering the wrong question.
+    ///
+    /// `document_end` is `<|im_end|>`, not `<|endoftext|>`: the checkpoint's
+    /// `tokenizer.ggml.eos_token_id` points at the turn terminator.
+    pub fn qwen35() -> Self {
+        Self {
+            dialect_type: DialectType::Qwen35,
+            no_think: "",
+            document_end: "<|im_end|>",
+            ..Self::chat_ml()
         }
     }
 

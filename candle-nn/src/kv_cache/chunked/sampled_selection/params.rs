@@ -11,34 +11,6 @@ pub const DEFAULT_REPORT_ARENA_CHUNKS: usize = 8192;
 /// Smaller arena span used by the calibration sweep over the sampled subset.
 pub const DEFAULT_CALIBRATION_ARENA_CHUNKS: usize = 2048;
 
-/// Shared production candidate ladders for adaptive runtime selection.
-const FULL_K_CANDIDATE_LADDER: &[QuantFormat] = &[
-    QuantFormat::Q0_V,
-    QuantFormat::Q1_S,
-    QuantFormat::Q2_A,
-    QuantFormat::Q2_S,
-    QuantFormat::Q3_0,
-    QuantFormat::Q3_1,
-    QuantFormat::Q4_0,
-    QuantFormat::Q4_1,
-    QuantFormat::Q4_KS,
-    QuantFormat::Q8_0,
-    QuantFormat::Q8_1,
-    QuantFormat::Q8_KS,
-];
-
-const FULL_V_CANDIDATE_LADDER: &[QuantFormat] = &[
-    QuantFormat::Q0_V,
-    QuantFormat::Q1_S,
-    QuantFormat::Q2_A,
-    QuantFormat::Q2_S,
-    QuantFormat::Q3_0,
-    QuantFormat::Q3_1,
-    QuantFormat::Q4_0,
-    QuantFormat::Q4_1,
-    QuantFormat::Q8_0,
-];
-
 #[rustfmt::skip]
 pub const PRODUCTION_K_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
     [
@@ -429,3 +401,101 @@ pub const QWEN3_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors
 /// Llama 3.x family. Currently identity but kept as a named constant so the
 /// production trait override and the offline report stay aligned when it diverges.
 pub const LLAMA_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors::IDENTITY;
+
+/// Per-generation scalar on top of [`LLAMA_KV_FACTORS`]: one multiplier
+/// applied to all four rows, carried by the model as its
+/// `compression_error_factor`. Llama 2 runs the base row; Llama 3 runs 10%
+/// tighter.
+pub const LLAMA2_KV_FACTOR: f32 = 1.0;
+/// See [`LLAMA2_KV_FACTOR`].
+pub const LLAMA3_KV_FACTOR: f32 = 0.9;
+
+/// Qwen3.5-0.8B (dense hybrid) — attention layers at `head_dim 256`.
+///
+/// **Derived 2026-08-23** on the 0.8B C-ladder gate
+/// (`quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b`) to the
+/// lineage's calibration target: **the whole range C0–C10 passes**, with the
+/// C10×10 rung sitting just under the breaking edge. Sweep facts that
+/// remain true for the next re-derivation: the critical blocks respond to
+/// the geometric mean of an axis's hi·lo pair, not to either factor alone
+/// (single-sided probes barely move them), and V is the sensitive axis on
+/// this model — K-only tightening made a second session diverge in the
+/// wide-rung sweep.
+pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    k_hi: 0.85,
+    k_low: 0.85,
+    v_hi: 0.6,
+    v_low: 0.6,
+};
+
+/// Qwen3.5-9B (dense hybrid).
+///
+/// **Derived 2026-08-23** on the 9B C-ladder gate
+/// (`quantized_qwen35::tests::test_parallel_batched_forwarding_9b`) to the
+/// lineage target: C0–C10 all pass, C10×10 just under the breaking edge.
+/// The 9B has real headroom over the 0.8B (its ladder passes at identity
+/// with room to spare), so the row loosens to sell that headroom for
+/// compression. Sweep facts that remain true: V alone saturates before it
+/// breaks the top rungs — K is this model's edge axis — and a
+/// hi-tight/low-loose redistribution at the same geometric means measured
+/// strictly worse than the symmetric split.
+pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    k_hi: 1.1,
+    k_low: 1.1,
+    v_hi: 1.9,
+    v_low: 1.9,
+};
+
+/// Qwen3.5-35B-A3B (routed hybrid).
+///
+/// **Derived 2026-08-23** on the 35B C-ladder gate
+/// (`quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b`) to
+/// the lineage target: C0–C10 all pass, C10×10 just under the breaking
+/// edge. The routed 35B is the most quantization-robust of the lineage
+/// (its ladder passes at identity with the most headroom), so its row is
+/// the loosest. Sweep fact that remains true: V is the fine-grained lever
+/// at the top of the ladder — the highest rungs' V candidate floors
+/// (Q0/Q1) are strictly worse than the rungs below (which keep Q4
+/// fallbacks), so V-loosening moves C10 differentially while C9 holds.
+pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    k_hi: 1.5,
+    k_low: 1.5,
+    v_hi: 2.3,
+    v_low: 2.3,
+};
+
+/// Qwen3.6-35B-A3B (routed hybrid point release).
+///
+/// **Derived 2026-08-23** on the 3.6 C-ladder gate
+/// (`quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b`)
+/// to the lineage target: C0–C10 all pass, C10×10 just under the breaking
+/// edge. The point release shares its base model's quantization-error
+/// profile (the 3.5-35B row transferred within one notch on first
+/// derivation), and the two rows are currently identical. Derivation
+/// caution that remains true: wave-width changes (e.g. the VRAM-governor
+/// fix widening the spans) shift accumulation order and move marginal edge
+/// sessions — re-verify this row after any admission or width change.
+pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    k_hi: 1.5,
+    k_low: 1.5,
+    v_hi: 2.2,
+    v_low: 2.2,
+};
+
+/// Qwen3.8-27B (dense flagship hybrid). **Extrapolated, not derived**: the
+/// dense 27B is build-only on the 16 GB dev card, so this row cannot be
+/// measured here. The measured lineage rows order by capacity — the 0.8B
+/// tightest, the 9B looser, the 35B/3.6 MoE loosest — and the 27B sits
+/// between the 9B and the MoE pair in capacity, so this row sits just above
+/// the 9B's, deliberately conservative (thresholds err tight, quality errs
+/// safe). The derivation gate
+/// (`quantized_qwen38::tests::test_parallel_batched_forwarding_27b`)
+/// replaces it with a measured row on the workstation, tuned to the same
+/// target as the rest of the lineage: C0–C10 all pass with C10×10 just
+/// under the breaking edge.
+pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    k_hi: 1.5,
+    k_low: 1.5,
+    v_hi: 2.0,
+    v_low: 2.0,
+};

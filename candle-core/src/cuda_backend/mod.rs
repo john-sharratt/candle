@@ -394,13 +394,17 @@ fn dtype_to_affine_dtype(dtype: DType) -> i32 {
 }
 
 /// Execute affine transformation via direct FFI call (no PTX JIT)
+/// `inherit` is the operand's arena; the resolved backing comes back alongside
+/// the slice so the caller can stamp it rather than claiming ownership of what
+/// may be a view into a wave span.
 fn run_affine_ffi(
     src: &CudaStorageSlice,
     dev: &CudaDevice,
     layout: &Layout,
     mul: f64,
     add: f64,
-) -> Result<CudaStorageSlice> {
+    inherit: Backing,
+) -> Result<(CudaStorageSlice, Backing)> {
     let shape = layout.shape();
     let dims = shape.dims();
     let el = shape.elem_count();
@@ -435,12 +439,16 @@ fn run_affine_ffi(
     };
     let dtype_i32 = dtype_to_affine_dtype(dtype);
 
+    // Assigned by the macro to whatever `alloc_inheriting` resolved.
+    let out_backing;
+
     // Execute based on dtype - allocate output and call FFI
     macro_rules! affine_impl {
         ($slice:expr, $dtype_variant:ident) => {{
             let src_slice = $slice.slice(start_offset..);
             // SAFETY: Allocated memory will be initialized by the kernel
-            let out = unsafe { dev.alloc(el)? };
+            let (out, resolved) = unsafe { alloc_inheriting(dev, el, inherit)? };
+            out_backing = resolved;
             {
                 let (src_ptr, _src_guard) = src_slice.device_ptr(&stream);
                 let (out_ptr, _out_guard) = out.device_ptr(&stream);
@@ -477,7 +485,7 @@ fn run_affine_ffi(
         CudaStorageSlice::I64(s) => affine_impl!(s, I64),
     };
 
-    Ok(out)
+    Ok((out, out_backing))
 }
 
 /// Execute parametric unary operation (Elu/Powf) via direct FFI call
@@ -3894,11 +3902,12 @@ impl BackendStorage for CudaStorage {
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         let device = self.device().clone();
-        let slice = run_affine_ffi(&self.slice, &device, layout, mul, add)?;
+        let (slice, backing) =
+            run_affine_ffi(&self.slice, &device, layout, mul, add, self.backing)?;
         Ok(Self {
             slice,
             device,
-            backing: Backing::Owned,
+            backing,
         })
     }
 
@@ -4688,12 +4697,21 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let elem_count = b * m * n;
         let dev = &self.device;
+        // The activation's arena, not the weight's: `self` is the left operand,
+        // which for every `x @ W` in a forward is the value flowing through the
+        // layer, while `rhs` is a model parameter that names no arena. Assigned
+        // by each arm from what `alloc_inheriting` resolved, so a full span
+        // falls back to the pool rather than failing.
+        let inherit = self.backing;
+        let out_backing;
         let slice = match (&self.slice, &rhs.slice) {
             (CudaStorageSlice::BF16(lhs), CudaStorageSlice::BF16(rhs)) => {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
                 let cfg = gemm_config(bf16::ONE, bf16::ZERO, (b, m, n, k), lhs_l, rhs_l)?;
-                let mut out = unsafe { dev.alloc::<bf16>(elem_count)? };
+                let (mut out, resolved) =
+                    unsafe { alloc_inheriting::<bf16>(dev, elem_count, inherit)? };
+                out_backing = resolved;
                 // Check 16-byte alignment: bf16 is 2 bytes, so offset must be multiple of 8 elements
                 // CUDA malloc guarantees 256-byte aligned base, output is fresh allocation
                 let known_aligned =
@@ -4715,7 +4733,9 @@ impl BackendStorage for CudaStorage {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
                 let cfg = gemm_config(f16::ONE, f16::ZERO, (b, m, n, k), lhs_l, rhs_l)?;
-                let mut out = unsafe { dev.alloc::<f16>(elem_count)? };
+                let (mut out, resolved) =
+                    unsafe { alloc_inheriting::<f16>(dev, elem_count, inherit)? };
+                out_backing = resolved;
                 // Check 16-byte alignment: f16 is 2 bytes, so offset must be multiple of 8 elements
                 let known_aligned =
                     (lhs_l.start_offset() * 2) % 16 == 0 && (rhs_l.start_offset() * 2) % 16 == 0;
@@ -4736,7 +4756,9 @@ impl BackendStorage for CudaStorage {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
                 let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
-                let mut out = unsafe { dev.alloc::<f32>(elem_count)? };
+                let (mut out, resolved) =
+                    unsafe { alloc_inheriting::<f32>(dev, elem_count, inherit)? };
+                out_backing = resolved;
                 // Check 16-byte alignment: f32 is 4 bytes, so offset must be multiple of 4 elements
                 let known_aligned =
                     (lhs_l.start_offset() * 4) % 16 == 0 && (rhs_l.start_offset() * 4) % 16 == 0;
@@ -4757,7 +4779,9 @@ impl BackendStorage for CudaStorage {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
                 let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
-                let mut out = unsafe { dev.alloc::<f64>(elem_count)? };
+                let (mut out, resolved) =
+                    unsafe { alloc_inheriting::<f64>(dev, elem_count, inherit)? };
+                out_backing = resolved;
                 unsafe {
                     self.device
                         .blas
@@ -4766,15 +4790,17 @@ impl BackendStorage for CudaStorage {
                 .w()?;
                 CudaStorageSlice::F64(out)
             }
-            _ => Err(CudaError::InternalError(
-                "dtype mismatch in matmul op".to_string(),
-            ))?,
+            _ => {
+                return Err(
+                    CudaError::InternalError("dtype mismatch in matmul op".to_string()).into(),
+                )
+            }
         };
         let device = dev.clone();
         Ok(Self {
             slice,
             device,
-            backing: Backing::Owned,
+            backing: out_backing,
         })
     }
 

@@ -11,6 +11,13 @@
 //! Ignored (loads DeepSeek-V4-Flash on CUDA + per-token prefill is minutes at
 //! a few-thousand-token context).
 
+// The harness this drives (`models::batch_test`) is compiled only under
+// `cuda` + `ruler-bench` (integration tests build the lib without `cfg(test)`,
+// so the module's `any(test, …)` arm never applies here). The same gate on
+// this target keeps a plain `--tests` build from trying to import a module
+// that does not exist in that configuration.
+#![cfg(all(feature = "cuda", feature = "ruler-bench"))]
+
 use candle::Device;
 use candle_transformers::models::batch_test::ruler_gen::{
     generate_ruler_samples, run_ruler_eval, score_ruler_sample, RulerSample, RulerTask,

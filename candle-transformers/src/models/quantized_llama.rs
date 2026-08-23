@@ -25,10 +25,13 @@ use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
 use super::llama_rope::llama_inv_freq;
 use super::profile::{pipeline_record, profile_now, profile_sync};
+use super::quantized_mlp::QuantizedMlp;
 use super::rope_tables::CisPrecomputations;
 use super::{decode_utils, quantized_matmul::QMatMul};
 use crate::models::batched_layer::WaveRef;
 use crate::models::llama::{Llama3RopeConfig, Llama3RopeType};
+#[allow(unused_imports)]
+use crate::models::mmdit::blocks::SelfAttnDiTBlock;
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
 #[cfg(feature = "cuda")]
@@ -36,11 +39,11 @@ use candle::quantized::cuda::DynamicActs;
 #[cfg(feature = "cuda")]
 use candle::quantized::register_mmap_cuda;
 use candle::quantized::QTensor;
-use candle::quantized::{ggml_file, gguf_file, GgmlDType, Int8Mode};
+use candle::quantized::{ggml_file, gguf_file, Int8Mode};
 use candle::LiveTensor;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::WaveGeneration;
+use candle_nn::kv_cache::{WaveGeneration, LLAMA2_KV_FACTOR, LLAMA3_KV_FACTOR, LLAMA_KV_FACTORS};
 use candle_nn::{kv_cache::KvCache, Embedding, Module};
 
 /// Initial number of RoPE positions to precompute for quantized llama models.
@@ -59,220 +62,12 @@ pub const ROPE_EXTEND_CHUNK: usize = 1024;
 type SharedCis = Arc<RwLock<CisPrecomputations>>;
 
 #[derive(Debug, Clone)]
-struct Mlp {
-    feed_forward_gate_up: Option<QMatMul>,
-    feed_forward_w1: Option<QMatMul>,
-    feed_forward_w2: QMatMul,
-    feed_forward_w3: Option<QMatMul>,
-}
-
-impl Mlp {
-    fn from_qtensors(
-        feed_forward_w1: QTensor,
-        feed_forward_w2: QTensor,
-        feed_forward_w3: QTensor,
-        device_is_cuda: bool,
-        // The dense MLP's `ffn_norm` emits int8 (q8a128) activations in int8 mode, so its
-        // weights must be the matching KO twins. MoE experts receive FP activations and pass
-        // `Int8Mode::Off`. The fused gate+up weight is repacked to a single KO twin too.
-        int8mode: Int8Mode,
-    ) -> Result<Self> {
-        let try_fuse = device_is_cuda
-            && feed_forward_w1.dtype() == feed_forward_w3.dtype()
-            && !matches!(
-                feed_forward_w1.dtype(),
-                GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-            );
-
-        let (feed_forward_gate_up, feed_forward_w1, feed_forward_w3) = if try_fuse {
-            #[cfg(feature = "cuda")]
-            {
-                let (w1_n, w1_k) = feed_forward_w1.shape().dims2()?;
-                let (w3_n, w3_k) = feed_forward_w3.shape().dims2()?;
-                if w1_n != w3_n || w1_k != w3_k {
-                    candle::bail!(
-                        "cannot fuse ffn_gate/ffn_up due to shape mismatch: gate=({}, {}) up=({}, {})",
-                        w1_n,
-                        w1_k,
-                        w3_n,
-                        w3_k
-                    );
-                }
-                let fused = QTensor::concat_rows_cuda(&[&feed_forward_w1, &feed_forward_w3])?;
-                (
-                    Some(QMatMul::from_qtensor_with_mode(fused, int8mode)?),
-                    None,
-                    None,
-                )
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                candle::bail!("fused gate+up requires the cuda feature");
-            }
-        } else {
-            (
-                None,
-                Some(QMatMul::from_qtensor_with_mode(feed_forward_w1, int8mode)?),
-                Some(QMatMul::from_qtensor_with_mode(feed_forward_w3, int8mode)?),
-            )
-        };
-
-        Ok(Self {
-            feed_forward_gate_up,
-            feed_forward_w1,
-            feed_forward_w2: QMatMul::from_qtensor_with_mode(feed_forward_w2, int8mode)?,
-            feed_forward_w3,
-        })
-    }
-}
-
-impl Module for Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dims = xs.dims();
-        let stage_prefix = if dims.len() >= 2 && dims[1] == 1 {
-            "decode"
-        } else {
-            "prefill"
-        };
-
-        let w1w3_name = if stage_prefix == "decode" {
-            "decode:model:mlp:ffn:w1w3"
-        } else {
-            "prefill:model:mlp:ffn:w1w3"
-        };
-        let w1_name = if stage_prefix == "decode" {
-            "decode:model:mlp:ffn:w1"
-        } else {
-            "prefill:model:mlp:ffn:w1"
-        };
-        let w3_name = if stage_prefix == "decode" {
-            "decode:model:mlp:ffn:w3"
-        } else {
-            "prefill:model:mlp:ffn:w3"
-        };
-        let silu_name = if stage_prefix == "decode" {
-            "decode:model:mlp:ffn:silu"
-        } else {
-            "prefill:model:mlp:ffn:silu"
-        };
-        let mul_name = if stage_prefix == "decode" {
-            "decode:model:mlp:ffn:mul"
-        } else {
-            "prefill:model:mlp:ffn:mul"
-        };
-        let w2_name = if stage_prefix == "decode" {
-            "decode:model:mlp:ffn:w2"
-        } else {
-            "prefill:model:mlp:ffn:w2"
-        };
-
-        let (w1, w3) = if let Some(w) = &self.feed_forward_gate_up {
-            let t_w1w3 = profile_now();
-            let gu = w.forward(xs)?;
-            profile_sync(gu.device());
-            pipeline_record(w1w3_name, t_w1w3);
-
-            let last_dim = gu.rank() - 1;
-            let out_dim = gu.dim(last_dim)?;
-            if out_dim % 2 != 0 {
-                candle::bail!("unexpected fused gate+up output dim {out_dim} (not even)");
-            }
-            let half = out_dim / 2;
-            (
-                gu.narrow(last_dim, 0, half)?,
-                gu.narrow(last_dim, half, half)?,
-            )
-        } else {
-            let t_w1 = profile_now();
-            let w1 = self
-                .feed_forward_w1
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w1".into()))?
-                .forward(xs)?;
-            profile_sync(w1.device());
-            pipeline_record(w1_name, t_w1);
-
-            let t_w3 = profile_now();
-            let w3 = self
-                .feed_forward_w3
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w3".into()))?
-                .forward(xs)?;
-            profile_sync(w3.device());
-            pipeline_record(w3_name, t_w3);
-            (w1, w3)
-        };
-
-        let t_silu = profile_now();
-        let silu_w1 = candle_nn::ops::silu(&w1)?;
-        profile_sync(silu_w1.device());
-        pipeline_record(silu_name, t_silu);
-
-        let t_mul = profile_now();
-        let intermediate = (silu_w1 * w3)?;
-        profile_sync(intermediate.device());
-        pipeline_record(mul_name, t_mul);
-
-        let t_w2 = profile_now();
-        let out = self.feed_forward_w2.forward_live(&intermediate)?;
-        profile_sync(out.device());
-        pipeline_record(w2_name, t_w2);
-        Ok(out)
-    }
-}
-
-impl Mlp {
-    /// B3 consumer: gate/up over a producer-prepared (fused ffn_norm) activation, shared across
-    /// both projections; down-proj closes the block. CUDA only.
-    #[cfg(feature = "cuda")]
-    fn forward_dynamic<'w>(
-        &self,
-        acts: &DynamicActs<'w>,
-        out_dtype: DType,
-    ) -> Result<LiveTensor<'w>> {
-        let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
-            let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
-            // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
-            // gate/up views: `gu` is owned + contiguous here so the cast is allocation-free.
-            // Casting the two aliasing narrows separately instead forces two fallback allocations
-            // (an in-place cast on a shared view is unsafe — see `Tensor::to_dtype_mut`).
-            gu.to_dtype_mut(out_dtype)?;
-            let last = gu.rank() - 1;
-            let half = gu.dim(last)? / 2;
-            (gu.narrow(last, 0, half)?, gu.narrow(last, half, half)?)
-        } else {
-            let w1 = self
-                .feed_forward_w1
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w1".into()))?
-                .forward_dynamic(acts.as_dynamic(), out_dtype)?;
-            let w3 = self
-                .feed_forward_w3
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w3".into()))?
-                .forward_dynamic(acts.as_dynamic(), out_dtype)?;
-            (w1, w3)
-        };
-        // Run silu/mul/down in out_dtype: the Float path returns the activation dtype (F16), but
-        // MLP intermediates can exceed F16's ~65504 range, so compute in out_dtype (BF16). The
-        // fused path already coerced `gu` above and the int8 path already returns out_dtype, so
-        // these are no-ops except on the separate-weight Float path.
-        w1.to_dtype_mut(out_dtype)?;
-        w3.to_dtype_mut(out_dtype)?;
-        let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
-        let mut out = self.feed_forward_w2.forward_live(&intermediate)?;
-        out.to_dtype_mut(out_dtype)?;
-        Ok(out)
-    }
-}
-
-#[derive(Debug, Clone)]
 enum MlpOrMoe {
-    Mlp(Mlp),
+    Mlp(QuantizedMlp),
     MoE {
         n_expert_used: usize,
         feed_forward_gate_inp: QMatMul,
-        experts: Vec<Mlp>,
+        experts: Vec<QuantizedMlp>,
     },
 }
 
@@ -330,9 +125,14 @@ impl Module for MlpOrMoe {
                     // Index the correct hidden states and compute the expert hidden state for
                     // the current expert. We need to make sure to multiply the output hidden
                     // states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-                    let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
+                    // The expert runs on `[1, tokens, hidden]` (the MLP reads a
+                    // batched 3-D activation); the result flattens back to the
+                    // `[tokens, hidden]` rows the scatter below indexes.
+                    let current_state = xs.index_select(&top_x, 0)?.reshape((1, (), hidden_dim))?;
                     // current_hidden_states = expert_layer(current_state, routing_weights[top_x_list, idx_list, None])
-                    let current_hidden_states = expert_layer.forward(&current_state)?;
+                    let current_hidden_states = expert_layer
+                        .forward(&current_state)?
+                        .reshape(((), hidden_dim))?;
                     let current_hidden_states =
                         current_hidden_states.broadcast_mul(&selected_rws)?;
                     ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
@@ -750,7 +550,12 @@ impl BatchedAttentionLayer for LayerWeights {
                     .forward_dynamic(acts.as_dynamic(), out_dtype)?,
             ),
         };
-        Ok(QkvProjection { q, k, v })
+        Ok(QkvProjection {
+            q,
+            k,
+            v,
+            gate: None,
+        })
     }
 }
 
@@ -768,6 +573,7 @@ pub struct ModelWeights {
     /// `0` on non-CUDA.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     base_weight_bytes: usize,
+    compression_error_factor: f32,
 }
 
 /// Implementation of BatchedModelCore for use with BatchedInference wrapper.
@@ -791,18 +597,23 @@ impl BatchedModelCore for ModelWeights {
     /// routed case reads one expert's projection and its own `n_expert_used`
     /// rather than assuming a dense FFN.
     fn wave_shapes(&self) -> WaveShapes {
-        let (down, experts_per_tok, n_experts) = match &self.layers[0].mlp_or_moe {
-            MlpOrMoe::Mlp(mlp) => (&mlp.feed_forward_w2, 1, 1),
+        let (mlp, experts_per_tok, n_experts) = match &self.layers[0].mlp_or_moe {
+            MlpOrMoe::Mlp(mlp) => (mlp, 1, 1),
             MlpOrMoe::MoE {
                 n_expert_used,
                 experts,
                 ..
-            } => (&experts[0].feed_forward_w2, *n_expert_used, experts.len()),
+            } => (&experts[0], *n_expert_used, experts.len()),
         };
-        let dims = down.weight_dims();
+        // Panics on a non-2-D `ffn_down`: a zeroed shape would silently
+        // mis-size the transient plan, which is worse than failing where the
+        // weight is wrong.
+        let (hidden, intermediate) = mlp
+            .hidden_and_intermediate()
+            .expect("ffn_down has a 2-D shape");
         WaveShapes {
-            hidden: dims[0],
-            intermediate: dims[1],
+            hidden,
+            intermediate,
             experts_per_tok,
             n_experts,
         }
@@ -864,20 +675,24 @@ impl BatchedModelCore for ModelWeights {
         Ok(())
     }
 
+    // The family row scaled by this checkpoint's per-generation scalar
+    // (`compression_error_factor`, pinned by the `_v2`/`_v3` constructors) —
+    // one multiplier across all four rows, so a generation dials the whole
+    // calibration tighter or looser without forking the row.
     fn k_hi_error_threshold_factor(&self) -> f32 {
-        candle_nn::kv_cache::LLAMA_KV_FACTORS.k_hi
+        LLAMA_KV_FACTORS.k_hi * self.compression_error_factor
     }
 
     fn k_low_error_threshold_factor(&self) -> f32 {
-        candle_nn::kv_cache::LLAMA_KV_FACTORS.k_low
+        LLAMA_KV_FACTORS.k_low * self.compression_error_factor
     }
 
     fn v_hi_error_threshold_factor(&self) -> f32 {
-        candle_nn::kv_cache::LLAMA_KV_FACTORS.v_hi
+        LLAMA_KV_FACTORS.v_hi * self.compression_error_factor
     }
 
     fn v_low_error_threshold_factor(&self) -> f32 {
-        candle_nn::kv_cache::LLAMA_KV_FACTORS.v_low
+        LLAMA_KV_FACTORS.v_low * self.compression_error_factor
     }
 }
 
@@ -908,11 +723,11 @@ impl ModelWeights {
                 let feed_forward_w1 = ct.remove(&format!("{prefix}.feed_forward.w1.weight"))?;
                 let feed_forward_w2 = ct.remove(&format!("{prefix}.feed_forward.w2.weight"))?;
                 let feed_forward_w3 = ct.remove(&format!("{prefix}.feed_forward.w3.weight"))?;
-                MlpOrMoe::Mlp(Mlp::from_qtensors(
+                // w1 is the gate projection, w3 the up, w2 the down.
+                MlpOrMoe::Mlp(QuantizedMlp::from_weights(
                     feed_forward_w1,
-                    feed_forward_w2,
                     feed_forward_w3,
-                    matches!(ct.device, Device::Cuda(_)),
+                    feed_forward_w2,
                     Int8Mode::Off,
                 )?)
             };
@@ -951,13 +766,31 @@ impl ModelWeights {
             span_output,
             // Legacy GGML path (not the GGUF load the daemon uses) — left unmeasured.
             base_weight_bytes: 0,
+            compression_error_factor: 0.9,
         })
     }
 
-    pub fn from_gguf<R: std::io::Seek + std::io::Read>(
+    pub fn from_gguf_v2<R: std::io::Seek + std::io::Read>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
+    ) -> Result<Self> {
+        Self::from_gguf(ct, reader, device, LLAMA2_KV_FACTOR)
+    }
+
+    pub fn from_gguf_v3<R: std::io::Seek + std::io::Read>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::from_gguf(ct, reader, device, LLAMA3_KV_FACTOR)
+    }
+
+    fn from_gguf<R: std::io::Seek + std::io::Read>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        compression_error_factor: f32,
     ) -> Result<Self> {
         // The span is sized from the governor's measured capacity — without
         // one, the governor-less test constant cannot hold a 32-layer model's
@@ -1063,17 +896,10 @@ impl ModelWeights {
                 ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
 
             let mlp_or_moe = if n_expert <= 1 {
-                let feed_forward_w1 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
-                let feed_forward_w2 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
-                let feed_forward_w3 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
-                MlpOrMoe::Mlp(Mlp::from_qtensors(
-                    feed_forward_w1,
-                    feed_forward_w2,
-                    feed_forward_w3,
-                    matches!(device, Device::Cuda(_)),
+                MlpOrMoe::Mlp(QuantizedMlp::from_weights(
+                    ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?,
+                    ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?,
+                    ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?,
                     Int8Mode::Off,
                 )?)
             } else {
@@ -1081,17 +907,10 @@ impl ModelWeights {
                     ct.tensor(reader, &format!("{prefix}.ffn_gate_inp.weight"), device)?;
                 let mut experts = Vec::with_capacity(n_expert);
                 for i in 0..n_expert {
-                    let feed_forward_w1 =
-                        ct.tensor(reader, &format!("{prefix}.ffn_gate.{i}.weight"), device)?;
-                    let feed_forward_w2 =
-                        ct.tensor(reader, &format!("{prefix}.ffn_down.{i}.weight"), device)?;
-                    let feed_forward_w3 =
-                        ct.tensor(reader, &format!("{prefix}.ffn_up.{i}.weight"), device)?;
-                    experts.push(Mlp::from_qtensors(
-                        feed_forward_w1,
-                        feed_forward_w2,
-                        feed_forward_w3,
-                        matches!(device, Device::Cuda(_)),
+                    experts.push(QuantizedMlp::from_weights(
+                        ct.tensor(reader, &format!("{prefix}.ffn_gate.{i}.weight"), device)?,
+                        ct.tensor(reader, &format!("{prefix}.ffn_up.{i}.weight"), device)?,
+                        ct.tensor(reader, &format!("{prefix}.ffn_down.{i}.weight"), device)?,
                         Int8Mode::Off,
                     )?)
                 }
@@ -1141,24 +960,45 @@ impl ModelWeights {
             span,
             span_output,
             base_weight_bytes,
+            compression_error_factor,
         })
     }
 
-    /// Load model from GGUF file using memory-mapped I/O for zero-copy tensor loading.
+    /// Llama-2-family checkpoint by path, int8 mode picked from the device —
+    /// the by-path twin of [`Self::from_gguf_v2`].
+    pub fn from_gguf_by_path_v2(file_path: &std::path::Path, device: &Device) -> Result<Self> {
+        Self::from_gguf_by_path_with_int8_v2(file_path, device, Int8Mode::auto(device))
+    }
+
+    /// Llama-3-family checkpoint by path, int8 mode picked from the device —
+    /// the by-path twin of [`Self::from_gguf_v3`].
+    pub fn from_gguf_by_path_v3(file_path: &std::path::Path, device: &Device) -> Result<Self> {
+        Self::from_gguf_by_path_with_int8_v3(file_path, device, Int8Mode::auto(device))
+    }
+
+    pub fn from_gguf_by_path_with_int8_v2(
+        file_path: &std::path::Path,
+        device: &Device,
+        int8mode: Int8Mode,
+    ) -> Result<Self> {
+        Self::from_gguf_by_path_with_int8(file_path, device, int8mode, LLAMA2_KV_FACTOR)
+    }
+
+    pub fn from_gguf_by_path_with_int8_v3(
+        file_path: &std::path::Path,
+        device: &Device,
+        int8mode: Int8Mode,
+    ) -> Result<Self> {
+        Self::from_gguf_by_path_with_int8(file_path, device, int8mode, LLAMA3_KV_FACTOR)
+    }
+
+    /// Load from a GGUF file using memory-mapped I/O for zero-copy tensor
+    /// loading: File (mmap) → GPU, one copy, no intermediate `Vec<u8>` and no
+    /// doubled peak RAM, with the OS page cache doing the read scheduling.
     ///
-    /// This method eliminates intermediate RAM allocations and copies by using mmap:
-    /// - Traditional: File → Vec<u8> → GPU (2 copies, 2x peak RAM)
-    /// - This method: File (mmap) → GPU (1 copy, 1x peak RAM)
-    ///
-    /// Benefits:
-    /// - **Eliminates RAM allocation** for tensor data
-    /// - **Eliminates file→RAM copy** - only mmap→GPU remains
-    /// - **Lower peak memory usage** - no temporary buffers
-    /// - **OS page cache efficiency** - kernel optimizes page access
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the GGUF file
-    /// * `device` - Device to load tensors onto
+    /// Callers go through the `_v2`/`_v3` wrappers, which pin the generation's
+    /// KV factor; the int8 mode is explicit here and device-derived in
+    /// [`Self::from_gguf_by_path_v2`] / [`Self::from_gguf_by_path_v3`].
     ///
     /// # Example
     /// ```no_run
@@ -1168,18 +1008,14 @@ impl ModelWeights {
     ///
     /// let path = Path::new("model.gguf");
     /// let device = Device::cuda_if_available(0)?;
-    /// let model = ModelWeights::from_gguf_by_path(path, &device)?;
+    /// let model = ModelWeights::from_gguf_by_path_v3(path, &device)?;
     /// # Ok::<(), candle::Error>(())
     /// ```
-    pub fn from_gguf_by_path(file_path: &std::path::Path, device: &Device) -> Result<Self> {
-        Self::from_gguf_by_path_with_int8(file_path, device, Int8Mode::auto(device))
-    }
-
-    /// Like from_gguf_by_path but with an explicit int8mode (test path selects from INT8MODE).
-    pub fn from_gguf_by_path_with_int8(
+    fn from_gguf_by_path_with_int8(
         file_path: &std::path::Path,
         device: &Device,
         int8mode: Int8Mode,
+        compression_error_factor: f32,
     ) -> Result<Self> {
         use memmap2::MmapOptions;
 
@@ -1314,28 +1150,23 @@ impl ModelWeights {
             let attention_wo = load_tensor(&format!("{prefix}.attn_output.weight"))?;
 
             let mlp_or_moe = if n_expert <= 1 {
-                let feed_forward_w1 = load_tensor(&format!("{prefix}.ffn_gate.weight"))?;
-                let feed_forward_w2 = load_tensor(&format!("{prefix}.ffn_down.weight"))?;
-                let feed_forward_w3 = load_tensor(&format!("{prefix}.ffn_up.weight"))?;
-                MlpOrMoe::Mlp(Mlp::from_qtensors(
-                    feed_forward_w1,
-                    feed_forward_w2,
-                    feed_forward_w3,
-                    matches!(device, Device::Cuda(_)),
+                // The dense MLP's `ffn_norm` emits int8 (q8a128) activations in int8 mode, so
+                // its weights must be the matching KO twins. MoE experts receive FP activations
+                // and pass `Int8Mode::Off`.
+                MlpOrMoe::Mlp(QuantizedMlp::from_weights(
+                    load_tensor(&format!("{prefix}.ffn_gate.weight"))?,
+                    load_tensor(&format!("{prefix}.ffn_up.weight"))?,
+                    load_tensor(&format!("{prefix}.ffn_down.weight"))?,
                     int8mode,
                 )?)
             } else {
                 let feed_forward_gate_inp = load_tensor(&format!("{prefix}.ffn_gate_inp.weight"))?;
                 let mut experts = Vec::with_capacity(n_expert);
                 for i in 0..n_expert {
-                    let feed_forward_w1 = load_tensor(&format!("{prefix}.ffn_gate.{i}.weight"))?;
-                    let feed_forward_w2 = load_tensor(&format!("{prefix}.ffn_down.{i}.weight"))?;
-                    let feed_forward_w3 = load_tensor(&format!("{prefix}.ffn_up.{i}.weight"))?;
-                    experts.push(Mlp::from_qtensors(
-                        feed_forward_w1,
-                        feed_forward_w2,
-                        feed_forward_w3,
-                        matches!(device, Device::Cuda(_)),
+                    experts.push(QuantizedMlp::from_weights(
+                        load_tensor(&format!("{prefix}.ffn_gate.{i}.weight"))?,
+                        load_tensor(&format!("{prefix}.ffn_up.{i}.weight"))?,
+                        load_tensor(&format!("{prefix}.ffn_down.{i}.weight"))?,
                         Int8Mode::Off,
                     )?)
                 }
@@ -1390,6 +1221,7 @@ impl ModelWeights {
             span,
             span_output,
             base_weight_bytes,
+            compression_error_factor,
         })
     }
 
@@ -1639,7 +1471,7 @@ mod tests {
         // Load model using optimized mmap path
         println!("Loading model with mmap optimization...");
         let load_start = std::time::Instant::now();
-        let model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let model = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
         let load_duration = load_start.elapsed();
         println!(
             "✓ Model loaded in {:.3}s using mmap\n",
@@ -1776,7 +1608,7 @@ mod tests {
         println!("Using device: {:?}\n", device);
 
         // Load model
-        let model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let model = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
         println!("✓ Model loaded\n");
 
         // Test 1: Process a long prompt (should trigger Flash Attention)
@@ -2256,7 +2088,8 @@ mod tests {
 "
         );
         let load_model = || {
-            let model = ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;
+            let model =
+                ModelWeights::from_gguf_by_path_with_int8_v3(&model_path, &device, int8mode)?;
             println!("✓ Model loaded\n");
             // Get the custom inv_freq (includes rope scaling if configured)
             let inv_freq = model
@@ -2459,7 +2292,8 @@ mod tests {
 "
         );
         let load_model = || {
-            let model = ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;
+            let model =
+                ModelWeights::from_gguf_by_path_with_int8_v2(&model_path, &device, int8mode)?;
             println!("✓ Llama 2 7B Chat model loaded\n");
             // Get the custom inv_freq (includes rope scaling if configured)
             let inv_freq = model
@@ -2540,7 +2374,7 @@ mod tests {
             })?;
             println!("Model path: {:?}", model_path);
 
-            let raw = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+            let raw = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
             let inv_freq = raw
                 .rope_inv_freq()
                 .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
@@ -2729,7 +2563,7 @@ mod tests {
             .get("model-Q4_K_M.gguf")
             .map_err(|e| candle::Error::Msg(format!("Download failed: {}", e)))?;
 
-        let raw = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let raw = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
         let inv_freq = raw
             .rope_inv_freq()
             .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;

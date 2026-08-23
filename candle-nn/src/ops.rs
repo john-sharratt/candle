@@ -1,6 +1,7 @@
 //! Tensor ops.
 //!
 
+use candle::wave_provenance::WaveTicket;
 use candle::{CpuStorage, DType, Layout, LiveTensor, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
@@ -534,6 +535,14 @@ pub fn softmax_last_dim<'w>(xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
 #[derive(Debug, Clone)]
 struct RmsNorm {
     eps: f32,
+    /// The arena to allocate the output from when the *operand* names none.
+    ///
+    /// Every op downstream of a wave-backed value inherits its arena from that
+    /// value, so a chain only needs to be told where it lives once — at its
+    /// head, whose operand is the residual stream and therefore pool-backed.
+    /// `None` is the ordinary case and means "inherit or fall back to the pool",
+    /// which is what plain [`rms_norm`] does.
+    root: Option<WaveTicket>,
 }
 
 impl candle::CustomOp2 for RmsNorm {
@@ -645,14 +654,17 @@ impl candle::CustomOp2 for RmsNorm {
         };
 
         // The operand's arena: this op's output is allocated beside its input,
-
         // which is what makes the `'w` on the result true rather than merely
-
-        // permitted. Declared before the dispatch macro because a `macro_rules!`
-
-        // body resolves free identifiers at its definition site, not its call.
-
-        let inherit = s1.backing;
+        // permitted. When the operand names no arena — the head of a chain,
+        // whose input is the residual stream and so pool-backed — `root` says
+        // where the chain lives instead, and everything downstream follows from
+        // this one output without another mention of the wave. Declared before
+        // the dispatch macro because a `macro_rules!` body resolves free
+        // identifiers at its definition site, not its call.
+        let inherit = match s1.backing.inherit_ticket() {
+            Some(_) => s1.backing,
+            None => candle::cuda_backend::Backing::from_ticket(self.root),
+        };
 
         // Assigned by the macro to whatever `alloc_inheriting` resolved.
 
@@ -772,6 +784,26 @@ pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
 }
 
 pub fn rms_norm<'w>(xs: &LiveTensor<'w>, alpha: &Tensor, eps: f32) -> Result<LiveTensor<'w>> {
+    rms_norm_rooted(xs, alpha, eps, None)
+}
+
+/// [`rms_norm`], allocating its output from `root` when `xs` names no arena.
+///
+/// **The seed of a wave-scoped chain.** Operand provenance carries an arena from
+/// a value to everything computed from it, so a chain of forty ops needs to be
+/// told where it lives exactly once — and it cannot inherit that from its own
+/// input, which is the residual stream and crosses layers on the pool. This is
+/// where a layer says it: normalise the residual into the wave's span, and the
+/// rest of the layer lands there by construction.
+///
+/// `root` is ignored when `xs` already carries an arena — a value that came from
+/// a wave belongs to *that* wave, and a caller cannot re-home it by asking.
+pub fn rms_norm_rooted<'w>(
+    xs: &LiveTensor<'w>,
+    alpha: &Tensor,
+    eps: f32,
+    root: Option<WaveTicket>,
+) -> Result<LiveTensor<'w>> {
     let hidden_size_xs = xs.dim(D::Minus1)?;
     let hidden_size_alpha = alpha.dims1()?;
     if hidden_size_xs != hidden_size_alpha {
@@ -781,7 +813,7 @@ pub fn rms_norm<'w>(xs: &LiveTensor<'w>, alpha: &Tensor, eps: f32) -> Result<Liv
             alpha.shape()
         )
     }
-    xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
+    xs.apply_op2_no_bwd(alpha, &RmsNorm { eps, root })
 }
 
 // =============================================================================

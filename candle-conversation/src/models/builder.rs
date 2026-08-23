@@ -741,7 +741,11 @@ impl ModelBuilder {
                 use candle_transformers::models::quantized_llama::ModelWeights;
                 // Per-layer progress not yet wired for this arch.
                 let _ = progress;
-                let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
+                // The deployed Llama is the 3.x family (Llama-3.2-3B), so the
+                // v3 KV-factor row applies; a Llama-2 checkpoint needs its own
+                // `ModelArch` split onto `from_gguf_by_path_v2` before it can
+                // load through the daemon.
+                let raw = ModelWeights::from_gguf_by_path_v3(model_path, device)?;
                 let inv = raw.rope_inv_freq().ok_or_else(|| {
                     ConversationError::Model(candle::Error::Msg(
                         "model missing rope inv_freq".into(),

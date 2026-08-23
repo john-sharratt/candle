@@ -257,7 +257,7 @@ impl BackingInner {
         }
     }
 
-    fn release_empty_arenas(&self) -> Result<usize> {
+    pub(super) fn release_empty_arenas(&self) -> Result<usize> {
         let mut freed = 0;
 
         // Phase 1: Pool-driven tombstoning of fully-free arenas.
@@ -2462,6 +2462,32 @@ pub fn global_arena_memory_report() -> Vec<(usize, String, usize, usize)> {
         }
     }
     results
+}
+
+/// Release every fully-empty arena across all registered backings, returning
+/// their regions to the pool. Returns arenas freed.
+///
+/// The reactive twin of the per-backing sweep, callable from the region layer
+/// itself: the transient-tier placement (`region_pool::place_transient`)
+/// measures its footprint against *claimed* regions, and a region whose arena
+/// went chunk-empty since the last periodic sweep still reads as claimed —
+/// measured on the Llama-2 MHA gate, 238 empty arenas stood between a 4-region
+/// tier and its ground. An arena release is a free-list push, so this is safe
+/// wherever a claim is.
+pub(super) fn global_release_empty_arenas() -> usize {
+    let mut freed = 0;
+    if let Ok(registry) = BACKING_REGISTRY.lock() {
+        for weak in registry.iter() {
+            if let Some(inner) = weak.upgrade() {
+                // The pool's atomic fast path makes a no-op backing cost one
+                // load, so this is callable from every claim without weight.
+                if inner.pool.has_reclaimable() {
+                    freed += inner.release_empty_arenas().unwrap_or(0);
+                }
+            }
+        }
+    }
+    freed
 }
 
 /// Get the total GPU memory used by all registered arena backings (bytes).

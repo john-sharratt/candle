@@ -128,7 +128,7 @@ const QUANTIZED_KERNELS: [&str; 45] = [
 ];
 
 // Flash-attention kernels: 12 total
-const FLASH_KERNELS: [&str; 13] = [
+const FLASH_KERNELS: [&str; 14] = [
     // Batched sampling (1 api + 4 variants)
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
@@ -147,6 +147,9 @@ const FLASH_KERNELS: [&str; 13] = [
     "src/paged-glue/paged_glue_api_bf16.cu",
     // Paged latent attention: single-latent K≡V window + compressed top-k
     "src/paged-latent/paged_latent_api_bf16.cu",
+    // Gated DeltaNet (Qwen3.5/3.8 hybrid layers): one F32 entry TU over the
+    // decode-step/conv-step and fused-prefill-scan kernel headers
+    "src/delta-net/delta_net_api_f32.cu",
 ];
 
 /// Provenance BDP scan — the scalar backend, the b1 tensor-core (BMMA) backend
@@ -202,6 +205,14 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
 
     if is_msvc {
         base_args.push("-D_USE_MATH_DEFINES".to_string());
+        // Match Rust's MSVC target, which links the *dynamic* CRT: without
+        // this, cl.exe compiles nvcc's host-side launch stubs against the
+        // static CRT (/MT → LIBCMT defaultlib directives in every object),
+        // and the final link reports LNK4098 (`LIBCMT conflicts with use of
+        // other libs`) — two CRTs in one binary, which is a real hazard
+        // (duplicate allocators/locale state), not just noise.
+        base_args.push("-Xcompiler".to_string());
+        base_args.push("/MD".to_string());
     } else {
         base_args.push("-Xcompiler".to_string());
         base_args.push("-fPIC".to_string());
@@ -431,6 +442,24 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
             name: "paged_latent".to_string(),
             kernels: latent_kernels,
             compile_args: latent_args,
+            include_dirs: flash_includes.clone(),
+        });
+    }
+
+    // 8. Gated DeltaNet (Qwen3.5/3.8 hybrid layers). Plain F32 recurrence
+    //    kernels — no tensor cores, no smem heroics — validated against the
+    //    tolerance-based sequential reference, so the stock decode flags are
+    //    all it needs.
+    {
+        let dn_kernels: Vec<String> = FLASH_KERNELS
+            .iter()
+            .filter(|k| k.contains("delta-net"))
+            .map(|s| s.to_string())
+            .collect();
+        groups.push(ArchiveGroup {
+            name: "delta_net".to_string(),
+            kernels: dn_kernels,
+            compile_args: decode_args,
             include_dirs: flash_includes,
         });
     }

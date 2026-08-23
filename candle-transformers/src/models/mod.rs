@@ -108,6 +108,7 @@ pub mod quantized_gemma3;
 pub mod quantized_llama;
 pub mod quantized_llama2_c;
 pub mod quantized_matmul;
+pub mod quantized_mlp;
 pub mod quantized_metavoice;
 pub mod quantized_mistral;
 pub mod quantized_mixformer;
@@ -116,9 +117,19 @@ pub mod quantized_mpt;
 pub mod quantized_phi;
 pub mod quantized_phi3;
 pub mod quantized_qwen2;
+pub mod delta_net;
 pub mod quantized_qwen3;
 #[cfg(feature = "cuda")]
 pub mod quantized_qwen3_moe;
+#[cfg(feature = "cuda")]
+pub mod quantized_qwen35;
+#[cfg(feature = "cuda")]
+pub mod quantized_qwen35_moe;
+#[cfg(feature = "cuda")]
+pub mod quantized_qwen36_moe;
+#[cfg(feature = "cuda")]
+pub mod quantized_qwen38;
+pub mod rotary_layout;
 pub mod quantized_recurrent_gemma;
 pub mod quantized_rwkv_v5;
 pub mod quantized_rwkv_v6;
@@ -127,6 +138,7 @@ pub mod quantized_t5;
 pub mod qwen2;
 pub mod qwen2_moe;
 pub mod qwen3;
+pub mod qwen35;
 pub mod qwen3_moe;
 pub mod rope_tables;
 pub mod routing_capture;
@@ -156,6 +168,7 @@ pub mod vgg;
 pub mod vit;
 pub mod voxtral;
 mod wave_admit;
+pub mod wave_driver;
 #[cfg(feature = "cuda")]
 pub mod wave_buffers;
 pub mod whisper;

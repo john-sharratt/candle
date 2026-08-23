@@ -692,6 +692,12 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // The int8 tensor-core kernels emit F32 before the cast back to
             // `act_dtype`; both buffers are live at once, so both are planned.
             accum_dtype: DType::F32,
+            // Moot here — this forward takes its transients from the CUDA pool
+            // rather than the span (see `prefill_width_cap` below), so no
+            // projection buffer is carved from a wave arena at all.
+            projection_accum_roundtrip: false,
+            gated_qkv: false,
+            partial_rotary: false,
         }
     }
 

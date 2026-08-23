@@ -77,6 +77,15 @@ pub(crate) enum WriteJob {
         stream_id: StreamId,
         grid: TurnChunkGrid,
     },
+    /// A conversation's recurrent-state snapshot at a turn seal
+    /// (`Snapshot` record — the Gated DeltaNet matrices + conv tails). The
+    /// newest supersedes all previous for the stream (single tail); the
+    /// writer registers the fresh location in the substrate index after the
+    /// append, `Tokens`-style.
+    Snapshot {
+        stream_id: StreamId,
+        payload: Vec<u8>,
+    },
     /// Drain everything queued, fsync, ack, and stop the thread.
     Shutdown(Sender<()>),
 }
@@ -87,6 +96,7 @@ impl WriteJob {
             WriteJob::StreamDecl { payload, .. } => payload.len() as u64,
             WriteJob::Tokens { token_ids, .. } => (token_ids.len() * 4) as u64,
             WriteJob::WideQSigs { payload, .. } => payload.len() as u64,
+            WriteJob::Snapshot { payload, .. } => payload.len() as u64,
             WriteJob::KvCold { grid, .. } => grid.bytes() as u64,
             WriteJob::Shutdown(_) => 0,
         }
@@ -98,7 +108,9 @@ impl WriteJob {
     /// behind a compaction holding the persistence lock) can never block the
     /// scheduler's latency-critical seal metadata behind the byte cap.
     fn is_bulk(&self) -> bool {
-        matches!(self, WriteJob::KvCold { .. })
+        // Snapshots are multi-MB state blobs: byte-capped with the KV so a
+        // backlog can never crowd out the small seal metadata.
+        matches!(self, WriteJob::KvCold { .. } | WriteJob::Snapshot { .. })
     }
 }
 
@@ -281,6 +293,28 @@ fn process_one(
                     stream_id = stream_id.0,
                     "wide-Q sigs append failed: {e}"
                 );
+            }
+        }
+        WriteJob::Snapshot { stream_id, payload } => {
+            // Append under the persistence lock, then register the fresh
+            // location under the substrate lock — non-nested, persistence
+            // first, the `Tokens` discipline. The old location is simply
+            // overwritten in the index; its bytes were already credited dead
+            // by the accounting layer inside the append.
+            let loc = {
+                let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+                p.write_snapshot(stream_id, &payload)
+            };
+            match loc {
+                Ok(loc) => substrate
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .apply_snapshot_loc(stream_id, loc),
+                Err(e) => tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    stream_id = stream_id.0,
+                    "snapshot append failed: {e}"
+                ),
             }
         }
         WriteJob::KvCold {

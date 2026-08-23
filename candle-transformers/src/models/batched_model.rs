@@ -230,6 +230,13 @@ pub trait BatchedModelCore {
             // three largest buffers a MoE layer allocates — was priced at half
             // its size.
             accum_dtype: DType::F32,
+            // The census this plan was read off (Qwen3-30B-A3B) shows the
+            // projections consuming the norm's packed output and emitting
+            // `act_dtype` directly — no upcast, no cast back. See
+            // `ModelGeometry::projection_accum_roundtrip`.
+            projection_accum_roundtrip: false,
+            gated_qkv: false,
+            partial_rotary: false,
         }
     }
 

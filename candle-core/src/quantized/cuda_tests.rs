@@ -170,6 +170,9 @@ fn cuda_mmv_q8_1() -> Result<()> {
         /* nrows */ 1,
         /* b_size */ 1,
         &dev,
+        // No wave here, so nothing to inherit: the result is an ordinary owned
+        // allocation, which is what these tests read back from.
+        Backing::Owned,
     )?;
     let vs = cuda_storage.as_cuda_slice::<f32>()?;
     let vs = dev.memcpy_dtov(&vs.slice(..))?;
@@ -210,6 +213,7 @@ fn cuda_mm_q8_1() -> Result<()> {
         /* y_rows */ ncols,
         /* y_cols */ 4,
         &dev,
+        Backing::Owned,
     )?;
     let vs = cuda_storage.as_cuda_slice::<f32>()?;
     let vs = dev.memcpy_dtov(&vs.slice(..))?;
@@ -251,6 +255,7 @@ fn cuda_mm_q8_1_pad() -> Result<()> {
         /* y_rows */ ncols,
         /* y_cols */ y_cols,
         &dev,
+        Backing::Owned,
     )?;
     let vs = cuda_storage.as_cuda_slice::<f32>()?;
     let _vs = dev.memcpy_dtov(&vs.slice(..))?;
@@ -289,6 +294,7 @@ fn cuda_mm_q4_k() -> Result<()> {
         /* y_rows */ ncols,
         /* y_cols */ y_cols,
         &dev,
+        Backing::Owned,
     )?;
     let result = cuda_storage.as_cuda_slice::<f32>()?;
     let result = dev.memcpy_dtov(&result.slice(..))?;
@@ -339,6 +345,7 @@ fn cuda_mm_q4_k_large() -> Result<()> {
         /* y_rows */ ncols,
         /* y_cols */ y_cols,
         &dev,
+        Backing::Owned,
     )?;
     let result = cuda_storage.as_cuda_slice::<f32>()?;
     let result = dev.memcpy_dtov(&result.slice(..))?;
