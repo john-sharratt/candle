@@ -442,6 +442,77 @@ impl ManagedBatchedModel for HybridBatched {
         result
     }
 
+    /// **This lineage cannot be rewound.** The DeltaNet state is a running sum
+    /// with no per-token decomposition, so there is no suffix to remove and no
+    /// inverse to apply, and K/V rewound under a state that still holds the
+    /// un-truncated history is silent corruption — the model answers as though
+    /// it remembers tokens the cache no longer has (measured: re-prefilling a
+    /// truncated prompt diverges by ~9.5 in the logits).
+    ///
+    /// Declaring it here refuses the one path that rewinds — speculative
+    /// decode — at its entry point. That replaces a bail *inside* the rewind,
+    /// which fired only after the driver had drafted and verified, and which
+    /// site 8 (the `<think>` re-prefill) bypassed entirely by reaching the
+    /// session directly.
+    fn carries_recurrent_state(&self) -> bool {
+        true
+    }
+
+    /// The recurrent map is keyed by sequence id and owned by the *model*, so
+    /// the scheduler freeing the KV slot does not touch it. This is the hook
+    /// that ties the two lifetimes together.
+    fn release_sequence(&self, seq: usize) -> Result<()> {
+        self.release_recurrent(seq)
+    }
+
+    fn recurrent_memory_count(&self) -> usize {
+        HybridBatched::recurrent_len(self).unwrap_or(0)
+    }
+
+    /// A view carve. The child borrows the parent's KV; its recurrent state has
+    /// to be copied, because it is about to advance it.
+    ///
+    /// Tolerant of a parent with no state yet: a view can be carved before the
+    /// parent has ever run a wave (a brand-new conversation's first turn), and
+    /// there the child correctly starts from the sequence-start value — a fresh
+    /// store holds exactly that, so the child's own `ensure_recurrent` does the
+    /// right thing and there is nothing to copy.
+    fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
+        if !self.has_recurrent(parent)? {
+            return Ok(());
+        }
+        HybridBatched::fork_recurrent(self, parent, child)
+    }
+
+    /// A view finalizes: its decoded blocks transfer to the parent, and its
+    /// state goes with them.
+    ///
+    /// Tolerant in the same direction and for the same reason — a view that
+    /// never ran a wave has nothing to move, and the parent keeps what it had.
+    fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
+        if !self.has_recurrent(child)? {
+            return Ok(());
+        }
+        HybridBatched::move_recurrent(self, child, parent)
+    }
+
+    fn export_recurrent(
+        &self,
+        seq: usize,
+    ) -> Result<Option<(u64, Vec<crate::models::delta_net::ExportedLayerState>)>> {
+        HybridBatched::export_recurrent(self, seq)
+    }
+
+    fn restore_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: &[crate::models::delta_net::ExportedLayerState],
+    ) -> Result<bool> {
+        HybridBatched::restore_recurrent(self, seq, schedule_hash, layers)?;
+        Ok(true)
+    }
+
     fn prune(&self) -> Result<()> {
         Ok(())
     }

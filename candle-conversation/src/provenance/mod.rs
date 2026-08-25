@@ -43,8 +43,12 @@ pub use gpu::{score_batched_gpu, BatchedGpuGallery, SegmentInput};
 pub use packed::{score_packed, PackedGallery};
 pub use raw_store::extract_q_vector_r16;
 pub use scan::{
-    score_provenance_late_fusion, score_provenance_late_fusion_fused,
-    score_provenance_late_fusion_grouped, score_provenance_late_fusion_weighted,
+    heads_per_group, score_provenance_late_fusion, score_provenance_late_fusion_fused,
+    score_provenance_late_fusion_grouped, score_provenance_late_fusion_weighted, FOLD_GROUPS,
 };
 pub use selection::{GroupBudget, SectionPolicy, SectionSelector};
-pub use wide_sig::{decode_wide_sigs, encode_wide_sigs, fold_provenance, WideQSig};
+pub use wide_sig::{
+    active_fold, decode_wide_sigs, decode_wide_sigs_for_scoring, encode_wide_sigs,
+    encode_wide_sigs_with, fold_fits, fold_provenance, fold_provenance_checked,
+    fold_provenance_fitted, set_active_fold, wide_sig_fold_params, FoldParams, WideQSig,
+};

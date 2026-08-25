@@ -21,7 +21,7 @@ use candle_kernels::provenance::run_batched_bdp_scan;
 use rayon::prelude::*;
 
 use super::packed::PackedGallery;
-use super::scan::{HEADS_PER_GROUP, NEEDLE_KEEP_FRAC};
+use super::scan::{heads_per_group, FOLD_GROUPS, NEEDLE_KEEP_FRAC};
 use super::WideQSig;
 
 /// Query-token tile width — MUST mirror `BDP_TQ` in `bdp_scan.cu`. The kernel's
@@ -124,8 +124,8 @@ impl BatchedGpuGallery {
     pub fn from_packed(gallery: &PackedGallery) -> Result<Self> {
         let n_tokens = gallery.n_tokens();
         let wpt = gallery.wpt();
-        let n_groups = gallery.n_heads() / HEADS_PER_GROUP;
-        let gw = HEADS_PER_GROUP * gallery.wph();
+        let n_groups = FOLD_GROUPS;
+        let gw = heads_per_group(gallery.n_heads()) * gallery.wph();
         let src = gallery.words(); // token-major [n_tokens][wpt]
         let n_cases = gallery.n_cases();
 
@@ -165,8 +165,8 @@ impl BatchedGpuGallery {
             .ok_or_else(|| candle::Error::Msg("BDP gallery: no gallery tokens".into()))?;
         let wpt = first.words.len();
         let n_heads = first.n_heads as usize;
-        let n_groups = n_heads / HEADS_PER_GROUP;
-        let gw = HEADS_PER_GROUP * (wpt / n_heads.max(1));
+        let n_groups = FOLD_GROUPS;
+        let gw = heads_per_group(n_heads) * (wpt / n_heads.max(1));
 
         // Token-major first (then transpose), with global case + segment prefixes.
         let mut tokens_tm: Vec<u64> = Vec::new();

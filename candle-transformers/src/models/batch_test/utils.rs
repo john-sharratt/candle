@@ -511,11 +511,20 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
 /// per-layer instrument must clear that same control before its output means
 /// anything.
 ///
-/// **Shared across models on purpose, as the harness control.** This replays
-/// through `truncate_sequence_to_tokens`, and if that did not restore
-/// byte-identical state the probe would report its own drift as model
-/// non-determinism. Running the identical code against a model known to be
-/// reproducible is what rules that out.
+/// **Shared across models on purpose, as the harness control.** The probe's own
+/// reset has to restore byte-identical state, or it reports its own drift as
+/// model non-determinism. Running the identical code against a model known to
+/// be reproducible is what rules that out.
+///
+/// **Each replay runs on a FRESH SEQUENCE.** It used to rewind one sequence with
+/// `truncate_sequence_to_tokens`, which restores the K/V and nothing else —
+/// correct exactly as long as the K/V is the whole of a sequence's memory. On a
+/// model carrying recurrent state it is not: the probe's decode wave commits,
+/// the state advances by a token, and a K/V rewind cannot reach it, so every
+/// replay would enter from a state one token further along and the divergence
+/// reported would be the harness's own. Allocating a sequence per replay
+/// restores identical state on *every* model rather than only on models that
+/// have no state to restore, at the cost of one prefill per replay.
 ///
 /// Returns the number of replays that diverged from their predecessor.
 pub fn decode_replay_probe<M: ManagedBatchedModel>(
@@ -530,12 +539,16 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
     let n_layers = model.num_layers();
     let prompt_len = prompt_ids.len();
     let mut session = model.create_batched_session(BatchedConfig::default())?;
-    let seq = session.create_sequence()?;
-
     let prompt = Tensor::new(prompt_ids, device)?.unsqueeze(0)?;
-    let first = {
+
+    // Prefill a sequence and return it alongside the prompt's own next-token
+    // argmax. Each `WaveResult` is scoped so it drops: it holds the arena's
+    // forward-span guard, and a step still in scope makes the next
+    // `forward_wave` fail.
+    let prefill = |session: &mut BatchedInferenceSession| -> Result<(usize, u32)> {
+        let seq = session.create_sequence()?;
         let step = model.forward_wave(
-            &mut session,
+            session,
             &[],
             &[],
             &[seq],
@@ -547,16 +560,22 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
             None,
         )?;
         session.advance_sequence(seq, prompt_len)?;
-        step.logits_owned()?[0]
+        let tok = step.logits_owned()?[0]
             .i(0)?
             .argmax(0)?
-            .to_scalar::<u32>()?
+            .to_scalar::<u32>()?;
+        Ok((seq, tok))
     };
 
-    // Run the decode row through `[0, d)` and roll the KV back. Each `WaveResult`
-    // is scoped so it drops: it holds the arena's forward-span guard, and a step
-    // still in scope makes the next `forward_wave` fail.
+    let (warm_seq, first) = prefill(&mut session)?;
+    session.free_sequence(warm_seq)?;
+    model.release_sequence(warm_seq)?;
+
+    // One replay: a fresh sequence, prefilled from scratch, decoding the same
+    // single token — so every sample starts from a state that is identical by
+    // construction rather than by a rewind that only covers the K/V.
     let mut probe = || -> Result<Vec<u32>> {
+        let (seq, _) = prefill(&mut session)?;
         let tok = Tensor::new(&[first][..], device)?.unsqueeze(0)?;
         let t = {
             let step = model.forward_wave(
@@ -577,7 +596,8 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
                 .ok_or_else(|| candle::Error::msg("decode wave produced no logits"))?
         };
         let v = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-        session.truncate_sequence_to_tokens(seq, prompt_len)?;
+        session.free_sequence(seq)?;
+        model.release_sequence(seq)?;
         Ok(v.iter().map(|x| x.to_bits()).collect())
     };
 
@@ -1169,17 +1189,46 @@ impl TestParams {
         // attention window. Truncate each sequence back to its pre-prompt
         // length between repeats so every repeat is a true re-prefill from
         // identical state; the final repeat leaves exactly one prompt in KV.
+        //
+        // **"Identical state" has to mean all of it.** The truncation restores
+        // the K/V, which is the whole of a sequence's memory only for a model
+        // that keeps nothing else. On a model carrying recurrent state, repeat
+        // N would enter having absorbed the previous N−1 prompts — the story
+        // read N times after all, just invisibly, and attributed to the model
+        // rather than to this loop. So each sequence's state is forked aside at
+        // the base offset and forked back between repeats, which is exactly the
+        // snapshot the K/V gets for free by being append-only. Both calls are
+        // no-ops on a model with no such state.
         let repeat_base_offsets: Vec<usize> = sequence_indices
             .iter()
             .map(|&i| session.sequence_offset(i).unwrap_or(0))
             .collect();
+        // Only when the loop will actually repeat: the shadows cost a slot each.
+        let repeat_shadows: Vec<usize> = if config.num_repeats.max(1) > 1 {
+            let mut shadows = Vec::with_capacity(sequence_indices.len());
+            for &seq_idx in &sequence_indices {
+                let shadow = session.create_sequence()?;
+                model.fork_recurrent(seq_idx, shadow)?;
+                shadows.push(shadow);
+            }
+            shadows
+        } else {
+            Vec::new()
+        };
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
         let mut repeat_base_logits: Option<Vec<Tensor>> = None;
         for repeat in 0..config.num_repeats.max(1) {
             if repeat > 0 {
-                for (&seq_idx, &base) in sequence_indices.iter().zip(repeat_base_offsets.iter()) {
+                for (i, (&seq_idx, &base)) in sequence_indices
+                    .iter()
+                    .zip(repeat_base_offsets.iter())
+                    .enumerate()
+                {
                     session.truncate_sequence_to_tokens(seq_idx, base)?;
+                    if let Some(&shadow) = repeat_shadows.get(i) {
+                        model.fork_recurrent(shadow, seq_idx)?;
+                    }
                 }
             }
             let nl = model.num_layers();
@@ -1227,6 +1276,11 @@ impl TestParams {
             for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {
                 run.logits = logits;
             }
+        }
+        // The shadows exist only to hold the base state across the repeats.
+        for &shadow in &repeat_shadows {
+            session.free_sequence(shadow)?;
+            model.release_sequence(shadow)?;
         }
         // Advance each sequence by its own (ragged) prompt length.
         for (&seq_idx, &ulen) in sequence_indices.iter().zip(user_lens.iter()) {

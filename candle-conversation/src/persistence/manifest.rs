@@ -174,6 +174,7 @@ impl Manifest {
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
             | RecordType::Snapshot
+            | RecordType::BranchCheckpoint
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }

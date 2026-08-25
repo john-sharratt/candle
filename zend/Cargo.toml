@@ -60,6 +60,11 @@ tree-sitter-html        = "0.20"
 tree-sitter-css         = "0.21"
 
 [dev-dependencies]
+# `test-helpers` on top of the runtime features: the behavioural test catalogue
+# (`docs/recurrent_state_behavioural_tests.md`) asserts on a conversation's
+# recurrent MEMORY, which is otherwise visible only through the record a seal
+# writes — too coarse for a continuity oracle and impossible for a leak test.
+candle-conversation = { path = "../candle-conversation", features = ["hub", "test-helpers"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 rayon = { workspace = true }

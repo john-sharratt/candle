@@ -281,6 +281,30 @@ impl TurnLayout {
         self.user_span().end()
     }
 
+    /// Whether this turn's grid **contains its own boundary markers** — a real
+    /// (`kv: Some`) leading `UserStart`.
+    ///
+    /// The projection assembler asks before deciding whether to emit boundary
+    /// glue around this turn, because the answer is per-turn and durable: turns
+    /// sealed once the boundaries moved into the grid carry them, while turns
+    /// already in a workspace's redo log were sealed with ethereal ones
+    /// (`kv: None`, supplied live by the assembler of the day) that
+    /// [`Self::realize`] skips. Answering it globally — assuming every turn
+    /// bakes — injects historical turns with no role markers at all, so an
+    /// entire recovered conversation reads as one unbroken run and the model
+    /// misparses who said what, silently.
+    pub fn bakes_own_boundaries(&self) -> bool {
+        self.segments.iter().any(|s| {
+            matches!(
+                s,
+                TurnSegment::Glue {
+                    marker: GlueKind::UserStart,
+                    kv: Some(_),
+                }
+            )
+        })
+    }
+
     /// Slice `grid` (the turn's full token id buffer) into the token run of each
     /// real segment, in order.  `grid.len()` must equal [`Self::kv_len`].  Used
     /// by the K/V (re)build path and by tests that assert the layout reproduces
@@ -302,6 +326,8 @@ impl TurnLayout {
     /// `assistant_start` is the first assistant-content token, `total` the grid
     /// length.  A non-zero `user_content_start` is honored as a real leading
     /// `UserStart` boundary (not used today, but representable).
+    ///
+    /// Equivalent to [`Self::from_flat_grid_with_tail`] with no reserved tail.
     #[allow(clippy::too_many_arguments)]
     pub fn from_flat_grid(
         user_content_start: u32,
@@ -310,6 +336,52 @@ impl TurnLayout {
         total: u32,
         im_end_len: u32,
         assistant_start_len: u32,
+        user_text: String,
+        assistant_text: Option<String>,
+        no_think: bool,
+    ) -> Self {
+        Self::from_flat_grid_with_tail(
+            user_content_start,
+            user_content_end,
+            assistant_start,
+            total,
+            im_end_len,
+            assistant_start_len,
+            0,
+            user_text,
+            assistant_text,
+            no_think,
+        )
+    }
+
+    /// [`Self::from_flat_grid`] with `trailing_marker_len` tokens of the grid
+    /// reserved for the turn's own closing `<|im_end|>`.
+    ///
+    /// **The trailing twin of the leading boundary.** `user_content_start > 0`
+    /// already means "the grid reserves room for the opener, so bake it real";
+    /// this is the same statement at the other end — the assistant body becomes
+    /// `[assistant_start, total − trailing_marker_len)` and the closing `ImEnd`
+    /// occupies the reserved tail instead of being recorded ethereally.
+    ///
+    /// Both ends exist because ownership is **both ends or neither**: every
+    /// inter-turn island the assembler emits is exactly `assistant_end ++
+    /// user_start`, so a turn that owned only its opener would drop every
+    /// closer and one that owned only its closer would drop every opener. See
+    /// `docs/deltanet_state_persistence.md` §4.7a.
+    ///
+    /// `0` reproduces the ethereal tail exactly, which is what every caller
+    /// passes today — the mechanism is representable before it is exercised,
+    /// deliberately, so the caller change that reserves the room is the only
+    /// thing left to get wrong.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_flat_grid_with_tail(
+        user_content_start: u32,
+        user_content_end: u32,
+        assistant_start: u32,
+        total: u32,
+        im_end_len: u32,
+        assistant_start_len: u32,
+        trailing_marker_len: u32,
         user_text: String,
         assistant_text: Option<String>,
         no_think: bool,
@@ -361,16 +433,22 @@ impl TurnLayout {
             marker: GlueKind::AssistantStart,
             kv: Some(KvSpan::new(user_content_end + im_end, region - im_end)),
         });
+        // The tail is clamped to what the grid actually has past the assistant
+        // start, so an over-large reservation cannot produce a negative body.
+        let tail = trailing_marker_len.min(total.saturating_sub(assistant_start));
+        let body_end = total - tail;
         segments.push(TurnSegment::Assistant {
             text: assistant_text,
-            kv: KvSpan::new(assistant_start, total.saturating_sub(assistant_start)),
+            kv: KvSpan::new(assistant_start, body_end.saturating_sub(assistant_start)),
         });
-        // The turn closes with `<|im_end|>` (the glue shift's suffix). Like the
-        // opener, it is materialized by the projection spine, not this turn's own
-        // grid, so it is recorded ethereally.
+        // The turn closes with `<|im_end|>` (the glue shift's suffix). If the
+        // grid reserves room for it, it is a baked (real) boundary the turn
+        // owns; otherwise it is materialized by the projection spine and
+        // recorded ETHEREALLY here — the turn still "owns" the marker, it just
+        // isn't in this turn's own grid.
         segments.push(TurnSegment::Glue {
             marker: GlueKind::ImEnd,
-            kv: None,
+            kv: (tail > 0).then(|| KvSpan::new(body_end, tail)),
         });
         Self { segments }
     }
@@ -539,6 +617,107 @@ mod tests {
         ]);
         assert_eq!(layout.kv_len(), 12);
         assert_eq!(layout.validate_tiling(12), Ok(()));
+    }
+
+    /// **The trailing twin.** A reserved tail makes the closing `<|im_end|>` a
+    /// real span the turn owns, and the assistant body stops short of it.
+    ///
+    /// The pair of this and `leading_boundary_offsets_user_body` is what makes
+    /// both-ends ownership representable: a turn that owned only its opener
+    /// would drop every closer, because the assembler's inter-turn island is
+    /// exactly `assistant_end ++ user_start` and splitting it at that seam is
+    /// only lossless when both halves find an owner.
+    #[test]
+    fn a_reserved_tail_bakes_the_closing_im_end() {
+        // grid: [us(4)][user(5)][im_end(2)][a_start(3)][answer(6)][im_end(2)]
+        //        0..4   4..9     9..11      11..14      14..20     20..22
+        let layout = TurnLayout::from_flat_grid_with_tail(
+            4,
+            9,
+            14,
+            22,
+            2,
+            3,
+            2, // the reserved trailing marker
+            "u".into(),
+            Some("a".into()),
+            false,
+        );
+        assert_eq!(layout.validate_tiling(22), Ok(()));
+
+        // The answer stops short of the reserved tail.
+        assert_eq!(layout.assistant_span(), KvSpan::new(14, 6));
+
+        // Both ends are real, and the turn owns them.
+        match layout.segments.first() {
+            Some(TurnSegment::Glue {
+                marker: GlueKind::UserStart,
+                kv: Some(span),
+            }) => assert_eq!(*span, KvSpan::new(0, 4)),
+            other => panic!("expected a real leading UserStart, got {other:?}"),
+        }
+        match layout.segments.last() {
+            Some(TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(span),
+            }) => assert_eq!(*span, KvSpan::new(20, 2)),
+            other => panic!("expected a real trailing ImEnd, got {other:?}"),
+        }
+    }
+
+    /// A zero reservation reproduces the ethereal tail **exactly** — which is
+    /// what every caller passes today, so the mechanism can exist before it is
+    /// exercised without moving a single sealed turn.
+    #[test]
+    fn a_zero_tail_reservation_is_byte_identical_to_the_ethereal_form() {
+        let args = || {
+            (
+                0u32,
+                3u32,
+                8u32,
+                12u32,
+                2u32,
+                3u32,
+                "hi".to_string(),
+                Some("ok".to_string()),
+                false,
+            )
+        };
+        let (a, b, c, d, e, f, g, h, i) = args();
+        let ethereal = TurnLayout::from_flat_grid(a, b, c, d, e, f, g, h, i);
+        let (a, b, c, d, e, f, g, h, i) = args();
+        let explicit = TurnLayout::from_flat_grid_with_tail(a, b, c, d, e, f, 0, g, h, i);
+        assert_eq!(
+            ethereal, explicit,
+            "a zero tail must not change the layout in any way"
+        );
+        assert!(matches!(
+            ethereal.segments.last(),
+            Some(TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: None
+            })
+        ));
+    }
+
+    /// An over-large reservation cannot eat the assistant body — it clamps to
+    /// what the grid actually holds past the assistant start.
+    #[test]
+    fn an_over_large_tail_reservation_clamps() {
+        let layout = TurnLayout::from_flat_grid_with_tail(
+            0,
+            3,
+            8,
+            12,
+            2,
+            3,
+            999,
+            "u".into(),
+            Some("a".into()),
+            false,
+        );
+        assert_eq!(layout.validate_tiling(12), Ok(()));
+        assert_eq!(layout.assistant_span(), KvSpan::new(8, 0));
     }
 
     /// A leading boundary offset (non-zero `user_content_start`) is a real
@@ -845,6 +1024,352 @@ mod tests {
         assert!(!layout.no_think());
         assert_eq!(layout.user_content_start(), 0);
         assert_eq!(layout.assistant_content_start(), 8);
+    }
+
+    /// **T3.6 — a sealed turn's suppression flag is a property of its own bytes,
+    /// and nothing later can move it.**
+    ///
+    /// This is the condition the bake was granted on. §10 decision 9: *"assume
+    /// fixed once sealed, and add the test. If the test fails, fall back to
+    /// leaving `NoThink` ethereal."* Baking the switch into the turn's grid
+    /// freezes a decision that used to be re-made on every projection, so the
+    /// assumption underneath it has to be checked rather than read.
+    ///
+    /// Three things together make it hold, and each is asserted:
+    ///
+    /// 1. the flag is **derived from the segments**, not stored beside them, so
+    ///    there is no second copy to drift;
+    /// 2. it **survives the persistence round-trip**, which is the only way a
+    ///    sealed layout ever comes back; and
+    /// 3. two turns sealed under different dial settings keep their **own**
+    ///    answers — the leak the live-glue path had to guard against, where a
+    ///    past suppressed turn put a stale switch on a later thinking turn,
+    ///    cannot happen when each turn's grid holds its own.
+    #[test]
+    fn a_sealed_turns_no_think_flag_is_fixed_by_its_own_grid() {
+        // `/no_think` is a 3-token rider after the 1-token `user_start`, so the
+        // suppressed turn's body starts at 4 and the thinking one's at 1.
+        let suppressed = TurnLayout::from_flat_grid_with_tail(
+            4,
+            9,
+            11,
+            16,
+            1,
+            2,
+            1,
+            "hi".into(),
+            Some("there".into()),
+            true,
+        );
+        let thinking = TurnLayout::from_flat_grid_with_tail(
+            1,
+            6,
+            8,
+            13,
+            1,
+            2,
+            1,
+            "hi".into(),
+            Some("there".into()),
+            false,
+        );
+
+        assert!(suppressed.no_think(), "the baked switch must be visible");
+        assert!(!thinking.no_think());
+
+        // (1) Derived, not stored: the answer is exactly "is there a NoThink
+        // segment", so removing it changes the answer and nothing else holds a
+        // stale copy that could disagree.
+        let mut stripped = suppressed.clone();
+        stripped.segments.retain(|s| {
+            !matches!(
+                s,
+                TurnSegment::Glue {
+                    marker: GlueKind::NoThink,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !stripped.no_think(),
+            "the flag survived removal of the segment it is supposed to be read \
+             from — there is a second copy, and the two can drift"
+        );
+
+        // (2) Survives the round-trip the substrate actually performs.
+        for layout in [&suppressed, &thinking] {
+            let json = serde_json::to_string(layout).expect("serialize");
+            let back: TurnLayout = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(
+                back.no_think(),
+                layout.no_think(),
+                "a reloaded turn disagreed with the one that was sealed"
+            );
+            assert_eq!(back.segments, layout.segments);
+        }
+
+        // (3) Independent: neither turn's answer depends on the other's, in
+        // either order.
+        let both = [&suppressed, &thinking];
+        assert!(both[0].no_think() && !both[1].no_think());
+        let reversed = [&thinking, &suppressed];
+        assert!(!reversed[0].no_think() && reversed[1].no_think());
+    }
+
+    /// **Stream equivalence — the load-bearing test for boundary ownership.**
+    ///
+    /// The projection spine used to emit `user_start` before every sealed turn
+    /// and `assistant_end` after it, so a run of turns came out as
+    ///
+    /// ```text
+    ///   US body₀ AE  US body₁ AE  US body₂ AE
+    ///   └island┘     └─island─┘    └─island─┘
+    /// ```
+    ///
+    /// with each `AE ++ US` pair forming one gap-filled island between turns.
+    /// Now each turn's own grid carries `US … AE`, and the turns abut directly.
+    ///
+    /// The token stream must be **identical** — equality, not tolerance, because
+    /// §4.7a proves the split is exact rather than approximate. The failure this
+    /// catches is a dropped or doubled `<|im_end|>`, which reads perfectly and
+    /// shifts every boundary after it.
+    #[test]
+    fn baked_boundaries_reproduce_the_spine_emitted_stream_exactly() {
+        // Dialect markers, as token ids.
+        const US: &[u32] = &[100, 101];
+        const AE: &[u32] = &[200];
+        const UE: &[u32] = &[150];
+        const AS: &[u32] = &[160, 161];
+
+        // Three turns' bodies.
+        let bodies: [(&[u32], &[u32]); 3] = [
+            (&[1, 2, 3], &[10, 11]),
+            (&[4, 5], &[12, 13, 14]),
+            (&[6], &[15]),
+        ];
+
+        // ── The reference: what the spine used to emit. ──────────────────────
+        let mut reference: Vec<u32> = Vec::new();
+        for (user, answer) in bodies {
+            reference.extend_from_slice(US);
+            reference.extend_from_slice(user);
+            reference.extend_from_slice(UE);
+            reference.extend_from_slice(AS);
+            reference.extend_from_slice(answer);
+            reference.extend_from_slice(AE);
+        }
+
+        // ── The baked arrangement: each turn's grid carries its own markers,
+        //    and `realize()` walks only what the turn actually owns. ──────────
+        let mut baked: Vec<u32> = Vec::new();
+        for (user, answer) in bodies {
+            let mut grid: Vec<u32> = Vec::new();
+            grid.extend_from_slice(US);
+            grid.extend_from_slice(user);
+            grid.extend_from_slice(UE);
+            grid.extend_from_slice(AS);
+            grid.extend_from_slice(answer);
+            grid.extend_from_slice(AE);
+
+            let us_len = US.len() as u32;
+            let user_end = us_len + user.len() as u32;
+            let asst_start = user_end + UE.len() as u32 + AS.len() as u32;
+            let total = grid.len() as u32;
+            let layout = TurnLayout::from_flat_grid_with_tail(
+                us_len,
+                user_end,
+                asst_start,
+                total,
+                UE.len() as u32,
+                AS.len() as u32,
+                AE.len() as u32,
+                "u".into(),
+                Some("a".into()),
+                false,
+            );
+            assert_eq!(
+                layout.validate_tiling(total),
+                Ok(()),
+                "a baked turn must tile its own grid exactly"
+            );
+            // Every real segment, in order — which is what the inject path walks.
+            for (_, toks) in layout.realize(&grid) {
+                baked.extend_from_slice(toks);
+            }
+        }
+
+        assert_eq!(
+            baked, reference,
+            "the baked-boundary stream diverged from the spine-emitted one — a \
+             dropped or doubled boundary marker reads fine and shifts every \
+             token position after it"
+        );
+    }
+
+    /// The same equivalence with the `/no_think` switch present: it rides the
+    /// opener, inside the turn that carries it.
+    ///
+    /// Each turn holding its own switch is *stronger* than the spine re-deciding
+    /// it per projection, not weaker — the leak the live path guarded against
+    /// (a past suppressed turn putting a stale switch on a later thinking-on
+    /// turn) cannot happen when the switch lives in the suppressed turn's grid.
+    #[test]
+    fn a_suppressed_turns_switch_is_baked_into_its_own_opener() {
+        const US: &[u32] = &[100];
+        const NT: &[u32] = &[42];
+        const AE: &[u32] = &[200];
+
+        // head = user_start ++ no_think, so the opener span covers both.
+        let head_len = (US.len() + NT.len()) as u32;
+        let mut grid: Vec<u32> = Vec::new();
+        grid.extend_from_slice(US);
+        grid.extend_from_slice(NT);
+        grid.extend_from_slice(&[1, 2]); // user body
+        grid.extend_from_slice(&[150]); // user_end
+        grid.extend_from_slice(&[160]); // assistant_start
+        grid.extend_from_slice(&[10]); // answer
+        grid.extend_from_slice(AE);
+
+        let layout = TurnLayout::from_flat_grid_with_tail(
+            head_len,
+            head_len + 2,
+            head_len + 4,
+            grid.len() as u32,
+            1,
+            1,
+            AE.len() as u32,
+            "u".into(),
+            Some("a".into()),
+            true,
+        );
+        assert_eq!(layout.validate_tiling(grid.len() as u32), Ok(()));
+
+        // The opener span covers `user_start ++ no_think` together.
+        match layout.segments.first() {
+            Some(TurnSegment::Glue {
+                marker: GlueKind::UserStart,
+                kv: Some(span),
+            }) => {
+                assert_eq!(*span, KvSpan::new(0, head_len));
+                assert_eq!(&grid[span.range()], &[100, 42]);
+            }
+            other => panic!("expected a real leading UserStart, got {other:?}"),
+        }
+        // Realising reproduces the grid, switch included.
+        let rebuilt: Vec<u32> = layout
+            .realize(&grid)
+            .iter()
+            .flat_map(|(_, t)| t.iter().copied())
+            .collect();
+        assert_eq!(rebuilt, grid);
+    }
+
+    /// **A compression turn is framed exactly like a dialogue turn.**
+    ///
+    /// It builds its grid directly rather than going through the turn-submit
+    /// funnel, and it used to carry no head at all — correct while the assembler
+    /// re-emitted one around every sealed turn, and silently wrong the moment
+    /// turns started owning their boundaries. A summary with no opener runs
+    /// straight on from the previous turn's closer with no role marker to say
+    /// whose words it is.
+    ///
+    /// Exactly **one** opener: not zero (the assembler stopped and the builder
+    /// was not updated) and not two (both fired).
+    #[test]
+    fn a_compression_turn_is_framed_like_a_dialogue_turn() {
+        const US: &[u32] = &[100, 101];
+        const AE: &[u32] = &[200];
+
+        // [user_start][question(3)][user_end(1)][assistant_start(1)][answer(2)][im_end]
+        let mut grid: Vec<u32> = Vec::new();
+        grid.extend_from_slice(US);
+        let user_content_start = grid.len() as u32;
+        grid.extend_from_slice(&[1, 2, 3]);
+        let user_end_at = grid.len() as u32;
+        grid.extend_from_slice(&[150]);
+        grid.extend_from_slice(&[160]);
+        let asst_start_at = grid.len() as u32;
+        grid.extend_from_slice(&[10, 11]);
+        grid.extend_from_slice(AE);
+
+        let layout = TurnLayout::from_flat_grid_with_tail(
+            user_content_start,
+            user_end_at,
+            asst_start_at,
+            grid.len() as u32,
+            1,
+            1,
+            AE.len() as u32,
+            "q".into(),
+            Some("a".into()),
+            false,
+        );
+        assert_eq!(layout.validate_tiling(grid.len() as u32), Ok(()));
+
+        let openers = layout
+            .segments
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    TurnSegment::Glue {
+                        marker: GlueKind::UserStart,
+                        kv: Some(_)
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            openers, 1,
+            "a compression turn must have exactly one opener"
+        );
+
+        // Real at both ends, and it reproduces its own grid.
+        assert!(matches!(
+            layout.segments.last(),
+            Some(TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(_)
+            })
+        ));
+        let rebuilt: Vec<u32> = layout
+            .realize(&grid)
+            .iter()
+            .flat_map(|(_, t)| t.iter().copied())
+            .collect();
+        assert_eq!(rebuilt, grid);
+    }
+
+    /// **The `TurnHalf` window excludes the baked opener** (P5b.8).
+    ///
+    /// The compression pass injects a sealed turn's user half and supplies its
+    /// own framing. `turn_user_sealed_half` windows on
+    /// `user_content_start..user_content_end`, which now starts *past* the baked
+    /// marker — so the marker and the compression pass's framing cannot both
+    /// land. This pins that the window is the user body alone.
+    #[test]
+    fn the_user_half_window_excludes_the_baked_opener() {
+        let layout = TurnLayout::from_flat_grid_with_tail(
+            4, // the opener occupies [0, 4)
+            9,
+            14,
+            22,
+            2,
+            3,
+            2,
+            "u".into(),
+            Some("a".into()),
+            false,
+        );
+        let span = layout.user_span();
+        assert_eq!(
+            span,
+            KvSpan::new(4, 5),
+            "the user half must start past the opener, or a turn-half injection \
+             carries the role marker into a pass that supplies its own"
+        );
+        assert_eq!(layout.user_content_start(), 4);
+        assert_eq!(layout.user_content_end(), 9);
     }
 
     /// A gap between real segments is rejected.

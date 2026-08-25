@@ -14,7 +14,7 @@
 
 use rayon::prelude::*;
 
-use super::scan::{group_agreement, needle_gate_tally, HEADS_PER_GROUP};
+use super::scan::{group_agreement, heads_per_group, needle_gate_tally, FOLD_GROUPS};
 use super::WideQSig;
 
 /// A gallery packed into one contiguous buffer, scan-ready.
@@ -141,11 +141,12 @@ impl PackedGallery {
 pub fn score_packed(query: &[WideQSig], gallery: &PackedGallery) -> Vec<f32> {
     let n_cases = gallery.n_cases;
     let n_tokens = gallery.n_tokens();
-    if n_tokens == 0 || gallery.n_heads < HEADS_PER_GROUP {
+    let hpg = heads_per_group(gallery.n_heads);
+    if n_tokens == 0 || hpg == 0 {
         return vec![0.0; n_cases];
     }
-    let n_groups = gallery.n_heads / HEADS_PER_GROUP;
-    let gw = HEADS_PER_GROUP * gallery.wph; // words per layer-group
+    let n_groups = FOLD_GROUPS;
+    let gw = hpg * gallery.wph; // words per layer-group
     let wpt = gallery.wpt;
     let need = wpt; // n_groups × gw
     let n_gal = n_tokens as f32;

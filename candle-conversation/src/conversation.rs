@@ -7,15 +7,22 @@
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnHandle, TurnResponse};
-use crate::persistence::content_hash::{hash_tokens, ContentChain};
+use candle_transformers::models::delta_net::ExportedLayerState;
+
+use crate::persistence::content_hash::{hash_tokens, ContentChain, ContentHash};
+use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
     from_projection_with_origins, Builder, Conversation, ProjectionEvent, ProjectionMode,
-    ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
+    ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId,
+    TurnIndex,
 };
 use crate::provenance::WideQSig;
-use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
-use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
+use crate::scheduler::projection_assembler::materialize_conversation;
+use crate::scheduler::{
+    note_branch_checkpoint_computed, note_branch_checkpoint_installed, ProjectionInputs,
+    ReprojectionPolicy, SchedulerRequest,
+};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
@@ -158,6 +165,36 @@ use std::sync::Arc;
 /// for event in handle.stream() { /* ... */ }
 /// conv.finish_turn(&response);
 /// ```
+/// Whether a fork's target timeline already carries the parent's turns.
+///
+/// Not a mode — a fact about the timeline, and the thing that decides whether
+/// the child may take the parent's recurrent memory. Memory describes a token
+/// history; handing it to a conversation that does not hold that history is the
+/// same defect as the reverse, and just as quiet.
+///
+/// It is therefore **derived** in [`Sequence::fork_onto`] from the one
+/// comparison that settles it — is the fork's timeline the parent's own? — and
+/// never passed in. A caller cannot know it: `fork_resuming` targets a timeline
+/// whose history belongs to whichever conversation sealed it, which is the
+/// parent only in the re-attach case. Deciding this per constructor is how the
+/// daemon's resume path came to hand every restored conversation the *base*
+/// conversation's memory over the top of its own restored snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InheritsHistory {
+    Yes,
+    No,
+}
+
+/// The one comparison that settles [`InheritsHistory`], as a free function so it
+/// can be asserted without a scheduler, a model, or a workspace behind it.
+fn fork_inherits_history(parent: TimelineId, fork: TimelineId) -> InheritsHistory {
+    if parent == fork {
+        InheritsHistory::Yes
+    } else {
+        InheritsHistory::No
+    }
+}
+
 pub struct Sequence {
     /// Channel to submit GPU work to the scheduler.
     scheduler_tx: Sender<SchedulerRequest>,
@@ -230,6 +267,26 @@ pub struct Sequence {
     /// `projection.project()`.  Different cognitive activities (dialogue,
     /// bug analysis, dream log, …) point at different targets.
     pub(crate) target: ProjectionTarget,
+    /// The birth-time primed section list and the branch windows inside it —
+    /// retained because `prompt_branch` needs both to rebuild a checkpoint
+    /// when the FIRST turn's dials select a different branch than the
+    /// create-time default.
+    ///
+    /// One window per [`SectionTree`] the schema declares, in item order: a
+    /// schema may declare several (zend's does), each contributing its own
+    /// run of ids to the primed list.
+    primed_prefix: Arc<Vec<SectionId>>,
+    branch_spans: Vec<(usize, usize)>,
+    /// True when this conversation was **born with a prompt checkpoint** — as
+    /// opposed to a fork, whose state is the parent's or the timeline's and
+    /// must never be swapped.
+    ///
+    /// Half of the branch-swap window; the other half (has anything advanced
+    /// that state since?) is derived from the timeline's turn count at the use
+    /// site in [`Sequence::submit_turn_with_options`], because every path that
+    /// advances the state lands a turn on the timeline and a tracked flag
+    /// would have to be cleared by each of them.
+    state_is_prompt_only: bool,
 }
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
@@ -330,6 +387,9 @@ impl Sequence {
             projection: Arc::new(projection),
             substrate,
             target,
+            primed_prefix: Arc::new(Vec::new()),
+            branch_spans: Vec::new(),
+            state_is_prompt_only: false,
         };
 
         // Set the in-memory tree's system prompt tokens so the tree's
@@ -373,6 +433,12 @@ impl Sequence {
         // `depends_on`-gated sections — feeds the priming projection
         // so the first-turn slot mirrors the empty-collection layout.
         let mut fixed_prefix: Vec<SectionId> = Vec::new();
+        // Where each section tree's emitted ids land inside `fixed_prefix`, as
+        // `(start, len)` — the windows the branch-checkpoint pass rewrites per
+        // leaf, one per declared tree in item order. Empty when the layer
+        // declares no tree, which makes the prompt single-branch and the pass a
+        // single checkpoint.
+        let mut branch_spans: Vec<(usize, usize)> = Vec::new();
 
         // ── Progress accounting ────────────────────────────────────────
         // Byte totals across every section we're about to ingest. The
@@ -444,11 +510,25 @@ impl Sequence {
         // like it would at projection time, producing K_raw values
         // conditioned on the real preceding content context.
         //
-        // Template-kind sections (`is_template = true`) are skipped:
-        // their K/V is live-prefilled at projection-apply time under
-        // the actual runtime left context, so the substrate never sees
-        // them and they contribute nothing to other sections' ingest
-        // prefix here.
+        // Template-kind sections (`is_template = true`) ingest here too, and
+        // that is a change: their K/V used to be live-prefilled at
+        // projection-apply time under the actual runtime left context, so the
+        // substrate never saw them.
+        //
+        // They are dialect structural text — `<|im_start|>system\n`,
+        // `<tools>`, `</tools>`, the system close — a handful of tokens whose
+        // *content* is fixed and whose position in the prompt is fixed. What
+        // varied was their left context, because a `depends_on` template emits
+        // only when its collection materialises. Sealing them therefore accepts
+        // the same approximation the collection path already accepts: a
+        // section's K/V is not a strict function of which members ingested.
+        //
+        // The reason to accept it is that a live-prefilled run is a glue
+        // **island**, and an island is a hole in the middle of the sequence
+        // that the engine must gap-fill. A recurrence cannot compute the output
+        // of a token inserted mid-sequence, so on the hybrid lineage the
+        // alternative to an approximate bake is not a more accurate answer —
+        // it is a refused wave. See `docs/deltanet_state_persistence.md` §4.7d.
         //
         // `Collection` items: every member ingests in parallel with
         // the *same* pre-collection prefix (members do not attend to
@@ -458,9 +538,6 @@ impl Sequence {
         for item in &layer_items {
             match item {
                 SystemPromptItem::Section(s) => {
-                    if s.is_template {
-                        continue;
-                    }
                     conv.insert_section_with_prefix(s.id, s.content.as_str(), &linear_prefix)?;
                     linear_prefix.push(s.id);
                     // Sections with `depends_on` are conditional — they
@@ -477,7 +554,6 @@ impl Sequence {
                     let batch: Vec<(SectionId, &str)> = coll
                         .sections
                         .iter()
-                        .filter(|sec| !sec.is_template)
                         .map(|sec| (sec.id, sec.content.as_str()))
                         .collect();
                     if !batch.is_empty() {
@@ -606,6 +682,13 @@ impl Sequence {
                     // Sections declared after the tree (and the priming
                     // projection) attend to the default branch — the fan-out is
                     // bounded to the tree itself.
+                    //
+                    // Remember where this tree's branch ids sit in
+                    // `fixed_prefix`, so the checkpoint pass below can swap the
+                    // default branch for any other leaf without re-walking the
+                    // schema. Pushed rather than assigned: a schema may declare
+                    // several trees, and each owns its own window.
+                    branch_spans.push((fixed_prefix.len(), tree.default_present_ids.len()));
                     for id in &tree.default_present_ids {
                         linear_prefix.push(*id);
                         fixed_prefix.push(*id);
@@ -613,6 +696,30 @@ impl Sequence {
                 }
             }
         }
+
+        // Compute one recurrent checkpoint per prompt branch.
+        //
+        // A new conversation Arc-injects its sealed prompt K/V, so the wave
+        // never sees those tokens: on a model whose memory is a recurrence the
+        // state would enter the first user turn at zero while the attention
+        // layers hold the entire prompt. This is the only place a conversation
+        // needs a state it did not compute (§4.6), and the only way to get it is
+        // to run the tokens — a recurrence cannot be Arc-injected.
+        //
+        // Nothing here runs on a plain transformer: `carries_recurrent_state`
+        // is false, so the loop is skipped and no forward is paid.
+        let branch_checkpoint = if conv.model_core.carries_recurrent_state {
+            conv.build_branch_checkpoint(&fixed_prefix, &branch_spans)?
+        } else {
+            None
+        };
+        // Retained for the first-turn branch re-key: the composer dials arrive
+        // with the first `TurnOptions.selection`, which this create cannot
+        // know, so the checkpoint installed below is the DEFAULT branch's. If
+        // that first turn selects a different branch, `submit_turn_with_options`
+        // rebuilds from exactly these inputs.
+        conv.primed_prefix = Arc::new(fixed_prefix.clone());
+        conv.branch_spans = branch_spans;
 
         // Pre-warm the slot: inject all system-prompt sections now so the
         // first `submit_turn` sees an already-populated slot and skips
@@ -638,7 +745,252 @@ impl Sequence {
             rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
         }
 
+        // The prompt's K/V is on the slot; give the recurrent layers the state
+        // that goes with it. Order matters and is the reason this is not folded
+        // into `create_sequence` alongside the timeline-snapshot restore — see
+        // `restore_branch_checkpoint`.
+        if let Some((prefix, fresh)) = branch_checkpoint {
+            conv.restore_branch_checkpoint(prefix, fresh)?;
+        }
+        // From here until the first turn advances it, this conversation's
+        // state is exactly the installed prompt checkpoint — the window in
+        // which a dial-selected branch may swap it.
+        conv.state_is_prompt_only = conv.model_core.carries_recurrent_state;
+
         Ok(conv)
+    }
+
+    /// The ordered sections this conversation's system prompt is built from,
+    /// and the content prefix that identifies them.
+    ///
+    /// `primed` is the birth-time projection — the collections-as-empty section
+    /// list the slot is primed with — and `branch_spans` are the windows inside
+    /// it that the section trees filled, one per tree in item order. Each
+    /// window is **re-derived** from its tree and this conversation's own
+    /// selection rather than taken as-is, because the walk that built `primed`
+    /// had only the authored defaults to go on: `SectionTree::branch_prefix_ids`
+    /// is what turns a selection into the branch's sealed sections, so a
+    /// conversation opened on a non-default assignment names the branch it will
+    /// actually run.
+    ///
+    /// A schema declaring several trees gets all of them spliced. Re-deriving
+    /// only the first would splice that tree's ids into whichever window the
+    /// spans happened to name — the two disagree the moment a second tree
+    /// exists, which zend's bundled schema is.
+    ///
+    /// Collection members are skipped, for the same reason the section-ingest
+    /// chain skips them: projection picks a subset at runtime, so a prefix that
+    /// counted them would change whenever the catalog did.
+    fn prompt_branch(
+        &self,
+        primed: &[SectionId],
+        branch_spans: &[(usize, usize)],
+    ) -> (ContentHash, Vec<u32>) {
+        let schema = self.projection.schema();
+        let trees: Vec<&SectionTree> = schema.system_prompt.section_trees().collect();
+        let mut ids: Vec<SectionId> = Vec::with_capacity(primed.len());
+        // Walk the windows in order, copying the untouched runs between them
+        // and re-deriving each tree's own run. `cursor` is where the last
+        // window ended, so an out-of-order or out-of-range span is caught
+        // rather than producing a scrambled prefix.
+        let mut cursor = 0usize;
+        let mut spliced = trees.len() == branch_spans.len();
+        if spliced {
+            for (tree, &(start, len)) in trees.iter().zip(branch_spans) {
+                if start < cursor || start + len > primed.len() {
+                    spliced = false;
+                    break;
+                }
+                ids.extend_from_slice(&primed[cursor..start]);
+                let selection = tree.selection(|id| self.selection.get(id));
+                ids.extend(tree.branch_prefix_ids(&selection));
+                cursor = start + len;
+            }
+        }
+        if spliced {
+            ids.extend_from_slice(&primed[cursor..]);
+        } else {
+            // No trees, or spans that no longer index `primed`: the primed list
+            // is the prompt.
+            ids = primed.to_vec();
+        }
+
+        let view = self.substrate.read();
+        let mut chain = ContentChain::new();
+        let mut tokens: Vec<u32> = Vec::new();
+        for id in ids {
+            if schema.system_prompt.is_collection_member(id) {
+                continue;
+            }
+            let section = view.section_tokens_of(id);
+            if section.is_empty() {
+                continue;
+            }
+            chain.push_section(&section);
+            tokens.extend_from_slice(&section);
+        }
+        (chain.prefix(), tokens)
+    }
+
+    /// Compute and persist this conversation's prompt branch checkpoint (§4.6).
+    ///
+    /// A checkpoint is valid for an *ordered prefix* and nothing weaker: state
+    /// does not compose, so `state([A][B])` is not any function of `state([A])`
+    /// and `state([B])`. It is keyed by the branch's content prefix, which is
+    /// what the sealed K/V is already addressed by, so the two go stale
+    /// together.
+    ///
+    /// **One branch, not the cross-product.** §4.6 describes pre-sealing every
+    /// leaf the way the K/V tree does, and measurement made that obviously
+    /// wrong: the live tree has 200 branches and a conversation uses one, so
+    /// the eager version put 199 unused full-prompt prefills in front of the
+    /// first turn. Each branch is computed the first time some conversation
+    /// selects it and persisted, so the cost is one prefill per distinct branch
+    /// *ever used*, paid once across every conversation and restart.
+    ///
+    /// Returns `(prefix, freshly computed payload)`. The payload comes back in
+    /// memory rather than being re-read, and that is correctness rather than
+    /// economy: the write is fire-and-forget onto the persistence thread, so a
+    /// read issued immediately after finds nothing. The first version of this
+    /// restored from disk and installed **zero** checkpoints out of two hundred
+    /// computed, silently, because a miss is a warning and not an error.
+    ///
+    /// Failures are logged, never fatal. A missing checkpoint costs the first
+    /// turn its prompt memory, which is a degradation; refusing to open the
+    /// conversation is an outage.
+    fn build_branch_checkpoint(
+        &self,
+        primed: &[SectionId],
+        branch_spans: &[(usize, usize)],
+    ) -> crate::Result<Option<(ContentHash, Option<BranchCheckpointPayload>)>> {
+        let (prefix, tokens) = self.prompt_branch(primed, branch_spans);
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        match self.substrate.read_branch_checkpoint(prefix) {
+            // Already durable — and hand the decoded payload straight back
+            // rather than dropping it. `read_branch_checkpoint` reads the whole
+            // ~63 MiB record off the log and decodes it; returning `None` here
+            // made `restore_branch_checkpoint` read and decode the identical
+            // record a moment later, so every conversation opened on an
+            // already-checkpointed branch — the steady state, and the entire
+            // point of the cache — paid the cost twice under the persistence
+            // lock.
+            Ok(Some(p)) => return Ok(Some((prefix, Some(p)))),
+            Ok(None) => {}
+            Err(e) => {
+                // Present but unreadable: recompute over it rather than leaving
+                // the branch without one.
+                tracing::warn!("branch checkpoint unreadable, recomputing: {e}");
+            }
+        }
+
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::BranchCheckpointPass {
+                tokens: TokenBuffer::from(tokens),
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
+            Ok(Some((schedule_hash, layers))) => {
+                let payload = BranchCheckpointPayload {
+                    prefix_hash: prefix,
+                    schedule_hash,
+                    layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+                };
+                self.substrate
+                    .enqueue_branch_checkpoint(prefix, payload.encode());
+                note_branch_checkpoint_computed();
+                tracing::info!("computed the prompt branch checkpoint");
+                Ok(Some((prefix, Some(payload))))
+            }
+            // The model carries no recurrent state after all.
+            Ok(None) => Ok(None),
+            Err(e) => {
+                tracing::warn!(
+                    "branch checkpoint pass failed ({e}) — the first turn will start \
+                     without its prompt state, and will read perfectly while doing so"
+                );
+                Ok(Some((prefix, None)))
+            }
+        }
+    }
+
+    /// Install this conversation's branch checkpoint onto its slot (P6.4).
+    ///
+    /// Runs **after** priming, which is the difference from the conversation
+    /// resume path: that one installs inside `create_sequence`, before any
+    /// wave, because a timeline snapshot depends on nothing else. A branch
+    /// checkpoint describes the state after the prompt, so the prompt's K/V has
+    /// to be on the slot first — otherwise the pair is installed in the wrong
+    /// order and nothing says so.
+    ///
+    /// A miss is a degradation, not a failure: the conversation starts with its
+    /// prompt in K/V and zero in the recurrent layers, exactly as it did before
+    /// any of this existed. It is logged at WARN because that state reads
+    /// perfectly.
+    fn restore_branch_checkpoint(
+        &self,
+        prefix: ContentHash,
+        fresh: Option<BranchCheckpointPayload>,
+    ) -> crate::Result<()> {
+        // Just computed ⇒ already in hand. Only a branch this process did not
+        // compute needs the disk, and by then the record is durable.
+        let payload = match fresh {
+            Some(p) => p,
+            None => match self.substrate.read_branch_checkpoint(prefix) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    tracing::warn!(
+                        "no branch checkpoint for this prompt branch — the first turn \
+                         will run with the system prompt in K/V and nothing in the \
+                         recurrent layers, and will read perfectly while doing so"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("branch checkpoint unreadable ({e}) — starting from zero");
+                    return Ok(());
+                }
+            },
+        };
+        let layers: Vec<ExportedLayerState> = payload
+            .layers
+            .into_iter()
+            .map(|l| ExportedLayerState {
+                layer_index: l.layer_index,
+                n_v_heads: l.n_v_heads,
+                d_v: l.d_v,
+                d_k: l.d_k,
+                state: l.state,
+                conv_channels: l.conv_channels,
+                conv_tail_cols: l.conv_tail_cols,
+                conv_tail: l.conv_tail,
+            })
+            .collect();
+        let n = layers.len();
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::InstallRecurrentState {
+                sequence_id: self.id,
+                schedule_hash: payload.schedule_hash,
+                layers,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
+            Ok(true) => {
+                note_branch_checkpoint_installed();
+                tracing::debug!(layers = n, "installed prompt branch checkpoint");
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                "BRANCH CHECKPOINT REFUSED (hash or geometry mismatch): {e} — the first \
+                 turn starts with no memory of its system prompt"
+            ),
+        }
+        Ok(())
     }
 
     /// Install an observer channel for cognitive task events (summarization,
@@ -1089,6 +1441,8 @@ impl Sequence {
             .send(SchedulerRequest::NewSequence {
                 conversation: self.substrate.clone(),
                 target: None,
+                // Scratch: a GPU resource, not a continuation of anything.
+                parent: None,
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -1123,7 +1477,44 @@ impl Sequence {
         // becomes the conversation's current selection and drives every
         // projection — initial prefill and decode reprojection — until the next
         // turn changes it.
+        let selection_changed = self.selection != options.selection;
         self.selection = options.selection.clone();
+
+        // A FIRST turn whose dials select a different prompt branch: the
+        // checkpoint installed at create is the default branch's, because
+        // create cannot know the dials. This is the one moment it can be
+        // swapped — the state is still exactly that checkpoint, and the
+        // projection this submit runs will show the newly selected sections.
+        // State must match what the K/V shows (§4.6); without this, every
+        // conversation whose first turn carried non-default dials ran on the
+        // default branch's prompt memory while projecting the dialed prompt —
+        // E2 of the behavioural catalogue caught it by the checkpoint counters
+        // sitting still.
+        //
+        // **The window is DERIVED, not tracked.** `state_is_prompt_only` says
+        // this conversation was born with a checkpoint (a fork's state is real
+        // and must never be swapped); the empty timeline says nothing has
+        // advanced that state since. A tracked "still pristine" bool has to be
+        // cleared by every path that advances the state, and the paths that
+        // are not this one — `insert_turn_inner`, `submit_prefilled_turn`,
+        // `catch_memory_up_to` — each seal or adopt a turn onto this timeline
+        // BEFORE any later submit runs, so the turn count states the same fact
+        // without anyone having to remember. Without the derived half, a
+        // code_read conversation that ingested scopes and then took a dialed
+        // first turn had the bare prompt checkpoint installed over the state
+        // that had absorbed them: K/V holding the ingest, recurrent layers
+        // having forgotten it — the very defect this block exists to remove.
+        let timeline_is_empty = self.substrate.read().turn_count(self.target.timeline) == 0;
+        if selection_changed && self.state_is_prompt_only && timeline_is_empty {
+            let primed = Arc::clone(&self.primed_prefix);
+            let spans = self.branch_spans.clone();
+            if let Some((prefix, fresh)) = self.build_branch_checkpoint(&primed, &spans)? {
+                self.restore_branch_checkpoint(prefix, fresh)?;
+            }
+        }
+        // Whatever branch it started from, this turn's decode advances the
+        // state past the prompt — the swap window closes.
+        self.state_is_prompt_only = false;
 
         // Pin the system prompt into the substrate (idempotent).
         // Subsequent SubmitTurn calls re-inject it onto the slot via
@@ -1146,13 +1537,14 @@ impl Sequence {
         // dominated by the turn's own (invariant) content.
         //
         // Thinking suppression is PER-TURN, driven by the composer effort dial.
-        // Qwen3's `/no_think` soft-switch is only honoured from the user turn (not
-        // the system prompt), so when suppressed it is emitted as live GLUE right
-        // before this user message by the scheduler (`no_think_current`, gated on
-        // the same selector — see `reproject` + `BoundaryMarkers`), never baked
-        // into the turn.  The assistant header itself is never modified: a
-        // suppressed turn decodes its own empty `<think></think>`, a thinking turn
-        // opens its own `<think>`.
+        // Qwen3's `/no_think` soft-switch is only honoured from the user turn, not
+        // from the system prompt — so a suppressed turn carries it in its own grid,
+        // baked immediately after `user_start` by `turn_head_tokens`. Baking it
+        // into the turn that carries it is what keeps the dial per-turn: a past
+        // suppressed turn cannot put a stale switch on a later thinking-on turn
+        // when each turn's grid holds its own.  The assistant header itself is
+        // never modified: a suppressed turn decodes its own empty
+        // `<think></think>`, a thinking turn opens its own `<think>`.
         let assistant_start_marker = self.config.dialect.assistant_start;
         // Optional assistant prefill: text seeded as the start of the response so
         // the decode is forced to continue from it (e.g. `<tool_call>` commits to
@@ -1420,6 +1812,68 @@ impl Sequence {
         reprojection: Option<ReprojectionPolicy>,
         triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<TurnHandle> {
+        // ── Bake the turn's own boundary markers into its grid ──────────────
+        //
+        // A turn owns its leading `user_start` (with its `/no_think`, when the
+        // dial suppressed thinking) and its trailing `<|im_end|>`. Both used to
+        // be live `Generated` glue the projection spine re-emitted around every
+        // sealed turn; they are now part of the turn's own prefill, so a sealed
+        // turn injects complete and the spine emits nothing between turns.
+        //
+        // **Both ends or neither.** Every inter-turn island the assembler used
+        // to emit is exactly `assistant_end ++ user_start`, so splitting it at
+        // that seam is lossless only when each turn takes both halves — leading
+        // only would drop every closer, trailing only every opener. Pinned by
+        // `every_inter_turn_island_is_assistant_end_then_user_start`.
+        //
+        // Central, so it cannot diverge between the three turn-producing paths
+        // (dialogue, prefilled calibration, inserted). A path that baked its
+        // opener and not its closer would read fine and shift every boundary
+        // after it.
+        //
+        // Uniform across models, deliberately: the emitted token stream is
+        // identical either way, so there is no reason for a glue-capable model
+        // to take a different path. What differs is only that the marker's K is
+        // now computed under the prefix present at seal rather than re-derived
+        // per projection — the same approximation the substrate already makes
+        // for every sealed turn's own K/V. `TurnSegment::Glue { kv: Some(..) }`
+        // keeps regeneration reachable for a model that wants it.
+        let head = self.turn_head_tokens(no_think)?;
+        let head_len = head.len() as u32;
+        let (
+            prefill_text,
+            prefill_tokens,
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+        ) = if head_len == 0 {
+            (
+                prefill_text,
+                prefill_tokens,
+                user_content_start,
+                user_content_end,
+                assistant_content_start,
+            )
+        } else {
+            let mut baked = head;
+            baked.extend_from_slice(&prefill_tokens);
+            (
+                format!("{}{}", self.turn_head_text(no_think), prefill_text),
+                baked,
+                // The user body starts past the marker; the two interior
+                // boundaries shift with it. The seal's `from_flat_grid`
+                // reads a non-zero `user_content_start` as "the grid
+                // reserves room for the opener, so bake it real".
+                user_content_start + head_len,
+                user_content_end + head_len,
+                assistant_content_start + head_len,
+            )
+        };
+        // The closing marker rides the post-decode tail, so it lands after the
+        // decoded body and inside the sealed grid.
+        let mut post_decode_tokens = post_decode_tokens;
+        post_decode_tokens.extend_from_slice(&self.tokenize(self.config.dialect.assistant_end)?);
+
         let disable_reprojection = self.config.disable_reprojection;
         // Append-only ingests skip the per-turn projection rebuild and also
         // suppress continuous mid-decode reprojection.
@@ -1453,6 +1907,31 @@ impl Sequence {
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
+    }
+
+    /// The text a turn's grid opens with: `user_start`, plus the `/no_think`
+    /// soft-switch when this turn's dial suppressed thinking.
+    ///
+    /// The switch sits **inside the turn that carries it**, which is what stops
+    /// a past suppressed turn from leaking a stale switch onto a later
+    /// thinking-on one: each turn's grid holds its own, decided once at submit
+    /// from the dial that was live then, rather than re-decided from the current
+    /// dial every projection. (Qwen3 only honours the switch from the user turn,
+    /// so it has to follow the opener rather than sit in the system prompt.)
+    fn turn_head_text(&self, no_think: bool) -> String {
+        let switch = if no_think {
+            self.config.dialect.no_think
+        } else {
+            ""
+        };
+        format!("{}{}", self.config.dialect.user_start, switch)
+    }
+
+    /// [`Self::turn_head_text`] tokenised — tokenised as ONE string, so a
+    /// tokenizer that merges across the `user_start`/`no_think` join produces
+    /// the same ids the model would see from the concatenated text.
+    fn turn_head_tokens(&self, no_think: bool) -> crate::Result<TokenBuffer> {
+        self.tokenize(&self.turn_head_text(no_think))
     }
 
     /// Build the projection inputs the scheduler needs to run
@@ -1902,6 +2381,9 @@ impl Sequence {
             .substrate
             .mint_timeline(self.target.layer, self.target.group);
         self.substrate.mark_timeline_transient(fork_timeline);
+        // A scope fork is a fresh timeline: it ingests its own scope against the
+        // system prompt and holds none of the file conversation's dialogue, so
+        // it must not inherit the file conversation's memory either.
         self.fork_onto(fork_timeline)
     }
 
@@ -1941,11 +2423,78 @@ impl Sequence {
         self.substrate
             .couple_turn(file_tl, new_call.0)
             .map_err(ConversationError::Model)?;
+        // The adopted K/V arrived by reference, so this conversation's memory has
+        // not seen it. Catch it up over the whole adopted span at once.
+        self.catch_memory_up_to(&[new_call.0, new_resp.0])?;
         // The fork's turns now live on the file timeline (their K/V shared by
         // reference); tombstone the fork so its orphaned timeline isn't reloaded
         // or scored. The shared chunks stay alive via the file timeline's clones.
         let _ = self.substrate.tombstone_timeline(fork_timeline);
         Ok((new_call.0, new_resp.0))
+    }
+
+    /// Advance this conversation's recurrent memory over turns it has just
+    /// adopted **by reference**.
+    ///
+    /// A splice moves a scope fork's sealed K/V onto this timeline without it
+    /// ever passing through this conversation's forward, so its memory is behind
+    /// the K/V it now holds — §1's defect, produced by the merge rather than by
+    /// a restart. §4.4 calls N-children-into-one a *divergent join* and declares
+    /// it out of scope on the grounds that there is no operation meaning "and
+    /// also these other tokens"; there is one here, because the adopted turns
+    /// land at the **tail**. A recurrence cannot fill a hole in the middle of a
+    /// sequence, but it can absorb an append.
+    ///
+    /// One pass over the whole adopted span, not one per turn: the state is a
+    /// function of the ordered stream, so the batching is free correctness-wise
+    /// and turns N prefills into one.
+    fn catch_memory_up_to(&self, adopted: &[u32]) -> crate::Result<()> {
+        if !self.model_core.carries_recurrent_state {
+            return Ok(());
+        }
+        // The adopted tokens, and where the adopted span starts — everything
+        // before it is this conversation's own history, which the replay must
+        // attend over.
+        //
+        // The scheduler injects those prior turns onto the replay slot so the
+        // adopted span sees the left context it would have seen had this
+        // conversation decoded it. Replaying against nothing — the first
+        // version of this — makes the attention layers feed the recurrent
+        // layers outputs no real forward ever produced.
+        let (tokens, adopted_from) = {
+            let view = self.substrate.read();
+            let tokens: Vec<u32> = adopted
+                .iter()
+                .flat_map(|idx| view.token_ids_of(self.target.timeline, TurnIndex(*idx)))
+                .collect();
+            (tokens, adopted.iter().copied().min().unwrap_or(0))
+        };
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::MemoryCatchUp {
+                sequence_id: self.id,
+                tokens: TokenBuffer::from(tokens),
+                adopted_from,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Not fatal to the splice — the K/V is committed and the
+                // conversation is usable — but it leaves memory behind its
+                // history, which is invisible from the outside.
+                tracing::warn!(
+                    "memory catch-up after a scope splice failed ({e}) — this \
+                     conversation now holds K/V its recurrent layers never saw, \
+                     and will read perfectly while doing so"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// [`Self::splice_scope_turns`] for a chain of any length: adopt every turn
@@ -1978,6 +2527,8 @@ impl Sequence {
                 .couple_turn(target_tl, *idx)
                 .map_err(ConversationError::Model)?;
         }
+        // One catch-up over the whole adopted chain — see `catch_memory_up_to`.
+        self.catch_memory_up_to(&adopted)?;
         let _ = self.substrate.tombstone_timeline(fork_timeline);
         Ok(adopted)
     }
@@ -2275,24 +2826,18 @@ impl Sequence {
             stats.tokens_generated as u32,
             stats.decode_ms / 1000.0,
         );
-        // Materialized dialogue glue, from the SAME `assemble_pieces` decision the
-        // engine injects from, so the persisted panel shows the real boundary
-        // markers. Best-effort: if the markers can't be tokenised, leave it empty
-        // and the panel reconstructs the framing.
-        if let Ok(markers) = BoundaryMarkers::from_dialect(&self.config.dialect, |s| {
-            self.tokenizer
-                .encode(s, false)
-                .map(|e| e.get_ids().to_vec())
-        }) {
-            ev.materialized = materialize_conversation(
-                &projection.segments,
-                &markers,
-                &projection.selection_origins,
-                &resolver,
-                self.projection.schema(),
-                |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
-            );
-        }
+        // Materialized dialogue, from the SAME `assemble_pieces` decision the
+        // engine injects from, so the persisted panel can never drift from what
+        // the projection really does. It no longer needs the dialect's boundary
+        // markers: a sealed turn carries its own, so there is nothing left for
+        // the assembler to emit between turns.
+        ev.materialized = materialize_conversation(
+            &projection.segments,
+            &projection.selection_origins,
+            &resolver,
+            self.projection.schema(),
+            |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
+        );
         Some(ev)
     }
 
@@ -2454,14 +2999,26 @@ impl Sequence {
         Ok(String::new())
     }
 
-    /// Fork this sequence: allocate a fresh slot on the same
-    /// workspace `Conversation` (substrate handle), with its own
-    /// fresh [`crate::projection::TimelineId`] so the fork's turns
-    /// don't interleave with the parent's in the substrate.  The
-    /// fork's initial slot is empty — the next `submit_turn`
-    /// materialises the parent's history onto it via
-    /// `apply_projection` from the shared substrate.  No GPU CoW,
-    /// no chunk copying; substrate is the canonical parent.
+    /// Fork this sequence onto a **fresh timeline**: a new conversation thread
+    /// sharing the workspace substrate and the system prompt, starting with no
+    /// dialogue history of its own.
+    ///
+    /// **It does not inherit the parent's turns**, and the naming has misled
+    /// before: turns are gathered per timeline, and this mints a new one, so the
+    /// child projects the system prompt and nothing else. A behavioural test
+    /// settled it — asked about a codeword stated one turn before the fork, the
+    /// child answered by reasoning about the *system prompt*, because that was
+    /// the whole of its context.
+    ///
+    /// That is why the child's recurrent memory starts from the prompt branch
+    /// rather than from the parent: **memory must match the history the
+    /// conversation actually holds.** Handing it the parent's live memory would
+    /// give it a recollection of turns its attention layers have never seen —
+    /// state without K/V, which is §7.8 defect 2 and reads perfectly.
+    ///
+    /// For a fork that *does* continue the parent's conversation, see
+    /// [`Self::fork_resuming`], which targets a timeline that already holds the
+    /// history.
     pub fn fork(&self) -> crate::Result<Sequence> {
         // Mint a fresh timeline within the parent's (layer, group)
         // shape — each fork is its own conversation thread.
@@ -2483,7 +3040,128 @@ impl Sequence {
     pub fn fork_resuming(&self, timeline: TimelineId) -> crate::Result<Sequence> {
         self.substrate
             .register_timeline(timeline, self.target.layer, self.target.group);
+        // The child's memory comes from `timeline`'s own sealed snapshot, not
+        // from this sequence: the daemon resumes a client's conversation by
+        // forking its *base* conversation onto that client's timeline, and the
+        // base holds a memory of turns the client never had. `fork_onto` takes
+        // the parent's live state only when `timeline` is this sequence's own.
         self.fork_onto(timeline)
+    }
+
+    /// This conversation's **live** recurrent memory, right now, without sealing
+    /// a turn to see it.
+    ///
+    /// `None` when the model carries no such memory. Test observability: the
+    /// only other view is the record a seal writes, which forces a test to
+    /// advance the conversation to observe it — changing what it is measuring —
+    /// and makes "does a freed conversation still hold memory?" unaskable.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn memory(&self) -> crate::Result<Option<Vec<ExportedLayerState>>> {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::ReadRecurrentMemory {
+                sequence_id: self.id,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+    }
+
+    /// The last projection's score-density selection for this conversation's
+    /// timeline, rendered as one line: node ids with their origin tags.
+    ///
+    /// Test observability for the continuity oracles. The summary tree
+    /// summarises turns on its own thread, and the selector picks NODES —
+    /// summaries where they exist, raw turns where they do not — so what a
+    /// projection attends over depends on how far that thread has gotten. Two
+    /// conversations fed identical tokens can legitimately select different
+    /// nodes, and nothing else observable from a test says so.
+    ///
+    /// `None` when no projection has run or the rule-based path was used.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn last_selection_debug(&self) -> Option<String> {
+        let view = self.substrate.read();
+        let diag = view.last_selection_of(self.target.timeline)?.clone();
+        Some(
+            diag.selected_nodes
+                .iter()
+                .zip(diag.origins.iter())
+                .map(|(n, o)| format!("{n:?}:{o:?}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
+    /// Digest of a sealed turn's hot K/V content — formats, palettes, scales,
+    /// and gathered arena bytes, per layer per chunk. `None` when the turn
+    /// holds no hot sealed K/V (not materialised, or no such turn).
+    ///
+    /// Test observability: the continuity oracles' last discriminator. Two
+    /// conversations whose recurrent state, layout, selection, and materialized
+    /// glue all compare equal can still decode differently only if the K/V
+    /// bytes they attend over differ — and those bytes are visible nowhere
+    /// else.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn turn_kv_digest(
+        &self,
+        timeline: TimelineId,
+        index: u32,
+    ) -> crate::Result<Option<ContentHash>> {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::ReadTurnKvDigest {
+                sequence_id: self.id,
+                timeline,
+                index: TurnIndex(index),
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+    }
+
+    /// The conversation's sealed block count after its last completed turn —
+    /// the coarsest observable of the projected layout.
+    ///
+    /// Test observability for the continuity oracles: two conversations fed the
+    /// same tokens must land on the same block count, and a resumed
+    /// conversation whose count differs from its uninterrupted twin has had its
+    /// history laid out differently — positions shift, RoPE shifts, and decode
+    /// legitimately diverges from there, with nothing else saying why.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn sealed_block_count(&self) -> usize {
+        self.current_blocks.0
+    }
+
+    /// A stable digest of this conversation's live memory — `None` when it
+    /// carries none.
+    ///
+    /// Equality of the digest is equality of the memory: it hashes every
+    /// layer's bytes in order. Tests compare digests rather than megabytes, and
+    /// a digest that matches when the memory does not would defeat the point,
+    /// so this is a content hash and not a summary.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn memory_digest(&self) -> crate::Result<Option<ContentHash>> {
+        Ok(self.memory()?.map(|layers| {
+            let mut h = crate::persistence::content_hash::ContentHasher::new();
+            for l in &layers {
+                h.update(&l.layer_index.to_le_bytes());
+                h.update(&l.state);
+                h.update(&l.conv_tail);
+            }
+            h.finish()
+        }))
+    }
+
+    /// True when this conversation's memory is entirely zeros — the shape a
+    /// conversation takes when it has forgotten everything, which is otherwise
+    /// indistinguishable from one that remembers.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn memory_is_empty(&self) -> crate::Result<bool> {
+        Ok(self.memory()?.is_none_or(|layers| {
+            layers
+                .iter()
+                .all(|l| l.state.iter().all(|&b| b == 0) && l.conv_tail.iter().all(|&b| b == 0))
+        }))
     }
 
     /// Swap the projection schema this sequence projects + reprojects with.
@@ -2496,9 +3174,54 @@ impl Sequence {
         self.projection = projection;
     }
 
-    /// Shared body of [`Self::fork`] / [`Self::fork_resuming`]: allocate a
-    /// fresh scheduler slot bound to the workspace substrate and `timeline`.
+    /// The projection schema this sequence currently projects with — the getter
+    /// paired with [`Self::set_projection`].
+    ///
+    /// Handing it back and setting it again is how a caller asks for a
+    /// reprojection without changing what is projected, which is otherwise not
+    /// expressible: reprojection is policy-driven from inside the decode loop.
+    pub fn projection(&self) -> Arc<Builder> {
+        Arc::clone(&self.projection)
+    }
+
+    /// Shared body of [`Self::fork`] / [`Self::fork_resuming`] /
+    /// [`Self::fork_scope`]: allocate a fresh scheduler slot bound to the
+    /// workspace substrate and `timeline`.
+    ///
+    /// `inherits` is the whole of the difference, and it is not a mode: it is a
+    /// statement about `fork_timeline`. A timeline that already holds this
+    /// conversation's turns gives the child that history, so the child may take
+    /// the parent's memory. A freshly minted one gives it nothing, so the
+    /// parent's memory would be a recollection of turns the child's attention
+    /// layers have never seen.
     fn fork_onto(&self, fork_timeline: TimelineId) -> crate::Result<Sequence> {
+        // The parent's live memory describes the parent's own history. It is
+        // therefore the child's memory exactly when the child continues that
+        // history — when the fork lands back on the timeline the parent is
+        // already on. Every other fork, including a resume of some *other*
+        // conversation's timeline, must keep the state `create_sequence`
+        // restored from that timeline's own sealed snapshot.
+        let inherits = fork_inherits_history(self.target.timeline, fork_timeline);
+        // **A fork must be taken at a sealed boundary.**
+        //
+        // The child's spliced K/V covers the parent's history *as sealed*. A
+        // parent with a turn in flight has advanced its per-sequence state past
+        // that point, so copying it produces a child whose recurrent layers
+        // have seen tokens its attention layers have not — an asymmetry nothing
+        // downstream can detect and no later operation can repair. Refusing is
+        // the same rule the view carve obeys automatically by being taken at
+        // the turn boundary; the difference is only that a user-facing fork
+        // needs an error where the internal one has an invariant.
+        if self.turn_in_flight {
+            return Err(ConversationError::Channel(
+                "fork with a turn in flight: the parent's per-sequence state is \
+                 ahead of its sealed K/V, so the fork would carry a recurrent \
+                 memory of tokens its attention layers never saw. Finish or \
+                 cancel the turn, then fork."
+                    .into(),
+            ));
+        }
+
         let fork_target = ProjectionTarget {
             layer: self.target.layer,
             group: self.target.group,
@@ -2512,6 +3235,14 @@ impl Sequence {
             .send(SchedulerRequest::NewSequence {
                 conversation: self.substrate.clone(),
                 target: Some(fork_target),
+                // The live parent, so the child's memory comes across
+                // device-to-device instead of via the last seal's record — but
+                // only when the child is actually continuing the parent's
+                // history. A fresh timeline holds none of it.
+                parent: match inherits {
+                    InheritsHistory::Yes => Some(self.id),
+                    InheritsHistory::No => None,
+                },
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -2537,6 +3268,12 @@ impl Sequence {
             // history aggregation continues to work.
             substrate: self.substrate.clone(),
             target: fork_target,
+            primed_prefix: Arc::clone(&self.primed_prefix),
+            branch_spans: self.branch_spans.clone(),
+            // A fork's state is real — the parent's live state or the
+            // timeline's snapshot, never exactly the prompt checkpoint — so
+            // the branch-swap window is closed.
+            state_is_prompt_only: false,
             // Forks start with a fresh scanner state — scoring will refresh
             // on the next provenance scan.  No need to clone the parent's scores.
         };
@@ -3386,6 +4123,54 @@ mod windowed_ingest_tests {
         // Window reaches into the system-prompt region (keep_from <= sys_end) →
         // contiguous → whole parent.
         assert_eq!(w(13, &starts, 20, 2), vec![(0, 20)]);
+    }
+}
+
+/// **A1 — a fork inherits the parent's memory only on the parent's own
+/// timeline.**
+///
+/// Recurrent memory describes a token history. A fork's spliced K/V comes from
+/// its *target* timeline's sealed records, so its memory must come from there
+/// too; the parent's live state is the right answer only when the fork lands
+/// back where the parent already is.
+///
+/// This is asserted here, on the predicate, rather than only end-to-end because
+/// the end-to-end oracle costs two model loads and fourteen minutes, and because
+/// nothing else can see the defect: a conversation given the wrong memory holds
+/// the *right* K/V, answers from it fluently, and passes every recall probe.
+#[cfg(test)]
+mod fork_inherits_history_tests {
+    use super::{fork_inherits_history, InheritsHistory};
+    use crate::projection::TimelineId;
+
+    #[test]
+    fn only_a_fork_onto_the_parents_own_timeline_takes_the_parents_memory() {
+        let parent = TimelineId::for_test(7);
+
+        // Re-attaching to the timeline the parent is already on: its live state
+        // is current, describes exactly this history, and beats the snapshot.
+        assert_eq!(
+            fork_inherits_history(parent, parent),
+            InheritsHistory::Yes,
+            "a fork onto the parent's own timeline continues the parent's turns"
+        );
+
+        // The daemon's resume: fork the *base* conversation onto a client's
+        // timeline. The base holds a memory of turns this client never had, so
+        // the snapshot `create_sequence` restored must stand. Deciding this per
+        // constructor instead is how every restored conversation came to run on
+        // the base conversation's memory.
+        assert_eq!(
+            fork_inherits_history(parent, TimelineId::for_test(9)),
+            InheritsHistory::No,
+            "resuming another timeline must keep that timeline's restored snapshot"
+        );
+
+        // A freshly minted timeline — `fork` and `fork_scope` — holds nothing.
+        assert_eq!(
+            fork_inherits_history(parent, TimelineId::for_test(1)),
+            InheritsHistory::No
+        );
     }
 }
 

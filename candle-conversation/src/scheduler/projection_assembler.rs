@@ -260,10 +260,39 @@ pub(crate) enum AssembledPiece {
 /// `user_start` (flushed into the glue island immediately before it) and
 /// `assistant_end` (carried into the island after it, so it merges with the next
 /// turn's `user_start`); `NewUserMessage` is deferred past the gap-fill.
-pub(crate) fn assemble_pieces(
+/// [`assemble_pieces`] with the per-turn boundary question answered by the
+/// caller — `bakes(timeline, index)` reports whether that turn's grid carries
+/// its own `user_start` / `assistant_end`.
+///
+/// Turns sealed since the boundaries moved into the grid bake them; turns
+/// already in a workspace's redo log do not, and their ethereal markers are
+/// dropped by `TurnLayout::realize`. So the assembler emits the framing for
+/// exactly the turns that lack it — which is what keeps a resumed
+/// pre-existing conversation from projecting as one unbroken run with no role
+/// markers anywhere.
+pub(crate) fn assemble_pieces_with(
     segments: &[ProjectionSegment],
     markers: &BoundaryMarkers,
-    mut turn_no_think: impl FnMut(Option<TimelineId>, TurnIndex) -> bool,
+    bakes: &dyn Fn(TimelineId, TurnIndex) -> bool,
+) -> Vec<AssembledPiece> {
+    assemble_inner(segments, Some((markers, bakes)))
+}
+
+/// [`assemble_pieces_with`] for callers with no substrate to ask (tests, and
+/// the panel's structural rendering): every turn is assumed to bake, which is
+/// true of everything sealed by this build.
+pub(crate) fn assemble_pieces(segments: &[ProjectionSegment]) -> Vec<AssembledPiece> {
+    assemble_inner(segments, None)
+}
+
+type BoundaryQuery<'a> = (
+    &'a BoundaryMarkers,
+    &'a dyn Fn(TimelineId, TurnIndex) -> bool,
+);
+
+fn assemble_inner(
+    segments: &[ProjectionSegment],
+    boundaries: Option<BoundaryQuery<'_>>,
 ) -> Vec<AssembledPiece> {
     let mut pieces: Vec<AssembledPiece> = Vec::new();
     let mut run: Vec<u32> = Vec::new();
@@ -288,15 +317,37 @@ pub(crate) fn assemble_pieces(
                 pieces.push(AssembledPiece::Section(rs.id));
             }
             ProjectionSegment::Sealed(SealedKind::Turn(rt, role)) => {
-                run.extend(markers.user_start.iter().copied());
-                // Re-render this turn's `/no_think` soft-switch if it was sealed
-                // with thinking suppressed — sits right after `user_start`, where
-                // Qwen3 honours it, matching the live-turn `no_think_current`
-                // glue.  Keeps a re-rendered suppressed turn self-consistent: a
-                // `/no_think` opener for its empty `<think></think>`, instead of
-                // an unexplained empty block the model learns to mimic.
-                if turn_no_think(rt.timeline, rt.index()) {
-                    run.extend(markers.no_think.iter().copied());
+                // **A sealed turn emits alone.**
+                //
+                // Its opener (`user_start`, plus the `/no_think` switch it was
+                // sealed with) and its closer (`assistant_end`) are baked into
+                // its own grid at submit — see `Sequence::submit_prefill_unit`
+                // — so re-emitting them here would double every boundary. What
+                // used to be an `assistant_end ++ user_start` island between
+                // consecutive turns is now the tail of one turn's grid abutting
+                // the head of the next, which is the same token stream with no
+                // gap chunk to fill.
+                //
+                // That is the whole point: an island is a run the engine must
+                // GAP-FILL, and a recurrent model cannot compute K/V for tokens
+                // inserted mid-sequence. With the boundaries owned, a
+                // projection of system prompt + sealed turns + a live user
+                // message reserves no gap chunks at all.
+                //
+                // Except for a turn that does NOT own them: one sealed before
+                // the boundaries moved into the grid, still sitting in a
+                // workspace's redo log with ethereal markers that
+                // `TurnLayout::realize` drops. For those the assembler is still
+                // the only source, so it emits the framing exactly as it used
+                // to — a per-turn answer, from the turn's own layout.
+                let bakes = boundaries
+                    .as_ref()
+                    .and_then(|(_, q)| rt.timeline.map(|tl| q(tl, rt.index())))
+                    .unwrap_or(true);
+                if !bakes {
+                    if let Some((markers, _)) = boundaries.as_ref() {
+                        run.extend(markers.user_start.iter().copied());
+                    }
                 }
                 flush(&mut run, &mut pieces);
                 pieces.push(AssembledPiece::Turn {
@@ -305,7 +356,11 @@ pub(crate) fn assemble_pieces(
                     role: *role,
                     timeline: rt.timeline,
                 });
-                run.extend(markers.assistant_end.iter().copied());
+                if !bakes {
+                    if let Some((markers, _)) = boundaries.as_ref() {
+                        run.extend(markers.assistant_end.iter().copied());
+                    }
+                }
             }
             ProjectionSegment::Sealed(SealedKind::TurnHalf(rt)) => {
                 // The compression pass supplies its own framing glue, so the
@@ -343,7 +398,6 @@ pub(crate) fn assemble_pieces(
 /// via `resolver` + `origins`.
 pub(crate) fn materialize_conversation(
     segments: &[ProjectionSegment],
-    markers: &BoundaryMarkers,
     origins: &HashMap<TurnKey, SelectionOrigin>,
     resolver: &dyn ContentResolver,
     schema: &Schema,
@@ -362,11 +416,7 @@ pub(crate) fn materialize_conversation(
             )
         })
         .unwrap_or(segments.len());
-    // `/no_think` per turn comes from the same suppression bit the assembler
-    // reads, so the re-rendered soft-switch matches the engine exactly.
-    let no_think =
-        |tl: Option<TimelineId>, idx: TurnIndex| tl.is_some_and(|t| resolver.turn_no_think(t, idx));
-    assemble_pieces(&segments[start..], markers, no_think)
+    assemble_pieces(&segments[start..])
         .into_iter()
         .filter_map(|piece| match piece {
             AssembledPiece::Glue(tokens) => {
@@ -436,8 +486,10 @@ pub(super) struct ApplyContext<'a> {
     pub(super) tokenizer: &'a tokenizers::Tokenizer,
     pub(super) slot_tokens: &'a mut HashMap<SequenceId, Vec<u32>>,
     /// Pre-tokenised inter-turn boundary markers — see [`BoundaryMarkers`].
-    /// The walker pre-pends `user_start` and trails `assistant_end`
-    /// around every `Sealed::Turn` segment.
+    ///
+    /// No longer emitted around sealed turns (each turn owns its own); still
+    /// carried because the compression probe frames its synthetic exchange with
+    /// them and the debug view decodes them.
     pub(super) boundary_markers: &'a BoundaryMarkers,
 }
 
@@ -642,15 +694,30 @@ pub(super) fn apply_segments_build(
     // The glue/order decision is owned by `assemble_pieces` (the single source
     // of truth, shared with the substrate debug view).
     let mut walker = SegmentWalker::new();
-    // Look up a sealed turn's recorded `no_think` so the assembler can re-render
-    // its `/no_think` switch.  The turn carries its own timeline (stamped at
-    // projection), so this reads it directly — no group→timeline resolution.
-    // Immutable borrow ends before the mutable walk below.
-    let conversation = ctx.conversation;
-    let no_think_for = |timeline: Option<TimelineId>, index: TurnIndex| -> bool {
-        timeline.is_some_and(|tl| conversation.read().turn_no_think(tl, index))
+    // A sealed turn's `/no_think` switch needs no look-up here: it is baked into
+    // the turn's own grid, so injecting the turn injects the switch it was
+    // sealed with. Its ROLE MARKERS do need one: a turn sealed before the
+    // boundaries moved into the grid carries ethereal ones, and the assembler
+    // is still its only source (see `assemble_pieces_with`).
+    // Answered for every sealed turn in ONE read-lock pass, before assembly:
+    // the closure below is consulted per turn per assembly, and taking the
+    // substrate lock (and cloning a layout) inside it put that cost on the
+    // projection hot path.
+    let unbaked: std::collections::HashSet<(TimelineId, TurnIndex)> = {
+        let read = ctx.conversation.read();
+        new_segments
+            .iter()
+            .filter_map(|seg| match seg {
+                ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => {
+                    rt.timeline.map(|tl| (tl, rt.index()))
+                }
+                _ => None,
+            })
+            .filter(|(tl, idx)| !read.turn_bakes_own_boundaries(*tl, *idx))
+            .collect()
     };
-    let pieces = assemble_pieces(new_segments, ctx.boundary_markers, no_think_for);
+    let bakes = |tl: TimelineId, idx: TurnIndex| !unbaked.contains(&(tl, idx));
+    let pieces = assemble_pieces_with(new_segments, ctx.boundary_markers, &bakes);
     // ── Island-cache keying: a rolling hash over the CONTENT identity of every
     // piece the walk has placed so far. A glue island's K/V is a function of its
     // own tokens, its (backward-unbounded) attended prefix, and — when its
@@ -994,6 +1061,23 @@ fn reserve_glue_island(
     let n = tokens.len();
     if n == 0 {
         return Ok(());
+    }
+    // **A model that cannot gap-fill must never reach here.**
+    //
+    // Reserving an island commits the projection to computing K/V for tokens
+    // in the MIDDLE of the sequence, which a recurrence cannot do: its state has
+    // already accumulated past the hole and there is no way to re-enter it
+    // there. The wave would bail on `n_glue > 0` a layer down, after the
+    // projection had been planned and the chunks reserved — so the refusal
+    // belongs here, where it can name what asked for an island and why.
+    if !ctx.model.model_core_properties().can_gap_fill {
+        return Err(ConversationError::Channel(format!(
+            "projection reserved a {n}-token glue island, but this model cannot \
+             gap-fill: its per-sequence memory is a recurrence, so a token \
+             inserted mid-sequence has no computable output. Every producer of a \
+             live `Generated` run has to become sealed content for this lineage \
+             (docs/deltanet_state_persistence.md §4.6-§4.7d)."
+        )));
     }
     let parent = ctx.parent_id.0;
     let chunk = ctx.chunk_size.max(1);
@@ -1736,24 +1820,19 @@ mod tests {
         assert!(none.sections.is_empty() && none.turns.is_empty());
     }
 
-    fn test_markers() -> BoundaryMarkers {
-        BoundaryMarkers {
-            user_start: Arc::new(vec![100]),
-            assistant_end: Arc::new(vec![200]),
-            user_end: Arc::new(vec![101]),
-            assistant_start: Arc::new(vec![201]),
-            no_think: Arc::new(vec![]),
-            user_start_str: "<|im_start|>user\n".into(),
-            assistant_end_str: "<|im_end|>\n".into(),
-            user_end_str: "<|im_end|>\n".into(),
-            assistant_start_str: "<|im_start|>assistant\n".into(),
-            causal_only_glue: false,
-        }
-    }
-
+    /// **A sealed turn emits alone, and consecutive turns share no island.**
+    ///
+    /// This used to assert the opposite — `Glue(user_start)` before each turn
+    /// and a merged `Glue(assistant_end ++ user_start)` between them. Those
+    /// markers now live in each turn's own grid, so the assembler emits nothing
+    /// around a sealed turn and consecutive turns abut directly.
+    ///
+    /// The emitted TOKEN stream is unchanged; what changed is that the markers
+    /// arrive as part of a sealed turn's injected K/V rather than as a run the
+    /// engine must gap-fill. That is the whole difference for a recurrent model:
+    /// there is no hole in the middle of the sequence left to compute.
     #[test]
-    fn assemble_pieces_wraps_turns_merges_glue_and_defers_user() {
-        let m = test_markers();
+    fn assemble_pieces_emits_sealed_turns_alone_and_defers_user() {
         let segments = vec![
             generated_seg("a", 0, &[1, 2]),
             section_seg(7),
@@ -1764,37 +1843,87 @@ mod tests {
                 tokens: Arc::new(vec![9, 9]),
             },
         ];
-        let pieces = assemble_pieces(&segments, &m, |_, _| false);
+        let pieces = assemble_pieces(&segments);
         assert_eq!(
             pieces,
             vec![
-                // leading Generated run
+                // leading Generated run — template glue, still the assembler's
                 AssembledPiece::Glue(vec![1, 2]),
                 AssembledPiece::Section(SectionId::new(7)),
-                // user_start flushed just before the first turn
-                AssembledPiece::Glue(vec![100]),
+                // no opener island: the turn carries its own
                 AssembledPiece::Turn {
                     group: GroupId::for_test(2),
                     index: TurnIndex(3),
                     role: crate::Role::Assistant,
                     timeline: Some(TimelineId::for_test(2)),
                 },
-                // turn 1's assistant_end MERGES with turn 2's user_start in one island
-                AssembledPiece::Glue(vec![200, 100]),
+                // and no island BETWEEN turns — turn 3's closer and turn 4's
+                // opener are inside their respective grids, abutting directly
                 AssembledPiece::Turn {
                     group: GroupId::for_test(2),
                     index: TurnIndex(4),
                     role: crate::Role::Assistant,
                     timeline: Some(TimelineId::for_test(2)),
                 },
-                // turn 2's assistant_end merges with the trailing Generated run
-                AssembledPiece::Glue(vec![200, 3]),
+                // the trailing Generated run stands alone now
+                AssembledPiece::Glue(vec![3]),
                 // in-flight user message deferred past the gap-fill
                 AssembledPiece::DeferredUser(Arc::new(vec![9, 9])),
             ]
         );
     }
 
+    /// **The gate: a projection of sealed turns reserves no glue at all.**
+    ///
+    /// System prompt sections + sealed turns + a live user message must emit
+    /// zero `Glue` pieces, because every `Glue` piece is an island the engine
+    /// gap-fills and a recurrence cannot compute K/V for tokens inserted
+    /// mid-sequence. This is `T5c.1` at the assembler level — the single
+    /// assertion that says the lineage can run.
+    #[test]
+    fn a_projection_of_sealed_turns_and_a_live_message_emits_no_glue() {
+        let segments = vec![
+            section_seg(7),
+            section_seg(8),
+            turn_seg(1, 2, 3),
+            turn_seg(1, 2, 4),
+            turn_seg(1, 2, 5),
+            ProjectionSegment::NewUserMessage {
+                tokens: Arc::new(vec![9, 9]),
+            },
+        ];
+        let pieces = assemble_pieces(&segments);
+        let glue: Vec<&AssembledPiece> = pieces
+            .iter()
+            .filter(|p| matches!(p, AssembledPiece::Glue(_)))
+            .collect();
+        assert!(
+            glue.is_empty(),
+            "a projection with no template sections must reserve no glue \
+             islands — every one is a hole a recurrent model cannot fill: {glue:?}"
+        );
+        assert!(matches!(
+            pieces.last(),
+            Some(AssembledPiece::DeferredUser(_))
+        ));
+    }
+
+    /// **Every inter-turn island is exactly `assistant_end ++ user_start`.**
+    ///
+    /// This is the structural fact that decides boundary ownership, and it is
+    /// asserted here as a *shape* rather than as one expected vector so it
+    /// keeps meaning something as the surrounding test data changes.
+    ///
+    /// Splitting that island at the `AE|US` seam is lossless **only** if each
+    /// turn takes both halves: leading-only drops every `assistant_end`,
+    /// trailing-only drops every `user_start`. That is why
+    /// `TurnLayout::from_flat_grid_with_tail` bakes both ends or neither, and
+    /// this test is what stops a later "simplify to one end" from looking safe.
+    ///
+    /// It also pins the CURRENT stream, which is the reference the baked-turn
+    /// change (§4.7 / P5b) has to reproduce token for token — the failure it
+    /// guards against is a dropped or doubled `<|im_end|>`, which reads fine
+    /// and shifts every boundary after it.
     #[test]
     fn glue_bridge_window_opens_only_into_turns() {
         let turn = AssembledPiece::Turn {
@@ -1827,7 +1956,6 @@ mod tests {
     fn glue_bridge_window_matches_assembled_stream() {
         // Walk the same stream as `assemble_pieces_wraps_turns_…`: every glue
         // island's window is decided by the piece that follows it.
-        let m = test_markers();
         let segments = vec![
             generated_seg("a", 0, &[1, 2]),
             section_seg(7),
@@ -1838,44 +1966,26 @@ mod tests {
                 tokens: Arc::new(vec![9, 9]),
             },
         ];
-        let pieces = assemble_pieces(&segments, &m, |_, _| false);
+        let pieces = assemble_pieces(&segments);
         let windows: Vec<u32> = (0..pieces.len())
             .filter(|&i| matches!(pieces[i], AssembledPiece::Glue(_)))
             .map(|i| glue_bridge_window(pieces.get(i + 1)))
             .collect();
-        // Glue islands in order: leading run→Section (0), user_start→Turn (16),
-        // assistant_end++user_start→Turn (16), assistant_end++run→DeferredUser (0).
-        assert_eq!(
-            windows,
-            vec![0, TURN_BRIDGE_FWD_AHEAD, TURN_BRIDGE_FWD_AHEAD, 0]
-        );
-    }
-
-    #[test]
-    fn assemble_pieces_reinjects_no_think_for_recorded_suppressed_turn() {
-        let mut m = test_markers();
-        m.no_think = Arc::new(vec![42]); // the `/no_think` soft-switch tokens
-        let segments = vec![turn_seg(1, 2, 3)];
-
-        // Recorded thinking-ON: only `user_start` [100] precedes the turn.
-        let on = assemble_pieces(&segments, &m, |_, _| false);
-        assert_eq!(on[0], AssembledPiece::Glue(vec![100]));
-
-        // Recorded thinking-SUPPRESSED: `user_start` [100] ++ `/no_think` [42],
-        // so the re-rendered prior turn shows its switch.
-        let off = assemble_pieces(&segments, &m, |_, _| true);
-        assert_eq!(off[0], AssembledPiece::Glue(vec![100, 42]));
+        // Two islands remain, both from template `Generated` runs: the leading
+        // run→Section (0) and the trailing run→DeferredUser (0). The two that
+        // used to sit around the turns are gone — the turns carry their own
+        // markers — so no glue island leads into a Turn any more.
+        assert_eq!(windows, vec![0, 0]);
     }
 
     #[test]
     fn assemble_pieces_consecutive_generated_form_one_island() {
-        let m = test_markers();
         let segments = vec![
             generated_seg("a", 0, &[1]),
             generated_seg("b", 1, &[2, 3]),
             section_seg(5),
         ];
-        let pieces = assemble_pieces(&segments, &m, |_, _| false);
+        let pieces = assemble_pieces(&segments);
         assert_eq!(
             pieces,
             vec![
@@ -1887,7 +1997,7 @@ mod tests {
 
     #[test]
     fn assemble_pieces_empty_is_empty() {
-        assert!(assemble_pieces(&[], &test_markers(), |_, _| false).is_empty());
+        assert!(assemble_pieces(&[]).is_empty());
     }
 
     #[test]

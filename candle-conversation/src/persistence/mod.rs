@@ -221,7 +221,7 @@ fn record_metadata_loc(map: &mut HashMap<(RecordType, u64), RecordLoc>, entry: &
 fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     match h.record_type {
-        RecordType::Snapshot => {
+        RecordType::Snapshot | RecordType::BranchCheckpoint => {
             map.insert(
                 h.stream_id,
                 RecordLoc {
@@ -661,7 +661,10 @@ impl SubstratePersistence {
     /// writes AND maintenance relocations keep the map current; the load /
     /// compact walk uses the free-function mirror [`record_snapshot_loc`].
     fn track_snapshot_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
-        if h.record_type == RecordType::Snapshot {
+        if matches!(
+            h.record_type,
+            RecordType::Snapshot | RecordType::BranchCheckpoint
+        ) {
             self.snapshot_locs.insert(
                 h.stream_id,
                 RecordLoc {
@@ -714,8 +717,27 @@ impl SubstratePersistence {
     /// exactly this copy alive through segment maintenance. Returns the
     /// record's location for the caller's in-RAM index.
     pub fn write_snapshot(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<RecordLoc> {
+        self.write_recurrent_record(RecordType::Snapshot, stream_id, payload)
+    }
+
+    /// Append a prompt branch's recurrent checkpoint — the same single-tail
+    /// append under a `BranchCheckpoint` record.
+    pub fn write_branch_checkpoint(
+        &mut self,
+        stream_id: StreamId,
+        payload: &[u8],
+    ) -> Result<RecordLoc> {
+        self.write_recurrent_record(RecordType::BranchCheckpoint, stream_id, payload)
+    }
+
+    fn write_recurrent_record(
+        &mut self,
+        record_type: RecordType,
+        stream_id: StreamId,
+        payload: &[u8],
+    ) -> Result<RecordLoc> {
         let (segment, offset, size) =
-            self.append_record(RecordType::Snapshot, 0, stream_id.0, 0, 0, 0, payload)?;
+            self.append_record(record_type, 0, stream_id.0, 0, 0, 0, payload)?;
         Ok(RecordLoc {
             segment,
             offset,

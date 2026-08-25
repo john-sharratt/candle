@@ -562,7 +562,9 @@ pub(crate) fn turn_belief_key(turn: TurnKey) -> String {
 #[cfg(test)]
 impl PriorBelief {
     /// A collection's member map (test-only readable view over `beliefs`).
-    fn coll(&self, name: &str) -> &HashMap<String, (f32, bool, bool)> {
+    /// `pub(crate)` so the scheduler's resume-seeding test can assert the
+    /// recovered belief's content, not merely its presence.
+    pub(crate) fn coll(&self, name: &str) -> &HashMap<String, (f32, bool, bool)> {
         &self.beliefs[&GroupKey::Collection(name.to_string())]
     }
     /// A turn group's member map (test-only readable view over `beliefs`).
@@ -912,7 +914,7 @@ impl OptionalState {
 /// Rust type.  For the engine's own closed conventions (the `optional`
 /// present/absent state), use the typed [`Self::optional`] / [`Self::set_optional`]
 /// accessors rather than bare string literals.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectionState {
     chosen: HashMap<String, String>,
 }
@@ -1967,36 +1969,28 @@ fn emit_system_prompt_items<R: ContentResolver>(
     out
 }
 
-/// Emit a single [`SectionSchema`] as either a [`ProjectionSegment::Sealed`]
-/// (content section — K/V comes from substrate) or a
-/// [`ProjectionSegment::Generated`] (template section — K/V is
-/// live-prefilled at apply time under the runtime left context).
+/// Emit a single [`SectionSchema`] as a [`ProjectionSegment::Sealed`] — its
+/// K/V comes from the substrate.
 ///
-/// Panics if a template section has not been tokenised — the schema
-/// must run through [`super::Builder::tokenize_templates`] before
-/// `project()` is called on a schema containing template items.
+/// **Template sections seal like any other.** They used to emit a
+/// [`ProjectionSegment::Generated`] run, live-prefilled at apply time under the
+/// runtime left context. They are dialect structural text — a handful of tokens
+/// whose content and position are both fixed — and what varied was only their
+/// left context, because a `depends_on` template emits just when its collection
+/// materialises.
+///
+/// A live-prefilled run is a glue **island**: a hole in the middle of the
+/// sequence the engine has to gap-fill. That is impossible for a model whose
+/// per-sequence memory is a recurrence, so the choice is between an approximate
+/// bake — the same approximation a collection member's K/V already carries — and
+/// a wave that refuses to run. See `docs/deltanet_state_persistence.md` §4.7d.
+///
+/// The distinction survives in the schema (`is_template` still selects the
+/// dialect text at build time) but no longer changes what a projection emits.
 fn push_section_segment(out: &mut Vec<ProjectionSegment>, s: &SectionSchema) {
-    if s.is_template {
-        let tokens = s.template_tokens.clone().unwrap_or_else(|| {
-            panic!(
-                "projection: template section {:?} (id {}) has no pre-tokenised tokens — \
-                 call Builder::tokenize_templates before project()",
-                s.name,
-                s.id.raw(),
-            )
-        });
-        out.push(ProjectionSegment::Generated {
-            tokens,
-            identity: GeneratedIdentity {
-                name: s.name.clone(),
-                position: out.len(),
-            },
-        });
-    } else {
-        out.push(ProjectionSegment::Sealed(SealedKind::Section(
-            ResolvedSection { id: s.id },
-        )));
-    }
+    out.push(ProjectionSegment::Sealed(SealedKind::Section(
+        ResolvedSection { id: s.id },
+    )));
 }
 
 /// Apply a collection's selection rule, returning the surviving

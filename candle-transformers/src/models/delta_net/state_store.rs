@@ -138,6 +138,12 @@ pub struct RecurrentStateStore {
     /// operations act on every slot together, so a per-slot answer could only
     /// ever disagree with its neighbours by being wrong.
     open: bool,
+    /// Whether this store's state was put here deliberately — by a fork or a
+    /// restore — and must therefore survive one `offset == 0` reset.
+    ///
+    /// Store-level, unlike `advanced`, because seeding is a property of where
+    /// the whole state came from rather than of which layers a sweep reached.
+    seeded: bool,
     device: Device,
 }
 
@@ -149,8 +155,12 @@ impl RecurrentStateStore {
             if *k == LayerKind::DeltaNet {
                 slots.push(LayerSlot {
                     layer_index: i,
+                    // `live` is genuinely READ at zero — it is the
+                    // sequence-start state — so it must be zeroed.
                     live: DeltaNetState::zeros(dims, device)?,
-                    backup: DeltaNetState::zeros(dims, device)?,
+                    // `backup` is the write half: fully stamped by the first
+                    // wave before anything reads it (invariant 6).
+                    backup: DeltaNetState::uninit(dims, device)?,
                     advanced: false,
                 });
             }
@@ -160,6 +170,9 @@ impl RecurrentStateStore {
             hash: schedule_hash(layer_kinds, dims),
             slots,
             open: false,
+            // A fresh store already holds the sequence-start value, so there is
+            // nothing for a reset to destroy.
+            seeded: false,
             device: device.clone(),
         })
     }
@@ -368,6 +381,82 @@ impl RecurrentStateStore {
         Ok(())
     }
 
+    /// An independent store carrying this one's state — the fork primitive.
+    ///
+    /// Device-to-device: each slot's live `s` and conv tail go through
+    /// [`DeltaNetState::snapshot`], which is `Tensor::copy` and never touches
+    /// the host. The write half of the ping-pong is **not** copied — a wave
+    /// fully overwrites it before reading it, so its contents are not state,
+    /// they are scratch.
+    ///
+    /// Refused mid-wave, and the reason is sharper than `export`'s. Mid-wave
+    /// the *advanced* state is in `backup` while `live` is one wave stale, so a
+    /// mid-wave fork would not merely copy a moving value — it would copy the
+    /// wrong buffer, confidently, and the child would come up a wave behind its
+    /// parent with every shape correct.
+    ///
+    /// Reads the slot fields directly rather than going through
+    /// [`Self::layer_state_pair_mut`], which marks a slot `advanced` and would
+    /// make the parent's next commit swap in a buffer no wave ever wrote.
+    pub fn fork_from(&self) -> Result<Self> {
+        if self.open {
+            candle::bail!(
+                "recurrent store: fork_from mid-wave — the advanced state is in the \
+                 write buffer and `live` is a wave behind, so the child would come up \
+                 stale. Fork at a wave boundary."
+            );
+        }
+        let mut slots = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            slots.push(LayerSlot {
+                layer_index: slot.layer_index,
+                live: slot.live.snapshot()?,
+                // Scratch, not state: the kernels fully overwrite the write
+                // buffer before anything reads it, so copying it would be
+                // ~2 MB per layer of device traffic for bytes nobody reads —
+                // and for the same reason it is allocated UNINITIALISED
+                // (hot-path invariant 6). Zeroing it memset ~63 MiB per fork,
+                // ~3 forks per turn, over bytes the next wave stamps anyway.
+                backup: DeltaNetState::uninit(&self.dims, &self.device)?,
+                advanced: false,
+            });
+        }
+        Ok(Self {
+            dims: self.dims,
+            hash: self.hash,
+            slots,
+            open: false,
+            seeded: true,
+            device: self.device.clone(),
+        })
+    }
+
+    /// Whether this store's state arrived by fork or restore and must survive
+    /// its first `offset == 0` reset. Consumed by that reset — see
+    /// [`Self::take_seeded`].
+    pub fn is_seeded(&self) -> bool {
+        self.seeded
+    }
+
+    /// Mark the state as externally seeded (a restore).
+    pub fn mark_seeded(&mut self) {
+        self.seeded = true;
+    }
+
+    /// Read and clear the seeded flag: `true` exactly once after a fork or a
+    /// restore, and the caller must then not reset the store.
+    ///
+    /// The flag exists because "was this slot's state put here deliberately?"
+    /// has no other answer. `ensure_recurrent` resets on `offset == 0` because
+    /// a sequence with no history must hold the sequence-start value, and a
+    /// freshly restored slot standing at offset 0 before its first wave looks
+    /// exactly like one. Relying on the projection to have moved the offset
+    /// first is correct today by ordering nothing asserts; this makes it
+    /// explicit.
+    pub fn take_seeded(&mut self) -> bool {
+        std::mem::take(&mut self.seeded)
+    }
+
     /// Read every layer back as LE F32 bytes — the turn-seal snapshot body.
     /// Refused mid-wave: a snapshot must capture a sealed boundary, never a
     /// wave in flight.
@@ -458,6 +547,11 @@ impl RecurrentStateStore {
                 )?,
             })?;
         }
+        // Restored state is state someone put here on purpose. Without this the
+        // first wave on a resumed slot standing at offset 0 would reset it, and
+        // the conversation would come back fluent and amnesiac — the exact
+        // failure resume exists to remove.
+        self.seeded = true;
         Ok(())
     }
 }
@@ -659,6 +753,323 @@ mod tests {
         assert!(store.export().is_err(), "export mid-wave");
         store.commit_wave();
         assert!(store.export().is_ok());
+    }
+
+    /// A fork carries the parent's state exactly. Byte equality through
+    /// `export`, not a tolerance: this is a memory copy, and a tolerance would
+    /// hide a layout bug behind "close enough".
+    #[test]
+    fn fork_carries_the_parents_state_exactly() {
+        let parent = filled_store();
+        let child = parent.fork_from().unwrap();
+        assert_eq!(
+            child.export().unwrap(),
+            parent.export().unwrap(),
+            "the fork must carry the parent's state byte for byte"
+        );
+        assert_eq!(child.schedule_hash(), parent.schedule_hash());
+        assert_eq!(child.n_recurrent_layers(), parent.n_recurrent_layers());
+    }
+
+    /// **The `Clone`-shares-storage hazard, on both halves of the ping-pong.**
+    ///
+    /// `Tensor::clone` is a shallow handle clone, so a fork built from clones
+    /// would look right and then track every mutation. The live half is the
+    /// obvious one. The write half matters just as much and is easier to miss:
+    /// `layer_state_pair` hands out a [`DeltaNetOut`] whose tensors are clones
+    /// of `backup`'s, so a fork that shared it would read correct until the
+    /// child's first commit swapped that buffer into the parent's live position.
+    #[test]
+    fn fork_buffers_are_distinct_allocations_on_both_halves() {
+        let parent = filled_store();
+        let mut child = parent.fork_from().unwrap();
+        let parent_before = parent.export().unwrap();
+
+        // Live half: mutate the child, the parent must not move.
+        {
+            let live = child.layer_state_mut(0).unwrap();
+            let ones = Tensor::ones(live.s.shape(), live.s.dtype(), &Device::Cpu).unwrap();
+            live.s.add_mut(&ones).unwrap();
+            live.conv_tail
+                .add_mut(
+                    &Tensor::ones(live.conv_tail.shape(), live.conv_tail.dtype(), &Device::Cpu)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            parent.export().unwrap(),
+            parent_before,
+            "the child shares the parent's LIVE buffer"
+        );
+
+        // Write half: writing the child's `backup` must not reach the parent's.
+        //
+        // Both write buffers are STAMPED to a known value first. `backup` is
+        // allocated uninitialised (invariant 6 — the kernels overwrite it whole
+        // before any read), so "is the parent's write buffer still zero?" is
+        // not a question with an answer, and uninitialised f32 can hold NaN,
+        // which compares unequal even to itself. The property under test is
+        // aliasing — did the child's write move the parent's bytes? — and
+        // stamping makes that the only thing the assertion can fail on.
+        let (_, child_out) = child.layer_state_pair(0).unwrap();
+        let (_, parent_out) = parent.layer_state_pair(0).unwrap();
+        let stamp = |t: &Tensor, v: f32| {
+            let full = Tensor::full(v, t.shape(), &Device::Cpu)
+                .unwrap()
+                .to_dtype(t.dtype())
+                .unwrap();
+            t.slice_set(&full, 0, 0).unwrap();
+        };
+        for (c, p) in [
+            (&child_out.s, &parent_out.s),
+            (&child_out.conv_tail, &parent_out.conv_tail),
+        ] {
+            stamp(c, 0.0);
+            stamp(p, 0.0);
+            stamp(c, 1.0);
+            let parent_v: Vec<f32> = p.flatten_all().unwrap().to_vec1().unwrap();
+            assert!(
+                parent_v.iter().all(|&x| x == 0.0),
+                "the child shares the parent's WRITE buffer — this reads correct \
+                 until the child's first commit swaps it into the parent's live slot"
+            );
+        }
+    }
+
+    /// Mid-wave the advanced state is in `backup` and `live` is a wave behind,
+    /// so a fork taken there is not merely racy — it copies the wrong buffer.
+    #[test]
+    fn fork_mid_wave_is_refused() {
+        let mut store = filled_store();
+        store.begin_wave().unwrap();
+        let err = match store.fork_from() {
+            Ok(_) => panic!("a mid-wave fork must be refused, not silently stale"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("mid-wave"), "{err}");
+        store.commit_wave();
+        assert!(store.fork_from().is_ok(), "a wave boundary is fine");
+    }
+
+    /// Forking must not mark the parent's slots `advanced`. Reading through
+    /// `layer_state_pair_mut` would, and the parent's next commit would then
+    /// swap in a write buffer no wave ever wrote — installing, on the layers
+    /// the fork touched, whatever was there two waves ago.
+    #[test]
+    fn forking_does_not_disturb_the_parents_wave_bookkeeping() {
+        let mut parent = filled_store();
+        let entry = parent.export().unwrap();
+
+        let _child = parent.fork_from().unwrap();
+
+        // A wave that touches nothing: if the fork marked the slots advanced,
+        // this commit swaps their untouched write buffers into live.
+        parent.begin_wave().unwrap();
+        parent.commit_wave();
+        assert_eq!(
+            parent.export().unwrap(),
+            entry,
+            "forking marked the parent's slots advanced, so a commit installed \
+             a buffer no wave wrote"
+        );
+    }
+
+    /// The fork reads `live` — the committed state — never the write buffer.
+    ///
+    /// Under the ping-pong "the current state" is whichever tensor `live`
+    /// points at *after* the last commit's swap, so a fork taken between waves
+    /// must see the wave's result, not the buffer it is about to reuse.
+    #[test]
+    fn fork_reads_the_committed_buffer_not_the_write_buffer() {
+        let mut store = filled_store();
+        let before = store.export().unwrap();
+
+        // Run a wave properly: read `live`, write the pair's out-buffer.
+        store.begin_wave().unwrap();
+        {
+            let (live, out) = store.layer_state_pair_mut(0).unwrap();
+            bump_into(live, &out);
+        }
+        store.commit_wave();
+        let after = store.export().unwrap();
+        assert_ne!(after, before, "the wave advanced layer 0");
+
+        let child = store.fork_from().unwrap();
+        assert_eq!(
+            child.export().unwrap(),
+            after,
+            "the fork read the pre-commit buffer — a child a wave behind its \
+             parent, with every shape correct"
+        );
+    }
+
+    /// A fork is seeded: its state was put there deliberately, so the first
+    /// `offset == 0` wave must not reset it — once.
+    #[test]
+    fn a_fork_is_seeded_exactly_once() {
+        let parent = filled_store();
+        let mut child = parent.fork_from().unwrap();
+        assert!(child.is_seeded(), "a fresh fork carries seeded state");
+        assert!(child.take_seeded(), "the first read reports it");
+        assert!(
+            !child.take_seeded(),
+            "and consumes it — a second offset-0 wave resets normally"
+        );
+        assert!(
+            !RecurrentStateStore::new(&kinds(), &dims(), &Device::Cpu)
+                .unwrap()
+                .is_seeded(),
+            "a fresh store holds the sequence-start value already"
+        );
+    }
+
+    /// Import is a restore, so it seeds for the same reason a fork does.
+    #[test]
+    fn import_seeds_the_store() {
+        let store = filled_store();
+        let exported = store.export().unwrap();
+        let mut fresh = RecurrentStateStore::new(&kinds(), &dims(), &Device::Cpu).unwrap();
+        assert!(!fresh.is_seeded());
+        fresh.import(store.schedule_hash(), &exported).unwrap();
+        assert!(
+            fresh.is_seeded(),
+            "a restored slot standing at offset 0 before its first wave looks \
+             exactly like a fresh one — without the flag the reset wipes it"
+        );
+    }
+
+    /// A refused import must not seed either: the store still holds zeros, and
+    /// claiming otherwise would suppress the one reset that keeps it honest.
+    #[test]
+    fn a_refused_import_does_not_seed() {
+        let store = filled_store();
+        let exported = store.export().unwrap();
+        let mut fresh = RecurrentStateStore::new(&kinds(), &dims(), &Device::Cpu).unwrap();
+        assert!(fresh.import(store.schedule_hash() ^ 1, &exported).is_err());
+        assert!(!fresh.is_seeded(), "a rejected restore seeded the store");
+    }
+
+    /// **A failed wave that reached only part of the stack leaves NO trace.**
+    ///
+    /// The composition behind `heal_tail_divergence`: when a wave fails, the
+    /// recurrent rollback puts every layer back to its entry value and the KV
+    /// heal trims the layers back to the offset the session actually delivered,
+    /// so the two agree afterwards. This pins the recurrent half at its hardest
+    /// point — a sweep that advanced layers 0 and 1 and never reached layer 3.
+    ///
+    /// Rolling back is doing nothing, so the risk is not that it fails to
+    /// restore but that a later `commit_wave` swaps in a write buffer no wave
+    /// wrote. The `advanced` flag is per slot precisely for this, and a partial
+    /// sweep is the only shape that can catch it being per store.
+    #[test]
+    fn a_partial_sweep_that_rolls_back_leaves_every_layer_at_its_entry_value() {
+        let mut store = filled_store();
+        let entry = store.export().unwrap();
+
+        // A wave that reaches layers 0 and 1 but dies before layer 3.
+        store.begin_wave().unwrap();
+        for li in [0usize, 1] {
+            let (live, out) = store.layer_state_pair_mut(li).unwrap();
+            bump_into(live, &out);
+        }
+        store.rollback_wave().unwrap();
+        assert_eq!(
+            store.export().unwrap(),
+            entry,
+            "a rolled-back partial sweep moved the state"
+        );
+
+        // And the next wave must not inherit the dead one's bookkeeping: a
+        // commit here would swap layers 0 and 1's write buffers — still holding
+        // the failed wave's output — into live if `advanced` had survived.
+        store.begin_wave().unwrap();
+        store.commit_wave();
+        assert_eq!(
+            store.export().unwrap(),
+            entry,
+            "a later commit installed the FAILED wave's output — `advanced` \
+             outlived the rollback"
+        );
+    }
+
+    /// A partial sweep that COMMITS advances exactly the layers it reached, and
+    /// leaves the rest alone. The mirror of the test above: together they pin
+    /// that `advanced` tracks the sweep rather than the store.
+    #[test]
+    fn a_partial_sweep_that_commits_advances_only_the_layers_it_reached() {
+        let mut store = filled_store();
+        let entry = store.export().unwrap();
+
+        store.begin_wave().unwrap();
+        {
+            let (live, out) = store.layer_state_pair_mut(0).unwrap();
+            bump_into(live, &out);
+        }
+        store.commit_wave();
+
+        let after = store.export().unwrap();
+        assert_ne!(after[0].state, entry[0].state, "layer 0 advanced");
+        assert_eq!(
+            after[1].state, entry[1].state,
+            "layer 1 was never reached and must not have moved"
+        );
+        assert_eq!(after[2].state, entry[2].state, "nor layer 3");
+    }
+
+    /// **The resume oracle.** Seal → drop the store entirely → resume from the
+    /// exported rows → the state is bit-identical.
+    ///
+    /// Byte equality, not a tolerance. This is a memory copy end to end, and a
+    /// tolerance would hide exactly the layout bug the test exists to catch:
+    /// a state scattered into the wrong slots reads as "close" and is wrong.
+    #[test]
+    fn seal_drop_resume_restores_a_bit_identical_state() {
+        let sealed = {
+            let store = filled_store();
+            (store.schedule_hash(), store.export().unwrap())
+        }; // the store is dropped here — nothing of it survives but the bytes
+
+        let mut resumed = RecurrentStateStore::new(&kinds(), &dims(), &Device::Cpu).unwrap();
+        resumed.import(sealed.0, &sealed.1).unwrap();
+        assert_eq!(
+            resumed.export().unwrap(),
+            sealed.1,
+            "the resumed state must be byte-identical to the sealed one"
+        );
+    }
+
+    /// A resume under a different model or a changed layer schedule refuses and
+    /// leaves the store untouched, so the caller recomputes from a known state
+    /// rather than from a half-scattered foreign one.
+    #[test]
+    fn resume_under_a_foreign_schedule_refuses_and_changes_nothing() {
+        let store = filled_store();
+        let exported = store.export().unwrap();
+
+        let mut fresh = RecurrentStateStore::new(&kinds(), &dims(), &Device::Cpu).unwrap();
+        let zeros = fresh.export().unwrap();
+        assert!(fresh.import(store.schedule_hash() ^ 1, &exported).is_err());
+        assert_eq!(fresh.export().unwrap(), zeros, "the refusal is total");
+        assert!(!fresh.is_seeded(), "and it does not claim to be seeded");
+    }
+
+    /// Resume, then fork: a restored conversation forks exactly like a live
+    /// one. This is the daemon-restart path — resume the timeline, then carve a
+    /// view for the first turn — and it must not depend on the state having
+    /// arrived by wave rather than by import.
+    #[test]
+    fn a_resumed_store_forks_like_a_live_one() {
+        let sealed = {
+            let store = filled_store();
+            (store.schedule_hash(), store.export().unwrap())
+        };
+        let mut resumed = RecurrentStateStore::new(&kinds(), &dims(), &Device::Cpu).unwrap();
+        resumed.import(sealed.0, &sealed.1).unwrap();
+
+        let child = resumed.fork_from().unwrap();
+        assert_eq!(child.export().unwrap(), sealed.1);
+        assert!(child.is_seeded());
     }
 
     #[test]

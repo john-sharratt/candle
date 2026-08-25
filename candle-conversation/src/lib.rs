@@ -82,8 +82,11 @@ pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use projection::{
     BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState, NO_THINK_SELECTOR,
 };
+pub use scheduler::branch_checkpoint_counts;
 pub use scheduler::memory_report;
 pub use scheduler::phase_ring;
+pub use scheduler::provenance_capture_path_counts;
+pub use scheduler::recurrent_state_cost;
 pub use scheduler::relief_trace;
 pub use sequence_handle::SequenceId;
 pub use stats::TurnStats;

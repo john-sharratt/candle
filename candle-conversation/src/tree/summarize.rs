@@ -223,8 +223,10 @@ impl SummarizationTask {
             .send(SchedulerRequest::NewSequence {
                 conversation: crate::projection::Conversation::new(),
                 // Summarisation task: raw prefill+decode, no projection,
-                // no substrate write — no target binding needed.
+                // no substrate write — no target binding needed, and no
+                // conversation to continue.
                 target: None,
+                parent: None,
                 response_tx: resp_tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;

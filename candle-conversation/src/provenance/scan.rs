@@ -32,9 +32,33 @@ use rayon::prelude::*;
 use super::fusion::FusionMode;
 use super::WideQSig;
 
-/// KV heads per folded layer-group — equals `n_kv_head` (heads are kept separate
-/// through the fold). Mirrors [`super::wide_sig::PROV_HEADS_PER_LAYER`].
-pub(super) const HEADS_PER_GROUP: usize = super::wide_sig::PROV_HEADS_PER_LAYER;
+/// Layer groups in a folded signature — **structural, not tuned**.
+///
+/// The fold emits one noise-absorbing lower group plus the top two capture
+/// layers on their own; [`super::wide_sig::FoldParams::group_sizes`] is a
+/// `[usize; 3]`, so the count is pinned by the type.
+pub const FOLD_GROUPS: usize = 3;
+
+/// KV heads per folded layer-group, **derived from the signature** rather than
+/// read off a constant.
+///
+/// Heads are kept separate through the fold, so a folded signature spans
+/// `FOLD_GROUPS × n_kv_head` heads and this recovers the model's `n_kv_head` by
+/// division. That matters because `n_kv_head` is not 4 everywhere: it is 4 on
+/// the 48-layer stack the fold was measured against and **2** on the hybrid, so
+/// a hardcoded 4 reads a 6-head signature as one group of four rather than
+/// three of two — the group boundaries land mid-signature and every score after
+/// that is a confident number computed over the wrong bits.
+///
+/// Returns 0 for a signature whose head count is not a whole number of groups,
+/// which callers treat as "not scorable" rather than guessing.
+#[inline]
+pub fn heads_per_group(n_heads: usize) -> usize {
+    if n_heads == 0 || !n_heads.is_multiple_of(FOLD_GROUPS) {
+        return 0;
+    }
+    n_heads / FOLD_GROUPS
+}
 
 /// Needle-gate keep-fraction: the belief is summed over only the top
 /// `NEEDLE_KEEP_FRAC` of query tokens by vote magnitude. Validated at 0.25 in
@@ -106,15 +130,12 @@ pub fn score_provenance_late_fusion_weighted(
     };
     let wph = shape.words_per_head();
     let n_heads = shape.n_heads as usize;
-    if wph == 0
-        || n_heads < HEADS_PER_GROUP
-        || gallery.is_empty()
-        || gallery.len() != gallery_case.len()
-    {
+    let hpg = heads_per_group(n_heads);
+    if wph == 0 || hpg == 0 || gallery.is_empty() || gallery.len() != gallery_case.len() {
         return vec![0.0; n_cases];
     }
-    let n_groups = n_heads / HEADS_PER_GROUP;
-    let gw = HEADS_PER_GROUP * wph; // words per layer-group
+    let n_groups = FOLD_GROUPS;
+    let gw = hpg * wph; // words per layer-group
     let need = n_groups * gw;
     let n_gal = gallery.len() as f32;
 
@@ -191,15 +212,12 @@ pub fn score_provenance_late_fusion_grouped(
     };
     let wph = shape.words_per_head();
     let n_heads = shape.n_heads as usize;
-    if wph == 0
-        || n_heads < HEADS_PER_GROUP
-        || gallery.is_empty()
-        || gallery.len() != gallery_case.len()
-    {
+    let hpg = heads_per_group(n_heads);
+    if wph == 0 || hpg == 0 || gallery.is_empty() || gallery.len() != gallery_case.len() {
         return Vec::new();
     }
-    let n_groups = n_heads / HEADS_PER_GROUP;
-    let gw = HEADS_PER_GROUP * wph;
+    let n_groups = FOLD_GROUPS;
+    let gw = hpg * wph;
     let need = n_groups * gw;
     let n_gal = gallery.len() as f32;
 
@@ -362,6 +380,55 @@ mod tests {
             n_heads: 12,
             words: vec![fill; 24],
         }
+    }
+
+    /// **The group split follows the signature, not a constant.**
+    ///
+    /// A folded signature always spans three layer-groups, so its head count
+    /// divided by three IS the model's `n_kv_head`: 4 on the 48-layer stack the
+    /// fold was measured against, 2 on the hybrid. Reading a fixed 4 turns the
+    /// hybrid's 6-head signature into one group of four — the group boundaries
+    /// land mid-signature, and every score computed after that is a confident
+    /// number over the wrong bits.
+    #[test]
+    fn heads_per_group_is_read_from_the_signature() {
+        assert_eq!(heads_per_group(12), 4, "Qwen3-30B: 3 groups x 4 kv heads");
+        assert_eq!(heads_per_group(6), 2, "the hybrid: 3 groups x 2 kv heads");
+        assert_eq!(heads_per_group(3), 1, "a single-kv-head stack still folds");
+        // Not a whole number of groups — not a folded signature, so not scorable.
+        assert_eq!(heads_per_group(0), 0);
+        assert_eq!(heads_per_group(4), 0, "4 heads is not 3 whole groups");
+        assert_eq!(heads_per_group(7), 0);
+    }
+
+    /// The hybrid's 6-head signature scores, and scores *per group*.
+    ///
+    /// Under the old constant this returned zeros: `n_heads < HEADS_PER_GROUP`
+    /// was false (6 > 4) so it did not bail, but `n_groups` came out 1 and the
+    /// group width 4 heads, so it read two groups' worth of one signature as a
+    /// single group and the remaining bits were never compared.
+    #[test]
+    fn a_hybrid_shaped_signature_scores_across_all_three_groups() {
+        // 6 heads x 4 words/head (head_dim 256) = 24 words.
+        let a = WideQSig {
+            n_heads: 6,
+            words: vec![0xAAAA_AAAA_AAAA_AAAA; 24],
+        };
+        let b = WideQSig {
+            n_heads: 6,
+            words: vec![0x5555_5555_5555_5555; 24],
+        };
+        let gallery = [&a, &b];
+        let cases = [0u32, 1];
+
+        let votes = score_provenance_late_fusion(std::slice::from_ref(&a), &gallery, &cases, 2);
+        // Per group: 2 heads x 4 words x 64 bits = 512 agreeing bits, so the
+        // same z x margin = 512 per group, over 3 groups.
+        assert!(
+            (votes[0] - 1536.0).abs() < 1e-2,
+            "the hybrid signature must score across all three groups: {votes:?}"
+        );
+        assert_eq!(votes[1], 0.0, "the complement gets no vote");
     }
 
     #[test]

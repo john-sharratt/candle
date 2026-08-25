@@ -56,7 +56,10 @@ impl RecordAccounting {
             | RecordType::Commit
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
-            | RecordType::Snapshot => (header.record_type, header.stream_id, 0),
+            | RecordType::Snapshot
+            // A branch checkpoint supersedes by the same rule: one live record
+            // per branch, keyed by the branch's content prefix in the header.
+            | RecordType::BranchCheckpoint => (header.record_type, header.stream_id, 0),
             RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => {
                 (header.record_type, 0, 0)
             }

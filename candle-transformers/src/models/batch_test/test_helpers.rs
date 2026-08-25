@@ -145,9 +145,19 @@ fn endpoint() -> String {
 }
 
 /// Fetch a file from the HF Hub via an explicit `hf_hub::Repo`, returning a local
-/// path. Tries hf-hub normally (cache, then default network); on failure, falls
-/// back to a resumable IPv4-only download.
+/// path. Answers from the local cache when it can; otherwise tries hf-hub's
+/// network path, then falls back to a resumable IPv4-only download.
+///
+/// The cache is consulted **first and on its own**. `Api::get` also ends at the
+/// cache, but only after asking the hub which revision it should be holding —
+/// so a file already on disk cannot be opened while the hub is unreachable, and
+/// an unanswered socket stalls for as long as the HTTP client will wait. Every
+/// caller here pins an explicit revision, which is exactly the case where a
+/// cache hit needs no confirmation.
 fn hf_get_repo(repo: &hf_hub::Repo, filename: &str) -> candle::Result<PathBuf> {
+    if let Some(p) = hf_hub::Cache::default().repo(repo.clone()).get(filename) {
+        return Ok(p);
+    }
     if let Ok(api) = hf_hub::api::sync::Api::new() {
         if let Ok(p) = api.repo(repo.clone()).get(filename) {
             return Ok(p);

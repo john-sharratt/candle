@@ -212,6 +212,14 @@ impl Fixture {
         self.backing.ensure_for_batch_entries(&entries, 1)?;
         let arena_info = self.backing.resolve_arena_info()?;
 
+        // The KV-pointer validity check, fetched once for the whole pass —
+        // `span_layout` takes the region pool's global lock, so every
+        // serialized head would otherwise take it again. This fixture exists
+        // to catch exactly the failure that check names (a resolved address
+        // into the transient tier or outside the span), so it runs the check
+        // rather than passing `None`.
+        let span = SlotStateHost::span_layout_for_checks();
+
         let mut keepalive: Vec<Tensor> = Vec::new();
         let mut hdr_all: Vec<u8> = Vec::with_capacity(24 * sc.num_slots);
 
@@ -235,7 +243,7 @@ impl Fixture {
             let slice_size = TokenSliceHost::record_size(sc.n_kv_head, sc.head_dim);
             let mut sbuf = Vec::with_capacity(st.slices.len() * slice_size);
             for s in &st.slices {
-                s.serialize_record(&mut sbuf);
+                s.serialize_record(&mut sbuf, span.as_ref());
             }
             let stensor = if sbuf.is_empty() {
                 Tensor::zeros(1, DType::U8, device)?

@@ -1158,16 +1158,10 @@ fn summarize_selection(tree: &projection::SectionTree) -> (Vec<u8>, Vec<String>)
 /// happened: the bundled schema had the option, the workspace copy did not, and
 /// three ingest runs produced garbage behind a single warning line.
 fn validate_summarize_branch(builder: &projection::Builder) -> anyhow::Result<()> {
-    use projection::SystemPromptItem;
     let unresolved: Vec<String> = builder
         .schema()
         .system_prompt
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            SystemPromptItem::SectionTree(t) => Some(t),
-            _ => None,
-        })
+        .section_trees()
         .flat_map(|t| summarize_selection(t).1)
         .collect();
     if unresolved.is_empty() {

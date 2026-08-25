@@ -1302,7 +1302,7 @@ fn run_pass(
 /// Gather every layer's `SealedSequence` into a [`TurnChunkGrid`]
 /// (CPU-side). Each per-layer entry is a `Vec<ChunkImage>` produced by
 /// the existing GPU gather helper.
-fn build_grid(
+pub(crate) fn build_grid(
     sealed_per_layer: &[SealedSequence],
     backings: &[ChunkedKvBacking],
     device: &Device,

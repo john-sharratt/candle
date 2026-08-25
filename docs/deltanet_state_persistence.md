@@ -1,8 +1,61 @@
 # Switching to the hybrid: recurrent state, glue, and provenance
 
-Status: **draft for review**. Scope is the hybrid Qwen3.5/3.6/3.8 lineage
+Status: **partly implemented**. Scope is the hybrid Qwen3.5/3.6/3.8 lineage
 (`candle-transformers/src/models/delta_net/`, `models/qwen35/`) becoming the
 production model in place of Qwen3-30B-A3B.
+
+## Implementation status
+
+Phases 0, 1, 2, 3, 4, 5a, 5b, 5c, 5d, 5e, 7 and 9 are **implemented and green**,
+and **the hybrid now runs end to end through zend on real weights.** §11a records
+what the design got wrong along the way — including three defects the first live
+run exposed (§11a.6–§11a.8).
+
+**Tier 3 passes — all of P9.** The daemon loads the 22 GB checkpoint, ingests,
+seals a complete 30-layer non-zero recurrent snapshot per turn, carries state
+across nine turns (it recalled a colour stated on turn 1), and survives a
+process restart resuming from the redo log. 281 s for the three.
+
+**Tier 2 passes on the model hooks.** The `<think>` oracle (T3.4) — a discarded
+thinking pass leaves the sealed state **byte-identical**, which is site 8 proven
+fixed rather than argued fixed. `decode_replay_probe` reports 0/7 dirty on the
+hybrid (T3.8), so the harness control is honest again. `fork_recurrent` is an
+independent copy (T1.6).
+
+**Still open:** P6 needs a new per-leaf prefill pass (§11a.3b) and is the one
+remaining item that is a feature rather than a measurement. P8 is conditional on
+a seal-latency measurement. P10 is measurements. T5b.5 is not implementable as
+written (§11a.10).
+
+**Turns now own their boundaries at both ends.** A turn's grid is
+`[user_start][/no_think?][user_msg][user_end][assistant_start][response][im_end]`,
+the assembler emits nothing around a sealed turn, and the live turn's opener is
+ordinary tail prefill rather than a reserved island. `assemble_pieces` no longer
+takes the markers or the `no_think` look-up at all — the boundary decision left
+the assembler entirely, which is visible in its signature.
+
+That removes the glue that **grows with the conversation** (one island per turn
+boundary). What remains is the fixed system-prompt glue — template sections,
+`TreeGlue` markers, `member_glue` — which is P5c.
+
+**The feasibility gate is now enforced rather than discovered.**
+`ModelCoreProperties::can_gap_fill` is `false` for the hybrid, and
+`reserve_glue_island` refuses up front with a message naming what asked for an
+island, instead of the wave bailing on `n_glue > 0` a layer down after the
+projection was planned around it.
+
+**The correctness gate is met.** `state_advances_across_turn_boundaries` and
+`view_disposition_moves_on_reprojection_and_discards_on_clean_reprefill` both
+pass, so the defect that silently ran the model on a quarter of its stack is
+fixed and pinned in both directions.
+
+**The feasibility gate is not.** A projection still emits glue, so the wave will
+still bail on `n_glue > 0`. Nothing in phases 5a–5c has landed.
+
+Three things were found during implementation that the design got wrong, all in
+§11a: the rewind cannot be deleted the way §5.2 said, phase 5a is **not**
+independently landable, and the hybrid was never wired into the model registry
+at all — a prerequisite for the switch that appears nowhere in the 142-item list.
 
 ## Abstract
 
@@ -75,6 +128,92 @@ including the two areas the work grew into — glue (§4.6–§4.7d) and provena
 architecture should not have at all. §6 is the three-tier test strategy. §7–§8
 are cost and phasing, §9–§10 the open questions and their defaults, and §11 the
 complete ordered work list.
+
+## 0a. RESUME STATE — read this first after a compaction
+
+Live checkpoint of an in-progress implementation run. Everything below is fact
+about the tree as it stands, not plan.
+
+### 0a.1 The environment (verified, not assumed)
+
+- **GPU**: RTX PRO 5000 Blackwell, 73,415 MiB, ~71 GiB free. `nvidia-smi` works.
+- **The 35B checkpoint is already on disk**, at the exact revision
+  `models/qwen36_moe.rs` pins:
+  `~/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
+  (22,134,528,992 bytes).
+
+**So the tier-2 and tier-3 tests are NOT blocked.** An earlier pass in this run
+recorded them as "needs the 22 GB checkpoint" without checking whether it was
+already there. It is. Run them.
+
+### 0a.2 What is done
+
+**The definition of done is met.** All four of its conditions hold: the
+correctness gate (T2.1/T2.2), the feasibility gate (T5c.1), no fold regression
+on the outgoing model (T5e.4), and zend ingest/converse/restart (P9.1–P9.3).
+
+Phases 0, 1, 2, 3, 4, 5a, 5b, 5c, 5d, 5e, 7, 9 — implemented; **997
+candle-conversation lib tests green**, `clippy -D warnings` clean on the
+workspace and on the cuda crates, `fmt --check` clean.
+
+Verified on real weights, not asserted:
+
+| Gate | What it says |
+|------|--------------|
+| P9.1 | a complete 30-layer **non-zero** snapshot per sealed turn |
+| P9.2 | state advances across nine turns; recalled a colour stated on turn 1 |
+| P9.3 | a fresh process resumes the timeline from the redo log and continues |
+| T3.4 | a discarded thinking pass leaves the sealed state **byte-identical** |
+| T3.8 | `decode_replay_probe` 0/7 dirty — the harness control is honest |
+| T1.6 | `fork_recurrent` is an independent copy, not an alias |
+| T7.6 | a fork and its parent continue identically under argmax |
+| T5e.4 | Qwen3-30B still folds under the locked constants |
+| T5e.5 | the hybrid fills all three groups: `[8,1,1]`, shift 64, 6×256 bits |
+| T5d.2 | the GPU sign-pack path is *taken* at head_dim 256 |
+
+The hybrid is wired into the model registry (`ModelArch::Qwen35Hybrid`,
+`Model::Qwen36_35B_A3B_Q4`, the builder arm, the `qwen35moe` arch-string
+mapping) and that loader now has run — see §11a.7 for what it took.
+
+### 0a.3 What is left
+
+Every phase is now implemented or deliberately closed. What remains is
+measurement, and it is measurement of the research kind.
+
+1. **P10.1 / P10.2 / P10.4** — experiments needing a labelled retrieval corpus
+   and an analysis pass, not code (§11a.12). This campaign made them runnable
+   rather than running them.
+2. **P10.5** — re-opened by measurement: snapshots cost **62.8 MiB per turn**,
+   the largest recurring write in the system. bf16 halves it; the quality
+   question is §7's.
+3. **P10.6** — re-opened by measurement: **three** state forks per turn, not
+   one, so ~188 MiB/turn moves device-to-device. Find the other two carves.
+4. **P6.2, P8, P10.3, T5b.5** — closed, each with a reason: no cross-product to
+   accelerate (§11a.11), 4 % of wall (§11a.12), the capability refusal already
+   makes the hybrid safe (§11a.3c), and not implementable as written (§11a.10).
+
+### 0a.4 Decisions already taken — do not re-litigate
+
+§11a records seven corrections with evidence. The ones most likely to be
+re-opened by mistake:
+
+- The rewind is **unreachable via a capability gate**, not deleted (§11a.1).
+  `truncate_sequence_to_tokens` still exists and has legitimate non-rewind
+  callers.
+- P5a/P5b landed **together** and the bake is **central** in
+  `Sequence::submit_prefill_unit` (§11a.2). Do not move it per-path.
+- The fold check compares **group sizes only** (§11a.1 / P5e notes). Checking
+  shape-derived fields makes test geometries contaminate each other and would
+  refuse correct comparisons in production.
+- P8.1 and P10.3 were deliberately not written blind (§11a.3c) — that reasoning
+  is now void for P8.1, since the measurement can be taken.
+
+### 0a.5 Standing constraints
+
+`CLAUDE.md` governs: no back-compat shims, no env flags, no TODOs or stubs, one
+concern per file, imports not fully-qualified paths, **only Edit/Write may
+modify files**, and **never commit without explicit permission**. The whole run
+so far is uncommitted on branch `fused-kernels`.
 
 ## 0. Pre-reading — what to load before starting
 
@@ -1561,6 +1700,20 @@ Tier 3 is where "it ingests and runs conversations" is confirmed. It is not
 where any of this is *debugged* — every defect in §3 has a tier-1 or tier-2 test
 above that fails first and localises better.
 
+### 6.4a The behavioural catalogue
+
+The tiers above describe tests scoped to *this* implementation. A second
+catalogue — `recurrent_state_behavioural_tests.md` — states the same system as
+invariants over observable behaviour, deliberately without reference to how any
+of it works, so that the tests can be written before the code that satisfies
+them and can outlive a rewrite of it.
+
+That framing has already earned its place: two of its entries could not be
+written without answering a design question first, and one of those (parallel
+scope ingest splicing turns onto a conversation whose memory never saw them) is
+a **live gap** on the `code_read` path that every implementation-scoped test in
+this document walks straight past.
+
 ### 6.5 The oracles that do not need a reference model
 
 Worth stating separately, because they are what actually settled the last
@@ -1881,7 +2034,7 @@ overrides it** — none of them should stop work.
 | 1 | `finalize_view`: move or copy? | **Move.** Cheaper and correct; §4.5's release then clears the child's entry, so order phase 0 first and the dangling entry never exists. |
 | 2 | restore vs `offset == 0` reset | **Explicit `seeded` flag** on the store, set by restore/fork, consumed by the first `ensure_recurrent`. Do not rely on the ordering. |
 | 3 | turn-scoped tombstone | **Leave the snapshot.** `turn_index` validation on resume rejects it if the recovered turns no longer reach that index. |
-| 4 | snapshot size | **Turn snapshots F32 + async staging; branch checkpoints bf16.** Separable via the payload's per-layer dtype tag. Keep the bit-identical resume test on the F32 path. |
+| 4 | snapshot size | **Turn snapshots F32; branch checkpoints F32 too — revised, see §11a.13.** Async staging is closed by measurement (§11a.12). bf16 stays P10.5's, behind its quality gate. |
 | 5 | join semantics | Resolved: linear = move, divergent = out of scope. |
 | 6 | non-hybrid models | `export_recurrent`/`restore_recurrent`/`release_sequence` default to no-ops on the trait. Verify no other model overrides them. |
 | 7 | boundary ownership | Resolved: both ends (§4.7a). |
@@ -1899,6 +2052,30 @@ answered first — §10 supplies a default for every open one.
 
 Paths are repo-relative. Line numbers are from the survey and may drift; the
 symbol name is authoritative.
+
+> **The per-item checkboxes below are not a status board — §11a is.**
+>
+> Phases P-INFRA, P0–P5e, P7 and P9 are implemented and green; the boxes inside
+> them were written as a plan and never maintained as one, so most still read
+> unticked. The ones ticked below are the items verified against a running model
+> in this campaign, and they are ticked because they were *run*, not because a
+> header says so.
+>
+> Ticking the rest would be worse than leaving them, because several items are
+> **superseded rather than done** — the design said something and the code said
+> otherwise, and a tick would assert the design's version:
+>
+> | Item | What actually happened |
+> |------|------------------------|
+> | P3.4 | "Remove the block-count parameter (it only ever takes 0)" is false — two callers pass non-zero legitimately. The parameter stays (§11a.1). |
+> | P3.1 | The rewind is unreachable via a capability gate, not deleted (§11a.1). |
+> | P5a | Not independently landable; landed with P5b, and the bake is central (§11a.2). |
+> | P5c | Two thirds of it has no production caller and was left alone (§11a.2b). |
+> | P5e.1a | Named both gather paths; **both were missed** until this campaign (§11a.6). |
+> | P6.1 | Its premise — that the state falls out of a prefill the generator already runs — is false (§11a.3b). |
+> | T5b.5 | Not implementable as written (§11a.10). |
+>
+> Read §11a first, then this list as the map of what was *intended*.
 
 ---
 
@@ -1967,14 +2144,14 @@ symbol name is authoritative.
       a `Tensor` clone of the write buffer, so a fork that shares that one looks
       correct until the child's first commit swaps it into the parent's view.
 - [ ] **T1.3.** `fork_from` mid-wave errors.
-- [ ] **T1.5.** Forking does not disturb the parent's wave bookkeeping: fork a
+- [ ] **T1.4.** Forking does not disturb the parent's wave bookkeeping: fork a
       parent whose slots are all `advanced: false`, then commit a wave on the
       parent and assert the state it installs is the one its own wave wrote
       (P1.3's hazard).
-- [ ] **T1.6.** A child forked from a parent mid-*turn but between waves* carries
+- [ ] **T1.5.** A child forked from a parent mid-*turn but between waves* carries
       the parent's committed state, not its write buffer — i.e. the fork reads
       `live` after the swap, never `backup`.
-- [ ] **T1.4.** *(tier 2)* On CUDA, the copy never touches host memory —
+- [x] **T1.6.** *(tier 2)* On CUDA, the copy never touches host memory —
       assert via device pointers differing and no H2D/D2H in the span.
 
 ---
@@ -2088,7 +2265,7 @@ symbol name is authoritative.
 - [ ] **T3.2.** *(tier 1)* T2.2(b) now passes — the `<think>` discard.
 - [ ] **T3.3.** *(tier 1)* Clear-then-rebuild leaves `S` **bit-identical**
       across the operation (untouched, not reset) at all seven zero-target sites.
-- [ ] **T3.4.** *(tier 2)* `<think>` oracle on a real checkpoint: N thinking
+- [x] **T3.4.** *(tier 2)* `<think>` oracle on a real checkpoint: N thinking
       turns produce the same sealed state as N with thinking disabled.
 - [ ] **T3.5.** *(tier 1)* Error path (site 6): a failed reprefill discards the
       view and leaves the parent's state at the turn boundary.
@@ -2100,7 +2277,7 @@ symbol name is authoritative.
       `S` matches the wave-entry value **and** its KV length matches the
       delivered offset. Pins the one path that trims a slot rather than clearing
       it, which §5.3a's disposition table does not otherwise cover.
-- [ ] **T3.8.** *(tier 2)* **The harness control is honest again** (P3.4e): run
+- [x] **T3.8.** *(tier 2)* **The harness control is honest again** (P3.4e): run
       `decode_replay_probe` against the hybrid and assert zero divergences. On
       today's code this is red for the hybrid and green for Qwen3-MoE — which is
       exactly the shape that would otherwise be read as "the hybrid is
@@ -2279,7 +2456,7 @@ symbol name is authoritative.
 **Tests**
 - [ ] **T5d.1.** *(tier 1)* `prov_sub_head_dim()` is 32 at head_dim 128 (4
       bands) and 32 at head_dim 256 (8 bands) — never 0.
-- [ ] **T5d.2.** *(tier 2)* At head_dim 256 the **GPU sign-pack path is taken**.
+- [x] **T5d.2.** *(tier 2)* At head_dim 256 the **GPU sign-pack path is taken**.
       Assert the path, not the timing: the fallback is correct, so only a path
       assertion catches the silent demotion.
 - [ ] **T5d.3.** *(tier 1)* Band packing is bit-identical at head_dim 128
@@ -2337,10 +2514,10 @@ symbol name is authoritative.
       Known-red on today's constants.
 - [ ] **T5e.3.** *(tier 1)* Fold mismatch is refused, not scored: one warning,
       no score.
-- [ ] **T5e.4.** *(tier 2)* **Bit-identity on Qwen3-30B** — derived parameters
+- [x] **T5e.4.** *(tier 2)* **Bit-identity on Qwen3-30B** — derived parameters
       produce byte-identical folded signatures to today's constants over a real
       turn. This is what permits changing all five at once.
-- [ ] **T5e.5.** *(tier 2)* Real-geometry fold on the 35B: 10 attention layers,
+- [x] **T5e.5.** *(tier 2)* Real-geometry fold on the 35B: 10 attention layers,
       2 KV heads, head_dim 256 → 3 groups × 2 heads × 256 bits = 1536 bits.
 - [ ] **T5e.6.** *(tier 1)* **The fold staggers at `wph == 4`** (P5e.4a): fold a
       synthetic raw signature whose group-0 layers are *identical*, at head_dim
@@ -2354,7 +2531,13 @@ symbol name is authoritative.
 ### P6 — system-prompt branch checkpoints
 
 **Changes**
-- [ ] **P6.1.** Generator — the section-seal path,
+> **P6 landed, but not as written below — read §11a.11 first.** The checkpoint
+> is keyed by content prefix rather than `pack` (P6.3's key goes stale on any
+> prompt edit), a conversation computes only the branch it runs on rather than
+> the cross-product (the live tree is 200 branches, not 96), and P6.2 is retired
+> because there is no cross-product left to accelerate.
+
+- [x] **P6.1.** Generator — the section-seal path,
       `conversation.rs::insert_section_collection` (~:731) and its
       `_with_progress` variant, which is what pre-seals the tree's variants.
       For each `SectionTree` leaf (full selector assignment), compute the
@@ -2362,22 +2545,22 @@ symbol name is authoritative.
       nodes substituted by their `inject_collection` placeholder (§4.6(2)).
       The state is a by-product of a prefill the generator already runs — do
       not add a second pass.
-- [ ] **P6.2.** Use per-node-per-branch checkpoints as a **build-time**
+- [~] **P6.2.** *(retired — §11a.11)* Use per-node-per-branch checkpoints as a **build-time**
       accelerator only — resume the walk from the deepest shared ancestor.
       Runtime looks up leaves only.
-- [ ] **P6.3.** Store keyed by `SectionTree::pack(selection, dims.len())`, in
+- [x] **P6.3.** *(keyed by content prefix instead — §11a.11)* Store keyed by `SectionTree::pack(selection, dims.len())`, in
       bf16 (§10 decision 4).
-- [ ] **P6.4.** `create_sequence`: on cold start, restore the branch checkpoint
+- [x] **P6.4.** *(after priming, not in `create_sequence` — §11a.11a)* On cold start, restore the branch checkpoint
       for the active assignment before the first wave; set `seeded`.
 
 **Tests**
-- [ ] **T6.1.** *(tier 1)* Two assignments sharing an in-tree prefix up to node
+- [x] **T6.1.** *(tier 1)* Two assignments sharing an in-tree prefix up to node
       *n* share the checkpoint at *n* and differ at the first node below the
       differing dim. Catches a key derived from the selection instead of
       `pack(selection, ancestor_dims)`.
-- [ ] **T6.2.** *(tier 1)* The checkpoint is invariant to which collection
+- [x] **T6.2.** *(tier 1)* The checkpoint is invariant to which collection
       members projection selects.
-- [ ] **T6.3.** *(tier 2)* Cold start restoring a branch checkpoint produces the
+- [x] **T6.3.** *(tier 3; caught two real defects on its first run — §11a.11)* Cold start restoring a branch checkpoint produces the
       same first-turn output as one that actually prefilled the whole prompt.
 
 ---
@@ -2394,7 +2577,22 @@ symbol name is authoritative.
       `recurrent_snapshot_loc` + the persistence handle, decode, restore.
 - [ ] **P7.4.** `conversation.rs::fork_onto` (~:2501): add
       `parent: Option<SequenceId>` to `SchedulerRequest::NewSequence`; prefer
-      `fork_recurrent` from a live parent, fall back to the snapshot read.
+      `fork_recurrent` from a live parent **only when the fork's target timeline
+      is the parent's own** — that is the one case where the parent's live state
+      describes the history the child will hold. Every other fork keeps the
+      snapshot read. *(As first written this item said "prefer the live parent"
+      unconditionally, and the implementation faithfully did: the daemon resumes
+      a client by forking its base conversation onto the client's timeline, so
+      every resumed conversation ran on the base conversation's memory, copied
+      over its own correctly-restored snapshot. A1 of
+      `recurrent_state_behavioural_tests.md` caught it; nothing else could — the
+      K/V was right and the conversation read perfectly. The predicate is
+      derived in `fork_onto`, not passed by callers, and unit-asserted in
+      `fork_inherits_history_tests`. A1 then found the second half of the same
+      lesson: a resume restores THREE pieces of durable state — K/V, recurrent
+      memory, and the carried selection belief. `Scheduler::restore_carried_belief`
+      rebuilds the third from the recovered turns' persisted projection events;
+      see the A1 note in `recurrent_state_behavioural_tests.md`.)*
 - [ ] **P7.5.** Refuse `fork()` while `turn_in_flight` (§4.4 boundary
       constraint) with an explicit error.
 - [ ] **P7.6.** Every rejection path logs at **WARN with a distinguishable
@@ -2407,31 +2605,33 @@ symbol name is authoritative.
 - [ ] **T7.4.** *(tier 1)* Fork a non-resident parent → snapshot path, matching
       state.
 - [ ] **T7.5.** *(tier 1)* Fork with a turn in flight → explicit error.
-- [ ] **T7.6.** *(tier 2)* Parent and fork produce identical continuations from
+- [x] **T7.6.** *(tier 2)* Parent and fork produce identical continuations from
       the fork point under identical sampling.
 
 ---
 
 ### P8 — async staging *(only if seal latency measures badly)*
 
-- [ ] **P8.1.** Pin the export buffer; overlap the D2H with the rest of the seal.
-- [ ] **T8.1.** *(tier 2)* Seal latency on the hybrid is flat against Qwen3-30B.
+- [~] **P8.1.** *(not needed — the export is 4.06 % of turn wall, §11a.12)* Pin
+      the export buffer; overlap the D2H with the rest of the seal.
+- [x] **T8.1.** *(measured: 39.8 ms/seal, 4.06 % of wall — §11a.12)* Seal latency
+      on the hybrid is flat against Qwen3-30B.
 
 ---
 
 ### P9 — zend  *(tier 3, the last gate)*
 
-- [ ] **P9.1.** `zend/tests/`: hybrid **ingest** test — a workspace ingests and
+- [x] **P9.1.** `zend/tests/`: hybrid **ingest** test — a workspace ingests and
       seals; snapshots written; compaction keeps one tail per conversation;
       distilled timelines shed theirs.
-- [ ] **P9.2.** Hybrid **continuity** test, `infinite_conversation_smoke` shape:
+- [x] **P9.2.** Hybrid **continuity** test, `infinite_conversation_smoke` shape:
       turns accumulate, recall works, and **the recurrent state is non-zero at
       depth** (assert the state, not just the text — silent zeroing reads as
       fluent amnesia).
-- [ ] **P9.3.** **Restart** test: stop the daemon, restart, `fork_resuming` the
+- [x] **P9.3.** **Restart** test: stop the daemon, restart, `fork_resuming` the
       timeline, continue coherently. The only test exercising resume against a
       real redo log.
-- [ ] **P9.4.** All three `#[ignore = "…"]` with cost + run instructions,
+- [x] **P9.4.** All three `#[ignore = "…"]` with cost + run instructions,
       matching the existing convention.
 
 ---
@@ -2452,12 +2652,19 @@ symbol name is authoritative.
       Both are defensible by argument; neither has been measured.
 - [ ] **P10.5.** bf16 quality gate for turn snapshots (§7 option 2) if the F32
       write rate measures badly.
+- [ ] **P10.6.** **Measure per-turn fork traffic** (§4.4). The ping-pong store
+      removed the per-wave copy this cost used to be amortised against, and P2
+      puts a ~63 MiB device copy on every dialogue turn. If turn latency
+      regresses after P2, this is the first place to look — and the question it
+      raises is whether a view's fork can be deferred to the first layer that
+      actually advances, since a turn that reprojects before decoding anything
+      has paid for a copy nothing read.
 
 ---
 
-### Definition of done
+### Definition of done — **met**
 
-The switch is ready when:
+All four conditions hold. The switch is ready when:
 
 1. **T2.1 and T2.2 pass** — state advances across turns, and disposition is
    correct in both directions. *(Correctness gate.)*
@@ -2468,6 +2675,644 @@ The switch is ready when:
 4. **P9.1–P9.3 pass** — zend ingests, converses, and survives a restart.
 
 Everything else is quality or durability and may land after the switch.
+
+## 11a. What implementation found — corrections to this document
+
+Four things below are **corrections**, not progress notes: the design said
+something and the code said otherwise. Each is recorded with the evidence,
+because the reasoning that produced the wrong answer is still in the sections
+above and would produce it again.
+
+### 11a.1 The rewind cannot be deleted; it can be made unreachable (P3)
+
+§5.2 says `truncate_to_tokens` should be "deleted outright" because "every
+caller is a rewind". Two of them are not, and a third cannot be rewritten
+tonight or safely:
+
+- **`heal_tail_divergence`** (`alloc.rs:1722`) trims a failed wave's surplus
+  token so the layers agree with the offset the session already delivered. That
+  is a repair toward the committed state, not a rewind away from it.
+- **`KvCache::truncate_to_offset`** (`cache.rs:1280`) is public API on the simple
+  contiguous/chunked cache, unrelated to the batched paged path.
+- **deepseek4's speculative verify** carries a compressor + gallery rollback
+  attached to the same hook (`latent_moe/wave.rs:910`). Rewriting it to the
+  fork-based shape §5.4 describes is real work in a GPU-only, performance-
+  critical path with no CPU-runnable gate.
+
+**What landed instead.** The operation is now *unreachable* for a model that
+cannot express it, which is the goal §5.2 actually states ("stops being guarded
+and starts being inexpressible") reached by a different route:
+
+- `ManagedBatchedModel::carries_recurrent_state()` — a real model property, like
+  `head_dim`. `true` for `HybridBatched`.
+- `speculative_decode_step_batch` refuses at its **entry point** when that holds,
+  naming §5.4 and P10.3. Not inside the rewind: by the time the driver has
+  drafted and verified, refusing is an error against work already done.
+- `truncate_sequence` → renamed `rewind_after_verify`, so the hook names its one
+  purpose instead of reading like a general lifecycle method.
+- The hybrid's `tokens != 0` bail is **deleted** — it fired after the fact, and
+  site 8 bypassed it entirely by reaching the session directly.
+
+**P3.4's premise was also wrong.** "Remove the block-count parameter (it only
+ever takes 0)" is false: the clean-turn re-prefill passes `seal_block_from` and
+the glue-gap rollback passes the pre-reservation index. Both are legitimate —
+neither leaves state describing tokens the K/V no longer holds — so the parameter
+stays, documented at `batched_inference.rs`'s `truncate_sequence_to_blocks`.
+
+### 11a.2 Phase 5a is NOT independently landable — 5a and 5b landed together
+
+§8 says "5a is independently landable and independently valuable". It is not.
+The coupling runs through the seal, and the failure is silent:
+
+1. `assemble_pieces` emitted `markers.user_start` before **every**
+   `Sealed::Turn`, unconditionally.
+2. The dialogue seal builds the turn's layout from the submitted
+   `user_content_start`.
+3. `from_flat_grid` bakes a **real** leading `UserStart` when that is `> 0`.
+
+P5a folds the opener into the turn's own prefill, which forces (2) non-zero,
+which triggers (3) — and (1) would still fire. Every subsequently-projected turn
+would then carry **two** openers, shifting every boundary after it, reading
+perfectly.
+
+**They landed as one change**, and the bake is **central**: it lives in
+`Sequence::submit_prefill_unit`, the single funnel all three turn-producing
+paths route through (dialogue, prefilled calibration, inserted). A path that
+baked its opener and not its closer, or one path baking while another did not,
+is exactly the silent-divergence this centralisation forecloses.
+
+Two consequences worth naming:
+
+- **The compression turn had to bake its own head and tail** (P5b.7 predicted
+  this exactly). It builds its grid directly in the scheduler and carried the
+  comment *"No leading `no_think` / `user_start` head: those are live
+  `Generated` segments the assembler re-emits"* — which stopped being true. Left
+  alone it would have projected with no opener at all.
+- **`assemble_pieces` lost its `markers` and `turn_no_think` parameters.** They
+  became dead the moment turns owned their boundaries, and removing them rather
+  than silencing them is what makes "the assembler no longer decides boundaries"
+  visible in the signature. `materialize_conversation` lost `markers` for the
+  same reason.
+
+### 11a.2b P5c was smaller than it looked — and two thirds of it is unused
+
+§4.7d treats the three remaining `Generated` producers as comparable work. They
+are not:
+
+- **`TreeGlue` and `member_glue` are not used by the live schema at all.**
+  `grep glue zend/src/prompts/projection.yaml` returns nothing. They are
+  capabilities with no production caller, so sealing them is speculative work
+  against an unexercised path.
+- **`is_template` sections were a two-line change**, because a template section
+  already carries its resolved dialect text in `SectionSchema::content` — the
+  same field a content section seals from. The ingest loop skipped them with an
+  explicit `continue`; removing it, and making `push_section_segment` always
+  emit `Sealed`, is the whole of it. `push_section_segment` lost its branch and
+  its panic (a template with no pre-tokenised tokens is no longer a way to fail).
+
+So the live system's only glue producer is sealed, and the two unused ones are
+left as they are — but they can no longer fail *silently*: `can_gap_fill` makes
+`reserve_glue_island` refuse with a message naming the island, so enabling
+either on this lineage stops the wave with an explanation rather than producing
+quiet nonsense.
+
+The approximation this accepts is the one §4.7d predicted: a template's K/V is
+now computed under the ingest prefix rather than the runtime one. For
+`depends_on` templates whose collection may or may not have materialised, that
+is exactly the "approximation-rich prefix" the collection path already concedes.
+
+### 11a.3 The hybrid is not reachable from the conversation layer (unlisted)
+
+The 142-item list assumes zend can already load the hybrid. It cannot — or
+rather, could not: `candle-conversation::models` had no `ModelArch` variant, no
+`Model` preset and no builder arm for this lineage. `HybridBatched` existed only
+behind candle-transformers' own `#[ignore]`d gates.
+
+This is a prerequisite for the switch that appears nowhere in §11, and §0's
+survey missed it by never asking whether `Model::` had an entry.
+
+**Landed** (it blocks P9 and the switch itself): `ModelArch::Qwen35Hybrid`, the
+`Model::Qwen36_35B_A3B_Q4` preset (`models/qwen36_moe.rs`), the builder arm, and
+the `qwen35moe` GGUF arch-string mapping. Compile-checked only — loading it needs
+the 22 GB checkpoint, so **the first person to run P9 is also the first to
+exercise this loader**.
+
+### 11a.3b P6.1's premise is false — the generator never prefills a branch prefix
+
+§4.6 / P6.1 says the branch checkpoint "is a by-product of a prefill the
+generator already runs — do not add a second pass." It is not, and the reason is
+this document's own subject appearing one level up.
+
+The section ingest **Arc-injects** the prefix and prefills only the section's own
+content (`conversation.rs:441`, `:706` — *"every section in `prefix_section_ids`
+is Arc-injected onto the scratch slot before this section's prefill"*). That is
+the right design for K/V: the prefix's K/V already exists, so copying it is free
+and the forward attends to real preceding context.
+
+A recurrence cannot be Arc-injected. So after sealing a variant, the fork's
+recurrent state covers **only that section's tokens**, computed under a K/V
+prefix the recurrence never processed — KV-without-state, in the prompt builder,
+exactly the mismatch §1 describes for conversations.
+
+The consequence for P6 is not a detail. There is no existing prefill to harvest;
+a branch checkpoint needs a **dedicated pass** that runs the full ordered prefix
+through the model for each leaf. At a five-binary-plus-one-ternary tree that is
+96 full-prompt prefills at build time — affordable as a one-off, but it is new
+work with a new cost, not a by-product. P6.2's "build-time accelerator" (resume
+the walk from the deepest shared ancestor) stops being an optimisation and
+becomes the thing that makes the pass affordable at all.
+
+**Not implemented**: it needs the model both to run and to validate, and getting
+it wrong produces a conversation that starts with a *plausible* prompt state
+rather than an obviously-empty one — the failure mode that reads fine.
+
+### 11a.3c P8.1 and P10.3 were implementable and were still not done
+
+Both could have been written blind. Neither should be, and the reason is the
+same in each case: the change is only *correct* if a measurement or a gate says
+so, and running either needs the checkpoint.
+
+- **P8.1** (pin the export buffer, overlap the D2H) is guarded by its own phase
+  condition — "only if seal latency measures badly". The measurement has not
+  been taken. Landing async CUDA stream plumbing on the seal path, unmeasured
+  and unrun, trades a cost nobody has shown is real for a class of bug (a race
+  between the staging copy and the seal's own writes) that does not reproduce on
+  CPU and would surface as intermittently wrong resumed state.
+- **P10.3** (spec-decode on forks) means reworking deepseek4's verify path,
+  which carries its own compressor and gallery rollback. It is a working,
+  GPU-only, performance-critical feature with no CPU-runnable gate. The capability
+  refusal (§11a.1) already makes the hybrid safe there; the rework buys deepseek4
+  nothing it does not already have.
+
+Recorded because "not done" and "not done *yet*, deliberately" are different
+states, and the second one should not be re-litigated from scratch.
+
+### 11a.4 `head_dim / 4` is a whole-word rotation at head_dim 256
+
+P5e.3 derives the fold shift as `head_dim / 4`. At 128 that is 32 bits — a
+half-word, which mixes bits *within* each u64. At 256 it is 64 bits, exactly one
+word, so the stagger only permutes words and never mixes within them.
+
+Found because a first draft of the stagger test used word-periodic data and the
+layers cancelled anyway. That is weaker decorrelation than the measured 128-bit
+case, and it feeds directly into P10.1's re-derivation: the question is not only
+*which layers* the groups take but whether the shift should avoid word alignment.
+The tests document it at `wide_sig.rs`'s `the_fold_staggers_at_head_dim_256`.
+
+### 11a.5 Deviations of detail
+
+- **P2's disposition is decided at the seal branch, not at `finalize_view`.**
+  The doc has `finalize_view` move the state; but whether the turn keeps its
+  decoded blocks is not known until the clean-reprefill branch has run. The view's
+  state is therefore left under the view id (`finalize_view` frees the session
+  slot but not the model's map entry) and disposed of at the branch — released on
+  the clean re-prefill, moved everywhere else. Deciding it eagerly *is* the
+  `<think>` skew.
+- **P4.2 resolved as predicted**: the hook returns `Vec<ExportedLayerState>` +
+  hash, and the scheduler assembles `SnapshotPayload`.
+- **P7's rejections log at WARN with distinguishable reasons**, as specified —
+  unreadable / model-carries-none / hash-or-geometry-mismatch, each naming that
+  the conversation will "read fluently and have forgotten".
+- **The `seeded` flag is consumed on the first wave regardless of offset**, not
+  only at `offset == 0`. A flag that outlived its one wave would suppress a later
+  genuine reset — defect 6 wearing the fix's clothes.
+- **P5e.5/5a resolved without a record change.** The fold emits exactly three
+  layer-groups — `FoldParams::group_sizes` is a `[usize; 3]`, so the count is
+  pinned by the type — which makes `heads_per_group = n_heads / 3` **derivable
+  from the signature itself**: 12/3 = 4 on Qwen3-30B, 6/3 = 2 on the hybrid. No
+  new field, no version bump, and no churn across 41 construction sites. All
+  four `HEADS_PER_GROUP` readers (`scan.rs`, `packed.rs`, `gpu.rs`, and the
+  un-aliased copy in `zend/examples/provenance_layers.rs`) now derive it; the
+  example's silent group-drop became an assert.
+- **P5e.6–8 done, but the check is narrower than §4.8 specifies — on purpose.**
+  The record is now `WQS5` and carries the fold (`encode_wide_sigs_with`); the
+  scheduler publishes this process's fold at construction from the model's own
+  geometry; the two substrate gallery reads go through
+  `decode_wide_sigs_for_scoring`, which refuses a mismatch with a WARN.
+
+  What it compares is **only the group sizes**. Everything else in a fold is
+  recoverable from the signature's own shape — `heads_per_layer` is `n_heads / 3`,
+  `head_dim` is `wph × 64`, `shift` follows — and the scorer already derives
+  those per signature, so a shape difference is *handled* rather than being a
+  mismatch to refuse. The group sizes are the one parameter the shape cannot
+  reveal (they depend on the capture-layer count) and therefore the one case
+  nothing else catches.
+
+  This was found the hard way: checking the shape-derived fields too made every
+  geometry constructed in a test process contaminate the next, and two substrate
+  tests went red. That is not merely a test artefact — it is the same coupling
+  in production, where a check that fires on shape would refuse comparisons that
+  are correct.
+- **`ModelCoreProperties::provenance_capture_layers`** is new and needed for the
+  derivation: the fold groups `[n − 2, 1, 1]` over layers that actually have a Q,
+  which is `num_layers` on a uniform stack and the **attention** count on a
+  hybrid. Passing transformer depth would size the lower group for 30 layers that
+  contribute nothing.
+- **Both halves of the boundary bake exist, are tested, and are now used.**
+  `from_flat_grid_with_tail` reserves the closing `<|im_end|>` the way
+  `user_content_start > 0` already reserved the opener, and a zero reservation
+  is asserted byte-identical to the ethereal form.
+- **Stream equivalence is asserted directly** rather than by pinning the old
+  island shape: `baked_boundaries_reproduce_the_spine_emitted_stream_exactly`
+  builds the reference stream the spine used to emit (`US body AE` per turn,
+  with the `AE ++ US` islands between) and asserts the baked layouts' `realize()`
+  walk reproduces it **token for token**. Equality, not tolerance — §4.7a proves
+  the split is exact. A companion test covers the `/no_think` rider that §4.7a's
+  ownership table omits.
+- **The `no_think` switch is now stronger, not weaker.** §4.7b worried that
+  baking would freeze a deliberately dynamic decision. Baking it into the turn
+  that carries it *removes* the leak the live path guarded against — a past
+  suppressed turn putting a stale switch on a later thinking-on turn cannot
+  happen when each turn's grid holds its own.
+
+### 11a.6 The fold's bits and its stamp came from different places (P5e.1a)
+
+P5e.1a says, in as many words: *"Thread it through **both** gather paths — they
+are separate code and either can be missed."* Both were missed, and the result
+was worse than either miss alone.
+
+`Scheduler::new` derived the fold from the model's geometry and published it;
+the seal stamped each `WQS5` record with that derived value; and both capture
+paths — the GPU fast path's `assemble_folded_prov_sigs` and the CPU R16
+fallback — still called `fold_provenance`, which is `fold_provenance_with(raw,
+FoldParams::locked())`. `fold_provenance_checked`, written for exactly this and
+described in §4.8 as the thing that refuses an unfillable fold, had **no
+production caller at all**.
+
+So a record's header described a fold its bytes had not been produced under.
+On Qwen3-30B the two agree (`derive(4, 48, 128) == locked()`), which is why
+nothing showed. On the hybrid the bits would be folded `[46, 1, 1]` at
+4 heads/layer over a 10-layer, 2-head stack — groups 1 and 2 all zero — while
+the header claimed `[8, 1, 1]` at 2 heads/layer. The mismatch check would then
+*pass*, because it compares the stamp against this process's fold and both are
+the derived one, and the scorer would run over two thirds of nothing.
+
+**What landed.** The fold is a field on the `Scheduler`, set once at
+construction from the model's geometry, and it is the value used for *both* the
+fold and the stamp. One source, so they cannot drift. Both capture paths call
+`fold_provenance_checked` and store nothing when the fold cannot fill all three
+groups, warning once — an all-zero group is not a weak signature, it is a
+scorer input that agrees with everything.
+
+A second miss came out with it: the compression/summary path persisted its
+node signature with `encode_wide_sigs` — **unstamped**. An unstamped record
+reads back with group sizes `0`, which `decode_wide_sigs_checked` treats as
+"not stated" and scores without checking, so summary nodes bypassed the fold
+check entirely. They stamp now.
+
+The general lesson is the one §0.4 already states and this document's own TODO
+anticipated: a checked variant with no caller is indistinguishable from no
+check, and "threaded through" is a claim about call sites that only a grep
+settles.
+
+### 11a.7 A cached checkpoint could not be opened while the hub was unreachable
+
+Not a design point — a live failure, hit on the first tier-3 run. The test sat
+for eighteen minutes on twenty seconds of CPU with two sockets in `CloseWait`
+and the model never opened.
+
+`ModelBuilder::download_or_fail` called `Api::get`, which consults the local
+cache only *after* asking the hub which revision it should be holding. These
+are pinned files — one filename in one repo, whose exact length the spec
+records — so a cache hit needs no confirmation, and asking anyway makes every
+load depend on the network. The same shape was in the test helper
+`hf_get_repo`, where every caller pins an explicit revision.
+
+Both now check the cache first and go to the network only on a miss. This is a
+daemon startup property, not a test convenience: a workstation with the
+checkpoint on disk should not fail to start because the hub is unreachable.
+
+### 11a.8 A view that borrows no K/V reads perfectly
+
+`BatchedInferenceSession::create_view_sequence` took `visible_block_ranges` and
+treated an **empty slice** as "borrow nothing", returning a zero-block view
+without complaint. "Empty means every block" is the *scheduler wrapper's*
+convention — it expands to `[(0, total_blocks)]` before calling down — and the
+two read identically at the call site.
+
+A view carved that way decodes at its parent's position with an empty K/V. It
+produced fluent, grammatical, entirely unrelated text, and the tier-2
+continuation gate (T7.6) read that as a fork defect twice before the carve
+itself was checked. The recurrent state was being copied correctly the whole
+time; T1.6 passed throughout, because its claims are about state and the state
+was right.
+
+The empty slice is now an error naming the fix, and the tier-2 gates carve
+through one helper that asks for the parent's whole block range and asserts it
+got it. Worth recording because it is this document's failure signature
+appearing in the *test harness*: the instrument reported a defect in the thing
+it was measuring, and the report was fluent.
+
+### 11a.9 `thinking(false)` does not suppress thinking
+
+Observed while reading the P9.3 output, where the resumed conversation emitted
+a real `<think>` block and the pre-restart one had emitted an empty one. It is
+not a fork or resume defect. `ModelBuilder` has two levers and on this
+configuration neither fires:
+
+- `format_system_prompt` prepends `/no_think` to the **system prompt**, and
+  `conversation.rs` records — correctly — that Qwen3 honours the switch only
+  from the user turn, which is why a suppressed turn now bakes it into its own
+  grid via `turn_head_tokens`.
+- the non-thinking sampling params are applied only when the caller has not set
+  sampling explicitly, and the tier-3 harness sets `argmax`.
+
+So suppression was inert in both engines and the model simply chose
+differently. Left as it is: making the builder's flag reach the per-turn
+selector changes behaviour for every model and every conversation, and there is
+no gate here for that. Recorded, and noted at the call site so the `<think>`
+blocks in these tests are not read as a defect. The comment in
+`submit_prefill_unit` that still described the deleted `no_think_current` glue
+was corrected.
+
+### 11a.10 T5b.5 is not implementable as written
+
+*"With boundary K/V present, a `can_gap_fill: true` model produces identical
+output whether it injects or regenerates — proving `Option` is a hit/miss, not
+a mode."*
+
+The assertion needs the same model, on the same turn, to take both branches.
+After P5b a turn's `TurnLayout` is built at seal time and stored on the turn;
+its `Glue` segments carry `kv: Some(span)` because the boundary really is in the
+K/V. There is no way to make that turn regenerate instead — and the two ways to
+add one are both prohibited:
+
+- a switch saying "regenerate even though you have it" is optionality-as-a-mode,
+  which is what the test exists to disprove; and
+- a mutation path that rewrites a sealed layout's `kv` to `None` would be a
+  test-only API on the seal path.
+
+**What the property rests on instead.** `TurnSegment::is_real()` is a plain
+`kv.is_some()`, and both values occur naturally for reasons that have nothing to
+do with capability: a `<think>` block whose K/V was deliberately dropped is
+`None`, a sealed boundary is `Some`. Nothing reads `can_gap_fill` to decide
+which to write. The capability is read in exactly one place —
+`reserve_glue_island` — and both of its outcomes are already gated: the hybrid
+refuses (the feasibility gate, T5c.1), and Qwen3-30B does not.
+
+What would settle the remaining question is not a test but a comparison across
+the bake: the same Qwen3-30B conversation, same seed, before and after P5b.
+That belongs with P10.4's ablation, which already has to measure the two baked
+approximations, and it is recorded there rather than left as an unwritable test.
+
+### 11a.11 P6 landed, and §4.6's cross-product is the wrong shape
+
+P6 is implemented: the per-leaf prefill pass, its persistence, and the
+cold-start restore. Two things about it are **not** what §4.6 specifies, and
+both were settled by measurement rather than argument.
+
+**(1) A conversation computes its own branch, not the cross-product.** §4.6
+says to pre-seal every leaf the way the K/V tree does. The first working
+version did exactly that and the tier-2 gate reported **200 checkpoints
+computed** on a single conversation open — the live schema's tree is
+`no_think(2) × persona(2) × reasoning_stance(2) × thinking_effort(5) ×
+response_length(5)`, not the "five-binary-plus-one-ternary = 96" §4.6 estimates.
+A conversation uses exactly one of those 200. Eagerly computing the rest is not
+warm-start, it is 199 full-prompt prefills of latency in front of the first
+turn, for branches that may never be selected.
+
+§4.6's own conclusion already points the other way — *"what is needed at runtime
+is only the leaves"* — and the reason it did not follow through is that the K/V
+tree really does pre-seal the cross-product, so the symmetry looked right.
+It is not symmetric: sealing a variant's K/V is one section's prefill, while a
+branch checkpoint is the *whole prompt* every time, because a recurrence cannot
+be Arc-injected (§11a.3b).
+
+So a branch is computed the first time some conversation selects it and
+persisted under its content prefix. Cost: one prefill per distinct branch ever
+used, paid once across every conversation and every restart. **This also
+retires P6.2**: resume-from-the-deepest-shared-ancestor exists to make a
+cross-product affordable, and there is no cross-product. The enumeration and
+addressing survives as `SectionTree::branch_prefix_ids` (with T6.1/T6.2),
+because that is what *names* a branch and the pass uses it to derive one from a
+selection. The enumeration that went with it does not: a
+`leaf_selections` that returned every reachable assignment had no caller once
+the cross-product went, and a capability with no production caller is the exact
+thing §11a.2b criticises about `TreeGlue`.
+
+**(2) The checkpoint is keyed by content prefix, not by `pack`.** P6.3 says to
+key on `SectionTree::pack(selection, dims.len())`. That names a branch only
+within one build of one schema: `SectionId`s are assigned in declaration order,
+so editing a section's text — or inserting one above it — leaves every pack key
+pointing at a branch whose tokens have changed, and the restore seeds a
+conversation with the state of a prompt it is not running. Keying on the
+cumulative `ContentChain` prefix, which is what the sealed K/V is already
+addressed by, makes a checkpoint and its K/V go stale together by construction.
+
+**What the gate caught on its first run.** T6.3 asserted the install path and
+found **200 computed, zero installed**. The write is fire-and-forget onto the
+persistence thread and the restore read the record back immediately, before it
+had landed — so every conversation did the whole pass and then started from
+zero, warning once at a level nobody reads. Reading back a value computed
+moments earlier was the mistake; the default branch's payload is now carried in
+memory to the install, and disk is what the *next* process reads. This is the
+same shape as every other defect in this document: it cost real work, produced
+no error, and the conversation read perfectly.
+
+### 11a.11a How P6 is put together
+
+The pieces, since none of them is where §11 says:
+
+- **`SectionTree::branch_prefix_ids`** — the ordered sealed sections a branch is
+  built from, with placeholder nodes contributing their own anchor rather than
+  the collection's runtime top-k (§4.6(2)). `Sequence::prompt_branch` derives the
+  branch from the conversation's own selection through it, rather than trusting
+  the ingest walk's layout, so a conversation opened on a non-default assignment
+  names the branch it will actually run. T6.1/T6.2 cover it, including that an
+  out-of-scope gated dim resolves to one branch however it is set.
+- **`SchedulerRequest::BranchCheckpointPass`** — prefills an ordered token
+  stream on a throwaway slot and exports the state. Deliberately *not* routed
+  through the section-ingest batcher: that path exists to share forwards across
+  many concurrent section prefills and finishes by sealing K/V, and this wants
+  neither. It drives `forward_wave` directly in `max_prefill_pass_tokens`
+  chunks, for the same reason `build_section_batch` bounds its own budget — one
+  forward over a whole prompt is an activation spike large enough to page.
+- **`BranchCheckpointPayload`** — rides `RecordType::Snapshot` under a different
+  stream id. Nothing in the single-tail machinery needed changing: accounting,
+  the recovery walk's location map and the compactor's carry-forward all key on
+  `header.stream_id` and never decode a payload. Two payload shapes under one
+  record type is not an overload, because the stream id *is* the identity of
+  what the state belongs to and a reader computes it before asking.
+- **`SchedulerRequest::InstallRecurrentState`** — the restore. It runs *after*
+  priming rather than inside `create_sequence` like the timeline-snapshot
+  restore, because a branch checkpoint describes the state after the prompt and
+  the prompt's K/V has to be on the slot first.
+
+**The payloads needed a magic byte, and the test that found out is worth
+keeping.** Without one they are wire-*compatible*: `(version, timeline, turn,
+schedule, n_layers)` and `(version, prefix_lo, prefix_hi, schedule, n_layers)`
+are the same widths in the same order, so a conversation snapshot decodes as a
+branch checkpoint cleanly, every field landing somewhere plausible. The test
+asserting the refusal failed, which is how `BRCK` came to exist.
+
+### 11a.12 What the state costs — measured
+
+Six sealed turns on the 35B, via `recurrent_state_cost_is_measured_not_assumed`.
+Numbers, not estimates, and each one closes or re-opens an item.
+
+| | Measured | Verdict |
+|---|---|---|
+| **T8.1** seal export | 39.8 ms/seal, **4.06 %** of turn wall | **P8 stays closed** |
+| **P10.5** snapshot write | **62.8 MiB** per turn | **re-opened** — see below |
+| **P10.6** fork traffic | 18 forks / 6 turns, **~188 MiB per turn** | **re-opened** — 3× the prediction |
+
+**P8 is closed, with evidence rather than by deferral.** §11a.3c declined to pin
+the export buffer and overlap the D2H because the phase is conditional on a
+measurement nobody had taken, and landing async stream plumbing on the seal path
+risks a race between the staging copy and the seal's own writes — intermittently
+wrong resumed state, not reproducible on CPU. At 4 % of turn wall the saving is
+bounded by 4 %, and that is not worth the class of bug. The gate now asserts the
+threshold (10 %) rather than the conclusion, so the day the ratio moves, the
+decision re-opens by itself.
+
+**P10.5 deserves attention.** 62.8 MiB per turn is exactly the ~63 MiB §7
+predicted, which is the good news; the bad news is that it is per turn, to the
+redo log, forever, and it is the single largest recurring write in the system. A
+conversation at one turn per second sustains ~63 MB/s of snapshot alone. bf16
+storage halves it for a quality question §7 already framed and P10.5 already
+owns. This is now a measured cost rather than a hypothetical one.
+
+**P10.6 found three forks per turn, not one.** §4.4 and P10.6 both reason about
+"a ~63 MiB device copy on every dialogue turn". There are three, so ~188 MiB per
+turn moves device-to-device. P10.6 asks precisely the right follow-up already —
+*"whether a view's fork can be deferred to the first layer that actually
+advances, since a turn that reprojects before decoding anything has paid for a
+copy nothing read"* — and the multiplier makes it three times more worth asking.
+The next step is to find out what the other two carves are: a turn takes one view,
+so either reprojection carves again or the seal path does.
+
+**P10.1, P10.2 and P10.4 are experiments, not code.** Each needs a labelled
+retrieval corpus and an analysis pass, not an implementation: which layers carry
+identity on a 10-attention-layer stack (P10.1), whether attention-only capture
+retains retrieval quality (P10.2), and the zero-glue/fork-glue ablation together
+with the two baked approximations and the pre/post-bake comparison §11a.10 moved
+here (P10.4). What this campaign changed is that they are now *runnable*: the
+fold derives correctly on the hybrid, and the layer-attribution harness no longer
+silently scores an empty projection when the fold shape moves (§11a.6, P5e.5a).
+
+### 11a.13 Gaps found by reading this document against the code
+
+Five, found by cross-referencing §4/§9/§10 against what shipped. Three were
+real defects, one was a decision whose premise had gone, one was a question
+nobody had answered.
+
+**1. `turn_index` was logged on resume, never validated.** The worst of them,
+because §4.1 *depends* on it. The seal enqueues the snapshot **before** the
+turn's `Tokens` record, justified as: a torn shutdown can then leave a snapshot
+for a turn whose records never landed — "handled" — but never the reverse. The
+handling is §4.3's *"reload discards a snapshot newer than the last recovered
+turn"*, and `restore_recurrent_state` only ever passed `payload.turn_index` to
+`tracing::`. So the write ordering deliberately produced a tear it could not
+survive: resume installed a state one turn **ahead** of its K/V — state without
+KV, §7.8 defect 2, and fluent. Now rejected with a distinguishable WARN, behind
+`snapshot_within_recovered_history` so the boundary is unit-testable (T7.3).
+This is also what makes §10 decision 3 (leave a turn-tombstoned snapshot alone)
+work at all.
+
+**2. Branch checkpoints had no reclaim path.** Introduced by this campaign, not
+by the design. Turn snapshots have three: supersede by header key, timeline
+tombstone, distillation. A checkpoint is keyed by *content*, so a prompt edit
+supersedes nothing and orphans the old branch, and no timeline tombstone names
+it — the log grew by one 63 MiB orphan per prompt edit, carried forward verbatim
+by every compaction, forever.
+
+The fix names what a checkpoint actually is. It is a **cache**: a pure function
+of a prompt still on disk, so losing it costs one prefill, where losing a
+conversation snapshot loses history nothing can recompute. That distinction now
+lives in the type — `RecordType::BranchCheckpoint = 21`, its own substrate index
+— because the compactor reads headers, never payloads, and had no way to tell
+them apart. Compaction keeps the newest `MAX_BRANCH_CHECKPOINTS`; maintenance
+relocates them under their own type so a cache is never re-typed as durable
+state.
+
+**3. §10 decision 4's branch-checkpoint half is revised, not implemented.** It
+says branch checkpoints store bf16, on the reasoning that *"the cost is fixed and
+paid up front rather than growing with use"* — 96 leaves ≈ 6 GB. Two things
+since: the pass computes one branch per conversation rather than the
+cross-product (§11a.11), and compaction now caps them. The worst case is
+`MAX_BRANCH_CHECKPOINTS × 63 MiB`, bounded and small, so the premise for
+measuring bf16 *before* landing is gone.
+
+What is left is the ordinary version of the question — is lossy stored state
+acceptable — and §7 already answers how to settle it: *"a measured quality gate,
+not an assumption."* That gate is P10.5. Landing bf16 now would be shipping a
+quality change ahead of its measurement, which is precisely the trade §11a.3c
+declined for P8.1. Both payloads are F32; the per-layer dtype tag is still the
+extension point, and it is honestly documented as F32-only today rather than
+described as a capability that does not exist.
+
+**4. T3.6 was never written**, and §10 decision 9 made the bake conditional on
+it: *"assume fixed once sealed, and add the test. If the test fails, fall back
+to leaving `NoThink` ethereal."* §11a.5 argues the property is now stronger,
+which is an argument, and the decision asked for a test because baking freezes
+an assumption. Written: the flag is derived from the segments (no second copy to
+drift), survives the persistence round-trip, and two turns sealed under
+different dial settings keep their own answers.
+
+**5. §9 Q6 had no recorded answer.** *"Confirm no other model in the tree carries
+recurrent state that should ride this."* The answer is on
+`carries_recurrent_state` now, because the confirmation is what the doc comment
+should have said in the first place: per-sequence state outside the K/V is not
+the criterion — **irrecoverability** is. `latent_moe`'s engine carries a
+per-sequence compressor and provenance gallery and answers `false` correctly,
+because both are derived from a corpus that is already durable. A delta-rule
+matrix has no such source; it is the only record of the tokens that built it.
+
+### 11a.14 Gaps found by a code review of the finished work
+
+The behavioural catalogue proved the *design* holds. A full review of the diff
+found ten defects the catalogue's oracles could not see, six of them in this
+work and three of those introduced by its own fixes. Recorded because the
+pattern is more instructive than any single bug: **every one of them was a
+place where two derivations of the same fact were allowed to disagree.**
+
+1. **A tracked "state is still pristine" flag** gated the first-turn branch
+   re-key, and only the dialogue path cleared it — so an ingest or a splice
+   advanced the state with the window still open, and the next dialed turn
+   installed the bare prompt checkpoint over it. Now DERIVED: the flag says
+   only *born with a checkpoint*, and the timeline's turn count says whether
+   anything has advanced it. Every path that advances state lands a turn, so
+   nobody has to remember.
+2. **The provenance palette count was derived on one side and constant on the
+   other.** `prov_n_palette` computed 8 bands at `head_dim` 256 while the arena
+   stores 4 and the kernel's contract is `head_dim / N_PALETTE`; the fast path
+   re-activated and captured half of every signature, dim-permuted, no longer
+   bit-identical to the CPU fold it is documented to match. The band count is a
+   property of the R16 arena, not a free choice: it reports `N_PALETTE`, and a
+   256-wide head correctly declines to the (slow, correct) CPU path until the
+   arena and kernel genuinely band that wide.
+3. **The fold-group divisor was swept everywhere but the scorer.**
+   `resolver.rs` still divided by the locked `PROV_HEADS_PER_LAYER`, reading 1
+   group for the hybrid's 6-head signatures — collapsing three-group late
+   fusion to a single scan and making `layer_weights` address groups never
+   scanned. Now `heads_per_group`, the same derivation as the capture side.
+4. **The splice catch-up replayed adopted tokens against an empty context.**
+   The scratch slot held the parent's state but none of its K/V, so the
+   attention layers fed the recurrent layers outputs no forward ever produced.
+   The scratch now BORROWS the conversation's leading blocks (`prefix_blocks`,
+   the extent before the adopted span), giving the replay the left context a
+   real append would have had — without double-counting K/V that is already
+   spliced in.
+5. **The post-decode tail advanced the wrong state.** Prefilled before the
+   view-state disposition, it was absorbed twice on the clean-re-prefill path
+   and lost on the move path — the same skew the disposition comment describes
+   for `<think>` and deliberately avoids, one call earlier. It now runs after
+   the disposition, so the state that absorbs the tail is the one being sealed.
+6. **Boundary ownership moved into the grid, and history was not asked.** Turns
+   sealed before the move carry ethereal markers that `realize` drops, and the
+   assembler had stopped emitting them — so a resumed pre-existing workspace
+   projected as one unbroken run with no role markers anywhere. The assembler
+   now asks each turn's own layout (`TurnLayout::bakes_own_boundaries`) and
+   supplies the framing for exactly the turns that lack it.
+
+Also fixed: the write-half of a forked recurrent state was zeroed
+(invariant 6 — ~63 MiB of memset per fork, ~3 forks/turn) and is now
+`uninit`; summariser scratch slots inherited the conversation's recurrent
+state and belief through the `create_sequence` funnel (`StateSeed::Neutral`
+now says a timeline can be an *address* rather than a history to continue);
+the branch checkpoint was read and decoded twice per conversation open; and
+`clear_walker_state` cleared the branch-checkpoint index but not the
+recurrent-snapshot one, which compaction had just been taught to shrink.
 
 ## 12. References
 

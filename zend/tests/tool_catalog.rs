@@ -213,12 +213,8 @@ fn persona_selector_exposes_assistant_and_summarize() {
     let tree = builder
         .schema()
         .system_prompt
-        .items
-        .iter()
-        .find_map(|it| match it {
-            SystemPromptItem::SectionTree(t) => Some(t),
-            _ => None,
-        })
+        .section_trees()
+        .next()
         .expect("system prompt has a section_tree");
     let persona = tree
         .nodes
@@ -251,12 +247,7 @@ fn summarize_examples_optional_carries_stuffed_turns() {
     let node = builder
         .schema()
         .system_prompt
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            SystemPromptItem::SectionTree(t) => Some(t),
-            _ => None,
-        })
+        .section_trees()
         .flat_map(|t| t.nodes.iter())
         .find(|n| n.name == "summarize_examples")
         .expect("schema has a `summarize_examples` optional node");

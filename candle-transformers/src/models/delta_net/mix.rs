@@ -139,6 +139,33 @@ impl DeltaNetState {
     pub fn absorb_solo(&mut self, out: &DeltaNetOut) -> Result<()> {
         self.conv_tail.slice_set(&out.conv_tail, 0, 0)
     }
+
+    /// Allocate the buffers **without zeroing** — for a write half the kernels
+    /// fully overwrite before anything reads it.
+    ///
+    /// Hot-path invariant 6 (`CLAUDE.md`): a buffer a kernel stamps end to end
+    /// must not be memset first. The zeroed twin costs a full-width device
+    /// memset per layer (~2 MB × 30 layers ≈ 63 MiB per fork) on the exact
+    /// bytes the next wave overwrites, and forks run ~3× per turn.
+    ///
+    /// Sound for BOTH halves under the current ping-pong: [`commit_wave`]
+    /// installs `s` and the conv tail together because the wave's kernels write
+    /// both into the backup half (the conv kernels take the entering and
+    /// advanced tails as two pointers). [`Self::zeros`] remains the constructor
+    /// for a state that is genuinely read at zero — a sequence-start value —
+    /// and [`Self::solo_out`] keeps its zeroed scratch tail deliberately.
+    ///
+    /// [`commit_wave`]: super::state_store::RecurrentStateStore::commit_wave
+    pub fn uninit(dims: &DeltaNetDims, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            s: Tensor::empty(
+                (dims.n_v_heads, dims.head_dim, dims.head_dim),
+                DType::F32,
+                dev,
+            )?,
+            conv_tail: Tensor::empty((dims.conv_dim(), dims.conv_kernel - 1), DType::F32, dev)?,
+        })
+    }
 }
 
 /// Where a wave WRITES one sequence's advanced state for a layer: the store's

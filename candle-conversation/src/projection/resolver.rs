@@ -14,20 +14,26 @@ use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
 use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
+use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
-use crate::persistence::content_hash::snapshot_stream_id;
+use crate::persistence::content_hash::{
+    branch_checkpoint_stream_id, snapshot_stream_id, ContentHash,
+};
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
 use crate::persistence::manifest::RecordLoc;
-use crate::persistence::record::{DistillMode, TreeMetadataPayload};
+use crate::persistence::record::{
+    BranchCheckpointPayload, DistillMode, SnapshotPayload, TreeMetadataPayload,
+};
 use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::SubstratePersistence;
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
-use crate::provenance::wide_sig::PROV_HEADS_PER_LAYER;
+use crate::provenance::heads_per_group;
 use crate::provenance::{
-    decode_wide_sigs, score_slots_grouped, score_slots_weighted, FusionMode, GalleryArena, WideQSig,
+    decode_wide_sigs_for_scoring, score_slots_grouped, score_slots_weighted, FusionMode,
+    GalleryArena, WideQSig,
 };
 use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
@@ -594,9 +600,23 @@ impl Conversation {
                             // then fused per the mode — the same law as the CPU
                             // `score_slots_fused`. The ungated group sum rides
                             // along as the mass base.
-                            let n_groups = p
-                                .first()
-                                .map(|s| (s.n_heads as usize / PROV_HEADS_PER_LAYER).max(1))?;
+                            // Groups are `n_heads / heads_per_group(n_heads)` —
+                            // i.e. FOLD_GROUPS whenever the signature is
+                            // well-formed. Dividing by the LOCKED
+                            // `PROV_HEADS_PER_LAYER` instead reads 1 group for
+                            // the hybrid's 6-head signatures (3 groups x 2 kv
+                            // heads), collapsing the three-group late fusion to
+                            // a single scan and making every `layer_weights`
+                            // entry past the first address a group that is
+                            // never scanned separately — confident, wrong
+                            // rankings with no error.
+                            let n_groups = p.first().map(|s| {
+                                let n = s.n_heads as usize;
+                                match heads_per_group(n) {
+                                    0 => 1,
+                                    per => (n / per).max(1),
+                                }
+                            })?;
                             let mut grouped: Vec<Vec<f32>> = Vec::with_capacity(n_groups);
                             for g in 0..n_groups {
                                 let mut one_hot = vec![0.0f32; n_groups];
@@ -867,7 +887,10 @@ impl Conversation {
                     if !d.tags.is_empty() {
                         return None;
                     }
-                    let sig = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b))?;
+                    let sig = e
+                        .wide_q_sigs
+                        .as_ref()
+                        .and_then(|b| decode_wide_sigs_for_scoring(b))?;
                     (!sig.is_empty()).then_some((d.timeline_id, d.turn_index, sig))
                 })
                 .collect()
@@ -1286,9 +1309,15 @@ impl Conversation {
                         })
                     }
                     mode => {
-                        let n_groups = p
-                            .first()
-                            .map(|s| (s.n_heads as usize / PROV_HEADS_PER_LAYER).max(1))?;
+                        // Derived, not the locked constant — see the turn-group
+                        // scan above.
+                        let n_groups = p.first().map(|s| {
+                            let n = s.n_heads as usize;
+                            match heads_per_group(n) {
+                                0 => 1,
+                                per => (n / per).max(1),
+                            }
+                        })?;
                         // grouped_files[g][file][slot]
                         let mut grouped_files: Vec<Vec<Vec<f32>>> =
                             Vec::with_capacity(n_groups);
@@ -2694,12 +2723,105 @@ impl Conversation {
             .enqueue(WriteJob::Snapshot { stream_id, payload });
     }
 
+    /// Enqueue a **prompt branch's** recurrent checkpoint — the state after the
+    /// whole system prompt for one selector assignment, keyed by the branch's
+    /// cumulative content prefix.
+    ///
+    /// Rides the identical single-tail path as a conversation's snapshot: the
+    /// writer appends it under this stream id and registers the location,
+    /// superseding any earlier checkpoint for the same branch. Superseding is
+    /// the right behaviour here too — a branch has exactly one state, and a
+    /// second computation of it can only be a recomputation.
+    pub fn enqueue_branch_checkpoint(&self, prefix: ContentHash, payload: Vec<u8>) {
+        let stream_id = branch_checkpoint_stream_id(prefix);
+        self.writer
+            .enqueue(WriteJob::BranchCheckpoint { stream_id, payload });
+    }
+
+    /// Read a prompt branch's recurrent checkpoint, if one was computed.
+    ///
+    /// `None` is ordinary: no checkpoint has been built for this branch, or the
+    /// prompt changed and this branch's content prefix with it. An indexed but
+    /// unreadable record is an **error** for the same reason it is on the
+    /// conversation path — silently starting from zeros is the amnesia this
+    /// exists to remove.
+    pub fn read_branch_checkpoint(
+        &self,
+        prefix: ContentHash,
+    ) -> Result<Option<BranchCheckpointPayload>, ConversationError> {
+        let Some(loc) = self
+            .read()
+            .branch_checkpoint_loc(branch_checkpoint_stream_id(prefix))
+        else {
+            return Ok(None);
+        };
+        let bytes = self
+            .persistence
+            .lock()
+            .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
+            .read_record_payload(&loc)
+            .map_err(|e| {
+                ConversationError::Channel(format!(
+                    "branch checkpoint {prefix:?} is indexed but unreadable: {e}"
+                ))
+            })?;
+        let payload = BranchCheckpointPayload::decode(&bytes).map_err(|e| {
+            ConversationError::Channel(format!(
+                "branch checkpoint {prefix:?} failed to decode: {e}"
+            ))
+        })?;
+        if payload.prefix_hash != prefix {
+            return Err(ConversationError::Channel(format!(
+                "branch checkpoint under {prefix:?} states prefix {:?} — the stream \
+                 id collided, and restoring it would seed a conversation with \
+                 another branch's prompt state",
+                payload.prefix_hash
+            )));
+        }
+        Ok(Some(payload))
+    }
+
     /// The live recurrent-state snapshot location for `timeline`, if one is
     /// on disk. Resume reads the payload through the persistence handle and
     /// validates `(schedule_hash, turn_index)` before scattering state.
     pub fn recurrent_snapshot_loc(&self, timeline: TimelineId) -> Option<RecordLoc> {
         self.read()
             .recurrent_snapshot_loc(snapshot_stream_id(timeline.raw()))
+    }
+
+    /// Read and decode a timeline's recurrent-state snapshot — the resume read.
+    ///
+    /// `None` means "no snapshot for this timeline", which is an ordinary
+    /// outcome: a conversation sealed by a model that carries no recurrent
+    /// state has none, and so does one whose first turn has not sealed yet. A
+    /// snapshot that is present but unreadable is an **error**, not a `None`:
+    /// falling back to zeros there is the silent amnesia this whole path exists
+    /// to remove, so the caller has to see it and say so.
+    pub fn read_recurrent_snapshot(
+        &self,
+        timeline: TimelineId,
+    ) -> Result<Option<SnapshotPayload>, ConversationError> {
+        let Some(loc) = self.recurrent_snapshot_loc(timeline) else {
+            return Ok(None);
+        };
+        let bytes = self
+            .persistence
+            .lock()
+            .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
+            .read_record_payload(&loc)
+            .map_err(|e| {
+                ConversationError::Channel(format!(
+                    "recurrent snapshot for timeline {} is indexed but unreadable: {e}",
+                    timeline.raw()
+                ))
+            })?;
+        let payload = SnapshotPayload::decode(&bytes).map_err(|e| {
+            ConversationError::Channel(format!(
+                "recurrent snapshot for timeline {} failed to decode: {e}",
+                timeline.raw()
+            ))
+        })?;
+        Ok(Some(payload))
     }
 
     /// Declare a section stream — appends a `StreamDecl::PromptSection`

@@ -62,7 +62,7 @@ use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, LayerId, ProjectionTarget, SectionId,
     TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
-use crate::provenance::{decode_wide_sigs, WideQSig};
+use crate::provenance::{decode_wide_sigs_for_scoring, WideQSig};
 use crate::summary_tree::exchange::Couplings;
 use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
@@ -241,6 +241,20 @@ pub struct Substrate {
     /// on disk until a resume materializes it, exactly like `Tokens`.
     /// Last-writer-wins by walk/append order — the single tail.
     recurrent_snapshots: HashMap<StreamId, RecordLoc>,
+    /// The live recurrent checkpoint per **prompt branch**
+    /// (`branch_checkpoint_stream_id(content prefix)`). Same single-tail rule
+    /// and same location-only storage as `recurrent_snapshots`, kept separate
+    /// because the two are reclaimed by opposite rules and the compactor cannot
+    /// tell them apart from a location.
+    ///
+    /// A conversation's snapshot is **durable state**: losing it loses history
+    /// nothing can recompute, so it lives until its timeline is tombstoned or
+    /// distilled. A branch checkpoint is a **cache**: it is a pure function of a
+    /// prompt that is still on disk, so losing it costs one prefill. Nothing
+    /// supersedes one when the prompt changes — the key is the old content —
+    /// and no timeline tombstone names it, so without a bound they accumulate
+    /// one orphan per prompt edit at ~63 MiB each.
+    branch_checkpoints: HashMap<StreamId, RecordLoc>,
     /// Timelines whose KV is transient scratch — code_read scope forks whose
     /// sealed turns are spliced by REFERENCE onto a file timeline and then
     /// tombstoned. Their residences are flagged [`SequenceResidence::no_cold_persist`]
@@ -738,14 +752,30 @@ pub struct SectionEntryData {
 /// One turn's pinned content in the substrate.  The turn's K/V
 /// chunks are a single contiguous block addressing the persisted
 /// token sequence
-/// `[user_msg][user_end][assistant_start][response]`
-/// — the inter-turn `user_start` head and `assistant_end` tail are
-/// **not** persisted: the projection assembler re-emits them as
-/// live `Generated` runs at every cross-turn boundary so their K
-/// vectors are computed under the actual runtime causal prefix.
-/// The interior `user_end` + `assistant_start` pair stays baked
-/// because its semantic context (the turn's own user message and
-/// decoded response) is invariant across projections.
+/// `[user_start][/no_think?][user_msg][user_end][assistant_start][response][im_end]`.
+///
+/// **A turn owns its boundaries at both ends.**  The `user_start` head
+/// (carrying the `/no_think` soft-switch when the turn was sealed with
+/// thinking suppressed) and the `assistant_end` tail are part of the turn's
+/// own grid, so a sealed turn injects complete and the projection assembler
+/// emits nothing between turns.  The interior `user_end` +
+/// `assistant_start` pair is baked for the same reason it always was — its
+/// semantic context is the turn's own, invariant across projections.
+///
+/// This reverses the earlier contract, in which the head and tail were **not**
+/// persisted and the assembler re-emitted them as live `Generated` runs at
+/// every cross-turn boundary so their K vectors were computed under the
+/// actual runtime causal prefix.  That is a real property to give up: a baked
+/// marker's K is computed under the prefix present at seal and reused under a
+/// different one.  It is given up deliberately, for two reasons.  It is the
+/// approximation the substrate already makes for every sealed turn's own K/V,
+/// extended to the two least context-sensitive tokens in the projection.  And
+/// a live `Generated` run between turns is an island the engine must
+/// **gap-fill**, which a recurrent model cannot do even in principle — token
+/// *t*'s output depends on the accumulated state over everything before it,
+/// in order — so on the hybrid lineage the alternative to an approximate bake
+/// is not a better answer but a refused wave.  See
+/// `docs/deltanet_state_persistence.md` §4.7.
 ///
 /// A thinking turn's reasoning is part of `[response]`: the model
 /// opens its own `<think>…</think>` as the first decoded tokens.  A
@@ -2897,7 +2927,7 @@ impl Substrate {
             .streams
             .get(&stream_id)
             .and_then(|e| e.wide_q_sigs.as_ref())
-            .and_then(|b| decode_wide_sigs(b))
+            .and_then(|b| decode_wide_sigs_for_scoring(b))
             .filter(|w| !w.is_empty())
             .map(Arc::new);
         self.sig_cache
@@ -2997,6 +3027,22 @@ impl Substrate {
     pub fn clear_walker_state(&mut self) {
         self.streams.clear();
         self.timeline_by_debug_id.clear();
+        // The two indexes compaction can *shrink* — an entry whose record was
+        // dropped would otherwise survive here pointing into a segment that no
+        // longer exists, and the replay only ever ADDS. Clearing lets it
+        // rebuild exactly the set that was carried forward.
+        //
+        // Branch checkpoints shrink because compaction caps them. Recurrent
+        // snapshots shrink because it drops a DISTILLED timeline's — and a
+        // distilled timeline is not tombstoned, so nothing else removes its
+        // entry (`apply_distill` only marks the timeline). A stale snapshot loc
+        // is worse than a stale checkpoint one: `SnapshotPayload` has no
+        // leading magic (unlike `BranchCheckpointPayload`'s `BRCK`), so
+        // arbitrary bytes at the reused offset can decode as a plausible
+        // payload and install a foreign recurrent state, and maintenance's
+        // relocation walk can match the entry too.
+        self.branch_checkpoints.clear();
+        self.recurrent_snapshots.clear();
         for tl in self.timelines.values_mut() {
             tl.label = None;
             tl.conv_id = None;
@@ -3142,6 +3188,23 @@ impl Substrate {
     /// for carrying the tails forward.
     pub fn recurrent_snapshot_entries(&self) -> impl Iterator<Item = (StreamId, RecordLoc)> + '_ {
         self.recurrent_snapshots.iter().map(|(k, v)| (*k, *v))
+    }
+
+    /// Record the latest checkpoint location for a **prompt branch**.
+    /// Last-writer-wins, exactly as for a conversation snapshot.
+    pub fn apply_branch_checkpoint_loc(&mut self, stream_id: StreamId, loc: RecordLoc) {
+        self.branch_checkpoints.insert(stream_id, loc);
+    }
+
+    /// The live checkpoint for a prompt branch, if one exists. The caller
+    /// derives `stream_id` from the branch's content prefix.
+    pub fn branch_checkpoint_loc(&self, stream_id: StreamId) -> Option<RecordLoc> {
+        self.branch_checkpoints.get(&stream_id).copied()
+    }
+
+    /// Every live branch checkpoint `(stream id, location)`.
+    pub fn branch_checkpoint_entries(&self) -> impl Iterator<Item = (StreamId, RecordLoc)> + '_ {
+        self.branch_checkpoints.iter().map(|(k, v)| (*k, *v))
     }
 
     /// Record the highest chunk index the stream is durably committed
@@ -3528,6 +3591,17 @@ impl Substrate {
             }
             RecordType::Snapshot => {
                 self.apply_snapshot_loc(
+                    stream_id,
+                    RecordLoc {
+                        segment: entry.segment,
+                        offset: entry.offset,
+                        payload_len: h.payload_len,
+                        record_size: entry.size,
+                    },
+                );
+            }
+            RecordType::BranchCheckpoint => {
+                self.apply_branch_checkpoint_loc(
                     stream_id,
                     RecordLoc {
                         segment: entry.segment,
@@ -3963,6 +4037,18 @@ impl Substrate {
     /// clone with no re-derivation. `None` if the turn isn't found.
     pub fn turn_layout(&self, timeline: TimelineId, index: TurnIndex) -> Option<TurnLayout> {
         self.turn(timeline, index).map(|e| e.content.layout.clone())
+    }
+
+    /// Whether the turn's grid carries its own boundary markers — the
+    /// projection assembler's per-turn question, answered without cloning the
+    /// layout (which [`Self::turn_layout`] does, and which is far too much for
+    /// a predicate consulted once per turn per assembly).
+    ///
+    /// `false` for a turn with no recorded layout: that is the oldest shape of
+    /// turn there is, and it certainly did not bake its own boundaries.
+    pub fn turn_bakes_own_boundaries(&self, timeline: TimelineId, index: TurnIndex) -> bool {
+        self.turn(timeline, index)
+            .is_some_and(|e| e.content.layout.bakes_own_boundaries())
     }
 
     /// The turn's slot block extent `(block_start, block_end)` — needed by the

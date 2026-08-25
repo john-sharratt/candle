@@ -457,6 +457,24 @@ impl ConversationEngine {
     /// `new_conversation_with_projection` / `Sequence::submit_turn`
     /// — this accessor is for tooling that needs the raw substrate
     /// (integration tests, diagnostics, the workspace inspector).
+    /// How many sequences the model currently holds recurrent memory for.
+    ///
+    /// The leak gauge. Slot ids are recycled pool indices, so memory that
+    /// outlives its conversation is not merely wasted VRAM — the next
+    /// conversation on that id inherits a stranger's memory, fluently.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn live_memory_count(&self) -> usize {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        if self
+            .scheduler_tx
+            .send(crate::scheduler::SchedulerRequest::CountRecurrentMemories { response_tx: tx })
+            .is_err()
+        {
+            return 0;
+        }
+        rx.recv().unwrap_or(0)
+    }
+
     pub fn conversation(&self) -> Conversation {
         self.conversation.clone()
     }
@@ -1038,6 +1056,9 @@ impl ConversationEngine {
             .send(SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
                 target: Some(target),
+                // A fresh conversation: any state comes from the timeline's own
+                // snapshot, which `create_sequence` reads.
+                parent: None,
                 response_tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -1133,6 +1154,10 @@ impl ConversationEngine {
             match self.scheduler_tx.send(SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
                 target: Some(target),
+                // Resume by timeline: the snapshot read in `create_sequence` is
+                // the whole of the state recovery here — there is no live
+                // parent to copy from.
+                parent: None,
                 response_tx,
             }) {
                 Ok(()) => {
@@ -1212,6 +1237,7 @@ impl ConversationEngine {
                 // Raw RULER eval path: no projection, no substrate
                 // write, so no target binding either.
                 target: None,
+                parent: None,
                 response_tx: resp_tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;

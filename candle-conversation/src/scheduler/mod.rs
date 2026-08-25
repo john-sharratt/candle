@@ -37,20 +37,24 @@ use crate::handle::{SealResult, TurnEvent, TurnResponse};
 use crate::persistence::cold_load::{
     preallocate_pinned_scratch, ColdLoadStager, PINNED_PREALLOC_BYTES,
 };
-use crate::persistence::content_hash::{section_stream_id, turn_stream_id, ContentChain};
+use crate::persistence::content_hash::{
+    section_stream_id, turn_stream_id, ContentChain, ContentHash, ContentHasher,
+};
 use crate::persistence::elevate::{elevate_to_hot, sealed_total_bytes};
+use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
 use crate::projection::event::{group_name_of, layer_name_of_group};
 use crate::projection::Content;
 use crate::projection::{
-    encode_events, summary_node_event, Builder, CompressionPrompt, Conversation, GeneratedIdentity,
-    GroupKey, OptionalState, PriorBelief, ProjectionMode, ProjectionSegment, ProjectionTarget,
-    ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
-    TimelineId, TurnId, TurnIndex, TurnKey, NO_THINK_SELECTOR,
+    decode_events, encode_events, summary_node_event, Builder, CompressionPrompt, Conversation,
+    GroupKey, PriorBelief, ProjectionMode, ProjectionSegment, ProjectionTarget, ResolvedSection,
+    ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnId,
+    TurnIndex, TurnKey,
 };
 use crate::provenance::{
-    encode_wide_sigs, extract_q_vector_r16, fold_provenance, GalleryArena, WideQSig,
+    encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
+    GalleryArena, WideQSig,
 };
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{Healed, StencilDriver, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL};
@@ -71,6 +75,7 @@ use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked,
 };
+use candle_transformers::models::delta_net::ExportedLayerState;
 use crossbeam::channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -105,6 +110,16 @@ pub(crate) enum SchedulerRequest {
         /// summarisation) that allocate a slot purely as a GPU scratch
         /// resource and never touch the substrate.
         target: Option<ProjectionTarget>,
+        /// The slot this one is forking from, when it is a fork of a **live**
+        /// conversation.
+        ///
+        /// A fork's spliced K/V covers the parent's history as sealed, and its
+        /// recurrent state has to correspond to the same token stream. When the
+        /// parent is resident the state comes straight across device-to-device;
+        /// when it is not (daemon restart, parent already freed) the slot falls
+        /// back to the snapshot read, which is what `None` selects. This is a
+        /// real hit/miss, not a mode.
+        parent: Option<SequenceId>,
         response_tx: Sender<Result<SequenceId, ConversationError>>,
     },
 
@@ -313,6 +328,58 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<SealResult, ConversationError>>,
     },
 
+    /// Install a recurrent state onto an existing slot — the branch-checkpoint
+    /// restore.
+    ///
+    /// The conversation-resume path installs from a timeline snapshot inside
+    /// `create_sequence`, before any wave. A branch checkpoint cannot: the slot
+    /// has to be primed with its prompt K/V first, and priming is its own
+    /// request. So this arrives after, on a slot that exists and has not yet
+    /// run a turn.
+    ///
+    /// Replies `Ok(false)` when the model carries no recurrent state.
+    InstallRecurrentState {
+        sequence_id: SequenceId,
+        schedule_hash: u64,
+        layers: Vec<ExportedLayerState>,
+        response_tx: Sender<Result<bool, ConversationError>>,
+    },
+
+    /// Advance a conversation's recurrent memory over tokens whose K/V it
+    /// already holds — the catch-up after a splice adopts turns by reference.
+    ///
+    /// Replies `Ok(false)` when the model carries no recurrent memory, so the
+    /// splice can ask unconditionally.
+    MemoryCatchUp {
+        sequence_id: SequenceId,
+        tokens: TokenBuffer,
+        /// The first adopted turn index. Turns before it are this
+        /// conversation's own history and are injected onto the replay slot as
+        /// context; turns from it on are the span being replayed.
+        adopted_from: u32,
+        response_tx: Sender<Result<bool, ConversationError>>,
+    },
+
+    /// Prefill an ordered token stream on a throwaway slot and hand back the
+    /// recurrent state it produced — the **branch checkpoint pass**.
+    ///
+    /// **A genuine prefill, not an injection, and that is the whole point.**
+    /// Section ingest Arc-injects its prefix and prefills only the new
+    /// section's own content, which is right for K/V — the prefix's K/V already
+    /// exists, so copying it is free and the forward attends to real preceding
+    /// context. A recurrence cannot be Arc-injected: the state that a prefix
+    /// would have produced exists nowhere until the tokens actually pass
+    /// through the model, in order. So this request runs the whole branch.
+    ///
+    /// Replies `Ok(None)` when the model carries no recurrent state, so the
+    /// caller can ask unconditionally and pay nothing on a plain transformer.
+    BranchCheckpointPass {
+        /// The branch's complete ordered token stream — every sealed section of
+        /// the system prompt under one selector assignment, concatenated.
+        tokens: TokenBuffer,
+        response_tx: Sender<Result<Option<(u64, Vec<ExportedLayerState>)>, ConversationError>>,
+    },
+
     /// Recover a previously-persisted section directly from the redo
     /// log instead of running a fresh prefill.  Used when an ingest
     /// caller has computed a section's content-addressed stream id
@@ -409,6 +476,49 @@ pub(crate) enum SchedulerRequest {
         sequence_id: SequenceId,
         response_tx: Sender<Result<Vec<WideQSig>, ConversationError>>,
     },
+
+    /// Read a **live** sequence's recurrent memory, without sealing.
+    ///
+    /// Test observability, and it exists because the alternative is worse than
+    /// inconvenient. Memory is otherwise visible only through the record a seal
+    /// writes, so any behavioural test has to advance the conversation a whole
+    /// turn to look at it — which changes the thing it is measuring — and a
+    /// leak test (does a freed slot still hold memory?) cannot be written at
+    /// all, because a freed slot never seals again.
+    ///
+    /// Reply is `None` for a model that carries no such memory, and for a slot
+    /// that has none yet.
+    #[cfg(any(test, feature = "test-helpers"))]
+    ReadRecurrentMemory {
+        sequence_id: SequenceId,
+        response_tx: Sender<Result<Option<Vec<ExportedLayerState>>, ConversationError>>,
+    },
+
+    /// Digest a sealed turn's **hot K/V content** — per layer, per chunk: the
+    /// window offset, every band's format tag, palette maps, outer scales, and
+    /// the gathered arena bytes. Test observability for the continuity oracles:
+    /// after every coarser instrument (layout blocks, selection items,
+    /// materialized glue, recurrent state) compared equal across a live/resumed
+    /// divergence, the K/V bytes the engine actually serves are the last place
+    /// the difference can live, and nothing else can see them.
+    ///
+    /// Reply is `None` when the turn holds no hot sealed K/V (not yet
+    /// materialised, or no such turn).
+    #[cfg(any(test, feature = "test-helpers"))]
+    ReadTurnKvDigest {
+        sequence_id: SequenceId,
+        timeline: TimelineId,
+        index: TurnIndex,
+        response_tx: Sender<Result<Option<ContentHash>, ConversationError>>,
+    },
+
+    /// How many sequences the model currently holds recurrent memory for.
+    ///
+    /// The leak gauge. A slot's memory is dropped on free, and a slot id is a
+    /// recycled pool index, so a leak here is not merely wasted VRAM — it is the
+    /// next conversation on that id inheriting a stranger's memory.
+    #[cfg(any(test, feature = "test-helpers"))]
+    CountRecurrentMemories { response_tx: Sender<usize> },
 
     /// Run a §6 summary probe over a list of child substrate turns.
     ///
@@ -521,6 +631,113 @@ static PROV_RESOLVE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static PROV_KERNEL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PROV_ASSEMBLE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Provenance captures served by the GPU sign-pack path and by the CPU R16
+/// fallback, since process start. **Never reset** — the timing accumulators
+/// above are swapped to zero each wave, which makes them useless for answering
+/// "which path ran".
+///
+/// The question is worth a counter because the fallback is *correct*: when the
+/// GPU path is unavailable the capture still happens, still stores a signature,
+/// and still scores. What changes is that a per-seal device→host copy of every
+/// layer's R16 Q replaces a few KB of packed bits, and nothing about the output
+/// says so. A geometry that silently demotes therefore costs throughput with no
+/// symptom, which is why the assertion is on the path and not on a duration.
+static PROV_PATH_GPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROV_PATH_CPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(gpu, cpu)` provenance captures since process start — see [`PROV_PATH_GPU`].
+pub fn provenance_capture_path_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (PROV_PATH_GPU.load(Relaxed), PROV_PATH_CPU.load(Relaxed))
+}
+
+/// Prompt branch checkpoints computed by a prefill pass, and installed onto a
+/// new conversation's slot, since process start. **Never reset.**
+///
+/// Counted for the same reason the provenance path is: a conversation that
+/// failed to install its branch checkpoint is *correct* in every observable
+/// way except the one that matters. It has the whole system prompt in K/V, it
+/// answers fluently, and its recurrent layers simply do not remember the
+/// prompt. Nothing in the output distinguishes that from a conversation that
+/// installed one, so the only assertion that can is on the path.
+static BRANCH_CKPT_COMPUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BRANCH_CKPT_INSTALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a freshly created slot's recurrent state starts as.
+///
+/// Not a mode: a statement about what the slot IS. A conversation's slot
+/// continues that conversation, so it starts from the timeline's persisted
+/// state. A **scratch** slot — the summariser's compression and reproject
+/// passes — merely borrows the timeline as an address so sealed-turn injection
+/// can resolve it; its decode must be conditioned on the children it is
+/// compressing and nothing else. Seeding it from the timeline makes every
+/// summary depend on how far the conversation had got when the probe ran, and
+/// costs a full ~63 MiB state install per probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateSeed {
+    /// Restore the timeline's snapshot and carried belief — a real conversation.
+    FromTimeline,
+    /// Start at the sequence-start state — a scratch slot bound to a timeline
+    /// only for address resolution.
+    Neutral,
+}
+
+/// `(computed, installed)` prompt branch checkpoints since process start.
+pub fn branch_checkpoint_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BRANCH_CKPT_COMPUTED.load(Relaxed),
+        BRANCH_CKPT_INSTALLED.load(Relaxed),
+    )
+}
+
+/// Record a branch checkpoint computed by the prefill pass.
+pub(crate) fn note_branch_checkpoint_computed() {
+    BRANCH_CKPT_COMPUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record a branch checkpoint installed onto a conversation's slot.
+pub(crate) fn note_branch_checkpoint_installed() {
+    BRANCH_CKPT_INSTALLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Cost of carrying recurrent state, accumulated since process start.
+///
+/// These exist to answer three questions the design left open rather than
+/// closed (`docs/deltanet_state_persistence.md` P8, P10.5, P10.6), all of which
+/// are of the form "is this cheap enough to leave alone?" and none of which
+/// should be answered by reasoning about it:
+///
+/// - **P8 / T8.1** — does the turn seal's device→host state export show up in
+///   seal latency? If it does, the export buffer wants pinning and the copy
+///   wants overlapping; if it does not, that is async stream plumbing on the
+///   seal path bought for nothing.
+/// - **P10.5** — the F32 snapshot write rate, which decides whether turn
+///   snapshots want bf16 storage.
+/// - **P10.6** — per-turn fork traffic. The ping-pong store removed the
+///   per-wave copy this used to be amortised against, and views carry state
+///   now, so every dialogue turn pays one device-to-device copy of the whole
+///   state.
+static SNAPSHOT_EXPORT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SNAPSHOT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SNAPSHOT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FORK_RECURRENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What carrying recurrent state has cost so far.
+///
+/// `(seal exports, total export µs, total snapshot bytes, state forks)`. Per-fork
+/// bytes are `snapshot_bytes / exports` — one state is one state, however it is
+/// moved — so the fork traffic is `forks × that`.
+pub fn recurrent_state_cost() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SNAPSHOT_COUNT.load(Relaxed),
+        SNAPSHOT_EXPORT_US.load(Relaxed),
+        SNAPSHOT_BYTES.load(Relaxed),
+        FORK_RECURRENT_COUNT.load(Relaxed),
+    )
+}
+
 /// Scheduler-thread time spent blocked on a deliberate GPU/persistence **wait** —
 /// `device.synchronize()` (draining the GPU queue) and `flush_blocking` (waiting
 /// on the persistence thread's hot→warm drain). Accumulated across a wave and
@@ -622,15 +839,20 @@ fn record_phase(start: Instant, phase: &'static str) {
 /// Assemble per-token raw wide `sign(Q)` from the GPU-packed sub-band bits
 /// ([`ProvSignPacked`]) and fold each to the compact provenance signature. This
 /// is the on-CPU tail of the GPU fast path in [`Scheduler::gather_wide_sigs`] and
-/// is **bit-identical** to `fold_provenance(WideQSig::from_band(..))`: a head's
-/// `head_dim` sign bits are its `n_palette` sub-band u32s laid down at global
-/// dims `[p*sub_head_dim, (p+1)*sub_head_dim)` — exactly how `from_band` packs
-/// them (bit `i` → word `i/64`, bit `i%64`). Only real tokens (per the chunk
-/// `layout`) are emitted, skipping partial-chunk padding.
+/// is **bit-identical** to `fold_provenance_checked(WideQSig::from_band(..), fold)`:
+/// a head's `head_dim` sign bits are its `n_palette` sub-band u32s laid down at
+/// global dims `[p*sub_head_dim, (p+1)*sub_head_dim)` — exactly how `from_band`
+/// packs them (bit `i` → word `i/64`, bit `i%64`). Only real tokens (per the
+/// chunk `layout`) are emitted, skipping partial-chunk padding.
+///
+/// `fold` is the model's own derived fold, not the locked constants: it is what
+/// the record will be stamped with, so folding under anything else stores bits
+/// that disagree with their own description.
 fn assemble_folded_prov_sigs(
     packed: &ProvSignPacked,
     layout: &[(u16, u16, usize)],
     head_dim: usize,
+    fold: FoldParams,
 ) -> Vec<WideQSig> {
     let chunk = candle_nn::CHUNK_SIZE;
     let wph = head_dim.div_ceil(64);
@@ -641,6 +863,15 @@ fn assemble_folded_prov_sigs(
     let n_blocks = packed.block_indices.len();
     let n_raw_heads = n_layers * n_kv_head;
     if wph == 0 || n_raw_heads == 0 || sub == 0 {
+        return Vec::new();
+    }
+    // Checked once, not per token: every token of this capture has the same
+    // `n_raw_heads` and `wph`, so the verdict cannot differ between them. A fold
+    // that cannot fill all three groups would leave two thirds of every
+    // signature zero, and an all-zero group agrees with everything it is scored
+    // against — store nothing rather than that.
+    if !fold_fits(n_raw_heads, wph, fold) {
+        warn_unfoldable_capture(n_raw_heads, fold);
         return Vec::new();
     }
 
@@ -683,13 +914,54 @@ fn assemble_folded_prov_sigs(
                     }
                 }
             }
-            out.push(fold_provenance(&WideQSig {
-                n_heads: n_raw_heads as u16,
-                words,
-            }));
+            out.push(fold_provenance_fitted(
+                &WideQSig {
+                    n_heads: n_raw_heads as u16,
+                    words,
+                },
+                fold,
+            ));
         }
     }
     out
+}
+
+/// Whether a snapshot taken at `turn_index` describes a turn this timeline
+/// actually recovered.
+///
+/// Recovered turns are `0..recovered_turns`, so a snapshot at `recovered_turns`
+/// or beyond names a turn that is not there. That is reachable **by design**:
+/// the seal enqueues the snapshot *before* the turn's `Tokens` record, so the
+/// only tear it can produce is a snapshot ahead of its turn rather than a turn
+/// ahead of its snapshot — silent staleness being the worse of the two. The
+/// trade only holds if the too-new snapshot is then rejected, because installing
+/// one puts the recurrent layers a turn ahead of the K/V, and a model whose
+/// state remembers a token its attention never saw reads perfectly.
+///
+/// Also what makes the turn-scoped tombstone decision work: shedding the turn a
+/// snapshot was taken at leaves its index unreachable, and this rejects it
+/// without the tombstone path needing to know snapshots exist.
+fn snapshot_within_recovered_history(turn_index: u32, recovered_turns: u32) -> bool {
+    turn_index < recovered_turns
+}
+
+/// One warning per process for a capture geometry the fold cannot express.
+///
+/// Per-token would be one line per token of every turn; per-turn would still be
+/// a flood. The condition is a property of the model's geometry, so it is the
+/// same answer every time and saying it once is saying it.
+fn warn_unfoldable_capture(n_raw_heads: usize, fold: FoldParams) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            n_raw_heads,
+            heads_per_layer = fold.heads_per_layer,
+            group_sizes = ?fold.group_sizes,
+            "provenance capture refused: the model's fold cannot fill all three \
+             layer-groups from this stack, so no signature is stored. Retrieval \
+             falls back to recency for these turns."
+        );
+    });
 }
 
 /// Chunks of the turn's head (the user query) that stay in every reprojection
@@ -2115,15 +2387,31 @@ pub(crate) struct Scheduler {
     /// kernels see the writes for free (same-stream serialisation).
     elevate_pinned_scratch: Option<PinnedBuf>,
 
-    /// Pre-tokenised inter-turn boundary markers (`user_start` /
-    /// `assistant_end`) for the engine's dialect.  Built once at
-    /// engine construction and passed into the scheduler; the
-    /// projection assembler reads them via `ApplyContext` to wrap
-    /// every `Sealed::Turn` segment in a live-prefilled boundary
-    /// run, and the `SubmitTurn` handler reads `user_start` to
-    /// append the trailing `Generated(UserStart)` ahead of the
-    /// current turn's prefill.
+    /// Pre-tokenised role markers for the engine's dialect. Built once at
+    /// engine construction and passed into the scheduler.
+    ///
+    /// Turns own their own boundaries — `Sequence::submit_prefill_unit` bakes
+    /// the opener and closer into the turn's grid — so the assembler no longer
+    /// emits anything around a `Sealed::Turn` and reads only `causal_only_glue`
+    /// from here. What still reads the token forms is the scheduler itself: the
+    /// compression turn, which builds its grid directly and therefore has to
+    /// bake its own head and tail, and the summary probe, which frames a
+    /// synthetic user→assistant exchange so the model responds rather than
+    /// continuing the prompt.
     boundary_markers: projection_assembler::BoundaryMarkers,
+
+    /// The provenance fold this process's model produces, derived once from its
+    /// geometry at construction.
+    ///
+    /// **One source for both the bits and the stamp.** A signature is
+    /// comparable only to another folded the same way, so the parameters that
+    /// fold a capture and the parameters stamped onto the stored record have to
+    /// be the same value — not two derivations that happen to agree. They did
+    /// not agree: the stamp was derived while the fold ran on the locked
+    /// 48-layer/4-head/128-dim constants, which is an identity on Qwen3-30B and
+    /// silently wrong on anything else. Holding the value here is what makes
+    /// them one thing.
+    prov_fold: crate::provenance::FoldParams,
 
     /// Periodic forward-pass batch-size telemetry (diagnostic; one line / 2 s).
     wave_stats: WaveStats,
@@ -2308,6 +2596,23 @@ impl Scheduler {
     ) -> Self {
         let device = model.device().clone();
 
+        // Derive this process's provenance fold from the model's own geometry,
+        // once. Every stored signature is comparable only to one folded the same
+        // way, so this single value both folds the captures and stamps the
+        // records, and the substrate read paths check a record's stamp against
+        // it and refuse a mismatch rather than scoring incomparable bits into a
+        // confident number.
+        let prov_fold = {
+            let props = model.model_core_properties();
+            let f = crate::provenance::FoldParams::derive(
+                props.n_kv_heads,
+                props.provenance_capture_layers,
+                props.head_dim,
+            );
+            crate::provenance::set_active_fold(f);
+            f
+        };
+
         // Force this thread to bind to the device's CUDA context
         // BEFORE we allocate pinned host memory below. The model and
         // session were created on another thread; the CUDA context is
@@ -2377,6 +2682,7 @@ impl Scheduler {
                 "scheduler::elevate_pinned_scratch",
             ),
             boundary_markers,
+            prov_fold,
             wave_stats: WaveStats::new(),
             compression_jobs: HashMap::new(),
             pending_compression_seals: HashMap::new(),
@@ -2476,9 +2782,30 @@ impl Scheduler {
             SchedulerRequest::NewSequence {
                 conversation,
                 target,
+                parent,
                 response_tx,
             } => {
-                let result = self.create_sequence(conversation, target);
+                let result = self.create_sequence(conversation, target).and_then(|slot| {
+                    // A live parent's state beats the snapshot: it is current
+                    // rather than as-of-the-last-seal, and the copy is
+                    // device-to-device with no host round trip. `create_sequence`
+                    // already tried the snapshot read, so this overwrites a
+                    // strictly older state when both are available.
+                    //
+                    // "Older" is only true because `parent` is `Some` solely
+                    // when the fork targets the parent's OWN timeline
+                    // (`fork_onto` derives it; `fork_inherits_history_tests`
+                    // asserts it). For any other timeline the snapshot is the
+                    // right state and the parent's is a different
+                    // conversation's — overwriting it here is exactly how every
+                    // daemon resume once ran on the base conversation's memory.
+                    if let Some(parent_id) = parent {
+                        self.model
+                            .fork_recurrent(parent_id.0, slot.0)
+                            .map_err(ConversationError::Model)?;
+                    }
+                    Ok(slot)
+                });
                 let _ = response_tx.send(result);
                 true
             }
@@ -2719,7 +3046,6 @@ impl Scheduler {
                         turn_belief = PriorBelief::from_selection(&opening.selection);
                         opening.materialized = projection_assembler::materialize_conversation(
                             &projection.segments,
-                            &self.boundary_markers,
                             &projection.selection_origins,
                             &view,
                             inputs.projection.schema(),
@@ -2790,22 +3116,20 @@ impl Scheduler {
                         }
                     }
 
-                    // Append a trailing `Generated(UserStart)` so the
-                    // current turn's user-side prefill begins behind a
-                    // live `<|im_start|>user\n` opener.  This is the
-                    // boundary between the most recent past turn (or
-                    // the system block) and the new turn — adjacent to
-                    // the previous turn's assembler-emitted
-                    // `assistant_end` boundary, so the assembler
-                    // batches them into a single live-prefill run.
-                    let pos = segments.len();
-                    segments.push(ProjectionSegment::Generated {
-                        tokens: self.boundary_markers.user_start.clone(),
-                        identity: GeneratedIdentity {
-                            name: "user_start_current".into(),
-                            position: pos,
-                        },
-                    });
+                    // **No trailing `Generated(UserStart)`.**
+                    //
+                    // The live turn's opener is now the head of its own prefill
+                    // (`Sequence::submit_prefill_unit`), so it arrives as
+                    // ordinary tail prefill rather than as a glue island the
+                    // engine has to gap-fill. The distinction is the whole
+                    // difference for this lineage: appending at the writer tail
+                    // is prefill, which any model can do; filling a hole in the
+                    // middle of a sequence is gap-fill, which a recurrence
+                    // cannot do even in principle.
+                    //
+                    // It is invisible in the token stream — the same ids in the
+                    // same order — and visible only in whether a gap chunk was
+                    // reserved, which is what `T5a.1` asserts on.
                     // Build the composition for a staged prefill's per-segment
                     // projection events now, while the view guard is live. The
                     // calibration projection is pinned (`SelectionRule::Named`), so
@@ -2823,28 +3147,15 @@ impl Scheduler {
                             0.0,
                         ));
                     }
-                    // When the composer dial suppresses thinking, follow the user
-                    // opener with a live `/no_think` run.  Qwen3 only honours the
-                    // soft-switch from the user turn (not the system prompt), and
-                    // emitting it as GLUE here — re-decided from the current dial
-                    // every projection, never sealed into a turn — keeps it out of
-                    // the substrate and prevents a past suppressed turn from leaking
-                    // a stale switch onto a later thinking-on turn.  The assembler
-                    // batches it into the same live-prefill run as `user_start`.
-                    let suppress = matches!(
-                        inputs.selection.optional(NO_THINK_SELECTOR),
-                        Some(OptionalState::Present)
-                    );
-                    if suppress && !self.boundary_markers.no_think.is_empty() {
-                        let pos = segments.len();
-                        segments.push(ProjectionSegment::Generated {
-                            tokens: self.boundary_markers.no_think.clone(),
-                            identity: GeneratedIdentity {
-                                name: "no_think_current".into(),
-                                position: pos,
-                            },
-                        });
-                    }
+                    // **No live `/no_think` run either.**
+                    //
+                    // The soft-switch is baked into the head of the turn that
+                    // carries it, decided once at submit from the dial that was
+                    // live then. That is *stronger* than re-deciding it every
+                    // projection, not weaker: the leak this used to guard
+                    // against — a past suppressed turn putting a stale switch on
+                    // a later thinking-on turn — cannot happen when each turn's
+                    // grid holds its own.
                     (sections, segments)
                 } else {
                     (Vec::new(), Vec::new())
@@ -3027,6 +3338,16 @@ impl Scheduler {
                 tracing::debug!(target: "sched", "free_sequence {}", sequence_id);
                 if let Err(e) = self.session.free_sequence(sequence_id.0) {
                     tracing::warn!("failed to free sequence {}: {}", sequence_id, e);
+                }
+                // The session owns the KV; per-sequence state the MODEL keeps
+                // outside it (a recurrent store) is freed here or not at all.
+                // Slot ids recycle, so this is correctness, not housekeeping.
+                if let Err(e) = self.model.release_sequence(sequence_id.0) {
+                    tracing::warn!(
+                        "failed to release model state for sequence {}: {}",
+                        sequence_id,
+                        e
+                    );
                 }
                 // Clean up persistent sampling state.
                 self.sampling_states.remove(&sequence_id);
@@ -3315,6 +3636,72 @@ impl Scheduler {
                 let result =
                     self.handle_extract_raw_kvq(sequence_id.0, &layer_indices, block_range);
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::BranchCheckpointPass {
+                tokens,
+                response_tx,
+            } => {
+                let result = self.handle_branch_checkpoint_pass(&tokens);
+                let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::MemoryCatchUp {
+                sequence_id,
+                tokens,
+                adopted_from,
+                response_tx,
+            } => {
+                let result = self.handle_memory_catch_up(sequence_id, &tokens, adopted_from);
+                let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::InstallRecurrentState {
+                sequence_id,
+                schedule_hash,
+                layers,
+                response_tx,
+            } => {
+                let result = self
+                    .model
+                    .restore_recurrent(sequence_id.0, schedule_hash, &layers)
+                    .map_err(ConversationError::Model);
+                let _ = response_tx.send(result);
+                true
+            }
+
+            #[cfg(any(test, feature = "test-helpers"))]
+            SchedulerRequest::ReadRecurrentMemory {
+                sequence_id,
+                response_tx,
+            } => {
+                let result = self
+                    .model
+                    .export_recurrent(sequence_id.0)
+                    .map(|opt| opt.map(|(_hash, layers)| layers))
+                    .map_err(ConversationError::Model);
+                let _ = response_tx.send(result);
+                true
+            }
+
+            #[cfg(any(test, feature = "test-helpers"))]
+            SchedulerRequest::ReadTurnKvDigest {
+                sequence_id,
+                timeline,
+                index,
+                response_tx,
+            } => {
+                let result = self.handle_read_turn_kv_digest(sequence_id, timeline, index);
+                let _ = response_tx.send(result);
+                true
+            }
+
+            #[cfg(any(test, feature = "test-helpers"))]
+            SchedulerRequest::CountRecurrentMemories { response_tx } => {
+                let _ = response_tx.send(self.model.recurrent_memory_count());
                 true
             }
 
@@ -3844,52 +4231,50 @@ impl Scheduler {
                 Role::Assistant,
             )));
         }
-        // The instruction user-turn opener: `user_start` + `/no_think`. `/no_think`
-        // rides it as live glue — the same mechanism the dialogue's
-        // `no_think_current` uses — so the compressor never reasons (the summary
-        // budget is tiny). Unconditional: a summary pass always suppresses.
-        segments.push(ProjectionSegment::Generated {
-            tokens: Arc::new(self.boundary_markers.user_start.as_ref().clone()),
-            identity: GeneratedIdentity {
-                name: "compress_open".to_string(),
-                position: 0,
-            },
-        });
-        if !self.boundary_markers.no_think.is_empty() {
-            segments.push(ProjectionSegment::Generated {
-                tokens: self.boundary_markers.no_think.clone(),
-                identity: GeneratedIdentity {
-                    name: "compress_no_think".to_string(),
-                    position: 0,
-                },
-            });
-        }
-        // Close glue: the summarise instruction followed by `user_end`. No
-        // prior-summary anchor — the pass sees only its children and the prompt, so
-        // there is nothing for it to reproduce verbatim (a leak we hit when
-        // anchoring on prior summaries).
-        let close: Vec<u32> = {
-            let mut t = self
-                .tokenizer
-                .encode(format!("\n\n{}", prompt.user_prompt), false)
-                .map_err(|e| format!("SubmitSummaryProbe: encode instruction: {e}"))?
-                .get_ids()
-                .to_vec();
+        // The instruction turn: `user_start` + `/no_think` + the summarise
+        // instruction + `user_end`, as ONE tail run. `/no_think` keeps the
+        // compressor from reasoning (the summary budget is tiny); no
+        // prior-summary anchor — the pass sees only its children and the
+        // prompt, so there is nothing for it to reproduce verbatim (a leak we
+        // hit when anchoring on prior summaries).
+        //
+        // A `NewUserMessage`, NOT `Generated` runs: the framing sits at the
+        // TAIL, after every sealed piece, and the deferred-user path prefills
+        // it there as a plain append — which a recurrence can compute, its
+        // state having accumulated through the whole prefix. As `Generated`
+        // runs the assembler reserved them as a gap-fill island, which a
+        // recurrent-lineage model refuses (`reserve_glue_island`) — so the
+        // summariser errored and re-enqueued every probe forever, and no
+        // conversation on such a model was ever summarised. A1's suite caught
+        // it the first time the WARNs were visible.
+        let instruction: Vec<u32> = {
+            let mut t = self.boundary_markers.user_start.as_ref().clone();
+            t.extend_from_slice(&self.boundary_markers.no_think);
+            t.extend_from_slice(
+                self.tokenizer
+                    .encode(format!("\n\n{}", prompt.user_prompt), false)
+                    .map_err(|e| format!("SubmitSummaryProbe: encode instruction: {e}"))?
+                    .get_ids(),
+            );
             t.extend_from_slice(&self.boundary_markers.user_end);
             t
         };
-        segments.push(ProjectionSegment::Generated {
-            tokens: Arc::new(close),
-            identity: GeneratedIdentity {
-                name: "compress_close".to_string(),
-                position: 1,
-            },
+        segments.push(ProjectionSegment::NewUserMessage {
+            tokens: Arc::new(instruction),
         });
 
         // Scratch slot bound to the timeline (so sealed-turn injection can resolve
         // it from `slot_target`). Freed once the pass completes.
+        //
+        // `Neutral`: the timeline is an ADDRESS here, not a history to continue.
+        // A compression pass must be conditioned on the children it is
+        // compressing — which this projection injects — and nothing else.
+        // Seeding it from the timeline would let the compressor carry forward
+        // content its children never contained, make each summary depend on how
+        // far the conversation had got when the probe ran, and pay a ~63 MiB
+        // state install per probe.
         let slot = self
-            .create_sequence(conv.clone(), Some(target))
+            .create_sequence_seeded(conv.clone(), Some(target), StateSeed::Neutral)
             .map_err(|e| format!("SubmitSummaryProbe: create slot: {e}"))?;
         // Lift the children (and the compressor system section) into hot VRAM
         // before `setup_compression_decode` injects them. The children are
@@ -4187,22 +4572,36 @@ impl Scheduler {
         let user_tokens = self.strip_think_from_tokens(&user_tokens);
         let assistant_tokens = self.strip_think_from_tokens(&assistant_tokens);
 
-        // Frame the compressed exchange as a clean, marker-framed turn — the
-        // question body, then `[user_end][assistant_start]`, then the answer body.
-        // No leading `no_think` / `user_start` head: those are live `Generated`
-        // segments the assembler re-emits around the sealed turn on every future
-        // projection (matching the persisted form of a normal turn).
+        // Frame the compressed exchange as a clean, marker-framed turn:
+        // `[user_start][question][user_end][assistant_start][answer][im_end]`.
+        //
+        // **The head and tail are baked here, like any other turn.** They used
+        // to be live `Generated` segments the assembler re-emitted around every
+        // sealed turn; now a sealed turn owns its own boundaries, so a
+        // compression turn that did not bake them would be projected with no
+        // opener at all — a summary that runs straight on from the previous
+        // turn's closer, with no role marker to say whose words these are.
+        let user_start = self.boundary_markers.user_start.as_ref().clone();
         let user_end = self.boundary_markers.user_end.as_ref().clone();
         let assistant_start = self.boundary_markers.assistant_start.as_ref().clone();
+        let assistant_end = self.boundary_markers.assistant_end.as_ref().clone();
         let mut token_ids: Vec<u32> = Vec::with_capacity(
-            user_tokens.len() + user_end.len() + assistant_start.len() + assistant_tokens.len(),
+            user_start.len()
+                + user_tokens.len()
+                + user_end.len()
+                + assistant_start.len()
+                + assistant_tokens.len()
+                + assistant_end.len(),
         );
+        token_ids.extend_from_slice(&user_start);
+        let user_content_start = token_ids.len();
         token_ids.extend_from_slice(&user_tokens);
         let user_end_at = token_ids.len();
         token_ids.extend_from_slice(&user_end);
         token_ids.extend_from_slice(&assistant_start);
         let asst_start_at = token_ids.len();
         token_ids.extend_from_slice(&assistant_tokens);
+        token_ids.extend_from_slice(&assistant_end);
         let token_count = token_ids.len();
 
         // Decode both halves' display text. On failure reply to the summariser
@@ -4229,7 +4628,14 @@ impl Scheduler {
         // onto. Its question body lands in user-message position (user-role K/V),
         // its answer body after `assistant_start` (assistant-role K/V) — the
         // role-coherent K/V that replaces the passes' decode-time K/V.
-        let slot = match self.create_sequence(conversation.clone(), Some(target)) {
+        // `Neutral` for the same reason as the compression pass: a scratch slot
+        // that re-prefills a marker-framed turn, addressed by the timeline but
+        // not continuing it.
+        let slot = match self.create_sequence_seeded(
+            conversation.clone(),
+            Some(target),
+            StateSeed::Neutral,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let e = format!("SubmitSummaryProbe: reproject slot: {e}");
@@ -4250,17 +4656,19 @@ impl Scheduler {
         // `complete_compression_turn` snapshots + records it when the prefill
         // finishes.
         // Build the compressed turn's segment layout. The exchange is framed
-        // `[question][user_end][assistant_start][answer]` with no leading head,
-        // so the user body spans `[0, user_end_at)` and the answer body starts at
-        // `asst_start_at`. Summaries strip their think block, so there is no
-        // thinking split here.
-        let layout = TurnLayout::from_flat_grid(
-            0,
+        // `[user_start][question][user_end][assistant_start][answer][im_end]`,
+        // so the user body spans `[user_content_start, user_end_at)` and the
+        // answer body starts at `asst_start_at` and stops short of the reserved
+        // tail. Summaries strip their think block, so there is no thinking split
+        // here.
+        let layout = TurnLayout::from_flat_grid_with_tail(
+            user_content_start as u32,
             user_end_at as u32,
             asst_start_at as u32,
             token_count as u32,
             user_end.len() as u32,
             assistant_start.len() as u32,
+            assistant_end.len() as u32,
             user_text,
             Some(assistant_text),
             false,
@@ -4343,13 +4751,19 @@ impl Scheduler {
         let assistant_text = crate::think_strip::strip_empty_think_blocks(&assistant_text);
         let im_end_len = self.boundary_markers.user_end.len() as u32;
         let assistant_start_len = self.boundary_markers.assistant_start.len() as u32;
-        let layout = TurnLayout::from_flat_grid(
+        // The turn's own closing `<|im_end|>` rides the post-decode tail, so the
+        // grid ends with it and the layout bakes it as a real span the turn
+        // owns. Paired with the non-zero `user_content_start` the head bake
+        // produces: both ends or neither (§4.7a).
+        let trailing_marker_len = self.boundary_markers.assistant_end.len() as u32;
+        let layout = TurnLayout::from_flat_grid_with_tail(
             user_content_start,
             user_content_end,
             assistant_content_start,
             total,
             im_end_len,
             assistant_start_len,
+            trailing_marker_len,
             user_text,
             (!assistant_text.is_empty()).then(|| assistant_text.clone()),
             no_think,
@@ -4759,9 +5173,14 @@ impl Scheduler {
         let stream_id = turn_stream_id(timeline.raw(), idx.0);
         conversation.enqueue_tokens(stream_id, persist_token_ids.clone());
         // Persist the node's wide-Q signature under the same stream — the
-        // gallery entry a provenance scan matches against the summary.
+        // gallery entry a provenance scan matches against the summary. Stamped
+        // with this process's fold like every other capture: an unstamped record
+        // reads back with group sizes `0`, which the read path treats as "not
+        // stated" and scores without checking, so a summary node written under
+        // one geometry would be compared against turns written under another.
         if !wide_sigs.is_empty() {
-            conversation.enqueue_wide_q_sigs(stream_id, encode_wide_sigs(&wide_sigs));
+            conversation
+                .enqueue_wide_q_sigs(stream_id, encode_wide_sigs_with(&wide_sigs, self.prov_fold));
         }
         // Synthesize + persist the node's projection event: the mandatory
         // provenance linkage naming the node itself and the turns it covers
@@ -4968,6 +5387,7 @@ impl Scheduler {
     /// delta's RAII `ChunkGid`s keep the arena chunks alive after this returns.
     fn free_summary_slot(&mut self, slot: SequenceId) {
         let _ = self.session.free_sequence(slot.0);
+        let _ = self.model.release_sequence(slot.0);
         self.slot_conversations.remove(&slot);
         let freed_target = self.slot_targets.remove(&slot);
         self.sampling_states.remove(&slot);
@@ -5013,10 +5433,25 @@ impl Scheduler {
     /// handler can resolve it without re-derivation on every submit.
     /// `None` is for raw paths (RULER eval, summarisation) that don't
     /// project from the substrate.
+    ///
+    /// The slot starts from the timeline's persisted recurrent state and
+    /// carried belief ([`StateSeed::FromTimeline`]) — see [`StateSeed`] for
+    /// the scratch-slot case, which binds a target without inheriting it.
     fn create_sequence(
         &mut self,
         conversation: Conversation,
         target: Option<ProjectionTarget>,
+    ) -> Result<SequenceId, ConversationError> {
+        self.create_sequence_seeded(conversation, target, StateSeed::FromTimeline)
+    }
+
+    /// [`Self::create_sequence`] with an explicit choice of what the slot's
+    /// recurrent state starts as.
+    fn create_sequence_seeded(
+        &mut self,
+        conversation: Conversation,
+        target: Option<ProjectionTarget>,
+        seed: StateSeed,
     ) -> Result<SequenceId, ConversationError> {
         let raw_id = self
             .session
@@ -5035,6 +5470,24 @@ impl Scheduler {
         // Register the conversation handle and (optional) projection
         // target for this slot — see [`Self::slot_conversations`] and
         // [`Self::slot_targets`].
+        // Restore the timeline's recurrent state, if it has one.
+        //
+        // **Before the first wave, and after the store could exist.**
+        // `create_sequence` is the funnel every entry point routes through
+        // (`NewSequence`, `NewEphemeralSequence`, `ResumeSequence`) and runs
+        // before any `submit_turn`, so both halves of that ordering hold here
+        // and nowhere else.
+        //
+        // Every rejection falls back to a zero state, which is a conversation
+        // that resumes fluent and having forgotten everything the recurrent
+        // layers held. That is the failure this whole path exists to remove, so
+        // it must not be the *quiet* error path: each reason logs at WARN, and
+        // the reasons are distinguishable.
+        if let (Some(target), StateSeed::FromTimeline) = (target, seed) {
+            self.restore_recurrent_state(slot_id, &conversation, target.timeline);
+            self.restore_carried_belief(slot_id, &conversation, target.timeline);
+        }
+
         self.slot_conversations.insert(slot_id, conversation);
         if let Some(target) = target {
             self.slot_targets.insert(slot_id, target);
@@ -5050,6 +5503,226 @@ impl Scheduler {
             slot_id,
         );
         Ok(slot_id)
+    }
+
+    /// Restore the conversation's carried selection belief onto a freshly
+    /// created slot — the third piece of a timeline's durable state, beside its
+    /// K/V and its recurrent memory.
+    ///
+    /// [`Self::carried_beliefs`] is what a submit-time projection seeds from,
+    /// and its comment says "empty only for a genuinely fresh conversation". A
+    /// RESUMED conversation is not a fresh conversation — but its slot is, so
+    /// without this it selected its sections and tools from an empty prior
+    /// while the conversation it continues had a prior evolved over every
+    /// turn. Near a selection gate (a tools-catalog entry, a grounding
+    /// variant) that flips a section in or out of the context, and the first
+    /// resumed decode diverges from its uninterrupted twin — deterministic,
+    /// marginal, and invisible to every recall probe. A1 of the behavioural
+    /// catalogue is the only oracle that sees it.
+    ///
+    /// Reconstruction is the same fold the live path performs: the seal
+    /// harvests `merge_from(from_selection(final composition))` per turn, so
+    /// folding each recovered turn's LAST persisted projection event in turn
+    /// order rebuilds the harvest exactly. (The per-turn decay is applied to a
+    /// clone at submit, never written back, so the stored map is the undecayed
+    /// merge — the same thing this rebuilds.)
+    fn restore_carried_belief(
+        &mut self,
+        slot_id: SequenceId,
+        conversation: &Conversation,
+        timeline: TimelineId,
+    ) {
+        let read = conversation.read();
+        let mut belief = PriorBelief::default();
+        let mut turns_folded = 0usize;
+        for idx in read.turn_indices(timeline) {
+            let Some(blob) = read.projection_events_blob(timeline, idx) else {
+                continue;
+            };
+            // The turn's last event carries the selection in force at its
+            // seal — the composition the live harvest folded into the carry.
+            let Some(last) = decode_events(blob).pop() else {
+                continue;
+            };
+            belief.merge_from(&PriorBelief::from_selection(&last.selection));
+            turns_folded += 1;
+        }
+        if turns_folded > 0 {
+            tracing::debug!(
+                "restored carried belief for slot {slot_id} from {turns_folded} recovered \
+                 turn(s) on timeline {timeline}"
+            );
+            self.carried_beliefs.insert(slot_id, belief);
+        }
+    }
+
+    /// Digest a sealed turn's hot K/V content — see
+    /// [`SchedulerRequest::ReadTurnKvDigest`].
+    ///
+    /// Gathers with the SAME machinery the cold write uses
+    /// ([`crate::persistence::thread::build_grid`] → per-chunk
+    /// [`crate::persistence::record::ChunkPayload`]), so what is hashed is
+    /// exactly what a tier migration would persist: offsets, band formats,
+    /// palette maps, outer scales, and the raw arena bytes.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn handle_read_turn_kv_digest(
+        &mut self,
+        sequence_id: SequenceId,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Result<Option<ContentHash>, ConversationError> {
+        let Some(conversation) = self.slot_conversations.get(&sequence_id) else {
+            return Err(ConversationError::Channel(format!(
+                "ReadTurnKvDigest: unknown sequence {sequence_id}"
+            )));
+        };
+        let Some(sealed) = conversation.read().turn_sealed_of(timeline, index) else {
+            return Ok(None);
+        };
+        let backings = self.session.backings();
+        let grid = crate::persistence::thread::build_grid(&sealed, backings, self.model.device())
+            .map_err(ConversationError::Model)?;
+        let mut h = ContentHasher::new();
+        for layer in 0..grid.n_layers() {
+            h.update(&(layer as u32).to_le_bytes());
+            for chunk in grid.layer(layer) {
+                h.update(&chunk.token_count.to_le_bytes());
+                h.update(&chunk.payload.offset.to_le_bytes());
+                h.update(&chunk.payload.k_formats);
+                h.update(&chunk.payload.v_formats);
+                h.update(&chunk.payload.k_pal);
+                h.update(&chunk.payload.v_pal);
+                for s in &chunk.payload.k_scale {
+                    h.update(&s.to_le_bytes());
+                }
+                for s in &chunk.payload.v_scale {
+                    h.update(&s.to_le_bytes());
+                }
+                h.update(&chunk.payload.kv_bytes);
+            }
+        }
+        Ok(Some(h.finish()))
+    }
+
+    /// Install a timeline's persisted recurrent state onto a freshly created
+    /// slot, or say — audibly — why it could not.
+    ///
+    /// Never returns an error: a conversation that cannot restore its state is
+    /// still a conversation, and refusing to open it would be worse than
+    /// recomputing. But every path out of here that leaves the slot at zeros
+    /// logs a **distinguishable** reason, because "resumed with no memory" and
+    /// "resumed correctly" are indistinguishable from the outside — both read
+    /// fluently, and only one of them is right.
+    fn restore_recurrent_state(
+        &mut self,
+        slot_id: SequenceId,
+        conversation: &Conversation,
+        timeline: TimelineId,
+    ) {
+        let payload = match conversation.read_recurrent_snapshot(timeline) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                // Not an error and not always worth a warning: a model with no
+                // recurrent state never writes one, and a conversation whose
+                // first turn has not sealed has nothing to write yet.
+                tracing::debug!(
+                    "no recurrent snapshot for timeline {timeline}; starting from the \
+                     sequence-start state"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "RECURRENT RESUME FAILED (unreadable) for timeline {timeline}: {e} — \
+                     the conversation will continue with NO recurrent memory of its \
+                     history. It will read fluently and have forgotten."
+                );
+                return;
+            }
+        };
+
+        // **The torn-shutdown check, and the reason the seal writes in the order
+        // it does.**
+        //
+        // The snapshot is enqueued BEFORE the turn's `Tokens` record precisely
+        // so the only reachable tear is a snapshot for a turn whose records
+        // never landed — never the reverse, which would be silent staleness.
+        // That trade is only sound if the too-new snapshot is then *rejected*:
+        // installed, it puts the recurrent layers one turn ahead of the K/V,
+        // which is `state without KV` — the mirror of the defect this whole path
+        // exists to remove, and just as fluent.
+        //
+        // Recovered turns are `0..turn_count`, so a snapshot taken at index
+        // `turn_count` or beyond describes a turn this timeline does not have.
+        // It is also what makes the turn-scoped tombstone decision work (§4.2):
+        // shedding the turn the snapshot was taken at leaves the index
+        // unreachable, and this rejects it without the tombstone path needing to
+        // know about snapshots at all.
+        let recovered_turns = conversation.read().turn_count(timeline);
+        if !snapshot_within_recovered_history(payload.turn_index, recovered_turns) {
+            tracing::warn!(
+                "RECURRENT RESUME REJECTED (snapshot is newer than the recovered \
+                 history) for timeline {timeline}: the snapshot was taken at turn {} \
+                 but only {recovered_turns} turn(s) recovered — a torn shutdown \
+                 between the snapshot and the turn's records. Installing it would \
+                 put the recurrent layers a turn ahead of the K/V. The conversation \
+                 continues with NO recurrent memory of its history.",
+                payload.turn_index,
+            );
+            return;
+        }
+
+        let layers: Vec<ExportedLayerState> = payload
+            .layers
+            .iter()
+            .map(|l| ExportedLayerState {
+                layer_index: l.layer_index,
+                n_v_heads: l.n_v_heads,
+                d_v: l.d_v,
+                d_k: l.d_k,
+                state: l.state.clone(),
+                conv_channels: l.conv_channels,
+                conv_tail_cols: l.conv_tail_cols,
+                conv_tail: l.conv_tail.clone(),
+            })
+            .collect();
+
+        match self
+            .model
+            .restore_recurrent(slot_id.0, payload.schedule_hash, &layers)
+        {
+            Ok(true) => {
+                tracing::debug!(
+                    "restored recurrent state for timeline {timeline} at turn {} \
+                     ({} layers)",
+                    payload.turn_index,
+                    payload.layers.len(),
+                );
+            }
+            Ok(false) => {
+                // The model carries no recurrent state. A snapshot exists, so
+                // the timeline was sealed by a different model — worth saying,
+                // because it means this conversation's history was built under
+                // an architecture this process is not running.
+                tracing::warn!(
+                    "RECURRENT RESUME SKIPPED (model carries no recurrent state) for \
+                     timeline {timeline}: a snapshot exists, so this conversation was \
+                     sealed by a different model"
+                );
+            }
+            Err(e) => {
+                // `import` validates the schedule hash and every layer's
+                // geometry before touching a tensor, so this is a different
+                // model or a changed layer schedule, and the store is
+                // untouched. Recomputing is correct; doing it silently is not.
+                tracing::warn!(
+                    "RECURRENT RESUME REFUSED (hash or geometry mismatch) for timeline \
+                     {timeline} at turn {}: {e} — the conversation will continue with \
+                     NO recurrent memory of its history.",
+                    payload.turn_index,
+                );
+            }
+        }
     }
 
     /// Handle the case where generation finishes on the first token (EOS or max=0).
@@ -5354,6 +6027,11 @@ impl Scheduler {
                     }
                 }
 
+                // The finalized view's `(view_id, parent_id)`, held until the
+                // seal branch below decides whether its recurrent state moves
+                // onto the parent or is dropped with the blocks it advanced
+                // over. `None` on the non-view path, which has no child state.
+                let mut pending_view_state: Option<(SequenceId, SequenceId)> = None;
                 let (seal_slot, seal_block_from) = if let Some(view_state) = finalized_view {
                     if let Err(e) = self.session.finalize_view(
                         seq_id.0,
@@ -5367,6 +6045,24 @@ impl Scheduler {
                             e,
                         );
                     }
+                    // **The state's disposition is NOT decided here.**
+                    //
+                    // `finalize_view` frees the view's session slot but leaves
+                    // the model's per-sequence state under the view id, and
+                    // that is deliberate: whether this turn moves it onto the
+                    // parent or drops it depends on a branch that has not run
+                    // yet. A `SealAction::Turn` re-prefills the turn clean —
+                    // the decoded blocks, thinking tokens and all, are
+                    // abandoned — and the parent's state must stay at the turn
+                    // boundary so the re-prefill advances it over
+                    // `[user][clean response]` exactly once. Every other seal
+                    // keeps the blocks, so the state moves with them.
+                    //
+                    // Deciding it eagerly here is the `<think>` skew: the state
+                    // would end up having seen `[prefix][thinking][clean]` while
+                    // the K/V holds `[prefix][clean]`, on every thinking turn,
+                    // compounding. See `pending_view_state` below.
+                    pending_view_state = Some((seq_id, view_state.parent_id));
                     self.sampling_states.remove(&seq_id);
                     // The view's KV blocks just got transferred onto
                     // the parent — mirror the same merge in the
@@ -5427,17 +6123,21 @@ impl Scheduler {
                     "turn complete",
                 );
 
-                // Post-decode forward pass: append the turn's
-                // closing structural tokens (e.g. ChatML's `\n` after
-                // `<|im_end|>`) into the slot before sealing, so the
-                // turn's pinned KV closes its own brackets.  The
-                // model didn't emit these — we synthesise them as if
-                // it did.
-                if !state.post_decode_tokens.is_empty() {
-                    if let Err(e) = self.run_prefill(seal_slot, &state.post_decode_tokens[..]) {
-                        tracing::warn!("post-decode prefill failed for slot {}: {}", seal_slot, e,);
-                    }
-                }
+                // The post-decode tail (the turn's closing structural tokens —
+                // ChatML's `\n` after `<|im_end|>`) is prefilled AFTER the
+                // view-state disposition below, not here.
+                //
+                // It has to be, because `run_prefill` advances the recurrent
+                // state of the slot it runs on, and this slot is the PARENT.
+                // Run here it lands on the wrong side of both dispositions: on
+                // the DISCARD path the tail is truncated away and re-prefilled
+                // by the clean pass anyway, so this advance is a phantom the
+                // sealed state carries twice (`… ⊕ tail ⊕ user ⊕ clean ⊕ tail`)
+                // over a K/V that holds it once; on the MOVE path the view's
+                // state — which never saw the tail — is written over the
+                // parent immediately after, losing it. Both are the skew the
+                // DISCARD comment below describes for `<think>`, one call
+                // earlier, and both compound one marker per turn.
 
                 // Diagnostic: dump the *entire* token stream the
                 // kernel saw for this turn — every injected system
@@ -5497,6 +6197,28 @@ impl Scheduler {
                         })
                         .is_ok()
                 {
+                    // **DISCARD.** The decoded blocks — thinking tokens and all
+                    // — were just truncated away, and the turn is about to be
+                    // re-prefilled clean onto the parent. The recurrent state
+                    // follows the K/V, so the view's advanced state is dropped
+                    // with the blocks it advanced over, leaving the parent at
+                    // the turn boundary. The clean re-prefill then advances it
+                    // over `[user][clean response]` exactly once.
+                    //
+                    // Moving here instead is the `<think>` skew — a state that
+                    // has seen the reasoning as well as the answer while the
+                    // K/V holds only the answer — on every thinking turn, and
+                    // it compounds. It is also invisible: the model stays
+                    // fluent and simply remembers a little more than it said.
+                    if let Some((view_id, _parent_id)) = pending_view_state.take() {
+                        if let Err(e) = self.model.release_sequence(view_id.0) {
+                            tracing::warn!(
+                                "failed to release recurrent state for discarded view {}: {}",
+                                view_id,
+                                e,
+                            );
+                        }
+                    }
                     let stats = TurnStats {
                         prefill_ms: state.prefill_ms,
                         decode_ms,
@@ -5514,6 +6236,40 @@ impl Scheduler {
                         stats,
                     );
                     continue;
+                }
+
+                // **MOVE.** Everything past the clean-reprefill branch keeps the
+                // view's decoded blocks on the parent, so the state it advanced
+                // over them moves with them. Reached both when the seal is not a
+                // turn and when the clean re-prefill could not be set up — in
+                // the latter case the blocks stayed, so the state must too.
+                if let Some((view_id, parent_id)) = pending_view_state.take() {
+                    if let Err(e) = self.model.move_recurrent(view_id.0, parent_id.0) {
+                        tracing::warn!(
+                            "failed to move recurrent state from view {} to parent {}: {}",
+                            view_id,
+                            parent_id,
+                            e,
+                        );
+                    }
+                }
+
+                // Post-decode forward pass: append the turn's closing
+                // structural tokens into the slot before sealing, so the turn's
+                // pinned K/V closes its own brackets. The model didn't emit
+                // these — we synthesise them as if it did.
+                //
+                // Deliberately AFTER the disposition above (see the note at the
+                // top of this block): the state that absorbs the tail must be
+                // the one being sealed, and on the MOVE path that state only
+                // arrives on the parent a few lines up. The DISCARD path never
+                // reaches here — it `continue`s — and its clean re-prefill
+                // replays `[user][clean answer][post_decode]`, so the tail is
+                // absorbed there exactly once, in order.
+                if !state.post_decode_tokens.is_empty() {
+                    if let Err(e) = self.run_prefill(seal_slot, &state.post_decode_tokens[..]) {
+                        tracing::warn!("post-decode prefill failed for slot {}: {}", seal_slot, e,);
+                    }
                 }
 
                 // Seal-and-write step.  When `seal_action != None`, we
@@ -6389,7 +7145,61 @@ impl Scheduler {
                 // same turn stream.
                 if !wide_sigs.is_empty() {
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
-                    conversation.enqueue_wide_q_sigs(stream_id, encode_wide_sigs(&wide_sigs));
+                    // Stamped with the same fold that produced the bits above, so
+                    // a later build that folds differently refuses to score them
+                    // instead of comparing incomparable bits.
+                    conversation.enqueue_wide_q_sigs(
+                        stream_id,
+                        encode_wide_sigs_with(&wide_sigs, self.prov_fold),
+                    );
+                }
+                // Persist the sequence's recurrent state, if it carries any.
+                //
+                // **Before the `Tokens` enqueue, deliberately.** The snapshot
+                // must be durable no later than the turn it describes.
+                // `turn_index` carries the rule for the torn case: reload
+                // discards a snapshot NEWER than the last recovered turn and
+                // recomputes. Writing first can therefore leave a snapshot for
+                // a turn whose records never landed — handled — but never a
+                // turn whose snapshot never landed, which would be silent
+                // staleness: a resume that installs a state one turn behind its
+                // K/V, reads fluently, and is wrong.
+                //
+                // `export_recurrent` returns `None` for a model with no such
+                // state, so this site is model-agnostic and Qwen3-30B pays a
+                // branch.
+                let t_export = Instant::now();
+                match self.model.export_recurrent(seal_slot.0) {
+                    Ok(Some((schedule_hash, layers))) => {
+                        let payload = SnapshotPayload {
+                            timeline_id: target.timeline.raw(),
+                            turn_index: idx.0,
+                            schedule_hash,
+                            layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+                        };
+                        let bytes = payload.encode();
+                        // Timed around export + encode, which is the whole of
+                        // what the seal pays synchronously: the append itself is
+                        // the off-thread writer's problem.
+                        use std::sync::atomic::Ordering::Relaxed;
+                        SNAPSHOT_EXPORT_US
+                            .fetch_add(t_export.elapsed().as_micros() as u64, Relaxed);
+                        SNAPSHOT_BYTES.fetch_add(bytes.len() as u64, Relaxed);
+                        SNAPSHOT_COUNT.fetch_add(1, Relaxed);
+                        conversation.enqueue_recurrent_snapshot(target.timeline, bytes);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Not fatal to the seal — the turn's K/V and text are
+                        // already committed — but it means this conversation
+                        // cannot be resumed from here, so it must be visible.
+                        tracing::warn!(
+                            "recurrent snapshot export failed for turn {} (the turn is \
+                             sealed, but resuming it will recompute from zeros): {}",
+                            idx.0,
+                            e,
+                        );
+                    }
                 }
                 // Persist the turn's `Tokens` record — tiny and
                 // load-bearing for substrate reconstruction. Enqueued onto
@@ -6553,6 +7363,189 @@ impl Scheduler {
 
     /// Extract raw K/V/Q float data for multiple layer indices.
     ///
+    /// Prefill `tokens` on a throwaway slot and export the recurrent state that
+    /// results — the branch checkpoint pass.
+    ///
+    /// Deliberately not routed through the section-ingest batcher. That path
+    /// exists to make many concurrent section prefills share forwards, and it
+    /// finishes by sealing K/V into the substrate; this wants neither. It runs
+    /// once per branch at prompt-build time, wants no K/V kept, and wants only
+    /// the state — so it drives `forward_wave` directly, in
+    /// `max_prefill_pass_tokens` chunks, and throws the slot away.
+    ///
+    /// The chunking is not an optimisation: one forward over a whole 2,000-token
+    /// prompt is a transient activation spike large enough to page, which is the
+    /// same reason `build_section_batch` bounds its own per-forward budget.
+    fn handle_branch_checkpoint_pass(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<Option<(u64, Vec<ExportedLayerState>)>, ConversationError> {
+        if !self.model.carries_recurrent_state() {
+            return Ok(None);
+        }
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        let seq = self
+            .session
+            .create_sequence()
+            .map_err(ConversationError::Model)?;
+        let result = self.prefill_tokens_on(seq, tokens).and_then(|()| {
+            self.model
+                .export_recurrent(seq)
+                .map_err(ConversationError::Model)
+        });
+        let _ = self.model.release_sequence(seq);
+        let _ = self.session.free_sequence(seq);
+        result
+    }
+
+    /// Run `tokens` through the model on `seq`, in `max_prefill_pass_tokens`
+    /// chunks.
+    ///
+    /// The chunking is not an optimisation: one forward over a whole prompt is a
+    /// transient activation spike large enough to page, which is the same reason
+    /// `build_section_batch` bounds its own per-forward budget.
+    fn prefill_tokens_on(&mut self, seq: usize, tokens: &[u32]) -> Result<(), ConversationError> {
+        let cap = self.max_prefill_pass_tokens.max(1);
+        let n_layers = self.model.num_layers();
+        let mut off = 0usize;
+        while off < tokens.len() {
+            let advance = (tokens.len() - off).min(cap);
+            let input = Tensor::new(&tokens[off..off + advance], &self.device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(ConversationError::Model)?;
+            let step = self
+                .model
+                .forward_wave(
+                    &mut self.session,
+                    &[],
+                    &[],
+                    &[seq],
+                    std::slice::from_ref(&input),
+                    &[],
+                    &[],
+                    0,
+                    n_layers,
+                    None,
+                )
+                .map_err(ConversationError::Model)?;
+            drop(step);
+            self.session
+                .advance_sequence(seq, advance)
+                .map_err(ConversationError::Model)?;
+            off += advance;
+        }
+        Ok(())
+    }
+
+    /// Advance `sequence_id`'s recurrent memory over `tokens` **without adding
+    /// K/V for them** — the catch-up a splice needs.
+    ///
+    /// `adopt_turn` moves a scope fork's sealed turns onto this conversation's
+    /// timeline **by reference**: the K/V arrives without ever passing through
+    /// this conversation's forward, so its memory has not seen those tokens. §4.4
+    /// calls that shape a divergent join and puts it out of scope — but the
+    /// `code_read` splice performs one, and left alone it leaves a conversation
+    /// holding K/V its memory never saw, which is this document's whole subject.
+    ///
+    /// A recurrence *can* absorb them, because they land at the tail rather than
+    /// mid-sequence. What it must not do is write their K/V a second time, so the
+    /// work happens on a scratch slot seeded from this conversation's memory and
+    /// the result is moved back: fork the memory out, run the tokens, move it
+    /// home, throw the scratch K/V away.
+    ///
+    /// **The scratch is given the conversation's history as context.** The
+    /// adopted span has to be replayed under the left context a real append
+    /// would have given it — this conversation's own turns — because the
+    /// attention layers produce what the recurrent layers consume. A bare slot
+    /// (the first version) replays them against an empty context and moves home
+    /// a state no forward could have produced: fluent, wrong, and invisible to
+    /// a recall probe, since the spliced K/V answers from attention either way.
+    /// `adopted_from` is the first adopted turn index — everything before it is
+    /// injected as context, everything from it on is the span being replayed
+    /// (already spliced by reference, so injecting it too would double it). The
+    /// scratch's own written K/V is discarded with the slot, so nothing is
+    /// written twice.
+    fn handle_memory_catch_up(
+        &mut self,
+        sequence_id: SequenceId,
+        tokens: &[u32],
+        adopted_from: u32,
+    ) -> Result<bool, ConversationError> {
+        if !self.model.carries_recurrent_state() || tokens.is_empty() {
+            return Ok(false);
+        }
+        // Give the replay this conversation's history as its left context, by
+        // INJECTING it onto the scratch from the substrate.
+        //
+        // The history's K/V lives in the substrate, not necessarily on the
+        // conversation's slot: a slot only carries K/V once a projection has
+        // materialised it, and a splice routinely lands before the file
+        // conversation has submitted anything (its slot holds zero blocks —
+        // measured, not assumed). So borrowing from the slot yields nothing in
+        // the very flow this exists for. Arc-injecting the prior turns is the
+        // same zero-copy operation `apply_projection` performs, and it works
+        // whether or not the slot has been materialised.
+        //
+        // Turns at or after `adopted_from` are the span being replayed; their
+        // K/V is already spliced onto this timeline by reference, so injecting
+        // them here as well would double them.
+        let scratch = self
+            .session
+            .create_sequence()
+            .map_err(ConversationError::Model)?;
+        let mut injected = 0usize;
+        if let (Some(conversation), Some(target)) = (
+            self.slot_conversations.get(&sequence_id).cloned(),
+            self.slot_targets.get(&sequence_id).copied(),
+        ) {
+            let prior: Vec<TurnIndex> = {
+                let read = conversation.read();
+                read.turn_indices(target.timeline)
+                    .filter(|idx| idx.0 < adopted_from)
+                    .collect()
+            };
+            // Lift them hot first: the tier system may have evicted older turns
+            // to warm/cold, and an un-elevated turn injects nothing — the
+            // compression pass learned the same lesson.
+            let keys: Vec<TurnKey> = prior
+                .iter()
+                .map(|idx| TurnKey::new(target.timeline, *idx))
+                .collect();
+            self.elevate_projection_working_set(&conversation, &[], &keys, "memory catch-up");
+            for idx in prior {
+                let sealed = conversation.read().turn_sealed_of(target.timeline, idx);
+                if let Some(sealed) = sealed {
+                    match self.session.inject_sealed_at_tail(scratch, &sealed) {
+                        Ok(_) => injected += 1,
+                        Err(e) => tracing::warn!(
+                            "memory catch-up: could not inject turn {idx} as context ({e}) — \
+                             the adopted span replays with less context than a real append"
+                        ),
+                    }
+                }
+            }
+        }
+        tracing::debug!(
+            "memory catch-up: replaying {} adopted tokens over {injected} injected turns",
+            tokens.len(),
+        );
+        let result = self
+            .model
+            .fork_recurrent(sequence_id.0, scratch)
+            .map_err(ConversationError::Model)
+            .and_then(|()| self.prefill_tokens_on(scratch, tokens))
+            .and_then(|()| {
+                self.model
+                    .move_recurrent(scratch, sequence_id.0)
+                    .map_err(ConversationError::Model)
+            });
+        let _ = self.model.release_sequence(scratch);
+        let _ = self.session.free_sequence(scratch);
+        result.map(|()| true)
+    }
+
     /// Calls the R16 dump path for each layer and returns results in the
     /// same order as `layer_indices`.  Each element is
     /// `(layer_idx, Vec<(block_idx, k_flat, v_flat, q_flat)>)`.
@@ -6581,8 +7574,8 @@ impl Scheduler {
     /// contribute only their real tokens, never their zero padding; the result is 1:1
     /// aligned with the turn's `Tokens` record. Every token of each block is captured (no
     /// structural filter; filtering is a query-time concern). Each token's raw all-heads /
-    /// all-layers `sign(Q)` is [`fold_provenance`]-folded to the compact locked signature
-    /// (46,1,1 layer groups, heads separate, 1536 bits) before storing. Blocks whose R16
+    /// all-layers `sign(Q)` is folded to the compact signature under this model's own
+    /// derived fold (three layer-groups, heads separate) before storing. Blocks whose R16
     /// backing is gone (compressed) contribute nothing — capture a turn while its KV is
     /// still R16 (e.g. `kv_lossless`, or at seal before the bg-quantizer runs).
     fn gather_wide_sigs(&self, seq_id: SequenceId, range: (usize, usize)) -> Vec<WideQSig> {
@@ -6628,8 +7621,9 @@ impl Scheduler {
                         n_palette: candle_nn::kv_cache::N_PALETTE,
                         sub_head_dim: sub,
                     };
-                    let sigs = assemble_folded_prov_sigs(&ps, &layout, head_dim);
+                    let sigs = assemble_folded_prov_sigs(&ps, &layout, head_dim, self.prov_fold);
                     PROV_ASSEMBLE_US.fetch_add(t_asm.elapsed().as_micros() as u64, Relaxed);
+                    PROV_PATH_GPU.fetch_add(1, Relaxed);
                     return sigs;
                 }
             }
@@ -6644,6 +7638,12 @@ impl Scheduler {
                 Ok(d) if !d.is_empty() && !d[0].is_empty() => d,
                 _ => return Vec::new(),
             };
+        PROV_PATH_CPU.fetch_add(1, Relaxed);
+        // Once per capture, not per token — same shape for every token here.
+        if !fold_fits(n_layers * n_kv_head, head_dim.div_ceil(64), self.prov_fold) {
+            warn_unfoldable_capture(n_layers * n_kv_head, self.prov_fold);
+            return Vec::new();
+        }
         let chunk = candle_nn::CHUNK_SIZE;
         let band_len = n_layers * n_kv_head * head_dim;
         let n_blocks = dump[0].len();
@@ -6675,11 +7675,16 @@ impl Scheduler {
                     }
                 }
                 if ok && band.len() == band_len {
-                    // Fold the raw all-heads/all-layers sign(Q) into the compact locked
-                    // provenance signature (46,1,1 layer groups, 32-bit stagger, heads
-                    // separate) before storing — 16× smaller than the full wide-Q, and
-                    // what the z-score late-fusion retrieval scores. See docs §23.
-                    out.push(fold_provenance(&WideQSig::from_band(&band, head_dim)));
+                    // Fold the raw all-heads/all-layers sign(Q) into the compact
+                    // provenance signature (three layer-groups, per-layer stagger,
+                    // heads separate) before storing — 16× smaller than the full
+                    // wide-Q, and what the z-score late-fusion retrieval scores.
+                    // See docs §23. Same fold as the GPU path above, and the same
+                    // fold the record is stamped with.
+                    out.push(fold_provenance_fitted(
+                        &WideQSig::from_band(&band, head_dim),
+                        self.prov_fold,
+                    ));
                 }
             }
         }
@@ -6708,11 +7713,12 @@ impl Scheduler {
         // `BatchedInferenceSession::sequence_block_count`.
         let raw_ranges: Vec<(usize, usize)> = if visible_block_ranges.is_empty() {
             let total_blocks = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
-            if total_blocks == 0 {
-                vec![]
-            } else {
-                vec![(0, total_blocks)]
-            }
+            // A zero-block parent yields a zero-LENGTH range, not an empty range
+            // LIST. They borrow the same nothing, but the session rejects an empty
+            // list outright: there, an empty list is a caller that never expanded
+            // this sentinel, and a view built from one decodes at its parent's
+            // position over empty K/V — fluently, and about nothing.
+            vec![(0, total_blocks)]
         } else {
             visible_block_ranges.iter().map(|r| r.to_raw()).collect()
         };
@@ -6723,6 +7729,20 @@ impl Scheduler {
             .map_err(ConversationError::Model)?;
         let view_id = SequenceId(vs.view_idx);
         let borrowed = BlockCount(vs.borrowed_block_count);
+
+        // The view borrows the parent's KV blocks zero-copy; per-sequence model
+        // state cannot be borrowed the same way, because the view is about to
+        // advance it. Copy it instead.
+        //
+        // Without this a hybrid's recurrent layers carry nothing across a turn
+        // boundary: the view is a distinct sequence id, so it would start from
+        // the sequence-start value while its KV holds the parent's entire
+        // history — three quarters of the stack contributing nothing but a
+        // function of the current turn, fluently and without an error.
+        self.model
+            .fork_recurrent(parent_id.0, view_id.0)
+            .map_err(ConversationError::Model)?;
+        FORK_RECURRENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Seed sampling state for the view (clone parent's state so
         // the DRY window survives the carve).
@@ -7391,7 +8411,6 @@ impl Scheduler {
             // markers ARE special tokens).
             composition.materialized = projection_assembler::materialize_conversation(
                 &projection.segments,
-                &self.boundary_markers,
                 &projection.selection_origins,
                 &view,
                 policy.projection.schema(),
@@ -7540,8 +8559,27 @@ impl Scheduler {
         // tokens in the turn-complete context dump that don't reflect
         // anything actually in the KV cache.
         self.slot_tokens.remove(&view_id);
+        // **This path finalizes, so the state MOVES — it is not discarded.**
+        //
+        // The KV is preserved: `tail_per_layer` above captured the active
+        // turn's chunks and they are re-injected onto the parent below. By the
+        // disposition rule the recurrent state follows the K/V, so the turn's
+        // decode so far has to survive with it. Releasing here instead would
+        // silently lose every token decoded before the reprojection — the
+        // reprojected turn would read fluently and have forgotten its own
+        // first half.
+        //
+        // Ordering: move before the free, or there is nothing left to read.
+        // The move already removes the view's entry, so the release below is
+        // just the general per-sequence cleanup.
+        self.model
+            .move_recurrent(view_id.0, parent_id.0)
+            .map_err(ConversationError::Model)?;
         self.session
             .free_sequence(view_id.0)
+            .map_err(ConversationError::Model)?;
+        self.model
+            .release_sequence(view_id.0)
             .map_err(ConversationError::Model)?;
 
         // Reset parent and re-project onto it.  `apply_projection`'s
@@ -7805,6 +8843,7 @@ mod tests {
 
     use super::*;
     use candle::{DType, Tensor};
+    use std::sync::Mutex;
 
     #[test]
     fn carve_ms_redistributes_and_bounds() {
@@ -7834,9 +8873,15 @@ mod tests {
     /// This drives both from the same synthetic signs — the kernel just produces
     /// the packed `u32`s this test hand-packs — so it validates the whole host
     /// mapping (palette→word, warp indexing, layout) without a GPU.
+    ///
+    /// The two sides are folded differently on purpose: the assembled side takes
+    /// the **derived** fold the scheduler now carries, the reference side the
+    /// **locked** constants. At Qwen3-30B's geometry the derivation is an
+    /// identity, so equality here is simultaneously the assembly-mapping check
+    /// and the tier-1 half of the no-regression gate on the outgoing model.
     #[test]
     fn gpu_assembled_prov_sigs_match_cpu_fold() {
-        use crate::provenance::WideQSig;
+        use crate::provenance::{fold_provenance, WideQSig};
         const N_LAYERS: usize = 48;
         const N_KV_HEAD: usize = 4; // == PROV_HEADS_PER_LAYER
         const N_PALETTE: usize = 4;
@@ -7895,7 +8940,12 @@ mod tests {
         };
         // Block 0: real tokens at physical slots 0..n_real.
         let layout = vec![(0u16, n_real as u16, 0usize)];
-        let gpu = assemble_folded_prov_sigs(&ps, &layout, HEAD_DIM);
+        let gpu = assemble_folded_prov_sigs(
+            &ps,
+            &layout,
+            HEAD_DIM,
+            FoldParams::derive(N_KV_HEAD, N_LAYERS, HEAD_DIM),
+        );
 
         assert_eq!(gpu.len(), cpu.len(), "token count");
         for (t, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
@@ -8025,6 +9075,290 @@ mod tests {
         }
     }
 
+    // —— Recurrent dummy model ————————————————————————————————————————————————
+
+    /// One sequence's toy recurrent state: 2 layers × a flattened 2×2 matrix.
+    ///
+    /// Deliberately tiny. Every assertion against it is an **exact** comparison
+    /// rather than a tolerance — a state that should be `[2.0, 4.0, 6.0, 8.0]`
+    /// either is or is not — which is what lets a tier-1 test fail for a
+    /// plumbing defect that the real model would only ever express as
+    /// slightly different, perfectly fluent prose.
+    type ToyState = [[f32; 4]; 2];
+
+    const ZERO_STATE: ToyState = [[0.0; 4]; 2];
+
+    /// The toy recurrence: `s ← 2s + t·k`, per element, with `k` the element's
+    /// 1-based index.
+    ///
+    /// Three properties earn their place. It is **order-dependent** (advancing
+    /// by 3 then 7 lands somewhere else than 7 then 3), so a test can tell a
+    /// lost turn from a duplicated one. It is **exact in f32** for the token
+    /// counts these tests use, so assertions need no epsilon. And it is
+    /// **non-composable** the way the real delta rule is — you cannot recover
+    /// it from a per-token record, which is the whole reason the state has to
+    /// be carried rather than replayed.
+    fn toy_advance(state: &mut ToyState, tokens: usize) {
+        for (l, layer) in state.iter_mut().enumerate() {
+            for (j, cell) in layer.iter_mut().enumerate() {
+                *cell = *cell * 2.0 + tokens as f32 * (l * 4 + j + 1) as f32;
+            }
+        }
+    }
+
+    /// A handle on the recurrent map, cloned out before the model is boxed into
+    /// the scheduler.
+    ///
+    /// The scheduler owns its model as `Box<dyn ManagedBatchedModel>`, which a
+    /// test cannot downcast back to ask what the state is. Sharing the map
+    /// itself is what makes the state observable, and it mirrors the real
+    /// arrangement: `HybridBatched` also keeps this map behind a lock because
+    /// the scheduler holds the model by shared reference while a wave mutates
+    /// the sequences in it.
+    #[derive(Clone, Default)]
+    struct RecurrentProbe {
+        states: Arc<Mutex<HashMap<usize, ToyState>>>,
+        /// Sequences whose state arrived by fork or restore, and must therefore
+        /// survive exactly one `offset == 0` reset. The store-level `seeded`
+        /// flag of §10 decision 2, modelled per sequence.
+        seeded: Arc<Mutex<HashSet<usize>>>,
+    }
+
+    impl RecurrentProbe {
+        fn get(&self, seq: usize) -> Option<ToyState> {
+            self.states.lock().unwrap().get(&seq).copied()
+        }
+
+        fn len(&self) -> usize {
+            self.states.lock().unwrap().len()
+        }
+
+        fn set(&self, seq: usize, state: ToyState) {
+            self.states.lock().unwrap().insert(seq, state);
+        }
+
+        fn is_seeded(&self, seq: usize) -> bool {
+            self.seeded.lock().unwrap().contains(&seq)
+        }
+
+        /// `ensure_recurrent`'s contract, modelled exactly: a vacant slot gets
+        /// zeros; an occupied slot standing at offset 0 is **reset**, because a
+        /// sequence with no history must hold the sequence-start value — unless
+        /// it was seeded, which suppresses the reset once and once only.
+        fn ensure(&self, seq: usize, offset: usize) {
+            let mut states = self.states.lock().unwrap();
+            match states.entry(seq) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(ZERO_STATE);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    // Consumed on the FIRST wave either way — the same rule as
+                    // the real `ensure_recurrent`. The flag protects the one
+                    // wave that follows a fork or a restore; one that outlived
+                    // it would suppress a later, genuine reset.
+                    let seeded = self.seeded.lock().unwrap().remove(&seq);
+                    if offset == 0 && !seeded {
+                        slot.insert(ZERO_STATE);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `DummyModel` plus the per-sequence recurrent state the hybrid lineage
+    /// carries — the tier-1 stand-in for `HybridBatched`.
+    #[derive(Clone)]
+    struct DummyRecurrentModel {
+        inner: DummyModel,
+        probe: RecurrentProbe,
+    }
+
+    impl DummyRecurrentModel {
+        /// This double's layer-schedule fingerprint. Arbitrary, but fixed: what
+        /// matters is that a restore under a *different* one is refused.
+        const SCHEDULE_HASH: u64 = 0xD0D0_1234_5678_9ABC;
+
+        fn new() -> Self {
+            Self {
+                inner: DummyModel::new(),
+                probe: RecurrentProbe::default(),
+            }
+        }
+    }
+
+    impl ManagedBatchedModel for DummyRecurrentModel {
+        fn maybe_change_dtype(&self, dtype: DType) -> candle::Result<()> {
+            self.inner.maybe_change_dtype(dtype)
+        }
+        fn num_layers(&self) -> usize {
+            self.inner.num_layers()
+        }
+        fn n_kv_head(&self) -> usize {
+            self.inner.n_kv_head()
+        }
+        fn head_dim(&self) -> usize {
+            self.inner.head_dim()
+        }
+        fn wave_geometry(&self, act_dtype: DType) -> candle_nn::kv_cache::ModelGeometry {
+            self.inner.wave_geometry(act_dtype)
+        }
+        fn device(&self) -> &candle::Device {
+            self.inner.device()
+        }
+
+        /// Advances every participating sequence's state by the tokens it
+        /// carries, after applying `ensure_recurrent`'s reset rule — the same
+        /// order the real wave runs them in, because the reset keying off the
+        /// offset is exactly what a restore has to survive.
+        #[allow(clippy::too_many_arguments)]
+        fn forward_wave(
+            &self,
+            session: &mut BatchedInferenceSession,
+            decode_seqs: &[usize],
+            decode_inputs: &[Tensor],
+            prefill_seqs: &[usize],
+            prefill_inputs: &[Tensor],
+            glue_seqs: &[usize],
+            glue_inputs: &[Tensor],
+            layer_start: usize,
+            layer_end: usize,
+            residual_in: Option<Tensor>,
+        ) -> candle::Result<candle_transformers::models::batched_inference::WaveResult> {
+            for (seqs, inputs) in [(decode_seqs, decode_inputs), (prefill_seqs, prefill_inputs)] {
+                for (i, &seq) in seqs.iter().enumerate() {
+                    let offset = session.sequence_offset(seq).unwrap_or(0);
+                    self.probe.ensure(seq, offset);
+                    let tokens = inputs.get(i).map(|t| t.elem_count()).unwrap_or(0);
+                    if let Some(state) = self.probe.states.lock().unwrap().get_mut(&seq) {
+                        toy_advance(state, tokens);
+                    }
+                }
+            }
+            self.inner.forward_wave(
+                session,
+                decode_seqs,
+                decode_inputs,
+                prefill_seqs,
+                prefill_inputs,
+                glue_seqs,
+                glue_inputs,
+                layer_start,
+                layer_end,
+                residual_in,
+            )
+        }
+
+        fn prune(&self) -> candle::Result<()> {
+            self.inner.prune()
+        }
+
+        fn release_sequence(&self, seq: usize) -> candle::Result<()> {
+            self.probe.states.lock().unwrap().remove(&seq);
+            self.probe.seeded.lock().unwrap().remove(&seq);
+            Ok(())
+        }
+
+        /// Copy, and seed the copy. Tolerant of a parent with no state — a view
+        /// can be carved before the parent has ever run a wave, and there the
+        /// child correctly starts from the sequence-start value.
+        /// **The property the double used to get wrong.** It forks and moves
+        /// recurrent state, so reporting `false` here — the trait default — made
+        /// it a model that demonstrably carries state while claiming it carries
+        /// none, which also made `can_gap_fill` true for it. Anything asserting
+        /// on either property passed for the wrong reason, and the branch
+        /// checkpoint path (gated on exactly this) was never entered by a CPU
+        /// test at all.
+        fn carries_recurrent_state(&self) -> bool {
+            true
+        }
+
+        fn fork_recurrent(&self, parent: usize, child: usize) -> candle::Result<()> {
+            let parent_state = self.probe.get(parent);
+            if let Some(state) = parent_state {
+                self.probe.set(child, state);
+                self.probe.seeded.lock().unwrap().insert(child);
+            }
+            Ok(())
+        }
+
+        /// The toy state as snapshot rows. One "layer" per `ToyState` row, with
+        /// the row's four floats standing in for the delta-rule matrix and a
+        /// zero-length conv tail — enough shape for the record round-trip and
+        /// the geometry validation `restore_recurrent` performs.
+        fn export_recurrent(
+            &self,
+            seq: usize,
+        ) -> candle::Result<Option<(u64, Vec<ExportedLayerState>)>> {
+            let Some(state) = self.probe.get(seq) else {
+                return Ok(None);
+            };
+            let layers = state
+                .iter()
+                .enumerate()
+                .map(|(i, row)| ExportedLayerState {
+                    layer_index: i as u32,
+                    n_v_heads: 1,
+                    d_v: 1,
+                    d_k: 4,
+                    state: row.iter().flat_map(|f| f.to_le_bytes()).collect(),
+                    conv_channels: 0,
+                    conv_tail_cols: 0,
+                    conv_tail: Vec::new(),
+                })
+                .collect();
+            Ok(Some((Self::SCHEDULE_HASH, layers)))
+        }
+
+        /// Refuses a foreign schedule hash rather than scattering it, exactly as
+        /// `RecurrentStateStore::import` does — a restore that silently accepted
+        /// another model's layout is the fluent-amnesia failure this path exists
+        /// to remove.
+        fn restore_recurrent(
+            &self,
+            seq: usize,
+            schedule_hash: u64,
+            layers: &[ExportedLayerState],
+        ) -> candle::Result<bool> {
+            if schedule_hash != Self::SCHEDULE_HASH {
+                candle::bail!(
+                    "schedule hash mismatch: {schedule_hash:#x} is not this model's \
+                     {:#x}",
+                    Self::SCHEDULE_HASH
+                );
+            }
+            if layers.len() != 2 {
+                candle::bail!("expected 2 layers, got {}", layers.len());
+            }
+            let mut state = ZERO_STATE;
+            for (row, l) in state.iter_mut().zip(layers) {
+                if l.state.len() != 16 {
+                    candle::bail!(
+                        "layer {}: state is {} bytes, want 16",
+                        l.layer_index,
+                        l.state.len()
+                    );
+                }
+                for (slot, chunk) in row.iter_mut().zip(l.state.chunks_exact(4)) {
+                    *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+            }
+            self.probe.set(seq, state);
+            self.probe.seeded.lock().unwrap().insert(seq);
+            Ok(true)
+        }
+
+        /// Move: the child's entry is gone afterwards and the parent's old
+        /// state is replaced. Tolerant of a child that never ran a wave.
+        fn move_recurrent(&self, child: usize, parent: usize) -> candle::Result<()> {
+            let taken = self.probe.states.lock().unwrap().remove(&child);
+            self.probe.seeded.lock().unwrap().remove(&child);
+            if let Some(state) = taken {
+                self.probe.set(parent, state);
+            }
+            Ok(())
+        }
+    }
+
     // —— Helpers ——————————————————————————————————————————————————————————————
 
     /// Minimal CPU-backed session: 1 layer, 1 KV head, head_dim=16.
@@ -8080,7 +9414,764 @@ mod tests {
         (scheduler, tx)
     }
 
+    /// [`make_test_scheduler`] over a [`DummyRecurrentModel`], returning the
+    /// probe as well so a test can read the state the scheduler's boxed model
+    /// is carrying.
+    fn make_test_scheduler_recurrent() -> (
+        Scheduler,
+        crossbeam::channel::Sender<SchedulerRequest>,
+        RecurrentProbe,
+    ) {
+        let (tx, rx) = crossbeam::channel::bounded(16);
+        let session = make_test_session();
+        let tokenizer = make_dummy_tokenizer();
+        let model = DummyRecurrentModel::new();
+        let probe = model.probe.clone();
+        let scheduler = Scheduler::new(
+            rx,
+            Box::new(model),
+            session,
+            tokenizer,
+            vec![0u32].into(),
+            64,
+            8,
+            false,
+            None,
+            DecodeHealthConfig::default(),
+            512,
+            PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
+        );
+        (scheduler, tx, probe)
+    }
+
+    // ── Branch checkpoints (P6) ──────────────────────────────────────────────
+    //
+    // These run the real handlers on the CPU double. Before it reported
+    // `carries_recurrent_state`, `handle_branch_checkpoint_pass` returned
+    // `Ok(None)` on its first line and none of this path was reachable below
+    // tier 3 — which is where the write/read race below was actually caught, at
+    // ten minutes and 22 GB a run.
+
+    /// **The pass prefills the tokens and hands back the state they produced.**
+    ///
+    /// Not a copy of anything: the checkpoint's whole reason to exist is that a
+    /// recurrence cannot be Arc-injected, so the tokens must genuinely pass
+    /// through the model. A pass that returned the sequence-start state would
+    /// look identical from the caller's side.
+    #[test]
+    fn the_branch_checkpoint_pass_returns_state_the_tokens_produced() {
+        let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let (hash, layers) = sched
+            .handle_branch_checkpoint_pass(&[1, 2, 3, 4])
+            .expect("pass ran")
+            .expect("a model that carries state returns some");
+        assert_eq!(hash, DummyRecurrentModel::SCHEDULE_HASH);
+        assert_eq!(layers.len(), 2, "one row per toy layer");
+        let advanced = layers.iter().any(|l| l.state.iter().any(|&b| b != 0));
+        assert!(
+            advanced,
+            "the exported state is all zeros — the tokens never reached the model, \
+             and every conversation restoring this would start with no memory of \
+             its system prompt while reading perfectly"
+        );
+    }
+
+    /// **The pass leaves no slot behind.**
+    ///
+    /// It allocates a throwaway sequence per call and runs once per new branch
+    /// per process. A slot leaked here is a slot leaked for the life of the
+    /// daemon.
+    #[test]
+    fn the_branch_checkpoint_pass_frees_its_slot() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let before = probe.len();
+        for _ in 0..4 {
+            sched
+                .handle_branch_checkpoint_pass(&[7, 7, 7])
+                .expect("pass ran");
+        }
+        assert_eq!(
+            probe.len(),
+            before,
+            "four passes left {} live state entries — the throwaway slots are not \
+             being released",
+            probe.len() - before
+        );
+    }
+
+    /// **A model carrying no recurrent state pays nothing.**
+    ///
+    /// The gate that keeps this whole path off a plain transformer. `DummyModel`
+    /// answers `false`, so the pass must return before allocating anything.
+    #[test]
+    fn the_branch_checkpoint_pass_is_a_no_op_without_recurrent_state() {
+        let (mut sched, _tx) = make_test_scheduler();
+        assert!(
+            sched
+                .handle_branch_checkpoint_pass(&[1, 2, 3])
+                .expect("pass ran")
+                .is_none(),
+            "a model with no recurrent state must not run a prefill for a \
+             checkpoint nothing will read"
+        );
+    }
+
+    /// **A checkpoint round-trips through its record and installs.**
+    ///
+    /// The whole P6 loop below the conversation layer: export → encode → decode
+    /// → install, with the state byte-identical at the far end. Byte equality,
+    /// not tolerance — these are copies, so any difference is a layout bug.
+    #[test]
+    fn a_branch_checkpoint_round_trips_through_its_record_and_installs() {
+        use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
+
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let (hash, layers) = sched
+            .handle_branch_checkpoint_pass(&[5, 6, 7, 8])
+            .expect("pass ran")
+            .expect("state");
+        let computed = layers.clone();
+
+        let payload = BranchCheckpointPayload {
+            prefix_hash: crate::persistence::content_hash::ContentHash { lo: 9, hi: 11 },
+            schedule_hash: hash,
+            layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+        };
+        let back = BranchCheckpointPayload::decode(&payload.encode()).expect("decode");
+        assert_eq!(back, payload, "the record did not survive its own encoding");
+
+        // Install onto a fresh slot and read the state back out.
+        let slot = sched.session.create_sequence().expect("slot");
+        let restored: Vec<ExportedLayerState> = back
+            .layers
+            .into_iter()
+            .map(|l| ExportedLayerState {
+                layer_index: l.layer_index,
+                n_v_heads: l.n_v_heads,
+                d_v: l.d_v,
+                d_k: l.d_k,
+                state: l.state,
+                conv_channels: l.conv_channels,
+                conv_tail_cols: l.conv_tail_cols,
+                conv_tail: l.conv_tail,
+            })
+            .collect();
+        assert!(sched
+            .model
+            .restore_recurrent(slot, back.schedule_hash, &restored)
+            .expect("restore"));
+
+        let (_, after) = sched
+            .model
+            .export_recurrent(slot)
+            .expect("export")
+            .expect("state");
+        assert_eq!(
+            after.iter().map(|l| l.state.clone()).collect::<Vec<_>>(),
+            computed.iter().map(|l| l.state.clone()).collect::<Vec<_>>(),
+            "the installed state is not the computed one"
+        );
+        assert!(
+            probe.is_seeded(slot),
+            "a restored slot must be seeded, or its first wave resets the state it \
+             was just given back to zero — defect 6 wearing the fix's clothes"
+        );
+    }
+
+    /// **A checkpoint from another model's schedule is refused, not scattered.**
+    #[test]
+    fn a_branch_checkpoint_under_a_foreign_schedule_is_refused() {
+        let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let (_, layers) = sched
+            .handle_branch_checkpoint_pass(&[3, 1, 4])
+            .expect("pass ran")
+            .expect("state");
+        let slot = sched.session.create_sequence().expect("slot");
+        let err = sched
+            .model
+            .restore_recurrent(slot, 0xBAD, &layers)
+            .expect_err("a foreign schedule hash must not install");
+        assert!(err.to_string().contains("schedule hash"), "{err}");
+    }
+
+    /// **`InstallRecurrentState` is the request the conversation layer uses.**
+    ///
+    /// Dispatched through `handle_request`, so the wiring is covered and not
+    /// just the handler body.
+    #[test]
+    fn install_recurrent_state_request_installs_onto_the_named_slot() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let (hash, layers) = sched
+            .handle_branch_checkpoint_pass(&[2, 4, 6])
+            .expect("pass ran")
+            .expect("state");
+        let slot = SequenceId(sched.session.create_sequence().expect("slot"));
+
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        sched.handle_request(SchedulerRequest::InstallRecurrentState {
+            sequence_id: slot,
+            schedule_hash: hash,
+            layers,
+            response_tx: tx,
+        });
+        assert!(
+            rx.recv().expect("reply").expect("install"),
+            "the install reported that no state was carried"
+        );
+        assert!(probe.get(slot.0).is_some(), "the slot has no state");
+    }
+
+    /// **T7.3 — a snapshot newer than the recovered history is rejected.**
+    ///
+    /// The seal writes the snapshot *before* the turn's `Tokens` record, on the
+    /// stated grounds that the resulting tear — a snapshot for a turn whose
+    /// records never landed — is "handled". This is the handling. Without it the
+    /// write ordering is actively harmful: it guarantees the tear it cannot
+    /// survive, and a resume installs a state one turn ahead of its K/V.
+    ///
+    /// The boundary is the whole test. Turns are `0..n`, so a snapshot at `n` is
+    /// the first invalid one, and an off-by-one here accepts exactly the torn
+    /// case the ordering was chosen to produce.
+    #[test]
+    fn a_snapshot_newer_than_the_recovered_history_is_rejected() {
+        // Three turns recovered: 0, 1, 2.
+        assert!(snapshot_within_recovered_history(0, 3));
+        assert!(snapshot_within_recovered_history(2, 3), "the last turn");
+        assert!(
+            !snapshot_within_recovered_history(3, 3),
+            "turn 3 does not exist when 3 turns recovered — this is the torn \
+             shutdown the seal ordering deliberately allows"
+        );
+        assert!(!snapshot_within_recovered_history(9, 3));
+
+        // Nothing recovered: every snapshot is ahead of the history, including
+        // the first. A conversation whose records were all lost must not inherit
+        // a state describing them.
+        assert!(!snapshot_within_recovered_history(0, 0));
+    }
+
+    /// Exact state equality — no tolerance, ever.
+    ///
+    /// A tolerance here would pass a state that is plumbed correctly but
+    /// *wrong*, which is the entire failure class this document's tier 1
+    /// exists to catch.
+    #[track_caller]
+    fn assert_state_eq(probe: &RecurrentProbe, seq: usize, expected: ToyState) {
+        let actual = probe
+            .get(seq)
+            .unwrap_or_else(|| panic!("sequence {seq} carries no recurrent state at all"));
+        assert_eq!(actual, expected, "recurrent state for sequence {seq}");
+    }
+
     // —— Tests ————————————————————————————————————————————————————————————————
+
+    // —— recurrent release-on-free tests ——————————————————————————————————————
+
+    /// **The recycled-slot defect.** Slot ids are pool indices and come back
+    /// round; the recurrent map is keyed by that id and owned by the model,
+    /// which outlives every session. So a freed slot whose state was never
+    /// released leaves a stranger's memory sitting under an id the next
+    /// conversation is about to be handed.
+    ///
+    /// The second sequence's first wave carries `offset > 0` — it is resuming
+    /// against injected K/V, which is the normal case and precisely the one
+    /// `ensure_recurrent`'s `offset == 0` reset cannot catch. Without the
+    /// release hook the `Occupied` arm hands back the previous conversation's
+    /// state, every shape matches, nothing errors, and the model answers from
+    /// a history this cache never had.
+    #[test]
+    fn a_recycled_slot_does_not_inherit_the_previous_conversations_state() {
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+
+        // Conversation A runs on slot 3 and leaves a non-zero state behind.
+        probe.ensure(3, 0);
+        probe
+            .states
+            .lock()
+            .unwrap()
+            .insert(3, [[1.0, 2.0, 3.0, 4.0]; 2]);
+        assert_ne!(probe.get(3), Some(ZERO_STATE), "A left something behind");
+
+        // The slot is freed. This is the call P0.3 wires into every free path.
+        model.release_sequence(3).unwrap();
+        assert_eq!(
+            probe.get(3),
+            None,
+            "the freed slot must carry no state at all"
+        );
+
+        // Conversation B lands on the recycled id, and its first wave is a
+        // resume: offset > 0, so the reset does not fire.
+        probe.ensure(3, 64);
+        assert_eq!(
+            probe.get(3),
+            Some(ZERO_STATE),
+            "a recycled slot inherited the previous conversation's recurrent \
+             state — the model now remembers a conversation this cache never had"
+        );
+    }
+
+    /// The leak half of the same defect: the map is the model's, so nothing
+    /// else can shrink it. At ~63 MiB per conversation on the 35B, a map that
+    /// only grows is the process's lifetime memory profile.
+    #[test]
+    fn releasing_a_sequence_returns_the_map_to_its_previous_size() {
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        probe.ensure(0, 0);
+        let before = probe.len();
+
+        probe.ensure(1, 0);
+        probe.ensure(2, 0);
+        assert_eq!(probe.len(), before + 2);
+
+        model.release_sequence(1).unwrap();
+        model.release_sequence(2).unwrap();
+        assert_eq!(
+            probe.len(),
+            before,
+            "freed sequences must not stay resident in the recurrent map"
+        );
+    }
+
+    /// Releasing clears the seeded mark too. A stale mark would make the next
+    /// conversation on that id skip its `offset == 0` reset exactly once —
+    /// which is the recycled-slot defect wearing the fix's own clothes.
+    #[test]
+    fn releasing_a_sequence_clears_its_seeded_mark() {
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        probe.ensure(5, 0);
+        probe.seeded.lock().unwrap().insert(5);
+        model.release_sequence(5).unwrap();
+        assert!(!probe.is_seeded(5), "the seeded mark outlived the sequence");
+
+        probe.ensure(5, 0);
+        probe.set(5, [[9.0; 4]; 2]);
+        probe.ensure(5, 0);
+        assert_eq!(
+            probe.get(5),
+            Some(ZERO_STATE),
+            "a stale seeded mark suppressed the reset for a new conversation"
+        );
+    }
+
+    // —— view state-carry tests (the switch gate) —————————————————————————————
+
+    /// **The gate.** A view is a distinct sequence id, so without an explicit
+    /// carry the recurrent state does not cross a turn boundary in *either*
+    /// direction: the child starts from the sequence-start value while its K/V
+    /// borrows the parent's whole history, and at finalize only the blocks go
+    /// back.
+    ///
+    /// Three turns must land somewhere a one-turn conversation does not. The
+    /// toy recurrence is order-dependent, so this fails both ways — a lost
+    /// turn and a duplicated one land on different values.
+    #[test]
+    fn state_advances_across_turn_boundaries() {
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+
+        // One "turn": carve a view off the parent, advance it, finalize.
+        let turn = |parent: usize, view: usize, tokens: usize, offset: usize| {
+            model.fork_recurrent(parent, view).unwrap();
+            probe.ensure(view, offset);
+            let mut s = probe.get(view).expect("the view carries state");
+            toy_advance(&mut s, tokens);
+            probe.set(view, s);
+            model.move_recurrent(view, parent).unwrap();
+        };
+
+        probe.ensure(0, 0);
+        turn(0, 1, 5, 0);
+        let after_one = probe.get(0).unwrap();
+
+        turn(0, 1, 5, 64);
+        turn(0, 1, 5, 128);
+        let after_three = probe.get(0).unwrap();
+
+        assert_ne!(
+            after_three, after_one,
+            "the recurrent state did not advance across turn boundaries — on a \
+             hybrid this is three quarters of the stack contributing nothing, \
+             and it reads perfectly"
+        );
+        // s ← 2s + 5k, three times from zero: 5k·(4+2+1) = 35k.
+        assert_eq!(after_three[0][0], 35.0, "turn 1 then 2 then 3, in order");
+        assert_eq!(after_one[0][0], 5.0);
+    }
+
+    /// **The disposition pair — both halves required.**
+    ///
+    /// A build that always moves passes (a) and fails (b); one that always
+    /// discards passes (b) and fails (a). Only the pair pins the rule, and the
+    /// rule is: *the recurrent state follows the K/V*.
+    #[test]
+    fn view_disposition_moves_on_reprojection_and_discards_on_clean_reprefill() {
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+
+        // (a) MID-TURN REPROJECTION MOVES. The KV is preserved — the tail is
+        // captured and re-injected — so the state must survive with it. Decode
+        // 10, reproject, decode 10; that has to equal a straight-through 20.
+        probe.ensure(0, 0);
+        model.fork_recurrent(0, 1).unwrap();
+        probe.ensure(1, 0);
+        {
+            let mut s = probe.get(1).unwrap();
+            toy_advance(&mut s, 10);
+            probe.set(1, s);
+        }
+        // Reprojection: the view finalizes onto the parent, then a fresh view
+        // is carved off it.
+        model.move_recurrent(1, 0).unwrap();
+        model.fork_recurrent(0, 2).unwrap();
+        probe.ensure(2, 64);
+        {
+            let mut s = probe.get(2).unwrap();
+            toy_advance(&mut s, 10);
+            probe.set(2, s);
+        }
+        model.move_recurrent(2, 0).unwrap();
+        let reprojected = probe.get(0).unwrap();
+
+        let mut straight = ZERO_STATE;
+        toy_advance(&mut straight, 10);
+        toy_advance(&mut straight, 10);
+        assert_eq!(
+            reprojected, straight,
+            "a reprojection discarded the state — the turn's first ten tokens \
+             are gone and the reply will read as though it never saw them"
+        );
+
+        // (b) CLEAN REPREFILL DISCARDS. The thinking tokens are being un-said:
+        // the view's blocks are abandoned and re-prefilled clean onto the
+        // untouched parent, so the state must be abandoned with them.
+        let probe2 = RecurrentProbe::default();
+        let model2 = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe2.clone(),
+        };
+        probe2.ensure(0, 0);
+        model2.fork_recurrent(0, 1).unwrap();
+        probe2.ensure(1, 0);
+        {
+            // The turn decodes WITH thinking.
+            let mut s = probe2.get(1).unwrap();
+            toy_advance(&mut s, 30);
+            probe2.set(1, s);
+        }
+        // Clean seal: do NOT move. Discard the view, re-prefill clean onto the
+        // parent, which never saw the thinking tokens.
+        model2.release_sequence(1).unwrap();
+        {
+            let mut s = probe2.get(0).unwrap();
+            toy_advance(&mut s, 8); // the clean re-prefill
+            probe2.set(0, s);
+        }
+        let after_thinking_turn = probe2.get(0).unwrap();
+
+        let mut never_thought = ZERO_STATE;
+        toy_advance(&mut never_thought, 8);
+        assert_eq!(
+            after_thinking_turn, never_thought,
+            "a thinking turn's sealed state absorbed the reasoning tokens as \
+             well as the clean ones — the state saw [think][clean] while the \
+             K/V holds only [clean], and it compounds every turn"
+        );
+    }
+
+    /// A move leaves nothing under the child id. A lingering entry is a leak
+    /// keyed by a slot index that is about to be recycled, which is defect 6
+    /// re-entering through the fix for defect 0.
+    #[test]
+    fn move_recurrent_leaves_no_entry_under_the_child() {
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        probe.ensure(0, 0);
+        probe.set(0, [[3.0; 4]; 2]);
+        model.fork_recurrent(0, 1).unwrap();
+        assert!(probe.get(1).is_some());
+
+        model.move_recurrent(1, 0).unwrap();
+        assert_eq!(probe.get(1), None, "the child's entry outlived the move");
+        assert!(!probe.is_seeded(1), "and so did its seeded mark");
+        assert_eq!(
+            probe.get(0),
+            Some([[3.0; 4]; 2]),
+            "the parent has the state"
+        );
+    }
+
+    /// The seeded flag suppresses **exactly one** reset.
+    ///
+    /// A forked view legitimately stands at offset 0 before its first wave —
+    /// it has decoded nothing yet — and it holds state that was put there on
+    /// purpose. Without the flag, `ensure_recurrent`'s reset fires and the
+    /// fork was pointless. With a flag that never clears, a later genuine reset
+    /// is suppressed and a recycled slot inherits a stranger's memory.
+    #[test]
+    fn the_seeded_flag_suppresses_exactly_one_reset() {
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        probe.ensure(0, 0);
+        probe.set(0, [[7.0; 4]; 2]);
+        model.fork_recurrent(0, 1).unwrap();
+
+        // First wave at offset 0: the fork survives.
+        probe.ensure(1, 0);
+        assert_eq!(
+            probe.get(1),
+            Some([[7.0; 4]; 2]),
+            "the reset wiped a freshly forked view before it ran a single token"
+        );
+
+        // Second wave at offset 0: this one is a genuine reset.
+        probe.ensure(1, 0);
+        assert_eq!(
+            probe.get(1),
+            Some(ZERO_STATE),
+            "the seeded flag outlived its one wave and suppressed a real reset"
+        );
+    }
+
+    /// **A resume that cannot install the state falls back to zeros — audibly.**
+    ///
+    /// Every rejection path leaves the slot at the sequence-start value, which
+    /// is a conversation that comes back fluent and having forgotten. That is
+    /// the failure this whole path exists to remove, so it must not *also* be
+    /// the quiet path: the three reasons are distinguishable and each logs.
+    ///
+    /// Driven through `restore_recurrent_state` itself rather than asserted on
+    /// the log, because what matters is that the slot ends at zeros and the
+    /// scheduler carries on — a resume failure must never take the conversation
+    /// down with it.
+    #[test]
+    fn a_refused_resume_leaves_the_slot_at_zeros_and_does_not_fail_the_open() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let conversation = crate::projection::Conversation::new();
+        let timeline = TimelineId::for_test(9);
+
+        // No snapshot for this timeline at all — the ordinary case for a model
+        // that carries no recurrent state, or a first turn that has not sealed.
+        let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+        scheduler.restore_recurrent_state(slot, &conversation, timeline);
+        assert_eq!(
+            probe.get(slot.0),
+            None,
+            "a missing snapshot must leave the slot untouched, not half-written"
+        );
+
+        // And the slot still opens and runs: `ensure_recurrent` gives it the
+        // sequence-start value, exactly as a fresh conversation gets.
+        probe.ensure(slot.0, 0);
+        assert_eq!(probe.get(slot.0), Some(ZERO_STATE));
+        assert!(
+            !probe.is_seeded(slot.0),
+            "nothing was restored, so nothing may claim to be seeded — a stale \
+             seeded mark would suppress this slot's next genuine reset"
+        );
+    }
+
+    /// **Speculative decode is refused up front on a model that cannot rewind.**
+    ///
+    /// The accept step puts the sequence back to the accepted prefix, which a
+    /// recurrent state cannot express. The refusal has to happen at the entry
+    /// point rather than inside the rewind: by the time the driver has drafted
+    /// and verified, erroring is an error against work already done, and *not*
+    /// erroring is a state that has absorbed tokens the K/V no longer holds.
+    #[test]
+    fn speculative_decode_is_refused_for_a_model_carrying_recurrent_state() {
+        struct Recurrent(DummyRecurrentModel);
+        impl ManagedBatchedModel for Recurrent {
+            fn maybe_change_dtype(&self, d: DType) -> candle::Result<()> {
+                self.0.maybe_change_dtype(d)
+            }
+            fn num_layers(&self) -> usize {
+                self.0.num_layers()
+            }
+            fn n_kv_head(&self) -> usize {
+                self.0.n_kv_head()
+            }
+            fn head_dim(&self) -> usize {
+                self.0.head_dim()
+            }
+            fn wave_geometry(&self, d: DType) -> candle_nn::kv_cache::ModelGeometry {
+                self.0.wave_geometry(d)
+            }
+            fn device(&self) -> &candle::Device {
+                self.0.device()
+            }
+            #[allow(clippy::too_many_arguments)]
+            fn forward_wave(
+                &self,
+                s: &mut BatchedInferenceSession,
+                a: &[usize],
+                b: &[Tensor],
+                c: &[usize],
+                d: &[Tensor],
+                e: &[usize],
+                f: &[Tensor],
+                g: usize,
+                h: usize,
+                i: Option<Tensor>,
+            ) -> candle::Result<candle_transformers::models::batched_inference::WaveResult>
+            {
+                self.0.forward_wave(s, a, b, c, d, e, f, g, h, i)
+            }
+            fn prune(&self) -> candle::Result<()> {
+                Ok(())
+            }
+            fn carries_recurrent_state(&self) -> bool {
+                true
+            }
+        }
+
+        let model = Recurrent(DummyRecurrentModel::new());
+        let mut session = make_test_session();
+        let seq = session.create_sequence().unwrap();
+        let mut sink: Vec<Box<dyn FnMut(u32) -> bool + '_>> = vec![Box::new(|_| true)];
+
+        let err = match model.speculative_decode_step_batch(
+            &mut session,
+            &[seq],
+            &[1u32],
+            4,
+            model.num_layers(),
+            &mut sink,
+        ) {
+            Ok(_) => panic!(
+                "speculative decode ran on a model that cannot rewind — the accept \
+                 step would leave the state holding rejected draft tokens"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("recurrent state"),
+            "the refusal must name the reason, got: {err}"
+        );
+    }
+
+    /// **F2's gate input: a model carrying recurrent state cannot gap-fill.**
+    ///
+    /// `reserve_glue_island` refuses to plan a mid-sequence glue island for a
+    /// model whose `model_core_properties().can_gap_fill` is false, naming the
+    /// island size and the reason — a recurrence's state has accumulated past
+    /// the hole and cannot re-enter it. That refusal is only as good as this
+    /// property, which the test double used to get wrong (see
+    /// [`DummyRecurrentModel::carries_recurrent_state`]): a model that forks
+    /// and moves state while reporting `can_gap_fill = true` sails past the
+    /// refusal and fails a layer down, after the chunks are reserved.
+    #[test]
+    fn a_recurrent_model_reports_it_cannot_gap_fill() {
+        let model = DummyRecurrentModel::new();
+        assert!(model.carries_recurrent_state());
+        assert!(
+            !model.model_core_properties().can_gap_fill,
+            "a model with recurrent per-sequence memory claimed it can compute \
+             K/V for a token inserted mid-sequence — the projection would plan \
+             glue islands the wave must then refuse"
+        );
+    }
+
+    /// Forking from a parent that has never run a wave is not an error — a view
+    /// is carved on a brand-new conversation's first turn, before the parent
+    /// has any state. The child correctly begins at the sequence-start value.
+    #[test]
+    fn forking_a_stateless_parent_is_not_an_error() {
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        model.fork_recurrent(0, 1).expect("a cold parent is legal");
+        assert_eq!(probe.get(1), None, "nothing to copy, so nothing copied");
+        probe.ensure(1, 0);
+        assert_eq!(probe.get(1), Some(ZERO_STATE), "and it starts from zero");
+    }
+
+    /// **The wiring, not just the hook.** Drives `Scheduler::create_view`
+    /// itself and asserts the view came out carrying the parent's state.
+    ///
+    /// The hook-level tests above would all pass with `create_view` never
+    /// calling `fork_recurrent` at all — which is exactly the shape of the
+    /// defect this phase fixes, so the wiring needs its own assertion.
+    #[test]
+    fn scheduler_create_view_forks_the_parents_recurrent_state() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+
+        let parent_raw = scheduler.session.create_sequence().unwrap();
+        let parent_id = SequenceId(parent_raw);
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let input = candle::Tensor::new(&tokens[..], &scheduler.device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        scheduler
+            .session
+            .ensure_capacity(&[parent_raw], tokens.len())
+            .unwrap();
+        let nl = scheduler.model.num_layers().max(1);
+        scheduler
+            .model
+            .forward_wave(
+                &mut scheduler.session,
+                &[],
+                &[],
+                &[parent_raw],
+                &[input],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )
+            .unwrap();
+        scheduler
+            .session
+            .advance_sequence(parent_raw, tokens.len())
+            .unwrap();
+
+        // The parent's prefill advanced its state by the 8 prompt tokens.
+        let mut expected = ZERO_STATE;
+        toy_advance(&mut expected, tokens.len());
+        assert_state_eq(&probe, parent_raw, expected);
+
+        let (view_id, _) = scheduler
+            .create_view(parent_id, &[BlockRange::new(0, 1)])
+            .expect("view creation");
+
+        assert_state_eq(&probe, view_id.0, expected);
+        assert!(
+            probe.is_seeded(view_id.0),
+            "the forked view must be seeded, or its first wave at offset 0 \
+             resets the state the fork just copied"
+        );
+    }
 
     // —— view-creation tests —————————————————————————————————————————————————
 
@@ -8183,6 +10274,84 @@ mod tests {
         );
     }
 
+    /// **The session refuses a view with no ranges; the scheduler's sentinel is
+    /// what expands to "all blocks".**
+    ///
+    /// The two spellings look identical at a call site and mean opposite things.
+    /// `Scheduler::create_view(&[])` is the sentinel and must succeed;
+    /// `BatchedInferenceSession::create_view_sequence(&[])` names zero blocks to
+    /// borrow and must not, because the view it used to return decoded at its
+    /// parent's position over an **empty** K/V — fluent, plausible text with no
+    /// relation to the prompt, and no error anywhere. That cost two tier-2 runs,
+    /// each reported as a fork defect.
+    #[test]
+    fn a_session_view_with_no_ranges_is_refused_while_the_scheduler_sentinel_is_not() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let parent = scheduler.session.create_sequence().unwrap();
+        // A real forward, so the parent owns a block and "all" is
+        // distinguishable from "none". Advancing the offset alone allocates
+        // nothing.
+        let tokens = [1u32, 2, 3, 4];
+        let input = Tensor::new(&tokens[..], &scheduler.device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        scheduler
+            .session
+            .ensure_capacity(&[parent], tokens.len())
+            .unwrap();
+        let nl = scheduler.model.num_layers().max(1);
+        scheduler
+            .model
+            .forward_wave(
+                &mut scheduler.session,
+                &[],
+                &[],
+                &[parent],
+                &[input],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )
+            .unwrap();
+        scheduler
+            .session
+            .advance_sequence(parent, tokens.len())
+            .unwrap();
+
+        let err = scheduler
+            .session
+            .create_view_sequence(parent, &[])
+            .expect_err("an empty range list must not silently borrow nothing");
+        assert!(
+            err.to_string().contains("no visible block ranges"),
+            "the refusal must name the fix: {err}"
+        );
+
+        // A zero-LENGTH range is a different thing and stays legal: it is what
+        // the scheduler's sentinel expands to for a parent with no blocks.
+        assert!(
+            scheduler
+                .session
+                .create_view_sequence(parent, &[(0, 0)])
+                .is_ok(),
+            "a zero-length range borrows nothing legitimately"
+        );
+
+        // And the sentinel itself still means "all blocks".
+        let (view, borrowed) = scheduler
+            .create_view(SequenceId(parent), &[])
+            .expect("the scheduler sentinel expands to the parent's blocks");
+        assert!(
+            borrowed.0 > 0,
+            "the sentinel borrowed {} blocks from a parent that has some",
+            borrowed.0
+        );
+        let _ = view;
+    }
+
     // —— View swap tests ——————————————————————————————————————————————————————
     //
     // The previous `swap_view_with_new_ranges` mid-decode view-swap path
@@ -8226,6 +10395,100 @@ mod tests {
             !scheduler.carried_beliefs.contains_key(&seq_id),
             "a reset slot is reused for new content — the previous occupant's \
              belief must not survive the reset"
+        );
+    }
+
+    /// **A resumed slot seeds its carried belief from the recovered selection
+    /// events — the same fold the live seal harvest performs.**
+    ///
+    /// `carried_beliefs` is what a submit-time projection seeds from, and it is
+    /// keyed by slot, so before this a resumed conversation selected its
+    /// sections and tools from an EMPTY prior while its uninterrupted twin
+    /// carried a prior evolved over every turn. Near a selection gate that
+    /// flips a section in or out of the context, and the first resumed decode
+    /// diverges — deterministically, marginally, and past every recall probe.
+    /// A1 of the behavioural catalogue caught it; this pins the fix at unit
+    /// scope so it never again needs two model loads to check.
+    #[test]
+    fn a_resumed_slot_seeds_carried_belief_from_the_recovered_selections() {
+        use crate::persistence::content_hash::turn_stream_id;
+        use crate::projection::event::{ProjectionEvent, ProjectionSelection, SystemItem};
+        use crate::projection::SelectedSection;
+        use crate::substrate::TurnPartWrite;
+
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let timeline = TimelineId::for_test(11);
+        conversation.register_timeline(
+            timeline,
+            crate::projection::LayerId::from_raw(1).unwrap(),
+            crate::projection::GroupId::from_raw(1).unwrap(),
+        );
+
+        // Two recovered turns whose final projection events both name the same
+        // tools-catalog member: the merge must fold them in TURN ORDER, so the
+        // later turn's belief wins — exactly what the live harvest holds.
+        for (expected_idx, score) in [(0u32, 0.25f32), (1u32, 0.75f32)] {
+            let idx = conversation
+                .record_turn(
+                    timeline,
+                    Role::Assistant,
+                    TurnPartWrite {
+                        token_count: 1,
+                        block_end: 1,
+                        sealed_gpu: Some(Arc::new(vec![])),
+                        ..Default::default()
+                    },
+                    |_| Ok(vec![]),
+                )
+                .expect("record turn");
+            assert_eq!(idx.0, expected_idx, "turns land in order");
+            let event = ProjectionEvent {
+                selection: ProjectionSelection {
+                    system: vec![SystemItem::Collection {
+                        name: "tools".into(),
+                        sections: vec![SelectedSection {
+                            name: "calculator".into(),
+                            tokens: 5,
+                            selected: true,
+                            score,
+                            qualified: true,
+                        }],
+                    }],
+                    turns: vec![],
+                },
+                ..Default::default()
+            };
+            conversation
+                .persist_projection_events(
+                    turn_stream_id(timeline.raw(), idx.0),
+                    &encode_events(&[event]),
+                )
+                .expect("persist events");
+        }
+
+        let slot = SequenceId(scheduler.session.create_sequence().expect("slot"));
+        scheduler.restore_carried_belief(slot, &conversation, timeline);
+
+        let belief = scheduler
+            .carried_beliefs
+            .get(&slot)
+            .expect("a resumed slot must not select from an empty prior");
+        assert_eq!(
+            belief.coll("tools").get("calculator"),
+            Some(&(0.75, true, true)),
+            "the recovered belief must be the turn-ordered fold of the persisted \
+             selections — the last turn's stamped score, not the first's"
+        );
+
+        // A timeline with no recovered events seeds nothing: an empty prior IS
+        // right for a genuinely fresh conversation, and inserting a default
+        // would erase that distinction.
+        let fresh = SequenceId(scheduler.session.create_sequence().expect("slot"));
+        scheduler.restore_carried_belief(fresh, &conversation, TimelineId::for_test(12));
+        assert!(
+            !scheduler.carried_beliefs.contains_key(&fresh),
+            "no recovered selections must mean no seeded belief"
         );
     }
 

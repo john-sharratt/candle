@@ -29,9 +29,26 @@ use candle_conversation::provenance::{
 };
 use candle_conversation::substrate::Substrate;
 
-/// KV heads per layer-group — the granularity `score_provenance_late_fusion`
-/// slices the signature into (`n_groups = n_heads / HEADS_PER_GROUP`).
-const HEADS_PER_GROUP: usize = 4;
+/// Layer groups in a folded signature — structural (one noise-absorbing lower
+/// group plus the top two capture layers), matching `FoldParams::group_sizes`.
+const FOLD_GROUPS: usize = 3;
+
+/// KV heads per layer-group, **derived from the probed signature** rather than
+/// hardcoded.
+///
+/// This used to be a bare `const … = 4`, which is `n_kv_head` on the 48-layer
+/// stack the fold was measured against and **2** on the hybrid — and being a
+/// literal rather than an alias, it did not turn up in a grep for the shared
+/// constant. Left alone it strides `project_groups` past the end of a hybrid
+/// signature, the bounds check drops the group, and the harness scores an
+/// **empty** projection as a valid one. In a tool whose only output is which
+/// layers carry the signal, that is the one answer it must not give.
+fn heads_per_group(n_heads: usize) -> usize {
+    if n_heads == 0 || !n_heads.is_multiple_of(FOLD_GROUPS) {
+        return 0;
+    }
+    n_heads / FOLD_GROUPS
+}
 
 /// Project a signature down to only the layer-`groups` listed, concatenated in
 /// order. Produces a `WideQSig` the scorer reads as having exactly those groups,
@@ -42,17 +59,31 @@ fn project_groups(sig: &WideQSig, groups: &[usize]) -> WideQSig {
         return sig.clone();
     }
     let wph = sig.words.len() / n_heads;
-    let gw = HEADS_PER_GROUP * wph; // words per layer-group
+    let hpg = heads_per_group(n_heads);
+    if hpg == 0 {
+        // Not a folded signature (its head count is not a whole number of
+        // groups). Say so rather than slicing it into an empty projection the
+        // scorer would happily rank.
+        panic!(
+            "signature spans {n_heads} heads, which is not {FOLD_GROUPS} whole \
+             layer-groups — this is not a folded provenance signature"
+        );
+    }
+    let gw = hpg * wph; // words per layer-group
     let mut words = Vec::with_capacity(groups.len() * gw);
     for &g in groups {
         let s = g * gw;
         let e = s + gw;
-        if e <= sig.words.len() {
-            words.extend_from_slice(&sig.words[s..e]);
-        }
+        assert!(
+            e <= sig.words.len(),
+            "group {g} runs past the signature ({e} > {}) — a silently dropped \
+             group makes this harness report an empty projection as a result",
+            sig.words.len(),
+        );
+        words.extend_from_slice(&sig.words[s..e]);
     }
     WideQSig {
-        n_heads: (groups.len() * HEADS_PER_GROUP) as u16,
+        n_heads: (groups.len() * hpg) as u16,
         words,
     }
 }
@@ -161,7 +192,11 @@ fn main() -> anyhow::Result<()> {
     } else {
         shape.words.len() / shape.n_heads as usize
     };
-    let n_groups = shape.n_heads as usize / HEADS_PER_GROUP;
+    let n_groups = if heads_per_group(shape.n_heads as usize) == 0 {
+        0
+    } else {
+        FOLD_GROUPS
+    };
     println!("═══ §83 repo_map layer-group sweep ═══\n");
     println!("probe : {query_hex}  ({} tokens)", probe.len());
     println!(

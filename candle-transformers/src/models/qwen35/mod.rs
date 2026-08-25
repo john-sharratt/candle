@@ -44,6 +44,11 @@ pub mod quantized_loader;
 pub mod quantized_moe;
 pub mod quantized_weights;
 pub mod spec;
+
+/// Tier-2 gates for the recurrent-state hooks — inside the lib because they
+/// drive `batch_test`, which is `cfg(test)` on this crate.
+#[cfg(all(test, feature = "cuda"))]
+mod recurrent_gates;
 #[cfg(feature = "cuda")]
 pub mod wave;
 

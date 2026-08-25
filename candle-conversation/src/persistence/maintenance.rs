@@ -230,6 +230,8 @@ pub struct MaintenancePlan {
     token_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(snapshot stream, source_loc)` recurrent-state snapshots to relocate.
     snapshot_relocs: Vec<(StreamId, RecordLoc)>,
+    /// `(branch stream, source_loc)` prompt branch checkpoints to relocate.
+    branch_checkpoint_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(type, source_loc)` singleton records to relocate.
     singleton_relocs: Vec<(RecordType, RecordLoc)>,
 }
@@ -251,6 +253,8 @@ pub struct MaintenanceResult {
     token_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
     /// `(snapshot stream, old_loc, new_loc)`.
     snapshot_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
+    /// `(branch stream, old_loc, new_loc)`.
+    branch_checkpoint_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
 }
 
 impl MaintenanceResult {
@@ -276,6 +280,11 @@ impl MaintenanceResult {
             // copy of the old one is dead and reclaimed by a later pass.
             if substrate.recurrent_snapshot_loc(*sid) == Some(*old) {
                 substrate.apply_snapshot_loc(*sid, *new);
+            }
+        }
+        for (sid, old, new) in &self.branch_checkpoint_updates {
+            if substrate.branch_checkpoint_loc(*sid) == Some(*old) {
+                substrate.apply_branch_checkpoint_loc(*sid, *new);
             }
         }
         substrate.refresh_cold_refs();
@@ -495,14 +504,20 @@ impl SubstratePersistence {
         } else {
             Vec::new()
         };
-        let (chunk_relocs, token_relocs, snapshot_relocs, singleton_relocs) =
-            self.gather_relocations(substrate, &op.targets());
+        let (
+            chunk_relocs,
+            token_relocs,
+            snapshot_relocs,
+            branch_checkpoint_relocs,
+            singleton_relocs,
+        ) = self.gather_relocations(substrate, &op.targets());
         Ok(Some(MaintenancePlan {
             op,
             resident,
             chunk_relocs,
             token_relocs,
             snapshot_relocs,
+            branch_checkpoint_relocs,
             singleton_relocs,
         }))
     }
@@ -640,6 +655,18 @@ impl SubstratePersistence {
         let snapshot_updates =
             self.relocate_stream_records(RecordType::Snapshot, &live_snapshots)?;
 
+        // Branch checkpoints relocate by the same rule and under their own
+        // record type — writing them back as `Snapshot` would re-type a cache
+        // as durable state, and compaction's cap would then never see them.
+        let live_branch: Vec<(StreamId, RecordLoc)> = plan
+            .branch_checkpoint_relocs
+            .iter()
+            .filter(|(sid, old)| self.snapshot_locs.get(&sid.0) == Some(old))
+            .copied()
+            .collect();
+        let branch_updates =
+            self.relocate_stream_records(RecordType::BranchCheckpoint, &live_branch)?;
+
         // Singletons — few (≤3); the encoding append repoints them via
         // `manifest.ingest`.
         for &(rt, old) in &plan.singleton_relocs {
@@ -656,6 +683,7 @@ impl SubstratePersistence {
             chunk_updates,
             token_updates,
             snapshot_updates,
+            branch_checkpoint_updates: branch_updates,
         })
     }
 
@@ -786,14 +814,20 @@ impl SubstratePersistence {
         } else {
             Vec::new()
         };
-        let (chunk_relocs, token_relocs, snapshot_relocs, singleton_relocs) =
-            self.gather_relocations(substrate, &op.targets());
+        let (
+            chunk_relocs,
+            token_relocs,
+            snapshot_relocs,
+            branch_checkpoint_relocs,
+            singleton_relocs,
+        ) = self.gather_relocations(substrate, &op.targets());
         let plan = MaintenancePlan {
             op: *op,
             resident,
             chunk_relocs,
             token_relocs,
             snapshot_relocs,
+            branch_checkpoint_relocs,
             singleton_relocs,
         };
         let result = self.execute_maintenance(&plan)?;
@@ -810,6 +844,7 @@ impl SubstratePersistence {
         targets: &[SegmentId],
     ) -> (
         Vec<(StreamId, u64, ChunkLoc)>,
+        Vec<(StreamId, RecordLoc)>,
         Vec<(StreamId, RecordLoc)>,
         Vec<(StreamId, RecordLoc)>,
         Vec<(RecordType, RecordLoc)>,
@@ -872,6 +907,16 @@ impl SubstratePersistence {
                 snapshots.push((sid, loc));
             }
         }
+        // Branch checkpoints relocate too — maintenance moves records out of a
+        // segment it is about to drop, and a checkpoint left behind would leave
+        // the index pointing at bytes that are gone. The compaction *cap* is a
+        // separate concern: this pass preserves, `collect_live_records` bounds.
+        let mut branch_checkpoints: Vec<(StreamId, RecordLoc)> = Vec::new();
+        for (sid, loc) in substrate.branch_checkpoint_entries() {
+            if in_target(loc.segment) {
+                branch_checkpoints.push((sid, loc));
+            }
+        }
         let mut singletons: Vec<(RecordType, RecordLoc)> = Vec::new();
         for (rt, loc) in [
             (RecordType::ModelSpec, self.manifest.model_spec),
@@ -884,7 +929,7 @@ impl SubstratePersistence {
                 }
             }
         }
-        (chunks, tokens, snapshots, singletons)
+        (chunks, tokens, snapshots, branch_checkpoints, singletons)
     }
 
     /// Live read-back record bytes per segment — `Chunk` / `Tokens` /
@@ -1073,7 +1118,7 @@ mod tests {
 
         // Relocation worklist contains exactly the tail (the dead copy is
         // invisible to the index).
-        let (_, _, snapshots, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (_, _, snapshots, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].0, sid);
 
@@ -1084,7 +1129,7 @@ mod tests {
             reason: None,
         });
         assert!(substrate.recurrent_snapshot_loc(sid).is_none());
-        let (_, _, snapshots, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (_, _, snapshots, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
         assert!(
             snapshots.is_empty(),
             "tombstoned snapshot must not relocate"
@@ -1435,7 +1480,7 @@ mod tests {
 
         // Phase 1 — plan (snapshot).
         let t = Instant::now();
-        let (chunk_relocs, _, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (chunk_relocs, _, _, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
         let plan_el = t.elapsed();
 
         // Reference: the naive per-record read path (`read_chunk` decodes +
@@ -1616,7 +1661,7 @@ mod tests {
             "the stream is an orphan: chunk present, no decl",
         );
         // gather_relocations must NOT relocate the orphan's chunk.
-        let (chunks, _tokens, _snapshots, _singletons) =
+        let (chunks, _tokens, _snapshots, _branch, _singletons) =
             sp.gather_relocations(&substrate, &[SegmentId(1)]);
         assert!(
             chunks.is_empty(),

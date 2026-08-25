@@ -86,6 +86,14 @@ pub(crate) enum WriteJob {
         stream_id: StreamId,
         payload: Vec<u8>,
     },
+    /// A prompt branch's recurrent checkpoint (`BranchCheckpoint` record).
+    /// Same single-tail append as [`Self::Snapshot`] and the same byte-cap
+    /// class; a separate job because the record type is what tells compaction
+    /// this one is a cache it may reclaim.
+    BranchCheckpoint {
+        stream_id: StreamId,
+        payload: Vec<u8>,
+    },
     /// Drain everything queued, fsync, ack, and stop the thread.
     Shutdown(Sender<()>),
 }
@@ -97,6 +105,7 @@ impl WriteJob {
             WriteJob::Tokens { token_ids, .. } => (token_ids.len() * 4) as u64,
             WriteJob::WideQSigs { payload, .. } => payload.len() as u64,
             WriteJob::Snapshot { payload, .. } => payload.len() as u64,
+            WriteJob::BranchCheckpoint { payload, .. } => payload.len() as u64,
             WriteJob::KvCold { grid, .. } => grid.bytes() as u64,
             WriteJob::Shutdown(_) => 0,
         }
@@ -110,7 +119,10 @@ impl WriteJob {
     fn is_bulk(&self) -> bool {
         // Snapshots are multi-MB state blobs: byte-capped with the KV so a
         // backlog can never crowd out the small seal metadata.
-        matches!(self, WriteJob::KvCold { .. } | WriteJob::Snapshot { .. })
+        matches!(
+            self,
+            WriteJob::KvCold { .. } | WriteJob::Snapshot { .. } | WriteJob::BranchCheckpoint { .. }
+        )
     }
 }
 
@@ -264,6 +276,21 @@ fn process_one(
             stream_id,
             token_ids,
         } => {
+            // Fault injection (test-helpers): a stream armed via
+            // [`fault::drop_next_tokens`] loses this record — the deterministic
+            // stand-in for a crash between the snapshot append and the tokens
+            // append, which is the one tear the §4.1 write ordering permits.
+            // Nothing else about the write path changes; the record is simply
+            // never appended, exactly as a crash would leave it.
+            #[cfg(any(test, feature = "test-helpers"))]
+            if fault::take_drop_tokens(stream_id) {
+                tracing::warn!(
+                    target: "candle_conversation::persistence::writer",
+                    stream_id = stream_id.0,
+                    "FAULT INJECTION: dropping Tokens record"
+                );
+                return None;
+            }
             // Append under the persistence lock, then register the record's
             // location in the substrate index under the substrate lock — taken
             // NON-nested, persistence released first (same order as the KV-cold
@@ -314,6 +341,25 @@ fn process_one(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
                     "snapshot append failed: {e}"
+                ),
+            }
+        }
+        WriteJob::BranchCheckpoint { stream_id, payload } => {
+            // Same append-then-register discipline as `Snapshot`, into the
+            // branch index.
+            let loc = {
+                let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+                p.write_branch_checkpoint(stream_id, &payload)
+            };
+            match loc {
+                Ok(loc) => substrate
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .apply_branch_checkpoint_loc(stream_id, loc),
+                Err(e) => tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    stream_id = stream_id.0,
+                    "branch checkpoint append failed: {e}"
                 ),
             }
         }
@@ -376,6 +422,41 @@ fn commit(persistence: &Arc<Mutex<SubstratePersistence>>) {
                 target: "candle_conversation::persistence::writer",
                 "substrate writer commit failed: {e}"
             );
+        }
+    }
+}
+
+/// Deterministic fault injection for the durable write path — the enablement
+/// the torn-seal oracles (catalogue D2/D3) are blocked on. Not a behaviour
+/// switch: production code never arms a fault; a test arms a specific stream
+/// and the writer drops exactly that one record, reproducing the one tear the
+/// §4.1 write ordering permits (snapshot landed, tokens lost) without needing
+/// to crash the process at a precise instant.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod fault {
+    use std::sync::Mutex;
+
+    use crate::persistence::streams::StreamId;
+
+    static DROP_TOKENS: Mutex<Vec<StreamId>> = Mutex::new(Vec::new());
+
+    /// Arm: the next `Tokens` record for `stream` is silently dropped instead
+    /// of appended. One-shot per call — the arm is consumed when it fires.
+    pub fn drop_next_tokens(stream: StreamId) {
+        DROP_TOKENS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(stream);
+    }
+
+    /// Consume an armed drop for `stream`, if any.
+    pub(super) fn take_drop_tokens(stream: StreamId) -> bool {
+        let mut armed = DROP_TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = armed.iter().position(|s| *s == stream) {
+            armed.remove(pos);
+            true
+        } else {
+            false
         }
     }
 }
