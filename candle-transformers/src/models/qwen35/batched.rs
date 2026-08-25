@@ -30,6 +30,7 @@ use crate::models::batched_inference::{
 };
 use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::RecurrentStateStore;
+use crate::models::draft_ladder::DraftLadder;
 use crate::models::rotary_layout::RotaryLayout;
 
 /// A loaded hybrid model of this lineage, ready to be driven by the scheduler.
@@ -46,6 +47,13 @@ pub struct HybridBatched {
     /// supplied at construction because thresholds are model-specific by
     /// standing rule and this struct serves the whole lineage.
     kv_factors: KvErrorThresholdFactors,
+    /// The concrete model's draft-budget ladder
+    /// (`crate::models::draft_ladder::QWEN35_9B_DRAFT` and siblings). Supplied
+    /// at construction for the same reason as the factor row above: how far
+    /// ahead it pays to draft is measured per checkpoint, and this struct serves
+    /// the whole lineage. A checkpoint with no NextN head carries
+    /// [`DraftLadder::NONE`].
+    draft: DraftLadder,
     kv_map: KvLayerMap,
     rotary: RotaryLayout,
     /// Inverse frequencies over the **rotary** width, not the head width.
@@ -112,8 +120,13 @@ pub struct HybridBatched {
 }
 
 impl HybridBatched {
-    /// Wrap a loaded model with its derived KV threshold factor row.
-    pub fn new(model: QuantModel, kv_factors: KvErrorThresholdFactors) -> Result<Self> {
+    /// Wrap a loaded model with the two rows derived per checkpoint: its KV
+    /// threshold factors and its draft-budget ladder.
+    pub fn new(
+        model: QuantModel,
+        kv_factors: KvErrorThresholdFactors,
+        draft: DraftLadder,
+    ) -> Result<Self> {
         let kv_map = KvLayerMap::new(&model.cfg.layer_kinds);
         if kv_map.num_kv_layers() == 0 {
             candle::bail!(
@@ -136,6 +149,7 @@ impl HybridBatched {
         Ok(Self {
             model,
             kv_factors,
+            draft,
             kv_map,
             rotary,
             inv_freq,
@@ -436,6 +450,20 @@ impl HybridBatched {
         self.model.mtp.is_some()
     }
 
+    /// This checkpoint's draft budget for a wave of `width` sequences.
+    ///
+    /// Gated on the head actually being loaded, not just on the ladder being
+    /// non-empty: a checkpoint converted without the NextN tensors would
+    /// otherwise have every wave pay a drafting call that can only return
+    /// nothing.
+    pub fn draft_budget_for(&self, width: usize) -> usize {
+        if self.has_drafter() {
+            self.draft.budget(width)
+        } else {
+            0
+        }
+    }
+
     /// The KV layer the draft head writes, past every trunk attention layer.
     /// `None` on a checkpoint without a head, where no such layer is allocated.
     pub fn mtp_kv_layer(&self) -> Option<usize> {
@@ -584,17 +612,31 @@ impl HybridBatched {
             );
         }
 
+        let want = session.activation_dtype();
         let (draftable, seeds): (Vec<usize>, Vec<Tensor>) = {
-            let map = self
+            let mut map = self
                 .seed
                 .lock()
                 .map_err(|_| candle::Error::Msg("qwen35: seed lock poisoned".into()))?;
             let mut idx = Vec::with_capacity(seqs.len());
             let mut seeds = Vec::with_capacity(seqs.len());
             for (i, seq) in seqs.iter().enumerate() {
-                if let Some(s) = map.get(seq) {
-                    idx.push(i);
-                    seeds.push(s.clone());
+                match map.get(seq) {
+                    // A seed captured under a DIFFERENT activation dtype belongs
+                    // to a session that no longer exists — the harness builds one
+                    // session per config and a sequence index is reused across
+                    // them, so the seed left behind is a previous run's hidden.
+                    // Concatenating it with this run's embedding is a dtype
+                    // mismatch, and the sequence simply drafts nothing until the
+                    // next wave captures a fresh one.
+                    Some(s) if s.dtype() != want => {
+                        map.remove(seq);
+                    }
+                    Some(s) => {
+                        idx.push(i);
+                        seeds.push(s.clone());
+                    }
+                    None => {}
                 }
             }
             (idx, seeds)
@@ -779,6 +821,37 @@ impl HybridBatched {
     /// single place the conversion happens — at session creation, never
     /// inside a wave.
     pub fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+        // A dtype change means a NEW session — this is the one place that
+        // happens, and only a new session can change it. Every piece of draft
+        // state is an activation captured under the old one, belonging to a
+        // sequence numbering the new session will reuse for something else, so
+        // all of it dies here. Nothing is dropped when the dtype is unchanged,
+        // which is what a sibling session sharing the backings gets.
+        //
+        // Not hypothetical: a gate that runs F16 and then BF16 against one
+        // loaded model would otherwise hand the draft head an F16 hidden to
+        // concatenate with a BF16 embedding.
+        let stale = self
+            .verify_hidden
+            .lock()
+            .map(|m| m.values().any(|t| t.dtype() != dtype))
+            .unwrap_or(false)
+            || self
+                .seed
+                .lock()
+                .map(|m| m.values().any(|t| t.dtype() != dtype))
+                .unwrap_or(false);
+        if stale {
+            if let Ok(mut m) = self.verify_hidden.lock() {
+                m.clear();
+            }
+            if let Ok(mut m) = self.seed.lock() {
+                m.clear();
+            }
+            if let Ok(mut m) = self.capture_rows.lock() {
+                m.clear();
+            }
+        }
         let block = |l: &QuantLayer| -> Result<()> {
             l.attn_norm.maybe_change_dtype(dtype)?;
             l.post_attn_norm.maybe_change_dtype(dtype)?;

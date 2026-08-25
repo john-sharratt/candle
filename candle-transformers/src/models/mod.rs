@@ -49,6 +49,7 @@ pub mod debertav2;
 pub mod decode_utils;
 pub mod deepseek2;
 pub mod delta_net;
+pub mod draft_ladder;
 // The DeepSeek-V4 arch descriptor names `latent_moe`'s geometry and weights, so
 // it shares that engine's gating.
 #[cfg(feature = "cuda")]
@@ -190,6 +191,7 @@ pub mod segment_anything;
 pub mod siglip;
 pub mod slot_state;
 pub mod snac;
+pub mod speculative_choice;
 pub mod stable_diffusion;
 pub mod stable_lm;
 pub mod starcoder2;
@@ -197,6 +199,10 @@ pub mod stella_en_v5;
 pub mod t5;
 pub mod tensor_cat;
 pub mod trocr;
+// Names `ManagedBatchedModel` and `BatchedInferenceSession`, so it follows
+// `batched_inference` behind the same gate.
+#[cfg(feature = "cuda")]
+pub mod verify_wave;
 pub mod vgg;
 pub mod vit;
 pub mod voxtral;

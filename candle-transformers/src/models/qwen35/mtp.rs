@@ -53,8 +53,8 @@
 //! `eh_proj` is a single `[hidden, 2·hidden]` weight spanning both halves, so
 //! swapping them multiplies each input by the other's block. The head still
 //! returns a finite, plausible token — and speculation is lossless, so nothing
-//! downstream ever disagrees. A mis-wired head shows up only as acceptance that
-//! never beats the n-gram fallback, which is far too weak a signal to debug
+//! downstream ever disagrees. A mis-wired head shows up only as acceptance
+//! decaying toward 1.00, which is far too weak a signal to debug
 //! from. The order is taken from the reference consumer of these tensor names,
 //! llama.cpp `src/models/qwen35moe.cpp`:
 //! `ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0)` — ggml's dim 0 is the
@@ -91,6 +91,10 @@ use candle_nn::kv_cache::KvCache;
 /// recurrently has that reach and no more, so budget 3 pays a full extra draft
 /// pass for nothing and measured *slower* end to end (77.5 t/s against 83.6).
 pub const MTP_MAX_DRAFT: usize = 2;
+
+/// How far ahead it is worth drafting is a separate question from how far the
+/// head can reach, and it lives in [`crate::models::draft_ladder`]: reach is a
+/// property of this block, worth is a property of the wave it rides on.
 
 /// The head's input assembly: the two norms and the projection over their
 /// concatenation.

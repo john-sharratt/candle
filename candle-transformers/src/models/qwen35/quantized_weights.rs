@@ -109,6 +109,114 @@ struct PendingLayer {
     ffn: PendingFfn,
 }
 
+/// The FFN half of a block at tensor prefix `p`, routed or dense.
+///
+/// **Shared by the trunk loop and the MTP draft head**, which is the point: the
+/// head is `blk.{num_layers}` with a trunk block's tensor set, and on a routed
+/// checkpoint that includes a full 256-expert FFN with its own router and
+/// shared expert. Two transcriptions of this would be two chances for the
+/// head's experts to be indexed differently from the trunk's, and the expert
+/// cache keys on a dense `moe_layer_idx` that both sides have to agree on.
+///
+/// `moe_layer_idx_next` is that counter, threaded through so the head — built
+/// after the trunk loop — takes the index straight after the last trunk MoE
+/// layer. `expert_host_refs` enumerates the checkpoint in the same order (trunk
+/// layers, then the head), so the two agree by construction rather than by
+/// coincidence.
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+fn pending_ffn<R: Read + Seek>(
+    g: &mut Loader<'_, R>,
+    cfg: &Qwen35Config,
+    p: &str,
+    mode: Int8Mode,
+    #[cfg(feature = "cuda")] moe_layer_idx_next: &mut usize,
+) -> Result<PendingFfn> {
+    if !g.has(&format!("{p}.ffn_gate_inp.weight")) {
+        return Ok(PendingFfn::Dense(g.dense_ffn(p)?));
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        candle::bail!("{p} is a MoE layer — the expert cache is a CUDA-only path");
+    }
+    #[cfg(feature = "cuda")]
+    {
+        // The shared gate is stored as a `[hidden]` vector; the matmul
+        // that consumes it wants a `[1, hidden]` row.
+        //
+        // **Padded to a full KO tile.** This projection has exactly one
+        // output — a scalar gate per token — and the int8 KO layout
+        // tiles output rows in groups of 32, so a 1-row weight cannot
+        // be represented (`repack_ko` refuses it). Without a KO twin
+        // the weight stays float, and a float weight fed the q8a128
+        // activations the fused norms emit has no kernel at all: the
+        // model loads and then dies on its first MoE layer.
+        //
+        // So the row is padded with zeros to 32 and the consumer takes
+        // output 0 back (`shared_expert_contribution`). The padding is
+        // unconditional rather than mode-dependent, so there is one
+        // shape here regardless of numeric path; it costs a
+        // `[32, hidden]` matmul in place of `[1, hidden]`, which is
+        // three orders of magnitude below the expert chain beside it.
+        let gate_row = g
+            .raw(&format!("{p}.ffn_gate_inp_shexp.weight"))?
+            .dequantize(&g.device)?
+            .reshape((1, cfg.hidden_size))?;
+        let pad = Tensor::zeros(
+            (SHARED_GATE_TILE - 1, cfg.hidden_size),
+            gate_row.dtype(),
+            &g.device,
+        )?;
+        let gate_vec = Tensor::cat(&[&gate_row, &pad], 0)?;
+        let pending = PendingFfn::Moe {
+            gate: g.proj(&format!("{p}.ffn_gate_inp.weight"))?,
+            shared: QuantFfnWeights::from_weights(
+                g.raw(&format!("{p}.ffn_gate_shexp.weight"))?,
+                g.raw(&format!("{p}.ffn_up_shexp.weight"))?,
+                g.raw(&format!("{p}.ffn_down_shexp.weight"))?,
+                mode,
+            )?,
+            shared_gate: QMatMul::from_qtensor_with_mode(
+                QTensor::quantize(&gate_vec, GgmlDType::F32)?,
+                mode,
+            )?,
+            moe_layer_idx: *moe_layer_idx_next,
+        };
+        *moe_layer_idx_next += 1;
+        Ok(pending)
+    }
+}
+
+/// The draft head with everything but its experts.
+///
+/// Deferred for exactly the reason a routed trunk layer is: the expert cache is
+/// sized from a measurement of the span the dense weights leave behind, so it
+/// cannot exist until every dense tensor is resident. On a routed checkpoint
+/// the head's FFN is a 256-expert block like any other, so it waits with them.
+struct PendingMtp {
+    input: MtpInput,
+    block: PendingLayer,
+    head_norm: RmsNorm,
+    layer_index: usize,
+}
+
+impl PendingMtp {
+    fn resolve(
+        self,
+        experts: Option<&std::sync::Arc<ExpertCache>>,
+        n_experts_used: usize,
+        norm_topk_prob: bool,
+    ) -> Result<MtpHead> {
+        Ok(MtpHead {
+            input: self.input,
+            block: self
+                .block
+                .resolve(experts, n_experts_used, norm_topk_prob)?,
+            head_norm: self.head_norm,
+            layer_index: self.layer_index,
+        })
+    }
+}
+
 impl PendingLayer {
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn resolve(
@@ -373,60 +481,14 @@ where
                 norm: g.f32(&format!("{p}.ssm_norm.weight"))?,
             }),
         };
-        let ffn = if g.has(&format!("{p}.ffn_gate_inp.weight")) {
-            #[cfg(not(feature = "cuda"))]
-            {
-                candle::bail!("blk.{li} is a MoE layer — the expert cache is a CUDA-only path");
-            }
+        let ffn = pending_ffn(
+            &mut g,
+            &cfg,
+            &p,
+            mode,
             #[cfg(feature = "cuda")]
-            {
-                // The shared gate is stored as a `[hidden]` vector; the matmul
-                // that consumes it wants a `[1, hidden]` row.
-                //
-                // **Padded to a full KO tile.** This projection has exactly one
-                // output — a scalar gate per token — and the int8 KO layout
-                // tiles output rows in groups of 32, so a 1-row weight cannot
-                // be represented (`repack_ko` refuses it). Without a KO twin
-                // the weight stays float, and a float weight fed the q8a128
-                // activations the fused norms emit has no kernel at all: the
-                // model loads and then dies on its first MoE layer.
-                //
-                // So the row is padded with zeros to 32 and the consumer takes
-                // output 0 back (`shared_expert_contribution`). The padding is
-                // unconditional rather than mode-dependent, so there is one
-                // shape here regardless of numeric path; it costs a
-                // `[32, hidden]` matmul in place of `[1, hidden]`, which is
-                // three orders of magnitude below the expert chain beside it.
-                let gate_row = g
-                    .raw(&format!("{p}.ffn_gate_inp_shexp.weight"))?
-                    .dequantize(&g.device)?
-                    .reshape((1, cfg.hidden_size))?;
-                let pad = Tensor::zeros(
-                    (SHARED_GATE_TILE - 1, cfg.hidden_size),
-                    gate_row.dtype(),
-                    &g.device,
-                )?;
-                let gate_vec = Tensor::cat(&[&gate_row, &pad], 0)?;
-                let pending = PendingFfn::Moe {
-                    gate: g.proj(&format!("{p}.ffn_gate_inp.weight"))?,
-                    shared: QuantFfnWeights::from_weights(
-                        g.raw(&format!("{p}.ffn_gate_shexp.weight"))?,
-                        g.raw(&format!("{p}.ffn_up_shexp.weight"))?,
-                        g.raw(&format!("{p}.ffn_down_shexp.weight"))?,
-                        mode,
-                    )?,
-                    shared_gate: QMatMul::from_qtensor_with_mode(
-                        QTensor::quantize(&gate_vec, GgmlDType::F32)?,
-                        mode,
-                    )?,
-                    moe_layer_idx: moe_layer_idx_next,
-                };
-                moe_layer_idx_next += 1;
-                pending
-            }
-        } else {
-            PendingFfn::Dense(g.dense_ffn(&p)?)
-        };
+            &mut moe_layer_idx_next,
+        )?;
         pending_layers.push(PendingLayer {
             attn_norm: g.norm(&format!("{p}.attn_norm.weight"), cfg.rms_norm_eps)?,
             post_attn_norm: g.norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_norm_eps)?,
@@ -503,28 +565,35 @@ where
                 );
             }
         }
-        if g.has(&format!("{p}.ffn_gate_inp.weight")) {
-            candle::bail!(
-                "qwen35: the MTP head at {p} is a routed (MoE) block, and the expert \
-                 cache is sized and indexed over the TRUNK's MoE layers only — \
-                 drafting from it would read experts nothing has staged. Load a dense \
-                 MTP checkpoint, or extend the cache to carry the head's layer first"
-            );
-        }
-        let head = MtpHead {
-            // The head's block, built by the SAME helpers a trunk attention
-            // layer is: `Loader::attention` already reads exactly these tensor
-            // names, because the head is `blk.{num_layers}` in the checkpoint
-            // and is named like every other block. Nothing here is
-            // head-specific, which is the point — it runs the production
-            // attention path unchanged.
-            block: QuantLayer {
-                attn_norm: g.norm(&format!("{p}.attn_norm.weight"), cfg.rms_norm_eps)?,
-                post_attn_norm: g
-                    .norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_norm_eps)?,
-                mix: QuantLayerMix::Attention(g.attention(&p, cfg.rms_norm_eps)?),
-                ffn: QuantFfn::Dense(g.dense_ffn(&p)?),
-            },
+        // **A routed head is loaded, not refused.** On a MoE checkpoint the
+        // head is a complete MoE block — its own router, 256 experts and shared
+        // expert, at the trunk's geometry — so it takes the same `pending_ffn`
+        // the trunk layers take and the same deferred resolve, and its experts
+        // land at the `moe_layer_idx` straight after the last trunk MoE layer.
+        // `expert_host_refs` walks the checkpoint in that same order, so the
+        // cache holds the head's experts at exactly the index the router asks
+        // for. (This used to bail: the cache was sized and indexed over the
+        // trunk only, and drafting would have read experts nothing staged.)
+        let block = PendingLayer {
+            // Built by the SAME helpers a trunk layer is: `Loader::attention`
+            // and `pending_ffn` already read exactly these tensor names,
+            // because the head is `blk.{num_layers}` in the checkpoint and is
+            // named like every other block. Nothing here is head-specific,
+            // which is the point — it runs the production path unchanged.
+            attn_norm: g.norm(&format!("{p}.attn_norm.weight"), cfg.rms_norm_eps)?,
+            post_attn_norm: g.norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_norm_eps)?,
+            mix: QuantLayerMix::Attention(g.attention(&p, cfg.rms_norm_eps)?),
+            ffn: pending_ffn(
+                &mut g,
+                &cfg,
+                &p,
+                mode,
+                #[cfg(feature = "cuda")]
+                &mut moe_layer_idx_next,
+            )?,
+        };
+        let head = PendingMtp {
+            block,
             input: MtpInput {
                 enorm: g.norm(&format!("{p}.nextn.enorm.weight"), cfg.rms_norm_eps)?,
                 hnorm: g.norm(&format!("{p}.nextn.hnorm.weight"), cfg.rms_norm_eps)?,
@@ -544,6 +613,7 @@ where
         tracing::info!(
             target: "candle_transformers::qwen35",
             block = mi,
+            routed = matches!(head.block.ffn, PendingFfn::Dense(_)).then_some(false).unwrap_or(true),
             "qwen35 MTP draft head loaded"
         );
         Some(head)
@@ -557,6 +627,10 @@ where
         .into_iter()
         .map(|l| l.resolve(experts.as_ref(), n_used, norm_topk))
         .collect::<Result<Vec<_>>>()?;
+    // The head resolves against the same cache, after it — see `PendingMtp`.
+    let mtp = mtp
+        .map(|m| m.resolve(experts.as_ref(), n_used, norm_topk))
+        .transpose()?;
 
     Ok(QuantModel {
         cfg,

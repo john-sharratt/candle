@@ -1,5 +1,7 @@
+use super::spec_chooser::SpecChooser;
 use super::*;
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
+use candle_transformers::models::speculative_choice::{AcceptWalk, TokenChooser};
 
 /// Max number of LOW-priority (bulk-ingest) decodes allowed to co-batch into a
 /// wave that also carries a HIGH-priority (interactive dialogue) decode. Keeps
@@ -332,7 +334,7 @@ impl Scheduler {
             // Drive a glue-only wave (no decode/prefill rows) to drain the deferred
             // fire, materialising the gap so the slot decodes next wave.
             if !self.deferred_glue_fires.is_empty() {
-                if let Err(e) = self.decode_forward_cobatched(&[], &[]) {
+                if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
                     tracing::error!("decode: deferred-glue drain wave failed: {e}");
                 }
             }
@@ -355,20 +357,6 @@ impl Scheduler {
             .iter()
             .map(|&id| *self.active_decodes[&id].generated_tokens.last().unwrap())
             .collect();
-        let inputs: Vec<Tensor> = match input_tokens
-            .iter()
-            .map(|&last_token| {
-                Tensor::new(&[last_token], &self.device).and_then(|t| t.unsqueeze(0))
-            })
-            .collect::<candle::Result<Vec<_>>>()
-        {
-            Ok(t) => t,
-            Err(e) => {
-                self.fail_all_decodes(&seq_ids, &format!("failed to create decode inputs: {e}"));
-                return;
-            }
-        };
-
         // Extract raw usize IDs for the forward_batched call into candle-transformers.
         let seq_ids_raw: Vec<usize> = seq_ids.iter().map(|id| id.0).collect();
 
@@ -380,13 +368,123 @@ impl Scheduler {
             .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
             .sum();
 
-        // Forward pass: all active sequences, 1 token each — co-batching the
-        // in-flight prefill cohort into decode's sweep at its active layer window
-        // (docs/continuous_fair_waves.md) so one expert load per layer serves both.
+        // Where each sequence stands before this step, which is what its KV
+        // rolls back to plus however many tokens it keeps.
+        let poss: Vec<usize> = seq_ids_raw
+            .iter()
+            .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
+            .collect();
+
+        // ── Draft ────────────────────────────────────────────────────────────
+        //
+        // **Every decode runs this path, drafter or not.** A model without one
+        // proposes nothing, every sequence takes an ordinary one-token row, and
+        // the accept walk below commits exactly one token each — so there is no
+        // second, plain decode path to drift out of step with this one.
         let t_fwd = std::time::Instant::now();
-        let logits_vec = match self.decode_forward_cobatched(&seq_ids_raw, &inputs) {
+        // The model's own measured width ladder: how far it is worth drafting
+        // shrinks as the wave widens, and where it stops paying depends on the
+        // checkpoint's shape rather than on anything the scheduler knows.
+        let budget = self.model.draft_budget(seq_ids.len());
+        let mut drafts = match self.model.speculative_draft(
+            &mut self.session,
+            &seq_ids_raw,
+            &input_tokens,
+            budget,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                self.fail_all_decodes(&seq_ids, &format!("decode draft failed: {e}"));
+                return;
+            }
+        };
+        if drafts.len() != seq_ids.len() {
+            self.fail_all_decodes(
+                &seq_ids,
+                &format!(
+                    "drafter returned {} proposal lists for {} sequences",
+                    drafts.len(),
+                    seq_ids.len()
+                ),
+            );
+            return;
+        }
+        // A sequence under a grammar stencil takes a plain row. Its next token is
+        // constrained to the stencil's frontier, so there is nothing to
+        // speculate about — and drafting past it would mean advancing that
+        // grammar through positions the walk may reject, which is a rollback the
+        // stencil driver has no notion of.
+        for (i, &id) in seq_ids.iter().enumerate() {
+            if self
+                .active_decodes
+                .get(&id)
+                .is_some_and(|s| s.stencil.is_some())
+            {
+                drafts[i].clear();
+            }
+        }
+
+        // A block is the sequence's committed token followed by its proposals.
+        // A sequence that drafted nothing has a one-token block and rides the
+        // wave as a plain decode row rather than a verify member.
+        let blocks: Vec<Vec<u32>> = drafts
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let mut b = Vec::with_capacity(d.len() + 1);
+                b.push(input_tokens[i]);
+                b.extend_from_slice(d);
+                b
+            })
+            .collect();
+        let plain: Vec<(usize, u32)> = (0..blocks.len())
+            .filter(|&i| blocks[i].len() == 1)
+            .map(|i| (seq_ids_raw[i], input_tokens[i]))
+            .collect();
+        let spec_idx: Vec<usize> = (0..blocks.len()).filter(|&i| blocks[i].len() > 1).collect();
+        let spec_seqs: Vec<usize> = spec_idx.iter().map(|&i| seq_ids_raw[i]).collect();
+        let spec_blocks: Vec<Vec<u32>> = spec_idx.iter().map(|&i| blocks[i].clone()).collect();
+
+        // ── The wave ─────────────────────────────────────────────────────────
+        //
+        // The model plans its rows; this owns the forward, so the verify blocks
+        // ride the SAME continuous-fair wave as the creep group and the glue and
+        // speculation costs no prefill throughput.
+        let plan = match self.model.begin_verify(
+            &mut self.session,
+            &plain,
+            &spec_seqs,
+            &spec_blocks,
+            budget,
+        ) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                self.fail_all_decodes(
+                    &seq_ids,
+                    "this model drafted proposals but cannot verify them — it overrides \
+                     `speculative_draft` without `begin_verify`",
+                );
+                return;
+            }
+            Err(e) => {
+                // It may have armed some of what it arms before failing, and a
+                // stash or a capture left standing outlives the step it belongs
+                // to — the next rewind would replay from it.
+                self.model.abort_verify(&spec_seqs);
+                self.fail_all_decodes(&seq_ids, &format!("verify setup failed: {e}"));
+                return;
+            }
+        };
+        let wave_rows = plan.rows;
+        let logits = match self.decode_forward_cobatched(
+            &plan.decode_seqs,
+            &plan.decode_inputs,
+            &plan.verify_seqs,
+            &plan.verify_inputs,
+        ) {
             Ok(l) => l,
             Err(e) => {
+                self.model.abort_verify(&spec_seqs);
                 self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
                 return;
             }
@@ -403,23 +501,54 @@ impl Scheduler {
             }
         }
         super::record_phase(t_fwd, "decode_forward");
-        // Decode batch = N sequences × 1 token each.
+        // Rows, not sequences: a speculative step scores a block per drafted
+        // sequence, and pricing it as one row each would understate the wave.
         self.wave_stats
-            .record(false, seq_ids.len(), seq_ids.len(), kv_len, fwd_ms);
+            .record(false, seq_ids.len(), wave_rows, kv_len, fwd_ms);
 
-        // Advance offsets (1 token per sequence) and mirror the
-        // input token into the slot's diagnostic log — this is the
-        // moment the kernel commits `input_tokens[i]` to the slot's
-        // KV cache.
-        for (i, &id) in seq_ids.iter().enumerate() {
-            if let Err(e) = self.session.advance_sequence(id.0, 1) {
-                tracing::warn!("failed to advance sequence {}: {}", id, e);
+        // Reads the scored rows back and advances each sequence by what the wave
+        // actually wrote — the walk below rolls the rejected tail off again.
+        let (plain_rows, spec_rows) =
+            match self
+                .model
+                .end_verify(&mut self.session, &plain, &spec_seqs, &spec_blocks, logits)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    self.model.abort_verify(&spec_seqs);
+                    self.fail_all_decodes(&seq_ids, &format!("verify readback failed: {e}"));
+                    return;
+                }
+            };
+        // Scored rows per sequence in cohort order: one for a plain row, one per
+        // block position for a verify member.
+        let mut rows_of: Vec<Vec<Tensor>> = vec![Vec::new(); blocks.len()];
+        {
+            let mut p = 0usize;
+            for i in 0..blocks.len() {
+                if blocks[i].len() == 1 {
+                    match plain_rows.get(p) {
+                        Some(r) => rows_of[i] = vec![r.clone()],
+                        None => {
+                            self.fail_all_decodes(&seq_ids, "verify returned too few plain rows");
+                            return;
+                        }
+                    }
+                    p += 1;
+                }
             }
-            super::Scheduler::record_slot_tokens(
-                &mut self.slot_tokens,
-                id,
-                std::slice::from_ref(&input_tokens[i]),
-            );
+            for (k, &i) in spec_idx.iter().enumerate() {
+                match spec_rows.get(k) {
+                    Some(r) if r.len() == blocks[i].len() => rows_of[i] = r.clone(),
+                    _ => {
+                        self.fail_all_decodes(
+                            &seq_ids,
+                            "verify returned the wrong number of rows for a block",
+                        );
+                        return;
+                    }
+                }
+            }
         }
 
         // Clone sampling configs before taking mutable references
@@ -469,11 +598,11 @@ impl Scheduler {
             }
         }
 
-        let config_refs: Vec<&SamplingConfig> = configs.iter().collect();
-
-        // Temporarily remove persistent sampling states to avoid borrow
-        // conflict with self.sample_batch_from_logits().
-        let mut removed_states: Vec<(SequenceId, SequenceSamplingState)> = seq_ids
+        // Hand the persistent sampling states to the chooser for the duration of
+        // the step: it needs them mutably (each sampled token is recorded into
+        // its sequence's history, which is what prices the next block position),
+        // and they go back into the map immediately after the walk.
+        let removed_states: Vec<(SequenceId, SequenceSamplingState)> = seq_ids
             .iter()
             .map(|&id| {
                 let mut state = self
@@ -498,29 +627,93 @@ impl Scheduler {
             })
             .collect();
 
-        let mut sampling_states: Vec<&mut SequenceSamplingState> =
-            removed_states.iter_mut().map(|(_, state)| state).collect();
-
-        // Sample next token for all sequences in a single batched call
+        // ── Accept walk ──────────────────────────────────────────────────────
+        //
+        // One sampler dispatch per block position over the sequences still
+        // alive. Sampling each row — rather than taking its argmax — is what
+        // makes speculation draw from the distribution plain decoding would:
+        // every drafter here proposes greedily, so the textbook accept/reject
+        // rule collapses to "sample the row, accept the proposal iff the sample
+        // agrees" (see `candle_transformers::models::speculative_choice`).
         let t_sample = std::time::Instant::now();
-        let mut next_tokens =
-            match self.sample_batch_from_logits(&logits_vec, &mut sampling_states, &config_refs) {
-                Ok(tokens) => tokens,
-                Err(e) => {
-                    // Reinsert states before failing
-                    for (id, state) in removed_states {
-                        self.sampling_states.insert(id, state);
+        let (state_ids, states): (Vec<SequenceId>, Vec<SequenceSamplingState>) =
+            removed_states.into_iter().unzip();
+        let mut chooser = SpecChooser::new(&self.sampler, states, configs);
+        let mut emitted: Vec<Vec<u32>> = vec![Vec::new(); blocks.len()];
+        // How many more tokens each sequence may generate. The sinks apply only
+        // this and EOS — the cheap half of the stop policy, which bounds how much
+        // of a block reaches the KV; the full per-token path below can still stop
+        // a sequence earlier, and what it keeps is rolled back to at the end.
+        let room: Vec<usize> = seq_ids
+            .iter()
+            .map(|id| {
+                self.active_decodes
+                    .get(id)
+                    .map_or(0, |s| s.max_tokens.saturating_sub(s.generated_tokens.len()))
+            })
+            .collect();
+        let walked = {
+            let eos = &self.eos_tokens;
+            let mut walk = AcceptWalk::new(&blocks);
+            let mut failure = None;
+            while !walk.finished() {
+                let rows = walk.rows();
+                let picked: Vec<Tensor> = walk
+                    .alive()
+                    .iter()
+                    .map(|&i| rows_of[i][walk.position()].clone())
+                    .collect();
+                let stacked = match Tensor::cat(&picked, 0) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
                     }
-                    let seq_ids: Vec<SequenceId> = self.active_decodes.keys().copied().collect();
-                    self.fail_all_decodes(&seq_ids, &format!("sampling failed: {e}"));
-                    return;
+                };
+                let tokens = match chooser.choose(&stacked, &rows) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                };
+                if let Err(e) = walk.commit(&tokens, |i, t| {
+                    emitted[i].push(t);
+                    !eos.contains(&t) && emitted[i].len() < room[i]
+                }) {
+                    failure = Some(e);
+                    break;
                 }
-            };
-
-        // Reinsert persistent sampling states
-        for (id, state) in removed_states {
+            }
+            match failure {
+                Some(e) => Err(e),
+                None => Ok(walk.finish()),
+            }
+        };
+        let kept = match walked {
+            // The walk's next-seed is not read here: the scheduler takes each
+            // step's input from `generated_tokens.last()`, which the commit
+            // below fills, so a second copy of it could only disagree.
+            Ok((_, kept)) => kept,
+            Err(e) => {
+                for (id, state) in state_ids.into_iter().zip(chooser.into_states()) {
+                    self.sampling_states.insert(id, state);
+                }
+                // The rollback below is never reached, so the rewind spans this
+                // step's verify took are still held. Drop them: they name
+                // offsets inside a block whose accept never happened.
+                self.model.abort_verify(&spec_seqs);
+                self.fail_all_decodes(&seq_ids, &format!("sampling failed: {e}"));
+                return;
+            }
+        };
+        // The row each token was drawn from, for the health checks, taken before
+        // the states go back.
+        let captured: Vec<Vec<Tensor>> = chooser.rows().to_vec();
+        for (id, state) in state_ids.into_iter().zip(chooser.into_states()) {
             self.sampling_states.insert(id, state);
         }
+
         let sample_ms = t_sample.elapsed().as_millis() as u64;
         super::record_phase(t_sample, "decode_sample");
 
@@ -535,13 +728,13 @@ impl Scheduler {
             // Slot-labelled (`seq:token`): each fragment attributes to its slot
             // so a cross-slot row swap (one stream continuing another's text)
             // is directly visible in the trace instead of an anonymous mixture.
-            next_tokens
+            emitted
                 .iter()
                 .zip(seq_ids.iter())
-                .map(|(&t, id)| {
+                .map(|(toks, id)| {
                     let frag = self
                         .tokenizer
-                        .decode(&[t], skip)
+                        .decode(toks, skip)
                         .unwrap_or_else(|_| "<?>".to_string());
                     format!("{}:{}", id.0, frag)
                 })
@@ -551,15 +744,122 @@ impl Scheduler {
             String::new()
         };
 
+        let accepted: usize = kept.iter().sum();
         tracing::trace!(
             target: "candle_conversation::scheduler::timing",
             batch = seq_ids.len(),
+            rows = wave_rows,
+            accepted,
             fwd_ms,
             sample_ms,
             token_str = %token_str,
             "decode_step",
         );
 
+        // ── Commit, one position at a time ───────────────────────────────────
+        //
+        // Each token the walk accepted runs the full per-token path — stencil
+        // advance, health, the stream event, reprojection triggers — exactly as
+        // it would on a single-token step. A sequence that the walk carried
+        // further than the per-token path will tolerate simply stops appearing.
+        let deepest = emitted.iter().map(|e| e.len()).max().unwrap_or(0);
+        let mut committed = vec![0usize; blocks.len()];
+        for p in 0..deepest {
+            let at: Vec<usize> = (0..blocks.len())
+                .filter(|&i| emitted[i].len() > p)
+                .filter(|&i| {
+                    self.active_decodes.get(&seq_ids[i]).is_some_and(|s| {
+                        // Stopped by the per-token path — a health abort, a sink
+                        // that closed.
+                        !s.finished
+                            // **A grammar that opened inside this block ends
+                            // it.** A sequence with no stencil was allowed to
+                            // draft, so its later positions were sampled with no
+                            // allow-list; if position `p - 1` turned out to be a
+                            // trigger token, those tokens are exactly the ones
+                            // the grammar was supposed to constrain. Committing
+                            // them would feed unconstrained text to
+                            // `driver.accept`, whose heal path then rewrites the
+                            // token and prefills a corrected prefix — against a
+                            // sequence whose KV already holds the rest of the
+                            // block. Stop instead and let the truncation below
+                            // discard the tail; the grammar decodes properly
+                            // from the next wave.
+                            && (p == 0 || s.stencil.is_none())
+                    })
+                })
+                .collect();
+            if at.is_empty() {
+                break;
+            }
+            let ids: Vec<SequenceId> = at.iter().map(|&i| seq_ids[i]).collect();
+            let mut toks: Vec<u32> = at.iter().map(|&i| emitted[i][p]).collect();
+            let rows: Vec<Tensor> = at.iter().map(|&i| captured[i][p].clone()).collect();
+            self.commit_decoded_tokens(&ids, &mut toks, &rows);
+            for &i in &at {
+                committed[i] += 1;
+            }
+        }
+
+        // ── Roll each sequence back to what actually reached the turn ────────
+        //
+        // The wave wrote every block whole, rejected proposals included, so this
+        // is where a partial accept becomes real. It runs **after** the commit
+        // loop, not before it, and keys on `committed` rather than on the walk's
+        // `kept`: the per-token path can stop a sequence short of what the walk
+        // accepted, and those tokens must come off too.
+        //
+        // One call, not two. A rewind consumes the verifying sequence's span
+        // from the shared stash — a span is good for exactly one step — so a
+        // second `truncate_sequences` in the same step finds no rewind point and
+        // refuses, taking every other sequence's rollback down with it. The
+        // earlier arrangement truncated to `kept` here and tried to correct to
+        // `committed` afterwards, which could not work for that reason and left
+        // rejected tokens in the KV whenever the per-token path stopped early.
+        let targets: Vec<(usize, usize)> = seq_ids_raw
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (s, poss[i] + committed[i]))
+            .collect();
+        if let Err(e) = self.model.truncate_sequences(&mut self.session, &targets) {
+            self.fail_all_decodes(&seq_ids, &format!("speculative rollback failed: {e}"));
+            return;
+        }
+        // Mirror what the KV really holds into the slot's diagnostic log: the
+        // block prefix that survived the rollback.
+        for (i, &id) in seq_ids.iter().enumerate() {
+            let n = committed[i].min(blocks[i].len());
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, id, &blocks[i][..n]);
+        }
+    }
+
+    /// Commit one decoded token per sequence: everything that happens to a token
+    /// between "the sampler chose it" and "the turn has moved on".
+    ///
+    /// Stencil advance and exit-token healing, the think-block and DRY span
+    /// edges, every decode-health check, the generated-token push, EOS/budget
+    /// termination, the stream event, and the reprojection triggers — in that
+    /// order, because each stage's guards depend on the ones before it (a
+    /// dropped `</think>` must not reach the EOS seal; a heal rewrites
+    /// `next_tokens[i]` before the token is committed anywhere).
+    ///
+    /// **One call commits one token per listed sequence, and `seq_ids` is the
+    /// cohort for THIS token, not for the wave.** Plain decode calls it once
+    /// with every sequence in the forward. Speculative decode calls it once per
+    /// accepted block position with the sequences still alive at that position,
+    /// so a multi-token step runs each token through the identical path a
+    /// single-token step would have — which is the whole reason this is a
+    /// function and not the tail of [`Self::batch_decode_step`].
+    ///
+    /// `logits_vec[i]` must be the row that PRODUCED `next_tokens[i]`: the
+    /// health checks read its distribution, so handing over a later position's
+    /// row would judge a token against logits that did not choose it.
+    fn commit_decoded_tokens(
+        &mut self,
+        seq_ids: &[SequenceId],
+        next_tokens: &mut [u32],
+        logits_vec: &[Tensor],
+    ) {
         // Advance each sequence's tool-call stencil with the token just sampled:
         // feed it into an active walk, or start a walk if it is a trigger token
         // (e.g. `<tool_call>`).  An empty trigger registry never starts a walk.

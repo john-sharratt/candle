@@ -17,6 +17,8 @@ use std::path::Path;
 use candle::{Device, Result};
 use candle_nn::kv_cache::QWEN38_KV_FACTORS;
 
+use crate::models::draft_ladder::QWEN38_27B_DRAFT;
+
 use super::qwen35::{load_hybrid_gguf, HybridBatched, Qwen35LoadOptions};
 
 /// The 3.8 tokenizer, pinned to the canonical base-repo revision.
@@ -50,7 +52,7 @@ pub fn from_gguf_path(
              load it through quantized_qwen35_moe or quantized_qwen36_moe instead"
         );
     }
-    HybridBatched::new(model, QWEN38_KV_FACTORS)
+    HybridBatched::new(model, QWEN38_KV_FACTORS, QWEN38_27B_DRAFT)
 }
 
 #[cfg(test)]
@@ -255,5 +257,51 @@ mod tests {
             Ok(m)
         };
         params.run(configs, load)
+    }
+
+    /// Speculative decode on the 27B — the lineage gate at the flagship
+    /// geometry. See [`crate::models::quantized_qwen35::tests::speculative_gate`].
+    ///
+    /// **No repin was needed for this one.** The pinned `unsloth/Qwen3.8-27B-GGUF`
+    /// already carries the NextN tensors (`blk.64.nextn.{enorm,hnorm,eh_proj,
+    /// shared_head_norm}` against `block_count = 65`,
+    /// `nextn_predict_layers = 1`), and unlike the 35B siblings the head is
+    /// **dense** — `blk.64.ffn_{gate,up,down}`, no router and no experts — so it
+    /// loads through the path the 9B already proved and needs nothing from the
+    /// expert cache. That is also why there is no `-MTP-GGUF` repo to move to:
+    /// none is published, and none is required.
+    ///
+    /// **Runs on the production workstation**, for the same reason as the gate
+    /// above: dense at 16.5 GB leaves no room on a 16 GB card.
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.8-27B GGUF (16.5 GB) and needs a GPU with more \
+                than 16 GB of VRAM (dense — no expert relief; this is a production-\
+                workstation gate, per docs/qwen35_qwen38_models.md §3). Run with: \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen38::tests::speculative_decode_27b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn speculative_decode_27b() -> Result<()> {
+        use crate::models::quantized_qwen35::tests::speculative_gate;
+
+        let model_path = pinned()?;
+        let int8mode = Int8Mode::Performance;
+        speculative_gate("Qwen3.8-27B", int8mode, &[1, 4], move || {
+            let device = Device::new_cuda(0)?;
+            let m = from_gguf_path(
+                &model_path,
+                &device,
+                Qwen35LoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: None,
+                },
+            )?;
+            assert!(
+                m.has_drafter(),
+                "the pinned 27B declares an MTP head but none loaded — the pin has \
+                 moved to a conversion that drops the NextN tensors"
+            );
+            println!("✓ Model loaded\n");
+            Ok(m)
+        })
     }
 }

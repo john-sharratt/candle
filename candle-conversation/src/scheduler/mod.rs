@@ -27,6 +27,7 @@ pub(crate) mod projection_assembler;
 pub mod relief_trace;
 mod run;
 mod sample;
+mod spec_chooser;
 
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
@@ -65,7 +66,7 @@ use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
 use crate::{SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
-use candle::{Device, IndexOp, Tensor};
+use candle::{Device, Tensor};
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
