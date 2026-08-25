@@ -281,46 +281,60 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         };
-        // The 9B's gate/up projection: the widest matmul in a DeltaNet layer,
-        // and the one `dn:ffn` spends its time in.
-        let (out_dim, in_dim) = (12288usize, 4096usize);
-        let w = Tensor::randn(0f32, 0.02, (out_dim, in_dim), &dev).unwrap();
-        let q = QMatMul::from_qtensor(QTensor::quantize(&w, GgmlDType::Q6_K).unwrap()).unwrap();
-        let weight_mib = (out_dim * in_dim / 256 * 210) >> 20;
-        eprintln!(
-            "--- Q6_K [{out_dim}, {in_dim}] = {weight_mib} MiB; vec ≤ 8, x16-MMQ 9–32, x64-MMQ above ---"
-        );
-
-        for rows in [1usize, 2, 4, 8, 9, 12, 16, 17, 24, 32, 33, 48, 49, 64, 128] {
-            let x = Tensor::randn(0f32, 1.0, (rows, in_dim), &dev)
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap();
-            let run = || {
-                let _ = q.inner().forward(&x).unwrap();
-            };
-            for _ in 0..10 {
-                run();
-            }
-            dev.synchronize().unwrap();
-            let reps = 100;
-            let t0 = std::time::Instant::now();
-            for _ in 0..reps {
-                run();
-            }
-            dev.synchronize().unwrap();
-            let us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
-            let path = if rows <= 8 {
-                "vec"
-            } else if rows <= 32 {
-                "mmq-x16"
-            } else {
-                "mmq-x64"
-            };
+        // **Two shapes, because the boundary is not shape-independent.**
+        //
+        // The gate/up projection is where a DeltaNet layer spends its time and
+        // is what the boundary was originally set on. The LM head is an order of
+        // magnitude wider in its output dimension, and it is the matmul the MTP
+        // drafter is bound by — a drafted token spends most of its time in one
+        // read of it. The drafter runs one row per session, so a decode wave of
+        // `n` sessions crosses this boundary at exactly `n = 9`, which is where
+        // speculation was measured to fall off a cliff (1.46x at eight sessions,
+        // 0.45x at ten). If the two shapes disagree about where MMQ starts
+        // winning, that cliff is this dispatch and not the wave.
+        for (label, out_dim, in_dim) in [
+            ("gate/up", 12288usize, 4096usize),
+            ("lm_head", 151936usize, 4096usize),
+        ] {
+            let w = Tensor::randn(0f32, 0.02, (out_dim, in_dim), &dev).unwrap();
+            let q = QMatMul::from_qtensor(QTensor::quantize(&w, GgmlDType::Q6_K).unwrap()).unwrap();
+            let weight_mib = (out_dim * in_dim / 256 * 210) >> 20;
             eprintln!(
-                "  {rows:>4} rows  {us:8.1} µs  {:7.2} µs/row  {path}",
-                us / rows as f64
+                "--- {label}: Q6_K [{out_dim}, {in_dim}] = {weight_mib} MiB; \
+                 vec ≤ 8, x16-MMQ 9–32, x64-MMQ above ---"
             );
+
+            for rows in [1usize, 2, 4, 8, 9, 12, 16, 17, 24, 32, 33, 48, 49, 64, 128] {
+                let x = Tensor::randn(0f32, 1.0, (rows, in_dim), &dev)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let run = || {
+                    let _ = q.inner().forward(&x).unwrap();
+                };
+                for _ in 0..10 {
+                    run();
+                }
+                dev.synchronize().unwrap();
+                let reps = 100;
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    run();
+                }
+                dev.synchronize().unwrap();
+                let us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                let path = if rows <= 8 {
+                    "vec"
+                } else if rows <= 32 {
+                    "mmq-x16"
+                } else {
+                    "mmq-x64"
+                };
+                eprintln!(
+                    "  {rows:>4} rows  {us:8.1} µs  {:7.2} µs/row  {path}",
+                    us / rows as f64
+                );
+            }
         }
     }
 }

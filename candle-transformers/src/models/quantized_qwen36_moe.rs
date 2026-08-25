@@ -13,6 +13,8 @@ use std::path::Path;
 use candle::{Device, Result};
 use candle_nn::kv_cache::QWEN36_MOE_KV_FACTORS;
 
+use crate::models::draft_ladder::QWEN36_35B_A3B_DRAFT;
+
 use super::qwen35::{load_hybrid_gguf, HybridBatched, Qwen35LoadOptions};
 
 /// The 3.6 tokenizer, pinned. The point release ships its own tokenizer
@@ -23,9 +25,16 @@ pub const TOKENIZER_REV: &str = "995ad96eacd98c81ed38be0c5b274b04031597b0";
 
 /// Pinned checkpoint (repo, revision, file) — revision-pinned so an upstream
 /// re-upload fails the gate loudly instead of drifting under it.
+///
+/// **The `-MTP-` repo**, because the plain conversion drops the NextN tensors
+/// and a model without them cannot speculate. Same quant as before
+/// (`UD-Q4_K_M`), so only the head is new here — unlike the 3.5, whose repo
+/// move also changed quantization. The head is a full routed block and the
+/// expert cache carries its layer alongside the trunk's
+/// (`expert_host_refs`).
 pub const QWEN36_35B_A3B: (&str, &str, &str) = (
-    "unsloth/Qwen3.6-35B-A3B-GGUF",
-    "a483e9e6cbd595906af30beda3187c2663a1118c",
+    "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+    "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
     "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
 );
 
@@ -48,7 +57,7 @@ pub fn from_gguf_path(
              load it through quantized_qwen35 instead"
         );
     }
-    HybridBatched::new(model, QWEN36_MOE_KV_FACTORS)
+    HybridBatched::new(model, QWEN36_MOE_KV_FACTORS, QWEN36_35B_A3B_DRAFT)
 }
 
 #[cfg(test)]
@@ -264,8 +273,8 @@ mod tests {
     /// The same sweep as the dense gates
     /// ([`crate::models::quantized_qwen35::tests::speculative_gate`]): the
     /// StoryRewrite fixture at 256 generated tokens, run once plain and once
-    /// per draft budget, with the lossless driver and the weightless n-gram
-    /// drafter. Every run validates against the same fixture at 100%, so a
+    /// per draft budget, with the lossless driver and the checkpoint's own MTP
+    /// head as the drafter. Every run validates against the same fixture at 100%, so a
     /// recurrent rewind that lost a token shows up as broken text rather than
     /// as a quiet quality slide.
     ///
@@ -283,6 +292,18 @@ mod tests {
 
         let model_path = pinned()?;
         let int8mode = Int8Mode::Performance;
+        // **Widths 1 and 4, and this is the ceiling the fixture supports.** The
+        // scheduler's draft budget is a step function of wave width
+        // (`SPEC_MAX_WIDTH`), so this sweep is what sets it — but width 8 cannot
+        // be a row here: at eight concurrent sessions the *baseline* run drops
+        // to 6/8 against the expected string, two sessions diverging by a single
+        // pronoun ~780 characters in. That is the lineage's known stochastic
+        // floor — batched reductions reassociate with cohort width, and one
+        // near-tied argmax eventually falls the other way — not a decode defect,
+        // and it fails the 100% threshold before any speculative budget runs.
+        // Widening the measurement needs a fixture that tolerates it, not a
+        // looser threshold here: the threshold is what makes this gate a
+        // losslessness check.
         speculative_gate("Qwen3.6-35B-A3B", int8mode, &[1, 4], move || {
             let device = Device::new_cuda(0)?;
             let m = from_gguf_path(
@@ -293,6 +314,14 @@ mod tests {
                     expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                 },
             )?;
+            // A gate that silently fell back to plain decode would still pass
+            // — speculation is lossless, so the only symptom is the speedup
+            // going away. Assert the drafter is really there.
+            assert!(
+                m.has_drafter(),
+                "the pinned 3.6-35B has no MTP head — the pin has moved off the \
+                 -MTP-GGUF repo, or its conversion dropped the NextN tensors"
+            );
             println!("✓ Model loaded\n");
             Ok(m)
         })

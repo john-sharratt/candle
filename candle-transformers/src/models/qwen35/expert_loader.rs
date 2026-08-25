@@ -31,6 +31,16 @@ use crate::models::expert_lre::{
 /// every layer. A checkpoint that split experts into 2-D per-expert tensors
 /// would need the other branch; these do not, and are refused explicitly
 /// rather than silently mis-read.
+///
+/// **The MTP draft head's layer is included**, and it must be. The head is
+/// `blk.{num_layers}`, and on a routed checkpoint it carries a full expert set
+/// of its own — so the range walked here is `0..=num_layers` when the
+/// checkpoint declares a head, not `0..num_layers`. The position of a layer in
+/// the returned vector IS the `moe_layer_idx` its router keys the cache on, and
+/// `load_quantized_model` assigns those in this same order (trunk loop first,
+/// then the head), so scanning the head last is what makes the two agree.
+/// Leave it out and the head's router asks for an index the cache does not
+/// have; put it anywhere but last and every trunk layer's index shifts.
 pub fn expert_host_refs(content: &Content, cfg: &Qwen35Config) -> Result<Vec<Vec<MmapExpertRef>>> {
     let moe = cfg
         .moe
@@ -38,7 +48,7 @@ pub fn expert_host_refs(content: &Content, cfg: &Qwen35Config) -> Result<Vec<Vec
     let n_expert = moe.n_experts;
     let mut all = Vec::new();
 
-    for li in 0..cfg.num_layers {
+    for li in 0..cfg.num_layers + cfg.num_mtp_layers {
         let p = format!("blk.{li}");
         let names = [
             format!("{p}.ffn_gate_exps.weight"),

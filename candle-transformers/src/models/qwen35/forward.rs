@@ -47,6 +47,7 @@ use super::spec::{split_block_rows, StashSpan, VerifyStash};
 use super::wave::delta_net_mix_wave;
 use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::{RecurrentStateStore, StashSlot};
+use crate::models::verify_wave::VerifyPlan;
 use candle_nn::kv_cache::ModelGeometry;
 
 use crate::models::batched_inference::{
@@ -161,6 +162,12 @@ impl ManagedBatchedModel for HybridBatched {
         )
     }
 
+    /// This checkpoint's own ladder, supplied at construction — see
+    /// [`crate::models::draft_ladder`].
+    fn draft_budget(&self, width: usize) -> usize {
+        self.draft_budget_for(width)
+    }
+
     /// Draft with the checkpoint's own NextN/MTP head ([`super::mtp`]), for the
     /// whole cohort in one batched pass.
     ///
@@ -179,7 +186,8 @@ impl ManagedBatchedModel for HybridBatched {
         self.mtp_draft(session, seqs, committed, max_len.min(MTP_MAX_DRAFT))
     }
 
-    /// Verify every drafted block in ONE wave, alongside the plain cohort.
+    /// Plan the rows for a wave that verifies every drafted block alongside the
+    /// plain cohort, and arm what that wave has to write.
     ///
     /// Each block is a **prefill span**, not a run of decode rows: the
     /// recurrence is sequential within a sequence, so two rows of one sequence
@@ -193,17 +201,23 @@ impl ManagedBatchedModel for HybridBatched {
     /// head scores every one of their rows (a block position's prediction is
     /// what a proposal is checked against), and each DeltaNet layer stashes
     /// their recurrence operands so [`Self::truncate_sequence`] can replay the
-    /// accepted prefix. Cleared on the way out, error or not.
-    fn verify_blocks(
+    /// accepted prefix. Cleared in `end_verify` / `abort_verify`, error or not.
+    fn begin_verify(
         &self,
         session: &mut BatchedInferenceSession,
         plain: &[(usize, u32)],
         seqs: &[usize],
         blocks: &[Vec<u32>],
-        layer_end: usize,
-    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        budget: usize,
+    ) -> Result<Option<VerifyPlan>> {
         if plain.is_empty() && seqs.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Some(VerifyPlan {
+                decode_seqs: Vec::new(),
+                decode_inputs: Vec::new(),
+                verify_seqs: Vec::new(),
+                verify_inputs: Vec::new(),
+                rows: 0,
+            }));
         }
         if seqs.len() != blocks.len() {
             candle::bail!(
@@ -223,14 +237,17 @@ impl ManagedBatchedModel for HybridBatched {
                 b.len()
             );
         }
+        // The model's device, not the host: these rows are cat'd with whatever
+        // else the caller has on the wave, and the scheduler's creep group and
+        // glue are device-side.
         let dseqs: Vec<usize> = plain.iter().map(|&(s, _)| s).collect();
         let dinputs: Vec<Tensor> = plain
             .iter()
-            .map(|&(_, t)| Tensor::from_vec(vec![t], (1, 1), &Device::Cpu))
+            .map(|&(_, t)| Tensor::from_vec(vec![t], (1, 1), self.device()))
             .collect::<Result<_>>()?;
         let pinputs: Vec<Tensor> = blocks
             .iter()
-            .map(|b| Tensor::from_vec(b.clone(), (1, b.len()), &Device::Cpu))
+            .map(|b| Tensor::from_vec(b.clone(), (1, b.len()), self.device()))
             .collect::<Result<_>>()?;
 
         // **Size every verifying sequence's stash before the forward opens.**
@@ -252,46 +269,87 @@ impl ManagedBatchedModel for HybridBatched {
         // what lets a sequence that drafted nothing this step draft on the
         // next, and it is the only way the very first step after prefill ever
         // acquires a seed.
+        //
+        // **Skipped when the caller has switched drafting off** — above the
+        // width its ladder speculates at, every seed captured is a seed nothing
+        // will ever draft from, and the sweep still pays to write one hidden row
+        // per sequence per layer sweep for it. Keyed on the budget rather than on
+        // `seqs` being empty, because an empty verify cohort also means "the
+        // drafter had no seed yet", which is exactly when this must run.
+        //
+        // The cost of skipping is one step: when the wave narrows back to a
+        // width that drafts, the sequences have no seed and take plain rows,
+        // that wave arms capture again, and the step after it drafts. Self-
+        // healing, and paid only on the transition.
         if self.has_drafter() {
-            let mut want: Vec<(usize, usize)> = plain.iter().map(|&(s, _)| (s, 1)).collect();
-            want.extend(seqs.iter().enumerate().map(|(i, &s)| (s, blocks[i].len())));
-            self.arm_hidden_capture(&want, session.activation_dtype())?;
+            if budget > 0 {
+                let mut want: Vec<(usize, usize)> = plain.iter().map(|&(s, _)| (s, 1)).collect();
+                want.extend(seqs.iter().enumerate().map(|(i, &s)| (s, blocks[i].len())));
+                self.arm_hidden_capture(&want, session.activation_dtype())?;
+            } else {
+                // **Skipping the capture is not enough — the old one has to go.**
+                // `capture_rows` and `verify_hidden` deliberately outlive
+                // `disarm_hidden_capture`, so this step's `mtp_take_seeds` would
+                // otherwise find the buffer some earlier wave filled and install
+                // a row of it as the seed. The sequence would then look seeded
+                // while holding a hidden from an arbitrary number of steps ago,
+                // and the first wave that narrowed back under the ladder's
+                // bracket would draft from it — losslessly, so nothing fails; it
+                // just proposes badly and acceptance sits near 1.00.
+                //
+                // Dropping the state instead leaves the sequence honestly
+                // seedless, which is the one-step cost the ladder's doc
+                // describes: it takes plain rows on the wave that re-arms
+                // capture, and drafts on the one after.
+                for &(seq, _) in plain {
+                    self.release_draft(seq);
+                }
+                for &seq in seqs {
+                    self.release_draft(seq);
+                }
+            }
         }
+        // Naming the verifying sequences makes the head score every one of
+        // their rows and each DeltaNet layer stash its recurrence operands.
+        // Cleared in `end_verify` / `abort_verify`, error or not.
         self.set_verify_row_seqs(seqs)?;
-        let step = self.forward_wave(
-            session,
-            &dseqs,
-            &dinputs,
-            seqs,
-            &pinputs,
-            &[],
-            &[],
-            0,
-            layer_end,
-            None,
-        );
+        Ok(Some(VerifyPlan {
+            decode_seqs: dseqs,
+            decode_inputs: dinputs,
+            verify_seqs: seqs.to_vec(),
+            verify_inputs: pinputs,
+            rows: plain.len() + blocks.iter().map(|b| b.len()).sum::<usize>(),
+        }))
+    }
+
+    fn end_verify(
+        &self,
+        session: &mut BatchedInferenceSession,
+        plain: &[(usize, u32)],
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        logits: Vec<Tensor>,
+    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
         self.set_verify_row_seqs(&[])?;
         self.disarm_hidden_capture();
-        let step = match step {
-            Ok(s) => s,
-            Err(e) => {
-                // The wave rolled its recurrent state back, so the stash names
-                // a rewind point that no longer exists.
-                self.drop_verify_stashes(seqs);
-                return Err(e);
-            }
-        };
         for &(seq, _) in plain {
             session.advance_sequence(seq, 1)?;
         }
         for (i, &seq) in seqs.iter().enumerate() {
             session.advance_sequence(seq, blocks[i].len())?;
         }
-        // Copied off the wave's span: the driver compares argmaxes and may run
-        // another forward before it is done with these rows.
-        let logits = step.logits_owned()?;
+        // Already copied off the wave's span by the caller: the accept walk
+        // reads these position by position and may run another forward first.
         let lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
         split_block_rows(&logits, plain.len(), &lens)
+    }
+
+    fn abort_verify(&self, seqs: &[usize]) {
+        let _ = self.set_verify_row_seqs(&[]);
+        self.disarm_hidden_capture();
+        // The wave rolled its recurrent state back, so the stash names a rewind
+        // point that no longer exists.
+        self.drop_verify_stashes(seqs);
     }
 
     /// Roll `seq` back to `tokens`, recurrent state included.

@@ -2035,11 +2035,28 @@ impl Scheduler {
         &mut self,
         decode_seqs: &[usize],
         decode_inputs: &[Tensor],
+        verify_seqs: &[usize],
+        verify_inputs: &[Tensor],
     ) -> candle::Result<Vec<Tensor>> {
         let n = self.model.num_layers().max(1);
         let n_dec = decode_seqs.len();
         let none_seqs: [usize; 0] = [];
         let none_inputs: [Tensor; 0] = [];
+        // A speculative step's verify blocks. They are multi-token, so they take
+        // the PREFILL slot rather than the decode slot — but they are
+        // **full-sweep** members like decode, not creep: their logits are read
+        // by the accept walk in this same step, so a block held mid-sweep would
+        // stall the decode it exists to accelerate. They therefore ride the
+        // prefill slot in EVERY segment, and the creep joins them only inside
+        // its window. Empty on an ordinary decode wave, which collapses all of
+        // this back to what it was.
+        let verify_tok: usize = verify_inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(0))
+            .sum();
+        // Rows ahead of the creep in caller order, and the logits prefix the
+        // caller gets back: `[decode | verify]`.
+        let head_rows = n_dec + verify_tok;
         // Wave-step wall-clock, shared across the co-batched classes so the prefill
         // and section throughput panels reflect the CONCURRENT rate (they ride
         // decode's sweep in one forward) rather than reading zero.
@@ -2102,8 +2119,9 @@ impl Scheduler {
                 Some((s, i, g, a)) => (s, i, g, a),
                 None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             };
-            if sec_seqs.is_empty() && !has_fullsweep {
-                // Nothing to run: no creep, no section, no decode, no glue.
+            if sec_seqs.is_empty() && !has_fullsweep && verify_seqs.is_empty() {
+                // Nothing to run: no creep, no section, no decode, no glue, no
+                // verify blocks.
                 return Ok(Vec::new());
             }
             if !sec_seqs.is_empty() {
@@ -2112,12 +2130,17 @@ impl Scheduler {
             if let Some(p) = glue_pending {
                 self.session.set_pending_glue(p.clone());
             }
+            // Verify blocks lead the prefill slot so `[decode | verify]` stays
+            // the logits prefix regardless of what else joined.
+            let pre_seqs: Vec<usize> = verify_seqs.iter().chain(&sec_seqs).copied().collect();
+            let pre_inputs: Vec<Tensor> =
+                verify_inputs.iter().chain(&sec_inputs).cloned().collect();
             let out = self.model.forward_wave(
                 &mut self.session,
                 decode_seqs,
                 decode_inputs,
-                &sec_seqs,
-                &sec_inputs,
+                &pre_seqs,
+                &pre_inputs,
                 glue_seqs,
                 glue_inputs,
                 0,
@@ -2128,7 +2151,7 @@ impl Scheduler {
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
             let logits = out.logits_owned()?;
-            let d = n_dec.min(logits.len());
+            let d = head_rows.min(logits.len());
             let dec_logits = logits[..d].to_vec();
             if !sec_gidx.is_empty() {
                 // Attended-KV summed before `complete_section_chunk` advances the
@@ -2213,7 +2236,7 @@ impl Scheduler {
         // Segment 1 — full-sweep members only over [0, cursor). Runs when there is
         // any full-sweep member (decode or glue) and cursor > 0; the creep resumes
         // from its held residual at `cursor`. Yields caller order `[decode | glue]`.
-        let seg1_res: Option<Tensor> = if cursor > 0 && has_fullsweep {
+        let seg1_res: Option<Tensor> = if cursor > 0 && (has_fullsweep || !verify_seqs.is_empty()) {
             if let Some(p) = glue_pending {
                 self.session.set_pending_glue(p.clone());
             }
@@ -2222,8 +2245,8 @@ impl Scheduler {
                     &mut self.session,
                     decode_seqs,
                     decode_inputs,
-                    &none_seqs,
-                    &none_inputs,
+                    verify_seqs,
+                    verify_inputs,
                     glue_seqs,
                     glue_inputs,
                     0,
@@ -2234,17 +2257,17 @@ impl Scheduler {
         } else {
             None
         };
-        // Split seg1's `[decode | glue]` so the creep residual inserts between them
-        // for seg2's `[decode | creep | glue]` order.
+        // Split seg1's `[decode | verify | glue]` so the creep residual inserts
+        // between them for seg2's `[decode | verify | creep | glue]` order.
         let (seg1_dec, seg1_glue): (Option<Tensor>, Option<Tensor>) = match &seg1_res {
             Some(r) => {
-                let dec = if n_dec > 0 {
-                    Some(r.narrow(1, 0, n_dec)?)
+                let dec = if head_rows > 0 {
+                    Some(r.narrow(1, 0, head_rows)?)
                 } else {
                     None
                 };
                 let g = if glue_tok > 0 {
-                    Some(r.narrow(1, n_dec, glue_tok)?)
+                    Some(r.narrow(1, head_rows, glue_tok)?)
                 } else {
                     None
                 };
@@ -2266,12 +2289,17 @@ impl Scheduler {
         // decode+glue over [0, cursor), which the creep did NOT ride, so charging
         // its wall-clock to the prefill channel would understate the prefill rate.
         let t_seg2 = Instant::now();
+        // Verify blocks lead the prefill slot, the creep follows: `[decode |
+        // verify]` then stays the contiguous head that every segment shares and
+        // that the caller reads its logits from.
+        let mid_seqs: Vec<usize> = verify_seqs.iter().chain(&seq_ids).copied().collect();
+        let mid_inputs: Vec<Tensor> = verify_inputs.iter().chain(&inputs).cloned().collect();
         let seg2 = match self.model.forward_wave(
             &mut self.session,
             decode_seqs,
             decode_inputs,
-            &seq_ids,
-            &inputs,
+            &mid_seqs,
+            &mid_inputs,
             glue_seqs,
             glue_inputs,
             cursor,
@@ -2338,7 +2366,7 @@ impl Scheduler {
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
             let logits = seg2.logits_owned()?;
-            let d = n_dec.min(logits.len());
+            let d = head_rows.min(logits.len());
             let creep_end = (d + members.len()).min(logits.len());
             let dec_logits = logits[..d].to_vec();
             let member_logits = logits[d..creep_end].to_vec();
@@ -2351,14 +2379,14 @@ impl Scheduler {
         let res = seg2
             .into_residual()
             .ok_or_else(|| candle::Error::Msg("co-batch wave: missing residual".into()))?;
-        let dec_part = if n_dec > 0 {
-            Some(res.narrow(1, 0, n_dec)?)
+        let dec_part = if head_rows > 0 {
+            Some(res.narrow(1, 0, head_rows)?)
         } else {
             None
         };
-        let creep_part = res.narrow(1, n_dec, creep_tok)?;
+        let creep_part = res.narrow(1, head_rows, creep_tok)?;
         let glue_part = if glue_tok > 0 {
-            Some(res.narrow(1, n_dec + creep_tok, glue_tok)?)
+            Some(res.narrow(1, head_rows + creep_tok, glue_tok)?)
         } else {
             None
         };
@@ -2367,9 +2395,9 @@ impl Scheduler {
         self.wave_prefill_members = members;
 
         // Segment 3 — full-sweep members only over [win_end, N). Input caller order
-        // `[decode | glue]`. Skipped when there is no full-sweep member (the creep
-        // paused at win_end, nothing else to sweep).
-        if !has_fullsweep {
+        // `[decode | verify | glue]`. Skipped when there is no full-sweep member
+        // (the creep paused at win_end, nothing else to sweep).
+        if !has_fullsweep && verify_seqs.is_empty() {
             return Ok(Vec::new());
         }
         let seg3_in = Self::cat_caller_residual(&[dec_part.as_ref(), glue_part.as_ref()])?;
@@ -2380,8 +2408,8 @@ impl Scheduler {
             &mut self.session,
             decode_seqs,
             decode_inputs,
-            &none_seqs,
-            &none_inputs,
+            verify_seqs,
+            verify_inputs,
             glue_seqs,
             glue_inputs,
             win_end,
@@ -2391,7 +2419,9 @@ impl Scheduler {
         if has_glue {
             self.reconcile_wave_offsets(glue_seqs)?;
         }
-        seg3.logits_owned()
+        let mut logits = seg3.logits_owned()?;
+        logits.truncate(head_rows);
+        Ok(logits)
     }
 
     /// Handle a device-OOM from the ragged prefill forward: the batch was too
