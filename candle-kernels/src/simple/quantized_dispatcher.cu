@@ -165,8 +165,10 @@ extern "C" __global__ void dequantize_mul_mat_vec_q4_k(const void*, const float*
 extern "C" __global__ void dequantize_mul_mat_vec_q5_k(const void*, const float*, float*, const int);
 extern "C" __global__ void dequantize_mul_mat_vec_q6_k(const void*, const float*, float*, const int, const int);
 extern "C" __global__ void dequantize_mul_mat_vec_q8_k(const void*, const float*, float*, const int, const int);
-extern "C" __global__ void dequantize_mul_mat_vec_q_awq_cuda(const void*, const float*, float*, const int, const int);
-extern "C" __global__ void dequantize_mul_mat_vec_q_awq_g64_cuda(const void*, const float*, float*, const int, const int);
+// No AWQ: it is a KV arena format here, not a matmul weight format. Its
+// dequantize/quantize kernels below serve the cache; its matmul kernels are
+// gone, and `QCudaStorage::fwd` refuses an AWQ weight before reaching any of
+// these switches. See that guard for why the layout never worked.
 
 // Mul mat vec via Q8_1 kernels (batch sizes 1-8)
 #define DECLARE_MUL_MAT_VEC_Q8_1(qtype) \
@@ -191,8 +193,6 @@ DECLARE_MUL_MAT_VEC_Q8_1(q4_K)
 DECLARE_MUL_MAT_VEC_Q8_1(q5_K)
 DECLARE_MUL_MAT_VEC_Q8_1(q6_K)
 DECLARE_MUL_MAT_VEC_Q8_1(q8_K)
-DECLARE_MUL_MAT_VEC_Q8_1(q_awq)
-DECLARE_MUL_MAT_VEC_Q8_1(q_awq_g64)
 
 #undef DECLARE_MUL_MAT_VEC_Q8_1
 
@@ -209,8 +209,21 @@ extern "C" __global__ void mul_mat_q4_K(const void*, const void*, float*, const 
 extern "C" __global__ void mul_mat_q5_K(const void*, const void*, float*, const int, const int, const int, const int, const int);
 extern "C" __global__ void mul_mat_q6_K(const void*, const void*, float*, const int, const int, const int, const int, const int);
 extern "C" __global__ void mul_mat_q8_K(const void*, const void*, float*, const int, const int, const int, const int, const int);
-extern "C" __global__ void mul_mat_q_awq(const void*, const void*, float*, const int, const int, const int, const int, const int);
-extern "C" __global__ void mul_mat_q_awq_g64(const void*, const void*, float*, const int, const int, const int, const int, const int);
+
+// The batch-narrow (mmq_x = 16) instantiations of the same kernels, selected
+// when the whole batch fits one narrow tile — see run_mul_mat.
+extern "C" __global__ void mul_mat_q4_0_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q4_1_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q5_0_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q5_1_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q8_0_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q8_1_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q2_K_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q3_K_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q4_K_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q5_K_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q6_K_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
+extern "C" __global__ void mul_mat_q8_K_x16(const void*, const void*, float*, const int, const int, const int, const int, const int);
 
 // =============================================================================
 // Helper functions
@@ -693,8 +706,6 @@ extern "C" void run_dequantize_mul_mat_vec(
         case QTYPE_Q6_K: dequantize_mul_mat_vec_q6_k<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
         case QTYPE_Q8_1: dequantize_mul_mat_vec_q8_1_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
         case QTYPE_Q8_K: dequantize_mul_mat_vec_q8_k<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_QAWQ: dequantize_mul_mat_vec_q_awq_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_QAWQ_G64: dequantize_mul_mat_vec_q_awq_g64_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
     }
 }
 
@@ -763,8 +774,6 @@ extern "C" void run_mul_mat_vec_q8_1(
         case QTYPE_Q6_K: DISPATCH_BSIZE(q6_K); break;
         case QTYPE_Q8_1: DISPATCH_BSIZE(q8_1); break;
         case QTYPE_Q8_K: DISPATCH_BSIZE(q8_K); break;
-        case QTYPE_QAWQ: DISPATCH_BSIZE(q_awq); break;
-        case QTYPE_QAWQ_G64: DISPATCH_BSIZE(q_awq_g64); break;
     }
 
     #undef DISPATCH_BSIZE
@@ -813,25 +822,46 @@ extern "C" void run_mul_mat(
             break;
     }
 
+    // A small batch takes the mmq_x = 16 instantiation: the dot work scales
+    // with the tile's batch width while the weight-tile loads do not, so a
+    // 12-row batch under a 64-wide tile spends 4/5 of its arithmetic on clamped
+    // padding columns whose results the store discards. Measured on Q6_K
+    // [12288, 4096] (rows → µs): one narrow column serves 9..16 at ~107 vs the
+    // wide tile's ~251, and even two columns — a second full pass over the
+    // weight tiles, but a concurrent one — serve 17..32 at ~200. From three
+    // columns up the extra passes cancel the padding saved and the wide tile
+    // takes over. The curve lives in candle-transformers
+    // `quantized_matmul::tests::qmatmul_row_count_curve`; re-measure before
+    // moving this boundary.
+    const bool narrow = ncols_y <= 32;
+    if (narrow) mmq_x = 16;
+
     dim3 grid(ceil_div(nrows_x, mmq_y), ceil_div(ncols_y, mmq_x), 1);
     dim3 block(WARP_SIZE, 4, 1);
 
+    #define DISPATCH_MMQ(qname) \
+        if (narrow) { \
+            mul_mat_##qname##_x16<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); \
+        } else { \
+            mul_mat_##qname<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); \
+        }
+
     switch (qtype) {
-        case QTYPE_Q4_0: mul_mat_q4_0<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q4_1: mul_mat_q4_1<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q5_0: mul_mat_q5_0<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q5_1: mul_mat_q5_1<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q8_0: mul_mat_q8_0<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q2_K: mul_mat_q2_K<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q3_K: mul_mat_q3_K<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q4_K: mul_mat_q4_K<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q5_K: mul_mat_q5_K<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q6_K: mul_mat_q6_K<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q8_1: mul_mat_q8_1<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_Q8_K: mul_mat_q8_K<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_QAWQ: mul_mat_q_awq<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
-        case QTYPE_QAWQ_G64: mul_mat_q_awq_g64<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); break;
+        case QTYPE_Q4_0: DISPATCH_MMQ(q4_0); break;
+        case QTYPE_Q4_1: DISPATCH_MMQ(q4_1); break;
+        case QTYPE_Q5_0: DISPATCH_MMQ(q5_0); break;
+        case QTYPE_Q5_1: DISPATCH_MMQ(q5_1); break;
+        case QTYPE_Q8_0: DISPATCH_MMQ(q8_0); break;
+        case QTYPE_Q2_K: DISPATCH_MMQ(q2_K); break;
+        case QTYPE_Q3_K: DISPATCH_MMQ(q3_K); break;
+        case QTYPE_Q4_K: DISPATCH_MMQ(q4_K); break;
+        case QTYPE_Q5_K: DISPATCH_MMQ(q5_K); break;
+        case QTYPE_Q6_K: DISPATCH_MMQ(q6_K); break;
+        case QTYPE_Q8_1: DISPATCH_MMQ(q8_1); break;
+        case QTYPE_Q8_K: DISPATCH_MMQ(q8_K); break;
     }
+
+    #undef DISPATCH_MMQ
 }
 
 // =============================================================================

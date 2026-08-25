@@ -21,5 +21,7 @@ mod q5_k;
 mod q6_k;
 mod q8_k;
 
-// AWQ (Activation-aware Weight Quantization)
-mod q_awq;
+// AWQ is gone from this suite because it is gone from the matmul path — see
+// `QCudaStorage::fwd`, which refuses it. It survives only as a KV arena format
+// (`ArenaFormatTag::QAWQ`), where its own dequantize/quantize kernels are
+// exercised by the KV cache tests, not by a matmul sweep.

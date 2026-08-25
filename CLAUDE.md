@@ -120,6 +120,23 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
    the hot path is a full-tensor memory pass a kernel could have avoided by writing its
    output in the type the next consumer wants. Norms emit the kernel's input type; attention
    kernels emit the out-proj's input type.
+1b. **VALIDATE the type, do not CONVERT it — `expect_dtype`, never a defensive `to_dtype`.**
+   Where two types are *supposed* to agree, assert it with
+   `models::operand_guard::{expect_dtype, expect_dense, expect_dense_dtype}` (layout metadata
+   only — no allocation, no launch, free on the hot path). A `to_dtype` there is wrong whichever
+   way it lands: when the types already match it is dead code that protects nothing while
+   silently absorbing a producer that later starts handing over the wrong type, and when they
+   do not it is a full-tensor pass per call, per layer, per step — invisible, because the line
+   reads as a cast rather than as a copy. The same applies to a defensive `contiguous()`
+   (invariant 2). If a genuinely different type or layout must be supported, teach the consumer
+   to read it — a template parameter, a stride argument, a producer that emits the right type —
+   rather than rewriting the tensor at the call site. Reserve `to_dtype` for conversions the
+   design actually calls for (an F32 accumulator deliberately narrowed for storage, a table
+   built once at load), and say in a comment which it is.
+   > This is not hypothetical in either direction. The MTP capture buffers were allocated F32
+   > against a BF16 wave, so a "harmless" cast at each end was a real launch per sequence per
+   > wave; and the casts that *were* no-ops sat over exactly the mismatches that would otherwise
+   > have been caught at the boundary that introduced them.
 2. **No allocate-plus-copy to materialise a layout, by any spelling.** `contiguous()`,
    `force_contiguous()`, `Tensor::cat`, and `slice_set` are the SAME operation as far as this
    invariant is concerned — each allocates and copies so a consumer can be handed the layout it

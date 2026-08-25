@@ -40,10 +40,12 @@
 //! - **`advanced` is per slot**, not per store. A sweep may cover part of the
 //!   stack, and swapping a layer the wave never ran would install whatever its
 //!   write buffer held two waves ago.
-//! - **Only `s` ping-pongs.** The conv tail is advanced in place — the decode
-//!   kernel shifts it through the pointer table, the prefill path writes it back
-//!   — so commit swaps `live.s` alone. Swapping the whole state would file the
-//!   freshly advanced tail into the backup and install a stale one.
+//! - **Both buffers ping-pong.** `s` and the conv tail are one state and swap
+//!   together, because the conv kernels take the entering and advanced tails as
+//!   two pointers: the decode kernel shifts one into the other and the prefill
+//!   kernel writes the advance where the copy-back used to land. That copy-back
+//!   was the last `slice_set` on this path — one launch per prefill span per
+//!   layer, and the largest single source of `copy2d_f32` in the engine.
 //!
 //! A slot's buffers are still allocated once for its whole life; what a commit
 //! changes is which of the two is live, so a device address resolved from the
@@ -61,7 +63,7 @@
 
 use candle::{Device, Result, Tensor};
 
-use super::mix::DeltaNetState;
+use super::mix::{DeltaNetOut, DeltaNetState};
 use super::types::{DeltaNetDims, LayerKind};
 
 /// One recurrent layer's state, exported as LE F32 bytes. Field-for-field the
@@ -225,7 +227,7 @@ impl RecurrentStateStore {
     /// partial sweep will never reach, so building it must not be what decides
     /// a layer gets swapped at commit. The layer records itself when it runs,
     /// through [`Self::layer_state_pair_mut`].
-    pub fn layer_state_pair(&self, layer_index: usize) -> Result<(&DeltaNetState, Tensor)> {
+    pub fn layer_state_pair(&self, layer_index: usize) -> Result<(&DeltaNetState, DeltaNetOut)> {
         let slot = self
             .slots
             .iter()
@@ -235,7 +237,7 @@ impl RecurrentStateStore {
                     "recurrent store: layer {layer_index} holds no recurrent state"
                 ))
             })?;
-        Ok((&slot.live, slot.backup.s.clone()))
+        Ok((&slot.live, slot.backup.write_half()))
     }
 
     /// The layer's `(entering, advanced)` buffers — what a wave reads and what
@@ -247,7 +249,7 @@ impl RecurrentStateStore {
     pub fn layer_state_pair_mut(
         &mut self,
         layer_index: usize,
-    ) -> Result<(&mut DeltaNetState, Tensor)> {
+    ) -> Result<(&mut DeltaNetState, DeltaNetOut)> {
         let slot = self
             .slots
             .iter_mut()
@@ -258,8 +260,48 @@ impl RecurrentStateStore {
                 ))
             })?;
         slot.advanced = true;
-        let s_out = slot.backup.s.clone();
-        Ok((&mut slot.live, s_out))
+        let out = slot.backup.write_half();
+        Ok((&mut slot.live, out))
+    }
+
+    /// The layer's halves **the other way round**: the state the last committed
+    /// wave *entered* with, and the live buffer to write a corrected advance
+    /// into.
+    ///
+    /// This is the rewind primitive. `commit_wave` exchanges a slot's two
+    /// buffers, so immediately afterwards the half that is no longer live still
+    /// holds the pre-wave state — untouched, because a wave writes only the
+    /// buffer it is not reading. Re-running a *prefix* of the wave's tokens
+    /// from there lands the correct shorter advance in the live buffer, which
+    /// is how a speculative block keeps the accepted tokens and drops the rest;
+    /// `S` is a running sum with no suffix to subtract, so replaying forward is
+    /// the only exact answer.
+    ///
+    /// **Valid only between the commit and the next `begin_wave`.** After
+    /// another wave has run, the non-live half holds *that* wave's entry state
+    /// and this returns a rewind to the wrong point. Refused while a wave is
+    /// open, which is the half of that the store can see.
+    pub fn layer_state_rewind(
+        &mut self,
+        layer_index: usize,
+    ) -> Result<(&mut DeltaNetState, DeltaNetOut)> {
+        if self.open {
+            candle::bail!(
+                "recurrent store: layer_state_rewind mid-wave — the entering state \
+                 to rewind to is the buffer the open wave is writing"
+            );
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|s| s.layer_index == layer_index)
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "recurrent store: layer {layer_index} holds no recurrent state"
+                ))
+            })?;
+        let out = slot.live.write_half();
+        Ok((&mut slot.backup, out))
     }
 
     /// Open a wave. Refuses while one is already open.
@@ -298,12 +340,11 @@ impl RecurrentStateStore {
     pub fn commit_wave(&mut self) {
         for slot in &mut self.slots {
             if slot.advanced {
-                // **`s` only.** The conv tail is advanced IN PLACE in `live` —
-                // the decode kernel shifts it through the pointer table and the
-                // prefill path writes it back — so it is already correct where
-                // it stands. Swapping the whole state would file the advanced
-                // tail away in the backup and install a stale one as live.
-                std::mem::swap(&mut slot.live.s, &mut slot.backup.s);
+                // The whole state: `s` and the conv tail are both written into
+                // the backup half by the wave's kernels — the conv kernels take
+                // the entering and advanced tails as two pointers — so they are
+                // installed together.
+                std::mem::swap(&mut slot.live, &mut slot.backup);
                 slot.advanced = false;
             }
         }
@@ -443,6 +484,17 @@ mod tests {
         ]
     }
 
+    /// One wave's worth of writes into a layer's destination half: `live + 1`
+    /// in both buffers, which is what the kernels do to their two pointers.
+    fn bump_into(live: &DeltaNetState, out: &DeltaNetOut) {
+        let one = |src: &Tensor, dst: &Tensor| {
+            let ones = Tensor::ones(src.shape(), src.dtype(), &Device::Cpu).unwrap();
+            dst.slice_set(&src.add(&ones).unwrap(), 0, 0).unwrap();
+        };
+        one(&live.s, &out.s);
+        one(&live.conv_tail, &out.conv_tail);
+    }
+
     fn filled_store() -> RecurrentStateStore {
         let dev = Device::Cpu;
         let d = dims();
@@ -508,11 +560,10 @@ mod tests {
         // A wave writes into the slot's OTHER buffer — the half `commit_wave`
         // swaps in — so the entering state survives by never being written.
         let bump = |store: &mut RecurrentStateStore| {
-            let (live, s_out) = store.layer_state_pair_mut(0).unwrap();
-            let ones = Tensor::ones(live.s.shape(), live.s.dtype(), &Device::Cpu).unwrap();
-            let advanced = live.s.add(&ones).unwrap();
-            // Stands in for the kernel's write into the destination buffer.
-            s_out.slice_set(&advanced, 0, 0).unwrap();
+            let (live, out) = store.layer_state_pair_mut(0).unwrap();
+            // Stands in for the kernels' writes into the destination buffers —
+            // both of them, because commit installs the whole state.
+            bump_into(live, &out);
         };
         store.begin_wave().unwrap();
         bump(&mut store);
@@ -523,11 +574,24 @@ mod tests {
             "rollback must restore the wave-entry state exactly"
         );
 
-        // A successful wave: mutate, commit — the write stands.
+        // A successful wave: mutate, commit — the write stands, in BOTH
+        // buffers. Asserting only on `s` would pass while the conv tail was
+        // left behind in the half the swap filed away, which is precisely the
+        // failure a partial swap produces: a state one wave ahead of its tail.
         store.begin_wave().unwrap();
         bump(&mut store);
         store.commit_wave();
-        assert_ne!(store.export().unwrap(), entry);
+        let committed = store.export().unwrap();
+        assert_ne!(
+            committed[0].state, entry[0].state,
+            "commit must install `s`"
+        );
+        assert_ne!(
+            committed[0].conv_tail, entry[0].conv_tail,
+            "commit must install the advanced conv tail, not just `s`"
+        );
+        // Layer 1 never ran, so its slot keeps both buffers as they were.
+        assert_eq!(committed[1], entry[1], "an unrun layer must not be swapped");
     }
 
     /// **A wave never writes the buffer it read, so an entering alias is never
@@ -554,10 +618,8 @@ mod tests {
 
         store.begin_wave().unwrap();
         {
-            let (live, s_out) = store.layer_state_pair_mut(0).unwrap();
-            let ones = Tensor::ones(live.s.shape(), live.s.dtype(), &Device::Cpu).unwrap();
-            let advanced = live.s.add(&ones).unwrap();
-            s_out.slice_set(&advanced, 0, 0).unwrap();
+            let (live, out) = store.layer_state_pair_mut(0).unwrap();
+            bump_into(live, &out);
         }
         let during: Vec<f32> = alias.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(
@@ -573,10 +635,8 @@ mod tests {
         // And on the committing path the swap installs the wave's output.
         store.begin_wave().unwrap();
         {
-            let (live, s_out) = store.layer_state_pair_mut(0).unwrap();
-            let ones = Tensor::ones(live.s.shape(), live.s.dtype(), &Device::Cpu).unwrap();
-            let advanced = live.s.add(&ones).unwrap();
-            s_out.slice_set(&advanced, 0, 0).unwrap();
+            let (live, out) = store.layer_state_pair_mut(0).unwrap();
+            bump_into(live, &out);
         }
         store.commit_wave();
         let committed: Vec<f32> = store

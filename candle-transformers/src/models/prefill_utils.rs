@@ -287,6 +287,8 @@ fn build_slot_headers(
     }
     let mut records_buf: Vec<u8> = Vec::with_capacity(total_slices * rec_bytes);
     let mut srcs: Vec<KvSrc> = Vec::with_capacity(total_slices);
+    // Fetched ONCE for the whole pass — see `SlotStateHost::span_layout_for_checks`.
+    let span = SlotStateHost::span_layout_for_checks();
     for (slot, cache) in slots.iter().zip(caches.iter()) {
         for slice in &slot.slices {
             match &slice.meta {
@@ -307,7 +309,7 @@ fn build_slot_headers(
                 }
                 None => {
                     let off = records_buf.len();
-                    slice.serialize_record(&mut records_buf);
+                    slice.serialize_record(&mut records_buf, span.as_ref());
                     srcs.push(KvSrc::Scratch(off));
                 }
             }

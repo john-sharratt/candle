@@ -69,6 +69,48 @@
 namespace delta_net {
 
 // ============================================================================
+// The prefill span table — the multi-sequence half of `DeltaNetLayerTable`.
+//
+// A wave carries one span per prefilling or verifying sequence, each with its
+// own carried state and its own row range of the packed buffers. Launching one
+// kernel per span is what the decode path already refuses to do (hot-path
+// invariant 5): its states live in per-session allocations, so it takes their
+// ADDRESSES on the device and runs the whole cohort in one launch. These spans
+// are the same problem with two extra fields, so they take the same answer.
+//
+//   ptrs  [4, n] i64 — conv tail in, conv tail out, state in, state out
+//   spans [2, n] u32 — first row in the packed wave buffer, row count
+//
+// The pointer rows are laid out exactly as the decode table's, so one builder
+// serves both. `blockIdx.z` selects the span; every kernel below rebases its
+// wave-buffer reads by `start` and bounds its work by `len`, which is what lets
+// spans of different lengths share a launch.
+// ============================================================================
+struct DnSpan {
+    const float* tail;
+    float*       tail_out;
+    const float* state;
+    float*       state_out;
+    int          start;
+    int          len;
+};
+
+__device__ __forceinline__ DnSpan dn_span(
+        const long long* __restrict__ ptrs,
+        const unsigned int* __restrict__ spans,
+        int n_spans,
+        int z) {
+    DnSpan s;
+    s.tail      = reinterpret_cast<const float*>(ptrs[z]);
+    s.tail_out  = reinterpret_cast<float*>(ptrs[n_spans + z]);
+    s.state     = reinterpret_cast<const float*>(ptrs[2 * n_spans + z]);
+    s.state_out = reinterpret_cast<float*>(ptrs[3 * n_spans + z]);
+    s.start     = (int)spans[z];
+    s.len       = (int)spans[n_spans + z];
+    return s;
+}
+
+// ============================================================================
 // Token-parallel causal conv with the SiLU + Q|K-norm epilogue: the output is
 // the post-activation, post-norm buffer every downstream kernel reads q/k/v
 // from through strides.
@@ -77,14 +119,17 @@ namespace delta_net {
 // stores the RAW inputs (pre-activation, as the conv window wants them) and
 // goes to `tail_out` — never in place, because blocks computing outputs for
 // t < K−1 are still reading the entering tail.
+//
+// One launch for every span in the wave: `blockIdx.z` picks the span, and
+// `x`/`y` are the whole packed buffers rebased by its `start`.
 // ============================================================================
 static __global__ void delta_net_conv_prefill_f32_kernel(
-        const float* __restrict__ x,       // [T, C]
+        const float* __restrict__ x_wave,  // [T_wave, C]
         const float* __restrict__ kernel,  // [C, K]
-        const float* __restrict__ tail,    // [C, K-1]
-        float*       __restrict__ y,       // [T, C]
-        float*       __restrict__ tail_out,// [C, K-1]
-        int t_len,
+        float*       __restrict__ y_wave,  // [T_wave, C]
+        const long long*    __restrict__ ptrs,
+        const unsigned int* __restrict__ spans,
+        int n_spans,
         int channels,
         int kwidth,
         int qk_channels,
@@ -92,7 +137,18 @@ static __global__ void delta_net_conv_prefill_f32_kernel(
     __shared__ float red[256];
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
+    const DnSpan sp = dn_span(ptrs, spans, n_spans, blockIdx.z);
     const int t = blockIdx.y;
+    // The launch is a rectangle over the WIDEST span, so shorter spans leave
+    // block rows with no token. `t` is `blockIdx.y`, so this is uniform across
+    // the block and the epilogue's block-collective reduction below is never
+    // entered by only part of a block.
+    if (t >= sp.len) return;
+    const float* __restrict__ x = x_wave + (size_t)sp.start * channels;
+    float* __restrict__ y = y_wave + (size_t)sp.start * channels;
+    const float* __restrict__ tail = sp.tail;
+    float* __restrict__ tail_out = sp.tail_out;
+    const int t_len = sp.len;
     const int tcols = kwidth - 1;
     const float* krow = kernel + (size_t)c * kwidth;
 
@@ -133,17 +189,19 @@ static __global__ void delta_net_conv_prefill_f32_kernel(
 // read x[j] for j < i, so the garbage stays confined to discarded lanes.
 // ============================================================================
 static __global__ void delta_net_prefill_intra_f32_kernel(
-        const float* __restrict__ qk,     // Q|K columns of the conv output
-        const float* __restrict__ v,      // base at the V column, same stride
-        const float* __restrict__ alpha,  // [T, h_v] raw
-        const float* __restrict__ blin,   // [T, h_v] raw
-        const float* __restrict__ dt_bias,// [h_v]
-        const float* __restrict__ a_neg,  // [h_v]
-        float*       __restrict__ u,      // [h_v, T, D]
-        float*       __restrict__ w,      // [h_v, T, D]
-        float*       __restrict__ kq,     // [h_v, T, C]
-        float*       __restrict__ g_cs,   // [h_v, T]
-        int t_len,
+        const float* __restrict__ qk_wave,   // Q|K columns of the conv output
+        const float* __restrict__ v_wave,    // base at the V column, same stride
+        const float* __restrict__ alpha_wave,// [T_wave, h_v] raw
+        const float* __restrict__ blin_wave, // [T_wave, h_v] raw
+        const float* __restrict__ dt_bias,   // [h_v]
+        const float* __restrict__ a_neg,     // [h_v]
+        float*       __restrict__ u,         // [h_v, T_tran, D]
+        float*       __restrict__ w,         // [h_v, T_tran, D]
+        float*       __restrict__ kq,        // [h_v, T_tran, C]
+        float*       __restrict__ g_cs,      // [h_v, T_tran]
+        const unsigned int* __restrict__ spans,
+        int n_spans,
+        int t_tran,     // rows per head of the shared transients
         int n_v_heads,
         int n_k_heads,
         int tok_stride, // conv_dim: q, k and v are strided views of one buffer
@@ -155,9 +213,26 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
     float* sg = sA + DNP_CHUNK * DNP_ALD;      // [C] G cumsum
     float* sb = sg + DNP_CHUNK;                // [C] β
 
+    const int z = blockIdx.z;
+    const int span_start = (int)spans[z];
+    const int t_len = (int)spans[n_spans + z];
+    const int t0 = blockIdx.x * DNP_CHUNK;
+    // The launch is a rectangle over the span with the most chunks; a shorter
+    // span's surplus blocks have no tokens. Uniform across the block.
+    if (t0 >= t_len) return;
+    // Rebase the packed wave buffers so every index below is span-local — the
+    // same arithmetic this kernel ran when it was launched once per span.
+    const float* __restrict__ qk = qk_wave + (size_t)span_start * tok_stride;
+    const float* __restrict__ v = v_wave + (size_t)span_start * tok_stride;
+    const float* __restrict__ alpha = alpha_wave + (size_t)span_start * n_v_heads;
+    const float* __restrict__ blin = blin_wave + (size_t)span_start * n_v_heads;
+    // The transients are ONE wave-wide allocation per layer rather than one per
+    // span, so a head's rows are `t_tran` apart and this span's sit at
+    // `span_start` within them.
+    const size_t tran = (size_t)span_start;
+
     const int h = blockIdx.y;
     const int kh = h % n_k_heads; // ggml's tiled GQA broadcast
-    const int t0 = blockIdx.x * DNP_CHUNK;
     const int c_len = min(DNP_CHUNK, t_len - t0);
     const int tid = (int)threadIdx.x;
     const int qk_stride = tok_stride;
@@ -185,7 +260,7 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
         if (tid < DNP_CHUNK) sg[tid] += add;
         __syncthreads();
     }
-    if (tid < c_len) g_cs[(size_t)h * t_len + (t0 + tid)] = sg[tid];
+    if (tid < c_len) g_cs[(size_t)h * t_tran + tran + (t0 + tid)] = sg[tid];
 
     // Stage this K head's k and q rows straight from the Q|K stack — q scaled
     // by the read scale on load, so no scaled copy of q exists anywhere.
@@ -228,7 +303,7 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
             if (j > i) break;
             const float dec = expf(fminf(0.f, sg[i] - sg[j]));
             if (j < i) sA[i * DNP_ALD + j] = sb[i] * dkk[q] * dec;
-            kq[((size_t)h * t_len + (t0 + i)) * DNP_CHUNK + j] = dqk[q] * dec;
+            kq[((size_t)h * t_tran + tran + (t0 + i)) * DNP_CHUNK + j] = dqk[q] * dec;
         }
     }
 
@@ -262,7 +337,7 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
     }
 
     for (int i = 0; i < c_len; ++i) {
-        const size_t dst = ((size_t)h * t_len + (t0 + i)) * DNP_DIM + d;
+        const size_t dst = ((size_t)h * t_tran + tran + (t0 + i)) * DNP_DIM + d;
         if (is_v) u[dst] = xr[i];
         else      w[dst] = xr[i];
     }
@@ -292,15 +367,16 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
 // vnew [C][TV+1], and the chunk's decay vectors.
 // ============================================================================
 static __global__ void delta_net_prefill_state_f32_kernel(
-        const float* __restrict__ state,     // [h_v, D, D] entering
-        float*       __restrict__ state_out, // [h_v, D, D] advanced
-        const float* __restrict__ qk,     // Q|K columns of the conv output
-        const float* __restrict__ u,      // [h_v, T, D]
-        const float* __restrict__ w,      // [h_v, T, D]
-        const float* __restrict__ kq,     // [h_v, T, C]
-        const float* __restrict__ g_cs,   // [h_v, T]
-        float*       __restrict__ o,      // span rows of [T_wave, h_v·D]
-        int t_len,
+        const float* __restrict__ qk_wave,// Q|K columns of the conv output
+        const float* __restrict__ u,      // [h_v, T_tran, D]
+        const float* __restrict__ w,      // [h_v, T_tran, D]
+        const float* __restrict__ kq,     // [h_v, T_tran, C]
+        const float* __restrict__ g_cs,   // [h_v, T_tran]
+        float*       __restrict__ o_wave, // [T_wave, h_v·D]
+        const long long*    __restrict__ ptrs,
+        const unsigned int* __restrict__ spans,
+        int n_spans,
+        int t_tran,
         int n_v_heads,
         int n_k_heads,
         int tok_stride, // conv_dim: q and k are strided views of the conv output
@@ -312,6 +388,17 @@ static __global__ void delta_net_prefill_state_f32_kernel(
     float* sge   = vnew + DNP_CHUNK * (DNP_TV + 1);  // e^{G}
     float* sgd   = sge + DNP_CHUNK;                  // e^{G_last − G}
     __shared__ float s_decay;                        // e^{G_last}
+
+    const DnSpan sp = dn_span(ptrs, spans, n_spans, blockIdx.z);
+    const int t_len = sp.len;
+    const float* __restrict__ state = sp.state;
+    float* __restrict__ state_out = sp.state_out;
+    // As in the intra pass: the wave buffers are rebased to the span, and the
+    // transients are one wave-wide allocation this span occupies `t_tran`-strided
+    // rows of.
+    const float* __restrict__ qk = qk_wave + (size_t)sp.start * tok_stride;
+    float* __restrict__ o = o_wave + (size_t)sp.start * (size_t)n_v_heads * DNP_DIM;
+    const size_t tran = (size_t)sp.start;
 
     const int h = blockIdx.x;
     const int kh = h % n_k_heads;
@@ -338,11 +425,11 @@ static __global__ void delta_net_prefill_state_f32_kernel(
 
         __syncthreads(); // previous chunk's phase-3 reads are complete
         if (tid == 0) {
-            s_decay = expf(g_cs[(size_t)h * t_len + (t0 + c_len - 1)]);
+            s_decay = expf(g_cs[(size_t)h * t_tran + tran + (t0 + c_len - 1)]);
         }
         if (tid < c_len) {
-            const float gv = g_cs[(size_t)h * t_len + (t0 + tid)];
-            const float gl = g_cs[(size_t)h * t_len + (t0 + c_len - 1)];
+            const float gv = g_cs[(size_t)h * t_tran + tran + (t0 + tid)];
+            const float gl = g_cs[(size_t)h * t_tran + tran + (t0 + c_len - 1)];
             sge[tid] = expf(gv);
             sgd[tid] = expf(gl - gv); // G decreases, so the exponent is ≤ 0
         }
@@ -360,7 +447,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
                 const int i = idx / DNP_DIM;
                 const int d = idx % DNP_DIM;
                 stage[i * DNP_LD + d] =
-                    w[((size_t)h * t_len + (t0 + hb + i)) * DNP_DIM + d];
+                    w[((size_t)h * t_tran + tran + (t0 + hb + i)) * DNP_DIM + d];
             }
             __syncthreads();
             // warp → t (stride 8, 4 at a time), lane → r: stage[t][j]
@@ -384,7 +471,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
                 for (int q = 0; q < 4; ++q) {
                     const int t = warp + q * 8;
                     if (t < hlen) {
-                        const float uv = u[((size_t)h * t_len + (t0 + hb + t)) * DNP_DIM +
+                        const float uv = u[((size_t)h * t_tran + tran + (t0 + hb + t)) * DNP_DIM +
                                            (i_base + lane)];
                         vnew[(hb + t) * (DNP_TV + 1) + lane] = uv - acc[q];
                     }
@@ -424,7 +511,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
                     // rows broadcast across the warp, vnew (fully written in
                     // phase 1) is bank-clean per lane.
                     const float* kqrow =
-                        kq + ((size_t)h * t_len + (t0 + tc)) * DNP_CHUNK;
+                        kq + ((size_t)h * t_tran + tran + (t0 + tc)) * DNP_CHUNK;
                     float intra = 0.f;
                     for (int s = 0; s <= tc; ++s) {
                         intra += __ldg(kqrow + s) * vnew[s * (DNP_TV + 1) + lane];
@@ -495,45 +582,50 @@ static __global__ void delta_net_prefill_state_f32_kernel(
 }
 
 static inline void launch_conv_prefill_f32(
-        const float* x,
+        const float* x_wave,
         const float* kernel,
-        const float* tail,
-        float* y,
-        float* tail_out,
-        int t_len,
+        float* y_wave,
+        const long long* ptrs,
+        const unsigned int* spans,
+        int n_spans,
+        int max_len,
         int channels,
         int kwidth,
         int qk_channels,
         float eps,
         cudaStream_t stream) {
-    if (t_len <= 0 || channels <= 0 || kwidth <= 1) return;
+    if (n_spans <= 0 || max_len <= 0 || channels <= 0 || kwidth <= 1) return;
     // The epilogue's norm reduction is block-local; a block must hold whole
     // head groups, which qk_channels = h_k·256 guarantees at 256 threads.
     if (qk_channels < 0 || qk_channels > channels || qk_channels % 256 != 0) return;
     const int threads = 256;
-    dim3 grid((channels + threads - 1) / threads, t_len);
+    dim3 grid((channels + threads - 1) / threads, max_len, n_spans);
     delta_net_conv_prefill_f32_kernel<<<grid, threads, 0, stream>>>(
-        x, kernel, tail, y, tail_out, t_len, channels, kwidth, qk_channels, eps);
+        x_wave, kernel, y_wave, ptrs, spans, n_spans, channels, kwidth,
+        qk_channels, eps);
 }
 
 static inline void launch_prefill_intra_f32(
-        const float* qk,
-        const float* v,
-        const float* alpha,
-        const float* blin,
+        const float* qk_wave,
+        const float* v_wave,
+        const float* alpha_wave,
+        const float* blin_wave,
         const float* dt_bias,
         const float* a_neg,
         float* u,
         float* w,
         float* kq,
         float* g_cs,
-        int t_len,
+        const unsigned int* spans,
+        int n_spans,
+        int max_len,
+        int t_tran,
         int n_v_heads,
         int n_k_heads,
         int tok_stride,
         float q_scale,
         cudaStream_t stream) {
-    if (t_len <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return;
+    if (n_spans <= 0 || max_len <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return;
     const int smem_bytes =
         (2 * DNP_CHUNK * DNP_LD + DNP_CHUNK * DNP_ALD + 2 * DNP_CHUNK) *
         (int)sizeof(float);
@@ -546,37 +638,44 @@ static inline void launch_prefill_intra_f32(
                              smem_bytes);
         smem_raised = 1;
     }
-    const int n_chunks = (t_len + DNP_CHUNK - 1) / DNP_CHUNK;
-    dim3 grid(n_chunks, n_v_heads);
+    // Chunks for the WIDEST span: shorter spans' surplus blocks return at the
+    // top of the kernel. A rectangle wastes at most `max_len − len` block rows
+    // per span, which is nothing against the launch it replaces.
+    const int n_chunks = (max_len + DNP_CHUNK - 1) / DNP_CHUNK;
+    dim3 grid(n_chunks, n_v_heads, n_spans);
     delta_net_prefill_intra_f32_kernel<<<grid, DNP_THREADS, smem_bytes, stream>>>(
-        qk, v, alpha, blin, dt_bias, a_neg, u, w, kq, g_cs,
-        t_len, n_v_heads, n_k_heads, tok_stride, q_scale);
+        qk_wave, v_wave, alpha_wave, blin_wave, dt_bias, a_neg, u, w, kq, g_cs,
+        spans, n_spans, t_tran, n_v_heads, n_k_heads, tok_stride, q_scale);
 }
 
 static inline void launch_prefill_state_f32(
-        const float* state,
-        float* state_out,
-        const float* qk,
+        const float* qk_wave,
         const float* u,
         const float* w,
         const float* kq,
         const float* g_cs,
-        float* o,
-        int t_len,
+        float* o_wave,
+        const long long* ptrs,
+        const unsigned int* spans,
+        int n_spans,
+        int t_tran,
         int n_v_heads,
         int n_k_heads,
         int tok_stride,
         float q_scale,
         cudaStream_t stream) {
-    if (t_len <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return;
+    if (n_spans <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return;
     // ~42 KB — deliberately under the 48 KB default so two blocks share an SM.
     const int smem_bytes = (DNP_TV * DNP_LD + DNP_TH * DNP_LD +
                             DNP_CHUNK * (DNP_TV + 1) + 2 * DNP_CHUNK) *
                            (int)sizeof(float);
-    dim3 grid(n_v_heads, DNP_DIM / DNP_TV);
+    // No span dimension in the grid's extent beyond `n_spans`: this pass walks
+    // its span's chunks serially inside the block, so its shape never depended
+    // on the length.
+    dim3 grid(n_v_heads, DNP_DIM / DNP_TV, n_spans);
     delta_net_prefill_state_f32_kernel<<<grid, 256, smem_bytes, stream>>>(
-        state, state_out, qk, u, w, kq, g_cs, o, t_len, n_v_heads, n_k_heads,
-        tok_stride, q_scale);
+        qk_wave, u, w, kq, g_cs, o_wave, ptrs, spans, n_spans, t_tran,
+        n_v_heads, n_k_heads, tok_stride, q_scale);
 }
 
 } // namespace delta_net

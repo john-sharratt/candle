@@ -341,7 +341,10 @@ fn run_glue(
             }
             None => {
                 let off = records_buf.len();
-                s.serialize_record(&mut records_buf);
+                // No span layout in a fixture: these addresses are the test's
+                // own arenas, not the engine's KV reservation, so the pointer
+                // guard has nothing to check them against.
+                s.serialize_record(&mut records_buf, None);
                 srcs.push(KvSrc::Scratch(off));
             }
         }
@@ -862,7 +865,10 @@ fn build_glue_slot(
             }
             None => {
                 let off = records_buf.len();
-                s.serialize_record(&mut records_buf);
+                // No span layout in a fixture: these addresses are the test's
+                // own arenas, not the engine's KV reservation, so the pointer
+                // guard has nothing to check them against.
+                s.serialize_record(&mut records_buf, None);
                 srcs.push(KvSrc::Scratch(off));
             }
         }

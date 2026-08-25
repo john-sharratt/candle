@@ -43,7 +43,7 @@
 use candle::cuda_backend::Backing;
 use candle::quantized::cuda::{alloc_host_mapped, HostMappedAlloc};
 use candle::quantized::{cuda::QCudaStorage, GgmlDType, QStorage, QTensor};
-use candle::{Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 use candle_kernels::simple::gather_rows::run_gather_rows_bytes;
 use cudarc::driver::DevicePtr;
 
@@ -137,7 +137,7 @@ impl RowLayout {
     /// VRAM this table would occupy if dequantized and made resident — the
     /// quantity [`should_serve_from_host`] judges, and the saving realised by not
     /// doing it.
-    pub fn resident_bytes_if_dequantized(&self, dtype: candle::DType) -> u64 {
+    pub fn resident_bytes_if_dequantized(&self, dtype: DType) -> u64 {
         (self.n_rows as u64)
             .saturating_mul(self.ncols as u64)
             .saturating_mul(dtype.size_in_bytes() as u64)
@@ -177,6 +177,21 @@ impl HostEmbedding {
         n_rows: usize,
         ncols: usize,
     ) -> Result<Self> {
+        // **Block-quantized tables only.** A `block_size` of 1 is a passthrough
+        // float table — F32/F16/BF16 stored dense — and both halves of this
+        // design lapse for it. The bandwidth premise is gone, because the row on
+        // the bus is already the row the residual stream wants rather than a
+        // compressed form of it. And the dequantize that would end the gather
+        // does not exist: `QTensor::dequantize_f16`/`_bf16` dispatch a block
+        // codec per format and have no identity kernel, so the call fails at the
+        // first forward rather than here. Refusing at construction hands the
+        // caller its ordinary resident path with the reason attached.
+        if dtype.block_size() <= 1 {
+            candle::bail!(
+                "host embedding: {dtype:?} is a dense float table, not a block \
+                 quantization — there is no compressed row to gather"
+            );
+        }
         let layout = RowLayout::new(dtype, n_rows, ncols, byte_offset, mmap.len())?;
         let table_bytes = layout.n_rows * layout.row_bytes;
         let (host_ptr, device_base, guard) = alloc_host_mapped(table_bytes)?;
@@ -202,11 +217,18 @@ impl HostEmbedding {
     }
 
     /// Gather the rows named by `ids` and return them dequantized as
-    /// `[n_ids, ncols]`.
+    /// `[n_ids, ncols]` of `dtype`.
     ///
     /// `ids` is the live **device** tensor of token ids, read on the device
     /// deliberately — see the module header.
-    /// Gather this forward's rows and dequantize them.
+    ///
+    /// `dtype` is the residual stream's type, and the dequantize kernel emits it
+    /// directly (CLAUDE.md invariant 1). That is not a convenience: it is where
+    /// the PCIe saving is realised. What crosses the bus is the QUANTIZED row —
+    /// 4352 B for a Q8_0 4096-wide row against 16 KiB dequantized, 8704 B against
+    /// 32 KiB for the 9B's 8192 — and the widening to `dtype` happens on the far
+    /// side, in VRAM. Dequantizing before the transfer, or emitting a fixed type
+    /// and converting after, gives the bus 2–4x the bytes for the same rows.
     ///
     /// `staging` is the arena the gathered *quantized* bytes are carved from.
     /// They are written by the gather and read once by the dequantize on the next
@@ -217,17 +239,23 @@ impl HostEmbedding {
     /// The **result** is deliberately not carved from it: the dequantized rows
     /// become `x`, the residual stream, which outlives this call and may be
     /// persisted and resumed on a later wave.
-    pub fn embed(&self, ids: &Tensor, device: &Device, staging: Backing) -> Result<Tensor> {
+    pub fn embed(
+        &self,
+        ids: &Tensor,
+        device: &Device,
+        staging: Backing,
+        dtype: DType,
+    ) -> Result<Tensor> {
         let cuda = match device {
             Device::Cuda(d) => d,
             _ => candle::bail!("host embedding requires a CUDA device"),
         };
-        if ids.dtype() != candle::DType::U32 {
+        if ids.dtype() != DType::U32 {
             candle::bail!("host embedding: ids must be U32, got {:?}", ids.dtype());
         }
         let n_ids = ids.elem_count();
         if n_ids == 0 {
-            return Tensor::zeros((0, self.layout.ncols), candle::DType::F16, device);
+            return Tensor::zeros((0, self.layout.ncols), dtype, device);
         }
 
         let (ids_storage, ids_layout) = ids.storage_and_layout();
@@ -264,11 +292,18 @@ impl HostEmbedding {
             );
         }
 
-        // Hand the gathered rows to the ordinary quantized path: `dequantize_f16`
-        // is the same call the resident embedding would have made at load, so
-        // every format it supports is supported here with identical numerics.
+        // Hand the gathered rows to the ordinary quantized path: these are the
+        // same calls the resident embedding would have made at load, so every
+        // format they support is supported here with identical numerics.
         let qt = QTensor::new(QStorage::Cuda(staged), (n_ids, self.layout.ncols))?;
-        qt.dequantize_f16(device)
+        match dtype {
+            DType::F32 => qt.dequantize(device),
+            DType::F16 => qt.dequantize_f16(device),
+            DType::BF16 => qt.dequantize_bf16(device),
+            other => candle::bail!(
+                "host embedding: {other:?} is not a residual-stream type the dequantize emits"
+            ),
+        }
     }
 }
 
@@ -335,6 +370,7 @@ mod cuda_tests {
             &Tensor::new(ids.as_slice(), &device)?,
             &device,
             Backing::Owned,
+            DType::F16,
         )?;
         assert_eq!(out.dims(), &[ids.len(), ncols]);
         let got = out.to_vec2::<f16>()?;
@@ -345,6 +381,61 @@ mod cuda_tests {
                 "row {k} should be table row {id}"
             );
         }
+
+        drop(mmap);
+        std::fs::remove_file(&path).ok();
+        Ok(())
+    }
+
+    /// The dequantize emits the residual stream's type directly, and every type
+    /// it emits carries the same values.
+    ///
+    /// This is what lets the caller drop its `to_dtype`, so the three must agree
+    /// exactly rather than approximately: Q8_0 dequantization is `scale * q`,
+    /// computed in f32 and rounded once to the target, so the f32 answer cast
+    /// down is the f16/bf16 answer.
+    #[test]
+    fn the_dequantize_emits_the_requested_type() -> Result<()> {
+        let _gpu = gpu_guard();
+        let device = Device::new_cuda(0)?;
+        let (n_rows, ncols) = (8usize, 64usize);
+        let (bytes, _) = synthetic_q8_0(n_rows, ncols);
+
+        let path = std::env::temp_dir().join("candle_host_embedding_dtype.bin");
+        std::fs::write(&path, &bytes).map_err(candle::Error::wrap)?;
+        let file = std::fs::File::open(&path).map_err(candle::Error::wrap)?;
+        // SAFETY: the file is written above and not modified while mapped.
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(candle::Error::wrap)? };
+        let table = HostEmbedding::new(&mmap, 0, GgmlDType::Q8_0, n_rows, ncols)?;
+        let ids = Tensor::new([5u32, 2, 0].as_slice(), &device)?;
+
+        let f32_rows = table.embed(&ids, &device, Backing::Owned, DType::F32)?;
+        assert_eq!(f32_rows.dtype(), DType::F32);
+        let reference = f32_rows.to_vec2::<f32>()?;
+
+        for dtype in [DType::F16, DType::BF16] {
+            let rows = table.embed(&ids, &device, Backing::Owned, dtype)?;
+            assert_eq!(rows.dtype(), dtype, "embed must emit the type it was asked");
+            let narrowed = rows.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+            for (r, (got, want)) in narrowed.iter().zip(reference.iter()).enumerate() {
+                let cast: Vec<f32> = match dtype {
+                    DType::F16 => want.iter().map(|&v| f16::from_f32(v).to_f32()).collect(),
+                    _ => want
+                        .iter()
+                        .map(|&v| half::bf16::from_f32(v).to_f32())
+                        .collect(),
+                };
+                assert_eq!(got, &cast, "row {r} differs at {dtype:?}");
+            }
+        }
+
+        // An integer residual stream is a caller mistake, not something to
+        // silently widen into.
+        let err = match table.embed(&ids, &device, Backing::Owned, DType::U32) {
+            Ok(_) => panic!("U32 is not a residual-stream type"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("residual-stream type"), "{err}");
 
         drop(mmap);
         std::fs::remove_file(&path).ok();
@@ -432,12 +523,29 @@ mod tests {
         assert!(RowLayout::new(GgmlDType::Q8_0, 8, 64, 14, 13 + 8 * 68).is_err());
     }
 
+    /// A dense float table has no compressed row to gather and no dequantize to
+    /// end the gather with, so it must be refused at construction — where the
+    /// caller still has its resident path — rather than at the first forward.
+    ///
+    /// Qwen3.5-0.8B is the checkpoint that proves this is not hypothetical: its
+    /// `token_embd.weight` ships BF16 while the 9B's is Q6_K.
+    #[test]
+    fn a_dense_float_table_is_refused() {
+        for dtype in [GgmlDType::F32, GgmlDType::F16, GgmlDType::BF16] {
+            assert_eq!(dtype.block_size(), 1, "{dtype:?} should be passthrough");
+        }
+        // The geometry rules still apply to the quantized types, so the refusal
+        // has to be the format's and not a size accident.
+        assert_eq!(GgmlDType::Q6_K.block_size(), 256);
+        assert_eq!(GgmlDType::Q8_0.block_size(), 32);
+    }
+
     /// The policy judges the DEQUANTIZED size — what the table would have
     /// occupied in VRAM, not what it occupies in the file.
     #[test]
     fn resident_size_is_the_dequantized_size() {
         let l = RowLayout::new(GgmlDType::Q8_0, 4, 64, 0, 4 * 68).expect("well formed");
-        assert_eq!(l.resident_bytes_if_dequantized(candle::DType::F16), 512);
-        assert_eq!(l.resident_bytes_if_dequantized(candle::DType::F32), 1024);
+        assert_eq!(l.resident_bytes_if_dequantized(DType::F16), 512);
+        assert_eq!(l.resident_bytes_if_dequantized(DType::F32), 1024);
     }
 }

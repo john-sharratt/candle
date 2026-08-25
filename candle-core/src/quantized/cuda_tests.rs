@@ -207,6 +207,62 @@ fn cuda_mmv_q8_1() -> Result<()> {
     Ok(())
 }
 
+/// A batch past the mmvq templates' 8-row ceiling runs as ≤8-row launches over
+/// slices of one staging buffer into one output — and the slicing is pure
+/// pointer arithmetic, so the result must be BIT-identical to running the
+/// slices as separate calls. Identity is the assertion because the chunks run
+/// the same kernels on the same bytes; only the offsets can be wrong, and a
+/// wrong offset moves whole rows, which tolerance would still catch but
+/// identity catches without an argument about thresholds.
+///
+/// 12 rows on purpose: `sessions × (draft + 1)` of a four-session verify wave
+/// at draft budget 2 — the production count that used to fall off the vec path
+/// onto the MMQ tile.
+#[test]
+fn cuda_mmv_q8_1_batches_past_the_template_ceiling() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let (ncols, nrows, b_size) = (512usize, 96usize, 12usize);
+    // Distinct values row to row, so a chunk reading another's rows cannot
+    // coincidentally agree.
+    let vs: Vec<f32> = (0..ncols * b_size)
+        .map(|v| ((v * 37 + 11) % 199) as f32 / 16.0 - 6.0)
+        .collect();
+    let y = dev.memcpy_stod(&vs)?;
+    let w: Vec<f32> = (0..ncols * nrows)
+        .map(|v| ((v * 13 + 5) % 251) as f32 / 32.0 - 4.0)
+        .collect();
+    let w_dev = dev.memcpy_stod(&w)?;
+    let mut xs = QCudaStorage::zeros(&dev, ncols * nrows, GgmlDType::Q6_K)?;
+    xs.quantize(&CudaStorage::wrap_cuda_slice(w_dev, dev.clone()))?;
+
+    let run = |view: &CudaView<f32>, b: usize| -> Result<Vec<f32>> {
+        let out = mul_mat_vec_via_q8_1(
+            &xs.data,
+            view,
+            GgmlDType::Q6_K,
+            ncols,
+            nrows,
+            b,
+            &dev,
+            Backing::Owned,
+        )?;
+        let out = out.as_cuda_slice::<f32>()?;
+        Ok(dev.memcpy_dtov(&out.slice(..))?)
+    };
+
+    let whole = run(&y.slice(..), b_size)?;
+    assert_eq!(whole.len(), b_size * nrows);
+    // Compare against the exact ≤8-row slices the implementation takes — 8 then
+    // 4 — and no other split: the kernel's warp count varies with its batch
+    // size, so calls at different batch sizes reduce in different orders and
+    // only the same-sized launch is bit-comparable.
+    let first = run(&y.slice(..8 * ncols), 8)?;
+    let second = run(&y.slice(8 * ncols..), b_size - 8)?;
+    assert_eq!(&whole[..8 * nrows], &first[..], "rows 0..8 differ");
+    assert_eq!(&whole[8 * nrows..], &second[..], "rows 8..12 differ");
+    Ok(())
+}
+
 #[test]
 fn cuda_mm_q8_1() -> Result<()> {
     let dev = CudaDevice::new(0)?;

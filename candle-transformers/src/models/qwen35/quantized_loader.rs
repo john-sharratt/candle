@@ -22,6 +22,7 @@ use std::sync::Arc;
 use candle::quantized::{gguf_file::Content, Int8Mode};
 use candle::{Device, Result};
 
+use super::embedding::EmbeddingTable;
 use super::expert_loader::build_expert_cache;
 use super::quantized_weights::{load_quantized_model, QuantModel};
 use crate::models::batched_model::ensure_vram_governor;
@@ -104,6 +105,12 @@ pub fn load_hybrid_gguf(
     // than aliased out of it, so the mapping itself only has to outlive the
     // load — except on a routed checkpoint, where the expert cache keeps its own
     // `Arc` and streams from it for the life of the model.
+    // The embedding is the one dense tensor read per token rather than per
+    // forward, so it is bound to host-mapped memory here — where the mapping
+    // is — and the GPU gathers its rows from device-side ids. `None` falls back
+    // to the F32 host table inside the load.
+    let host_embed = EmbeddingTable::host_mapped(&content, &mmap);
+
     let mut reader = std::io::Cursor::new(&mmap[..]);
     let pack_dir = options.expert_pack_dir.clone();
     let mmap_for_cache = mmap.clone();
@@ -112,6 +119,7 @@ pub fn load_hybrid_gguf(
         &mut reader,
         device,
         int8mode,
+        host_embed,
         |content, cfg| -> Result<Option<Arc<ExpertCache>>> {
             build_expert_cache(
                 content,

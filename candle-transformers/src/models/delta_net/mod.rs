@@ -20,9 +20,10 @@ pub mod types;
 
 pub use kv_layout::KvLayerMap;
 pub use mix::{
-    causal_conv1d, delta_net_layer_forward, delta_net_mix, delta_net_mix_spans, delta_recurrence,
-    delta_step, l2_norm, seq_spans, DeltaNetConstants, DeltaNetLayerTable, DeltaNetProjections,
-    DeltaNetSeq, DeltaNetState, DeltaNetWeights, SeqSpan,
+    causal_conv1d, delta_net_advance_spans, delta_net_layer_forward, delta_net_mix,
+    delta_net_mix_spans, delta_recurrence, delta_step, l2_norm, seq_spans, DeltaNetConstants,
+    DeltaNetLayerTable, DeltaNetOut, DeltaNetProjections, DeltaNetSeq, DeltaNetSpanTable,
+    DeltaNetState, DeltaNetWeights, SeqSpan, SpanOperands, StashSlot,
 };
 pub use quantized::{
     quantized_delta_net_layer_forward, quantized_delta_net_layer_forward_spans,

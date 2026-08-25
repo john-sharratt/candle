@@ -55,14 +55,16 @@ extern "C" {
     /// the wave, with the SiLU + Q|K-norm epilogue: each sequence's output
     /// row of `y [T_wave, channels]` is the post-activation operand row the
     /// decode step reads. `x [T_wave, channels]` (the wave's raw QKV rows),
-    /// `tails [n_decode]` device f32 pointers to each sequence's
-    /// `[channels, kwidth−1]` carried tail (shifted in place, raw values),
-    /// `rows [n_decode]` wave rows. `qk_channels` (= `2·h_k·128`, a multiple
-    /// of 256) bounds the l2-normed columns; `eps` is the norm's root floor.
+    /// `tails`/`tails_out [n_decode]` device f32 pointers to each sequence's
+    /// entering and advanced `[channels, kwidth−1]` tails (raw values, shifted
+    /// left with this token appended), `rows [n_decode]` wave rows.
+    /// `qk_channels` (= `2·h_k·128`, a multiple of 256) bounds the l2-normed
+    /// columns; `eps` is the norm's root floor.
     pub fn run_delta_net_conv_decode_f32(
         x: *const f32,
         kernel: *const f32,
         tails: *const i64,
+        tails_out: *const i64,
         rows: *const u32,
         y: *mut f32,
         n_decode: i32,
@@ -100,12 +102,13 @@ extern "C" {
     /// buffer because blocks computing the first `kwidth−1` outputs read the
     /// entering tail concurrently). `qk_channels`/`eps` as in the conv step.
     pub fn run_delta_net_conv_prefill_f32(
-        x: *const f32,
+        x_wave: *const f32,
         kernel: *const f32,
-        tail: *const f32,
-        y: *mut f32,
-        tail_out: *mut f32,
-        t_len: i32,
+        y_wave: *mut f32,
+        ptrs: *const i64,
+        spans: *const u32,
+        n_spans: i32,
+        max_len: i32,
         channels: i32,
         kwidth: i32,
         qk_channels: i32,
@@ -125,17 +128,20 @@ extern "C" {
     /// `kq [n_v_heads, t_len, DELTA_NET_PREFILL_CHUNK]` (rows valid for
     /// `s ≤ t` only) and `g_cs [n_v_heads, t_len]`.
     pub fn run_delta_net_prefill_intra_f32(
-        qk: *const f32,
-        v: *const f32,
-        alpha: *const f32,
-        blin: *const f32,
+        qk_wave: *const f32,
+        v_wave: *const f32,
+        alpha_wave: *const f32,
+        blin_wave: *const f32,
         dt_bias: *const f32,
         a_neg: *const f32,
         u: *mut f32,
         w: *mut f32,
         kq: *mut f32,
         g_cs: *mut f32,
-        t_len: i32,
+        spans: *const u32,
+        n_spans: i32,
+        max_len: i32,
+        t_tran: i32,
         n_v_heads: i32,
         n_k_heads: i32,
         tok_stride: i32,
@@ -151,15 +157,16 @@ extern "C" {
     /// 128]` in place in the stored orientation. `qk`/`tok_stride` as in the
     /// intra kernel.
     pub fn run_delta_net_prefill_state_f32(
-        state: *const f32,
-        state_out: *mut f32,
-        qk: *const f32,
+        qk_wave: *const f32,
         u: *const f32,
         w: *const f32,
         kq: *const f32,
         g_cs: *const f32,
-        o: *mut f32,
-        t_len: i32,
+        o_wave: *mut f32,
+        ptrs: *const i64,
+        spans: *const u32,
+        n_spans: i32,
+        t_tran: i32,
         n_v_heads: i32,
         n_k_heads: i32,
         tok_stride: i32,

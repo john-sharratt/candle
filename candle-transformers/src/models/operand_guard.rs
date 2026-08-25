@@ -1,4 +1,10 @@
-//! Zero-cost operand guards for the hand-written kernel wrappers.
+//! Zero-cost operand guards — the engine-wide alternative to a defensive
+//! `to_dtype` / `contiguous` on a value that should already be right.
+//!
+//! **Validate, don't convert.** Wherever a value reaches a consumer that has a
+//! fixed requirement — a hand-written kernel wrapper, a buffer another pass
+//! fills, a cache row a later step reads back — state the requirement here
+//! rather than papering over it at the call site.
 //!
 //! A kernel that indexes `base + row * row_len` has two hard requirements on
 //! every operand: the element type it was compiled against, and a dense layout.
@@ -20,10 +26,16 @@
 //! free to call on the hot path, and a caller that violates the contract gets an
 //! error naming the operand rather than a hidden per-layer copy.
 //!
-//! The rule this encodes: **a kernel wrapper VALIDATES its operands; it does not
+//! The rule this encodes: **a consumer VALIDATES its operands; it does not
 //! CONVERT them.** If a genuinely different type or layout has to be supported,
-//! the fix is to teach the kernel to read it (a template parameter, a stride
-//! argument), not to rewrite the tensor at the call site.
+//! the fix is to teach the consumer to read it (a template parameter, a stride
+//! argument, a producer that emits the right type), not to rewrite the tensor at
+//! the call site.
+//!
+//! `to_dtype` is for a conversion the design actually calls for — an F32
+//! accumulator deliberately narrowed for storage, a table built once at load.
+//! Reach for these guards for the other case, where the two types are *supposed*
+//! to agree and the cast is there in case they do not.
 
 use candle::{DType, Result, Tensor};
 

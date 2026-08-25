@@ -465,8 +465,8 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         groups.push(ArchiveGroup {
             name: "delta_net".to_string(),
             kernels: dn_kernels,
-            compile_args: decode_args,
-            include_dirs: flash_includes,
+            compile_args: decode_args.clone(),
+            include_dirs: flash_includes.clone(),
         });
     }
 

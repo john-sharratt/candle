@@ -1,6 +1,8 @@
 //! Host-side slot state for paged attention kernels (decode and prefill).
 
 use candle::{Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{span_layout, SpanLayout};
 use candle_nn::kv_cache::{
     HeadGids, LiveChunkRef, MetaGid, ResolvedArenaInfo, SealedChunk, N_PALETTE,
 };
@@ -8,6 +10,18 @@ use candle_nn::kv_cache::{
 // ---------------------------------------------------------------------------
 // Device pointer extraction
 // ---------------------------------------------------------------------------
+
+/// The KV span serialized pointers are checked against.
+///
+/// Aliased rather than named directly so the serialization signatures are the
+/// same on both builds: the span layout is a CUDA-side concept, and off CUDA
+/// there is no reservation to check against, so the parameter degenerates to a
+/// value no caller can supply anything but `None` for.
+#[cfg(feature = "cuda")]
+pub type PtrCheckSpan = SpanLayout;
+/// See the CUDA definition.
+#[cfg(not(feature = "cuda"))]
+pub type PtrCheckSpan = ();
 
 /// Extract the raw CUDA device pointer from a U8 tensor.
 ///
@@ -211,7 +225,16 @@ impl KvHeadHost {
     }
 
     /// Serialise this head into `buf` in the exact layout the CUDA kernel expects.
-    pub fn serialize_into(&self, buf: &mut Vec<u8>) {
+    ///
+    /// `layout` is the KV span to check every pointer against, fetched ONCE by
+    /// the caller for the whole serialization pass — see [`Self::check_pointers`]
+    /// and [`SlotStateHost::span_layout_for_checks`]. `None` disables the check,
+    /// which is what a device with no reservation yields.
+    pub fn serialize_into(
+        &self,
+        buf: &mut Vec<u8>,
+        #[allow(unused_variables)] layout: Option<&PtrCheckSpan>,
+    ) {
         // **Every KV pointer the attention kernels dereference passes through
         // here**, which makes this the one place worth checking them.
         //
@@ -228,7 +251,9 @@ impl KvHeadHost {
         // given the same bytes), into the weight side (expert slots), or outside
         // the span altogether — the three ways a resolved address can be wrong.
         #[cfg(feature = "cuda")]
-        self.check_pointers();
+        if let Some(l) = layout {
+            self.check_pointers(l);
+        }
         // k_pal/v_pal share `pal_len` (= head_dim/4 bytes, bit-packed); only the
         // valid prefix is serialized so the byte layout matches the CUDA struct.
         // Sizes for k_scale / v_scale are encoded in the array types
@@ -264,25 +289,20 @@ impl KvHeadHost {
     /// what the kernel reads from each pointer, so it is the range that has to
     /// be inside the arena rather than merely starting there.
     #[cfg(feature = "cuda")]
-    fn check_pointers(&self) {
-        use candle_nn::kv_cache::expect_kv_range;
+    fn check_pointers(&self, layout: &SpanLayout) {
+        use candle_nn::kv_cache::expect_kv_range_in;
 
-        // Ordinal 0: this engine runs one device, and `span_layout` answers
-        // `None` for any device with no reservation, so a wrong guess here
-        // disables the check rather than misfiring.
-        const DEV: usize = 0;
         for (side, ptrs) in [("k_ptr", &self.k_ptr), ("v_ptr", &self.v_ptr)] {
-            for (p_idx, &addr) in ptrs.iter().enumerate() {
+            for &addr in ptrs.iter() {
                 if addr == 0 {
                     continue;
                 }
-                expect_kv_range(
-                    DEV,
-                    addr,
-                    1,
-                    &format!("{side}[{p_idx}]"),
-                    "KvHead::serialize_into",
-                );
+                // `side` alone, not `format!("{side}[{p_idx}]")`: this runs
+                // `N_PALETTE` times per side per head per slice, and formatting
+                // a name for every pointer costs more than the check it labels.
+                // The panic path prints the address, which is what identifies
+                // the offender.
+                expect_kv_range_in(layout, addr, 1, side, "KvHead::serialize_into");
             }
         }
     }
@@ -514,9 +534,11 @@ impl TokenSliceHost {
 
     /// Serialize this slice's out-of-line `KvHead[n_kv_head]` record (the bytes
     /// `kvheads_ptr` points at). Length is [`record_size`].
-    pub fn serialize_record(&self, buf: &mut Vec<u8>) {
+    /// `layout` is fetched once per serialization pass by the caller — see
+    /// [`SlotStateHost::span_layout_for_checks`].
+    pub fn serialize_record(&self, buf: &mut Vec<u8>, layout: Option<&PtrCheckSpan>) {
         for head in &self.heads {
-            head.serialize_into(buf);
+            head.serialize_into(buf, layout);
         }
     }
 
@@ -568,6 +590,27 @@ pub fn pack_position_entry(slice_idx: u32, in_blk: u32) -> u32 {
 }
 
 impl SlotStateHost {
+    /// The KV span every serialized pointer is checked against, fetched ONCE
+    /// for a whole serialization pass.
+    ///
+    /// [`span_layout`](candle_nn::kv_cache::span_layout) takes the region
+    /// pool's global lock, so it belongs outside the loop, not inside the
+    /// check: a slot's record carries `N_PALETTE` K and V addresses per head,
+    /// and fetching per pointer made the metadata pack 98% lock traffic
+    /// (4,608 acquisitions per attention layer per speculative step). The
+    /// layout cannot change during a pass — the pool that owns it is not
+    /// reachable from serialization.
+    ///
+    /// `None` on a device with no reservation, which disables the check
+    /// exactly as it always did.
+    #[cfg(feature = "cuda")]
+    pub fn span_layout_for_checks() -> Option<SpanLayout> {
+        // Ordinal 0: this engine runs one device, and `span_layout` answers
+        // `None` for any device with no reservation, so a wrong guess here
+        // disables the check rather than misfiring.
+        span_layout(0)
+    }
+
     /// Construct from a sequence of sealed chunks with resolved arena pointers.
     ///
     /// Each chunk's `rope_base` is computed as the cumulative `token_count`

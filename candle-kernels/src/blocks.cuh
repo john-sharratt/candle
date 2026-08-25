@@ -541,11 +541,10 @@ typedef struct {
 #define QK_Q_AWQ 128
 #define QR_Q_AWQ 2
 #define QI_Q_AWQ (QK_Q_AWQ / (4 * QR_Q_AWQ))
-typedef struct {
-    uint8_t qs[QK_Q_AWQ / 2];  // 64 bytes: 128 × 4-bit nibbles
-    half scale;               // scale factor
-    half zero;                // zero point
-} block_q_awq;
+// No `block_q_awq` struct: it existed only for the AWQ matmul path, which is
+// gone (`QCudaStorage::fwd` refuses an AWQ weight). The KV arena reads AWQ
+// through `block_c_q_awq_k128` in `quantized/block_compact.cuh`, which is a
+// different — and correct — layout.
 
 // Q_AWQ K/128 constants
 #define QK_Q_AWQ_KTILE 128
@@ -557,11 +556,9 @@ typedef struct {
 #define QK_Q_AWQ_G64 64
 #define QR_Q_AWQ_G64 2
 #define QI_Q_AWQ_G64 (QK_Q_AWQ_G64 / (4 * QR_Q_AWQ_G64))
-typedef struct {
-    uint8_t qs[QK_Q_AWQ_G64 / 2];  // 32 bytes: 64 × 4-bit nibbles
-    half scale;                   // scale factor
-    half zero;                    // zero point
-} block_q_awq_g64;
+// No `block_q_awq_g64` struct, for the same reason — and this one was the more
+// wrong of the two: it declared 64 elements with a single scale/zero where the
+// Rust `BlockQAWQ_G64` has 128 with `scales[2]` / `zeros[2]`.
 
 // Q_AWQ_G64 K/128 constants
 #define QK_Q_AWQ_G64_KTILE 128

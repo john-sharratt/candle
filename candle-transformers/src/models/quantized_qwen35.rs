@@ -30,14 +30,29 @@ pub const TOKENIZER_REV: &str = "2fc06364715b967f1860aea9cf38778875588b17";
 /// Pinned checkpoints (repo, revision, file). Revisions are pinned because an
 /// upstream re-upload once silently invalidated a threshold tuning — a gate
 /// must fail loudly on a checkpoint change, not drift.
+///
+/// # Prefer the `-MTP-GGUF` repos wherever one exists
+///
+/// Qwen3.5/3.6 are trained with multi-token prediction and ship the head. The
+/// **plain** GGUF conversion drops it; unsloth publishes a parallel
+/// `…-MTP-GGUF` repo per model carrying the same quants under the same
+/// filenames, plus `{arch}.nextn_predict_layers` and the `blk.N.nextn.*`
+/// tensors. Pinning the plain one costs the drafter and shows up nowhere else
+/// — the model loads and answers identically — which is exactly how an earlier
+/// pass concluded the architecture had no MTP at all. Pin the MTP variant so
+/// the head is *there*; whether it is loaded is a separate question the loader
+/// answers.
+///
+/// The 0.8B has no MTP head in any conversion (none in the upstream config or
+/// tensor index), so it keeps the plain repo.
 pub const QWEN35_0_8B: (&str, &str, &str) = (
     "unsloth/Qwen3.5-0.8B-GGUF",
     "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
     "Qwen3.5-0.8B-BF16.gguf",
 );
 pub const QWEN35_9B: (&str, &str, &str) = (
-    "unsloth/Qwen3.5-9B-GGUF",
-    "3885219b6810b007914f3a7950a8d1b469d598a5",
+    "unsloth/Qwen3.5-9B-MTP-GGUF",
+    "9716a636ee4bddc3fed678220b7a33dd2a4160ae",
     "Qwen3.5-9B-Q6_K.gguf",
 );
 
@@ -86,12 +101,13 @@ pub(crate) fn tokenizer_json() -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::models::batch_test::test_helpers::hf_get;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
-    use crate::models::batched_inference::InferenceMode;
+    use crate::models::batched_inference::{InferenceMode, ManagedBatchedModel};
     use crate::models::dialect::Dialect;
+    use crate::models::qwen35::mtp::MTP_MAX_DRAFT;
     use candle::quantized::Int8Mode;
     use hf_hub::RepoType;
 
@@ -497,6 +513,132 @@ mod tests {
             Ok(m)
         };
         params.run(configs, load)
+    }
+
+    /// **Speculative decode on the 0.8B, measured against itself.**
+    ///
+    /// The same StoryRewrite configs run twice: once through the plain decode
+    /// loop, once through the lossless speculative driver with the weightless
+    /// n-gram drafter. Two things come out of it.
+    ///
+    /// * **Correctness.** Speculation accepts only the model's own argmaxes, so
+    ///   the second run must produce the same text as the first — and the
+    ///   harness validates both against the same fixture at the same 100%
+    ///   threshold. A rewind that left the recurrent state one token ahead of
+    ///   the KV would show up here as degraded output, which is exactly the
+    ///   failure `truncate_sequence` used to refuse to risk.
+    /// * **Throughput.** `t/s (single)` is the per-session decode rate; the
+    ///   ratio between the two tables is what speculation bought.
+    ///
+    /// A rewrite task is the drafter's best case *and its honest one*: the
+    /// output overlaps the prompt heavily, which is the same shape as editing
+    /// code — the workload this engine is for.
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.5-0.8B GGUF and needs a GPU. Run with: \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35::tests::speculative_decode_0_8b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn speculative_decode_0_8b() -> Result<()> {
+        speculative_gate(
+            "Qwen3.5-0.8B",
+            Int8Mode::Off,
+            &[1, 4],
+            dense_loader(pinned(QWEN35_0_8B)?, Int8Mode::Off),
+        )
+    }
+
+    /// The same measurement on the dense 9B — the size where a decode step is
+    /// weight-bandwidth-bound rather than launch-bound, so the speculative win
+    /// is the one a production session would see.
+    ///
+    /// Swept at width, like its siblings: the ladder gate runs this same
+    /// checkpoint in BF16 at 4 and 20 contexts, so a speculative step that
+    /// cannot is the speculative path's problem and not the card's.
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.5-9B GGUF (7.5 GB) and needs a GPU. Run with: \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35::tests::speculative_decode_9b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn speculative_decode_9b() -> Result<()> {
+        speculative_gate(
+            "Qwen3.5-9B",
+            Int8Mode::Off,
+            &[1, 4],
+            dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
+        )
+    }
+
+    /// Run the speculative comparison for a dense checkpoint of the lineage.
+    ///
+    /// **256 generated tokens**, not the gates' 10: speculation is a property
+    /// of the decode loop, and ten tokens is six driver steps — a number small
+    /// enough that the prefill and the first block dominate it. The draft
+    /// budget is swept so the table shows where the yield stops paying for the
+    /// rows it adds.
+    pub(crate) fn speculative_gate<M>(
+        label: &str,
+        int8mode: Int8Mode,
+        widths: &[usize],
+        load: impl Fn() -> Result<M>,
+    ) -> Result<()>
+    where
+        M: ManagedBatchedModel,
+    {
+        let configs: Vec<TestConfig> = widths
+            .iter()
+            .map(|&n| TestConfig {
+                mode: InferenceMode::BF16,
+                use_batched: true,
+                num_contexts: n,
+                num_repeats: 1,
+                generate_max_len: 256,
+                test_mode: Some(TestMode::StoryRewrite),
+            })
+            .collect();
+        // Up to the head's own ceiling, [`MTP_MAX_DRAFT`], and no further: past
+        // it the drafter clamps, so the extra rows would report the same
+        // configuration twice. The turnover the sweep used to look for is what
+        // set that constant — the measurements are recorded there.
+        for draft in 0..=MTP_MAX_DRAFT {
+            println!(
+                "\n=== {label}: {} ===\n",
+                if draft == 0 {
+                    "plain decode (baseline)".to_string()
+                } else {
+                    format!("speculative decode, draft budget {draft}")
+                }
+            );
+            let mut params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
+                .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+                .with_suppress_thinking(true)
+                .with_timeout_secs(3600);
+            if draft > 0 {
+                params = params.with_speculative(draft);
+            }
+            params = params.with_int8mode(int8mode);
+            params.run(configs.clone(), &load)?;
+        }
+        Ok(())
+    }
+
+    /// The dense lineage's loader, as [`speculative_gate`] takes it.
+    fn dense_loader(
+        model_path: std::path::PathBuf,
+        int8mode: Int8Mode,
+    ) -> impl Fn() -> Result<HybridBatched> {
+        move || {
+            let device = Device::new_cuda(0)?;
+            let m = from_gguf_path(
+                &model_path,
+                &device,
+                Qwen35LoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: None,
+                },
+            )?;
+            println!("✓ Model loaded\n");
+            Ok(m)
+        }
     }
 
     /// The story-rewrite gate on the dense 9B: the hybrid sweep end to end —
