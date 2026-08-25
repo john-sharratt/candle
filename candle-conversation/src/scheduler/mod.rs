@@ -38,9 +38,10 @@ use crate::handle::{SealResult, TurnEvent, TurnResponse};
 use crate::persistence::cold_load::{
     preallocate_pinned_scratch, ColdLoadStager, PINNED_PREALLOC_BYTES,
 };
-use crate::persistence::content_hash::{
-    section_stream_id, turn_stream_id, ContentChain, ContentHash, ContentHasher,
-};
+use crate::persistence::content_hash::{section_stream_id, turn_stream_id, ContentChain};
+// Only the K/V-digest request carries these, and it is a test-helper probe.
+#[cfg(any(test, feature = "test-helpers"))]
+use crate::persistence::content_hash::{ContentHash, ContentHasher};
 use crate::persistence::elevate::{elevate_to_hot, sealed_total_bytes};
 use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
 use crate::persistence::streams::{ContentAddress, StreamId};
@@ -841,7 +842,7 @@ fn record_phase(start: Instant, phase: &'static str) {
 /// ([`ProvSignPacked`]) and fold each to the compact provenance signature. This
 /// is the on-CPU tail of the GPU fast path in [`Scheduler::gather_wide_sigs`] and
 /// is **bit-identical** to `fold_provenance_checked(WideQSig::from_band(..), fold)`:
-/// a head's `head_dim` sign bits are its `n_palette` sub-band u32s laid down at
+/// a head's `head_dim` sign bits are its `n_palette` sub-band u64s laid down at
 /// global dims `[p*sub_head_dim, (p+1)*sub_head_dim)` — exactly how `from_band`
 /// packs them (bit `i` → word `i/64`, bit `i%64`). Only real tokens (per the
 /// chunk `layout`) are emitted, skipping partial-chunk padding.
@@ -894,10 +895,9 @@ fn assemble_folded_prov_sigs(
                     for p in 0..n_palette {
                         let warp =
                             ((layer * n_blocks + block_pos) * n_kv_head + head) * n_palette + p;
-                        let Some(&bits_u32) = packed.packed.get(warp * chunk + t) else {
+                        let Some(&bits) = packed.packed.get(warp * chunk + t) else {
                             continue;
                         };
-                        let bits = bits_u32 as u64;
                         // Palette p → global head-dims [p*sub, (p+1)*sub); place its
                         // `sub` bits at that offset within the head's `wph` words,
                         // splitting across the word boundary if it straddles one.
@@ -8844,6 +8844,7 @@ mod tests {
 
     use super::*;
     use candle::{DType, Tensor};
+    use candle_transformers::models::speculative_choice::GreedyChooser;
     use std::sync::Mutex;
 
     #[test]
@@ -8911,19 +8912,19 @@ mod tests {
             cpu.push(fold_provenance(&WideQSig::from_band(&band, HEAD_DIM)));
         }
 
-        // Hand-pack the kernel's warp-major u32 output for the same signs.
+        // Hand-pack the kernel's warp-major u64 output for the same signs.
         let n_blocks = 1usize;
         let n_warps = N_LAYERS * n_blocks * N_KV_HEAD * N_PALETTE;
-        let mut packed = vec![0u32; n_warps * chunk];
+        let mut packed = vec![0u64; n_warps * chunk];
         for l in 0..N_LAYERS {
             for h in 0..N_KV_HEAD {
                 for p in 0..N_PALETTE {
                     let warp = ((l * n_blocks) * N_KV_HEAD + h) * N_PALETTE + p;
                     for t in 0..n_real {
-                        let mut bits = 0u32;
+                        let mut bits = 0u64;
                         for d in 0..SUB {
                             if sgn(l, h, t, p * SUB + d) {
-                                bits |= 1u32 << d;
+                                bits |= 1u64 << d;
                             }
                         }
                         packed[warp * chunk + t] = bits;
@@ -10056,6 +10057,11 @@ mod tests {
         let mut session = make_test_session();
         let seq = session.create_sequence().unwrap();
         let mut sink: Vec<Box<dyn FnMut(u32) -> bool + '_>> = vec![Box::new(|_| true)];
+        // The chooser is immaterial here: the refusal is a property of the model
+        // (recurrent state it cannot rewind), so it must fire before any row is
+        // ever scored. Greedy is the one whose behaviour needs no explanation if
+        // that ordering ever regresses and this reaches the sampling step.
+        let mut chooser = GreedyChooser;
 
         let err = match model.speculative_decode_step_batch(
             &mut session,
@@ -10063,6 +10069,7 @@ mod tests {
             &[1u32],
             4,
             model.num_layers(),
+            &mut chooser,
             &mut sink,
         ) {
             Ok(_) => panic!(

@@ -73,12 +73,19 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
-        mlp_dtype: DType,
+        work_dtype: DType,
+        out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.layer.ffn {
-            QuantFfn::Dense(m) => m.forward_dynamic(&acts, mlp_dtype),
-            QuantFfn::Moe(m) => m.forward_dynamic(acts, mlp_dtype, wave),
+            QuantFfn::Dense(m) => m.forward_dynamic(&acts, work_dtype, out_dtype),
+            // See the qwen3-MoE arm: the shared+routed combine writes the width
+            // its experts ran in, so this path narrows on return.
+            QuantFfn::Moe(m) => {
+                let mut out = m.forward_dynamic(acts, work_dtype, wave)?;
+                out.to_dtype_mut(out_dtype)?;
+                Ok(out)
+            }
         }
     }
 

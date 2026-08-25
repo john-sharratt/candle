@@ -442,8 +442,11 @@ impl ChunkedKvBacking {
             .single_latent
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        // For quantized configs, arenas are created as F16 float (matching dequantize_f16).
-        // For float configs, use the configured dtype.
+        // For quantized configs the live arena is F16 (K in `R16`, raw F16 with
+        // Q-capture space; V in plain F16), which is also what `KvCache::dtype`
+        // reports as the activation dtype — so the K/V arriving here already IS
+        // this dtype and the casts below are skipped. For float configs, use the
+        // configured dtype.
         //
         // The single latent stores its bands across two arenas of DIFFERENT
         // dtypes (nope FP8 ‖ rope BF16), so a single up-front cast can't serve

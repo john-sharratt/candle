@@ -215,6 +215,10 @@ fn around_creep(
 /// The model is borrowed shared, so a caller holding `&mut` on its own wave
 /// state — cursor, residual, group membership — can still call this with the
 /// model it also owns.
+// The wave's three row-classes plus the layer window: each is an independent
+// input to the sweep, and a struct between them and the launch would hide which
+// rows a given call actually issues.
+#[allow(clippy::too_many_arguments)]
 pub fn issue_verify_wave<M>(
     model: &M,
     session: &mut BatchedInferenceSession,

@@ -1354,7 +1354,6 @@ impl TestParams {
         self.device.synchronize()?;
         let generate_start = std::time::Instant::now();
         let t_decode_total = profile_now();
-        let steps_run;
         // The steady-state decode loop is the hot loop the transient tier
         // exists for, so it is the window worth measuring: every device
         // allocation inside it is one the wave path should have taken from a
@@ -1372,7 +1371,7 @@ impl TestParams {
         // only the model's own greedy continuation, both produce identical text,
         // so every gate's expected-output check is now also a losslessness check
         // — across the whole C0–C10 ladder, not just the speculative gates.
-        steps_run = self.speculative_decode_phase(
+        let steps_run = self.speculative_decode_phase(
             &mut session,
             &sequence_indices,
             &mut runs,

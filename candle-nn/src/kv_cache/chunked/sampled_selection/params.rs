@@ -412,20 +412,35 @@ pub const LLAMA3_KV_FACTOR: f32 = 0.9;
 
 /// Qwen3.5-0.8B (dense hybrid) — attention layers at `head_dim 256`.
 ///
-/// **Derived 2026-08-23** on the 0.8B C-ladder gate
+/// **Re-derived 2026-08-25** on the 0.8B C-ladder gate
 /// (`quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b`) to the
 /// lineage's calibration target: **the whole range C0–C10 passes**, with the
-/// C10×10 rung sitting just under the breaking edge. Sweep facts that
-/// remain true for the next re-derivation: the critical blocks respond to
-/// the geometric mean of an axis's hi·lo pair, not to either factor alone
-/// (single-sided probes barely move them), and V is the sensitive axis on
-/// this model — K-only tightening made a second session diverge in the
-/// wide-rung sweep.
+/// C10×10 rung sitting just under the breaking edge. Green twice with identical
+/// ratios (C8 3.88×, C9 4.15×, C10 4.68×).
+///
+/// **The row it replaces was fit to a different numeric path.** The 2026-08-23
+/// row (k 0.85, v 0.60) was derived while the gate pinned the *unquantized* BF16
+/// conversion, which forced `Int8Mode::Off` and left this the only model in the
+/// lineage on the FP matmul path. The gate now pins Q8_0 and takes `auto`, so it
+/// runs int8 like its siblings — and like a deployment. Only V needed moving:
+/// 0.60 fails C10 by one session, 0.55 and 0.45 both pass, and the whole usable
+/// band is 4.64×–4.68× against the failing row's 4.71%. K stays at 0.85.
+///
+/// Sweep facts for the next re-derivation:
+/// * **V is the lever at the top rung, K is not** — C8 passes at k 0.85
+///   throughout, and C10 moves on V alone. (On the old FP path the opposite held,
+///   which is a warning that these facts belong to a numeric path, not a model.)
+/// * V barely moves compression here — 0.10 of factor is ~0.9% of ratio — so
+///   margin is nearly free. Prefer a value that passes repeatably over the
+///   largest one that passes once; a rung sitting *on* the edge flips with any
+///   numerical change, and this ladder is statistical, not deterministic.
+/// * The critical blocks respond to the geometric mean of an axis's hi·lo pair,
+///   not to either factor alone.
 pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 0.85,
     k_low: 0.85,
-    v_hi: 0.6,
-    v_low: 0.6,
+    v_hi: 0.55,
+    v_low: 0.55,
 };
 
 /// Qwen3.5-9B (dense hybrid).

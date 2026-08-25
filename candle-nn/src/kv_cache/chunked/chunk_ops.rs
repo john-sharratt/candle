@@ -1632,24 +1632,29 @@ impl ChunkedKvBacking {
                 bump_arena::persistence_domain(copy_stream)?.generation(NOT_A_WAVE, NOT_A_WAVE)?;
             let staging = loop {
                 let batch_bytes: usize = layers[li..lj].iter().map(|l| l.layer_bytes).sum();
-                // Host scratch (fallible — see the per-layer variant's note).
-                let host_res = {
+                // **GPU staging first, host scratch only once it is in place.**
+                // The order used to be the other way round, and the host buffer is
+                // grow-only PINNED memory: a batch the domain was always going to
+                // refuse still left `pinned_scratch` sized to it. With a single
+                // 126–186 MB layer against the 64 MiB budget that is ~186 MB of
+                // non-pageable host memory held for the process, to serve a retry
+                // that can never need more than the cap.
+                //
+                // The bisect shrinks against the domain's *declared* budget rather
+                // than against the driver refusing an allocation — same loop, a
+                // bound that is ours.
+                let alloc_res = staging_gen.alloc(batch_bytes, 256).and_then(|range| {
+                    // Host scratch (fallible — see the per-layer variant's note).
                     let need_grow = pinned_scratch
                         .as_ref()
                         .map(|b| b.len() < batch_bytes)
                         .unwrap_or(true);
                     if need_grow {
                         PinnedBuf::alloc_default_or_host_fallible(batch_bytes)
-                            .map(|b| *pinned_scratch = Some(b))
-                    } else {
-                        Ok(())
+                            .map(|b| *pinned_scratch = Some(b))?;
                     }
-                };
-                // GPU staging (only once the host scratch is in place). The
-                // bisect now shrinks against the domain's *declared* budget
-                // rather than against the driver refusing an allocation —
-                // same loop, a bound that is ours.
-                let alloc_res = host_res.and_then(|_| staging_gen.alloc(batch_bytes, 256));
+                    Ok(range)
+                });
                 match alloc_res {
                     Ok(range) => break range,
                     Err(e) if lj > li + 1 => {
@@ -1663,6 +1668,21 @@ impl ChunkedKvBacking {
                         );
                         continue;
                     }
+                    // **A lone layer over the cap is reported, not retried here.**
+                    //
+                    // The bisect halves a layer *span*, so its floor is one layer —
+                    // and one layer's hot set is not bounded by the cap. A workload
+                    // that seals many lossless-R16 turns before the drain catches up
+                    // puts 100–200 MB in a single layer against a 64 MiB span.
+                    //
+                    // The per-layer path (`migrate_sealed_to_cpu_batch_async`) groups
+                    // by BAND and always fits, so it is the right answer — but NOT
+                    // from here. This function is reached with the sequence-state
+                    // write lock held across its allocation loop, and re-entering the
+                    // allocator underneath it is the shape that deadlocked the daemon
+                    // three times (`bump_arena`'s lock-order note). The caller runs
+                    // with no such lock, so the retry belongs there; see
+                    // `persistence::thread`'s handling of this error.
                     Err(e) => return Err(e),
                 }
             };

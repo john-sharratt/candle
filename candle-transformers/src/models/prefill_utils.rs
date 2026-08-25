@@ -1666,6 +1666,23 @@ pub fn paged_glue_attn<'w>(
         KvCache::prime_chunked_decode_slots_batch(caches)?;
     }
     drop(header_upload);
+    // Returned at the ARENA's compute dtype, which is not always the caller's
+    // activation dtype — and deliberately NOT reconciled here.
+    //
+    // Nothing downstream asserts the two are equal. The context's only consumers
+    // are the attention gate and the out-projection: the gate belongs to the
+    // Qwen3-Next/Qwen3.5 lineage, which is `head_dim` 256 and so is refused by
+    // this path's 128-only route gate — it is always `None` here — and
+    // `output_projection` names the residual's width as its store type, so the
+    // conversion happens inside a GEMM that was running anyway.
+    //
+    // A `to_dtype` here would therefore be a full-tensor pass that converts
+    // nothing in every reachable configuration, and in the one configuration it
+    // could convert (an F32 reference session over a half-typed arena) it would
+    // duplicate what the projection's store already does — hot-path invariant 1b.
+    // If a gated `head_dim` 128 model is ever added, `apply_attention_gate`'s
+    // `expect_dtype` is the right place for it to fail: loudly, at the boundary
+    // that introduced the mismatch, rather than absorbed by a cast here.
     Ok(out)
 }
 

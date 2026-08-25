@@ -507,12 +507,29 @@ impl ManagedBatchedModel for HybridBatched {
     /// it remembers tokens the cache no longer has (measured: re-prefilling a
     /// truncated prompt diverges by ~9.5 in the logits).
     ///
-    /// Declaring it here refuses the one path that rewinds — speculative
-    /// decode — at its entry point. That replaces a bail *inside* the rewind,
-    /// which fired only after the driver had drafted and verified, and which
-    /// site 8 (the `<think>` re-prefill) bypassed entirely by reaching the
-    /// session directly.
+    /// What this declares is that the state exists outside the session's KV and
+    /// must be snapshotted, forked and released with the sequence. It is no
+    /// longer also a statement that the state cannot be rewound — see
+    /// [`Self::can_rewind_speculative_block`] below.
     fn carries_recurrent_state(&self) -> bool {
+        true
+    }
+
+    /// **The hybrid can rewind a verified block**, which is why it does not take
+    /// the default `!carries_recurrent_state()`.
+    ///
+    /// `S` has no per-token decomposition, so there is no suffix to subtract —
+    /// but a rewind does not need one. [`Self::truncate_sequences`] replays the
+    /// mixer over the accepted prefix from the state the block was entered with,
+    /// which the wave's ping-pong leaves intact in the half it was not writing,
+    /// and the mixer's row `i` depends on no row after it. The result is the
+    /// state those `m` tokens alone would have produced (`super::spec`).
+    ///
+    /// The claim is bounded: it covers offsets inside a block this model stashed
+    /// operands for. `truncate_sequences` refuses anything else by name rather
+    /// than silently resetting, so a caller that rewinds somewhere no replay can
+    /// reach gets an error instead of a zeroed recurrence.
+    fn can_rewind_speculative_block(&self) -> bool {
         true
     }
 

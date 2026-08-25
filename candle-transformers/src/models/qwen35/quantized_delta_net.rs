@@ -22,6 +22,8 @@ use candle_nn::kv_cache::{begin_wave, LayerPhase};
 #[cfg(feature = "cuda")]
 use super::quantized_weights::{QuantFfn, QuantLayer};
 #[cfg(feature = "cuda")]
+use crate::models::operand_guard::expect_dtype;
+#[cfg(feature = "cuda")]
 use crate::models::profile::gpu_span;
 #[cfg(feature = "cuda")]
 use crate::models::tensor_cat::TensorCat;
@@ -50,7 +52,11 @@ pub fn quantized_delta_net_ffn(
         _ => None,
     };
     let g_ffn = gpu_span("dn:ffn", x.as_cat_tensor().device());
-    let mut h = {
+    // The dense MLP's down projection stores `orig_dtype`, so its result needs
+    // no narrowing here — that cast was a full-tensor pass per DeltaNet layer
+    // per wave (18 of them on the 0.8B) undoing a widening only the SwiGLU
+    // intermediates needed. The MoE combine still writes its working width.
+    let h = {
         let mode = layer.ffn_int8mode();
         let acts = layer.post_attn_norm.forward_dynamic(
             x.as_cat_tensor(),
@@ -58,12 +64,20 @@ pub fn quantized_delta_net_ffn(
             wave_root(ffn_wave.as_ref()),
         )?;
         match &layer.ffn {
-            QuantFfn::Dense(m) => m.forward_dynamic(&acts, mlp_dtype)?,
-            QuantFfn::Moe(m) => m.forward_dynamic(acts, mlp_dtype, ffn_wave.as_ref())?,
+            QuantFfn::Dense(m) => m.forward_dynamic(&acts, mlp_dtype, orig_dtype)?,
+            QuantFfn::Moe(m) => {
+                let mut out = m.forward_dynamic(acts, mlp_dtype, ffn_wave.as_ref())?;
+                out.to_dtype_mut(orig_dtype)?;
+                out
+            }
         }
     };
-    h.to_dtype_mut(orig_dtype)?;
-    x.to_dtype_mut(orig_dtype)?;
+    // VALIDATED, not converted: the dense arm's down projection stores
+    // `orig_dtype` and the MoE arm narrows to it above, so the two agree by
+    // construction. Rewriting the residual here would be a full-tensor pass per
+    // DeltaNet layer per wave that also hides a producer emitting the wrong
+    // width (hot-path invariant 1b).
+    expect_dtype(&h, orig_dtype, "delta-net residual: ffn(x) vs the stream")?;
     x.add_mut(&h)?;
     g_ffn.end();
     // `h` borrows `ffn_wave`, so the compiler already refuses any drop order

@@ -744,12 +744,89 @@ fn migrate_group_hot_to_warm(
                 );
                 break 'work false;
             }
+            // **A batch too big for the staging span retries per layer rather than
+            // dropping the pass.**
+            //
+            // The cross-layer path bisects by layer span, so its floor is one layer,
+            // and one layer's hot set is not bounded by that span: a burst of sealed
+            // lossless-R16 turns puts 100–200 MB in a single layer against a 64 MiB
+            // budget. Reporting that as a failed pass wedges the tier — nothing
+            // migrates, the pressure that asked for the drain is unrelieved, and the
+            // next pass rebuilds the identical oversized batch and fails identically.
+            // Measured as a daemon that never finished starting, with 39k futile
+            // empty-arena sweeps behind a drain that could not move a byte.
+            //
+            // The per-layer path groups by BAND (`staging_groups`), so it always fits
+            // and always makes progress, and it is the reference the batched path is
+            // proven bit-identical against — the retry costs syncs, not bytes. It runs
+            // HERE, not inside the batched call, because that one holds the
+            // sequence-state write lock across its allocation loop and re-entering the
+            // allocator under it is the shape `bump_arena`'s lock-order note records
+            // as having deadlocked the daemon three times.
             Err(e) => {
                 tracing::warn!(
-                    "cache: hot→warm batched DtoH failed: {e} (last CUDA kernel on this thread: {})",
+                    "cache: hot→warm batched DtoH failed: {e} — retrying per layer \
+                     (last CUDA kernel on this thread: {})",
                     candle::last_cuda_kernel_launch()
                 );
-                break 'work false;
+                // **Not atomic, unlike the batched path — so it is ordered to fail
+                // early rather than mid-way.** The batched call allocates before it
+                // scatters, so a refusal costs nothing; this loop copies as it goes,
+                // and a failure at layer k throws away k layers of completed copies
+                // and the CPU arenas they claimed. Nothing is left inconsistent (the
+                // commit downstream is gated on every layer being present), but a
+                // persistent failure would churn most of a drain per attempt.
+                //
+                // The widest layer is the one that fails if any does, so it goes
+                // first: the loop then either refuses having done no work, or the
+                // rest — all no wider — follow it. `layer_bytes` is not visible from
+                // here, so the proxy is the sealed chunk count, which is what the
+                // byte length is a per-format multiple of.
+                let mut order: Vec<usize> = (0..backings.len()).collect();
+                order.sort_by_key(|&i| {
+                    std::cmp::Reverse(
+                        gpu_hot_per_layer[i]
+                            .iter()
+                            .map(|s| s.chunks.len())
+                            .sum::<usize>(),
+                    )
+                });
+                let mut slots: Vec<Option<Vec<SealedSequence>>> =
+                    (0..backings.len()).map(|_| None).collect();
+                let mut recovered = true;
+                for &i in &order {
+                    let backing = &backings[i];
+                    let seqs = &gpu_hot_per_layer[i];
+                    let refs: Vec<&SealedSequence> = seqs.iter().collect();
+                    match backing.migrate_sealed_to_cpu_batch_async(
+                        device,
+                        copy_stream,
+                        pinned_scratch,
+                        &refs,
+                    ) {
+                        Ok(v) => slots[i] = Some(v),
+                        Err(e2) => {
+                            tracing::warn!(
+                                "cache: hot→warm per-layer retry failed at layer {i}: {e2} — the \
+                                 group stays hot-float + consistent and retries next pass"
+                            );
+                            if !is_wave_deferral(&e2) {
+                                signal_vram_starvation(device, &e2);
+                            }
+                            recovered = false;
+                            break;
+                        }
+                    }
+                }
+                if !recovered {
+                    break 'work false;
+                }
+                // Back into layer order — the scatter below indexes by layer, and
+                // the retry ran widest-first.
+                slots
+                    .into_iter()
+                    .map(|s| s.expect("every layer migrated when recovered"))
+                    .collect()
             }
         };
         // Distribute warm (per layer, in layer order) into per-residence order.

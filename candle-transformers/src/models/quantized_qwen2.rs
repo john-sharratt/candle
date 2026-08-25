@@ -315,12 +315,13 @@ impl BatchedAttentionLayer for LayerWeights {
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
-        mlp_dtype: DType,
+        work_dtype: DType,
+        out_dtype: DType,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
         _wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
-        self.mlp.forward_dynamic(&acts, mlp_dtype)
+        self.mlp.forward_dynamic(&acts, work_dtype, out_dtype)
     }
 
     /// B1 producer: fuse attention_norm -> q8a128 (int8) or FP rms_norm (Off).

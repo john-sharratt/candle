@@ -961,19 +961,26 @@ impl BatchedAttentionLayer for LayerWeights {
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
-        mlp_dtype: DType,
+        work_dtype: DType,
+        out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.ffn {
             FeedForward::MoE(m) => {
                 // FP acts get the F16→BF16 stability cast; q8a128 is range-safe (no cast).
                 let acts = match acts {
-                    DynamicActs::Float(t) => DynamicActs::Float(t.to_dtype(mlp_dtype)?),
+                    DynamicActs::Float(t) => DynamicActs::Float(t.to_dtype(work_dtype)?),
                     int8 => int8,
                 };
-                m.forward_dynamic(acts, mlp_dtype, wave)
+                // The MoE combine writes the width its experts ran in — the
+                // router logits and the device dispatch share that one dtype —
+                // so this path narrows on return. Giving the combine its own
+                // store width is the same change one level down.
+                let mut out = m.forward_dynamic(acts, work_dtype, wave)?;
+                out.to_dtype_mut(out_dtype)?;
+                Ok(out)
             }
-            FeedForward::Mlp(m) => m.forward_dynamic(&acts, mlp_dtype),
+            FeedForward::Mlp(m) => m.forward_dynamic(&acts, work_dtype, out_dtype),
         }
     }
 }

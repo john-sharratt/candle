@@ -8,11 +8,17 @@
 //! themselves: their checkpoints, their tokenizer, and the gate tests that
 //! hold the engine to exact outputs on them.
 //!
-//! The dense models are the hybrid engine's proving ground: the 0.8B is
-//! unquantized BF16 (no quantization in the picture at all), and the 9B runs
-//! the same sweep as the 35B with the expert cache out of the picture — so a
+//! The dense models are the hybrid engine's proving ground: the 0.8B is the
+//! smallest checkpoint that exercises the whole hybrid, and the 9B runs the
+//! same sweep as the 35B with the expert cache out of the picture — so a
 //! failure here is the hybrid, and a failure only on the MoE sibling is the
 //! experts.
+//!
+//! Both dense gates run **Q8_0 weights on the int8 matmul**. The 0.8B was
+//! pinned to the BF16 conversion while its top compression rung depended on
+//! BF16-width activations; once the rung was traced to that and the int8 path
+//! carried it, Q8_0 became the pin — it is the same arithmetic the 9B and the
+//! MoE siblings run, and roughly twice the throughput.
 
 use std::path::Path;
 
@@ -47,10 +53,29 @@ pub const TOKENIZER_REV: &str = "2fc06364715b967f1860aea9cf38778875588b17";
 ///
 /// The 0.8B has no MTP head in any conversion (none in the upstream config or
 /// tensor index), so it keeps the plain repo.
+///
+/// **Q8_0, not the BF16 conversion.** The repo publishes both. BF16 was pinned
+/// originally and made this the only model in the lineage on `Int8Mode::Off`:
+/// float weights have no KO twin to select, so every projection took the FP path
+/// while 9B/35B/27B took the int8 one — a numeric path no deployment of this
+/// model would use, and the prime suspect for why `QWEN35_0_8B_KV_FACTORS` had
+/// to sit ~3× tighter than every sibling's row.
+///
+/// One weight here is below the KO tile. `w_alpha`/`w_beta` are
+/// `[n_v_heads, hidden]` = `[16, 1024]`, and `repack_ko` needs `nrows % 32 == 0`
+/// (the q8a128 matmul tiles N in blocks of 32) — 16 linear-V heads does not
+/// clear it, where the 9B and 35B have 32 and the 27B 48. That is a *per-tensor*
+/// fact, not a model-level exclusion: `QMatMul::from_weights_with_mode` leaves a
+/// non-tileable weight on the dequant path and gives every wide projection its
+/// twin. It used to propagate the bail instead, which is what made a quantized
+/// 0.8B unloadable in int8 over one small matrix.
+///
+/// (`Q8_1` is not a published GGUF file type — it exists as an internal block
+/// format for activation quantization, not as a model conversion.)
 pub const QWEN35_0_8B: (&str, &str, &str) = (
     "unsloth/Qwen3.5-0.8B-GGUF",
     "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
-    "Qwen3.5-0.8B-BF16.gguf",
+    "Qwen3.5-0.8B-Q8_0.gguf",
 );
 pub const QWEN35_9B: (&str, &str, &str) = (
     "unsloth/Qwen3.5-9B-MTP-GGUF",
@@ -302,6 +327,120 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// **How the recurrent scan's cost scales with prompt length.**
+    ///
+    /// `delta_net_prefill_state` walks its span's chunks *serially* inside the
+    /// block, and its grid — `(n_v_heads, DNP_DIM/DNP_TV, n_spans)` — carries no
+    /// length dimension at all. So the serial depth grows as
+    /// `ceil(len / DNP_CHUNK)` while the parallelism stays pinned at 128 blocks
+    /// on a 110-SM card. Profiled at the gate's 134-token prompt that is
+    /// invisible (3 chunks); this sweep is what makes it visible, and what sizes
+    /// a blocked scan that would put sections on `grid.z`.
+    ///
+    /// Reports `dn:mix` (the scan's span) against `dn:ffn` (dense GEMMs, known
+    /// compute-bound) so length-scaling is read against a control that should
+    /// stay linear.
+    /// Gated on `cuda` because it reads the scan's chunk width from the kernel's
+    /// own constant, which lives in the cuda-only `candle-kernels` dependency —
+    /// the alternative is a second copy of that number drifting out of sync.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "downloads the pinned 9B GGUF and needs a GPU. Run with: \
+                cargo test --release --features cuda,profile --lib \
+                -p candle-transformers quantized_qwen35::tests::prefill_scan_scaling \
+                -- --ignored --nocapture"]
+    fn prefill_scan_scaling() -> Result<()> {
+        use crate::models::batched_inference::BatchedConfig;
+        use crate::models::profile::pipeline_snapshot_and_reset;
+        use candle::Tensor;
+        use candle_kernels::delta_net::DELTA_NET_PREFILL_CHUNK;
+        use std::time::Instant;
+
+        let model_path = pinned(QWEN35_9B)?;
+        let device = Device::new_cuda(0)?;
+        let model = from_gguf_path(
+            &model_path,
+            &device,
+            Qwen35LoadOptions {
+                int8mode: Some(Int8Mode::auto(&device)),
+                expert_pack_dir: None,
+            },
+        )?;
+
+        // A real prompt cycled to length: the token ids must be in-vocabulary,
+        // and repetition is fine here because the scan's cost is a function of
+        // shape, not of content.
+        let params = TestParams::new(4, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?;
+        let mut seed = params.system_prompt_tokens(0);
+        seed.extend(params.user_prompt_tokens(0));
+
+        println!(
+            "\n  {:>7} {:>7} {:>10} {:>12} {:>12} {:>10}",
+            "tokens", "chunks", "wall ms", "dn:mix ms", "dn:ffn ms", "mix/chunk"
+        );
+        for &len in &[128usize, 512, 1024, 2048, 4096, 8192] {
+            let ids: Vec<u32> = (0..len).map(|i| seed[i % seed.len()]).collect();
+            let mut session = model.create_batched_session(BatchedConfig::default())?;
+            let seq = session.create_sequence()?;
+            let t = Tensor::from_vec(ids, (1, len), &device)?;
+
+            let _ = pipeline_snapshot_and_reset();
+            device.synchronize()?;
+            let t0 = Instant::now();
+            let step = model.forward_wave(
+                &mut session,
+                &[],
+                &[],
+                &[seq],
+                &[t],
+                &[],
+                &[],
+                0,
+                model.num_layers(),
+                None,
+            )?;
+            drop(step);
+            device.synchronize()?;
+            let wall = t0.elapsed().as_secs_f64() * 1e3;
+            // `dn:mix` / `dn:ffn` are `gpu_span`s — CUDA event pairs that only
+            // reach the accumulator when drained, so the snapshot is empty
+            // without this.
+            crate::models::profile::gpu_drain_blocking();
+            let snap = pipeline_snapshot_and_reset();
+            let get = |name: &str| -> f64 {
+                snap.entries
+                    .iter()
+                    .find(|(n, _, _)| n == name)
+                    .map(|(_, ms, _)| *ms)
+                    .unwrap_or(0.0)
+            };
+            let (mix, ffn) = (get("dn:mix"), get("dn:ffn"));
+            // The scan's serial depth at this length. Read from the kernel's own
+            // constant, so retuning the chunk width cannot leave this column
+            // quietly reporting the old one.
+            let chunks = len.div_ceil(DELTA_NET_PREFILL_CHUNK);
+            println!(
+                "  {len:>7} {chunks:>7} {wall:>10.1} {mix:>12.1} {ffn:>12.1} {:>10.3}",
+                mix / chunks as f64
+            );
+            // At the longest length, the whole span table: `dn:mix` and `dn:ffn`
+            // are both linear here, so whatever makes the wall superlinear is a
+            // third span — print it rather than infer it.
+            if len == 8192 {
+                let mut rows = snap.entries.clone();
+                rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+                println!("    --- full span table at {len} tokens ---");
+                for (name, ms, count) in rows.iter().take(12) {
+                    println!("    {name:<24} {ms:>9.1} ms  (×{count})");
+                }
+            }
+            session.free_sequence(seq)?;
+            model.release_sequence(seq)?;
+        }
+        Ok(())
+    }
+
     /// Engine throughput on the 0.8B and 9B, apart from the gate harness.
     #[test]
     #[ignore = "downloads the pinned 0.8B and 9B GGUFs and needs a GPU. Run with: \
@@ -350,14 +489,21 @@ pub(crate) mod tests {
                 the card if cargo runs them concurrently)"]
     fn test_parallel_batched_forwarding_0_8b() -> Result<()> {
         println!("\n=== Qwen3.5-0.8B hybrid batched forwarding ===\n");
+        let model_path = pinned(QWEN35_0_8B)?;
+        let device = Device::new_cuda(0)?;
+
+        // **Resolved here, then used twice**, so the table's `int8` column
+        // cannot disagree with what the model loaded. This gate set only the
+        // loader and left the label defaulting to `Off`, so it printed `off`
+        // while running int8 — visible only as a doubled throughput that the
+        // column said should not exist.
+        let int8mode = Int8Mode::auto(&device);
         let params = TestParams::new(10, &tokenizer_json()?, Dialect::qwen35())
             .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
             .with_suppress_thinking(true)
             .with_print_outputs(true)
+            .with_int8mode(int8mode)
             .with_timeout_secs(1800);
-
-        let model_path = pinned(QWEN35_0_8B)?;
-        let device = Device::new_cuda(0)?;
 
         let configs = vec![
             TestConfig {
@@ -505,11 +651,14 @@ pub(crate) mod tests {
                 &model_path,
                 &device,
                 Qwen35LoadOptions {
-                    // `Off` here is a statement about the checkpoint, not an
-                    // unexamined default: the 0.8B is unquantized BF16, so every
-                    // projection is a float weight and there is no KO twin for
-                    // an int8 mode to select.
-                    int8mode: Some(Int8Mode::Off),
+                    // `auto`, like the 9B gate: the checkpoint is Q8_0, so the
+                    // wide projections get KO twins and this rung runs the same
+                    // numeric path as the rest of the lineage — and as a
+                    // deployment would. The DeltaNet `w_alpha`/`w_beta` sit below
+                    // the KO tile and stay dense on their own (see
+                    // `QWEN35_0_8B`); that costs those two weights their twin,
+                    // not the model its int8 path.
+                    int8mode: Some(int8mode),
                     expert_pack_dir: None,
                 },
             )?;
@@ -797,12 +946,14 @@ pub(crate) mod tests {
         // cannot disagree with what the model loaded — the label is set
         // independently of the loader, and a gate that pins one and defaults the
         // other reports a numeric path it is not running.
-        // `Performance`, not `auto_sized`. Auto picks `Precision` on this card,
-        // and the two differ only in the weight twin — the q8a128 activation is
-        // the same — so the choice is a throughput/accuracy dial, not a
-        // capability one, and the gate is the place to hold it steady rather
-        // than let it move with the device.
-        let int8mode = Int8Mode::Performance;
+        // `auto`, so the gate runs the twin production selects rather than a
+        // pinned one. It used to pin `Performance` on the grounds that the two
+        // twins are interchangeable — measured true *on this model* (every rung
+        // valid either way, throughput inside the run-to-run band) and false in
+        // general: the same swap takes Llama-3's ladder to C6 0/1, C7 0/1,
+        // C8 9/10. A dial that is free on one model is not free on the next, so
+        // the gate follows the default instead of asserting the two are alike.
+        let int8mode = Int8Mode::auto(&device);
         let params = TestParams::new(10, &tokenizer_json()?, Dialect::qwen35())
             .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
             .with_suppress_thinking(true)

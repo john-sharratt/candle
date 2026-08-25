@@ -92,9 +92,9 @@ use candle_nn::kv_cache::KvCache;
 /// pass for nothing and measured *slower* end to end (77.5 t/s against 83.6).
 pub const MTP_MAX_DRAFT: usize = 2;
 
-/// How far ahead it is worth drafting is a separate question from how far the
-/// head can reach, and it lives in [`crate::models::draft_ladder`]: reach is a
-/// property of this block, worth is a property of the wave it rides on.
+// How far ahead it is worth drafting is a separate question from how far the
+// head can reach, and it lives in `crate::models::draft_ladder`: reach is a
+// property of this block, worth is a property of the wave it rides on.
 
 /// The head's input assembly: the two norms and the projection over their
 /// concatenation.

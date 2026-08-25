@@ -596,8 +596,21 @@ impl Int8Mode {
 
     /// Auto-select the numeric mode for `device`: [`Int8Mode::Precision`] when the device can run
     /// the int8 `m16n8k32` tensor-core MMA (CUDA, compute capability >= 8.0 / Ampere+), otherwise
-    /// [`Int8Mode::Off`] (the FP16 reference). Precision is chosen over Performance because its
-    /// stepped-up KO twin is near-lossless versus the source quant at no measurable decode cost.
+    /// [`Int8Mode::Off`] (the FP16 reference).
+    ///
+    /// **Precision, and the margin is model-dependent — do not generalise it from one model.**
+    /// The two modes differ only in the weight twin (the q8a128 activation is identical), so the
+    /// choice is a throughput/accuracy dial. Measured on an RTX PRO 5000 Blackwell (sm_120):
+    ///
+    /// * Qwen3.5-9B is **insensitive** — every C-ladder rung valid in both, identical compression
+    ///   ratios, throughput inside the run-to-run band (C8 5823 vs 5831 bulk).
+    /// * Llama-3 is **not** — the same swap takes its ladder from green to C6 0/1, C7 0/1 and
+    ///   C8 9/10. Precision's stepped-up twin is doing real work there.
+    ///
+    /// So a model that shows no difference says nothing about the next one, and the default holds
+    /// the accurate twin. `Performance` stays available where a gate has measured it safe (the
+    /// DeepSeek-V4 engine pins it) or where the larger twin does not fit — see
+    /// [`Int8Mode::auto_sized`].
     pub fn auto(device: &crate::Device) -> Self {
         match device {
             #[cfg(feature = "cuda")]
@@ -607,12 +620,16 @@ impl Int8Mode {
     }
 
     /// VRAM-aware [`Int8Mode::auto`]: on an int8-MMA-capable CUDA device, picks
-    /// [`Int8Mode::Precision`] (near-lossless, but the *larger* stepped-up weight
+    /// [`Int8Mode::Precision`] (the accurate, but *larger* stepped-up weight
     /// twin) only when the weights leave comfortable headroom — the model is at
     /// most ~70% of free VRAM, so the KV cache, activations, and (MoE) hot
     /// experts still fit — and otherwise drops to [`Int8Mode::Performance`] (the
     /// smaller same-width twin) so a tight model still fits. `Off` (FP16) on CPU
     /// / non-int8 devices, or [`Int8Mode::Performance`] if VRAM can't be queried.
+    ///
+    /// The fallback is a **capability** judgement, not a quality one: dropping to
+    /// the smaller twin costs accuracy on some models (see [`Int8Mode::auto`]),
+    /// and is worth it only when the accurate twin would not fit at all.
     ///
     /// `model_bytes` is the on-disk quantized weight size (e.g. the GGUF length).
     // `model_bytes` is only weighed against free VRAM, which is a CUDA query;

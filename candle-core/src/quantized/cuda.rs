@@ -12,6 +12,7 @@ use crate::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin};
 use crate::cuda_backend::Backing;
 use crate::cuda_backend::INHERIT_ALIGN;
 use crate::quantized::k_quants::GgmlType;
+use crate::quantized::ko_quant::ko_tileable;
 use crate::LiveTensor;
 use crate::{CudaDevice, CudaStorage, Result, Shape};
 use half::{bf16, f16};
@@ -3977,9 +3978,10 @@ impl QCudaStorage {
         let (nrows, ncols) = shape.dims2()?;
         // The KO chunk layout packs 8 rows × 128 K per chunk, but the q8a128 matmul kernel that
         // reads the result tiles N in blocks of 32 — so require `nrows % 32` (not just 8), matching
-        // the matmul. Callers (`repack_for_optimization` → `qlinear_int8`) treat the bail as "not
-        // KO-tileable" and fall back to a dense weight (e.g. the tiny mHC `fn_w`, `mix_hc=24`).
-        if nrows % 32 != 0 || ncols % 128 != 0 {
+        // the matmul (`ko_tileable`). Callers test that predicate themselves and route a sub-tile
+        // weight to the dense path; reaching this bail means a caller did not, so it is a real
+        // error and must not be read as "not KO-tileable".
+        if !ko_tileable(nrows, ncols) {
             crate::bail!(
                 "repack_ko: shape [{nrows}, {ncols}] must have nrows % 32 == 0 and ncols % 128 == 0"
             );

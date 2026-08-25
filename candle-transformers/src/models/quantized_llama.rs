@@ -469,17 +469,24 @@ impl BatchedAttentionLayer for LayerWeights {
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
-        mlp_dtype: DType,
+        work_dtype: DType,
+        out_dtype: DType,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
         _wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.mlp_or_moe {
-            MlpOrMoe::Mlp(m) => m.forward_dynamic(&acts, mlp_dtype),
+            MlpOrMoe::Mlp(m) => m.forward_dynamic(&acts, work_dtype, out_dtype),
             _ => match acts {
-                DynamicActs::Float(t) => self
-                    .mlp_or_moe
-                    .forward(&t.to_owned_tensor()?.to_dtype(mlp_dtype)?),
+                // The `Module`-shaped MoE has no store-width parameter, so this
+                // arm narrows the result instead of storing it narrow.
+                DynamicActs::Float(t) => {
+                    let mut out = self
+                        .mlp_or_moe
+                        .forward(&t.to_owned_tensor()?.to_dtype(work_dtype)?)?;
+                    out.to_dtype_mut(out_dtype)?;
+                    Ok(out)
+                }
                 DynamicActs::Int8(_) => {
                     candle::bail!("llama MoE ffn_forward received int8 acts")
                 }

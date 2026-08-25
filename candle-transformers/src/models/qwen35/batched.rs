@@ -1016,6 +1016,11 @@ impl HybridBatched {
         config.k_low_error_threshold_factor *= self.kv_factors.k_low;
         config.v_hi_error_threshold_factor *= self.kv_factors.v_hi;
         config.v_low_error_threshold_factor *= self.kv_factors.v_low;
+        // **This duplicates the generic `create_batched_session`.** It reads
+        // `kv_factors` directly rather than `model_core_properties()`, so any
+        // per-model property added to that struct lands there and is silently
+        // dropped here — a new field looks wired, builds clean, and simply never
+        // reaches this model. Extend both when adding one.
         let session = create_session(&self.model.cfg, &self.model.device, config)?;
         self.maybe_change_dtype(session.activation_dtype())?;
         Ok(session)

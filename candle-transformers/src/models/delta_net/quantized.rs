@@ -97,11 +97,15 @@ pub fn quantized_delta_net_layer_forward<'w>(
 /// `S` is a running sum carried across every token of a sequence — the one
 /// value in the stack with no bound on how many additions it accumulates. In
 /// half precision it drifts, and the drift is unbounded in context length,
-/// which is the opposite of what the O(1)-error design is for. The projections
-/// stay in the wave's activation dtype (their kernels want it); the mixer's
-/// inputs are widened at this boundary and the result narrowed on the way back
-/// out to the output projection. That is two conversions per DeltaNet layer,
-/// and they are the arithmetic rather than an oversight.
+/// which is the opposite of what the O(1)-error design is for.
+///
+/// Holding that boundary costs no tensor passes, because both matmuls that
+/// straddle the mixer name their own width. The four projections ask the KO
+/// kernel to store F32 out of the F32 accumulator it already has, and the
+/// output projection reads the mixer's F32 directly — its activation quantizer
+/// takes F32 natively — while storing the dtype the residual stream wants.
+/// Every conversion on this path is a kernel's own store; none is a pass over a
+/// tensor (hot-path invariant 1).
 pub fn quantized_delta_net_layer_forward_spans<'w>(
     x: &LiveTensor<'w>,
     w: &QuantDeltaNetWeights,
@@ -145,15 +149,15 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     };
     let g_mix = gpu_span("dn:mix", x.device());
     let gated = delta_net_mix_spans(&p, &c, dims, seqs, rms_eps, table)?;
-    let gated = if gated.dtype() == act {
-        gated
-    } else {
-        gated.to_dtype(act)?
-    };
     g_mix.end();
 
     let g_out = gpu_span("dn:out_proj", x.device());
-    let out = w.w_out.forward_live(&gated)?;
+    // The mixer's F32 goes straight in. Narrowing it here first would be a
+    // full-tensor pass per DeltaNet layer per wave that rounds away precision
+    // the mixer has just computed — and the FP fallback would widen it right
+    // back on the next line. `out_dtype` names what the residual stream wants,
+    // so the store does the conversion the cast used to.
+    let out = w.w_out.forward_live_as(&gated, act)?;
     g_out.end();
     Ok(out)
 }

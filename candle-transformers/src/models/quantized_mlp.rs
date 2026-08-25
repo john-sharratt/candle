@@ -155,39 +155,45 @@ impl QuantizedMlp {
 
     /// B3 consumer: gate/up over a producer-prepared (fused ln2) activation,
     /// shared across both projections so ln2→q8a128 is not paid twice.
+    ///
+    /// `work_dtype` is the width the SwiGLU intermediates are carried in — wide
+    /// enough for their range, which is why an F16 activation runs this in BF16.
+    /// `out_dtype` is what the residual stream wants back, and the down
+    /// projection **stores** it: narrowing afterwards would be a full-tensor
+    /// pass per layer per wave to undo a widening the intermediates needed and
+    /// the result does not (hot-path invariant 1).
     #[cfg(feature = "cuda")]
     pub fn forward_dynamic<'w>(
         &self,
         acts: &DynamicActs<'w>,
+        work_dtype: DType,
         out_dtype: DType,
     ) -> Result<LiveTensor<'w>> {
         let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
-            let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+            let mut gu = w.forward_dynamic(acts.as_dynamic(), work_dtype)?;
             let (_, _, out_dim) = gu.dims3()?;
             let half = Self::fused_half(out_dim)?;
             // Coerce the fused output ONCE, in place, before splitting: `gu`
             // is owned + contiguous here so the cast is allocation-free,
             // whereas casting the two aliasing narrows separately forces two
             // fallback allocations.
-            gu.to_dtype_mut(out_dtype)?;
+            gu.to_dtype_mut(work_dtype)?;
             (gu.narrow(2, 0, half)?, gu.narrow(2, half, half)?)
         } else {
             let (gate_proj, up_proj) = self.separate()?;
             (
-                gate_proj.forward_dynamic(acts.as_dynamic(), out_dtype)?,
-                up_proj.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+                gate_proj.forward_dynamic(acts.as_dynamic(), work_dtype)?,
+                up_proj.forward_dynamic(acts.as_dynamic(), work_dtype)?,
             )
         };
-        // Run silu/mul/down in out_dtype: the Float path returns the
-        // activation dtype (F16), but MLP intermediates can exceed F16's
-        // ~65504 range. The fused path already coerced `gu` above and the
-        // int8 path already returns out_dtype, so these are no-ops except on
-        // the separate-weight Float path.
-        gate.to_dtype_mut(out_dtype)?;
-        up.to_dtype_mut(out_dtype)?;
+        // Run silu/mul in `work_dtype`: the Float path returns the activation
+        // dtype (F16), but MLP intermediates can exceed F16's ~65504 range. The
+        // fused path already coerced `gu` above and the int8 path already
+        // returns `work_dtype`, so these are no-ops except on the
+        // separate-weight Float path.
+        gate.to_dtype_mut(work_dtype)?;
+        up.to_dtype_mut(work_dtype)?;
         let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
-        let mut out = self.down_proj.forward_live(&gated)?;
-        out.to_dtype_mut(out_dtype)?;
-        Ok(out)
+        self.down_proj.forward_live_as(&gated, out_dtype)
     }
 }

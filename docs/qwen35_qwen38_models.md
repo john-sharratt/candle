@@ -103,7 +103,7 @@ Hard numeric constraints (all verified in-code by the research pass):
 | Constraint | Value | Where |
 |---|---|---|
 | Paged **decode** head_dim | 64, 96 (fp16 only), **128**, **256** | `paged_decode_api_*.cu:35-41` |
-| Paged **prefill** head_dim | **64, 128 only** (256's staging slabs exceed the 25.6 KB smem budget) | `paged_prefill_int8_fp16.cu:28-43`, `prefill_utils.rs:1189-1191` |
+| Paged **prefill** head_dim | 64, 128, **256** — 256 added for this lineage in `3bf7dfc7`, so a head_dim-256 model runs the paged kernel and **not** the float fallback | `paged_prefill_int8_fp16.cu:28-43`, `prefill_utils.rs:1168-1170` |
 | q8a1024 decode context (B2) | 128 only | `paged_decode_api_fp16.cu:60` |
 | Paged glue (reprojection) | 128 only | `paged_glue_api_fp16.cu:48-50` |
 | GQA fast path | `n_head/n_kv_head ∈ 1..=8` (BMMA only at head_dim 128; else stripe) | `int8_decode_kernel.cuh:1689-1774` |
@@ -1272,8 +1272,29 @@ a misreading of the per-layer profile: DeltaNet *layers* are 80% of prefill
 because there are three times as many of them, and each includes its own
 projections and FFN. Each was only 38% more expensive than an attention layer,
 and is now cheaper than one. On the 9B the eight attention layers take 336 ms of
-a 792 ms prefill — **42% of the time from 25% of the layers** — so the
-`head_dim` 256 fallback below is now the dominant per-layer prefill cost.
+a 792 ms prefill — **42% of the time from 25% of the layers**.
+
+> **Superseded, twice over (re-profiled 2026-08-25, 9B, `--features profile`).**
+>
+> * *The fallback.* This paragraph ended "so the `head_dim` 256 fallback below is
+>   now the dominant per-layer prefill cost". Untrue since `3bf7dfc7` added
+>   `case 256:` to `paged_prefill_int8_fp16.cu` and put 256 in
+>   `int8_prefill_head_dim`: this lineage takes the **paged** prefill kernel. The
+>   float fallback serves only genuinely unsupported shapes (a head_dim outside
+>   {64, 128, 256}) or an F32 reference-mode session. The stale line cost a
+>   measurement pass — it named that fallback's `Tensor::cat` pair as the top
+>   optimisation target on a path this lineage never executes.
+> * *The 42%.* Attention is no longer 42% of prefill. Measured on the C10×10 rung
+>   (890 ms wall, GPU spans summing to ~938 ms — prefill is GPU-bound):
+>   `prefill:{kernel,qkv_proj,out_proj}` total **130 ms = 15%**, while the
+>   DeltaNet spans total **808 ms = 91%**, of which `dn:ffn` alone is **433 ms =
+>   49%**. So the per-layer picture inverted again after the batched prefill
+>   attention landed: the FFN half of the DeltaNet layers is now the prefill, and
+>   attention is a sixth of it.
+>
+> **Re-profile before optimising from this section.** Three claims in it have gone
+> stale in turn as the work moved underneath them, and each one sent a pass at the
+> wrong target.
 
 ### 7.13 The prefill KV *write* was the largest span, not the attention
 

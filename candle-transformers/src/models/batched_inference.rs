@@ -561,13 +561,14 @@ pub struct ProvSignPacked {
     /// set iff Q dim `d` of that sub-band is `>= 0` (`d` in `0..sub_head_dim`).
     /// Warp index = `((layer*n_blocks + block_pos)*n_kv_head + head)*n_palette + palette`,
     /// where `block_pos` indexes [`Self::block_indices`].
-    pub packed: Vec<u32>,
+    pub packed: Vec<u64>,
     /// Absolute chunk indices captured (identical across all layers).
     pub block_indices: Vec<usize>,
     pub n_layers: usize,
     pub n_kv_head: usize,
     pub n_palette: usize,
-    /// `head_dim / n_palette` — bits packed per palette sub-band (`<= 32`).
+    /// `head_dim / n_palette` — bits packed per palette sub-band (`<= 64`, the
+    /// width of a physical R16 band at `head_dim` 256).
     pub sub_head_dim: usize,
 }
 
@@ -1875,8 +1876,9 @@ impl BatchedInferenceSession {
     /// format, which is right for the accounting it feeds. The forward instead
     /// derives its activation dtype from the sequence's live caches, and
     /// [`candle_nn::kv_cache::KvCache::dtype`] reports **F16** for a quantized
-    /// backing — that is the dtype the norms will actually see. Reading `dtype`
-    /// here yields BF16 weights for an F16 forward, which the norm refuses.
+    /// backing — the live arena really is F16 (K in `R16`, V in plain F16), so
+    /// that is the dtype the norms will actually see. Reading `dtype` here
+    /// yields BF16 weights for an F16 forward, which the norm refuses.
     pub fn activation_dtype(&self) -> DType {
         crate::models::batched_model::activation_dtype(
             self.config.k_format.dtype().unwrap_or(DType::F16),
@@ -1987,7 +1989,7 @@ impl BatchedInferenceSession {
     /// per-token `WideQSig` from `packed` and folds it — bit-identical to the CPU
     /// path. Returns `None` (caller falls back to the CPU gather) when not CUDA,
     /// when any layer has no R16 blocks, when the layers' block sets disagree, or
-    /// when `sub_head_dim > 32` (can't pack into a u32).
+    /// when `sub_head_dim > 64` (can't pack into a u64).
     pub fn gather_provenance_sign_packed(
         &self,
         seq_idx: usize,
@@ -2034,28 +2036,37 @@ impl BatchedInferenceSession {
     /// 32 dims of each physical 64-dim band and the host lays band `p` at
     /// `p * 32` instead of `p * 64` — half of every signature dropped, the
     /// rest dim-permuted, and no longer bit-identical to the CPU fold it is
-    /// documented to match. Re-banding the arena and the kernel is the real
-    /// fix for that; until then the CPU fallback is slow and correct.
+    /// documented to match.
+    ///
+    /// The band count was never the thing to change. What declined at 256 was
+    /// the kernel's **word width**: it packed a band into a `u32`, and the
+    /// physical band there is 64 dims. It packs a `u64` now, so a 256-wide head
+    /// takes the fast path with its real banding intact.
     pub fn prov_n_palette(&self) -> usize {
         candle_nn::kv_cache::N_PALETTE
     }
 
     /// The provenance sign-pack sub-band width (`head_dim / n_palette`), or 0
-    /// when the geometry cannot be packed into a u32 — callers treat 0 as "use
-    /// the CPU path".
+    /// when the geometry cannot be packed into one word — callers treat 0 as
+    /// "use the CPU path".
     ///
-    /// Zero at `head_dim` 256 (bands are 64 dims wide, a u32 holds 32) is a
-    /// **correct decline**, not a lost optimization: see [`Self::prov_n_palette`].
-    /// The cost is that provenance capture on such a model pulls the R16 dump
-    /// device→host per seal — visible as slowness, which is the right way for a
-    /// geometry the kernel cannot serve to present itself.
+    /// The bound is 64, the kernel's word width and the width of a physical R16
+    /// band at `head_dim` 256 — so both production geometries (128 → 32-dim
+    /// bands, 256 → 64-dim bands) take the GPU path. It was 32, which declined
+    /// at 256 and sent every seal of the hybrid through a full R16 device→host
+    /// copy; the signatures were correct, so nothing but a path assertion could
+    /// see it (`hybrid_capture_takes_the_gpu_sign_pack_path`).
+    ///
+    /// A wider band than 64 still declines rather than silently truncating: the
+    /// band is the arena's, not this function's, and narrowing it here would
+    /// drop dims (see [`Self::prov_n_palette`]).
     pub fn prov_sub_head_dim(&self) -> usize {
         let head_dim = self.head_dim();
         if head_dim == 0 {
             return 0;
         }
         let sub = head_dim / self.prov_n_palette();
-        if sub == 0 || sub > 32 {
+        if sub == 0 || sub > candle_kernels::simple::prov_sign_pack::MAX_SUB_HEAD_DIM {
             0
         } else {
             sub
@@ -2103,7 +2114,7 @@ impl BatchedInferenceSession {
         &self,
         all_ptrs: &[i64],
         sub_head_dim: usize,
-    ) -> candle::Result<Vec<u32>> {
+    ) -> candle::Result<Vec<u64>> {
         match self.backings.first() {
             Some(b) => b.run_prov_sign_pack(all_ptrs, sub_head_dim),
             None => Ok(Vec::new()),
@@ -3475,6 +3486,29 @@ pub trait ManagedBatchedModel {
         false
     }
 
+    /// Whether a speculative block's rejected tail can be rolled back on this model.
+    ///
+    /// **Distinct from [`Self::carries_recurrent_state`], which used to answer both.**
+    /// Carrying recurrent state means there is something outside the session's KV to
+    /// snapshot; for as long as no model could rewind such a state, one declaration
+    /// served for both questions and the speculative entry point refused on it. The
+    /// hybrid's verify replay separates them. It still carries state — nothing else
+    /// records the tokens that built `S` — and it can now rewind *inside a block it
+    /// just verified*, by replaying the mixer over the accepted prefix from the
+    /// ping-pong entering state the wave left untouched (`qwen35::spec`).
+    ///
+    /// Default: a model carrying recurrent state cannot rewind, which keeps every
+    /// model that has not implemented a replay refused exactly as before.
+    ///
+    /// Overriding to `true` is a claim about [`Self::truncate_sequences`], not about
+    /// the state: that it restores the recurrence exactly for the targets it accepts.
+    /// It is not a claim that every offset is rewindable — a replay covers the block
+    /// it stashed operands for and nothing else, so `truncate_sequences` is what
+    /// refuses a target with no rewind point, at the one place that knows.
+    fn can_rewind_speculative_block(&self) -> bool {
+        !self.carries_recurrent_state()
+    }
+
     /// Roll `seq` back to exactly `tokens` tokens after a speculative verify — called by the
     /// driver with `pos + kept` once the accepted prefix is known. Default: the session-level KV
     /// truncation. A model whose forward maintains per-sequence streaming state OUTSIDE the
@@ -3483,10 +3517,12 @@ pub trait ManagedBatchedModel {
     /// truncation can't see, and later attention reads corrupted context.
     ///
     /// **Reached only by the speculative verify path**, despite the broad name.
-    /// A model that cannot express a rewind at all declares
-    /// [`Self::carries_recurrent_state`] and is refused at the entry point, so
-    /// it never arrives here — the guard is the declaration, not a bail inside
-    /// an override raised after the driver has committed.
+    /// A model that cannot express a rewind at all leaves
+    /// [`Self::can_rewind_speculative_block`] at its default `false` and is
+    /// refused at the entry point, so it never arrives here — the guard is the
+    /// declaration, not a bail inside an override raised after the driver has
+    /// committed. A model that *can* rewind, but only within a block it stashed
+    /// operands for, accepts here and refuses the uncovered offsets itself.
     fn truncate_sequence(
         &self,
         session: &mut BatchedInferenceSession,
@@ -3833,6 +3869,10 @@ pub trait ManagedBatchedModel {
     /// `Some(next_committed)` — the seed to pass as `committed` on the next call (already emitted,
     /// held out of the KV) — or `None` when `emit` asked to stop. With no drafter this is one plain
     /// decode (emits exactly one token). At least one token is always emitted.
+    // The argument list is the step's inputs: the session, the sequence, its committed
+    // seed, the sampling policy, and the emit sink. Grouping them into a struct would
+    // put a shape between the caller and the step it is driving.
+    #[allow(clippy::too_many_arguments)]
     fn speculative_decode_step(
         &self,
         session: &mut BatchedInferenceSession,
@@ -3870,6 +3910,8 @@ pub trait ManagedBatchedModel {
     /// under sampling as well as under greedy decode — see [`speculative_choice`] for why a
     /// greedy drafter reduces the textbook accept/reject rule to "sample the row, accept the
     /// proposal iff the sample agrees". Pass [`GreedyChooser`] for bit-identical greedy output.
+    // As [`Self::speculative_decode_step`], one slice per per-sequence input.
+    #[allow(clippy::too_many_arguments)]
     fn speculative_decode_step_batch(
         &self,
         session: &mut BatchedInferenceSession,
@@ -3894,26 +3936,29 @@ pub trait ManagedBatchedModel {
         // **Refused up front for a model that cannot rewind.**
         //
         // Speculative decode is built on "decode the whole draft block, then put
-        // the sequence back to the accepted prefix". That second half is an
-        // operation a recurrent state cannot express — `S` is an accumulated sum
-        // with no per-token decomposition, so there is no suffix to remove. The
-        // check belongs here, at the one entry point, and not inside the rewind:
-        // by the time the driver has drafted and verified, refusing is an error
-        // raised against work already done, and *not* refusing is a state that
-        // has absorbed rejected tokens the K/V no longer holds.
+        // the sequence back to the accepted prefix". The check belongs here, at
+        // the one entry point, and not inside the rewind: by the time the driver
+        // has drafted and verified, refusing is an error raised against work
+        // already done, and *not* refusing is a state that has absorbed rejected
+        // tokens the K/V no longer holds.
         //
-        // The fix is not a guard but a different algorithm — fork before the
-        // verify block, discard the child on a partial accept, and advance a
-        // fresh fork over the accepted tokens as one batched prefill. See
-        // `docs/deltanet_state_persistence.md` §5.4 and P10.3.
-        if self.carries_recurrent_state() {
+        // The question is whether the model can REWIND, not whether it carries
+        // recurrent state — the hybrid does both. Its verify replay re-runs the
+        // mixer over the accepted prefix from the entering state the wave's
+        // ping-pong left intact, which reconstructs exactly the state those
+        // tokens alone would have produced (`qwen35::spec`,
+        // `docs/deltanet_state_persistence.md` §5.4). Which offsets are
+        // rewindable is a property of the stashed block, so `truncate_sequences`
+        // is what refuses one it has no rewind point for.
+        if !self.can_rewind_speculative_block() {
             candle::bail!(
-                "speculative decode is unavailable on a model carrying recurrent \
-                 state: accepting k of n drafted tokens requires rewinding the \
-                 sequence, and a recurrent state has no per-token decomposition to \
-                 rewind to. The fork-based verify path (docs/deltanet_state_\
-                 persistence.md §5.4) replaces it; until it lands, run this model \
-                 without a drafter."
+                "speculative decode is unavailable on this model: accepting k of n \
+                 drafted tokens requires rewinding the sequence, and this model \
+                 carries recurrent state with no per-token decomposition to rewind \
+                 to. A model whose `truncate_sequences` can restore the recurrence \
+                 — as the qwen35 lineage's replay does — declares \
+                 `can_rewind_speculative_block`; without that, run it without a \
+                 drafter."
             );
         }
         // Draft per sequence. A sequence whose drafter proposes NOTHING (no

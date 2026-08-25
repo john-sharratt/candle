@@ -37,10 +37,16 @@
 //! Reach for these guards for the other case, where the two types are *supposed*
 //! to agree and the cast is there in case they do not.
 
-use candle::{DType, Result, Tensor};
+use candle::{DType, LiveTensor, Result, Tensor};
 
 /// Require `t` to already be `want`.
-pub fn expect_dtype(t: &Tensor, want: DType, what: &str) -> Result<()> {
+///
+/// Takes a `LiveTensor<'_>` rather than a `Tensor` so it reaches **wave-scoped**
+/// operands too — `Tensor` is `LiveTensor<'static>`, so every owned-tensor
+/// caller still passes unchanged, but the residual stream and the per-layer
+/// intermediates that live on a wave arena are exactly where this guard earns
+/// its keep.
+pub fn expect_dtype(t: &LiveTensor<'_>, want: DType, what: &str) -> Result<()> {
     if t.dtype() != want {
         candle::bail!(
             "{what}: kernel operand is {:?}, expected {want:?} — the wrapper validates \
