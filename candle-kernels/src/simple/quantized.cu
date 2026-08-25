@@ -183,40 +183,6 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #define NWARPS_Q8_1_AMPERE 4
 #endif
 
-// Q_AWQ (group size 128) MMQ config - similar to Q4_0/Q4_1 (both 4-bit)
-#define  MMQ_X_Q_AWQ_RDNA2  64
-#define  MMQ_Y_Q_AWQ_RDNA2  128
-#define NWARPS_Q_AWQ_RDNA2  8
-#define  MMQ_X_Q_AWQ_RDNA1  64
-#define  MMQ_Y_Q_AWQ_RDNA1  64
-#define NWARPS_Q_AWQ_RDNA1  8
-#if defined(CUDA_USE_TENSOR_CORES)
-#define  MMQ_X_Q_AWQ_AMPERE 4
-#define  MMQ_Y_Q_AWQ_AMPERE 32
-#define NWARPS_Q_AWQ_AMPERE 4
-#else
-#define  MMQ_X_Q_AWQ_AMPERE 64
-#define  MMQ_Y_Q_AWQ_AMPERE 128
-#define NWARPS_Q_AWQ_AMPERE 4
-#endif
-
-// Q_AWQ_G64 (group size 64) MMQ config - same as Q_AWQ
-#define  MMQ_X_Q_AWQ_G64_RDNA2  64
-#define  MMQ_Y_Q_AWQ_G64_RDNA2  128
-#define NWARPS_Q_AWQ_G64_RDNA2  8
-#define  MMQ_X_Q_AWQ_G64_RDNA1  64
-#define  MMQ_Y_Q_AWQ_G64_RDNA1  64
-#define NWARPS_Q_AWQ_G64_RDNA1  8
-#if defined(CUDA_USE_TENSOR_CORES)
-#define  MMQ_X_Q_AWQ_G64_AMPERE 4
-#define  MMQ_Y_Q_AWQ_G64_AMPERE 32
-#define NWARPS_Q_AWQ_G64_AMPERE 4
-#else
-#define  MMQ_X_Q_AWQ_G64_AMPERE 64
-#define  MMQ_Y_Q_AWQ_G64_AMPERE 128
-#define NWARPS_Q_AWQ_G64_AMPERE 4
-#endif
-
 #define  MMQ_X_Q2_K_RDNA2  64
 #define  MMQ_Y_Q2_K_RDNA2  128
 #define NWARPS_Q2_K_RDNA2  8
@@ -395,26 +361,15 @@ typedef struct {
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_fp16_t) + QK8_0, "wrong q8_1 block size/padding");
 
-// AWQ (Activation-aware Weight Quantization) types
-// Q_AWQ with group size 128: 128 × 4-bit + 1 scale + 1 zero
-#define QK_Q_AWQ 128
-#define QR_Q_AWQ 2
-#define QI_Q_AWQ (QK_Q_AWQ / (4 * QR_Q_AWQ))  // 16 ints
-typedef struct {
-    uint8_t qs[QK_Q_AWQ / 2];  // 64 bytes: 128 × 4-bit nibbles
-    half scale;               // scale factor
-    half zero;                // zero point
-} block_q_awq;
-
-// Q_AWQ_G64 with group size 64: 64 × 4-bit + 1 scale + 1 zero per group
-#define QK_Q_AWQ_G64 64
-#define QR_Q_AWQ_G64 2
-#define QI_Q_AWQ_G64 (QK_Q_AWQ_G64 / (4 * QR_Q_AWQ_G64))  // 8 ints
-typedef struct {
-    uint8_t qs[QK_Q_AWQ_G64 / 2];  // 32 bytes: 64 × 4-bit nibbles
-    half scale;                   // scale factor
-    half zero;                    // zero point
-} block_q_awq_g64;
+// AWQ has no matmul block types here. It is a KV arena format
+// (`ArenaFormatTag::QAWQ`) and nothing in this engine loads an AWQ *weight* —
+// `QCudaStorage::fwd` refuses one. The matmul structs that stood here described
+// a different format from the Rust blocks they were cast over: `block_q_awq`
+// declared 68 bytes against a `repr(C, align(16))` 80, and `block_q_awq_g64`
+// declared 64 elements with a single scale/zero against 128 with `scales[2]` /
+// `zeros[2]`. Reading an 80-byte array at a 68-byte stride is why every AWQ
+// matmul returned NaN. The KV path's own layouts (`block_q_awq_k128`,
+// `block_q_awq_g64_k128`, below) were always correct and are untouched.
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs);
 typedef void (*allocate_tiles_cuda_t)(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc);
@@ -850,36 +805,9 @@ static __device__ __forceinline__ void dequantize_q8_1(const void * vx, const in
 #endif // GGML_CUDA_F16
 }
 
-// AWQ dequantize functions for dequantize_mul_mat_vec template
-// These extract 2 values at a time (matching dfloat2 output)
-static __device__ __forceinline__ void dequantize_q_awq(const void * vx, const int ib, const int iqs, dfloat2 & v){
-    const block_q_awq * x = (const block_q_awq *) vx;
-
-    const float scale = __half2float(x[ib].scale);
-    const float zero = __half2float(x[ib].zero);
-
-    // iqs is the byte index, extract 2 nibbles (2 values)
-    const uint8_t q = x[ib].qs[iqs];
-    const int nibble0 = q & 0xF;
-    const int nibble1 = q >> 4;
-
-    v.x = scale * (nibble0 - zero);
-    v.y = scale * (nibble1 - zero);
-}
-
-static __device__ __forceinline__ void dequantize_q_awq_g64(const void * vx, const int ib, const int iqs, dfloat2 & v){
-    const block_q_awq_g64 * x = (const block_q_awq_g64 *) vx;
-
-    const float scale = __half2float(x[ib].scale);
-    const float zero = __half2float(x[ib].zero);
-
-    const uint8_t q = x[ib].qs[iqs];
-    const int nibble0 = q & 0xF;
-    const int nibble1 = q >> 4;
-
-    v.x = scale * (nibble0 - zero);
-    v.y = scale * (nibble1 - zero);
-}
+// The AWQ `dfloat2` dequantizers went with the matmul path they fed. The KV
+// arena's own AWQ dequantize is `dequantize_block_q_awq` below, over the
+// `block_q_awq_k128` layout, and is unaffected.
 
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -1699,15 +1627,6 @@ extern "C" __global__ void dequantize_mul_mat_vec_q8_1_cuda(const void * vx, con
     dequantize_mul_mat_vec<QK8_1, QR8_1, dequantize_q8_1>(vx, y, dst, ncols, nrows);
 }
 
-// AWQ dequantize_mul_mat_vec kernels
-extern "C" __global__ void dequantize_mul_mat_vec_q_awq_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows) {
-    dequantize_mul_mat_vec<QK_Q_AWQ, QR_Q_AWQ, dequantize_q_awq>(vx, y, dst, ncols, nrows);
-}
-
-extern "C" __global__ void dequantize_mul_mat_vec_q_awq_g64_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows) {
-    dequantize_mul_mat_vec<QK_Q_AWQ_G64, QR_Q_AWQ_G64, dequantize_q_awq_g64>(vx, y, dst, ncols, nrows);
-}
-
 extern "C" __global__ void dequantize_mul_mat_vec_q2_k(const void * __restrict__ vx, const float * __restrict__ yy, float * __restrict__ dst, const int ncols, int nrows) {
 
     static_assert(16%K_QUANTS_PER_ITERATION == 0, "16 must be divisible by K_QUANTS_PER_ITERATION");
@@ -2505,77 +2424,6 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_1_q8_1_imp
 // AWQ (Activation-aware Weight Quantization) kernels
 // =============================================================================
 
-// AWQ constants for mul_mat_vec
-// Q_AWQ: 128 elements per block, 16 ints, each thread processes 2 ints (16 nibbles = 16 values)
-#define VDR_Q_AWQ_Q8_1_MMVQ 2
-#define VDR_Q_AWQ_Q8_1_MMQ  4
-
-// Q_AWQ_G64: 64 elements per block, 8 ints, each thread processes 1 int (8 nibbles = 8 values)
-#define VDR_Q_AWQ_G64_Q8_1_MMVQ 1
-#define VDR_Q_AWQ_G64_Q8_1_MMQ  2
-
-// AWQ 4-bit asymmetric: value = scale * (nibble - zero)
-// This processes 8 quantized values at a time (one int = 8 nibbles, paired with 8 Q8_1 values)
-template <int vdr> static __device__ __forceinline__ float vec_dot_q_awq_q8_1_impl(
-    const int * v, const int * u, const float scale, const float zero, const half2 * ds8) {
-
-    float sumf = 0.0f;
-
-#pragma unroll
-    for (int i = 0; i < vdr; ++i) {
-        // Extract 8 nibbles from v[i]
-        const int vi0 = (v[i] >> 0) & 0x0F0F0F0F;
-        const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
-        
-        // Get Q8_1 scale (d field)
-        const float d8 = __low2float(ds8[i]);
-        
-        // Compute dot product: sum((nibble - zero) * q8_val) * scale * d8
-        // Using dp4a for efficiency
-        int sumi = 0;
-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
-        
-        // Subtract zero contribution: each dp4a processes 4 bytes, so 8 bytes total per iteration
-        // The sum of Q8_1 values is in ds8[i].y
-        const float sum8 = __high2float(ds8[i]);
-        
-        sumf += d8 * scale * (sumi - zero * sum8);
-    }
-
-    return sumf;
-}
-
-// AWQ G64 4-bit asymmetric with group size 64
-// Each block covers 64 elements with its own scale/zero
-template <int vdr> static __device__ __forceinline__ float vec_dot_q_awq_g64_q8_1_impl(
-    const int * v, const int * u, const float scale, const float zero, const half2 * ds8) {
-
-    float sumf = 0.0f;
-
-#pragma unroll
-    for (int i = 0; i < vdr; ++i) {
-        // Extract 8 nibbles from v[i]
-        const int vi0 = (v[i] >> 0) & 0x0F0F0F0F;
-        const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
-        
-        // Get Q8_1 scale (d field)
-        const float d8 = __low2float(ds8[i]);
-        
-        // Compute dot product
-        int sumi = 0;
-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
-        
-        // Subtract zero contribution
-        const float sum8 = __high2float(ds8[i]);
-        
-        sumf += d8 * scale * (sumi - zero * sum8);
-    }
-
-    return sumf;
-}
-
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  2
 
@@ -2982,58 +2830,6 @@ static __device__ __forceinline__ float vec_dot_q8_1_q8_1(
     const float d_v = __low2float(bq8_1_v->ds);
     const float d_u = __low2float(bq8_1->ds);
     return vec_dot_q8_0_q8_1_impl<VDR_Q8_1_Q8_1_MMVQ>(v, u, d_v, d_u);
-}
-
-// AWQ vec_dot for mul_mat_vec_q template
-// Q_AWQ: 128 elements per block, paired with Q8_1 activation blocks
-static __device__ __forceinline__ float vec_dot_q_awq_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
-
-    const block_q_awq * bq_awq = (const block_q_awq *) vbq;
-
-    int v[VDR_Q_AWQ_Q8_1_MMVQ];
-    int u[2*VDR_Q_AWQ_Q8_1_MMVQ];
-    half2 ds8[VDR_Q_AWQ_Q8_1_MMVQ];
-
-    const float scale = __half2float(bq_awq->scale);
-    const float zero = __half2float(bq_awq->zero);
-
-#pragma unroll
-    for (int i = 0; i < VDR_Q_AWQ_Q8_1_MMVQ; ++i) {
-        // Get int from AWQ qs (4-bit packed)
-        v[i] = get_int_from_uint8(bq_awq->qs, iqs + i);
-        // Get corresponding Q8_1 values - need 8 values per v[i] (split across low/high nibbles)
-        u[2*i+0] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
-        u[2*i+1] = get_int_from_int8_aligned(bq8_1->qs, iqs + i + QI_Q_AWQ);
-        ds8[i] = bq8_1[i].ds;
-    }
-
-    return vec_dot_q_awq_q8_1_impl<VDR_Q_AWQ_Q8_1_MMVQ>(v, u, scale, zero, ds8);
-}
-
-// AWQ G64 vec_dot for mul_mat_vec_q template
-// Q_AWQ_G64: 64 elements per block
-static __device__ __forceinline__ float vec_dot_q_awq_g64_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
-
-    const block_q_awq_g64 * bq_awq = (const block_q_awq_g64 *) vbq;
-
-    int v[VDR_Q_AWQ_G64_Q8_1_MMVQ];
-    int u[2*VDR_Q_AWQ_G64_Q8_1_MMVQ];
-    half2 ds8[VDR_Q_AWQ_G64_Q8_1_MMVQ];
-
-    const float scale = __half2float(bq_awq->scale);
-    const float zero = __half2float(bq_awq->zero);
-
-#pragma unroll
-    for (int i = 0; i < VDR_Q_AWQ_G64_Q8_1_MMVQ; ++i) {
-        v[i] = get_int_from_uint8(bq_awq->qs, iqs + i);
-        u[2*i+0] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
-        u[2*i+1] = get_int_from_int8_aligned(bq8_1->qs, iqs + i + QI_Q_AWQ_G64);
-        ds8[i] = bq8_1[i].ds;
-    }
-
-    return vec_dot_q_awq_g64_q8_1_impl<VDR_Q_AWQ_G64_Q8_1_MMVQ>(v, u, scale, zero, ds8);
 }
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
@@ -4179,124 +3975,6 @@ extern "C" __global__ void mul_mat_vec_q8_K_q8_1_cuda8(
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-// =============================================================================
-// AWQ mul_mat_vec_q8_1 kernels (batch sizes 1-8)
-// =============================================================================
-
-// Q_AWQ kernels
-extern "C" __global__ void mul_mat_vec_q_awq_q8_1_cuda1(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<1, QK_Q_AWQ, QI_Q_AWQ, block_q_awq, VDR_Q_AWQ_Q8_1_MMVQ, vec_dot_q_awq_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_q8_1_cuda2(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<2, QK_Q_AWQ, QI_Q_AWQ, block_q_awq, VDR_Q_AWQ_Q8_1_MMVQ, vec_dot_q_awq_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_q8_1_cuda3(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<3, QK_Q_AWQ, QI_Q_AWQ, block_q_awq, VDR_Q_AWQ_Q8_1_MMVQ, vec_dot_q_awq_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_q8_1_cuda4(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<4, QK_Q_AWQ, QI_Q_AWQ, block_q_awq, VDR_Q_AWQ_Q8_1_MMVQ, vec_dot_q_awq_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_q8_1_cuda5(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<5, QK_Q_AWQ, QI_Q_AWQ, block_q_awq, VDR_Q_AWQ_Q8_1_MMVQ, vec_dot_q_awq_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_q8_1_cuda6(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<6, QK_Q_AWQ, QI_Q_AWQ, block_q_awq, VDR_Q_AWQ_Q8_1_MMVQ, vec_dot_q_awq_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_q8_1_cuda7(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<7, QK_Q_AWQ, QI_Q_AWQ, block_q_awq, VDR_Q_AWQ_Q8_1_MMVQ, vec_dot_q_awq_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_q8_1_cuda8(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<8, QK_Q_AWQ, QI_Q_AWQ, block_q_awq, VDR_Q_AWQ_Q8_1_MMVQ, vec_dot_q_awq_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-// Q_AWQ_G64 kernels
-extern "C" __global__ void mul_mat_vec_q_awq_g64_q8_1_cuda1(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<1, QK_Q_AWQ_G64, QI_Q_AWQ_G64, block_q_awq_g64, VDR_Q_AWQ_G64_Q8_1_MMVQ, vec_dot_q_awq_g64_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_g64_q8_1_cuda2(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<2, QK_Q_AWQ_G64, QI_Q_AWQ_G64, block_q_awq_g64, VDR_Q_AWQ_G64_Q8_1_MMVQ, vec_dot_q_awq_g64_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_g64_q8_1_cuda3(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<3, QK_Q_AWQ_G64, QI_Q_AWQ_G64, block_q_awq_g64, VDR_Q_AWQ_G64_Q8_1_MMVQ, vec_dot_q_awq_g64_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_g64_q8_1_cuda4(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<4, QK_Q_AWQ_G64, QI_Q_AWQ_G64, block_q_awq_g64, VDR_Q_AWQ_G64_Q8_1_MMVQ, vec_dot_q_awq_g64_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_g64_q8_1_cuda5(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<5, QK_Q_AWQ_G64, QI_Q_AWQ_G64, block_q_awq_g64, VDR_Q_AWQ_G64_Q8_1_MMVQ, vec_dot_q_awq_g64_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_g64_q8_1_cuda6(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<6, QK_Q_AWQ_G64, QI_Q_AWQ_G64, block_q_awq_g64, VDR_Q_AWQ_G64_Q8_1_MMVQ, vec_dot_q_awq_g64_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_g64_q8_1_cuda7(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<7, QK_Q_AWQ_G64, QI_Q_AWQ_G64, block_q_awq_g64, VDR_Q_AWQ_G64_Q8_1_MMVQ, vec_dot_q_awq_g64_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void mul_mat_vec_q_awq_g64_q8_1_cuda8(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-    mul_mat_vec_q<8, QK_Q_AWQ_G64, QI_Q_AWQ_G64, block_q_awq_g64, VDR_Q_AWQ_G64_Q8_1_MMVQ, vec_dot_q_awq_g64_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
-
 extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
     const int ix = blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -4666,186 +4344,10 @@ static __device__ __forceinline__ float vec_dot_q8_1_q8_1_mul_mat(
          y_ds[j * (WARP_SIZE/QI8_1) + k/QI8_1]);
 }
 
-// =============================================================================
-// Q_AWQ MMQ tile functions - for AWQ (4-bit asymmetric) x Q8_1 matrix multiplication
-// =============================================================================
-// AWQ uses half scale and half zero point (separate, not packed)
-
-template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q_awq(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
-    GGML_UNUSED(x_qh); GGML_UNUSED(x_sc);
-
-    // QK_Q_AWQ = 128 elements per block, QI_Q_AWQ = 16 ints (128/8)
-    __shared__ int   tile_x_qs[mmq_y * (WARP_SIZE)           + mmq_y];
-    __shared__ half2 tile_x_dm[mmq_y * (WARP_SIZE/QI_Q_AWQ) + mmq_y/QI_Q_AWQ];
-
-    *x_ql = tile_x_qs;
-    *x_dm = tile_x_dm;
-}
-
-template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q_awq(
-    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
-    GGML_UNUSED(x_qh); GGML_UNUSED(x_sc);
-
-    GGML_CUDA_ASSUME(i_offset >= 0);
-    GGML_CUDA_ASSUME(i_offset <  nwarps);
-    GGML_CUDA_ASSUME(k >= 0);
-    GGML_CUDA_ASSUME(k <  WARP_SIZE);
-
-    const int kbx  = k / QI_Q_AWQ;
-    const int kqsx = k % QI_Q_AWQ;
-
-    const block_q_awq * bx0 = (const block_q_awq *) vx;
-
-#pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
-        int i = i0 + i_offset;
-
-        if (need_check) {
-            i = min(i, i_max);
-        }
-
-        const block_q_awq * bxi = bx0 + i*blocks_per_row + kbx;
-
-        // Load 4-bit nibbles packed into int (8 elements per int)
-        x_ql[i * (WARP_SIZE + 1) + k] = get_int_from_uint8(bxi->qs, kqsx * 4);
-    }
-
-    const int blocks_per_tile_x_row = WARP_SIZE / QI_Q_AWQ;
-    const int kbxd = k % blocks_per_tile_x_row;
-
-#pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI_Q_AWQ) {
-        int i = i0 + i_offset * QI_Q_AWQ + k / blocks_per_tile_x_row;
-
-        if (need_check) {
-            i = min(i, i_max);
-        }
-
-        const block_q_awq * bxi = bx0 + i*blocks_per_row + kbxd;
-
-        // Pack scale and zero into half2
-        x_dm[i * (WARP_SIZE/QI_Q_AWQ) + i / QI_Q_AWQ + kbxd] = make_half2(bxi->scale, bxi->zero);
-    }
-}
-
-static __device__ __forceinline__ float vec_dot_q_awq_q8_1_mul_mat(
-    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
-    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
-    GGML_UNUSED(x_qh); GGML_UNUSED(x_sc);
-
-    // AWQ is asymmetric 4-bit: y = scale * (x - zero)
-    // x_dm contains packed (scale, zero) as half2
-    const half2 dm = x_dm[i * (WARP_SIZE/QI_Q_AWQ) + i/QI_Q_AWQ + k/QI_Q_AWQ];
-    const float scale = __half2float(__low2half(dm));
-    const float zero  = __half2float(__high2half(dm));
-
-    const float * y_df = (const float *) y_ds;
-    const float d8 = y_df[j * (WARP_SIZE/QI8_1) + k/QI8_1];
-
-    // Dequantize 4-bit and dot product with Q8_1
-    const int qs = x_ql[i * (WARP_SIZE + 1) + k];
-    const int u  = y_qs[j * WARP_SIZE + k];
-
-    // Process 8 nibbles (4-bit values) from one int
-    int sumi = 0;
-    for (int l = 0; l < 8; ++l) {
-        const int q4 = (qs >> (4*l)) & 0xF;
-        const int q8 = ((const int8_t *)&u)[l];
-        sumi += q4 * q8;
-    }
-
-    // AWQ: scale * (q4 - zero) * q8 * d8 = scale * d8 * (sumi - zero * sum_q8)
-    // But we need sum of q8 values, which is tricky in MMQ. Simplified:
-    return scale * d8 * (float)sumi - scale * zero * d8 * 8.0f; // Approximate
-}
-
-// =============================================================================
-// Q_AWQ_G64 MMQ tile functions - for AWQ group-64 (4-bit asymmetric) x Q8_1
-// =============================================================================
-
-template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q_awq_g64(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
-    GGML_UNUSED(x_qh); GGML_UNUSED(x_sc);
-
-    // QK_Q_AWQ_G64 = 64 elements per block, QI_Q_AWQ_G64 = 8 ints
-    __shared__ int   tile_x_qs[mmq_y * (WARP_SIZE)               + mmq_y];
-    __shared__ half2 tile_x_dm[mmq_y * (WARP_SIZE/QI_Q_AWQ_G64) + mmq_y/QI_Q_AWQ_G64];
-
-    *x_ql = tile_x_qs;
-    *x_dm = tile_x_dm;
-}
-
-template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q_awq_g64(
-    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
-    GGML_UNUSED(x_qh); GGML_UNUSED(x_sc);
-
-    GGML_CUDA_ASSUME(i_offset >= 0);
-    GGML_CUDA_ASSUME(i_offset <  nwarps);
-    GGML_CUDA_ASSUME(k >= 0);
-    GGML_CUDA_ASSUME(k <  WARP_SIZE);
-
-    const int kbx  = k / QI_Q_AWQ_G64;
-    const int kqsx = k % QI_Q_AWQ_G64;
-
-    const block_q_awq_g64 * bx0 = (const block_q_awq_g64 *) vx;
-
-#pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
-        int i = i0 + i_offset;
-
-        if (need_check) {
-            i = min(i, i_max);
-        }
-
-        const block_q_awq_g64 * bxi = bx0 + i*blocks_per_row + kbx;
-
-        // Load 4-bit nibbles packed into int
-        x_ql[i * (WARP_SIZE + 1) + k] = get_int_from_uint8(bxi->qs, kqsx * 4);
-    }
-
-    const int blocks_per_tile_x_row = WARP_SIZE / QI_Q_AWQ_G64;
-    const int kbxd = k % blocks_per_tile_x_row;
-
-#pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI_Q_AWQ_G64) {
-        int i = i0 + i_offset * QI_Q_AWQ_G64 + k / blocks_per_tile_x_row;
-
-        if (need_check) {
-            i = min(i, i_max);
-        }
-
-        const block_q_awq_g64 * bxi = bx0 + i*blocks_per_row + kbxd;
-
-        // Pack scale and zero into half2
-        x_dm[i * (WARP_SIZE/QI_Q_AWQ_G64) + i / QI_Q_AWQ_G64 + kbxd] = make_half2(bxi->scale, bxi->zero);
-    }
-}
-
-static __device__ __forceinline__ float vec_dot_q_awq_g64_q8_1_mul_mat(
-    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
-    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
-    GGML_UNUSED(x_qh); GGML_UNUSED(x_sc);
-
-    const half2 dm = x_dm[i * (WARP_SIZE/QI_Q_AWQ_G64) + i/QI_Q_AWQ_G64 + k/QI_Q_AWQ_G64];
-    const float scale = __half2float(__low2half(dm));
-    const float zero  = __half2float(__high2half(dm));
-
-    const float * y_df = (const float *) y_ds;
-    const float d8 = y_df[j * (WARP_SIZE/QI8_1) + k/QI8_1];
-
-    const int qs = x_ql[i * (WARP_SIZE + 1) + k];
-    const int u  = y_qs[j * WARP_SIZE + k];
-
-    int sumi = 0;
-    for (int l = 0; l < 8; ++l) {
-        const int q4 = (qs >> (4*l)) & 0xF;
-        const int q8 = ((const int8_t *)&u)[l];
-        sumi += q4 * q8;
-    }
-
-    return scale * d8 * (float)sumi - scale * zero * d8 * 8.0f;
-}
+// AWQ has no MMQ tile functions: it is a KV arena format here, not a matmul
+// weight format, and `QCudaStorage::fwd` refuses an AWQ weight. What stood here
+// could not have been right in any case — its dot carried the comment "we need
+// sum of q8 values, which is tricky in MMQ. Simplified: … // Approximate".
 
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q2_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
     GGML_UNUSED(x_qh);
@@ -5580,32 +5082,6 @@ extern "C" __global__ void
 }
 
 extern "C" __global__ void
-    mul_mat_q_awq(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
-    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
-    const int mmq_x  =  MMQ_X_Q_AWQ_AMPERE;
-    const int mmq_y  =  MMQ_Y_Q_AWQ_AMPERE;
-    const int nwarps = NWARPS_Q_AWQ_AMPERE;
-
-    mul_mat_q<QK_Q_AWQ, QR_Q_AWQ, QI_Q_AWQ, false, block_q_awq, mmq_x, mmq_y, nwarps, allocate_tiles_q_awq<mmq_y>,
-        load_tiles_q_awq<mmq_y, nwarps, true>, VDR_Q_AWQ_Q8_1_MMQ, vec_dot_q_awq_q8_1_mul_mat>
-        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void
-    mul_mat_q_awq_g64(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
-    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
-    const int mmq_x  =  MMQ_X_Q_AWQ_G64_AMPERE;
-    const int mmq_y  =  MMQ_Y_Q_AWQ_G64_AMPERE;
-    const int nwarps = NWARPS_Q_AWQ_G64_AMPERE;
-
-    mul_mat_q<QK_Q_AWQ_G64, QR_Q_AWQ_G64, QI_Q_AWQ_G64, false, block_q_awq_g64, mmq_x, mmq_y, nwarps, allocate_tiles_q_awq_g64<mmq_y>,
-        load_tiles_q_awq_g64<mmq_y, nwarps, true>, VDR_Q_AWQ_G64_Q8_1_MMQ, vec_dot_q_awq_g64_q8_1_mul_mat>
-        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
-}
-
-extern "C" __global__ void
 mul_mat_q2_K(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5676,3 +5152,74 @@ extern "C" __global__ void
         load_tiles_q8_K<mmq_y, nwarps, true>, VDR_Q8_K_Q8_1_MMQ, vec_dot_q8_K_q8_1_mul_mat>
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
+
+// =============================================================================
+// Batch-narrow MMQ: the same kernels at mmq_x = 16.
+// =============================================================================
+//
+// `mmq_x` tiles the BATCH (ncols_y): the y-staging smem, the per-thread
+// accumulator array, and the dot loops all scale with it, while the weight-tile
+// loads do not. The wide wrappers above fix mmq_x at 64–128 per type, so a
+// small batch computes a mostly-padded tile column — every lane past ncols_y
+// dots against a clamped duplicate column and the result is discarded at the
+// store. Measured on Q6_K [12288, 4096]: 12 rows cost the same ~256 µs as 64.
+//
+// These instantiations keep each type's own mmq_y and nwarps and change ONLY
+// mmq_x, so a batch of ≤16 does a quarter (or an eighth, for the 128-wide
+// types) of the dot work in the same single pass over the weights. The
+// dispatcher selects them by ncols_y; past their width the wide tiles win
+// because a second tile column means a second full weight read.
+//
+// One template constraint is deliberately relaxed rather than violated: the
+// y-scale staging loop steps by `nwarps * QI8_1` = 32 > mmq_x, so its index
+// wraps `% mmq_x` and some threads store the same (ids, kby) slot twice — the
+// same value from the same source, a benign duplicate write.
+#define MUL_MAT_QX16(name, qk, qr, qi, need_sum, blk, mmq_y_c, nwarps_c, alloc, loadt, vdr, vdot) \
+extern "C" __global__ void name( \
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) { \
+    const int mmq_y  = mmq_y_c; \
+    const int nwarps = nwarps_c; \
+    mul_mat_q<qk, qr, qi, need_sum, blk, 16, mmq_y, nwarps, alloc<mmq_y>, \
+        loadt<mmq_y, nwarps, true>, vdr, vdot> \
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); \
+}
+
+MUL_MAT_QX16(mul_mat_q4_0_x16, QK4_0, QR4_0, QI4_0, true, block_q4_0,
+    MMQ_Y_Q4_0_AMPERE, NWARPS_Q4_0_AMPERE, allocate_tiles_q4_0, load_tiles_q4_0,
+    VDR_Q4_0_Q8_1_MMQ, vec_dot_q4_0_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q4_1_x16, QK4_1, QR4_1, QI4_1, true, block_q4_1,
+    MMQ_Y_Q4_1_AMPERE, NWARPS_Q4_1_AMPERE, allocate_tiles_q4_1, load_tiles_q4_1,
+    VDR_Q4_1_Q8_1_MMQ, vec_dot_q4_1_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q5_0_x16, QK5_0, QR5_0, QI5_0, false, block_q5_0,
+    MMQ_Y_Q5_0_AMPERE, NWARPS_Q5_0_AMPERE, allocate_tiles_q5_0, load_tiles_q5_0,
+    VDR_Q5_0_Q8_1_MMQ, vec_dot_q5_0_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q5_1_x16, QK5_1, QR5_1, QI5_1, true, block_q5_1,
+    MMQ_Y_Q5_1_AMPERE, NWARPS_Q5_1_AMPERE, allocate_tiles_q5_1, load_tiles_q5_1,
+    VDR_Q5_1_Q8_1_MMQ, vec_dot_q5_1_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q8_0_x16, QK8_0, QR8_0, QI8_0, false, block_q8_0,
+    MMQ_Y_Q8_0_AMPERE, NWARPS_Q8_0_AMPERE, allocate_tiles_q8_0, load_tiles_q8_0,
+    VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q8_1_x16, QK8_1, QR8_1, QI8_1, false, block_q8_1,
+    MMQ_Y_Q8_1_AMPERE, NWARPS_Q8_1_AMPERE, allocate_tiles_q8_1, load_tiles_q8_1,
+    VDR_Q8_1_Q8_1_MMQ, vec_dot_q8_1_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q2_K_x16, QK_K, QR2_K, QI2_K, false, block_q2_K,
+    MMQ_Y_Q2_K_AMPERE, NWARPS_Q2_K_AMPERE, allocate_tiles_q2_K, load_tiles_q2_K,
+    VDR_Q2_K_Q8_1_MMQ, vec_dot_q2_K_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q3_K_x16, QK_K, QR3_K, QI3_K, false, block_q3_K,
+    MMQ_Y_Q3_K_AMPERE, NWARPS_Q3_K_AMPERE, allocate_tiles_q3_K, load_tiles_q3_K,
+    VDR_Q3_K_Q8_1_MMQ, vec_dot_q3_K_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q4_K_x16, QK_K, QR4_K, QI4_K, true, block_q4_K,
+    MMQ_Y_Q4_K_AMPERE, NWARPS_Q4_K_AMPERE, allocate_tiles_q4_K, load_tiles_q4_K,
+    VDR_Q4_K_Q8_1_MMQ, vec_dot_q4_K_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q5_K_x16, QK_K, QR5_K, QI5_K, true, block_q5_K,
+    MMQ_Y_Q5_K_AMPERE, NWARPS_Q5_K_AMPERE, allocate_tiles_q5_K, load_tiles_q5_K,
+    VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q6_K_x16, QK_K, QR6_K, QI6_K, false, block_q6_K,
+    MMQ_Y_Q6_K_AMPERE, NWARPS_Q6_K_AMPERE, allocate_tiles_q6_K, load_tiles_q6_K,
+    VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat)
+MUL_MAT_QX16(mul_mat_q8_K_x16, QK_K, QR8_K, QI8_K, false, block_q8_K,
+    MMQ_Y_Q8_K_AMPERE, NWARPS_Q8_K_AMPERE, allocate_tiles_q8_K, load_tiles_q8_K,
+    VDR_Q8_K_Q8_1_MMQ, vec_dot_q8_K_q8_1_mul_mat)
+
+#undef MUL_MAT_QX16

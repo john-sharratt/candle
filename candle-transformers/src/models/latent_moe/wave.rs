@@ -1419,6 +1419,7 @@ impl ManagedBatchedModel for BatchedEngine {
             .collect();
         let std_meta = {
             let (pm, headers, stride) = session.build_decode_metadata_at(
+                0..session.num_layers(),
                 &all_seqs,
                 &generation,
                 &overrides,
@@ -2752,6 +2753,38 @@ impl ManagedBatchedModel for BatchedEngine {
     /// target — so the conditioning only affects acceptance, never output. Returns empty (⇒ plain
     /// decode) when no drafter is attached or the sequence has no stashed feature yet.
     fn speculative_draft(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seqs: &[usize],
+        committed: &[u32],
+        max_len: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        if committed.len() != seqs.len() {
+            candle::bail!(
+                "dspark draft: {} committed tokens for {} sequences",
+                committed.len(),
+                seqs.len()
+            );
+        }
+        // Per sequence, because DSpark conditions each proposal on that
+        // sequence's own stashed target feature and gates it on that sequence's
+        // own acceptance EMA. The qwen35 NextN head batches its cohort instead
+        // (`qwen35::mtp::MtpHead::draft_cohort`), which is what removes the
+        // per-session weight read the width-aware break-even below is priced
+        // against; doing the same here is a separate change to a drafter with
+        // its own measured schedule, not a rename.
+        let cohort = seqs.len();
+        seqs.iter()
+            .zip(committed)
+            .map(|(&seq, &tok)| self.draft_one(session, seq, tok, max_len, cohort))
+            .collect()
+    }
+}
+
+impl BatchedEngine {
+    /// One sequence's DSpark proposal — see
+    /// [`ManagedBatchedModel::speculative_draft`].
+    fn draft_one(
         &self,
         session: &mut BatchedInferenceSession,
         seq: usize,

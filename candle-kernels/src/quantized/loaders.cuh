@@ -60,9 +60,10 @@ template <> struct loader_num_parts<block_c_q4_K> { static constexpr int value =
 template <> struct loader_num_parts<block_c_q5_K> { static constexpr int value = 1; };
 template <> struct loader_num_parts<block_c_q6_K> { static constexpr int value = 1; };
 
-// AWQ types
-template <> struct loader_num_parts<block_q_awq> { static constexpr int value = 1; };
-template <> struct loader_num_parts<block_q_awq_g64> { static constexpr int value = 1; };
+// AWQ types — the COMPACT forms only. The GGML-layout `block_q_awq` /
+// `block_q_awq_g64` went with the matmul path (see `QCudaStorage::fwd`), and
+// nothing instantiated a loader over them: the KV arena reads AWQ through the
+// compact types below.
 template <> struct loader_num_parts<block_c_q_awq> { static constexpr int value = 1; };
 template <> struct loader_num_parts<block_c_q_awq_g64> { static constexpr int value = 1; };
 
@@ -118,9 +119,7 @@ template <> struct block_compact<block_c_q8_KO> { using type = block_c_q8_KO_k10
 template <> struct block_compact<block_c_q2_KO> { using type = block_c_q2_KO_k1024; };
 template <> struct block_compact<block_c_mxfp4> { using type = block_c_mxfp4_k1024; };
 
-// AWQ mappings
-template <> struct block_compact<block_q_awq> { using type = block_c_q_awq; };
-template <> struct block_compact<block_q_awq_g64> { using type = block_c_q_awq_g64; };
+// AWQ mappings — compact forms only, as above.
 template <> struct block_compact<block_c_q_awq> { using type = block_c_q_awq; };
 template <> struct block_compact<block_c_q_awq_g64> { using type = block_c_q_awq_g64; };
 

@@ -412,4 +412,32 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Speculative decode on the 3.5-35B — the 3.6 gate's sibling, on the
+    /// checkpoint where every layer routes. See
+    /// [`crate::models::quantized_qwen35::tests::speculative_gate`].
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.5-35B-A3B GGUF (22 GB) and needs a GPU. Run with: \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35_moe::tests::speculative_decode_35b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn speculative_decode_35b() -> Result<()> {
+        use crate::models::quantized_qwen35::tests::speculative_gate;
+
+        let model_path = pinned()?;
+        let int8mode = Int8Mode::Performance;
+        speculative_gate("Qwen3.5-35B-A3B", int8mode, &[1, 4], move || {
+            let device = Device::new_cuda(0)?;
+            let m = from_gguf_path(
+                &model_path,
+                &device,
+                Qwen35LoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                },
+            )?;
+            println!("✓ Model loaded\n");
+            Ok(m)
+        })
+    }
 }

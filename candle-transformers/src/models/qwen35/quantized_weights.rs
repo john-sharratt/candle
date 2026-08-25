@@ -25,13 +25,18 @@
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
 use candle::{Device, Result, Tensor};
 use std::io::{Read, Seek};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 use super::config::Qwen35Config;
+use super::embedding::EmbeddingTable;
+use super::mtp::{MtpHead, MtpInput};
 #[cfg(feature = "cuda")]
 use super::quantized_moe::Qwen35MoeBlock;
 use crate::models::delta_net::{LayerKind, QuantDeltaNetWeights};
 #[cfg(feature = "cuda")]
 use crate::models::expert_lre::ExpertCache;
+use crate::models::host_embedding::HostEmbedding;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::quantized_mlp::QuantizedMlp;
 #[cfg(feature = "cuda")]
@@ -173,16 +178,26 @@ impl QuantLayer {
 
 /// The loaded production model.
 ///
-/// `embed` is deliberately **host-resident**: the embedding lookup is one of
-/// the two sanctioned GPU→CPU touches on the hot path (CLAUDE.md invariant
-/// 3) — a host `index_select` over the token ids followed by a single upload
-/// keeps a `vocab × hidden` table (4 GB at the 9B's geometry) out of VRAM.
-/// The tied LM head is a separate device-side [`QMatMul`] over the same
-/// checkpoint tensor, because that one *is* a matmul.
+/// `embed` is deliberately **off the card**: a `vocab × hidden` table is 4 GB at
+/// the 9B's geometry for one row read per token, the worst VRAM-per-access ratio
+/// in the model. Where it lives instead, and why the production path no longer
+/// pays a GPU→CPU touch for it, is [`EmbeddingTable`]. The tied LM head is a
+/// separate device-side [`QMatMul`] over the same checkpoint tensor, because
+/// that one *is* a matmul and reads its whole weight every call.
 pub struct QuantModel {
     pub cfg: Qwen35Config,
-    pub embed: Tensor,
+    /// The token-embedding table, off the card either way — see
+    /// [`EmbeddingTable`] for what the two residencies cost.
+    pub embed: EmbeddingTable,
     pub layers: Vec<QuantLayer>,
+    /// The NextN / MTP draft head, when the conversion kept it.
+    ///
+    /// `None` on a plain GGUF — which is not a property of the architecture but
+    /// of the file: Qwen3.5/3.6 are trained with multi-token prediction and
+    /// ship the head, and unsloth publishes a parallel `…-MTP-GGUF` repo per
+    /// model that keeps it. With `None` the lineage drafts through the
+    /// weightless fallback instead. See [`super::mtp`].
+    pub mtp: Option<MtpHead>,
     /// The shared expert cache, `None` on a dense checkpoint.
     ///
     /// Also reachable through any MoE layer's router, but held here as well
@@ -191,7 +206,7 @@ pub struct QuantModel {
     /// telemetry — are about the cache as a whole and must not depend on the
     /// stack having a MoE layer at a particular index.
     #[cfg(feature = "cuda")]
-    pub experts: Option<std::sync::Arc<ExpertCache>>,
+    pub experts: Option<Arc<ExpertCache>>,
     /// The head's norm — a fused producer feeding `lm_head`, so [`RmsNorm`]
     /// rather than a bare gain, exactly like the per-layer norms.
     pub final_norm: RmsNorm,
@@ -242,6 +257,31 @@ impl<R: Read + Seek> Loader<'_, R> {
     fn has(&self, name: &str) -> bool {
         self.content.tensor_infos.contains_key(name)
     }
+
+    /// A gated-attention block's projections and Q/K norms, at tensor prefix
+    /// `p`. Shared by the trunk's attention layers and the MTP draft head,
+    /// which carries exactly the same tensor set.
+    fn attention(&mut self, p: &str, eps: f64) -> Result<QuantAttentionWeights> {
+        Ok(QuantAttentionWeights {
+            wq: self.proj(&format!("{p}.attn_q.weight"))?,
+            wk: self.proj(&format!("{p}.attn_k.weight"))?,
+            wv: self.proj(&format!("{p}.attn_v.weight"))?,
+            wo: self.proj(&format!("{p}.attn_output.weight"))?,
+            q_norm: self.norm(&format!("{p}.attn_q_norm.weight"), eps)?,
+            k_norm: self.norm(&format!("{p}.attn_k_norm.weight"), eps)?,
+        })
+    }
+
+    /// A dense gated MLP at tensor prefix `p`.
+    fn dense_ffn(&mut self, p: &str) -> Result<QuantFfnWeights> {
+        let mode = self.mode;
+        QuantFfnWeights::from_weights(
+            self.raw(&format!("{p}.ffn_gate.weight"))?,
+            self.raw(&format!("{p}.ffn_up.weight"))?,
+            self.raw(&format!("{p}.ffn_down.weight"))?,
+            mode,
+        )
+    }
 }
 
 /// Load the production model from a GGUF onto `device`.
@@ -269,6 +309,7 @@ pub fn load_quantized_model<R, F>(
     reader: &mut R,
     device: &Device,
     mode: Int8Mode,
+    host_embed: Option<HostEmbedding>,
     build_experts: F,
 ) -> Result<QuantModel>
 where
@@ -285,16 +326,24 @@ where
         device_bytes: 0,
     };
 
-    // Host-resident embedding table (see [`QuantModel::embed`]).
-    //
-    // The quantized tensor lands on the device to be read and the F32 copy on
-    // the host, so the device bytes it touched are transient and must come back
-    // off the count — charging them would inflate the dense footprint by the
-    // largest single tensor in the model (594 MiB on the 35B).
-    let embed_q = g.raw("token_embd.weight")?;
-    let embed_transient = embed_q.storage_size_in_bytes();
-    let embed = embed_q.dequantize(&Device::Cpu)?;
-    g.device_bytes -= embed_transient.min(g.device_bytes);
+    // The embedding table, off the card under either residency (see
+    // [`EmbeddingTable`]). Host-mapped when the caller could pin it, which is
+    // strictly better and therefore not a choice made here.
+    let embed = match host_embed {
+        Some(h) => EmbeddingTable::HostMapped(h),
+        None => {
+            // The quantized tensor lands on the device to be read and the F32
+            // copy on the host, so the device bytes it touched are transient and
+            // must come back off the count — charging them would inflate the
+            // dense footprint by the largest single tensor in the model (594 MiB
+            // on the 35B).
+            let embed_q = g.raw("token_embd.weight")?;
+            let embed_transient = embed_q.storage_size_in_bytes();
+            let table = embed_q.dequantize(&Device::Cpu)?;
+            g.device_bytes -= embed_transient.min(g.device_bytes);
+            EmbeddingTable::Host(table)
+        }
+    };
     let final_norm = g.norm("output_norm.weight", cfg.rms_norm_eps)?;
     let lm_head = if g.has("output.weight") {
         g.proj("output.weight")?
@@ -311,14 +360,7 @@ where
     for li in 0..cfg.num_layers {
         let p = format!("blk.{li}");
         let mix = match cfg.layer_kinds[li] {
-            LayerKind::Attention => QuantLayerMix::Attention(QuantAttentionWeights {
-                wq: g.proj(&format!("{p}.attn_q.weight"))?,
-                wk: g.proj(&format!("{p}.attn_k.weight"))?,
-                wv: g.proj(&format!("{p}.attn_v.weight"))?,
-                wo: g.proj(&format!("{p}.attn_output.weight"))?,
-                q_norm: g.norm(&format!("{p}.attn_q_norm.weight"), cfg.rms_norm_eps)?,
-                k_norm: g.norm(&format!("{p}.attn_k_norm.weight"), cfg.rms_norm_eps)?,
-            }),
+            LayerKind::Attention => QuantLayerMix::Attention(g.attention(&p, cfg.rms_norm_eps)?),
             LayerKind::DeltaNet => QuantLayerMix::DeltaNet(QuantDeltaNetWeights {
                 wqkv: g.proj(&format!("{p}.attn_qkv.weight"))?,
                 wz: g.proj(&format!("{p}.attn_gate.weight"))?,
@@ -383,12 +425,7 @@ where
                 pending
             }
         } else {
-            PendingFfn::Dense(QuantFfnWeights::from_weights(
-                g.raw(&format!("{p}.ffn_gate.weight"))?,
-                g.raw(&format!("{p}.ffn_up.weight"))?,
-                g.raw(&format!("{p}.ffn_down.weight"))?,
-                mode,
-            )?)
+            PendingFfn::Dense(g.dense_ffn(&p)?)
         };
         pending_layers.push(PendingLayer {
             attn_norm: g.norm(&format!("{p}.attn_norm.weight"), cfg.rms_norm_eps)?,
@@ -418,6 +455,100 @@ where
             "qwen35 dense weights resident"
         );
     }
+    // ── The NextN / MTP draft head, when the conversion kept it ──
+    //
+    // `nextn_predict_layers` blocks sit past the trunk, and the trunk loop
+    // above stops before them because `cfg.num_layers` already excludes them.
+    // The head is structurally a trunk attention layer (see `super::mtp`), so
+    // it loads through the same two helpers.
+    //
+    // Absent on a plain GGUF conversion, which drops the MTP tensors — that is
+    // the common case and is not an error; the model simply has no drafter and
+    // decodes a token at a time. Present-but-malformed IS an error.
+    let mtp = if cfg.num_mtp_layers == 0 {
+        None
+    } else {
+        let mi = cfg.num_layers;
+        let p = format!("blk.{mi}");
+        if cfg.num_mtp_layers != 1 {
+            candle::bail!(
+                "qwen35: {} nextn_predict_layers — this stack drafts from a single \
+                 MTP block (llama.cpp asserts the same for this architecture), and \
+                 chaining several is a different recurrence, not more of this one",
+                cfg.num_mtp_layers
+            );
+        }
+        for t in ["nextn.enorm", "nextn.hnorm", "nextn.eh_proj"] {
+            if !g.has(&format!("{p}.{t}.weight")) {
+                candle::bail!(
+                    "qwen35: the checkpoint declares nextn_predict_layers = {} but \
+                     {p}.{t}.weight is missing — a conversion that kept the metadata \
+                     and dropped the tensors",
+                    cfg.num_mtp_layers
+                );
+            }
+        }
+        // Dedicated embedding / head tensors exist in the format for
+        // checkpoints trained with them. These are not (`mtp_use_dedicated_
+        // embeddings: false`), and the head sharing the target's `token_embd` +
+        // `output.weight` is what makes it cost one block rather than a second
+        // model — so a checkpoint that carries them is a different animal and
+        // is refused rather than silently drafted with the wrong tables.
+        for t in ["nextn.embed_tokens", "nextn.shared_head_head"] {
+            if g.has(&format!("{p}.{t}.weight")) {
+                candle::bail!(
+                    "qwen35: {p}.{t}.weight is present — this checkpoint's MTP head \
+                     has its own embedding/LM head, which this drafter does not read \
+                     (it shares the target's)"
+                );
+            }
+        }
+        if g.has(&format!("{p}.ffn_gate_inp.weight")) {
+            candle::bail!(
+                "qwen35: the MTP head at {p} is a routed (MoE) block, and the expert \
+                 cache is sized and indexed over the TRUNK's MoE layers only — \
+                 drafting from it would read experts nothing has staged. Load a dense \
+                 MTP checkpoint, or extend the cache to carry the head's layer first"
+            );
+        }
+        let head = MtpHead {
+            // The head's block, built by the SAME helpers a trunk attention
+            // layer is: `Loader::attention` already reads exactly these tensor
+            // names, because the head is `blk.{num_layers}` in the checkpoint
+            // and is named like every other block. Nothing here is
+            // head-specific, which is the point — it runs the production
+            // attention path unchanged.
+            block: QuantLayer {
+                attn_norm: g.norm(&format!("{p}.attn_norm.weight"), cfg.rms_norm_eps)?,
+                post_attn_norm: g
+                    .norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_norm_eps)?,
+                mix: QuantLayerMix::Attention(g.attention(&p, cfg.rms_norm_eps)?),
+                ffn: QuantFfn::Dense(g.dense_ffn(&p)?),
+            },
+            input: MtpInput {
+                enorm: g.norm(&format!("{p}.nextn.enorm.weight"), cfg.rms_norm_eps)?,
+                hnorm: g.norm(&format!("{p}.nextn.hnorm.weight"), cfg.rms_norm_eps)?,
+                eh_proj: g.proj(&format!("{p}.nextn.eh_proj.weight"))?,
+            },
+            // `shared_head_norm` is the head's own final norm. llama.cpp falls
+            // back to the model's `output_norm` when it is absent; these
+            // checkpoints ship it, and quietly substituting a different norm
+            // would be a drafter that is subtly wrong in a way only acceptance
+            // could show — so it is required here.
+            head_norm: g.norm(
+                &format!("{p}.nextn.shared_head_norm.weight"),
+                cfg.rms_norm_eps,
+            )?,
+            layer_index: mi,
+        };
+        tracing::info!(
+            target: "candle_transformers::qwen35",
+            block = mi,
+            "qwen35 MTP draft head loaded"
+        );
+        Some(head)
+    };
+
     let experts = build_experts(content, &cfg)?;
     let (n_used, norm_topk) = cfg
         .moe
@@ -431,6 +562,7 @@ where
         cfg,
         embed,
         layers,
+        mtp,
         #[cfg(feature = "cuda")]
         experts,
         final_norm,

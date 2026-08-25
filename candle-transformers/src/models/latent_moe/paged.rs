@@ -4058,8 +4058,14 @@ mod tests {
             } else {
                 &[]
             };
-            let (_pm, headers, _stride) =
-                session.build_decode_metadata_at(&[seq], &generation, &[], &[], snap_seqs)?;
+            let (_pm, headers, _stride) = session.build_decode_metadata_at(
+                0..session.num_layers(),
+                &[seq],
+                &generation,
+                &[],
+                &[],
+                snap_seqs,
+            )?;
             let headers = headers.expect("decode metadata headers");
             let out = paged_latent_decode_raw(
                 &q,

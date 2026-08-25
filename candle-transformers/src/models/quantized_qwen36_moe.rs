@@ -258,4 +258,43 @@ mod tests {
         };
         params.run(configs, load)
     }
+
+    /// **Speculative decode on the 3.6-35B — the production target.**
+    ///
+    /// The same sweep as the dense gates
+    /// ([`crate::models::quantized_qwen35::tests::speculative_gate`]): the
+    /// StoryRewrite fixture at 256 generated tokens, run once plain and once
+    /// per draft budget, with the lossless driver and the weightless n-gram
+    /// drafter. Every run validates against the same fixture at 100%, so a
+    /// recurrent rewind that lost a token shows up as broken text rather than
+    /// as a quiet quality slide.
+    ///
+    /// The MoE is what makes this the interesting one. A verify block widens
+    /// the wave's routed-expert union, so on a streaming-expert config the
+    /// extra rows cost expert DMA that a one-token decode would not have paid —
+    /// which is exactly the trade the draft-budget sweep prices.
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.6-35B-A3B GGUF (22 GB) and needs a GPU. Run with: \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen36_moe::tests::speculative_decode_36_35b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn speculative_decode_36_35b() -> Result<()> {
+        use crate::models::quantized_qwen35::tests::speculative_gate;
+
+        let model_path = pinned()?;
+        let int8mode = Int8Mode::Performance;
+        speculative_gate("Qwen3.6-35B-A3B", int8mode, &[1, 4], move || {
+            let device = Device::new_cuda(0)?;
+            let m = from_gguf_path(
+                &model_path,
+                &device,
+                Qwen35LoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                },
+            )?;
+            println!("✓ Model loaded\n");
+            Ok(m)
+        })
+    }
 }

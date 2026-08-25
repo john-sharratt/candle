@@ -42,7 +42,6 @@ mod engine;
 mod footprint;
 mod gallery;
 pub mod geometry;
-mod guard;
 mod hyper;
 mod indexer;
 #[cfg(feature = "cuda")]

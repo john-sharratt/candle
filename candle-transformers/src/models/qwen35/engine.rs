@@ -14,7 +14,7 @@
 //! These are computed from the config so they can be tested without a
 //! loaded checkpoint, and the model methods delegate to them.
 
-use candle::DType;
+use candle::{DType, Device};
 use candle_nn::kv_cache::ModelGeometry;
 
 use super::config::Qwen35Config;
@@ -125,17 +125,20 @@ pub fn provenance_layer_indices(
     })
 }
 
-/// Create a batched session whose KV is allocated per *attention* layer.
+/// KV layers a session of this stack allocates: one per *attention* layer,
+/// plus one for the MTP draft head when the checkpoint carries it.
 ///
 /// `BatchedInferenceSession` takes the count of per-layer KV chunk sets,
 /// which on a hybrid is the attention-layer count — passing transformer
 /// depth would allocate four times the backings, and would make admission
 /// price every wave's KV at four times its real cost.
-pub fn create_session(
-    cfg: &Qwen35Config,
-    device: &candle::Device,
-    config: BatchedConfig,
-) -> candle::Result<BatchedInferenceSession> {
+///
+/// The head's layer sits **past** every trunk layer, so [`KvLayerMap`] — which
+/// only ever yields `0..num_kv_layers()` — cannot name it and the layer sweep
+/// cannot reach it. It is written by the head's own pass at the end of each
+/// wave and read only when drafting. See [`super::mtp`] for why the head is a
+/// layer of the model rather than a sidecar with a private cache.
+pub fn session_kv_layers(cfg: &Qwen35Config) -> candle::Result<usize> {
     let kv_layers = KvLayerMap::new(&cfg.layer_kinds).num_kv_layers();
     if kv_layers == 0 {
         candle::bail!(
@@ -143,8 +146,45 @@ pub fn create_session(
              state store carries all of its history"
         );
     }
+    // The loader refuses anything but 0 or 1, so this is a count of heads, not
+    // a schedule over them.
+    Ok(kv_layers + cfg.num_mtp_layers)
+}
+
+/// The KV layer the MTP draft head writes, or `None` on a checkpoint without
+/// one. Always the last, which is what keeps it out of the sweep's reach.
+pub fn mtp_kv_layer(cfg: &Qwen35Config) -> Option<usize> {
+    (cfg.num_mtp_layers > 0).then(|| KvLayerMap::new(&cfg.layer_kinds).num_kv_layers())
+}
+
+/// The KV layers a wave over `[layer_start, layer_end)` **touches** — the
+/// layer map's range, plus the draft head's when the window reaches the last
+/// trunk layer, because that is when the head's pass runs.
+///
+/// One answer, three callers, deliberately: admission claims this range, the
+/// failure rollback restores it, and the sweep writes it. They must be the same
+/// set or the engine breaks in two different ways — a claim short of the sweep
+/// is a chunk allocated from inside the forward that owns the partition, and a
+/// rollback short of the sweep leaves the head's layer one token ahead of the
+/// trunk's after a failed wave, which the next wave "heals" by truncating a
+/// token the caller was never given.
+pub fn wave_kv_range(cfg: &Qwen35Config, layer_start: usize, layer_end: usize) -> (usize, usize) {
+    let map = KvLayerMap::new(&cfg.layer_kinds);
+    let (start, mut end) = map.kv_range(layer_start, layer_end);
+    if mtp_kv_layer(cfg).is_some() && layer_end == cfg.num_layers {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Create a batched session whose KV is allocated per [`session_kv_layers`].
+pub fn create_session(
+    cfg: &Qwen35Config,
+    device: &Device,
+    config: BatchedConfig,
+) -> candle::Result<BatchedInferenceSession> {
     BatchedInferenceSession::new(
-        kv_layers,
+        session_kv_layers(cfg)?,
         cfg.num_kv_heads,
         cfg.attn_head_dim,
         device,
@@ -267,7 +307,7 @@ mod tests {
     #[test]
     fn session_allocates_kv_per_attention_layer_not_per_layer() -> candle::Result<()> {
         let cfg = nine_b();
-        let device = candle::Device::new_cuda(0)?;
+        let device = Device::new_cuda(0)?;
         let session = create_session(&cfg, &device, BatchedConfig::default())?;
         assert_eq!(
             session.num_layers(),
@@ -278,11 +318,95 @@ mod tests {
         Ok(())
     }
 
+    /// **A checkpoint with an MTP head pages one KV layer more, and it is the
+    /// last one.**
+    ///
+    /// Both halves matter and only one of them is arithmetic. The extra layer
+    /// is what gives the draft head a paged history at all; putting it LAST is
+    /// what keeps it out of everything else's way, because
+    /// [`KvLayerMap::kv_index`] only ever yields `0..num_kv_layers()` — so the
+    /// sweep cannot name it, and no range the map produces can reach it. Move
+    /// it anywhere else and a trunk layer's KV silently becomes the head's.
+    #[test]
+    fn an_mtp_checkpoint_pages_one_more_kv_layer_and_it_is_last() -> candle::Result<()> {
+        let mut cfg = nine_b();
+        assert_eq!(session_kv_layers(&cfg)?, 8, "no head, no extra layer");
+        assert_eq!(mtp_kv_layer(&cfg), None);
+
+        cfg.num_mtp_layers = 1;
+        assert_eq!(session_kv_layers(&cfg)?, 9);
+        let head = mtp_kv_layer(&cfg).expect("a head has a layer");
+        assert_eq!(head, 8, "the head's layer sits past every trunk KV layer");
+        assert_eq!(
+            head,
+            session_kv_layers(&cfg)? - 1,
+            "the head must be the LAST layer, or the map's range would cover it"
+        );
+
+        let map = KvLayerMap::new(&cfg.layer_kinds);
+        assert!(
+            (0..cfg.num_layers).all(|l| map.kv_index(l).is_none_or(|kv| kv < head)),
+            "a trunk layer resolved to the head's KV index — the sweep would \
+             write the draft head's history"
+        );
+        assert_eq!(
+            map.kv_range(0, cfg.num_layers).1,
+            head,
+            "the layer MAP must stop short of the head's layer — nothing that \
+             translates a trunk layer may reach it"
+        );
+        Ok(())
+    }
+
+    /// **A wave that reaches the last trunk layer touches the head's KV too,
+    /// and a partial window does not.**
+    ///
+    /// The head's pass runs at the end of a complete sweep, so that is the only
+    /// window whose range covers it. Admission claims this range, the failure
+    /// rollback restores it, and the sweep writes it — three callers that must
+    /// agree, which is why there is one function rather than three `+ 1`s.
+    #[test]
+    fn a_full_sweep_claims_the_head_s_kv_layer_and_a_partial_window_does_not() {
+        let mut cfg = nine_b();
+        let n = cfg.num_layers;
+
+        // No head: the range is the map's, whatever the window.
+        assert_eq!(wave_kv_range(&cfg, 0, n), (0, 8));
+        assert_eq!(wave_kv_range(&cfg, 0, n / 2), (0, 4));
+
+        cfg.num_mtp_layers = 1;
+        assert_eq!(
+            wave_kv_range(&cfg, 0, n),
+            (0, 9),
+            "a full sweep runs the head's pass, so its layer must be claimed"
+        );
+        assert_eq!(
+            wave_kv_range(&cfg, 0, n / 2),
+            (0, 4),
+            "a half window never reaches the head's pass and must not claim its \
+             layer — the claim would be storage no wave in that window writes"
+        );
+        assert_eq!(
+            wave_kv_range(&cfg, n / 2, n),
+            (4, 9),
+            "the tail window is where the head's pass runs, even though the \
+             window does not start at layer 0"
+        );
+        // Contiguous with the trunk's last KV layer: `admit_wave_kv` and
+        // `rollback_wave_kv` both walk the range as a range, so a gap would
+        // index a layer neither of them means.
+        assert_eq!(
+            wave_kv_range(&cfg, 0, n).1 - 1,
+            mtp_kv_layer(&cfg).unwrap(),
+            "the head's layer must be the range's last, with no gap before it"
+        );
+    }
+
     #[test]
     fn a_stack_with_no_attention_is_refused_a_session() {
         let mut cfg = nine_b();
         cfg.layer_kinds = vec![LayerKind::DeltaNet; cfg.num_layers];
-        let device = candle::Device::Cpu;
+        let device = Device::Cpu;
         let err = match create_session(&cfg, &device, BatchedConfig::default()) {
             Ok(_) => panic!("a stack with no attention layers must not get a KV session"),
             Err(e) => e,

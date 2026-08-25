@@ -38,12 +38,15 @@ use candle_nn::kv_cache::{
 };
 
 use super::batched::HybridBatched;
+use super::draft::{head_wave_pass, HeadWave};
+use super::mtp::MTP_MAX_DRAFT;
 use super::quantized_attention::Qwen35AttentionLayer;
 use super::quantized_delta_net::quantized_delta_net_ffn;
 use super::quantized_weights::{QuantLayerMix, QuantModel};
+use super::spec::{split_block_rows, StashSpan, VerifyStash};
 use super::wave::delta_net_mix_wave;
 use crate::models::delta_net::seq_spans;
-use crate::models::delta_net::RecurrentStateStore;
+use crate::models::delta_net::{RecurrentStateStore, StashSlot};
 use candle_nn::kv_cache::ModelGeometry;
 
 use crate::models::batched_inference::{
@@ -158,38 +161,285 @@ impl ManagedBatchedModel for HybridBatched {
         )
     }
 
-    /// A sequence ends: its recurrent state must go with its KV slots, or the
-    /// map grows for the life of the process.
+    /// Draft with the checkpoint's own NextN/MTP head ([`super::mtp`]), for the
+    /// whole cohort in one batched pass.
     ///
-    /// **Truncation to a non-zero offset is refused.** A recurrent state
-    /// cannot be truncated — `S` is a running sum with no per-token
-    /// decomposition, so there is no suffix to remove — and KV rewound under
-    /// a state that still holds the un-truncated history is silent
-    /// corruption: the model answers as though it remembers tokens the cache
-    /// no longer has (measured: re-prefilling a truncated prompt diverges by
-    /// ~9.5 in the logits). Truncating to zero is the one case with an
-    /// answer — the state returns to its sequence-start value, which is what
-    /// a fresh store holds. Partial truncation (speculative rejection,
-    /// scheduler forks) needs recurrent-state checkpoints at the rewind
-    /// offsets; until those exist, refusing loudly here is the difference
-    /// between an error and a model that quietly hallucinates its history.
+    /// Empty — a plain decode step — when the conversion carried no head, or
+    /// before a sequence has a seed. Lossless either way: the verify pass keeps
+    /// only this model's own argmaxes.
+    ///
+    /// The budget is capped at [`MTP_MAX_DRAFT`] whatever the caller asks for.
+    fn speculative_draft(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seqs: &[usize],
+        committed: &[u32],
+        max_len: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        self.mtp_draft(session, seqs, committed, max_len.min(MTP_MAX_DRAFT))
+    }
+
+    /// Verify every drafted block in ONE wave, alongside the plain cohort.
+    ///
+    /// Each block is a **prefill span**, not a run of decode rows: the
+    /// recurrence is sequential within a sequence, so two rows of one sequence
+    /// cannot decode in parallel against a single carried state — the prefill
+    /// scan is the form that walks them in order. Plain rows lead as ordinary
+    /// decode rows in the same wave, so the whole step pays one launch floor
+    /// rather than two, and the MoE's per-layer expert traffic amortizes across
+    /// both cohorts.
+    ///
+    /// Naming the verifying sequences does two things inside the sweep: the
+    /// head scores every one of their rows (a block position's prediction is
+    /// what a proposal is checked against), and each DeltaNet layer stashes
+    /// their recurrence operands so [`Self::truncate_sequence`] can replay the
+    /// accepted prefix. Cleared on the way out, error or not.
+    fn verify_blocks(
+        &self,
+        session: &mut BatchedInferenceSession,
+        plain: &[(usize, u32)],
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        layer_end: usize,
+    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        if plain.is_empty() && seqs.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if seqs.len() != blocks.len() {
+            candle::bail!(
+                "qwen35 verify: {} sequences against {} blocks",
+                seqs.len(),
+                blocks.len()
+            );
+        }
+        // A one-token block is a decode step; the driver routes those to
+        // `plain` and never here, and a 1-row prefill would be folded into the
+        // decode group by the driver — where the head scores it as one row
+        // anyway, so the row split below would still hold. Refuse it rather
+        // than rely on that: the stash's `len` would disagree with the block.
+        if let Some(b) = blocks.iter().find(|b| b.len() < 2) {
+            candle::bail!(
+                "qwen35 verify: a {}-token block is a plain decode step, not a verify",
+                b.len()
+            );
+        }
+        let dseqs: Vec<usize> = plain.iter().map(|&(s, _)| s).collect();
+        let dinputs: Vec<Tensor> = plain
+            .iter()
+            .map(|&(_, t)| Tensor::from_vec(vec![t], (1, 1), &Device::Cpu))
+            .collect::<Result<_>>()?;
+        let pinputs: Vec<Tensor> = blocks
+            .iter()
+            .map(|b| Tensor::from_vec(b.clone(), (1, b.len()), &Device::Cpu))
+            .collect::<Result<_>>()?;
+
+        // **Size every verifying sequence's stash before the forward opens.**
+        // A wave's storage is claimed by `admit_wave_kv` and the transient tier
+        // is placed against that claim, so the arena refuses a device
+        // allocation from inside the forward — which is what a stash that
+        // allocated as the sweep reached each layer would be. (It is also not
+        // hypothetical: the 9B at four contexts is where the pool first had no
+        // room to spare and the wave failed outright. That failure looked like a
+        // VRAM ceiling and was recorded as one; it was this, and the width-4 row
+        // of `speculative_decode_9b` is what holds the fix down.)
+        let cohort: Vec<(usize, usize)> = seqs
+            .iter()
+            .enumerate()
+            .map(|(i, &seq)| (seq, blocks[i].len()))
+            .collect();
+        self.begin_verify_stash(&cohort)?;
+        // Arm the MTP seed capture over BOTH cohorts: a plain row's hidden is
+        // what lets a sequence that drafted nothing this step draft on the
+        // next, and it is the only way the very first step after prefill ever
+        // acquires a seed.
+        if self.has_drafter() {
+            let mut want: Vec<(usize, usize)> = plain.iter().map(|&(s, _)| (s, 1)).collect();
+            want.extend(seqs.iter().enumerate().map(|(i, &s)| (s, blocks[i].len())));
+            self.arm_hidden_capture(&want, session.activation_dtype())?;
+        }
+        self.set_verify_row_seqs(seqs)?;
+        let step = self.forward_wave(
+            session,
+            &dseqs,
+            &dinputs,
+            seqs,
+            &pinputs,
+            &[],
+            &[],
+            0,
+            layer_end,
+            None,
+        );
+        self.set_verify_row_seqs(&[])?;
+        self.disarm_hidden_capture();
+        let step = match step {
+            Ok(s) => s,
+            Err(e) => {
+                // The wave rolled its recurrent state back, so the stash names
+                // a rewind point that no longer exists.
+                self.drop_verify_stashes(seqs);
+                return Err(e);
+            }
+        };
+        for &(seq, _) in plain {
+            session.advance_sequence(seq, 1)?;
+        }
+        for (i, &seq) in seqs.iter().enumerate() {
+            session.advance_sequence(seq, blocks[i].len())?;
+        }
+        // Copied off the wave's span: the driver compares argmaxes and may run
+        // another forward before it is done with these rows.
+        let logits = step.logits_owned()?;
+        let lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
+        split_block_rows(&logits, plain.len(), &lens)
+    }
+
+    /// Roll `seq` back to `tokens`, recurrent state included.
+    ///
+    /// Three cases, and only the middle one is new:
+    ///
+    /// * `tokens == 0` — a full reset. The state returns to its sequence-start
+    ///   value, which is what a fresh store holds, so the store is dropped.
+    /// * `tokens` inside a block this model just verified — the speculative
+    ///   rewind. `S` is a running sum with no suffix to remove, so the state is
+    ///   re-advanced *forward* over the accepted prefix from the wave's
+    ///   entering state, which the store's ping-pong still holds
+    ///   ([`super::spec`]). Exact, not approximate: the replay runs the same
+    ///   mixer over the same operands.
+    /// * `tokens` equal to the sequence's current length — a no-op, which is
+    ///   what the driver's uniform truncate is for a plain decode row.
+    ///
+    /// Anything else has no answer and is refused. KV rewound under a state
+    /// that still holds the un-truncated history is silent corruption: the
+    /// model answers as though it remembers tokens the cache no longer has
+    /// (measured: re-prefilling a truncated prompt diverges by ~9.5 in the
+    /// logits).
     fn truncate_sequence(
         &self,
         session: &mut BatchedInferenceSession,
         seq: usize,
         tokens: usize,
     ) -> Result<()> {
-        if tokens != 0 {
-            candle::bail!(
-                "qwen35: cannot truncate sequence {seq} to {tokens} tokens — the \
-                 DeltaNet recurrent state has no per-token decomposition to rewind \
-                 to a non-zero offset. Truncate to 0 (full reset) or keep the \
-                 sequence intact; partial rewind needs recurrent-state checkpoints."
-            );
+        self.truncate_sequences(session, &[(seq, tokens)])
+    }
+
+    /// The whole step's truncates in one call, so the cohort's recurrent
+    /// rewinds batch: every rewinding sequence's replay runs as ONE launch pair
+    /// per DeltaNet layer through the shared stash, instead of one per layer
+    /// per sequence.
+    ///
+    /// Validation runs for every target before anything mutates — a target with
+    /// no rewind point aborts the call with nothing absorbed and nothing
+    /// replayed, and the stash goes back untouched.
+    fn truncate_sequences(
+        &self,
+        session: &mut BatchedInferenceSession,
+        targets: &[(usize, usize)],
+    ) -> Result<()> {
+        if targets.is_empty() {
+            return Ok(());
         }
-        session.truncate_sequence_to_tokens(seq, tokens)?;
-        self.release_recurrent(seq)?;
-        Ok(())
+        let mut stash = self.take_verify_stash()?;
+
+        // What each target needs, decided before anything is touched.
+        enum Plan {
+            Reset,
+            NoOp,
+            Rewind { span: StashSpan, kept: usize },
+        }
+        let mut plans: Vec<Plan> = Vec::with_capacity(targets.len());
+        for &(seq, tokens) in targets {
+            if tokens == 0 {
+                plans.push(Plan::Reset);
+                continue;
+            }
+            let span = stash.as_ref().and_then(|st| st.span_of(seq));
+            let current = session.sequence_offset(seq).unwrap_or(0);
+            match span {
+                Some(sp) if tokens >= sp.start && tokens <= sp.start + sp.len => {
+                    plans.push(Plan::Rewind {
+                        span: sp,
+                        kept: tokens - sp.start,
+                    });
+                }
+                _ if tokens == current => plans.push(Plan::NoOp),
+                _ => {
+                    // Nothing has mutated yet; hand the buffers back before
+                    // aborting the step.
+                    if let Some(st) = stash {
+                        self.put_verify_stash(st)?;
+                    }
+                    candle::bail!(
+                        "qwen35: cannot truncate sequence {seq} to {tokens} tokens — it \
+                         stands at {current} and no verified block covers that offset, so \
+                         the DeltaNet recurrent state has no rewind point. Truncate to 0 \
+                         (full reset), or rewind inside a block this model just verified."
+                    )
+                }
+            }
+        }
+
+        // Every target's span is consumed now, whatever its plan: a stash span
+        // is good for exactly one step, and a failed replay's must not survive
+        // to rewind a later one.
+        if let Some(st) = stash.as_mut() {
+            for &(seq, _) in targets {
+                st.remove(seq);
+            }
+        }
+
+        let mut jobs: Vec<(StashSpan, usize)> = Vec::new();
+        let result = (|| -> Result<()> {
+            // Take each sequence's next draft seed from the hiddens this wave
+            // captured — the row at the last position the accept kept. This
+            // runs for no-ops exactly as for rewinds, because a PLAIN row's
+            // one-token block is how a sequence that drafted nothing acquires
+            // the seed to draft next step; only a reset skips it, and its
+            // sequence has no history left to seed from.
+            //
+            // A rewind carries its own row count; a **no-op does not**, and
+            // must not be given one. It means the accept kept everything the
+            // wave ran, which is a count only the capture knows — `None` asks
+            // it. Hardcoding 1 here would be right for every plain decode row
+            // and silently wrong for anything else that ever classifies as a
+            // no-op, seeding from the block's first hidden instead of its last.
+            //
+            // The head's KV needs nothing here. It took every one of these
+            // positions inside the wave, as a layer, and the truncate below
+            // rolls its rejected tail back with every other layer's.
+            let seeds: Vec<(usize, Option<usize>)> = targets
+                .iter()
+                .zip(&plans)
+                .filter_map(|(&(seq, _), plan)| match plan {
+                    Plan::Reset => None,
+                    Plan::NoOp => Some((seq, None)),
+                    Plan::Rewind { kept, .. } => Some((seq, Some(*kept))),
+                })
+                .collect();
+            self.mtp_take_seeds(&seeds)?;
+
+            for (&(seq, tokens), plan) in targets.iter().zip(&plans) {
+                match plan {
+                    Plan::Reset => {
+                        session.truncate_sequence_to_tokens(seq, tokens)?;
+                        self.release_recurrent(seq)?;
+                    }
+                    Plan::NoOp => {}
+                    Plan::Rewind { span, kept } => {
+                        jobs.push((*span, *kept));
+                        session.truncate_sequence_to_tokens(seq, tokens)?;
+                    }
+                }
+            }
+            match stash.as_ref() {
+                Some(st) => self.replay_recurrent(st, &jobs),
+                None => Ok(()),
+            }
+        })();
+        if let Some(st) = stash {
+            self.put_verify_stash(st)?;
+        }
+        result
     }
 
     fn prune(&self) -> Result<()> {
@@ -272,7 +522,7 @@ impl WaveSweep for HybridBatched {
     }
 
     fn kv_layer_range(&self, layer_start: usize, layer_end: usize) -> (usize, usize) {
-        self.kv_map().kv_range(layer_start, layer_end)
+        HybridBatched::kv_layer_range(self, layer_start, layer_end)
     }
 
     /// Open the wave's recurrent state, sweep, then commit or roll back.
@@ -391,8 +641,10 @@ fn sweep_layers(
     // **Phase 1: admit** — claim every KV chunk this wave will write before a
     // byte of it computes, so the arena frontier is final when the transient
     // tier is placed against it. Over the **KV** range: three quarters of the
-    // trunk range owns no cache at all.
-    let (kv_start, kv_end) = model.kv_map().kv_range(layer_start, layer_end);
+    // trunk range owns no cache at all, and the draft head's layer is one past
+    // the end of it (see [`HybridBatched::kv_layer_range`]).
+    let (kv_start, kv_end) = model.kv_layer_range(layer_start, layer_end);
+    let head_kv = model.mtp_kv_layer().filter(|_| layer_end == num_layers);
     admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
 
     // **Phase 2: price and reserve this wave's transient tier**, sized to this
@@ -514,6 +766,38 @@ fn sweep_layers(
     #[cfg(feature = "cuda")]
     let dn_table = crate::models::delta_net::cuda::build_wave_table(&spans, stores)?;
 
+    // Spans a speculative verify will have to rewind stash each DeltaNet
+    // layer's recurrence operands as the sweep passes through it — every
+    // verifying span into its own rows of ONE shared set of buffers, which is
+    // what lets the replay advance the whole cohort per layer in one launch.
+    // The buffers were sized by `verify_blocks` BEFORE this forward opened —
+    // nothing here allocates. `None` on every ordinary wave, so nothing is
+    // copied either.
+    let verify_seqs = model.verify_row_seqs()?;
+    let cohort_stash: Option<VerifyStash> = if verify_seqs.is_empty() {
+        None
+    } else {
+        model.take_verify_stash()?
+    };
+    // Each span's row in the shared buffers, resolved once rather than per
+    // layer.
+    let stash_rows: Vec<Option<usize>> = spans
+        .iter()
+        .map(|s| {
+            cohort_stash
+                .as_ref()
+                .and_then(|st| st.span_of(s.seq))
+                .map(|sp| sp.row)
+        })
+        .collect();
+    // Which recurrent layer each DeltaNet index is, counted the way
+    // `RecurrentStateStore::recurrent_layer_indices` counts — the order the
+    // replay walks the stash in.
+    let mut dn_ord = q.layers[..layer_start]
+        .iter()
+        .filter(|l| matches!(l.mix, QuantLayerMix::DeltaNet(_)))
+        .count();
+
     for li in layer_start..layer_end {
         match &q.layers[li].mix {
             QuantLayerMix::Attention(_) => {
@@ -567,35 +851,121 @@ fn sweep_layers(
                 };
                 #[cfg(not(feature = "cuda"))]
                 let layer_table = None;
-                delta_net_mix_wave(q, li, &spans, &mut x, stores, eps, layer_table.as_ref())?;
+                let slots: Vec<Option<StashSlot<'_>>> = stash_rows
+                    .iter()
+                    .map(|row| {
+                        row.and_then(|r| {
+                            cohort_stash.as_ref().map(|st| StashSlot {
+                                ops: &st.layers[dn_ord],
+                                row: r,
+                            })
+                        })
+                    })
+                    .collect();
+                delta_net_mix_wave(
+                    q,
+                    li,
+                    &spans,
+                    &mut x,
+                    stores,
+                    eps,
+                    layer_table.as_ref(),
+                    &slots,
+                )?;
+                dn_ord += 1;
                 quantized_delta_net_ffn(&q.layers[li], &mut x, embed_dtype, orig)?;
             }
         }
     }
 
     if layer_end < num_layers {
+        if !verify_seqs.is_empty() {
+            candle::bail!(
+                "qwen35 wave: a speculative verify was split across layer windows — its \
+                 stash would cover only this segment's DeltaNet layers, and a rewind from \
+                 a partial stash advances some layers and not others"
+            );
+        }
         return Ok((WavePhase::Residual(x), None));
     }
 
-    // Head over the rows that need logits: every decode row (one token each,
-    // flat positions `0..n_decode`) and the last token of every prefill row.
+    // The stash is complete: every DeltaNet layer of a full sweep has captured
+    // its operands. Stamp each span's ABSOLUTE start — not `span.start`, which
+    // is its row in the packed wave buffer, a different number entirely for
+    // anything but the first span; the driver rewinds to
+    // `sequence_offset + accepted` — and file it back where the truncate will
+    // find it if the accept comes back short.
+    if let Some(mut st) = cohort_stash {
+        for sp in st.spans.iter_mut() {
+            let at = spans.iter().position(|s| s.seq == sp.seq).ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "qwen35 wave: stash span for sequence {} has no wave span",
+                    sp.seq
+                ))
+            })?;
+            sp.start = offsets[at];
+        }
+        model.put_verify_stash(st)?;
+    }
+
     let xt = x.to_tensor();
     let hidden = xt.dim(2)?;
     let x_flat = xt.reshape((xt.dim(1)?, hidden))?;
-    let mut idx: Vec<u32> = Vec::with_capacity(n_decode + n_prefill);
-    for d in 0..n_decode {
+
+    // **The draft head's layer.** One more attention pass over the same rows at
+    // the same positions, against the KV layer past every trunk one, so the
+    // head's history stays exactly as long as the sequence it drafts for. It
+    // runs here rather than inside the sweep because its input is the trunk's
+    // OUTPUT, not the residual stream. See [`super::draft`].
+    if let (Some(head), Some(kv_layer)) = (q.mtp.as_ref(), head_kv) {
+        let packed: Vec<Tensor> = contexts.iter().map(|c| c.input_ids.clone()).collect();
+        let ids = TensorCat::from_tensors(1, packed)?;
+        head_wave_pass(
+            model,
+            head,
+            contexts,
+            &x_flat,
+            &ids.to_tensor(),
+            &HeadWave {
+                n_decode,
+                pre_rows,
+                dec_off,
+                pre_off,
+                dec_params: &dec_params,
+                pre_params: &pre_params,
+                spans: &spans,
+                kv_layer,
+                act_dtype: embed_dtype,
+            },
+        )?;
+    }
+
+    // Head over the rows that need logits: every decode row (one token each,
+    // flat positions `0..n_decode`) and the last token of every prefill row —
+    // except a **verifying** span, where every row is a prediction to compare a
+    // proposal against, so all of them are scored.
+    let mut idx: Vec<u32> = Vec::with_capacity(n_decode + pre_rows);
+    for (d, _) in seq_ids.iter().take(n_decode).enumerate() {
         idx.push(d as u32);
     }
     let mut acc = n_decode as u32;
-    for &l in pre_q {
+    for (k, &l) in pre_q.iter().enumerate() {
+        let seq = seq_ids[n_decode + k];
+        if verify_seqs.contains(&seq) {
+            for t in 0..l as u32 {
+                idx.push(acc + t);
+            }
+        } else {
+            idx.push(acc + l as u32 - 1);
+        }
         acc += l as u32;
-        idx.push(acc - 1);
     }
     if idx.is_empty() {
         return Ok((WavePhase::Residual(x), None));
     }
     let pre_norm = {
-        let sel = Tensor::from_vec(idx, n_decode + n_prefill, x_flat.device())?;
+        let n_sel = idx.len();
+        let sel = Tensor::from_vec(idx, n_sel, x_flat.device())?;
         x_flat.index_select(&sel, 0)?.contiguous()?
     };
     // The head's span, reset per forward — the lifetime the norm and the logits
@@ -626,27 +996,39 @@ fn sweep_layers(
             q.lm_head.forward(&q.final_norm.forward(&pre_norm)?)?
         }
     };
+
     Ok((
         WavePhase::Logits(TensorCat::from_cat_tensor(logits, 0)?),
         head_span,
     ))
 }
 
-/// Embed token ids through the host-resident table.
+/// Embed token ids through the off-card table, as `[1, n, hidden]` of `dtype`.
 ///
-/// One of the two sanctioned GPU→CPU touches on the hot path (CLAUDE.md
-/// invariant 3): the ids come back, a CPU `index_select` gathers the rows, and
-/// one upload carries them in — which keeps a `vocab × hidden` table (4 GB at
-/// the 9B's geometry) out of VRAM entirely.
+/// The table is never resident — a `vocab × hidden` tensor is 4 GB at the 9B's
+/// geometry for one row read per token — so this is where the forward reaches
+/// off the device for it.
+///
+/// Under [`EmbeddingTable::HostMapped`] that reach is not a *synchronisation*:
+/// the GPU gathers the quantized rows over PCIe from the ids where they already
+/// are. The staging span is opened just for the gather, before the layer loop
+/// claims the same arena for real work — the bytes are reserved whether or not
+/// anything uses them, so they are free here, and the gathered bytes are dead
+/// the moment the dequantize on the next line has read them.
 fn embed_rows(model: &QuantModel, ids: &Tensor, dtype: DType) -> Result<Tensor> {
-    let flat = ids.flatten_all()?;
-    let n = flat.elem_count();
-    let host_ids = flat.to_dtype(DType::U32)?.to_device(&Device::Cpu)?;
-    let rows = model.embed.index_select(&host_ids, 0)?;
-    let hidden = model.cfg.hidden_size;
-    rows.reshape((1, n, hidden))?
-        .to_dtype(dtype)?
-        .to_device(&model.device)
+    let n = ids.elem_count();
+    #[cfg(feature = "cuda")]
+    let staging = match &model.device {
+        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
+        _ => None,
+    };
+    #[cfg(not(feature = "cuda"))]
+    let staging: Option<WaveGuard> = None;
+    let rows = model
+        .embed
+        .rows(ids, &model.device, wave_root(staging.as_ref()), dtype)?;
+    drop(staging);
+    rows.reshape((1, n, model.cfg.hidden_size))
 }
 
 #[cfg(test)]

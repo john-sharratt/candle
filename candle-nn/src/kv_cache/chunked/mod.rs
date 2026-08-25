@@ -135,7 +135,7 @@ pub use bump_arena::{
     wave_domain_stats, BumpRange, ForwardOpen, Generation as WaveGeneration, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
-pub use guard::expect_kv_range;
+pub use guard::{expect_kv_range, expect_kv_range_in};
 #[cfg(feature = "cuda")]
 pub use region_pool::{
     initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,

@@ -151,50 +151,89 @@ use candle_transformers::models::quantized_matmul::QMatMul as QMatMulWrapper;
 // Note: max_rel_diff can be very high when baseline values are near zero.
 // We use rtol primarily for sanity checking, atol is the main constraint.
 // ============================================================================
-// EMPIRICAL BASELINES (from Q4_K and Q6_K with float accumulators):
-//   BF16:   max_diff = 0.008-0.017  → ATOL = 0.025 (~50% headroom)
-//   F16:    max_diff = 0.001-0.0024 → ATOL = 0.004 (~65% headroom)
-//   F32:    max_diff = 0.0005-0.0018 → ATOL = 0.003 (~65% headroom)
-//   F8E4M3: max_diff = 0.049-0.063  → ATOL = 0.080 (~25% headroom)
+// THE ERROR TRACKS THE WEIGHT FORMAT, NOT THE ACTIVATION DTYPE.
+//
+// `compute_baseline` dequantizes the SAME weight the kernel reads, so weight
+// quantization error cancels and what is left is how the kernel accumulates.
+// That path quantizes the activations to **Q8_1 whatever dtype they arrive in**
+// (`mul_mat_vec_via_q8_1`, and MMQ's `quantize_row_q8_1`), so an F32 activation
+// — which suffers no rounding at all before the kernel — lands on the same floor
+// as BF16. Measured, K=2048, across every batch size, per format:
+//
+//   format   BF16      F16       F32       F8E4M3
+//   Q2_K     0.008573  0.008386  0.008387  0.064909
+//   Q3_K     0.010153  0.008052  0.008153  0.064467
+//   Q4_0     0.037627  0.037871  0.037871  0.080813
+//   Q4_1     0.046146  0.046176  0.046175  0.089088
+//   Q4_K     0.046472  0.046533  0.046504  0.093061
+//   Q5_0     0.028712  0.028471  0.028387  0.064409
+//   Q5_1     0.045567  0.045933  0.045959  0.085718
+//   Q5_K     0.046247  0.046125  0.046122  0.086442
+//   Q6_K     0.012313  0.009384  0.008967  0.065172
+//   Q8_0     0.010062  0.008602  0.008944  0.065954
+//   Q8_K     0.009488  0.009043  0.008911  0.065606
+//
+// The three float columns agree to the third decimal within every row and vary
+// 5x between rows — the format is the variable, the activation dtype is not.
+// F8E4M3 is the one real exception: it is lossy *before* the kernel sees it.
+//
+// The previous table modelled the opposite (one tolerance per activation dtype,
+// F32 held ~8x tighter than BF16) and was calibrated, in its own words, "with
+// float accumulators" — the FP fast path deleted in 3bf7dfc7. It has been
+// unreachable since: `run_all_dtype_tests` bails in step 1, so this sweep has
+// not run since that commit and the stale numbers were never contradicted.
 // ============================================================================
 
-/// BF16 tolerances (7-bit mantissa → ~2 ULP = 0.016 at magnitude 1.0)
-/// Q4_K observed: 0.013-0.017, Q6_K observed: 0.008-0.016
+/// Relative tolerance. Secondary — `check_tolerance` needs BOTH relative and
+/// absolute to fail, and `max_rel_diff` is meaningless where the baseline is
+/// near zero, so the absolute bound below is what actually constrains.
 #[cfg(feature = "cuda")]
-pub const RTOL_BF16: f32 = 0.05;
-#[cfg(feature = "cuda")]
-pub const ATOL_BF16: f32 = 0.025; // max observed 0.017
+pub const RTOL: f32 = 0.05;
 
-/// F16 tolerances (10-bit mantissa → ~2 ULP = 0.002 at magnitude 1.0)
-/// Q4_K observed: 0.0017-0.0024, Q6_K observed: 0.001-0.0022
-#[cfg(feature = "cuda")]
-pub const RTOL_F16: f32 = 0.05;
-#[cfg(feature = "cuda")]
-pub const ATOL_F16: f32 = 0.004; // max observed 0.0024
-
-/// F32 tolerances (quantization error floor, TC path slightly higher)
-/// Q4_K observed: 0.001-0.0018, Q6_K observed: 0.0005-0.001
-#[cfg(feature = "cuda")]
-pub const RTOL_F32: f32 = 0.05;
-#[cfg(feature = "cuda")]
-pub const ATOL_F32: f32 = 0.003; // max observed 0.0018
-
-/// F8E4M3 tolerances (3-bit mantissa → 1 ULP = 0.0625 at magnitude 1.0)
-/// Q4_K observed: 0.049-0.063, Q6_K observed: 0.053-0.063
+/// Relative tolerance for F8E4M3 activations, which are coarse enough that the
+/// relative bound has to give as well.
 #[cfg(feature = "cuda")]
 pub const RTOL_F8: f32 = 0.10;
-#[cfg(feature = "cuda")]
-pub const ATOL_F8: f32 = 0.080; // max observed 0.063
 
-/// Get tolerance for a given dtype
+/// The largest batch the mmvq (vec) kernel serves before the dispatcher hands
+/// over to MMQ — `max_bm` in `QCudaStorage::fwd`, mirrored here because the
+/// batch sweep straddles it and the two kernels reduce differently.
+///
+/// Keep in step with the dispatcher: if that boundary moves, this sweep will
+/// compare a vec batch against an MMQ one and report a kernel bug that is
+/// really a dispatch change.
 #[cfg(feature = "cuda")]
-pub fn get_tolerance(dtype: DType) -> (f32, f32) {
+pub const VEC_KERNEL_MAX_BATCH: usize = 8;
+
+/// The float-activation absolute bound for `dtype`, at ~1.4x the measured
+/// maximum above.
+///
+/// Per format rather than one global number: a single bound loose enough for
+/// Q4_K (0.047) would be 5x slack on Q8_0 (0.010) and would stop catching
+/// anything there.
+#[cfg(feature = "cuda")]
+pub fn atol_for_format(dtype: GgmlDType) -> f32 {
     match dtype {
-        DType::F32 => (RTOL_F32, ATOL_F32),
-        DType::F16 => (RTOL_F16, ATOL_F16),
-        DType::BF16 => (RTOL_BF16, ATOL_BF16),
-        DType::F8E4M3 => (RTOL_F8, ATOL_F8),
-        _ => (RTOL_BF16, ATOL_BF16), // Default to BF16 tolerances
+        GgmlDType::Q4_1 | GgmlDType::Q4_K | GgmlDType::Q5_1 | GgmlDType::Q5_K => 0.065,
+        GgmlDType::Q4_0 => 0.055,
+        GgmlDType::Q5_0 => 0.040,
+        _ => 0.018,
+    }
+}
+
+/// The F8E4M3 bound for `dtype`: the float floor plus the ~0.06 the activation
+/// format costs on its own (1 ULP at magnitude 1.0 is 0.0625).
+#[cfg(feature = "cuda")]
+pub fn atol_f8_for_format(dtype: GgmlDType) -> f32 {
+    atol_for_format(dtype) + 0.070
+}
+
+/// Tolerances for one (weight format, activation dtype) pair.
+#[cfg(feature = "cuda")]
+pub fn get_tolerance_for(weight: GgmlDType, activation: DType) -> (f32, f32) {
+    match activation {
+        DType::F8E4M3 => (RTOL_F8, atol_f8_for_format(weight)),
+        _ => (RTOL, atol_for_format(weight)),
     }
 }
 
@@ -490,7 +529,7 @@ pub fn run_dtype_test(
     device: &Device,
 ) -> Result<ComparisonStats> {
     let dtype_name = format!("{:?}", input_dtype);
-    let (rtol, atol) = get_tolerance(input_dtype);
+    let (rtol, atol) = get_tolerance_for(config.dtype, input_dtype);
 
     // Create and quantize weights
     let weights_f32 = create_test_weights(config.nrows, config.ncols, device)?;
@@ -599,7 +638,8 @@ pub fn run_all_dtype_tests(config: &QuantTestConfig, device: &Device) -> Result<
         let dtype_name = format!("{:?}", dtype);
         let mut baseline_max_diff: Option<f32> = None;
         let mut degradation_detected = false;
-        let (rtol, atol) = get_tolerance(dtype);
+        let mut crossed_mmq = false;
+        let (rtol, atol) = get_tolerance_for(config.dtype, dtype);
 
         // Test across all batch sizes with seq=1 for simplicity
         for &batch_size in TEST_BATCH_SIZES {
@@ -646,11 +686,29 @@ pub fn run_all_dtype_tests(config: &QuantTestConfig, device: &Device) -> Result<
                 );
             }
 
-            match &result.stats {
-                Some(stats) => {
-                    // Check for precision degradation with increasing batch size
-                    if let Some(base_diff) = baseline_max_diff {
-                        // For FP8, use fixed threshold based on expected quantization error (2 ULP = 0.125)
+            if let Some(stats) = &result.stats {
+                // Precision must not degrade with batch size **within one
+                // kernel**. Across the vec→MMQ boundary it legitimately does:
+                // those are different kernels with different reduction orders,
+                // and the dispatcher picks between them precisely by batch size
+                // (`max_bm` in `QCudaStorage::fwd`). Measured on Q4_K, BF16:
+                // 0.0049 at batch 1 rising to 0.0073 at batch 8, then 0.0300 at
+                // 16, 0.0429 at 64, 0.0465 at 128 — a 4x step exactly at the
+                // boundary and a smooth climb on either side of it.
+                //
+                // Comparing across it asserted an invariant the design does not
+                // have ("batch size should NOT affect precision"), so the
+                // baseline resets when the kernel changes and each arm is
+                // judged against its own first batch.
+                if batch_size > VEC_KERNEL_MAX_BATCH && baseline_max_diff.is_some() && !crossed_mmq
+                {
+                    crossed_mmq = true;
+                    baseline_max_diff = None;
+                }
+                match baseline_max_diff {
+                    Some(base_diff) => {
+                        // For FP8, a fixed threshold: its own quantization error
+                        // (2 ULP = 0.125) dwarfs any batch effect.
                         let threshold = if dtype == DType::F8E4M3 {
                             0.15
                         } else {
@@ -659,11 +717,9 @@ pub fn run_all_dtype_tests(config: &QuantTestConfig, device: &Device) -> Result<
                         if stats.max_diff.abs() > threshold {
                             degradation_detected = true;
                         }
-                    } else {
-                        baseline_max_diff = Some(stats.max_diff);
                     }
+                    None => baseline_max_diff = Some(stats.max_diff),
                 }
-                None => {}
             }
             all_results.push(result);
         }
@@ -4699,8 +4755,8 @@ fn test_single_config_quick(config: &QuantTestConfig, device: &Device) -> bool {
         let qmatmul = QMatMulWrapper::from_qtensor(qtensor)?;
         let result = qmatmul.forward(&input)?;
 
-        // Check correctness with F16 tolerance
-        let (rtol, atol) = get_tolerance(DType::F16);
+        // Check correctness at this format's F16-activation tolerance
+        let (rtol, atol) = get_tolerance_for(config.dtype, DType::F16);
         assert_approx_eq(&baseline, &result, rtol, atol)?;
 
         Ok(())
@@ -4812,23 +4868,62 @@ pub fn expected_repacked_size(config: &QuantTestConfig) -> usize {
     config.nrows * blocks_per_row * K128_BLOCK_BYTES[qtype]
 }
 
-/// Validate dequantized output by comparing loader-based dequant against original.
+/// **Does the repacked weight compute the same product as the original?**
 ///
-/// This test compares element-by-element:
-/// 1. Dequantize original tensor using standard GGML path (ground truth)
-/// 2. Dequantize repacked tensor using loader-based kernel
-/// 3. Find and report mismatches with position information
+/// The independent half of the repack test, and the one that would catch a
+/// wrong permutation: `validate_repack` only asserts the repacked bytes are the
+/// expected *size*, which a repack that shuffled elements into the wrong lanes
+/// would satisfy exactly. This runs the K/128 form through the FP GEMX kernel
+/// and compares against the dequantized original, so the two disagree the
+/// moment an element lands in the wrong place.
 ///
-/// For each mismatch, also searches where the actual value appears in the
-/// expected buffer to help debug element mapping issues.
+/// Both sides read the SAME quantized weight, so quantization error cancels and
+/// what is left is the accumulation difference between a BF16-activation kernel
+/// and an F32 reference matmul — hence the BF16 tolerance.
+///
+/// Reached through `candle::quantized::QMatMul`, not `QMatMulWrapper`: the
+/// wrapper's `from_qtensor_repacked` is the production entry for expert slots
+/// and takes **KO twins only**, because that is the only repacked form the
+/// engine runs. The FP GEMX form has its own kernel and its own entry point
+/// (`forward_via_gemx`), which is what this exercises. Borrowing the wrapper's
+/// constructor for it — as this test did before — asked the production path to
+/// accept a tensor production never hands it.
 #[cfg(feature = "cuda")]
-pub fn validate_dequant_mapping(
+pub fn validate_gemx_matmul(
     original: &QTensor,
-    repacked_qmatmul: &QMatMulWrapper,
+    repacked: QTensor,
     config: &QuantTestConfig,
+    device: &Device,
 ) -> Result<()> {
-    println!("  Skipping dequant mapping (embedded K/128 layout)");
-    let _ = (original, repacked_qmatmul, config);
+    let (n, k) = (config.nrows, config.ncols);
+    let seq = 4usize;
+
+    // Reference: the dequantized weight through an ordinary F32 matmul.
+    let w = original.dequantize(device)?.to_dtype(DType::F32)?;
+    let x = create_test_input(1, seq, k, DType::BF16, device)?;
+    let reference = x
+        .reshape((seq, k))?
+        .to_dtype(DType::F32)?
+        .matmul(&w.t()?.contiguous()?)?;
+
+    // Under test: the K/128 repack through the FP GEMX kernel.
+    let gemx = candle::quantized::QMatMul::from_qtensor(repacked)?
+        .forward_via_gemx(&x)?
+        .reshape((seq, n))?
+        .to_dtype(DType::F32)?;
+
+    let (rtol, atol) = get_tolerance_for(config.dtype, DType::BF16);
+    assert_approx_eq(&gemx, &reference, rtol, atol).map_err(|e| {
+        candle::Error::Msg(format!(
+            "{} GEMX repack does not match the dequantized original — the K/128 \
+             layout is the right SIZE but computes a different product: {e}",
+            config.name
+        ))
+    })?;
+    println!(
+        "  ✓ {} GEMX matmul matches the dequantized original",
+        config.name
+    );
     Ok(())
 }
 
@@ -4912,10 +5007,8 @@ pub fn test_repacking(config: &QuantTestConfig, device: &Device) -> Result<()> {
     // Validate byte-level repack
     validate_repack(&qtensor, &repacked, config)?;
 
-    println!("\n  Step 2: Validate dequantization mapping");
-    // Create QMatMulWrapper from repacked tensor (K/128 has embedded scales)
-    let repacked_wrapper = QMatMulWrapper::from_qtensor_repacked(repacked)?;
-    validate_dequant_mapping(&qtensor, &repacked_wrapper, config)?;
+    println!("\n  Step 2: Validate the repack computes the same product");
+    validate_gemx_matmul(&qtensor, repacked, config, device)?;
 
     Ok(())
 }
@@ -4956,7 +5049,10 @@ pub mod negative_tests {
         let a = Tensor::from_vec(vec![1.0f32, 2.0, f32::NAN, 4.0], 4, device)?;
         let b = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], 4, device)?;
 
-        let result = assert_approx_eq(&a, &b, RTOL_BF16, ATOL_BF16);
+        // Tolerances wide enough that nothing could fail on magnitude: what is
+        // being asserted is that the NaN / shape checks fire on their own, not
+        // that these particular numbers happen to exceed a bound.
+        let result = assert_approx_eq(&a, &b, 1.0, 1.0);
         assert!(result.is_err(), "Should have detected NaN");
 
         let err_msg = format!("{:?}", result.unwrap_err());
@@ -4975,7 +5071,10 @@ pub mod negative_tests {
         let a = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], 3, device)?;
         let b = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], 4, device)?;
 
-        let result = assert_approx_eq(&a, &b, RTOL_BF16, ATOL_BF16);
+        // Tolerances wide enough that nothing could fail on magnitude: what is
+        // being asserted is that the NaN / shape checks fire on their own, not
+        // that these particular numbers happen to exceed a bound.
+        let result = assert_approx_eq(&a, &b, 1.0, 1.0);
         assert!(result.is_err(), "Should have detected shape mismatch");
 
         let err_msg = format!("{:?}", result.unwrap_err());

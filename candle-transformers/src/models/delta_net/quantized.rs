@@ -64,16 +64,21 @@ pub fn quantized_delta_net_layer_forward<'w>(
     rms_eps: f64,
 ) -> Result<LiveTensor<'w>> {
     let t = x.dim(0)?;
-    // One buffer, as in the float single-span path: read and write the same
-    // tensor, since there is no wave to roll back here.
-    let s_out = state.s.clone();
+    // One carried state, as in the float single-span path: `s` is read and
+    // written in place, the conv tail lands in a scratch buffer that is folded
+    // back below. There is no wave to roll back here.
+    let out = state.solo_out()?;
     let mut one = [DeltaNetSeq {
         start: 0,
         len: t,
         state,
-        s_out,
+        out,
+        stash: None,
     }];
-    quantized_delta_net_layer_forward_spans(x, w, dims, &mut one, rms_eps, None)
+    let mixed = quantized_delta_net_layer_forward_spans(x, w, dims, &mut one, rms_eps, None)?;
+    let [seq] = one;
+    seq.state.absorb_solo(&seq.out)?;
+    Ok(mixed)
 }
 
 /// One production DeltaNet layer over a `[T, hidden]` activation block holding
@@ -124,6 +129,14 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
         alpha_lin: w.w_alpha.forward_live_as(x, candle::DType::F32)?,
     };
     g_proj.end();
+    // A span that will have to rewind keeps this layer's operands, copied out
+    // of the wave arena that is reclaimed at the end of the forward. The
+    // destination is already allocated — see `DeltaNetSeq::stash`.
+    for s in seqs.iter() {
+        if let Some(slot) = s.stash.as_ref() {
+            slot.ops.capture(&p, s.start, slot.row, s.len)?;
+        }
+    }
     let c = DeltaNetConstants {
         dt_bias: &w.dt_bias,
         a: &w.a,
@@ -181,9 +194,14 @@ mod tests {
         let content = Content::read(&mut reader)?;
         reader.seek(SeekFrom::Start(0))?;
         // The 9B is dense, so it needs no expert cache.
-        let model = load_quantized_model(&content, &mut reader, &device, Int8Mode::Off, |_, _| {
-            Ok(None)
-        })?;
+        let model = load_quantized_model(
+            &content,
+            &mut reader,
+            &device,
+            Int8Mode::Off,
+            None,
+            |_, _| Ok(None),
+        )?;
 
         let dims = model.cfg.delta_net;
         println!(

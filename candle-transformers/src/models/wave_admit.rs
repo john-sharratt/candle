@@ -104,8 +104,38 @@ pub(crate) fn admit_wave_kv(
         // Each sequence's own token count, never the batch maximum: an
         // over-allocated tail chunk on a shorter sequence desyncs its decode
         // writer slice.
+        //
+        // **`add + 1`, not `add`.** The multi-token attention entry ends by
+        // priming the persistent decode slot buffers
+        // (`KvCache::prime_chunked_decode_slots_batch`), which ensures capacity
+        // for ONE more token — the first decode step's write chunk — so the hot
+        // path can reuse the serialized slot instead of rebuilding it. That
+        // call happens INSIDE the forward, and when a prefill ends exactly on a
+        // chunk boundary it is a real allocation: the tail is full, so the
+        // extra token needs a chunk nothing claimed. It lands in the tail's
+        // free room the rest of the time, which is why the hole stayed shut for
+        // as long as the pool had slack in every format rung. It stopped being
+        // shut when this lineage grew a ninth KV layer for the MTP draft head
+        // ([`crate::models::qwen35::draft`]): one more layer priming per wave,
+        // against rungs already at 4096/4096, and the claim came back as
+        // "creating a KV arena from inside the forward that owns the partition"
+        // — which is unrecoverable by design, because the thread that would
+        // have to end the wave is the one asking.
+        //
+        // Claiming the token here costs at most one chunk per sequence per
+        // layer, and only in the boundary case. It is never a wasted chunk even
+        // on the quantized path, where the prime is skipped (the slot buffers
+        // rebuild after reconcile instead): the next decode step's own
+        // `ensure_for_batch_entries_all(.., 1)` claims exactly this chunk. All
+        // that changes is which side of the forward the claim falls on, which
+        // is the whole point — outside it, a pool with no ground can still be
+        // relieved.
         for (i, &add) in q_lens[..n_prefill].iter().enumerate() {
-            KvCache::ensure_chunked_capacity_batch(&mut caches[i..i + 1], &offsets[i..i + 1], add)?;
+            KvCache::ensure_chunked_capacity_batch(
+                &mut caches[i..i + 1],
+                &offsets[i..i + 1],
+                add + 1,
+            )?;
         }
     }
     Ok(())

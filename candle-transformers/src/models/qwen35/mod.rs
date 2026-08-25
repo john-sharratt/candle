@@ -24,6 +24,9 @@ pub mod attention;
 #[cfg(feature = "cuda")]
 pub mod batched;
 pub mod config;
+#[cfg(feature = "cuda")]
+pub mod draft;
+pub mod embedding;
 pub mod engine;
 pub mod expert_loader;
 #[cfg(feature = "cuda")]
@@ -31,6 +34,7 @@ pub mod forward;
 pub mod loader;
 pub mod model;
 pub mod moe;
+pub mod mtp;
 #[cfg(feature = "cuda")]
 pub mod quantized_attention;
 pub mod quantized_delta_net;
@@ -39,6 +43,7 @@ pub mod quantized_loader;
 #[cfg(feature = "cuda")]
 pub mod quantized_moe;
 pub mod quantized_weights;
+pub mod spec;
 #[cfg(feature = "cuda")]
 pub mod wave;
 

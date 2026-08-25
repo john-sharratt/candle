@@ -1527,11 +1527,19 @@ impl TestParams {
             committed.push(c);
             active.push(run.output.len() < max_tokens && !stop_on.contains(&c));
         }
+        // Acceptance is the whole economics of speculation: a step costs about
+        // one plain wave and yields however many tokens the verify confirmed,
+        // so mean accepted/step IS the speedup ceiling. Reported rather than
+        // asserted — it is a property of the text, not of the code.
+        let (mut steps, mut emitted) = (0usize, 0usize);
+        let t_spec = std::time::Instant::now();
         loop {
             let idxs: Vec<usize> = (0..sequence_indices.len()).filter(|&i| active[i]).collect();
             if idxs.is_empty() {
                 break;
             }
+            steps += 1;
+            let before: usize = idxs.iter().map(|&i| runs[i].output.len()).sum();
             let seqs: Vec<usize> = idxs.iter().map(|&i| sequence_indices[i]).collect();
             let comms: Vec<u32> = idxs.iter().map(|&i| committed[i]).collect();
             // Per-session emit sinks over DISJOINT `runs` borrows: each pushes
@@ -1561,7 +1569,23 @@ impl TestParams {
                     None => active[i] = false,
                 }
             }
+            emitted += idxs.iter().map(|&i| runs[i].output.len()).sum::<usize>() - before;
         }
+        let secs = t_spec.elapsed().as_secs_f64();
+        println!(
+            "  speculative: {steps} steps, {emitted} tokens, {:.2} accepted/step \
+             ({:.1} tok/s over the cohort, draft budget {max_draft})",
+            if steps > 0 {
+                emitted as f64 / steps as f64
+            } else {
+                0.0
+            },
+            if secs > 0.0 {
+                emitted as f64 / secs
+            } else {
+                0.0
+            },
+        );
         Ok(max_tokens)
     }
 

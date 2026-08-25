@@ -113,21 +113,26 @@ static __global__ void delta_net_decode_step_f32_kernel(
 }
 
 // Causal depthwise conv, one token step per decode sequence, batched over
-// the wave: grid ((channels+255)/256, n_decode). Tails are carried in place
-// (each sequence's tail lives in its own allocation — the pointer table
-// again), and the SiLU + Q|K-norm epilogue makes the output row the same
-// operand-buffer contract as the prefill conv.
-//   x      : [T_wave, channels]      the wave's pre-conv fused QKV rows
-//   kernel : [channels, kwidth]
-//   tails  : [n_decode] device f32* to [channels, kwidth-1] (shift left,
-//            append the RAW x — the conv window wants pre-activation values)
-//   rows   : [n_decode] each sequence's row in x/y
-//   y      : [T_wave, channels]      y = epilogue(sum_j kern[c,j]*window[j])
+// the wave: grid ((channels+255)/256, n_decode). The entering and advanced
+// tails are separate allocations named by two pointer tables — the wave writes
+// the buffer it is not reading, so a failed wave leaves the entering tail
+// intact and `commit_wave` installs the advance with a host pointer swap. The
+// SiLU + Q|K-norm epilogue makes the output row the same operand-buffer
+// contract as the prefill conv.
+//   x         : [T_wave, channels]   the wave's pre-conv fused QKV rows
+//   kernel    : [channels, kwidth]
+//   tails     : [n_decode] device f32* to the entering [channels, kwidth-1]
+//   tails_out : [n_decode] device f32* to the advanced [channels, kwidth-1]
+//               (the entering tail shifted left with the RAW x appended — the
+//               conv window wants pre-activation values)
+//   rows      : [n_decode] each sequence's row in x/y
+//   y         : [T_wave, channels]   y = epilogue(sum_j kern[c,j]*window[j])
 // window = [tail | x] so the output sees inputs t-K+1 ..= t.
 static __global__ void delta_net_conv_decode_f32_kernel(
         const float*        __restrict__ x,
         const float*        __restrict__ kernel,
         const long long*    __restrict__ tails,
+        const long long*    __restrict__ tails_out,
         const unsigned int* __restrict__ rows,
         float*              __restrict__ y,
         int channels,
@@ -141,23 +146,24 @@ static __global__ void delta_net_conv_decode_f32_kernel(
     const int row = (int)rows[seq];
 
     const int tcols = kwidth - 1;
-    float* trow = ((float*)tails[seq]) + (size_t)c * tcols;
+    const float* trow_in = ((const float*)tails[seq]) + (size_t)c * tcols;
+    float* trow_out = ((float*)tails_out[seq]) + (size_t)c * tcols;
     const float xv = x[(size_t)row * channels + c];
     const float* krow = kernel + (size_t)c * kwidth;
 
     float acc = krow[kwidth - 1] * xv;
     for (int j = 0; j < tcols; ++j) {
-        acc += krow[j] * trow[j];
+        acc += krow[j] * trow_in[j];
     }
     y[(size_t)row * channels + c] =
         dn_silu_norm_epilogue(acc, c, qk_channels, eps, (int)threadIdx.x, red);
 
     // Shift the tail left and append this token.
     for (int j = 0; j + 1 < tcols; ++j) {
-        trow[j] = trow[j + 1];
+        trow_out[j] = trow_in[j + 1];
     }
     if (tcols > 0) {
-        trow[tcols - 1] = xv;
+        trow_out[tcols - 1] = xv;
     }
 }
 
@@ -213,6 +219,7 @@ static inline void launch_conv_decode_f32(
         const float* x,
         const float* kernel,
         const long long* tails,
+        const long long* tails_out,
         const unsigned int* rows,
         float* y,
         int n_decode,
@@ -227,7 +234,7 @@ static inline void launch_conv_decode_f32(
     const int threads = 256;
     dim3 grid((channels + threads - 1) / threads, n_decode);
     delta_net_conv_decode_f32_kernel<<<grid, threads, 0, stream>>>(
-        x, kernel, tails, rows, y, channels, kwidth, qk_channels, eps);
+        x, kernel, tails, tails_out, rows, y, channels, kwidth, qk_channels, eps);
 }
 
 static inline void launch_batch_ptrs(

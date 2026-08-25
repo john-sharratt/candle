@@ -26,7 +26,7 @@ use super::quantized_delta_net::quantized_delta_net_ffn;
 use super::quantized_weights::{QuantLayerMix, QuantModel};
 use crate::models::delta_net::{
     quantized_delta_net_layer_forward_spans, DeltaNetLayerTable, DeltaNetSeq, KvLayerMap,
-    RecurrentStateStore, SeqSpan,
+    RecurrentStateStore, SeqSpan, StashSlot,
 };
 use crate::models::rotary_layout::RotaryLayout;
 use crate::models::tensor_cat::TensorCat;
@@ -44,6 +44,11 @@ use crate::models::tensor_cat::TensorCat;
 /// The stores are advanced in place: this is the point at which a sequence's
 /// state moves forward, which is why a failed wave must `rollback_wave`
 /// rather than simply not commit.
+// `stores` and `stash` are two per-span arrays the caller owns separately —
+// the stores are lifted out of the model's map for the sweep, the stash slots
+// are the sweep's own. Zipping them into one slice would make every caller
+// build a temporary pairing to satisfy a lint.
+#[allow(clippy::too_many_arguments)]
 pub fn delta_net_mix_wave(
     model: &QuantModel,
     layer_idx: usize,
@@ -52,17 +57,19 @@ pub fn delta_net_mix_wave(
     stores: &mut [&mut RecurrentStateStore],
     rms_eps: f64,
     table: Option<&DeltaNetLayerTable>,
+    stash: &[Option<StashSlot<'_>>],
 ) -> Result<()> {
     let layer = &model.layers[layer_idx];
     let QuantLayerMix::DeltaNet(w) = &layer.mix else {
         candle::bail!("delta_net_mix_wave called on a non-DeltaNet layer {layer_idx}");
     };
-    if stores.len() != spans.len() {
+    if stores.len() != spans.len() || stash.len() != spans.len() {
         candle::bail!(
-            "delta_net_mix_wave: {} spans against {} state stores — every \
-             sequence in the wave carries its own recurrent state",
+            "delta_net_mix_wave: {} spans against {} state stores and {} stash slots — \
+             every sequence in the wave carries its own recurrent state",
             spans.len(),
-            stores.len()
+            stores.len(),
+            stash.len()
         );
     }
     let dims = &model.cfg.delta_net;
@@ -109,16 +116,20 @@ pub fn delta_net_mix_wave(
     // also what records that this layer advanced, so a sweep that covers part
     // of the stack commits only the layers it actually ran.
     //
-    // The conv tail inside `state` is still advanced in place; only `s` has two
-    // buffers.
+    // Both carried buffers have two halves — `s` and the conv tail alike — so
+    // the layer advances without a copy anywhere.
     let mut seqs: Vec<DeltaNetSeq<'_>> = Vec::with_capacity(spans.len());
-    for (span, store) in spans.iter().zip(stores.iter_mut()) {
-        let (state, s_out) = store.layer_state_pair_mut(layer_idx)?;
+    for ((span, store), slot) in spans.iter().zip(stores.iter_mut()).zip(stash.iter()) {
+        let (state, out) = store.layer_state_pair_mut(layer_idx)?;
         seqs.push(DeltaNetSeq {
             start: span.start,
             len: span.len,
             state,
-            s_out,
+            out,
+            // `Some` only for a span a speculative verify will have to rewind
+            // — see `super::spec`. Every other span stashes nothing, so an
+            // ordinary wave copies nothing.
+            stash: *slot,
         });
     }
     let mixed =
@@ -254,20 +265,25 @@ mod tests {
         use candle::{Module, Tensor};
         use std::io::{BufReader, Seek, SeekFrom};
 
-        let path = hf_get(
-            "unsloth/Qwen3.5-9B-GGUF",
-            hf_hub::RepoType::Model,
-            "3885219b6810b007914f3a7950a8d1b469d598a5",
-            "Qwen3.5-9B-Q6_K.gguf",
-        )?;
+        // The lineage's own pin, not a second copy of it: a test that names its
+        // own revision keeps passing against a checkpoint the gates no longer
+        // run, which is how this one was still fetching the pre-MTP 9B after
+        // the pin moved.
+        let spec = crate::models::quantized_qwen35::QWEN35_9B;
+        let path = hf_get(spec.0, hf_hub::RepoType::Model, spec.1, spec.2)?;
         let device = Device::new_cuda(0)?;
         let mut reader = BufReader::new(std::fs::File::open(&path)?);
         let content = Content::read(&mut reader)?;
         reader.seek(SeekFrom::Start(0))?;
         // The 9B is dense, so it needs no expert cache.
-        let model = load_quantized_model(&content, &mut reader, &device, Int8Mode::Off, |_, _| {
-            Ok(None)
-        })?;
+        let model = load_quantized_model(
+            &content,
+            &mut reader,
+            &device,
+            Int8Mode::Off,
+            None,
+            |_, _| Ok(None),
+        )?;
 
         let li = 0usize; // DeltaNet under the 3:1 schedule
         let hidden = model.cfg.hidden_size;
@@ -311,8 +327,20 @@ mod tests {
             RecurrentStateStore::new(&model.cfg.layer_kinds, &model.cfg.delta_net, &device)?;
         let mut x = TensorCat::from_cat_tensor(packed, 0)?;
         {
+            // **Open and commit the wave, as the sweep does.** The mixer writes
+            // the half a store is NOT reading and `commit_wave` is what makes
+            // that half live, so a caller that skips the bracket reads the
+            // entering state back and sees two sequences that never advanced —
+            // which is what this test's own isolation check then reports as a
+            // span bug. `delta_net_mix_wave` is one level below `sweep`, so the
+            // bracket is the test's to supply.
+            store_a.begin_wave()?;
+            store_b.begin_wave()?;
             let mut stores = vec![&mut store_a, &mut store_b];
-            delta_net_mix_wave(&model, li, &spans, &mut x, &mut stores, eps, None)?;
+            let stash = vec![None, None];
+            delta_net_mix_wave(&model, li, &spans, &mut x, &mut stores, eps, None, &stash)?;
+            store_a.commit_wave();
+            store_b.commit_wave();
         }
         let got = x.as_cat_tensor().reshape((total, hidden))?;
 

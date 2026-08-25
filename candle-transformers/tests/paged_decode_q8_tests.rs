@@ -213,7 +213,8 @@ fn decode_one_slot(
             rec_offset.push(None);
         } else {
             rec_offset.push(Some(records_buf.len()));
-            s.serialize_record(&mut records_buf);
+            // No span layout in a fixture — see `serialize_record`.
+            s.serialize_record(&mut records_buf, None);
         }
     }
     let records_tensor = if records_buf.is_empty() {
