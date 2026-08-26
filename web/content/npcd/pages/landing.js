@@ -7,6 +7,7 @@
 
 import { API } from '../lib/api.js';
 import { h, mount } from '../lib/dom.js';
+import { AUTH_UNAVAILABLE } from '../app.js';
 
 const MARK = `<svg viewBox="0 0 32 32" width="100%" height="100%">
   <circle cx="16" cy="7.4" r="3.1" fill="currentColor"/>
@@ -15,9 +16,21 @@ const MARK = `<svg viewBox="0 0 32 32" width="100%" height="100%">
   <rect x="4" y="23.8" width="24" height="3.1" rx="1.55" fill="currentColor" opacity=".34"/>
 </svg>`;
 
+/* One button, not a provider list. `/auth/login` takes only `next` — the
+ * gateway decides which provider runs the exchange — so a row of provider
+ * buttons would be several controls that all do the same thing, one of them
+ * naming a provider the gateway may not have configured. Adding a provider is
+ * gateway configuration, not a change here. */
+function signIn(label) {
+  return AUTH_UNAVAILABLE
+    ? h('div', { class: 'tiny dim', style: 'align-self:center;max-width:320px' },
+      'Sign-in is not configured on this deployment yet — the daemon has no session key, so nobody can be ' +
+      'signed in. Everything below is live regardless.')
+    : h('button', { class: 'btn primary lg', onClick: () => window.__npcdSignIn() }, label);
+}
+
 export async function render() {
   const el = h('div', { class: 'landing' });
-  const providers = (await API.getProviders().catch(() => ({ providers: [] }))).providers || [];
 
   // ── hero ──────────────────────────────────────────────────────────────────
 
@@ -28,10 +41,7 @@ export async function render() {
       'A mind per character. Years of lived history, convictions that hold under pressure, and a hundred of ' +
       'them thinking at once — on a single graphics card.'),
     h('div', { class: 'cta' },
-      providers.length
-        ? providers.map((p) => h('button', { class: 'btn primary lg', onClick: () => window.__npcdSignIn() },
-          'Continue with ' + p.display))
-        : h('button', { class: 'btn primary lg', onClick: () => window.__npcdSignIn() }, 'Get started'),
+      signIn('Get started'),
       h('a', { class: 'btn lg', href: '#demo' }, 'Watch one think ↓')),
     h('div', { class: 'tiny dim', style: 'margin-top:16px' },
       'Free while in preview · your characters stay yours')));
@@ -114,8 +124,7 @@ export async function render() {
   el.appendChild(h('section', { class: 'closer' },
     h('h2', {}, 'Give a character a year of memory.'),
     h('p', { class: 'lede' }, 'Then see whether it still recognises you.'),
-    h('div', { class: 'cta' },
-      h('button', { class: 'btn primary lg', onClick: () => window.__npcdSignIn() }, 'Start building')),
+    h('div', { class: 'cta' }, signIn('Start building')),
     h('div', { class: 'foot tiny dim' },
       'npcd · the NPC engine behind Battle Cities · runs headless on your own hardware')));
 

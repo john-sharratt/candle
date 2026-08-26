@@ -739,19 +739,30 @@ GET  /v1/me/profile/history         → every revision, live and tombstoned
 > `PUT /v1/me/profile` **appends a new profile turn and tombstones the previous one.** The old
 > turn is never edited and never deleted.
 
-The mechanism already exists: `Substrate::tombstone_turn(timeline, turn_index)` flags a single
-turn dead, replay-order-independently, without touching the timeline it lives on.
+The account file is where this happens, not the substrate. Accounts are authored records kept as
+files so they survive a substrate wipe (§8.2), and a profile is part of the account, so its turns
+are revisions in that file: `profile` is the live one and `profile_history` holds every
+predecessor, each stamped with the `tombstoned_ms` at which it stopped being the answer. A reader
+with a turn index can therefore tell which text was live when a given turn was gathered. The
+history is not returned by `/v1/me` — it is the larger half of the record and is asked for
+rarely — which is why `/v1/me/profile/history` exists as its own route.
+
+For NPC-side timelines the equivalent mechanism is `Substrate::tombstone_turn(timeline,
+turn_index)`, which flags a single turn dead replay-order-independently without touching the
+timeline it lives on. Same semantics, different store; the three reasons below hold for both.
 
 Three reasons this is append-and-tombstone rather than an update:
 
-**The substrate is append-only, and the user is in it.** An in-place edit would be the only
-mutable turn in a system whose entire design rests on nothing being rewritten. The projection,
-persistence and replay paths all assume append-only; a special case for user details would be a
-special case everywhere.
+**Everything an NPC reads is append-only, and the user is something an NPC reads.** An in-place
+edit would be the only mutable turn in a system whose entire design rests on nothing being
+rewritten. The projection, persistence and replay paths all assume append-only; a special case
+for user details would be a special case everywhere — and the fact that this particular record
+happens to live in a file rather than a timeline is a storage decision, not a licence to rewrite.
 
-**KV stays valid.** A sealed turn's KV is shared by reference across every conversation that
-attended it. Rewriting the bytes would invalidate cache that other timelines are still reading;
-tombstoning leaves those reads intact and simply stops the turn being gathered from now on.
+**KV stays valid.** Once gathered, a profile revision is a sealed turn whose KV is shared by
+reference across every conversation that attended it. Editing the source text and re-gathering
+under the same identity would leave two timelines citing one turn id with different contents;
+appending gives the new text a new revision and leaves those reads intact.
 
 **An NPC's memory of who you were stays true.** If you tell Varek you are a soldier, and later
 change your profile to say you are a merchant, the NPC's memory of the conversations where you
@@ -765,8 +776,15 @@ the architecture refuses everywhere else, and the user's own record is no except
 Not the email, not the provider id, not the display name from the OAuth account.
 
 ```
-POST /v1/me/unique-name   { "unique_name": "Wren" }   → 409 name_taken if collides
+PUT /v1/me/unique-name   { "unique_name": "Wren" }   → 409 name_taken if collides
+                                                     → 400 bad_unique_name if malformed
 ```
+
+`PUT`, matching `/v1/me/profile`: the name is a single-valued field being replaced, so setting it
+to what it already is must succeed rather than collide with itself. The shape is narrower than a
+display name — 2–24 of `[A-Za-z0-9_-]`, no leading or trailing separator — because a person types
+it into a tool call, and because confusable spellings of one author's address are impersonation
+rather than a typo. Uniqueness is case-insensitive for the same reason.
 
 It matters because the NPC's tools take it as an argument. When Varek sends an image, he sends
 it *to Wren* — the tool call carries the name, and the interaction layer resolves the name to a
@@ -1829,17 +1847,14 @@ and can be developed with `?mock=1` like everything else.
 
 ## 25. Sign-in
 
-Sign-in is a provider list, not a form — there is no password to collect.
+Sign-in is one button, not a form — there is no password to collect.
 
 ```
 ┌───────────────────────────────────────────────┐
 │              Sign in to npcd                  │
 │                                               │
 │   ┌───────────────────────────────────────┐   │
-│   │  🔵  Continue with Google             │   │
-│   └───────────────────────────────────────┘   │
-│   ┌───────────────────────────────────────┐   │
-│   │  ⬛  Continue with GitHub             │   │
+│   │             Get started               │   │
 │   └───────────────────────────────────────┘   │
 │                                               │
 │   New here? Signing in creates your account.  │
@@ -1847,8 +1862,16 @@ Sign-in is a provider list, not a form — there is no password to collect.
 └───────────────────────────────────────────────┘
 ```
 
-The button links to the gateway's `/auth/login?next=<this page>`, so adding a provider is
-configuration on the gateway rather than a GUI change here. First sign-in creates the account
+**One button, not a provider list.** `/auth/login` takes only `next`; the gateway decides which
+provider runs the exchange. A row of provider buttons would therefore be several controls that
+all navigate to the same URL, one of them naming a provider the gateway may not have configured
+— a menu whose choices do not reach the thing that chooses. Adding a provider is gateway
+configuration rather than a GUI change here.
+
+Sign-in can also be *unavailable*, which is not the same as being signed out: a deployment whose
+daemon holds no session key cannot authenticate anyone, and `/v1/me` answers `503
+auth_unconfigured` rather than `401` to say so. The page then states that instead of offering a
+button that cannot work. The rest of the landing page — including the live demo — is unaffected. First sign-in creates the account
 with no separate registration step. On return, the user lands on the page they originally asked
 for — `next` carries it through the round trip, and is refused unless it points inside this
 estate, since an unchecked one is an open redirect.

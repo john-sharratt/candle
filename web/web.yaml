@@ -57,10 +57,22 @@ server:
 # What it does when on: the gateway runs the OIDC exchange and issues a session
 # cookie on the PARENT domain, so signing in at tokera.com is already signed in
 # at code.tokera.com and bot.tokera.com — the browser presents the cookie to
-# each of them and the daemons never authenticate anyone themselves. They read
-# the identity this process asserts on `X-Tokera-*`, which is why they listen on
-# private addresses: the gateway is the only way in, and it strips those headers
-# off every inbound request before setting its own.
+# each of them and no daemon runs an OIDC exchange of its own. The gateway then
+# asserts that identity downstream on `X-Tokera-*`, stripping any inbound copy
+# of those headers before setting its own.
+#
+# A daemon does not have to take that on trust, and `npcd` does not: alongside
+# the plain headers the gateway sends `X-Tokera-Assertion`, the same identity
+# signed with the session key, and npcd verifies the signature. Headers alone
+# authenticate nobody there. That costs one shared file and buys a daemon whose
+# security no longer rests on its bind address being unreachable:
+#
+#   cp web/secrets/session.key npcd/secrets/session.key
+#
+# Without it npcd answers `/v1/me` with 503 `auth_unconfigured` — deliberately
+# distinct from 401, so its console can say sign-in is unavailable rather than
+# offer a button that cannot work. Copy the key whenever you rotate it; a npcd
+# holding last week's key rejects every assertion as a forgery.
 #
 # Paths resolve against THIS FILE, like `roots` and `papers`, so keep them
 # relative and the same table works on a laptop and on the DMZ box. Both
