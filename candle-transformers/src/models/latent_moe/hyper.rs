@@ -9,8 +9,8 @@
 use candle::{DType, Result, Tensor, D};
 use candle_nn::ops::sigmoid;
 
-use super::guard::expect_dtype;
 use super::linear::QLinear;
+use crate::models::operand_guard::expect_dtype;
 
 /// The learned per-block hyper-connection parameters for one sub-block (attention or
 /// FFN). `fn_w` is `[mix_hc, hc_mult*dim]`, `base` is `[mix_hc]`, `scale` is `[3]`,
@@ -358,8 +358,8 @@ impl candle::CustomOp1 for SinkhornOp {
 /// oracle for `fused_pre_post_matches_eager`.
 #[cfg(feature = "cuda")]
 mod cuda_fused {
-    use super::super::guard::expect_dense_dtype;
     use super::HyperParams;
+    use crate::models::operand_guard::expect_dense_dtype;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::{DType, Device, Result, Storage, Tensor};
     use candle_kernels::simple::hyper_mhc::{

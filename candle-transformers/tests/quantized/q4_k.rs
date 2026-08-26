@@ -9,7 +9,7 @@
 #[cfg(feature = "cuda")]
 mod cuda_tests {
     use crate::quantized::common::cuda::require_cuda;
-    use crate::quantized::common::{self, get_tolerance, negative_tests, QuantTestConfig};
+    use crate::quantized::common::{self, get_tolerance_for, negative_tests, QuantTestConfig};
     use candle::quantized::GgmlDType;
     use candle::{DType, Result};
 
@@ -42,7 +42,7 @@ mod cuda_tests {
         let config = q4k_config();
         let batch = 1;
         let seq = 4;
-        let (rtol, atol) = get_tolerance(DType::F32);
+        let (rtol, atol) = get_tolerance_for(config.dtype, DType::F32);
 
         println!(
             "Testing {} with F32 (high-precision validation)",

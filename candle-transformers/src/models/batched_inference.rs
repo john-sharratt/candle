@@ -37,6 +37,7 @@ use candle_nn::kv_cache::{
     ModelGeometry, QuantFormat, WavePlan, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
@@ -44,6 +45,8 @@ use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePh
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::pipeline_record_duration;
+use crate::models::speculative_choice::{AcceptWalk, TokenChooser};
+use crate::models::verify_wave::{issue_verify_wave, VerifyPlan, WaveCoBatch};
 
 /// One R16 chunk's unpacked contents: `(block_idx, k_flat, v_flat, q_flat)`.
 ///
@@ -797,7 +800,7 @@ impl BatchedInferenceSession {
         seq_indices: &[usize],
         generation: &Generation,
     ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
-        self.build_decode_metadata_at(seq_indices, generation, &[], &[], &[])
+        self.build_decode_metadata_at(0..self.num_layers, seq_indices, generation, &[], &[], &[])
     }
 
     /// [`Self::build_decode_metadata`] with explicit per-sequence offset
@@ -823,8 +826,27 @@ impl BatchedInferenceSession {
     /// chunk is pre-ensured so it never reallocs) keeps the zero-copy LIVE
     /// pointer + on-device write-len commit — the cheap decode path. Passing
     /// `&[]` makes every row live.
+    ///
+    /// `layers` names the contiguous group of KV layers to describe. The whole
+    /// stack (`0..num_layers`) is the ordinary answer, and the shared position
+    /// map is what makes it one build rather than N — every layer of the group
+    /// must therefore agree on block structure, which
+    /// [`ChunkedKvBacking::ensure_for_batch_entries_all`] establishes over the
+    /// group before the map is read from its first backing.
+    ///
+    /// A NARROWER group exists for exactly one reason: a layer that legitimately
+    /// stands at a different length from the rest. The MTP draft head is one —
+    /// its layer runs one position ahead of the trunk's for each speculative
+    /// token it proposes, and a whole-stack build would see that as divergence
+    /// and "heal" it by truncating the head's proposal away. Asking for
+    /// `head..head + 1` describes that layer against its own length, and the
+    /// group is trivially self-consistent.
+    ///
+    /// Headers are packed for the GROUP, so the kernel index of layer `l` is
+    /// `l - layers.start`, not `l`.
     pub fn build_decode_metadata_at(
         &self,
+        layers: Range<usize>,
         seq_indices: &[usize],
         generation: &Generation,
         offset_overrides: &[(usize, usize)],
@@ -835,6 +857,15 @@ impl BatchedInferenceSession {
         if n_active == 0 {
             return Ok((None, None, 0));
         }
+        if layers.start >= layers.end || layers.end > self.num_layers {
+            candle::bail!(
+                "decode metadata: layer group {:?} is empty or past the session's \
+                 {} KV layers",
+                layers,
+                self.num_layers
+            )
+        }
+        let group = &self.backings[layers.clone()];
         // Per-row snapshot decision (layer-invariant), aligned with `seq_indices`.
         let snapshot_mask: Vec<bool> = seq_indices
             .iter()
@@ -843,7 +874,7 @@ impl BatchedInferenceSession {
 
         // 24-byte SlotHeader: n_slices, write_slice, slices_ptr, position_map_ptr.
         let header_stride = n_active * 24;
-        let mut all_headers: Vec<u8> = Vec::with_capacity(self.num_layers * header_stride);
+        let mut all_headers: Vec<u8> = Vec::with_capacity(group.len() * header_stride);
 
         // Pre-compute per-sequence offsets once (same for all layers).
         let seq_offsets: Vec<(usize, usize)> = seq_indices
@@ -865,25 +896,26 @@ impl BatchedInferenceSession {
 
         // Build per-sequence position_map covering [0, state.offset + 1).
         // Each entry is u32: (slice_idx << 16) | in_blk.  The map is
-        // layer-invariant (slice metadata is uniform), built once, and every
-        // layer's SlotHeader points into the per-sequence region.
+        // invariant across the GROUP (slice metadata is uniform within it),
+        // built once, and every layer's SlotHeader points into the
+        // per-sequence region.
         // Entry at index state.offset is the write slot for the new token.
         let mut pm_flat: Vec<u32> = Vec::new();
         let mut pm_seq_byte_offsets: Vec<usize> = Vec::with_capacity(n_active);
         // `(slice count, write slice)` the map was built against, per sequence.
-        // Both are read from layer 0 while the map is one buffer every layer's
-        // slot header points at, so every layer's own answer is checked against
-        // them below rather than assumed equal.
+        // Both are read from the group's FIRST layer while the map is one buffer
+        // every layer's slot header points at, so every layer's own answer is
+        // checked against them below rather than assumed equal.
         let mut pm_slot_shape: Vec<(u32, u32)> = Vec::with_capacity(n_active);
         // Ensure backings are sized for the upcoming decode write so the slot's
         // chunks reflect the post-write layout when we read them, and reconcile
         // any block-structure skew between layers — the map built below is one
         // buffer describing all of them.
         //
-        // ALL layers at once, and once per decode step rather than once per
-        // layer: only the layers that need an allocation take the write guard,
-        // which is what the per-layer form cost 48 times per decoded token in a
-        // steady state where the answer is "nothing to allocate".
+        // Every layer of the GROUP at once, and once per decode step rather than
+        // once per layer: only the layers that need an allocation take the write
+        // guard, which is what the per-layer form cost 48 times per decoded
+        // token in a steady state where the answer is "nothing to allocate".
         //
         // Only for sequences that actually decode-write — a speculative-verify
         // slot replays already-written positions and must not have a write
@@ -893,13 +925,11 @@ impl BatchedInferenceSession {
             .copied()
             .filter(|(s, _)| !non_writer.contains(s))
             .collect();
-        ChunkedKvBacking::ensure_for_batch_entries_all(&self.backings, &writer_offsets, 1)?;
+        ChunkedKvBacking::ensure_for_batch_entries_all(group, &writer_offsets, 1)?;
         for &(seq_idx, seq_offset) in &seq_offsets {
             let entry_start = pm_flat.len();
             pm_seq_byte_offsets.push(entry_start * 4);
-            let chunks = self.backings[0]
-                .live_chunks_as_sealed(seq_idx)
-                .unwrap_or_default();
+            let chunks = group[0].live_chunks_as_sealed(seq_idx).unwrap_or_default();
             for (sidx, c) in chunks.iter().enumerate() {
                 let base = (sidx as u32) << 16;
                 pm_flat.extend(
@@ -919,9 +949,7 @@ impl BatchedInferenceSession {
             // match the `write_slice` rule in `sync_decode_gpu_chunks`, or the
             // kernel scatters the token into one chunk while attention is told
             // (via the position_map) to read it from another.
-            let wstart = self.backings[0]
-                .writer_start_idx_for_seq(seq_idx)
-                .unwrap_or(0);
+            let wstart = group[0].writer_start_idx_for_seq(seq_idx).unwrap_or(0);
             let n_ch = chunks.len();
             let wi = if n_ch == 0 {
                 0
@@ -958,11 +986,12 @@ impl BatchedInferenceSession {
         let mut saw_slot_rebuild = false;
         let mut saw_slot_reuse = false;
 
-        for layer_idx in 0..self.num_layers {
-            // Capacity for the upcoming write is ensured for EVERY layer above,
-            // before this loop — see `ensure_for_batch_entries_all`.
+        for (slot, backing) in group.iter().enumerate() {
+            // Capacity for the upcoming write is ensured for EVERY layer of the
+            // group above, before this loop — see `ensure_for_batch_entries_all`.
+            let layer_idx = layers.start + slot;
 
-            let arena_info = self.backings[layer_idx].resolve_arena_info()?;
+            let arena_info = backing.resolve_arena_info()?;
 
             // Incrementally sync each sequence's GPU slot-state buffer.
             // Common case: the cached GPU buffer is already valid and we only
@@ -976,7 +1005,7 @@ impl BatchedInferenceSession {
             // Per-row live-or-snapshot: only the rows in `snapshot_seqs` pay the
             // immutable copy; decode rows keep the live pointer (mask all-false ⇒
             // the whole wave is the cheap live path).
-            let (seq_ptrs, sync_stats) = self.backings[layer_idx].sync_decode_gpu_chunks_snapshot(
+            let (seq_ptrs, sync_stats) = backing.sync_decode_gpu_chunks_snapshot(
                 &seq_offsets,
                 &arena_info,
                 generation,
@@ -1002,9 +1031,10 @@ impl BatchedInferenceSession {
                     candle::bail!(
                         "decode metadata: layer {layer_idx} describes sequence {} as \
                          {n_slices} slices writing slice {write_slice}, but the position map \
-                         every layer shares was built from layer 0 as {exp_slices} slices \
-                         writing slice {exp_write}",
-                        seq_offsets[i].0
+                         every layer of {layers:?} shares was built from layer {} as \
+                         {exp_slices} slices writing slice {exp_write}",
+                        seq_offsets[i].0,
+                        layers.start
                     )
                 }
                 let pm_ptr = pm_base_ptr + pm_seq_byte_offsets[i] as u64;
@@ -1026,8 +1056,8 @@ impl BatchedInferenceSession {
             u64::from(saw_slot_rebuild),
         );
 
-        // Upload all layers' headers in a single pinned → GPU copy.
-        let total = self.num_layers * header_stride;
+        // Upload the group's headers in a single pinned → GPU copy.
+        let total = group.len() * header_stride;
         let mut pinned = generation.alloc(total)?;
         pinned.copy_from_slice(&all_headers);
         let gpu_buf = generation.submit(pinned)?;
@@ -1282,6 +1312,19 @@ impl BatchedInferenceSession {
         }
         if let Some(Some(state)) = self.sequences.get_mut(seq_idx) {
             state.offset = target_tokens;
+            // **The per-layer caches carry their own length, and it is not the
+            // backing's.** Leaving them is how a rewound sequence walks into
+            // the next wave with two answers for how long it is: the wave's
+            // pre-claim ensures a write chunk at the SESSION offset, while the
+            // decode path primes its write slot from `KvCache::current_seq_len`
+            // — so a stale cache asks for a chunk nobody claimed, and the arena
+            // refuses to create one from inside the forward that owns the
+            // partition. That is not a hypothetical: it is what a speculative
+            // sequence did on the step after a partial accept, once it had
+            // dropped back to a plain decode row.
+            for cache in state.caches.caches.iter_mut() {
+                cache.truncate_to_offset(target_tokens)?;
+            }
         }
         Ok(())
     }
@@ -3182,25 +3225,63 @@ pub trait ManagedBatchedModel {
     // generic `speculative_decode_step` driver. A model with no drafter inherits the defaults
     // and `speculative_decode_step` degrades to a single plain decode — so the hook is always
     // safe to call. A model with a drafter overrides `speculative_draft` (and, for the actual
-    // speedup, `verify_block`). The accepted tokens are always this model's own argmaxes, so the
-    // output is bit-identical to greedy decoding regardless of draft quality.
+    // speedup, `verify_block`). The accepted tokens are always drawn by the caller's own
+    // `TokenChooser` from this model's own logits, so the output is distributed exactly as plain
+    // decoding through that chooser would be, regardless of draft quality — bit-identical under
+    // `GreedyChooser`, and drawn from the identical distribution under a sampler.
 
-    /// Draft up to `max_len` speculative next-tokens for `seq` following `committed`, using the
-    /// model's own drafter (e.g. an MTP / DSpark head). Proposals only — the caller verifies them
-    /// and keeps the converging prefix. `cohort` is how many sessions decode in this step's
-    /// wave: a plain wave amortizes its launch floor across all of them, so a drafter's
-    /// economic break-even RISES with width and the gate must know it. Default: no drafter →
-    /// empty (a plain decode step follows).
+    /// Tokens this model wants each sequence to draft on a wave of `width` sequences.
+    ///
+    /// **Zero means take a plain decode row**, and that is the default: a model with no drafter
+    /// never speculates, and one whose ladder has not been measured does not guess.
+    ///
+    /// The budget belongs to the model because the trade does. A verify block scores `k + 1` rows
+    /// where a plain decode scores one, and writes `k + 1` KV entries where a plain decode writes
+    /// one. Both are nearly free while the wave is memory-bandwidth-bound — a narrow decode reads
+    /// the entire weight set to score a handful of rows — and both cost what they weigh once it is
+    /// compute-bound. Where that turns over depends on the checkpoint's shape: how much weight a
+    /// step reads, whether experts stream, how wide the KV rows are. It is measured per model, by
+    /// the `speculative_decode_*` gates' width sweep, and recorded on the model.
+    ///
+    /// Called once per wave, so it must be cheap and must not touch the device.
+    fn draft_budget(&self, width: usize) -> usize {
+        let _ = width;
+        0
+    }
+
+    /// Draft up to `max_len` speculative next-tokens for **every** sequence in the step's
+    /// cohort, each following its own `committed` token, using the model's own drafter (e.g.
+    /// an MTP / DSpark head). Proposals only — the caller verifies them and keeps the
+    /// converging prefix. Returns one proposal list per entry of `seqs`, in order; an empty
+    /// list means that sequence takes a plain decode row instead of a verify block.
+    ///
+    /// **Takes the whole cohort, not one sequence, because a drafter is weight-bound.** The
+    /// recurrence is serial *within* a sequence — step `j` needs `embed(argmax)` of step
+    /// `j-1` — but step `j` of one sequence is independent of step `j` of every other, so the
+    /// cohort's `j`-th steps are one batched pass. That matters because the dominant cost is
+    /// reading weights, not arithmetic: on the 9B a drafted token spends 1.5 ms of 2.7 ms in
+    /// one full read of the ~795 MiB output projection to score a single row, and four rows
+    /// measured 1.69 ms against one row's 1.66. Drafting per sequence therefore reads the same
+    /// weight once per session per step; drafting per cohort reads it once. That is also why
+    /// a drafter's break-even used to rise with width — the answer is to batch the drafter,
+    /// not to stop drafting at width.
+    ///
+    /// **Default: no drafter → no proposals**, and the step below degrades to one plain decode.
+    /// A model drafts by overriding this with a head its checkpoint actually carries — the
+    /// `qwen35` lineage's NextN/MTP block (`qwen35::mtp`), DeepSeek's DSpark. There is
+    /// deliberately no generic fallback proposer: one that guesses from the sequence's own text
+    /// can only re-propose what the sequence already said, which is worth nothing on the
+    /// reasoning and first-draft tokens a decode loop actually spends its time on, and it costs
+    /// a per-sequence token history that grows with context to buy it.
     fn speculative_draft(
         &self,
         session: &mut BatchedInferenceSession,
-        seq: usize,
-        committed: u32,
+        seqs: &[usize],
+        committed: &[u32],
         max_len: usize,
-        cohort: usize,
-    ) -> Result<Vec<u32>> {
-        let _ = (session, seq, committed, max_len, cohort);
-        Ok(Vec::new())
+    ) -> Result<Vec<Vec<u32>>> {
+        let _ = (session, committed, max_len);
+        Ok(vec![Vec::new(); seqs.len()])
     }
 
     /// Verify a block of `tokens` for `seq`: append them and return one next-token logits row
@@ -3209,6 +3290,12 @@ pub trait ManagedBatchedModel {
     /// (this is what makes speculative decode *lossless* by default). Models override with a
     /// single batched forward over the whole block for the throughput win. Advances the sequence
     /// by `tokens.len()`; the driver truncates back to the accepted length.
+    ///
+    /// **A model that overrides [`Self::speculative_draft`] but not this should not be driven
+    /// speculatively.** The default spends one forward per block position to buy at most that
+    /// many tokens, so a drafted step is break-even at best and a loss whenever a proposal is
+    /// rejected. It stays correct so a new drafter can be brought up against it and then made
+    /// fast; it is not a throughput path.
     fn verify_block(
         &self,
         session: &mut BatchedInferenceSession,
@@ -3255,7 +3342,34 @@ pub trait ManagedBatchedModel {
         seq: usize,
         tokens: usize,
     ) -> Result<()> {
+        // Already there: nothing to roll back. This is the common case, not a
+        // corner one — every decode step ends by reconciling each sequence to
+        // what it kept, and a step that kept everything it wrote (any plain
+        // decode row, and a fully accepted block) reconciles to the offset the
+        // sequence already stands at. Without this the KV backing would seal,
+        // release and re-claim chunks around the live tail once per sequence per
+        // step, against the compressor and the sealing thread.
+        if session.sequence_offset(seq) == Some(tokens) {
+            return Ok(());
+        }
         session.truncate_sequence_to_tokens(seq, tokens)
+    }
+
+    /// The whole step's rollbacks in one call — `(seq, tokens)` per sequence.
+    /// Default: [`Self::truncate_sequence`] per target, which is correct for
+    /// any model. A model whose rollback does real per-sequence work overrides
+    /// this to batch it — the qwen35 lineage's recurrent replay runs one
+    /// launch pair per DeltaNet layer for the whole cohort here, against one
+    /// per layer PER SEQUENCE through the per-target default.
+    fn truncate_sequences(
+        &self,
+        session: &mut BatchedInferenceSession,
+        targets: &[(usize, usize)],
+    ) -> Result<()> {
+        for &(seq, tokens) in targets {
+            self.truncate_sequence(session, seq, tokens)?;
+        }
+        Ok(())
     }
 
     /// One speculative step's whole forward: decode every PLAIN sequence's committed token
@@ -3268,6 +3382,117 @@ pub trait ManagedBatchedModel {
     /// then amortize across every session AND the two cohorts stop paying two launch floors per
     /// step. Advances plain sequences by 1 and drafted sequences by their block length; the
     /// driver truncates drafted sequences back to the accepted lengths.
+    /// Plan the rows this verify step's wave carries, and do whatever must
+    /// happen *before* that wave opens.
+    ///
+    /// Returning `None` means this model has no one-wave verify — it has not
+    /// promised the head will score every row of a multi-token member, which is
+    /// the one thing a verify block needs — and [`Self::verify_blocks`] falls
+    /// back to sequential single-token forwards. A model with a drafter
+    /// overrides this and [`Self::end_verify`] together.
+    ///
+    /// **Split from the wave on purpose.** The setup here is real work with real
+    /// ordering constraints — the `qwen35` lineage sizes every verifying
+    /// sequence's rewind stash before the forward opens, because the arena
+    /// refuses a device allocation from inside a wave, and arms the MTP seed
+    /// capture over both cohorts; DeepSeek snapshots the streaming
+    /// compressor/gallery state its blocks are about to absorb. None of it wants
+    /// to know what else is riding the wave, and the caller that *does* know —
+    /// the scheduler, folding these rows into the continuous-fair wave — cannot
+    /// hand a `&mut self` borrow down into a model method. So the model plans,
+    /// the caller runs the wave, and the model reads the rows back.
+    ///
+    /// `budget` is what the caller asked each sequence to draft this step, and
+    /// it is **not** recoverable from `seqs`/`blocks`: an empty `seqs` means
+    /// either that drafting was switched off for this wave *or* that the
+    /// drafter had nothing to propose from yet — the first step after a prefill,
+    /// which is precisely when the setup here has to run so a seed exists to
+    /// draft from next time. A model that skips work when nothing will be
+    /// drafted must read this, not the block shapes.
+    ///
+    /// On a wave that fails, the caller calls [`Self::abort_verify`] instead of
+    /// [`Self::end_verify`].
+    fn begin_verify(
+        &self,
+        session: &mut BatchedInferenceSession,
+        plain: &[(usize, u32)],
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        budget: usize,
+    ) -> Result<Option<VerifyPlan>> {
+        let _ = (session, blocks, budget);
+        // A model that has not overridden this has not promised its head scores
+        // every row of a multi-token member, so it cannot verify a block. It can
+        // still plan the *undrafted* case, and that is not a courtesy: it is what
+        // lets the scheduler run one decode path for every model instead of a
+        // speculative one and a plain one. A model with no drafter proposes
+        // nothing, every sequence lands in `plain`, and this plan is an ordinary
+        // one-token-per-sequence decode wave.
+        if !seqs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(VerifyPlan {
+            decode_seqs: plain.iter().map(|&(s, _)| s).collect(),
+            // **The model's own device, not the host.** A plan's rows are cat'd
+            // with whatever else the caller has on the wave — the scheduler's
+            // creep group and glue live on the device — so a host-side row makes
+            // the wave's own concatenation fail on a device mismatch. It only
+            // looked safe while a verify wave carried nothing but its own rows.
+            decode_inputs: plain
+                .iter()
+                .map(|&(_, t)| Tensor::from_vec(vec![t], (1, 1), self.device()))
+                .collect::<Result<_>>()?,
+            verify_seqs: Vec::new(),
+            verify_inputs: Vec::new(),
+            rows: plain.len(),
+        }))
+    }
+
+    /// Read a verify wave's scored rows back, and undo whatever
+    /// [`Self::begin_verify`] armed.
+    ///
+    /// `logits` is the wave's `[decode | verify]` prefix in plan order. Returns
+    /// the plain cohort's rows and one row per position of each block, which is
+    /// what the accept walk reads. Advancing the sequences by what the wave
+    /// wrote belongs here too — the driver truncates back to the accepted
+    /// prefix afterwards.
+    fn end_verify(
+        &self,
+        session: &mut BatchedInferenceSession,
+        plain: &[(usize, u32)],
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        logits: Vec<Tensor>,
+    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        let _ = blocks;
+        if !seqs.is_empty() {
+            candle::bail!(
+                "end_verify: {} verify blocks came back to a model that planned none",
+                seqs.len()
+            );
+        }
+        if logits.len() != plain.len() {
+            candle::bail!(
+                "end_verify: wave scored {} rows for {} undrafted sequences",
+                logits.len(),
+                plain.len()
+            );
+        }
+        for &(seq, _) in plain {
+            session.advance_sequence(seq, 1)?;
+        }
+        Ok((logits, Vec::new()))
+    }
+
+    /// Release whatever [`Self::begin_verify`] armed, after a wave that failed.
+    ///
+    /// The wave rolled its own state back, so a stash or snapshot taken before
+    /// it names a rewind point that no longer exists — left in place, a later
+    /// truncate would replay from it.
+    fn abort_verify(&self, seqs: &[usize]) {
+        let _ = seqs;
+    }
+
     fn verify_blocks(
         &self,
         session: &mut BatchedInferenceSession,
@@ -3275,7 +3500,40 @@ pub trait ManagedBatchedModel {
         seqs: &[usize],
         blocks: &[Vec<u32>],
         layer_end: usize,
+        budget: usize,
     ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        // The standalone shape: one wave carrying nothing but this step's own
+        // rows. The scheduler does not come through here — it runs the same
+        // three phases around its own co-batched wave.
+        if let Some(plan) = self.begin_verify(session, plain, seqs, blocks, budget)? {
+            let issued = issue_verify_wave(
+                self,
+                session,
+                &plan.decode_seqs,
+                &plan.decode_inputs,
+                &plan.verify_seqs,
+                &plan.verify_inputs,
+                &WaveCoBatch::standalone(),
+                layer_end,
+            );
+            return match issued {
+                Ok(out) => {
+                    if out.logits.len() != plan.rows {
+                        self.abort_verify(seqs);
+                        candle::bail!(
+                            "verify_blocks: wave scored {} rows, plan wanted {}",
+                            out.logits.len(),
+                            plan.rows
+                        );
+                    }
+                    self.end_verify(session, plain, seqs, blocks, out.logits)
+                }
+                Err(e) => {
+                    self.abort_verify(seqs);
+                    Err(e)
+                }
+            };
+        }
         let mut plain_out = Vec::with_capacity(plain.len());
         if !plain.is_empty() {
             let dseqs: Vec<usize> = plain.iter().map(|&(s, _)| s).collect();
@@ -3316,9 +3574,9 @@ pub trait ManagedBatchedModel {
 
     /// One lossless speculative-decode step for `seq` (model-agnostic). `committed` is the last
     /// accepted token, held OUT of the KV; it is placed at the current sequence offset. Drafts a
-    /// block, verifies `[committed, drafts…]`, accepts the longest prefix whose tokens match this
-    /// model's own argmaxes, and **emits each accepted token to `emit`, one at a time** — the
-    /// model's exact greedy continuation, in order. This is what keeps speculative decode a
+    /// block, verifies `[committed, drafts…]`, accepts the longest prefix whose proposals agree
+    /// with what `chooser` draws for this model, and **emits each accepted token to `emit`, one at
+    /// a time** — the model's own continuation, in order. This is what keeps speculative decode a
     /// *transparent accelerator*: the caller's main loop runs its normal per-token handling (stop
     /// sequences, EOS, sampling/steering decisions) on each token exactly as for plain decode,
     /// instead of the driver re-implementing any of it. `emit` returns `false` to stop generating
@@ -3333,6 +3591,7 @@ pub trait ManagedBatchedModel {
         committed: u32,
         max_draft: usize,
         layer_end: usize,
+        chooser: &mut dyn TokenChooser,
         emit: &mut dyn FnMut(u32) -> bool,
     ) -> Result<Option<u32>> {
         // The batch-of-1 case of the batched driver — one implementation.
@@ -3343,6 +3602,7 @@ pub trait ManagedBatchedModel {
             &[committed],
             max_draft,
             layer_end,
+            chooser,
             &mut emits,
         )?;
         Ok(next[0])
@@ -3351,10 +3611,16 @@ pub trait ManagedBatchedModel {
     /// One lossless speculative-decode step for MANY sequences — semantics identical to running
     /// [`Self::speculative_decode_step`] once per sequence, with the expensive parts batched:
     /// every block is verified in ONE `verify_blocks` call (a single wave when the model overrides
-    /// it), and every scored row's argmax runs in ONE kernel + ONE readback (per-row `to_scalar`
-    /// round-trips are a launch-overhead wall at batch width). Each sequence keeps its own emit
-    /// sink and truncates to its own accepted prefix. Returns each sequence's next `committed`
-    /// seed (`None` where its emit stopped).
+    /// it), and every scored row of the step is stacked once so `chooser` pays one dispatch per
+    /// block position rather than one per row (per-row `to_scalar` round-trips are a
+    /// launch-overhead wall at batch width). Each sequence keeps its own emit sink and truncates
+    /// to its own accepted prefix. Returns each sequence's next `committed` seed (`None` where its
+    /// emit stopped).
+    ///
+    /// `chooser` decides what each scored row commits, which is what makes the step lossless
+    /// under sampling as well as under greedy decode — see [`speculative_choice`] for why a
+    /// greedy drafter reduces the textbook accept/reject rule to "sample the row, accept the
+    /// proposal iff the sample agrees". Pass [`GreedyChooser`] for bit-identical greedy output.
     fn speculative_decode_step_batch(
         &self,
         session: &mut BatchedInferenceSession,
@@ -3362,6 +3628,7 @@ pub trait ManagedBatchedModel {
         committed: &[u32],
         max_draft: usize,
         layer_end: usize,
+        chooser: &mut dyn TokenChooser,
         emits: &mut [Box<dyn FnMut(u32) -> bool + '_>],
     ) -> Result<Vec<Option<u32>>> {
         if seqs.len() != committed.len() || seqs.len() != emits.len() {
@@ -3383,19 +3650,31 @@ pub trait ManagedBatchedModel {
         // to avoid. Drafted sequences still verify together in one wave.
         let t_draft = std::time::Instant::now();
         let mut poss = Vec::with_capacity(seqs.len());
-        let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
-        for (i, &seq) in seqs.iter().enumerate() {
-            let pos = session.sequence_offset(seq).ok_or_else(|| {
+        for &seq in seqs {
+            poss.push(session.sequence_offset(seq).ok_or_else(|| {
                 candle::Error::msg("speculative_decode_step_batch: unknown sequence")
-            })?;
-            poss.push(pos);
-            let drafts =
-                self.speculative_draft(session, seq, committed[i], max_draft, seqs.len())?;
-            let mut block = Vec::with_capacity(drafts.len() + 1);
-            block.push(committed[i]);
-            block.extend_from_slice(&drafts);
-            blocks.push(block);
+            })?);
         }
+        // ONE call for the whole cohort: the drafter batches its own passes so
+        // the weights it reads are read once for the step, not once per session.
+        let drafts = self.speculative_draft(session, seqs, committed, max_draft)?;
+        if drafts.len() != seqs.len() {
+            candle::bail!(
+                "speculative_decode_step_batch: drafter returned {} proposal lists for {} sequences",
+                drafts.len(),
+                seqs.len()
+            );
+        }
+        let blocks: Vec<Vec<u32>> = drafts
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let mut block = Vec::with_capacity(d.len() + 1);
+                block.push(committed[i]);
+                block.extend_from_slice(d);
+                block
+            })
+            .collect();
         pipeline_record_duration("spec:draft", t_draft.elapsed(), 1);
         let plain: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() == 1).collect();
         let spec: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() > 1).collect();
@@ -3412,29 +3691,31 @@ pub trait ManagedBatchedModel {
             plain.iter().map(|&i| (seqs[i], committed[i])).collect();
         let spec_seqs: Vec<usize> = spec.iter().map(|&i| seqs[i]).collect();
         let spec_blocks: Vec<Vec<u32>> = spec.iter().map(|&i| blocks[i].clone()).collect();
-        let (mut plain_rows, spec_logits) =
-            self.verify_blocks(session, &plain_pairs, &spec_seqs, &spec_blocks, layer_end)?;
+        let (mut plain_rows, spec_logits) = self.verify_blocks(
+            session,
+            &plain_pairs,
+            &spec_seqs,
+            &spec_blocks,
+            layer_end,
+            max_draft,
+        )?;
         pipeline_record_duration("spec:verify", t_verify.elapsed(), 1);
         let mut plain_logits: Vec<Option<Tensor>> = vec![None; seqs.len()];
         for &i in plain.iter().rev() {
             plain_logits[i] = plain_rows.pop();
         }
 
-        // Batched greedy argmax over EVERY scored row of BOTH waves: one stacked
-        // [R, vocab] argmax + one readback, split back per sequence
-        // (plain rows first, then each verify block's rows).
+        // Every scored row of BOTH waves, stacked once: plain rows lead (in
+        // `plain` order), then each verify block's rows. `row_of[i]` locates
+        // sequence `i`'s run inside it, so the accept walk lifts one block
+        // position across the whole cohort with a single `index_select` rather
+        // than slicing per sequence.
         let rows: Vec<Tensor> = plain
             .iter()
             .map(|&i| plain_logits[i].as_ref().expect("filled above").squeeze(0))
             .chain(spec_logits.iter().flatten().map(|t| t.squeeze(0)))
             .collect::<Result<_>>()?;
         let stacked = Tensor::stack(&rows, 0)?; // [R, vocab]
-        let arg: Vec<u32> = stacked
-            .argmax(candle::D::Minus1)?
-            .to_dtype(DType::U32)?
-            .to_vec1::<u32>()?;
-        // Per-sequence argmax slices, in `seqs` order: plain rows occupy the
-        // stacked prefix (one row each, in `plain` order), verify blocks follow.
         let mut row_of: Vec<(usize, usize)> = vec![(0, 0); seqs.len()];
         for (k, &i) in plain.iter().enumerate() {
             row_of[i] = (k, 1);
@@ -3445,43 +3726,61 @@ pub trait ManagedBatchedModel {
             row_of[i] = (cur, n);
             cur += n;
         }
-
-        // Per-sequence accept / emit / rollback — the exact single-seq semantics.
-        let t_accept = std::time::Instant::now();
-        let mut next = Vec::with_capacity(seqs.len());
-        for (i, &seq) in seqs.iter().enumerate() {
-            let block = &blocks[i];
-            let (start, n_rows) = row_of[i];
-            let args = &arg[start..start + n_rows];
-            // Greedy accept: position j's argmax is this model's real token at
-            // pos+j+1. Keep it; stop at the first drafted position whose
-            // proposal the model rejects (that argmax is the correction). If
-            // every draft matches, the final row yields a free bonus token.
-            let mut reals = Vec::with_capacity(block.len());
-            for (j, &a) in args.iter().enumerate() {
-                reals.push(a);
-                if j + 1 < block.len() && a != block[j + 1] {
-                    break;
-                }
+        // A block scores exactly one row per token and the walk indexes rows by
+        // block position, so a verify that returned a different count would read
+        // some other sequence's row instead of failing.
+        for (i, &(_, n_rows)) in row_of.iter().enumerate() {
+            if n_rows != blocks[i].len() {
+                candle::bail!(
+                    "speculative_decode_step_batch: sequence {} verified {n_rows} rows for a \
+                     {}-token block",
+                    seqs[i],
+                    blocks[i].len()
+                );
             }
-            // Hand the accepted tokens to this sequence's sink one at a time; it
-            // stops wherever it likes (EOS, a stop sequence, a steering
-            // decision). `kept` counts the tokens it consumed — including the
-            // one it stopped on — and the KV rolls back to exactly that prefix
-            // (the last kept token is held out of the KV for the next step, as
-            // `committed` always is).
-            let mut kept = 0usize;
-            let mut go_on = true;
-            for &t in &reals {
-                kept += 1;
-                if !(emits[i])(t) {
-                    go_on = false;
-                    break;
-                }
-            }
-            self.truncate_sequence(session, seq, poss[i] + kept)?;
-            next.push(if go_on { reals.last().copied() } else { None });
         }
+
+        // Position-major accept, then one batched rollback over every target.
+        //
+        // Positions run in order and a sequence leaves `alive` as soon as it
+        // commits a token that ends its block — either the model's own token
+        // diverged from the proposal (that token IS the correction) or the block
+        // ran out (its last row is a free bonus token). The cohort therefore
+        // narrows as the walk goes, and the step costs at most `max_draft + 1`
+        // chooser dispatches over the sequences still standing.
+        //
+        // Walking positions rather than deciding one stacked argmax over
+        // everything is what lets a sampling chooser be exact: row `j` is scored
+        // under the draft prefix that reaches it, so a chooser carrying
+        // repetition penalties or a grammar stencil advances its per-sequence
+        // state along exactly the path this loop commits.
+        let t_accept = std::time::Instant::now();
+        let mut walk = AcceptWalk::new(&blocks);
+        while !walk.finished() {
+            let rows = walk.rows();
+            // One `index_select` lifts this position's rows across the cohort
+            // out of the stack, rather than a slice per sequence.
+            let idx = Tensor::from_vec(
+                walk.alive()
+                    .iter()
+                    .map(|&i| (row_of[i].0 + walk.position()) as u32)
+                    .collect::<Vec<_>>(),
+                walk.alive().len(),
+                stacked.device(),
+            )?;
+            let tokens = chooser.choose(&stacked.index_select(&idx, 0)?, &rows)?;
+            walk.commit(&tokens, |i, token| (emits[i])(token))?;
+        }
+        let (next, kept) = walk.finish();
+        let targets: Vec<(usize, usize)> = seqs
+            .iter()
+            .enumerate()
+            .map(|(i, &seq)| (seq, poss[i] + kept[i]))
+            .collect();
+        // ONE rollback call for the step: every sequence's target at once, so a
+        // model whose rollback does real work (the recurrent replay) batches it
+        // across the cohort instead of paying it per sequence.
+        self.truncate_sequences(session, &targets)?;
         pipeline_record_duration("spec:accept", t_accept.elapsed(), 1);
         Ok(next)
     }

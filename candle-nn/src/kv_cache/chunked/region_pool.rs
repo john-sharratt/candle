@@ -1820,6 +1820,19 @@ impl SpanLayout {
 }
 
 /// The reservation's current addresses, or `None` if this device has none yet.
+///
+/// **Takes the pool's global lock — hoist it out of loops.** The layout is read
+/// far more often than it changes, but it is not a constant (the weight floor
+/// moves, the transient tier comes and goes, growth changes `total`), so it
+/// lives behind the same mutex as the mutation. A caller that checks a *batch*
+/// of addresses takes one snapshot and reuses it; a caller that fetches per
+/// address turns a lock designed for arena claims into per-pointer traffic.
+///
+/// That is not hypothetical: the slot-metadata pointer guard fetched per
+/// pointer, at `N_PALETTE` K and V addresses per KV head per slice — 4,608
+/// acquisitions per attention layer, 98% of the metadata pack. Both other
+/// callers already snapshot once and loop
+/// (`expert_lre::compute`, `SlotStateHost::span_layout_for_checks`).
 pub fn span_layout(ordinal: usize) -> Option<SpanLayout> {
     let map = pools().lock().unwrap_or_else(|e| e.into_inner());
     map.get(&ordinal).map(|pool| SpanLayout {

@@ -194,7 +194,7 @@ impl Scheduler {
         {
             return;
         }
-        if let Err(e) = self.decode_forward_cobatched(&[], &[]) {
+        if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
             tracing::error!("decode-less wave step failed: {e}");
         }
     }

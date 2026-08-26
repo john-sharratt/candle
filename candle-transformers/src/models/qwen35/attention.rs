@@ -38,7 +38,7 @@ pub struct AttentionWeights {
 
 /// Carried KV for the reference forward: plain contiguous history per layer.
 /// `k`/`v` are `[n_kv_heads, P, head_dim]`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AttentionState {
     pub k: Option<Tensor>,
     pub v: Option<Tensor>,
@@ -94,6 +94,12 @@ impl RopeTables {
         self.rope_dim
     }
 
+    /// How many positions these tables span — what a caller growing them on
+    /// demand compares against.
+    pub fn max_pos(&self) -> usize {
+        self.cos.dim(0).unwrap_or(0)
+    }
+
     /// Apply to `x [T, n_heads, head_dim]` for absolute positions
     /// `offset..offset + T`. Dims `[rope_dim, head_dim)` pass through.
     pub fn apply(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
@@ -140,20 +146,67 @@ pub fn attention_layer_forward(
     rms_eps: f64,
 ) -> Result<(Tensor, AttentionState)> {
     let (t, _hidden) = x.dims2()?;
-    let past = state.seq_len();
     let d = head_dim;
+    let (gated, state) = gated_attention_core(
+        &x.matmul(&w.wq.t()?)?,
+        &x.matmul(&w.wk.t()?)?,
+        &x.matmul(&w.wv.t()?)?,
+        &w.q_norm,
+        &w.k_norm,
+        state,
+        rope,
+        n_head,
+        n_kv_head,
+        head_dim,
+        rms_eps,
+    )?;
+    let out = gated.reshape((t, n_head * d))?.matmul(&w.wo.t()?)?;
+    Ok((out, state))
+}
 
-    // Interleaved [q | gate] projection.
-    let q_full = x.matmul(&w.wq.t()?)?.reshape((t, n_head, 2, d))?;
+/// The gated-attention algebra, from raw projections to the gated context —
+/// everything between `wq`/`wk`/`wv` and `wo`.
+///
+/// Split out so the **MTP draft head** ([`super::mtp`]) runs the same
+/// arithmetic without a second transcription of it. The head's projections are
+/// quantized `QMatMul`s where the reference's are plain matmuls, and that is the
+/// only difference between them; the norms, the interleaved `[q|gate]` split,
+/// the RoPE order, the GQA expansion, the causal mask and the sigmoid gate are
+/// one implementation.
+///
+/// `qg` is `[T, 2·n_head·head_dim]` (interleaved `[q|gate]` per head), `k` and
+/// `v` are `[T, n_kv_head·head_dim]`. Returns the gated context
+/// `[T, n_head, head_dim]` — the caller applies its own `wo`.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_attention_core(
+    qg: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    q_norm_w: &Tensor,
+    k_norm_w: &Tensor,
+    state: AttentionState,
+    rope: &RopeTables,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    rms_eps: f64,
+) -> Result<(Tensor, AttentionState)> {
+    let d = head_dim;
+    let t = qg.dim(0)?;
+    let past = state.seq_len();
+
+    // Interleaved [q | gate]: head `h`'s query is dims `[2h·d, 2h·d + d)` and
+    // its gate the next `d`. The gate is neither normed nor roped.
+    let q_full = qg.reshape((t, n_head, 2, d))?;
     let q = q_full.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?; // [T, H, d]
     let gate = q_full.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?;
 
-    let k = x.matmul(&w.wk.t()?)?.reshape((t, n_kv_head, d))?;
-    let v = x.matmul(&w.wv.t()?)?.reshape((t, n_kv_head, d))?;
+    let k = k.reshape((t, n_kv_head, d))?;
+    let v = v.reshape((t, n_kv_head, d))?;
 
     // Norm, then RoPE — the reference order.
-    let q = rope.apply(&rms_norm_head(&q, &w.q_norm, rms_eps)?, past)?;
-    let k = rope.apply(&rms_norm_head(&k, &w.k_norm, rms_eps)?, past)?;
+    let q = rope.apply(&rms_norm_head(&q, q_norm_w, rms_eps)?, past)?;
+    let k = rope.apply(&rms_norm_head(&k, k_norm_w, rms_eps)?, past)?;
 
     // Append to history: [n_kv, P + T, d].
     let k_hist = k.transpose(0, 1)?.contiguous()?;
@@ -167,43 +220,61 @@ pub fn attention_layer_forward(
     };
     let total = past + t;
 
-    // GQA: expand KV heads across their query group.
+    // GQA by GROUPING THE QUERIES, not by broadcasting the KV.
+    //
+    // Head `h` reads KV head `h / group`, so heads are consecutive within a
+    // group and `[H, T, d]` reshapes to `[n_kv, group·T, d]` with every row
+    // already beside the KV head it wants. That turns the broadcast into a
+    // batched matmul against `k_all` as it stands.
+    //
+    // The alternative — `expand(...).contiguous()` to `[H, total, d]` — writes
+    // the whole history out again per K and per V, `group` times over. On the
+    // draft head at a conversational depth that was ~38 MB of allocate-and-copy
+    // per sequence per step, to feed a single query row (hot-path invariant 2:
+    // teach the consumer to read the layout that exists).
     let group = n_head / n_kv_head;
-    let expand = |kv: &Tensor| -> Result<Tensor> {
-        kv.unsqueeze(1)?
-            .expand((n_kv_head, group, total, d))?
-            .reshape((n_head, total, d))
-    };
-    let k_exp = expand(&k_all)?.contiguous()?;
-    let v_exp = expand(&v_all)?.contiguous()?;
-
-    // Scores [H, T, total] with causal mask (query i sees keys ≤ past + i).
-    let q_h = q.transpose(0, 1)?.contiguous()?; // [H, T, d]
     let scale = 1f64 / (d as f64).sqrt();
-    let scores = (q_h.matmul(&k_exp.transpose(1, 2)?)? * scale)?;
-    let mask_vals: Vec<f32> = (0..t)
-        .flat_map(|i| {
-            (0..total).map(move |j| {
-                if j <= past + i {
-                    0f32
-                } else {
-                    f32::NEG_INFINITY
-                }
+    let q_h = q.transpose(0, 1)?.contiguous()?; // [H, T, d]
+    let q_g = q_h.reshape((n_kv_head, group * t, d))?;
+    // [n_kv, group·T, total] → [H, T, total]
+    let scores = (q_g.matmul(&k_all.transpose(1, 2)?)? * scale)?.reshape((n_head, t, total))?;
+    // A single query row masks nothing: it sits at `past`, the history is
+    // `total = past + 1` long, so every key `j < total` satisfies `j <= past`
+    // and the mask is all zeros. Building it means a `total`-long host vector
+    // and an upload per call — on the draft head, which runs one row per
+    // sequence per step against a history that grows with the conversation,
+    // that was the single largest host cost in the decode loop. Skipping it is
+    // exact, not approximate: the add it replaces is `+ 0.0`.
+    let probs = if t == 1 {
+        candle_nn::ops::softmax_last_dim(&scores)?
+    } else {
+        let mask_vals: Vec<f32> = (0..t)
+            .flat_map(|i| {
+                (0..total).map(move |j| {
+                    if j <= past + i {
+                        0f32
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
             })
-        })
-        .collect();
-    let mask = Tensor::from_vec(mask_vals, (1, t, total), x.device())?;
-    let scores = scores.broadcast_add(&mask)?;
-    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-    let ctx = probs.matmul(&v_exp)?; // [H, T, d]
+            .collect();
+        let mask = Tensor::from_vec(mask_vals, (1, t, total), qg.device())?;
+        candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask)?)?
+    };
+    // Same grouping on the way back out: `[H, T, total]` → `[n_kv, group·T,
+    // total]` reads `v_all` in place, no broadcast copy.
+    let ctx = probs
+        .reshape((n_kv_head, group * t, total))?
+        .matmul(&v_all)?
+        .reshape((n_head, t, d))?; // [H, T, d]
 
-    // Gate, flatten, project.
+    // Gate — the caller applies its own output projection.
     let ctx = ctx.transpose(0, 1)?.contiguous()?; // [T, H, d]
     let gated = ctx.mul(&candle_nn::ops::sigmoid(&gate)?)?;
-    let out = gated.reshape((t, n_head * d))?.matmul(&w.wo.t()?)?;
 
     Ok((
-        out,
+        gated,
         AttentionState {
             k: Some(k_all),
             v: Some(v_all),

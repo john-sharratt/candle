@@ -710,8 +710,12 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                             }
                             _ => None,
                         };
-                        let rows =
-                            he.embed(&flat, self.model.device(), wave_root(staging.as_ref()))?;
+                        let rows = he.embed(
+                            &flat,
+                            self.model.device(),
+                            wave_root(staging.as_ref()),
+                            embed_dtype,
+                        )?;
                         rows.reshape((1, n, he.layout().ncols))?
                     }
                     #[cfg(not(feature = "cuda"))]
@@ -727,7 +731,10 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         .forward_as_dtype(&xt, embed_dtype)?
                         .contiguous()?,
                 };
-                TensorCat::from_cat_tensor(embedded.to_dtype(embed_dtype)?, 0)?
+                // No `to_dtype` here: both arms already emit `embed_dtype` — the
+                // host gather because its dequantize takes the type, the resident
+                // table because `forward_as_dtype` does.
+                TensorCat::from_cat_tensor(embedded, 0)?
             }
             Some(resume) => resume,
         };

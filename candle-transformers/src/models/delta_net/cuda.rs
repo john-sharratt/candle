@@ -16,7 +16,7 @@ use candle_kernels::delta_net::{
     run_delta_net_prefill_state_f32, DELTA_NET_PREFILL_CHUNK,
 };
 
-use super::mix::{DeltaNetLayerTable, DeltaNetSeq, SeqSpan};
+use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, SeqSpan};
 use super::state_store::RecurrentStateStore;
 
 /// The wave tensors every fused DeltaNet kernel reads through strides, plus
@@ -64,13 +64,26 @@ impl<'a, 'w> DeltaNetFused<'a, 'w> {
     ///
     /// `h_k` is derived, not passed: the conv row is `[Q|K|V]` with Q and K
     /// `h_k·d` each and V `h_v·d`, so `h_k = (conv_dim/d − h_v) / 2`.
-    fn resolve(&self, state: &Tensor, start: usize, len: usize) -> Result<FusedPtrs> {
-        let (h_v, d_v, d_k) = state.dims3()?;
-        if d_v != d_k {
-            candle::bail!("delta_net cuda: state must be square per head, got ({d_v}, {d_k})");
-        }
-        let d = d_v;
+    fn resolve_wave(&self) -> Result<FusedPtrs> {
         let (t, conv_dim) = self.conved.dims2()?;
+        // Derived from the WAVE tensors rather than from a carried state: the
+        // spans that share this launch each bring their own state, so no single
+        // one of them can be the source of truth for the geometry they all use.
+        let (ta, h_v) = self.alpha.dims2()?;
+        if ta != t || h_v == 0 {
+            candle::bail!(
+                "delta_net cuda: alpha must be [{t}, h_v], got {:?}",
+                self.alpha.dims()
+            );
+        }
+        let (to, o_cols) = self.o.dims2()?;
+        if to != t || !o_cols.is_multiple_of(h_v) {
+            candle::bail!(
+                "delta_net cuda: o must be [{t}, h_v·d], got {:?}",
+                self.o.dims()
+            );
+        }
+        let d = o_cols / h_v;
         if !conv_dim.is_multiple_of(d) || conv_dim <= h_v * d {
             candle::bail!(
                 "delta_net cuda: conv row of {conv_dim} cannot be [Q|K|V] with \
@@ -88,32 +101,25 @@ impl<'a, 'w> DeltaNetFused<'a, 'w> {
         if !h_v.is_multiple_of(h_k) {
             candle::bail!("delta_net cuda: h_v {h_v} must be a multiple of h_k {h_k}");
         }
-        if self.alpha.dims2()? != (t, h_v) || self.blin.dims2()? != (t, h_v) {
-            candle::bail!("delta_net cuda: alpha/beta_lin must be [{t}, {h_v}]");
+        if self.blin.dims2()? != (t, h_v) {
+            candle::bail!("delta_net cuda: beta_lin must be [{t}, {h_v}]");
         }
         if self.dt_bias.dims1()? != h_v || self.a.dims1()? != h_v {
             candle::bail!("delta_net cuda: dt_bias/a must be [{h_v}]");
         }
-        if self.o.dims2()? != (t, h_v * d) {
-            candle::bail!("delta_net cuda: o must be [{t}, {}]", h_v * d);
-        }
-        if start + len > t {
-            candle::bail!("delta_net cuda: span {start}+{len} exceeds the wave's {t} rows");
-        }
-        // Byte offsets into the wave tensors: the span is a base address, and
-        // q/k/v are all views of the conv output — Q|K at column 0, V at the
-        // trailing block.
-        let f = std::mem::size_of::<f32>() as u64;
+        // Bases of the packed wave buffers. q/k/v are all views of the conv
+        // output — Q|K at column 0, V at the trailing block — and each kernel
+        // adds its own span's row offset from the table.
         let conved_p = f32_ptr(self.conved, "conved")?;
         let v_off = conv_dim - h_v * d;
         Ok(FusedPtrs {
-            qk_p: conved_p + (start * conv_dim) as u64 * f,
-            v_p: conved_p + (start * conv_dim + v_off) as u64 * f,
-            alpha_p: f32_ptr(self.alpha, "alpha")? + (start * h_v) as u64 * f,
-            blin_p: f32_ptr(self.blin, "beta_lin")? + (start * h_v) as u64 * f,
+            qk_p: conved_p,
+            v_p: conved_p + v_off as u64 * std::mem::size_of::<f32>() as u64,
+            alpha_p: f32_ptr(self.alpha, "alpha")?,
+            blin_p: f32_ptr(self.blin, "beta_lin")?,
             dt_p: f32_ptr(self.dt_bias, "dt_bias")?,
             a_p: f32_ptr(self.a, "a")?,
-            o_p: f32_ptr(self.o, "o")? + (start * h_v * d) as u64 * f,
+            o_p: f32_ptr(self.o, "o")?,
             h_v,
             h_k,
             d,
@@ -124,8 +130,19 @@ impl<'a, 'w> DeltaNetFused<'a, 'w> {
 
 const MAX_HEAD_DIM: usize = 256;
 
+/// Rows of a decode pointer table: conv tail in, conv tail out, state in,
+/// state out. Both carried buffers name their read and write halves, so the
+/// kernels advance a sequence without a copy anywhere and `commit_wave`
+/// installs the result by exchanging handles.
+const TABLE_ROWS: usize = 4;
+
 /// Device address of `t`'s first element, checking dtype and contiguity.
-fn typed_ptr(t: &LiveTensor<'_>, dtype: DType, what: &str) -> Result<u64> {
+///
+/// Public because it is generic tensor plumbing rather than anything about the
+/// mixer: the MTP head's kernel wrapper builds the same pointer tables from the
+/// same checks, and a second transcription of "resolve, verify, hand the
+/// address to a kernel" is a second place for the verification to be forgotten.
+pub fn typed_ptr(t: &LiveTensor<'_>, dtype: DType, what: &str) -> Result<u64> {
     if t.dtype() != dtype {
         candle::bail!(
             "delta_net cuda: {what} must be {dtype:?}, got {:?}",
@@ -171,7 +188,7 @@ fn typed_ptr(t: &LiveTensor<'_>, dtype: DType, what: &str) -> Result<u64> {
     Ok(ptr)
 }
 
-fn f32_ptr(t: &LiveTensor<'_>, what: &str) -> Result<u64> {
+pub fn f32_ptr(t: &LiveTensor<'_>, what: &str) -> Result<u64> {
     typed_ptr(t, DType::F32, what)
 }
 
@@ -185,8 +202,8 @@ fn f32_ptr(t: &LiveTensor<'_>, what: &str) -> Result<u64> {
 /// buffers are allocated once and mutated in place — the store's standing
 /// rule, which `begin_wave`/`rollback_wave` also rely on.
 pub struct DeltaNetWaveTable {
-    /// `[n_dn_layers, 2, n_decode]` I64 — per layer: row 0 tail ptrs, row 1
-    /// state ptrs.
+    /// `[n_dn_layers, 4, n_decode]` I64 — per layer, the entering and advanced
+    /// halves of both carried buffers: tail-in, tail-out, state-in, state-out.
     ptrs: Tensor,
     /// `[n_decode]` U32 wave rows, shared by every layer.
     rows: Tensor,
@@ -204,7 +221,7 @@ impl DeltaNetWaveTable {
         Ok(DeltaNetLayerTable {
             // A narrow on the leading axis of a contiguous tensor is itself
             // contiguous, so the reshape is a view — no copy per layer.
-            ptrs: self.ptrs.narrow(0, ord, 1)?.reshape((3, n))?,
+            ptrs: self.ptrs.narrow(0, ord, 1)?.reshape((4, n))?,
             rows: self.rows.clone(),
         })
     }
@@ -226,34 +243,38 @@ pub fn build_wave_table(
     };
     let layers: Vec<usize> = first.recurrent_layer_indices().collect();
     let n = decode.len();
-    // Three rows per layer: the conv tail (advanced in place), then the state's
-    // entering and advanced buffers. The state's two are distinct allocations —
-    // the wave reads one and writes the other, and `commit_wave` exchanges them
-    // — so the kernel needs both addresses.
+    // Four rows per layer: the conv tail's entering and advanced buffers, then
+    // the state's. Every one of the four is a distinct allocation — the wave
+    // reads one half and writes the other, and `commit_wave` exchanges them —
+    // so the kernels need both addresses of both buffers.
     //
     // Resolved through the NON-marking accessor: this table covers every
     // recurrent layer, but a sweep may run only part of the stack, and a layer
     // that never ran must not be swapped at commit (its write buffer still holds
     // an older wave's output). Each layer records itself when it actually runs.
-    let mut ptrs: Vec<i64> = Vec::with_capacity(layers.len() * 3 * n);
+    let mut ptrs: Vec<i64> = Vec::with_capacity(layers.len() * 4 * n);
     for &li in &layers {
         for &i in &decode {
-            let st = stores[i].layer_state(li)?;
-            ptrs.push(f32_ptr(&st.conv_tail, "conv tail")? as i64);
+            let (live, _) = stores[i].layer_state_pair(li)?;
+            ptrs.push(f32_ptr(&live.conv_tail, "conv tail in")? as i64);
+        }
+        for &i in &decode {
+            let (_, out) = stores[i].layer_state_pair(li)?;
+            ptrs.push(f32_ptr(&out.conv_tail, "conv tail out")? as i64);
         }
         for &i in &decode {
             let (live, _) = stores[i].layer_state_pair(li)?;
             ptrs.push(f32_ptr(&live.s, "state in")? as i64);
         }
         for &i in &decode {
-            let (_, s_out) = stores[i].layer_state_pair(li)?;
-            ptrs.push(f32_ptr(&s_out, "state out")? as i64);
+            let (_, out) = stores[i].layer_state_pair(li)?;
+            ptrs.push(f32_ptr(&out.s, "state out")? as i64);
         }
     }
     let rows: Vec<u32> = decode.iter().map(|&i| spans[i].start as u32).collect();
     let dev = stores[decode[0]].layer_state(layers[0])?.s.device().clone();
     Ok(Some(DeltaNetWaveTable {
-        ptrs: Tensor::from_vec(ptrs, (layers.len(), 3, n), &dev)?,
+        ptrs: Tensor::from_vec(ptrs, (layers.len(), 4, n), &dev)?,
         rows: Tensor::from_vec(rows, n, &dev)?,
         layers,
     }))
@@ -268,24 +289,119 @@ pub fn build_layer_table(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetLayerTable>
         candle::bail!("delta_net cuda: no decode spans to table");
     }
     let n = decode.len();
-    // The reference/test path carries one state per span rather than the store's
-    // pair, so the entering and advanced rows name the same buffer: the kernels
-    // accept that (each element is read before it is written) and the span
-    // advances in place, as this path always has.
-    let mut ptrs: Vec<i64> = Vec::with_capacity(3 * n);
+    // Same four rows as the wave table, taken from each span's own read and
+    // write halves. A caller carrying one state (`DeltaNetState::solo_out`)
+    // names the same buffer in both rows of `s`, which the state kernel accepts
+    // because it holds its `S` tile in registers for the whole sequence; its
+    // conv tail always has a distinct write buffer, because the prefill conv's
+    // readers of the entering tail run alongside the block writing the advance.
+    let mut ptrs: Vec<i64> = Vec::with_capacity(4 * n);
     for s in &decode {
-        ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail")? as i64);
+        ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail in")? as i64);
     }
-    for _ in 0..2 {
-        for s in &decode {
-            ptrs.push(f32_ptr(&s.state.s, "state")? as i64);
-        }
+    for s in &decode {
+        ptrs.push(f32_ptr(&s.out.conv_tail, "conv tail out")? as i64);
+    }
+    for s in &decode {
+        ptrs.push(f32_ptr(&s.state.s, "state in")? as i64);
+    }
+    for s in &decode {
+        ptrs.push(f32_ptr(&s.out.s, "state out")? as i64);
     }
     let rows: Vec<u32> = decode.iter().map(|s| s.start as u32).collect();
     let dev = decode[0].state.s.device().clone();
     Ok(DeltaNetLayerTable {
-        ptrs: Tensor::from_vec(ptrs, (3, n), &dev)?,
+        ptrs: Tensor::from_vec(ptrs, (4, n), &dev)?,
         rows: Tensor::from_vec(rows, n, &dev)?,
+    })
+}
+
+/// The multi-row spans of a wave, tabled for one launch per kernel.
+///
+/// Returns `None` when the wave carries no span longer than a row — every
+/// sequence decoding, which the batched decode kernels already handle — so the
+/// caller can skip the prefill launches entirely rather than issue empty ones.
+///
+/// The pointer rows are built exactly as [`build_layer_table`] builds them, and
+/// for the same reason: a span's conv tail and state live in that sequence's own
+/// allocation, so batching needs their addresses where the kernel can read them.
+pub fn build_span_table(seqs: &[DeltaNetSeq<'_>]) -> Result<Option<DeltaNetSpanTable>> {
+    let spans: Vec<&DeltaNetSeq<'_>> = seqs.iter().filter(|s| s.len > 1).collect();
+    if spans.is_empty() {
+        return Ok(None);
+    }
+    build_span_rows(&spans).map(Some)
+}
+
+/// [`build_span_table`] over EVERY span, single-row spans included.
+///
+/// The wave filters those out because its decode kernels take them; the
+/// speculative replay must not — the wave ran its stashed rows through the
+/// PREFILL kernels whatever the count, and a rewind that retraced a one-row
+/// accept through the decode kernels instead would be a different reduction
+/// order where bit-identity to the wave is the contract.
+pub fn build_span_table_all(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetSpanTable> {
+    if seqs.is_empty() {
+        candle::bail!("delta_net cuda: no spans to table");
+    }
+    let spans: Vec<&DeltaNetSeq<'_>> = seqs.iter().collect();
+    build_span_rows(&spans)
+}
+
+fn build_span_rows(spans: &[&DeltaNetSeq<'_>]) -> Result<DeltaNetSpanTable> {
+    let n = spans.len();
+    let mut ptrs: Vec<i64> = Vec::with_capacity(4 * n);
+    for s in spans {
+        ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail in")? as i64);
+    }
+    for s in spans {
+        // The prefill conv's blocks that read the entering tail run alongside
+        // the one that writes the advance, so the two must be distinct buffers.
+        // Checked here, where the table is assembled and both are in hand,
+        // rather than inside a kernel that cannot report it.
+        if s.state.conv_tail.same_storage(&s.out.conv_tail) {
+            candle::bail!(
+                "delta_net cuda: a prefill span's entering and advanced conv tails \
+                 must be separate buffers"
+            );
+        }
+        ptrs.push(f32_ptr(&s.out.conv_tail, "conv tail out")? as i64);
+    }
+    for s in spans {
+        // The geometry the launch shares is derived from the wave tensors
+        // (`DeltaNetFused::resolve_wave`), so each span's own state has to be
+        // checked against it here — a span carrying a differently shaped state
+        // would otherwise be read with the cohort's strides.
+        let (h_v, d_v, d_k) = s.state.s.dims3()?;
+        if d_v != d_k {
+            candle::bail!("delta_net cuda: state must be square per head, got ({d_v}, {d_k})");
+        }
+        if s.out.s.dims3()? != (h_v, d_v, d_k) {
+            candle::bail!(
+                "delta_net cuda: a span's entering and advanced states differ in shape: \
+                 {:?} against {:?}",
+                s.state.s.dims(),
+                s.out.s.dims()
+            );
+        }
+        ptrs.push(f32_ptr(&s.state.s, "state in")? as i64);
+    }
+    for s in spans {
+        ptrs.push(f32_ptr(&s.out.s, "state out")? as i64);
+    }
+    // `start` is the span's row in the PACKED wave buffer; the transients the
+    // scan hands between its two passes are indexed by the same number, which
+    // is what lets them be one wave-wide allocation instead of one per span.
+    let mut extents: Vec<u32> = Vec::with_capacity(2 * n);
+    extents.extend(spans.iter().map(|s| s.start as u32));
+    extents.extend(spans.iter().map(|s| s.len as u32));
+    let max_len = spans.iter().map(|s| s.len).max().unwrap_or(0);
+    let dev = spans[0].state.s.device().clone();
+    Ok(DeltaNetSpanTable {
+        ptrs: Tensor::from_vec(ptrs, (4, n), &dev)?,
+        spans: Tensor::from_vec(extents, (2, n), &dev)?,
+        n,
+        max_len,
     })
 }
 
@@ -319,7 +435,7 @@ pub fn delta_net_decode_batch(
     }
     let h_k = qk_heads / 2;
     let (table_rows, n_decode) = table.ptrs.dims2()?;
-    if table_rows != 3 || table.rows.dims1()? != n_decode {
+    if table_rows != TABLE_ROWS || table.rows.dims1()? != n_decode {
         candle::bail!("delta_net cuda: malformed decode table");
     }
     let dev = match fused.conved.device() {
@@ -327,9 +443,9 @@ pub fn delta_net_decode_batch(
         _ => candle::bail!("delta_net cuda: conved must live on a CUDA device"),
     };
     let stream = dev.cuda_stream();
-    // Row 1 holds the entering state pointers, row 2 the advanced ones.
-    let states_p = typed_ptr(&table.ptrs.narrow(0, 1, 1)?, DType::I64, "state table")?;
-    let states_out_p = typed_ptr(&table.ptrs.narrow(0, 2, 1)?, DType::I64, "state out table")?;
+    // Row 2 holds the entering state pointers, row 3 the advanced ones.
+    let states_p = typed_ptr(&table.ptrs.narrow(0, 2, 1)?, DType::I64, "state table")?;
+    let states_out_p = typed_ptr(&table.ptrs.narrow(0, 3, 1)?, DType::I64, "state out table")?;
     let rows_p = typed_ptr(&table.rows, DType::U32, "row table")?;
     let conved_p = f32_ptr(fused.conved, "conved")?;
     let alpha_p = f32_ptr(fused.alpha, "alpha")?;
@@ -386,7 +502,7 @@ pub fn delta_net_conv_decode(
     }
     check_qk_channels(qk_channels, channels)?;
     let (table_rows, n_decode) = table.ptrs.dims2()?;
-    if table_rows != 3 || table.rows.dims1()? != n_decode {
+    if table_rows != TABLE_ROWS || table.rows.dims1()? != n_decode {
         candle::bail!("delta_net cuda: malformed decode table");
     }
     let dev = match qkv.device() {
@@ -394,8 +510,9 @@ pub fn delta_net_conv_decode(
         _ => candle::bail!("delta_net cuda: qkv must live on a CUDA device"),
     };
     let stream = dev.cuda_stream();
-    // Row 0 of the table holds the tail pointers.
+    // Row 0 holds the entering tail pointers, row 1 the advanced ones.
     let tails_p = typed_ptr(&table.ptrs.narrow(0, 0, 1)?, DType::I64, "tail table")?;
+    let tails_out_p = typed_ptr(&table.ptrs.narrow(0, 1, 1)?, DType::I64, "tail out table")?;
     let rows_p = typed_ptr(&table.rows, DType::U32, "row table")?;
     let x_p = f32_ptr(qkv, "qkv")?;
     let k_p = f32_ptr(kernel, "kernel")?;
@@ -405,6 +522,7 @@ pub fn delta_net_conv_decode(
             x_p as *const f32,
             k_p as *const f32,
             tails_p as *const i64,
+            tails_out_p as *const i64,
             rows_p as *const u32,
             y_p as *mut f32,
             n_decode as i32,
@@ -531,66 +649,63 @@ pub fn solve_unit_lower<'w>(a: &LiveTensor<'w>, rhs: LiveTensor<'w>) -> Result<L
 ///
 /// `x [len, channels]` is **token-major** — the projection's own rows, so the
 /// caller narrows the fused QKV buffer instead of transposing it to
-/// channel-major. Returns the advanced tail (raw values) as a **separate**
-/// buffer: blocks computing the first `kwidth−1` outputs read the entering
-/// tail concurrently, so an in-place shift would race. The caller writes it
-/// back into the carried state.
-pub fn delta_net_conv_prefill<'w>(
-    x: &LiveTensor<'_>,
+/// channel-major. `tail_out` receives the advanced tail (raw values) and must
+/// be a **different** allocation from `tail`: blocks computing the first
+/// `kwidth−1` outputs read the entering tail concurrently, so writing over it
+/// would race. It is the wave's write half of the sequence's state, so the
+/// advance lands where `commit_wave` will install it and nothing is copied.
+// Eight: the kernel's own operands. Boxing them into a struct would put a
+// shape-checked argument list behind a constructor that checks nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_conv_prefill(
+    qkv: &LiveTensor<'_>,
     kernel: &Tensor,
-    tail: &Tensor,
+    table: &DeltaNetSpanTable,
     qk_channels: usize,
     eps: f32,
-    conved: &LiveTensor<'w>,
-    start: usize,
-) -> Result<LiveTensor<'w>> {
-    let (len, channels) = x.dims2()?;
+    conved: &LiveTensor<'_>,
+) -> Result<()> {
+    let (t_wave, channels) = qkv.dims2()?;
     let (kc, kwidth) = kernel.dims2()?;
     if kc != channels {
         candle::bail!("delta_net cuda: kernel channels {kc} != x channels {channels}");
     }
-    if tail.dims2()? != (channels, kwidth - 1) {
-        candle::bail!("delta_net cuda: tail must be [channels, kwidth-1]");
-    }
-    let (t_wave, cc) = conved.dims2()?;
-    if cc != channels || start + len > t_wave {
+    let (tc, cc) = conved.dims2()?;
+    if cc != channels || tc != t_wave {
         candle::bail!(
-            "delta_net cuda: span {start}+{len} of [{t_wave}, {cc}] cannot hold [{len}, {channels}]"
+            "delta_net cuda: conv output {:?} does not match its operand {:?}",
+            conved.dims(),
+            qkv.dims()
         );
     }
     check_qk_channels(qk_channels, channels)?;
-    let dev = match x.device() {
+    let dev = match qkv.device() {
         Device::Cuda(d) => d.clone(),
         _ => candle::bail!("delta_net cuda: x must live on a CUDA device"),
     };
-    // Fully written by the kernel (hot-path invariant 6), in the conv
-    // output's arena — it outlives this span's call.
-    let tail_out = conved.empty_beside((channels, kwidth - 1), DType::F32)?;
-    {
-        let stream = dev.cuda_stream();
-        let x_p = f32_ptr(x, "x")?;
-        let k_p = f32_ptr(kernel, "kernel")?;
-        let t_p = f32_ptr(tail, "tail")?;
-        let y_p =
-            f32_ptr(conved, "conved")? + (start * channels * std::mem::size_of::<f32>()) as u64;
-        let to_p = f32_ptr(&tail_out, "tail_out")?;
-        unsafe {
-            run_delta_net_conv_prefill_f32(
-                x_p as *const f32,
-                k_p as *const f32,
-                t_p as *const f32,
-                y_p as *mut f32,
-                to_p as *mut f32,
-                len as i32,
-                channels as i32,
-                kwidth as i32,
-                qk_channels as i32,
-                eps,
-                stream.cu_stream() as *mut core::ffi::c_void,
-            );
-        }
+    let stream = dev.cuda_stream();
+    let x_p = f32_ptr(qkv, "qkv")?;
+    let k_p = f32_ptr(kernel, "kernel")?;
+    let y_p = f32_ptr(conved, "conved")?;
+    let ptrs_p = typed_ptr(&table.ptrs, DType::I64, "span ptrs")?;
+    let spans_p = typed_ptr(&table.spans, DType::U32, "span extents")?;
+    unsafe {
+        run_delta_net_conv_prefill_f32(
+            x_p as *const f32,
+            k_p as *const f32,
+            y_p as *mut f32,
+            ptrs_p as *const i64,
+            spans_p as *const u32,
+            table.n as i32,
+            table.max_len as i32,
+            channels as i32,
+            kwidth as i32,
+            qk_channels as i32,
+            eps,
+            stream.cu_stream() as *mut core::ffi::c_void,
+        );
     }
-    Ok(tail_out)
+    Ok(())
 }
 
 /// The fused prefill scan for the span `[start, start + len)`: the chunked
@@ -605,12 +720,13 @@ pub fn delta_net_conv_prefill<'w>(
 /// the state kernel keeps its S tile in registers across the whole sequence.
 pub fn delta_net_prefill_scan(
     fused: &DeltaNetFused<'_, '_>,
-    state: &Tensor,
-    state_out: &Tensor,
-    start: usize,
-    len: usize,
+    table: &DeltaNetSpanTable,
 ) -> Result<()> {
-    let p = fused.resolve(state, start, len)?;
+    // Resolved over the WHOLE wave, not a span: the kernels rebase to their own
+    // span from the table, so the pointers handed to them are the packed
+    // buffers' bases.
+    let t_wave = fused.conved.dim(0)?;
+    let p = fused.resolve_wave()?;
     if p.d != DELTA_NET_PREFILL_DIM {
         candle::bail!(
             "delta_net cuda: the prefill scan is compiled for d == {DELTA_NET_PREFILL_DIM}, \
@@ -618,29 +734,35 @@ pub fn delta_net_prefill_scan(
             p.d
         );
     }
-    let dev = match state.device() {
+    let dev = match fused.conved.device() {
         Device::Cuda(d) => d.clone(),
-        _ => candle::bail!("delta_net cuda: state must live on a CUDA device"),
+        _ => candle::bail!("delta_net cuda: the wave must live on a CUDA device"),
     };
     // Transients: fully kernel-written, allocated in the wave's arena by
     // operand provenance (pool fallback when full). `kq` rows are valid for
     // `s ≤ t` only; the state kernel never reads past that, so the rest stays
     // uninitialised.
+    //
+    // ONE allocation for the whole wave rather than one per span: a head's rows
+    // are `t_wave` apart and each span writes the slice at its own `start`, so
+    // the spans never overlap and no span reads another's. Sized by the wave and
+    // not by the spans' total, so the row index is the same number the packed
+    // buffers use and no second mapping exists to disagree.
     let (h_v, d) = (p.h_v, p.d);
-    let u = fused.conved.empty_beside((h_v, len, d), DType::F32)?;
-    let w = fused.conved.empty_beside((h_v, len, d), DType::F32)?;
+    let u = fused.conved.empty_beside((h_v, t_wave, d), DType::F32)?;
+    let w = fused.conved.empty_beside((h_v, t_wave, d), DType::F32)?;
     let kq = fused
         .conved
-        .empty_beside((h_v, len, DELTA_NET_PREFILL_CHUNK), DType::F32)?;
-    let g_cs = fused.conved.empty_beside((h_v, len), DType::F32)?;
+        .empty_beside((h_v, t_wave, DELTA_NET_PREFILL_CHUNK), DType::F32)?;
+    let g_cs = fused.conved.empty_beside((h_v, t_wave), DType::F32)?;
     {
         let stream = dev.cuda_stream();
-        let state_p = f32_ptr(state, "state")?;
-        let state_out_p = f32_ptr(state_out, "state out")?;
         let u_p = f32_ptr(&u, "u")?;
         let w_p = f32_ptr(&w, "w")?;
         let kq_p = f32_ptr(&kq, "kq")?;
         let gcs_p = f32_ptr(&g_cs, "g_cs")?;
+        let ptrs_p = typed_ptr(&table.ptrs, DType::I64, "span ptrs")?;
+        let spans_p = typed_ptr(&table.spans, DType::U32, "span extents")?;
         let raw = stream.cu_stream() as *mut core::ffi::c_void;
         unsafe {
             run_delta_net_prefill_intra_f32(
@@ -654,7 +776,10 @@ pub fn delta_net_prefill_scan(
                 w_p as *mut f32,
                 kq_p as *mut f32,
                 gcs_p as *mut f32,
-                len as i32,
+                spans_p as *const u32,
+                table.n as i32,
+                table.max_len as i32,
+                t_wave as i32,
                 p.h_v as i32,
                 p.h_k as i32,
                 p.conv_dim as i32,
@@ -662,15 +787,16 @@ pub fn delta_net_prefill_scan(
                 raw,
             );
             run_delta_net_prefill_state_f32(
-                state_p as *const f32,
-                state_out_p as *mut f32,
                 p.qk_p as *const f32,
                 u_p as *const f32,
                 w_p as *const f32,
                 kq_p as *const f32,
                 gcs_p as *const f32,
                 p.o_p as *mut f32,
-                len as i32,
+                ptrs_p as *const i64,
+                spans_p as *const u32,
+                table.n as i32,
+                t_wave as i32,
                 p.h_v as i32,
                 p.h_k as i32,
                 p.conv_dim as i32,
@@ -739,6 +865,52 @@ mod tests {
     use super::super::mix::{causal_conv1d, delta_recurrence, l2_norm};
     use super::*;
     use candle::{DType, Device};
+
+    /// One span as the kernel tests hold it: they drive the launches directly,
+    /// without the mixer's [`DeltaNetSeq`] bookkeeping around them.
+    struct TestSpan<'a> {
+        /// The table is shared by the conv and the scan, and each reads only the
+        /// rows it needs — the conv the tails, the scan the states. A case that
+        /// drives one kernel names any live tensor in the rows that kernel does
+        /// not dereference.
+        tail: &'a Tensor,
+        tail_out: &'a Tensor,
+        state: &'a Tensor,
+        state_out: &'a Tensor,
+        start: usize,
+        len: usize,
+    }
+
+    /// The table [`build_span_table`] produces, from tensors rather than from
+    /// `DeltaNetSeq`s. Same layout, so a divergence between them is a
+    /// compile-time break rather than a silent one.
+    fn span_table(rows: &[TestSpan<'_>]) -> DeltaNetSpanTable {
+        let n = rows.len();
+        let mut ptrs: Vec<i64> = Vec::with_capacity(4 * n);
+        for r in rows {
+            ptrs.push(f32_ptr(r.tail, "tail").unwrap() as i64);
+        }
+        for r in rows {
+            ptrs.push(f32_ptr(r.tail_out, "tail out").unwrap() as i64);
+        }
+        for r in rows {
+            ptrs.push(f32_ptr(r.state, "state").unwrap() as i64);
+        }
+        for r in rows {
+            ptrs.push(f32_ptr(r.state_out, "state out").unwrap() as i64);
+        }
+        let mut ext: Vec<u32> = Vec::with_capacity(2 * n);
+        ext.extend(rows.iter().map(|r| r.start as u32));
+        ext.extend(rows.iter().map(|r| r.len as u32));
+        let max_len = rows.iter().map(|r| r.len).max().unwrap();
+        let dev = rows[0].tail.device().clone();
+        DeltaNetSpanTable {
+            ptrs: Tensor::from_vec(ptrs, (4, n), &dev).unwrap(),
+            spans: Tensor::from_vec(ext, (2, n), &dev).unwrap(),
+            n,
+            max_len,
+        }
+    }
 
     fn lcg_tensor(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
         let n: usize = shape.iter().product();
@@ -1033,13 +1205,15 @@ mod tests {
             let ptrs: Vec<i64> = vec![
                 f32_ptr(&tails[0], "tail").unwrap() as i64,
                 f32_ptr(&tails[1], "tail").unwrap() as i64,
+                f32_ptr(&tails[0], "tail").unwrap() as i64,
+                f32_ptr(&tails[1], "tail").unwrap() as i64,
                 f32_ptr(&states[0], "state").unwrap() as i64,
                 f32_ptr(&states[1], "state").unwrap() as i64,
                 f32_ptr(&states[0], "state").unwrap() as i64,
                 f32_ptr(&states[1], "state").unwrap() as i64,
             ];
             let table = DeltaNetLayerTable {
-                ptrs: Tensor::from_vec(ptrs, (3, 2), &gpu).unwrap(),
+                ptrs: Tensor::from_vec(ptrs, (4, 2), &gpu).unwrap(),
                 rows: Tensor::from_vec(vec![2 * i as u32, 2 * i as u32 + 1], 2, &gpu).unwrap(),
             };
             delta_net_decode_batch(&fused, &table).unwrap();
@@ -1129,8 +1303,14 @@ mod tests {
         }
 
         // GPU: one batched launch per step over both sequences, interleaved
-        // wave rows (A on even, B on odd), tails shifted in place.
-        let tails = [
+        // wave rows (A on even, B on odd). Each sequence carries two tail
+        // buffers and they are exchanged after every step — the store's
+        // ping-pong, which is what the kernel's two pointer tables are for.
+        let mut tails = [
+            Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap(),
+            Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap(),
+        ];
+        let mut tails_out = [
             Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap(),
             Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap(),
         ];
@@ -1166,21 +1346,24 @@ mod tests {
         let qkv = Tensor::from_vec(xw, (t_wave, c), &gpu).unwrap();
         let conved = Tensor::zeros((t_wave, c), DType::F32, &gpu).unwrap();
         for i in 0..steps {
-            // Entering and advanced rows name the same buffers: this test
-            // advances its states in place, as the reference path does.
+            // The state rows are unused by the conv kernel; the tail rows name
+            // this step's read and write halves.
             let ptrs: Vec<i64> = vec![
-                f32_ptr(&tails[0], "tail").unwrap() as i64,
-                f32_ptr(&tails[1], "tail").unwrap() as i64,
+                f32_ptr(&tails[0], "tail in").unwrap() as i64,
+                f32_ptr(&tails[1], "tail in").unwrap() as i64,
+                f32_ptr(&tails_out[0], "tail out").unwrap() as i64,
+                f32_ptr(&tails_out[1], "tail out").unwrap() as i64,
                 f32_ptr(&states[0], "state").unwrap() as i64,
                 f32_ptr(&states[1], "state").unwrap() as i64,
                 f32_ptr(&states[0], "state").unwrap() as i64,
                 f32_ptr(&states[1], "state").unwrap() as i64,
             ];
             let table = DeltaNetLayerTable {
-                ptrs: Tensor::from_vec(ptrs, (3, 2), &gpu).unwrap(),
+                ptrs: Tensor::from_vec(ptrs, (4, 2), &gpu).unwrap(),
                 rows: Tensor::from_vec(vec![2 * i as u32, 2 * i as u32 + 1], 2, &gpu).unwrap(),
             };
             delta_net_conv_decode(&qkv, &kern_g, &table, &conved, qkc, eps as f32).unwrap();
+            std::mem::swap(&mut tails, &mut tails_out);
         }
 
         let y_cpu = conved.to_device(&cpu).unwrap();
@@ -1225,7 +1408,11 @@ mod tests {
         // Segments 9, then 2 (shorter than kw−1, so the new tail mixes old
         // tail and fresh tokens), then 5 — one running CPU oracle throughout.
         let mut tail_cpu = Tensor::zeros((c, kw - 1), DType::F32, &cpu).unwrap();
-        let tail_gpu = Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap();
+        // Two halves, exchanged after each segment — the store's ping-pong, in
+        // the smallest form that still exercises the kernel's contract that the
+        // entering and advanced tails are separate allocations.
+        let mut tail_gpu = Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap();
+        let mut tail_gpu_out = Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap();
         for (seg, seed) in [(9usize, 42u64), (2, 43), (5, 44)] {
             let x_cm = lcg_tensor(&[c, seg], seed, &cpu); // [C, seg]
             let (y_raw, tail_next) = causal_conv1d(&x_cm, &kern, &tail_cpu).unwrap();
@@ -1242,10 +1429,16 @@ mod tests {
                 .to_device(&gpu)
                 .unwrap();
             let conved = Tensor::zeros((seg, c), DType::F32, &gpu).unwrap();
-            let tail_out =
-                delta_net_conv_prefill(&x_tok, &kern_g, &tail_gpu, qkc, eps as f32, &conved, 0)
-                    .unwrap();
-            tail_gpu.slice_set(&tail_out, 1, 0).unwrap();
+            let tbl = span_table(&[TestSpan {
+                tail: &tail_gpu,
+                tail_out: &tail_gpu_out,
+                state: &tail_gpu,
+                state_out: &tail_gpu_out,
+                start: 0,
+                len: seg,
+            }]);
+            delta_net_conv_prefill(&x_tok, &kern_g, &tbl, qkc, eps as f32, &conved).unwrap();
+            std::mem::swap(&mut tail_gpu, &mut tail_gpu_out);
 
             let y_cm = conved
                 .t()
@@ -1289,7 +1482,15 @@ mod tests {
 
         let s_gpu = s0.to_device(&gpu).unwrap().contiguous().unwrap();
         let o = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
-        delta_net_prefill_scan(&case.fused(&o), &s_gpu, &s_gpu, 0, t).unwrap();
+        let tbl = span_table(&[TestSpan {
+            tail: &s_gpu,
+            tail_out: &s_gpu,
+            state: &s_gpu,
+            state_out: &s_gpu,
+            start: 0,
+            len: t,
+        }]);
+        delta_net_prefill_scan(&case.fused(&o), &tbl).unwrap();
 
         let o_gpu = o.reshape((t, h_v, d)).unwrap().to_device(&cpu).unwrap();
         let od = max_diff(&o_gpu, &o_ref);
@@ -1297,6 +1498,191 @@ mod tests {
         println!("prefill scan vs sequential: o {od:.3e}, state {sd:.3e}");
         assert!(od < 3e-4, "outputs diverged from the sequential rule: {od}");
         assert!(sd < 3e-4, "state diverged from the sequential rule: {sd}");
+    }
+
+    /// **Several sequences in one launch must equal each of them alone.**
+    ///
+    /// This is what the span table exists for, and the property it can break:
+    /// the spans share a launch but not a state, so an index that reaches past
+    /// its own span — the transients are one wave-wide allocation, and the
+    /// packed buffers are rebased per span — silently mixes one sequence's rows
+    /// into another's recurrence. Bit-identity is the assertion, not closeness:
+    /// batching changes which blocks run together, never the arithmetic any one
+    /// of them does, so a span's rows and its advanced state must come back the
+    /// same to the bit as when it ran by itself.
+    ///
+    /// The spans are deliberately UNEQUAL in length (and neither a multiple of
+    /// the 64-token chunk), because the launch is a rectangle over the widest of
+    /// them: an equal-length case would never exercise the surplus-block guard.
+    #[test]
+    fn spans_batched_equal_spans_alone() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let cpu = Device::Cpu;
+        let (h_k, h_v, d) = (2usize, 4usize, 128usize);
+        let lens = [70usize, 33, 129];
+        let t: usize = lens.iter().sum();
+        let case = FusedCase::build(t, h_k, h_v, 77, &cpu, &gpu);
+
+        let starts: Vec<usize> = lens
+            .iter()
+            .scan(0usize, |acc, &l| {
+                let s = *acc;
+                *acc += l;
+                Some(s)
+            })
+            .collect();
+
+        // Entering states that differ per span, so a span reading the wrong
+        // one cannot coincidentally agree.
+        let states: Vec<Tensor> = (0..lens.len())
+            .map(|i| {
+                lcg_tensor(&[h_v, d, d], 900 + i as u64, &cpu)
+                    .to_device(&gpu)
+                    .unwrap()
+            })
+            .collect();
+
+        // Together: one table, one launch pair.
+        let batched_states: Vec<Tensor> = states.iter().map(|s| s.copy().unwrap()).collect();
+        let o_batched = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
+        let rows: Vec<TestSpan<'_>> = (0..lens.len())
+            .map(|i| TestSpan {
+                tail: &batched_states[i],
+                tail_out: &batched_states[i],
+                state: &batched_states[i],
+                state_out: &batched_states[i],
+                start: starts[i],
+                len: lens[i],
+            })
+            .collect();
+        delta_net_prefill_scan(&case.fused(&o_batched), &span_table(&rows)).unwrap();
+
+        // Alone: one table per span, into a separate output buffer.
+        let o_alone = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
+        let alone_states: Vec<Tensor> = states.iter().map(|s| s.copy().unwrap()).collect();
+        for i in 0..lens.len() {
+            let tbl = span_table(&[TestSpan {
+                tail: &alone_states[i],
+                tail_out: &alone_states[i],
+                state: &alone_states[i],
+                state_out: &alone_states[i],
+                start: starts[i],
+                len: lens[i],
+            }]);
+            delta_net_prefill_scan(&case.fused(&o_alone), &tbl).unwrap();
+        }
+
+        let b = o_batched.to_device(&cpu).unwrap().to_vec2::<f32>().unwrap();
+        let a = o_alone.to_device(&cpu).unwrap().to_vec2::<f32>().unwrap();
+        for (r, (br, ar)) in b.iter().zip(a.iter()).enumerate() {
+            assert_eq!(
+                br, ar,
+                "row {r} differs between the batched and lone launches"
+            );
+        }
+        for i in 0..lens.len() {
+            let bs = batched_states[i]
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap();
+            let as_ = alone_states[i]
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap();
+            assert_eq!(
+                bs.to_vec1::<f32>().unwrap(),
+                as_.to_vec1::<f32>().unwrap(),
+                "span {i}'s advanced state differs between the batched and lone launches"
+            );
+        }
+    }
+
+    /// The conv half of the same property: every span's tail advanced in one
+    /// launch must equal each advanced alone.
+    #[test]
+    fn conv_spans_batched_equal_spans_alone() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let cpu = Device::Cpu;
+        let (c, kw, qkc, eps) = (768usize, 4usize, 512usize, 1e-6f64);
+        let lens = [5usize, 17, 2];
+        let t: usize = lens.iter().sum();
+        let starts: Vec<usize> = lens
+            .iter()
+            .scan(0usize, |acc, &l| {
+                let s = *acc;
+                *acc += l;
+                Some(s)
+            })
+            .collect();
+
+        let kern = lcg_tensor(&[c, kw], 51, &cpu).to_device(&gpu).unwrap();
+        let qkv = lcg_tensor(&[t, c], 52, &cpu).to_device(&gpu).unwrap();
+        let tails: Vec<Tensor> = (0..lens.len())
+            .map(|i| {
+                lcg_tensor(&[c, kw - 1], 60 + i as u64, &cpu)
+                    .to_device(&gpu)
+                    .unwrap()
+            })
+            .collect();
+
+        let run = |outs: &[Tensor], batched: bool| -> Tensor {
+            let conved = Tensor::zeros((t, c), DType::F32, &gpu).unwrap();
+            let mk = |i: usize| TestSpan {
+                tail: &tails[i],
+                tail_out: &outs[i],
+                state: &tails[i],
+                state_out: &outs[i],
+                start: starts[i],
+                len: lens[i],
+            };
+            if batched {
+                let rows: Vec<TestSpan<'_>> = (0..lens.len()).map(mk).collect();
+                delta_net_conv_prefill(&qkv, &kern, &span_table(&rows), qkc, eps as f32, &conved)
+                    .unwrap();
+            } else {
+                for i in 0..lens.len() {
+                    delta_net_conv_prefill(
+                        &qkv,
+                        &kern,
+                        &span_table(&[mk(i)]),
+                        qkc,
+                        eps as f32,
+                        &conved,
+                    )
+                    .unwrap();
+                }
+            }
+            conved
+        };
+
+        let outs_b: Vec<Tensor> = (0..lens.len())
+            .map(|_| Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap())
+            .collect();
+        let outs_a: Vec<Tensor> = (0..lens.len())
+            .map(|_| Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap())
+            .collect();
+        let cb = run(&outs_b, true).to_device(&cpu).unwrap();
+        let ca = run(&outs_a, false).to_device(&cpu).unwrap();
+        assert_eq!(
+            cb.to_vec2::<f32>().unwrap(),
+            ca.to_vec2::<f32>().unwrap(),
+            "conv output differs between the batched and lone launches"
+        );
+        for i in 0..lens.len() {
+            assert_eq!(
+                outs_b[i].to_device(&cpu).unwrap().to_vec2::<f32>().unwrap(),
+                outs_a[i].to_device(&cpu).unwrap().to_vec2::<f32>().unwrap(),
+                "span {i}'s advanced conv tail differs"
+            );
+        }
     }
 
     /// Segmenting a sequence across calls must equal one call over the whole
@@ -1315,14 +1701,27 @@ mod tests {
 
         let s_one = Tensor::zeros((h_v, d, d), DType::F32, &gpu).unwrap();
         let o_one = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
-        delta_net_prefill_scan(&case.fused(&o_one), &s_one, &s_one, 0, t).unwrap();
+        let one = |s: &Tensor, start: usize, len: usize| {
+            span_table(&[TestSpan {
+                tail: s,
+                tail_out: s,
+                state: s,
+                state_out: s,
+                start,
+                len,
+            }])
+        };
+        delta_net_prefill_scan(&case.fused(&o_one), &one(&s_one, 0, t)).unwrap();
 
-        // 70 + 60: neither boundary is a multiple of the 64-token chunk.
+        // 70 + 60: neither boundary is a multiple of the 64-token chunk. Two
+        // CALLS, not two spans of one table: the segments are the same sequence
+        // and the second must enter with the state the first left, where spans
+        // sharing a launch are independent and all enter with their own.
         let s_seg = Tensor::zeros((h_v, d, d), DType::F32, &gpu).unwrap();
         let o_seg = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
         let fused = case.fused(&o_seg);
-        delta_net_prefill_scan(&fused, &s_seg, &s_seg, 0, 70).unwrap();
-        delta_net_prefill_scan(&fused, &s_seg, &s_seg, 70, 60).unwrap();
+        delta_net_prefill_scan(&fused, &one(&s_seg, 0, 70)).unwrap();
+        delta_net_prefill_scan(&fused, &one(&s_seg, 70, 60)).unwrap();
 
         // The chunk grouping differs (the second call re-chunks from its own
         // origin), so this is numerical closeness, not bitwise identity.
@@ -1382,12 +1781,20 @@ mod tests {
 
         eprintln!("--- fused mixer kernels, 9B geometry, T={t} ---");
         let conved = Tensor::zeros((t, conv_dim), DType::F32, &gpu).unwrap();
+        let tail_out = Tensor::zeros((conv_dim, kw - 1), DType::F32, &gpu).unwrap();
+        let whole = span_table(&[TestSpan {
+            tail: &tail,
+            tail_out: &tail_out,
+            state: &state,
+            state_out: &state,
+            start: 0,
+            len: t,
+        }]);
         let c_us = time("conv_prefill (+epilogue)", &mut || {
-            let _ =
-                delta_net_conv_prefill(&qkv, &kern, &tail, qk_channels, 1e-6, &conved, 0).unwrap();
+            delta_net_conv_prefill(&qkv, &kern, &whole, qk_channels, 1e-6, &conved).unwrap();
         });
         let s_us = time("scan (intra + state)", &mut || {
-            delta_net_prefill_scan(&fused, &state, &state, 0, t).unwrap();
+            delta_net_prefill_scan(&fused, &whole).unwrap();
         });
         let g_us = time("norm_gate", &mut || {
             let _ = delta_net_norm_gate(&o, &z, &gain, d, 1e-6).unwrap();
@@ -1403,18 +1810,20 @@ mod tests {
         let dec_states: Vec<Tensor> = (0..n_dec)
             .map(|_| Tensor::zeros((h_v, d, d), DType::F32, &gpu).unwrap())
             .collect();
-        let dec_tails: Vec<Tensor> = (0..n_dec)
+        let dec_tails: Vec<Tensor> = (0..2 * n_dec)
             .map(|_| Tensor::zeros((conv_dim, kw - 1), DType::F32, &gpu).unwrap())
             .collect();
         let mut ptrs: Vec<i64> = Vec::new();
         for tl in &dec_tails {
             ptrs.push(f32_ptr(tl, "tail").unwrap() as i64);
         }
-        for st in &dec_states {
-            ptrs.push(f32_ptr(st, "state").unwrap() as i64);
+        for _ in 0..2 {
+            for st in &dec_states {
+                ptrs.push(f32_ptr(st, "state").unwrap() as i64);
+            }
         }
         let dec_table = DeltaNetLayerTable {
-            ptrs: Tensor::from_vec(ptrs, (2, n_dec), &gpu).unwrap(),
+            ptrs: Tensor::from_vec(ptrs, (4, n_dec), &gpu).unwrap(),
             rows: Tensor::from_vec((0..n_dec as u32).collect::<Vec<_>>(), n_dec, &gpu).unwrap(),
         };
         let d_us = time("decode step (batch of 4)", &mut || {

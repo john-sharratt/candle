@@ -19,6 +19,8 @@ use std::path::Path;
 use candle::{Device, Result};
 use candle_nn::kv_cache::{QWEN35_0_8B_KV_FACTORS, QWEN35_9B_KV_FACTORS};
 
+use crate::models::draft_ladder::{QWEN35_0_8B_DRAFT, QWEN35_9B_DRAFT};
+
 use super::qwen35::{load_hybrid_gguf, HybridBatched, Qwen35LoadOptions};
 
 /// The tokenizer repo, pinned. The GGUF ships `tokenizer.ggml.tokens` but no
@@ -30,14 +32,29 @@ pub const TOKENIZER_REV: &str = "2fc06364715b967f1860aea9cf38778875588b17";
 /// Pinned checkpoints (repo, revision, file). Revisions are pinned because an
 /// upstream re-upload once silently invalidated a threshold tuning — a gate
 /// must fail loudly on a checkpoint change, not drift.
+///
+/// # Prefer the `-MTP-GGUF` repos wherever one exists
+///
+/// Qwen3.5/3.6 are trained with multi-token prediction and ship the head. The
+/// **plain** GGUF conversion drops it; unsloth publishes a parallel
+/// `…-MTP-GGUF` repo per model carrying the same quants under the same
+/// filenames, plus `{arch}.nextn_predict_layers` and the `blk.N.nextn.*`
+/// tensors. Pinning the plain one costs the drafter and shows up nowhere else
+/// — the model loads and answers identically — which is exactly how an earlier
+/// pass concluded the architecture had no MTP at all. Pin the MTP variant so
+/// the head is *there*; whether it is loaded is a separate question the loader
+/// answers.
+///
+/// The 0.8B has no MTP head in any conversion (none in the upstream config or
+/// tensor index), so it keeps the plain repo.
 pub const QWEN35_0_8B: (&str, &str, &str) = (
     "unsloth/Qwen3.5-0.8B-GGUF",
     "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
     "Qwen3.5-0.8B-BF16.gguf",
 );
 pub const QWEN35_9B: (&str, &str, &str) = (
-    "unsloth/Qwen3.5-9B-GGUF",
-    "3885219b6810b007914f3a7950a8d1b469d598a5",
+    "unsloth/Qwen3.5-9B-MTP-GGUF",
+    "9716a636ee4bddc3fed678220b7a33dd2a4160ae",
     "Qwen3.5-9B-Q6_K.gguf",
 );
 
@@ -62,12 +79,14 @@ pub fn from_gguf_path(
              load it through quantized_qwen35_moe instead"
         );
     }
-    let kv_factors = if model.cfg.hidden_size >= 4096 {
-        QWEN35_9B_KV_FACTORS
+    // Both per-checkpoint rows are chosen by the same width test that already
+    // tells the two dense siblings apart.
+    let (kv_factors, draft) = if model.cfg.hidden_size >= 4096 {
+        (QWEN35_9B_KV_FACTORS, QWEN35_9B_DRAFT)
     } else {
-        QWEN35_0_8B_KV_FACTORS
+        (QWEN35_0_8B_KV_FACTORS, QWEN35_0_8B_DRAFT)
     };
-    HybridBatched::new(model, kv_factors)
+    HybridBatched::new(model, kv_factors, draft)
 }
 
 /// Shared by the sibling model files: the pinned family tokenizer as a JSON
@@ -86,12 +105,13 @@ pub(crate) fn tokenizer_json() -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::models::batch_test::test_helpers::hf_get;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
-    use crate::models::batched_inference::InferenceMode;
+    use crate::models::batched_inference::{InferenceMode, ManagedBatchedModel};
     use crate::models::dialect::Dialect;
+    use crate::models::qwen35::mtp::MTP_MAX_DRAFT;
     use candle::quantized::Int8Mode;
     use hf_hub::RepoType;
 
@@ -497,6 +517,260 @@ mod tests {
             Ok(m)
         };
         params.run(configs, load)
+    }
+
+    /// **Speculative decode on the dense 9B, measured against itself.**
+    ///
+    /// The lineage's smallest checkpoint that can speculate at all, and the
+    /// size where a decode step is weight-bandwidth-bound rather than
+    /// launch-bound — so the win here is the one a production session would
+    /// see. The 0.8B has no gate of its own because it has no MTP head in any
+    /// conversion: [`speculative_gate`] on it would run the same plain decode
+    /// under three budget labels and pass unconditionally.
+    ///
+    /// The same StoryRewrite configs run once per draft budget: once through
+    /// the plain decode loop, then through the lossless speculative driver
+    /// with the checkpoint's own MTP head as the drafter. Two things come out
+    /// of it.
+    ///
+    /// * **Correctness.** Speculation accepts only the model's own argmaxes, so
+    ///   every run must produce the same text as the first — and the harness
+    ///   validates all of them against the same fixture at the same 100%
+    ///   threshold. A rewind that left the recurrent state one token ahead of
+    ///   the KV would show up here as degraded output, which is exactly the
+    ///   failure `truncate_sequence` used to refuse to risk.
+    /// * **Throughput.** `t/s (single)` is the per-session decode rate; the
+    ///   ratio between the tables is what speculation bought.
+    ///
+    /// A rewrite task is the drafter's best case *and its honest one*: the
+    /// output overlaps the prompt heavily, which is the same shape as editing
+    /// code — the workload this engine is for.
+    ///
+    /// Swept at width, like its siblings: the ladder gate runs this same
+    /// checkpoint in BF16 at 4 and 20 contexts, so a speculative step that
+    /// cannot is the speculative path's problem and not the card's.
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.5-9B GGUF (7.5 GB) and needs a GPU. Run with: \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35::tests::speculative_decode_9b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn speculative_decode_9b() -> Result<()> {
+        speculative_gate(
+            "Qwen3.5-9B",
+            Int8Mode::Off,
+            &[1, 4],
+            dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
+        )
+    }
+
+    /// Derive `MTP_WIDTH_LADDER` for the lineage on the 9B — the width × budget
+    /// grid, at 256 tokens. See [`speculative_width_ladder`]. Not a pass/fail
+    /// gate: it reports the curve the ladder is set from, so it is run when the
+    /// ladder is being re-derived rather than on every sweep.
+    #[test]
+    #[ignore = "measurement sweep, not a gate: runs the 9B at five widths x three budgets \
+                (~15 runs of 256 tokens). Run with: cargo test --release --features cuda --lib \
+                -p candle-transformers quantized_qwen35::tests::width_ladder_9b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn width_ladder_9b() -> Result<()> {
+        speculative_width_ladder(
+            "Qwen3.5-9B",
+            Int8Mode::Off,
+            &[1, 4, 8, 12, 20],
+            dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
+        )
+    }
+
+    /// **Is a middle rung ever the right answer?**
+    ///
+    /// The ladder assumes the budget should step down through 1 on its way to
+    /// 0, but a step pays for one draft pass and one verify wave whatever `k`
+    /// is — only the extra scored row scales with it. If that fixed cost
+    /// dominates, budget 1 buys ~1.5 tokens for close to what budget 2 pays for
+    /// ~2.25, and is never the best answer at any width: the ladder would
+    /// collapse to "full budget or none" and lose its middle bracket entirely.
+    ///
+    /// The evidence is currently contradictory. A hot sweep put budget 1 ahead
+    /// at width 8 (1.13x, against 0.50x for budget 2); the forwarding gate put
+    /// budget 1 *behind* budget 2 at width 10 (0.80x against 0.94x, both losing
+    /// to plain decode). Those cannot both be right, and a thermally throttled
+    /// tail is exactly the thing that inverts a row.
+    ///
+    /// Deliberately two widths, not a sweep. These are the only ones where the
+    /// two datasets disagree — 1 through 5 win at budget 2 on every instrument,
+    /// 20 loses on every instrument — so this is six generate runs over three
+    /// model loads rather than a grid, and short enough to finish before the
+    /// card's clocks start sagging.
+    #[test]
+    #[ignore = "targeted measurement: 2 widths x 3 budgets on the 9B, three model loads. \
+                Run cold. cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35::tests::middle_rung_9b -- --ignored --nocapture \
+                --test-threads=1"]
+    fn middle_rung_9b() -> Result<()> {
+        speculative_width_ladder(
+            "Qwen3.5-9B middle-rung",
+            Int8Mode::Off,
+            &[8, 10],
+            dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
+        )
+    }
+
+    /// **The width ladder, measured.** One run produces the whole
+    /// width × budget grid a model's `MTP_WIDTH_LADDER` is read off.
+    ///
+    /// Speculation's win is not a constant: a verify block's extra rows are
+    /// nearly free on a narrow wave and cost what they weigh on a wide one, and
+    /// where that turns over is a property of the checkpoint. This sweeps both
+    /// axes so the turnover is read rather than guessed — at each width, budget
+    /// 0 is that width's own baseline, so the ratios are within-run and immune to
+    /// this machine's run-to-run band.
+    ///
+    /// 256 generated tokens, like the other speculative gates and for the same
+    /// reason: the forwarding gates generate ten, where a drafter's warm-up is a
+    /// large fraction of the measurement and the ratios wobble by more than the
+    /// effect being measured.
+    pub(crate) fn speculative_width_ladder<M>(
+        label: &str,
+        int8mode: Int8Mode,
+        widths: &[usize],
+        load: impl Fn() -> Result<M>,
+    ) -> Result<()>
+    where
+        M: ManagedBatchedModel,
+    {
+        // **Budget outer, widths inner** — one model load per budget instead of
+        // one per cell. The budget is a `TestParams` field and the width a
+        // `TestConfig`, so a width-major loop reloads the checkpoint for every
+        // point on the grid; this way a five-width sweep costs three loads
+        // rather than fifteen. On a laptop card the difference is not just
+        // wall-clock: it is fifteen model loads' worth of heat soaking into the
+        // measurement the sweep exists to take.
+        for draft in 0..=MTP_MAX_DRAFT {
+            {
+                println!("\n=== {label}: draft budget {draft}, widths {widths:?} ===\n");
+                let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
+                    .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+                    .with_suppress_thinking(true)
+                    .with_timeout_secs(3600)
+                    .with_speculative(draft)
+                    // **A measurement, so it must reach the widths that matter.**
+                    // The fixture cannot validate a wide cohort at 100%: past
+                    // about eight sessions, batched reductions reassociate and a
+                    // near-tied argmax eventually falls the other way, so a
+                    // session or two diverges by a pronoun. That is the lineage's
+                    // stochastic floor, and holding this sweep to 100% would stop
+                    // it at exactly the widths the ladder is about — which is what
+                    // happened the first time it was run.
+                    //
+                    // Losslessness is not being checked here and does not need to
+                    // be: `speculative_decode_9b` proves it at 100% on the widths
+                    // the fixture does support, and it is a property of the accept
+                    // rule, not of the cohort width. The bar is kept high enough
+                    // to catch a speculative path that is producing garbage
+                    // rather than drifting by a token.
+                    //
+                    // Half. Not tuned to what a run happened to score — the
+                    // divergence rate grows with width (six of eight at 8, fewer
+                    // at 20), so any threshold close to the observed value just
+                    // moves the wall further out. Half is the level a *broken*
+                    // speculative path cannot reach: a wrong accept rule or a
+                    // mis-rolled KV does not reproduce a 1228-character fixture
+                    // in most of the cohort, it reproduces it in none of it.
+                    .with_majority_pass_threshold(50)
+                    .with_int8mode(int8mode);
+                let configs: Vec<TestConfig> = widths
+                    .iter()
+                    .map(|&width| TestConfig {
+                        mode: InferenceMode::BF16,
+                        use_batched: true,
+                        num_contexts: width,
+                        num_repeats: 1,
+                        generate_max_len: 256,
+                        test_mode: Some(TestMode::StoryRewrite),
+                    })
+                    .collect();
+                params.run(configs, &load)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the speculative comparison for a dense checkpoint of the lineage.
+    ///
+    /// **256 generated tokens**, not the gates' 10: speculation is a property
+    /// of the decode loop, and ten tokens is six driver steps — a number small
+    /// enough that the prefill and the first block dominate it. The draft
+    /// budget is swept so the table shows where the yield stops paying for the
+    /// rows it adds.
+    pub(crate) fn speculative_gate<M>(
+        label: &str,
+        int8mode: Int8Mode,
+        widths: &[usize],
+        load: impl Fn() -> Result<M>,
+    ) -> Result<()>
+    where
+        M: ManagedBatchedModel,
+    {
+        let configs: Vec<TestConfig> = widths
+            .iter()
+            .map(|&n| TestConfig {
+                mode: InferenceMode::BF16,
+                use_batched: true,
+                num_contexts: n,
+                num_repeats: 1,
+                generate_max_len: 256,
+                test_mode: Some(TestMode::StoryRewrite),
+            })
+            .collect();
+        // Up to the head's own ceiling, [`MTP_MAX_DRAFT`], and no further: past
+        // it the drafter clamps, so the extra rows would report the same
+        // configuration twice. The turnover the sweep used to look for is what
+        // set that constant — the measurements are recorded there.
+        for draft in 0..=MTP_MAX_DRAFT {
+            println!(
+                "\n=== {label}: {} ===\n",
+                if draft == 0 {
+                    "plain decode (baseline)".to_string()
+                } else {
+                    format!("speculative decode, draft budget {draft}")
+                }
+            );
+            let mut params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
+                .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+                .with_suppress_thinking(true)
+                .with_timeout_secs(3600);
+            params = params.with_speculative(draft).with_int8mode(int8mode);
+            params.run(configs.clone(), &load)?;
+        }
+        Ok(())
+    }
+
+    /// The dense lineage's loader, as [`speculative_gate`] takes it.
+    fn dense_loader(
+        model_path: std::path::PathBuf,
+        int8mode: Int8Mode,
+    ) -> impl Fn() -> Result<HybridBatched> {
+        move || {
+            let device = Device::new_cuda(0)?;
+            let m = from_gguf_path(
+                &model_path,
+                &device,
+                Qwen35LoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: None,
+                },
+            )?;
+            // A gate that silently fell back to plain decode would still pass
+            // — speculation is lossless, so the only symptom is the speedup
+            // going away. Assert the drafter is really there.
+            assert!(
+                m.has_drafter(),
+                "the pinned dense checkpoint has no MTP head — the pin has moved \
+                 off the -MTP-GGUF repo, or its conversion dropped the NextN tensors"
+            );
+            println!("✓ Model loaded\n");
+            Ok(m)
+        }
     }
 
     /// The story-rewrite gate on the dense 9B: the hybrid sweep end to end —

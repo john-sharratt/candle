@@ -23,6 +23,8 @@ use crate::models::batched_inference::{
 use candle_nn::kv_cache::ModelGeometry;
 use candle_nn::kv_cache::CHUNK_SIZE;
 
+use crate::models::verify_wave::VerifyPlan;
+
 use super::attention::rms_norm;
 use super::engine::Engine;
 use super::gallery::{
@@ -1419,6 +1421,7 @@ impl ManagedBatchedModel for BatchedEngine {
             .collect();
         let std_meta = {
             let (pm, headers, stride) = session.build_decode_metadata_at(
+                0..session.num_layers(),
                 &all_seqs,
                 &generation,
                 &overrides,
@@ -2632,16 +2635,26 @@ impl ManagedBatchedModel for BatchedEngine {
     /// every row of these sequences (see `forward_wave`); it is cleared before returning, even on
     /// error. Advances each sequence by its block length; the driver truncates back to the
     /// accepted lengths.
-    fn verify_blocks(
+    fn begin_verify(
         &self,
         session: &mut BatchedInferenceSession,
         plain: &[(usize, u32)],
         seqs: &[usize],
         blocks: &[Vec<u32>],
-        layer_end: usize,
-    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        budget: usize,
+    ) -> Result<Option<VerifyPlan>> {
+        // Nothing here is armed speculatively: the corpus-state snapshots below
+        // are taken per verifying sequence, and a zero budget leaves that cohort
+        // empty, so this model already does no work it will not use.
+        let _ = budget;
         if plain.is_empty() && seqs.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Some(VerifyPlan {
+                decode_seqs: Vec::new(),
+                decode_inputs: Vec::new(),
+                verify_seqs: Vec::new(),
+                verify_inputs: Vec::new(),
+                rows: 0,
+            }));
         }
         // Pre-verify corpus-state snapshots: the forward below absorbs the WHOLE
         // blocks (including drafts the driver may reject) into the streaming
@@ -2664,7 +2677,7 @@ impl ManagedBatchedModel for BatchedEngine {
         let mut row_inputs: Vec<Tensor> = Vec::with_capacity(n_rows);
         for &(seq, tok) in plain {
             row_seqs.push(seq);
-            row_inputs.push(Tensor::from_vec(vec![tok], (1, 1), &Device::Cpu)?);
+            row_inputs.push(Tensor::from_vec(vec![tok], (1, 1), self.device())?);
         }
         for (i, &seq) in seqs.iter().enumerate() {
             if blocks[i].is_empty() {
@@ -2674,46 +2687,40 @@ impl ManagedBatchedModel for BatchedEngine {
             self.snapshot_verify_state(seq, q_start, blocks[i].len())?;
             for &tok in &blocks[i] {
                 row_seqs.push(seq);
-                row_inputs.push(Tensor::from_vec(vec![tok], (1, 1), &Device::Cpu)?);
+                row_inputs.push(Tensor::from_vec(vec![tok], (1, 1), self.device())?);
             }
         }
         s_snap.end();
-        let s_fwd = span("verify:forward");
         *self
             .verify_all_rows
             .write()
             .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))? =
             seqs.to_vec();
-        let step = self.forward_wave(
-            session,
-            &row_seqs,
-            &row_inputs,
-            &[],
-            &[],
-            &[],
-            &[],
-            0,
-            layer_end,
-            None,
-        );
+        // Every row of both cohorts goes in the DECODE slot — this model packs a
+        // block as one decode row per position rather than one multi-token
+        // member, so the whole step is full-sweep by construction.
+        Ok(Some(VerifyPlan {
+            decode_seqs: row_seqs,
+            decode_inputs: row_inputs,
+            verify_seqs: Vec::new(),
+            verify_inputs: Vec::new(),
+            rows: n_rows,
+        }))
+    }
+
+    fn end_verify(
+        &self,
+        session: &mut BatchedInferenceSession,
+        plain: &[(usize, u32)],
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        logits: Vec<Tensor>,
+    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
         self.verify_all_rows
             .write()
             .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))?
             .clear();
-        let step = match step {
-            Ok(s) => s,
-            Err(e) => {
-                // Failed verify: drop the snapshots so a later truncate cannot
-                // replay from a half-populated one.
-                if let Ok(mut m) = self.verify_snap.write() {
-                    for &s in seqs {
-                        m.remove(&s);
-                    }
-                }
-                return Err(e);
-            }
-        };
-        s_fwd.end();
+        let n_rows: usize = plain.len() + blocks.iter().map(|b| b.len()).sum::<usize>();
         let s_post = span("verify:post");
         for &(seq, _) in plain {
             session.advance_sequence(seq, 1)?;
@@ -2721,14 +2728,13 @@ impl ManagedBatchedModel for BatchedEngine {
         for (i, &seq) in seqs.iter().enumerate() {
             session.advance_sequence(seq, blocks[i].len())?;
         }
-        // Copy the rows off the wave's span (`logits_owned`): the driver reads
-        // them after this forward returns — argmax comparison, and on partial
-        // accept a rollback + a NEXT forward — so span-lifetime views would
-        // dangle by then.
-        let logits = step.logits_owned()?;
+        // Already copied off the wave's span by the caller: the accept walk
+        // reads these after the forward returns — position by position, and on
+        // partial accept a rollback + a NEXT forward — so span-lifetime views
+        // would dangle by then.
         if logits.len() != n_rows {
             candle::bail!(
-                "verify_blocks: expected {} scored rows, got {}",
+                "end_verify: expected {} scored rows, got {}",
                 n_rows,
                 logits.len()
             );
@@ -2746,12 +2752,57 @@ impl ManagedBatchedModel for BatchedEngine {
         Ok((plain_out, out))
     }
 
+    fn abort_verify(&self, seqs: &[usize]) {
+        if let Ok(mut v) = self.verify_all_rows.write() {
+            v.clear();
+        }
+        // Failed verify: drop the snapshots so a later truncate cannot replay
+        // from a half-populated one.
+        if let Ok(mut m) = self.verify_snap.write() {
+            for &s in seqs {
+                m.remove(&s);
+            }
+        }
+    }
+
     /// DSpark speculative draft: propose a block of up to `max_len` tokens after `committed`,
     /// conditioned on `seq`'s stashed target feature (the concatenated `dflash.target_layers`
     /// hidden states — paper Eq. 2). Lossless — the caller verifies every proposal against the
     /// target — so the conditioning only affects acceptance, never output. Returns empty (⇒ plain
     /// decode) when no drafter is attached or the sequence has no stashed feature yet.
     fn speculative_draft(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seqs: &[usize],
+        committed: &[u32],
+        max_len: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        if committed.len() != seqs.len() {
+            candle::bail!(
+                "dspark draft: {} committed tokens for {} sequences",
+                committed.len(),
+                seqs.len()
+            );
+        }
+        // Per sequence, because DSpark conditions each proposal on that
+        // sequence's own stashed target feature and gates it on that sequence's
+        // own acceptance EMA. The qwen35 NextN head batches its cohort instead
+        // (`qwen35::mtp::MtpHead::draft_cohort`), which is what removes the
+        // per-session weight read the width-aware break-even below is priced
+        // against; doing the same here is a separate change to a drafter with
+        // its own measured schedule, not a rename.
+        let cohort = seqs.len();
+        seqs.iter()
+            .zip(committed)
+            .map(|(&seq, &tok)| self.draft_one(session, seq, tok, max_len, cohort))
+            .collect()
+    }
+}
+
+impl BatchedEngine {
+    /// One sequence's DSpark proposal — see
+    /// [`ManagedBatchedModel::speculative_draft`].
+    fn draft_one(
         &self,
         session: &mut BatchedInferenceSession,
         seq: usize,
@@ -2917,6 +2968,9 @@ mod tests {
     // run against `arch::test_arch` instead.
     use crate::models::deepseek4::DEEPSEEK_V4;
     use crate::models::gpu_test_lock::gpu_serial;
+    // Lossless gates: they assert speculation reproduces plain GREEDY decode
+    // token for token, so they choose greedily.
+    use crate::models::speculative_choice::GreedyChooser;
     use candle::quantized::Int8Mode;
     use candle::IndexOp;
 
@@ -3298,6 +3352,7 @@ mod tests {
                 committed,
                 4,
                 n_layers,
+                &mut GreedyChooser,
                 &mut |t| {
                     gen.push(t);
                     gen.len() < 12 && t != eos
@@ -3433,6 +3488,7 @@ mod tests {
                 committed,
                 max_draft,
                 n_layers,
+                &mut GreedyChooser,
                 &mut |t| {
                     gen.push(t);
                     gen.len() < 12 && t != eos
@@ -3616,6 +3672,7 @@ mod tests {
                 committed,
                 4,
                 n_layers,
+                &mut GreedyChooser,
                 &mut |t| {
                     spec.push(t);
                     spec.len() < MAX_NEW && t != eos
@@ -3752,6 +3809,7 @@ mod tests {
                 committed,
                 max_draft,
                 n_layers,
+                &mut GreedyChooser,
                 &mut |t| {
                     gen.push(t);
                     gen.len() < MAX_NEW && t != eos

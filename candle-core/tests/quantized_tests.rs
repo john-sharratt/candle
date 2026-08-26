@@ -305,9 +305,12 @@ fn qmm_batch(dev: &Device) -> Result<()> {
     assert_eq!(mm4.shape().dims(), [12, 6]);
     let diff4 = (mm4.i(..6)? - &mm3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
     if dev.is_cuda() {
-        // We use a different kernel for sizes from 1 to 8 on cuda which explains
-        // the difference here.
-        assert!(0. < diff4 && diff4 < 1e-4)
+        // Batches through 16 rows share the vec-kernel family on cuda (a batch
+        // past the templates' 8 runs as ≤8-row chunks), but the kernel's warp
+        // count varies with its batch count, so same-row results across
+        // different batch sizes agree only to rounding — a 12-row call's rows
+        // straddle an 8-row and a 4-row launch where the 6-row call was one.
+        assert!(diff4 < 1e-4, "12-row rows 0..6 vs 6-row call: {diff4}")
     } else {
         assert_eq!(diff4, 0.0)
     };
@@ -315,7 +318,27 @@ fn qmm_batch(dev: &Device) -> Result<()> {
         .abs()?
         .sum_all()?
         .to_vec0::<f32>()?;
-    assert_eq!(diff4, 0.0);
+    if dev.is_cuda() {
+        // Duplicate inputs, but not one launch: rows 8..12 run as the 4-row
+        // chunk (4 warps) while their twins in 0..6 sit in the 8-row chunk
+        // (2 warps), so this is rounding-equal, not bit-equal.
+        assert!(diff4 < 1e-4, "12-row halves disagree: {diff4}")
+    } else {
+        assert_eq!(diff4, 0.0)
+    };
+
+    // Across the vec/MMQ boundary at 8: the tiled kernel reduces in a
+    // different order, so agreement is to tolerance, and the tolerance is the
+    // property — both paths must describe the same matmul.
+    let lhs5 = Tensor::cat(&[&lhs4, &lhs3], 0)?;
+    let mm5 = rhs.forward(&lhs5)?;
+    assert_eq!(mm5.shape().dims(), [18, 6]);
+    let diff5 = (mm5.i(..6)? - &mm3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
+    if dev.is_cuda() {
+        assert!(diff5 < 1e-3, "MMQ vs vec paths diverged: {diff5}")
+    } else {
+        assert_eq!(diff5, 0.0)
+    };
     Ok(())
 }
 

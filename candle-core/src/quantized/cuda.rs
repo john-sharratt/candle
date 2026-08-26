@@ -2628,6 +2628,15 @@ fn dequantize_mul_mat_vec(
 /// names none, so a quantized projection's output belongs wherever the value
 /// flowing through the layer came from — and so does the q8_1 staging buffer,
 /// which dies at the end of this call.
+///
+/// `b_size` may exceed the mmvq kernel's 8-batch template ceiling: the batch is
+/// then run as `ceil(b_size / 8)` launches over ≤8-row slices of ONE staging
+/// buffer into ONE output. Both are batch-major — the q8_1 staging is
+/// `[b][ncols_padded]` blocks, `dst` is `[b][nrows]` — so a slice is a pointer
+/// offset, not a copy, and the rows of an N-row call are bit-identical to the
+/// same ≤8-row calls run separately. `fwd` routes batches past 8 to MMQ, so the
+/// chunking's caller is the format MMQ cannot take — Q8_K forces the vec path
+/// at every batch size, and used to fail outright past 8.
 #[allow(clippy::too_many_arguments)]
 fn mul_mat_vec_via_q8_1(
     data: &PaddedCudaSlice,
@@ -2646,13 +2655,14 @@ fn mul_mat_vec_via_q8_1(
     if y.len() != ncols * b_size {
         crate::bail!("unexpected y size {}, ncols {ncols} {nrows}", y.len())
     }
-    if b_size == 0 || b_size > 8 {
-        crate::bail!("only bsize between 1 and 8 are supported, got {b_size}")
+    if b_size == 0 {
+        crate::bail!("mmvq needs at least one batch row")
     }
-    // Start by quantizing y
+    // Start by quantizing y — the WHOLE batch in one launch, whatever the
+    // per-launch ceiling below slices it into.
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
-    let y_size_in_bytes =
-        b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+    let row_q8_bytes = ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+    let y_size_in_bytes = b_size * row_q8_bytes;
     // The staging buffer stays on the pool. It is a bare `CudaSlice` that this
     // function drops, and dropping a lease means `cuMemFreeAsync` on an address
     // inside the VMM reservation — which the driver rejects and cudarc records,
@@ -2668,18 +2678,26 @@ fn mul_mat_vec_via_q8_1(
         let (data_ptr, _data_guard) = data.inner.device_ptr(&stream);
         let (y_q8_1_ptr, _y_guard) = y_q8_1.device_ptr(&stream);
         let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
-        unsafe {
-            run_mul_mat_vec_q8_1(
-                data_ptr as *const std::ffi::c_void,
-                y_q8_1_ptr as *const std::ffi::c_void,
-                dst_ptr as *mut f32,
-                ncols as i32,
-                nrows as i32,
-                ncols_padded as i32,
-                nrows as i32,
-                b_size as i32,
-                qtype as i32,
-            );
+        // The kernel is templated over its batch count, instantiated 1..=8 —
+        // each thread carries one accumulator per batch, so the ceiling is
+        // register pressure, not convention.
+        let mut off = 0usize;
+        while off < b_size {
+            let chunk = (b_size - off).min(8);
+            unsafe {
+                run_mul_mat_vec_q8_1(
+                    (data_ptr as *const u8) as *const std::ffi::c_void,
+                    (y_q8_1_ptr as *const u8).add(off * row_q8_bytes) as *const std::ffi::c_void,
+                    (dst_ptr as *mut f32).add(off * nrows),
+                    ncols as i32,
+                    nrows as i32,
+                    ncols_padded as i32,
+                    nrows as i32,
+                    chunk as i32,
+                    qtype as i32,
+                );
+            }
+            off += chunk;
         }
     }
     Ok(CudaStorage::wrap_cuda_slice_backed(
@@ -3690,13 +3708,58 @@ impl QCudaStorage {
                  kernels address unconditionally. Copy it into an owned QTensor first."
             )
         }
+        // **AWQ is not a matmul weight format here.** It survives as a KV arena
+        // format (`ArenaFormatTag::QAWQ`), where its own dequantize/quantize
+        // kernels serve the cache, and nothing in this engine loads an AWQ
+        // weight — the GGUF loader does not produce one. Its matmul path was
+        // never correct: the CUDA `block_q_awq_g64` declares 64 elements with a
+        // single scale/zero where the Rust `BlockQAWQ_G64` has 128 with
+        // `scales[2]`/`zeros[2]`, so the two describe different formats and the
+        // kernel returned NaN at every batch size and activation dtype. Refused
+        // here rather than left to answer with NaN.
+        if matches!(self.dtype, GgmlDType::QAWQ | GgmlDType::QAWQ_G64) {
+            crate::bail!(
+                "QMatMul over a {:?} weight: AWQ is a KV arena format in this engine, \
+                 not a matmul weight format, and its matmul kernels were removed \
+                 because their block layout never matched the Rust one. Dequantize the \
+                 weight, or load it in a format the matmul kernels are built for.",
+                self.dtype
+            )
+        }
+        // Vec kernel through 8 rows, MMQ beyond. Both sides of the boundary are
+        // measured, not assumed — the curve lives in candle-transformers
+        // `quantized_matmul::tests::qmatmul_row_count_curve`, re-run it before
+        // moving this number. On a Q6_K [12288, 4096] (the 9B's gate/up): vec
+        // 47–113 µs over 1–8 rows; MMQ's batch-narrow (mmq_x = 16) tile takes
+        // 9–32 rows at 107–200 µs, and its wide tile the rest. The narrow tile
+        // is what makes 8 the right boundary — against the wide-tile-only MMQ
+        // of old, 9 rows cost 2.4× what 8 did and this threshold had to sit at
+        // 16 with the vec path double-launching to cover the gap.
+        //
+        // The count that lands in 9..=16 in production is a speculative VERIFY
+        // wave: `sessions × (draft + 1)` rows — 12 at four sessions, budget 2 —
+        // where the decode wave beside it carries `sessions` rows and stays vec.
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
         } else {
             8
         };
-        // Q8K doesn't have MMQ support (QI8_K > WARP_SIZE), always use vec kernel
-        let force_vec = self.dtype == GgmlDType::Q8_K;
+        // Formats MMQ cannot serve, whatever the batch — the vec kernel is the
+        // only correct path for them.
+        //
+        // * **Q8_K**: `QI8_K > WARP_SIZE`, so the tile never had an MMQ form.
+        // * **Q8_1**: it has one, and it is wrong. Measured against a
+        //   dequantized reference at K=2048, Q8_1 weights agree to 0.0074 for
+        //   every batch the vec kernel takes (1..=8) and then return garbage the
+        //   moment MMQ picks it up — max_diff 1.7e5 at batch 16 and 2.6e5 at 64
+        //   and 128, with HALF the output elements zero, identically for BF16,
+        //   F16, F32 and F8E4M3 activations. Q8_1 is the ACTIVATION format these
+        //   kernels quantize into, and its block carries two scales where the
+        //   MMQ tile loader expects one; nothing in a GGUF ships Q8_1 weights,
+        //   which is why a broken tile went unnoticed. Routed here rather than
+        //   left to compute silently wrong answers for anyone who quantizes a
+        //   weight to it. `quantized::q8_1::cuda_tests` is the gate.
+        let force_vec = matches!(self.dtype, GgmlDType::Q8_K | GgmlDType::Q8_1);
         let use_vec_kernel = force_vec
             || match layout.shape().dims() {
                 [b, m, _k] => b * m <= max_bm,

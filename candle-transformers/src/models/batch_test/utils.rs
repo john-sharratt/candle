@@ -21,6 +21,34 @@ use crate::models::batched_inference::{
 };
 use crate::models::dialect::Dialect;
 use crate::models::expert_lre::PipelineStats;
+use crate::models::speculative_choice::GreedyChooser;
+
+/// How a run decides its draft budget.
+///
+/// Not a feature switch — both variants run the same generate path, and the
+/// difference is whether the run is *using* the model's tuning or *producing*
+/// it. A gate measuring the width ladder has to hold the budget still while it
+/// varies the width; everything else should behave the way production does,
+/// which means asking the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftBudget {
+    /// Ask the model what it wants at this config's width — production
+    /// behaviour, and what every gate uses unless it is measuring the ladder.
+    Adaptive,
+    /// Hold the budget at `k` regardless of width. `0` is a plain-decode
+    /// baseline; anything else is a point on the curve being measured.
+    Fixed(usize),
+}
+
+impl DraftBudget {
+    /// Resolve to a token count for a wave of `width` sequences.
+    fn resolve<M: ManagedBatchedModel + ?Sized>(self, model: &M, width: usize) -> usize {
+        match self {
+            Self::Adaptive => model.draft_budget(width),
+            Self::Fixed(k) => k,
+        }
+    }
+}
 use crate::models::profile::{
     gpu_drain_blocking, pipeline_record, pipeline_snapshot_and_reset, profile_now, ProfileSnapshot,
 };
@@ -90,12 +118,16 @@ pub struct TestParams {
     /// table records which numeric mode produced it. Defaults to `Off`; set via
     /// [`Self::with_int8mode`].
     pub int8mode: Int8Mode,
-    /// When `Some(k)`, the generate phase uses lossless speculative decoding via
-    /// [`ManagedBatchedModel::speculative_decode_step`] with a draft budget of `k`, instead of
-    /// the one-token-per-step batched loop. Model-agnostic: a model with no drafter degrades to
-    /// plain decode, so the output (and validation) is unchanged; a model with a drafter produces
-    /// the same tokens faster. Defaults to `None` (classic batched decode).
-    pub speculative_max_draft: Option<usize>,
+    /// How the generate phase decides each step's draft budget.
+    ///
+    /// Defaults to [`DraftBudget::Adaptive`], so a gate measures what production
+    /// would actually do at that width. **Asked for, not granted** either way: a
+    /// model clamps the answer to its own drafter's ceiling, and a model with no
+    /// drafter proposes nothing and decodes one token per step. Speculation
+    /// accepts only the model's own greedy continuation, so the generated text —
+    /// and therefore every gate's expected-output check — is identical at any
+    /// budget. See [`Self::with_speculative`].
+    pub speculative_max_draft: DraftBudget,
 }
 
 impl TestParams {
@@ -138,13 +170,15 @@ impl TestParams {
             begin_document_token,
             timeout_secs: 120,
             int8mode: Int8Mode::Off,
-            speculative_max_draft: None,
+            speculative_max_draft: DraftBudget::Adaptive,
         })
     }
 
-    /// Enable lossless speculative decoding in the generate phase with a draft budget of `k`.
+    /// Pin the draft budget instead of asking the model — `0` for a plain-decode
+    /// baseline, otherwise a point on the width/budget curve being measured.
+    /// See [`Self::speculative_max_draft`]; the model still clamps it.
     pub fn with_speculative(mut self, max_draft: usize) -> Self {
-        self.speculative_max_draft = Some(max_draft);
+        self.speculative_max_draft = DraftBudget::Fixed(max_draft);
         self
     }
 
@@ -1261,29 +1295,12 @@ impl TestParams {
             self.device.synchronize()?;
         }
 
-        // Generate phase
-        let mut remaining_steps = self.generate_token_count;
-
-        // Early-stop predicate: every session has emitted a stop token.
-        let all_stopped = |toks: &[u32]| -> bool {
-            !self.stop_on_eos.is_empty() && toks.iter().all(|t| self.stop_on_eos.contains(t))
-        };
-
-        // Warmup step (step 0) — skipped for the speculative phase, which runs
-        // its own driver over the whole generate window.
-        let mut stopped = false;
-        if self.speculative_max_draft.is_none() && remaining_steps > 0 {
-            let toks =
-                self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
-            self.device.synchronize()?;
-            remaining_steps -= 1;
-            stopped = all_stopped(&toks);
-        }
-
+        // Generate phase. Budget and early-stop live inside the driver's per
+        // sequence emit sinks now, so there is nothing to track out here.
         self.device.synchronize()?;
         let generate_start = std::time::Instant::now();
         let t_decode_total = profile_now();
-        let mut steps_run = 0usize;
+        let steps_run;
         // The steady-state decode loop is the hot loop the transient tier
         // exists for, so it is the window worth measuring: every device
         // allocation inside it is one the wave path should have taken from a
@@ -1294,25 +1311,21 @@ impl TestParams {
         // Arming is scoped to this block so an early `?` cannot leave the
         // detector on for the sealing and reporting that follow.
         let detector = forbidden_alloc::armed();
-        if let Some(max_draft) = self.speculative_max_draft {
-            // Lossless speculative decode (model-agnostic), per session.
-            steps_run = self.speculative_decode_phase(
-                &mut session,
-                &sequence_indices,
-                &mut runs,
-                model,
-                max_draft,
-            )?;
-        } else if !stopped {
-            for _step_num in 0..remaining_steps {
-                let toks =
-                    self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
-                steps_run += 1;
-                if all_stopped(&toks) {
-                    break;
-                }
-            }
-        }
+        // ONE generate path for every gate and every model. A model with a
+        // drafter speculates; a model without one proposes nothing and the
+        // driver degrades to a token-per-step decode, which is what the
+        // one-token loop this replaced used to do. Because speculation accepts
+        // only the model's own greedy continuation, both produce identical text,
+        // so every gate's expected-output check is now also a losslessness check
+        // — across the whole C0–C10 ladder, not just the speculative gates.
+        steps_run = self.speculative_decode_phase(
+            &mut session,
+            &sequence_indices,
+            &mut runs,
+            model,
+            self.speculative_max_draft
+                .resolve(model, sequence_indices.len()),
+        )?;
         self.device.synchronize()?;
         drop(detector);
         let forbidden = forbidden_alloc::take_report();
@@ -1521,17 +1534,43 @@ impl TestParams {
         // OUT of the KV as the driver's `committed` seed.
         let mut committed: Vec<u32> = Vec::with_capacity(sequence_indices.len());
         let mut active: Vec<bool> = Vec::with_capacity(sequence_indices.len());
-        for run in runs.iter_mut() {
-            let c = run.logits.squeeze(0)?.argmax(0)?.to_scalar::<u32>()?;
+        for (i, run) in runs.iter_mut().enumerate() {
+            let row = run.logits.squeeze(0)?;
+            let c = row.argmax(0)?.to_scalar::<u32>()?;
+            // `argmax` yields `u32::MAX` when every value is -inf or NaN, which
+            // is what a corrupted forward looks like from here — a token id that
+            // no vocabulary has. Caught at the seed because a bad seed feeds the
+            // drafter and the whole block, so the failure would otherwise
+            // surface as unreadable output several steps later.
+            if c == u32::MAX {
+                let f = |t: Result<Tensor>| -> f32 {
+                    t.and_then(|x| x.to_dtype(DType::F32)?.to_vec0::<f32>())
+                        .unwrap_or(f32::NAN)
+                };
+                candle::bail!(
+                    "invalid token id sampled for sequence {i} — prefill logits corrupted \
+                     (max={}, min={})",
+                    f(row.max(0)),
+                    f(row.min(0))
+                );
+            }
             run.output.push(c);
             committed.push(c);
             active.push(run.output.len() < max_tokens && !stop_on.contains(&c));
         }
+        // Acceptance is the whole economics of speculation: a step costs about
+        // one plain wave and yields however many tokens the verify confirmed,
+        // so mean accepted/step IS the speedup ceiling. Reported rather than
+        // asserted — it is a property of the text, not of the code.
+        let (mut steps, mut emitted) = (0usize, 0usize);
+        let t_spec = std::time::Instant::now();
         loop {
             let idxs: Vec<usize> = (0..sequence_indices.len()).filter(|&i| active[i]).collect();
             if idxs.is_empty() {
                 break;
             }
+            steps += 1;
+            let before: usize = idxs.iter().map(|&i| runs[i].output.len()).sum();
             let seqs: Vec<usize> = idxs.iter().map(|&i| sequence_indices[i]).collect();
             let comms: Vec<u32> = idxs.iter().map(|&i| committed[i]).collect();
             // Per-session emit sinks over DISJOINT `runs` borrows: each pushes
@@ -1549,8 +1588,19 @@ impl TestParams {
                     }) as Box<dyn FnMut(u32) -> bool>
                 })
                 .collect();
-            let next = model
-                .speculative_decode_step_batch(session, &seqs, &comms, max_draft, nl, &mut emits)?;
+            // Greedy: this harness seeds from the prefill row's argmax and
+            // validates every run against a fixed expected string, so the
+            // speculative path must reproduce plain greedy decode token for
+            // token.
+            let next = model.speculative_decode_step_batch(
+                session,
+                &seqs,
+                &comms,
+                max_draft,
+                nl,
+                &mut GreedyChooser,
+                &mut emits,
+            )?;
             drop(emits);
             for (k, &i) in idxs.iter().enumerate() {
                 // `Some(c)` ⇒ the sink accepted `c` under budget/EOS policy (it
@@ -1561,117 +1611,29 @@ impl TestParams {
                     None => active[i] = false,
                 }
             }
+            emitted += idxs.iter().map(|&i| runs[i].output.len()).sum::<usize>() - before;
         }
-        Ok(max_tokens)
-    }
-
-    /// Decode step for batched mode
-    fn decode_step_batched<M>(
-        &self,
-        session: &mut BatchedInferenceSession,
-        sequence_indices: &[usize],
-        runs: &mut [TestRun],
-        model: &M,
-    ) -> Result<Vec<u32>>
-    where
-        M: ManagedBatchedModel,
-    {
-        let t_sample = profile_now();
-        // Sample tokens using batched fused CUDA kernel (argmax mode)
-        // Stack all logits into [batch_size, vocab_size] tensor
-        let logits_batch: Vec<Tensor> = runs
-            .iter()
-            .map(|run| run.logits.squeeze(0))
-            .collect::<Result<Vec<_>>>()?;
-        let stacked_logits = Tensor::stack(&logits_batch, 0)?;
-
-        // Use fused batched sampling kernel on CUDA, standard argmax elsewhere.
-        // batched_sample_argmax() dispatches to the optimized CUDA kernel which
-        // does argmax in a single kernel launch across all sequences.
-        let token_ids = stacked_logits.batched_sample_argmax()?;
-
-        // Convert to u32 tokens
-        let sampled_tokens = token_ids.to_vec1::<u32>()?;
-
-        // Validate sampled tokens - argmax returns u32::MAX when all values are -inf/NaN
-        for (i, &tok) in sampled_tokens.iter().enumerate() {
-            if tok == u32::MAX {
-                // Get the actual logits for this sequence to help debug
-                let seq_logits = &logits_batch[i];
-                let max_val = seq_logits
-                    .max(0)?
-                    .to_dtype(DType::F32)?
-                    .to_vec0::<f32>()
-                    .unwrap_or(f32::NAN);
-                let min_val = seq_logits
-                    .min(0)?
-                    .to_dtype(DType::F32)?
-                    .to_vec0::<f32>()
-                    .unwrap_or(f32::NAN);
-                candle::bail!(
-                    "Invalid token ID {} sampled for sequence {} - logits corrupted (max={}, min={})",
-                    tok, i, max_val, min_val
-                );
-            }
-        }
-        pipeline_record("bench:decode_sample", t_sample);
-
-        // Update outputs
-        for (run, &tok) in runs.iter_mut().zip(sampled_tokens.iter()) {
-            run.output.push(tok);
-        }
-
-        let t_inputs = profile_now();
-        // Create input tensors
-        let input_tensors: Vec<Tensor> = sampled_tokens
-            .iter()
-            .map(|&tok| {
-                Tensor::new(&[tok], &self.device)
-                    .unwrap()
-                    .unsqueeze(0)
-                    .unwrap()
-            })
-            .collect();
-        pipeline_record("bench:decode_input_tensors", t_inputs);
-
-        // Validate that no two sessions share a GID before the decode kernel.
-        // This catches cross-session KV aliasing on the host side before it
-        // silently corrupts GPU attention reads.
-        if std::env::var("KV_VALIDATE_GIDS").is_ok() {
-            session.validate_gid_uniqueness(sequence_indices)?;
-        }
-
-        let t_forward = profile_now();
-        // Forward all sequences in batch (decode step: q=1 rows in the decode group)
-        let nl = model.num_layers();
-        let logits_vec = model
-            .forward_wave(
-                session,
-                sequence_indices,
-                &input_tensors,
-                &[],
-                &[],
-                &[],
-                &[],
-                0,
-                nl,
-                None,
-            )?
-            .logits_owned()?;
-        pipeline_record("bench:decode_forward_call", t_forward);
-
-        for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {
-            run.logits = logits;
-        }
-
-        let t_advance = profile_now();
-        // Advance all sequence offsets by 1
-        for &seq_idx in sequence_indices {
-            session.advance_sequence(seq_idx, 1)?;
-        }
-        pipeline_record("bench:decode_advance", t_advance);
-
-        Ok(sampled_tokens)
+        let secs = t_spec.elapsed().as_secs_f64();
+        println!(
+            "  speculative: {steps} steps, {emitted} tokens, {:.2} accepted/step \
+             ({:.1} tok/s over the cohort, draft budget {max_draft})",
+            if steps > 0 {
+                emitted as f64 / steps as f64
+            } else {
+                0.0
+            },
+            if secs > 0.0 {
+                emitted as f64 / secs
+            } else {
+                0.0
+            },
+        );
+        // Tokens per session, not steps: the perf table multiplies this by the
+        // context count to get the generated total, and a speculative step emits
+        // more than one. Derived from what was actually emitted rather than from
+        // the budget, so a cohort that stopped early on EOS is not credited with
+        // tokens it never produced.
+        Ok(emitted / sequence_indices.len().max(1))
     }
 
     /// Validate results and print comparison table

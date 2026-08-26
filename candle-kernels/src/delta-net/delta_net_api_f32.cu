@@ -42,6 +42,7 @@ extern "C" void run_delta_net_conv_decode_f32(
         const float* x,
         const float* kernel,
         const long long* tails,
+        const long long* tails_out,
         const unsigned int* rows,
         float* y,
         int n_decode,
@@ -51,8 +52,8 @@ extern "C" void run_delta_net_conv_decode_f32(
         float eps,
         void* stream) {
     delta_net::launch_conv_decode_f32(
-        x, kernel, tails, rows, y, n_decode, channels, kwidth, qk_channels,
-        eps, (cudaStream_t)stream);
+        x, kernel, tails, tails_out, rows, y, n_decode, channels, kwidth,
+        qk_channels, eps, (cudaStream_t)stream);
 }
 
 extern "C" void run_delta_net_batch_ptrs(
@@ -70,63 +71,68 @@ extern "C" void run_delta_net_batch_ptrs(
 }
 
 extern "C" void run_delta_net_conv_prefill_f32(
-        const float* x,
+        const float* x_wave,
         const float* kernel,
-        const float* tail,
-        float* y,
-        float* tail_out,
-        int t_len,
+        float* y_wave,
+        const long long* ptrs,
+        const unsigned int* spans,
+        int n_spans,
+        int max_len,
         int channels,
         int kwidth,
         int qk_channels,
         float eps,
         void* stream) {
     delta_net::launch_conv_prefill_f32(
-        x, kernel, tail, y, tail_out, t_len, channels, kwidth, qk_channels,
-        eps, (cudaStream_t)stream);
+        x_wave, kernel, y_wave, ptrs, spans, n_spans, max_len, channels,
+        kwidth, qk_channels, eps, (cudaStream_t)stream);
 }
 
 extern "C" void run_delta_net_prefill_intra_f32(
-        const float* qk,
-        const float* v,
-        const float* alpha,
-        const float* blin,
+        const float* qk_wave,
+        const float* v_wave,
+        const float* alpha_wave,
+        const float* blin_wave,
         const float* dt_bias,
         const float* a_neg,
         float* u,
         float* w,
         float* kq,
         float* g_cs,
-        int t_len,
+        const unsigned int* spans,
+        int n_spans,
+        int max_len,
+        int t_tran,
         int n_v_heads,
         int n_k_heads,
         int tok_stride,
         float q_scale,
         void* stream) {
     delta_net::launch_prefill_intra_f32(
-        qk, v, alpha, blin, dt_bias, a_neg, u, w, kq, g_cs,
-        t_len, n_v_heads, n_k_heads, tok_stride, q_scale,
-        (cudaStream_t)stream);
+        qk_wave, v_wave, alpha_wave, blin_wave, dt_bias, a_neg, u, w, kq, g_cs,
+        spans, n_spans, max_len, t_tran, n_v_heads, n_k_heads, tok_stride,
+        q_scale, (cudaStream_t)stream);
 }
 
 extern "C" void run_delta_net_prefill_state_f32(
-        const float* state,
-        float* state_out,
-        const float* qk,
+        const float* qk_wave,
         const float* u,
         const float* w,
         const float* kq,
         const float* g_cs,
-        float* o,
-        int t_len,
+        float* o_wave,
+        const long long* ptrs,
+        const unsigned int* spans,
+        int n_spans,
+        int t_tran,
         int n_v_heads,
         int n_k_heads,
         int tok_stride,
         float q_scale,
         void* stream) {
     delta_net::launch_prefill_state_f32(
-        state, state_out, qk, u, w, kq, g_cs, o, t_len, n_v_heads, n_k_heads,
-        tok_stride, q_scale, (cudaStream_t)stream);
+        qk_wave, u, w, kq, g_cs, o_wave, ptrs, spans, n_spans, t_tran,
+        n_v_heads, n_k_heads, tok_stride, q_scale, (cudaStream_t)stream);
 }
 
 extern "C" void run_delta_net_norm_gate_f32(

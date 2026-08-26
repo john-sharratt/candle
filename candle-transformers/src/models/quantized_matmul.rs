@@ -206,7 +206,9 @@ impl QMatMul {
         // The weight twin was baked in at load by `from_*_with_mode`.
         #[cfg(feature = "cuda")]
         if self.int8mode.is_int8() {
-            let out2 = self.inner.forward_via_int8(&xs2, self.int8mode, out_dtype)?;
+            let out2 = self
+                .inner
+                .forward_via_int8(&xs2, self.int8mode, out_dtype)?;
             pipeline_record("qmatmul_q8", t_mm);
             return if let Some((b, s)) = reshape_back {
                 let n = out2.dim(1)?;
@@ -248,5 +250,91 @@ impl Module for QMatMul {
 impl std::fmt::Debug for QMatMul {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "QMatMul")
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use candle::quantized::{GgmlDType, QTensor};
+    use candle::{DType, Device, Tensor};
+
+    /// **The row-count dispatch curve — the measurement both dispatch
+    /// boundaries are pinned from.**
+    ///
+    /// Two decisions come from this curve. `QCudaStorage::fwd`'s `max_bm`
+    /// splits the vec kernel (≤ 8 rows, its template ceiling) from MMQ; and
+    /// `run_mul_mat`'s `narrow` gate splits MMQ's batch-narrow `mmq_x = 16`
+    /// tile (through 32 rows) from its wide per-type tile. The narrow tile
+    /// exists because MMQ's dot work scales with the tile's batch width while
+    /// its weight loads do not, so a 12-row batch under a 64-wide tile spent
+    /// 4/5 of its arithmetic on padding — the row counts a speculative VERIFY
+    /// wave produces (`sessions × (draft + 1)`) sat exactly there.
+    ///
+    /// Prints µs/call and µs/row; asserts nothing, because the shape of the
+    /// curve is the property and its absolute height is the machine's. Re-run
+    /// this before moving either boundary.
+    #[test]
+    #[ignore = "GPU timing harness — prints the qmatmul row-count curve"]
+    fn qmatmul_row_count_curve() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        // **Two shapes, because the boundary is not shape-independent.**
+        //
+        // The gate/up projection is where a DeltaNet layer spends its time and
+        // is what the boundary was originally set on. The LM head is an order of
+        // magnitude wider in its output dimension, and it is the matmul the MTP
+        // drafter is bound by — a drafted token spends most of its time in one
+        // read of it. The drafter runs one row per session, so a decode wave of
+        // `n` sessions crosses this boundary at exactly `n = 9`, which is where
+        // speculation was measured to fall off a cliff (1.46x at eight sessions,
+        // 0.45x at ten). If the two shapes disagree about where MMQ starts
+        // winning, that cliff is this dispatch and not the wave.
+        for (label, out_dim, in_dim) in [
+            ("gate/up", 12288usize, 4096usize),
+            ("lm_head", 151936usize, 4096usize),
+        ] {
+            let w = Tensor::randn(0f32, 0.02, (out_dim, in_dim), &dev).unwrap();
+            let q = QMatMul::from_qtensor(QTensor::quantize(&w, GgmlDType::Q6_K).unwrap()).unwrap();
+            let weight_mib = (out_dim * in_dim / 256 * 210) >> 20;
+            eprintln!(
+                "--- {label}: Q6_K [{out_dim}, {in_dim}] = {weight_mib} MiB; \
+                 vec ≤ 8, x16-MMQ 9–32, x64-MMQ above ---"
+            );
+
+            for rows in [1usize, 2, 4, 8, 9, 12, 16, 17, 24, 32, 33, 48, 49, 64, 128] {
+                let x = Tensor::randn(0f32, 1.0, (rows, in_dim), &dev)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let run = || {
+                    let _ = q.inner().forward(&x).unwrap();
+                };
+                for _ in 0..10 {
+                    run();
+                }
+                dev.synchronize().unwrap();
+                let reps = 100;
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    run();
+                }
+                dev.synchronize().unwrap();
+                let us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                let path = if rows <= 8 {
+                    "vec"
+                } else if rows <= 32 {
+                    "mmq-x16"
+                } else {
+                    "mmq-x64"
+                };
+                eprintln!(
+                    "  {rows:>4} rows  {us:8.1} µs  {:7.2} µs/row  {path}",
+                    us / rows as f64
+                );
+            }
+        }
     }
 }

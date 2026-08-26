@@ -18,14 +18,29 @@ use std::path::Path;
 use candle::{Device, Result};
 use candle_nn::kv_cache::QWEN35_MOE_KV_FACTORS;
 
+use crate::models::draft_ladder::QWEN35_35B_A3B_DRAFT;
+
 use super::qwen35::{load_hybrid_gguf, HybridBatched, Qwen35LoadOptions};
 
 /// Pinned checkpoint (repo, revision, file) — revision-pinned so an upstream
 /// re-upload fails the gate loudly instead of drifting under it.
+///
+/// **The `-MTP-` repo**, because the plain conversion drops the NextN tensors
+/// and a model without them cannot speculate. On this checkpoint the head is a
+/// full routed block — `blk.40`, its own router, 256 experts and shared expert
+/// at the trunk's geometry — which is why the expert cache carries one layer
+/// more than the trunk has (`expert_host_refs`).
+///
+/// **The quant moved with the repo**: `Q4_K_M` → `UD-Q4_K_M`, because the MTP
+/// repo publishes only the UD variants. That is a different quantization of the
+/// same weights, so the KV error-threshold factors below were derived against
+/// the old file and the compression ladder is the gate that says whether they
+/// still hold. Re-derive them if C10 starts flaking rather than loosening the
+/// rung — the thresholds are model-specific by standing rule.
 pub const QWEN35_35B_A3B: (&str, &str, &str) = (
-    "unsloth/Qwen3.5-35B-A3B-GGUF",
-    "bc014a17be43adabd7066b7a86075ff935c6a4e2",
-    "Qwen3.5-35B-A3B-Q4_K_M.gguf",
+    "unsloth/Qwen3.5-35B-A3B-MTP-GGUF",
+    "63af8373893a7a73c6dfcb84cb63d815981da5e0",
+    "Qwen3.5-35B-A3B-UD-Q4_K_M.gguf",
 );
 
 /// Load the routed Qwen3.5 checkpoint and wrap it for the scheduler.
@@ -46,7 +61,7 @@ pub fn from_gguf_path(
              load it through quantized_qwen35 instead"
         );
     }
-    HybridBatched::new(model, QWEN35_MOE_KV_FACTORS)
+    HybridBatched::new(model, QWEN35_MOE_KV_FACTORS, QWEN35_35B_A3B_DRAFT)
 }
 
 #[cfg(test)]
@@ -358,8 +373,20 @@ mod tests {
         let refs = expert_host_refs(&content, &cfg)?;
 
         let moe = cfg.moe.expect("35B declares experts");
-        assert_eq!(refs.len(), cfg.num_layers, "every layer of the 35B is MoE");
+        // Every trunk layer routes, and so does the MTP draft head at
+        // `blk.{num_layers}` — its experts are the LAST entry, which is what
+        // puts them at the `moe_layer_idx` its router asks the cache for.
+        assert_eq!(
+            refs.len(),
+            cfg.num_layers + cfg.num_mtp_layers,
+            "every layer of the 35B routes, the draft head included"
+        );
         assert_eq!(refs[0].len(), moe.n_experts);
+        assert_eq!(
+            refs.last().expect("at least one layer").len(),
+            moe.n_experts,
+            "the head carries a full expert set, not a partial one"
+        );
         println!(
             "{} MoE layers x {} experts, slot {} + {} + {} bytes",
             refs.len(),
@@ -411,5 +438,41 @@ mod tests {
             "gate is [expert_ffn, hidden] per expert"
         );
         Ok(())
+    }
+
+    /// Speculative decode on the 3.5-35B — the 3.6 gate's sibling, on the
+    /// checkpoint where every layer routes. See
+    /// [`crate::models::quantized_qwen35::tests::speculative_gate`].
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.5-35B-A3B GGUF (22 GB) and needs a GPU. Run with: \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35_moe::tests::speculative_decode_35b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn speculative_decode_35b() -> Result<()> {
+        use crate::models::quantized_qwen35::tests::speculative_gate;
+
+        let model_path = pinned()?;
+        let int8mode = Int8Mode::Performance;
+        speculative_gate("Qwen3.5-35B-A3B", int8mode, &[1, 4], move || {
+            let device = Device::new_cuda(0)?;
+            let m = from_gguf_path(
+                &model_path,
+                &device,
+                Qwen35LoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                },
+            )?;
+            // A gate that silently fell back to plain decode would still pass
+            // — speculation is lossless, so the only symptom is the speedup
+            // going away. Assert the drafter is really there.
+            assert!(
+                m.has_drafter(),
+                "the pinned 35B has no MTP head — the pin has moved off the \
+                 -MTP-GGUF repo, or its conversion dropped the NextN tensors"
+            );
+            println!("✓ Model loaded\n");
+            Ok(m)
+        })
     }
 }
