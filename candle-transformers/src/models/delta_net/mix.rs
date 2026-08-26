@@ -1384,6 +1384,10 @@ pub fn delta_net_advance_spans(
         candle::bail!("delta_net_advance_spans: spans reach row {cursor} of a {t}-row buffer");
     }
 
+    // Bound under the same cfg as its only two uses below — the kernel's
+    // geometry check and the query scale. Without cuda there is no CUDA path to
+    // take, so the binding would be dead rather than merely unread.
+    #[cfg(feature = "cuda")]
     let d = dims.head_dim;
     #[cfg(feature = "cuda")]
     if p.qkv.device().is_cuda()

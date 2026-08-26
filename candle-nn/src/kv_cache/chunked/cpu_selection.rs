@@ -55,6 +55,12 @@ use crate::kv_cache::QuantFormat;
 use std::cmp::Ordering;
 
 const CHUNK_SIZE: usize = 32;
+/// The head dimension this mirror is written for — a property of *this file*,
+/// not of the algorithm or of the live path. The selection operates on
+/// 32-element blocks, so head dimension only sets how many blocks a palette
+/// band covers; the GPU path takes any compiled shape that divides by
+/// `N_PALETTE` (128 and 256 today). Fixing it here buys stack arrays and
+/// exact-size asserts, which is what a differential debugging mirror wants.
 const HEAD_DIM: usize = 128;
 const N_PALETTE: usize = 4;
 const SLOT_QUOTA: usize = HEAD_DIM / N_PALETTE;
@@ -98,7 +104,11 @@ pub struct SelectionOutput {
 /// Public entry point. `head_id = chunk * n_kv_head + head_idx` keys into
 /// `output.heads`.
 pub fn select_palette4(input: SelectionInput<'_>) -> SelectionOutput {
-    assert_eq!(input.head_dim, HEAD_DIM, "head_dim must be 128");
+    assert_eq!(
+        input.head_dim, HEAD_DIM,
+        "this mirror is built for head_dim {HEAD_DIM}; the live path is not \
+         restricted to it (see the constant)"
+    );
     let total_heads = input.n_chunks * input.n_kv_head;
     let per_head_floats = HEAD_DIM * CHUNK_SIZE;
     let expected = total_heads * per_head_floats;

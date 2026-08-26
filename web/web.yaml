@@ -1,0 +1,142 @@
+# ============================================================================
+# web — the site table for the DMZ front door.
+#
+# A request is resolved in three steps:
+#
+#     Host header  ->  site      (exact, then *.wildcard, then the default)
+#     path prefix  ->  upstream  (longest matching prefix wins; `exact` beats
+#                                 any prefix)
+#     otherwise    ->  a file, from that site's roots in order
+#
+# `roots` is a list because one URL tree is assembled from several directories:
+# `[content/npcd, content/common]` means /lib/dom.js falls through to the shared
+# framework while /pages/roster.js does not. Neither site owns the framework.
+#
+# Paths are relative to this file, so the config travels with its content.
+# `web --check` prints the resolved table without binding anything.
+#
+# TWO WAYS TO RUN THIS FILE:
+#
+#   web                   the deployment below — this box holds the files, the
+#                         daemons answer the APIs from their own machines.
+#   web --authoritative   every forwarded API answered from the built-in mocks
+#                         instead. Nothing outside the process is contacted, so
+#                         the whole estate works on a laptop with no daemons.
+#
+# The flag rewrites the upstreams; it does not need a second config.
+# ============================================================================
+
+server:
+  bind: "0.0.0.0:8080"
+
+  # `no-store` while iterating. The failure this prevents is a cached page
+  # talking to a newer API; set a real max-age once assets are hashed.
+  cache_control: "no-store"
+
+  # A daemon that is down is not retried on every request: the window opens at
+  # 250ms and doubles to 10s, requests inside it fail fast with an error page
+  # that refreshes itself, and one probe is released when it expires. Recovery
+  # needs no operator action.
+  backoff:
+    initial_ms: 250
+    max_ms: 10000
+
+  connect_timeout_ms: 5000
+
+# ── sign-in, for the whole estate ───────────────────────────────────────────
+# OFF by default, and the block below is commented out. tokera.com is a public
+# site: the home page, the blog and the papers need no account, so a missing
+# key must not stop them being served. With no `auth:` block, `/auth/me`
+# reports `configured: false` and the UI shows no sign-in button at all.
+#
+# Turn it on and it becomes strict — a missing or unreadable secret is then a
+# hard startup failure, because at that point you have said you want sign-in
+# and a gateway that quietly has none is the worse outcome. `web --check`
+# reports it without binding anything.
+#
+# What it does when on: the gateway runs the OIDC exchange and issues a session
+# cookie on the PARENT domain, so signing in at tokera.com is already signed in
+# at code.tokera.com and bot.tokera.com — the browser presents the cookie to
+# each of them and the daemons never authenticate anyone themselves. They read
+# the identity this process asserts on `X-Tokera-*`, which is why they listen on
+# private addresses: the gateway is the only way in, and it strips those headers
+# off every inbound request before setting its own.
+#
+# Paths resolve against THIS FILE, like `roots` and `papers`, so keep them
+# relative and the same table works on a laptop and on the DMZ box. Both
+# secrets are files rather than inline values so this table can be committed
+# without carrying one; `web/secrets/` is gitignored.
+#
+#   mkdir -p web/secrets
+#   # any 32+ bytes; on Windows:
+#   #   [Convert]::ToBase64String((1..48|%{Get-Random -Max 256})) > web/secrets/session.key
+#   head -c 48 /dev/urandom | base64 > web/secrets/session.key
+#   # client secret: Google Cloud console → APIs & Services → Credentials →
+#   #                OAuth 2.0 Client ID, saved to web/secrets/google.secret
+#   # redirect URI:  register the value below EXACTLY, or Google answers
+#   #                redirect_uri_mismatch
+#
+# auth:
+#   cookie_domain: ".tokera.com"
+#   session_ttl_hours: 720
+#   session_secret_file: "secrets/session.key"
+#   google:
+#     client_id: "REPLACE-ME.apps.googleusercontent.com"
+#     client_secret_file: "secrets/google.secret"
+#     redirect_uri: "https://tokera.com/auth/callback"
+
+sites:
+  # ── tokera.com ──────────────────────────────────────────────────────────
+  # The default site: any Host matching nothing else lands here. It has no
+  # daemon — `web` is its backend, because the whole site is documents.
+  #
+  # `papers` is the directory its papers are read from, live. It is NOT a
+  # content root: only documents named in content/tokera/papers.yaml are
+  # reachable, so pointing it at the repo's docs/ publishes the papers rather
+  # than the whole design directory.
+  #
+  # The routes below are the generated pages. Everything else on the site —
+  # site.css, favicon.svg, and /base.css from the shared root — is a file,
+  # which is why `/` is `exact`: a bare `/` prefix would swallow them all.
+  - name: tokera
+    default: true
+    hosts: ["tokera.com", "www.tokera.com", "tokera.localhost",
+            "battlecities.net", "www.battlecities.net"]
+    roots: ["content/tokera", "content/common"]
+    papers: "../docs"
+    api:
+      - {prefix: /, exact: true, upstream: local}
+      - {prefix: /blog, upstream: local}
+      - {prefix: /papers, upstream: local}
+
+  # ── bot.tokera.com — the NPC console ────────────────────────────────────
+  # Files from this box; the daemon runs on 192.168.0.6. `npcd.localhost`
+  # resolves to 127.0.0.1 in every current browser, so it needs no hosts entry
+  # to reach this site during local development.
+  - name: npcd
+    hosts: ["bot.tokera.com", "npcd.localhost", "npcd.test", "*.npcd.dev"]
+    roots: ["content/npcd", "content/common"]
+    # Extensionless paths naming no file land here, so the hash router owns
+    # navigation and a deep link survives a refresh. A missing *.js still 404s.
+    fallback: "index.html"
+    api:
+      - prefix: /v1
+        upstream: "http://192.168.0.6:8081"
+      # Same upstream, listed separately so websockets can move to their own
+      # host later without disturbing the REST rule.
+      - prefix: /ws
+        upstream: "http://192.168.0.6:8081"
+
+  # ── code.tokera.com — Zen Code ──────────────────────────────────────────
+  # zend still embeds and serves its own assets, so this site is a pure
+  # gateway: no roots, everything forwarded, navigation included. When zend is
+  # split the same way as npcd, give it `roots: ["content/zend",
+  # "content/common"]` and drop its embedded copy.
+  #
+  # It has no mock, so `--authoritative` cannot stand in for it — that is
+  # reported at startup rather than discovered from an empty page.
+  - name: zend
+    hosts: ["code.tokera.com", "zend.localhost", "zend.test"]
+    api:
+      - prefix: /
+        upstream: "http://192.168.0.5:8081"

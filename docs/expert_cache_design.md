@@ -592,10 +592,23 @@ means the page cache is already an uncontrolled warm tier underneath us.
 **2. The NVMe : PCIe bandwidth ratio, which decides whether the warm tier is
 worth building at all.**
 
-| machine | NVMe | PCIe to GPU | warm tier value |
-|---|---|---|---|
-| dev (this box) | single, ~3–7 GB/s | ~25 GB/s | 4–8× — earns its keep |
-| production (`CLAUDE.md`) | 16 TB PCIe 5.0 RAID 0 **@ 45 GB/s** | ~25 GB/s | disk is *faster than the bus* — buys ≈ nothing |
+**Name the machine when quoting a bus number.** "PCIe to GPU" is a property of the
+*host*, not the card, and the dev boxes differ by more than 2×. An unattributed
+bandwidth figure gets reused on the wrong machine and silently invalidates a
+sizing decision — which is exactly what this table is for.
+
+| machine | link | NVMe | PCIe to GPU | warm tier value |
+|---|---|---|---|---|
+| dev — 4090 Mobile 16 GB | PCIe 4.0 ×16 | single, ~3–7 GB/s | **~25 GB/s** (measured) | 4–8× — earns its keep |
+| dev — RTX 3090 24 GB (i7-10700K) | **PCIe 3.0 ×16** | single | **~12 GB/s** (gen-3 cap, 15.75 theoretical) | 2–4× — earns its keep, more so |
+| dev — RTX PRO 5000 72 GB | PCIe 5.0 ×16 | single | ~25 GB/s+ | large VRAM makes it mostly moot |
+| production (`CLAUDE.md`) | PCIe 5.0 ×16 | 16 TB PCIe 5.0 RAID 0 **@ 45 GB/s** | ~25 GB/s | disk is *faster than the bus* — buys ≈ nothing |
+
+The 3090 box is the interesting case: the **i7-10700K is Comet Lake and caps the
+link at gen 3**, so its host↔GPU bandwidth is roughly half the 4090 Mobile's
+despite being the newer-looking desktop part. Any sizing that assumes ~25 GB/s
+is wrong there by 2×. The warm tier is *more* valuable on that box, not less,
+because the NVMe:PCIe ratio narrows.
 
 The warm tier may be a dev-box concession rather than a permanent architecture.
 That is an argument for keeping it as simple as §6 describes and for making it

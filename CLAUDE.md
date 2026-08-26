@@ -57,12 +57,33 @@ Qwen3 thresholds are model-specific and must be re-derived for each variant. Whe
 
 ## Hardware
 
-**Two dev machines, swapped between.** The framework must work on both, and
-neither is "the" target — check what you are actually on (`nvidia-smi`)
+**Three dev machines, worked on in parallel.** The framework must work on all
+three, and none is "the" target — check what you are actually on (`nvidia-smi`)
 rather than assuming, because sizing decisions differ between them:
 
-- **RTX 4090 Mobile 16 GB** (sm_89), 32 GB host RAM.
-- **RTX PRO 5000 Blackwell 72 GB** (sm_120).
+| Machine | VRAM | SM | Host | Link |
+|---|---|---|---|---|
+| **RTX 4090 Mobile** | 16 GB | sm_89 (Ada) | 32 GB RAM | PCIe 4.0 ×16, ~25 GB/s |
+| **RTX 3090** | 24 GB | sm_86 (GA102) | i7-10700K 8C/16T, 64 GB RAM | **PCIe 3.0 ×16, ~12 GB/s** |
+| **RTX PRO 5000 Blackwell** | 72 GB | sm_120 | — | PCIe 5.0 ×16 |
+
+Two traps specific to the **3090 box**, both easy to miss because the card
+looks like the biggest consumer part in the fleet:
+
+- **Its host caps the link at PCIe 3.0.** The i7-10700K is Comet Lake, so
+  host↔GPU is ~12 GB/s — roughly *half* the 4090 Mobile's, despite 50% more
+  VRAM. Any sizing that reuses the "~25 GB/s" figure from
+  `docs/expert_cache_design.md` is wrong there by 2×. That table now names its
+  machine per row; keep it that way.
+- **sm_86 has no native FP8** (`device_caps.cuh` gates `has_native_fp8` at
+  `sm >= 890`). The sm_89 b1 BMMA and Blackwell INT8 IMMA provenance backends
+  also do not apply; both degrade to the next rung, so it runs — just not on
+  the fast path. Do not benchmark provenance scan here and compare to the
+  4090 Mobile without accounting for it.
+
+At 24 GB the 3090 crosses `Q6_MIN_TOTAL_VRAM_BYTES`, so it runs
+**Qwen3-30B-A3B Q6_K** (~25 GB, expert-LRU paged) where the 16 GB box runs
+Q4_K_M — see `zend/src/model_choice.rs`.
 
 Reference benchmarks (measured on the 4090 Mobile 16 GB): 509 t/s
 single-session, 2,446 t/s aggregate (64 sessions), Qwen3-30B-A3B.
