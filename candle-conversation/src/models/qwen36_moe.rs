@@ -28,12 +28,20 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
         arch: ModelArch::Qwen35Hybrid,
         dialect: chat_format.dialect(),
         chat_format,
-        model_repo: "unsloth/Qwen3.6-35B-A3B-GGUF".into(),
+        // The `-MTP-` repo, not the plain one. Both publish the same quant under
+        // the same filename, and they differ only in that the plain conversion
+        // drops the NextN tensors — so a model loaded from it cannot speculate.
+        // That failure is silent: speculation is lossless, so a drafter-less
+        // checkpoint answers identically and only the ~2x decode is missing.
+        // `quantized_qwen36_moe` pins the same repo and asserts `has_drafter()`
+        // for exactly this reason.
+        model_repo: "unsloth/Qwen3.6-35B-A3B-MTP-GGUF".into(),
         model_filename: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf".into(),
         // The published file's exact length, read off the local snapshot at the
         // pinned revision. Downloaders use it for progress totals when the
-        // server omits Content-Length, so a guess shows a wrong bar.
-        model_bytes: 22_134_528_992,
+        // server omits Content-Length, so a guess shows a wrong bar. The MTP
+        // file is the larger of the two by the size of the head.
+        model_bytes: 22_663_387_424,
         tokenizer_repo: "Qwen/Qwen3.6-35B-A3B".into(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 4096,

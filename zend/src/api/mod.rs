@@ -28,6 +28,7 @@ pub mod conversations;
 pub mod files;
 mod memory;
 pub mod models;
+pub mod profile;
 mod repo_map;
 pub mod status;
 pub mod substrate;
@@ -73,6 +74,8 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/memory", get(memory::dump))
         .route("/v1/repo_map", get(repo_map::completeness))
         .route("/v1/telemetry", get(telemetry::telemetry))
+        // Reading this RESETS the counters, so two calls bracket a window.
+        .route("/v1/profile", get(profile::profile))
         .route("/v1/phases", get(telemetry::phases))
         .route("/v1/promotes", get(telemetry::promotes))
         .route("/v1/substrate", get(substrate::overview))

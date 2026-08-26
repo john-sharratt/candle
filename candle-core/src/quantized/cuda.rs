@@ -6412,8 +6412,17 @@ pub fn fused_deterministic_scatter(
         return Ok(());
     }
     let (_, hidden_dim) = down_out.dims2()?;
-    let dtype = down_out.dtype();
-    let moe_dtype = dtype_to_moe_scatter_dtype(dtype)?;
+    // The kernel is selected by where it WRITES. `down_out` is the grouped int8
+    // GEMM's F32 output and is read as such — validated, not converted, so no
+    // full-tensor pass stands between the GEMM and this accumulation.
+    let moe_dtype = dtype_to_moe_scatter_dtype(ys.dtype())?;
+    if down_out.dtype() != crate::DType::F32 {
+        crate::bail!(
+            "fused_deterministic_scatter: down_out must be F32 (the grouped GEMM's \
+             emit type), got {:?} — convert the PRODUCER, never the tensor here",
+            down_out.dtype(),
+        );
+    }
 
     if !ys.layout().is_contiguous() || ys.layout().start_offset() != 0 {
         crate::bail!("fused_deterministic_scatter: ys must be contiguous with zero offset");
@@ -6470,20 +6479,16 @@ pub fn fused_deterministic_scatter(
         }};
     }
 
-    match (&ys_cuda.slice, &src_cuda.slice) {
-        (CudaStorageSlice::BF16(ys_s), CudaStorageSlice::BF16(src_s)) => {
-            dispatch_var_k_scatter!(ys_s, src_s);
-        }
-        (CudaStorageSlice::F16(ys_s), CudaStorageSlice::F16(src_s)) => {
-            dispatch_var_k_scatter!(ys_s, src_s);
-        }
-        (CudaStorageSlice::F32(ys_s), CudaStorageSlice::F32(src_s)) => {
-            dispatch_var_k_scatter!(ys_s, src_s);
-        }
+    let CudaStorageSlice::F32(src_s) = &src_cuda.slice else {
+        crate::bail!("fused_deterministic_scatter: down_out storage is not F32");
+    };
+    match &ys_cuda.slice {
+        CudaStorageSlice::BF16(ys_s) => dispatch_var_k_scatter!(ys_s, src_s),
+        CudaStorageSlice::F16(ys_s) => dispatch_var_k_scatter!(ys_s, src_s),
+        CudaStorageSlice::F32(ys_s) => dispatch_var_k_scatter!(ys_s, src_s),
         _ => crate::bail!(
-            "fused_deterministic_scatter: dtype mismatch ys={:?} src={:?}",
-            ys.dtype(),
-            down_out.dtype()
+            "fused_deterministic_scatter: unsupported ys dtype {:?}",
+            ys.dtype()
         ),
     }
 

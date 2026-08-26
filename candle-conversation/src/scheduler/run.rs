@@ -235,6 +235,7 @@ impl Scheduler {
             // handles SubmitTurn (projection + elevate + apply_segments gap-fill
             // + view create) on the scheduler thread — a prime suspect for the
             // wall-clock that is NOT a forward, so time it.
+            let _g_drain = profile::span("loop:drain_submissions");
             let t_drain = Instant::now();
             // Flag the drain so the assembler's shared sub-timers (inject / prefill
             // / gap-fill, also used by reproject) attribute to the drain buckets,
@@ -252,6 +253,7 @@ impl Scheduler {
             IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
             self.wave_stats
                 .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);
+            _g_drain.end();
             if !cont {
                 break; // Shutdown requested or channel closed.
             }
@@ -285,10 +287,13 @@ impl Scheduler {
             }
 
             // 2. Promote queued PrefillWork → ActivePrefill (up to cap).
-            let t_promote = Instant::now();
-            self.promote_new_prefills();
-            self.wave_stats
-                .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
+            {
+                let _g = profile::span("loop:promote_new_prefills");
+                let t_promote = Instant::now();
+                self.promote_new_prefills();
+                self.wave_stats
+                    .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
+            }
 
             // 3. If idle, block waiting for work. Deferred glue counts as work: the
             // unified wave step scatters it (`take_wave_glue`), so don't block while
@@ -351,7 +356,10 @@ impl Scheduler {
             // in-flight prefill completes) strands finished prefills in
             // `active_prefills` — blocking new admissions and stalling ingest with
             // "no forwards". Idempotent and cheap when nothing finished.
-            self.promote_finished_prefills_to_decodes();
+            {
+                let _g = profile::span("loop:promote_finished");
+                self.promote_finished_prefills_to_decodes();
+            }
 
             // Per-wave ingest backpressure + gentle demote. These are cheap (an
             // atomic backlog read + a bounded warm-backed LRU walk) and self-gate on
@@ -365,8 +373,14 @@ impl Scheduler {
             // Sizing the admission window to the drain backlog and shedding the
             // warm-backed tail every wave bounds KV production to the drain rate, so
             // `used` holds at the demote watermark instead of climbing.
-            self.regulate_ingest_admission();
-            self.demote_cold_ingest_if_pressured();
+            {
+                let _g = profile::span("loop:ingest_admission");
+                self.regulate_ingest_admission();
+            }
+            {
+                let _g = profile::span("loop:demote_cold_ingest");
+                self.demote_cold_ingest_if_pressured();
+            }
 
             // AIMD reopen (non-ingest): if a prior pressure episode cut the
             // admission budget, probe it back open by one quantum per loop once
@@ -413,6 +427,17 @@ impl Scheduler {
                     }
                 }
             }
+
+            // Harvest the GPU spans this wave's forwards enqueued. Non-blocking:
+            // a pair whose work is still in flight stays pending for a later
+            // pass, so this costs a few `cuEventQuery` calls and never stalls
+            // the loop. It has to happen SOMEWHERE, though — the events are
+            // recorded into the stream by the model and only become numbers at a
+            // drain, so without one a daemon opens spans forever, the pool walks
+            // up to its high-water mark, and the span that was meant to cost two
+            // enqueues starts blocking instead. The bench harness drains at its
+            // config boundary; the wave loop is this process's equivalent.
+            candle_transformers::models::profile::gpu_drain();
 
             // Flush the wave summary + phase breakdown if its 2 s window
             // elapsed — even when no forward ran this iteration, so stalls still
@@ -590,6 +615,7 @@ impl Scheduler {
     /// (the reprojection drain inside it is separately attributed to
     /// [`WavePhase::Reproject`] as a sub-slice).
     fn timed_decode(&mut self) {
+        let _g = profile::span("loop:decode");
         let t = Instant::now();
         self.run_decode_until_budget();
         self.wave_stats
@@ -598,6 +624,7 @@ impl Scheduler {
 
     /// Run the prefill quantum, attributing its wall-clock to [`WavePhase::Prefill`].
     fn timed_prefill(&mut self) {
+        let _g = profile::span("loop:prefill");
         let t = Instant::now();
         self.run_prefill_until_budget();
         self.wave_stats
@@ -607,6 +634,7 @@ impl Scheduler {
     /// Run the section-ingest quantum, attributing its wall-clock to
     /// [`WavePhase::Section`].
     fn timed_section(&mut self) {
+        let _g = profile::span("loop:section");
         let t = Instant::now();
         self.run_section_ingest_until_budget();
         self.wave_stats

@@ -780,7 +780,15 @@ impl ModelBuilder {
                 let model = quantized_qwen36_moe::from_gguf_path(
                     model_path,
                     device,
-                    Qwen35LoadOptions::default(),
+                    Qwen35LoadOptions {
+                        // Without a directory the pack is EPHEMERAL — written to
+                        // the system temp dir and unlinked as soon as it is
+                        // published, so every boot repacks all 41 layers (53 s
+                        // measured on the 3.6-35B) instead of reading the one
+                        // beside the checkpoint.
+                        expert_pack_dir: self.expert_pack_dir.clone(),
+                        ..Default::default()
+                    },
                 )
                 .map_err(ConversationError::Model)?;
                 Ok(Box::new(model))

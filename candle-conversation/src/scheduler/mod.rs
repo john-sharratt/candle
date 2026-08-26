@@ -5831,8 +5831,7 @@ impl Scheduler {
         // eviction can protect it (see `evict_cold_tail`).
         state.working_set = projection_assembler::working_set_from_segments(segments);
 
-        profile::reset();
-        let r = projection_assembler::apply_segments(
+        projection_assembler::apply_segments(
             state,
             projection_assembler::ApplyContext {
                 session: &mut self.session,
@@ -5849,9 +5848,7 @@ impl Scheduler {
             },
             segments,
             defer,
-        );
-        profile::report("apply_projection");
-        r
+        )
     }
 
     /// Build phase of [`Self::apply_projection`] for the cross-conversation wave:
@@ -5880,7 +5877,6 @@ impl Scheduler {
         // stamp it here where the segments are in hand.
         let state = self.slot_projection_state.entry(parent_id).or_default();
         state.working_set = projection_assembler::working_set_from_segments(segments);
-        profile::reset();
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
             model: &mut self.model,
@@ -5931,9 +5927,7 @@ impl Scheduler {
         };
         // The wave path fires the batched gap-fill BEFORE this finish, so the
         // fresh islands' K/V is in the gaps and capturable.
-        let r = projection_assembler::apply_segments_finish(state, &mut ctx, plan, true);
-        profile::report("apply_projection");
-        r
+        projection_assembler::apply_segments_finish(state, &mut ctx, plan, true)
     }
 
     // —— Cleanup ————————————————————————————————————————————————————————

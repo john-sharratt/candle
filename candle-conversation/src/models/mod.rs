@@ -108,6 +108,7 @@ pub enum ModelArch {
 /// | `Hermes3_70B_Q4` | 70 B | Q4_K_M | Llama | ChatML | ~40 GB |
 /// | `Qwen3_30B_A3B_Q4` | 30 B (3B active) | Q4_K_M | Qwen3Moe | ChatML | ~17 GB (LRU) |
 /// | `Qwen3_30B_A3B_Q6` | 30 B (3B active) | Q6_K | Qwen3Moe | ChatML | ~25 GB (LRU) |
+/// | `Qwen36_35B_A3B_Q4` | 35 B (3B active) | UD-Q4_K_M | Qwen35Hybrid | ChatML | ~22 GB (tiered) |
 /// | `Custom(_)` | — | — | any | any | — |
 #[derive(Debug, Clone)]
 #[allow(non_camel_case_types)]

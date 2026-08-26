@@ -36,6 +36,26 @@ use super::types::{
     PipelineMessage, PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
+
+/// Report, once per distinct reason, that a call could not use the device
+/// dispatch tables. Once because the caller is a per-layer hot path — the point
+/// is that the reason is *stated*, not that it is repeated 40 times a token.
+#[cfg(feature = "cuda")]
+fn log_dispatch_refusal(reason: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut s) = seen.lock() {
+        if s.insert(reason.to_string()) {
+            tracing::warn!(
+                reason,
+                "expert cache: this MoE layer takes the host path's blocking routing \
+                 readback instead of the device tables"
+            );
+        }
+    }
+}
 use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
@@ -1161,11 +1181,35 @@ impl ExpertCache {
         moe_layer_idx: usize,
         n_experts: usize,
     ) -> Option<&GpuDispatchTables> {
-        let gd = self.gpu_dispatch.as_ref()?;
-        if gd.expert_base(moe_layer_idx).is_none()
-            || gd.n_experts != n_experts
-            || self.pipeline_dead()
-        {
+        // Each refusal names itself, ONCE. `GpuDispatchTables::build` already
+        // reports why the tables could not be made; this is the other half —
+        // tables that exist but are not usable for this call — and it was the
+        // silent half. Costing decode a multiple because a per-layer condition
+        // quietly disagreed is not something to learn from a profiler three
+        // crates away.
+        let Some(gd) = self.gpu_dispatch.as_ref() else {
+            // Deliberately does NOT guess why. A paged cache never builds
+            // tables by design, and an all-resident one that failed to has
+            // already said so with the actual reason — asserting one of those
+            // here would put a confident wrong answer next to the right one.
+            log_dispatch_refusal("no dispatch tables were built for this cache");
+            return None;
+        };
+        if gd.expert_base(moe_layer_idx).is_none() {
+            log_dispatch_refusal(&format!(
+                "MoE layer {moe_layer_idx} is outside the covered table range"
+            ));
+            return None;
+        }
+        if gd.n_experts != n_experts {
+            log_dispatch_refusal(&format!(
+                "router width {n_experts} disagrees with the tables' {}",
+                gd.n_experts
+            ));
+            return None;
+        }
+        if self.pipeline_dead() {
+            log_dispatch_refusal("expert pipeline thread is dead");
             return None;
         }
         Some(gd)
@@ -1360,12 +1404,20 @@ impl ExpertCache {
 
     /// Record a profiling span from external callers (e.g. SparseMoeBlock).
     ///
+    /// Recorded twice, into two tables that answer two questions. This cache's
+    /// own is per-instance and is what the bench harness snapshots per config;
+    /// the pipeline profiler is process-wide and is what a running daemon serves
+    /// over its API, where an expert-routing cost that appeared in neither the
+    /// scheduler's phases nor the kernel spans would otherwise be a hole in the
+    /// breakdown exactly where the MoE lives.
+    ///
     /// When profiling is disabled, this is an inline no-op.
     #[cfg(feature = "profile")]
     pub fn record_profile(&self, name: &'static str, start: ProfileMark) {
         if let Ok(mut prof) = self.forward_profile.lock() {
             prof.record(name, start);
         }
+        crate::models::profile::pipeline_record(name, start);
     }
 
     /// No-op when profiling is disabled.

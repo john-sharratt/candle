@@ -919,11 +919,22 @@ fn sweep_layers(
     // The buffers were sized by `verify_blocks` BEFORE this forward opened —
     // nothing here allocates. `None` on every ordinary wave, so nothing is
     // copied either.
+    //
+    // **Only the wave that actually carries the armed rows touches the stash.**
+    // `verify_row_seqs` is model state that stays set for the whole speculative
+    // step — from `begin_verify` to `end_verify` — so every OTHER wave the
+    // scheduler runs inside that window sees it too: an ingest creep, a section
+    // batch, a glue drain. Those carry none of the verifying sequences, so
+    // taking the stash there would move it out of the model for a sweep that
+    // captures nothing into it, and lose it outright if that sweep then failed.
+    // Every armed sequence rides the same `decode_forward_cobatched` call, so a
+    // wave carries all of them or none.
     let verify_seqs = model.verify_row_seqs()?;
-    let cohort_stash: Option<VerifyStash> = if verify_seqs.is_empty() {
-        None
-    } else {
+    let carries_verify = spans.iter().any(|s| verify_seqs.contains(&s.seq));
+    let mut cohort_stash: Option<VerifyStash> = if carries_verify {
         model.take_verify_stash()?
+    } else {
+        None
     };
     // Each span's row in the shared buffers, resolved once rather than per
     // layer.
@@ -1008,6 +1019,10 @@ fn sweep_layers(
                         })
                     })
                     .collect();
+                // Whether this layer actually wrote the cohort's operands, which
+                // is what `filled` records — a stash with no row on this wave
+                // captures nothing here and must not claim the ordinal.
+                let captured = slots.iter().any(|s| s.is_some());
                 delta_net_mix_wave(
                     q,
                     li,
@@ -1018,29 +1033,36 @@ fn sweep_layers(
                     layer_table.as_ref(),
                     &slots,
                 )?;
+                // Releases the borrow of `cohort_stash` the slots hold.
+                drop(slots);
+                if captured {
+                    if let Some(st) = cohort_stash.as_mut() {
+                        if let Some(f) = st.filled.get_mut(dn_ord) {
+                            *f = true;
+                        }
+                    }
+                }
                 dn_ord += 1;
                 quantized_delta_net_ffn(&q.layers[li], &mut x, embed_dtype, orig)?;
             }
         }
     }
 
-    if layer_end < num_layers {
-        if !verify_seqs.is_empty() {
-            candle::bail!(
-                "qwen35 wave: a speculative verify was split across layer windows — its \
-                 stash would cover only this segment's DeltaNet layers, and a rewind from \
-                 a partial stash advances some layers and not others"
-            );
-        }
-        return Ok((WavePhase::Residual(x), None));
-    }
-
-    // The stash is complete: every DeltaNet layer of a full sweep has captured
-    // its operands. Stamp each span's ABSOLUTE start — not `span.start`, which
-    // is its row in the packed wave buffer, a different number entirely for
-    // anything but the first span; the driver rewinds to
-    // `sequence_offset + accepted` — and file it back where the truncate will
-    // find it if the accept comes back short.
+    // File the stash back, whether this sweep was whole or one window of a
+    // segmented one. `dn_ord` counts the recurrent layers BEFORE `layer_start`,
+    // so a window writes its own layers' operands into the GLOBAL slots
+    // `begin_verify_stash` sized before the first forward opened, and the window
+    // that follows fills the rest. Putting it back at every boundary is what
+    // lets the windows accumulate into the one complete stash the rewind needs
+    // — a verify rides the prefill slot of EVERY segment, so the segments
+    // together always cover `[0, num_layers)`, and the accept walk does not read
+    // the stash until the last of them has run.
+    //
+    // Stamp each span's ABSOLUTE start — not `span.start`, which is its row in
+    // the packed wave buffer, a different number entirely for anything but the
+    // first span; the driver rewinds to `sequence_offset + accepted`. The value
+    // is the same in every window (a sequence does not advance between them), so
+    // restamping is idempotent.
     if let Some(mut st) = cohort_stash {
         for sp in st.spans.iter_mut() {
             let at = spans.iter().position(|s| s.seq == sp.seq).ok_or_else(|| {
@@ -1052,6 +1074,10 @@ fn sweep_layers(
             sp.start = offsets[at];
         }
         model.put_verify_stash(st)?;
+    }
+
+    if layer_end < num_layers {
+        return Ok((WavePhase::Residual(x), None));
     }
 
     let xt = x.to_tensor();

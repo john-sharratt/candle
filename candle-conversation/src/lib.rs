@@ -54,6 +54,17 @@ pub mod narrator;
 pub mod normalization;
 pub mod persistence;
 pub mod projection;
+/// The process-wide hot-path span profiler, for a daemon that serves its own
+/// timings.
+///
+/// Re-exported rather than reimplemented: the spans are recorded across three
+/// crates — this one's scheduler loop, the model's host stages, and the GPU
+/// spans in the kernels — into a single table, and a second accessor would be a
+/// second table by another name. Snapshotting resets, so two reads bracket a
+/// window exactly.
+pub mod profile {
+    pub use candle_transformers::models::profile::{pipeline_snapshot_and_reset, ProfileSnapshot};
+}
 pub mod prompts;
 pub mod provenance;
 pub(crate) mod scheduler;

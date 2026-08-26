@@ -37,7 +37,7 @@ use crate::conv_file_store::ConvFileStore;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
-use crate::model_choice::qwen30;
+use crate::model_choice::model;
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
@@ -572,7 +572,7 @@ impl InferenceState {
         // workspace on this model, survives `--wipe-substrate`, and turns the
         // ~42 s expert repack into a read on every restart after the first.
         let expert_pack_dir = model_path.parent().map(|p| p.to_path_buf());
-        let mut builder = qwen30()
+        let mut builder = model()
             .builder()
             .system_prompt(&before_text)
             .model_path(model_path)
@@ -4008,7 +4008,12 @@ impl ZendSession {
                 let _rt_guard = rt_handle.as_ref().map(|h| h.enter());
 
                 status_tx.send("Loading model…".into()).ok();
-                tracing::info!("loading inference engine (Qwen3-30B-A3B) …");
+                // Named from the choice rather than spelled out, so the line
+                // cannot go on claiming a model zend has stopped running.
+                tracing::info!(
+                    "loading inference engine ({}) …",
+                    model().spec().model_filename,
+                );
                 let load_progress_for_blocking = Arc::clone(&load_progress);
                 // `InferenceState::load` is fully synchronous (CUDA model
                 // load + substrate recovery + ingestion).  Call directly
