@@ -44,10 +44,10 @@ server:
   connect_timeout_ms: 5000
 
 # ── sign-in, for the whole estate ───────────────────────────────────────────
-# OFF by default, and the block below is commented out. tokera.com is a public
-# site: the home page, the blog and the papers need no account, so a missing
-# key must not stop them being served. With no `auth:` block, `/auth/me`
-# reports `configured: false` and the UI shows no sign-in button at all.
+# OFF unless `secrets/auth.yaml` exists. tokera.com is a public site: the home
+# page, the blog and the papers need no account, so a missing key must not stop
+# them being served. With no auth config, `/auth/me` reports
+# `configured: false` and the UI shows no sign-in button at all.
 #
 # Turn it on and it becomes strict — a missing or unreadable secret is then a
 # hard startup failure, because at that point you have said you want sign-in
@@ -73,10 +73,26 @@ server:
 # estate, so handing it to a daemon would let a compromised one mint identities
 # at every hostname. This file is the gateway's alone.
 #
-# Paths resolve against THIS FILE, like `roots` and `papers`, so keep them
-# relative and the same table works on a laptop and on the DMZ box. Both
-# secrets are files rather than inline values so this table can be committed
-# without carrying one; `web/secrets/` is gitignored.
+# ── where the sign-in config lives ──────────────────────────────────────────
+# In `secrets/auth.yaml`, not here — and the file being absent is what turns
+# sign-in off, exactly as a commented-out block used to.
+#
+# It is a separate file because THIS one must be identical on every machine.
+# When the block was inline, the one deployment holding a real `client_id`
+# carried a permanently modified `web.yaml`, and every attempt to update the
+# site table there stopped with *your local changes would be overwritten* — on
+# a file whose only deployment-specific part was those four lines. Splitting
+# them out means the sites can be pulled and the credentials never move.
+#
+# Present but unparseable is still a hard startup failure: at that point the
+# deployment has said it wants sign-in, and a gateway that quietly has none is
+# the worse outcome. `web --check` reports which of the three you are in
+# without binding anything.
+auth_file: "secrets/auth.yaml"
+
+# Paths inside it resolve against THIS FILE, like `roots` and `papers`, so keep
+# them relative and one table works on a laptop and on the DMZ box. Both
+# secrets are files rather than inline values, so even `auth.yaml` carries none.
 #
 #   mkdir -p web/secrets
 #   # any 32+ bytes; on Windows:
@@ -84,10 +100,9 @@ server:
 #   head -c 48 /dev/urandom | base64 > web/secrets/session.key
 #   # client secret: Google Cloud console → APIs & Services → Credentials →
 #   #                OAuth 2.0 Client ID, saved to web/secrets/google.secret
-#   # redirect URI:  register the value below EXACTLY, or Google answers
-#   #                redirect_uri_mismatch
+#   # redirect URI:  register it EXACTLY, or Google answers redirect_uri_mismatch
 #
-# auth:
+#   cat > web/secrets/auth.yaml <<'YAML'
 #   cookie_domain: ".tokera.com"
 #   session_ttl_hours: 720
 #   session_secret_file: "secrets/session.key"
@@ -95,6 +110,7 @@ server:
 #     client_id: "REPLACE-ME.apps.googleusercontent.com"
 #     client_secret_file: "secrets/google.secret"
 #     redirect_uri: "https://tokera.com/auth/callback"
+#   YAML
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────
