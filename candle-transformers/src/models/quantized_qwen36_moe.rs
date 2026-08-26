@@ -67,6 +67,7 @@ mod tests {
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
+    use crate::models::quantized_qwen35::tests::cold_speculative_point;
     use candle::quantized::Int8Mode;
     use hf_hub::RepoType;
 
@@ -116,7 +117,7 @@ mod tests {
             .with_int8mode(int8mode)
             .with_timeout_secs(3600);
 
-        let configs = vec![
+        let mut configs = vec![
             TestConfig {
                 mode: InferenceMode::BF16,
                 use_batched: true,
@@ -227,20 +228,53 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-            // C10×10 is the top rung and the calibration target:
-            // `QWEN36_MOE_KV_FACTORS` is tuned so the whole range C0–C10
-            // passes with C10 just under the breaking edge. A red C10 row
-            // means the thresholds drifted past the edge — retighten the
-            // factor row rather than widening tolerances.
-            TestConfig {
+        ];
+
+        // ── The top rung, at the widths worth seeing it at ───────────────────
+        //
+        // C10 is the calibration target: `QWEN36_MOE_KV_FACTORS` is tuned so the
+        // whole range C0–C10 passes with C10 just under the breaking edge. A red
+        // C10 row means the thresholds drifted past it — retighten the factor
+        // row rather than widening tolerances.
+        //
+        // Run at **8 and 16** rather than one middling width. Both sit inside
+        // the draft ladder's bracket, so both speculate at full budget, and the
+        // pair shows the compression and the speculation compounding as the
+        // cohort grows — which is the number this engine is actually for.
+        configs.extend([8usize, 16].map(|n| TestConfig {
+            mode: InferenceMode::C10,
+            use_batched: true,
+            num_contexts: n,
+            num_repeats: 1,
+            generate_max_len: 40,
+            test_mode: Some(TestMode::StoryRewrite),
+        }));
+
+        // **On a big card, keep going — but only on this rung.**
+        //
+        // What bounds concurrency here is per-session state, not the
+        // checkpoint: DeltaNet holds `n_v_heads × head_dim × head_dim` in F32
+        // per recurrent layer per sequence, doubled for the live/backup
+        // ping-pong — about 120 MiB a session on this geometry — and C10 KV adds
+        // only a couple more. So 32 sessions want ~4 GiB of per-session state
+        // and 64 want ~8 GiB, on top of a resident footprint that already fills
+        // a 16 GiB card. Forty is the gate: comfortably past what this laptop
+        // can hold, comfortably inside a workstation card.
+        //
+        // Only C10 is widened. The lower rungs carry uncompressed or lightly
+        // compressed KV, where the same widths would be bounded by KV bytes
+        // instead and would measure the card rather than the engine.
+        let (_, total_vram) = device.mem_get_info().unwrap_or((0, 0));
+        if total_vram >= 40 << 30 {
+            configs.extend([32usize, 64].map(|n| TestConfig {
                 mode: InferenceMode::C10,
                 use_batched: true,
-                num_contexts: 10,
+                num_contexts: n,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
-            },
-        ];
+            }));
+        }
 
         let load = || {
             // Keep the pack beside the checkpoint: the gate reloads once per
@@ -267,6 +301,77 @@ mod tests {
         };
         params.run(configs, load)
     }
+
+    /// The 3.6's own cold points, one width and one budget per process.
+    ///
+    /// **The dense 9B's ladder cannot be assumed to carry over.** Both models run
+    /// the same NextN head, but this one streams its experts: a verify block
+    /// scores `k + 1` positions per sequence and each routes to its own top-8 of
+    /// 256, so the wave's routed union widens with the block and the extra rows
+    /// are paid for in PCIe traffic rather than in arithmetic. Where that stops
+    /// being worth it depends on the resident ratio — how much of the expert set
+    /// the card is holding — which is a property of this checkpoint on this
+    /// machine, not of the lineage.
+    ///
+    /// Read the expert-pipeline table alongside the throughput: hit rate, DMA
+    /// loads and late loads are what say whether a budget-2 wave is paying in
+    /// bandwidth, and they are the half of the picture the dense measurement
+    /// does not have.
+    ///
+    /// Run singly and cold — see `cold_speculative_point` for why a multi-config
+    /// sweep on a laptop card measures its own boost budget.
+    macro_rules! cold_point_36 {
+        ($name:ident, $mode:expr, $width:expr, $budget:expr) => {
+            #[test]
+            #[ignore = "cold measurement point on the 3.6-35B — run singly, letting the card \
+                        settle between points."]
+            fn $name() -> Result<()> {
+                let model_path = pinned()?;
+                let int8mode = Int8Mode::Performance;
+                cold_speculative_point(
+                    "Qwen3.6-35B-A3B",
+                    &tokenizer_json()?,
+                    $mode,
+                    $width,
+                    $budget,
+                    int8mode,
+                    move || {
+                        let device = Device::new_cuda(0)?;
+                        from_gguf_path(
+                            &model_path,
+                            &device,
+                            Qwen35LoadOptions {
+                                int8mode: Some(int8mode),
+                                expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                            },
+                        )
+                    },
+                )
+            }
+        };
+    }
+
+    cold_point_36!(cold36_w4_b0, InferenceMode::BF16, 4, 0);
+    cold_point_36!(cold36_w4_b2, InferenceMode::BF16, 4, 2);
+    cold_point_36!(cold36_w10_b0, InferenceMode::BF16, 10, 0);
+    cold_point_36!(cold36_w10_b2, InferenceMode::BF16, 10, 2);
+    cold_point_36!(cold36_w16_b0, InferenceMode::BF16, 16, 0);
+    cold_point_36!(cold36_w16_b2, InferenceMode::BF16, 16, 2);
+
+    // **Does compression push the bracket out?** The BF16 points put the ceiling
+    // near 16, and the suspicion is that what runs out is KV: a wave's rows are
+    // cheap while the arena can serve them from free regions and expensive once
+    // it cannot. C10 stores the same context in roughly a seventh of the bytes,
+    // so if the ceiling is KV-bound it should move outward with compression —
+    // and widths that could not be measured at all in BF16 (32 sessions did not
+    // finish a 256-token run) should come into reach.
+    //
+    // If instead these track the BF16 numbers, the ceiling is about the wave's
+    // row count rather than the memory behind it, and compression is orthogonal.
+    cold_point_36!(cold36_c10_w20_b0, InferenceMode::C10, 20, 0);
+    cold_point_36!(cold36_c10_w20_b2, InferenceMode::C10, 20, 2);
+    cold_point_36!(cold36_c10_w32_b0, InferenceMode::C10, 32, 0);
+    cold_point_36!(cold36_c10_w32_b2, InferenceMode::C10, 32, 2);
 
     /// **Speculative decode on the 3.6-35B — the production target.**
     ///

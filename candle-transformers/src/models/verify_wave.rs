@@ -215,6 +215,10 @@ fn around_creep(
 /// The model is borrowed shared, so a caller holding `&mut` on its own wave
 /// state — cursor, residual, group membership — can still call this with the
 /// model it also owns.
+// Four groups of rows, a co-batch and a layer bound. Bundling them into a
+// struct would only move the same fields behind a name that adds nothing —
+// the caller assembles them from four different places.
+#[allow(clippy::too_many_arguments)]
 pub fn issue_verify_wave<M>(
     model: &M,
     session: &mut BatchedInferenceSession,

@@ -20,18 +20,27 @@
 //!
 //! # Measuring a row
 //!
-//! `quantized_qwen35::tests::speculative_width_ladder` sweeps width × budget in
-//! one run, comparing each budget against **its own width's** budget-0 baseline
-//! so the ratios are within-run. Two things to respect when reading its output:
+//! **One point per process, and let the card settle between them.**
+//! `quantized_qwen35::tests::cold_speculative_point` takes a single width and a
+//! single budget and runs exactly one config; the `cold_*` tests beside it are
+//! the points. Run them singly, waiting for the card to return to idle
+//! temperature and clocks in between, and read each budget against its own
+//! width's budget-0 point.
 //!
-//! * **Run it cold.** These are long sweeps on a laptop-class card and a
-//!   thermally throttled tail does not merely add noise, it inverts rows. A 9B
-//!   sweep's 12-wide row came back with budget 1 losing and budget 2 winning,
-//!   contradicting both its neighbours, after six prior configs had been run
-//!   back to back.
-//! * **Check the baselines before the ratios.** If aggregate throughput falls as
-//!   width rises, that row's ratio is between two degraded numbers and says more
-//!   about the card than the ladder.
+//! That protocol is not fussiness. A laptop card holds full boost for the first
+//! tens of seconds of load and then roughly halves its clock, so a sweep that
+//! runs several configs against one loaded model measures *position in the run*
+//! as much as the variable it varies. The same config measured 247 tok/s as the
+//! first config of a load and 103 as the third, four repetitions running, with
+//! the KV region ledger byte-identical between them — no leak, no pressure, just
+//! a spent boost budget.
+//!
+//! An earlier sweep here did exactly that, width-major, and every "width curve"
+//! it produced was that artefact: width rose with position, so boost depletion
+//! read as a cliff. It has been deleted rather than documented, because a
+//! confounded instrument left in the tree gets run again.
+//! `decay_across_configs_9b` is kept as the demonstration — one config three
+//! times over, which is where the effect is unmistakable.
 
 /// A checkpoint's draft budget as a function of decode-wave width.
 ///
@@ -93,35 +102,87 @@ impl DraftLadder {
 /// transformer block applied recurrently — so they start from one row and split
 /// only where measurement says they differ.
 ///
-/// **There is no middle rung: it is full budget or none.** Measured cold on the
-/// 9B (`middle_rung_9b`, 256 tokens, each budget against its own width's
-/// budget-0 baseline):
+/// **Full budget or none, and it holds much wider than it first appeared.**
+///
+/// Measured on the 9B with the `cold_*` points — one width and one budget per
+/// process, the card cooled to ~52 °C between every point, each budget against
+/// its own width's budget-0 baseline:
 ///
 /// | width | budget 1 | budget 2 |
 /// |-------|----------|----------|
-/// | 8     | 1.41x    | **1.46x** |
-/// | 10    | 0.42x    | 0.45x     |
+/// | 10    | 1.25x    | **1.53x** |
+/// | 16    | 1.01x    | **1.05x** |
+/// | 20    | 1.00x    | 0.39x     |
 ///
-/// Budget 2 beats budget 1 at *both* widths — including the one where both
-/// lose. A step pays for one draft pass and one verify wave whatever `k` is,
-/// and only the extra scored row scales with it, so budget 1 buys about
-/// two-thirds of the tokens for very nearly the same price. It is never the best
-/// answer, and the ladder has one bracket rather than two.
+/// Two things come out of it. Budget 2 beats budget 1 wherever speculation pays
+/// at all, so there is no middle rung: a step buys one draft pass and one verify
+/// wave whatever `k` is, and only the extra scored row scales with it, so budget
+/// 1 pays nearly the full price for two-thirds of the tokens. And the win decays
+/// smoothly to break-even around 16 before collapsing by 20 — so the bracket
+/// sits at 16, the widest width measured to still pay.
 ///
-/// Acceptance says the same thing from the other side: at budget 2 it is 2.93
-/// per session at width 8 and 2.93 at width 10, identical. Width 10 does not
-/// lose because the drafter got worse — it loses because the wave got
-/// expensive.
+/// **Every earlier reading of this curve was an artefact, including the ones
+/// that were in this comment.** A laptop card holds full boost for the first
+/// tens of seconds of load and then halves its clock, so a gate running several
+/// configs against one loaded model measures position in the run as much as
+/// width — the same config measured 247 tok/s first and 103 tok/s third, four
+/// times over, with the KV region ledger byte-identical between them. Width rose
+/// with position in every sweep, so boost depletion read as a width cliff. An
+/// earlier version of this table put the bracket at 8 and called width 10 a
+/// 0.45x collapse; measured cold, width 10 is a 1.53x win.
 ///
-/// **The cliff is between 8 and 10**, and it is a cliff: 1.46x to 0.45x with
-/// nothing in between measured. Width 9 is untested, so the bracket sits at the
-/// widest width observed to win rather than at a fitted crossing.
+/// So: measure one point per process, cool between points, and distrust any row
+/// that shared a process with the row before it. `cold_speculative_point` is the
+/// instrument.
 ///
-/// An earlier *hot* sweep read width 8 the other way round (budget 1 at 1.13x,
-/// budget 2 at 0.50x) and had this table stepping through 1 on the way down.
-/// That row was inverted by thermal throttling — the cold run above is the one
-/// to trust, and it is why this module tells you to run these sweeps cold.
-const LINEAGE_START: &[(usize, usize)] = &[(8, 2)];
+/// Above 20 is extrapolation, not measurement — 32 sessions do not fit this
+/// card's budget for a 256-token run. The collapse at 20 is steep enough that
+/// zero is the safe answer beyond the bracket either way.
+///
+/// **The bracket sits on its own edge, and that is a deliberate but thin
+/// choice.** 16 is the widest width measured to pay, and it pays by only
+/// 5–10%; 17, 18 and 19 are unmeasured; 20 loses badly. So the top of the range
+/// is nearly free either way, and the case for 16 over something with margin is
+/// that widths 13–16 are common and their gain is real. If a later measurement
+/// finds the turn is below 16 rather than between 16 and 20, pull the bracket
+/// in — the asymmetry favours it, because the loss past the turn (0.39x) dwarfs
+/// the gain before it.
+///
+/// The 35B-A3B and 27B carry this row **unmeasured**. The 3.6-35B is the only
+/// routed checkpoint with cold points of its own, and it tracked the dense 9B
+/// closely enough to justify sharing — but "same head, similar curve" is
+/// evidence for two checkpoints, not for four.
+///
+/// # The routed checkpoints share this row, and now by measurement
+///
+/// A streaming-expert MoE looked like it should want a *narrower* bracket: a
+/// verify block scores `k + 1` positions per sequence and each routes to its own
+/// top-8 of 256, so the wave's routed union widens with the block, and on this
+/// card expert traffic crosses PCIe. Measured on the 3.6-35B with the same cold
+/// points (`cold36_*`), it does not — the curve tracks the dense 9B closely:
+///
+/// | width | 9B (dense) | 3.6-35B (routed) |
+/// |-------|-----------|------------------|
+/// | 4     | —         | **1.91x** |
+/// | 10    | 1.53x     | **1.48x** |
+/// | 16    | 1.05x     | **1.10x** |
+///
+/// **Expert bandwidth moves the other way from the intuition.** Over the same
+/// 4,080 generated tokens at width 16, host-to-device expert loads were
+/// **244,180 at budget 0 and 180,691 at budget 2** — speculation costs 26%
+/// *fewer*, with late loads falling from 26 to 0. The union per wave is wider
+/// and the hit rate does drop (40.6% → 36.0%), but a speculative step emits
+/// about three tokens where a decode step emits one, so a third as many waves
+/// each load experts once. Fewer waves beats wider unions.
+///
+/// The practical consequence is the opposite of the worry: speculation is *more*
+/// attractive on a streaming-expert model than on a dense one, because it
+/// amortises the expert loads that dominate its step.
+///
+/// Qwen3-30B-A3B is absent from this table because it cannot speculate at all —
+/// no NextN tensors in any conversion, so it takes the trait default of zero and
+/// has no ladder to carry.
+const LINEAGE_START: &[(usize, usize)] = &[(16, 2)];
 
 /// Qwen3.5-9B (dense). Has a NextN head.
 pub const QWEN35_9B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
@@ -166,13 +227,16 @@ mod tests {
     fn budget_is_full_or_nothing() {
         let l = QWEN35_9B_DRAFT;
         assert_eq!(l.budget(1), 2);
-        assert_eq!(l.budget(8), 2);
-        assert_eq!(l.budget(9), 0);
+        assert_eq!(l.budget(10), 2);
+        assert_eq!(l.budget(16), 2);
+        assert_eq!(l.budget(17), 0);
+        assert_eq!(l.budget(20), 0);
         assert_eq!(l.budget(4096), 0);
         // Nothing in the lineage's shipped rows asks for a single proposal.
         assert!(
             !LINEAGE_START.iter().any(|&(_, b)| b == 1),
-            "a budget-1 bracket reappeared — `middle_rung_9b` measured it as never optimal"
+            "a budget-1 bracket reappeared — the cold points measured budget 2 ahead of \
+             budget 1 at every width where speculation pays at all"
         );
     }
 

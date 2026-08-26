@@ -113,7 +113,7 @@ mod tests {
             .with_int8mode(int8mode)
             .with_timeout_secs(3600);
 
-        let configs = vec![
+        let mut configs = vec![
             TestConfig {
                 mode: InferenceMode::BF16,
                 use_batched: true,
@@ -224,20 +224,53 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-            // C10×10 is the top rung and the calibration target:
-            // `QWEN35_MOE_KV_FACTORS` is tuned so the whole range C0–C10
-            // passes with C10 just under the breaking edge. A red C10 row
-            // means the thresholds drifted past the edge — retighten the
-            // factor row rather than widening tolerances.
-            TestConfig {
+        ];
+
+        // ── The top rung, at the widths worth seeing it at ───────────────────
+        //
+        // C10 is the calibration target: `QWEN35_MOE_KV_FACTORS` is tuned so the
+        // whole range C0–C10 passes with C10 just under the breaking edge. A red
+        // C10 row means the thresholds drifted past it — retighten the factor
+        // row rather than widening tolerances.
+        //
+        // Run at **8 and 16** rather than one middling width. Both sit inside
+        // the draft ladder's bracket, so both speculate at full budget, and the
+        // pair shows the compression and the speculation compounding as the
+        // cohort grows — which is the number this engine is actually for.
+        configs.extend([8usize, 16].map(|n| TestConfig {
+            mode: InferenceMode::C10,
+            use_batched: true,
+            num_contexts: n,
+            num_repeats: 1,
+            generate_max_len: 40,
+            test_mode: Some(TestMode::StoryRewrite),
+        }));
+
+        // **On a big card, keep going — but only on this rung.**
+        //
+        // What bounds concurrency here is per-session state, not the
+        // checkpoint: DeltaNet holds `n_v_heads × head_dim × head_dim` in F32
+        // per recurrent layer per sequence, doubled for the live/backup
+        // ping-pong — about 120 MiB a session on this geometry — and C10 KV adds
+        // only a couple more. So 32 sessions want ~4 GiB of per-session state
+        // and 64 want ~8 GiB, on top of a resident footprint that already fills
+        // a 16 GiB card. Forty is the gate: comfortably past what this laptop
+        // can hold, comfortably inside a workstation card.
+        //
+        // Only C10 is widened. The lower rungs carry uncompressed or lightly
+        // compressed KV, where the same widths would be bounded by KV bytes
+        // instead and would measure the card rather than the engine.
+        let (_, total_vram) = device.mem_get_info().unwrap_or((0, 0));
+        if total_vram >= 40 << 30 {
+            configs.extend([32usize, 64].map(|n| TestConfig {
                 mode: InferenceMode::C10,
                 use_batched: true,
-                num_contexts: 10,
+                num_contexts: n,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
-            },
-        ];
+            }));
+        }
 
         let load = || {
             // Keep the pack beside the checkpoint: the gate reloads once per

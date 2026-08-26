@@ -949,6 +949,22 @@ impl TestParams {
             // GPU memory tracking: snapshot before config and register arena state
             let arena_bytes = candle_nn::kv_cache::global_arena_gpu_bytes();
             candle::gpu_memory::register("arenas (all backings)", arena_bytes);
+            // **What the KV side is holding as this config starts.** A gate runs
+            // its configs against ONE loaded model, so anything a config fails to
+            // hand back is still held when the next one begins — and the symptom
+            // is a throughput figure, not an error. Printing the region ledger
+            // per config is what turns "the third config is slow" into "the third
+            // config started with N fewer free regions than the first".
+            if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
+                println!(
+                    "  [regions] total {} | live {} | free {} | blocked {} | arenas {} MiB",
+                    rs.total,
+                    rs.live,
+                    rs.free,
+                    rs.blocked,
+                    arena_bytes >> 20,
+                );
+            }
             let _ = candle::gpu_memory::snapshot(
                 &format!("before_{:?}×{}", config.mode, config.num_contexts),
                 &self.device,
@@ -1300,7 +1316,6 @@ impl TestParams {
         self.device.synchronize()?;
         let generate_start = std::time::Instant::now();
         let t_decode_total = profile_now();
-        let steps_run;
         // The steady-state decode loop is the hot loop the transient tier
         // exists for, so it is the window worth measuring: every device
         // allocation inside it is one the wave path should have taken from a
@@ -1318,7 +1333,7 @@ impl TestParams {
         // only the model's own greedy continuation, both produce identical text,
         // so every gate's expected-output check is now also a losslessness check
         // — across the whole C0–C10 ladder, not just the speculative gates.
-        steps_run = self.speculative_decode_phase(
+        let steps_run = self.speculative_decode_phase(
             &mut session,
             &sequence_indices,
             &mut runs,

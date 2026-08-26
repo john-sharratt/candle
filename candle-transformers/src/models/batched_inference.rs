@@ -3584,6 +3584,10 @@ pub trait ManagedBatchedModel {
     /// `Some(next_committed)` — the seed to pass as `committed` on the next call (already emitted,
     /// held out of the KV) — or `None` when `emit` asked to stop. With no drafter this is one plain
     /// decode (emits exactly one token). At least one token is always emitted.
+    // Session, sequence, seed, budget, layer bound, chooser and sink: seven
+    // independent inputs plus `self`. A struct here would name a bag that no
+    // caller holds as a unit.
+    #[allow(clippy::too_many_arguments)]
     fn speculative_decode_step(
         &self,
         session: &mut BatchedInferenceSession,
@@ -3621,6 +3625,8 @@ pub trait ManagedBatchedModel {
     /// under sampling as well as under greedy decode — see [`speculative_choice`] for why a
     /// greedy drafter reduces the textbook accept/reject rule to "sample the row, accept the
     /// proposal iff the sample agrees". Pass [`GreedyChooser`] for bit-identical greedy output.
+    // As [`Self::speculative_decode_step`], over a cohort.
+    #[allow(clippy::too_many_arguments)]
     fn speculative_decode_step_batch(
         &self,
         session: &mut BatchedInferenceSession,
