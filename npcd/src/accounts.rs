@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use web::auth::session::Identity;
 
@@ -86,8 +86,10 @@ impl Accounts {
                 "unique_name": default_unique_name(id),
                 "profile": {
                     "description": "",
-                    "gender": "—",
-                    "pronouns": "",
+                    // Blank until the author picks one. An account is created
+                    // by the act of signing in, before anybody has been asked
+                    // anything, so every field here starts unstated.
+                    "gender": "",
                     "history": "",
                     "turn_index": 0,
                     "revision": 0
@@ -110,6 +112,14 @@ impl Accounts {
             // The subject is the identity of the record. A file whose `sub` has
             // drifted from its name is a corrupted record, not a rename.
             map.insert("sub".into(), json!(id.sub));
+
+            // The live profile is held to its current shape. A record written
+            // when the shape was different is corrected here — the comparison
+            // below then sees a change and writes it back, so the correction is
+            // durable rather than applied afresh on every read.
+            let mut profile = map.remove("profile").unwrap_or_else(|| json!({}));
+            normalise_profile(&mut profile);
+            map.insert("profile".into(), profile);
         }
 
         // Only write when something actually changed. A GET of `/v1/me` on
@@ -130,10 +140,16 @@ impl Accounts {
     ///
     /// Only the profile sub-object is touched: a `PUT /v1/me/profile` that
     /// could reach `sub` or `email` would be a way to become somebody else.
+    /// The patch is a `Map` rather than a `Value` so a body that is not an
+    /// object cannot reach here at all. It used to be a `Value`, and a `PUT`
+    /// carrying `[]` or `"x"` fell through the merge — which is guarded — into
+    /// the tombstone and the write, which are not: the live revision was filed
+    /// into history, `revision` never advanced, and two turns ended up claiming
+    /// the same number while the file grew on every repeat.
     pub fn put_profile(
         &mut self,
         sub: &str,
-        patch: &Value,
+        patch: &Map<String, Value>,
         now_ms: u64,
     ) -> anyhow::Result<Option<Value>> {
         let key = file_id(sub);
@@ -146,6 +162,7 @@ impl Accounts {
                 anyhow::bail!("account {key} is not an object");
             };
             let mut profile = map.get("profile").cloned().unwrap_or_else(|| json!({}));
+            normalise_profile(&mut profile);
 
             // The outgoing revision, stamped with the moment it stopped being
             // the answer. A reader with a turn index can then tell which text
@@ -155,21 +172,30 @@ impl Accounts {
                 old.insert("tombstoned_ms".into(), json!(now_ms));
             }
 
-            if let (Some(dst), Some(src)) = (profile.as_object_mut(), patch.as_object()) {
-                for (k, v) in src {
-                    // The store owns both counters; a caller that could set
-                    // `revision` could make two turns claim the same number.
-                    if k != "revision" && k != "tombstoned_ms" {
-                        dst.insert(k.clone(), v.clone());
-                    }
+            // `normalise_profile` above guarantees an object, so the merge and
+            // the revision bump are unconditional — as the tombstone below
+            // already was. There is no longer a shape of input that files a
+            // revision into history without advancing the counter.
+            let dst = profile
+                .as_object_mut()
+                .expect("normalise_profile leaves an object");
+            for (k, v) in patch {
+                // The store owns both counters; a caller that could set
+                // `revision` could make two turns claim the same number.
+                if k != "revision" && k != "tombstoned_ms" {
+                    dst.insert(k.clone(), v.clone());
                 }
-                let next = dst.get("revision").and_then(|r| r.as_u64()).unwrap_or(0) + 1;
-                dst.insert("revision".into(), json!(next));
-                // `turn_index` names the live profile turn. The profile's turns
-                // are the revisions in this file, so it tracks the revision
-                // rather than being a second, independently-drifting counter.
-                dst.insert("turn_index".into(), json!(next));
             }
+            let next = dst.get("revision").and_then(|r| r.as_u64()).unwrap_or(0) + 1;
+            dst.insert("revision".into(), json!(next));
+            // `turn_index` names the live profile turn. The profile's turns are
+            // the revisions in this file, so it tracks the revision rather than
+            // being a second, independently-drifting counter.
+            dst.insert("turn_index".into(), json!(next));
+            // A patch cannot introduce a field either: the shape is the
+            // store's, not the caller's, so an unrecognised key is discarded
+            // rather than stored where it would look like part of the profile.
+            normalise_profile(&mut profile);
 
             let mut history = match map.remove("profile_history") {
                 Some(Value::Array(v)) => v,
@@ -259,6 +285,96 @@ impl Accounts {
     pub fn get(&self, sub: &str) -> Option<Value> {
         let key = file_id(sub);
         self.reg.get(&key).map(|r| with_public_id(&key, &r.body))
+    }
+}
+
+/// Every field a profile has. There are no others.
+///
+/// The registry preserves unknown keys on purpose — an authored world is
+/// hand-edited and must survive a round trip through a program that has not
+/// heard of half of it. A profile is the opposite: its shape is defined here,
+/// so a key on disk that this list does not name is not a field, it is
+/// residue, and [`normalise_profile`] removes it on the next write.
+const PROFILE_FIELDS: [&str; 5] = ["description", "gender", "history", "turn_index", "revision"];
+
+/// Force a stored profile into the shape above: drop what is not a field, fill
+/// in what is missing, and blank a `gender` that is not a value it may hold.
+///
+/// Called on every sign-in, so a record written by an older shape corrects
+/// itself the next time its owner appears rather than needing anyone to go and
+/// find it.
+fn normalise_profile(profile: &mut Value) {
+    let Some(map) = profile.as_object_mut() else {
+        *profile = json!({});
+        return normalise_profile(profile);
+    };
+
+    map.retain(|k, _| PROFILE_FIELDS.contains(&k.as_str()));
+
+    for text in ["description", "gender", "history"] {
+        if !map.get(text).is_some_and(Value::is_string) {
+            map.insert(text.into(), json!(""));
+        }
+    }
+    for count in ["turn_index", "revision"] {
+        if !map.get(count).is_some_and(Value::is_u64) {
+            map.insert(count.into(), json!(0));
+        }
+    }
+    if !map["gender"].as_str().is_some_and(gender_ok) {
+        map.insert("gender".into(), json!(""));
+    }
+}
+
+/// The values `gender` may hold, plus blank for not-yet-chosen.
+///
+/// A closed set rather than free text because a character reads this field and
+/// writes prose from it — "she" or "he" follows from it directly. Free text
+/// would make that a guess, and a guess is the one thing an NPC should not be
+/// doing about the person it is talking to.
+pub const GENDERS: [&str; 2] = ["Male", "Female"];
+
+/// Whether a submitted `gender` is one this profile can hold.
+pub fn gender_ok(v: &str) -> bool {
+    v.is_empty() || GENDERS.contains(&v)
+}
+
+/// The profile fields a caller writes, all of them free text.
+const AUTHORED_TEXT: [&str; 2] = ["description", "history"];
+
+/// Why a profile patch was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PatchError {
+    /// A field the caller may write was sent as something other than a string.
+    NotText(&'static str),
+    /// `gender` was a string, but not one of the values it may hold.
+    BadGender,
+}
+
+/// Check a profile patch before any of it is merged.
+///
+/// It runs over the whole patch rather than one field, because the failure it
+/// prevents is the same in every case and is silent: [`normalise_profile`]
+/// coerces a wrong-typed field to `""` on its way to disk, so `{"gender": 3}`
+/// or `{"description": 42}` would answer `200 OK` while destroying whatever the
+/// author had written there. Repairing a record read off disk is what that
+/// coercion is for; it must never be how a live request is handled.
+pub fn check_patch(patch: &Map<String, Value>) -> Result<(), PatchError> {
+    for field in AUTHORED_TEXT {
+        if patch.get(field).is_some_and(|v| !v.is_string()) {
+            return Err(PatchError::NotText(field));
+        }
+    }
+    match patch.get("gender") {
+        None => Ok(()),
+        // Checked for type first: `null` and `3` are not "an invalid gender",
+        // they are the wrong kind of thing, and saying so is the difference
+        // between a caller fixing the value and a caller fixing the request.
+        Some(v) => match v.as_str() {
+            None => Err(PatchError::NotText("gender")),
+            Some(g) if !gender_ok(g) => Err(PatchError::BadGender),
+            Some(_) => Ok(()),
+        },
     }
 }
 
@@ -354,17 +470,31 @@ fn default_unique_name(id: &Identity) -> String {
 mod tests {
     use super::*;
 
+    /// A directory of this test's own.
+    ///
+    /// Counted rather than timestamped. `SystemTime::now()` is only as fine as
+    /// the platform clock — around 15ms on Windows — so tests starting together
+    /// were handed the *same* nanosecond and therefore the same directory, and
+    /// then wrote over each other's accounts. It failed as an account that had
+    /// just been saved coming back missing, which reads as a bug in the store.
     fn tmp() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
             "npcd-accounts-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        // A previous run of the same PID could have left one behind.
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// `json!` builds a `Value`; the store takes a `Map`, because a patch that
+    /// is not an object is not a patch. This is the seam the API does for real.
+    fn patch(v: Value) -> Map<String, Value> {
+        v.as_object().expect("a test patch is an object").clone()
     }
 
     fn ident(sub: &str, email: &str, name: &str) -> Identity {
@@ -414,7 +544,7 @@ mod tests {
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "wren@example.com", "Wren"), 1)
             .unwrap();
-        a.put_profile("g1", &json!({"description": "Ex-surveyor."}), 2)
+        a.put_profile("g1", &patch(json!({"description": "Ex-surveyor."})), 2)
             .unwrap();
 
         let me = a
@@ -450,7 +580,7 @@ mod tests {
         let me = a
             .put_profile(
                 "g1",
-                &json!({"description": "x", "email": "attacker@evil.com", "sub": "someone-else"}),
+                &patch(json!({"description": "x", "email": "attacker@evil.com", "sub": "someone-else"})),
                 2,
             )
             .unwrap()
@@ -468,13 +598,13 @@ mod tests {
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let one = a
-            .put_profile("g1", &json!({"description": "a"}), 2)
+            .put_profile("g1", &patch(json!({"description": "a"})), 2)
             .unwrap()
             .unwrap();
         assert_eq!(one["profile"]["revision"], 1);
         // A caller cannot set it.
         let two = a
-            .put_profile("g1", &json!({"description": "b", "revision": 99}), 3)
+            .put_profile("g1", &patch(json!({"description": "b", "revision": 99})), 3)
             .unwrap()
             .unwrap();
         assert_eq!(two["profile"]["revision"], 2);
@@ -488,9 +618,9 @@ mod tests {
         let dir = tmp();
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
-        a.put_profile("g1", &json!({"description": "Surveyor."}), 100)
+        a.put_profile("g1", &patch(json!({"description": "Surveyor."})), 100)
             .unwrap();
-        a.put_profile("g1", &json!({"description": "Ex-surveyor."}), 200)
+        a.put_profile("g1", &patch(json!({"description": "Ex-surveyor."})), 200)
             .unwrap();
 
         let h = a.profile_history("g1").unwrap();
@@ -521,7 +651,7 @@ mod tests {
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let me = a
-            .put_profile("g1", &json!({"description": "a"}), 2)
+            .put_profile("g1", &patch(json!({"description": "a"})), 2)
             .unwrap()
             .unwrap();
         assert!(me.get("profile_history").is_none());
@@ -545,6 +675,141 @@ mod tests {
                 "`{sub}` → `{key}`"
             );
         }
+    }
+
+    /// A record written under an older profile shape corrects itself the next
+    /// time its owner signs in — no field survives that the profile does not
+    /// have, and a `gender` outside the allowed set is cleared rather than
+    /// carried.
+    #[test]
+    fn an_older_shape_is_corrected_on_the_next_sign_in() {
+        let dir = tmp();
+        let key = file_id("g1");
+        std::fs::write(
+            dir.join(format!("{key}.yaml")),
+            serde_yaml::to_string(&json!({
+                "sub": "g1",
+                "provider": "google",
+                "created_ms": 1,
+                "unique_name": "wren",
+                "profile": {
+                    "description": "Ex-surveyor.",
+                    "gender": "—",
+                    "pronouns": "they/them",
+                    "history": "",
+                    "turn_index": 0,
+                    "revision": 0
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut a = Accounts::load(&dir).unwrap();
+        let me = a
+            .upsert(&ident("g1", "wren@example.com", "Wren"), 2)
+            .unwrap();
+
+        assert!(me["profile"].get("pronouns").is_none(), "{me}");
+        assert_eq!(me["profile"]["gender"], "", "an invalid gender was kept");
+        // What the profile does have is untouched.
+        assert_eq!(me["profile"]["description"], "Ex-surveyor.");
+
+        // Durable, not re-derived on every read.
+        let again = Accounts::load(&dir).unwrap();
+        let stored = &again.get("g1").unwrap()["profile"];
+        assert!(stored.get("pronouns").is_none(), "{stored}");
+        assert_eq!(stored["gender"], "");
+    }
+
+    /// Everything a caller may write is checked before any of it is merged.
+    ///
+    /// The failure this guards is silent rather than loud: `normalise_profile`
+    /// blanks a wrong-typed field on its way to disk, which is right for
+    /// repairing a record and catastrophic for a live write — a `200 OK` that
+    /// erased the author's prose. `null` and `3` are refused as the wrong
+    /// *kind* of thing, separately from a string that is not an allowed gender,
+    /// because those are two different mistakes to fix.
+    #[test]
+    fn a_wrong_typed_field_is_refused_rather_than_blanked() {
+        for bad in [
+            json!({"description": 42}),
+            json!({"history": null}),
+            json!({"description": ["a"]}),
+            json!({"gender": null}),
+            json!({"gender": 3}),
+            json!({"gender": {"v": "Male"}}),
+        ] {
+            let m = patch(bad.clone());
+            assert!(
+                matches!(check_patch(&m), Err(PatchError::NotText(_))),
+                "{bad} was accepted as text"
+            );
+        }
+
+        // A string that is simply not one of the values is its own answer.
+        assert_eq!(
+            check_patch(&patch(json!({"gender": "Other"}))),
+            Err(PatchError::BadGender)
+        );
+
+        for good in [
+            json!({}),
+            json!({"description": ""}),
+            json!({"gender": ""}),
+            json!({"gender": "Female", "history": "x"}),
+            // Unknown keys are the store's to discard, not a reason to refuse.
+            json!({"nickname": 7}),
+        ] {
+            assert_eq!(check_patch(&patch(good.clone())), Ok(()), "{good} refused");
+        }
+    }
+
+    /// A patch that is not an object cannot reach the store at all, so it
+    /// cannot file a revision into history without advancing the counter.
+    ///
+    /// It used to be able to: the merge was guarded by `patch.as_object()` but
+    /// the tombstone and the write below it were not, so `PUT []` retired the
+    /// live profile, left `revision` where it was, and grew the file on every
+    /// repeat until two turns claimed the same number. The signature is the fix
+    /// — `Map` rather than `Value` — and this is the assertion that the shape
+    /// really is unrepresentable.
+    #[test]
+    fn a_body_that_is_not_an_object_is_not_a_patch() {
+        for not_a_patch in [json!([]), json!("x"), json!(3), json!(null)] {
+            assert!(
+                not_a_patch.as_object().is_none(),
+                "{not_a_patch} would still reach the store"
+            );
+        }
+
+        // And a legitimate empty patch still advances exactly one revision.
+        let dir = tmp();
+        let mut a = Accounts::load(&dir).unwrap();
+        a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
+        let me = a.put_profile("g1", &patch(json!({})), 2).unwrap().unwrap();
+        assert_eq!(me["profile"]["revision"], 1);
+        assert_eq!(a.profile_history("g1").unwrap().len(), 2);
+    }
+
+    /// A caller cannot add one back, either.
+    #[test]
+    fn a_patch_cannot_introduce_a_field_the_profile_does_not_have() {
+        let dir = tmp();
+        let mut a = Accounts::load(&dir).unwrap();
+        a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
+        let me = a
+            .put_profile(
+                "g1",
+                &patch(json!({"description": "x", "pronouns": "they/them", "nickname": "boss"})),
+                2,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(me["profile"]["description"], "x");
+        assert!(me["profile"].get("pronouns").is_none(), "{me}");
+        assert!(me["profile"].get("nickname").is_none(), "{me}");
     }
 
     /// The store must never suggest a name its own setter would refuse — the

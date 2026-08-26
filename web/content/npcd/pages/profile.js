@@ -37,6 +37,19 @@ export async function render() {
       hint ? h('div', { class: 'tiny dim', style: 'margin-top:4px' }, hint) : null);
   };
 
+  /* A closed set, so a `<select>` rather than a text box. The blank option is
+   * what a new account starts on — signing in creates the record before anyone
+   * has been asked anything — and it stays available, because a field nobody
+   * has filled in should not silently claim the first value in the list. */
+  const choice = (key, label, options, hint) => {
+    const ctl = h('select', { class: 'select' },
+      h('option', { value: '' }, '—'),
+      ...options.map((o) => h('option', p[key] === o ? { value: o, selected: true } : { value: o }, o)));
+    f[key] = ctl;
+    return h('label', { class: 'field' }, h('span', {}, label), ctl,
+      hint ? h('div', { class: 'tiny dim', style: 'margin-top:4px' }, hint) : null);
+  };
+
   el.appendChild(h('div', { class: 'hd' },
     h('div', { class: 'row', style: 'gap:14px' },
       faceOf(me, 46),
@@ -65,8 +78,8 @@ export async function render() {
           h('input', { class: 'input', value: me.email || '', disabled: true })),
         h('div', { class: 'tiny dim' }, 'Set by ' + (me.provider || 'your provider') + ', not editable here.'))),
 
-    field('pronouns', 'Pronouns'),
-    field('gender', 'Gender'),
+    choice('gender', 'Gender', ['Male', 'Female'],
+      'A character writes about you in prose, so it needs this rather than inferring it.'),
     field('description', 'Description — how a character perceives you', null, 4),
     field('history', 'History', 'Background a character can come to know about you over time.', 3),
 

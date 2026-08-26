@@ -39,8 +39,7 @@ pub fn user() -> Value {
         "profile": {
             "description": "Reads people quickly, talks slowly. Ex-surveyor, so \
                             tends to describe places by their edges.",
-            "gender": "—",
-            "pronouns": "they/them",
+            "gender": "Male",
             "history": "Grew up on the coast. Came inland for work and stayed.",
             "turn_index": 7,
             "revision": 3

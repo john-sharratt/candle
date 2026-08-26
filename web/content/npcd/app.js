@@ -6,39 +6,44 @@ import { h, mount } from './lib/dom.js';
 import { toast } from './lib/ui.js';
 import { checkBuild, takeReloadState } from './lib/build.js';
 import { state as vp, onBreakpoint } from './lib/viewport.js';
+import { estateSwitcher } from './lib/estate.js';
 
 // ── page registry ───────────────────────────────────────────────────────────
 // Adding a page touches exactly one entry here plus one file. Nav is derived.
 
-definePage({ path: '/', title: () => 'My NPCs', nav: { section: 'main', order: 10, label: 'My NPCs' },
+/* Each page is a path, how to load it, and — for the ones that appear in
+ * navigation — where it sits there. No `title`: the tab keeps the name
+ * `index.html` gave it, so a per-page title had no reader and was quietly
+ * becoming a second, unmaintained set of labels beside `nav.label`. */
+definePage({ path: '/', nav: { section: 'main', order: 10, label: 'My NPCs' },
   load: () => import('./pages/roster.js') });
-definePage({ path: '/npc/new', title: () => 'New character',
+definePage({ path: '/npc/new',
   load: () => import('./pages/create.js') });
-definePage({ path: '/npc/:id', title: () => 'Character', keepsRail: true,
+definePage({ path: '/npc/:id', keepsRail: true,
   load: () => import('./pages/npc.js') });
-definePage({ path: '/npc/:id/:tab', title: () => 'Character', keepsRail: true,
+definePage({ path: '/npc/:id/:tab', keepsRail: true,
   load: () => import('./pages/npc.js') });
-definePage({ path: '/interaction/:ix', title: () => 'Interaction',
+definePage({ path: '/interaction/:ix',
   load: () => import('./pages/console.js') });
-definePage({ path: '/worlds', title: () => 'Worlds', nav: { section: 'main', order: 20, label: 'Worlds' },
+definePage({ path: '/worlds', nav: { section: 'main', order: 20, label: 'Worlds' },
   load: () => import('./pages/worlds.js') });
-definePage({ path: '/world/:wid', title: () => 'World',
+definePage({ path: '/world/:wid',
   load: () => import('./pages/worlds.js') });
-definePage({ path: '/archetypes', title: () => 'Archetypes', nav: { section: 'main', order: 30, label: 'Archetypes' },
+definePage({ path: '/archetypes', nav: { section: 'main', order: 30, label: 'Archetypes' },
   load: () => import('./pages/archetypes.js') });
-definePage({ path: '/tools', title: () => 'Tools', nav: { section: 'main', order: 40, label: 'Tools' },
+definePage({ path: '/tools', nav: { section: 'main', order: 40, label: 'Tools' },
   load: () => import('./pages/tools.js') });
-definePage({ path: '/substrate', title: () => 'Substrate', nav: { section: 'main', order: 50, label: 'Substrate' },
+definePage({ path: '/substrate', nav: { section: 'main', order: 50, label: 'Substrate' },
   load: () => import('./pages/substrate.js') });
-definePage({ path: '/performance', title: () => 'Performance', nav: { section: 'main', order: 60, label: 'Performance' },
+definePage({ path: '/performance', nav: { section: 'main', order: 60, label: 'Performance' },
   load: () => import('./pages/system.js') });
-definePage({ path: '/probe', title: () => 'Probe', nav: { section: 'main', order: 55, label: 'Probe' },
+definePage({ path: '/probe', nav: { section: 'main', order: 55, label: 'Probe' },
   load: () => import('./pages/probe.js') });
-definePage({ path: '/logs', title: () => 'Logs', nav: { section: 'main', order: 70, label: 'Logs' },
+definePage({ path: '/logs', nav: { section: 'main', order: 70, label: 'Logs' },
   load: () => import('./pages/logs.js') });
-definePage({ path: '/system', title: () => 'System', load: () => import('./pages/system.js') });
-definePage({ path: '/me', title: () => 'Profile', load: () => import('./pages/profile.js') });
-definePage({ path: '/welcome', title: () => 'npcd', load: () => import('./pages/landing.js') });
+definePage({ path: '/system', load: () => import('./pages/system.js') });
+definePage({ path: '/me', load: () => import('./pages/profile.js') });
+definePage({ path: '/welcome', load: () => import('./pages/landing.js') });
 
 // ── theme ───────────────────────────────────────────────────────────────────
 
@@ -308,6 +313,12 @@ async function boot() {
   st('st-backend', 'backend: ' + BACKEND, 'add ?mock=1 to run without a daemon');
   st('st-build', (status && status.build) || '');
 
+  /* The brand corner is the switcher. Its "you are here" row goes to this
+   * console's own front page rather than to `https://bot.tokera.com/`, which
+   * would be a full page load to arrive where you already are. */
+  const estate = document.getElementById('estate');
+  if (estate) mount(estate, estateSwitcher('npcd', { homeHref: '#/welcome' }));
+
   renderChrome();
   renderNav(null);   // tabs appear immediately, even if the first page fails to render
 
@@ -343,7 +354,10 @@ async function boot() {
 
   start(document.getElementById('outlet'), (page, params) => {
     renderNav(page);
-    document.title = page ? (typeof page.title === 'function' ? page.title(params) : page.title) + ' · npcd' : 'npcd';
+    /* The tab keeps the name it was served with. It used to be rewritten on
+     * every route — `Roster · npcd`, `Worlds · npcd` — which is restless when
+     * the page already says where you are, twice, in the nav and in its own
+     * heading. `index.html` sets it once and nothing here touches it. */
     // Pages own the rail; clear it on every route so a stale one never lingers.
     const rail = document.getElementById('rail');
     if (rail && !(page && page.keepsRail)) rail.replaceChildren();

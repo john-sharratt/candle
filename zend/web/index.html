@@ -141,6 +141,13 @@
   @media (max-width: 560px) { .z-dial-label { display: none !important; } }
   .z-chatscroll > div:last-child { margin-bottom: 2.5rem !important; }
 </style>
+<!-- The estate switcher's styles, shared with tokera.com and the npcd console.
+     A copy, because this app embeds its own assets and cannot read the shared
+     content directory; `web/src/site/tokera/page.rs` compares the two byte for
+     byte so the copy cannot drift. Every colour in it is a `var(--x, fallback)`
+     and this app defines none of those tokens, so it takes the fallbacks, which
+     are tuned to this palette. -->
+<link rel="stylesheet" href="lib/estate.css">
 </head>
 <body>
 <div id="app"></div>
@@ -148,12 +155,21 @@
 <script src="zend-api.mock.js"></script>
 <script src="zend-api.live.js"></script>
 <script src="zend-api.js"></script>
-<script>
+<script type="module">
 /* ============================================================================
  * Zend UI — vanilla single-file app (plain DOM, no framework).
  * Talks only to window.ZendAPI (the seam); never calls fetch directly.
  * See docs/zend_ui_redesign.md.
+ *
+ * `type="module"` for one reason: the estate switcher below is a shared module.
+ * The classic scripts above still run first and still set `window.ZendAPI` —
+ * they execute during parsing, a module executes after it — so the seam is in
+ * place before a line of this runs. The IIFE is now redundant (module scope is
+ * already private) and is kept only so this diff is a wrapper change rather
+ * than a re-indent of two thousand lines.
  * ========================================================================== */
+import { estateSwitcher } from './lib/estate.js';
+
 (function () {
   'use strict';
   const API = window.ZendAPI;
@@ -1175,7 +1191,11 @@
     });
     return h('div', { class: 'zscroll-blue z-sb', style: 'width:' + w + 'px; flex-shrink:0; ' + pos + ' display:flex; flex-direction:column; background:#1e2a3a; color:#c0ccd8;' },
       h('div', { style: 'flex-shrink:0; display:flex; align-items:center; justify-content:space-between; padding:0.9rem 0.8rem 0.75rem; border-bottom:1px solid #2a3848; background:#19222f;' },
-        h('div', { style: 'display:flex; align-items:center; gap:0.5rem; font-size:0.82rem; font-weight:650; color:#d0dae4;', html: starLogo(22, '#1a1714') + '<span>&nbsp;Zend</span>' }),
+        // The brand corner is the estate switcher — the same control, from the
+        // same module, as tokera.com and the npcd console. Built fresh on each
+        // render because this header re-renders; it holds no state of its own
+        // beyond `<details open>`, which is the point of using `<details>`.
+        estateSwitcher('zend', { homeHref: '/' }),
         h('div', { style: 'display:flex; align-items:center; gap:5px;' },
           iconBtn('M7 2v10M2 7h10', 'New conversation', newConv, 27),
           iconBtn('M9 2L4 7l5 5', drawer ? 'Close' : 'Collapse sidebar', closeSidebar, 27))),
