@@ -191,7 +191,6 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
         .collect::<Vec<_>>()
         .join(" · ");
     let meta = Meta {
-        title: &paper.title,
         heading: &paper.title,
         subtitle: (!paper.subtitle.is_empty()).then_some(paper.subtitle.as_str()),
         byline: (!byline.is_empty()).then_some(byline.as_str()),

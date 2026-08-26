@@ -130,7 +130,6 @@ pub async fn index(state: Arc<State>) -> Response {
     }
 
     let meta = Meta {
-        title: "Blog",
         heading: "Blog",
         subtitle: None,
         byline: None,
@@ -191,7 +190,6 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
     };
 
     let meta = Meta {
-        title: &post.title,
         heading: &post.title,
         subtitle: None,
         byline: Some(&post.date),

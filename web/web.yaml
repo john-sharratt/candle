@@ -114,14 +114,32 @@ sites:
   # which is why `/` is `exact`: a bare `/` prefix would swallow them all.
   - name: tokera
     default: true
-    hosts: ["tokera.com", "www.tokera.com", "tokera.localhost",
-            "battlecities.net", "www.battlecities.net"]
+    hosts: ["tokera.com", "www.tokera.com", "tokera.localhost"]
     roots: ["content/tokera", "content/common"]
     papers: "../docs"
     api:
       - {prefix: /, exact: true, upstream: local}
       - {prefix: /blog, upstream: local}
       - {prefix: /papers, upstream: local}
+
+  # ── battlecities.net — the game's own site ──────────────────────────────
+  # A handful of static files: a title image, a download link, and the icon set
+  # the game already shipped. No daemon, no API, no generated pages — so it is
+  # `roots` and nothing else, and a bare `/` finds `index.html` on its own.
+  #
+  # It was a `hosts:` entry on the tokera site until now, which meant it served
+  # tokera's pages and tokera's brand mark. Two products cannot share one site
+  # entry and keep separate identities: an icon is a file, so a shared root is a
+  # shared icon however different the two brands are meant to look, and
+  # battlecities.net wore the Tokera triskelion. Its own entry gives it the Zen
+  # back. `roles.rs` asserts the split so it cannot quietly close again.
+  #
+  # The download link points at `battle-cities.exe`, which is not here. That is
+  # the game's build output rather than repository content, so the link 404s
+  # until a release is dropped alongside these files.
+  - name: battlecities
+    hosts: ["battlecities.net", "www.battlecities.net", "battlecities.localhost"]
+    roots: ["content/battlecities"]
 
   # ── bot.tokera.com — the NPC console ────────────────────────────────────
   # A pure gateway, like zend below: no roots, everything forwarded, navigation
@@ -150,7 +168,7 @@ sites:
       - prefix: /
         upstream: "http://192.168.0.6:8081"
 
-  # ── code.tokera.com — Zen Code ──────────────────────────────────────────
+  # ── code.tokera.com — Zend ──────────────────────────────────────────────
   # zend still embeds and serves its own assets, so this site is a pure
   # gateway: no roots, everything forwarded, navigation included. When zend is
   # split the same way as npcd, give it `roots: ["content/zend",

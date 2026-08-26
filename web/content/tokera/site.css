@@ -56,21 +56,10 @@ body.tokera {
   border-bottom: 1px solid var(--line);
 }
 
-.site-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-weight: 660;
-  letter-spacing: -.35px;
-  font-size: 1.04rem;
-  color: var(--ink);
-  text-decoration: none;
-}
-.site-brand:hover { text-decoration: none; color: var(--ink); }
-
-/* The mark, inline so it takes the theme's colours. Same drawing as
-   favicon.svg. */
-.site-brand .mark { width: 21px; height: 21px; flex: none; display: block; }
+/* The brand corner is the estate switcher — `lib/estate.css` dresses it, and
+   the mark is the chip on its summary. Only the type size is this site's to
+   say; the rest of the control looks the same on all three. */
+.site-top > .estate > summary { font-size: 1.04rem; letter-spacing: -.35px; }
 
 .site-nav { display: flex; gap: 2px; }
 .site-nav a {
@@ -920,7 +909,7 @@ img, svg, video, canvas { max-width: 100%; }
 @media (max-width: 400px) {
   /* The narrowest phones still in use. Nothing clever, just stop things
      touching the edges or each other. */
-  .site-brand { font-size: .96rem; gap: 8px; }
+  .site-top > .estate > summary { font-size: .96rem; }
   .site-nav { gap: 0; }
   .site-nav a { padding: 6px 7px; font-size: .8rem; }
   main.wide, main.reading { padding-left: 14px; padding-right: 14px; }
@@ -975,16 +964,6 @@ img, svg, video, canvas { max-width: 100%; }
   clip-path: inset(50%);
   white-space: nowrap;
   border: 0;
-}
-
-/* The brand mark's own two colours, held apart from the theme's semantic
-   tokens on purpose. `--accent`, `--info` and the rest exist to be retuned when
-   the palette needs it; a logo that moves when they do is not a logo. The
-   counter-form still uses `--bg`, because the T is *cut out* of the tile and
-   has to show whatever the page is actually made of. */
-:root {
-  --brand:      #2f74d0;
-  --brand-head: #34d399;
 }
 
 /* ── the scrollbar is navigation here ────────────────────────────────────────

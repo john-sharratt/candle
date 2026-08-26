@@ -536,11 +536,10 @@ User {
   "email":       "…",
   "avatar_url":  "…",
   "provider":    "google",
-  "profile": {                        // the self an NPC reads — substrate-backed
+  "profile": {                        // the self an NPC reads
     "description": "…",
-    "gender":      "…",
+    "gender":      "Male",            // or "Female", or "" until chosen
     "history":     "…",
-    "pronouns":    "…",
     "turn_index":  7,                 // the live profile turn
     "revision":    3
   },
@@ -756,7 +755,8 @@ The trigger is the first request carrying an `X-Tokera-User` this daemon has not
 
 ```
 first request from an unknown sub  → creates the account, writes profile turn #0
-GET  /v1/me/profile                 → { unique_name, description, gender, history, pronouns }
+GET  /v1/me/profile                 → { description, gender, history, turn_index, revision }
+                                      gender is "Male", "Female", or "" — 400 bad_gender otherwise
 PUT  /v1/me/profile                 → appends a new turn, tombstones the previous
 GET  /v1/me/profile/history         → every revision, live and tombstoned
 ```

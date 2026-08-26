@@ -650,3 +650,61 @@ async fn local_and_proxied_answers_are_indistinguishable() {
     assert_eq!(a.body, b.body);
     assert_eq!(a.content_type, b.content_type);
 }
+
+// ── the shipped table ──────────────────────────────────────────────────────
+
+/// The real `web.yaml`, resolved against the real content tree.
+fn shipped() -> Config {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    Config::from_yaml(include_str!("../web.yaml"), manifest).expect("web.yaml parses")
+}
+
+/// A product's identity is per-site, so two products cannot share a site entry.
+///
+/// `battlecities.net` was a `hosts:` entry on the tokera site, which meant it
+/// served tokera's pages *and* tokera's brand mark — the game's own domain wore
+/// the Tokera triskelion, and nothing failed to say so. Splitting it out is what
+/// gives it back its own icon, and this is the assertion that keeps it split.
+#[tokio::test]
+async fn each_brand_has_its_own_site_and_its_own_mark() {
+    let cfg = shipped();
+
+    let bc = cfg.site_for(Some("battlecities.net"));
+    assert_eq!(
+        bc.name, "battlecities",
+        "battlecities.net lost its own site"
+    );
+    assert_eq!(
+        cfg.site_for(Some("www.battlecities.net")).name,
+        "battlecities"
+    );
+
+    let tk = cfg.site_for(Some("tokera.com"));
+    assert_eq!(tk.name, "tokera");
+
+    // Separate roots is the mechanism: an icon is a file, and a shared root is
+    // a shared icon however different the two brands are meant to look.
+    assert!(
+        bc.roots.iter().all(|r| !tk.roots.contains(r)),
+        "the two brands share a content root, so they share a favicon"
+    );
+
+    // And each one's mark is actually present where its site will look for it.
+    // `content_dir` is the config's base, not the content tree, so this walks
+    // the site's own declared root rather than assuming where it points.
+    for site in [bc, tk] {
+        let root = content_dir().join(&site.roots[0]);
+        let found = ["favicon.ico", "favicon.png", "favicon.svg"]
+            .iter()
+            .any(|f| root.join(f).is_file());
+        assert!(found, "{} has no icon of its own", site.name);
+    }
+}
+
+/// An unknown Host lands on the default site, not on whichever was declared
+/// first — the difference decides what a bare IP or a stray CNAME serves.
+#[tokio::test]
+async fn an_unknown_host_still_lands_on_tokera() {
+    assert_eq!(shipped().site_for(Some("nowhere.example")).name, "tokera");
+    assert_eq!(shipped().site_for(None).name, "tokera");
+}

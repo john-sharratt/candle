@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use web::auth::session::Identity;
 
-use crate::accounts::{Accounts, NameError};
+use crate::accounts::{self, Accounts, NameError, PatchError};
 use crate::identity::{self, NotSignedIn};
 use crate::registry::Registry;
 
@@ -128,11 +128,36 @@ async fn put_profile(
         Ok(id) => id,
         Err(r) => return *r,
     };
+    // Everything the caller sent is checked before any of it is merged. The
+    // store repairs a wrong-typed field by blanking it — which is right for a
+    // record read off disk and wrong for a live request, where it would answer
+    // 200 while destroying what the author had written.
+    let Some(patch) = patch.as_object() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "expected a JSON object",
+        );
+    };
+    if let Err(e) = accounts::check_patch(patch) {
+        return match e {
+            PatchError::NotText(field) => err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                &format!("`{field}` must be a string"),
+            ),
+            PatchError::BadGender => err(
+                StatusCode::BAD_REQUEST,
+                "bad_gender",
+                &format!("expected one of {}", accounts::GENDERS.join(", ")),
+            ),
+        };
+    }
     match s
         .accounts
         .write()
         .await
-        .put_profile(&id.sub, &patch, now_ms())
+        .put_profile(&id.sub, patch, now_ms())
     {
         Ok(Some(me)) => Json(me["profile"].clone()).into_response(),
         Ok(None) => err(StatusCode::NOT_FOUND, "account_not_found", "no account yet"),
@@ -326,15 +351,22 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    /// A directory of this test's own.
+    ///
+    /// The tag names it and a counter keeps it unique. It used to be the tag
+    /// plus `SystemTime::now()`, which is only as fine as the platform clock —
+    /// around 15ms on Windows — so two tests sharing a tag, or starting in the
+    /// same tick, were handed the same directory and wrote over each other.
     fn tmp(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
             "npcd-api-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        // A previous run of the same PID could have left one behind.
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -553,6 +585,96 @@ mod tests {
                 "{bad:?} refused without saying why"
             );
         }
+    }
+
+    /// `gender` is a choice, so the API enforces the same two options the
+    /// console offers — a value a character cannot read must not be storable
+    /// just because the caller skipped the GUI.
+    #[tokio::test]
+    async fn gender_takes_only_the_values_a_character_can_read() {
+        let state = state(tmp("gender"));
+        let a = "google-1";
+        call(router(state.clone()), get("/v1/me", Some(a))).await;
+
+        for good in ["Male", "Female", ""] {
+            let req = send("/v1/me/profile", "PUT", a, json!({ "gender": good }));
+            let (s, p) = call(router(state.clone()), req).await;
+            assert_eq!(s, StatusCode::OK, "{good:?} should be accepted");
+            assert_eq!(p["gender"], good);
+        }
+
+        for bad in ["male", "M", "Other", "they/them", "—"] {
+            let req = send("/v1/me/profile", "PUT", a, json!({ "gender": bad }));
+            let (s, body) = call(router(state.clone()), req).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} should be refused");
+            assert_eq!(body["error"], "bad_gender");
+        }
+
+        // And a refusal must not have written a revision on its way out.
+        let (_, p) = call(router(state), get("/v1/me/profile", Some(a))).await;
+        assert_eq!(p["revision"], 3, "a rejected write bumped the revision");
+    }
+
+    /// The wrong *kind* of value is refused too, and does not quietly erase
+    /// what was there.
+    ///
+    /// Only strings used to be checked, so `{"gender": null}` and
+    /// `{"gender": 3}` walked past the guard, merged, and were blanked by the
+    /// store's repair pass — 200 OK, choice destroyed. The same held for the
+    /// prose fields: `{"description": 42}` wiped a paragraph and reported
+    /// success.
+    #[tokio::test]
+    async fn a_wrong_typed_field_is_refused_and_changes_nothing() {
+        let state = state(tmp("types"));
+        let a = "google-1";
+        call(router(state.clone()), get("/v1/me", Some(a))).await;
+
+        let seed = send(
+            "/v1/me/profile",
+            "PUT",
+            a,
+            json!({"gender": "Male", "description": "Ex-surveyor."}),
+        );
+        assert_eq!(call(router(state.clone()), seed).await.0, StatusCode::OK);
+
+        for bad in [
+            json!({"gender": null}),
+            json!({"gender": 3}),
+            json!({"description": 42}),
+            json!({"history": ["a"]}),
+        ] {
+            let req = send("/v1/me/profile", "PUT", a, bad.clone());
+            let (s, body) = call(router(state.clone()), req).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad} was accepted");
+            assert_eq!(body["error"], "bad_request", "{bad}");
+        }
+
+        // Nothing was merged, nothing was blanked, no revision was spent.
+        let (_, p) = call(router(state), get("/v1/me/profile", Some(a))).await;
+        assert_eq!(p["gender"], "Male");
+        assert_eq!(p["description"], "Ex-surveyor.");
+        assert_eq!(p["revision"], 1);
+    }
+
+    /// A body that is not an object is refused before it can retire a revision.
+    #[tokio::test]
+    async fn a_body_that_is_not_an_object_is_refused() {
+        let state = state(tmp("shape2"));
+        let a = "google-1";
+        call(router(state.clone()), get("/v1/me", Some(a))).await;
+
+        for body in [json!([]), json!("x"), json!(3), json!(null)] {
+            let req = send("/v1/me/profile", "PUT", a, body.clone());
+            let (s, e) = call(router(state.clone()), req).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body} was accepted");
+            assert_eq!(e["error"], "bad_request");
+        }
+
+        // The live revision is untouched and history has not grown.
+        let (_, p) = call(router(state.clone()), get("/v1/me/profile", Some(a))).await;
+        assert_eq!(p["revision"], 0);
+        let (_, h) = call(router(state), get("/v1/me/profile/history", Some(a))).await;
+        assert_eq!(h["revisions"].as_array().unwrap().len(), 1);
     }
 
     /// Every write is behind the same gate, not just the reads.
