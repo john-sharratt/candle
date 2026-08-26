@@ -1,3 +1,7 @@
 # Signing keys and OAuth client secrets. The site table names them by path so
 # that it can be committed and this directory cannot.
 secrets/
+
+# stdout/stderr of a gateway started in the background.
+gateway.out.log
+gateway.err.log

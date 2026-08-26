@@ -43,6 +43,7 @@ pub struct MemoryReport {
     pub experts: ExpertSection,
     pub weights: WeightSection,
     pub gallery: GallerySection,
+    pub accounting: AccountingSection,
 }
 
 /// Model weights resident in VRAM, split into the two parts that behave
@@ -115,6 +116,81 @@ pub struct GovernorSection {
     pub reserved_expert_bytes: u64,
     pub reserved_scratch_bytes: u64,
     pub reserved_kv_bytes: u64,
+}
+
+/// Whole-card reconciliation: what this report can account for, and what it
+/// cannot.
+///
+/// Every other section names one consumer. None of them adds up, and that is
+/// how several GiB stayed invisible: the dense weights, the gallery arena's
+/// slabs and the CUDA pool are each documented as sitting outside the KV pool
+/// and outside each other's tallies, so no reader could have summed them
+/// without knowing to look in three places and a fourth for the total.
+///
+/// [`Self::outside_span_bytes`] is the number that matters. The reservation is
+/// the budget; memory allocated outside it competes with it, and on WDDM the
+/// loser is paged to host RAM — measured at 3.7 GiB on the 3.6-35B, which cost
+/// 17x on decode with nothing anywhere saying why. Driving it to zero is the
+/// goal, and this is the meter for it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountingSection {
+    /// The VMM reservation: pinned, non-migratable, holds KV + experts +
+    /// transients. `None` without a region pool.
+    pub span_bytes: Option<u64>,
+    /// Ours, but NOT in the span — the demotable set.
+    ///
+    /// This **is** [`Self::outside_pool_bytes`], because on this device every
+    /// device allocation the engine makes outside the reservation is a CUDA pool
+    /// allocation: `CudaDevice::{alloc, alloc_zeros, memcpy_stod}` all reach
+    /// `CudaStream::alloc`, which calls `cuMemAllocAsync` whenever the context
+    /// reports `has_async_alloc`. The pool's OS-reserved footprint therefore
+    /// covers the whole outside set already.
+    pub outside_span_bytes: u64,
+    /// The CUDA async pool's OS-reserved footprint — the whole outside set.
+    pub outside_pool_bytes: u64,
+    /// The dense model tensors, which are **inside** [`Self::outside_pool_bytes`]
+    /// rather than beside it: they are loaded through the same `alloc` path as
+    /// everything else, so their bytes are pool bytes.
+    ///
+    /// Reported as a named component for the same reason
+    /// [`Self::inside_gallery_bytes`] is — a reader needs to see which part of
+    /// the pool is the permanent model and which part is per-wave churn, and
+    /// moving the weights into the span must show up as this shrinking rather
+    /// than as an unexplained drop in the total.
+    ///
+    /// **It used to be an addend**, summed with the pool as though the two were
+    /// disjoint. That inflated the demotable set by the size of the model —
+    /// 1,962 MiB of 4,746 reported — and correspondingly hid the same amount in
+    /// [`Self::unaccounted_bytes`], which read a reassuring 93 MiB while ~2 GiB
+    /// of the card was genuinely unexplained. The tell was already in the tree:
+    /// `vram::trim_pool_after_load` records the pool holding 1,952 MiB right
+    /// after load, against 1,921 MiB of dense weights. Same bytes.
+    pub outside_dense_bytes: u64,
+    /// The gallery arena, which is **inside** the span: its slabs are claimed
+    /// regions, the same 16 MiB unit a KV arena takes.
+    ///
+    /// Reported here beside the outside set rather than only in
+    /// [`GallerySection`] because it used to be part of it — the slabs came
+    /// from the CUDA pool and were, in the arena's own words, "never returned".
+    /// A reader comparing two runs needs to see that this moved rather than
+    /// vanished, and a regression that put it back outside would otherwise show
+    /// up only as `outside_pool_bytes` quietly growing.
+    pub inside_gallery_bytes: u64,
+    /// Per-sequence recurrent state, also **inside** the span: each store's
+    /// buffers are carved from claimed regions.
+    ///
+    /// Named for the same reason [`Self::inside_gallery_bytes`] is, and more
+    /// urgently — it is the largest thing in the span that is neither KV nor
+    /// weights (~126 MiB per sequence on a hybrid stack, several GiB across a
+    /// wide wave) and it moves with wave width, so a run that grows it and a run
+    /// that leaks it look identical in the span total alone.
+    pub inside_recurrent_bytes: u64,
+    /// Driver-reported in use across the whole card (`total - free`).
+    pub device_in_use_bytes: u64,
+    /// `device_in_use - (span + outside)`. Anything here is held by another
+    /// process, by the driver's own context, or by an allocation this report
+    /// still does not know about — the last being the interesting case.
+    pub unaccounted_bytes: i64,
 }
 
 /// KV arena occupancy, whole-process.
@@ -410,6 +486,45 @@ impl Scheduler {
                 .map_or(0, |a| a.resident_turns()),
         };
 
+        // ── Whole-card reconciliation ───────────────────────────────────────
+        //
+        // What lives outside the reservation, totalled HERE because nothing else
+        // does. Each part is already reported above; the point is the total, and
+        // the residual after it.
+        //
+        // **The pool IS the outside set.** Every device allocation the engine
+        // makes outside the span goes through `CudaDevice::{alloc, alloc_zeros,
+        // memcpy_stod}` → `CudaStream::alloc` → `cuMemAllocAsync`, so the pool's
+        // reserved footprint already covers all of it — the dense weights
+        // included. Adding the weights on top double-books them.
+        let outside_dense_bytes = weights.base_bytes.unwrap_or(0);
+        let outside_pool_bytes = vram.as_ref().map_or(0, |v| v.pool_reserved_bytes);
+        let outside_span_bytes = outside_pool_bytes;
+        // Inside the span — claimed regions, so already counted in `span_bytes`
+        // and deliberately NOT added to the outside set.
+        let inside_gallery_bytes = gallery.resident_bytes;
+        let inside_recurrent_bytes = self.model.recurrent_reserved_bytes() as u64;
+        let span_bytes = match self.device.location() {
+            candle::DeviceLocation::Cuda { gpu_id } => candle_nn::kv_cache::span_layout(gpu_id)
+                .map(|l| l.span_end.saturating_sub(l.span_base)),
+            _ => None,
+        };
+        let device_in_use_bytes = vram.as_ref().map_or(0, |v| {
+            v.driver_total_bytes.saturating_sub(v.driver_free_bytes)
+        });
+        let accounting = AccountingSection {
+            span_bytes,
+            outside_span_bytes,
+            outside_dense_bytes,
+            outside_pool_bytes,
+            inside_gallery_bytes,
+            inside_recurrent_bytes,
+            device_in_use_bytes,
+            unaccounted_bytes: device_in_use_bytes as i64
+                - span_bytes.unwrap_or(0) as i64
+                - outside_span_bytes as i64,
+        };
+
         MemoryReport {
             captured_unix_ms,
             vram,
@@ -420,6 +535,7 @@ impl Scheduler {
             experts,
             weights,
             gallery,
+            accounting,
         }
     }
 }
@@ -502,6 +618,23 @@ mod tests {
                 resident_bytes: 268_435_456,
                 resident_turns: 42,
             },
+            // Shaped like the real thing so the sums mean something: a 64 GiB
+            // span, a 4 GiB pool holding 2 GiB of dense weights inside it, the
+            // gallery's own figure from above, and a card holding 75 GiB.
+            accounting: AccountingSection {
+                span_bytes: Some(68_719_476_736),
+                // The pool IS the outside set — the weights are in it, not
+                // beside it.
+                outside_span_bytes: 4_294_967_296,
+                outside_pool_bytes: 4_294_967_296,
+                outside_dense_bytes: 2_147_483_648,
+                // Inside the span, so it must NOT appear in the outside sum.
+                inside_gallery_bytes: 268_435_456,
+                // Likewise inside: 16 sequences of hybrid recurrent state.
+                inside_recurrent_bytes: 2_113_929_216,
+                device_in_use_bytes: 80_530_636_800,
+                unaccounted_bytes: 80_530_636_800i64 - 68_719_476_736i64 - 4_294_967_296i64,
+            },
         }
     }
 
@@ -535,9 +668,80 @@ mod tests {
             "base_bytes",
             "resident_expert_bytes",
             "resident_turns",
+            // The reconciliation. `outside_span_bytes` is the meter for the
+            // demotable set — the thing that cost 17x on decode while every
+            // individual section read as healthy.
+            "outside_span_bytes",
+            "outside_dense_bytes",
+            "outside_pool_bytes",
+            "inside_gallery_bytes",
+            "inside_recurrent_bytes",
+            "unaccounted_bytes",
+            "span_bytes",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }
+    }
+
+    /// The named parts must be **contained** in the total, not summed into it.
+    ///
+    /// Trivial arithmetic, and worth a gate precisely because the bug it guards
+    /// was arithmetic somebody performed wrongly. The first version of this test
+    /// asserted `outside_span == dense + pool` and passed for exactly as long as
+    /// the code made the same mistake: the dense weights are allocated through
+    /// `CudaDevice::alloc` → `cuMemAllocAsync`, so they are *in* the pool, and
+    /// adding them to it counted the model twice — 4,746 MiB of demotable memory
+    /// reported where 2,784 MiB existed, with the difference silently deducted
+    /// from `unaccounted_bytes`.
+    ///
+    /// A sum test cannot catch that; a containment test can, which is why the
+    /// assertion is now an inequality on each part.
+    #[test]
+    fn the_outside_span_parts_are_contained_in_the_whole() {
+        let a = sample().accounting;
+        assert_eq!(
+            a.outside_span_bytes, a.outside_pool_bytes,
+            "the CUDA pool is the whole outside set: every non-span device \
+             allocation goes through `cuMemAllocAsync`",
+        );
+        assert!(
+            a.outside_dense_bytes > 0 && a.outside_dense_bytes < a.outside_pool_bytes,
+            "the dense weights are a PART of the pool ({} of {}), never an \
+             addend to it — the fixture must exercise that containment",
+            a.outside_dense_bytes,
+            a.outside_pool_bytes,
+        );
+        assert!(
+            a.inside_gallery_bytes > 0,
+            "the fixture must exercise a gallery that holds something, or this \
+             says nothing about where its bytes are counted",
+        );
+        assert!(
+            a.inside_recurrent_bytes > 0,
+            "likewise the recurrent state — it is the largest in-span tenant that \
+             is neither KV nor weights, and a zero fixture would not exercise the \
+             one thing this section is for",
+        );
+        // The in-span tenants are named PARTS of the span, never addends to it.
+        // Same containment rule as the dense weights against the pool, in the
+        // other half of the card: the two halves fail the same way, by summing
+        // a component with the total that already includes it.
+        let named_in_span = a.inside_gallery_bytes + a.inside_recurrent_bytes;
+        assert!(
+            named_in_span < a.span_bytes.expect("the fixture reserves a span"),
+            "the gallery and recurrent state are tenants OF the span ({named_in_span} \
+             of {:?}), so they must fit inside it",
+            a.span_bytes,
+        );
+        // The residual is the card minus the two totals — and specifically NOT
+        // minus the named parts, which are already inside them.
+        assert_eq!(
+            a.unaccounted_bytes,
+            a.device_in_use_bytes as i64
+                - a.span_bytes.unwrap_or(0) as i64
+                - a.outside_span_bytes as i64,
+            "the residual must be what the card holds minus what we can name",
+        );
     }
 
     /// `latest` hands back what `publish` stored, with a sane age.

@@ -4182,6 +4182,21 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// Reservation bytes held by per-sequence recurrent state, for the same
+    /// decomposition.
+    ///
+    /// Zero is the honest answer for a model with no recurrent layers, which is
+    /// why this is not an `Option`: a pure-attention stack holds none, it does
+    /// not fail to know.
+    ///
+    /// Reported because it is large and moves: a hybrid stack's recurrent memory
+    /// is ~126 MiB per sequence, so a wide wave puts several GiB of the
+    /// reservation here, and a total that omits it makes the span look emptier
+    /// than it is — the same class of blindness that let the dense weights hide.
+    fn recurrent_reserved_bytes(&self) -> usize {
+        0
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 
@@ -4369,6 +4384,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn resident_weight_bytes(&self) -> Option<usize> {
         self.model().resident_weight_bytes()
+    }
+
+    fn recurrent_reserved_bytes(&self) -> usize {
+        self.model().recurrent_reserved_bytes()
     }
 
     fn reset_expert_stats(&self) {

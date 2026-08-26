@@ -61,7 +61,11 @@
 //! assembly there). [`RecurrentStateStore::import`] is the resume path and
 //! validates dims + [`schedule_hash`] before touching any tensor.
 
+#[cfg(feature = "cuda")]
+use candle::{cuda_backend::cudarc::driver::result::memcpy_dtod_sync, CudaDevice, Error, Storage};
 use candle::{Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{span_region_refusal, SpanClaims, SpanRegion};
 
 use super::mix::{DeltaNetOut, DeltaNetState};
 use super::types::{DeltaNetDims, LayerKind};
@@ -145,22 +149,209 @@ pub struct RecurrentStateStore {
     /// the whole state came from rather than of which layers a sweep reached.
     seeded: bool,
     device: Device,
+    /// The reservation regions every buffer above is a view into.
+    ///
+    /// **This is the store's lifetime, and its cleanup.** Held for as long as
+    /// the sequence has recurrent memory; dropping the store returns them to
+    /// the region free list, exactly as a KV arena's handles do. There is no
+    /// eviction path and nothing to remember to call — the state is reclaimed
+    /// by the store ceasing to exist, which is the only moment at which it is
+    /// certainly dead.
+    ///
+    /// Empty on a CPU device, where the buffers are ordinary allocations.
+    #[cfg(feature = "cuda")]
+    regions: Vec<SpanRegion>,
+}
+
+/// Copy one state's two buffers into another's, device to device.
+///
+/// The fork path's replacement for `DeltaNetState::snapshot`, which allocates.
+/// Here the destination already exists — it is a view into the child's own
+/// regions — so the copy writes into it rather than producing a new buffer
+/// somewhere the reservation does not cover.
+#[cfg(feature = "cuda")]
+fn copy_state_into(device: &Device, src: &DeltaNetState, dst: &DeltaNetState) -> Result<()> {
+    let Device::Cuda(cuda) = device else {
+        candle::bail!("copy_state_into: expected a CUDA device");
+    };
+    for (s, d) in [(&src.s, &dst.s), (&src.conv_tail, &dst.conv_tail)] {
+        let bytes = s.elem_count() * s.dtype().size_in_bytes();
+        let src_ptr = tensor_device_ptr(cuda, s)?;
+        let dst_ptr = tensor_device_ptr(cuda, d)?;
+        // SAFETY: both ranges are `bytes` long, live, and disjoint — the
+        // destination belongs to a store being built, which nothing else has
+        // yet seen.
+        unsafe {
+            memcpy_dtod_sync(dst_ptr, src_ptr, bytes)
+                .map_err(|e| Error::Msg(format!("recurrent fork copy: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Base device address of a contiguous CUDA tensor.
+#[cfg(feature = "cuda")]
+fn tensor_device_ptr(cuda: &CudaDevice, t: &Tensor) -> Result<u64> {
+    let (storage, layout) = t.storage_and_layout();
+    if !layout.is_contiguous() {
+        candle::bail!("recurrent state buffers are contiguous by construction");
+    }
+    let Storage::Cuda(c) = &*storage else {
+        candle::bail!("recurrent state: expected CUDA storage");
+    };
+    let stream = cuda.cuda_stream();
+    let base = c.slice.device_ptr(&stream);
+    Ok(base + (layout.start_offset() * t.dtype().size_in_bytes()) as u64)
+}
+
+/// A bump allocator over freshly claimed reservation regions.
+///
+/// One store's buffers are laid down left to right; a buffer that would cross a
+/// region boundary starts the next region instead. The waste that costs is
+/// bounded by one buffer per region and is the price of every buffer being a
+/// single contiguous range — which the kernels require, since they take a base
+/// pointer and a stride, not a scatter list.
+#[cfg(feature = "cuda")]
+struct RegionBump {
+    device: Device,
+    /// The arena window, open for the whole store.
+    ///
+    /// One window rather than one per region: entering it hands back a standing
+    /// tier, so claiming a region at a time would release and re-place the tier
+    /// once per region, each carrying a device-wide quiesce. A store takes eight
+    /// or so, and that much churn reaches the WDDM watchdog.
+    claims: SpanClaims,
+    regions: Vec<SpanRegion>,
+    /// Bytes used in the last region.
+    cursor: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl RegionBump {
+    fn new(device: &Device) -> Result<Self> {
+        Ok(Self {
+            device: device.clone(),
+            claims: SpanClaims::open(device)?,
+            regions: Vec::new(),
+            // Forces the first `take` to claim, so there is no empty-vec case.
+            cursor: SpanRegion::bytes(),
+        })
+    }
+
+    /// A bump for `device`, or `None` when there is no reservation to carve
+    /// from — a CPU device in a CUDA build, which is every unit test here.
+    fn for_device(device: &Device) -> Result<Option<Self>> {
+        match device {
+            Device::Cuda(_) => Self::new(device).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// One layer's `(live, backup)` pair, laid down in one fixed order so the
+    /// layout is identical for every layer and every sequence.
+    fn take_state_pair(
+        &mut self,
+        dims: &DeltaNetDims,
+        device: &Device,
+    ) -> Result<(DeltaNetState, DeltaNetState)> {
+        let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(dims);
+        let live_s = self.take(s_bytes)?;
+        let live_conv = self.take(conv_bytes)?;
+        let backup_s = self.take(s_bytes)?;
+        let backup_conv = self.take(conv_bytes)?;
+        // SAFETY: every address names a distinct, non-overlapping range of a
+        // region this store holds for its whole life, sized by `byte_sizes` for
+        // exactly this state.
+        unsafe {
+            Ok((
+                DeltaNetState::at(dims, device, live_s, live_conv)?,
+                DeltaNetState::at(dims, device, backup_s, backup_conv)?,
+            ))
+        }
+    }
+
+    /// Address of `bytes` of region memory, claiming another region if this one
+    /// cannot hold the request contiguously.
+    fn take(&mut self, bytes: usize) -> Result<u64> {
+        let cap = SpanRegion::bytes();
+        if bytes > cap {
+            candle::bail!(
+                "recurrent state: a {bytes} B buffer exceeds the {cap} B region size — \
+                 the state no longer fits the allocator's unit"
+            );
+        }
+        // A zero-byte request would take the `else` branch on the very first
+        // call — the cursor starts AT `cap` precisely so the first `take`
+        // claims — and then read `regions.last()` of an empty vec. Reachable
+        // from `byte_sizes` with `conv_kernel == 1`, where the conv tail has no
+        // history to keep. There is no address to hand back for no bytes, and
+        // inventing one inside a region nobody claimed is worse than saying so.
+        if bytes == 0 {
+            candle::bail!(
+                "recurrent state: a zero-byte buffer has no address — the geometry \
+                 asks for a state with an empty half (conv_kernel = 1?)"
+            );
+        }
+        // 256-byte aligned: what the CUDA driver guarantees a fresh allocation
+        // and what the kernels' vectorised loads assume of a base pointer.
+        let aligned = self.cursor.next_multiple_of(256);
+        if aligned + bytes > cap {
+            let Some(region) = self.claims.claim()? else {
+                candle::bail!(
+                    "recurrent state: no region for this sequence after {} claimed — {}",
+                    self.regions.len(),
+                    span_region_refusal(&self.device),
+                );
+            };
+            self.regions.push(region);
+            self.cursor = 0;
+        } else {
+            self.cursor = aligned;
+        }
+        let base = self
+            .regions
+            .last()
+            .expect("a region was just claimed or already stood")
+            .base();
+        let at = base + self.cursor as u64;
+        self.cursor += bytes;
+        Ok(at)
+    }
 }
 
 impl RecurrentStateStore {
     /// Fresh zeros for every recurrent layer in `layer_kinds`.
     pub fn new(layer_kinds: &[LayerKind], dims: &DeltaNetDims, device: &Device) -> Result<Self> {
         let mut slots = Vec::new();
+        // On CUDA the whole store is carved from the device reservation. A
+        // region arrives zeroed, which is what `live` needs — it is genuinely
+        // READ at zero, being the sequence-start state — so no fill is issued
+        // for it and `backup` needs none either, being fully stamped by the
+        // first wave before anything reads it (invariant 6).
+        // The cfg gates COMPILATION; the device gates behaviour. A CUDA build
+        // still runs on a CPU device — every unit test here does — and there is
+        // no reservation there to carve from.
+        #[cfg(feature = "cuda")]
+        let mut bump = RegionBump::for_device(device)?;
         for (i, k) in layer_kinds.iter().enumerate() {
             if *k == LayerKind::DeltaNet {
+                #[cfg(feature = "cuda")]
+                let (live, backup) = match bump.as_mut() {
+                    Some(bump) => bump.take_state_pair(dims, device)?,
+                    None => (
+                        DeltaNetState::zeros(dims, device)?,
+                        DeltaNetState::uninit(dims, device)?,
+                    ),
+                };
+                #[cfg(not(feature = "cuda"))]
+                let (live, backup) = (
+                    DeltaNetState::zeros(dims, device)?,
+                    DeltaNetState::uninit(dims, device)?,
+                );
                 slots.push(LayerSlot {
                     layer_index: i,
-                    // `live` is genuinely READ at zero — it is the
-                    // sequence-start state — so it must be zeroed.
-                    live: DeltaNetState::zeros(dims, device)?,
-                    // `backup` is the write half: fully stamped by the first
-                    // wave before anything reads it (invariant 6).
-                    backup: DeltaNetState::uninit(dims, device)?,
+                    live,
+                    backup,
                     advanced: false,
                 });
             }
@@ -174,6 +365,8 @@ impl RecurrentStateStore {
             // nothing for a reset to destroy.
             seeded: false,
             device: device.clone(),
+            #[cfg(feature = "cuda")]
+            regions: bump.map_or_else(Vec::new, |b| b.regions),
         })
     }
 
@@ -407,17 +600,42 @@ impl RecurrentStateStore {
             );
         }
         let mut slots = Vec::with_capacity(self.slots.len());
+        // The child's memory comes from the reservation for the same reason the
+        // parent's does — a fork is another sequence, and at ~3 forks per turn
+        // this was ~126 MiB of pool traffic each.
+        #[cfg(feature = "cuda")]
+        let mut bump = RegionBump::for_device(&self.device)?;
         for slot in &self.slots {
+            // Scratch, not state, in either arm: the kernels fully overwrite
+            // the write buffer before anything reads it, so copying it would be
+            // ~2 MB per layer of device traffic for bytes nobody reads — and
+            // for the same reason it is left UNINITIALISED (invariant 6).
+            #[cfg(feature = "cuda")]
+            let (live, backup) = match bump.as_mut() {
+                Some(bump) => {
+                    let (live, backup) = bump.take_state_pair(&self.dims, &self.device)?;
+                    // The fork's whole point: the child starts from the
+                    // parent's state. A device-to-device copy into the child's
+                    // own range, rather than `snapshot()`, which would allocate
+                    // a fresh pool buffer and hand back a tensor pointing
+                    // outside the span.
+                    copy_state_into(&self.device, &slot.live, &live)?;
+                    (live, backup)
+                }
+                None => (
+                    slot.live.snapshot()?,
+                    DeltaNetState::uninit(&self.dims, &self.device)?,
+                ),
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (live, backup) = (
+                slot.live.snapshot()?,
+                DeltaNetState::uninit(&self.dims, &self.device)?,
+            );
             slots.push(LayerSlot {
                 layer_index: slot.layer_index,
-                live: slot.live.snapshot()?,
-                // Scratch, not state: the kernels fully overwrite the write
-                // buffer before anything reads it, so copying it would be
-                // ~2 MB per layer of device traffic for bytes nobody reads —
-                // and for the same reason it is allocated UNINITIALISED
-                // (hot-path invariant 6). Zeroing it memset ~63 MiB per fork,
-                // ~3 forks per turn, over bytes the next wave stamps anyway.
-                backup: DeltaNetState::uninit(&self.dims, &self.device)?,
+                live,
+                backup,
                 advanced: false,
             });
         }
@@ -428,7 +646,26 @@ impl RecurrentStateStore {
             open: false,
             seeded: true,
             device: self.device.clone(),
+            #[cfg(feature = "cuda")]
+            regions: bump.map_or_else(Vec::new, |b| b.regions),
         })
+    }
+
+    /// Reservation bytes this sequence's recurrent memory holds.
+    ///
+    /// Zero off CUDA, where the buffers are ordinary allocations. Reported
+    /// rather than merely held so a whole-card accounting can name it: this is
+    /// several GiB across a wide wave, and memory nothing can total is memory
+    /// that goes missing (`AccountingSection`).
+    pub fn reserved_bytes(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        {
+            self.regions.len() * SpanRegion::bytes()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            0
+        }
     }
 
     /// Whether this store's state arrived by fork or restore and must survive

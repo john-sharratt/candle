@@ -345,6 +345,18 @@ pub trait BatchedModelCore {
         None
     }
 
+    /// Reservation bytes held by per-sequence recurrent state, for the same
+    /// decomposition.
+    ///
+    /// Zero rather than `None`: a stack with no recurrent layers holds none, it
+    /// does not fail to know. On a hybrid stack this is the largest in-span
+    /// tenant that is neither KV nor weights (~126 MiB per sequence), and it
+    /// moves with wave width — so a total that omits it makes the span read
+    /// emptier than it is.
+    fn recurrent_reserved_bytes(&self) -> usize {
+        0
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 

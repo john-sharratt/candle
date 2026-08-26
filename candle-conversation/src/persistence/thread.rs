@@ -876,27 +876,7 @@ fn run_pass(
     run_maintenance: bool,
     backlog: &BacklogGauge,
 ) {
-    // Cross-thread write→read barrier. This persist pass runs on the background
-    // persistence thread and reads each freshly-sealed turn's K/V for the
-    // hot→warm migrate below. Those K/V bytes were WRITTEN by the scheduler
-    // thread's decode. Both threads queue on the same primary CUDA stream, but
-    // the ordering between two host threads issuing onto one stream is not
-    // guaranteed — the migrate could begin reading a turn's arena before the
-    // decode's writes to it have retired on the GPU, capturing half-written
-    // K/V. Synchronize the device once, up front, so every prior decode write
-    // is retired before we read any source arena. This is on the background
-    // thread, off the decode hot path.
     let t_pass = std::time::Instant::now();
-    if let Err(e) = device.synchronize() {
-        tracing::warn!(
-            target: "candle_conversation::persistence::tier",
-            "persist: pre-migrate device sync failed: {e:?}"
-        );
-    }
-    // Phase-timing breakdown so we can see *where* the hot→warm drain spends its
-    // time (the demote starves when this can't keep up with the ingest seal rate).
-    let sync_pre_ms = t_pass.elapsed().as_millis() as u64;
-    let t_migrate = std::time::Instant::now();
 
     // ── Phase 1: hot → warm ─────────────────────────────────────────────
     //
@@ -938,6 +918,49 @@ fn run_pass(
         }
         groups.entry(cc).or_default().push((idx, hot));
     }
+
+    // Cross-thread write→read barrier. This persist pass runs on the background
+    // persistence thread and reads each freshly-sealed turn's K/V for the
+    // hot→warm migrate below. Those K/V bytes were WRITTEN by the scheduler
+    // thread's decode. Both threads queue on the same primary CUDA stream, but
+    // the ordering between two host threads issuing onto one stream is not
+    // guaranteed — the migrate could begin reading a turn's arena before the
+    // decode's writes to it have retired on the GPU, capturing half-written
+    // K/V. Synchronize the device once, up front, so every prior decode write
+    // is retired before we read any source arena.
+    //
+    // **It fences more than the migrate, and the whole pass depends on that.**
+    // The obvious economy is to skip it when there is nothing to migrate, since
+    // the drain costs the depth of whatever inference is in flight — one full
+    // forward, ~285 ms, several when waves are queued — regardless of payload:
+    // a `residences=1 mib=0` pass measured 831 ms where an uncontended
+    // zero-byte pass measures 3 ms, and making it conditional on a non-empty
+    // work list took the worst pass to 18 ms.
+    //
+    // It also took `CUDA_ERROR_ILLEGAL_ADDRESS` from 0 to 199 in the same run.
+    // What comes AFTER the migrate — the deferred arena creation this pass owes
+    // the last one, and the maintenance sweep — touches arena topology the
+    // in-flight wave is still reading, and this is the only thing retiring it.
+    // The drain is a pass-wide fence wearing a migrate-shaped comment. Anything
+    // that removes it has to give those two their own ordering first.
+    // Timed from HERE, not from the top of the pass. The barrier used to be the
+    // pass's first statement, so `t_pass.elapsed()` was the barrier; it now sits
+    // below the snapshot and grouping above, and measuring from `t_pass` would
+    // book that host-side work as device-wait. This number is read to decide
+    // whether the drain keeps up with the ingest seal rate, and the whole reason
+    // the barrier is still here is a measurement — 831 ms against 3 ms — so it
+    // has to keep meaning what it says.
+    let t_sync = std::time::Instant::now();
+    if let Err(e) = device.synchronize() {
+        tracing::warn!(
+            target: "candle_conversation::persistence::tier",
+            "persist: pre-migrate device sync failed: {e:?}"
+        );
+    }
+    // Phase-timing breakdown so we can see *where* the hot→warm drain spends its
+    // time (the demote starves when this can't keep up with the ingest seal rate).
+    let sync_pre_ms = t_sync.elapsed().as_millis() as u64;
+    let t_migrate = std::time::Instant::now();
 
     let mut installs: Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)> = Vec::new();
     let mut quantize_ms = 0u64;

@@ -1142,6 +1142,30 @@ impl SequenceState {
         Ok((ptr, n as u32, wi as u32))
     }
 
+    /// The entry count a decode header promises the kernel must be the entry
+    /// count the device buffer was built for.
+    ///
+    /// Split out so the rule is arithmetic that tests without a device — the
+    /// same reason [`super::region_pool`]'s `tier_fits` and `claimable` are
+    /// free functions.
+    ///
+    /// `host_n > gpu_n` is the dangerous direction and the only one that can
+    /// reach a kernel: the header's walk runs off the end of the slot. `host_n <
+    /// gpu_n` is merely stale, but it is equally a sign that a `chunks` mutation
+    /// skipped its `gpu_chunks.clear()`, so both are refused.
+    fn slot_counts_agree(host_n: usize, gpu_n: usize) -> candle::Result<()> {
+        if host_n == gpu_n {
+            return Ok(());
+        }
+        candle::bail!(
+            "decode slot-state: the host chunk list holds {host_n} chunks but the device \
+             buffer was built for {gpu_n}. The header would tell the kernel to walk \
+             {host_n} entries through a buffer holding {gpu_n}, reading past the slot — and \
+             past its slab, unmapped — as slice records whose pointers are then \
+             dereferenced. A mutator of `chunks` did not clear `gpu_chunks`."
+        )
+    }
+
     /// Synchronise the GPU slot-state buffer for decode.
     ///
     /// The decode hot path trusts the cached GPU slot buffer whenever it exists.
@@ -1165,6 +1189,28 @@ impl SequenceState {
             return Ok((rebuilt, DecodeGpuChunksSyncKind::Rebuild));
         }
 
+        // **The count the kernel is promised must be the count the buffer holds.**
+        //
+        // `host_n` is the HOST chunk list's length; the device buffer was built
+        // for `gpu_chunks.n_chunks()`. The kernel indexes the buffer with the
+        // former, so if it ever exceeded the latter the walk would run off the
+        // end of the slot — and past the end of its slab it is unmapped memory,
+        // read as `KvHead` records whose `kvheads_ptr` fields are then
+        // dereferenced. That is a device-side out-of-range access on every warp
+        // at once: it poisons the context and takes the process down, with the
+        // error surfacing at whatever unrelated call synchronises next.
+        //
+        // The two agree today, and only because all seven mutators of `chunks`
+        // (`push_chunk`, `clear_chunks`, `drain_front_chunks`, `prepend_chunks`,
+        // `replace_chunks`, `truncate_chunks`, `extend_chunks`) each remember to
+        // `gpu_chunks.clear()`, which forces the rebuild above. That is an
+        // invariant held by discipline across seven call sites; an eighth that
+        // forgets would not fail here, it would fail in a kernel with no way
+        // back to the omission. Checking it costs an integer compare against
+        // two numbers already in hand — no launch, no allocation — so it is
+        // checked rather than trusted (CLAUDE.md invariant 1b: validate the
+        // agreement, do not paper over it by rebuilding defensively).
+        Self::slot_counts_agree(host_n, self.gpu_chunks.n_chunks())?;
         let wi = self.decode_write_chunk_idx();
         let ptr = self.gpu_chunks.raw_device_ptr();
         Ok((
@@ -1193,6 +1239,48 @@ impl SequenceState {
         let write_len = seq_offset.saturating_sub(rope_base) as u16;
         self.gpu_chunks
             .snapshot_into_generation(generation, wi, write_len)
+    }
+}
+
+#[cfg(test)]
+mod slot_count_tests {
+    use super::*;
+
+    /// The agreeing case is the whole hot path — it must not cost an error.
+    #[test]
+    fn equal_counts_pass() {
+        for n in [0usize, 1, 7, 4096] {
+            assert!(SequenceState::slot_counts_agree(n, n).is_ok(), "n={n}");
+        }
+    }
+
+    /// **The direction that reaches a kernel.** A header promising more entries
+    /// than the buffer holds walks off the end of the slot and past its slab,
+    /// reading unmapped memory as slice records and dereferencing the pointers
+    /// inside them. That is a device-side out-of-range access on every warp at
+    /// once — it poisons the CUDA context and kills the process, surfacing at
+    /// whatever unrelated call happens to synchronise next, which is as far from
+    /// the omission as a diagnosis can land.
+    #[test]
+    fn a_host_list_longer_than_the_buffer_is_refused() {
+        let err = SequenceState::slot_counts_agree(9, 8)
+            .expect_err("9 host chunks against an 8-entry buffer must not reach a kernel");
+        let msg = err.to_string();
+        assert!(msg.contains('9') && msg.contains('8'), "both counts: {msg}");
+        assert!(
+            msg.contains("clear"),
+            "the message must name the omission that causes this — a `chunks` \
+             mutation that skipped `gpu_chunks.clear()`: {msg}"
+        );
+    }
+
+    /// Stale in the safe direction, and still refused: the kernel would only
+    /// under-read, but the divergence has exactly one cause, and letting it pass
+    /// here would leave that cause to be found the next time it lands the other
+    /// way round.
+    #[test]
+    fn a_buffer_longer_than_the_host_list_is_also_refused() {
+        assert!(SequenceState::slot_counts_agree(8, 9).is_err());
     }
 }
 

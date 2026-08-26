@@ -69,6 +69,12 @@ default = []
 # Also enables candle-transformers' per-op pipeline profile (attn_core, mlp_ffn,
 # gemm_*) so the gap-fill forward's internal breakdown can be dumped.
 profile = ["candle-transformers/profile"]
+# Report every device allocation that reaches the CUDA driver while a wave is
+# running — the ones the bump arena was supposed to serve. The span is sized for
+# the arena's budget, so an allocation outside it is memory the reservation was
+# never told about, and on WDDM the overflow is demoted to host RAM rather than
+# refused. Off by default; `record` is an inlined no-op without it.
+forbidden_allocations = ["candle-transformers/forbidden_allocations"]
 # Scans gathered R16 K/V for all-zero tokens at the decode reprojection gather,
 # the pre-finalize view, the seal-write to the substrate, and projection inject,
 # emitting a `tracing::error` (target `kv_zero`) per dead token. Off by default;

@@ -618,18 +618,25 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    /// Dense tensors **plus** whatever experts are resident, which is what the
+    /// trait asks for and what the whole-card decomposition subtracts the expert
+    /// half back out of. Reporting only the experts made the dense half cancel
+    /// to zero — several GiB that no report, and no budget, could see.
     fn resident_weight_bytes(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
         {
-            self.model()
-                .experts
-                .as_ref()
-                .map(|c| c.resident_vram_bytes())
+            let m = self.model();
+            let experts = m.experts.as_ref().map_or(0, |c| c.resident_vram_bytes());
+            Some(m.dense_bytes + experts)
         }
         #[cfg(not(feature = "cuda"))]
         {
             None
         }
+    }
+
+    fn recurrent_reserved_bytes(&self) -> usize {
+        HybridBatched::recurrent_reserved_bytes(self)
     }
 
     fn reset_expert_stats(&self) {
@@ -683,6 +690,30 @@ impl WaveSweep for HybridBatched {
         groups: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
         let seqs = groups.seq_ids.to_vec();
+
+        // Hand back the previous wave's transient tier, and let the elastic
+        // boundary grow in the one gap it is legal in — every guard from that
+        // wave is dropped and this one has opened none.
+        //
+        // The release belongs HERE and not at the end of the wave that placed
+        // it. `end_wave_transient` gates on `live_generations`, a host-side
+        // count: by the time a sweep returns, its generations are dropped but
+        // its kernels are still in flight, so releasing there hands ground back
+        // to the persistence thread while the GPU is still reading it. Moving it
+        // there was measured — the hot→warm migrate path took an illegal address
+        // within seconds, 208 faults against a handful. What makes this point
+        // safe is the work in between, which drains the wave that placed it.
+        //
+        // It runs before `ensure_recurrent` because that claims span regions for
+        // any store it creates, and the ground those come from belongs to the wave
+        // once a tier is placed: claiming under one is refused outright, since no
+        // weight-side concession reaches above it.
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(d) = HybridBatched::device(self) {
+            end_wave_transient(&d.cuda_stream());
+            self.reclaim_spare_ground();
+        }
+
         // Offsets in context order, which is the order `seq_ids` is in — a
         // sequence standing at zero gets its recurrent state reset, not just
         // created (see `ensure_recurrent`).
@@ -773,16 +804,6 @@ fn sweep_layers(
         .unwrap_or(DType::F32);
     let embed_dtype = activation_dtype(cache_dtype);
     let dev = model.device();
-
-    // **Phase 0: hand back the previous forward's tier**, then let the elastic
-    // boundary grow in the one gap it is legal in — every guard from the last
-    // forward is dropped and this one has opened none. Admit runs next and
-    // claims against a pool the old tier would otherwise still be capping.
-    #[cfg(feature = "cuda")]
-    if let Device::Cuda(d) = dev {
-        end_wave_transient(&d.cuda_stream());
-        model.reclaim_spare_ground();
-    }
 
     // **Phase 1: admit** — claim every KV chunk this wave will write before a
     // byte of it computes, so the arena frontier is final when the transient

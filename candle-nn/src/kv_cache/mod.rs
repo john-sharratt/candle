@@ -56,7 +56,10 @@ pub use chunked::{
     BumpRange, ForwardOpen, WaveGeneration, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
-pub use chunked::{expect_kv_range, expect_kv_range_in, span_layout, SpanLayout};
+pub use chunked::{
+    claim_span_region, expect_kv_range, expect_kv_range_in, span_layout, span_region_refusal,
+    SpanClaims, SpanLayout, SpanRegion,
+};
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
 pub use chunked::{

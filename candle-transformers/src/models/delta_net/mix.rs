@@ -105,6 +105,57 @@ impl DeltaNetState {
         })
     }
 
+    /// Bytes one state's two buffers occupy, in the order [`Self::at`] lays
+    /// them out. `(s_bytes, conv_bytes)`.
+    pub fn byte_sizes(dims: &DeltaNetDims) -> (usize, usize) {
+        let f32_bytes = DType::F32.size_in_bytes();
+        (
+            dims.n_v_heads * dims.head_dim * dims.head_dim * f32_bytes,
+            dims.conv_dim() * (dims.conv_kernel - 1) * f32_bytes,
+        )
+    }
+
+    /// A state whose two buffers are **views** over memory owned elsewhere —
+    /// `s` at `s_ptr`, the conv tail at `conv_ptr`.
+    ///
+    /// This is how a sequence's recurrent memory lives inside the device
+    /// reservation instead of the CUDA pool. It is a per-sequence, fixed-size,
+    /// uniform allocation — the same shape as a KV arena's regions or an expert
+    /// slot — and allocating it from the pool instead put ~126 MiB per sequence
+    /// outside the reservation, which is memory the span was never sized for
+    /// and which WDDM demotes to host RAM rather than refusing. On a hybrid
+    /// stack that is three quarters of the model's per-sequence memory.
+    ///
+    /// [`LeaseOrigin::Foreign`] because the owner is not an allocator to carve
+    /// from: an op reading this state takes its output from the wave arena, not
+    /// from the sequence's state block, and `Foreign` is what says so.
+    ///
+    /// # Safety
+    ///
+    /// Both pointers must name at least [`Self::byte_sizes`] bytes of live,
+    /// correctly aligned memory that outlives this state and every view of it,
+    /// and that nothing else writes through another alias.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn at(dims: &DeltaNetDims, dev: &Device, s_ptr: u64, conv_ptr: u64) -> Result<Self> {
+        use candle::cuda_backend::wave_provenance::LeaseOrigin;
+        Ok(Self {
+            s: Tensor::from_leased_cuda_ptr(
+                s_ptr,
+                DType::F32,
+                (dims.n_v_heads, dims.head_dim, dims.head_dim),
+                dev,
+                LeaseOrigin::Foreign,
+            )?,
+            conv_tail: Tensor::from_leased_cuda_ptr(
+                conv_ptr,
+                DType::F32,
+                (dims.conv_dim(), dims.conv_kernel - 1),
+                dev,
+                LeaseOrigin::Foreign,
+            )?,
+        })
+    }
+
     /// Handles onto both buffers, as the half a wave WRITES.
     ///
     /// A `DeltaNetState` is the pair of allocations; which of a slot's two is

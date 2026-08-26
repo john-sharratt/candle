@@ -330,6 +330,13 @@ impl Scheduler {
             // of the width-ordered dispatch below.
             self.wave_cohort_advanced = false;
             self.wave_section_advanced = false;
+            // Watch this wave's quanta for allocations that reach the driver
+            // instead of the bump arena. Every one is memory the reservation was
+            // never sized for, and it is what grows the CUDA pool's reserved
+            // footprint by ~2 GiB under load — the exact bytes WDDM demotes
+            // first. A ZST guard without the feature.
+            #[cfg(feature = "forbidden_allocations")]
+            let alloc_watch = candle::forbidden_alloc::armed();
             let dw = self.foreground_decode_width();
             let pw = self.prefill_width();
             let sw = self.section_ingest_width();
@@ -345,6 +352,19 @@ impl Scheduler {
                 self.timed_prefill();
                 self.timed_section();
                 self.timed_decode();
+            }
+            #[cfg(feature = "forbidden_allocations")]
+            {
+                drop(alloc_watch);
+                let report = candle::forbidden_alloc::take_report();
+                if report.total_calls > 0 {
+                    tracing::warn!(
+                        target: "candle_conversation::scheduler::forbidden_alloc",
+                        calls = report.total_calls,
+                        mib = report.total_bytes >> 20,
+                        "wave allocated outside the bump arena\n{report}"
+                    );
+                }
             }
 
             // Drain prefills that reached the head this wave — whether they finished

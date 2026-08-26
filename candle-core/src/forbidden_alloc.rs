@@ -254,12 +254,6 @@ mod imp {
         registry().sites.clear();
     }
 
-    /// The first frame in `backtrace` that belongs to neither the capture
-    /// machinery nor the allocator itself — a one-line label for the summary
-    /// table, where a full stack would not fit.
-    ///
-    /// Best-effort: symbol text depends on the build's debug info, so an
-    /// unrecognisable stack yields `<unknown>` rather than a wrong attribution.
     /// How many user frames make up a site's label.
     ///
     /// **One is not enough, and the reason cost real time.** Symbolisation maps
@@ -267,9 +261,17 @@ mod imp {
     /// merged callee is reported under whichever neighbour owns that address —
     /// `qkv_segmented_matmul` surfaced as `grouped_matmul_gemx`, its neighbour in
     /// the same object, and a whole diagnosis was built on the wrong function.
-    /// A short chain is self-correcting: even when the innermost symbol is
+    /// A chain is self-correcting: even when the innermost symbol is
     /// misattributed, its callers place it unambiguously.
-    const LABEL_FRAMES: usize = 3;
+    ///
+    /// **Six rather than three**, because three stopped short of the answer on
+    /// the sites that mattered. The `delta_net` cluster labels its top five
+    /// entries `empty_beside <- {mix,cuda}::{...}` — five distinct call sites
+    /// that agree on their innermost three frames and diverge only above them,
+    /// so a three-frame label collapsed them into one row and hid which root was
+    /// feeding the cascade. The cost is table width, paid once per report, on a
+    /// diagnostic that is off by default.
+    const LABEL_FRAMES: usize = 6;
 
     /// The innermost few frames that belong to this codebase rather than to the
     /// allocator plumbing, innermost first, joined by ` <- `.

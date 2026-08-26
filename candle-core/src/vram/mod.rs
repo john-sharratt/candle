@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::Result;
+use crate::{Device, Result};
 use balloon::BalloonAllocator;
 use reading::VramReading as Reading;
 
@@ -369,6 +369,62 @@ pub fn note_host_pinned_free(bytes: u64) {
 /// Total host-pinned bytes currently allocated process-wide.
 pub fn host_pinned_bytes() -> u64 {
     HOST_PINNED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Return the CUDA async pool's reserved-but-unused memory to the OS, once
+/// loading is done. `(reserved_before, reserved_after)`, or `None` off CUDA.
+///
+/// The pool reserves its peak from the OS and by design never gives it back, so
+/// whatever it holds sits for the life of the daemon OUTSIDE the KV reservation
+/// — and it is the first thing WDDM spills to host RAM when the card fills.
+/// Measured on the 3.6-35B under load: 4.75 GiB reserved against 3.03 GiB live,
+/// and the 1.72 GiB gap matched what the driver had demoted almost exactly.
+///
+/// **On that model this reclaims nothing, and the reason is worth keeping.**
+/// Loading is *not* where the pool peaks: right after the weights and experts
+/// are staged it holds 1,952 MiB with no free blocks at all. The gap opens
+/// later, as wave width grows during calibration and ingest, which is exactly
+/// where `cuMemPoolTrimTo`'s synchronous unmap is unsafe. So this is the right
+/// reclaim at the only safe moment, and for a workload whose pool peaks at
+/// runtime it is a no-op — the fix for that one is to stop routing large
+/// runtime allocations through this pool, not to trim it harder.
+///
+/// **Call this only between load and serving.** `cuMemPoolTrimTo` unmaps
+/// synchronously rather than stream-ordered, so it needs a moment when no
+/// kernel holds a pointer into the freed blocks; the synchronize below makes
+/// that true rather than assumed. Only blocks nothing is using are released —
+/// live allocations, weights and staged experts included, are untouched.
+///
+/// Lives here rather than in the caller because `feature = "cuda"` is a
+/// candle-core feature: a `#[cfg(feature = "cuda")]` written in a crate that
+/// has no such feature is not a guard, it is an unconditional deletion of the
+/// code it wraps.
+pub fn trim_pool_after_load(device: &Device) -> Option<(usize, usize)> {
+    #[cfg(feature = "cuda")]
+    {
+        let Device::Cuda(cuda) = device else {
+            return None;
+        };
+        let before = cuda.pool_reserved_bytes().ok()?;
+        if let Err(e) = device.synchronize() {
+            tracing::warn!(
+                target: "candle_core::vram",
+                "post-load pool trim: device sync failed ({e}); leaving the pool alone"
+            );
+            return None;
+        }
+        if let Err(e) = cuda.trim_pool(0) {
+            tracing::warn!(target: "candle_core::vram", "post-load pool trim failed: {e}");
+            return None;
+        }
+        let after = cuda.pool_reserved_bytes().unwrap_or(before);
+        Some((before, after))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+        None
+    }
 }
 
 /// Size of the mmap-backed model weights, recorded once at load.

@@ -969,6 +969,18 @@ impl ModelBuilder {
 
         let model = self.load_model(&model_path, device, progress)?;
 
+        // Hand the load's pool high-water back before serving starts — it is
+        // several GiB held outside the KV reservation and never used again.
+        // See `candle::vram::trim_pool_after_load` for why here and nowhere
+        // later.
+        if let Some((before, after)) = candle::vram::trim_pool_after_load(device) {
+            tracing::info!(
+                reclaimed_mib = before.saturating_sub(after) >> 20,
+                pool_reserved_mib = after >> 20,
+                "post-load: returned the load's pool high-water to the OS"
+            );
+        }
+
         // Auto-derive max_hot_turns from arena geometry unless the caller
         // overrode it. Must happen before conversation_config() is called below.
         if self.max_hot_turns == 0 {

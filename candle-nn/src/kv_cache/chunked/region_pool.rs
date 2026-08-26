@@ -1767,6 +1767,146 @@ pub fn kv_spare_regions(stream: &std::sync::Arc<CudaStream>, slack: usize) -> Re
     })
 }
 
+/// One region of the reservation, held by a tenant that is not a KV arena.
+///
+/// The reservation is the budget. Anything this process allocates outside it —
+/// through `cudaMalloc`, through the async pool, through a bare
+/// `alloc_zeros` — is competing with it for the same card, and on WDDM the
+/// loser is not an error but a demotion to host RAM: measured at 3.7 GiB on the
+/// 3.6-35B, which cost 17x on decode with nothing anywhere reporting it. Memory
+/// inside the span cannot lose that fight, because its granules are pinned
+/// device allocations the driver may not migrate.
+///
+/// So a long-lived device buffer of region size belongs here rather than in the
+/// pool. Dropping the handle returns the region, exactly as an arena's does.
+pub struct SpanRegion {
+    inner: RegionHandle,
+}
+
+impl SpanRegion {
+    /// Device address of the region's first byte.
+    pub fn base(&self) -> u64 {
+        self.inner.base()
+    }
+
+    /// Bytes in a region — the unit this allocator deals in.
+    pub const fn bytes() -> usize {
+        REGION_BYTES
+    }
+}
+
+impl std::fmt::Debug for SpanRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpanRegion")
+            .field("base", &self.inner.base())
+            .field("index", &self.inner.index())
+            .finish()
+    }
+}
+
+/// Claim one region of the reservation for a non-KV tenant, or `None` when the
+/// KV side has none spare.
+///
+/// `None` is the same pressure signal [`claim_region`] gives an arena, and the
+/// caller's answer is the same: shed something, or do without. It is not an
+/// error — a tenant that cannot get a region is expected to say so and carry on
+/// with fewer, which is what the gallery's own cap already does.
+///
+/// The region's bytes are zero on return.
+///
+/// # It takes the arena window, and must
+///
+/// A claim moves `live_end`, and [`try_place`] puts the transient tier flush
+/// against `live_end` with **no gap above it** — a placement that is only sound
+/// because every claim used to be an arena creation, which
+/// [`enter_arena_window`] holds off until the gap between forwards. Claiming
+/// straight from `claim_region` skips that gate, so a region taken during a
+/// forward is carved out of ground the standing tier already occupies: the
+/// tenant's buffer and the wave's scratch become the same bytes, and whichever
+/// kernel reads them next dies somewhere else entirely.
+///
+/// That is not hypothetical. Gallery slabs and recurrent state claimed here
+/// without the window, and the hot→warm migrate path — an innocent reader of
+/// KV arena memory — took `CUDA_ERROR_ILLEGAL_ADDRESS` and
+/// `CUDA_ERROR_LAUNCH_FAILED` in the hundreds per run. Under
+/// `CUDA_LAUNCH_BLOCKING=1` it vanished, which is what a corrupted-address race
+/// looks like from the outside and is why it read as a fault in the migrate
+/// kernels for so long.
+///
+/// So a span tenant is bound by the same rule as an arena: **allocate between
+/// forwards.** Inside one, this refuses rather than corrupts.
+pub fn claim_span_region(device: &candle::Device) -> Result<Option<SpanRegion>> {
+    let candle::Device::Cuda(cuda) = device else {
+        candle::bail!("claim_span_region: the reservation is a CUDA allocation");
+    };
+    let stream = cuda.cuda_stream();
+    // Held across the claim, so a forward cannot open between the gate and the
+    // frontier moving.
+    let _window = super::bump_arena::enter_arena_window(&stream)?;
+    Ok(claim_region(&stream)?.map(|inner| SpanRegion { inner }))
+}
+
+/// An open arena window, for a tenant claiming SEVERAL regions at once.
+///
+/// [`claim_span_region`] takes the window per call, which is right for a tenant
+/// that wants one region and wrong for one that wants eight: entering the window
+/// hands back a standing tier, so a store built a region at a time releases and
+/// re-places the tier once per region, and every recycled claim inside that
+/// carries a device-wide quiesce. The churn is not a correctness problem — the
+/// gate holds either way — but it is enough of one to reach the WDDM watchdog,
+/// which terminates the launch and poisons the context just as surely.
+///
+/// Held open for the whole construction instead, a tenant pays for one window
+/// and one tier handback however many regions it takes.
+pub struct SpanClaims {
+    stream: std::sync::Arc<CudaStream>,
+    /// The window itself. Dropped with this, which is what re-arms the tier for
+    /// the next forward.
+    _window: super::bump_arena::ArenaWindow,
+}
+
+impl SpanClaims {
+    /// Open the window. Refuses inside a forward, for the reason on
+    /// [`claim_span_region`].
+    pub fn open(device: &candle::Device) -> Result<Self> {
+        let candle::Device::Cuda(cuda) = device else {
+            candle::bail!("SpanClaims: the reservation is a CUDA allocation");
+        };
+        let stream = cuda.cuda_stream();
+        let _window = super::bump_arena::enter_arena_window(&stream)?;
+        Ok(Self { stream, _window })
+    }
+
+    /// One more region, or `None` when the KV side has none spare.
+    pub fn claim(&self) -> Result<Option<SpanRegion>> {
+        Ok(claim_region(&self.stream)?.map(|inner| SpanRegion { inner }))
+    }
+}
+
+/// Why a [`claim_span_region`] came back empty, for an error message that can
+/// name the difference.
+///
+/// The two refusals have opposite fixes and a caller that cannot tell them
+/// apart reports the wrong one: a standing tier means the ground exists but
+/// belongs to a running wave (allocate earlier, or run a narrower wave), while
+/// exhaustion means the weight side would not concede (there is genuinely no
+/// room). Guessing between them cost an hour.
+pub fn span_region_refusal(device: &candle::Device) -> &'static str {
+    let candle::Device::Cuda(cuda) = device else {
+        return "not a CUDA device";
+    };
+    let stream = cuda.cuda_stream();
+    let standing = with_pool(&stream, |pool| Ok(pool.transient_base.is_some())).unwrap_or(false);
+    if standing {
+        "a wave transient tier is standing — this ran INSIDE a forward, where the \
+         ground above the tier belongs to the wave and no weight-side concession \
+         reaches it. Allocate before the wave opens."
+    } else {
+        "no tier stands, so the span is genuinely full — the weight side is at its \
+         own floor and could not concede ground."
+    }
+}
+
 /// The address the weight floor would sit at if the weight side gave up
 /// `regions` more regions (positive) or took `regions` fewer (negative).
 ///

@@ -88,3 +88,7 @@ cuda = []
 # candle-conversation; emits an aggregated breakdown under
 # `candle_conversation::scheduler::profile`.
 profile = ["candle-conversation/profile"]
+# Name the call sites that allocate from the CUDA driver during a wave — see
+# `candle::forbidden_alloc`. Diagnostic; the daemon logs one report per wave
+# window that finds anything.
+forbidden_allocations = ["candle-conversation/forbidden_allocations"]

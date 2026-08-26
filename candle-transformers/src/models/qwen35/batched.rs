@@ -383,6 +383,20 @@ impl HybridBatched {
 
     /// Give `child` a copy of `parent`'s recurrent state.
     ///
+    /// Reservation bytes every live sequence's recurrent state holds together.
+    ///
+    /// Summed over the map rather than derived from a per-sequence constant:
+    /// a store's region count depends on how its buffers packed, and a forked
+    /// child's need not match its parent's. A poisoned lock reports zero rather
+    /// than failing — this is a report, and a wrong number in it is preferable
+    /// to a scheduler that cannot answer how much memory it is using.
+    pub fn recurrent_reserved_bytes(&self) -> usize {
+        self.recurrent
+            .lock()
+            .map(|m| m.values().map(|s| s.reserved_bytes()).sum())
+            .unwrap_or(0)
+    }
+
     /// The turn loop carves a child slot per turn and decodes on it, borrowing
     /// the parent's KV blocks zero-copy. State cannot be borrowed the same way
     /// — the child advances it — so it is copied device-to-device

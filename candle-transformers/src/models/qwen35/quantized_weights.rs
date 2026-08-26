@@ -320,6 +320,16 @@ pub struct QuantModel {
     pub final_norm: RmsNorm,
     pub lm_head: QMatMul,
     pub device: Device,
+    /// VRAM the DENSE tensors hold — everything above except the paged experts.
+    ///
+    /// Kept because a footprint that is only ever handed to the governor is a
+    /// footprint no report can read back. `resident_weight_bytes` is documented
+    /// as "fixed base + time-varying resident experts" and could answer only the
+    /// second half without this, so the whole-card decomposition subtracted the
+    /// experts from themselves and reported the dense half as ZERO — several
+    /// GiB of VRAM invisible to every consumer, including the budget that is
+    /// supposed to size the reservation around it.
+    pub dense_bytes: usize,
 }
 
 struct Loader<'a, R: Read + Seek> {
@@ -642,5 +652,6 @@ where
         final_norm,
         lm_head,
         device: device.clone(),
+        dense_bytes: g.device_bytes,
     })
 }
