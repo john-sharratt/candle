@@ -22,7 +22,7 @@ else in this directory extends one of them.
 
 | Doc | Covers |
 |---|---|
-| [`unbounded_agents.md`](unbounded_agents.md) | **"One Card, One Stack"** — the canonical technical report. Asymptotic Numerical Stability theorem (O(1) error at unbounded context depth), the four integrated system contributions (Markov expert prediction, adaptive KV quantization, attentional provenance indexing, three-tier paged context), and the measured throughput numbers. Read this first. |
+| [`unbounded_agents.md`](unbounded_agents.md) | **"One Card, One Stack"** — the canonical technical report. **Published** at `tokera.com/papers/one-card`, rendered live from this file (see [`web_gateway_design.md`](web_gateway_design.md) §4) — an edit here is an edit to the public paper. Asymptotic Numerical Stability theorem (O(1) error at unbounded context depth), the four integrated system contributions (Markov expert prediction, adaptive KV quantization, attentional provenance indexing, three-tier paged context), and the measured throughput numbers. Read this first. |
 | [`theory_of_the_mind.md`](theory_of_the_mind.md) | "The Conversations a Mind Needs" — functional decomposition of the cognitive substrate into parallel sub-conversations (specialists, affect, goals, relationships, self), argued from engineering constraints and clinical phenomenology. Underlies `npc_mind_design.md`, `cognitive_coding.md`, and `sdlc_agent.md`. |
 | [`what_is_consciousness.md`](what_is_consciousness.md) | Substrate Composition Theory — consciousness as the compound effect of attention-weighted composition over specialised parallel sub-minds; reports an experimental protocol run on the substrate architecture. Read for the theoretical grounding behind the multi-layer substrate design, not for build details. |
 
@@ -97,6 +97,13 @@ web UI.
 |---|---|
 | [`npc_mind_design.md`](npc_mind_design.md) | "The Asynchronous Mind" — the NPC cognitive architecture: one mechanism (gather substrate under salience, attend, act, write back) applied uniformly, with a mutable substrate the model influences but never controls and an immutable core it cannot write. |
 | [`narrative_engine.md`](narrative_engine.md) | Roleplay Engine (RPE) design: translates structured player `Input` events into narrated prose via a conversation-as-KV-cache narrator, with `parse_turn`/`text_to_inputs` as the crate's entry points. |
+
+## Web tier & deployment
+
+| Doc | Covers |
+|---|---|
+| [`web_gateway_design.md`](web_gateway_design.md) | **Built.** The `web` crate: one front door for the estate. Host→site→upstream routing with layered content roots, tokera.com rendered from markdown (blog and the papers, read live from this directory), OIDC sign-in whose parent-domain cookie carries one account across `code.` and `bot.`, per-upstream backoff with readable error pages, and websocket tunnelling. Read before touching anything under `web/`. |
+| [`npc_api_gui_design.md`](npc_api_gui_design.md) | The NPC engine's HTTP surface and console. §2 and §8.1 defer to the gateway doc above. |
 
 ## Hardware & measured results
 

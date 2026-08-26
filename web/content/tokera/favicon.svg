@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Tokera">
+  <!-- A solid blue tile with a complete T knocked out of it, and a head above
+       the crossbar so the same shape reads as a figure standing with its arms
+       out. The two readings are the point: a T for Tokera, a person for what
+       the T is holding up.
+
+       Drawn for 16px first: one filled field, one high-contrast counter-form
+       and one accent dot read at any size, where thin strokes turn to mush.
+
+       The crossbar still runs the full width, edge to edge, and the stem
+       descends from its centre to the bottom — so what is left of the blue is a
+       band across the top, a head sitting on it, and two legs beneath.
+
+       The head is a separate colour rather than part of the knockout: at 16px
+       a same-coloured head merges into the crossbar and the figure disappears
+       back into a plain T. The contrast is what keeps both readings alive. -->
+  <defs>
+    <clipPath id="tk"><rect width="32" height="32" rx="7.5"/></clipPath>
+    <linearGradient id="tg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4a8ee6"/>
+      <stop offset="1" stop-color="#1f56b0"/>
+    </linearGradient>
+  </defs>
+  <g clip-path="url(#tk)">
+    <rect width="32" height="32" fill="url(#tg)"/>
+    <circle cx="16" cy="6.6" r="3.5" fill="#34d399"/>
+    <rect x="-2" y="12" width="36" height="5.4" fill="#0f1720"/>
+    <rect x="13.3" y="12" width="5.4" height="26" fill="#0f1720"/>
+  </g>
+</svg>

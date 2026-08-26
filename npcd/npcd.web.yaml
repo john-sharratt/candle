@@ -1,0 +1,30 @@
+# ============================================================================
+# npcd — the standalone site table.
+#
+# Compiled into the binary with include_str!, so `npcd` needs no config file on
+# disk and no second process: one executable serves the console and answers its
+# own API. That is what makes the daemon testable by itself.
+#
+# The difference from the DMZ deployment (web/web.yaml) is one word per route:
+# `upstream: local` dispatches into the axum Router this process built, instead
+# of opening a socket to another machine. Promoting a site from local to remote
+# is an edit, not a migration.
+#
+# There are no `roots` here because the content is compiled in too — main.rs
+# hands the embedded `content/npcd` + `content/common` directories to the
+# builder, or a directory on disk when `--content` is given for live editing.
+# ============================================================================
+
+server:
+  bind: "127.0.0.1:8081"
+  cache_control: "no-store"
+
+sites:
+  - name: npcd
+    default: true
+    fallback: "index.html"
+    api:
+      - prefix: /v1
+        upstream: local
+      - prefix: /ws
+        upstream: local

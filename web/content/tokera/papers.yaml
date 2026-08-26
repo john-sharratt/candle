@@ -1,0 +1,67 @@
+# ============================================================================
+# What tokera.com publishes as a paper.
+#
+# ORDER MATTERS: newest first. The top entry is what `/papers` opens, and the
+# list in the left pane is rendered in this order — so a new paper goes at the
+# TOP of this file, not the bottom.
+#
+# `source` names a file in the site's `papers:` directory (see web.yaml), which
+# points at the repo's `docs/`. The papers are therefore rendered live from the
+# working documents — an edit to a document is published the moment it is saved,
+# with no copy to keep in step.
+#
+# This file is what makes that safe: only documents named here are reachable,
+# so pointing at `docs/` publishes these papers and not the rest of the design
+# directory. `source` must be a plain file name; the loader refuses anything
+# with a path separator in it.
+#
+# `slug` is the URL and should not change once a link has been shared. The
+# title can be revised freely — it is read from here, not from the document's
+# own heading, so editing a working document cannot rename a published paper.
+# ============================================================================
+
+papers:
+  - slug: palquant
+    title: "PalQuant"
+    subtitle: >-
+      Calibration-free 7× KV cache compression via adaptive per-block
+      quantization
+    authors: "Johnathan Paul Sharratt"
+    date: "16 May 2026"
+    published: "2026-05-16"
+    doi: "10.5281/zenodo.20230306"
+    zenodo: "https://zenodo.org/records/20230306"
+    pdf: "https://zenodo.org/records/20230306/files/PalQuant-final.pdf?download=1"
+    source: palquant.md
+    summary: >-
+      Every prior online KV quantizer optimises the compression *primitive* —
+      one format, applied to every block. PalQuant optimises the
+      architecture: each (layer, head, chunk) picks four formats from a fixed
+      16-format codebook spanning 0.25–16 bits, and routes each block to one
+      of them by its measured reconstruction error. 7.42× on Qwen3-8B, 7.04×
+      on Qwen3-30B-A3B, 5.02× on Llama-3.2-3B, with no calibration data and
+      no per-model tuning of the algorithm — and a multi-session identity
+      test that catches a failure perplexity cannot see.
+
+  - slug: one-card
+    title: "One Card, One Stack"
+    subtitle: >-
+      Constraint-driven architecture for asymptotically stable inference over
+      unbounded agent memory
+    authors: "Johnathan Paul Sharratt"
+    date: "13 May 2026"
+    published: "2026-05-13"
+    doi: "10.5281/zenodo.20156060"
+    zenodo: "https://zenodo.org/records/20156060"
+    pdf: "https://zenodo.org/records/20156060/files/one-card-one-stack.pdf?download=1"
+    status: "v1 technical report"
+    source: unbounded_agents.md
+    summary: >-
+      Under standard full attention, numerical error per generated token grows
+      with context depth on any hardware and under any compression scheme.
+      This proves the problem is architectural rather than representational,
+      and presents a system whose per-step error is O(1) at unbounded depth:
+      provenance-selected attention over a three-tier paged context, adaptive
+      per-block KV quantization, and Markov expert prediction — measured at
+      509 tok/s single-session and 2,446 tok/s across 64 concurrent sessions
+      on a 16 GB card.

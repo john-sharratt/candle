@@ -1,0 +1,27 @@
+[package]
+name = "npcd"
+version = "0.1.0"
+edition = "2021"
+description = "NPC engine daemon — persistent NPCs on one card"
+
+[[bin]]
+name = "npcd"
+path = "src/main.rs"
+
+# NOTE: no candle / CUDA dependency yet, and no API of its own. Every endpoint
+# is answered by the console's mock fixture (`web::mock::npcd`), so the GUI can
+# be built and iterated on with a fast `cargo build` and no GPU. The engine
+# lands here behind the same routes later — the wire contract in
+# `docs/npc_api_gui_design.md` does not change when it does.
+[dependencies]
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio      = { version = "1", features = ["full"] }
+include_dir = { version = "0.7" }
+
+# The HTTP front. `npcd` supplies the console files and an API router; `web`
+# does host routing, static serving, and — in the DMZ deployment of the very
+# same crate — proxying. One binary either way.
+web = { path = "../web" }

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="npcd">
+  <!-- The mark: a stack of substrate layers narrowing upward into a single act.
+       Wide base = memory and world; narrowing = the gather under budget; the
+       dot on top = the one cognitive step that surfaces. Reads as a figure at
+       16px and as a diagram at 512px, which is the point. -->
+  <rect width="32" height="32" rx="8" fill="#1c1917"/>
+  <circle cx="16" cy="7.4" r="3.1" fill="#c98a3e"/>
+  <rect x="9.5"  y="13.4" width="13" height="3.1" rx="1.55" fill="#c98a3e" opacity=".92"/>
+  <rect x="6.6"  y="18.6" width="18.8" height="3.1" rx="1.55" fill="#c98a3e" opacity=".62"/>
+  <rect x="4"    y="23.8" width="24" height="3.1" rx="1.55" fill="#c98a3e" opacity=".34"/>
+</svg>

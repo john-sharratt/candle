@@ -1,0 +1,62 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2021"
+description = "Content server + API gateway — authoritative when embedded in a daemon, a proxy when run on its own"
+
+[[bin]]
+name = "web"
+path = "src/main.rs"
+
+[lib]
+name = "web"
+path = "src/lib.rs"
+
+# No candle, no CUDA, no model. This crate holds no application logic: sites are
+# directories, APIs are either a merged Router or an upstream URL.
+[dependencies]
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+tracing    = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+axum           = { version = "0.7", features = ["macros", "ws"] }
+tower          = { version = "0.5" }
+futures        = "0.3"
+tokio          = { version = "1", features = ["full"] }
+hyper          = { version = "1", features = ["client", "http1"] }
+hyper-util     = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+include_dir    = { version = "0.7" }
+mime_guess     = { version = "2" }
+
+# Long-form content. Papers and posts are markdown files rendered on the way
+# out — `latex2mathml` emits MathML, which every current browser lays out
+# natively, so there is no maths bundle, no web fonts and no build step.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+latex2mathml   = "0.2"
+
+# Sign-in. rustls rather than the default TLS so the DMZ box needs no OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hmac    = "0.12"
+sha2    = "0.10"
+base64  = { workspace = true }
+rand    = { workspace = true }
+
+[dev-dependencies]
+# A real websocket client for the `/ws/*` tests: the frames the console reads
+# must survive framing, not merely leave the handler.
+tokio-tungstenite = "0.24"
+futures-util      = "0.3"
+# For `examples/prepare-images.rs` only — the site itself serves plain files and
+# does no image work at runtime. `webp` on top of the workspace's jpeg/png
+# because generated source art commonly arrives in that format; the *output* is
+# always JPEG, so this is a decoder-side feature only.
+image             = { workspace = true, features = ["webp"] }
+# Stamping an mtime, so the render cache's invalidation can be tested without
+# sleeping past the filesystem's timestamp granularity.
+filetime          = "0.2"
+tempfile          = { workspace = true }

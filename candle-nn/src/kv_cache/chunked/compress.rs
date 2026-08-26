@@ -25,8 +25,12 @@
 //!   kernels read directly. Ineligible chunks (typically cold-loaded
 //!   ones already in mixed Q-formats) are routed to a pass-through
 //!   "preserve" bucket and merged back unchanged at the end.
-//! - `head_dim` must be 128 — the palette-4 kernel is compiled for
-//!   that shape only.
+//! - `head_dim` must divide by `N_PALETTE` — each palette band covers
+//!   `head_dim / N_PALETTE` consecutive dimensions, so 128 gives 32-wide
+//!   bands and 256 gives 64-wide ones. Both are compiled shapes
+//!   (`kvhead_supported_head_dim`); the selection itself is indifferent,
+//!   because it works on 32-element blocks and a band is just a count of
+//!   them.
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
@@ -1179,7 +1183,8 @@ fn quantize_sealed_in_place_impl(
 ///
 /// Eligible chunks are full chunks whose every `(h, p)` GID lives in a GPU
 /// `Quantized` (incl. `R16`) arena. Chunks already in GPU `Float` (partial
-/// tails) pass through the preserve bucket unchanged. `head_dim` must be 128.
+/// tails) pass through the preserve bucket unchanged. `head_dim` must be one of
+/// the compiled shapes and divide by `N_PALETTE`.
 /// Launch the batched palette4 convert over `descs` (`[jobs × n_kv_head]`, one
 /// "job" per chunk mapped onto the kernel's `num_layers` grid dim). Tiled at the
 /// 65535 grid.y cap. Bit-identical to converting the jobs in separate launches —

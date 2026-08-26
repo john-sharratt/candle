@@ -9,6 +9,8 @@ members = [
     "candle-transformers",
     "candle-wasm-examples/*",
     "candle-wasm-tests",
+    "npcd",
+    "web",
     "tensor-tools",
     "zend-tools",
 ]
