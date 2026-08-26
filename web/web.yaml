@@ -61,18 +61,17 @@ server:
 # asserts that identity downstream on `X-Tokera-*`, stripping any inbound copy
 # of those headers before setting its own.
 #
-# A daemon does not have to take that on trust, and `npcd` does not: alongside
-# the plain headers the gateway sends `X-Tokera-Assertion`, the same identity
-# signed with the session key, and npcd verifies the signature. Headers alone
-# authenticate nobody there. That costs one shared file and buys a daemon whose
-# security no longer rests on its bind address being unreachable:
+# Those headers are cleared from every inbound request first — by this gateway,
+# and again inside each daemon, since a daemon embedding its API as
+# `upstream: local` would otherwise be handed the client's own. A daemon opts
+# back in by calling `web::Builder::behind_gateway`, which asserts that its bind
+# address is reachable through the gateway and nothing else. Nothing verifies
+# that claim, so keep such a daemon on a private interface.
 #
-#   cp web/secrets/session.key npcd/secrets/session.key
-#
-# Without it npcd answers `/v1/me` with 503 `auth_unconfigured` — deliberately
-# distinct from 401, so its console can say sign-in is unavailable rather than
-# offer a button that cannot work. Copy the key whenever you rotate it; a npcd
-# holding last week's key rejects every assertion as a forgery.
+# **No secret is shared with any daemon.** There is deliberately no session key
+# to copy to `npcd` or `zend`: the session cookie signs sessions for the whole
+# estate, so handing it to a daemon would let a compromised one mint identities
+# at every hostname. This file is the gateway's alone.
 #
 # Paths resolve against THIS FILE, like `roots` and `papers`, so keep them
 # relative and the same table works on a laptop and on the DMZ box. Both
@@ -122,21 +121,30 @@ sites:
       - {prefix: /papers, upstream: local}
 
   # ── bot.tokera.com — the NPC console ────────────────────────────────────
-  # Files from this box; the daemon runs on 192.168.0.6. `npcd.localhost`
-  # resolves to 127.0.0.1 in every current browser, so it needs no hosts entry
-  # to reach this site during local development.
+  # A pure gateway, like zend below: no roots, everything forwarded, navigation
+  # included. The daemon on 192.168.0.6 owns its console — it serves those files
+  # from disk already, with its own `fallback: index.html` for deep links.
+  #
+  # It used to serve the console from THIS box's checkout while forwarding only
+  # `/v1` and `/ws`, which made the console and the daemon two deployments of
+  # one program. Every console edit then needed a commit here and a pull there
+  # before it could be seen, and the two could disagree silently — the console
+  # was twice found running against an API it did not match, each time reading
+  # as a bug in the daemon. One source, one deploy, and an edit on the daemon
+  # box is live on a refresh.
+  #
+  # `/auth/*` is unaffected: those routes are registered ahead of site routing
+  # precisely so a site proxying `/` cannot swallow them. Sign-in stays here.
+  #
+  # The cost is that `web --authoritative` can no longer stand in for this site,
+  # for the same reason it cannot for zend — there are no roots left to serve
+  # the console from, and the mock answers `/v1`, not `/app.js`. Run `npcd`
+  # itself instead; it embeds the same mock behind the same console, which is
+  # what `--authoritative` was standing in for.
   - name: npcd
     hosts: ["bot.tokera.com", "npcd.localhost", "npcd.test", "*.npcd.dev"]
-    roots: ["content/npcd", "content/common"]
-    # Extensionless paths naming no file land here, so the hash router owns
-    # navigation and a deep link survives a refresh. A missing *.js still 404s.
-    fallback: "index.html"
     api:
-      - prefix: /v1
-        upstream: "http://192.168.0.6:8081"
-      # Same upstream, listed separately so websockets can move to their own
-      # host later without disturbing the REST rule.
-      - prefix: /ws
+      - prefix: /
         upstream: "http://192.168.0.6:8081"
 
   # ── code.tokera.com — Zen Code ──────────────────────────────────────────

@@ -199,6 +199,59 @@ async fn a_client_cannot_forge_identity_headers_into_a_local_api() {
     assert!(!r.body.contains("made-up"), "{}", r.body);
 }
 
+/// A daemon behind the gateway does receive them — that is how it learns who
+/// is calling.
+///
+/// The mirror of the test above, and the pair is the point. Identity crosses an
+/// in-process boundary as a request extension and a network boundary as these
+/// headers, so a daemon on another box has nothing else to read. Clearing them
+/// for everyone makes the documented contract unimplementable; clearing them
+/// for everyone who has not declared `behind_gateway` makes it safe by default
+/// and possible on purpose.
+#[tokio::test]
+async fn a_daemon_behind_the_gateway_reads_the_identity_it_is_sent() {
+    let addr = spawn(
+        Builder::new(cfg(AUTHORITATIVE))
+            .behind_gateway()
+            .local_api("npcd", fake_api())
+            .router(),
+    )
+    .await;
+
+    let r = get_with_headers(
+        addr,
+        "/v1/saw-identity",
+        &[
+            ("x-tokera-user", "google-1"),
+            ("x-tokera-email", "wren@example.com"),
+        ],
+    )
+    .await;
+
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains(r#""user":"google-1""#), "{}", r.body);
+    assert!(r.body.contains("wren@example.com"), "{}", r.body);
+}
+
+/// The declaration is opt-in, so the safe behaviour is what you get by
+/// forgetting it — not what you get by remembering.
+///
+/// Worth asserting rather than assuming: this is the direction a refactor
+/// breaks silently, since flipping the default turns every existing caller into
+/// an open door and no test of the *new* behaviour would notice.
+#[tokio::test]
+async fn stripping_is_the_default_and_must_stay_that_way() {
+    let addr = spawn(
+        Builder::new(cfg(AUTHORITATIVE))
+            .local_api("npcd", fake_api())
+            .router(),
+    )
+    .await;
+
+    let r = get_with_headers(addr, "/v1/saw-identity", &[("x-tokera-user", "root")]).await;
+    assert!(r.body.contains(r#""user":"""#), "{}", r.body);
+}
+
 #[tokio::test]
 async fn authoritative_serves_files_and_answers_its_own_api() {
     let addr = spawn(

@@ -49,16 +49,6 @@ struct Cli {
     #[arg(long)]
     data: Option<PathBuf>,
 
-    /// The estate's shared session signing key — the same file the gateway
-    /// signs with, which is what makes one sign-in carry across tokera.com,
-    /// code. and bot. Defaults to `secrets/session.key` under `--data`.
-    ///
-    /// Without it this daemon authenticates nobody. That is deliberate: it
-    /// binds a LAN address, so treating an unconfigured key as "trust whatever
-    /// arrives" would turn a missing file into an open door.
-    #[arg(long)]
-    session_key: Option<PathBuf>,
-
     /// Increase log verbosity (-v debug, -vv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -123,22 +113,6 @@ async fn main() -> anyhow::Result<()> {
     // real email address and a provider subject id.
     let accounts = accounts::Accounts::load(data.join("accounts"))?;
 
-    let key_path = cli
-        .session_key
-        .unwrap_or_else(|| data.join("secrets").join("session.key"));
-    let verifier = if key_path.exists() {
-        let v = identity::Verifier::from_file(&key_path)?;
-        tracing::info!("sign-in: verifying assertions with {}", key_path.display());
-        v
-    } else {
-        tracing::warn!(
-            "sign-in: no key at {} — NOBODY will be authenticated. Copy the \
-             gateway's session key there to enable sign-in.",
-            key_path.display()
-        );
-        identity::Verifier::unconfigured()
-    };
-
     tracing::info!(
         "accounts: {} known, from {}",
         accounts.len(),
@@ -151,11 +125,16 @@ async fn main() -> anyhow::Result<()> {
     // answer falls through. Merging the two would panic on the overlap;
     // layering means each surface can become real one route at a time without
     // the console noticing.
-    let authored = api::Authored::new(worlds, archetypes, accounts, verifier);
+    let authored = api::Authored::new(worlds, archetypes, accounts);
     let router = api::router(authored).fallback_service(web::mock::npcd::router());
 
     Builder::new(cfg)
         .content("npcd", roots)
+        // Sign-in is the gateway's, and it names the caller on `X-Tokera-*`.
+        // Believing those headers is only sound because the bind address is
+        // reachable through the gateway and nothing else — see the flag's docs
+        // before pointing `--bind` at a public interface.
+        .behind_gateway()
         .local_api("npcd", router)
         .serve()
         .await

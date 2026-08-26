@@ -82,18 +82,60 @@ function themeMenu() {
 
 let ME = null;
 
+/* The signed-in person's face, or their initial when there is no picture.
+ *
+ * `referrerpolicy` because the src is the identity provider's CDN: without it
+ * every avatar load tells Google which page of the console is being read.
+ * `onError` because an avatar URL outlives the image behind it — a provider
+ * rotates the path and the chrome would otherwise show a broken-image glyph
+ * where a person's face was, which looks like a bug in the sign-in. */
+export function faceOf(me, px) {
+  // Every candidate can be present-but-blank: a provider may send a name that
+  // is only whitespace, and `''.trim()[0]` is `undefined`, which would throw on
+  // `.toUpperCase()` and take the whole top bar down with it.
+  const initial = ([me.display, me.unique_name, '?']
+    .map((s) => (s || '').trim()).find((s) => s.length)[0]).toUpperCase();
+  const ring = `width:${px}px;height:${px}px;border-radius:50%;flex:none`;
+  if (me.avatar_url) {
+    const img = h('img', {
+      src: me.avatar_url, alt: '', referrerpolicy: 'no-referrer',
+      style: ring + ';object-fit:cover',
+    });
+    img.addEventListener('error', () => img.replaceWith(letter(initial, px, ring)));
+    return img;
+  }
+  return letter(initial, px, ring);
+}
+
+function letter(initial, px, ring) {
+  return h('span', {
+    style: ring + ';background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;'
+      + `font-size:${Math.round(px * 0.44)}px;font-weight:800`,
+  }, initial);
+}
+
+/* Hover text: the display name is already visible, so the tooltip carries what
+ * is not — the account it belongs to, and the handle characters address. */
+function whoTitle() {
+  return [ME.email, ME.unique_name && '@' + ME.unique_name].filter(Boolean).join(' · ');
+}
+
 function renderChrome() {
   const host = document.getElementById('chrome');
   if (!host) return;
   mount(host,
     themeButton(),
     ME
+      /* Your own name and face, not your handle. `unique_name` is the address
+       * an NPC uses for you — a lowercased, punctuation-stripped thing derived
+       * from an email — and showing it here reads as somebody else's account.
+       * The provider's `display` and `avatar_url` are what a person recognises
+       * as themselves, so they are what the chrome shows; the handle belongs on
+       * the profile page, where it is being edited. */
       ? h('button', {
-        class: 'btn sm ghost', title: ME.display + ' · ' + (ME.email || ''),
+        class: 'btn sm ghost', title: whoTitle(),
         onClick: () => go('/me'),
-      }, h('span', {
-        style: 'width:20px;height:20px;border-radius:50%;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-size:.66rem;font-weight:800',
-      }, (ME.unique_name || '?')[0]), ME.unique_name)
+      }, faceOf(ME, 20), (ME.display || '').trim() || ME.unique_name || 'Signed in')
       /* Straight to the provider, not to `#/welcome` — a link to the page you
        * are already on is a control that visibly does nothing, and the welcome
        * page is where this button is most likely to be pressed. When sign-in is
@@ -205,13 +247,11 @@ window.__npcdSignOut = () => {
 /* Distinct from being signed out, and the difference decides whether to offer a
  * sign-in control at all: a button that cannot work is worse than none.
  *
- * It takes BOTH ends to answer, because either can be the one that is missing.
- * The daemon reports whether it holds the shared key — without it no assertion
- * can be verified, so nobody can be signed in here. The gateway reports whether
- * it has an identity provider configured, and it is the authority on that: with
- * `auth:` off it does not serve `/auth/login` at all, so the navigation lands on
- * site routing, gets `index.html` back, and reads to the visitor as a button
- * that does nothing. Asking only the daemon would miss exactly that case. */
+ * The gateway is the only authority on it, because it owns the whole flow. With
+ * `auth:` off it does not serve `/auth/login` at all — the navigation then lands
+ * on site routing, gets `index.html` back, and reads to the visitor as a button
+ * that does nothing. `/auth/me` says `configured: false` in that state, which is
+ * the one reliable way to know before offering the control. */
 export let AUTH_UNAVAILABLE = false;
 
 async function gatewayHasSignIn() {
@@ -242,18 +282,17 @@ async function boot() {
     await new Promise((r) => setTimeout(r, 400));
   }
 
-  /* 401 means signed out. 503 `auth_unconfigured` means this deployment has no
-   * session key at all — the operator's problem, not the visitor's, and worth
-   * telling them apart rather than showing a dead button. */
+  // A 401 here means signed out, which is the only thing this daemon can say
+  // about identity — it does not run sign-in and has no configuration of its
+  // own that could be missing.
   try {
     ME = await API.getMe();
   } catch (e) {
     ME = null;
-    if (e && e.error === 'auth_unconfigured') AUTH_UNAVAILABLE = true;
   }
-  // Only worth asking the gateway when nobody is signed in: a live session is
-  // itself proof that both ends are configured.
-  if (!ME && !AUTH_UNAVAILABLE && !(await gatewayHasSignIn())) AUTH_UNAVAILABLE = true;
+  // Whether anyone *could* sign in is the gateway's answer, and worth asking
+  // only when nobody is: a live session is itself proof that it is configured.
+  if (!ME && !(await gatewayHasSignIn())) AUTH_UNAVAILABLE = true;
 
   const bootEl = document.getElementById('boot');
   if (bootEl) bootEl.remove();

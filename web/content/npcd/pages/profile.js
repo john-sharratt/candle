@@ -7,22 +7,17 @@ import { API } from '../lib/api.js';
 import { h, mount, ago } from '../lib/dom.js';
 import { toast, empty } from '../lib/ui.js';
 import { go } from '../lib/router.js';
+import { AUTH_UNAVAILABLE, faceOf } from '../app.js';
 
 export async function render() {
-  let me = null;
-  let unconfigured = false;
-  try {
-    me = await API.getMe();
-  } catch (e) {
-    unconfigured = !!(e && e.error === 'auth_unconfigured');
-  }
+  const me = await API.getMe().catch(() => null);
 
   const el = h('div', { class: 'page', style: 'max-width:820px' });
   if (!me) {
-    /* Two different dead ends, and only one of them has a way out. */
-    el.appendChild(unconfigured
+    /* Two dead ends, and only one of them has a way out. */
+    el.appendChild(AUTH_UNAVAILABLE
       ? empty('◌', 'Sign-in is not configured',
-        'This daemon has no session key, so it cannot authenticate anyone. That is an operator setting, not ' +
+        'This deployment has no identity provider, so nobody can sign in. That is an operator setting, not ' +
         'something you can fix from here.')
       : empty('◌', 'Not signed in', 'Your profile is what characters read about you.',
         h('button', { class: 'btn primary', onClick: () => window.__npcdSignIn() }, 'Sign in')));
@@ -43,8 +38,12 @@ export async function render() {
   };
 
   el.appendChild(h('div', { class: 'hd' },
-    h('div', {}, h('h1', {}, 'Your profile'),
-      h('div', { class: 'sub' }, 'This is what characters read about you. It lives in the substrate like anything else.')),
+    h('div', { class: 'row', style: 'gap:14px' },
+      faceOf(me, 46),
+      h('div', {}, h('h1', {}, me.display || 'Your profile'),
+        h('div', { class: 'sub' },
+          'What characters read about you — and what they never see: your name, picture and email ' +
+          'stay between you and ' + (me.provider || 'your provider') + '.'))),
     h('div', { class: 'row' }, rev,
       h('button', {
         class: 'btn sm',
@@ -64,7 +63,7 @@ export async function render() {
       h('div', {},
         h('label', { class: 'field' }, h('span', {}, 'Account'),
           h('input', { class: 'input', value: me.email || '', disabled: true })),
-        h('div', { class: 'tiny dim' }, 'From ' + (me.provider || 'your provider') + '. Never shown to a character.'))),
+        h('div', { class: 'tiny dim' }, 'Set by ' + (me.provider || 'your provider') + ', not editable here.'))),
 
     field('pronouns', 'Pronouns'),
     field('gender', 'Gender'),
