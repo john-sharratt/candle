@@ -2532,7 +2532,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // BF16 single context
@@ -2541,7 +2540,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // BF16 multi-context
@@ -2550,7 +2548,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // Q8
@@ -2559,7 +2556,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 20,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             #[cfg(feature = "huge-context")]
@@ -2568,7 +2564,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 32,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // Q4
@@ -2577,7 +2572,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::Skip),
             },
             #[cfg(feature = "huge-context")]
@@ -2586,7 +2580,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 48,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::Skip),
             },
             TestConfig {
@@ -2597,7 +2590,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -2608,7 +2600,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -2619,7 +2610,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -2630,7 +2620,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -2641,7 +2630,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -2652,7 +2640,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -2663,7 +2650,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -2674,7 +2660,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -2685,7 +2670,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             /*
@@ -2695,7 +2679,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             */
@@ -2705,7 +2688,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // Q8 (after everything is warm)
@@ -2714,7 +2696,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 20,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::Skip),
             },
         ];
@@ -3498,7 +3479,6 @@ mod tests {
                     use_batched: true,
                     num_contexts: 1,
                     num_repeats: 1,
-                    generate_max_len: 256,
                     test_mode: Some(TestMode::Skip),
                 })
                 .collect();
@@ -3680,7 +3660,7 @@ mod tests {
             session.advance_sequence(seq_idx, prefill_len)?;
             println!("Prefill done ({} tokens)", prefill_len);
 
-            // Decode: 40 tokens (greedy argmax) — matching production generate_max_len
+            // Decode: 40 tokens (greedy argmax) — matching production generate_token_count
             let num_decode = 40usize;
             let mut last_logits = logits_vec
                 .into_iter()

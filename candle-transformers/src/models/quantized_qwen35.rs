@@ -365,7 +365,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -373,7 +372,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // Several sequences at once: the recurrent mixer runs per span and
@@ -384,7 +382,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 16,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // ── Quantized KV — the same ladder the Qwen3 mid-size gates run.
@@ -397,7 +394,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -405,7 +401,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -413,7 +408,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -421,7 +415,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -429,7 +422,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -437,7 +429,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -445,7 +436,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -453,7 +443,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -461,7 +450,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C8 runs wide — 32 concurrent contexts — the deepest rung that
@@ -473,7 +461,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 32,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -481,7 +468,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C10×10 is the top rung and the calibration target:
@@ -495,7 +481,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
         ];
@@ -608,7 +593,6 @@ pub(crate) mod tests {
                     use_batched: true,
                     num_contexts: 10,
                     num_repeats: 1,
-                    generate_max_len: tokens,
                     test_mode: Some(TestMode::StoryRewrite),
                 }],
                 &load,
@@ -673,7 +657,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: width,
                 num_repeats: 1,
-                generate_max_len: 256,
                 test_mode: Some(TestMode::StoryRewrite),
             }],
             checked,
@@ -712,6 +695,14 @@ pub(crate) mod tests {
     cold_point!(cold_w20_b0, 20, 0);
     cold_point!(cold_w20_b1, 20, 1);
     cold_point!(cold_w20_b2, 20, 2);
+    // **Width 32 needs a card this lineage's dev machines do not have.** Thirty
+    // recurrent layers holding a `32 × 128 × 128` F32 state per sequence, doubled
+    // for the live/backup ping-pong, is ~120 MiB per session and compression
+    // cannot touch it — so 32 sessions is ~3.8 GiB of DeltaNet state before any
+    // KV, and admission refuses on the 16 GB and 24 GB boxes. They are kept, and
+    // `#[ignore]`d like every other point here, because they are the instrument
+    // for the 72 GB Blackwell: the answer they carry is whether the turn at 16
+    // is the card or the design, and only a bigger card can say.
     cold_point!(cold_w32_b0, 32, 0);
     cold_point!(cold_w32_b1, 32, 1);
     cold_point!(cold_w32_b2, 32, 2);
@@ -749,7 +740,6 @@ pub(crate) mod tests {
             use_batched: true,
             num_contexts: 10,
             num_repeats: 1,
-            generate_max_len: 256,
             test_mode: Some(TestMode::StoryRewrite),
         };
         params.run(vec![one.clone(), one.clone(), one], &load)
@@ -778,7 +768,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: n,
                 num_repeats: 1,
-                generate_max_len: 256,
                 test_mode: Some(TestMode::StoryRewrite),
             })
             .collect();
@@ -800,7 +789,17 @@ pub(crate) mod tests {
                 .with_suppress_thinking(true)
                 .with_timeout_secs(3600);
             params = params.with_speculative(draft).with_int8mode(int8mode);
-            params.run(configs.clone(), &load)?;
+            // Same guard the cold points carry, for the same reason and with
+            // more at stake: this is the sweep the production bracket is read
+            // from, so a checkpoint that has quietly lost its NextN head would
+            // report every budget as 1.00× here and read as "speculation stopped
+            // paying" rather than "the drafter is missing".
+            let checked = || {
+                let m = load()?;
+                assert_drafter(&m, draft)?;
+                Ok(m)
+            };
+            params.run(configs.clone(), checked)?;
         }
         Ok(())
     }
@@ -895,7 +894,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -903,7 +901,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // Several sequences at once: the recurrent mixer runs per span and
@@ -914,7 +911,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // ── Quantized KV — the same ladder the 0.8B gate runs, on the
@@ -926,7 +922,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -934,7 +929,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -942,7 +936,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -950,7 +943,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -958,7 +950,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -966,7 +957,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -974,7 +964,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -982,7 +971,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -990,7 +978,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C8 runs wide (20 contexts) — deepest production-comfortable
@@ -1001,7 +988,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 20,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1009,7 +995,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C10×10 is the top rung and the calibration target:
@@ -1022,7 +1007,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
         ];

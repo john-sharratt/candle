@@ -182,6 +182,27 @@ impl DraftLadder {
 /// Qwen3-30B-A3B is absent from this table because it cannot speculate at all —
 /// no NextN tensors in any conversion, so it takes the trait default of zero and
 /// has no ladder to carry.
+/// # Measured on two checkpoints, applied to four
+///
+/// The bracket comes from cold points on Qwen3.5-9B (1.53× at 10, 1.05× at 16,
+/// 0.39× at 20) and Qwen3.6-35B-A3B (1.91× at 4, 1.48× at 10, 1.10× at 16).
+/// Widths 17–19 are unmeasured, and `QWEN35_35B_A3B_DRAFT` and
+/// `QWEN38_27B_DRAFT` have no points of their own — they inherit this row on the
+/// argument that the lineage shares a decode loop, which is a hypothesis rather
+/// than a measurement.
+///
+/// The asymmetry is what makes that worth stating: a bracket set a little short
+/// costs the 5–10% still on the table just before the turn, while one set a
+/// little long costs the 0.39× just after it — about 2.5×. So when a checkpoint
+/// here is measured for the first time and disagrees, give it its own row rather
+/// than moving this one, and expect the correction to be *inward*.
+///
+/// # Changing it re-opens a KV calibration in another crate
+///
+/// `candle_nn`'s `QWEN35_MOE_KV_FACTORS` was tuned against C10 rungs at ×8 and
+/// ×16 that speculate *because* this bracket reaches 16. Pulling it in below
+/// that turns those rungs into plain decode and moves the marginal session, so
+/// the KV gate goes red for a reason that lives here.
 const LINEAGE_START: &[(usize, usize)] = &[(16, 2)];
 
 /// Qwen3.5-9B (dense). Has a NextN head.

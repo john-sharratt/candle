@@ -80,7 +80,6 @@ pub struct TestConfig {
     pub use_batched: bool,
     pub num_contexts: usize,
     pub num_repeats: usize,
-    pub generate_max_len: usize,
     /// Override the global `TestParams::test_mode` for this specific config.
     /// `None` means use the global mode.
     pub test_mode: Option<TestMode>,
@@ -1704,7 +1703,7 @@ impl TestParams {
                 // `expected` field contains the FULL original prompt (~2 300
                 // chars) with "Marcus" replaced by the session's assigned
                 // name.  The model only generates ~40-50 chars (controlled
-                // by `generate_max_len`), so the output is always much
+                // by `generate_token_count`), so the output is always much
                 // shorter than `expected`.
                 //
                 // Two normalisation steps are applied before comparison:

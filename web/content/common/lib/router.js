@@ -67,11 +67,18 @@ export function start(host, onRoute) {
     const p = path();
     const hit = match(p);
     if (!hit) {
-      outlet.replaceChildren(Object.assign(document.createElement('div'), {
+      // `p` is `location.hash`, so it is whatever a link says it is. Written as
+      // text rather than interpolated into the markup: a crafted `#/<img src=x
+      // onerror=...>` would otherwise execute in this origin, where the session
+      // cookie lives, and the 404 page is the one page guaranteed to be
+      // reachable with an arbitrary path.
+      const page = Object.assign(document.createElement('div'), {
         className: 'page',
         innerHTML: `<div class="empty"><div class="big">404</div>
-          <div>No page at <code class="mono">${p}</code></div></div>`,
-      }));
+          <div>No page at <code class="mono"></code></div></div>`,
+      });
+      page.querySelector('code').textContent = p;
+      outlet.replaceChildren(page);
       if (onRoute) onRoute(null, {});
       return;
     }
@@ -94,8 +101,11 @@ export function start(host, onRoute) {
       box.className = 'page-error';
       const msg = (err && (err.stack || err.message)) || String(err);
       box.innerHTML = '<h3 style="color:var(--crit);margin:0">This page failed to render</h3>'
-        + '<div class="tiny dim" style="margin-top:6px">' + p + '</div>'
+        + '<div class="tiny dim" style="margin-top:6px"></div>'
         + '<pre></pre>';
+      // Both dynamic values as text, for the reason the 404 branch gives: `p`
+      // is the hash, and a page that throws is a state an attacker can steer.
+      box.querySelector('.tiny').textContent = p;
       box.querySelector('pre').textContent = msg;
       outlet.replaceChildren(box);
       console.error('[npcd] page render failed:', p, err);

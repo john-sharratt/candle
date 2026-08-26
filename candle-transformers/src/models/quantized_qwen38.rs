@@ -113,7 +113,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -121,7 +120,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // ── Quantized KV — the lineage ladder. `QWEN38_KV_FACTORS` is
@@ -133,7 +131,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -141,7 +138,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -149,7 +145,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -157,7 +152,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -165,7 +159,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -173,7 +166,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -181,7 +173,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -189,7 +180,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -197,7 +187,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C8 runs wide (20 contexts) — deepest production-comfortable
@@ -208,7 +197,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 20,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -216,7 +204,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C10×10 is the top rung and the calibration target, matching
@@ -231,7 +218,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
         ];

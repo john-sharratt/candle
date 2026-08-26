@@ -83,8 +83,9 @@ fn cfg(yaml: &str) -> Config {
     Config::from_yaml(yaml, content_dir()).expect("test config is valid")
 }
 
-/// The API a daemon merges in. Two shapes worth exercising: a plain JSON GET,
-/// and a POST, so the method and body actually reach the router.
+/// The API a daemon merges in. Three shapes worth exercising: a plain JSON GET,
+/// a POST so the method and body actually reach the router, and a route that
+/// reports the identity headers it was handed.
 fn fake_api() -> Router {
     Router::new()
         .route(
@@ -92,6 +93,63 @@ fn fake_api() -> Router {
             get(|| async { axum::Json(serde_json::json!({"state": "ready"})) }),
         )
         .route("/v1/echo", post(|body: String| async move { body }))
+        .route(
+            "/v1/saw-identity",
+            get(|headers: axum::http::HeaderMap| async move {
+                // Exactly what a daemon does with the documented contract: read
+                // the header and believe it.
+                let seen = |n: &str| {
+                    headers
+                        .get(n)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                axum::Json(serde_json::json!({
+                    "user": seen("x-tokera-user"),
+                    "email": seen("x-tokera-email"),
+                    "assertion": seen("x-tokera-assertion"),
+                }))
+            }),
+        )
+}
+
+/// A `GET` carrying caller-chosen headers, for the forgery test below.
+async fn get_with_headers(addr: SocketAddr, path: &str, extra: &[(&str, &str)]) -> Res {
+    use http_body_util::BodyExt;
+    use hyper::Request;
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut req = Request::builder()
+        .uri(path)
+        .header("host", "127.0.0.1")
+        .header("accept", "*/*");
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+    let res = sender
+        .send_request(req.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let content_type = res
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into();
+    Res {
+        status,
+        content_type,
+        body,
+    }
 }
 
 const AUTHORITATIVE: &str = r#"
@@ -105,6 +163,41 @@ sites:
 "#;
 
 // ── authoritative: content + in-process API ────────────────────────────────
+
+/// A client cannot assert an identity to an API merged into this process.
+///
+/// The equivalence this file exists to defend cuts both ways: an `upstream:
+/// local` route must be exactly as safe as a proxied one. It was not. The
+/// gateway stripped inbound `x-tokera-*` in `proxy::forward`, which a local
+/// route never reaches — so the daemon's router was called with the client's
+/// own headers, and a handler written against the documented contract believed
+/// `x-tokera-email: admin@tokera.com` from anyone. The identical code behind the
+/// proxy was safe, which is what made it invisible.
+#[tokio::test]
+async fn a_client_cannot_forge_identity_headers_into_a_local_api() {
+    let addr = spawn(
+        Builder::new(cfg(AUTHORITATIVE))
+            .local_api("npcd", fake_api())
+            .router(),
+    )
+    .await;
+
+    let r = get_with_headers(
+        addr,
+        "/v1/saw-identity",
+        &[
+            ("x-tokera-user", "root"),
+            ("x-tokera-email", "admin@tokera.com"),
+            ("x-tokera-assertion", "made-up"),
+        ],
+    )
+    .await;
+
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains(r#""user":"""#), "{}", r.body);
+    assert!(!r.body.contains("admin@tokera.com"), "{}", r.body);
+    assert!(!r.body.contains("made-up"), "{}", r.body);
+}
 
 #[tokio::test]
 async fn authoritative_serves_files_and_answers_its_own_api() {

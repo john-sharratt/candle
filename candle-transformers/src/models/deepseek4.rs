@@ -702,7 +702,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: n,
                 num_repeats: 1,
-                generate_max_len: 64,
                 test_mode: Some(TestMode::StoryRewrite),
             })
             .collect::<Vec<_>>();

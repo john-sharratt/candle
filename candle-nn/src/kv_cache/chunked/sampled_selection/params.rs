@@ -497,6 +497,17 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// so 2.5 sits under the edge with room rather than on it — the distinction the
 /// 2.3 → 2.0 note above was written about. Net against the row this replaces,
 /// **7.31x → 7.57x while gaining the ×16 rung it used to fail.**
+///
+/// # This row is coupled to the draft ladder, in another crate
+///
+/// The rungs it was derived on — C10 at ×8 and ×16 in `quantized_qwen35_moe` —
+/// run under `DraftBudget::Adaptive`, and both speculate only because
+/// `candle_transformers::models::draft_ladder`'s bracket reaches 16. Pull that
+/// bracket in and the ×16 rung silently reverts to plain decode, which changes
+/// the batched reduction order and moves the marginal C10 session. The symptom
+/// is a red KV gate caused by a speculation constant, with neither file naming
+/// the other — so re-verify this row after a ladder change, exactly as after an
+/// admission or width change.
 pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 1.2,
     k_low: 1.2,

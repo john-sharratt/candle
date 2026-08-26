@@ -60,7 +60,12 @@ const HOP_BY_HOP: [header::HeaderName; 7] = [
 /// headers is sound. A daemon that would rather verify than trust can check
 /// `X-Tokera-Assertion` — the signed session token itself — against the same
 /// key the gateway signs with.
-const IDENTITY_HEADERS: [&str; 5] = [
+/// The headers this gateway uses to tell a daemon who the caller is.
+///
+/// Cleared from every inbound request on ingress (`server::dispatch`) — a client
+/// that sets one is claiming to be someone — and set again here only from an
+/// identity this gateway itself resolved.
+pub(crate) const IDENTITY_HEADERS: [&str; 5] = [
     "x-tokera-user",
     "x-tokera-email",
     "x-tokera-name",
@@ -79,6 +84,14 @@ pub struct Forward<'a> {
     pub identity: Option<&'a crate::auth::Identity>,
     /// The signed session token, for a daemon that verifies rather than trusts.
     pub assertion: Option<&'a str>,
+    /// Whether the public entrance to this gateway is https, for
+    /// `X-Forwarded-Proto`.
+    ///
+    /// From the deployment's own configuration, never from the request: an
+    /// inbound `X-Forwarded-Proto` is only trustworthy when something trusted
+    /// set it, and this gateway cannot tell that from a client that simply says
+    /// so.
+    pub secure: bool,
 }
 
 pub async fn forward(f: Forward<'_>, req: Request) -> Response {
@@ -169,9 +182,15 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
     {
         headers.insert(header::HeaderName::from_static("x-forwarded-host"), v);
     }
+    // The scheme the *client* used, which on a TLS deployment is not the scheme
+    // of this hop. Hardcoding `http` told every daemon behind the gateway that
+    // the connection was insecure, so any of them setting cookie `Secure` flags,
+    // building absolute redirect or callback URLs, or enforcing HSTS from this
+    // header did the wrong thing on the production https site — with no config
+    // available to correct it.
     headers.insert(
         header::HeaderName::from_static("x-forwarded-proto"),
-        HeaderValue::from_static("http"),
+        HeaderValue::from_static(if f.secure { "https" } else { "http" }),
     );
     if let Some(v) = f
         .peer

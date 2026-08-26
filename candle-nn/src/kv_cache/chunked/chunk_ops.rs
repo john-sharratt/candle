@@ -2806,7 +2806,8 @@ mod tests {
     /// which then poisons the context for every test scheduled after it, so the
     /// reported failure is rarely the guilty one.
     #[cfg(feature = "cuda")]
-    fn cuda_device_or_skip() -> Option<(Device, std::sync::MutexGuard<'static, ()>)> {
+    fn cuda_device_or_skip() -> Option<(Device, crate::kv_cache::chunked::gpu_test_lock::GpuGuard)>
+    {
         let guard = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
         match Device::cuda_if_available(0) {
             Ok(d @ Device::Cuda(_)) => Some((d, guard)),

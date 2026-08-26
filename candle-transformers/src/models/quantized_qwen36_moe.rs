@@ -123,7 +123,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -131,7 +130,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // ── Quantized KV — the lineage ladder, with the streaming expert
@@ -142,7 +140,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -150,7 +147,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -158,7 +154,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -166,7 +161,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -174,7 +168,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -182,7 +175,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -190,7 +182,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -198,7 +189,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -206,7 +196,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C8 runs wider than the single-context rungs — the deepest rung
@@ -217,7 +206,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -225,7 +213,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
         ];
@@ -237,16 +224,29 @@ mod tests {
         // C10 row means the thresholds drifted past it — retighten the factor
         // row rather than widening tolerances.
         //
-        // Run at **8 and 16** rather than one middling width. Both sit inside
-        // the draft ladder's bracket, so both speculate at full budget, and the
-        // pair shows the compression and the speculation compounding as the
-        // cohort grows — which is the number this engine is actually for.
+        // **That row has not been re-derived since this rung moved.** It was
+        // calibrated when C10 ran at ×10; the widths below are ×8 and ×16, and
+        // the 3.5 sibling needed a retune (K 1.5→1.2, V 2.0→2.5) for exactly
+        // that widening, because ×16 lost a session under the old row. If a C10
+        // row here goes red, that is the first thing to suspect, and the fix is
+        // the factor row rather than this gate.
+        //
+        // Run at **8 and 16** rather than one middling width: the pair shows the
+        // top rung holding as the cohort grows, which is where a threshold row
+        // tuned at one width quietly stops covering the next.
+        //
+        // Both sit inside the draft ladder's bracket, so both decode
+        // speculatively — but this gate generates ten tokens, which at budget 2
+        // is about four drafted steps a session. That is enough for the accept
+        // path to be *exercised* and nowhere near enough to measure what it
+        // yields; the throughput answer comes from `cold_speculative_point` at
+        // 256 tokens, one width per process. Read these rows as compression
+        // correctness under speculation, not as a speed-up.
         configs.extend([8usize, 16].map(|n| TestConfig {
             mode: InferenceMode::C10,
             use_batched: true,
             num_contexts: n,
             num_repeats: 1,
-            generate_max_len: 40,
             test_mode: Some(TestMode::StoryRewrite),
         }));
 
@@ -271,7 +271,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: n,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             }));
         }
