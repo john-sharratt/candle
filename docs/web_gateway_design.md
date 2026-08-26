@@ -29,11 +29,19 @@ deploying it behind the gateway are the same build.
                          ┌──────────────────────────────┐
    tokera.com     ──────▶│                              │
    battlecities.net      │   web  (DMZ)                 │
-                         │   • tokera.com, rendered      │
-   bot.tokera.com ──────▶│   • console files for both    │──▶ 192.168.0.6:8081  npcd
-   code.tokera.com ─────▶│   • sign-in for the estate    │──▶ 192.168.0.5:8081  zend
+                         │   • tokera.com, rendered     │
+   bot.tokera.com ──────▶│   • sign-in for the estate   │──▶ 192.168.0.6:8081  npcd
+   code.tokera.com ─────▶│   • everything else: proxy   │──▶ 192.168.0.5:8081  zend
                          └──────────────────────────────┘
 ```
+
+The gateway renders tokera.com and owns `/auth/*` for every hostname. It serves
+files for **tokera.com only** — `npcd` and `zend` are proxied whole, console
+included, because a daemon's console and its API are one program and shipping
+them from two boxes means shipping two versions of it. That was not a
+hypothetical: while the gateway held npcd's console, it twice served one built
+against an API the daemon no longer had, and both times it read as a fault in
+the daemon.
 
 The daemons listen on private addresses. That is not incidental — it is the
 trust boundary §5 depends on.
@@ -187,10 +195,24 @@ They read the identity the gateway states, on `X-Tokera-User` / `-Email` /
 request** before setting its own: anything a client sent under those names is a
 forgery attempt by construction, since only the gateway may set them.
 
-That is sound exactly as far as the daemons are unreachable except through the
-gateway, which is why they listen on private addresses. A daemon that would
-rather verify than trust can check `X-Tokera-Assertion` — the signed session
-token itself — against the same key the gateway signs with.
+The strip runs on ingress in `web` itself, so it protects a daemon that embeds
+its API as `upstream: local` just as well as a proxied one — those two dispatch
+paths used to disagree, and the local one handed the router the client's own
+headers. A daemon opts back in with `Builder::behind_gateway`, which is the
+assertion *this bind address is reachable through the gateway and nothing else*.
+Nothing can verify that claim, so it lives at one call site beside the bind, and
+`tests/roles.rs` pins both directions.
+
+That is sound exactly as far as the claim is true, which is why the daemons
+listen on private addresses.
+
+**There is deliberately no shared signing key.** An earlier design let a daemon
+verify `X-Tokera-Assertion` against the gateway's session key. Since that
+assertion *is* the session cookie, it gave every daemon a replayable 30-day
+token per user and the means to mint sessions for the whole estate — a verifying
+credential that doubles as a minting one, so a single compromised daemon became
+every hostname. Trusting a header from a peer that cannot be anyone else is the
+smaller claim, and it distributes no secret at all.
 
 This supersedes `npc_api_gui_design.md` §8.1's per-daemon OAuth: `npcd` does not
 run its own dance, and its `/v1/me` reports the identity it was handed.
@@ -287,9 +309,9 @@ web/
 
 ## 8. Open
 
-- **zend is still a pure gateway.** It embeds and serves its own assets, so it
-  has no `roots` here and no mock. Splitting its console the same way as npcd's
-  is `roots: ["content/zend", "content/common"]` plus deleting the embedded copy.
+- **zend has no mock.** `npcd` and `zend` are both proxied whole now, so their
+  deployment shape is the same; what zend still lacks is a fixture daemon, which
+  is why `--authoritative` cannot stand in for it and says so at startup.
 - **battlecities.net lands on tokera.com** until it has a page of its own.
 - **`cache_control` is `no-store`** while iterating. It wants a real max-age once
   assets are content-hashed.

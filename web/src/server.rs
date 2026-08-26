@@ -41,6 +41,14 @@ struct App {
     /// Sign-in, if this deployment has any. Shared by every site: one account
     /// across the estate is the whole point of the gateway owning it.
     auth: Option<Arc<Auth>>,
+    /// Whether a trusted gateway is the only thing that can reach this server.
+    ///
+    /// Set by [`Builder::behind_gateway`], and the difference between reading
+    /// the inbound `x-tokera-*` headers and clearing them. Declared rather than
+    /// inferred: "has no `auth:` block" would look like the same thing and is
+    /// not — an authoritative instance without sign-in is still an entrance a
+    /// client can reach, and would then believe whatever it was told.
+    behind_gateway: bool,
     /// Per-site content roots, keyed by site name.
     roots: Arc<HashMap<String, Roots>>,
     /// Per-site in-process APIs, for routes whose upstream is `local`.
@@ -58,6 +66,7 @@ pub struct Builder {
     roots: HashMap<String, Roots>,
     local: HashMap<String, Router>,
     auth: Option<Arc<Auth>>,
+    behind_gateway: bool,
 }
 
 impl Builder {
@@ -74,6 +83,7 @@ impl Builder {
             roots,
             local: HashMap::new(),
             auth: None,
+            behind_gateway: false,
         };
 
         // Sites this crate is itself the backend for — tokera.com is documents,
@@ -119,6 +129,25 @@ impl Builder {
         self.cfg.sites.iter().map(|s| s.name.as_str())
     }
 
+    /// Declare that a trusted gateway is the only way to reach this server, so
+    /// the identity it forwards on `x-tokera-*` may be believed.
+    ///
+    /// This is how a daemon behind the gateway learns who is calling. Identity
+    /// crosses a process boundary as headers and an in-process boundary as a
+    /// request extension; a daemon on another box only ever gets the former, so
+    /// a server that clears them can never identify anybody. Without this call
+    /// they are cleared on ingress, because a client that sets one is claiming
+    /// to be someone.
+    ///
+    /// **It is an assertion about the network, and nothing here can check it.**
+    /// Call it only where the bind address is unreachable except through the
+    /// gateway — a private interface, a container network, a loopback tunnel.
+    /// On a public bind it hands anyone the right to be anyone.
+    pub fn behind_gateway(mut self) -> Self {
+        self.behind_gateway = true;
+        self
+    }
+
     /// The API answering this site's routes whose upstream is `local`.
     pub fn local_api(mut self, site: &str, router: Router) -> Self {
         self.local.insert(site.to_string(), router);
@@ -155,6 +184,7 @@ impl Builder {
             client,
             health,
             auth: self.auth,
+            behind_gateway: self.behind_gateway,
             roots: Arc::new(self.roots),
             local: Arc::new(self.local),
         };
@@ -250,8 +280,17 @@ async fn handle(
     // dispatch paths from disagreeing again the next time one is added. The
     // strip in `proxy::forward` stays: it is on the other side of a `.await`
     // from here, and cheap.
-    for name in proxy::IDENTITY_HEADERS {
-        req.headers_mut().remove(name);
+    //
+    // The exception is a server that declared [`Builder::behind_gateway`]: it
+    // is not an entrance, and these headers are the only identity it will ever
+    // receive, because identity crossed a network hop to reach it. Stripping
+    // there would make the header contract unimplementable rather than safe.
+    // Declared, never inferred — "has no `auth:` block" is not evidence of it,
+    // and an authoritative instance without sign-in is still an entrance.
+    if !app.behind_gateway {
+        for name in proxy::IDENTITY_HEADERS {
+            req.headers_mut().remove(name);
+        }
     }
 
     // Resolve who this is once, before anything downstream can see the request.

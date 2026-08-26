@@ -79,15 +79,18 @@ The files live in their own crate, `web/` — the static host and API gateway fo
 estate, documented in **[`web_gateway_design.md`](web_gateway_design.md)**, which is
 authoritative for everything in this section. What matters here is what it means for `npcd`:
 
-- **The console is not this daemon's problem.** `npcd`'s router has no HTML in it. The gateway
-  either compiles the console into the binary or hosts it on the DMZ box and forwards `/v1` and
-  `/ws` here; `npcd` cannot tell which.
+- **The console is not this daemon's *router's* problem.** `npcd`'s API router has no HTML in it;
+  the console is files, served by the `web` server `npcd` embeds — compiled in, or from disk with
+  `--content <dir>`. Either way it is served from the same box and the same checkout as the API,
+  which is the point: they are one program and must deploy as one.
 - **`npcd` does not authenticate anyone** — see §8.1. The gateway owns sign-in for
   tokera.com, code.tokera.com and bot.tokera.com, and states the identity on `X-Tokera-*`
   headers it strips from every inbound request first.
 - **bot.tokera.com** is the console's production hostname.
-- **`web --authoritative`** runs the console against `web::mock::npcd` with no daemon at all —
-  the second of the two mock depths described in §41.
+- **Running the console with no engine** is `npcd` itself: it layers its real routes over
+  `web::mock::npcd`, so every surface that is not yet built still answers. That is the second of
+  the two mock depths described in §41. `web --authoritative` cannot stand in for this site — the
+  gateway holds no npcd files to serve, and the mock answers `/v1`, not `/app.js`.
 
 The rest of this section is the part of that design a reader of *this* document needs.
 
@@ -109,13 +112,22 @@ sites:
     default: true                              # every unmatched Host lands here
     roots: ["content/tokera", "content/common"]
 
-  - name: npcd
+  - name: npcd                                 # no roots: a pure gateway
     hosts: ["bot.tokera.com", "npcd.localhost", "*.npcd.dev"]
-    roots: ["content/npcd", "content/common"]  # searched in order
     api:
-      - {prefix: /v1, upstream: "http://192.168.0.6:8081"}
-      - {prefix: /ws, upstream: "http://192.168.0.6:8081"}
+      - {prefix: /, upstream: "http://192.168.0.6:8081"}
 ```
+
+**`npcd` forwards whole, console included, and that is a correction.** The gateway used to serve
+the console from the DMZ box's checkout while forwarding only `/v1` and `/ws` — which made one
+program two deployments. A console edit needed a commit on the daemon box and a pull on the
+gateway before anyone could see it, and in between the two disagreed silently: the console was
+twice found running against an API it did not match, presenting both times as a bug in the
+daemon. Forwarding `/` costs a LAN hop per asset and ties the console's availability to the
+daemon's; it buys one source of truth and an edit that is live on a refresh.
+
+`/auth/*` is unaffected. Those routes are registered ahead of site routing precisely so a site
+proxying `/` cannot swallow them — sign-in stays the gateway's, for every hostname.
 
 `npcd.localhost` resolves to `127.0.0.1` in every current browser, so reaching a specific site
 during local development needs no `hosts` file entry.
@@ -283,13 +295,28 @@ X-Tokera-User       the provider's stable subject id — the only field safe to 
 X-Tokera-Email      display only; an address can be reassigned
 X-Tokera-Name
 X-Tokera-Picture
-X-Tokera-Assertion  the signed session token, for verifying rather than trusting
 ```
 
-`GET /v1/me` reports that identity. `npcd` has no `/v1/auth/*` routes and no client secret; a
-request arriving with `X-Tokera-*` set by a client cannot reach it, because the gateway removes
-those headers from every inbound request before setting its own. That holds exactly as far as
-`npcd` is unreachable except through the gateway — which is why it binds a private address.
+`GET /v1/me` reports that identity. `npcd` has no `/v1/auth/*` routes, no client secret, and no
+key of any kind. A request arriving with `X-Tokera-*` set by a client cannot reach it, because
+`web` clears those names on ingress before anything is dispatched — on the gateway *and* inside
+`npcd` itself, which matters because `npcd` embeds its API as `upstream: local` and would
+otherwise be handed the client's own headers untouched.
+
+The one exception is declared, never inferred: `npcd` calls `web::Builder::behind_gateway`, which
+says *this bind address is reachable through the gateway and nothing else*, and only then are the
+inbound headers left alone for its router to read. Nothing in the code can check that claim — it
+is a statement about the network — so it lives at one greppable call site next to the bind, and
+`web/tests/roles.rs` pins both directions: forged headers refused without it, forwarded headers
+readable with it.
+
+> **Not a shared signing key.** An earlier design had `npcd` verify an `X-Tokera-Assertion`
+> against the gateway's session key. Since that assertion *is* the session cookie, it handed every
+> daemon both a replayable 30-day token for each user and the means to mint sessions valid across
+> the whole estate — a verifying credential that doubles as a minting credential, which is worse
+> than the header trust it was meant to replace. One compromised daemon would have been the entire
+> estate. Trusting a header from a peer that cannot be anyone else is the smaller claim, and it
+> needs no secret distributed to any machine.
 
 Two credential shapes, deliberately not one:
 
@@ -1868,10 +1895,14 @@ all navigate to the same URL, one of them naming a provider the gateway may not 
 — a menu whose choices do not reach the thing that chooses. Adding a provider is gateway
 configuration rather than a GUI change here.
 
-Sign-in can also be *unavailable*, which is not the same as being signed out: a deployment whose
-daemon holds no session key cannot authenticate anyone, and `/v1/me` answers `503
-auth_unconfigured` rather than `401` to say so. The page then states that instead of offering a
-button that cannot work. The rest of the landing page — including the live demo — is unaffected. First sign-in creates the account
+Sign-in can also be *unavailable*, which is not the same as being signed out: a deployment with no
+`auth:` block has no identity provider, so nobody can sign in at all. The gateway is the only
+authority on that — with `auth:` off it does not serve `/auth/login`, and the navigation would
+land on site routing and come back as `index.html`, reading to the visitor as a button that does
+nothing. `/auth/me` reports `configured: false`, which the console asks before offering the
+control. The rest of the landing page — including the live demo — is unaffected.
+
+First sign-in creates the account
 with no separate registration step. On return, the user lands on the page they originally asked
 for — `next` carries it through the round trip, and is refused unless it points inside this
 estate, since an unchecked one is an open redirect.
