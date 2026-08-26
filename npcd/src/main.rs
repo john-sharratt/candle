@@ -18,6 +18,11 @@ use clap::Parser;
 use include_dir::{include_dir, Dir};
 use web::{Builder, Config, Roots};
 
+mod accounts;
+mod api;
+mod identity;
+mod registry;
+
 /// The console, compiled in. Two directories, searched in order: a request for
 /// `/lib/dom.js` falls through to the shared framework, `/pages/roster.js` does
 /// not. Same layering as the on-disk roots the proxy uses.
@@ -37,6 +42,22 @@ struct Cli {
     /// `web/content/npcd`; the shared root is added after it automatically.
     #[arg(long)]
     content: Option<PathBuf>,
+
+    /// Where authored content lives — `worlds/` and `archetypes/`, read once at
+    /// start and written back when the GUI saves. Defaults to the `npcd`
+    /// directory in the source tree, which is what makes a world edit a commit.
+    #[arg(long)]
+    data: Option<PathBuf>,
+
+    /// The estate's shared session signing key — the same file the gateway
+    /// signs with, which is what makes one sign-in carry across tokera.com,
+    /// code. and bot. Defaults to `secrets/session.key` under `--data`.
+    ///
+    /// Without it this daemon authenticates nobody. That is deliberate: it
+    /// binds a LAN address, so treating an unconfigured key as "trust whatever
+    /// arrives" would turn a missing file into an open door.
+    #[arg(long)]
+    session_key: Option<PathBuf>,
 
     /// Increase log verbosity (-v debug, -vv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -83,10 +104,59 @@ async fn main() -> anyhow::Result<()> {
         None => Roots::embedded(&[&SITE, &COMMON]),
     };
 
-    tracing::info!("backend: MOCK (no engine, no GPU)");
+    // Authored content, read once. Everything after this answers from memory,
+    // so a URL id is a key rather than a path — see `registry`.
+    let data = cli
+        .data
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let worlds = registry::Registry::load("world", data.join("worlds"))?;
+    let archetypes = registry::Registry::load("archetype", data.join("archetypes"))?;
+    tracing::info!(
+        "authored content: {} worlds, {} archetypes from {}",
+        worlds.len(),
+        archetypes.len(),
+        data.display()
+    );
+
+    // Accounts are durable but never published — `npcd/.gitignore` keeps the
+    // directory out of a public repository, because a record here carries a
+    // real email address and a provider subject id.
+    let accounts = accounts::Accounts::load(data.join("accounts"))?;
+
+    let key_path = cli
+        .session_key
+        .unwrap_or_else(|| data.join("secrets").join("session.key"));
+    let verifier = if key_path.exists() {
+        let v = identity::Verifier::from_file(&key_path)?;
+        tracing::info!("sign-in: verifying assertions with {}", key_path.display());
+        v
+    } else {
+        tracing::warn!(
+            "sign-in: no key at {} — NOBODY will be authenticated. Copy the \
+             gateway's session key there to enable sign-in.",
+            key_path.display()
+        );
+        identity::Verifier::unconfigured()
+    };
+
+    tracing::info!(
+        "accounts: {} known, from {}",
+        accounts.len(),
+        data.join("accounts").display()
+    );
+    tracing::info!("backend: MOCK for everything except authored content and accounts");
+
+    // The real routes sit *over* the mock rather than beside it: `npcd` owns
+    // `/v1/world*`, `/v1/archetype*` and `/v1/me*`, and anything it does not
+    // answer falls through. Merging the two would panic on the overlap;
+    // layering means each surface can become real one route at a time without
+    // the console noticing.
+    let authored = api::Authored::new(worlds, archetypes, accounts, verifier);
+    let router = api::router(authored).fallback_service(web::mock::npcd::router());
+
     Builder::new(cfg)
         .content("npcd", roots)
-        .local_api("npcd", web::mock::npcd::router())
+        .local_api("npcd", router)
         .serve()
         .await
 }

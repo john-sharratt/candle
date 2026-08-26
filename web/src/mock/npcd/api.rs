@@ -30,11 +30,11 @@ pub fn router() -> Router {
         // status / telemetry
         .route("/v1/status", get(|| async { Json(data::status()) }))
         .route("/v1/telemetry", get(|| async { Json(data::telemetry()) }))
-        // auth
-        .route("/v1/auth/providers", get(providers))
+        // Identity only. Signing in and out are the gateway's `/auth/*`, which
+        // is served ahead of site routing on every hostname, so `npcd` has no
+        // `/v1/auth/*` of its own and this mock must not invent one.
         .route("/v1/me", get(|| async { Json(data::user()) }))
         .route("/v1/me/profile", get(profile).put(put_profile))
-        .route("/v1/auth/logout", post(|| async { StatusCode::NO_CONTENT }))
         // npcs
         .route("/v1/npc", get(list_npcs).post(create_npc))
         .route("/v1/npc/:id", get(get_npc).patch(patch_npc))
@@ -123,13 +123,6 @@ fn not_found(code: &str, detail: &str) -> Response {
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
-
-async fn providers() -> impl IntoResponse {
-    Json(json!({ "providers": [
-        { "id": "google", "display": "Google", "icon": "google" },
-        { "id": "github", "display": "GitHub", "icon": "github" }
-    ]}))
-}
 
 async fn profile() -> impl IntoResponse {
     Json(data::user()["profile"].clone())

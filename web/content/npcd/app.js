@@ -94,7 +94,13 @@ function renderChrome() {
       }, h('span', {
         style: 'width:20px;height:20px;border-radius:50%;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-size:.66rem;font-weight:800',
       }, (ME.unique_name || '?')[0]), ME.unique_name)
-      : h('a', { class: 'btn sm primary', href: '#/welcome' }, 'Sign in'));
+      /* Straight to the provider, not to `#/welcome` — a link to the page you
+       * are already on is a control that visibly does nothing, and the welcome
+       * page is where this button is most likely to be pressed. When sign-in is
+       * unconfigured there is nowhere to send anyone, so it says so instead. */
+      : AUTH_UNAVAILABLE
+        ? h('span', { class: 'tiny dim', title: 'This deployment has no sign-in configured' }, 'sign-in off')
+        : h('button', { class: 'btn sm primary', onClick: () => window.__npcdSignIn() }, 'Sign in'));
   const old = document.querySelector('.menu');
   if (old) old.remove();
   const m = themeMenu();
@@ -180,14 +186,45 @@ function syncRailButton() {
 
 // ── boot ────────────────────────────────────────────────────────────────────
 
-/* There is no real auth yet, so `/v1/me` always answers. A local flag lets the
- * signed-out half of the product — the landing page, the provider list — be
- * reached and exercised. It disappears the day OAuth lands. */
-const signedOut = () => { try { return localStorage.getItem('npcd.signedout') === '1'; } catch (_) { return false; } };
-export const setSignedOut = (v) => {
-  try { v ? localStorage.setItem('npcd.signedout', '1') : localStorage.removeItem('npcd.signedout'); } catch (_) {}
+/* Sign-in is real. `/v1/me` answers only for a caller whose session assertion
+ * the daemon could verify against the estate's shared key, so being signed in
+ * is not something this page can decide — it is something it discovers.
+ *
+ * The gateway owns the flow. `/auth/login` is served on every hostname ahead of
+ * site routing, and the cookie it issues is on `.tokera.com`, which is what
+ * makes one sign-in carry to code. and bot. without either daemon taking part.
+ * So signing in is a navigation, not a fetch. */
+const here = () => location.pathname + location.search + location.hash;
+window.__npcdSignIn = () => {
+  location.href = '/auth/login?next=' + encodeURIComponent(here());
 };
-window.__npcdSignIn = () => { setSignedOut(false); location.hash = '#/'; location.reload(); };
+window.__npcdSignOut = () => {
+  location.href = '/auth/logout?next=' + encodeURIComponent('/#/welcome');
+};
+
+/* Distinct from being signed out, and the difference decides whether to offer a
+ * sign-in control at all: a button that cannot work is worse than none.
+ *
+ * It takes BOTH ends to answer, because either can be the one that is missing.
+ * The daemon reports whether it holds the shared key — without it no assertion
+ * can be verified, so nobody can be signed in here. The gateway reports whether
+ * it has an identity provider configured, and it is the authority on that: with
+ * `auth:` off it does not serve `/auth/login` at all, so the navigation lands on
+ * site routing, gets `index.html` back, and reads to the visitor as a button
+ * that does nothing. Asking only the daemon would miss exactly that case. */
+export let AUTH_UNAVAILABLE = false;
+
+async function gatewayHasSignIn() {
+  try {
+    const r = await fetch('/auth/me', { credentials: 'same-origin' });
+    if (!r.ok) return false;
+    return (await r.json()).configured !== false;
+  } catch (_) {
+    // Unreachable gateway. Not a claim that sign-in is broken forever, but it
+    // is a claim that this page cannot start a sign-in right now.
+    return false;
+  }
+}
 
 async function boot() {
   document.documentElement.setAttribute('data-theme', readTheme());
@@ -205,8 +242,18 @@ async function boot() {
     await new Promise((r) => setTimeout(r, 400));
   }
 
-  if (signedOut()) ME = null;
-  else { try { ME = await API.getMe(); } catch (_) { ME = null; } }
+  /* 401 means signed out. 503 `auth_unconfigured` means this deployment has no
+   * session key at all — the operator's problem, not the visitor's, and worth
+   * telling them apart rather than showing a dead button. */
+  try {
+    ME = await API.getMe();
+  } catch (e) {
+    ME = null;
+    if (e && e.error === 'auth_unconfigured') AUTH_UNAVAILABLE = true;
+  }
+  // Only worth asking the gateway when nobody is signed in: a live session is
+  // itself proof that both ends are configured.
+  if (!ME && !AUTH_UNAVAILABLE && !(await gatewayHasSignIn())) AUTH_UNAVAILABLE = true;
 
   const bootEl = document.getElementById('boot');
   if (bootEl) bootEl.remove();

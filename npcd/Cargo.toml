@@ -17,6 +17,21 @@ path = "src/main.rs"
 anyhow     = { workspace = true }
 clap       = { workspace = true }
 tracing    = { workspace = true }
+# Authored worlds and archetypes are YAML on disk and JSON on the wire. They are
+# carried as `serde_json::Value` rather than typed structs so a field the daemon
+# does not understand yet survives a load/save round trip instead of being
+# dropped — the schema is still moving and an author's work must outlive it.
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+# Same axum the `web` crate builds its router from — the two are layered
+# together at startup, so they must be the same version or the `Router` types
+# do not unify.
+axum       = { version = "0.7", features = ["macros"] }
+# Hashing a provider's subject id into a file name that is valid whatever shape
+# the provider chose. Not a security boundary — the subject inside the file is
+# authoritative — but it has to be total over every possible input.
+sha2       = "0.10"
+
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio      = { version = "1", features = ["full"] }
 include_dir = { version = "0.7" }
@@ -25,3 +40,12 @@ include_dir = { version = "0.7" }
 # does host routing, static serving, and — in the DMZ deployment of the very
 # same crate — proxying. One binary either way.
 web = { path = "../web" }
+
+[dev-dependencies]
+# For forging a token in the identity tests — proving a tampered payload is
+# rejected requires assembling one by hand.
+base64 = { workspace = true }
+# Driving the router directly in the integration tests: the auth wiring is the
+# part worth proving over HTTP rather than over function calls, and `oneshot`
+# does it without binding a port.
+tower = { version = "0.5" }
