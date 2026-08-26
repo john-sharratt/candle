@@ -1770,7 +1770,6 @@ mod tests {
                 use_batched: false,
                 num_contexts: 1,
                 num_repeats: 4,
-                generate_max_len: 40,
                 test_mode: None,
             },
             TestConfig {
@@ -1778,7 +1777,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 4,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1789,7 +1787,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // R16: Raw F16 with Q-capture space — lossless F16, should match F16 quality.
@@ -1798,7 +1795,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1806,7 +1802,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1814,7 +1809,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             /*
@@ -1823,7 +1817,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::NameGreeting),
             },
             // Composite tests
@@ -1832,7 +1825,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1840,7 +1832,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1848,7 +1839,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1856,7 +1846,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::NameGreeting),
             },
             TestConfig {
@@ -1864,7 +1853,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::NameGreeting),
             },
             TestConfig {
@@ -1872,7 +1860,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::NameGreeting),
             },
             */
@@ -1881,7 +1868,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 4,
-                generate_max_len: 40,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -1890,7 +1876,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 40,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: None,
             },
             TestConfig {
@@ -1898,7 +1883,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: None,
             },
             TestConfig {
@@ -1906,7 +1890,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: None,
             },
             // Q8_1K_Q4_0V: independent K/V formats — Q8_1 for K cache, Q4_1 for V cache.
@@ -1916,7 +1899,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::CoherenceCheck),
             },
             // Q4_0 uses NameGreeting validation: 4-bit quantization error accumulates over
@@ -1928,7 +1910,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::NameGreeting),
             },
             TestConfig {
@@ -1936,7 +1917,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::NameGreeting),
             },
             // Q4_KS uses CoherenceCheck: 4-bit with attention-sink sub-block scaling
@@ -1948,7 +1928,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::Skip),
             },
             // ──────── Adaptive C-levels (v2 candidate-list design) ────────
@@ -1967,7 +1946,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C1: K=[F16,Q8_0] V=[BF16,Q8_0,Q4_0] — ~1.53× CR, 47dB
@@ -1979,7 +1957,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 4,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C2: K=[F16,Q8_0,Q4_0] V=[BF16,Q8_0,Q4_0] — ~1.67× CR, 44dB
@@ -1991,7 +1968,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 4,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C3: K=[Q8_0,Q4_0] V=[Q8_0,Q4_0] — ~2.11× CR, 36dB (floor raised)
@@ -2003,7 +1979,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C4: K=[Q8_0,Q4_0] V=[Q8_0,Q4_0,Q3_0] — ~2.51× CR, 26dB
@@ -2015,7 +1990,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C5: K=[Q8_0,Q4_0,Q3_0] V=[Q8_0,Q4_0,Q3_0] — ~2.84× CR, 23dB
@@ -2027,7 +2001,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C6: K=[Q8_0,Q4_0,Q3_0] V=[Q8_0,Q4_0,Q3_0,Q2_0] — ~3.15× CR, 19dB
@@ -2039,7 +2012,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C7: K=[Q4_0,Q3_0] V=[Q4_0,Q3_0,Q2_0] — ~4.27× CR, 15dB
@@ -2051,7 +2023,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C8: K=[Q4_0,Q3_0,Q2_0] V=[Q4_0,Q3_0,Q2_0] — ~4.70× CR, 12dB
@@ -2060,7 +2031,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C9/C10 use CoherenceCheck: at ~4.3–5.6× CR (8dB) the exact-match
@@ -2074,7 +2044,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::CoherenceCheck),
             },
             // C10: K same as C9, V pushed further.
@@ -2083,7 +2052,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::CoherenceCheck),
             },
         ];
@@ -2202,7 +2170,6 @@ mod tests {
                 use_batched: false,
                 num_contexts: 1,
                 num_repeats: 2,
-                generate_max_len: 20,
                 test_mode: None,
             },
             // Batched F16 tests
@@ -2211,7 +2178,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 2,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -2219,7 +2185,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -2227,7 +2192,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 8,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             // Batched BF16 tests - scale up to maximum contexts
@@ -2236,7 +2200,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 2,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -2244,7 +2207,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 8,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -2252,7 +2214,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 16,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -2260,7 +2221,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 48,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -2268,7 +2228,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 32,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -2277,7 +2236,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 96,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -2285,7 +2243,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 32,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -2294,7 +2251,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 140,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
         ];

@@ -511,7 +511,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -519,7 +518,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // Several sequences at once: the recurrent mixer runs per span and
@@ -530,7 +528,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 16,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // ── Quantized KV — the same ladder the Qwen3 mid-size gates run.
@@ -543,7 +540,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -551,7 +547,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -559,7 +554,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -567,7 +561,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -575,7 +568,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -583,7 +575,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -591,7 +582,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -599,7 +589,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -607,7 +596,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C8 runs wide — 32 concurrent contexts — the deepest rung that
@@ -619,7 +607,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 32,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -627,7 +614,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C10×10 is the top rung and the calibration target:
@@ -641,7 +627,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
         ];
@@ -712,136 +697,201 @@ pub(crate) mod tests {
         )
     }
 
-    /// Derive `MTP_WIDTH_LADDER` for the lineage on the 9B — the width × budget
-    /// grid, at 256 tokens. See [`speculative_width_ladder`]. Not a pass/fail
-    /// gate: it reports the curve the ladder is set from, so it is run when the
-    /// ladder is being re-derived rather than on every sweep.
+    /// **Is a width ceiling about KV bytes, or about the session count?**
+    ///
+    /// Holding the width fixed while varying the generated length separates
+    /// them: total KV scales with `width × tokens`, while anything dimensioned
+    /// by session count — DeltaNet's per-sequence recurrent state, the transient
+    /// tier, admission — does not move at all.
+    ///
+    /// * Fast when short, slow when long → **KV capacity**.
+    /// * Flat across lengths → **session count**, and the search moves to what
+    ///   scales with it.
+    ///
+    /// It measured flat (242.6 / 257.1 / 262.8 tok/s at 64 / 128 / 256 tokens,
+    /// width 10), which is what pointed at DeltaNet: 30 recurrent layers each
+    /// holding a `32 × 128 × 128` F32 state per sequence, doubled for the
+    /// live/backup ping-pong, is 120 MiB per session and is untouched by KV
+    /// compression.
+    ///
+    /// **Each length is its own `params.run` and therefore its own model load**,
+    /// which is what makes this readable — see `cold_speculative_point` for why
+    /// that matters on this card.
+    ///
+    /// Budget 0 only. The question is about the baseline, and drafting would
+    /// just add rows to both arms.
     #[test]
-    #[ignore = "measurement sweep, not a gate: runs the 9B at five widths x three budgets \
-                (~15 runs of 256 tokens). Run with: cargo test --release --features cuda --lib \
-                -p candle-transformers quantized_qwen35::tests::width_ladder_9b \
-                -- --ignored --nocapture --test-threads=1"]
-    fn width_ladder_9b() -> Result<()> {
-        speculative_width_ladder(
-            "Qwen3.5-9B",
-            Int8Mode::Off,
-            &[1, 4, 8, 12, 20],
-            dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
-        )
-    }
-
-    /// **Is a middle rung ever the right answer?**
-    ///
-    /// The ladder assumes the budget should step down through 1 on its way to
-    /// 0, but a step pays for one draft pass and one verify wave whatever `k`
-    /// is — only the extra scored row scales with it. If that fixed cost
-    /// dominates, budget 1 buys ~1.5 tokens for close to what budget 2 pays for
-    /// ~2.25, and is never the best answer at any width: the ladder would
-    /// collapse to "full budget or none" and lose its middle bracket entirely.
-    ///
-    /// The evidence is currently contradictory. A hot sweep put budget 1 ahead
-    /// at width 8 (1.13x, against 0.50x for budget 2); the forwarding gate put
-    /// budget 1 *behind* budget 2 at width 10 (0.80x against 0.94x, both losing
-    /// to plain decode). Those cannot both be right, and a thermally throttled
-    /// tail is exactly the thing that inverts a row.
-    ///
-    /// Deliberately two widths, not a sweep. These are the only ones where the
-    /// two datasets disagree — 1 through 5 win at budget 2 on every instrument,
-    /// 20 loses on every instrument — so this is six generate runs over three
-    /// model loads rather than a grid, and short enough to finish before the
-    /// card's clocks start sagging.
-    #[test]
-    #[ignore = "targeted measurement: 2 widths x 3 budgets on the 9B, three model loads. \
+    #[ignore = "targeted measurement: width 10, three generated lengths, one model load. \
                 Run cold. cargo test --release --features cuda --lib -p candle-transformers \
-                quantized_qwen35::tests::middle_rung_9b -- --ignored --nocapture \
+                quantized_qwen35::tests::kv_or_width_9b -- --ignored --nocapture \
                 --test-threads=1"]
-    fn middle_rung_9b() -> Result<()> {
-        speculative_width_ladder(
-            "Qwen3.5-9B middle-rung",
-            Int8Mode::Off,
-            &[8, 10],
-            dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
-        )
+    fn kv_or_width_9b() -> Result<()> {
+        let load = dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off);
+        for tokens in [64usize, 128, 256] {
+            println!("\n=== Qwen3.5-9B: width 10, {tokens} generated tokens, plain decode ===\n");
+            let params = TestParams::new(tokens, &tokenizer_json()?, Dialect::qwen35())
+                .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+                .with_suppress_thinking(true)
+                .with_timeout_secs(3600)
+                .with_speculative(0)
+                .with_majority_pass_threshold(50)
+                .with_int8mode(Int8Mode::Off);
+            params.run(
+                vec![TestConfig {
+                    mode: InferenceMode::BF16,
+                    use_batched: true,
+                    num_contexts: 10,
+                    num_repeats: 1,
+                    test_mode: Some(TestMode::StoryRewrite),
+                }],
+                &load,
+            )?;
+        }
+        Ok(())
     }
 
-    /// **The width ladder, measured.** One run produces the whole
-    /// width × budget grid a model's `MTP_WIDTH_LADDER` is read off.
+    /// One width, one budget, one process — the only shape this machine can be
+    /// measured in.
     ///
-    /// Speculation's win is not a constant: a verify block's extra rows are
-    /// nearly free on a narrow wave and cost what they weigh on a wide one, and
-    /// where that turns over is a property of the checkpoint. This sweeps both
-    /// axes so the turnover is read rather than guessed — at each width, budget
-    /// 0 is that width's own baseline, so the ratios are within-run and immune to
-    /// this machine's run-to-run band.
+    /// A laptop card runs at full boost for the first tens of seconds of load
+    /// and settles to roughly half that afterwards (SM clock swings 450–2310 MHz
+    /// with the SW power cap asserting, at 67–77 °C — spent boost budget, not
+    /// thermal shutdown). Any gate that runs several configs against one loaded
+    /// model therefore measures *position in the run* as much as the variable it
+    /// varies: the same config measured 247 tok/s as the first config of a load
+    /// and 103 as the third, across four repetitions, with the KV region ledger
+    /// byte-identical between them.
     ///
-    /// 256 generated tokens, like the other speculative gates and for the same
-    /// reason: the forwarding gates generate ten, where a drafter's warm-up is a
-    /// large fraction of the measurement and the ratios wobble by more than the
-    /// effect being measured.
-    pub(crate) fn speculative_width_ladder<M>(
+    /// Every earlier "width curve" here was that artefact — width rose with
+    /// position, so boost depletion read as a cliff. One point per invocation is
+    /// what breaks the confound; the caller is responsible for letting the card
+    /// settle between them.
+    pub(crate) fn cold_speculative_point<M>(
         label: &str,
+        tokenizer: &str,
+        mode: InferenceMode,
+        width: usize,
+        budget: usize,
         int8mode: Int8Mode,
-        widths: &[usize],
         load: impl Fn() -> Result<M>,
     ) -> Result<()>
     where
         M: ManagedBatchedModel,
     {
-        // **Budget outer, widths inner** — one model load per budget instead of
-        // one per cell. The budget is a `TestParams` field and the width a
-        // `TestConfig`, so a width-major loop reloads the checkpoint for every
-        // point on the grid; this way a five-width sweep costs three loads
-        // rather than fifteen. On a laptop card the difference is not just
-        // wall-clock: it is fifteen model loads' worth of heat soaking into the
-        // measurement the sweep exists to take.
-        for draft in 0..=MTP_MAX_DRAFT {
-            {
-                println!("\n=== {label}: draft budget {draft}, widths {widths:?} ===\n");
-                let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
-                    .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
-                    .with_suppress_thinking(true)
-                    .with_timeout_secs(3600)
-                    .with_speculative(draft)
-                    // **A measurement, so it must reach the widths that matter.**
-                    // The fixture cannot validate a wide cohort at 100%: past
-                    // about eight sessions, batched reductions reassociate and a
-                    // near-tied argmax eventually falls the other way, so a
-                    // session or two diverges by a pronoun. That is the lineage's
-                    // stochastic floor, and holding this sweep to 100% would stop
-                    // it at exactly the widths the ladder is about — which is what
-                    // happened the first time it was run.
-                    //
-                    // Losslessness is not being checked here and does not need to
-                    // be: `speculative_decode_9b` proves it at 100% on the widths
-                    // the fixture does support, and it is a property of the accept
-                    // rule, not of the cohort width. The bar is kept high enough
-                    // to catch a speculative path that is producing garbage
-                    // rather than drifting by a token.
-                    //
-                    // Half. Not tuned to what a run happened to score — the
-                    // divergence rate grows with width (six of eight at 8, fewer
-                    // at 20), so any threshold close to the observed value just
-                    // moves the wall further out. Half is the level a *broken*
-                    // speculative path cannot reach: a wrong accept rule or a
-                    // mis-rolled KV does not reproduce a 1228-character fixture
-                    // in most of the cohort, it reproduces it in none of it.
-                    .with_majority_pass_threshold(50)
-                    .with_int8mode(int8mode);
-                let configs: Vec<TestConfig> = widths
-                    .iter()
-                    .map(|&width| TestConfig {
-                        mode: InferenceMode::BF16,
-                        use_batched: true,
-                        num_contexts: width,
-                        num_repeats: 1,
-                        generate_max_len: 256,
-                        test_mode: Some(TestMode::StoryRewrite),
-                    })
-                    .collect();
-                params.run(configs, &load)?;
+        println!("\n=== {label} cold point: {mode:?}, width {width}, draft budget {budget} ===\n");
+        let params = TestParams::new(256, tokenizer, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_timeout_secs(3600)
+            .with_speculative(budget)
+            // A throughput measurement, and a wide cohort cannot match a fixed
+            // string at any useful rate — the lineage's stochastic floor grows
+            // with width. Kept only as a garbage detector: a broken accept rule
+            // reproduces a 1228-character fixture in none of the cohort, not a
+            // quarter of it. Losslessness is gated at 100% in
+            // `speculative_decode_9b`.
+            .with_majority_pass_threshold(25)
+            .with_int8mode(int8mode);
+        // Checked before the run, not after: a budget the checkpoint cannot
+        // honour degrades silently to plain decode, and this measurement sets a
+        // production constant.
+        let checked = move || {
+            let m = load()?;
+            assert_drafter(&m, budget)?;
+            Ok(m)
+        };
+        params.run(
+            vec![TestConfig {
+                mode,
+                use_batched: true,
+                num_contexts: width,
+                num_repeats: 1,
+                test_mode: Some(TestMode::StoryRewrite),
+            }],
+            checked,
+        )
+    }
+
+    /// One `#[test]` per measurement point, so each runs in its own process with
+    /// its own boost budget. A macro because twelve hand-written copies of the
+    /// same two lines is where a transposed width or budget hides.
+    macro_rules! cold_point {
+        ($name:ident, $width:expr, $budget:expr) => {
+            #[test]
+            #[ignore = "cold measurement point — run singly, letting the card settle between \
+                        points. See `cold_speculative_point`."]
+            fn $name() -> Result<()> {
+                cold_speculative_point(
+                    "Qwen3.5-9B",
+                    &tokenizer_json()?,
+                    InferenceMode::BF16,
+                    $width,
+                    $budget,
+                    Int8Mode::Off,
+                    dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
+                )
             }
-        }
-        Ok(())
+        };
+    }
+
+    cold_point!(cold_w4_b0, 4, 0);
+    cold_point!(cold_w10_b0, 10, 0);
+    cold_point!(cold_w10_b1, 10, 1);
+    cold_point!(cold_w10_b2, 10, 2);
+    cold_point!(cold_w16_b0, 16, 0);
+    cold_point!(cold_w16_b1, 16, 1);
+    cold_point!(cold_w16_b2, 16, 2);
+    cold_point!(cold_w20_b0, 20, 0);
+    cold_point!(cold_w20_b1, 20, 1);
+    cold_point!(cold_w20_b2, 20, 2);
+    // **Width 32 needs a card this lineage's dev machines do not have.** Thirty
+    // recurrent layers holding a `32 × 128 × 128` F32 state per sequence, doubled
+    // for the live/backup ping-pong, is ~120 MiB per session and compression
+    // cannot touch it — so 32 sessions is ~3.8 GiB of DeltaNet state before any
+    // KV, and admission refuses on the 16 GB and 24 GB boxes. They are kept, and
+    // `#[ignore]`d like every other point here, because they are the instrument
+    // for the 72 GB Blackwell: the answer they carry is whether the turn at 16
+    // is the card or the design, and only a bigger card can say.
+    cold_point!(cold_w32_b0, 32, 0);
+    cold_point!(cold_w32_b1, 32, 1);
+    cold_point!(cold_w32_b2, 32, 2);
+
+    /// **Does throughput decay across configs within one model load?**
+    ///
+    /// Every sweep so far has been read as a width curve, and the widths were
+    /// confounded with their position in the run. Width 10 at 256 tokens
+    /// measured 118 tok/s as the third config of a load and 263 as the first —
+    /// the same deterministic work, 2.2x apart — while a fresh load is fast
+    /// every time.
+    ///
+    /// This runs ONE config three times over, so width, length, budget and
+    /// fixture are all held constant and only position varies. A monotone decay
+    /// means state is surviving between configs that should not: stranded
+    /// arenas holding regions, recurrent or draft state, unreleased sequences.
+    /// It would also mean every multi-config gate in this file under-reports its
+    /// later rows, and that the "width cliff" was never about width.
+    #[test]
+    #[ignore = "targeted measurement: one config three times over, single model load. \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35::tests::decay_across_configs_9b -- --ignored --nocapture \
+                --test-threads=1"]
+    fn decay_across_configs_9b() -> Result<()> {
+        let load = dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off);
+        let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_timeout_secs(3600)
+            .with_speculative(0)
+            .with_majority_pass_threshold(50)
+            .with_int8mode(Int8Mode::Off);
+        let one = TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 10,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        };
+        params.run(vec![one.clone(), one.clone(), one], &load)
     }
 
     /// Run the speculative comparison for a dense checkpoint of the lineage.
@@ -867,7 +917,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: n,
                 num_repeats: 1,
-                generate_max_len: 256,
                 test_mode: Some(TestMode::StoryRewrite),
             })
             .collect();
@@ -889,12 +938,41 @@ pub(crate) mod tests {
                 .with_suppress_thinking(true)
                 .with_timeout_secs(3600);
             params = params.with_speculative(draft).with_int8mode(int8mode);
-            params.run(configs.clone(), &load)?;
+            // Same guard the cold points carry, for the same reason and with
+            // more at stake: this is the sweep the production bracket is read
+            // from, so a checkpoint that has quietly lost its NextN head would
+            // report every budget as 1.00× here and read as "speculation stopped
+            // paying" rather than "the drafter is missing".
+            let checked = || {
+                let m = load()?;
+                assert_drafter(&m, draft)?;
+                Ok(m)
+            };
+            params.run(configs.clone(), checked)?;
         }
         Ok(())
     }
 
     /// The dense lineage's loader, as [`speculative_gate`] takes it.
+    /// Assert the model really carries a drafter, for a caller whose whole
+    /// purpose is measuring speculation.
+    ///
+    /// A budget the model cannot honour is not an error — `speculative_draft`
+    /// answers with no proposals and the step degrades to plain decode, which is
+    /// exactly the behaviour a checkpoint without a head should have. That makes
+    /// a pin or conversion regression invisible here in the worst way: the
+    /// measurement still produces a number, the number is a plain-decode number,
+    /// and it is the number the production bracket gets set from.
+    fn assert_drafter<M: ManagedBatchedModel>(model: &M, budget: usize) -> Result<()> {
+        if budget > 0 && model.draft_budget(1) == 0 {
+            candle::bail!(
+                "this checkpoint reports a zero draft budget even at width 1 — it carries no \
+                 NextN head, so a budget-{budget} measurement would silently report plain decode"
+            );
+        }
+        Ok(())
+    }
+
     fn dense_loader(
         model_path: std::path::PathBuf,
         int8mode: Int8Mode,
@@ -967,7 +1045,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -975,7 +1052,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // Several sequences at once: the recurrent mixer runs per span and
@@ -986,7 +1062,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // ── Quantized KV — the same ladder the 0.8B gate runs, on the
@@ -998,7 +1073,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1006,7 +1080,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1014,7 +1087,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1022,7 +1094,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1030,7 +1101,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1038,7 +1108,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1046,7 +1115,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1054,7 +1122,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1062,7 +1129,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C8 runs wide (20 contexts) — deepest production-comfortable
@@ -1073,7 +1139,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 20,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1081,7 +1146,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             // C10×10 is the top rung and the calibration target:
@@ -1094,7 +1158,6 @@ pub(crate) mod tests {
                 use_batched: true,
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
         ];

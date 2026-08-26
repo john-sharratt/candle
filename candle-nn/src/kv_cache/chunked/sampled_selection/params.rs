@@ -479,11 +479,55 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// so the rung was marginal rather than broken. 2.0 holds it at 7.39x across
 /// three alternating runs (six with the 3.6 gate, 6/6), with the C10 ratio
 /// identical run to run — a stable selection rather than a coin flip.
+///
+/// **Retuned 2026-08-26 for the widened top rung: K 1.5 → 1.2, V 2.0 → 2.5.**
+/// The two moves are opposite in direction and that is the point — the axes
+/// turned out to do different jobs here.
+///
+/// The gate's C10 rows moved from a single ×10 to ×8 and ×16, and the caution
+/// above came true as written: at the old row the ×8 rung held (7.31x) while
+/// ×16 lost one session of sixteen, diverging 35 characters in. A wider cohort
+/// reassociates the batched reductions, so a selection marginally inside the
+/// edge at ten sessions sits marginally outside it at sixteen.
+///
+/// **K is what moves that session; V is inert to it.** Stepping V 2.0 → 1.8
+/// cost ratio (7.31x → 6.99x) and failed the *same session at the same
+/// character* — the signature this file already records for the 3.6 row. So the
+/// "3.5 is V-limited" fact above was derived at ten sessions and does not
+/// survive the width: **the edge axis is a property of the cohort as well as of
+/// the checkpoint.** At sixteen this model behaves like its point release.
+/// K 1.2 clears it.
+///
+/// Being inert also makes V free to spend, which is where the ratio came back
+/// and then some. Bracketed against the widened rung:
+///
+/// | V   | C10×8 | C10×16 | ratio |
+/// |-----|-------|--------|-------|
+/// | 2.0 | pass  | pass   | 6.79x |
+/// | 2.5 | pass  | pass   | **7.57x** |
+/// | 2.8 | pass  | 15/16  | 8.06x |
+/// | 3.0 | 15/16 | 9/16   | 8.42x |
+///
+/// 2.5 rather than 2.7-ish: 2.8 already loses the wide rung and 3.0 loses both,
+/// so 2.5 sits under the edge with room rather than on it — the distinction the
+/// 2.3 → 2.0 note above was written about. Net against the row this replaces,
+/// **7.31x → 7.57x while gaining the ×16 rung it used to fail.**
+///
+/// # This row is coupled to the draft ladder, in another crate
+///
+/// The rungs it was derived on — C10 at ×8 and ×16 in `quantized_qwen35_moe` —
+/// run under `DraftBudget::Adaptive`, and both speculate only because
+/// `candle_transformers::models::draft_ladder`'s bracket reaches 16. Pull that
+/// bracket in and the ×16 rung silently reverts to plain decode, which changes
+/// the batched reduction order and moves the marginal C10 session. The symptom
+/// is a red KV gate caused by a speculation constant, with neither file naming
+/// the other — so re-verify this row after a ladder change, exactly as after an
+/// admission or width change.
 pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.5,
-    k_low: 1.5,
-    v_hi: 2.0,
-    v_low: 2.0,
+    k_hi: 1.2,
+    k_low: 1.2,
+    v_hi: 2.5,
+    v_low: 2.5,
 };
 
 /// Qwen3.6-35B-A3B (routed hybrid point release).

@@ -199,7 +199,40 @@ pub fn urlencode(s: &str) -> String {
 ///
 /// Only this estate. An unchecked `next` turns the login endpoint into an open
 /// redirect, which is how a phishing link gets to wear the real domain.
+///
+/// # What a browser reads is not what a naive split reads
+///
+/// Every rejection below is a case where the obvious parse and the browser's
+/// parse disagree, and the browser's is the one that matters:
+///
+/// - **Userinfo.** In `https://tokera.com:@evil.com/`, the authority's host is
+///   `evil.com` and `tokera.com:` is a username. Taking the text before the last
+///   `:` as the host reads it as `tokera.com` and waves it through, while the
+///   browser goes to the attacker. `https://a.tokera.com:80@evil.com/` is the
+///   same trick wearing a plausible port.
+/// - **Backslash.** WHATWG has the URL parser normalise `\` to `/` for special
+///   schemes, so `Location: /\evil.com` resolves as `//evil.com` — protocol
+///   relative, and off this estate — while `starts_with("//")` never sees it.
+/// - **Control bytes.** A `\r` or `\n` is header injection, and `HeaderValue`
+///   refuses to hold one, so it is also the reachable panic in [`see_other`].
+///
+/// So each is refused outright rather than parsed around. `next` is a path or a
+/// URL on this estate; none of these appear in either.
+///
+/// [`see_other`]: crate::auth::see_other
 pub fn safe_next(next: &str, cookie_domain: &str) -> bool {
+    if next.is_empty() {
+        return false;
+    }
+    // Refused before any structural test, because each one defeats the tests
+    // themselves rather than merely being unwanted.
+    if next
+        .bytes()
+        .any(|b| b < 0x20 || b == 0x7f || b == b'\\' || !b.is_ascii())
+    {
+        return false;
+    }
+
     if next.starts_with('/') && !next.starts_with("//") {
         return true; // same-origin path
     }
@@ -209,14 +242,24 @@ pub fn safe_next(next: &str, cookie_domain: &str) -> bool {
     else {
         return false;
     };
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Credentials are never something we would send a browser to, and their
+    // presence is the whole of the trick above — so this is a refusal, not an
+    // instruction to look after the `@`.
+    if authority.contains('@') {
+        return false;
+    }
+    // Now the last `:` really is the port separator: nothing else in an
+    // authority may carry one, IPv6 literals excepted, and those are bracketed
+    // and cannot match the domain suffix below anyway.
+    let host = authority
         .rsplit_once(':')
         .map(|(h, _)| h)
-        .unwrap_or_else(|| rest.split(['/', '?', '#']).next().unwrap_or(""))
+        .unwrap_or(authority)
         .to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
 
     let apex = cookie_domain.trim_start_matches('.').to_ascii_lowercase();
     host == apex || host.ends_with(&format!(".{apex}"))
@@ -304,6 +347,39 @@ mod tests {
         assert!(!safe_next("https://tokera.com.evil.com/", d));
         assert!(!safe_next("https://nottokera.com/", d));
         assert!(!safe_next("javascript:alert(1)", d));
+    }
+
+    /// The three ways a browser's URL parse disagrees with a naive one.
+    ///
+    /// Each of these was accepted at some point, and each is a working open
+    /// redirect off `/auth/login` — a phishing link that wears this domain all
+    /// the way through a real sign-in and lands the user elsewhere.
+    #[test]
+    fn next_rejects_authorities_the_browser_reads_differently() {
+        let d = ".tokera.com";
+
+        // Userinfo: the host is `evil.com`; `tokera.com:` is a username.
+        assert!(!safe_next("https://tokera.com:@evil.com/", d));
+        assert!(!safe_next("https://a.tokera.com:80@evil.com/", d));
+        assert!(!safe_next("https://tokera.com@evil.com/", d));
+        // ...including when the bait is in the path, where it reads best.
+        assert!(!safe_next("https://tokera.com:@evil.com/auth/login", d));
+
+        // Backslash: normalised to `/`, so this is protocol-relative.
+        assert!(!safe_next("/\\evil.com", d));
+        assert!(!safe_next("/\\/evil.com", d));
+        assert!(!safe_next("https://tokera.com\\@evil.com/", d));
+
+        // Control bytes: header injection, and the panic in `see_other`.
+        assert!(!safe_next("/\n", d));
+        assert!(!safe_next("/x\r\nLocation: https://evil.com", d));
+        assert!(!safe_next("/\0", d));
+        assert!(!safe_next("/\ta", d));
+
+        // Degenerate authorities that used to reduce to an empty host.
+        assert!(!safe_next("https://", d));
+        assert!(!safe_next("https://:8443/", d));
+        assert!(!safe_next("", d));
     }
 
     #[test]

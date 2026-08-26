@@ -120,10 +120,22 @@ async fn spawn_provider(sub: &'static str, email: &'static str) -> SocketAddr {
     }
 
     let token = move |body: String| async move {
-        // `nonce` has to come back in the id_token or the replay check is
-        // meaningless, and the provider only knows it from the authorize step —
-        // so the test threads it through the form as a stand-in for that.
-        let nonce = form_value(&body, "nonce").unwrap_or_default();
+        // **The nonce comes back in the id_token, carried by the code.**
+        //
+        // A real provider remembers the authorize request's nonce and mints it
+        // into the id_token; the code is the opaque handle binding the two. This
+        // stand-in never sees an authorize request — the test plays the browser
+        // and drives the redirect itself — so the code carries the nonce inline
+        // instead, which is the same binding without the server-side table.
+        //
+        // It used to read `nonce` from this form, which no OAuth token request
+        // has ever contained, so the mock minted a nonce-less token every time
+        // and the gateway's replay check — which skipped comparison when the
+        // claim was absent — passed it. Between them the check was never once
+        // exercised. It is now, so getting this wrong fails the suite.
+        let nonce = form_value(&body, "code")
+            .and_then(|c| c.split_once('.').map(|(_, n)| n.to_string()))
+            .unwrap_or_default();
         let claims = json!({
             "sub": sub, "email": email, "name": "Test Person",
             "picture": "", "nonce": nonce,
@@ -233,11 +245,11 @@ async fn signing_in_issues_a_cookie_on_the_parent_domain() {
         .unwrap()
         .to_string();
 
-    // 2. The provider sends the browser back with a code. The nonce rides
-    //    along so the stand-in can echo it, as a real provider does.
+    // 2. The provider sends the browser back with a code. The code carries the
+    //    nonce, standing in for the binding a real provider keeps server-side.
     let back = request(
         fx.gateway,
-        &format!("/auth/callback?code=abc&state={state}&nonce={nonce}"),
+        &format!("/auth/callback?code=abc.{nonce}&state={state}"),
         &[("cookie", &pending)],
     )
     .await;
@@ -334,6 +346,51 @@ async fn a_callback_with_the_wrong_state_is_refused() {
         cookie_pair(&back, "tokera_session").is_none(),
         "a session was issued anyway"
     );
+}
+
+/// An id_token minted for a different attempt — or for none — is refused.
+///
+/// `state` binds the callback to this browser; the nonce binds the *token* to
+/// this attempt, which is the half an attacker controls if they can get a token
+/// issued elsewhere. Both cases below were accepted before: the check skipped
+/// comparison whenever the claim was absent, so a token carrying no nonce at all
+/// was the one shape guaranteed to pass — exactly the shape a replayed or
+/// substituted one has.
+#[tokio::test]
+async fn a_callback_whose_token_carries_the_wrong_nonce_is_refused() {
+    let provider = spawn_provider("u-8", "replay@example.com").await;
+    let fx = fixture(provider, ".tokera.com").await;
+
+    let start = request(fx.gateway, "/auth/login", &[]).await;
+    let pending = cookie_pair(&start, "tokera_oauth").unwrap();
+    let loc = start.header("location");
+    let state = loc
+        .split("state=")
+        .nth(1)
+        .and_then(|s| s.split('&').next())
+        .unwrap()
+        .to_string();
+
+    // The code decides what nonce the provider mints into the id_token, so a
+    // wrong one here is a token belonging to some other sign-in.
+    for code in ["abc.some-other-attempt", "abc"] {
+        let back = request(
+            fx.gateway,
+            &format!("/auth/callback?code={code}&state={state}"),
+            &[("cookie", &pending)],
+        )
+        .await;
+        assert_eq!(back.status, 400, "code {code}: {}", back.body);
+        assert!(
+            back.body.contains("nonce_mismatch"),
+            "code {code}: {}",
+            back.body
+        );
+        assert!(
+            cookie_pair(&back, "tokera_session").is_none(),
+            "code {code}: a session was issued anyway"
+        );
+    }
 }
 
 #[tokio::test]
@@ -501,9 +558,9 @@ async fn sign_in(gateway: SocketAddr) -> String {
     let back = request(
         gateway,
         &format!(
-            "/auth/callback?code=abc&state={}&nonce={}",
-            pick("state"),
-            pick("nonce")
+            "/auth/callback?code=abc.{}&state={}",
+            pick("nonce"),
+            pick("state")
         ),
         &[("cookie", &pending)],
     )

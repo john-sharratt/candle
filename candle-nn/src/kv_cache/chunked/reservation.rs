@@ -27,7 +27,14 @@
 //!
 //! The write is a zero-fill, which the region tier then relies on: a
 //! freshly-mapped region is already zeroed, exactly as `Tensor::zeros` left the
-//! slabs it replaces.
+//! slabs it replaces. That is not a convenience — `RegionPool` hands a region
+//! whose `dirty_epoch` is still zero to its first tenant *without* cleaning it,
+//! on the strength of this write.
+//!
+//! The write is queued rather than awaited, and both of its readers are far
+//! enough downstream not to care. Its one hard rule is that the span must not be
+//! unmapped while it is still in flight, which [`Reservation::fence`] states and
+//! the two teardown paths obey.
 //!
 //! # There is no fallback, on purpose
 //!
@@ -270,9 +277,17 @@ impl Reservation {
         }
 
         // The touch. This is the real capacity test, and it doubles as the
-        // zero-fill the region tier relies on. Synchronous on purpose: it
-        // returns the driver's verdict here instead of surfacing it later as a
-        // sticky illegal-address on some unrelated kernel.
+        // zero-fill the region tier relies on — a region whose `dirty_epoch` is
+        // still zero is handed to its first tenant *without* cleaning, on the
+        // strength of this write.
+        //
+        // The fill is queued, not awaited. `memset_d8_sync` is `cuMemsetD8_v2`,
+        // which CUDA documents as asynchronous with respect to the host for
+        // device memory — the `_sync` names the legacy API rather than the
+        // stream-ordered one, and does not mean the host waits. That is fine for
+        // the two things this write is for, because both are read long after the
+        // balloon finishes. It is *not* fine against an unmap, so the span's
+        // teardown paths fence first; see [`Reservation::fence`].
         self.context
             .bind_to_thread()
             .map_err(|e| candle::Error::Msg(format!("bind_to_thread: {e}")))?;
@@ -292,8 +307,29 @@ impl Reservation {
         Ok(true)
     }
 
+    /// Wait for every write this span has queued, before any of it is unmapped.
+    ///
+    /// The mapping touch ([`Reservation::map_granule`]) is an asynchronous
+    /// `cuMemsetD8_v2`, so a granule can still be being written when the code
+    /// below decides to tear it down. Unmapping under a live write is a hardware
+    /// exception — and one raised by whichever unrelated call synchronises next,
+    /// which is almost never the code that caused it. It showed up as three
+    /// unrelated tests in this crate failing about one run in eight, and it
+    /// disappeared under `CUDA_LAUNCH_BLOCKING=1`: the shape of every
+    /// async-lifetime bug.
+    ///
+    /// The cost is nil because the teardown paths are: the balloon's single
+    /// refusal, and dropping the span. Neither is per-granule and neither is on
+    /// a forward. Errors are swallowed on purpose — this runs from `Drop`, and a
+    /// context already faulted has a real failure being reported elsewhere.
+    fn fence(&self) {
+        let _ = self.context.bind_to_thread();
+        let _ = self.context.synchronize();
+    }
+
     /// Unmap and release a granule that failed part-way through mapping.
     fn discard(&self, addr: CUdeviceptr, handle: u64) {
+        self.fence();
         // SAFETY: `addr` is mapped to `handle`, which is live; both are being
         // abandoned together so neither is used again.
         unsafe {
@@ -324,6 +360,8 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        // Nothing may still be writing into the span we are about to unmap.
+        self.fence();
         for (idx, handle) in self.granules.drain(..).enumerate() {
             let Some(handle) = handle else { continue };
             // SAFETY: each granule was mapped at `base + idx × granularity` by
@@ -360,7 +398,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn stream() -> Option<(
         std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
-        std::sync::MutexGuard<'static, ()>,
+        crate::kv_cache::chunked::gpu_test_lock::GpuGuard,
     )> {
         let guard = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
         match Device::new_cuda(0) {

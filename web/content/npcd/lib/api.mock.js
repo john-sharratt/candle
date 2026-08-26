@@ -105,7 +105,6 @@ export const MockAPI = {
       image_queue: { depth: 2, state: 'waiting_for_vram', current: null },
       throughput: { decode_tps: 0, prefill_tps: 0 } };
   },
-  async getProviders() { return { providers: [{ id: 'google', display: 'Google' }, { id: 'github', display: 'GitHub' }] }; },
   async getMe() {
     if (flag('loggedout')) return null;
     return { user_id: 'u_8812', unique_name: 'Wren', display: 'Johnathan', email: 'you@example.com',
@@ -116,7 +115,15 @@ export const MockAPI = {
   },
   async getProfile() { return (await this.getMe()).profile; },
   async putProfile(b) { return { ...(await this.getProfile()), ...b, revision: 4 }; },
-  async logout() { return null; },
+  async putUniqueName(n) { return { ...(await this.getMe()), unique_name: n }; },
+  async getProfileHistory() {
+    const live = await this.getProfile();
+    return { revisions: [
+      { ...live, live: true },
+      { ...live, live: false, revision: 2, tombstoned_ms: Date.now() - 864e5,
+        description: 'Ex-surveyor. Talks slowly.' },
+    ] };
+  },
 
   async listNpcs(f = {}) {
     await sleep(40);

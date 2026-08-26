@@ -124,6 +124,16 @@ impl Auth {
         cookie::get(headers, cookie::SESSION)
     }
 
+    /// Is this deployment reached over https?
+    ///
+    /// Read from the provider's `redirect_uri`, which is the one place the
+    /// public scheme is written down. It sets the cookie `Secure` flag, and it
+    /// is what the proxy reports as `X-Forwarded-Proto` — the two must agree, so
+    /// they come from the same field rather than from two guesses.
+    pub fn is_secure(&self) -> bool {
+        self.secure
+    }
+
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/auth/login", get(login))
@@ -147,8 +157,24 @@ fn see_other(location: &str, cookies: &[String]) -> Response {
     for c in cookies {
         b = b.header(header::SET_COOKIE, c);
     }
-    b.body(axum::body::Body::empty())
-        .expect("a redirect with valid header values")
+    match b.body(axum::body::Body::empty()) {
+        Ok(r) => r,
+        // **Never a panic.** `location` reaches here from a query parameter, and
+        // `Response::builder` refuses a header value holding a control byte —
+        // so an `.expect` here is an unauthenticated `GET /auth/login?next=/%0A`
+        // away from killing the connection task, on a service with no
+        // catch-panic layer. `safe_next` rejects those bytes before this point;
+        // this is the second lock on that door, because the cost of being wrong
+        // once is the whole request.
+        Err(e) => {
+            tracing::error!(error = %e, "refusing to build a redirect");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bad_redirect",
+                "that destination cannot be turned into a redirect",
+            )
+        }
+    }
 }
 
 fn trim(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -269,7 +295,14 @@ async fn callback(
     };
 
     // Replay protection: the id_token must be the one minted for this attempt.
-    if !claims.nonce.is_empty() && claims.nonce != pending.nonce {
+    //
+    // Compared unconditionally. Skipping the check when the token carries *no*
+    // nonce inverts it — an id_token with the field absent would be the one
+    // shape that sails past, which is precisely the shape a replayed or
+    // substituted token has. We put a nonce in every authorisation request, so
+    // a response without one is never legitimate and there is nothing to be
+    // lenient about.
+    if claims.nonce != pending.nonce {
         return problem(
             StatusCode::BAD_REQUEST,
             "nonce_mismatch",

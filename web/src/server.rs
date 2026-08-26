@@ -235,10 +235,29 @@ async fn handle(
     let site = app.cfg.site_for(host.as_deref());
     let path = req.uri().path().to_owned();
 
+    // **Strip inbound identity headers here, before anything is dispatched.**
+    //
+    // `x-tokera-*` is how this gateway tells a daemon who the caller is, so a
+    // client that sets one is asserting an identity. `proxy::forward` clears
+    // them before every proxied request — but a route with `upstream: local`
+    // never reaches it, and hands the daemon's own router the client's headers
+    // untouched. `zend` and `npcd` embed their APIs exactly that way, so a
+    // handler written against the documented header contract accepts
+    // `x-tokera-email: admin@tokera.com` from anyone when run in-process, while
+    // the identical code is safe behind the proxy.
+    //
+    // Doing it on ingress rather than in the local arm is what stops the two
+    // dispatch paths from disagreeing again the next time one is added. The
+    // strip in `proxy::forward` stays: it is on the other side of a `.await`
+    // from here, and cheap.
+    for name in proxy::IDENTITY_HEADERS {
+        req.headers_mut().remove(name);
+    }
+
     // Resolve who this is once, before anything downstream can see the request.
     // A local router reads it from the extensions; a proxied daemon reads it
     // from the headers the proxy sets. Both get the same answer from the same
-    // check.
+    // check — the session cookie, which the strip above does not touch.
     let identity = app.auth.as_ref().and_then(|a| a.identity(req.headers()));
     let assertion = app
         .auth
@@ -286,6 +305,7 @@ async fn handle(
                         want_html,
                         identity: identity.as_ref(),
                         assertion: assertion.as_deref(),
+                        secure: app.auth.as_ref().is_some_and(|a| a.is_secure()),
                     },
                     req,
                 )

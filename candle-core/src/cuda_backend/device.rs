@@ -5,13 +5,30 @@ use cudarc::driver::CudaFunction;
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::cuda_backend::{alloc_inheriting, Backing};
 use crate::forbidden_alloc;
 use candle_kernels::simple::fill::{run_arange_op, FillDType};
 use cudarc::driver::DevicePtr;
+
+/// The seed every device's random generator starts from.
+///
+/// Fixed, and re-applied for each handle: `candle` guarantees that a freshly
+/// built device draws the same numbers as the last one, which is what lets a
+/// test build a device and assert against literal values (see
+/// [`BackendDevice::set_seed`], which replaces the generator rather than
+/// re-seeding it, for the same reason).
+const DEFAULT_SEED: u64 = 299792458;
+
+/// Largest CUDA ordinal this build holds a device for.
+///
+/// The same ordinals `gpu_memory::MAX_TRACKED_GPUS` indexes free-VRAM readings
+/// by, and the two are meant to move together — a device this file will hand out
+/// but that file cannot record an init-free reading for would silently lose the
+/// KV budget gate its baseline.
+const MAX_CUDA_DEVICES: usize = 16;
 
 /// Unique identifier for cuda devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -507,30 +524,38 @@ impl CudaDevice {
         unsafe { context.disable_event_tracking() };
     }
 
+    /// A second handle on the same device with a **stream** of its own.
+    ///
+    /// A stream is all it adds. This used to build the whole device again for
+    /// the same ordinal, taking a fresh cuBLAS handle and curand generator with
+    /// it, which is the leak [`BackendDevice::new`] documents — reached by a
+    /// different door, and by a caller whose whole intent was "the same device,
+    /// another stream". Everything but the stream now comes from the cached
+    /// device, including the content-keyed caches below, so the two handles read
+    /// each other's uploads instead of each making their own.
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
-        let context = cudarc::driver::CudaContext::new(ordinal).w()?;
-        Self::validate_compute_capability(&context)?;
-        Self::disable_per_arg_event_tracking(&context);
-        let stream = context.new_stream().w()?;
+        let base = Self::new(ordinal)?;
+        let stream = base.context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
-        let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
-        let dev = Self {
+        let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
+        // **Compiled modules are shared; memoised buffers are not.** A
+        // `CudaModule` belongs to the context, is read-only once built, and is
+        // expensive enough that rebuilding it per handle is the cost this
+        // function is trying to avoid. The two table caches memoise
+        // `Uploaded<_>` — device *buffers*, allocated and freed on the stream
+        // that made them. Handing one to the other handle would let a kernel on
+        // this stream read a buffer uploaded on the base's, with no event
+        // between them and a `cuMemFreeAsync` on the far stream to race.
+        Ok(Self {
             id: DeviceId::new(),
-            context,
+            context: base.context.clone(),
+            custom_modules: base.custom_modules.clone(),
             stream,
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
-            custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             info_tables: Arc::new(Mutex::new(HashMap::new())),
             perm_tables: Arc::new(Mutex::new(HashMap::new())),
-        };
-        // Record free VRAM now, before any model weights load, so the KV budget
-        // gate can estimate our resident footprint and credit pageable memory
-        // the OS evicts for us (see `gpu_memory::device_init_free`).
-        if let Ok((free, _total)) = dev.mem_get_info() {
-            crate::gpu_memory::note_device_init_free(ordinal, free);
-        }
-        Ok(dev)
+        })
     }
 
     /// Returns the compute capability of this device as a (major, minor) tuple.
@@ -675,12 +700,89 @@ impl BackendDevice for CudaDevice {
     type Storage = CudaStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        // **One device per ordinal, for the life of the process.**
+        //
+        // Not for the context's sake — `CudaContext::new` retains the driver's
+        // *primary* context, so every call for an ordinal already shares one. It
+        // is the memoised state hanging off the handle: the compiled modules and
+        // the two upload caches below, whose entries are `Uploaded`, holding a
+        // `ManuallyDrop<CudaSlice>`. A device that built some and was dropped
+        // does not give that memory back, so a process that asks often enough
+        // runs the card down until something cannot allocate — surfacing as
+        // `CUBLAS_STATUS_NOT_INITIALIZED` from whichever request is unlucky,
+        // which reads as "CUDA is broken" rather than "you have made too many of
+        // these". `candle-nn`'s GPU tests hit it at around 220 devices: three
+        // failed only when run after the others, passed in isolation, and passed
+        // under every subset. Callers are right to treat a device as a value —
+        // helpers take `&Device`, tests build one per case — so the cheapness
+        // has to be true rather than assumed.
+        //
+        // The handle's two *stateful* resources are deliberately not shared; see
+        // the cache-hit path below.
+        //
+        // Indexed by ordinal rather than held in a map behind a lock: the cache
+        // is read on any thread that touches the GPU, and there is nothing to
+        // serialise — a slot is written once and read forever after. Reaching it
+        // is an atomic load, not a mutex acquisition. This mirrors
+        // `gpu_memory::DEVICE_INIT_FREE`, which indexes the same ordinals the
+        // same way.
+        //
+        // `cuda_device_reuse.rs` is the regression test.
+        static DEVICES: [OnceLock<CudaDevice>; MAX_CUDA_DEVICES] =
+            [const { OnceLock::new() }; MAX_CUDA_DEVICES];
+        let Some(slot) = DEVICES.get(ordinal) else {
+            crate::bail!(
+                "CUDA ordinal {ordinal} is beyond the {MAX_CUDA_DEVICES} this build indexes \
+                 per-device state for. Raise `MAX_CUDA_DEVICES` (and \
+                 `gpu_memory::MAX_TRACKED_GPUS`, which tracks the same ordinals) together — \
+                 there is deliberately no uncached path, because an uncached device exhausts \
+                 the driver's cuBLAS handles."
+            )
+        };
+        if let Some(dev) = slot.get() {
+            // **A context is current per THREAD, not per process.** Building one
+            // bound it to whichever thread built it; handing that same context to
+            // a second thread without binding leaves every driver call there
+            // failing `CUDA_ERROR_INVALID_CONTEXT`. Constructing per call hid
+            // this, because the construction did the binding.
+            dev.context.bind_to_thread().w()?;
+            let mut dev = dev.clone();
+
+            // **Everything stateful is rebuilt; everything memoised is shared.**
+            // The caches above are content- and shape-keyed tables of immutable
+            // bytes, so two handles reading one entry is the point of keeping
+            // them. These two are neither, and inheriting either is a silent
+            // wrong answer rather than a failure:
+            //
+            // - **cuBLAS.** A handle carries internal workspace and stream
+            //   state, and NVIDIA's contract is one handle per thread — sharing
+            //   one is a data race between concurrent GEMMs, not merely
+            //   contention. It cost `candle-core`'s `conv1d_gpu` a wrong result
+            //   and two `conv2d_*_gpu` an illegal access, intermittently, only
+            //   under a full parallel suite.
+            // - **curand.** A device is built expecting to draw from
+            //   `DEFAULT_SEED`; one advancing generator makes what a caller
+            //   draws a function of who drew before it, so a `Tensor::randn`
+            //   fixture stops being a fixture. It cost two
+            //   `candle-transformers` tests, each passing alone and failing in
+            //   the suite.
+            //
+            // Both are cheap to build and neither is what leaked — 512 handles'
+            // worth of each is a passing test (`cuda_device_reuse.rs`), which is
+            // how they were ruled out as the cause above.
+            dev.blas = Arc::new(cudarc::cublas::CudaBlas::new(dev.stream.clone()).w()?);
+            dev.curand = Arc::new(Mutex::new(CudaRng(
+                cudarc::curand::CudaRng::new(DEFAULT_SEED, dev.stream.clone()).w()?,
+            )));
+            return Ok(dev);
+        }
+
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         Self::validate_compute_capability(&context)?;
         Self::disable_per_arg_event_tracking(&context);
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
-        let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
+        let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
         let dev = Self {
             id: DeviceId::new(),
             context,
@@ -693,11 +795,18 @@ impl BackendDevice for CudaDevice {
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory
-        // the OS evicts for us (see `gpu_memory::device_init_free`).
+        // the OS evicts for us (see `gpu_memory::device_init_free`). Inside the
+        // build rather than on every call: it is a first-touch reading, and a
+        // cache hit happens long after weights have loaded.
         if let Ok((free, _total)) = dev.mem_get_info() {
             crate::gpu_memory::note_device_init_free(ordinal, free);
         }
-        Ok(dev)
+        // Two threads racing the first call for an ordinal both build one; the
+        // slot takes whichever arrives first and the other is dropped here,
+        // which is why the winner is read back rather than `dev` returned. The
+        // loser costs one device's worth of handles, once, at first touch —
+        // where the leak this exists to stop is one per call, forever.
+        Ok(slot.get_or_init(|| dev).clone())
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {

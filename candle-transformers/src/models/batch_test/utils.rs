@@ -80,7 +80,6 @@ pub struct TestConfig {
     pub use_batched: bool,
     pub num_contexts: usize,
     pub num_repeats: usize,
-    pub generate_max_len: usize,
     /// Override the global `TestParams::test_mode` for this specific config.
     /// `None` means use the global mode.
     pub test_mode: Option<TestMode>,
@@ -969,6 +968,22 @@ impl TestParams {
             // GPU memory tracking: snapshot before config and register arena state
             let arena_bytes = candle_nn::kv_cache::global_arena_gpu_bytes();
             candle::gpu_memory::register("arenas (all backings)", arena_bytes);
+            // **What the KV side is holding as this config starts.** A gate runs
+            // its configs against ONE loaded model, so anything a config fails to
+            // hand back is still held when the next one begins — and the symptom
+            // is a throughput figure, not an error. Printing the region ledger
+            // per config is what turns "the third config is slow" into "the third
+            // config started with N fewer free regions than the first".
+            if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
+                println!(
+                    "  [regions] total {} | live {} | free {} | blocked {} | arenas {} MiB",
+                    rs.total,
+                    rs.live,
+                    rs.free,
+                    rs.blocked,
+                    arena_bytes >> 20,
+                );
+            }
             let _ = candle::gpu_memory::snapshot(
                 &format!("before_{:?}×{}", config.mode, config.num_contexts),
                 &self.device,
@@ -1742,7 +1757,7 @@ impl TestParams {
                 // `expected` field contains the FULL original prompt (~2 300
                 // chars) with "Marcus" replaced by the session's assigned
                 // name.  The model only generates ~40-50 chars (controlled
-                // by `generate_max_len`), so the output is always much
+                // by `generate_token_count`), so the output is always much
                 // shorter than `expected`.
                 //
                 // Two normalisation steps are applied before comparison:

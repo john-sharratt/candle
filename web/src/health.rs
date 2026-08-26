@@ -12,21 +12,41 @@
 //! everything. Recovery needs no operator and no restart.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::Backoff;
+
+/// How long a probe may be outstanding before another is allowed through.
+///
+/// A probe is released by [`Health::gate`] and retired by [`Health::on_success`]
+/// or [`Health::on_failure`] — both of which run *after* the request future
+/// resolves. If that future is instead dropped, neither runs. The likeliest
+/// moment for exactly that is while the probe sits in a connect timeout against
+/// the machine presumed down, and the error page auto-refreshes: the client goes
+/// away, the future is cancelled, and without this the upstream stays flagged
+/// as probing with an expired window, so every later `gate` reports `Blocked`
+/// for the life of the process. Recovery would need the restart this module
+/// exists to avoid.
+///
+/// Pre-empting a probe that is merely slow is not a failure of this bound. Past
+/// this long the probe has either connected — in which case the upstream is
+/// answering and a second request is correct — or it is gone.
+const ABANDONED_PROBE_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct Upstream {
     failures: u32,
     /// When the backoff window ends. `None` means healthy.
     open_until: Option<Instant>,
-    /// Set while a probe is in flight so only ONE request tests a recovering
-    /// upstream — otherwise every request queued behind the window is released
-    /// at once and stampedes the machine that is still coming back up.
-    probing: AtomicBool,
+    /// When the in-flight probe was released, so only ONE request tests a
+    /// recovering upstream — otherwise every request queued behind the window is
+    /// released at once and stampedes the machine that is still coming back up.
+    ///
+    /// An instant rather than a flag because a probe can be cancelled without
+    /// ever reporting back, and "since when" is what distinguishes a probe in
+    /// flight from one that will never return. See [`ABANDONED_PROBE_AFTER`].
+    probe_since: Option<Instant>,
     last_error: Option<String>,
 }
 
@@ -35,7 +55,7 @@ impl Upstream {
         Self {
             failures: 0,
             open_until: None,
-            probing: AtomicBool::new(false),
+            probe_since: None,
             last_error: None,
         }
     }
@@ -77,8 +97,14 @@ impl Health {
 
         let now = Instant::now();
         if now >= until {
-            // Window expired — release exactly one probe.
-            if !up.probing.swap(true, Ordering::SeqCst) {
+            // Window expired — release exactly one probe, and treat one that has
+            // been out too long as gone rather than in flight, so a cancelled
+            // probe cannot hold the upstream shut for good.
+            let in_flight = up
+                .probe_since
+                .is_some_and(|since| now.duration_since(since) < ABANDONED_PROBE_AFTER);
+            if !in_flight {
+                up.probe_since = Some(now);
                 return Gate::Go;
             }
             // A probe is already out; hold the rest for one more short beat
@@ -102,7 +128,7 @@ impl Health {
             up.failures = 0;
             up.open_until = None;
             up.last_error = None;
-            up.probing.store(false, Ordering::SeqCst);
+            up.probe_since = None;
             if was_down {
                 tracing::info!(upstream = key, "upstream recovered");
             }
@@ -116,11 +142,24 @@ impl Health {
         let delay = self.backoff.delay(up.failures);
         up.open_until = Some(Instant::now() + delay);
         up.last_error = Some(err.to_string());
-        up.probing.store(false, Ordering::SeqCst);
+        up.probe_since = None;
         if up.failures == 1 {
             tracing::warn!(upstream = key, error = err, "upstream down — backing off");
         }
         delay
+    }
+
+    /// Pretend the in-flight probe was released `by` ago.
+    ///
+    /// [`ABANDONED_PROBE_AFTER`] is a minute, which a unit test cannot wait out
+    /// and should not have to. Rewinding the timestamp reaches the same state a
+    /// cancelled probe leaves behind, which is the state under test.
+    #[cfg(test)]
+    fn backdate_probe(&self, key: &str, by: Duration) {
+        let mut map = self.inner.lock().unwrap();
+        if let Some(up) = map.get_mut(key) {
+            up.probe_since = up.probe_since.and_then(|t| t.checked_sub(by));
+        }
     }
 
     /// Snapshot for the status endpoint / error page.
@@ -208,6 +247,40 @@ mod tests {
         // First caller through the expired window probes…
         assert_eq!(h.gate("a"), Gate::Go);
         // …and the rest are held rather than stampeding the recovering machine.
+        assert!(matches!(h.gate("a"), Gate::Blocked { .. }));
+    }
+
+    /// A probe that never reports back must not hold the upstream shut.
+    ///
+    /// `gate` releases the probe; only `on_success`/`on_failure` retire it, and
+    /// both run after the request future resolves. Drop that future — the client
+    /// disconnects, or the error page auto-refreshes during the connect timeout
+    /// against the machine presumed down — and neither runs. Before the deadline
+    /// this left the upstream permanently `Blocked` with an expired window: 503
+    /// for the life of the process, recoverable only by the restart this module
+    /// exists to make unnecessary.
+    #[test]
+    fn an_abandoned_probe_does_not_wedge_the_upstream_shut() {
+        let h = Health::new(Backoff {
+            initial_ms: 1,
+            max_ms: 10,
+        });
+        h.on_failure("a", "x");
+        std::thread::sleep(Duration::from_millis(6));
+
+        // A probe goes out, and is then cancelled — no on_success, no on_failure.
+        assert_eq!(h.gate("a"), Gate::Go);
+        assert!(matches!(h.gate("a"), Gate::Blocked { .. }));
+
+        // Long enough later, it is treated as gone and another is let through.
+        h.backdate_probe("a", ABANDONED_PROBE_AFTER + Duration::from_secs(1));
+        assert_eq!(
+            h.gate("a"),
+            Gate::Go,
+            "a cancelled probe held the upstream shut for good"
+        );
+
+        // And that one is still the only one: recovery, not a stampede.
         assert!(matches!(h.gate("a"), Gate::Blocked { .. }));
     }
 

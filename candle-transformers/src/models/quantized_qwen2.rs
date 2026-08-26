@@ -1323,7 +1323,6 @@ mod tests {
                 use_batched: false,
                 num_contexts: 1,
                 num_repeats: 10,
-                generate_max_len: 80,
                 test_mode: None,
             },
             TestConfig {
@@ -1331,7 +1330,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 10,
-                generate_max_len: 80,
                 test_mode: None,
             },
             TestConfig {
@@ -1339,7 +1337,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 10,
-                generate_max_len: 80,
                 test_mode: None,
             },
             TestConfig {
@@ -1347,7 +1344,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 2,
-                generate_max_len: 80,
                 test_mode: None,
             },
             TestConfig {
@@ -1355,7 +1351,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 60,
                 num_repeats: 2,
-                generate_max_len: 80,
                 test_mode: None,
             },
             TestConfig {
@@ -1363,7 +1358,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 60,
                 num_repeats: 2,
-                generate_max_len: 80,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -1372,7 +1366,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 120,
                 num_repeats: 1,
-                generate_max_len: 80,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -1381,7 +1374,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 240,
                 num_repeats: 1,
-                generate_max_len: 80,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -1390,7 +1382,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1600,
                 num_repeats: 1,
-                generate_max_len: 80,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -1399,7 +1390,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 400,
                 num_repeats: 1,
-                generate_max_len: 80,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -1408,7 +1398,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 3200,
                 num_repeats: 1,
-                generate_max_len: 80,
                 test_mode: None,
             },
         ];

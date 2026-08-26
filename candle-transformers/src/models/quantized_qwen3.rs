@@ -1361,7 +1361,6 @@ mod tests {
                 use_batched: false,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             // Batched tests with F16 and BF16 - single repeat for speed
@@ -1370,7 +1369,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -1378,7 +1376,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 2,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -1386,7 +1383,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -1394,7 +1390,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -1406,7 +1401,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             #[cfg(feature = "huge-context")]
@@ -1418,7 +1412,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 4,
                 num_repeats: 1,
-                generate_max_len: 20,
                 test_mode: None,
             },
             TestConfig {
@@ -1429,7 +1422,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1440,7 +1432,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1451,7 +1442,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1462,7 +1452,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1473,7 +1462,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1484,7 +1472,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1495,7 +1482,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1506,7 +1492,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 1,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1517,7 +1502,6 @@ mod tests {
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 10,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1525,7 +1509,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
             TestConfig {
@@ -1533,7 +1516,6 @@ mod tests {
                 use_batched: true,
                 num_contexts: 5,
                 num_repeats: 1,
-                generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
         ];

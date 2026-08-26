@@ -340,17 +340,40 @@ compresses with the rest.
 * `quantized_qwen35::tests::speculative_decode_9b` — §5, each budget validating
   its output at 100%.
 
-## 7. What is not built
+## 7. Width, and what the budget costs
 
-* **MoE checkpoints.** The 35B/3.6 MTP block is routed (256 experts + shared),
-  and the expert cache is sized and indexed over the trunk's MoE layers only.
-  The loader refuses that case loudly rather than reading experts nothing
-  staged, and those models stay pinned to their plain repos until the cache
-  carries the head's layer.
-* **Sampling (temperature / top-p).** The accept test is greedy equality. The
-  standard modified-rejection arm preserves the sampled distribution exactly and
-  slots into the same driver.
+Speculation is not free at every cohort width, and the budget is a per-model
+constant (`models::draft_ladder`) rather than a global: **budget 2 up to 16
+concurrent sequences, plain decode above**. Measured cold on the 9B and the
+3.6-35B — 1.53x / 1.48x at width 10, 1.05x / 1.10x at 16, 0.39x at 20 on the 9B.
+
+Two results worth carrying forward.
+
+**A middle rung is never right.** Budget 1 loses to budget 2 wherever
+speculation pays at all. A step buys one draft pass and one verify wave whatever
+`k` is, and only the extra scored row scales with it, so budget 1 pays nearly
+the full price for two-thirds of the tokens.
+
+**What caps the width is DeltaNet, not KV.** The recurrent state is
+`n_v_heads × head_dim × head_dim` in F32 per recurrent layer per sequence,
+doubled for the live/backup ping-pong — 120 MiB per session on the 35B, against
+54 MiB of C10 KV for the whole cohort at width 20. It is fixed-size, per-session
+and untouched by KV compression, so compressing harder does not buy concurrency:
+C10 at width 20 OOMs at budget 2 with every KV region still free.
+
+**Measure one point per process.** A laptop card halves its clock after the
+first tens of seconds of load, so a sweep running several configs against one
+loaded model measures position in the run — the same config gave 247 tok/s first
+and 103 third. `cold_speculative_point` and the `cold_*` tests are the
+instrument; `decay_across_configs_9b` demonstrates the trap.
+
+## 8. What is not built
+
 * **A non-copy measurement.** See §5 — and it matters more now than it did.
+* **Ladders for the 35B-A3B and the 27B.** Both inherit the lineage row
+  unmeasured. The 3.6-35B is the only routed checkpoint measured directly.
+* **Anything above width 20.** 32 sessions do not fit a 256-token run on the
+  16 GB card, so the far end of the curve is extrapolation.
 * **The head's KV is compressed like any other layer.** It participates in the
   C0–C10 policy, which is consistent with it being a layer, and its errors cost
   draft *quality* rather than correctness (verify keeps only the target's own

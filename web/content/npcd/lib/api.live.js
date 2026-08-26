@@ -12,7 +12,10 @@ async function j(path, opts) {
   if (!r.ok) {
     let e = { error: 'http_' + r.status, detail: r.statusText };
     try { e = await r.json(); } catch (_) {}
-    throw Object.assign(new Error(e.detail || e.error), e);
+    // Carry the status as well as the body. Some failures are told apart by
+    // code (`auth_unconfigured`) and some only by status, and a caller that has
+    // to re-fetch to learn which is a caller that will not bother.
+    throw Object.assign(new Error(e.detail || e.error), e, { status: r.status });
   }
   return r.status === 204 ? null : r.json();
 }
@@ -28,11 +31,15 @@ export const LiveAPI = {
   getStatus:    () => j('/v1/status'),
   getTelemetry: () => j('/v1/telemetry'),
 
-  getProviders: () => j('/v1/auth/providers'),
-  getMe:        () => j('/v1/me'),
-  getProfile:   () => j('/v1/me/profile'),
-  putProfile:   (b) => j('/v1/me/profile', { method: 'PUT', body: b }),
-  logout:       () => j('/v1/auth/logout', { method: 'POST' }),
+  /* No sign-in or sign-out here. The gateway owns both — its `/auth/*` is
+   * served ahead of site routing on every hostname, and the cookie it issues is
+   * on `.tokera.com`, which is what makes one sign-in carry to code. and bot.
+   * The daemon only ever reports who the gateway says you are. */
+  getMe:          () => j('/v1/me'),
+  getProfile:     () => j('/v1/me/profile'),
+  putProfile:     (b) => j('/v1/me/profile', { method: 'PUT', body: b }),
+  getProfileHistory: () => j('/v1/me/profile/history'),
+  putUniqueName:  (n) => j('/v1/me/unique-name', { method: 'PUT', body: { unique_name: n } }),
 
   listNpcs:  (f) => j('/v1/npc' + qs(f)),
   getNpc:    (id) => j(`/v1/npc/${id}`),

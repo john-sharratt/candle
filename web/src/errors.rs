@@ -128,9 +128,11 @@ fn html_page(p: &Problem) -> Response {
         .map(|s| format!(r#"<meta http-equiv="refresh" content="{s}">"#))
         .unwrap_or_default();
     let note = match retry {
+        // One line on purpose. A `\` line-continuation is an escape, and this is
+        // a *raw* string — so the wrapped version rendered the backslash and the
+        // indentation that followed it into the sentence the visitor reads.
         Some(s) => format!(
-            r#"<p class="r">Retrying automatically in <b>{s}s</b>. \
-               You do not need to do anything.</p>"#
+            r#"<p class="r">Retrying automatically in <b>{s}s</b>. You do not need to do anything.</p>"#
         ),
         None => String::new(),
     };

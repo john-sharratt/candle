@@ -43,7 +43,7 @@ const ARENA_CAPACITY: usize = 256;
 ///
 /// Bind it as `let Some((device, _gpu)) = cuda_device_or_skip() else { return };`
 /// — never to a bare `_`, which drops the guard immediately.
-fn cuda_device_or_skip() -> Option<(Device, std::sync::MutexGuard<'static, ()>)> {
+fn cuda_device_or_skip() -> Option<(Device, crate::kv_cache::chunked::gpu_test_lock::GpuGuard)> {
     match Device::cuda_if_available(0) {
         Ok(d @ Device::Cuda(_)) => Some((d, super::super::gpu_test_lock::gpu_serial())),
         _ => None,
