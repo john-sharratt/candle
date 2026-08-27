@@ -582,6 +582,49 @@ async fn both_faces_of_a_down_upstream_look_the_same() {
     assert!(!codes.is_empty());
 }
 
+/// An outage must not publish the estate's internal addressing.
+///
+/// The error page is served to the internet, and the thing it reports on is by
+/// definition on a private address. It used to name it — `http://192.168.0.5:8081
+/// is not answering` went to anyone who visited a site whose daemon was off,
+/// in the page *and* in the JSON. The transport error is no safer, since a
+/// failed connect usually quotes the address it could not reach.
+#[tokio::test]
+async fn an_outage_does_not_leak_the_upstream_address() {
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let port = dead.port().to_string();
+    let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
+
+    // Both the probe and the fast path, both content types.
+    for i in 0..4 {
+        if i % 2 == 1 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        for accept in ["text/html", "application/json"] {
+            let r = get_with(addr, "/v1/status", "npcd.test", accept).await;
+            for secret in ["127.0.0.1", &port, "http://"] {
+                assert!(
+                    !r.body.contains(secret),
+                    "`{secret}` leaked into a {accept} error body: {}",
+                    r.body
+                );
+            }
+        }
+    }
+
+    // And the headers say only that the gateway failed, not where.
+    let h = head_of(addr, "/v1/status", "npcd.test").await;
+    for (k, v) in &h {
+        assert!(
+            !v.contains("127.0.0.1") && !v.contains(&port),
+            "`{k}: {v}` leaks the upstream address"
+        );
+    }
+}
+
 /// The gateway marks its own failures, so a retrying page can tell "the service
 /// is still down" from "the service answered, with something that is not 200".
 ///
