@@ -75,6 +75,35 @@ async fn fetch(addr: SocketAddr, path: &str) -> Res {
     get_with(addr, path, "127.0.0.1", "*/*").await
 }
 
+/// The response headers, lowercased, for assertions about what the gateway
+/// stamps on its own answers.
+async fn head_of(addr: SocketAddr, path: &str, host: &str) -> Vec<(String, String)> {
+    use hyper::Request;
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .uri(path)
+        .header("host", host)
+        .header("accept", "text/html")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+    res.headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_ascii_lowercase(),
+                v.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
 fn content_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
@@ -457,16 +486,23 @@ async fn a_dead_upstream_gives_a_readable_page_then_backs_off() {
     let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
 
     // First request pays the connect attempt and reports it.
+    //
+    // `503`, not `502`: a daemon that is merely off is worth coming back for,
+    // and it answers with a `Retry-After`. The probe used to answer `502 Bad
+    // Gateway` under its own heading, so every second refresh of the
+    // reconnecting page looked like a different, worse fault.
     let r = get_with(addr, "/v1/status", "npcd.test", "text/html").await;
-    assert_eq!(r.status, 502);
+    assert_eq!(r.status, 503);
     assert!(
         r.content_type.starts_with("text/html"),
         "a browser gets a page"
     );
-    assert!(r.body.contains("not answering"), "{}", r.body);
+    assert!(r.body.contains("Reconnecting"), "{}", r.body);
+    // It retries itself with script, and still retries without it.
+    assert!(r.body.contains("_probe="), "the page has no retry loop");
     assert!(
-        r.body.contains("http-equiv=\"refresh\""),
-        "the page retries itself"
+        r.body.contains("<noscript><meta http-equiv=\"refresh\""),
+        "no fallback for a reader without scripting"
     );
 
     // Subsequent requests inside the window fail fast rather than repeating the
@@ -485,6 +521,118 @@ async fn a_dead_upstream_gives_a_readable_page_then_backs_off() {
     assert!(!r.content_type.starts_with("text/html"));
 }
 
+/// A service being off is one condition, however many times you refresh.
+///
+/// The gateway alternates between two answers while an upstream is down: a fast
+/// one while the backoff window is open, and the probe that reopens it. Both are
+/// the same news, so both must look the same — status, heading, and a page that
+/// keeps trying. They did not: the probe was `502 Bad Gateway` titled *That
+/// service is not answering*, so a reader refreshing a `503` *Reconnecting*
+/// page saw it flip to what looked like the site itself breaking.
+#[tokio::test]
+async fn both_faces_of_a_down_upstream_look_the_same() {
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
+
+    // Sleep past the window each time, so every request is the probe that
+    // reopens it — the path that used to answer 502 under its own heading.
+    // `proxy_cfg` caps the window well below this, so the wait is bounded.
+    let mut statuses = std::collections::BTreeSet::new();
+    let mut codes = std::collections::BTreeSet::new();
+    for i in 0..4 {
+        // Alternate: straight after the previous request the window is open
+        // (fast path); after a sleep it has expired (probe). Both faces, in one
+        // loop, without depending on timing luck.
+        if i % 2 == 1 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        let r = get_with(addr, "/v1/status", "npcd.test", "text/html").await;
+        statuses.insert(r.status);
+        assert!(r.body.contains("Reconnecting"), "{}", r.body);
+        assert!(r.body.contains("_probe="), "a page that does not retry");
+
+        let j = get_with(addr, "/v1/status", "npcd.test", "application/json").await;
+        codes.insert(
+            j.body
+                .split("\"error\":\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("?")
+                .to_owned(),
+        );
+    }
+
+    assert_eq!(
+        statuses,
+        [503].into_iter().collect(),
+        "a down upstream answered with more than one status"
+    );
+    // Every code seen is one of the two upstream-down codes, and nothing else
+    // leaked in. Stated as a subset rather than `a || b`, which is satisfied by
+    // either alone and so asserts nothing about the pair.
+    for c in &codes {
+        assert!(
+            c == "upstream_backoff" || c == "upstream_unavailable",
+            "unexpected code {c}"
+        );
+    }
+    assert!(!codes.is_empty());
+}
+
+/// The gateway marks its own failures, so a retrying page can tell "the service
+/// is still down" from "the service answered, with something that is not 200".
+///
+/// A recovered daemon may legitimately reply `401` because the session expired
+/// during the outage. Keying recovery on `response.ok` would leave the page
+/// reconnecting forever against a service a manual refresh would reach.
+#[tokio::test]
+async fn the_gateway_signs_its_own_error_responses() {
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
+
+    let down = head_of(addr, "/v1/status", "npcd.test").await;
+    assert!(
+        down.iter().any(|(k, v)| k == "x-tokera-gateway-error"
+            && (v == "upstream_backoff" || v == "upstream_unavailable")),
+        "the gateway did not mark its own failure: {down:?}"
+    );
+
+    // A live upstream's answer carries no such mark, whatever its status.
+    let up = spawn(fake_api()).await;
+    let ok = head_of(up, "/v1/status", "127.0.0.1").await;
+    assert!(
+        !ok.iter().any(|(k, _)| k == "x-tokera-gateway-error"),
+        "an upstream answer was marked as a gateway failure: {ok:?}"
+    );
+
+    // And the page's retry loop keys on that header rather than on the status.
+    //
+    // A text assertion, because nothing here runs the script — these tests
+    // speak HTTP, not DOM. It cannot prove the loop behaves; it can stop the
+    // check silently reverting to `r.ok`, which is the regression that would
+    // leave a page reconnecting forever against a daemon answering 401.
+    let page = get_with(addr, "/v1/status", "npcd.test", "text/html").await;
+    assert!(
+        page.body.contains("r.headers.get(MARK)"),
+        "the retry loop no longer keys on the gateway marker"
+    );
+    assert!(
+        !page.body.contains("if(r.ok)"),
+        "the retry loop is back to keying on the status"
+    );
+    // The schedule comes from the server, not from the script.
+    assert!(
+        page.body.contains("var FIRST=") && page.body.contains(",CAP="),
+        "the page carries no server-supplied backoff schedule"
+    );
+}
+
 #[tokio::test]
 async fn recovery_needs_no_operator() {
     // Reserve a port, close it, point the proxy at it, then start the real
@@ -500,7 +648,7 @@ async fn recovery_needs_no_operator() {
         get_with(addr, "/v1/status", "npcd.test", "application/json")
             .await
             .status,
-        502
+        503
     );
 
     let listener = tokio::net::TcpListener::bind(target).await.unwrap();

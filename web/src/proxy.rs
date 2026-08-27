@@ -106,7 +106,10 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
             Some(e) => format!("{} is not answering ({e})", f.upstream),
             None => format!("{} is not answering", f.upstream),
         };
-        return errors::respond(Problem::backing_off(detail, retry_after), f.want_html);
+        return errors::respond(
+            Problem::backing_off(detail, retry_after).with_cap(f.health.max_backoff()),
+            f.want_html,
+        );
     }
 
     let (mut parts, body) = req.into_parts();
@@ -214,7 +217,8 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
                 Problem::upstream_down(
                     format!("{} is not answering: {e}", f.upstream),
                     Some(retry),
-                ),
+                )
+                .with_cap(f.health.max_backoff()),
                 f.want_html,
             );
         }

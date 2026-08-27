@@ -87,6 +87,17 @@ impl Health {
         }
     }
 
+    /// The longest this will ever make a caller wait between attempts.
+    ///
+    /// Handed to the error page so its own retry loop can use the deployment's
+    /// ceiling rather than a number compiled into a script. The two disagreeing
+    /// is how a browser ends up polling faster than the gateway is willing to
+    /// probe — every one of those requests answered from the backoff window,
+    /// learning nothing.
+    pub fn max_backoff(&self) -> Duration {
+        Duration::from_millis(self.backoff.max_ms)
+    }
+
     /// Decide whether to attempt `key` now.
     pub fn gate(&self, key: &str) -> Gate {
         let mut map = self.inner.lock().unwrap();
