@@ -53,8 +53,12 @@ export async function render() {
     h('span', { class: 'dim tiny' }, 'waiting for the tick to close…'));
 
   el.appendChild(h('section', { class: 'demo', id: 'demo' },
-    h('div', { class: 'demo-label' },
-      h('span', { class: 'dot ticking' }), 'live — not a recording'),
+    /* Labelled as the sample it is. It used to say "live — not a recording",
+     * which committed the front page to running a real character for every
+     * visitor — a claim a stranger cannot check and we would have had to keep
+     * true forever. The demo makes its point either way, because the point is
+     * the shape of the exchange, not that this particular one just happened. */
+    h('div', { class: 'demo-label' }, 'a sample exchange'),
     h('div', { class: 'demo-frame' },
       h('div', { class: 'demo-hd' },
         h('div', { class: 'avatar' }, 'V'),

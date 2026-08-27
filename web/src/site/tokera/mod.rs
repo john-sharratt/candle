@@ -392,16 +392,25 @@ mod tests {
             page.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#),
             "the tab icon is not the brand mark"
         );
-        // The nav mark is now the switcher's own chip — same file, and
-        // relative, so it is this site's mark whichever host is serving it.
+        // The nav mark is the switcher's chip, drawn from the switcher's own
+        // copy rather than from this site's favicon. They are the same drawing;
+        // the copy exists because every site renders this menu and a site's
+        // favicon is unreachable whenever that site is down. `page.rs` pins the
+        // two byte for byte.
         let summary = page
             .split("<summary")
             .nth(1)
             .and_then(|s| s.split("</summary>").next())
             .expect("the switcher's summary");
         assert!(
-            summary.contains("url('/favicon.png')"),
+            summary.contains("url('/brand/tokera.png')"),
             "the nav mark is not the brand mark: {summary}"
+        );
+        // Nothing paints a colour behind a mark. Tokera's is transparent, so a
+        // tint sat *through* it and the chip read as a solid red square.
+        assert!(
+            !page.contains("estate-chip\" style=\"background-color"),
+            "a colour is painted behind a switcher icon"
         );
         // Root-relative specifically. Other sites in the switcher legitimately
         // have `.svg` favicons, and their absolute URLs are not this site's
