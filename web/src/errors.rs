@@ -26,6 +26,18 @@ pub struct Problem {
     /// and the doc comment claiming the two matched was true only for the
     /// default. `None` falls back to the same default the config uses.
     pub retry_cap: Option<Duration>,
+    /// What an operator needs to diagnose this, which the public must not see.
+    ///
+    /// [`detail`](Self::detail) is served to the internet, so it may say that a
+    /// service is down but never *which host and port*. The error page was
+    /// publishing `http://192.168.0.5:8081` to anyone who visited a site whose
+    /// daemon happened to be off — the internal addressing, handed over for
+    /// free, on a page specifically designed to be seen by strangers. The
+    /// transport error is no safer, since a failed connect usually quotes the
+    /// address it could not reach.
+    ///
+    /// Anything put here is logged by [`respond`] and never serialised.
+    pub internal: Option<String>,
 }
 
 impl Problem {
@@ -59,6 +71,7 @@ impl Problem {
             detail: detail.into(),
             retry_after,
             retry_cap: None,
+            internal: None,
         }
     }
 
@@ -70,6 +83,7 @@ impl Problem {
             detail: detail.into(),
             retry_after: Some(retry_after),
             retry_cap: None,
+            internal: None,
         }
     }
 
@@ -81,6 +95,12 @@ impl Problem {
         self
     }
 
+    /// Attach the diagnosis. Logged when the response is built, never sent.
+    pub fn because(mut self, internal: impl Into<String>) -> Self {
+        self.internal = Some(internal.into());
+        self
+    }
+
     pub fn not_found(detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -89,6 +109,7 @@ impl Problem {
             detail: detail.into(),
             retry_after: None,
             retry_cap: None,
+            internal: None,
         }
     }
 
@@ -100,6 +121,7 @@ impl Problem {
             detail: detail.into(),
             retry_after: None,
             retry_cap: None,
+            internal: None,
         }
     }
 }
@@ -149,6 +171,13 @@ pub fn wants_html(path: &str, headers: &HeaderMap) -> bool {
 pub const GATEWAY_ERROR: &str = "x-tokera-gateway-error";
 
 pub fn respond(p: Problem, html: bool) -> Response {
+    // The one place the diagnosis is emitted. Doing it here rather than at each
+    // call site means a new error cannot be added that forgets to log — and,
+    // more to the point, cannot reach for the internal address to make its
+    // public message more helpful.
+    if let Some(why) = &p.internal {
+        tracing::warn!(code = p.code, status = %p.status, "{why}");
+    }
     let mut res = if html { html_page(&p) } else { json_body(&p) };
     let h = res.headers_mut();
     if let Ok(v) = HeaderValue::from_str(p.code) {
