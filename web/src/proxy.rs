@@ -73,6 +73,14 @@ pub(crate) const IDENTITY_HEADERS: [&str; 5] = [
     "x-tokera-assertion",
 ];
 
+/// What a visitor is told when a daemon behind the gateway is not answering.
+///
+/// Deliberately says nothing about *where* it is. The page carrying this is
+/// public, and the thing it is reporting on is by definition on a private
+/// address — naming it turns an outage into a free map of the estate.
+const UPSTREAM_DOWN: &str =
+    "The service this page needs is not responding. It may be restarting or briefly offline.";
+
 pub struct Forward<'a> {
     pub client: &'a HttpClient,
     pub health: &'a Health,
@@ -102,11 +110,19 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         last_error,
     } = f.health.gate(f.upstream)
     {
-        let detail = match last_error {
+        // The visitor is told what is happening; the address it is happening to
+        // stays in the log. This page is served to the internet, and it used to
+        // name the host and port of whichever daemon was down.
+        let internal = match last_error {
             Some(e) => format!("{} is not answering ({e})", f.upstream),
             None => format!("{} is not answering", f.upstream),
         };
-        return errors::respond(Problem::backing_off(detail, retry_after), f.want_html);
+        return errors::respond(
+            Problem::backing_off(UPSTREAM_DOWN, retry_after)
+                .with_cap(f.health.max_backoff())
+                .because(internal),
+            f.want_html,
+        );
     }
 
     let (mut parts, body) = req.into_parts();
@@ -120,7 +136,8 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         Ok(u) => u,
         Err(e) => {
             return errors::respond(
-                Problem::upstream_down(format!("bad upstream URI `{target}`: {e}"), None),
+                Problem::upstream_down("This route is misconfigured.", None)
+                    .because(format!("bad upstream URI `{target}`: {e}")),
                 f.want_html,
             )
         }
@@ -211,10 +228,9 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         Err(e) => {
             let retry = f.health.on_failure(f.upstream, &e.to_string());
             return errors::respond(
-                Problem::upstream_down(
-                    format!("{} is not answering: {e}", f.upstream),
-                    Some(retry),
-                ),
+                Problem::upstream_down(UPSTREAM_DOWN, Some(retry))
+                    .with_cap(f.health.max_backoff())
+                    .because(format!("{} is not answering: {e}", f.upstream)),
                 f.want_html,
             );
         }

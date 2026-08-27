@@ -194,18 +194,10 @@ code, pre { font-family: var(--mono); }
   height: 50px; flex: 0 0 50px; padding: 0 16px;
   background: var(--panel); border-bottom: 1px solid var(--line);
 }
-.brand {
-  display: flex; align-items: center; gap: 9px; font-weight: 700;
-  letter-spacing: -.2px; margin-right: 20px; font-size: .97rem;
-}
-.brand { color: var(--ink); text-decoration: none; }
-.brand:hover { text-decoration: none; }
-.brand:hover .glyph { background: var(--raised); }
-.brand .glyph {
-  width: 26px; height: 26px; display: grid; place-items: center; border-radius: 7px;
-  background: var(--panel-3); color: var(--accent); transition: background var(--t);
-}
-.brand .glyph svg { display: block; }
+/* The brand corner is the estate switcher — see the block at the end of this
+   file. It replaced a plain `.brand` link whose only destination was this
+   site's own front page. */
+#estate { margin-right: 14px; }
 .navlink {
   position: relative; padding: 0 13px; height: 50px; display: inline-flex; align-items: center;
   background: none; border: none; color: var(--ink-soft);
@@ -509,8 +501,10 @@ label.field > span {
 
   .icon-btn { display: flex; }
   .topbar { height: 52px; flex-basis: 52px; padding: 0 12px; gap: 2px; }
-  .brand { margin-right: 10px; }
-  .brand-word { display: none; }          /* the mark alone carries it */
+  #estate { margin-right: 8px; }
+  /* The chip alone carries it — but only on the summary. The menu rows keep
+     their names, or the switcher becomes four unlabelled squares. */
+  .estate > summary .estate-name { display: none; }
   .hide-narrow { display: none !important; }
 
   /* The rail leaves the flow and becomes an overlay drawer. */
@@ -613,3 +607,8 @@ label.field > span {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
   .rail, .acts { transition: none; }
 }
+
+/* The estate switcher's own styles are in `lib/estate.css`, linked separately.
+   They live outside this file because zend does not load `base.css` — it embeds
+   its own assets — and a switcher that only looks right on two of the three
+   sites is not a shared component. */

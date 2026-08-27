@@ -1,0 +1,72 @@
+/* The estate switcher — the brand corner, opened out into every site.
+ *
+ * Its own file rather than part of `base.css`, because zend does not load that
+ * stylesheet: it embeds `zend/web` and serves its own assets, so it takes a
+ * copy of this file and of `estate.js` beside it. Two files to copy, one test
+ * pinning both — see `web/src/site/tokera/page.rs`.
+ *
+ * Every colour is `var(--token, fallback)`. The npcd console and tokera.com
+ * define those tokens and the switcher takes their theme; zend defines none of
+ * them and gets the fallbacks, which are tuned to its own dark blue. That is
+ * what lets one stylesheet dress three different design systems without a
+ * variant for each.
+ */
+
+.estate { position: relative; }
+
+.estate > summary {
+  display: flex; align-items: center; gap: 8px;
+  cursor: pointer; list-style: none; user-select: none;
+  padding: 4px 8px 4px 4px; border-radius: 9px;
+  border: 1px solid transparent;
+  color: var(--ink, #d0dae4);
+  transition: background .15s, border-color .15s;
+}
+/* Safari draws its own triangle and ignores `list-style` on a summary. */
+.estate > summary::-webkit-details-marker { display: none; }
+.estate > summary:hover,
+.estate[open] > summary {
+  background: var(--panel, #22303f);
+  border-color: var(--line-2, #2a3848);
+}
+.estate > summary:focus-visible { outline: 2px solid var(--accent, #c98a3e); outline-offset: 2px; }
+
+.estate-chip {
+  width: 21px; height: 21px; flex: none; border-radius: 6px;
+  background-size: contain; background-repeat: no-repeat; background-position: center;
+}
+.estate-name { font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
+.estate-caret { font-size: .62rem; opacity: .55; margin-left: 1px; }
+.estate[open] .estate-caret { opacity: .9; }
+
+.estate-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 60;
+  min-width: 232px; padding: 5px;
+  display: flex; flex-direction: column; gap: 1px;
+  background: var(--panel, #22303f);
+  border: 1px solid var(--line-2, #2a3848);
+  border-radius: 12px; box-shadow: 0 14px 38px rgba(0, 0, 0, .34);
+}
+.estate-row {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 9px; border-radius: 8px;
+  color: var(--ink, #d0dae4); text-decoration: none; font-size: .875rem;
+}
+.estate-row:hover { background: var(--bg-deep, #19222f); text-decoration: none; }
+.estate-row.is-current { background: var(--accent-soft, rgba(201, 138, 62, .14)); font-weight: 650; }
+.estate-here {
+  margin-left: auto; font-size: .64rem; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--ink-dim, #6a8098); font-weight: 600;
+}
+
+/* The menu is wider than a phone's brand corner; pin it to the viewport edge
+   rather than letting it push a horizontal scrollbar onto the page. */
+@media (max-width: 420px) {
+  .estate-menu { left: -4px; right: -4px; min-width: 0; }
+}
+
+/* Narrow: the chip alone carries the summary — but the menu rows keep their
+   names, or the switcher becomes four unlabelled squares. */
+@media (max-width: 860px) {
+  .estate > summary .estate-name { display: none; }
+}

@@ -6,39 +6,44 @@ import { h, mount } from './lib/dom.js';
 import { toast } from './lib/ui.js';
 import { checkBuild, takeReloadState } from './lib/build.js';
 import { state as vp, onBreakpoint } from './lib/viewport.js';
+import { estateSwitcher } from './lib/estate.js';
 
 // ── page registry ───────────────────────────────────────────────────────────
 // Adding a page touches exactly one entry here plus one file. Nav is derived.
 
-definePage({ path: '/', title: () => 'My NPCs', nav: { section: 'main', order: 10, label: 'My NPCs' },
+/* Each page is a path, how to load it, and — for the ones that appear in
+ * navigation — where it sits there. No `title`: the tab keeps the name
+ * `index.html` gave it, so a per-page title had no reader and was quietly
+ * becoming a second, unmaintained set of labels beside `nav.label`. */
+definePage({ path: '/', nav: { section: 'main', order: 10, label: 'My NPCs' },
   load: () => import('./pages/roster.js') });
-definePage({ path: '/npc/new', title: () => 'New character',
+definePage({ path: '/npc/new',
   load: () => import('./pages/create.js') });
-definePage({ path: '/npc/:id', title: () => 'Character', keepsRail: true,
+definePage({ path: '/npc/:id', keepsRail: true,
   load: () => import('./pages/npc.js') });
-definePage({ path: '/npc/:id/:tab', title: () => 'Character', keepsRail: true,
+definePage({ path: '/npc/:id/:tab', keepsRail: true,
   load: () => import('./pages/npc.js') });
-definePage({ path: '/interaction/:ix', title: () => 'Interaction',
+definePage({ path: '/interaction/:ix',
   load: () => import('./pages/console.js') });
-definePage({ path: '/worlds', title: () => 'Worlds', nav: { section: 'main', order: 20, label: 'Worlds' },
+definePage({ path: '/worlds', nav: { section: 'main', order: 20, label: 'Worlds' },
   load: () => import('./pages/worlds.js') });
-definePage({ path: '/world/:wid', title: () => 'World',
+definePage({ path: '/world/:wid',
   load: () => import('./pages/worlds.js') });
-definePage({ path: '/archetypes', title: () => 'Archetypes', nav: { section: 'main', order: 30, label: 'Archetypes' },
+definePage({ path: '/archetypes', nav: { section: 'main', order: 30, label: 'Archetypes' },
   load: () => import('./pages/archetypes.js') });
-definePage({ path: '/tools', title: () => 'Tools', nav: { section: 'main', order: 40, label: 'Tools' },
+definePage({ path: '/tools', nav: { section: 'main', order: 40, label: 'Tools' },
   load: () => import('./pages/tools.js') });
-definePage({ path: '/substrate', title: () => 'Substrate', nav: { section: 'main', order: 50, label: 'Substrate' },
+definePage({ path: '/substrate', nav: { section: 'main', order: 50, label: 'Substrate' },
   load: () => import('./pages/substrate.js') });
-definePage({ path: '/performance', title: () => 'Performance', nav: { section: 'main', order: 60, label: 'Performance' },
+definePage({ path: '/performance', nav: { section: 'main', order: 60, label: 'Performance' },
   load: () => import('./pages/system.js') });
-definePage({ path: '/probe', title: () => 'Probe', nav: { section: 'main', order: 55, label: 'Probe' },
+definePage({ path: '/probe', nav: { section: 'main', order: 55, label: 'Probe' },
   load: () => import('./pages/probe.js') });
-definePage({ path: '/logs', title: () => 'Logs', nav: { section: 'main', order: 70, label: 'Logs' },
+definePage({ path: '/logs', nav: { section: 'main', order: 70, label: 'Logs' },
   load: () => import('./pages/logs.js') });
-definePage({ path: '/system', title: () => 'System', load: () => import('./pages/system.js') });
-definePage({ path: '/me', title: () => 'Profile', load: () => import('./pages/profile.js') });
-definePage({ path: '/welcome', title: () => 'npcd', load: () => import('./pages/landing.js') });
+definePage({ path: '/system', load: () => import('./pages/system.js') });
+definePage({ path: '/me', load: () => import('./pages/profile.js') });
+definePage({ path: '/welcome', load: () => import('./pages/landing.js') });
 
 // ── theme ───────────────────────────────────────────────────────────────────
 
@@ -82,18 +87,60 @@ function themeMenu() {
 
 let ME = null;
 
+/* The signed-in person's face, or their initial when there is no picture.
+ *
+ * `referrerpolicy` because the src is the identity provider's CDN: without it
+ * every avatar load tells Google which page of the console is being read.
+ * `onError` because an avatar URL outlives the image behind it — a provider
+ * rotates the path and the chrome would otherwise show a broken-image glyph
+ * where a person's face was, which looks like a bug in the sign-in. */
+export function faceOf(me, px) {
+  // Every candidate can be present-but-blank: a provider may send a name that
+  // is only whitespace, and `''.trim()[0]` is `undefined`, which would throw on
+  // `.toUpperCase()` and take the whole top bar down with it.
+  const initial = ([me.display, me.unique_name, '?']
+    .map((s) => (s || '').trim()).find((s) => s.length)[0]).toUpperCase();
+  const ring = `width:${px}px;height:${px}px;border-radius:50%;flex:none`;
+  if (me.avatar_url) {
+    const img = h('img', {
+      src: me.avatar_url, alt: '', referrerpolicy: 'no-referrer',
+      style: ring + ';object-fit:cover',
+    });
+    img.addEventListener('error', () => img.replaceWith(letter(initial, px, ring)));
+    return img;
+  }
+  return letter(initial, px, ring);
+}
+
+function letter(initial, px, ring) {
+  return h('span', {
+    style: ring + ';background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;'
+      + `font-size:${Math.round(px * 0.44)}px;font-weight:800`,
+  }, initial);
+}
+
+/* Hover text: the display name is already visible, so the tooltip carries what
+ * is not — the account it belongs to, and the handle characters address. */
+function whoTitle() {
+  return [ME.email, ME.unique_name && '@' + ME.unique_name].filter(Boolean).join(' · ');
+}
+
 function renderChrome() {
   const host = document.getElementById('chrome');
   if (!host) return;
   mount(host,
     themeButton(),
     ME
+      /* Your own name and face, not your handle. `unique_name` is the address
+       * an NPC uses for you — a lowercased, punctuation-stripped thing derived
+       * from an email — and showing it here reads as somebody else's account.
+       * The provider's `display` and `avatar_url` are what a person recognises
+       * as themselves, so they are what the chrome shows; the handle belongs on
+       * the profile page, where it is being edited. */
       ? h('button', {
-        class: 'btn sm ghost', title: ME.display + ' · ' + (ME.email || ''),
+        class: 'btn sm ghost', title: whoTitle(),
         onClick: () => go('/me'),
-      }, h('span', {
-        style: 'width:20px;height:20px;border-radius:50%;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-size:.66rem;font-weight:800',
-      }, (ME.unique_name || '?')[0]), ME.unique_name)
+      }, faceOf(ME, 20), (ME.display || '').trim() || ME.unique_name || 'Signed in')
       /* Straight to the provider, not to `#/welcome` — a link to the page you
        * are already on is a control that visibly does nothing, and the welcome
        * page is where this button is most likely to be pressed. When sign-in is
@@ -186,32 +233,45 @@ function syncRailButton() {
 
 // ── boot ────────────────────────────────────────────────────────────────────
 
-/* Sign-in is real. `/v1/me` answers only for a caller whose session assertion
- * the daemon could verify against the estate's shared key, so being signed in
- * is not something this page can decide — it is something it discovers.
+/* Sign-in is real. `/v1/me` answers only for a caller the gateway named, so
+ * being signed in is not something this page can decide — it is something it
+ * discovers.
  *
  * The gateway owns the flow. `/auth/login` is served on every hostname ahead of
  * site routing, and the cookie it issues is on `.tokera.com`, which is what
  * makes one sign-in carry to code. and bot. without either daemon taking part.
- * So signing in is a navigation, not a fetch. */
-const here = () => location.pathname + location.search + location.hash;
+ * So signing in is a navigation, not a fetch.
+ *
+ * # `next` is absolute, and has to be
+ *
+ * The provider's registered redirect URI is `https://tokera.com/auth/callback` —
+ * one host for the whole estate, because that is what a provider registration
+ * is. So the browser always comes back to tokera.com, and a relative `next` like
+ * `/#/welcome` resolves *there*: sign in from this console and you land on the
+ * home page of a different site, having asked to come back here.
+ *
+ * Sending the full URL survives the hop. `safe_next` accepts it because the
+ * host is under the cookie domain, and refuses anything that is not — so this
+ * cannot be turned into an open redirect by handing it somebody else's URL. */
 window.__npcdSignIn = () => {
-  location.href = '/auth/login?next=' + encodeURIComponent(here());
+  location.href = '/auth/login?next=' + encodeURIComponent(location.href);
 };
 window.__npcdSignOut = () => {
-  location.href = '/auth/logout?next=' + encodeURIComponent('/#/welcome');
+  /* Logout needs no round trip through the provider, so a relative target would
+   * work — but the rule is worth keeping uniform: whoever is reading this next
+   * should not have to work out which of the two hops loses the host. */
+  location.href =
+    '/auth/logout?next=' + encodeURIComponent(location.origin + '/#/welcome');
 };
 
 /* Distinct from being signed out, and the difference decides whether to offer a
  * sign-in control at all: a button that cannot work is worse than none.
  *
- * It takes BOTH ends to answer, because either can be the one that is missing.
- * The daemon reports whether it holds the shared key — without it no assertion
- * can be verified, so nobody can be signed in here. The gateway reports whether
- * it has an identity provider configured, and it is the authority on that: with
- * `auth:` off it does not serve `/auth/login` at all, so the navigation lands on
- * site routing, gets `index.html` back, and reads to the visitor as a button
- * that does nothing. Asking only the daemon would miss exactly that case. */
+ * The gateway is the only authority on it, because it owns the whole flow. With
+ * `auth:` off it does not serve `/auth/login` at all — the navigation then lands
+ * on site routing, gets `index.html` back, and reads to the visitor as a button
+ * that does nothing. `/auth/me` says `configured: false` in that state, which is
+ * the one reliable way to know before offering the control. */
 export let AUTH_UNAVAILABLE = false;
 
 async function gatewayHasSignIn() {
@@ -242,18 +302,17 @@ async function boot() {
     await new Promise((r) => setTimeout(r, 400));
   }
 
-  /* 401 means signed out. 503 `auth_unconfigured` means this deployment has no
-   * session key at all — the operator's problem, not the visitor's, and worth
-   * telling them apart rather than showing a dead button. */
+  // A 401 here means signed out, which is the only thing this daemon can say
+  // about identity — it does not run sign-in and has no configuration of its
+  // own that could be missing.
   try {
     ME = await API.getMe();
   } catch (e) {
     ME = null;
-    if (e && e.error === 'auth_unconfigured') AUTH_UNAVAILABLE = true;
   }
-  // Only worth asking the gateway when nobody is signed in: a live session is
-  // itself proof that both ends are configured.
-  if (!ME && !AUTH_UNAVAILABLE && !(await gatewayHasSignIn())) AUTH_UNAVAILABLE = true;
+  // Whether anyone *could* sign in is the gateway's answer, and worth asking
+  // only when nobody is: a live session is itself proof that it is configured.
+  if (!ME && !(await gatewayHasSignIn())) AUTH_UNAVAILABLE = true;
 
   const bootEl = document.getElementById('boot');
   if (bootEl) bootEl.remove();
@@ -268,6 +327,12 @@ async function boot() {
   st('st-mode', (status && status.mode) || '');
   st('st-backend', 'backend: ' + BACKEND, 'add ?mock=1 to run without a daemon');
   st('st-build', (status && status.build) || '');
+
+  /* The brand corner is the switcher. Its "you are here" row goes to this
+   * console's own front page rather than to `https://bot.tokera.com/`, which
+   * would be a full page load to arrive where you already are. */
+  const estate = document.getElementById('estate');
+  if (estate) mount(estate, estateSwitcher('npcd', { homeHref: '#/welcome' }));
 
   renderChrome();
   renderNav(null);   // tabs appear immediately, even if the first page fails to render
@@ -304,7 +369,10 @@ async function boot() {
 
   start(document.getElementById('outlet'), (page, params) => {
     renderNav(page);
-    document.title = page ? (typeof page.title === 'function' ? page.title(params) : page.title) + ' · npcd' : 'npcd';
+    /* The tab keeps the name it was served with. It used to be rewritten on
+     * every route — `Roster · npcd`, `Worlds · npcd` — which is restless when
+     * the page already says where you are, twice, in the nav and in its own
+     * heading. `index.html` sets it once and nothing here touches it. */
     // Pages own the rail; clear it on every route so a stale one never lingers.
     const rail = document.getElementById('rail');
     if (rail && !(page && page.keepsRail)) rail.replaceChildren();

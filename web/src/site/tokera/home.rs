@@ -92,7 +92,7 @@ const WORK: [Work; 6] = [
     },
     Work {
         kicker: "The assistant",
-        name: "Zen Code",
+        name: "Zend",
         tagline: "A coding assistant that keeps the whole project in mind",
         body: "Most assistants forget between sessions and re-read the same files to re-derive \
                the same conclusions. This one keeps the codebase, the decisions and the reasons \
@@ -323,7 +323,6 @@ fn tile(w: &Work) -> String {
 
 pub async fn show() -> Response {
     let meta = Meta {
-        title: "Minds that outlive their bodies",
         heading: "Tokera",
         subtitle: None,
         byline: None,
@@ -496,6 +495,14 @@ mod tests {
     async fn only_the_engine_carries_the_diagram() {
         let html = rendered().await;
         assert_eq!(html.matches("<svg class=\"curve\"").count(), 1);
+        // The diagram has to be inline SVG so it can be theme-coloured and stay
+        // crisp; an image file is neither.
+        //
+        // Back to the blanket form. It was briefly relaxed to "the brand mark is
+        // the only image", for a spell when the mark was an `<img>` — but the
+        // switcher paints it as a background instead, so that exemption stopped
+        // matching any markup and the comparison became `0 == 0`: a check that
+        // could no longer fail, guarding the thing it was written to guard.
         assert!(
             !html.contains("<img"),
             "the diagram must not be an image file"

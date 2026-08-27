@@ -27,8 +27,27 @@ pub struct Config {
     pub sites: Vec<Site>,
     /// Sign-in, for the whole estate rather than per site — one account across
     /// every hostname is the point. Absent means no sign-in anywhere.
+    ///
+    /// Normally supplied by [`auth_file`](Self::auth_file) rather than written
+    /// here, so this table stays identical on every machine.
     #[serde(default)]
     pub auth: Option<Auth>,
+    /// A file to read [`auth`](Self::auth) from, resolved against this config.
+    ///
+    /// This is what lets the site table be pulled onto a deployment without
+    /// touching its credentials. The block used to live inline, which meant the
+    /// one machine that had a real `client_id` carried a locally-modified
+    /// `web.yaml` forever — and every attempt to update the sites there failed
+    /// with *your local changes would be overwritten*, on exactly the file that
+    /// had nothing deployment-specific about it except those four lines.
+    ///
+    /// **A missing file means sign-in is off**, which is the same thing the
+    /// commented-out block used to mean: a public site must not stop serving
+    /// because a key it does not need is absent. A file that *is* present and
+    /// does not parse is fatal, because at that point the deployment has said
+    /// it wants sign-in and a gateway that quietly has none is worse.
+    #[serde(default)]
+    pub auth_file: Option<PathBuf>,
     /// Directory the config was loaded from; relative roots resolve against it.
     #[serde(skip)]
     pub base: PathBuf,
@@ -312,6 +331,48 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Fold `auth_file` into [`auth`](Self::auth).
+    ///
+    /// Absent file, sign-in off. Present and broken, hard failure — the two
+    /// halves of the rule that keeps a public site serving without credentials
+    /// while refusing to run a half-configured one.
+    fn load_auth_file(&mut self, base: &Path) -> Result<()> {
+        let Some(rel) = self.auth_file.clone() else {
+            return Ok(());
+        };
+        if self.auth.is_some() {
+            // Silently preferring one would make the other look ignored, and
+            // which one won would depend on knowing this function exists.
+            bail!("both `auth:` and `auth_file:` are set; use one");
+        }
+
+        let path = if rel.is_absolute() {
+            rel
+        } else {
+            base.join(rel)
+        };
+        // Kept resolved, so `--check` can name the exact path it looked at
+        // rather than the relative one it was given.
+        self.auth_file = Some(path.clone());
+
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            // Distinguished on purpose: a file that is not there is a
+            // deployment without sign-in, and any other error — unreadable,
+            // a directory, a bad mount — is a deployment that meant to have it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!("sign-in: no {} — running without it", path.display());
+                return Ok(());
+            }
+            Err(e) => bail!("reading {}: {e}", path.display()),
+        };
+
+        self.auth = Some(
+            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
+        );
+        Ok(())
+    }
+
     fn finish(&mut self) -> Result<()> {
         if self.sites.is_empty() {
             bail!("no sites declared — nothing to serve");
@@ -323,6 +384,8 @@ impl Config {
         }
 
         let base = self.base.clone();
+
+        self.load_auth_file(&base)?;
 
         // Secret paths resolve against the config file, exactly like `roots`
         // and `papers`. Read as given they would follow the working directory
@@ -509,5 +572,131 @@ sites:
         // A typo in a config that silently does nothing is worse than a refusal.
         let y = "sites:\n  - {name: a, roots: ['.'], default: true, hsots: []}\n";
         assert!(Config::from_yaml(y, Path::new(".")).is_err());
+    }
+
+    // ── auth_file ───────────────────────────────────────────────────────────
+    //
+    // The site table has to be identical on every machine, so the one piece
+    // that is not — a real `client_id` — lives in a file beside it. These pin
+    // the three states that split creates.
+
+    /// A directory of this test's own. Counted rather than timestamped: the
+    /// platform clock is coarse enough that tests starting together get the
+    /// same nanosecond, and then the same directory.
+    fn tmpdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "web-authfile-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn with_auth_file(dir: &Path, body: Option<&str>) -> Result<Config> {
+        if let Some(b) = body {
+            std::fs::create_dir_all(dir.join("secrets")).unwrap();
+            std::fs::write(dir.join("secrets").join("auth.yaml"), b).unwrap();
+        }
+        let y = format!(
+            "auth_file: \"secrets/auth.yaml\"\n{}",
+            YAML.trim_start_matches('\n')
+        );
+        Config::from_yaml(&y, dir)
+    }
+
+    const AUTH: &str = r#"
+cookie_domain: ".tokera.com"
+session_ttl_hours: 720
+session_secret_file: "secrets/session.key"
+google:
+  client_id: "abc.apps.googleusercontent.com"
+  client_secret_file: "secrets/google.secret"
+  redirect_uri: "https://tokera.com/auth/callback"
+"#;
+
+    /// Absent file, sign-in off — the same meaning the commented-out block had.
+    /// A public site must not stop serving because a key it does not need is
+    /// missing.
+    #[test]
+    fn a_missing_auth_file_means_no_sign_in_rather_than_a_failure() {
+        let dir = tmpdir();
+        let c = with_auth_file(&dir, None).expect("a missing auth file is not an error");
+        assert!(c.auth.is_none());
+        // And the resolved path is kept, so `--check` can say what it looked for.
+        assert_eq!(c.auth_file.unwrap(), dir.join("secrets").join("auth.yaml"));
+    }
+
+    #[test]
+    fn a_present_auth_file_configures_sign_in() {
+        let dir = tmpdir();
+        let c = with_auth_file(&dir, Some(AUTH)).expect("valid auth file");
+        let a = c.auth.expect("sign-in is configured");
+        assert_eq!(a.cookie_domain, ".tokera.com");
+        assert_eq!(a.google.client_id, "abc.apps.googleusercontent.com");
+        // Its paths resolve against the config, exactly like `roots`.
+        assert_eq!(
+            a.session_secret_file,
+            dir.join("secrets").join("session.key")
+        );
+    }
+
+    /// Present but broken is fatal. By then the deployment has said it wants
+    /// sign-in, and a gateway that quietly has none is the worse outcome —
+    /// which is the whole reason a *missing* file is treated differently.
+    #[test]
+    fn a_broken_auth_file_is_a_hard_failure() {
+        for bad in [
+            "cookie_domain: [not a string]\n",
+            "google: {}\n",
+            "cookie_domain: \".x\"\nsession_secret_file: \"k\"\ngoogle:\n  client_id: a\n  client_secret_file: s\n  redirect_uri: r\n  typo: 1\n",
+            ": : :\n",
+        ] {
+            let dir = tmpdir();
+            assert!(
+                with_auth_file(&dir, Some(bad)).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    /// Two sources for one block would make whichever lost look ignored.
+    #[test]
+    fn inline_auth_and_an_auth_file_together_are_refused() {
+        let dir = tmpdir();
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        std::fs::write(dir.join("secrets").join("auth.yaml"), AUTH).unwrap();
+        let y = format!(
+            "auth_file: \"secrets/auth.yaml\"\nauth:\n{}\n{}",
+            AUTH.trim_start_matches('\n')
+                .lines()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            YAML.trim_start_matches('\n')
+        );
+        assert!(Config::from_yaml(&y, &dir).is_err());
+    }
+
+    /// The shipped table names an auth file and does not carry the block, so
+    /// it is the same bytes on every machine and can always be pulled.
+    #[test]
+    fn the_shipped_table_keeps_its_credentials_out_of_line() {
+        let text = include_str!("../web.yaml");
+        assert!(
+            text.contains("auth_file:"),
+            "web.yaml does not name an auth file"
+        );
+        // Only as a comment. An uncommented `auth:` here is the thing that made
+        // the file locally-modified on one box and unpullable ever after.
+        for line in text.lines() {
+            assert!(
+                !line.starts_with("auth:"),
+                "web.yaml carries an inline `auth:` block"
+            );
+        }
     }
 }

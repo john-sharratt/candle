@@ -93,7 +93,6 @@ pub fn oops(nav: Nav, detail: &str) -> Response {
 
 fn message(nav: Nav, heading: &str, detail: &str) -> Html<String> {
     let meta = Meta {
-        title: heading,
         heading,
         subtitle: None,
         byline: None,
@@ -377,64 +376,58 @@ mod tests {
         }
     }
 
-    /// The brand mark exists twice — inline in the nav so it can take the
-    /// theme's colours, and as `favicon.svg` for the browser tab. Two copies of
-    /// one drawing is exactly the thing that drifts, so the geometry is
-    /// compared rather than trusted.
+    /// The nav mark and the tab icon are one file, not two drawings.
+    ///
+    /// They used to be two — an inline SVG and a `favicon.svg` holding the same
+    /// coordinates — and this test compared the geometry because two copies of
+    /// one drawing is exactly the thing that drifts. Pointing both at the same
+    /// file removes the failure rather than detecting it, so what is left to
+    /// check is that the file is really there and that nothing still reaches
+    /// for the drawing it replaced.
     #[tokio::test]
-    async fn the_nav_mark_and_the_favicon_are_the_same_drawing() {
+    async fn the_nav_mark_and_the_favicon_are_one_file() {
         let (_, page) = get("/").await;
-        let favicon = String::from_utf8(
-            std::fs::read(content_root().join("tokera").join("favicon.svg")).unwrap(),
-        )
-        .unwrap();
 
-        // The four shapes that make the letter and the figure, by their
-        // coordinates. The crossbar is wider than the tile on purpose — it runs
-        // edge to edge and the rounded corners clip it.
-        for geometry in [
-            "width=\"32\" height=\"32\" rx=\"7.5\"",
-            "cx=\"16\" cy=\"6.6\" r=\"3.5\"",
-            "x=\"-2\" y=\"12\" width=\"36\" height=\"5.4\"",
-            "x=\"13.3\" y=\"12\" width=\"5.4\" height=\"26\"",
-        ] {
+        assert!(
+            page.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#),
+            "the tab icon is not the brand mark"
+        );
+        // The nav mark is the switcher's chip, drawn from the switcher's own
+        // copy rather than from this site's favicon. They are the same drawing;
+        // the copy exists because every site renders this menu and a site's
+        // favicon is unreachable whenever that site is down. `page.rs` pins the
+        // two byte for byte.
+        let summary = page
+            .split("<summary")
+            .nth(1)
+            .and_then(|s| s.split("</summary>").next())
+            .expect("the switcher's summary");
+        assert!(
+            summary.contains("url('/brand/tokera.png')"),
+            "the nav mark is not the brand mark: {summary}"
+        );
+        // Nothing paints a colour behind a mark. Tokera's is transparent, so a
+        // tint sat *through* it and the chip read as a solid red square.
+        assert!(
+            !page.contains("estate-chip\" style=\"background-color"),
+            "a colour is painted behind a switcher icon"
+        );
+        // Root-relative specifically. Other sites in the switcher legitimately
+        // have `.svg` favicons, and their absolute URLs are not this site's
+        // superseded drawing.
+        for stale in [r#"href="/favicon.svg""#, "url('/favicon.svg')"] {
             assert!(
-                page.contains(geometry),
-                "the nav mark is missing `{geometry}`"
-            );
-            assert!(
-                favicon.contains(geometry),
-                "the favicon is missing `{geometry}`"
+                !page.contains(stale),
+                "something still points at the superseded drawing: {stale}"
             );
         }
 
-        // The inline one is themed; the file cannot be, so it is literal.
+        let mark = content_root().join("tokera").join("favicon.png");
+        let bytes =
+            std::fs::read(&mark).unwrap_or_else(|e| panic!("reading {}: {e}", mark.display()));
         assert!(
-            page.contains("fill=\"var(--brand)\""),
-            "the nav mark is not themed"
-        );
-        assert!(
-            !favicon.contains("var(--"),
-            "a file favicon cannot read CSS variables"
-        );
-
-        // The head has to differ from the counter-form in both copies. If it
-        // ever matches, the figure collapses back into a plain T and the whole
-        // reason for the extra shape is gone — silently, and only at small
-        // sizes, which is exactly the kind of regression nobody spots.
-        assert!(
-            page.contains("fill=\"var(--brand-head)\""),
-            "the nav mark's head is not its own colour"
-        );
-        let head_fill = favicon
-            .split("<circle")
-            .nth(1)
-            .and_then(|s| s.split("fill=\"").nth(1))
-            .and_then(|s| s.split('"').next())
-            .expect("the favicon has a head with a fill");
-        assert!(
-            !favicon.contains(&format!("width=\"36\" height=\"5.4\" fill=\"{head_fill}\"")),
-            "the favicon's head is the same colour as the crossbar"
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "the brand mark is not a PNG"
         );
     }
 

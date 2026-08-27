@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use web::auth::session::Identity;
 
-use crate::accounts::{Accounts, NameError};
-use crate::identity::{NotSignedIn, Verifier};
+use crate::accounts::{self, Accounts, NameError, PatchError};
+use crate::identity::{self, NotSignedIn};
 use crate::registry::Registry;
 
 /// Both authored collections, shared with the HTTP layer.
@@ -39,21 +39,14 @@ pub struct Authored {
     pub worlds: RwLock<Registry>,
     pub archetypes: RwLock<Registry>,
     pub accounts: RwLock<Accounts>,
-    pub verifier: Verifier,
 }
 
 impl Authored {
-    pub fn new(
-        worlds: Registry,
-        archetypes: Registry,
-        accounts: Accounts,
-        verifier: Verifier,
-    ) -> Arc<Self> {
+    pub fn new(worlds: Registry, archetypes: Registry, accounts: Accounts) -> Arc<Self> {
         Arc::new(Self {
             worlds: RwLock::new(worlds),
             archetypes: RwLock::new(archetypes),
             accounts: RwLock::new(accounts),
-            verifier,
         })
     }
 }
@@ -80,41 +73,24 @@ pub fn router(state: Arc<Authored>) -> Router {
         .with_state(state)
 }
 
-/// Establish the caller, or produce the response that says why not.
+/// Establish the caller, or produce the 401 that says why not.
 ///
-/// The two failure shapes are deliberately different. `unconfigured` is the
-/// operator's problem — the console should say sign-in is unavailable rather
-/// than offer a button that cannot work — and a plain 401 is the visitor's, who
-/// simply needs to sign in.
 /// Boxed because a `Response` is large and this is the cold path — clippy is
 /// right that returning one by value in a `Result` is a big move for the common
 /// case, which is success.
-fn caller(s: &Authored, headers: &HeaderMap) -> Result<Identity, Box<Response>> {
-    s.verifier
-        .identify(headers, web::auth::session::now_secs())
-        .map_err(|why| {
-            Box::new(match why {
-                NotSignedIn::Unconfigured => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({
-                        "error": "auth_unconfigured",
-                        "detail": "this daemon has no session key, so it cannot verify a sign-in"
-                    })),
-                )
-                    .into_response(),
-                NotSignedIn::Absent => {
-                    err(StatusCode::UNAUTHORIZED, "unauthorized", "not signed in")
-                }
-                NotSignedIn::Rejected(e) => {
-                    err(StatusCode::UNAUTHORIZED, "unauthorized", &e.to_string())
-                }
-            })
-        })
+fn caller(headers: &HeaderMap) -> Result<Identity, Box<Response>> {
+    identity::identify(headers).map_err(|NotSignedIn| {
+        Box::new(err(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "not signed in",
+        ))
+    })
 }
 
 /// Who the caller is here, creating the local account on first sight.
 async fn me(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match caller(&headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -132,7 +108,7 @@ async fn me(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
 }
 
 async fn get_profile(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match caller(&headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -148,15 +124,40 @@ async fn put_profile(
     headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match caller(&headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
+    // Everything the caller sent is checked before any of it is merged. The
+    // store repairs a wrong-typed field by blanking it — which is right for a
+    // record read off disk and wrong for a live request, where it would answer
+    // 200 while destroying what the author had written.
+    let Some(patch) = patch.as_object() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "expected a JSON object",
+        );
+    };
+    if let Err(e) = accounts::check_patch(patch) {
+        return match e {
+            PatchError::NotText(field) => err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                &format!("`{field}` must be a string"),
+            ),
+            PatchError::BadGender => err(
+                StatusCode::BAD_REQUEST,
+                "bad_gender",
+                &format!("expected one of {}", accounts::GENDERS.join(", ")),
+            ),
+        };
+    }
     match s
         .accounts
         .write()
         .await
-        .put_profile(&id.sub, &patch, now_ms())
+        .put_profile(&id.sub, patch, now_ms())
     {
         Ok(Some(me)) => Json(me["profile"].clone()).into_response(),
         Ok(None) => err(StatusCode::NOT_FOUND, "account_not_found", "no account yet"),
@@ -177,7 +178,7 @@ async fn put_profile(
 /// rarely and read on every page load, so the history is the larger half of the
 /// record and almost never the part being asked for.
 async fn get_profile_history(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match caller(&headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -199,7 +200,7 @@ async fn put_unique_name(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match caller(&headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -349,47 +350,54 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
-    use web::auth::session::{self, Key};
 
+    /// A directory of this test's own.
+    ///
+    /// The tag names it and a counter keeps it unique. It used to be the tag
+    /// plus `SystemTime::now()`, which is only as fine as the platform clock —
+    /// around 15ms on Windows — so two tests sharing a tag, or starting in the
+    /// same tick, were handed the same directory and wrote over each other.
     fn tmp(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
             "npcd-api-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        // A previous run of the same PID could have left one behind.
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
     }
 
-    fn key() -> Key {
-        Key::new(vec![3u8; 32]).unwrap()
+    fn app() -> Router {
+        router(state(tmp("state")))
     }
 
-    fn app(verifier: Verifier) -> Router {
-        let base = tmp("state");
-        router(Authored::new(
+    /// Shared state, for a test that makes several requests against one store.
+    /// `router` consumes its state, so the `Arc` is what gets reused.
+    fn state(base: std::path::PathBuf) -> Arc<Authored> {
+        Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
             Registry::load("archetype", base.join("archetypes")).unwrap(),
             Accounts::load(base.join("accounts")).unwrap(),
-            verifier,
-        ))
+        )
     }
 
-    /// A live assertion for `sub`, signed with the key the app verifies against.
-    fn assertion(sub: &str) -> String {
-        session::sign(
-            &key(),
-            &Identity {
-                sub: sub.into(),
-                email: "wren@example.com".into(),
-                name: "Wren S".into(),
-                picture: String::new(),
-                exp: session::now_secs() + 3600,
-            },
-        )
+    /// The headers the gateway sets for a signed-in caller.
+    ///
+    /// This is the whole authentication story on this side: the gateway
+    /// resolved a session cookie and named the caller. `npcd` believes it
+    /// because `web` clears these on ingress unless the server declared
+    /// `behind_gateway`, which is asserted in `web/tests/roles.rs` rather than
+    /// here — an in-process router cannot observe its own ingress.
+    fn signed_in(sub: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("x-tokera-user", sub.to_owned()),
+            ("x-tokera-email", "wren@example.com".into()),
+            ("x-tokera-name", "Wren S".into()),
+        ]
     }
 
     async fn call(app: Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -402,103 +410,84 @@ mod tests {
         (status, body)
     }
 
-    fn get(path: &str, assertion: Option<&str>) -> Request<Body> {
+    fn get(path: &str, sub: Option<&str>) -> Request<Body> {
         let mut b = Request::builder().uri(path);
-        if let Some(a) = assertion {
-            b = b.header("x-tokera-assertion", a);
+        for (k, v) in sub.map(signed_in).unwrap_or_default() {
+            b = b.header(k, v);
         }
         b.body(Body::empty()).unwrap()
     }
 
+    fn send(path: &str, method: &str, sub: &str, body: Value) -> Request<Body> {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        for (k, v) in signed_in(sub) {
+            b = b.header(k, v);
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
     #[tokio::test]
     async fn a_signed_caller_gets_an_account_created_on_first_sight() {
-        let app = app(Verifier::with_key(key()));
-        let (status, me) = call(app, get("/v1/me", Some(&assertion("google-1")))).await;
+        let (status, me) = call(app(), get("/v1/me", Some("google-1"))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(me["email"], "wren@example.com");
         assert_eq!(me["display"], "Wren S");
         assert!(me["user_id"].as_str().unwrap().starts_with("u_"));
     }
 
-    /// The reason this daemon verifies rather than trusts: it binds a LAN
-    /// address, so header-setting is not a privilege.
+    /// A caller the gateway did not name is anonymous, and stays that way.
     #[tokio::test]
-    async fn identity_headers_alone_do_not_sign_anyone_in() {
-        let app = app(Verifier::with_key(key()));
+    async fn without_the_gateways_headers_nobody_is_signed_in() {
+        let (status, body) = call(app(), get("/v1/me", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
+    }
+
+    /// The subject is the account key, so a caller who sends everything *but*
+    /// a subject must not become an account — least of all the one their email
+    /// happens to name.
+    #[tokio::test]
+    async fn a_caller_with_no_subject_cannot_borrow_an_email_to_become_someone() {
         let req = Request::builder()
             .uri("/v1/me")
-            .header("x-tokera-user", "someone-else")
-            .header("x-tokera-email", "victim@example.com")
-            .header("x-tokera-name", "Victim")
+            .header("x-tokera-email", "admin@tokera.com")
+            .header("x-tokera-name", "Admin")
             .body(Body::empty())
             .unwrap();
-        let (status, _) = call(app, req).await;
+        let (status, _) = call(app(), req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn an_assertion_signed_with_another_key_is_refused() {
-        let other = session::sign(
-            &Key::new(vec![9u8; 32]).unwrap(),
-            &Identity {
-                sub: "admin".into(),
-                email: "a@b.c".into(),
-                name: "A".into(),
-                picture: String::new(),
-                exp: session::now_secs() + 3600,
-            },
-        );
-        let (status, _) = call(app(Verifier::with_key(key())), get("/v1/me", Some(&other))).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    /// Unconfigured is a different problem from signed-out, and the console has
-    /// to be able to tell them apart to show the right thing.
-    #[tokio::test]
-    async fn an_unconfigured_daemon_says_so_rather_than_returning_401() {
-        let (status, body) = call(
-            app(Verifier::unconfigured()),
-            get("/v1/me", Some(&assertion("google-1"))),
-        )
-        .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"], "auth_unconfigured");
     }
 
     #[tokio::test]
     async fn a_profile_edit_round_trips_for_its_owner() {
-        let base = tmp("profile");
-        let state = Authored::new(
-            Registry::load("world", base.join("worlds")).unwrap(),
-            Registry::load("archetype", base.join("archetypes")).unwrap(),
-            Accounts::load(base.join("accounts")).unwrap(),
-            Verifier::with_key(key()),
-        );
-        let a = assertion("google-1");
+        let state = state(tmp("profile"));
+        let a = "google-1";
 
         // `/v1/me` is what creates the record.
-        let (s, _) = call(router(state.clone()), get("/v1/me", Some(&a))).await;
+        let (s, _) = call(router(state.clone()), get("/v1/me", Some(a))).await;
         assert_eq!(s, StatusCode::OK);
 
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/v1/me/profile")
-            .header("x-tokera-assertion", &a)
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"description":"Ex-surveyor."}"#))
-            .unwrap();
+        let req = send(
+            "/v1/me/profile",
+            "PUT",
+            a,
+            json!({"description": "Ex-surveyor."}),
+        );
         let (s, p) = call(router(state.clone()), req).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(p["description"], "Ex-surveyor.");
         assert_eq!(p["revision"], 1);
 
-        let (s, p) = call(router(state.clone()), get("/v1/me/profile", Some(&a))).await;
+        let (s, p) = call(router(state.clone()), get("/v1/me/profile", Some(a))).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(p["description"], "Ex-surveyor.");
 
         // The superseded revision is still readable — the Save button promises
         // exactly this, and an NPC citing the old text depends on it.
-        let (s, h) = call(router(state), get("/v1/me/profile/history", Some(&a))).await;
+        let (s, h) = call(router(state), get("/v1/me/profile/history", Some(a))).await;
         assert_eq!(s, StatusCode::OK);
         let revisions = h["revisions"].as_array().unwrap();
         assert_eq!(revisions.len(), 2);
@@ -509,70 +498,50 @@ mod tests {
 
     #[tokio::test]
     async fn the_history_is_no_more_readable_than_the_profile_it_belongs_to() {
-        let app = app(Verifier::with_key(key()));
-        let (status, _) = call(app, get("/v1/me/profile/history", None)).await;
+        let (status, _) = call(app(), get("/v1/me/profile/history", None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     /// Two accounts must not see each other's profile.
     #[tokio::test]
     async fn one_signed_in_user_cannot_read_or_write_another() {
-        let base = tmp("two");
-        let state = Authored::new(
-            Registry::load("world", base.join("worlds")).unwrap(),
-            Registry::load("archetype", base.join("archetypes")).unwrap(),
-            Accounts::load(base.join("accounts")).unwrap(),
-            Verifier::with_key(key()),
-        );
-        let (a1, a2) = (assertion("google-1"), assertion("google-2"));
+        let state = state(tmp("two"));
+        let (a1, a2) = ("google-1", "google-2");
 
-        call(router(state.clone()), get("/v1/me", Some(&a1))).await;
-        call(router(state.clone()), get("/v1/me", Some(&a2))).await;
+        call(router(state.clone()), get("/v1/me", Some(a1))).await;
+        call(router(state.clone()), get("/v1/me", Some(a2))).await;
 
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/v1/me/profile")
-            .header("x-tokera-assertion", &a1)
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"description":"mine"}"#))
-            .unwrap();
+        let req = send("/v1/me/profile", "PUT", a1, json!({"description": "mine"}));
         call(router(state.clone()), req).await;
 
         // The second user's profile is untouched — there is no id in the URL to
         // point at somebody else in the first place, which is the design.
-        let (_, p2) = call(router(state), get("/v1/me/profile", Some(&a2))).await;
+        let (_, p2) = call(router(state), get("/v1/me/profile", Some(a2))).await;
         assert_eq!(p2["description"], "");
     }
 
     fn set_name(a: &str, name: &str) -> Request<Body> {
-        Request::builder()
-            .method("PUT")
-            .uri("/v1/me/unique-name")
-            .header("x-tokera-assertion", a)
-            .header("content-type", "application/json")
-            .body(Body::from(json!({ "unique_name": name }).to_string()))
-            .unwrap()
+        send(
+            "/v1/me/unique-name",
+            "PUT",
+            a,
+            json!({ "unique_name": name }),
+        )
     }
 
     #[tokio::test]
     async fn a_unique_name_is_the_authors_to_set_and_survives_the_next_sign_in() {
-        let base = tmp("uname");
-        let state = Authored::new(
-            Registry::load("world", base.join("worlds")).unwrap(),
-            Registry::load("archetype", base.join("archetypes")).unwrap(),
-            Accounts::load(base.join("accounts")).unwrap(),
-            Verifier::with_key(key()),
-        );
-        let a = assertion("google-1");
-        call(router(state.clone()), get("/v1/me", Some(&a))).await;
+        let state = state(tmp("uname"));
+        let a = "google-1";
+        call(router(state.clone()), get("/v1/me", Some(a))).await;
 
-        let (s, me) = call(router(state.clone()), set_name(&a, "ridge-walker")).await;
+        let (s, me) = call(router(state.clone()), set_name(a, "ridge-walker")).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(me["unique_name"], "ridge-walker");
 
         // The provider re-asserts `Wren S` on every sign-in; the chosen name
         // must not be reverted by it.
-        let (_, me) = call(router(state), get("/v1/me", Some(&a))).await;
+        let (_, me) = call(router(state), get("/v1/me", Some(a))).await;
         assert_eq!(me["unique_name"], "ridge-walker");
         assert_eq!(me["display"], "Wren S");
     }
@@ -581,46 +550,34 @@ mod tests {
     /// addresses a person by this name, so two of them is an ambiguous target.
     #[tokio::test]
     async fn two_authors_cannot_share_one_name() {
-        let base = tmp("clash");
-        let state = Authored::new(
-            Registry::load("world", base.join("worlds")).unwrap(),
-            Registry::load("archetype", base.join("archetypes")).unwrap(),
-            Accounts::load(base.join("accounts")).unwrap(),
-            Verifier::with_key(key()),
-        );
-        let (a1, a2) = (assertion("google-1"), assertion("google-2"));
-        call(router(state.clone()), get("/v1/me", Some(&a1))).await;
-        call(router(state.clone()), get("/v1/me", Some(&a2))).await;
+        let state = state(tmp("clash"));
+        let (a1, a2) = ("google-1", "google-2");
+        call(router(state.clone()), get("/v1/me", Some(a1))).await;
+        call(router(state.clone()), get("/v1/me", Some(a2))).await;
 
-        let (s, _) = call(router(state.clone()), set_name(&a1, "ridge-walker")).await;
+        let (s, _) = call(router(state.clone()), set_name(a1, "ridge-walker")).await;
         assert_eq!(s, StatusCode::OK);
 
         // Different case, same address.
-        let (s, body) = call(router(state.clone()), set_name(&a2, "Ridge-Walker")).await;
+        let (s, body) = call(router(state.clone()), set_name(a2, "Ridge-Walker")).await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert_eq!(body["error"], "name_taken");
 
         // Setting your own name to what it already is is not a clash with
         // yourself.
-        let (s, _) = call(router(state), set_name(&a1, "ridge-walker")).await;
+        let (s, _) = call(router(state), set_name(a1, "ridge-walker")).await;
         assert_eq!(s, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn a_malformed_name_is_refused_with_a_reason_worth_showing() {
-        let base = tmp("shape");
-        let state = Authored::new(
-            Registry::load("world", base.join("worlds")).unwrap(),
-            Registry::load("archetype", base.join("archetypes")).unwrap(),
-            Accounts::load(base.join("accounts")).unwrap(),
-            Verifier::with_key(key()),
-        );
-        let a = assertion("google-1");
-        call(router(state.clone()), get("/v1/me", Some(&a))).await;
+        let state = state(tmp("shape"));
+        let a = "google-1";
+        call(router(state.clone()), get("/v1/me", Some(a))).await;
 
         let too_long = "w".repeat(25);
         for bad in ["x", "-wren", "wren-", "wren s", "wrén", too_long.as_str()] {
-            let (s, body) = call(router(state.clone()), set_name(&a, bad)).await;
+            let (s, body) = call(router(state.clone()), set_name(a, bad)).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} should be refused");
             assert_eq!(body["error"], "bad_unique_name");
             assert!(
@@ -630,17 +587,106 @@ mod tests {
         }
     }
 
+    /// `gender` is a choice, so the API enforces the same two options the
+    /// console offers — a value a character cannot read must not be storable
+    /// just because the caller skipped the GUI.
     #[tokio::test]
-    async fn setting_a_name_still_needs_a_signature() {
-        let app = app(Verifier::with_key(key()));
+    async fn gender_takes_only_the_values_a_character_can_read() {
+        let state = state(tmp("gender"));
+        let a = "google-1";
+        call(router(state.clone()), get("/v1/me", Some(a))).await;
+
+        for good in ["Male", "Female", ""] {
+            let req = send("/v1/me/profile", "PUT", a, json!({ "gender": good }));
+            let (s, p) = call(router(state.clone()), req).await;
+            assert_eq!(s, StatusCode::OK, "{good:?} should be accepted");
+            assert_eq!(p["gender"], good);
+        }
+
+        for bad in ["male", "M", "Other", "they/them", "—"] {
+            let req = send("/v1/me/profile", "PUT", a, json!({ "gender": bad }));
+            let (s, body) = call(router(state.clone()), req).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} should be refused");
+            assert_eq!(body["error"], "bad_gender");
+        }
+
+        // And a refusal must not have written a revision on its way out.
+        let (_, p) = call(router(state), get("/v1/me/profile", Some(a))).await;
+        assert_eq!(p["revision"], 3, "a rejected write bumped the revision");
+    }
+
+    /// The wrong *kind* of value is refused too, and does not quietly erase
+    /// what was there.
+    ///
+    /// Only strings used to be checked, so `{"gender": null}` and
+    /// `{"gender": 3}` walked past the guard, merged, and were blanked by the
+    /// store's repair pass — 200 OK, choice destroyed. The same held for the
+    /// prose fields: `{"description": 42}` wiped a paragraph and reported
+    /// success.
+    #[tokio::test]
+    async fn a_wrong_typed_field_is_refused_and_changes_nothing() {
+        let state = state(tmp("types"));
+        let a = "google-1";
+        call(router(state.clone()), get("/v1/me", Some(a))).await;
+
+        let seed = send(
+            "/v1/me/profile",
+            "PUT",
+            a,
+            json!({"gender": "Male", "description": "Ex-surveyor."}),
+        );
+        assert_eq!(call(router(state.clone()), seed).await.0, StatusCode::OK);
+
+        for bad in [
+            json!({"gender": null}),
+            json!({"gender": 3}),
+            json!({"description": 42}),
+            json!({"history": ["a"]}),
+        ] {
+            let req = send("/v1/me/profile", "PUT", a, bad.clone());
+            let (s, body) = call(router(state.clone()), req).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad} was accepted");
+            assert_eq!(body["error"], "bad_request", "{bad}");
+        }
+
+        // Nothing was merged, nothing was blanked, no revision was spent.
+        let (_, p) = call(router(state), get("/v1/me/profile", Some(a))).await;
+        assert_eq!(p["gender"], "Male");
+        assert_eq!(p["description"], "Ex-surveyor.");
+        assert_eq!(p["revision"], 1);
+    }
+
+    /// A body that is not an object is refused before it can retire a revision.
+    #[tokio::test]
+    async fn a_body_that_is_not_an_object_is_refused() {
+        let state = state(tmp("shape2"));
+        let a = "google-1";
+        call(router(state.clone()), get("/v1/me", Some(a))).await;
+
+        for body in [json!([]), json!("x"), json!(3), json!(null)] {
+            let req = send("/v1/me/profile", "PUT", a, body.clone());
+            let (s, e) = call(router(state.clone()), req).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body} was accepted");
+            assert_eq!(e["error"], "bad_request");
+        }
+
+        // The live revision is untouched and history has not grown.
+        let (_, p) = call(router(state.clone()), get("/v1/me/profile", Some(a))).await;
+        assert_eq!(p["revision"], 0);
+        let (_, h) = call(router(state), get("/v1/me/profile/history", Some(a))).await;
+        assert_eq!(h["revisions"].as_array().unwrap().len(), 1);
+    }
+
+    /// Every write is behind the same gate, not just the reads.
+    #[tokio::test]
+    async fn setting_a_name_needs_the_gateway_to_have_named_you() {
         let req = Request::builder()
             .method("PUT")
             .uri("/v1/me/unique-name")
-            .header("x-tokera-user", "google-1")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"unique_name":"impostor"}"#))
             .unwrap();
-        let (status, _) = call(app, req).await;
+        let (status, _) = call(app(), req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

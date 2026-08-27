@@ -7,10 +7,12 @@
 //! that swap "Sign in" for your name, and the page is complete without it.
 
 pub struct Meta<'a> {
-    /// Browser title, before the site suffix.
-    pub title: &'a str,
-    /// The `<h1>`. Usually the same as `title`, but a paper's h1 is its full
-    /// name while the tab wants something shorter.
+    /// The `<h1>`.
+    ///
+    /// There is deliberately no separate browser title beside it. Every page
+    /// here is titled `Tokera` and stays that way while you read — a tab that
+    /// renames itself as you click is restless, and the page already says what
+    /// it is in letters an inch tall.
     pub heading: &'a str,
     pub subtitle: Option<&'a str>,
     /// Small text under the heading — a date, authors.
@@ -68,15 +70,47 @@ pub const LINKS: [(&str, &str, Nav); 3] = [
     ("/papers", "Papers", Nav::Papers),
 ];
 
-/// The other sites in the estate — separate hosts, so they are rendered as a
-/// distinct group rather than mixed in with the pages above. A nav that makes
-/// "somewhere else on this site" look identical to "a different site" is a nav
-/// that lies about where a click goes.
-pub const ELSEWHERE: [(&str, &str); 3] = [
-    ("https://code.tokera.com/", "Zen Code"),
-    ("https://bot.tokera.com/", "NPCs"),
-    ("https://battlecities.net/", "Battle Cities"),
+/// Every site in the estate, in the order they are offered.
+///
+/// `(id, name, url, icon)`. The id is what marks the current one; the icon is
+/// served by whichever site is showing the menu, from `content/common/brand/`.
+///
+/// It used to be each site's own favicon by absolute URL, which failed twice
+/// over: zend's icon came from `code.tokera.com`, so it vanished exactly when
+/// zend was down and you were most likely looking for a way elsewhere; and the
+/// colour painted behind it as a fallback sat *through* Tokera's transparent
+/// mark, leaving a red triskelion on a red square.
+///
+/// **This list exists three times** — here, in `content/common/lib/estate.js`
+/// for the npcd console, and in `zend/web/lib/estate.js` because zend embeds
+/// its own assets and cannot read the shared directory. Three copies of one
+/// list is exactly the thing that drifts, so
+/// [`tests::the_estate_list_matches_the_shared_module`] compares this against
+/// the JavaScript rather than trusting them to stay level.
+pub const ESTATE: [(&str, &str, &str, &str); 4] = [
+    (
+        "tokera",
+        "Tokera",
+        "https://tokera.com/",
+        "/brand/tokera.png",
+    ),
+    (
+        "zend",
+        "Zend",
+        "https://code.tokera.com/",
+        "/brand/zend.svg",
+    ),
+    ("npcd", "NPCs", "https://bot.tokera.com/", "/brand/npcd.svg"),
+    (
+        "battlecities",
+        "Battle Cities",
+        "https://battlecities.net/",
+        "/brand/battlecities.png",
+    ),
 ];
+
+/// Which entry of [`ESTATE`] this site is.
+const ME: &str = "tokera";
 
 /// Everything from the doctype to the end of the nav bar.
 fn doc_open(m: &Meta) -> String {
@@ -87,17 +121,17 @@ fn doc_open(m: &Meta) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<title>{title} · Tokera</title>
+<title>Tokera</title>
 <meta name="description" content="{description}">
-<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" href="/favicon.png">
 <link rel="stylesheet" href="/base.css">
+<link rel="stylesheet" href="/lib/estate.css">
 <link rel="stylesheet" href="/site.css">
 </head>
 <body class="tokera">
 {nav}
 "#,
         root = m.width.root_class(),
-        title = esc(m.title),
         description = esc(m.description),
         nav = nav_bar(m.nav),
     )
@@ -121,41 +155,85 @@ pub fn nav_bar(current: Nav) -> String {
         .collect::<Vec<_>>()
         .join("");
 
-    let elsewhere = ELSEWHERE
+    // The other sites, as a row of icons-with-labels. Rendered here as well as
+    // inside the switcher because the two answer different questions: this row
+    // is "what else exists", visible without a click, and the switcher is
+    // "where am I and how do I move".
+    let elsewhere = ESTATE
         .iter()
-        .map(|(href, label)| format!("<a href=\"{href}\">{label}</a>"))
+        .filter(|(id, ..)| *id != ME)
+        .map(|(_, name, url, icon)| {
+            format!(
+                "<a href=\"{url}\"><span class=\"estate-chip\" \
+                 style=\"background-image:url('{icon}')\"></span>{name}</a>"
+            )
+        })
         .collect::<Vec<_>>()
         .join("");
 
-    // The same mark as favicon.svg — a T that is also a figure with its arms
-    // out — inline so the counter-form takes the page's own background instead
-    // of a baked colour that goes wrong the moment someone switches to light.
-    //
-    // The tile and the head are brand colours rather than theme tokens: a mark
-    // that changes because somebody retuned `--info` is not a mark.
-    let mark = r##"<svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
-    <defs><clipPath id="tkmark"><rect width="32" height="32" rx="7.5"/></clipPath></defs>
-    <g clip-path="url(#tkmark)">
-      <rect width="32" height="32" fill="var(--brand)"/>
-      <circle cx="16" cy="6.6" r="3.5" fill="var(--brand-head)"/>
-      <rect x="-2" y="12" width="36" height="5.4" fill="var(--bg)"/>
-      <rect x="13.3" y="12" width="5.4" height="26" fill="var(--bg)"/>
-    </g>
-  </svg>"##;
+    // The brand, opened out into every site. `<details>` rather than a scripted
+    // popover: open, close, keyboard and Escape are the element's own
+    // behaviour, so the control still works with scripts off — which matters on
+    // a documents site whose whole point is that it renders without them.
+    let rows = ESTATE
+        .iter()
+        .map(|(id, name, url, icon)| {
+            let here = *id == ME;
+            // The site you are on links to its own root: the switcher is also
+            // the way home, which is what the brand did before it grew a menu.
+            let href = if here { "/" } else { url };
+            format!(
+                "<a href=\"{href}\" class=\"estate-row{cls}\"{aria}>\
+                 <span class=\"estate-chip\" style=\"background-image:url('{icon}')\"></span>\
+                 <span class=\"estate-name\">{name}</span>{tag}</a>",
+                cls = if here { " is-current" } else { "" },
+                aria = if here { " aria-current=\"true\"" } else { "" },
+                tag = if here {
+                    "<span class=\"estate-here\">you are here</span>"
+                } else {
+                    ""
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
 
     // `hidden` until the script decides which of the two to show, so a reader
     // with JavaScript off sees neither a wrong state nor a flash of both.
     format!(
         r#"<header class="site-top">
-  <a class="site-brand" href="/">{mark}Tokera</a>
+  <details class="estate">
+    <summary class="estate-current" aria-label="Switch site">
+      <span class="estate-chip" style="background-image:url('/brand/tokera.png')"></span>
+      <span class="estate-name">Tokera</span>
+      <span class="estate-caret" aria-hidden="true">&#9662;</span>
+    </summary>
+    <nav class="estate-menu" aria-label="Sites">{rows}</nav>
+  </details>
   <nav class="site-nav">{links}</nav>
   <nav class="site-away" aria-label="Other sites">{elsewhere}</nav>
   <div class="site-auth" id="site-auth" hidden></div>
 </header>
 <script type="module" src="/lib/auth.js"></script>
+{DISMISS}
 "#
     )
 }
+
+/// The one thing `<details>` will not do for itself: close when you click past
+/// it. Without this the menu stays open behind whatever you clicked next, which
+/// reads as stuck rather than as a menu.
+///
+/// Held out of the `format!` above because its braces would have to be doubled
+/// there, and JavaScript that has been escaped for a format string is
+/// JavaScript nobody wants to edit.
+const DISMISS: &str = r#"<script type="module">
+  document.addEventListener('click', (e) => {
+    for (const d of document.querySelectorAll('details.estate[open]')) {
+      if (!d.contains(e.target)) d.open = false;
+    }
+  });
+</script>"#;
 
 pub fn title_block(m: &Meta) -> String {
     let mut s = format!("<header class=\"doc-head\"><h1>{}</h1>", esc(m.heading));
@@ -178,9 +256,10 @@ fn footer() -> String {
         .iter()
         .map(|(href, label, _)| format!("<a href=\"{href}\">{label}</a>"))
         .collect::<String>();
-    let away = ELSEWHERE
+    let away = ESTATE
         .iter()
-        .map(|(href, label)| format!("<a href=\"{href}\">{label}</a>"))
+        .filter(|(id, ..)| *id != ME)
+        .map(|(_, name, url, ..)| format!("<a href=\"{url}\">{name}</a>"))
         .collect::<String>();
 
     format!(
@@ -239,10 +318,10 @@ pub fn esc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn meta() -> Meta<'static> {
         Meta {
-            title: "T",
             heading: "H",
             subtitle: None,
             byline: None,
@@ -259,7 +338,11 @@ mod tests {
             bar.contains("href=\"/papers\" aria-current=\"page\""),
             "{bar}"
         );
-        assert_eq!(bar.matches("aria-current").count(), 1);
+        // `page` specifically: the switcher marks the current *site* with
+        // `aria-current="true"`, which is a different claim about a different
+        // thing, and counting both together would make this assertion drift
+        // every time either nav changed.
+        assert_eq!(bar.matches("aria-current=\"page\"").count(), 1);
     }
 
     #[test]
@@ -267,14 +350,254 @@ mod tests {
         let bar = nav_bar(Nav::Home);
         assert!(bar.contains("class=\"site-nav\""));
         assert!(bar.contains("class=\"site-away\""));
-        for (href, label) in ELSEWHERE {
-            assert!(bar.contains(href), "{label} missing from the bar");
+        for (id, name, url, ..) in ESTATE {
+            if id == ME {
+                continue;
+            }
+            assert!(bar.contains(url), "{name} missing from the bar");
+            // Every one is an absolute URL to a different host — a relative
+            // link here would silently resolve against this site.
+            assert!(url.starts_with("https://"), "{url} is not absolute");
         }
-        // Every one of them is an absolute URL to a different host — a
-        // relative link here would silently resolve against this site.
-        for (href, _) in ELSEWHERE {
-            assert!(href.starts_with("https://"), "{href} is not absolute");
+    }
+
+    /// The switcher names every site, marks exactly one as current, and sends
+    /// that one home rather than to itself.
+    #[test]
+    fn the_switcher_lists_the_whole_estate_and_says_which_one_this_is() {
+        let bar = nav_bar(Nav::Blog);
+
+        assert!(bar.contains("<details class=\"estate\">"), "{bar}");
+        for (_, name, ..) in ESTATE {
+            assert!(bar.contains(name), "{name} is not in the switcher");
         }
+
+        assert_eq!(
+            bar.matches("estate-row").count(),
+            ESTATE.len(),
+            "the switcher does not have one row per site"
+        );
+        assert_eq!(bar.matches("is-current").count(), 1);
+        assert_eq!(bar.matches("you are here").count(), 1);
+
+        // The current site's row is the way home. Every other row leaves.
+        assert!(
+            bar.contains("<a href=\"/\" class=\"estate-row is-current\""),
+            "the current site does not link home: {bar}"
+        );
+        assert!(
+            !bar.contains("https://tokera.com/\" class=\"estate-row"),
+            "the current site links to itself by absolute URL"
+        );
+    }
+
+    /// The estate list exists three times and must say the same thing in all
+    /// three.
+    ///
+    /// Rust renders it here, `content/common/lib/estate.js` renders it for the
+    /// npcd console, and `zend/web/lib/estate.js` is a copy because zend embeds
+    /// its own assets. Nothing forces them to agree, and a switcher that offers
+    /// a different set of sites depending on which site you opened it from is
+    /// worse than no switcher — so the copies are compared rather than trusted.
+    #[test]
+    fn the_estate_list_matches_the_shared_module() {
+        let shared = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("content")
+            .join("common")
+            .join("lib")
+            .join("estate.js");
+        let js = std::fs::read_to_string(&shared)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", shared.display()));
+
+        for (id, name, url, icon) in ESTATE {
+            for needle in [id, name, url, icon] {
+                assert!(
+                    js.contains(needle),
+                    "`{needle}` is in the Rust list but not in {}",
+                    shared.display()
+                );
+            }
+        }
+
+        // And nothing extra on the other side: count the entries rather than
+        // only checking that ours are present, or a site added to the module
+        // alone would never show up here.
+        assert_eq!(
+            js.matches("url: 'https://").count(),
+            ESTATE.len(),
+            "the shared module lists a different number of sites"
+        );
+    }
+
+    /// Every switcher icon is the mark that site actually serves.
+    ///
+    /// They are copies, because the switcher is rendered by all four sites and
+    /// a site's own favicon is unreachable exactly when that site is down —
+    /// zend's row lost its mark the moment zend stopped, which is the one time
+    /// somebody is looking for the way somewhere else. A copy is a second file
+    /// to keep current, so it is compared against the original rather than
+    /// trusted to have been updated alongside it.
+    #[test]
+    fn the_switcher_icons_are_the_marks_their_sites_serve() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let content = root.join("content");
+        for (copy, original) in [
+            ("tokera.png", content.join("tokera").join("favicon.png")),
+            ("npcd.svg", content.join("npcd").join("favicon.svg")),
+            (
+                "battlecities.png",
+                content.join("battlecities").join("favicon-32x32.png"),
+            ),
+            (
+                "zend.svg",
+                root.join("..").join("zend").join("web").join("favicon.svg"),
+            ),
+        ] {
+            let mine = content.join("common").join("brand").join(copy);
+            let a =
+                std::fs::read(&mine).unwrap_or_else(|e| panic!("reading {}: {e}", mine.display()));
+            let b = std::fs::read(&original)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", original.display()));
+            assert_eq!(a, b, "brand/{copy} has drifted from {}", original.display());
+        }
+
+        // And every icon the list names actually exists to be served.
+        for (_, name, _, icon) in ESTATE {
+            let file = content.join("common").join(
+                icon.strip_prefix('/')
+                    .expect("switcher icons are root-relative"),
+            );
+            assert!(file.is_file(), "{name} has no icon at {}", file.display());
+        }
+    }
+
+    /// zend's copy is byte-identical to the shared module.
+    ///
+    /// It is a copy because zend embeds `zend/web` and cannot read this crate's
+    /// content directory. That is a deployment fact rather than a choice, so
+    /// what is left is to make the divergence impossible to land.
+    #[test]
+    fn zends_copy_of_the_module_is_identical() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for file in ["estate.js", "estate.css"] {
+            let shared = root.join("content").join("common").join("lib").join(file);
+            let zend = root
+                .join("..")
+                .join("zend")
+                .join("web")
+                .join("lib")
+                .join(file);
+
+            let a = std::fs::read_to_string(&shared)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", shared.display()));
+            let b = std::fs::read_to_string(&zend)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", zend.display()));
+            // Line endings are the checkout's business, not the content's.
+            assert_eq!(
+                a.replace("\r\n", "\n"),
+                b.replace("\r\n", "\n"),
+                "zend's copy of {file} has drifted from the shared one"
+            );
+        }
+
+        // The icons too — compared as bytes, since these are images.
+        for (_, name, _, icon) in ESTATE {
+            let rel = icon.strip_prefix('/').expect("root-relative");
+            let shared = root.join("content").join("common").join(rel);
+            let zend = root.join("..").join("zend").join("web").join(rel);
+            let a = std::fs::read(&shared)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", shared.display()));
+            let b =
+                std::fs::read(&zend).unwrap_or_else(|e| panic!("reading {}: {e}", zend.display()));
+            assert_eq!(a, b, "zend's copy of {name}'s icon has drifted");
+        }
+    }
+
+    /// Sign-in sends where to come back to as a whole URL, host included.
+    ///
+    /// The provider's registered redirect URI names one host for the estate, so
+    /// the browser always returns there. A relative `next` resolves against that
+    /// host rather than the one it was sent from — sign in from the npcd console
+    /// and you land on tokera.com's home page, having asked to come back to the
+    /// console. It reads as sign-in "moving" you and nothing errors.
+    ///
+    /// `safe_next` accepts an absolute URL under the cookie domain and refuses
+    /// everything else, so this cannot become an open redirect.
+    #[test]
+    fn sign_in_comes_back_to_the_host_it_left() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for rel in [
+            &["content", "npcd", "app.js"][..],
+            &["content", "common", "lib", "auth.js"][..],
+        ] {
+            let path = rel.iter().fold(root.clone(), |p, s| p.join(s));
+            let js = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+            // Stated as "never assemble one without the host" rather than by
+            // matching the call site, because either file may build it inline
+            // or through a helper and both are fine. `location.pathname` is the
+            // only way to get a host-less one, so its absence is the property.
+            assert!(
+                !js.contains("location.pathname"),
+                "{} builds a return address without its host",
+                path.display()
+            );
+            assert!(
+                js.contains("location.href"),
+                "{} has no whole-URL return address at all",
+                path.display()
+            );
+            assert!(
+                js.contains("/auth/login?next="),
+                "{} does not send anyone to sign in",
+                path.display()
+            );
+        }
+    }
+
+    /// Every shell that shows the switcher must also load its stylesheet.
+    ///
+    /// The failure this catches is silent rather than loud: the markup renders,
+    /// the menu still opens, and it appears as an unstyled list of links piled
+    /// on top of the page.
+    #[test]
+    fn every_shell_that_shows_the_switcher_loads_its_stylesheet() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for (path, href) in [
+            (
+                root.join("content").join("npcd").join("index.html"),
+                "/lib/estate.css",
+            ),
+            (
+                root.join("..").join("zend").join("web").join("index.html"),
+                "lib/estate.css",
+            ),
+        ] {
+            let html = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            assert!(
+                html.contains(href),
+                "{} does not link {href}",
+                path.display()
+            );
+        }
+        // And the server-rendered one.
+        assert!(head(&meta()).contains(r#"<link rel="stylesheet" href="/lib/estate.css">"#));
+    }
+
+    /// It must work with scripts off, because this site's whole claim is that
+    /// it renders without them. `<details>` is what buys that; a scripted
+    /// popover would not.
+    #[test]
+    fn the_switcher_needs_no_script_to_open() {
+        let bar = nav_bar(Nav::Home);
+        let menu = bar.split("<details").nth(1).expect("a switcher");
+        let menu = menu.split("</details>").next().unwrap();
+        assert!(
+            !menu.contains("<script") && !menu.contains("onclick"),
+            "the switcher's markup depends on script: {menu}"
+        );
     }
 
     #[test]
@@ -283,8 +606,11 @@ mod tests {
         // footer is the only route to those three. Both are generated from the
         // same constants; this asserts the fallback actually holds.
         let f = footer();
-        for (href, label) in ELSEWHERE {
-            assert!(f.contains(href), "{label} missing from the footer");
+        for (id, name, url, ..) in ESTATE {
+            if id == ME {
+                continue;
+            }
+            assert!(f.contains(url), "{name} missing from the footer");
         }
         for (href, label, _) in LINKS {
             assert!(f.contains(href), "{label} missing from the footer");
@@ -294,21 +620,55 @@ mod tests {
     #[test]
     fn the_head_carries_a_title_and_description() {
         let h = head(&meta());
-        assert!(h.contains("<title>T · Tokera</title>"), "{h}");
+        assert!(h.contains("<title>Tokera</title>"), "{h}");
         assert!(h.contains("name=\"description\" content=\"D\""), "{h}");
+    }
+
+    /// The tab says `Tokera` on every page and keeps saying it.
+    ///
+    /// A title that renames itself as you click is restless, and the page
+    /// already says what it is in letters an inch tall. The description still
+    /// varies per page — that is what search results and link previews read,
+    /// and it is not the thing sitting in front of you while you read.
+    #[test]
+    fn the_tab_title_does_not_follow_the_page() {
+        let mut seen = std::collections::BTreeSet::new();
+        for nav in [Nav::Home, Nav::Blog, Nav::Papers] {
+            for width in [Width::Reading, Width::Wide, Width::Split] {
+                let m = Meta {
+                    heading: "something else entirely",
+                    nav,
+                    width,
+                    ..meta()
+                };
+                let h = head(&m);
+                let t = h
+                    .split("<title>")
+                    .nth(1)
+                    .and_then(|s| s.split("</title>").next())
+                    .expect("a title");
+                seen.insert(t.to_owned());
+            }
+        }
+        assert_eq!(
+            seen,
+            ["Tokera".to_owned()].into_iter().collect(),
+            "the tab title changes with the page"
+        );
     }
 
     #[test]
     fn text_from_a_document_cannot_close_a_tag() {
         let m = Meta {
-            title: "a\"b",
             heading: "<script>alert(1)</script>",
+            description: "a\"b",
             ..meta()
         };
         let html = format!("{}{}", head(&m), title_block(&m));
         assert!(!html.contains("<script>alert"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
-        assert!(html.contains("content=\"D\""));
+        // A quote in a description would otherwise close the `content="` it
+        // sits in and let the rest of the string become attributes.
         assert!(html.contains("a&quot;b"), "{html}");
     }
 }

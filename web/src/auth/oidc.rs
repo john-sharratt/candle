@@ -341,6 +341,18 @@ mod tests {
         assert!(safe_next("https://bot.tokera.com/", d));
         assert!(safe_next("https://code.tokera.com:8443/s/1", d));
 
+        // Carrying a fragment, which is what a console whose router lives in the
+        // hash actually sends. It must be absolute — the provider returns the
+        // browser to one registered host for the whole estate, so a relative
+        // `next` would resolve there and land the visitor on a different site
+        // than the one they signed in from.
+        assert!(safe_next("https://bot.tokera.com/#/welcome", d));
+        assert!(safe_next("https://bot.tokera.com#/npc/7/beliefs", d));
+        assert!(safe_next("https://bot.tokera.com/?x=1#/worlds", d));
+        // And the fragment is no way round the host check.
+        assert!(!safe_next("https://evil.com/#/welcome", d));
+        assert!(!safe_next("https://evil.com#.tokera.com", d));
+
         // The ones that matter.
         assert!(!safe_next("https://evil.com/", d));
         assert!(!safe_next("//evil.com/", d));

@@ -75,6 +75,35 @@ async fn fetch(addr: SocketAddr, path: &str) -> Res {
     get_with(addr, path, "127.0.0.1", "*/*").await
 }
 
+/// The response headers, lowercased, for assertions about what the gateway
+/// stamps on its own answers.
+async fn head_of(addr: SocketAddr, path: &str, host: &str) -> Vec<(String, String)> {
+    use hyper::Request;
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .uri(path)
+        .header("host", host)
+        .header("accept", "text/html")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+    res.headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_ascii_lowercase(),
+                v.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
 fn content_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
@@ -197,6 +226,59 @@ async fn a_client_cannot_forge_identity_headers_into_a_local_api() {
     assert!(r.body.contains(r#""user":"""#), "{}", r.body);
     assert!(!r.body.contains("admin@tokera.com"), "{}", r.body);
     assert!(!r.body.contains("made-up"), "{}", r.body);
+}
+
+/// A daemon behind the gateway does receive them — that is how it learns who
+/// is calling.
+///
+/// The mirror of the test above, and the pair is the point. Identity crosses an
+/// in-process boundary as a request extension and a network boundary as these
+/// headers, so a daemon on another box has nothing else to read. Clearing them
+/// for everyone makes the documented contract unimplementable; clearing them
+/// for everyone who has not declared `behind_gateway` makes it safe by default
+/// and possible on purpose.
+#[tokio::test]
+async fn a_daemon_behind_the_gateway_reads_the_identity_it_is_sent() {
+    let addr = spawn(
+        Builder::new(cfg(AUTHORITATIVE))
+            .behind_gateway()
+            .local_api("npcd", fake_api())
+            .router(),
+    )
+    .await;
+
+    let r = get_with_headers(
+        addr,
+        "/v1/saw-identity",
+        &[
+            ("x-tokera-user", "google-1"),
+            ("x-tokera-email", "wren@example.com"),
+        ],
+    )
+    .await;
+
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains(r#""user":"google-1""#), "{}", r.body);
+    assert!(r.body.contains("wren@example.com"), "{}", r.body);
+}
+
+/// The declaration is opt-in, so the safe behaviour is what you get by
+/// forgetting it — not what you get by remembering.
+///
+/// Worth asserting rather than assuming: this is the direction a refactor
+/// breaks silently, since flipping the default turns every existing caller into
+/// an open door and no test of the *new* behaviour would notice.
+#[tokio::test]
+async fn stripping_is_the_default_and_must_stay_that_way() {
+    let addr = spawn(
+        Builder::new(cfg(AUTHORITATIVE))
+            .local_api("npcd", fake_api())
+            .router(),
+    )
+    .await;
+
+    let r = get_with_headers(addr, "/v1/saw-identity", &[("x-tokera-user", "root")]).await;
+    assert!(r.body.contains(r#""user":"""#), "{}", r.body);
 }
 
 #[tokio::test]
@@ -404,16 +486,23 @@ async fn a_dead_upstream_gives_a_readable_page_then_backs_off() {
     let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
 
     // First request pays the connect attempt and reports it.
+    //
+    // `503`, not `502`: a daemon that is merely off is worth coming back for,
+    // and it answers with a `Retry-After`. The probe used to answer `502 Bad
+    // Gateway` under its own heading, so every second refresh of the
+    // reconnecting page looked like a different, worse fault.
     let r = get_with(addr, "/v1/status", "npcd.test", "text/html").await;
-    assert_eq!(r.status, 502);
+    assert_eq!(r.status, 503);
     assert!(
         r.content_type.starts_with("text/html"),
         "a browser gets a page"
     );
-    assert!(r.body.contains("not answering"), "{}", r.body);
+    assert!(r.body.contains("Reconnecting"), "{}", r.body);
+    // It retries itself with script, and still retries without it.
+    assert!(r.body.contains("_probe="), "the page has no retry loop");
     assert!(
-        r.body.contains("http-equiv=\"refresh\""),
-        "the page retries itself"
+        r.body.contains("<noscript><meta http-equiv=\"refresh\""),
+        "no fallback for a reader without scripting"
     );
 
     // Subsequent requests inside the window fail fast rather than repeating the
@@ -432,6 +521,161 @@ async fn a_dead_upstream_gives_a_readable_page_then_backs_off() {
     assert!(!r.content_type.starts_with("text/html"));
 }
 
+/// A service being off is one condition, however many times you refresh.
+///
+/// The gateway alternates between two answers while an upstream is down: a fast
+/// one while the backoff window is open, and the probe that reopens it. Both are
+/// the same news, so both must look the same — status, heading, and a page that
+/// keeps trying. They did not: the probe was `502 Bad Gateway` titled *That
+/// service is not answering*, so a reader refreshing a `503` *Reconnecting*
+/// page saw it flip to what looked like the site itself breaking.
+#[tokio::test]
+async fn both_faces_of_a_down_upstream_look_the_same() {
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
+
+    // Sleep past the window each time, so every request is the probe that
+    // reopens it — the path that used to answer 502 under its own heading.
+    // `proxy_cfg` caps the window well below this, so the wait is bounded.
+    let mut statuses = std::collections::BTreeSet::new();
+    let mut codes = std::collections::BTreeSet::new();
+    for i in 0..4 {
+        // Alternate: straight after the previous request the window is open
+        // (fast path); after a sleep it has expired (probe). Both faces, in one
+        // loop, without depending on timing luck.
+        if i % 2 == 1 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        let r = get_with(addr, "/v1/status", "npcd.test", "text/html").await;
+        statuses.insert(r.status);
+        assert!(r.body.contains("Reconnecting"), "{}", r.body);
+        assert!(r.body.contains("_probe="), "a page that does not retry");
+
+        let j = get_with(addr, "/v1/status", "npcd.test", "application/json").await;
+        codes.insert(
+            j.body
+                .split("\"error\":\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("?")
+                .to_owned(),
+        );
+    }
+
+    assert_eq!(
+        statuses,
+        [503].into_iter().collect(),
+        "a down upstream answered with more than one status"
+    );
+    // Every code seen is one of the two upstream-down codes, and nothing else
+    // leaked in. Stated as a subset rather than `a || b`, which is satisfied by
+    // either alone and so asserts nothing about the pair.
+    for c in &codes {
+        assert!(
+            c == "upstream_backoff" || c == "upstream_unavailable",
+            "unexpected code {c}"
+        );
+    }
+    assert!(!codes.is_empty());
+}
+
+/// An outage must not publish the estate's internal addressing.
+///
+/// The error page is served to the internet, and the thing it reports on is by
+/// definition on a private address. It used to name it — `http://192.168.0.5:8081
+/// is not answering` went to anyone who visited a site whose daemon was off,
+/// in the page *and* in the JSON. The transport error is no safer, since a
+/// failed connect usually quotes the address it could not reach.
+#[tokio::test]
+async fn an_outage_does_not_leak_the_upstream_address() {
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let port = dead.port().to_string();
+    let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
+
+    // Both the probe and the fast path, both content types.
+    for i in 0..4 {
+        if i % 2 == 1 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        for accept in ["text/html", "application/json"] {
+            let r = get_with(addr, "/v1/status", "npcd.test", accept).await;
+            for secret in ["127.0.0.1", &port, "http://"] {
+                assert!(
+                    !r.body.contains(secret),
+                    "`{secret}` leaked into a {accept} error body: {}",
+                    r.body
+                );
+            }
+        }
+    }
+
+    // And the headers say only that the gateway failed, not where.
+    let h = head_of(addr, "/v1/status", "npcd.test").await;
+    for (k, v) in &h {
+        assert!(
+            !v.contains("127.0.0.1") && !v.contains(&port),
+            "`{k}: {v}` leaks the upstream address"
+        );
+    }
+}
+
+/// The gateway marks its own failures, so a retrying page can tell "the service
+/// is still down" from "the service answered, with something that is not 200".
+///
+/// A recovered daemon may legitimately reply `401` because the session expired
+/// during the outage. Keying recovery on `response.ok` would leave the page
+/// reconnecting forever against a service a manual refresh would reach.
+#[tokio::test]
+async fn the_gateway_signs_its_own_error_responses() {
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
+
+    let down = head_of(addr, "/v1/status", "npcd.test").await;
+    assert!(
+        down.iter().any(|(k, v)| k == "x-tokera-gateway-error"
+            && (v == "upstream_backoff" || v == "upstream_unavailable")),
+        "the gateway did not mark its own failure: {down:?}"
+    );
+
+    // A live upstream's answer carries no such mark, whatever its status.
+    let up = spawn(fake_api()).await;
+    let ok = head_of(up, "/v1/status", "127.0.0.1").await;
+    assert!(
+        !ok.iter().any(|(k, _)| k == "x-tokera-gateway-error"),
+        "an upstream answer was marked as a gateway failure: {ok:?}"
+    );
+
+    // And the page's retry loop keys on that header rather than on the status.
+    //
+    // A text assertion, because nothing here runs the script — these tests
+    // speak HTTP, not DOM. It cannot prove the loop behaves; it can stop the
+    // check silently reverting to `r.ok`, which is the regression that would
+    // leave a page reconnecting forever against a daemon answering 401.
+    let page = get_with(addr, "/v1/status", "npcd.test", "text/html").await;
+    assert!(
+        page.body.contains("r.headers.get(MARK)"),
+        "the retry loop no longer keys on the gateway marker"
+    );
+    assert!(
+        !page.body.contains("if(r.ok)"),
+        "the retry loop is back to keying on the status"
+    );
+    // The schedule comes from the server, not from the script.
+    assert!(
+        page.body.contains("var FIRST=") && page.body.contains(",CAP="),
+        "the page carries no server-supplied backoff schedule"
+    );
+}
+
 #[tokio::test]
 async fn recovery_needs_no_operator() {
     // Reserve a port, close it, point the proxy at it, then start the real
@@ -447,7 +691,7 @@ async fn recovery_needs_no_operator() {
         get_with(addr, "/v1/status", "npcd.test", "application/json")
             .await
             .status,
-        502
+        503
     );
 
     let listener = tokio::net::TcpListener::bind(target).await.unwrap();
@@ -596,4 +840,62 @@ async fn local_and_proxied_answers_are_indistinguishable() {
     assert_eq!(a.status, b.status);
     assert_eq!(a.body, b.body);
     assert_eq!(a.content_type, b.content_type);
+}
+
+// ── the shipped table ──────────────────────────────────────────────────────
+
+/// The real `web.yaml`, resolved against the real content tree.
+fn shipped() -> Config {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    Config::from_yaml(include_str!("../web.yaml"), manifest).expect("web.yaml parses")
+}
+
+/// A product's identity is per-site, so two products cannot share a site entry.
+///
+/// `battlecities.net` was a `hosts:` entry on the tokera site, which meant it
+/// served tokera's pages *and* tokera's brand mark — the game's own domain wore
+/// the Tokera triskelion, and nothing failed to say so. Splitting it out is what
+/// gives it back its own icon, and this is the assertion that keeps it split.
+#[tokio::test]
+async fn each_brand_has_its_own_site_and_its_own_mark() {
+    let cfg = shipped();
+
+    let bc = cfg.site_for(Some("battlecities.net"));
+    assert_eq!(
+        bc.name, "battlecities",
+        "battlecities.net lost its own site"
+    );
+    assert_eq!(
+        cfg.site_for(Some("www.battlecities.net")).name,
+        "battlecities"
+    );
+
+    let tk = cfg.site_for(Some("tokera.com"));
+    assert_eq!(tk.name, "tokera");
+
+    // Separate roots is the mechanism: an icon is a file, and a shared root is
+    // a shared icon however different the two brands are meant to look.
+    assert!(
+        bc.roots.iter().all(|r| !tk.roots.contains(r)),
+        "the two brands share a content root, so they share a favicon"
+    );
+
+    // And each one's mark is actually present where its site will look for it.
+    // `content_dir` is the config's base, not the content tree, so this walks
+    // the site's own declared root rather than assuming where it points.
+    for site in [bc, tk] {
+        let root = content_dir().join(&site.roots[0]);
+        let found = ["favicon.ico", "favicon.png", "favicon.svg"]
+            .iter()
+            .any(|f| root.join(f).is_file());
+        assert!(found, "{} has no icon of its own", site.name);
+    }
+}
+
+/// An unknown Host lands on the default site, not on whichever was declared
+/// first — the difference decides what a bare IP or a stray CNAME serves.
+#[tokio::test]
+async fn an_unknown_host_still_lands_on_tokera() {
+    assert_eq!(shipped().site_for(Some("nowhere.example")).name, "tokera");
+    assert_eq!(shipped().site_for(None).name, "tokera");
 }

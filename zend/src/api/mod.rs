@@ -46,22 +46,34 @@ pub fn build_id() -> &'static str {
     use std::sync::OnceLock;
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| {
+        // Every embedded file, not a list of them. The list was written by hand
+        // and went stale the first time the UI grew a directory: `lib/estate.js`
+        // and `lib/estate.css` were served but not hashed, so a change confined
+        // to the switcher left the id identical and open tabs kept the old
+        // module. Anything under `web/` counts, so nothing can be forgotten.
+        let mut files: Vec<(&str, &[u8])> = Vec::new();
+        collect(&WEB, &mut files);
+        // Sorted, because the id must depend on the content and not on the
+        // order a directory happened to be walked in.
+        files.sort_unstable_by_key(|(path, _)| *path);
+
         let mut h = DefaultHasher::new();
-        for name in [
-            "index.html",
-            "perf.html",
-            "substrate.html",
-            "project.html",
-            "zend-api.js",
-            "zend-api.mock.js",
-            "zend-api.live.js",
-        ] {
-            if let Some(f) = WEB.get_file(name) {
-                f.contents().hash(&mut h);
-            }
+        for (path, bytes) in files {
+            path.hash(&mut h);
+            bytes.hash(&mut h);
         }
         format!("{:016x}", h.finish())
     })
+}
+
+/// Every file under `dir`, depth first, as `(path, contents)`.
+fn collect<'a>(dir: &'a Dir<'a>, out: &mut Vec<(&'a str, &'a [u8])>) {
+    for f in dir.files() {
+        out.push((f.path().to_str().unwrap_or_default(), f.contents()));
+    }
+    for d in dir.dirs() {
+        collect(d, out);
+    }
 }
 
 /// Build the axum router.

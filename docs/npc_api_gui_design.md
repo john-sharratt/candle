@@ -79,15 +79,18 @@ The files live in their own crate, `web/` — the static host and API gateway fo
 estate, documented in **[`web_gateway_design.md`](web_gateway_design.md)**, which is
 authoritative for everything in this section. What matters here is what it means for `npcd`:
 
-- **The console is not this daemon's problem.** `npcd`'s router has no HTML in it. The gateway
-  either compiles the console into the binary or hosts it on the DMZ box and forwards `/v1` and
-  `/ws` here; `npcd` cannot tell which.
+- **The console is not this daemon's *router's* problem.** `npcd`'s API router has no HTML in it;
+  the console is files, served by the `web` server `npcd` embeds — compiled in, or from disk with
+  `--content <dir>`. Either way it is served from the same box and the same checkout as the API,
+  which is the point: they are one program and must deploy as one.
 - **`npcd` does not authenticate anyone** — see §8.1. The gateway owns sign-in for
   tokera.com, code.tokera.com and bot.tokera.com, and states the identity on `X-Tokera-*`
   headers it strips from every inbound request first.
 - **bot.tokera.com** is the console's production hostname.
-- **`web --authoritative`** runs the console against `web::mock::npcd` with no daemon at all —
-  the second of the two mock depths described in §41.
+- **Running the console with no engine** is `npcd` itself: it layers its real routes over
+  `web::mock::npcd`, so every surface that is not yet built still answers. That is the second of
+  the two mock depths described in §41. `web --authoritative` cannot stand in for this site — the
+  gateway holds no npcd files to serve, and the mock answers `/v1`, not `/app.js`.
 
 The rest of this section is the part of that design a reader of *this* document needs.
 
@@ -109,13 +112,22 @@ sites:
     default: true                              # every unmatched Host lands here
     roots: ["content/tokera", "content/common"]
 
-  - name: npcd
+  - name: npcd                                 # no roots: a pure gateway
     hosts: ["bot.tokera.com", "npcd.localhost", "*.npcd.dev"]
-    roots: ["content/npcd", "content/common"]  # searched in order
     api:
-      - {prefix: /v1, upstream: "http://192.168.0.6:8081"}
-      - {prefix: /ws, upstream: "http://192.168.0.6:8081"}
+      - {prefix: /, upstream: "http://192.168.0.6:8081"}
 ```
+
+**`npcd` forwards whole, console included, and that is a correction.** The gateway used to serve
+the console from the DMZ box's checkout while forwarding only `/v1` and `/ws` — which made one
+program two deployments. A console edit needed a commit on the daemon box and a pull on the
+gateway before anyone could see it, and in between the two disagreed silently: the console was
+twice found running against an API it did not match, presenting both times as a bug in the
+daemon. Forwarding `/` costs a LAN hop per asset and ties the console's availability to the
+daemon's; it buys one source of truth and an edit that is live on a refresh.
+
+`/auth/*` is unaffected. Those routes are registered ahead of site routing precisely so a site
+proxying `/` cannot swallow them — sign-in stays the gateway's, for every hostname.
 
 `npcd.localhost` resolves to `127.0.0.1` in every current browser, so reaching a specific site
 during local development needs no `hosts` file entry.
@@ -283,13 +295,28 @@ X-Tokera-User       the provider's stable subject id — the only field safe to 
 X-Tokera-Email      display only; an address can be reassigned
 X-Tokera-Name
 X-Tokera-Picture
-X-Tokera-Assertion  the signed session token, for verifying rather than trusting
 ```
 
-`GET /v1/me` reports that identity. `npcd` has no `/v1/auth/*` routes and no client secret; a
-request arriving with `X-Tokera-*` set by a client cannot reach it, because the gateway removes
-those headers from every inbound request before setting its own. That holds exactly as far as
-`npcd` is unreachable except through the gateway — which is why it binds a private address.
+`GET /v1/me` reports that identity. `npcd` has no `/v1/auth/*` routes, no client secret, and no
+key of any kind. A request arriving with `X-Tokera-*` set by a client cannot reach it, because
+`web` clears those names on ingress before anything is dispatched — on the gateway *and* inside
+`npcd` itself, which matters because `npcd` embeds its API as `upstream: local` and would
+otherwise be handed the client's own headers untouched.
+
+The one exception is declared, never inferred: `npcd` calls `web::Builder::behind_gateway`, which
+says *this bind address is reachable through the gateway and nothing else*, and only then are the
+inbound headers left alone for its router to read. Nothing in the code can check that claim — it
+is a statement about the network — so it lives at one greppable call site next to the bind, and
+`web/tests/roles.rs` pins both directions: forged headers refused without it, forwarded headers
+readable with it.
+
+> **Not a shared signing key.** An earlier design had `npcd` verify an `X-Tokera-Assertion`
+> against the gateway's session key. Since that assertion *is* the session cookie, it handed every
+> daemon both a replayable 30-day token for each user and the means to mint sessions valid across
+> the whole estate — a verifying credential that doubles as a minting credential, which is worse
+> than the header trust it was meant to replace. One compromised daemon would have been the entire
+> estate. Trusting a header from a peer that cannot be anyone else is the smaller claim, and it
+> needs no secret distributed to any machine.
 
 Two credential shapes, deliberately not one:
 
@@ -509,11 +536,10 @@ User {
   "email":       "…",
   "avatar_url":  "…",
   "provider":    "google",
-  "profile": {                        // the self an NPC reads — substrate-backed
+  "profile": {                        // the self an NPC reads
     "description": "…",
-    "gender":      "…",
+    "gender":      "Male",            // or "Female", or "" until chosen
     "history":     "…",
-    "pronouns":    "…",
     "turn_index":  7,                 // the live profile turn
     "revision":    3
   },
@@ -729,7 +755,8 @@ The trigger is the first request carrying an `X-Tokera-User` this daemon has not
 
 ```
 first request from an unknown sub  → creates the account, writes profile turn #0
-GET  /v1/me/profile                 → { unique_name, description, gender, history, pronouns }
+GET  /v1/me/profile                 → { description, gender, history, turn_index, revision }
+                                      gender is "Male", "Female", or "" — 400 bad_gender otherwise
 PUT  /v1/me/profile                 → appends a new turn, tombstones the previous
 GET  /v1/me/profile/history         → every revision, live and tombstoned
 ```
@@ -1835,15 +1862,19 @@ understand what it is and want an account.
 
 **The demo is the pitch.** A screenshot of a chat window looks like every other product. An
 NPC *acting before it explains itself* — the act stream moving while narration is still
-assembling — is the thing that cannot be faked by a competitor with a wrapper around an API,
-and it is visible in about four seconds. The demo runs a real sandboxed NPC on a shared demo
-world, rate-limited, read-mostly, and reset on a schedule.
+assembling — is visible in about four seconds, and it is the shape of the exchange rather than
+any particular exchange that makes the point.
 
-If the demo NPC is unavailable (model loading, VRAM pressure), the block degrades to a recorded
-replay of a real session rather than disappearing. The page must never be empty.
+**It is a sample, and it says so.** It runs from the mock seam, and the label under it reads *a
+sample exchange* rather than the *live — not a recording* it once claimed. That claim committed
+the front page to running a real sandboxed NPC for every visitor — a standing operational cost
+(a warm model, rate limiting, a world to reset on a schedule) in exchange for something a
+stranger cannot verify anyway. Worse, it is the kind of promise that quietly stops being true:
+the first time the demo world is down and the block falls back to a replay, the page is lying
+to everyone who reads it.
 
-The page renders from the **mock seam** when no session exists, so it has no privileged access
-and can be developed with `?mock=1` like everything else.
+Running a real one later is a strict improvement and needs no change here — the seam is the
+same. What must not happen is the label going back before the daemon does.
 
 ## 25. Sign-in
 
@@ -1868,10 +1899,14 @@ all navigate to the same URL, one of them naming a provider the gateway may not 
 — a menu whose choices do not reach the thing that chooses. Adding a provider is gateway
 configuration rather than a GUI change here.
 
-Sign-in can also be *unavailable*, which is not the same as being signed out: a deployment whose
-daemon holds no session key cannot authenticate anyone, and `/v1/me` answers `503
-auth_unconfigured` rather than `401` to say so. The page then states that instead of offering a
-button that cannot work. The rest of the landing page — including the live demo — is unaffected. First sign-in creates the account
+Sign-in can also be *unavailable*, which is not the same as being signed out: a deployment with no
+`auth:` block has no identity provider, so nobody can sign in at all. The gateway is the only
+authority on that — with `auth:` off it does not serve `/auth/login`, and the navigation would
+land on site routing and come back as `index.html`, reading to the visitor as a button that does
+nothing. `/auth/me` reports `configured: false`, which the console asks before offering the
+control. The rest of the landing page — including the live demo — is unaffected.
+
+First sign-in creates the account
 with no separate registration step. On return, the user lands on the page they originally asked
 for — `next` carries it through the round trip, and is refused unless it points inside this
 estate, since an unchecked one is an open redirect.
@@ -2811,10 +2846,12 @@ character degrades another's. Nothing in this document addresses per-user quotas
 scheduling between users, or what a user sees when the card is saturated by someone else. That
 is a scheduling design, and it is genuinely absent.
 
-**Is the hosted demo NPC on the home page worth its cost?** It is the strongest thing on that
-page and it consumes real GPU on a machine whose whole premise is that GPU is scarce.
-Rate-limiting and a recorded fallback are specified, but the policy — how much of the card a
-stranger may use — is not.
+**~~Is the hosted demo NPC on the home page worth its cost?~~** Answered: not yet. A live demo
+consumes real GPU on a machine whose whole premise is that GPU is scarce, and the liveness was
+the half a visitor could not verify anyway. The block now runs from the mock seam and is
+labelled *a sample exchange* (§24). Hosting a real one later is a strict improvement through the
+same seam; the open part is only the policy — how much of the card a stranger may use — which
+is a question worth having when there is a card to spare.
 
 **Where does the shared command parser actually live?** §35 requires the browser and the daemon
 to agree exactly. Compiling the Rust parser to WASM guarantees it and adds a WASM artifact to

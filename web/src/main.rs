@@ -115,7 +115,14 @@ fn print_table(cfg: &Config, authoritative: bool, secrets_ok: Option<bool>) {
                     None => "",
                 }
             ),
-            (None, _) => "not configured".to_string(),
+            // Naming the file it looked for and did not find, because "not
+            // configured" on its own leaves you guessing whether the path is
+            // wrong, the file is missing, or the key is not read from a file
+            // at all — three different things to go and check.
+            (None, _) => match &cfg.auth_file {
+                Some(p) => format!("not configured — no {}", p.display()),
+                None => "not configured — no `auth_file:` in this table".to_string(),
+            },
         }
     );
     for s in &cfg.sites {

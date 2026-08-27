@@ -13,8 +13,8 @@ async function j(path, opts) {
     let e = { error: 'http_' + r.status, detail: r.statusText };
     try { e = await r.json(); } catch (_) {}
     // Carry the status as well as the body. Some failures are told apart by
-    // code (`auth_unconfigured`) and some only by status, and a caller that has
-    // to re-fetch to learn which is a caller that will not bother.
+    // code (`name_taken`) and some only by status, and a caller that has to
+    // re-fetch to learn which is a caller that will not bother.
     throw Object.assign(new Error(e.detail || e.error), e, { status: r.status });
   }
   return r.status === 204 ? null : r.json();

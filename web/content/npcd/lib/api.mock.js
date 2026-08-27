@@ -110,7 +110,7 @@ export const MockAPI = {
     return { user_id: 'u_8812', unique_name: 'Wren', display: 'Johnathan', email: 'you@example.com',
       provider: 'google', npc_count: NPCS.length,
       profile: { description: 'Reads people quickly, talks slowly. Ex-surveyor, so tends to describe places by their edges.',
-        gender: '—', pronouns: 'they/them', history: 'Grew up on the coast. Came inland for work and stayed.',
+        gender: 'Male', history: 'Grew up on the coast. Came inland for work and stayed.',
         turn_index: 7, revision: 3 } };
   },
   async getProfile() { return (await this.getMe()).profile; },

@@ -44,10 +44,10 @@ server:
   connect_timeout_ms: 5000
 
 # ── sign-in, for the whole estate ───────────────────────────────────────────
-# OFF by default, and the block below is commented out. tokera.com is a public
-# site: the home page, the blog and the papers need no account, so a missing
-# key must not stop them being served. With no `auth:` block, `/auth/me`
-# reports `configured: false` and the UI shows no sign-in button at all.
+# OFF unless `secrets/auth.yaml` exists. tokera.com is a public site: the home
+# page, the blog and the papers need no account, so a missing key must not stop
+# them being served. With no auth config, `/auth/me` reports
+# `configured: false` and the UI shows no sign-in button at all.
 #
 # Turn it on and it becomes strict — a missing or unreadable secret is then a
 # hard startup failure, because at that point you have said you want sign-in
@@ -61,23 +61,38 @@ server:
 # asserts that identity downstream on `X-Tokera-*`, stripping any inbound copy
 # of those headers before setting its own.
 #
-# A daemon does not have to take that on trust, and `npcd` does not: alongside
-# the plain headers the gateway sends `X-Tokera-Assertion`, the same identity
-# signed with the session key, and npcd verifies the signature. Headers alone
-# authenticate nobody there. That costs one shared file and buys a daemon whose
-# security no longer rests on its bind address being unreachable:
+# Those headers are cleared from every inbound request first — by this gateway,
+# and again inside each daemon, since a daemon embedding its API as
+# `upstream: local` would otherwise be handed the client's own. A daemon opts
+# back in by calling `web::Builder::behind_gateway`, which asserts that its bind
+# address is reachable through the gateway and nothing else. Nothing verifies
+# that claim, so keep such a daemon on a private interface.
 #
-#   cp web/secrets/session.key npcd/secrets/session.key
+# **No secret is shared with any daemon.** There is deliberately no session key
+# to copy to `npcd` or `zend`: the session cookie signs sessions for the whole
+# estate, so handing it to a daemon would let a compromised one mint identities
+# at every hostname. This file is the gateway's alone.
 #
-# Without it npcd answers `/v1/me` with 503 `auth_unconfigured` — deliberately
-# distinct from 401, so its console can say sign-in is unavailable rather than
-# offer a button that cannot work. Copy the key whenever you rotate it; a npcd
-# holding last week's key rejects every assertion as a forgery.
+# ── where the sign-in config lives ──────────────────────────────────────────
+# In `secrets/auth.yaml`, not here — and the file being absent is what turns
+# sign-in off, exactly as a commented-out block used to.
 #
-# Paths resolve against THIS FILE, like `roots` and `papers`, so keep them
-# relative and the same table works on a laptop and on the DMZ box. Both
-# secrets are files rather than inline values so this table can be committed
-# without carrying one; `web/secrets/` is gitignored.
+# It is a separate file because THIS one must be identical on every machine.
+# When the block was inline, the one deployment holding a real `client_id`
+# carried a permanently modified `web.yaml`, and every attempt to update the
+# site table there stopped with *your local changes would be overwritten* — on
+# a file whose only deployment-specific part was those four lines. Splitting
+# them out means the sites can be pulled and the credentials never move.
+#
+# Present but unparseable is still a hard startup failure: at that point the
+# deployment has said it wants sign-in, and a gateway that quietly has none is
+# the worse outcome. `web --check` reports which of the three you are in
+# without binding anything.
+auth_file: "secrets/auth.yaml"
+
+# Paths inside it resolve against THIS FILE, like `roots` and `papers`, so keep
+# them relative and one table works on a laptop and on the DMZ box. Both
+# secrets are files rather than inline values, so even `auth.yaml` carries none.
 #
 #   mkdir -p web/secrets
 #   # any 32+ bytes; on Windows:
@@ -85,10 +100,9 @@ server:
 #   head -c 48 /dev/urandom | base64 > web/secrets/session.key
 #   # client secret: Google Cloud console → APIs & Services → Credentials →
 #   #                OAuth 2.0 Client ID, saved to web/secrets/google.secret
-#   # redirect URI:  register the value below EXACTLY, or Google answers
-#   #                redirect_uri_mismatch
+#   # redirect URI:  register it EXACTLY, or Google answers redirect_uri_mismatch
 #
-# auth:
+#   cat > web/secrets/auth.yaml <<'YAML'
 #   cookie_domain: ".tokera.com"
 #   session_ttl_hours: 720
 #   session_secret_file: "secrets/session.key"
@@ -96,6 +110,7 @@ server:
 #     client_id: "REPLACE-ME.apps.googleusercontent.com"
 #     client_secret_file: "secrets/google.secret"
 #     redirect_uri: "https://tokera.com/auth/callback"
+#   YAML
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────
@@ -112,8 +127,7 @@ sites:
   # which is why `/` is `exact`: a bare `/` prefix would swallow them all.
   - name: tokera
     default: true
-    hosts: ["tokera.com", "www.tokera.com", "tokera.localhost",
-            "battlecities.net", "www.battlecities.net"]
+    hosts: ["tokera.com", "www.tokera.com", "tokera.localhost"]
     roots: ["content/tokera", "content/common"]
     papers: "../docs"
     api:
@@ -121,25 +135,53 @@ sites:
       - {prefix: /blog, upstream: local}
       - {prefix: /papers, upstream: local}
 
+  # ── battlecities.net — the game's own site ──────────────────────────────
+  # A handful of static files: a title image, a download link, and the icon set
+  # the game already shipped. No daemon, no API, no generated pages — so it is
+  # `roots` and nothing else, and a bare `/` finds `index.html` on its own.
+  #
+  # It was a `hosts:` entry on the tokera site until now, which meant it served
+  # tokera's pages and tokera's brand mark. Two products cannot share one site
+  # entry and keep separate identities: an icon is a file, so a shared root is a
+  # shared icon however different the two brands are meant to look, and
+  # battlecities.net wore the Tokera triskelion. Its own entry gives it the Zen
+  # back. `roles.rs` asserts the split so it cannot quietly close again.
+  #
+  # The download link points at `battle-cities.exe`, which is not here. That is
+  # the game's build output rather than repository content, so the link 404s
+  # until a release is dropped alongside these files.
+  - name: battlecities
+    hosts: ["battlecities.net", "www.battlecities.net", "battlecities.localhost"]
+    roots: ["content/battlecities"]
+
   # ── bot.tokera.com — the NPC console ────────────────────────────────────
-  # Files from this box; the daemon runs on 192.168.0.6. `npcd.localhost`
-  # resolves to 127.0.0.1 in every current browser, so it needs no hosts entry
-  # to reach this site during local development.
+  # A pure gateway, like zend below: no roots, everything forwarded, navigation
+  # included. The daemon on 192.168.0.6 owns its console — it serves those files
+  # from disk already, with its own `fallback: index.html` for deep links.
+  #
+  # It used to serve the console from THIS box's checkout while forwarding only
+  # `/v1` and `/ws`, which made the console and the daemon two deployments of
+  # one program. Every console edit then needed a commit here and a pull there
+  # before it could be seen, and the two could disagree silently — the console
+  # was twice found running against an API it did not match, each time reading
+  # as a bug in the daemon. One source, one deploy, and an edit on the daemon
+  # box is live on a refresh.
+  #
+  # `/auth/*` is unaffected: those routes are registered ahead of site routing
+  # precisely so a site proxying `/` cannot swallow them. Sign-in stays here.
+  #
+  # The cost is that `web --authoritative` can no longer stand in for this site,
+  # for the same reason it cannot for zend — there are no roots left to serve
+  # the console from, and the mock answers `/v1`, not `/app.js`. Run `npcd`
+  # itself instead; it embeds the same mock behind the same console, which is
+  # what `--authoritative` was standing in for.
   - name: npcd
     hosts: ["bot.tokera.com", "npcd.localhost", "npcd.test", "*.npcd.dev"]
-    roots: ["content/npcd", "content/common"]
-    # Extensionless paths naming no file land here, so the hash router owns
-    # navigation and a deep link survives a refresh. A missing *.js still 404s.
-    fallback: "index.html"
     api:
-      - prefix: /v1
-        upstream: "http://192.168.0.6:8081"
-      # Same upstream, listed separately so websockets can move to their own
-      # host later without disturbing the REST rule.
-      - prefix: /ws
+      - prefix: /
         upstream: "http://192.168.0.6:8081"
 
-  # ── code.tokera.com — Zen Code ──────────────────────────────────────────
+  # ── code.tokera.com — Zend ──────────────────────────────────────────────
   # zend still embeds and serves its own assets, so this site is a pure
   # gateway: no roots, everything forwarded, navigation included. When zend is
   # split the same way as npcd, give it `roots: ["content/zend",
