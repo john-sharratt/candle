@@ -1273,6 +1273,10 @@ fn load_kv_blocks_for_q0_v_tests() -> Option<LoadedKvBlocks> {
 // ---------------------------------------------------------------------------
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "Q0_V kernel/model comparison over real KV dumps: a diagnostic, not a \
+            correctness test — it prints tables rather than asserting, and its cost is \
+            whatever the local dumps hold (>10s here). Run manually with --ignored \
+            --nocapture, as the comment above describes."]
 fn test_q0_v_kernel_roundtrip_pass_rates() {
     use crate::kv_cache::arena_table::N_PALETTE;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
