@@ -1862,15 +1862,19 @@ understand what it is and want an account.
 
 **The demo is the pitch.** A screenshot of a chat window looks like every other product. An
 NPC *acting before it explains itself* — the act stream moving while narration is still
-assembling — is the thing that cannot be faked by a competitor with a wrapper around an API,
-and it is visible in about four seconds. The demo runs a real sandboxed NPC on a shared demo
-world, rate-limited, read-mostly, and reset on a schedule.
+assembling — is visible in about four seconds, and it is the shape of the exchange rather than
+any particular exchange that makes the point.
 
-If the demo NPC is unavailable (model loading, VRAM pressure), the block degrades to a recorded
-replay of a real session rather than disappearing. The page must never be empty.
+**It is a sample, and it says so.** It runs from the mock seam, and the label under it reads *a
+sample exchange* rather than the *live — not a recording* it once claimed. That claim committed
+the front page to running a real sandboxed NPC for every visitor — a standing operational cost
+(a warm model, rate limiting, a world to reset on a schedule) in exchange for something a
+stranger cannot verify anyway. Worse, it is the kind of promise that quietly stops being true:
+the first time the demo world is down and the block falls back to a replay, the page is lying
+to everyone who reads it.
 
-The page renders from the **mock seam** when no session exists, so it has no privileged access
-and can be developed with `?mock=1` like everything else.
+Running a real one later is a strict improvement and needs no change here — the seam is the
+same. What must not happen is the label going back before the daemon does.
 
 ## 25. Sign-in
 
@@ -2842,10 +2846,12 @@ character degrades another's. Nothing in this document addresses per-user quotas
 scheduling between users, or what a user sees when the card is saturated by someone else. That
 is a scheduling design, and it is genuinely absent.
 
-**Is the hosted demo NPC on the home page worth its cost?** It is the strongest thing on that
-page and it consumes real GPU on a machine whose whole premise is that GPU is scarce.
-Rate-limiting and a recorded fallback are specified, but the policy — how much of the card a
-stranger may use — is not.
+**~~Is the hosted demo NPC on the home page worth its cost?~~** Answered: not yet. A live demo
+consumes real GPU on a machine whose whole premise is that GPU is scarce, and the liveness was
+the half a visitor could not verify anyway. The block now runs from the mock seam and is
+labelled *a sample exchange* (§24). Hosting a real one later is a strict improvement through the
+same seam; the open part is only the policy — how much of the card a stranger may use — which
+is a question worth having when there is a card to spare.
 
 **Where does the shared command parser actually live?** §35 requires the browser and the daemon
 to agree exactly. Compiling the Rust parser to WASM guarantees it and adds a WASM artifact to

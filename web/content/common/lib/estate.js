@@ -16,24 +16,31 @@
  * Rust constant against this file, and `zend`'s copy is compared byte for byte.
  * Edit this file first and let the tests tell you what else to change.
  *
- * # The icons are each site's own favicon, by absolute URL
+ * # The icons are served by whichever site is showing the menu
  *
- * Not copies. A copied icon is a second file to update when a brand changes,
- * and the favicon is the one asset guaranteed to exist and to be current on
- * every one of these hosts. The cost is that an icon 404s if a site is down —
- * which is why each entry also carries a colour, painted behind the image, so a
- * failed load degrades to a coloured chip rather than a broken-image glyph.
+ * `/brand/<id>` on every host, from copies this switcher owns, rather than each
+ * site's own favicon by absolute URL. That was the first design and it was
+ * wrong twice over:
+ *
+ *   - **A site's icon was unreachable exactly when it mattered.** zend's came
+ *     from `code.tokera.com`, so the moment zend was down its row lost its
+ *     mark — the one time you are most likely to be looking for the way to
+ *     somewhere else.
+ *   - **The fallback tint showed through.** It was painted behind the image so
+ *     a failed load degraded to a coloured chip; but Tokera's mark is a
+ *     transparent PNG, so the red sat behind the red triskelion permanently and
+ *     the chip read as a solid red blob.
+ *
+ * A copy is a second file to keep current, so the copies are pinned: the tests
+ * in `web/src/site/tokera/page.rs` compare each one against the favicon it was
+ * taken from, and against zend's set.
  */
 
 export const SITES = [
-  { id: 'tokera',       name: 'Tokera',        url: 'https://tokera.com/',
-    icon: 'https://tokera.com/favicon.png',            tint: '#a80c0c' },
-  { id: 'zend',         name: 'Zend',          url: 'https://code.tokera.com/',
-    icon: 'https://code.tokera.com/favicon.svg',       tint: '#c98a3e' },
-  { id: 'npcd',         name: 'NPCs',          url: 'https://bot.tokera.com/',
-    icon: 'https://bot.tokera.com/favicon.svg',        tint: '#c98a3e' },
-  { id: 'battlecities', name: 'Battle Cities', url: 'https://battlecities.net/',
-    icon: 'https://battlecities.net/favicon-32x32.png', tint: '#3a2a24' },
+  { id: 'tokera',       name: 'Tokera',        url: 'https://tokera.com/',       icon: '/brand/tokera.png' },
+  { id: 'zend',         name: 'Zend',          url: 'https://code.tokera.com/',  icon: '/brand/zend.svg' },
+  { id: 'npcd',         name: 'NPCs',          url: 'https://bot.tokera.com/',   icon: '/brand/npcd.svg' },
+  { id: 'battlecities', name: 'Battle Cities', url: 'https://battlecities.net/', icon: '/brand/battlecities.png' },
 ];
 
 /** The site this page belongs to, or `null` if it is not one of them. */
@@ -112,10 +119,9 @@ function armDismiss() {
 function chip(site) {
   const s = document.createElement('span');
   s.className = 'estate-chip';
-  if (site) {
-    s.style.backgroundColor = site.tint;
-    s.style.backgroundImage = `url("${site.icon}")`;
-  }
+  // No colour behind it. A mark with transparency would sit on top of whatever
+  // that colour was, which is how Tokera's triskelion ended up red-on-red.
+  if (site) s.style.backgroundImage = `url("${site.icon}")`;
   return s;
 }
 

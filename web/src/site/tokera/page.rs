@@ -72,11 +72,14 @@ pub const LINKS: [(&str, &str, Nav); 3] = [
 
 /// Every site in the estate, in the order they are offered.
 ///
-/// `(id, name, url, icon, tint)`. The id is what marks the current one; the
-/// icon is that site's own favicon by absolute URL rather than a copy, because
-/// a copied icon is a second file to update when a brand changes. The tint is
-/// painted behind it, so a site that is down degrades to a coloured chip
-/// instead of a broken-image glyph.
+/// `(id, name, url, icon)`. The id is what marks the current one; the icon is
+/// served by whichever site is showing the menu, from `content/common/brand/`.
+///
+/// It used to be each site's own favicon by absolute URL, which failed twice
+/// over: zend's icon came from `code.tokera.com`, so it vanished exactly when
+/// zend was down and you were most likely looking for a way elsewhere; and the
+/// colour painted behind it as a fallback sat *through* Tokera's transparent
+/// mark, leaving a red triskelion on a red square.
 ///
 /// **This list exists three times** — here, in `content/common/lib/estate.js`
 /// for the npcd console, and in `zend/web/lib/estate.js` because zend embeds
@@ -84,34 +87,25 @@ pub const LINKS: [(&str, &str, Nav); 3] = [
 /// list is exactly the thing that drifts, so
 /// [`tests::the_estate_list_matches_the_shared_module`] compares this against
 /// the JavaScript rather than trusting them to stay level.
-pub const ESTATE: [(&str, &str, &str, &str, &str); 4] = [
+pub const ESTATE: [(&str, &str, &str, &str); 4] = [
     (
         "tokera",
         "Tokera",
         "https://tokera.com/",
-        "https://tokera.com/favicon.png",
-        "#a80c0c",
+        "/brand/tokera.png",
     ),
     (
         "zend",
         "Zend",
         "https://code.tokera.com/",
-        "https://code.tokera.com/favicon.svg",
-        "#c98a3e",
+        "/brand/zend.svg",
     ),
-    (
-        "npcd",
-        "NPCs",
-        "https://bot.tokera.com/",
-        "https://bot.tokera.com/favicon.svg",
-        "#c98a3e",
-    ),
+    ("npcd", "NPCs", "https://bot.tokera.com/", "/brand/npcd.svg"),
     (
         "battlecities",
         "Battle Cities",
         "https://battlecities.net/",
-        "https://battlecities.net/favicon-32x32.png",
-        "#3a2a24",
+        "/brand/battlecities.png",
     ),
 ];
 
@@ -168,10 +162,10 @@ pub fn nav_bar(current: Nav) -> String {
     let elsewhere = ESTATE
         .iter()
         .filter(|(id, ..)| *id != ME)
-        .map(|(_, name, url, icon, tint)| {
+        .map(|(_, name, url, icon)| {
             format!(
                 "<a href=\"{url}\"><span class=\"estate-chip\" \
-                 style=\"background-color:{tint};background-image:url('{icon}')\"></span>{name}</a>"
+                 style=\"background-image:url('{icon}')\"></span>{name}</a>"
             )
         })
         .collect::<Vec<_>>()
@@ -183,14 +177,14 @@ pub fn nav_bar(current: Nav) -> String {
     // a documents site whose whole point is that it renders without them.
     let rows = ESTATE
         .iter()
-        .map(|(id, name, url, icon, tint)| {
+        .map(|(id, name, url, icon)| {
             let here = *id == ME;
             // The site you are on links to its own root: the switcher is also
             // the way home, which is what the brand did before it grew a menu.
             let href = if here { "/" } else { url };
             format!(
                 "<a href=\"{href}\" class=\"estate-row{cls}\"{aria}>\
-                 <span class=\"estate-chip\" style=\"background-color:{tint};background-image:url('{icon}')\"></span>\
+                 <span class=\"estate-chip\" style=\"background-image:url('{icon}')\"></span>\
                  <span class=\"estate-name\">{name}</span>{tag}</a>",
                 cls = if here { " is-current" } else { "" },
                 aria = if here { " aria-current=\"true\"" } else { "" },
@@ -210,7 +204,7 @@ pub fn nav_bar(current: Nav) -> String {
         r#"<header class="site-top">
   <details class="estate">
     <summary class="estate-current" aria-label="Switch site">
-      <span class="estate-chip" style="background-color:#a80c0c;background-image:url('/favicon.png')"></span>
+      <span class="estate-chip" style="background-image:url('/brand/tokera.png')"></span>
       <span class="estate-name">Tokera</span>
       <span class="estate-caret" aria-hidden="true">&#9662;</span>
     </summary>
@@ -415,8 +409,8 @@ mod tests {
         let js = std::fs::read_to_string(&shared)
             .unwrap_or_else(|e| panic!("reading {}: {e}", shared.display()));
 
-        for (id, name, url, icon, tint) in ESTATE {
-            for needle in [id, name, url, icon, tint] {
+        for (id, name, url, icon) in ESTATE {
+            for needle in [id, name, url, icon] {
                 assert!(
                     js.contains(needle),
                     "`{needle}` is in the Rust list but not in {}",
@@ -433,6 +427,48 @@ mod tests {
             ESTATE.len(),
             "the shared module lists a different number of sites"
         );
+    }
+
+    /// Every switcher icon is the mark that site actually serves.
+    ///
+    /// They are copies, because the switcher is rendered by all four sites and
+    /// a site's own favicon is unreachable exactly when that site is down —
+    /// zend's row lost its mark the moment zend stopped, which is the one time
+    /// somebody is looking for the way somewhere else. A copy is a second file
+    /// to keep current, so it is compared against the original rather than
+    /// trusted to have been updated alongside it.
+    #[test]
+    fn the_switcher_icons_are_the_marks_their_sites_serve() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let content = root.join("content");
+        for (copy, original) in [
+            ("tokera.png", content.join("tokera").join("favicon.png")),
+            ("npcd.svg", content.join("npcd").join("favicon.svg")),
+            (
+                "battlecities.png",
+                content.join("battlecities").join("favicon-32x32.png"),
+            ),
+            (
+                "zend.svg",
+                root.join("..").join("zend").join("web").join("favicon.svg"),
+            ),
+        ] {
+            let mine = content.join("common").join("brand").join(copy);
+            let a =
+                std::fs::read(&mine).unwrap_or_else(|e| panic!("reading {}: {e}", mine.display()));
+            let b = std::fs::read(&original)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", original.display()));
+            assert_eq!(a, b, "brand/{copy} has drifted from {}", original.display());
+        }
+
+        // And every icon the list names actually exists to be served.
+        for (_, name, _, icon) in ESTATE {
+            let file = content.join("common").join(
+                icon.strip_prefix('/')
+                    .expect("switcher icons are root-relative"),
+            );
+            assert!(file.is_file(), "{name} has no icon at {}", file.display());
+        }
     }
 
     /// zend's copy is byte-identical to the shared module.
@@ -462,6 +498,18 @@ mod tests {
                 b.replace("\r\n", "\n"),
                 "zend's copy of {file} has drifted from the shared one"
             );
+        }
+
+        // The icons too — compared as bytes, since these are images.
+        for (_, name, _, icon) in ESTATE {
+            let rel = icon.strip_prefix('/').expect("root-relative");
+            let shared = root.join("content").join("common").join(rel);
+            let zend = root.join("..").join("zend").join("web").join(rel);
+            let a = std::fs::read(&shared)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", shared.display()));
+            let b =
+                std::fs::read(&zend).unwrap_or_else(|e| panic!("reading {}: {e}", zend.display()));
+            assert_eq!(a, b, "zend's copy of {name}'s icon has drifted");
         }
     }
 
