@@ -1,0 +1,19 @@
+[package]
+name = "target-prune"
+version = "0.1.0"
+edition = "2021"
+description = "Delete the stale generations cargo leaves in target/*/deps."
+
+# No dependencies, on purpose. This runs from a build script on every build in
+# the workspace, so anything it pulled in would be compiled before anything else
+# could start — and it exists to be run on the day the disk is full, which is not
+# the day to need a build of your own first.
+[dependencies]
+
+[lib]
+name = "target_prune"
+path = "src/lib.rs"
+
+[[bin]]
+name = "target-prune"
+path = "src/main.rs"

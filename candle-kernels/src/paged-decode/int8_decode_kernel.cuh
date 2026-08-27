@@ -6,6 +6,19 @@
 // per palette (lane-collective INT8 dot fallback for head dims whose palette
 // isn't 32-wide) and the PV in INT8, with a per-32-token tile-batched softmax
 // and the §1A V read-through. Same slot-header / paged-arena interface as v2.
+//
+// # When this kernel faults and the address does not say where
+//
+// The kernels are built *without* `--generate-line-info`, so a fault here
+// surfaces as a bare device address rather than a file and line. Rebuild with
+// the `kernel-lineinfo` feature for the debugging session:
+//
+//     cargo test -p candle-transformers --features cuda,kernel-lineinfo ...
+//
+// then drop it again. It is off by default because it is two thirds of the
+// compiled archive — 175 KB of `.text` against 592 KB of debug sections in a
+// measured cubin — and every CUDA test binary links a copy. See
+// `candle-kernels/build_utils.rs`.
 // =============================================================================
 
 #include <assert.h>
@@ -1776,6 +1789,18 @@ int launch_int8_decode_attn(
 
         dim3 grid(num_active_slots, n_kv_head, num_splits);
         dim3 block(WARP_SIZE * WARPS_PER_BLOCK);
+
+        // **The stripe/bmma family only exists below 16 warps.**
+        //
+        // `use_stripe` requires `heads_per_group <= 8`, and 16 warps is selected
+        // only when `heads_per_group > 8` (`use_wide`, above) — so at 16 warps
+        // the branch below is unreachable by construction. Without the
+        // `if constexpr` it was still *instantiated*: eight `BMMA` plus eight
+        // `STRIPE` kernels per (head dim × rope × dtype), compiled into the
+        // archive and never launched. Gating the instantiation rather than the
+        // launch is what removes them.
+        bool launched_stripe = false;
+        if constexpr (WARPS_PER_BLOCK <= 8) {
         if (use_stripe) {
             // HPG compile-time so the per-head flash-state arrays stay in registers.
             // hd128 uses the batched-M INT8 tensor-core MMA; other head dims (no
@@ -1823,7 +1848,10 @@ int launch_int8_decode_attn(
             }
             #undef BMMA_LAUNCH
             #undef STRIPE_LAUNCH
-        } else {
+            launched_stripe = true;
+        }
+        }
+        if (!launched_stripe) {
             // Existing INT8-MMA kernel (warp=head). `pa` is non-null exactly
             // when the route goes through partials + combine (need_pool held
             // and the alloc succeeded — a failed alloc returned above); null
@@ -1851,11 +1879,18 @@ int launch_int8_decode_attn(
 
     // 4-way dispatch over (use_wide, rope_interleaved). use_wide selects
     // WARPS_PER_BLOCK=16 for heads_per_group > 8 (e.g. Llama-3 70B class), else 8.
-    if (use_wide) {
-        if (rope_interleaved) {
-            return launch(std::integral_constant<int, 16>{}, std::true_type{});
+    //
+    // The `if constexpr` is the same argument as the stripe gate above, one level
+    // out: `use_wide` carries `HEAD_DIM >= 128`, so below that head dim it is
+    // always false and the entire 16-warp half of this dispatch — every kernel
+    // `launch` instantiates — was compiled for a branch that cannot be taken.
+    if constexpr (HEAD_DIM >= 128) {
+        if (use_wide) {
+            if (rope_interleaved) {
+                return launch(std::integral_constant<int, 16>{}, std::true_type{});
+            }
+            return launch(std::integral_constant<int, 16>{}, std::false_type{});
         }
-        return launch(std::integral_constant<int, 16>{}, std::false_type{});
     }
     if (rope_interleaved) {
         return launch(std::integral_constant<int, 8>{}, std::true_type{});

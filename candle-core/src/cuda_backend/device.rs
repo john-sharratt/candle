@@ -558,6 +558,39 @@ impl CudaDevice {
         })
     }
 
+    /// Give this handle its own cuBLAS handle and curand generator.
+    ///
+    /// **Everything stateful is rebuilt; everything memoised is shared.** The
+    /// caches on a `CudaDevice` are content- and shape-keyed tables of immutable
+    /// bytes, so two handles reading one entry is the point of keeping them.
+    /// These two are neither, and inheriting either is a silent wrong answer
+    /// rather than a failure:
+    ///
+    /// - **cuBLAS.** A handle carries internal workspace and stream state, and
+    ///   NVIDIA's contract is one handle per thread — sharing one is a data race
+    ///   between concurrent GEMMs, not merely contention. It cost `candle-core`'s
+    ///   `conv1d_gpu` a wrong result and two `conv2d_*_gpu` an illegal access,
+    ///   intermittently, only under a full parallel suite.
+    /// - **curand.** A device is built expecting to draw from [`DEFAULT_SEED`];
+    ///   one advancing generator makes what a caller draws a function of who
+    ///   drew before it, so a `Tensor::randn` fixture stops being a fixture. It
+    ///   cost two `candle-transformers` tests, each passing alone and failing in
+    ///   the suite.
+    ///
+    /// Both are cheap to build and neither is what leaked — 512 handles' worth of
+    /// each is a passing test (`cuda_device_reuse.rs`), which is how they were
+    /// ruled out as the cause of the exhaustion the cache exists to stop.
+    ///
+    /// Called on **both** paths out of the cache: the hit, and the loser of a
+    /// first-touch race, which is also handed a clone of a shared device.
+    fn give_own_stateful(&mut self) -> Result<()> {
+        self.blas = Arc::new(cudarc::cublas::CudaBlas::new(self.stream.clone()).w()?);
+        self.curand = Arc::new(Mutex::new(CudaRng(
+            cudarc::curand::CudaRng::new(DEFAULT_SEED, self.stream.clone()).w()?,
+        )));
+        Ok(())
+    }
+
     /// Returns the compute capability of this device as a (major, minor) tuple.
     pub fn compute_capability(&self) -> Result<(i32, i32)> {
         use cudarc::driver::sys::CUdevice_attribute;
@@ -747,33 +780,8 @@ impl BackendDevice for CudaDevice {
             // this, because the construction did the binding.
             dev.context.bind_to_thread().w()?;
             let mut dev = dev.clone();
-
-            // **Everything stateful is rebuilt; everything memoised is shared.**
-            // The caches above are content- and shape-keyed tables of immutable
-            // bytes, so two handles reading one entry is the point of keeping
-            // them. These two are neither, and inheriting either is a silent
-            // wrong answer rather than a failure:
-            //
-            // - **cuBLAS.** A handle carries internal workspace and stream
-            //   state, and NVIDIA's contract is one handle per thread — sharing
-            //   one is a data race between concurrent GEMMs, not merely
-            //   contention. It cost `candle-core`'s `conv1d_gpu` a wrong result
-            //   and two `conv2d_*_gpu` an illegal access, intermittently, only
-            //   under a full parallel suite.
-            // - **curand.** A device is built expecting to draw from
-            //   `DEFAULT_SEED`; one advancing generator makes what a caller
-            //   draws a function of who drew before it, so a `Tensor::randn`
-            //   fixture stops being a fixture. It cost two
-            //   `candle-transformers` tests, each passing alone and failing in
-            //   the suite.
-            //
-            // Both are cheap to build and neither is what leaked — 512 handles'
-            // worth of each is a passing test (`cuda_device_reuse.rs`), which is
-            // how they were ruled out as the cause above.
-            dev.blas = Arc::new(cudarc::cublas::CudaBlas::new(dev.stream.clone()).w()?);
-            dev.curand = Arc::new(Mutex::new(CudaRng(
-                cudarc::curand::CudaRng::new(DEFAULT_SEED, dev.stream.clone()).w()?,
-            )));
+            // Everything memoised is shared; everything stateful is rebuilt.
+            dev.give_own_stateful()?;
             return Ok(dev);
         }
 
@@ -806,7 +814,15 @@ impl BackendDevice for CudaDevice {
         // which is why the winner is read back rather than `dev` returned. The
         // loser costs one device's worth of handles, once, at first touch —
         // where the leak this exists to stop is one per call, forever.
-        Ok(slot.get_or_init(|| dev).clone())
+        //
+        // **The loser still needs its own stateful parts.** Returning the
+        // winner's clone unmodified would hand two threads one cuBLAS handle and
+        // one curand generator — the exact sharing the cache-hit path above
+        // rebuilds to avoid, and the exact conditions (a parallel test suite at
+        // first touch) under which it was originally observed.
+        let mut dev = slot.get_or_init(|| dev).clone();
+        dev.give_own_stateful()?;
+        Ok(dev)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {

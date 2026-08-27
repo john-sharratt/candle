@@ -804,7 +804,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The dense lineage's loader, as [`speculative_gate`] takes it.
     /// Assert the model really carries a drafter, for a caller whose whole
     /// purpose is measuring speculation.
     ///
@@ -824,6 +823,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The dense lineage's loader, as [`speculative_gate`] takes it.
     fn dense_loader(
         model_path: std::path::PathBuf,
         int8mode: Int8Mode,

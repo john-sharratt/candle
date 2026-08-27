@@ -13,6 +13,25 @@
 // =============================================================================
 
 // Standard macro with __ldg optimization
+// Two loop bodies, not four.
+//
+// There used to be a specialisation for each of (both contiguous, lhs only,
+// rhs only, neither), and the three strided ones are near-identical: each walks
+// the dimensions computing `i_dim = tmp_i % dim_val` and accumulating an offset.
+// The single-sided variants exist only to skip *one* operand's accumulation, and
+// they cannot skip the `%` and `/` chain — that is shared, and it is the
+// expensive part. So they bought one multiply-add per dimension and cost a
+// third of the kernel each.
+//
+// The general branch below subsumes them: for a contiguous operand the stride
+// decomposition yields exactly `i`, which is what contiguity means. The fully
+// contiguous fast path stays, because it skips the index arithmetic entirely.
+//
+// This costs nothing that matters. Elementwise ops are memory-bound — the loads
+// and the store dominate — so a few extra integer ops per element disappear into
+// the memory latency, while the code they replace was multiplied across every
+// (op × dtype × vectorisation) instantiation. There are 364 kernels in
+// `binary.o` alone.
 #define BINARY_OP_OUT(TYPENAME, OUT_TYPENAME, FN_NAME, FUNC) \
 extern "C" __global__ void FN_NAME( \
     const unsigned int numel, \
@@ -30,34 +49,6 @@ extern "C" __global__ void FN_NAME( \
     if (lhs_cont && rhs_cont) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             TYPENAME x = __ldg(lhs + i); \
-            TYPENAME y = __ldg(rhs + i); \
-            out[i] = FUNC; \
-        } \
-    } else if (lhs_cont) { \
-        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
-            unsigned int tmp_i = i; \
-            unsigned int rhs_i = 0; \
-            for (int d = num_dims - 1; d >= 0; d--) { \
-                unsigned int dim_val = dims[d]; \
-                unsigned int i_dim = tmp_i % dim_val; \
-                rhs_i += i_dim * rhs_strides[d]; \
-                tmp_i /= dim_val; \
-            } \
-            TYPENAME x = __ldg(lhs + i); \
-            TYPENAME y = __ldg(rhs + rhs_i); \
-            out[i] = FUNC; \
-        } \
-    } else if (rhs_cont) { \
-        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
-            unsigned int tmp_i = i; \
-            unsigned int lhs_i = 0; \
-            for (int d = num_dims - 1; d >= 0; d--) { \
-                unsigned int dim_val = dims[d]; \
-                unsigned int i_dim = tmp_i % dim_val; \
-                lhs_i += i_dim * lhs_strides[d]; \
-                tmp_i /= dim_val; \
-            } \
-            TYPENAME x = __ldg(lhs + lhs_i); \
             TYPENAME y = __ldg(rhs + i); \
             out[i] = FUNC; \
         } \
@@ -80,7 +71,8 @@ extern "C" __global__ void FN_NAME( \
     } \
 }
 
-// Non-__ldg macro for types that don't support __ldg (like fp8)
+// Non-__ldg macro for types that don't support __ldg (like fp8).
+// Two loop bodies rather than four, for the reason `BINARY_OP_OUT` gives.
 #define BINARY_OP_OUT_NO_LDG(TYPENAME, OUT_TYPENAME, FN_NAME, FUNC) \
 extern "C" __global__ void FN_NAME( \
     const unsigned int numel, \
@@ -98,34 +90,6 @@ extern "C" __global__ void FN_NAME( \
     if (lhs_cont && rhs_cont) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             TYPENAME x = lhs[i]; \
-            TYPENAME y = rhs[i]; \
-            out[i] = FUNC; \
-        } \
-    } else if (lhs_cont) { \
-        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
-            unsigned int tmp_i = i; \
-            unsigned int rhs_i = 0; \
-            for (int d = num_dims - 1; d >= 0; d--) { \
-                unsigned int dim_val = dims[d]; \
-                unsigned int i_dim = tmp_i % dim_val; \
-                rhs_i += i_dim * rhs_strides[d]; \
-                tmp_i /= dim_val; \
-            } \
-            TYPENAME x = lhs[i]; \
-            TYPENAME y = rhs[rhs_i]; \
-            out[i] = FUNC; \
-        } \
-    } else if (rhs_cont) { \
-        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
-            unsigned int tmp_i = i; \
-            unsigned int lhs_i = 0; \
-            for (int d = num_dims - 1; d >= 0; d--) { \
-                unsigned int dim_val = dims[d]; \
-                unsigned int i_dim = tmp_i % dim_val; \
-                lhs_i += i_dim * lhs_strides[d]; \
-                tmp_i /= dim_val; \
-            } \
-            TYPENAME x = lhs[lhs_i]; \
             TYPENAME y = rhs[i]; \
             out[i] = FUNC; \
         } \

@@ -134,16 +134,29 @@ const QUANTIZED_KERNELS: [&str; 45] = [
 ];
 
 // Flash-attention kernels: 12 total
-const FLASH_KERNELS: [&str; 14] = [
+const FLASH_KERNELS: [&str; 22] = [
     // Batched sampling (1 api + 4 variants)
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
     "src/sampling/batched_sampling_f16.cu",
     "src/sampling/batched_sampling_bf16.cu",
     "src/sampling/batched_sampling_fp8_e4m3.cu",
-    // Paged decode: per-dtype dispatchers (hdim 64/96/128/256)
+    // Paged decode: a thin per-dtype dispatcher, plus one TU per head dim.
+    //
+    // Separate files because nvcc compiles a translation unit serially and each
+    // head dim expands to a whole dispatch tree — naming all four from one file
+    // made it a ten-minute job by itself while the parallel slots below sat
+    // idle. See `paged_decode_hd_bf16.cuh`.
     "src/paged-decode/paged_decode_api_fp16.cu",
     "src/paged-decode/paged_decode_api_bf16.cu",
+    "src/paged-decode/paged_decode_bf16_hd64.cu",
+    "src/paged-decode/paged_decode_bf16_hd96.cu",
+    "src/paged-decode/paged_decode_bf16_hd128.cu",
+    "src/paged-decode/paged_decode_bf16_hd256.cu",
+    "src/paged-decode/paged_decode_fp16_hd64.cu",
+    "src/paged-decode/paged_decode_fp16_hd96.cu",
+    "src/paged-decode/paged_decode_fp16_hd128.cu",
+    "src/paged-decode/paged_decode_fp16_hd256.cu",
     // INT8 prefix-attention prefill (1 api dispatcher + fp16, bf16)
     "src/paged-prefill/paged_prefill_int8_api.cu",
     "src/paged-prefill/paged_prefill_int8_fp16.cu",
@@ -196,18 +209,42 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         "--expt-relaxed-constexpr".to_string(),
         "--expt-extended-lambda".to_string(),
         "--use_fast_math".to_string(),
-        // Embed source-line info in PTX/CUBIN (no meaningful runtime overhead).
-        // Enables compute-sanitizer and cuda-gdb to report the exact kernel
-        // source file + line number on illegal-address and other faults.
-        "--generate-line-info".to_string(),
-        // Target archs: native SASS for Ada (sm_89) and Blackwell (sm_120),
-        // plus compute_120 PTX as a forward-compat fallback. These live in the
-        // shared compile args (rather than hardcoded at the nvcc call) so that
-        // changing the target arch invalidates the per-kernel and archive
-        // caches — otherwise stale cubins of the wrong arch get reused.
+        // Target archs: native SASS for Ada (sm_89) and Blackwell (sm_120).
+        // These live in the shared compile args (rather than hardcoded at the
+        // nvcc call) so that changing the target arch invalidates the per-kernel
+        // and archive caches — otherwise stale cubins of the wrong arch get
+        // reused.
+        //
+        // **SASS only — no embedded PTX.** `code=[sm_120,compute_120]` also
+        // emitted compute_120 PTX so a future architecture could JIT from it.
+        // That fallback costs a third code image in every cubin and the ptxas
+        // work to produce it, for a card that does not exist yet; when one
+        // arrives it gets its own `-gencode` line here, which is a better answer
+        // than shipping a JIT path nobody has ever run. Every GPU this targets
+        // today — Ada and Blackwell — loads native SASS.
         "-gencode=arch=compute_89,code=sm_89".to_string(),
-        "-gencode=arch=compute_120,code=[sm_120,compute_120]".to_string(),
+        "-gencode=arch=compute_120,code=sm_120".to_string(),
     ];
+
+    // **`kernel-lineinfo` — off unless a kernel is faulting and the address does
+    // not say where.**
+    //
+    // `--generate-line-info` costs nothing at runtime and is two thirds of the
+    // build's output on disk. Measured across a cubin: 175 KB of `.text` SASS
+    // against 592 KB of debug sections, `.nv_debug_ptx_txt` — the embedded PTX
+    // source text — being 490 KB of that on its own. Those archives are
+    // statically linked into every CUDA test binary, and cargo keeps every
+    // generation of every binary, so the multiplier is large.
+    //
+    // What it buys, when it is on, is `compute-sanitizer` and `cuda-gdb` naming
+    // the kernel file and line behind an illegal address instead of leaving a
+    // bare pointer. That is worth a rebuild for one session and not worth
+    // carrying the rest of the time. Since the compile args are hashed, turning
+    // it on rebuilds the affected archive groups and turning it off restores the
+    // cached small ones.
+    if std::env::var_os("CARGO_FEATURE_KERNEL_LINEINFO").is_some() {
+        base_args.push("--generate-line-info".to_string());
+    }
 
     if is_msvc {
         base_args.push("-D_USE_MATH_DEFINES".to_string());
@@ -795,6 +832,8 @@ fn compile_kernels_parallel(
     let (tx, rx) = mpsc::channel();
     let mut handles = Vec::new();
     let mut pending = kernel_paths.iter().peekable();
+    // (duration, kernel path) per nvcc job, reported slowest-first below.
+    let mut timings: Vec<(std::time::Duration, String)> = Vec::new();
 
     while pending.peek().is_some() || !handles.is_empty() {
         while handles.len() < max_threads {
@@ -805,8 +844,10 @@ fn compile_kernels_parallel(
                 let kernel_path = kernel_path.to_string();
 
                 handles.push(thread::spawn(move || {
+                    let started = std::time::Instant::now();
                     let result = compile_kernel_nvcc(&kernel_path, &build_dir, &build_args);
-                    tx.send((kernel_path, result)).unwrap();
+                    let elapsed = started.elapsed();
+                    tx.send((kernel_path, result, elapsed)).unwrap();
                 }));
             } else {
                 break;
@@ -814,10 +855,47 @@ fn compile_kernels_parallel(
         }
 
         if !handles.is_empty() {
-            let (kernel_path, result) = rx.recv().unwrap();
+            let (kernel_path, result, elapsed) = rx.recv().unwrap();
             handles.pop();
             result.with_context(|| format!("Failed to compile {}", kernel_path))?;
+            timings.push((elapsed, kernel_path));
         }
+    }
+
+    // **Where the kernel build's time actually goes.**
+    //
+    // Wall-clock on a laptop is unusable for this: back-to-back full builds of
+    // the same tree measured 11m58s, 12m59s, 20m40s and 9m43s, and the slowest
+    // was the one doing the least work. Thermal state and whatever else the box
+    // is doing swamp any change worth making, so "did that help?" cannot be
+    // answered from the clock.
+    //
+    // Per-kernel durations can be. They are measured inside one process, they do
+    // not include cargo's own work, and a kernel that takes minutes stands out
+    // regardless of how hot the machine is. nvcc compiles a translation unit
+    // serially, so this list is also the critical path: the slowest single entry
+    // is the floor for the whole group no matter how many cores are free.
+    //
+    // stderr, not `cargo:warning=` — build-script stdout is metadata cargo diffs
+    // between runs, and a line whose content changes every build would rebuild
+    // every dependent crate. Read it with `cargo build -vv`.
+    timings.sort_by(|a, b| b.0.cmp(&a.0));
+    let total: std::time::Duration = timings.iter().map(|(d, _)| *d).sum();
+    eprintln!(
+        "candle-kernels: compiled {} kernels, {:.1}s of nvcc across {} job slots",
+        timings.len(),
+        total.as_secs_f64(),
+        max_threads
+    );
+    for (elapsed, path) in timings.iter().take(10) {
+        eprintln!(
+            "  {:>7.1}s  {}",
+            elapsed.as_secs_f64(),
+            PathBuf::from(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        );
     }
 
     let out_files: Vec<PathBuf> = kernel_paths
