@@ -559,11 +559,14 @@ float float_fmt_roundtrip(float x, int fmt) {
 // `__syncwarp()` sequence. Internal shuffles use 0xffffffff masks. BF16/F16
 // sentinels fall through (caller handles those separately).
 //
-// IS_K is threaded through so format encoders that calibrate K and V
-// separately (Q0_V) pick the right table set. Other formats ignore it.
-template <bool IS_K>
+// `is_k` is a runtime argument so that this switch — which carries every
+// format's encoder — exists once. Templated on the side it existed twice, to
+// serve the one arm (Q0_V) that calibrates K and V separately; every other
+// format ignores it. Q0_V keeps its compile-time table choice inside its own
+// arm, which is two small encoders rather than two of everything.
 __device__ __forceinline__
-void quantize_to_smem(const float* __restrict__ src, uint8_t* __restrict__ dst, int fmt) {
+void quantize_to_smem(const float* __restrict__ src, uint8_t* __restrict__ dst, int fmt,
+                      bool is_k) {
     switch (fmt) {
         case SELECT_FMT_Q8_KS:   quantize_block_q8_ks  (src, (block_q8_ks*)  dst); break;
         case SELECT_FMT_Q8_0:    quantize_block_q8_0   (src, (block_q8_0*)   dst); break;
@@ -579,7 +582,11 @@ void quantize_to_smem(const float* __restrict__ src, uint8_t* __restrict__ dst, 
         case SELECT_FMT_Q2_S: quantize_block_q2_s(src, (block_q2_s*)dst); break;
         case SELECT_FMT_Q1_S: quantize_block_q1_s(src, (block_q1_s*)dst); break;
         case SELECT_FMT_Q0:      quantize_block_q0     (src, (block_q0*)     dst); break;
-        case SELECT_FMT_Q0_V:    quantize_block_q0_v<IS_K>(src, (block_q0_v*)dst); break;
+        // The one arm that reads `is_k`.
+        case SELECT_FMT_Q0_V:
+            if (is_k) quantize_block_q0_v<true>(src, (block_q0_v*)dst);
+            else      quantize_block_q0_v<false>(src, (block_q0_v*)dst);
+            break;
         case SELECT_FMT_Q1_A:    quantize_block_q1_a   (src, (block_q1_a*)   dst); break;
         case SELECT_FMT_Q0_X:    quantize_block_q0_x   (src, (block_q0_x*)   dst); break;
         case SELECT_FMT_Q0_M2:   quantize_block_q0_m2  (src, (block_q0_m2*)  dst); break;
@@ -617,13 +624,21 @@ void quantize_to_smem(const float* __restrict__ src, uint8_t* __restrict__ dst, 
 // intentionally absent: they have no block struct, and callers handle
 // them via `float_fmt_roundtrip` before reaching the quant path.
 
-// IS_K is threaded through so Q0_V can pick the K-side or V-side calibrated
-// table set at compile time. Other formats ignore IS_K. Single function
-// template + `if constexpr` because C++ does not allow partial specialisation
-// of function templates.
-template <int FMT, bool IS_K>
+// `is_k` picks Q0_V's K-side or V-side calibrated table set. **Every other
+// format ignores it**, which is why it is a runtime argument rather than a
+// template parameter: as a template parameter it doubled every instantiation
+// below it — `search_scales_for_fmt<FMT, IS_K, HB>` and everything it inlines —
+// to serve one arm of a nineteen-arm switch. Two full copies of eighteen codecs
+// so that the nineteenth could choose a table.
+//
+// Q0_V keeps its compile-time choice, one `if constexpr` deeper, where it costs
+// two small table-indexed encoders instead of two of everything.
+//
+// Single function template + `if constexpr` because C++ does not allow partial
+// specialisation of function templates.
+template <int FMT>
 __device__ __forceinline__ void quantize_block_for_fmt(
-    const float* src, uint8_t* dst)
+    const float* src, uint8_t* dst, bool is_k)
 {
     if      constexpr (FMT == SELECT_FMT_Q8_KS)  quantize_block_q8_ks_vec(src, (block_q8_ks*) dst);
     else if constexpr (FMT == SELECT_FMT_Q8_0)   quantize_block_q8_0_vec(src, (block_q8_0*)  dst);
@@ -639,7 +654,12 @@ __device__ __forceinline__ void quantize_block_for_fmt(
     else if constexpr (FMT == SELECT_FMT_Q2_S)   quantize_block_q2_s   (src, (block_q2_s*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q1_S)   quantize_block_q1_s   (src, (block_q1_s*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q0)     quantize_block_q0     (src, (block_q0*)     dst);
-    else if constexpr (FMT == SELECT_FMT_Q0_V)   quantize_block_q0_v<IS_K>(src, (block_q0_v*) dst);
+    else if constexpr (FMT == SELECT_FMT_Q0_V) {
+        // The one format that reads `is_k`; both table sets live here rather
+        // than duplicating every other codec above.
+        if (is_k) quantize_block_q0_v<true>(src, (block_q0_v*) dst);
+        else      quantize_block_q0_v<false>(src, (block_q0_v*) dst);
+    }
     else if constexpr (FMT == SELECT_FMT_Q1_A)   quantize_block_q1_a   (src, (block_q1_a*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q0_X)   quantize_block_q0_x   (src, (block_q0_x*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q0_M2)  quantize_block_q0_m2  (src, (block_q0_m2*)  dst);
@@ -684,12 +704,13 @@ template <> struct outer_cancels_in_roundtrip<SELECT_FMT_R16>   { static constex
 // is the SAME path the attention kernel uses to read the block at
 // inference time, so a successful round-trip here is a guarantee that
 // the attention kernel will see the same bytes we measured against.)
-// IS_K threaded through so Q0_V dequant picks the K-side or V-side calibrated
-// table set at compile time. Other formats ignore IS_K. Single function
-// template + `if constexpr` (no partial specialisation of function templates).
-template <int FMT, bool IS_K>
+// `is_k` picks Q0_V's calibrated table set; every other format ignores it, so it
+// is a runtime argument for the reason `quantize_block_for_fmt` gives above.
+// Single function template + `if constexpr` (no partial specialisation of
+// function templates).
+template <int FMT>
 __device__ __forceinline__ float dequant_element_for_fmt(
-    const uint8_t* blk, int lane, float outer)
+    const uint8_t* blk, int lane, float outer, bool is_k)
 {
     if      constexpr (FMT == SELECT_FMT_Q8_KS)
         return BlockConverter<block_q8_ks, float>::load_element(reinterpret_cast<const block_q8_ks*>(blk), lane, outer);
@@ -720,7 +741,9 @@ __device__ __forceinline__ float dequant_element_for_fmt(
     else if constexpr (FMT == SELECT_FMT_Q0)
         return BlockConverter<block_q0,    float>::load_element(reinterpret_cast<const block_q0*>(blk),    lane, outer);
     else if constexpr (FMT == SELECT_FMT_Q0_V)
-        return q0_v_load_element_f32<IS_K>(reinterpret_cast<const block_q0_v*>(blk), lane, outer);
+        // The one format that reads `is_k`; see `quantize_block_for_fmt`.
+        return is_k ? q0_v_load_element_f32<true>(reinterpret_cast<const block_q0_v*>(blk), lane, outer)
+                    : q0_v_load_element_f32<false>(reinterpret_cast<const block_q0_v*>(blk), lane, outer);
     else if constexpr (FMT == SELECT_FMT_Q1_A)
         return BlockConverter<block_q1_a,  float>::load_element(reinterpret_cast<const block_q1_a*>(blk),  lane, outer);
     else if constexpr (FMT == SELECT_FMT_Q0_X)
@@ -784,10 +807,13 @@ __device__ __forceinline__ int alive_count(const uint64_t* mask) {
 // SEARCH / CLAIM HELPERS  (compile-time fmt dispatch)
 // =============================================================================
 // These are the building blocks the inner search and claim loops are
-// built from. Each is templated on FMT (and IS_K where the metric
-// branches), so a single per-candidate switch in the caller dispatches
-// to a fully-inlined body — no per-block runtime fmt branching, no
-// __noinline__ slow-path call for the cold quant formats.
+// built from. Each is templated on FMT, so a single per-candidate switch in
+// the caller dispatches to a fully-inlined body — no per-block runtime fmt
+// branching, no __noinline__ slow-path call for the cold quant formats.
+//
+// The K/V side is a *runtime* argument, not a second template parameter. Only
+// Q0_V's calibrated table set reads it, and templating it doubled every one of
+// these — nineteen codecs, twice — so that one arm could pick a table.
 //
 // Cooperative warp model: every helper assumes a fully-active warp (all
 // 32 lanes call simultaneously). `warp_f32_smem` and `warp_quant_smem`
@@ -812,19 +838,20 @@ __device__ __forceinline__ int alive_count(const uint64_t* mask) {
 // reads them, and that the quantized bytes are visible before the
 // per-lane `dequant_element_for_fmt` load. Since the scratch buffers
 // are warp-private smem, no broader barrier is needed.
-template <int FMT, bool IS_K>
+template <int FMT>
 __device__ __forceinline__ float roundtrip_block_for_fmt(
     float orig,
     float outer,
     int lane,
     float* warp_f32_smem,
-    uint8_t* warp_quant_smem
+    uint8_t* warp_quant_smem,
+    bool is_k
 ) {
     warp_f32_smem[lane] = orig * outer;
     __syncwarp();
-    quantize_block_for_fmt<FMT, IS_K>(warp_f32_smem, warp_quant_smem);
+    quantize_block_for_fmt<FMT>(warp_f32_smem, warp_quant_smem, is_k);
     __syncwarp();
-    return dequant_element_for_fmt<FMT, IS_K>(warp_quant_smem, lane, outer);
+    return dequant_element_for_fmt<FMT>(warp_quant_smem, lane, outer, is_k);
 }
 
 // Compute the (pass_metric, threshold) pair for a single (orig, recon)
@@ -843,9 +870,10 @@ __device__ __forceinline__ float roundtrip_block_for_fmt(
 // makes the lane-0-only mask accumulation in `search_scales_for_fmt`
 // safe — every lane sees the same predicate value.
 //
-// Templated on IS_K so the side-specific reductions vanish under
-// inlining; the compiler emits two distinct functions and the call
-// sites pick the right one based on a constexpr.
+// `is_k` is a runtime argument, not a template parameter. It is uniform across
+// the block — the side loop sets it — so the branch is warp-uniform and the two
+// collective reductions below stay safe; what it is not worth is a second copy
+// of everything that calls this, which is what templating it cost.
 //
 // Hoisted constants (`inv_head_amax`, `inv_head_amax_sq`, `v_thr_sq`)
 // are computed once per side in `process_side`. The V-side hoist
@@ -855,7 +883,6 @@ __device__ __forceinline__ float roundtrip_block_for_fmt(
 // though sink_weight is fixed after Phase 2.5. With ~7,680 search
 // iterations per side, that hoist eliminates ~15K redundant warp-max
 // reductions per head.
-template <bool IS_K>
 __device__ __forceinline__ void compute_pass_metric(
     float orig,
     float recon,
@@ -865,9 +892,10 @@ __device__ __forceinline__ void compute_pass_metric(
     float v_thr_sq,
     const __half* kthresh,
     float& pass_metric,
-    float& thr_to_compare
+    float& thr_to_compare,
+    bool is_k
 ) {
-    if (IS_K) {
+    if (is_k) {
         const float err = mean_top4_abs_error_warp(orig, recon, 1.0f);
         pass_metric    = err * inv_head_amax;
         thr_to_compare = __half2float(kthresh[b]);
@@ -956,8 +984,13 @@ __device__ __forceinline__ void compute_pass_metric(
 // (written to shared memory and loaded after __syncthreads) and feed
 // `preferred_range` to produce the six outer-scale candidates.
 
-template <int FMT, bool IS_K, int HB>
+// `is_k` is a runtime argument rather than a template parameter: only Q0_V's
+// table choice ever reads it, and templating it emitted a second copy of this
+// function — and of every codec it inlines — for all nineteen formats. See
+// `quantize_block_for_fmt`.
+template <int FMT, int HB>
 __device__ __noinline__ void search_scales_for_fmt(
+    bool is_k,
     float slot_amax,   // max amax of the alive set
     float safe_p95,    // amax exceeded by 5% of alive blocks
     float safe_p80,    // amax exceeded by 20% of alive blocks
@@ -1035,15 +1068,15 @@ __device__ __noinline__ void search_scales_for_fmt(
             const int b = idx_compact[i];
 
             const float orig  = __half2float(smem_data[b * FUSED_WARP_SIZE + lane]);
-            const float recon = roundtrip_block_for_fmt<FMT, IS_K>(
-                orig, outer, lane, warp_f32_warp, warp_quant_warp);
+            const float recon = roundtrip_block_for_fmt<FMT>(
+                orig, outer, lane, warp_f32_warp, warp_quant_warp, is_k);
 
             float pass_metric, thr_to_compare;
-            compute_pass_metric<IS_K>(
+            compute_pass_metric(
                 orig, recon, b,
                 inv_head_amax, inv_head_amax_sq, v_thr_sq,
                 kthresh,
-                pass_metric, thr_to_compare);
+                pass_metric, thr_to_compare, is_k);
 
             // pass_metric and thr_to_compare are warp-uniform after the
             // metric reductions, so all 32 lanes evaluate the same predicate.
@@ -1194,14 +1227,14 @@ __device__ __forceinline__ int claim_passing_blocks_from_mask(
 // the fused selection kernel. Given a runtime fmt value and a callable
 // `f`, it invokes `f(FmtTag<FMT>{})` where FMT is the matching
 // SELECT_FMT_* constant. Inside the callable, the tag's `::value` is
-// a constexpr, so any call like `search_scales_for_fmt<FMT, IS_K, HB>(...)`
+// a constexpr, so any call like `search_scales_for_fmt<FMT, HB>(...)`
 // resolves at compile time and the body inlines fully.
 //
 // Usage in the kernel:
 //
 //     with_select_fmt(fmt, [&](auto tag) {
 //         constexpr int FMT = decltype(tag)::value;
-//         search_scales_for_fmt<FMT, /*IS_K=*/true, HB>(...);
+//         search_scales_for_fmt<FMT, HB>(is_k, ...);
 //     });
 //
 // Replaces the older macro-based dispatch: the cases are written once
@@ -2460,7 +2493,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     // round-trip in process_side. It depends only on `sink_weight` (now
     // finalised) and the two threshold knobs — i.e. it's invariant across
     // (slot, fmt, scale, block). Computing it once here saves ~15K redundant
-    // warp-max reductions per head in `compute_pass_metric<false>`.
+    // warp-max reductions per head in `compute_pass_metric`'s V-side branch.
     //
     // All 4 warps redundantly compute the same value from the shared
     // `sink_weight[0..31]` — cheaper than a smem broadcast for a single
@@ -2721,8 +2754,8 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
 
             // ── Search: BPE-ascending format × NUM_SCALE_CANDIDATES scales ──
             // Per-candidate dispatch: `with_select_fmt` resolves the runtime
-            // fmt to a compile-time FmtTag, then the lambda picks the IS_K
-            // specialisation. Inside `search_scales_for_fmt`, both quant and
+            // fmt to a compile-time FmtTag, and the side rides along as a
+            // runtime argument. Inside `search_scales_for_fmt`, both quant and
             // dequant paths fully inline — no per-block fmt branching, no
             // __noinline__ slow-path call for cold formats.
             //
@@ -2735,33 +2768,23 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             for (int ci = 0; ci < num_cands; ci++) {
                 if (s_search_done) break;
                 const int fmt = cands[ci];
+                // One instantiation per format, with the side passed in. This
+                // used to branch on `is_k` here and instantiate the whole search
+                // twice per format — see `search_scales_for_fmt`.
                 with_select_fmt(fmt, [&](auto tag) {
                     constexpr int FMT = decltype(tag)::value;
-                    if (is_k) {
-                        search_scales_for_fmt<FMT, true, HB>(
-                            slot_amax, safe_p95, safe_p80, slot_mean, safe_p25,
-                            smem_data, idx_compact, live_count,
-                            tid, warp_id, lane,
-                            warp_f32[warp_id], warp_quant[warp_id], kthresh,
-                            inv_head_amax, inv_head_amax_sq, v_thr_sq,
-                            warp_count, warp_pass, warp_amax_err,
-                            &s_best_fmt, &s_best_scale, &s_best_err,
-                            s_best_pass, &s_search_done,
-                            &s_fallback_fmt, &s_fallback_scale, &s_fallback_err,
-                            s_fallback_pass);
-                    } else {
-                        search_scales_for_fmt<FMT, false, HB>(
-                            slot_amax, safe_p95, safe_p80, slot_mean, safe_p25,
-                            smem_data, idx_compact, live_count,
-                            tid, warp_id, lane,
-                            warp_f32[warp_id], warp_quant[warp_id], kthresh,
-                            inv_head_amax, inv_head_amax_sq, v_thr_sq,
-                            warp_count, warp_pass, warp_amax_err,
-                            &s_best_fmt, &s_best_scale, &s_best_err,
-                            s_best_pass, &s_search_done,
-                            &s_fallback_fmt, &s_fallback_scale, &s_fallback_err,
-                            s_fallback_pass);
-                    }
+                    search_scales_for_fmt<FMT, HB>(
+                        is_k,
+                        slot_amax, safe_p95, safe_p80, slot_mean, safe_p25,
+                        smem_data, idx_compact, live_count,
+                        tid, warp_id, lane,
+                        warp_f32[warp_id], warp_quant[warp_id], kthresh,
+                        inv_head_amax, inv_head_amax_sq, v_thr_sq,
+                        warp_count, warp_pass, warp_amax_err,
+                        &s_best_fmt, &s_best_scale, &s_best_err,
+                        s_best_pass, &s_search_done,
+                        &s_fallback_fmt, &s_fallback_scale, &s_fallback_err,
+                        s_fallback_pass);
                 });
             }
 
@@ -3154,8 +3177,7 @@ extern "C" __global__ void sample_quant_errors_paged(
         } else {
             warp_f32[lane] = x_val;
             __syncwarp();
-            if (side_is_k) quantize_to_smem<true> (warp_f32, warp_quant, fmt);
-            else           quantize_to_smem<false>(warp_f32, warp_quant, fmt);
+            quantize_to_smem(warp_f32, warp_quant, fmt, side_is_k);
             __syncwarp();
             x_rt = side_is_k
                 ? dequant_element_inline<float, true >((const char*)warp_quant, lane, select_fmt_to_arena_fmt(fmt), 1.0f)
@@ -3302,7 +3324,7 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
         } else {
             warp_f32[lane] = k_val;
             __syncwarp();
-            quantize_to_smem<true>(warp_f32, warp_quant, fmt);  // K side
+            quantize_to_smem(warp_f32, warp_quant, fmt, /*is_k=*/true);
             __syncwarp();
             k_rt = dequant_element_inline<float, true>((const char*)warp_quant, lane, select_fmt_to_arena_fmt(fmt), 1.0f);
         }
@@ -3339,7 +3361,7 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
         } else {
             warp_f32[lane] = v_val;
             __syncwarp();
-            quantize_to_smem<false>(warp_f32, warp_quant, fmt);  // V side
+            quantize_to_smem(warp_f32, warp_quant, fmt, /*is_k=*/false);
             __syncwarp();
             v_rt = dequant_element_inline<float>((const char*)warp_quant, lane, select_fmt_to_arena_fmt(fmt), 1.0f);
         }

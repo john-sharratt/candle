@@ -51,6 +51,12 @@ rand    = { workspace = true }
 # must survive framing, not merely leave the handler.
 tokio-tungstenite = "0.24"
 futures-util      = "0.3"
+# `test-util`, for `#[tokio::test(start_paused = true)]`. Tokio's `full` leaves
+# it out on purpose, so the dependency above cannot supply it. The mock console
+# streams on a 1.4s/2.6s cadence chosen so a human can read the pane, and a test
+# waiting on real ticks spends that cadence for every frame; a paused clock
+# advances whenever the runtime idles, so the same frames arrive at once.
+tokio             = { version = "1", features = ["full", "test-util"] }
 # For `examples/prepare-images.rs` only — the site itself serves plain files and
 # does no image work at runtime. `webp` on top of the workspace's jpeg/png
 # because generated source art commonly arrives in that format; the *output* is

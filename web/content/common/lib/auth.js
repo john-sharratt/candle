@@ -13,8 +13,15 @@
 
 const slot = document.getElementById('site-auth');
 
-/** Come back here after signing in, path and query only. */
-const here = () => location.pathname + location.search;
+/** Come back *here* after signing in — the whole URL, host included.
+ *
+ * The provider's registered redirect URI names one host for the estate, so the
+ * browser always returns to it and a relative `next` resolves against that host
+ * rather than the one you left. This file only ever runs on the callback host
+ * today, which is the sort of accident that holds until someone loads it on a
+ * second site and cannot see why sign-in moves them. `safe_next` accepts an
+ * absolute URL under the cookie domain and refuses everything else. */
+const here = () => location.href;
 
 function el(tag, attrs, text) {
   const n = document.createElement(tag);

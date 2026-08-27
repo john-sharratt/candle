@@ -48,6 +48,9 @@ ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate", "candle-nn/accelerate"]
 cuda = ["candle/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-kernels"]
+# Kernel source-line info for `compute-sanitizer`/`cuda-gdb`. One debugging
+# session, not a default — see `candle-kernels/Cargo.toml`.
+kernel-lineinfo = ["cuda", "candle/kernel-lineinfo", "candle-nn/kernel-lineinfo"]
 forbidden_allocations = [
     "candle/forbidden_allocations",
     "candle-nn/forbidden_allocations",

@@ -45,6 +45,9 @@ serial_test = "3.0"
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate"]
 cuda = ["candle/cuda"]
+# Kernel source-line info for `compute-sanitizer`/`cuda-gdb`. One debugging
+# session, not a default — see `candle-kernels/Cargo.toml`.
+kernel-lineinfo = ["cuda", "candle/kernel-lineinfo"]
 forbidden_allocations = ["candle/forbidden_allocations"]
 verbose = []
 dont_check = []

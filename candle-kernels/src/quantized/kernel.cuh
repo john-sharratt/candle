@@ -1443,9 +1443,32 @@ __device__ __forceinline__ void load_activations(
 // -----------------------------------------------------------------------------
 // TC kernel implementation: takes SMEM as parameters for unified dispatch
 // This avoids SMEM summing when called from dispatch functions
+//
+// **`__noinline__` here buys compile time, not size.** Worth stating precisely,
+// because the obvious reading is wrong.
+//
+// Sixteen `tc16_N` entry points exist, one per `REMAINDER_BATCH`, and this body
+// does not depend on `REMAINDER_BATCH` — only on the four type parameters — so
+// every one of them carries the same instantiation. In `q8_0_bf16.o`, `tc16_0`
+// (the pure path, no remainder tile) is ~14 KB and each `tc16_1..15` is ~26 KB:
+// the shared body plus an N-specific tail.
+//
+// `__noinline__` does **not** remove those copies. ptxas re-inlines a device
+// function reached from a single call site whatever the front end asked for, and
+// the per-kernel sizes are unmoved by it (13,696 → 14,464; 25,472 → 26,112).
+// Anyone adding this expecting a smaller archive will not get one — measured,
+// the archives grew 3.7 MB from the call-boundary ABI.
+//
+// What it does buy is the front end no longer re-inlining and re-optimising this
+// tensor-core loop sixteen times per translation unit: **nvcc time fell 20%**,
+// 4,623s → 3,715s across a full kernel build, with `q8_0_bf16.cu` going 182.8s →
+// 146.7s. On a build where every one of the ten slowest translation units is a
+// `q*` object from this header, that is the axis worth trading 3.7 MB for. No
+// measurable runtime cost: this is the kernel body, entered once per block, and
+// the quantized suite times the same either way (4.88s → 4.74s).
 // -----------------------------------------------------------------------------
 template <typename block_c_t, typename compute_t, typename act_t, typename output_t>
-__device__ void tc16_kernel_impl(
+__device__ __noinline__ void tc16_kernel_impl(
     const block_c_t* __restrict__ weights,
     const act_t* __restrict__ activations,
     output_t* __restrict__ dst,
@@ -3089,9 +3112,14 @@ __device__ __forceinline__ void load_frag_a_64(
 // TC kernel implementation for batch tile = 32 - takes SMEM as parameters
 // batch_tile_idx: Decoded batch tile index (hierarchical or simple grid)
 // row_tile_idx: Decoded row tile index (-1 = use blockIdx.y for legacy)
+//
+// `__noinline__` for the reason `tc16_kernel_impl` gives — a compile-time
+// saving, not a size one: sixteen `tc32_N` entry points share this body, which
+// does not vary with `REMAINDER_BATCH`, and the front end was re-optimising it
+// once per entry point.
 // -----------------------------------------------------------------------------
 template <typename block_c_t, typename compute_t, typename act_t, typename output_t>
-__device__ void tc32_kernel_impl(
+__device__ __noinline__ void tc32_kernel_impl(
     const block_c_t* __restrict__ weights,
     const act_t* __restrict__ activations,
     output_t* __restrict__ dst,

@@ -9,6 +9,25 @@ keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+# Compile the CUDA kernels with `--generate-line-info`, so `compute-sanitizer`
+# and `cuda-gdb` can name the kernel source file and line behind a fault.
+#
+# **Off by default, and it should stay off.** Measured across a cubin: `.text`
+# holds 175 KB of SASS against 592 KB of debug sections, `.nv_debug_ptx_txt`
+# (the embedded PTX source text) being 490 KB of that. Two thirds of every
+# archive, statically linked into every test binary that touches CUDA.
+#
+# Turn it on for one debugging session — when a kernel faults and the address
+# alone does not say where — then turn it off again:
+#
+#     cargo test -p candle-transformers --features cuda,kernel-lineinfo ...
+#
+# The build script hashes the compile arguments, so flipping this rebuilds the
+# kernels and flipping it back restores the cached small ones.
+kernel-lineinfo = []
+
 [dependencies]
 half = { version = "2.5.0", features = ["num-traits"] }
 float8 = { version = "0.4.2", features = ["num-traits"] }

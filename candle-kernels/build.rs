@@ -101,8 +101,15 @@ fn main() -> Result<()> {
 
     let mut dirty_groups: Vec<DirtyGroup> = Vec::new();
 
+    // Every kernel that still exists, by object stem — the live set the staged
+    // cache is pruned against at the end of this function.
+    let mut all_kernel_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for group in &archive_groups {
         all_archive_names.push(group.name.clone());
+        for k in &group.kernels {
+            all_kernel_stems.insert(kernel_stem(k));
+        }
 
         let (kernel_hashes, aggregate_hash) =
             compute_group_hashes(group, &base_dir, &mut dep_cache)?;
@@ -300,19 +307,105 @@ fn main() -> Result<()> {
         }
     }
 
+    // **Drop cache entries whose source no longer exists.**
+    //
+    // Both caches here are keyed by name and nothing ever removed an entry when
+    // the thing it cached went away, so they only grew. Measured before this was
+    // written: `precompiled/` held `libfused_attn_v1.a.gz` at 107.8 MB for a
+    // group deleted in June — more than every live entry combined — and
+    // `staged/` held 377.9 MB of orphans across 54 objects, one of them
+    // (`launch.o`) 133.6 MB on its own. A cache that cannot shrink is the same
+    // defect as a `target/` that cannot, and this is the one place that knows
+    // both what is cached and what is live.
+    prune_orphans(&staged_dir, |stem| all_kernel_stems.contains(stem));
+
+    let live: std::collections::HashSet<String> = all_archive_names
+        .iter()
+        .map(|n| format!("lib{n}"))
+        .collect();
+
     for entry in fs::read_dir(&precompiled_dir)?.flatten() {
         let path = entry.path();
-        if let Some(ext) = path.extension() {
-            if ext == "gz" || ext == "sha256" {
-                let path_str = if cfg!(windows) {
-                    path.to_string_lossy().replace('\\', "/")
-                } else {
-                    path.to_string_lossy().to_string()
-                };
-                println!("cargo:rerun-if-changed={}", path_str);
-            }
+        let Some(ext) = path.extension() else {
+            continue;
+        };
+        if ext != "gz" && ext != "sha256" {
+            continue;
         }
+        // `libfoo.a.gz` / `libfoo.a.sha256` → `libfoo`.
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.split(".a.").next())
+            .unwrap_or_default()
+            .to_string();
+        if !stem.is_empty() && !live.contains(&stem) {
+            drop_orphan(&path, "no such archive group");
+            continue;
+        }
+
+        let path_str = if cfg!(windows) {
+            path.to_string_lossy().replace('\\', "/")
+        } else {
+            path.to_string_lossy().to_string()
+        };
+        println!("cargo:rerun-if-changed={}", path_str);
     }
 
     Ok(())
+}
+
+/// Delete every staged file in `dir` whose kernel is not `live`.
+///
+/// The staged half of the cache sweep — `precompiled/` is walked inline above
+/// because it also has to emit `rerun-if-changed` for the survivors, which this
+/// does not.
+///
+/// **The stem must be derived by stripping suffixes, not by `file_stem()`.** The
+/// cache stores two files per kernel, `<name>.o` and its hash sidecar
+/// `<name>.o.sha256`, and `Path::file_stem` on the latter yields `<name>.o` —
+/// which is never in the live set, so every sidecar was deleted on every build.
+/// `is_staged_kernel_valid` needs that file, so the effect was a staged cache
+/// that could never hit: every kernel in every dirty group recompiled from
+/// scratch, which is exactly what this cache exists to prevent. It was found in
+/// the live tree as 122 `.o` files and zero `.sha256`.
+fn prune_orphans(dir: &Path, live: impl Fn(&str) -> bool) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // `<name>.o.sha256` → `<name>.o` → `<name>`; `<name>.o` → `<name>`.
+        // Anything else in here is not ours to remove.
+        let base = name.strip_suffix(".sha256").unwrap_or(name);
+        let Some(stem) = base
+            .strip_suffix(".o")
+            .or_else(|| base.strip_suffix(".obj"))
+        else {
+            continue;
+        };
+        if !live(stem) {
+            drop_orphan(&path, "no such kernel");
+        }
+    }
+}
+
+/// Remove one orphaned cache file, reporting what it reclaimed.
+///
+/// **stderr, not `cargo:warning=`.** A build script's *stdout* is metadata cargo
+/// diffs between runs, so a line that appears only when there was something to
+/// delete marks this crate dirty and rebuilds every crate depending on it —
+/// measured at 5–7s per build before it was moved here.
+fn drop_orphan(path: &Path, why: &str) {
+    let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if fs::remove_file(path).is_ok() {
+        eprintln!(
+            "candle-kernels: dropped stale cache entry {} ({:.1} MB) — {why}",
+            path.display(),
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
 }

@@ -572,6 +572,69 @@ pub fn run_dtype_test(
 #[cfg(feature = "cuda")]
 pub const TEST_BATCH_SIZES: &[usize] = &[1, 2, 3, 4, 5, 6, 7, 8, 16, 64, 128];
 
+/// The weights a sweep reuses, built once.
+///
+/// Everything here is a pure function of [`QuantTestConfig`], so it is identical
+/// for every dtype and batch size the sweep visits. Rebuilding it per
+/// configuration is what made these tests the slowest in the workspace: at
+/// 2048×2048 the fixture is a 4.2M-element host loop, an upload, a quantize and
+/// a dequantize, repeated 44 times to compare 44 matmuls against it. Hoisting it
+/// leaves the per-configuration work as the thing actually under test — build an
+/// input, run both paths, compare.
+#[cfg(feature = "cuda")]
+pub struct SweepWeights {
+    /// The quantized weights under test, wrapped for the GEMX path.
+    qmatmul: QMatMulWrapper,
+    /// Dequantized and transposed, ready to be the reference matmul's operand.
+    /// F32, so the comparison never pays a conversion error the kernel did not
+    /// make.
+    weights_t: Tensor,
+}
+
+#[cfg(feature = "cuda")]
+impl SweepWeights {
+    pub fn build(config: &QuantTestConfig, device: &Device) -> Result<Self> {
+        let weights_f32 = create_test_weights(config.nrows, config.ncols, device)?;
+        let qtensor = QTensor::quantize(&weights_f32, config.dtype)?;
+        let weights_t = qtensor.dequantize(device)?.t()?;
+        Ok(Self {
+            qmatmul: QMatMulWrapper::from_qtensor(qtensor)?,
+            weights_t,
+        })
+    }
+
+    /// Does the kernel agree with the reference at all, at batch 1 in F16?
+    ///
+    /// The cheapest question worth asking before printing a 44-row table: a
+    /// kernel that is broken outright makes every row below noise.
+    fn quick_check(&self, config: &QuantTestConfig, device: &Device) -> bool {
+        let check = || -> Result<()> {
+            let input = create_test_input(1, 1, config.ncols, DType::F16, device)?;
+            let baseline = self.baseline(&input, 1, 1, config)?;
+            let result = self.qmatmul.forward(&input)?;
+            let (rtol, atol) = get_tolerance_for(config.dtype, DType::F16);
+            assert_approx_eq(&baseline, &result, rtol, atol)
+        };
+        check().is_ok()
+    }
+
+    /// The reference result: dequantized weights through an ordinary matmul.
+    fn baseline(
+        &self,
+        input: &Tensor,
+        batch: usize,
+        seq: usize,
+        config: &QuantTestConfig,
+    ) -> Result<Tensor> {
+        let input_2d = input
+            .to_dtype(DType::F32)?
+            .reshape((batch * seq, config.ncols))?;
+        input_2d
+            .matmul(&self.weights_t)?
+            .reshape((batch, seq, config.nrows))
+    }
+}
+
 /// Result of a single test run (for deferred failure reporting)
 #[cfg(feature = "cuda")]
 #[derive(Debug)]
@@ -602,10 +665,22 @@ pub fn run_all_dtype_tests(config: &QuantTestConfig, device: &Device) -> Result<
         config.name
     );
 
-    // STEP 2: Quick kernel functionality check (silent unless errors)
+    // The fixture every row below shares. It depends only on `config`, so the
+    // sweep used to rebuild this identical 2048×2048 matrix 44 times over —
+    // quantizing and dequantizing 4.2M elements each time to compare one matmul
+    // against it.
+    let weights = SweepWeights::build(config, device)?;
+
+    // STEP 2: Quick kernel functionality check (silent unless errors).
+    //
+    // Only the *small* config earns its own fixture: 256×256 is a different
+    // shape — one quant block rather than eight — so it exercises tiling the
+    // sweep never reaches. The large check is batch 1 at F16, which is literally
+    // the sweep's first row, so it reuses the shared weights instead of building
+    // a second copy of them to ask the same question.
     let small_config = QuantTestConfig::small(config.name, config.dtype);
     let small_works = test_single_config_quick(&small_config, device);
-    let large_works = test_single_config_quick(config, device);
+    let large_works = weights.quick_check(config, device);
 
     if !small_works || !large_works {
         println!(
@@ -643,7 +718,8 @@ pub fn run_all_dtype_tests(config: &QuantTestConfig, device: &Device) -> Result<
 
         // Test across all batch sizes with seq=1 for simplicity
         for &batch_size in TEST_BATCH_SIZES {
-            let result = run_dtype_test_no_fail(config, dtype, batch_size, 1, device, rtol, atol);
+            let result =
+                run_dtype_test_no_fail(config, &weights, dtype, batch_size, 1, device, rtol, atol);
 
             // Print row immediately
             let dtype_str = format!("{:?}", result.dtype);
@@ -808,8 +884,10 @@ pub fn run_all_dtype_tests(config: &QuantTestConfig, device: &Device) -> Result<
 
 /// Run a single dtype test without failing - returns result for deferred reporting
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn run_dtype_test_no_fail(
     config: &QuantTestConfig,
+    weights: &SweepWeights,
     input_dtype: DType,
     batch: usize,
     seq: usize,
@@ -821,27 +899,15 @@ fn run_dtype_test_no_fail(
 
     // Try to run the test
     let test_result = (|| -> Result<(ComparisonStats, bool, Tensor, Tensor)> {
-        // Create and quantize weights
-        let weights_f32 = create_test_weights(config.nrows, config.ncols, device)?;
-        let qtensor = QTensor::quantize(&weights_f32, config.dtype)?;
-
         // Create test input with distinct values per batch element
         let input = create_test_input(batch, seq, config.ncols, input_dtype, device)?;
 
-        // Baseline: dequantize + matmul
-        let baseline = compute_baseline(
-            &qtensor,
-            &input,
-            batch,
-            seq,
-            config.nrows,
-            config.ncols,
-            device,
-        )?;
+        // Baseline: the same dequantized weights every configuration compares
+        // against, built once by the caller.
+        let baseline = weights.baseline(&input, batch, seq, config)?;
 
         // GEMX path via wrapper
-        let qmatmul = QMatMulWrapper::from_qtensor(qtensor)?;
-        let gemx_result = qmatmul.forward(&input)?;
+        let gemx_result = weights.qmatmul.forward(&input)?;
 
         // Compare
         let stats = compare_tensors(&baseline, &gemx_result)?;

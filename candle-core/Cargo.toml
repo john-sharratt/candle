@@ -79,6 +79,11 @@ serial_test = "3.0"
 [features]
 default = []
 cuda = ["cudarc", "dep:candle-kernels", "dep:ug-cuda", "float8/cuda"]
+# Build the CUDA kernels with source-line info, so `compute-sanitizer` and
+# `cuda-gdb` can name the file and line behind a fault. Costs two thirds of the
+# kernel archives' size, so it is for one debugging session, not for carrying —
+# see `candle-kernels/Cargo.toml`.
+kernel-lineinfo = ["cuda", "candle-kernels/kernel-lineinfo"]
 # Expose the VRAM Governor's scripted probe/allocator test doubles to other
 # crates' tests (candle-core's own tests get them via `cfg(test)`).
 vram-test-util = []
