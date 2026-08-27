@@ -1,6 +1,7 @@
 use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
 use super::prefill::VramPhase;
 use super::*;
+use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use std::time::{Duration, Instant};
 
 /// Wall-clock ceiling for one decode quantum ("wave"). The quantum is CLIPPED to
@@ -337,6 +338,13 @@ impl Scheduler {
             // first. A ZST guard without the feature.
             #[cfg(feature = "forbidden_allocations")]
             let alloc_watch = candle::forbidden_alloc::armed();
+            // Why the pool was reached, scoped to THIS wave — always on, unlike
+            // the site-naming report above. The lifetime totals cannot answer it:
+            // they are dominated by declines that are correct (the residual
+            // stream has no arena to inherit, model loading has no wave), so only
+            // a window in which every allocation *should* inherit separates a
+            // provenance break from ordinary work. Two atomic loads.
+            let declines = DeclineSnapshot::now();
             let dw = self.foreground_decode_width();
             let pw = self.prefill_width();
             let sw = self.section_ingest_width();
@@ -353,6 +361,8 @@ impl Scheduler {
                 self.timed_section();
                 self.timed_decode();
             }
+            let (no_ticket, arena_full) = declines.bytes_since();
+            publish_wave_declines(no_ticket, arena_full);
             #[cfg(feature = "forbidden_allocations")]
             {
                 drop(alloc_watch);

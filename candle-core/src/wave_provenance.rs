@@ -36,6 +36,7 @@
 //! driver rejects it and cudarc records the error; nothing is freed. The hazard
 //! is structural, not something each call site has to be careful about.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Which wave arena a leased storage was allocated from.
@@ -81,6 +82,188 @@ pub fn install_wave_allocator(f: WaveAllocFn) {
 /// on, so a miss costs an allocation rather than a failure.
 pub fn wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<u64> {
     WAVE_ALLOC.get()?(ticket, bytes, align)
+}
+
+/// Why an allocation that *could* have been served from a wave arena was not.
+///
+/// **The two have opposite fixes, and telling them apart is the whole point.**
+/// `NoTicket` is a provenance break: something upstream produced a tensor with
+/// no wave backing, and everything derived from it inherits the pool — so the
+/// fix is at that root, possibly many frames above the site that shows up in a
+/// report. `ArenaFull` is a sizing problem: provenance is intact and the arena
+/// simply had no room, so the fix is the arena's width and nothing about the
+/// call site is wrong.
+///
+/// Guessing between them was costing real time. The fallback in
+/// [`crate::cuda_backend::alloc_inheriting`] is silent and both paths land on
+/// `CudaDevice::alloc`, so a forbidden-allocation report shows an identical row
+/// either way — a site that has lost its provenance and a site whose arena
+/// overflowed are the same line of output.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ArenaDecline {
+    /// The origin carried no wave ticket — a `Foreign` lease, an owned pool
+    /// allocation, or a tensor that never had provenance to begin with.
+    NoTicket,
+    /// The origin had a ticket and the arena refused: no room, or a generation
+    /// that has since closed.
+    ///
+    /// Also covers a process with no resolver installed at all, which in
+    /// practice means before candle-nn registers one at startup — a window with
+    /// no waves in it, so it contributes nothing to a steady-state reading.
+    ArenaFull,
+}
+
+/// `[NoTicket, ArenaFull]` — calls, then bytes, indexed by `ArenaDecline as
+/// usize`. Relaxed throughout: these are counters read by a report, never a
+/// value anything orders against.
+static DECLINE_CALLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static DECLINE_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Carve from `from`'s arena, recording why if that is not possible.
+///
+/// The single decision point for "arena or pool", so the accounting cannot drift
+/// from the behaviour: a caller that carves without asking here is a caller that
+/// does not appear in the totals.
+pub fn wave_alloc_attributed(from: Option<WaveTicket>, bytes: usize, align: usize) -> Option<u64> {
+    let Some(ticket) = from else {
+        record_decline(ArenaDecline::NoTicket, bytes);
+        return None;
+    };
+    match wave_alloc(ticket, bytes, align) {
+        Some(ptr) => Some(ptr),
+        None => {
+            record_decline(ArenaDecline::ArenaFull, bytes);
+            None
+        }
+    }
+}
+
+fn record_decline(why: ArenaDecline, bytes: usize) {
+    let i = why as usize;
+    DECLINE_CALLS[i].fetch_add(1, Ordering::Relaxed);
+    DECLINE_BYTES[i].fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// Cumulative `(calls, bytes)` for one decline reason since process start.
+pub fn arena_declines(why: ArenaDecline) -> (u64, u64) {
+    let i = why as usize;
+    (
+        DECLINE_CALLS[i].load(Ordering::Relaxed),
+        DECLINE_BYTES[i].load(Ordering::Relaxed),
+    )
+}
+
+/// Zero both counters.
+///
+/// Test-only: production measures an interval with [`DeclineSnapshot`], which
+/// subtracts two readings instead and so cannot lose a count to the persistence
+/// thread racing between the zeroing and the read.
+#[cfg(test)]
+pub fn reset_arena_declines() {
+    for i in 0..2 {
+        DECLINE_CALLS[i].store(0, Ordering::Relaxed);
+        DECLINE_BYTES[i].store(0, Ordering::Relaxed);
+    }
+}
+
+/// A reading of both counters, for measuring an interval by subtraction.
+///
+/// **The lifetime totals do not mean what they look like they mean.** They count
+/// every declined allocation in the process, and most declines are by design: an
+/// op on the residual stream has no ticket to inherit because the residual
+/// crosses layers and belongs on the pool, model loading has no wave at all, and
+/// neither is a defect. Read cumulatively, `NoTicket` is dominated by exactly
+/// those and says nothing about whether provenance is broken.
+///
+/// What answers that question is the delta across ONE WAVE, where every
+/// allocation should be inheriting. Monotonic counters and a subtraction, rather
+/// than a reset, so a concurrent persistence thread cannot lose a count between
+/// the zeroing and the read.
+#[derive(Clone, Copy, Debug)]
+pub struct DeclineSnapshot {
+    no_ticket: (u64, u64),
+    arena_full: (u64, u64),
+}
+
+impl DeclineSnapshot {
+    /// Read both counters now.
+    pub fn now() -> Self {
+        Self {
+            no_ticket: arena_declines(ArenaDecline::NoTicket),
+            arena_full: arena_declines(ArenaDecline::ArenaFull),
+        }
+    }
+
+    /// `(no_ticket_bytes, arena_full_bytes)` accumulated since `self` was taken.
+    pub fn bytes_since(&self) -> (u64, u64) {
+        let now = Self::now();
+        (
+            now.no_ticket.1.saturating_sub(self.no_ticket.1),
+            now.arena_full.1.saturating_sub(self.arena_full.1),
+        )
+    }
+}
+
+/// The last completed wave's decline bytes, `(no_ticket, arena_full)`.
+static LAST_WAVE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Publish one wave's decline delta. Called by the scheduler at wave end.
+pub fn publish_wave_declines(no_ticket_bytes: u64, arena_full_bytes: u64) {
+    LAST_WAVE[0].store(no_ticket_bytes, Ordering::Relaxed);
+    LAST_WAVE[1].store(arena_full_bytes, Ordering::Relaxed);
+}
+
+/// The last wave's decline bytes — the figure the memory report should show,
+/// since it is the one scoped to a window where inheriting is expected.
+pub fn last_wave_declines() -> (u64, u64) {
+    (
+        LAST_WAVE[0].load(Ordering::Relaxed),
+        LAST_WAVE[1].load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod decline_tests {
+    use super::{
+        arena_declines, reset_arena_declines, wave_alloc_attributed, ArenaDecline, WaveTicket,
+    };
+
+    /// A ticketless origin is charged to `NoTicket`, with its bytes.
+    ///
+    /// The counters are process-global, so this test resets first and asserts on
+    /// the delta it creates rather than on absolutes. It cannot run beside
+    /// another test that allocates — there is none in this crate that installs a
+    /// resolver, and the whole point of the split is that it needs no device.
+    #[test]
+    fn a_ticketless_origin_is_charged_to_no_ticket() {
+        reset_arena_declines();
+        assert_eq!(wave_alloc_attributed(None, 4096, 256), None);
+        let (calls, bytes) = arena_declines(ArenaDecline::NoTicket);
+        assert_eq!((calls, bytes), (1, 4096));
+        assert_eq!(
+            arena_declines(ArenaDecline::ArenaFull),
+            (0, 0),
+            "a missing ticket is not an arena that refused — the two have \
+             opposite fixes and must not share a counter",
+        );
+    }
+
+    /// A ticket whose arena will not serve it is charged to `ArenaFull`.
+    ///
+    /// With no resolver installed every ticket declines, which is exactly the
+    /// path a closed generation or a full arena takes.
+    #[test]
+    fn a_refused_ticket_is_charged_to_arena_full() {
+        reset_arena_declines();
+        let ticket = WaveTicket {
+            domain: 0,
+            arena: 0,
+            epoch: 0,
+        };
+        assert_eq!(wave_alloc_attributed(Some(ticket), 8192, 256), None);
+        assert_eq!(arena_declines(ArenaDecline::ArenaFull), (1, 8192));
+        assert_eq!(arena_declines(ArenaDecline::NoTicket), (0, 0));
+    }
 }
 
 /// What owns the memory behind a [`crate::cuda_backend::Backing::Lease`].

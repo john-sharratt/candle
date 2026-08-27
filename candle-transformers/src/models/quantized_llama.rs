@@ -22,6 +22,7 @@ use std::sync::{Arc, RwLock};
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::{BatchedModelCore, WaveShapes};
+use super::dense_span;
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
 use super::llama_rope::llama_inv_freq;
 use super::profile::gpu_span_phase;
@@ -792,6 +793,11 @@ impl ModelWeights {
         #[cfg(feature = "cuda")]
         super::batched_model::ensure_vram_governor(device);
 
+        // After the governor, so the span is sized from a measured card, and
+        // before the baseline below, so the span's own mapping is not read as
+        // weight bytes (`dense_span`).
+        dense_span::open_for_load(device, &ct)?;
+
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]
         let used_before = super::batched_model::driver_used_bytes(device);
@@ -940,11 +946,16 @@ impl ModelWeights {
         }
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        // Both halves: the driver delta sees only what went to the CUDA pool,
+        // and whatever was carved from the span sits inside the mapping the
+        // baseline already counted, so it has to be added rather than inferred.
+        let dense_in_span = dense_span::close_load(device)?;
         #[cfg(feature = "cuda")]
-        let base_weight_bytes =
-            super::batched_model::driver_used_bytes(device).saturating_sub(used_before);
+        let base_weight_bytes = super::batched_model::driver_used_bytes(device)
+            .saturating_sub(used_before)
+            + dense_in_span;
         #[cfg(not(feature = "cuda"))]
-        let base_weight_bytes = 0usize;
+        let base_weight_bytes = dense_in_span;
         Ok(Self {
             embeddings: Embedding::new(tok_embeddings, embedding_length)?,
             layers,
@@ -1041,6 +1052,11 @@ impl ModelWeights {
         // arena floor plus the wave transient tier.
         #[cfg(feature = "cuda")]
         super::batched_model::ensure_vram_governor(device);
+
+        // After the governor, so the span is sized from a measured card, and
+        // before the baseline below, so the span's own mapping is not read as
+        // weight bytes (`dense_span`).
+        dense_span::open_for_load(device, &ct)?;
 
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]
@@ -1201,11 +1217,16 @@ impl ModelWeights {
 
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        // Both halves: the driver delta sees only what went to the CUDA pool,
+        // and whatever was carved from the span sits inside the mapping the
+        // baseline already counted, so it has to be added rather than inferred.
+        let dense_in_span = dense_span::close_load(device)?;
         #[cfg(feature = "cuda")]
-        let base_weight_bytes =
-            super::batched_model::driver_used_bytes(device).saturating_sub(used_before);
+        let base_weight_bytes = super::batched_model::driver_used_bytes(device)
+            .saturating_sub(used_before)
+            + dense_in_span;
         #[cfg(not(feature = "cuda"))]
-        let base_weight_bytes = 0usize;
+        let base_weight_bytes = dense_in_span;
         Ok(Self {
             embeddings: Embedding::new(tok_embeddings, embedding_length)?,
             layers,

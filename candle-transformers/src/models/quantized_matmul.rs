@@ -7,6 +7,41 @@ use candle::{DType, Module, Result, Tensor};
 
 use crate::models::profile::{pipeline_record, profile_now};
 
+/// Where a weight's KO twin should be written: the span's dense block, or the
+/// pool.
+///
+/// `None` whenever the dense block cannot serve the request, and every such case
+/// is legitimate rather than a failure — no CUDA device, no reservation, or a
+/// repack outside the load phase (a test, a second model, anything built after
+/// `freeze_dense`). The pool is the correct destination for all of them, which
+/// is exactly what the old code did unconditionally.
+///
+/// The refusal is logged at debug and not propagated: a model load reaching it
+/// would mean the weights quietly stayed in the pool, and that shows up in
+/// `dense_mib` at the freeze rather than as an error here.
+#[cfg(feature = "cuda")]
+fn dense_destination(
+    src: &QTensor,
+    mode: Int8Mode,
+) -> Option<(u64, candle::cuda_backend::wave_provenance::LeaseOrigin)> {
+    use candle::cuda_backend::wave_provenance::LeaseOrigin;
+    let candle::Device::Cuda(cuda) = src.device() else {
+        return None;
+    };
+    let ko_dtype = src.dtype().to_ko(mode).ok()?;
+    let bytes = candle::quantized::cuda::ko_repacked_bytes(src.shape(), ko_dtype).ok()?;
+    match candle_nn::kv_cache::claim_dense(&cuda.cuda_stream(), bytes) {
+        Ok(ptr) => Some((ptr, LeaseOrigin::Foreign)),
+        Err(e) => {
+            tracing::debug!(
+                bytes,
+                "dense block declined this weight ({e}); repacking to the CUDA pool"
+            );
+            None
+        }
+    }
+}
+
 /// Traced quantized matmul wrapper.
 ///
 /// Key behavior:
@@ -99,8 +134,21 @@ impl QMatMul {
                     let f32 = ws.dequantize(&ws.device())?;
                     std::sync::Arc::new(QTensor::quantize(&f32, GgmlDType::Q8_0)?)
                 };
-                let inner =
-                    candle::quantized::QMatMul::from_arc(src)?.repack_for_optimization(mode)?;
+                // **Place the twin in the device reservation, not the pool.**
+                // The twin is what stays: `src` is dropped as this returns, so
+                // it is the twin's bytes that make up the model's resident
+                // footprint and the twin that has to be inside the span.
+                //
+                // A refusal is not fatal. The dense block is a load-phase
+                // allocator, so anything repacking outside that window — a test,
+                // a second model, a weight built after `freeze_dense` — has no
+                // address to be given and belongs on the pool, exactly as before.
+                // Reported at debug rather than swallowed silently, because a
+                // *model load* landing here would be the whole change quietly
+                // not happening.
+                let dst = dense_destination(&src, mode);
+                let inner = candle::quantized::QMatMul::from_arc(src)?
+                    .repack_for_optimization_into(mode, dst)?;
                 return Ok(Self {
                     inner,
                     span,

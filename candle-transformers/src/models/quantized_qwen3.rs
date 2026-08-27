@@ -11,6 +11,7 @@
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::{BatchedModelCore, WaveShapes};
+use super::dense_span;
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
 use super::quantized_matmul::QMatMul;
 use super::quantized_mlp::QuantizedMlp;
@@ -650,6 +651,10 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        // Claim the reservation before the baseline below is taken, so the span's
+        // own mapping is not read as weight bytes — and before any tensor, which
+        // is what lets the weights be carved out of it (`dense_span`).
+        dense_span::open_for_load(device, &ct)?;
         let mut gg = Gguf::new(ct, reader, device.clone());
         // Driver-used VRAM baseline before any weights load — the delta to the
         // fully-built model is the fixed resident-weight footprint.
@@ -747,11 +752,19 @@ impl ModelWeights {
         let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        // **Both halves, because the weights now land in two places.** The driver
+        // delta sees only what went to the CUDA pool; whatever was carved from
+        // the span is already inside the mapping the baseline counted, so it
+        // contributes nothing to the delta and has to be added explicitly.
+        // Reporting the delta alone would show a model that shrank to almost
+        // nothing the moment it moved into the reservation.
+        let dense_in_span = dense_span::close_load(device)?;
         #[cfg(feature = "cuda")]
-        let base_weight_bytes =
-            super::batched_model::driver_used_bytes(device).saturating_sub(used_before);
+        let base_weight_bytes = super::batched_model::driver_used_bytes(device)
+            .saturating_sub(used_before)
+            + dense_in_span;
         #[cfg(not(feature = "cuda"))]
-        let base_weight_bytes = 0usize;
+        let base_weight_bytes = dense_in_span;
         Ok(Self {
             embeddings,
             layers,
@@ -835,6 +848,10 @@ impl ModelWeights {
         // Parse GGUF metadata from mmap (23x faster than reading from File!)
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct = gguf_file::Content::read(&mut cursor)?;
+
+        // Before the baseline, so the span's own mapping is not read as weight
+        // bytes, and before any tensor, so the weights can be carved from it.
+        dense_span::open_for_load(device, &ct)?;
 
         // Driver-used VRAM baseline before any weights load — the delta to the
         // fully-built model is the fixed resident-weight footprint.
@@ -974,11 +991,14 @@ impl ModelWeights {
 
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        // Both halves — see the sibling loader above.
+        let dense_in_span = dense_span::close_load(device)?;
         #[cfg(feature = "cuda")]
-        let base_weight_bytes =
-            super::batched_model::driver_used_bytes(device).saturating_sub(used_before);
+        let base_weight_bytes = super::batched_model::driver_used_bytes(device)
+            .saturating_sub(used_before)
+            + dense_in_span;
         #[cfg(not(feature = "cuda"))]
-        let base_weight_bytes = 0usize;
+        let base_weight_bytes = dense_in_span;
         Ok(Self {
             embeddings,
             layers,

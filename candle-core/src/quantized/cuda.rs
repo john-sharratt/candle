@@ -8,7 +8,7 @@ use super::{GgmlDType, Int8Mode, QStorage};
 use crate::backend::{BackendDevice, BackendStorage};
 
 use crate::cuda_backend::alloc_inheriting;
-use crate::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin};
+use crate::cuda_backend::wave_provenance::{wave_alloc_attributed, LeaseOrigin};
 use crate::cuda_backend::Backing;
 use crate::cuda_backend::INHERIT_ALIGN;
 use crate::quantized::k_quants::GgmlType;
@@ -3975,6 +3975,34 @@ impl QCudaStorage {
     /// `run_quantize_ko` without ever leaving VRAM. The int8-mode counterpart of
     /// [`Self::repack_gemx`] used by `QMatMul::repack_for_optimization`.
     pub fn repack_ko(&self, shape: &Shape, ko_dtype: GgmlDType) -> Result<Self> {
+        self.repack_ko_into(shape, ko_dtype, None)
+    }
+
+    /// [`Self::repack_ko`], writing the twin into memory the caller already owns.
+    ///
+    /// `dst` is `(address, origin)` for a destination of exactly
+    /// [`ko_repacked_bytes`], or `None` to allocate from the CUDA pool as
+    /// before. It is what puts the model's weights inside the device
+    /// reservation: the twin is the buffer that *stays* — the compact source is
+    /// dropped the moment this returns — so placing the twin is what moves the
+    /// resident set, and placing the source instead would fill a block with no
+    /// free path with buffers that die seconds later.
+    ///
+    /// Genuinely optional rather than a second code path: a CPU test or a
+    /// process with no reservation has no address to give, and the pool is the
+    /// right answer there.
+    ///
+    /// # Safety
+    ///
+    /// When `Some`, the address must name at least [`ko_repacked_bytes`] bytes
+    /// of device memory that outlives the returned storage and is not aliased.
+    /// The storage is stamped `Lease`, so dropping it frees nothing.
+    pub fn repack_ko_into(
+        &self,
+        shape: &Shape,
+        ko_dtype: GgmlDType,
+        dst: Option<(u64, LeaseOrigin)>,
+    ) -> Result<Self> {
         let (nrows, ncols) = shape.dims2()?;
         // The KO chunk layout packs 8 rows × 128 K per chunk, but the q8a128 matmul kernel that
         // reads the result tiles N in blocks of 32 — so require `nrows % 32` (not just 8), matching
@@ -4012,7 +4040,20 @@ impl QCudaStorage {
                 .map_err(crate::Error::wrap)?;
             let ko =
                 crate::quantized::ko_quant::mxfp4_native_to_ko_gpu_chunk(&native, nrows, ncols);
-            let mut out = unsafe { self.device.alloc::<u8>(ko.len())? };
+            // The host reorder decides its own length; the caller sized `dst`
+            // from `ko_repacked_bytes`. They agree by construction — both are
+            // chunks × `MXFP4_KO_GPU_CHUNK_BYTES` — and this is what keeps them
+            // agreeing, because a divergence writes past the destination and
+            // corrupts the weight placed after it.
+            let want = ko_repacked_bytes(shape, ko_dtype)?;
+            if ko.len() != want {
+                crate::bail!(
+                    "repack_ko(MXFP4_KO): the reorder produced {} B but the destination \
+                     was sized for {want} B",
+                    ko.len(),
+                );
+            }
+            let (mut out, backing) = self.dest_slice(ko.len(), dst)?;
             self.device
                 .memcpy_htod(&ko, &mut out.slice_mut(..ko.len()))?;
             return Ok(Self {
@@ -4022,16 +4063,27 @@ impl QCudaStorage {
                 }),
                 dtype: ko_dtype,
                 device: self.device.clone(),
-                backing: Backing::Owned,
+                backing,
             });
         }
         let qtype = dtype_to_qtype(ko_dtype)? as i32;
-        let bytes =
-            (nrows / 8) * (ncols / 128) * crate::quantized::ko_quant::ko_chunk_bytes(ko_dtype);
+        // **The same function the caller sized `dst` with.** These two numbers
+        // must agree exactly: the caller carves a destination of
+        // `ko_repacked_bytes` and this writes `bytes` into it, through a raw
+        // pointer with no length check. Computing the product inline here — as
+        // this did — put two copies of that arithmetic in different files, where
+        // one could be corrected and the other left, and the failure would be a
+        // silent write past the end of one weight into the next.
+        let bytes = ko_repacked_bytes(shape, ko_dtype)?;
         // dequantize stays on-device; quantize reads that f32 buffer directly (no D2H/H2D).
+        //
+        // **This is the load's peak allocation**, and it is the whole tensor: a
+        // `[248320, 2048]` head costs ~2 GiB of F32 here to produce a few hundred
+        // MiB of twin. It comes from the pool, which is why the reservation is
+        // claimed with a headroom sized to exactly this (`peak_repack_scratch`).
         let f32_storage = self.dequantize(nrows * ncols)?;
         let f32_slice = f32_storage.as_cuda_slice::<f32>()?;
-        let mut out = unsafe { self.device.alloc::<u8>(bytes)? };
+        let (mut out, backing) = self.dest_slice(bytes, dst)?;
         {
             let stream = self.device.cuda_stream();
             let (wp, _gw) = f32_slice.device_ptr(&stream);
@@ -4053,8 +4105,34 @@ impl QCudaStorage {
             }),
             dtype: ko_dtype,
             device: self.device.clone(),
-            backing: Backing::Owned,
+            backing,
         })
+    }
+
+    /// A `bytes`-long destination: the caller's, or a fresh pool allocation.
+    ///
+    /// The one place the two answers are produced, so a repack path cannot end
+    /// up wrapping a leased address as `Owned` — which would hand the
+    /// reservation's memory to `cuMemFreeAsync` on drop.
+    fn dest_slice(
+        &self,
+        bytes: usize,
+        dst: Option<(u64, LeaseOrigin)>,
+    ) -> Result<(CudaSlice<u8>, Backing)> {
+        match dst {
+            // SAFETY: the caller's contract on `repack_ko_into` — at least
+            // `bytes` of live, un-aliased device memory outliving the storage.
+            Some((ptr, origin)) => Ok((
+                unsafe {
+                    self.device
+                        .cuda_stream()
+                        .upgrade_device_ptr::<u8>(ptr, bytes)
+                },
+                Backing::Lease(origin),
+            )),
+            // SAFETY: filled by the copy or the kernel the caller runs next.
+            None => Ok((unsafe { self.device.alloc::<u8>(bytes)? }, Backing::Owned)),
+        }
     }
 
     /// Get the size in bytes after GEMX repacking, without actually repacking.
@@ -4077,6 +4155,27 @@ impl QCudaStorage {
             false
         }
     }
+}
+
+/// Bytes the KO twin of a `shape` weight occupies.
+///
+/// Knowable before the repack runs, which is what lets a caller carve the
+/// destination out of the reservation and hand it to
+/// [`QCudaStorage::repack_ko_into`]. A whole number of 8×128 chunks with no
+/// `MATRIX_ROW_PADDING` tail — the KO matmul reads chunks, not padded rows.
+pub fn ko_repacked_bytes(shape: &Shape, ko_dtype: GgmlDType) -> Result<usize> {
+    let (nrows, ncols) = shape.dims2()?;
+    if !ko_tileable(nrows, ncols) {
+        crate::bail!(
+            "ko_repacked_bytes: shape [{nrows}, {ncols}] has no KO twin — nrows % 32 \
+             and ncols % 128 are what the matmul tiles on"
+        );
+    }
+    let chunks = (nrows / 8) * (ncols / 128);
+    if ko_dtype == GgmlDType::MXFP4_KO {
+        return Ok(chunks * crate::quantized::ko_quant::MXFP4_KO_GPU_CHUNK_BYTES);
+    }
+    Ok(chunks * crate::quantized::ko_quant::ko_chunk_bytes(ko_dtype))
 }
 
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
@@ -4693,10 +4792,14 @@ type ResolvedOut<T> = (u64, Option<CudaSlice<T>>, Backing);
 /// which must stay pooled because it crosses layers — so those call sites pass a
 /// synthesised `Backing::Lease(Wave(ticket))` to seed the chain instead.
 fn resolve_u8_out(origin: Backing, dev: &CudaDevice, bytes: usize) -> Result<ResolvedOut<u8>> {
-    if let Some(ticket) = origin.inherit_ticket() {
-        if let Some(ptr) = wave_alloc(ticket, bytes, INHERIT_ALIGN) {
-            return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
-        }
+    let ticket = origin.inherit_ticket();
+    // The third of the three sites making this decision, attributed like the
+    // other two. A `NoTicket` decline here is always a genuine provenance break:
+    // the phase-first buffers described above do not reach it, because they seed
+    // a synthesised ticket rather than arriving without one.
+    if let Some(ptr) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN) {
+        let ticket = ticket.expect("a carved range implies a ticket");
+        return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
     // SAFETY: the kernel the caller launches next fills this before anything
     // reads it, exactly as when it allocated inline.
@@ -4718,11 +4821,14 @@ fn resolve_typed_out<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     dev: &CudaDevice,
     elems: usize,
 ) -> Result<ResolvedOut<T>> {
-    if let Some(ticket) = origin.inherit_ticket() {
-        let bytes = elems * std::mem::size_of::<T>();
-        if let Some(ptr) = wave_alloc(ticket, bytes, INHERIT_ALIGN) {
-            return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
-        }
+    let ticket = origin.inherit_ticket();
+    let bytes = elems * std::mem::size_of::<T>();
+    // Attributed for the same reason as `alloc_inheriting` — this is the other
+    // half of the same decision, and a report that cannot tell the two decline
+    // reasons apart sends the reader to the wrong fix.
+    if let Some(ptr) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN) {
+        let ticket = ticket.expect("a carved range implies a ticket");
+        return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
     // SAFETY: filled by the kernel the caller launches next.
     let slice = unsafe { dev.alloc::<T>(elems)? };

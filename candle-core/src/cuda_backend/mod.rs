@@ -2607,17 +2607,20 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
     elem_count: usize,
     from: Backing,
 ) -> Result<(CudaSlice<T>, Backing)> {
-    if let Some(ticket) = from.inherit_ticket() {
-        let bytes = elem_count * std::mem::size_of::<T>();
-        if let Some(ptr) = wave_provenance::wave_alloc(ticket, bytes, INHERIT_ALIGN) {
-            // Dropping this slice bare would `cuMemFreeAsync` an address inside
-            // the VMM reservation the wave arenas are carved from — memory the
-            // stream-ordered pool never allocated — so the driver rejects it and
-            // nothing is freed. That is what makes the window between here and
-            // the caller stamping `Backing::Lease` harmless.
-            let slice = dev.cuda_stream().upgrade_device_ptr::<T>(ptr, elem_count);
-            return Ok((slice, Backing::Lease(LeaseOrigin::Wave(ticket))));
-        }
+    let ticket = from.inherit_ticket();
+    let bytes = elem_count * std::mem::size_of::<T>();
+    // Attributed, so the fall-through below is not silent: a site that lost its
+    // provenance and a site whose arena overflowed both end up on `dev.alloc`
+    // and are otherwise indistinguishable in any report.
+    if let Some(ptr) = wave_provenance::wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN) {
+        // Dropping this slice bare would `cuMemFreeAsync` an address inside
+        // the VMM reservation the wave arenas are carved from — memory the
+        // stream-ordered pool never allocated — so the driver rejects it and
+        // nothing is freed. That is what makes the window between here and
+        // the caller stamping `Backing::Lease` harmless.
+        let slice = dev.cuda_stream().upgrade_device_ptr::<T>(ptr, elem_count);
+        let ticket = ticket.expect("a carved range implies a ticket");
+        return Ok((slice, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
     Ok((dev.alloc::<T>(elem_count)?, Backing::Owned))
 }

@@ -57,8 +57,9 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    claim_span_region, expect_kv_range, expect_kv_range_in, span_layout, span_region_refusal,
-    SpanClaims, SpanLayout, SpanRegion,
+    claim_dense, claim_span_region, dense_bytes, ensure_reservation, expect_kv_range,
+    expect_kv_range_in, freeze_dense, span_layout, span_region_refusal, SpanClaims, SpanLayout,
+    SpanRegion,
 };
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]

@@ -15,6 +15,7 @@
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::{BatchedModelCore, WaveShapes};
+use super::dense_span;
 #[cfg(feature = "cuda")]
 use super::expert_lre::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
@@ -1355,6 +1356,8 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        // Before any tensor — see `dense_span`.
+        dense_span::open_for_load(device, &ct)?;
         let mut gg = Gguf::new(ct, reader, device.clone());
         let md_get = |s: &str| match gg.metadata().get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -1648,6 +1651,10 @@ impl ModelWeights {
         // Parse GGUF
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct = gguf_file::Content::read(&mut cursor)?;
+
+        // Before any tensor, so the weights are carved from the reservation
+        // rather than from the CUDA pool (`dense_span`).
+        dense_span::open_for_load(device, &ct)?;
 
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -2117,6 +2124,13 @@ impl ModelWeights {
         if let Some(g) = candle::vram::get(gpu_id) {
             g.set_class(candle::vram::AllocClass::Weights, dense_bytes.get() as u64);
         }
+
+        // The load phase closes here, before the expert cache sizes its zone from
+        // the span's free ground — that is not knowable while the dense block can
+        // still grow. `base_weight_bytes` below needs no adjustment: it is summed
+        // from the tensors themselves (`dense_bytes`), which is immune to where
+        // those tensors were placed, unlike the driver deltas the dense loaders use.
+        dense_span::close_load(device)?;
 
         let expert_cache = if has_experts {
             let total_experts = num_moe_layers * n_expert;

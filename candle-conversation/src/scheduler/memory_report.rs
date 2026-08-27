@@ -22,6 +22,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use candle::vram::{host_pinned_bytes, AllocClass};
+use candle::wave_provenance::last_wave_declines;
+use candle::Device;
 use candle_nn::kv_cache::global_arena_memory_report;
 use serde::Serialize;
 
@@ -123,9 +125,11 @@ pub struct GovernorSection {
 ///
 /// Every other section names one consumer. None of them adds up, and that is
 /// how several GiB stayed invisible: the dense weights, the gallery arena's
-/// slabs and the CUDA pool are each documented as sitting outside the KV pool
-/// and outside each other's tallies, so no reader could have summed them
-/// without knowing to look in three places and a fourth for the total.
+/// slabs and the CUDA pool each sat outside the KV pool and outside each
+/// other's tallies, so no reader could have summed them without knowing to look
+/// in three places and a fourth for the total. All three are inside the
+/// reservation now, and this section is where that is checked rather than
+/// assumed.
 ///
 /// [`Self::outside_span_bytes`] is the number that matters. The reservation is
 /// the budget; memory allocated outside it competes with it, and on WDDM the
@@ -148,24 +152,24 @@ pub struct AccountingSection {
     pub outside_span_bytes: u64,
     /// The CUDA async pool's OS-reserved footprint — the whole outside set.
     pub outside_pool_bytes: u64,
-    /// The dense model tensors, which are **inside** [`Self::outside_pool_bytes`]
-    /// rather than beside it: they are loaded through the same `alloc` path as
-    /// everything else, so their bytes are pool bytes.
-    ///
-    /// Reported as a named component for the same reason
-    /// [`Self::inside_gallery_bytes`] is — a reader needs to see which part of
-    /// the pool is the permanent model and which part is per-wave churn, and
-    /// moving the weights into the span must show up as this shrinking rather
-    /// than as an unexplained drop in the total.
-    ///
-    /// **It used to be an addend**, summed with the pool as though the two were
-    /// disjoint. That inflated the demotable set by the size of the model —
-    /// 1,962 MiB of 4,746 reported — and correspondingly hid the same amount in
-    /// [`Self::unaccounted_bytes`], which read a reassuring 93 MiB while ~2 GiB
-    /// of the card was genuinely unexplained. The tell was already in the tree:
-    /// `vram::trim_pool_after_load` records the pool holding 1,952 MiB right
-    /// after load, against 1,921 MiB of dense weights. Same bytes.
-    pub outside_dense_bytes: u64,
+    // There is deliberately no `outside_dense_bytes`. It was wrong three times,
+    // and the third is the instructive one.
+    //
+    // First it was an ADDEND to the pool, as though the weights sat beside it
+    // rather than in it — inflating the demotable set by the size of the model.
+    // Then a named PART of the pool, correct until the weights moved into the
+    // span, at which point it reported a component larger than the whole
+    // containing it. Then a SUBTRACTION, `total_dense - inside_dense`, which
+    // looked principled and was not: `total_dense` sums the raw GGUF bytes the
+    // loader read, `inside_dense` sums the repacked twins that stayed, and a
+    // Q4_K source is not the size of its Q4_KO twin. Subtracting two different
+    // populations produced a confident 135 MiB of weights that did not exist.
+    //
+    // What answers the question exactly is already here: [`Self::inside_dense_bytes`]
+    // is what the allocator handed out, and [`Self::outside_pool_bytes`] is what
+    // the driver says the pool holds. Right after load the second is the residual
+    // weight footprint — measured at 32 MiB, against 1,952 before the weights
+    // moved into the span. Neither is derived from the other.
     /// The gallery arena, which is **inside** the span: its slabs are claimed
     /// regions, the same 16 MiB unit a KV arena takes.
     ///
@@ -176,6 +180,14 @@ pub struct AccountingSection {
     /// vanished, and a regression that put it back outside would otherwise show
     /// up only as `outside_pool_bytes` quietly growing.
     pub inside_gallery_bytes: u64,
+    /// The model's dense weights, **inside** the span — the dense block, locked
+    /// at the end of load.
+    ///
+    /// The whole point of the reservation-before-load ordering: these bytes were
+    /// the single largest thing outside the span, and being outside it meant
+    /// WDDM could demote the model itself to host RAM. Inside, they are pinned
+    /// device allocations the driver may not migrate.
+    pub inside_dense_bytes: u64,
     /// Per-sequence recurrent state, also **inside** the span: each store's
     /// buffers are carved from claimed regions.
     ///
@@ -185,6 +197,31 @@ pub struct AccountingSection {
     /// wide wave) and it moves with wave width, so a run that grows it and a run
     /// that leaks it look identical in the span total alone.
     pub inside_recurrent_bytes: u64,
+    /// Bytes that went to the pool because their origin carried no wave ticket,
+    /// **over the last wave**.
+    ///
+    /// A provenance break: something upstream produced a tensor with no wave
+    /// backing and everything derived from it inherited the pool, so the fix is
+    /// at that root — which may be many frames above whatever site a
+    /// forbidden-allocation report names.
+    ///
+    /// Per-wave rather than cumulative, and the distinction is load-bearing. The
+    /// lifetime total is dominated by declines that are *correct*: an op on the
+    /// residual stream has nothing to inherit, because the residual crosses
+    /// layers and belongs on the pool by design, and model loading has no wave at
+    /// all. Read cumulatively this number is large, unfalsifiable, and says
+    /// nothing. Scoped to a wave — where every allocation is supposed to inherit
+    /// — a non-zero reading is a defect.
+    pub decline_no_ticket_bytes: u64,
+    /// Bytes that went to the pool because the arena had no room, over the last
+    /// wave.
+    ///
+    /// **A sizing problem, not a provenance one.** Nothing about the call site is
+    /// wrong; the wave arena was too narrow for the work. Reported beside
+    /// [`Self::decline_no_ticket_bytes`] because the two land on the same
+    /// `CudaDevice::alloc` and are otherwise indistinguishable — and they have
+    /// opposite fixes, so a reader who cannot separate them chases the wrong one.
+    pub decline_arena_full_bytes: u64,
     /// Driver-reported in use across the whole card (`total - free`).
     pub device_in_use_bytes: u64,
     /// `device_in_use - (span + outside)`. Anything here is held by another
@@ -495,15 +532,30 @@ impl Scheduler {
         // **The pool IS the outside set.** Every device allocation the engine
         // makes outside the span goes through `CudaDevice::{alloc, alloc_zeros,
         // memcpy_stod}` → `CudaStream::alloc` → `cuMemAllocAsync`, so the pool's
-        // reserved footprint already covers all of it — the dense weights
-        // included. Adding the weights on top double-books them.
-        let outside_dense_bytes = weights.base_bytes.unwrap_or(0);
+        // reserved footprint already covers all of it. The dense weights are no
+        // longer among them — they are carved from the span at load — so nothing
+        // is added on top of this figure.
+        // What the dense block actually handed out — asked of the allocator, not
+        // inferred from the model's own byte count. The two measure different
+        // populations (raw checkpoint bytes read versus repacked twins kept), so
+        // deriving one from the other is what produced a confident figure for
+        // weights that did not exist.
+        let inside_dense_bytes = match &self.device {
+            Device::Cuda(cuda) => {
+                candle_nn::kv_cache::dense_bytes(&cuda.cuda_stream()).unwrap_or(0) as u64
+            }
+            _ => 0,
+        };
         let outside_pool_bytes = vram.as_ref().map_or(0, |v| v.pool_reserved_bytes);
         let outside_span_bytes = outside_pool_bytes;
         // Inside the span — claimed regions, so already counted in `span_bytes`
         // and deliberately NOT added to the outside set.
         let inside_gallery_bytes = gallery.resident_bytes;
         let inside_recurrent_bytes = self.model.recurrent_reserved_bytes() as u64;
+        // Why the pool was reached at all, split by the two causes that have
+        // opposite fixes — over the last wave, not the run. See the field docs
+        // for why the lifetime totals answer nothing.
+        let (decline_no_ticket_bytes, decline_arena_full_bytes) = last_wave_declines();
         let span_bytes = match self.device.location() {
             candle::DeviceLocation::Cuda { gpu_id } => candle_nn::kv_cache::span_layout(gpu_id)
                 .map(|l| l.span_end.saturating_sub(l.span_base)),
@@ -515,10 +567,12 @@ impl Scheduler {
         let accounting = AccountingSection {
             span_bytes,
             outside_span_bytes,
-            outside_dense_bytes,
             outside_pool_bytes,
+            inside_dense_bytes,
             inside_gallery_bytes,
             inside_recurrent_bytes,
+            decline_no_ticket_bytes,
+            decline_arena_full_bytes,
             device_in_use_bytes,
             unaccounted_bytes: device_in_use_bytes as i64
                 - span_bytes.unwrap_or(0) as i64
@@ -618,22 +672,33 @@ mod tests {
                 resident_bytes: 268_435_456,
                 resident_turns: 42,
             },
-            // Shaped like the real thing so the sums mean something: a 64 GiB
-            // span, a 4 GiB pool holding 2 GiB of dense weights inside it, the
-            // gallery's own figure from above, and a card holding 75 GiB.
+            // Shaped like the measured 3.6-35B so the sums mean something: a
+            // 64 GiB span holding the model, a pool reduced to per-wave churn,
+            // and ~2 GiB the driver's own context holds that we cannot name.
+            //
+            // The pool figure is the one that carries the intent. It was 4 GiB
+            // when the weights loaded into it; the whole reservation-before-load
+            // change is what took it to a few hundred MiB, and a fixture still
+            // shaped around the old number would let the containment assertions
+            // below pass while asserting the opposite of the design.
             accounting: AccountingSection {
                 span_bytes: Some(68_719_476_736),
-                // The pool IS the outside set — the weights are in it, not
-                // beside it.
-                outside_span_bytes: 4_294_967_296,
-                outside_pool_bytes: 4_294_967_296,
-                outside_dense_bytes: 2_147_483_648,
-                // Inside the span, so it must NOT appear in the outside sum.
+                // The pool IS the outside set — but the weights are no longer
+                // in it.
+                outside_span_bytes: 234_881_024,
+                outside_pool_bytes: 234_881_024,
+                // The model, inside the span.
+                inside_dense_bytes: 1_914_699_776,
+                // Also inside, so neither may appear in the outside sum.
                 inside_gallery_bytes: 268_435_456,
-                // Likewise inside: 16 sequences of hybrid recurrent state.
+                // 16 sequences of hybrid recurrent state.
                 inside_recurrent_bytes: 2_113_929_216,
-                device_in_use_bytes: 80_530_636_800,
-                unaccounted_bytes: 80_530_636_800i64 - 68_719_476_736i64 - 4_294_967_296i64,
+                // One wave's worth: provenance breaks dominating, the arena
+                // itself never refusing — the shape measured on the 3.6-35B.
+                decline_no_ticket_bytes: 205_959_852,
+                decline_arena_full_bytes: 0,
+                device_in_use_bytes: 71_015_942_144,
+                unaccounted_bytes: 71_015_942_144i64 - 68_719_476_736i64 - 234_881_024i64,
             },
         }
     }
@@ -672,10 +737,12 @@ mod tests {
             // demotable set — the thing that cost 17x on decode while every
             // individual section read as healthy.
             "outside_span_bytes",
-            "outside_dense_bytes",
             "outside_pool_bytes",
+            "inside_dense_bytes",
             "inside_gallery_bytes",
             "inside_recurrent_bytes",
+            "decline_no_ticket_bytes",
+            "decline_arena_full_bytes",
             "unaccounted_bytes",
             "span_bytes",
         ] {
@@ -705,10 +772,12 @@ mod tests {
              allocation goes through `cuMemAllocAsync`",
         );
         assert!(
-            a.outside_dense_bytes > 0 && a.outside_dense_bytes < a.outside_pool_bytes,
-            "the dense weights are a PART of the pool ({} of {}), never an \
-             addend to it — the fixture must exercise that containment",
-            a.outside_dense_bytes,
+            a.inside_dense_bytes > a.outside_pool_bytes,
+            "the span must hold the model, and hold more of it than the pool holds \
+             of anything ({} in the span, {} in the whole pool) — this is the point \
+             of claiming the reservation before the load, and a fixture that did \
+             not exercise it would assert nothing",
+            a.inside_dense_bytes,
             a.outside_pool_bytes,
         );
         assert!(
@@ -726,7 +795,8 @@ mod tests {
         // Same containment rule as the dense weights against the pool, in the
         // other half of the card: the two halves fail the same way, by summing
         // a component with the total that already includes it.
-        let named_in_span = a.inside_gallery_bytes + a.inside_recurrent_bytes;
+        let named_in_span =
+            a.inside_gallery_bytes + a.inside_recurrent_bytes + a.inside_dense_bytes;
         assert!(
             named_in_span < a.span_bytes.expect("the fixture reserves a span"),
             "the gallery and recurrent state are tenants OF the span ({named_in_span} \

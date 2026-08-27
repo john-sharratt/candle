@@ -2400,6 +2400,24 @@ impl QMatMul {
 
     #[cfg(feature = "cuda")]
     pub fn repack_for_optimization(&self, mode: Int8Mode) -> Result<QMatMul> {
+        self.repack_for_optimization_into(mode, None)
+    }
+
+    /// [`Self::repack_for_optimization`], placing the repacked weight at `dst`.
+    ///
+    /// The seam that puts a model's weights inside the device reservation. The
+    /// repacked weight is the one that stays resident — the compact source is
+    /// dropped as this returns — so this is the allocation worth placing, and
+    /// the caller sizes `dst` with `cuda::ko_repacked_bytes`.
+    ///
+    /// `None` allocates from the pool, which is the right answer with no
+    /// reservation to carve from.
+    #[cfg(feature = "cuda")]
+    pub fn repack_for_optimization_into(
+        &self,
+        mode: Int8Mode,
+        dst: Option<(u64, crate::cuda_backend::wave_provenance::LeaseOrigin)>,
+    ) -> Result<QMatMul> {
         let qt = self
             .qtensor()
             .ok_or_else(|| crate::Error::Msg("repack_for_optimization: not a QTensor".into()))?;
@@ -2416,8 +2434,18 @@ impl QMatMul {
         let new_storage = match &qt.storage {
             QStorage::Cuda(cs) => {
                 if mode.is_int8() {
-                    QStorage::Cuda(cs.repack_ko(&shape, qt.dtype().to_ko(mode)?)?)
+                    QStorage::Cuda(cs.repack_ko_into(&shape, qt.dtype().to_ko(mode)?, dst)?)
                 } else {
+                    // The GEMX repack has no destination form: it is the
+                    // measurement path (`repack_gemx`'s own docs), not a path a
+                    // model load takes, so there is no weight here to place.
+                    if dst.is_some() {
+                        crate::bail!(
+                            "repack_for_optimization_into: a destination was supplied for a \
+                             non-int8 mode, which repacks through GEMX and allocates its own \
+                             output. The reservation would be left holding an unwritten hole."
+                        );
+                    }
                     QStorage::Cuda(cs.repack_gemx(&shape)?)
                 }
             }

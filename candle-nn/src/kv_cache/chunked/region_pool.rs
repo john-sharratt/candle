@@ -111,6 +111,23 @@ const MAX_WAVE_TRANSIENT_BYTES: usize = super::wave_spans::WAVE_ATTN_BYTES
 /// is not synchronised to the wave.
 const PERSIST_SPAN_BYTES: usize = MIGRATION_STAGING_CAP_BYTES;
 
+/// The smallest span that can run a forward: the fixed staging block plus one
+/// wave's transient tier, with nothing left for KV.
+///
+/// Two callers, and they must agree. `create_with_headroom` will not concede
+/// load headroom past this point, and the same function refuses a span that
+/// comes up short of it — so a disagreement would let the first hand back ground
+/// the second then rejects, turning an optimisation into a startup failure.
+const SPAN_MINIMUM_BYTES: usize = PERSIST_SPAN_BYTES + MAX_WAVE_TRANSIENT_BYTES;
+
+/// Alignment every dense weight tensor is placed on.
+///
+/// What the driver guarantees a fresh `cuMemAlloc`, so a tensor carved out of
+/// the span is aligned exactly as it would have been coming from the pool and no
+/// kernel can tell the difference. The tensor-core loads assume it of a base
+/// pointer.
+const DENSE_ALIGN: u64 = 256;
+
 const _: () = assert!(
     MAX_WAVE_TRANSIENT_BYTES.is_multiple_of(REGION_BYTES)
         && PERSIST_SPAN_BYTES.is_multiple_of(REGION_BYTES),
@@ -237,8 +254,45 @@ struct RegionPool {
     /// Bytes of the span actually backed by physical memory. May be less than
     /// what was reserved, when the driver refused part-way.
     span_bytes: usize,
-    /// First byte available to regions — past both fixed blocks.
+    /// First byte available to regions — past the persistence block and the
+    /// dense weights. **Moves while the model loads, never after**: see
+    /// [`claim_dense`].
     region_base: u64,
+    /// First byte of the dense weight block, at the persistence block's right
+    /// edge. Fixed for the pool's life.
+    dense_base: u64,
+    /// Bytes of the dense block handed out so far — the bump cursor.
+    ///
+    /// Grows only during model load and is frozen by the first region claim,
+    /// because every region address is measured from this block's right edge.
+    /// There is no free list and no release path: the weights live as long as
+    /// the process does, and the reservation is torn down with it.
+    dense_bytes: usize,
+    /// The span was sized from a measured card, so it may host the model.
+    ///
+    /// **Without a VRAM governor the span is a fixed constant sized for KV
+    /// alone**, and placing weights in it takes regions the KV side has no way
+    /// to do without: Qwen3-8B's dense block swallowed a `TEST_SPAN_BYTES` span
+    /// whole, leaving `0 regions` and a model that could not claim a single KV
+    /// block. The pool is the right home for weights there, exactly as it was
+    /// before any of this — so [`claim_dense`] refuses and
+    /// `QMatMul::from_weights_with_mode` falls back, which is a path it already
+    /// has for every other reason a destination can be unavailable.
+    dense_capable: bool,
+    /// The load phase is over: the dense block's right edge is final.
+    ///
+    /// Set by [`freeze_dense`], which is the boundary between loading and
+    /// serving. Before it, the two load allocators own the span and no region
+    /// exists; after it, the dense block is immovable and everything above it is
+    /// runtime ground.
+    ///
+    /// A flag as well as the `next > 0` test because the two say different
+    /// things. `next > 0` is "someone has already claimed, so it is too late" —
+    /// a backstop that catches a caller who never froze. This is "loading is
+    /// finished", which is knowable *before* the first region claim and is what
+    /// makes a late dense claim an error at its own call site rather than a
+    /// silent success followed by a corrupted arena much later.
+    dense_frozen: bool,
     /// The leftmost byte the weight side occupies: **the moving boundary**.
     /// `span_end` until an expert cache installs a zone.
     weight_floor: u64,
@@ -547,13 +601,29 @@ fn span_from(usable: usize, pool_reserve: usize) -> usize {
 /// ([`place_transient`]), so the regions run straight to the weight floor:
 ///
 /// ```text
-/// | persist 64 MiB | regions … | ← W → weight slots |
+/// | persist 64 MiB | dense weights | regions … | ← W → weight slots |
 /// ```
 ///
-/// The tier is deliberately absent. It is the one **variable-size** block in the
-/// span — priced per wave rather than at the widest wave — and it is safe to be
-/// variable precisely because it vanishes here: at the moment its extent changes
-/// it holds nothing, so a resize leaves no hole and moves no data.
+/// The **dense block** holds the model's permanent tensors. It is variable-size
+/// like the tier, but for the opposite reason and with the opposite discipline:
+/// it grows only during load, by [`claim_dense`], and once the first region is
+/// handed out it can never move again — every region address is an offset from
+/// its right edge, so shifting it afterwards would relocate live arenas. That
+/// rule is enforced rather than documented ([`claim_dense`] refuses once `next`
+/// has advanced), which is what lets it be a bump pointer with no free list: the
+/// weights are loaded once and released only when the process ends.
+///
+/// Sizing it needs no estimate, which is the point. The span is claimed **before
+/// the model loads**, so the weights are allocated out of it as they arrive and
+/// the region count is derived from whatever is left — where previously the span
+/// was sized from the memory the weights had already taken from the pool, and so
+/// could not contain them.
+///
+/// The tier is deliberately absent. It is the one variable-size block that
+/// changes size *at runtime* — priced per wave rather than at the widest wave —
+/// and it is safe to be variable precisely because it vanishes here: at the
+/// moment its extent changes it holds nothing, so a resize leaves no hole and
+/// moves no data.
 ///
 /// That is also why it belongs between the regions and the weights rather than
 /// at a fixed address beside the persistence block. A variable-size block at a
@@ -569,6 +639,9 @@ fn span_from(usable: usize, pool_reserve: usize) -> usize {
 struct Layout {
     region_base: u64,
     total: usize,
+    /// First byte of the dense weight block — fixed at the persistence block's
+    /// right edge, and the one address in the layout that never moves.
+    dense_base: u64,
     transient_end: u64,
     /// The weight floor as clamped into the span — what the caller asked for,
     /// corrected. Returned rather than recomputed so nothing downstream has to
@@ -577,12 +650,24 @@ struct Layout {
     slack: usize,
 }
 
-/// Divide a span of `span_bytes` at `span_base` with the weight side occupying
+/// Divide a span of `span_bytes` at `span_base`, with `dense_bytes` of model
+/// weights after the persistence block and the weight side occupying
 /// `[weight_floor, span_end)`.
-fn layout_span(span_base: u64, span_bytes: usize, weight_floor: u64) -> Layout {
-    let region_base = span_base + PERSIST_SPAN_BYTES as u64;
-    let transient_end = region_base;
+///
+/// The dense block is rounded up to a whole region so the region grid stays
+/// aligned to the reservation's granule. That wastes under one region and buys
+/// an address for every region that is `region_base + i · REGION_BYTES` with no
+/// second alignment rule to keep in step.
+fn layout_span(span_base: u64, span_bytes: usize, dense_bytes: usize, weight_floor: u64) -> Layout {
     let span_end = span_base + span_bytes as u64;
+    let dense_base = span_base + PERSIST_SPAN_BYTES as u64;
+    let dense_span = dense_bytes.next_multiple_of(REGION_BYTES);
+    // Saturating, and clamped into the span: a dense block wider than the span
+    // is refused by `claim_dense` before it can be stored, but the arithmetic
+    // here must stay sane for the refusal path to be able to *compute* the
+    // layout it is refusing.
+    let region_base = dense_base.saturating_add(dense_span as u64).min(span_end);
+    let transient_end = region_base;
     // Clamp rather than trust: the floor arrives from arithmetic done a crate
     // away, and a wrapped subtraction here would produce an address that looks
     // plausible. `.min(span_end)` keeps the lower bound meaningful on a span too
@@ -594,6 +679,7 @@ fn layout_span(span_base: u64, span_bytes: usize, weight_floor: u64) -> Layout {
     Layout {
         region_base,
         total,
+        dense_base,
         transient_end,
         weight_floor,
         slack: usable_for_regions - total * REGION_BYTES,
@@ -601,14 +687,61 @@ fn layout_span(span_base: u64, span_bytes: usize, weight_floor: u64) -> Layout {
 }
 
 impl RegionPool {
-    fn create(stream: &std::sync::Arc<CudaStream>) -> Result<Self> {
+    /// The span, with `load_headroom` bytes deliberately left outside it.
+    ///
+    /// **The headroom exists because loading a weight costs more than storing
+    /// it.** `repack_ko` dequantizes a whole tensor to F32 before quantizing it
+    /// into its KO twin, so a `[248320, 2048]` head needs ~2 GiB of scratch to
+    /// produce a few hundred MiB of weight — from the CUDA pool, which is
+    /// outside the span. Claiming the span before the model loads is what puts
+    /// the weights *inside* it, and it would otherwise leave the pool with only
+    /// its cushion and fail on the largest repack.
+    ///
+    /// So the caller measures the peak from the checkpoint — it is
+    /// `max(nrows × ncols) × 4` over the tensors that will repack, knowable from
+    /// the GGUF header before a byte is read — and the span gives up exactly
+    /// that much. Not an estimate with a safety factor: an arithmetic bound on
+    /// the one allocation that dominates.
+    ///
+    /// Zero once the repack is chunked, at which point the peak is a chunk and
+    /// this ground goes back to the KV side.
+    fn create_with_headroom(
+        stream: &std::sync::Arc<CudaStream>,
+        load_headroom: usize,
+    ) -> Result<Self> {
         let ordinal = stream.context().ordinal();
         // Read before the claim: mapping granules consumes headroom, so asking
         // afterwards reports what is left rather than what was available.
         let usable_before = candle::vram::get(ordinal)
             .and_then(|g| g.usable().ok())
             .unwrap_or(0) as usize;
-        let want = (span_target(ordinal)? / REGION_BYTES) * REGION_BYTES;
+        // **Headroom is conceded only from a MEASURED card.** Without a VRAM
+        // governor `span_target` answers with the fixed `TEST_SPAN_BYTES`
+        // constant, which is not a measurement of anything — there is no
+        // capacity the pool could be left room in, so subtracting from it takes
+        // KV regions to buy nothing.
+        //
+        // Both halves of getting this wrong were observed within one test.
+        // Subtracting unconditionally took Qwen3-8B's 2.4 GiB `output.weight`
+        // peak off the test constant and left 640 MiB against a 976 MiB
+        // minimum, refusing the reservation outright. Clamping the subtraction
+        // at the minimum stopped the refusal and produced the same failure one
+        // step later — a span of exactly the floor, `0 regions`, and a model
+        // that could not claim a single KV block.
+        //
+        // The clamp stays as well, for the measured path: a card whose capacity
+        // is genuinely close to the floor must keep its floor rather than
+        // concede into it. The headroom prevents a *possible* pool OOM during
+        // load and is never worth a *certain* refusal at startup.
+        let target = span_target(ordinal)?;
+        let measured = candle::vram::get(ordinal).is_some();
+        let concedable = target.saturating_sub(SPAN_MINIMUM_BYTES);
+        let for_span = if measured {
+            target - load_headroom.min(concedable)
+        } else {
+            target
+        };
+        let want = (for_span / REGION_BYTES) * REGION_BYTES;
         let mut reservation = Reservation::reserve(stream, want)?;
 
         // Claim left to right across the whole span. A refusal part-way ends the
@@ -619,19 +752,20 @@ impl RegionPool {
         let span_bytes = (claimed / REGION_BYTES) * REGION_BYTES;
         let span_base = reservation.base();
         let span_end = span_base + span_bytes as u64;
-        let minimum = PERSIST_SPAN_BYTES + MAX_WAVE_TRANSIENT_BYTES;
-        if span_bytes < minimum {
+        if span_bytes < SPAN_MINIMUM_BYTES {
             candle::bail!(
                 "reservation: the card backed only {span_bytes} B of the {want} B asked \
-                 for, below the {minimum} B of fixed staging and transient span a \
-                 forward needs — there is not enough VRAM left to run one"
+                 for, below the {SPAN_MINIMUM_BYTES} B of fixed staging and transient \
+                 span a forward needs — there is not enough VRAM left to run one"
             )
         }
 
         // No weight side yet: an expert cache installs one at load
         // (`set_weight_floor`), and a process without experts leaves the whole
         // span to KV.
-        let layout = layout_span(span_base, span_bytes, span_end);
+        // No dense block yet: the weights are claimed out of it by `claim_dense`
+        // as the loader walks the checkpoint, and until then it is empty.
+        let layout = layout_span(span_base, span_bytes, 0, span_end);
         let total = layout.total;
         // The partition, on the one channel that survives a test binary (which
         // installs no tracing subscriber, so the log lines below are invisible
@@ -699,6 +833,10 @@ impl RegionPool {
             span_base,
             span_bytes,
             region_base: layout.region_base,
+            dense_base: layout.dense_base,
+            dense_bytes: 0,
+            dense_capable: measured,
+            dense_frozen: false,
             weight_floor: span_end,
             total,
             next: 0,
@@ -730,6 +868,43 @@ impl RegionPool {
 
     fn span_end(&self) -> u64 {
         self.span_base + self.span_bytes as u64
+    }
+
+    /// Span the KV and weight sides may divide between them — everything above
+    /// the dense block.
+    ///
+    /// **Not `span_bytes`.** The persistence block and the model's dense weights
+    /// are carved off the left and belong to neither side; only the ground from
+    /// `region_base` up is theirs to trade. Sizing the weight side from the whole
+    /// span instead lets the expert cache commit slots for ground the weights
+    /// already hold, and it discovers the shortfall as *"Expert cache full,
+    /// cannot evict (all pinned)"* — a message about eviction, several steps from
+    /// the arithmetic that overcommitted. Qwen3-30B-A3B failed exactly this way
+    /// the first time its loader placed weights in the span.
+    fn tradeable_bytes(&self) -> usize {
+        (self.span_end() - self.region_base) as usize
+    }
+
+    /// Re-derive the region grid after the dense block grew.
+    ///
+    /// Only reachable from [`claim_dense`], which has already established that
+    /// no region has been handed out — so there is nothing to relocate and
+    /// `dirty_epoch` can simply be resized. Every region in the new grid is
+    /// still pristine (`0`), because the span was mapped and never written.
+    fn relayout_for_dense(&mut self) {
+        let layout = layout_span(
+            self.span_base,
+            self.span_bytes,
+            self.dense_bytes,
+            self.weight_floor,
+        );
+        self.region_base = layout.region_base;
+        self.total = layout.total;
+        self.dirty_epoch.resize(layout.total, 0);
+        // The peak windows opened at the old `total`; a window wider than the
+        // pool would let the weight side read a KV peak it can never observe.
+        self.kv_peak_window = self.kv_peak_window.min(layout.total);
+        self.kv_peak_prev_window = self.kv_peak_prev_window.min(layout.total);
     }
 
     /// The lowest address the wave transient tier may not reach below: one past
@@ -862,7 +1037,7 @@ impl RegionPool {
         if floor > span_end {
             candle::bail!("weight floor {floor:#x} is past the span end {span_end:#x}")
         }
-        let layout = layout_span(self.span_base, self.span_bytes, floor);
+        let layout = layout_span(self.span_base, self.span_bytes, self.dense_bytes, floor);
         let watermark = self.live_watermark();
         if layout.total < watermark {
             candle::bail!(
@@ -1061,7 +1236,10 @@ fn with_pool<R>(
     let ordinal = stream.context().ordinal();
     let pool = match map.entry(ordinal) {
         Entry::Occupied(o) => o.into_mut(),
-        Entry::Vacant(v) => v.insert(RegionPool::create(stream)?),
+        // No headroom on the lazy path: reaching here means nothing called
+        // `ensure_reservation`, so no model is loading and there is no repack
+        // peak to leave room for. That is every test, and the CPU-device paths.
+        Entry::Vacant(v) => v.insert(RegionPool::create_with_headroom(stream, 0)?),
     };
     f(pool)
 }
@@ -1675,6 +1853,188 @@ pub(crate) fn carve_persist(stream: &std::sync::Arc<CudaStream>, bytes: usize) -
     })
 }
 
+/// Carve `bytes` of the dense weight block, returning its device address.
+///
+/// The model loader's allocator: a bump pointer over `[dense_base, region_base)`
+/// that grows as tensors arrive. No estimate of the model's size is needed
+/// anywhere — the span is claimed before the load begins and the region count is
+/// derived from whatever the weights leave behind.
+///
+/// # It may only run before the first region is claimed
+///
+/// Every region address is `region_base + i · REGION_BYTES`, and `region_base`
+/// is this block's right edge. Growing the block after a region exists would
+/// move the ground under a live arena, so the boundary is frozen by the first
+/// claim rather than by a phase flag somebody has to remember to set. A dense
+/// claim after that point is refused, not clamped: it means the loader is
+/// running concurrently with inference, and there is no correct address to
+/// return.
+///
+/// # Alignment
+///
+/// 256 bytes, which is what the driver guarantees a fresh `cuMemAlloc` and what
+/// the tensor cores' vectorised loads assume of a base pointer. The block itself
+/// is region-aligned on the right, so the KV grid is unaffected by whatever the
+/// weights leave part-used.
+///
+/// # The bytes arrive zeroed, and a q-matmul operand depends on it
+///
+/// A quantized weight is allocated with `MATRIX_ROW_PADDING` past its data,
+/// because the q-matmul kernels **over-read into that tail by design** —
+/// `QCudaStorage::zeros` exists precisely to make that read a defined zero. A
+/// caller placing a weight here must therefore claim the *padded* size, and the
+/// tail must be zero.
+///
+/// It is, for a reason specific to this block: the span is freshly mapped and
+/// the dense block is handed out exactly once, so nothing has ever written these
+/// bytes. That is a stronger guarantee than the region free list's — which needs
+/// `dirty_epoch` and a memset because a region can be recycled — and it holds
+/// only as long as the block keeps its no-release discipline. If a dense free
+/// path is ever added, the padding stops being defined and the q-matmul
+/// over-read becomes a read of another weight's bytes.
+pub fn claim_dense(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<u64> {
+    with_pool(stream, |pool| {
+        if !pool.dense_capable {
+            candle::bail!(
+                "dense weights: this span was sized from the fixed test constant rather \
+                 than a measured card, so it holds only KV — a model placed here would \
+                 take every region. The CUDA pool is the right home for these weights."
+            )
+        }
+        if pool.dense_frozen {
+            candle::bail!(
+                "dense weights: the block was frozen at {} MiB when loading finished. \
+                 A claim after that point is a weight arriving late — there is no \
+                 address to give it, because everything above the block now belongs \
+                 to the KV side.",
+                pool.dense_bytes / (1024 * 1024),
+            )
+        }
+        if pool.next > 0 || pool.live > 0 {
+            candle::bail!(
+                "dense weights: {} regions have already been claimed and every one of \
+                 their addresses is measured from this block's right edge, so growing \
+                 it now would move ground a live arena is standing on. A dense claim \
+                 here means weights are loading while inference runs.",
+                pool.next,
+            )
+        }
+        let at = pool.dense_base + pool.dense_bytes as u64;
+        let aligned = at.next_multiple_of(DENSE_ALIGN);
+        let end = aligned
+            .checked_add(bytes as u64)
+            .ok_or_else(|| candle::Error::Msg("dense weights: address overflow".into()))?;
+        // Against the weight floor, not the span end: the expert zone is placed
+        // from the right edge and the dense block grows from the left, so the
+        // floor is what they would collide at. At load the floor is still
+        // `span_end`, which is the whole span — this only binds once an expert
+        // cache has installed a zone, and a loader that reaches that state has
+        // its ordering wrong anyway.
+        if end > pool.weight_floor {
+            candle::bail!(
+                "dense weights: {bytes} B does not fit — the block would end at \
+                 {end:#x}, past the weight floor at {:#x}. The span is {} MiB and \
+                 the weights have taken {} MiB of it.",
+                pool.weight_floor,
+                pool.span_bytes / (1024 * 1024),
+                pool.dense_bytes / (1024 * 1024),
+            )
+        }
+        pool.dense_bytes = (end - pool.dense_base) as usize;
+        pool.relayout_for_dense();
+        Ok(aligned)
+    })
+}
+
+/// Bytes of the span the model's dense weights hold.
+pub fn dense_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
+    with_pool(stream, |pool| Ok(pool.dense_bytes))
+}
+
+/// Claim the reservation **before the model loads**, leaving `load_headroom`
+/// bytes outside it for the load's own scratch.
+///
+/// This is the call that makes the weights span tenants at all. The span used to
+/// be sized from `usable()` *after* the weights were resident, so it was
+/// measured against the hole they had already taken from the CUDA pool and could
+/// not, even in principle, contain them. Claiming first inverts that: the span
+/// is sized from the whole card, and the weights are carved out of it by
+/// [`claim_dense`] as they arrive.
+///
+/// Nothing has to predict the model's size. The dense block grows to whatever
+/// the checkpoint needs and the region count is derived from the remainder at
+/// [`freeze_dense`]. The one quantity the caller does supply is `load_headroom`
+/// — see [`RegionPool::create_with_headroom`] — and that is an arithmetic bound
+/// read off the GGUF header, not a guess.
+///
+/// # It must be first, and it reports whether it was
+///
+/// `true` when this call created the reservation — the load is about to get the
+/// ordering this function exists for. `false` when one already existed, which is
+/// **not an error**: a process that loads a second model finds the span already
+/// claimed and sized, and its weights go to the pool exactly as they did before
+/// any of this. Only the first model through can be a span tenant, because only
+/// its load happens while the span is still unclaimed.
+///
+/// Returned rather than bailed so the caller can say which of the two happened.
+/// Failing instead would turn "this is the second model in the process" — every
+/// multi-model test binary — into a load failure, and swallowing it silently
+/// would leave a reader unable to explain why `dense_bytes` was zero.
+pub fn ensure_reservation(device: &candle::Device, load_headroom: usize) -> Result<bool> {
+    let candle::Device::Cuda(cuda) = device else {
+        candle::bail!("ensure_reservation: the reservation is a CUDA allocation");
+    };
+    let stream = cuda.cuda_stream();
+    let ordinal = stream.context().ordinal();
+
+    // **Claiming early is only right once the card has been measured.** Without
+    // a VRAM governor `span_target` answers with the fixed `TEST_SPAN_BYTES`
+    // constant, and claiming here would freeze that constant in as the span for
+    // the process — there is no second chance, because the reservation is
+    // created once.
+    //
+    // Loaders differ on when the governor appears: some install it before they
+    // read a tensor, others part-way through their own load. Qwen3-30B-A3B is
+    // the second kind, and calling this at the top of its loader took a 73 GiB
+    // card down to a **185-region, 2.9 GiB span** — enough for the model to load
+    // and then fail with "Expert cache full, cannot evict (all pinned)", a
+    // message about eviction several steps from the span that was never big
+    // enough. Declining here leaves the reservation to be created lazily and
+    // correctly later, exactly as it was before.
+    if candle::vram::get(ordinal).is_none() {
+        return Ok(false);
+    }
+
+    let mut map: MutexGuard<'_, HashMap<usize, RegionPool>> =
+        pools().lock().unwrap_or_else(|e| e.into_inner());
+    match map.entry(ordinal) {
+        Entry::Occupied(_) => Ok(false),
+        Entry::Vacant(v) => {
+            v.insert(RegionPool::create_with_headroom(&stream, load_headroom)?);
+            Ok(true)
+        }
+    }
+}
+
+/// End the load phase: lock the dense block's right edge and hand the rest of
+/// the span to the runtime.
+///
+/// The boundary between the two ways this span is used. Before it, the dense
+/// block bumps upward and no region exists. After it, the block is immovable and
+/// the ground from `region_base` to the span's right edge is the runtime's: KV
+/// regions growing up, the expert zone filling down.
+///
+/// Idempotent, and returns the dense block's final size so a caller can report
+/// what the model actually took rather than what it predicted. Nothing needs to
+/// have predicted anything: that is the point of loading into the span rather
+/// than sizing the span around a load that already happened.
+pub fn freeze_dense(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
+    with_pool(stream, |pool| {
+        pool.dense_frozen = true;
+        Ok(pool.dense_bytes)
+    })
+}
+
 /// Claim the reservation if it does not exist, and report the span's right edge.
 ///
 /// The address an expert cache builds its [`super::weight_zone::WeightZone`]
@@ -1692,7 +2052,7 @@ pub fn span_end(stream: &std::sync::Arc<CudaStream>) -> Result<u64> {
 /// is on the other side of the floor by construction.
 pub fn weight_capacity_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
     with_pool(stream, |pool| {
-        Ok(pool.span_bytes.saturating_sub(MIN_ELASTIC_RESERVE))
+        Ok(pool.tradeable_bytes().saturating_sub(MIN_ELASTIC_RESERVE))
     })
 }
 
@@ -1704,7 +2064,7 @@ pub fn weight_capacity_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usiz
 /// it starts, before any wave has said anything.
 pub fn initial_weight_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
     with_pool(stream, |pool| {
-        Ok(pool.span_bytes.saturating_sub(INITIAL_KV_RESERVE))
+        Ok(pool.tradeable_bytes().saturating_sub(INITIAL_KV_RESERVE))
     })
 }
 
@@ -2001,7 +2361,13 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
         fresh_claims_during_wave: pool.fresh_claims_during_wave,
         refusals_during_wave: pool.refusals_during_wave,
         weight_bytes: (pool.span_end() - pool.weight_floor) as usize,
-        slack_bytes: layout_span(pool.span_base, pool.span_bytes, pool.weight_floor).slack,
+        slack_bytes: layout_span(
+            pool.span_base,
+            pool.span_bytes,
+            pool.dense_bytes,
+            pool.weight_floor,
+        )
+        .slack,
         reserved_bytes: pool.reservation.reserved_bytes(),
         granularity: pool.reservation.granularity(),
     })
@@ -2543,7 +2909,7 @@ mod tests {
         let base = 0x1_0000_0000u64;
         let mib = 1024 * 1024;
         let span = 4096 * mib;
-        let l = super::layout_span(base, span, base + span as u64);
+        let l = super::layout_span(base, span, 0, base + span as u64);
         // A tier placed 8 regions below the weight floor drops the ceiling by 8.
         let tier = 8 * REGION_BYTES;
         let tier_base = (base + span as u64) - tier as u64;
@@ -2569,6 +2935,165 @@ mod tests {
         );
     }
 
+    /// The dense block takes its bytes from the **regions**, and from nothing
+    /// else in the layout.
+    ///
+    /// This is the whole arithmetic of putting the model weights inside the
+    /// reservation: the persistence block does not move, the weight floor does
+    /// not move, and the region count absorbs the difference — the same
+    /// property a short span already has.
+    #[test]
+    fn the_dense_block_costs_regions_and_moves_nothing_else() {
+        let base = 0x1_0000_0000u64;
+        let mib = 1024 * 1024;
+        let span = 4096 * mib;
+        let span_end = base + span as u64;
+        let empty = super::layout_span(base, span, 0, span_end);
+        // 1,921 MiB — the measured dense footprint of Qwen3.6-35B.
+        let dense = 1921 * mib;
+        let loaded = super::layout_span(base, span, dense, span_end);
+
+        assert_eq!(
+            loaded.dense_base, empty.dense_base,
+            "the dense block starts at the persistence block's right edge and \
+             never moves",
+        );
+        assert_eq!(
+            loaded.weight_floor, empty.weight_floor,
+            "the expert zone is placed from the right edge; the dense block \
+             cannot push it",
+        );
+        assert_eq!(
+            loaded.region_base - empty.region_base,
+            dense.next_multiple_of(REGION_BYTES) as u64,
+            "regions start past the dense block, rounded up to a whole region",
+        );
+        assert_eq!(
+            empty.total - loaded.total,
+            dense.div_ceil(REGION_BYTES),
+            "and the cost lands entirely on the region count",
+        );
+    }
+
+    /// Rounding the block up to a region wastes under one region, never more.
+    ///
+    /// The alignment is what lets every region address stay
+    /// `region_base + i · REGION_BYTES` with no second rule to keep in step, and
+    /// it is only worth that if the waste is bounded — so the bound is asserted
+    /// rather than assumed.
+    #[test]
+    fn dense_rounding_wastes_less_than_one_region() {
+        let base = 0x1_0000_0000u64;
+        let span = 4096 * 1024 * 1024;
+        let span_end = base + span as u64;
+        for bytes in [1usize, 255, 256, REGION_BYTES - 1, REGION_BYTES + 1] {
+            let l = super::layout_span(base, span, bytes, span_end);
+            let held = (l.region_base - l.dense_base) as usize;
+            assert!(held >= bytes, "the block must cover what was asked for");
+            assert!(
+                held - bytes < REGION_BYTES,
+                "{bytes} B rounded to {held} B — more than a region wasted",
+            );
+        }
+    }
+
+    /// The dense block and the region grid share one boundary and never overlap.
+    ///
+    /// `region_base` is the dense block's right edge and the first region's
+    /// address at the same time, so it is the single number keeping a KV chunk
+    /// out of a weight. Asserted as arithmetic because the runtime check lives
+    /// inside a `with_pool` closure that needs a device.
+    #[test]
+    fn the_dense_block_and_the_region_grid_meet_at_region_base() {
+        let base = 0x1_0000_0000u64;
+        let mib = 1024 * 1024;
+        let span = 4096 * mib;
+        let span_end = base + span as u64;
+        let dense = 1921 * mib;
+        let l = super::layout_span(base, span, dense, span_end);
+
+        assert!(
+            l.dense_base < l.region_base,
+            "the block must occupy ground below the regions",
+        );
+        assert_eq!(
+            (l.region_base - l.dense_base) as usize,
+            dense.next_multiple_of(REGION_BYTES),
+            "the dense block ends exactly where the first region begins",
+        );
+        // Every region is above the block, so no region address can land inside
+        // a weight.
+        for idx in [0usize, 1, l.total.saturating_sub(1)] {
+            let addr = l.region_base + (idx * REGION_BYTES) as u64;
+            assert!(addr >= l.region_base, "region {idx} is above the weights");
+            assert!(addr < span_end, "region {idx} stays inside the span");
+        }
+    }
+
+    /// Load headroom is conceded from what is spare, never from the span's
+    /// floor.
+    ///
+    /// **This is a regression test for a real failure.** `span_target` falls
+    /// back to a fixed `TEST_SPAN_BYTES` when no VRAM governor is installed —
+    /// every unit test, and any CPU-side path — and the first version of the
+    /// headroom subtracted the checkpoint's repack peak from that constant
+    /// unconditionally. Qwen3-8B's `output.weight` peak is ~2.4 GiB, which took
+    /// the span to 640 MiB against a 976 MiB minimum and refused the
+    /// reservation outright: a model that loaded before would not load at all.
+    ///
+    /// The headroom exists to keep a *possible* pool OOM from happening during
+    /// load. Trading that for a *certain* refusal at startup is never right, so
+    /// the concession stops at [`SPAN_MINIMUM_BYTES`] — and is skipped entirely
+    /// without a governor, since the fixed test constant is not a measurement
+    /// of a card and has no capacity to leave room in. Clamping alone was not
+    /// enough: it moved the failure from "reservation refused" to a span of
+    /// exactly the floor with `0 regions`, which fails one step later.
+    #[test]
+    fn headroom_is_conceded_from_spare_ground_only() {
+        let floor = super::SPAN_MINIMUM_BYTES;
+        // Exactly the shape that failed: a target barely above the floor, and a
+        // headroom several times larger than the whole span.
+        let target = floor + 64 * 1024 * 1024;
+        let greedy = 4 * target;
+        let conceded = greedy.min(target.saturating_sub(floor));
+        assert_eq!(
+            target - conceded,
+            floor,
+            "a headroom larger than the span must leave exactly the floor, not underflow it",
+        );
+
+        // With room to spare, the whole request is honoured.
+        let roomy = floor + 8 * 1024 * 1024 * 1024;
+        let want = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            roomy - want.min(roomy.saturating_sub(floor)),
+            roomy - want,
+            "when the span can afford the headroom it concedes all of it",
+        );
+
+        // And a span already at the floor concedes nothing.
+        assert_eq!(floor.saturating_sub(floor), 0);
+    }
+
+    /// A dense block that would swallow the span leaves no regions, and does not
+    /// wrap into a colossal count.
+    ///
+    /// `claim_dense` refuses this case before it can be stored, but the refusal
+    /// path computes the layout it is refusing, so the arithmetic has to survive
+    /// the input rather than merely be protected from it.
+    #[test]
+    fn a_dense_block_wider_than_the_span_yields_no_regions() {
+        let base = 0x1_0000_0000u64;
+        let span = 512 * 1024 * 1024;
+        let span_end = base + span as u64;
+        let l = super::layout_span(base, span, span * 4, span_end);
+        assert_eq!(l.total, 0);
+        assert!(
+            l.region_base <= span_end,
+            "region base stays inside the span"
+        );
+    }
+
     /// A span too small for the persist block yields no regions rather than
     /// wrapping into a colossal one. (`span_from` itself is only
     /// `usable − cushion`; a span that cannot hold the fixed block is refused
@@ -2581,16 +3106,16 @@ mod tests {
         assert_eq!(super::span_from(0, 1024), 0, "a cushion larger than usable");
         let base = 0x1_0000_0000u64;
         let persist = super::PERSIST_SPAN_BYTES;
-        let l = super::layout_span(base, persist, base + persist as u64);
+        let l = super::layout_span(base, persist, 0, base + persist as u64);
         assert_eq!(l.total, 0, "the persist block leaves nothing for KV");
         assert_eq!(l.slack, 0);
         // A span below even that stays sane rather than wrapping.
-        let l = super::layout_span(base, persist / 2, base + (persist / 2) as u64);
+        let l = super::layout_span(base, persist / 2, 0, base + (persist / 2) as u64);
         assert_eq!(l.total, 0);
         assert_eq!(l.slack, 0);
         // And the tier's worth of ground *is* the KV side's while nothing runs.
         let with_tier = persist + super::MAX_WAVE_TRANSIENT_BYTES;
-        let l = super::layout_span(base, with_tier, base + with_tier as u64);
+        let l = super::layout_span(base, with_tier, 0, base + with_tier as u64);
         assert_eq!(
             l.total,
             super::MAX_WAVE_TRANSIENT_BYTES / REGION_BYTES,
@@ -2611,7 +3136,7 @@ mod tests {
                 let span = span_mib * mib;
                 let span_end = base + span as u64;
                 let floor = span_end - (weight_mib * mib) as u64;
-                let l = super::layout_span(base, span, floor);
+                let l = super::layout_span(base, span, 0, floor);
 
                 // Only the persist block is fixed; the regions start straight
                 // after it and run up to the weight floor. The wave tier is not
@@ -2639,9 +3164,12 @@ mod tests {
     fn the_layout_clamps_a_floor_outside_the_span() {
         let base = 0x1_0000_0000u64;
         let span = 4096 * 1024 * 1024;
-        let past_end = super::layout_span(base, span, base + span as u64 + 4096);
-        assert_eq!(past_end, super::layout_span(base, span, base + span as u64));
-        let before_start = super::layout_span(base, span, 0);
+        let past_end = super::layout_span(base, span, 0, base + span as u64 + 4096);
+        assert_eq!(
+            past_end,
+            super::layout_span(base, span, 0, base + span as u64)
+        );
+        let before_start = super::layout_span(base, span, 0, 0);
         assert_eq!(
             before_start.total, 0,
             "a floor left of the regions leaves none"
@@ -2664,7 +3192,7 @@ mod tests {
         let span_end = base + span as u64;
         let expected = base + super::PERSIST_SPAN_BYTES as u64;
         for weight_mib in [0usize, 512, 2048, 6144, 9216] {
-            let l = super::layout_span(base, span, span_end - (weight_mib * mib) as u64);
+            let l = super::layout_span(base, span, 0, span_end - (weight_mib * mib) as u64);
             assert_eq!(l.region_base, expected, "regions start after persist");
             // Every byte between the persist block and the weight floor is
             // available to regions when no forward is running.
@@ -2687,7 +3215,7 @@ mod tests {
         let span = 12288 * mib;
         let span_end = base + span as u64;
         let at = |weight_mib: usize| {
-            super::layout_span(base, span, span_end - (weight_mib * mib) as u64)
+            super::layout_span(base, span, 0, span_end - (weight_mib * mib) as u64)
         };
 
         let wide = at(6144);
@@ -2710,7 +3238,7 @@ mod tests {
         let span_end = base + span as u64;
         for weight_mib in [0usize, 512, 2048, 6144] {
             let floor = span_end - (weight_mib * mib) as u64;
-            let l = super::layout_span(base, span, floor);
+            let l = super::layout_span(base, span, 0, floor);
             let weights = (span_end - l.weight_floor) as usize;
             let total = super::PERSIST_SPAN_BYTES + l.total * REGION_BYTES + l.slack + weights;
             assert_eq!(total, span, "span unaccounted at weight={weight_mib} MiB");
