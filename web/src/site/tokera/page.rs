@@ -513,6 +513,49 @@ mod tests {
         }
     }
 
+    /// Sign-in sends where to come back to as a whole URL, host included.
+    ///
+    /// The provider's registered redirect URI names one host for the estate, so
+    /// the browser always returns there. A relative `next` resolves against that
+    /// host rather than the one it was sent from — sign in from the npcd console
+    /// and you land on tokera.com's home page, having asked to come back to the
+    /// console. It reads as sign-in "moving" you and nothing errors.
+    ///
+    /// `safe_next` accepts an absolute URL under the cookie domain and refuses
+    /// everything else, so this cannot become an open redirect.
+    #[test]
+    fn sign_in_comes_back_to_the_host_it_left() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for rel in [
+            &["content", "npcd", "app.js"][..],
+            &["content", "common", "lib", "auth.js"][..],
+        ] {
+            let path = rel.iter().fold(root.clone(), |p, s| p.join(s));
+            let js = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+            // Stated as "never assemble one without the host" rather than by
+            // matching the call site, because either file may build it inline
+            // or through a helper and both are fine. `location.pathname` is the
+            // only way to get a host-less one, so its absence is the property.
+            assert!(
+                !js.contains("location.pathname"),
+                "{} builds a return address without its host",
+                path.display()
+            );
+            assert!(
+                js.contains("location.href"),
+                "{} has no whole-URL return address at all",
+                path.display()
+            );
+            assert!(
+                js.contains("/auth/login?next="),
+                "{} does not send anyone to sign in",
+                path.display()
+            );
+        }
+    }
+
     /// Every shell that shows the switcher must also load its stylesheet.
     ///
     /// The failure this catches is silent rather than loud: the markup renders,

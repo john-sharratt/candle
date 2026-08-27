@@ -233,20 +233,35 @@ function syncRailButton() {
 
 // ── boot ────────────────────────────────────────────────────────────────────
 
-/* Sign-in is real. `/v1/me` answers only for a caller whose session assertion
- * the daemon could verify against the estate's shared key, so being signed in
- * is not something this page can decide — it is something it discovers.
+/* Sign-in is real. `/v1/me` answers only for a caller the gateway named, so
+ * being signed in is not something this page can decide — it is something it
+ * discovers.
  *
  * The gateway owns the flow. `/auth/login` is served on every hostname ahead of
  * site routing, and the cookie it issues is on `.tokera.com`, which is what
  * makes one sign-in carry to code. and bot. without either daemon taking part.
- * So signing in is a navigation, not a fetch. */
-const here = () => location.pathname + location.search + location.hash;
+ * So signing in is a navigation, not a fetch.
+ *
+ * # `next` is absolute, and has to be
+ *
+ * The provider's registered redirect URI is `https://tokera.com/auth/callback` —
+ * one host for the whole estate, because that is what a provider registration
+ * is. So the browser always comes back to tokera.com, and a relative `next` like
+ * `/#/welcome` resolves *there*: sign in from this console and you land on the
+ * home page of a different site, having asked to come back here.
+ *
+ * Sending the full URL survives the hop. `safe_next` accepts it because the
+ * host is under the cookie domain, and refuses anything that is not — so this
+ * cannot be turned into an open redirect by handing it somebody else's URL. */
 window.__npcdSignIn = () => {
-  location.href = '/auth/login?next=' + encodeURIComponent(here());
+  location.href = '/auth/login?next=' + encodeURIComponent(location.href);
 };
 window.__npcdSignOut = () => {
-  location.href = '/auth/logout?next=' + encodeURIComponent('/#/welcome');
+  /* Logout needs no round trip through the provider, so a relative target would
+   * work — but the rule is worth keeping uniform: whoever is reading this next
+   * should not have to work out which of the two hops loses the host. */
+  location.href =
+    '/auth/logout?next=' + encodeURIComponent(location.origin + '/#/welcome');
 };
 
 /* Distinct from being signed out, and the difference decides whether to offer a
