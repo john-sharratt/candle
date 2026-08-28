@@ -61,13 +61,12 @@ use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
-    decode_record, encode_record, ChunkPayload, DebugIdPayload, Record, RecordHeader, RecordType,
+    decode_record, encode_record, ChunkPayload, DebugIdPayload, RecordHeader, RecordType,
     TombstonePayload, TreeMetadataPayload,
 };
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
-use walker::WalkEntry;
 
 /// Errors raised by the persistence layer.
 #[derive(Debug, Error)]
@@ -514,16 +513,11 @@ impl SubstratePersistence {
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_snapshot_loc(&header, segment, offset, size);
-        let entry = WalkEntry {
-            segment,
-            offset,
-            record: Record {
-                header,
-                payload: payload.to_vec(),
-            },
-            size,
-        };
-        self.manifest.ingest(&entry)?;
+        // Header + location only. This used to build a `WalkEntry`, whose
+        // `Record` owns its payload — so every appended record cloned its whole
+        // payload for a call that reads nothing but the header, then dropped it.
+        self.manifest
+            .ingest_located(&header, segment, offset, size)?;
         // Digest every data record for the header-index chain. Index
         // records themselves are self-describing via their `prev` links
         // and are never digested.
@@ -753,48 +747,6 @@ impl SubstratePersistence {
         Ok(())
     }
 
-    /// Write a conversation-metadata record for `timeline_id`. The record
-    /// carries both the client-supplied `conv_id` string (used by the
-    /// daemon as the sidebar id) and the human-readable `label`.
-    ///
-    /// Last-write-wins on replay: the conv_id is written at first-submit
-    /// time with an empty label, then re-written with the title once the
-    /// titler finishes. This call is a no-op when the manifest already
-    /// holds the same `(conv_id, label)` tuple — cheap to invoke on
-    /// every submit.
-    pub fn write_conv_meta(
-        &mut self,
-        timeline_id: u64,
-        conv_id: &str,
-        label: &str,
-        custom: &std::collections::BTreeMap<String, String>,
-    ) -> Result<()> {
-        // Idempotency was previously checked against `manifest.labels`;
-        // after Phase 3 the substrate is the authority for live label
-        // state.  Callers are expected to check against substrate
-        // state before invoking this method (the Conversation-level
-        // setters already do; daemon writes are infrequent enough
-        // that an occasional duplicate log entry is negligible —
-        // compaction collapses them).
-        //
-        // The Label record carries the *full* ConvMeta (conv_id + label +
-        // custom), so each setter reads the sibling fields from the
-        // substrate and passes them through — a partial write would drop
-        // the others on reload/compaction.
-        let payload = manifest::encode_label_payload(timeline_id, conv_id, label, custom);
-        self.append_record(RecordType::Label, 0, 0, 0, 0, 0, &payload)?;
-        Ok(())
-    }
-
-    /// Append a `ConvState` record for `timeline_id`.  Idempotency on
-    /// the current value is now the caller's responsibility (see
-    /// `write_conv_meta`).
-    pub fn write_conv_state(&mut self, timeline_id: u64, state: manifest::ConvState) -> Result<()> {
-        let payload = manifest::encode_conv_state_payload(timeline_id, state);
-        self.append_record(RecordType::ConvState, 0, 0, 0, 0, 0, &payload)?;
-        Ok(())
-    }
-
     /// Append a `TreeMetadata` record for one `(timeline_id,
     /// turn_index)` summary-tree node.  Last-writer-wins on replay.
     /// Callers check idempotency against substrate state.
@@ -862,17 +814,6 @@ impl SubstratePersistence {
         };
         let bytes = payload.encode();
         self.append_record(RecordType::TurnCoupling, 0, 0, 0, 0, 0, &bytes)?;
-        Ok(())
-    }
-
-    /// Append a [`RecordType::Distilled`] record marking `timeline_id` for
-    /// distillation at `mode` — its turns shed content on the next compaction
-    /// pass. Idempotent for a fixed mode; a later record upgrades the mode
-    /// (last-writer-wins on replay).
-    pub fn write_distill(&mut self, timeline_id: u64, mode: record::DistillMode) -> Result<()> {
-        let payload = record::DistillPayload { timeline_id, mode };
-        let bytes = payload.encode();
-        self.append_record(RecordType::Distilled, 0, 0, 0, 0, 0, &bytes)?;
         Ok(())
     }
 

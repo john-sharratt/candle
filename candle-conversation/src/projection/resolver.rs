@@ -20,9 +20,10 @@ use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, ContentHash,
 };
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
-use crate::persistence::manifest::RecordLoc;
+use crate::persistence::manifest::{self, RecordLoc};
 use crate::persistence::record::{
-    BranchCheckpointPayload, DistillMode, SnapshotPayload, TreeMetadataPayload,
+    BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SnapshotPayload,
+    TreeMetadataPayload,
 };
 use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
@@ -142,6 +143,21 @@ pub struct Conversation {
     /// compaction can hold across its relocation I/O). Shared across clones; the
     /// last drop drains + fsyncs + joins the writer. See [`SubstrateWriter`].
     writer: Arc<SubstrateWriter>,
+    /// The most recently read prompt-branch checkpoint, held decoded and keyed
+    /// by the content prefix it belongs to.
+    ///
+    /// Every conversation opened on a branch installs that branch's recurrent
+    /// state, and the durable record is large — ~63 MiB for a 40-layer hybrid.
+    /// Without this, each open re-read the whole record off the log and decoded
+    /// it again under the persistence mutex, which is the same mutex the writer
+    /// needs: measured at 144 ms per conversation across 817 opens of one
+    /// branch (~51 GB of reads) during the calibration phase, all of it on the
+    /// calling thread with the GPU idle behind it.
+    ///
+    /// One entry is the right size. The key is a content hash, so a branch
+    /// change misses and refills exactly once, and the phases that open many
+    /// conversations all open them on a single shared prompt branch.
+    branch_checkpoint: Arc<Mutex<Option<(ContentHash, Arc<BranchCheckpointPayload>)>>>,
 }
 
 /// Per-turn residency fingerprint for a decoded sig window: the memo's stable
@@ -205,6 +221,7 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
+            branch_checkpoint: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -226,6 +243,7 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
+            branch_checkpoint: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -242,6 +260,20 @@ impl Conversation {
     pub fn mint_timeline(&self, layer: LayerId, group: GroupId) -> TimelineId {
         let mut view = self.inner.write().unwrap();
         view.mint_timeline(layer, group, &self.allocator)
+    }
+
+    /// Mint `n` timelines under ONE write-lock acquisition.
+    ///
+    /// A batch create previously called [`Self::mint_timeline`] per conversation,
+    /// taking the substrate's exclusive lock once each — profiled as ~600
+    /// contended-lock samples, on the path that opens conversations in bursts.
+    /// Minting is pure allocator bookkeeping, so the whole burst fits in a single
+    /// span and every reader waits once instead of `n` times.
+    pub fn mint_timelines(&self, layer: LayerId, group: GroupId, n: usize) -> Vec<TimelineId> {
+        let mut view = self.inner.write().unwrap();
+        (0..n)
+            .map(|_| view.mint_timeline(layer, group, &self.allocator))
+            .collect()
     }
 
     /// Look up `(layer, group)` for a previously-minted timeline.
@@ -1512,9 +1544,14 @@ impl Conversation {
         // provenance gallery's `tags:` scoping.
         let segments = write.layout.segments.clone();
         let tags = write.tags.clone();
+        // Migrate BEFORE taking the write lock. The migration moves this turn's
+        // K/V off the device; holding the substrate's exclusive lock across it
+        // blocked every other reader and writer for the duration, once per
+        // sealed turn. The lock now covers only the insert.
+        let sealed_cpu = Substrate::migrate_sealed(&write, migrate_to_cpu)?;
         let idx = {
             let mut view = self.inner.write().unwrap();
-            view.append_complete(timeline, write, migrate_to_cpu)?
+            view.append_migrated(timeline, write, sealed_cpu)?
         };
         // Record the turn's structure into the redo log.
         let (layer_id, group_id) = self
@@ -2231,12 +2268,12 @@ impl Conversation {
         }
         let conv_id = self.conv_id_of(timeline).unwrap_or_default();
         let custom = self.read().custom_of(timeline).cloned().unwrap_or_default();
-        {
-            let mut p = self.persistence.lock().unwrap();
-            p.write_conv_meta(timeline.raw(), &conv_id, label, &custom)
-                .map_err(|e| candle::Error::Msg(format!("write_conv_meta: {e}")))?;
-        }
+        let payload = manifest::encode_label_payload(timeline.raw(), &conv_id, label, &custom);
         self.write().set_label(timeline, label);
+        self.writer.enqueue(WriteJob::ConvMeta {
+            record: RecordType::Label,
+            payload,
+        });
         Ok(())
     }
 
@@ -2272,17 +2309,30 @@ impl Conversation {
             return Ok(());
         }
         let conv_id = self.conv_id_of(timeline).unwrap_or_default();
-        let label = self.read().label_of(timeline).unwrap_or("").to_string();
-        let mut custom = self.read().custom_of(timeline).cloned().unwrap_or_default();
+        // Sibling fields and the merged bag under ONE read guard: the Label
+        // record carries the full ConvMeta, so a partial write would drop the
+        // others on reload/compaction.
+        let mut custom = {
+            let view = self.read();
+            let label = view.label_of(timeline).unwrap_or("").to_string();
+            let custom = view.custom_of(timeline).cloned().unwrap_or_default();
+            (label, custom)
+        };
         for (k, v) in kv {
-            custom.insert(k.clone(), v.clone());
+            custom.1.insert(k.clone(), v.clone());
         }
-        {
-            let mut p = self.persistence.lock().unwrap();
-            p.write_conv_meta(timeline.raw(), &conv_id, &label, &custom)
-                .map_err(|e| candle::Error::Msg(format!("write_conv_meta: {e}")))?;
-        }
+        // Encode on this thread, append on the writer's. The record is small and
+        // last-writer-wins, so it carries the same crash-loss window as every
+        // other enqueued metadata record: the in-RAM merge below is what this
+        // session reads, and a record that never lands leaves the tag absent on
+        // the next load rather than wrong.
+        let payload =
+            manifest::encode_label_payload(timeline.raw(), &conv_id, &custom.0, &custom.1);
         self.write().merge_custom(timeline, kv);
+        self.writer.enqueue(WriteJob::ConvMeta {
+            record: RecordType::Label,
+            payload,
+        });
         Ok(())
     }
 
@@ -2340,14 +2390,19 @@ impl Conversation {
         if conv_id.is_empty() {
             return Ok(());
         }
-        let label = self.read().label_of(timeline).unwrap_or("").to_string();
-        let custom = self.read().custom_of(timeline).cloned().unwrap_or_default();
-        {
-            let mut p = self.persistence.lock().unwrap();
-            p.write_conv_meta(timeline.raw(), conv_id, &label, &custom)
-                .map_err(|e| candle::Error::Msg(format!("write_conv_meta: {e}")))?;
-        }
+        let (label, custom) = {
+            let view = self.read();
+            (
+                view.label_of(timeline).unwrap_or("").to_string(),
+                view.custom_of(timeline).cloned().unwrap_or_default(),
+            )
+        };
+        let payload = manifest::encode_label_payload(timeline.raw(), conv_id, &label, &custom);
         self.write().set_conv_id(timeline, conv_id);
+        self.writer.enqueue(WriteJob::ConvMeta {
+            record: RecordType::Label,
+            payload,
+        });
         Ok(())
     }
 
@@ -2379,9 +2434,11 @@ impl Conversation {
             return Ok(());
         }
         let state = crate::persistence::manifest::ConvState { archived };
-        let mut p = self.persistence.lock().unwrap();
-        p.write_conv_state(timeline.raw(), state)
-            .map_err(|e| candle::Error::Msg(format!("write_conv_state: {e}")))?;
+        let payload = manifest::encode_conv_state_payload(timeline.raw(), state);
+        self.writer.enqueue(WriteJob::ConvMeta {
+            record: RecordType::ConvState,
+            payload,
+        });
         Ok(())
     }
 
@@ -2442,9 +2499,15 @@ impl Conversation {
     /// call may upgrade the mode (e.g. provenance-only → text-only on archive).
     pub fn distill_timeline(&self, timeline: TimelineId, mode: DistillMode) -> candle::Result<()> {
         self.write().distill_timeline(timeline, mode);
-        let mut p = self.persistence.lock().unwrap();
-        p.write_distill(timeline.raw(), mode)
-            .map_err(|e| candle::Error::Msg(format!("write_distill: {e}")))?;
+        let payload = DistillPayload {
+            timeline_id: timeline.raw(),
+            mode,
+        }
+        .encode();
+        self.writer.enqueue(WriteJob::ConvMeta {
+            record: RecordType::Distilled,
+            payload,
+        });
         Ok(())
     }
 
@@ -2659,16 +2722,20 @@ impl Conversation {
     /// [`crate::projection::encode_events`] JSON. Also mirrors the bytes into
     /// the in-RAM substrate so the current session reads them back without a
     /// restart.
-    pub fn persist_projection_events(
-        &self,
-        stream_id: StreamId,
-        payload: &[u8],
-    ) -> candle::Result<()> {
+    /// Mirror a turn's projection-event trajectory into the in-RAM substrate
+    /// (the GUI replay and any same-session read want it now) and enqueue the
+    /// durable append onto the off-thread writer, so the caller never blocks on
+    /// the persistence lock. Same crash-safety as [`Self::enqueue_tokens`]: the
+    /// record is last-writer-wins per stream, and one that never lands leaves
+    /// the turn without its replay trajectory rather than corrupting it.
+    ///
+    /// The payload is moved, not copied — the encode already happened on the
+    /// caller's side, and the in-RAM mirror and the queued job share it.
+    pub fn persist_projection_events(&self, stream_id: StreamId, payload: Vec<u8>) {
         self.write()
-            .set_projection_events_blob(stream_id, payload.to_vec());
-        let mut p = self.persistence.lock().unwrap();
-        p.append_projection_events(stream_id, payload)
-            .map_err(|e| candle::Error::Msg(format!("persist projection events: {e}")))
+            .set_projection_events_blob(stream_id, payload.clone());
+        self.writer
+            .enqueue(WriteJob::ProjectionEvents { stream_id, payload });
     }
 
     /// Persist a turn's encoded wide-Q signature window to the redo log (`WideQSig`
@@ -2748,7 +2815,17 @@ impl Conversation {
     pub fn read_branch_checkpoint(
         &self,
         prefix: ContentHash,
-    ) -> Result<Option<BranchCheckpointPayload>, ConversationError> {
+    ) -> Result<Option<Arc<BranchCheckpointPayload>>, ConversationError> {
+        // Served decoded when this is the branch we last read — see
+        // `branch_checkpoint`. The hash key makes the hit exact: a different
+        // branch misses and refills rather than installing the wrong state.
+        if let Ok(memo) = self.branch_checkpoint.lock() {
+            if let Some((cached, payload)) = memo.as_ref() {
+                if *cached == prefix {
+                    return Ok(Some(Arc::clone(payload)));
+                }
+            }
+        }
         let Some(loc) = self
             .read()
             .branch_checkpoint_loc(branch_checkpoint_stream_id(prefix))
@@ -2778,7 +2855,24 @@ impl Conversation {
                 payload.prefix_hash
             )));
         }
+        let payload = Arc::new(payload);
+        self.memo_branch_checkpoint(prefix, &payload);
         Ok(Some(payload))
+    }
+
+    /// Hold `payload` as the decoded checkpoint for `prefix`, so the next
+    /// conversation opened on that branch installs it without touching the log.
+    /// Called both after a read and after a fresh computation — a branch this
+    /// process just computed is exactly the one the following conversations
+    /// will ask for.
+    pub fn memo_branch_checkpoint(
+        &self,
+        prefix: ContentHash,
+        payload: &Arc<BranchCheckpointPayload>,
+    ) {
+        if let Ok(mut memo) = self.branch_checkpoint.lock() {
+            *memo = Some((prefix, Arc::clone(payload)));
+        }
     }
 
     /// The live recurrent-state snapshot location for `timeline`, if one is

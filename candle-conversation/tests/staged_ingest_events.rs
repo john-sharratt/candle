@@ -100,8 +100,7 @@ fn staged_events_reference_their_turn_and_survive_reload() {
             staged_ingest_event(3, 0.0, system, turns),
         ];
         let stream_id = turn_stream_id(timeline.raw(), second);
-        conv.persist_projection_events(stream_id, &encode_events(&events))
-            .expect("persist events");
+        conv.persist_projection_events(stream_id, encode_events(&events));
 
         // Live read-back, no reload.
         {

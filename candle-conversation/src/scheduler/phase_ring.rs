@@ -70,6 +70,18 @@ pub enum PhaseKind {
     /// Wall-clock the loop spent waiting on `rx.recv()` with no work to run — idle
     /// between requests, distinct from [`PhaseKind::Blocked`].
     Idle,
+    /// Scheduler-thread work servicing engine requests: slot creation (and its
+    /// snapshot / belief restore), branch-state installs, section restores, turn
+    /// submissions. Real work between forwards, not a stall — it is broken out so
+    /// an ingest that opens thousands of conversations reads as request handling
+    /// rather than as unattributed [`PhaseKind::Blocked`] time.
+    Requests,
+    /// Per-wave scheduler housekeeping between the timed quanta: promoting
+    /// finished prefills, regulating ingest admission, demoting cold ingest,
+    /// walking the AIMD admit budget, harvesting GPU spans. Outside every
+    /// quantum, so it was previously indistinguishable from
+    /// [`PhaseKind::Blocked`].
+    Housekeeping,
     /// Deliberate GPU/persistence wait — `device.synchronize()` draining the GPU
     /// queue + `flush_blocking` waiting on the hot→warm drain. The backpressure
     /// stall, distinct from Idle (no work) and Blocked (unattributed remainder).
@@ -88,6 +100,8 @@ impl PhaseKind {
             PhaseKind::Allocation => "allocation",
             PhaseKind::Blocked => "blocked",
             PhaseKind::Idle => "idle",
+            PhaseKind::Requests => "requests",
+            PhaseKind::Housekeeping => "housekeeping",
             PhaseKind::Sync => "sync",
         }
     }
@@ -475,6 +489,17 @@ mod tests {
     #[test]
     fn blocked_phase_has_stable_key() {
         assert_eq!(PhaseKind::Blocked.as_str(), "blocked");
+    }
+
+    /// The dashboard keys its colours, legend and stacking order off these
+    /// strings, so a rename silently drops the band from the chart rather than
+    /// failing anything. `requests` in particular exists to keep real
+    /// scheduler-thread work out of the `blocked` remainder — if it stops being
+    /// emitted under this key, that time goes back to reading as unattributed.
+    #[test]
+    fn requests_phase_has_stable_key() {
+        assert_eq!(PhaseKind::Requests.as_str(), "requests");
+        assert_eq!(PhaseKind::Housekeeping.as_str(), "housekeeping");
     }
 
     #[test]

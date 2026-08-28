@@ -320,12 +320,16 @@ pub fn encode_record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
     );
 
     let total = padded_record_len(header_line.len(), effective.payload_len);
-    let mut out = vec![0u8; total];
-    out[..header_line.len()].copy_from_slice(header_line.as_bytes());
-    out[header_line.len()] = b'\n';
-    let payload_start = header_line.len() + 1;
-    out[payload_start..payload_start + payload.len()].copy_from_slice(payload);
-    // The remaining bytes stay zero — the sector padding tail.
+    // Built by appending, not by zero-filling and overwriting. `vec![0u8; total]`
+    // memsets the header and payload span too, and both are then written in full
+    // — so a record cost a memset over its whole length plus the copy. Only the
+    // sector padding tail is genuinely zero-valued, and `resize` writes just that.
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(header_line.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(payload);
+    out.resize(total, 0);
+    debug_assert_eq!(out.len(), total, "encoded record must fill its padded span");
     out
 }
 

@@ -22,9 +22,17 @@
 //! If the arena fills while a generation is held, an **overflow arena** of
 //! the same size and flags is allocated and becomes the new bump target.
 //! This preserves zero-copy performance — no fallback to owned buffers or
-//! slow memcpy paths.  When the last generation drops, the stream is
-//! synchronised, all arenas are reset, and overflow arenas are freed
-//! (only the original slab is retained).
+//! slow memcpy paths.
+//!
+//! When the last generation drops, a CUDA **event** is recorded on the stream
+//! and the reset is DEFERRED — the arenas stay dirty until that fence fires.
+//! The next [`PinnedStager::begin_generation`] queries it (non-blocking) and,
+//! if it has fired, resets all arenas and frees the overflow slabs (only the
+//! original is retained). Dropping a generation therefore never blocks: the
+//! previous form synchronised the stream inline, draining the whole GPU
+//! pipeline from a destructor. The blocking reset still exists on the one path
+//! that genuinely needs the space back — an allocation that finds the arena
+//! full with no live generation.
 //!
 //! # Usage
 //!
@@ -36,7 +44,7 @@
 //!     let gpu = stager.submit(buf)?;
 //!     launch_kernel(gpu.dev_ptr());
 //! }
-//! drop(gen); // syncs stream, resets arena(s)
+//! drop(gen); // records a fence; the arena resets on the next generation
 //! ```
 
 use crate::cuda_backend::WrapErr;
@@ -49,8 +57,9 @@ use std::sync::{Arc, Mutex};
 /// RAII generation guard.
 ///
 /// While at least one `Generation` is alive, the arena will never be reset —
-/// all submitted bump pointers remain valid. When the last generation drops,
-/// if the arena is dirty the stream is synchronised and the arena reset.
+/// all submitted bump pointers remain valid. When the last generation drops
+/// over a dirty arena, a stream event is recorded and the reset is deferred to
+/// the next generation, which resets only once that fence has fired.
 ///
 /// Create via [`PinnedStager::begin_generation`].
 pub struct Generation {
@@ -68,27 +77,57 @@ impl Drop for Generation {
             inner.live_generations == 0 && inner.arena_dirty
         };
         if should_flush {
-            // Sync stream, then reset arena + free owned buffers.
-            let (dev, explicit_stream) = {
-                let inner = self.inner.lock().unwrap();
-                (inner.dev.clone(), inner.explicit_stream.clone())
-            };
-            if let Some(stream) = explicit_stream {
-                let _ = stream.synchronize();
-            } else if let Some(dev) = dev {
-                let _ = dev.cuda_stream().synchronize();
-            }
+            // Record a fence and leave. The arena stays dirty and un-reset until
+            // the event fires; `PinnedStagerInner::try_reclaim` does the actual
+            // reset on the next generation. Draining the stream here — from a
+            // destructor, on whatever thread dropped the last guard — stalled the
+            // entire GPU pipeline once per generation.
+            // The fence is recorded while HOLDING the lock, deliberately.
+            //
+            // Recording it outside and re-locking opens a window in which a whole
+            // generation can begin and end: that generation records a LATER fence
+            // and stores it, then this thread re-locks, still sees
+            // `live_generations == 0`, and overwrites it with its own STALE one.
+            // The stale event fires earlier, so `try_reclaim` would reset — and
+            // `truncate(1)` free — pinned overflow slabs while the newer
+            // generation's kernels were still reading them directly over PCIe.
+            //
+            // The old code was immune to this only because a `synchronize()`
+            // cannot be stale; a recorded event can. `record_event` is a cheap
+            // driver call and generation drops are no longer hot, so serialising
+            // them behind this mutex costs nothing worth the hazard.
             let mut inner = self.inner.lock().unwrap();
-            // Re-check: another generation may have started between our
-            // unlock and re-lock.
+            // Re-check under the same lock we will publish under: another
+            // generation may have started, in which case the arena is live again
+            // and no fence belongs here — that generation's own drop records one.
             if inner.live_generations == 0 {
-                for a in inner.arenas.iter_mut() {
-                    a.reset();
+                let stream = match (inner.explicit_stream.clone(), inner.dev.clone()) {
+                    (Some(stream), _) => Some(stream),
+                    (None, Some(dev)) => Some(dev.cuda_stream().clone()),
+                    (None, None) => None,
+                };
+                match stream {
+                    // No stream to fence against (CPU-only test stager): the
+                    // arena cannot be under GPU read, so reset immediately.
+                    None => inner.reset_arenas_now(),
+                    Some(stream) => match stream.record_event(None) {
+                        Ok(e) => inner.pending_reset = Some(e),
+                        // A FAILED record is not the same as "no stream", and must
+                        // never fall through to an unsynchronised reset: rewinding
+                        // the bump pointers and freeing overflow slabs while
+                        // kernels may still be reading them over PCIe is a
+                        // use-after-free. With no fence to defer behind, fall back
+                        // to the blocking behaviour this path replaced.
+                        Err(e) => {
+                            tracing::warn!(
+                                "pinned staging: fence record failed ({e}); \
+                                 synchronising before reset"
+                            );
+                            let _ = stream.synchronize();
+                            inner.reset_arenas_now();
+                        }
+                    },
                 }
-                inner.arenas.truncate(1);
-                inner.arena_dirty = false;
-                inner.pending_owned.clear();
-                inner.pending_owned_bytes = 0;
             }
         }
     }
@@ -471,12 +510,67 @@ struct PinnedStagerInner {
     /// Number of live [`Generation`] guards. While > 0, the arenas must not
     /// be reset — submitted bump pointers are still potentially in use.
     live_generations: usize,
+    /// Event recorded on the stream when the last generation dropped over a
+    /// dirty arena. The arena is safe to reset once this has FIRED — until then
+    /// kernels may still be reading the bump region directly over PCIe.
+    ///
+    /// This is what makes the reset deferred instead of synchronous. Dropping
+    /// the last generation used to call `stream.synchronize()` inline, draining
+    /// the whole GPU pipeline from a destructor on the caller's thread — 8.8% of
+    /// sampled CPU in a full-workspace ingest, reached via
+    /// `drive_wave` → drop `CpuStorage` → here. Recording an event costs a
+    /// queue entry; the reset then happens on the next generation, by which
+    /// point the event has almost always fired and the check is a query.
+    pending_reset: Option<cudarc::driver::CudaEvent>,
     /// Monotonic counter bumped every time a fresh [`Generation`] begins. A
     /// generation's arena is reset (all bump pointers invalidated) once the last
     /// guard drops, so the epoch captured at `begin` uniquely identifies the
     /// arena's current fill. Consumers that cache a device pointer handed out by
     /// one generation compare epochs to detect a reset before reusing it.
     epoch: u64,
+}
+
+impl PinnedStagerInner {
+    /// Reset the arenas and drop spent owned buffers. The caller must have
+    /// established that no kernel can still be reading them.
+    fn reset_arenas_now(&mut self) {
+        for a in self.arenas.iter_mut() {
+            a.reset();
+        }
+        self.arenas.truncate(1);
+        self.arena_dirty = false;
+        self.pending_owned.clear();
+        self.pending_owned_bytes = 0;
+        self.pending_reset = None;
+    }
+
+    /// Reset the arenas if a deferred reset is pending AND its fence has fired.
+    ///
+    /// Non-blocking: an event that has not fired leaves the arena dirty and the
+    /// reset pending, so the caller keeps bump-allocating (into an overflow
+    /// arena if needed) exactly as it would while a generation were live. Safe
+    /// to call whenever `live_generations == 0`.
+    ///
+    /// The blocking counterpart is [`PinnedStager::sync_and_reset_arena`], taken
+    /// when the arena is full and the space is genuinely needed: its stream sync
+    /// subsumes this fence, so no separate blocking wait exists here.
+    fn try_reclaim(&mut self) {
+        if self.live_generations != 0 {
+            return;
+        }
+        let Some(event) = self.pending_reset.as_ref() else {
+            return;
+        };
+        // `cuEventQuery` is the non-blocking form: SUCCESS means every preceding
+        // stream operation has completed, NOT_READY means work is outstanding.
+        // Anything else is a real driver error — treat it as not-ready and let
+        // the blocking path below deal with it, rather than resetting memory the
+        // GPU may still be reading.
+        let ready = unsafe { sys::cuEventQuery(event.cu_event()) } == sys::CUresult::CUDA_SUCCESS;
+        if ready {
+            self.reset_arenas_now();
+        }
+    }
 }
 
 impl PinnedStager {
@@ -519,6 +613,7 @@ impl PinnedStager {
                 arena_dirty: false,
                 bump_outstanding: 0,
                 live_generations: 0,
+                pending_reset: None,
                 epoch: 0,
             })),
         }
@@ -543,6 +638,7 @@ impl PinnedStager {
                 arena_dirty: false,
                 bump_outstanding: 0,
                 live_generations: 0,
+                pending_reset: None,
                 epoch: 0,
             })),
         }
@@ -565,6 +661,7 @@ impl PinnedStager {
                 arena_dirty: false,
                 bump_outstanding: 0,
                 live_generations: 0,
+                pending_reset: None,
                 epoch: 0,
             })),
         }
@@ -582,6 +679,11 @@ impl PinnedStager {
     /// properties). On flush, overflow arenas are freed.
     pub fn begin_generation(&self) -> Generation {
         let mut inner = self.inner.lock().unwrap();
+        // Collect the previous generation's deferred reset, if its fence has
+        // fired. This is where the reset actually happens in the steady state —
+        // by the time the next generation starts, the prior one's work is
+        // normally long done, so the query succeeds and costs nothing.
+        inner.try_reclaim();
         inner.live_generations += 1;
         inner.epoch += 1;
         let epoch = inner.epoch;
@@ -777,14 +879,11 @@ impl PinnedStager {
             dev.cuda_stream().synchronize().w()?;
         }
         let mut inner = self.inner.lock().unwrap();
-        // Reset all arenas, then drop overflow arenas (keep only the first).
-        for a in inner.arenas.iter_mut() {
-            a.reset();
-        }
-        inner.arenas.truncate(1);
-        inner.arena_dirty = false;
-        inner.pending_owned.clear();
-        inner.pending_owned_bytes = 0;
+        // Resets all arenas, drops the overflow slabs (keeping only the first),
+        // and CLEARS any deferred fence: the stream sync above subsumes it, so
+        // leaving `pending_reset` set would strand a fired event for a later
+        // `try_reclaim` to act on against an already-reset arena.
+        inner.reset_arenas_now();
         Ok(())
     }
 
@@ -800,14 +899,11 @@ impl PinnedStager {
             dev.cuda_stream().synchronize().w()?;
         }
         let mut inner = self.inner.lock().unwrap();
-        for a in inner.arenas.iter_mut() {
-            a.reset();
-        }
-        inner.arenas.truncate(1);
-        inner.arena_dirty = false;
-        // Also free any pending owned buffers since we synced anyway.
-        inner.pending_owned.clear();
-        inner.pending_owned_bytes = 0;
+        // The stream sync above subsumes any deferred fence — an event recorded
+        // on this stream has necessarily fired — so this clears `pending_reset`
+        // along with the arenas rather than leaving a stale event behind. Also
+        // frees any pending owned buffers, since we synced anyway.
+        inner.reset_arenas_now();
         Ok(())
     }
 
@@ -841,6 +937,77 @@ impl Drop for PinnedStagerInner {
             self.pending_owned.clear();
         }
         // arenas are dropped automatically (each frees its slab)
+    }
+}
+
+#[cfg(test)]
+mod deferred_reset_tests {
+    use super::*;
+
+    /// Dropping the last generation must NOT leave the arena permanently dirty.
+    ///
+    /// The reset moved from the drop (which synchronised the stream inline) to
+    /// the next `begin_generation`, gated on a recorded event. The hazard in
+    /// that move is a reset that never happens — the arena would grow overflow
+    /// slabs forever. On the device-free stager there is no stream to fence
+    /// against, so the drop must reset immediately rather than park a fence
+    /// nothing will ever fire.
+    #[test]
+    fn deviceless_drop_resets_immediately_rather_than_parking_a_fence() {
+        let stager = PinnedStager::noop();
+        {
+            let _g = stager.begin_generation();
+            let mut inner = stager.inner.lock().unwrap();
+            // Stand in for submitted bump allocations.
+            inner.arena_dirty = true;
+        }
+        let inner = stager.inner.lock().unwrap();
+        assert_eq!(inner.live_generations, 0, "guard released");
+        assert!(
+            !inner.arena_dirty,
+            "deviceless drop must reset, not defer behind a fence that cannot fire",
+        );
+        assert!(
+            inner.pending_reset.is_none(),
+            "no fence should be parked when there is no stream",
+        );
+    }
+
+    /// A generation still live must block the reset — the whole invariant the
+    /// guard exists for. Nesting is what makes the deferred path safe: the
+    /// inner drop sees a non-zero count and records nothing.
+    #[test]
+    fn nested_generation_keeps_arena_live() {
+        let stager = PinnedStager::noop();
+        let outer = stager.begin_generation();
+        {
+            let _inner_gen = stager.begin_generation();
+            let mut inner = stager.inner.lock().unwrap();
+            inner.arena_dirty = true;
+        }
+        {
+            let inner = stager.inner.lock().unwrap();
+            assert_eq!(inner.live_generations, 1, "outer guard still held");
+            assert!(
+                inner.arena_dirty,
+                "arena reset while a generation was still live — submitted bump \
+                 pointers would dangle",
+            );
+        }
+        drop(outer);
+        let inner = stager.inner.lock().unwrap();
+        assert!(!inner.arena_dirty, "reset once the last guard released");
+    }
+
+    /// `begin_generation` bumps the epoch, so a consumer holding a device
+    /// pointer from an earlier generation can detect that the arena underneath
+    /// it was reset. Deferring the reset must not stall the epoch.
+    #[test]
+    fn epoch_advances_per_generation() {
+        let stager = PinnedStager::noop();
+        let a = stager.begin_generation().epoch();
+        let b = stager.begin_generation().epoch();
+        assert!(b > a, "epoch must advance so stale pointers are detectable");
     }
 }
 

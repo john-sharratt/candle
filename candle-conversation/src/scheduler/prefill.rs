@@ -2488,7 +2488,14 @@ impl Scheduler {
                         }
                         self.free_summary_slot(slot);
                     }
-                    None => self.complete_compression_turn(slot, job_id),
+                    None => {
+                        let t = std::time::Instant::now();
+                        self.complete_compression_turn(slot, job_id);
+                        crate::scheduler::run::note_promote_split(
+                            crate::scheduler::run::PromoteStep::Compression,
+                            t.elapsed().as_micros() as u64,
+                        );
+                    }
                 }
                 continue;
             }
@@ -2505,7 +2512,14 @@ impl Scheduler {
                             let _ = self.session.truncate_sequence_to_blocks(p.parent_id.0, 0);
                         }
                     }
-                    None => self.complete_turn_reprefill(pending_id),
+                    None => {
+                        let t = std::time::Instant::now();
+                        self.complete_turn_reprefill(pending_id);
+                        crate::scheduler::run::note_promote_split(
+                            crate::scheduler::run::PromoteStep::Reprefill,
+                            t.elapsed().as_micros() as u64,
+                        );
+                    }
                 }
                 continue;
             }
@@ -2529,7 +2543,12 @@ impl Scheduler {
                 .unwrap_or(0.0);
             let turn_start = work.submitted_at;
             let token_count = work.tokens.len();
+            let t_fin = std::time::Instant::now();
             self.finalise_prefill(work, logits, prefill_ms, turn_start, token_count);
+            crate::scheduler::run::note_promote_split(
+                crate::scheduler::run::PromoteStep::Finalise,
+                t_fin.elapsed().as_micros() as u64,
+            );
             // swap_remove pulled the last element into i; don't increment.
         }
     }

@@ -1116,13 +1116,21 @@ pub fn run_with_sink<R: ContentResolver>(
     // on the returned `Projection` so the persisted record / GUI can show it.
     let mut selection_origins: HashMap<TurnKey, SelectionOrigin> = HashMap::new();
 
+    // Hoisted out of the per-layer loop below: the kill switch is process-global,
+    // so "is anything disabled?" has one answer for the whole assembly. Asking it
+    // per layer made this the second-hottest resolved symbol in an ingest profile.
+    let any_layer_disabled = super::layer_toggle::any_layer_disabled();
+
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = li == target_layer_idx;
         // Runtime diagnostic kill switch: a non-target layer toggled off
         // contributes nothing to the assembly (its groups are never scored or
         // selected). The target layer is never skipped — that would leave the
         // projection with nothing to emit. See `super::layer_toggle`.
-        if !layer_is_target && super::layer_toggle::is_layer_disabled(&layer.name) {
+        if !layer_is_target
+            && any_layer_disabled
+            && super::layer_toggle::is_layer_disabled(&layer.name)
+        {
             continue;
         }
         for group in &layer.groups {

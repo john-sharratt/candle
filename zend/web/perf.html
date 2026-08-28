@@ -33,6 +33,7 @@
     --ph-decode:#34d399; --ph-prefill:#38bdf8; --ph-section:#818cf8;
     --ph-projection:#c084fc; --ph-sealing:#fbbf24; --ph-eviction:#f87171; --ph-allocation:#94a3b8;
     --ph-blocked:#ec4899; --ph-idle:#334155; --ph-sync:#e11d48;
+    --ph-requests:#2dd4bf; --ph-housekeeping:#a3e635;
     --weights:#fb923c; --slack:#64748b; --freevram:#1f2a37;
     --ok:#34d399; --warn:#fbbf24; --crit:#f87171;
     --mono:ui-monospace,"SF Mono","Cascadia Code","Cascadia Mono",Consolas,"Roboto Mono",monospace;
@@ -476,7 +477,7 @@ function roundRect(g,x,y,w,h,r){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,
 // The inference phases carry a token volume + seqs; the memory / overhead phases
 // carry bytes / counts / ms. Both hang off one wave-window record (PG entry).
 const INF=['decode','prefill','section'];                 // token-volume phases, stacked
-const MEM=['projection','sealing','eviction','allocation','sync','idle','blocked']; // overhead phases
+const MEM=['projection','sealing','eviction','allocation','requests','housekeeping','sync','idle','blocked']; // overhead phases
 const phc=k=>cssvar('--ph-'+k);
 const tokps=p=>(p&&p.dur>0)?p.tok/(p.dur/1000):0;
 const miB=b=>b/(1024*1024);
@@ -627,7 +628,9 @@ function buildPhaseLegend(){
   const el=document.getElementById('phlegend'); if(!el||el.dataset.built) return; el.dataset.built='1';
   const lab={decode:'decode (small)',prefill:'prefill (large)',section:'section ingest',
     eviction:'eviction',sealing:'sealing',projection:'projection',allocation:'allocation',
-    sync:'sync (GPU/persist wait)',blocked:'blocked',idle:'idle'};
+    requests:'requests (slot create/install/restore)',
+    housekeeping:'housekeeping (admission/promote/demote/harvest)',
+    sync:'sync (GPU/persist wait)',blocked:'blocked (unattributed)',idle:'idle'};
   el.innerHTML=[...INF,...MEM].map(k=>
     `<span style="color:var(--ph-${k})"><i style="background:var(--ph-${k})"></i>${lab[k]}</span>`).join('');
 }

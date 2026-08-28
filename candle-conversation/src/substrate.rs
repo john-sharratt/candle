@@ -2380,10 +2380,17 @@ impl Substrate {
         }
         let mut ingest_residence: std::collections::HashSet<ResidenceIndex> =
             std::collections::HashSet::new();
-        for (tl, entry) in self.timelines.iter() {
-            if !ingest_timelines.contains(tl) {
+        // Driven by the ingest set, not by a scan of every registered timeline.
+        // The old form walked the whole timeline map to pick out the ingest ones,
+        // so the cost grew with the size of the substrate rather than with the
+        // ingest working set — on a workspace with thousands of ingested units
+        // that is a full map walk per pressured wave. Same set either way: a
+        // timeline had to be both registered and in `ingest_timelines` to be
+        // considered, which is exactly what the lookup below yields.
+        for tl in ingest_timelines {
+            let Some(entry) = self.timelines.get(tl) else {
                 continue;
-            }
+            };
             let n = entry.turns.len();
             let cutoff = n.saturating_sub(keep_recent);
             for (i, turn_data) in entry.turns.values().enumerate() {
@@ -3801,18 +3808,43 @@ impl Substrate {
         &mut self,
         timeline: TimelineId,
         write: TurnPartWrite,
-        mut migrate_to_cpu: impl FnMut(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
+        migrate_to_cpu: impl FnMut(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
     ) -> candle::Result<TurnIndex> {
-        // `Some(_)` (even an empty vec) means "this turn claims
-        // sealed bytes — run the migration to get the CPU side."
-        // `None` means "no bytes at all."  Empty input to migrate
-        // is legitimate: callers in the GPU-less test paths pass an
-        // empty `sealed_gpu` and rely on the migration closure to
-        // produce the canonical CPU content.
-        let sealed_cpu = match write.sealed_gpu.as_ref() {
-            Some(g) => migrate_to_cpu(g)?,
-            None => Vec::new(),
-        };
+        let sealed_cpu = Self::migrate_sealed(&write, migrate_to_cpu)?;
+        self.append_migrated(timeline, write, sealed_cpu)
+    }
+
+    /// Run a turn's GPU→CPU migration, without needing `&mut self`.
+    ///
+    /// Split out so a caller holding the substrate behind a lock can migrate
+    /// FIRST and take the lock only for the insert — see
+    /// [`Self::append_migrated`]. The migration moves K/V off the device, so
+    /// doing it inside the write lock held every sealed turn serialised the
+    /// copy against every reader and writer of the substrate.
+    ///
+    /// `Some(_)` (even an empty vec) means "this turn claims sealed bytes — run
+    /// the migration to get the CPU side." `None` means "no bytes at all."
+    /// Empty input to migrate is legitimate: callers in the GPU-less test paths
+    /// pass an empty `sealed_gpu` and rely on the migration closure to produce
+    /// the canonical CPU content.
+    pub fn migrate_sealed(
+        write: &TurnPartWrite,
+        mut migrate_to_cpu: impl FnMut(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
+    ) -> candle::Result<Vec<SealedSequence>> {
+        match write.sealed_gpu.as_ref() {
+            Some(g) => migrate_to_cpu(g),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// [`Self::append_complete`] with the migration already done — the part that
+    /// genuinely needs exclusive access to the substrate.
+    pub fn append_migrated(
+        &mut self,
+        timeline: TimelineId,
+        write: TurnPartWrite,
+        sealed_cpu: Vec<SealedSequence>,
+    ) -> candle::Result<TurnIndex> {
         let idx = self
             .timelines
             .get(&timeline)
@@ -6097,6 +6129,32 @@ mod tests {
             sub.residence[t3.0].hot.is_some(),
             "target met → t3 kept hot"
         );
+    }
+
+    /// An ingest timeline that was never registered must be skipped, not
+    /// panic — and must not stop the registered ones being demoted.
+    ///
+    /// This case only became reachable when the walk was driven by the ingest
+    /// set instead of by the timeline map: the old form iterated registered
+    /// timelines and filtered, so an unregistered id could not be visited at
+    /// all. Driving from the set means the lookup can miss, and the miss has to
+    /// be tolerated.
+    #[test]
+    fn demote_cold_ingest_skips_unregistered_ingest_timeline() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_, a) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, b) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+
+        let mut ingest = std::collections::HashSet::new();
+        ingest.insert(timeline);
+        // Never registered on this substrate.
+        ingest.insert(TimelineId::from_raw(4242).unwrap());
+
+        let report = sub.demote_cold_ingest(&ingest, &[], &[], 0, u64::MAX);
+        assert_eq!(report.count, 2, "the registered ingest turns still demote");
+        for r in [a, b] {
+            assert!(sub.residence[r.0].hot.is_none(), "demoted");
+        }
     }
 
     /// A timeline NOT in the ingest set is never touched — the demotion is scoped

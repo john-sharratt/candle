@@ -2,7 +2,82 @@ use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, Thrott
 use super::prefill::VramPhase;
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
+
+/// Per-sub-step housekeeping timers (microseconds), swapped out and logged at
+/// each wave-window flush. The `housekeeping` phase is one band on the
+/// dashboard; these decompose it so a regression can be pinned to the step that
+/// caused it rather than to the aggregate.
+static HOUSE_PROMOTE_US: AtomicU64 = AtomicU64::new(0);
+static HOUSE_ADMIT_US: AtomicU64 = AtomicU64::new(0);
+static HOUSE_DEMOTE_US: AtomicU64 = AtomicU64::new(0);
+static HOUSE_GPUDRAIN_US: AtomicU64 = AtomicU64::new(0);
+
+/// Which completion path inside `promote_finished_prefills_to_decodes` a span
+/// belongs to — that step dominates housekeeping, so it is decomposed further.
+pub(super) enum PromoteStep {
+    Finalise,
+    Reprefill,
+    Compression,
+}
+
+static PROMOTE_FINALISE_US: AtomicU64 = AtomicU64::new(0);
+static PROMOTE_REPREFILL_US: AtomicU64 = AtomicU64::new(0);
+static PROMOTE_COMPRESSION_US: AtomicU64 = AtomicU64::new(0);
+
+/// Record one completion-path span (microseconds).
+pub(super) fn note_promote_split(step: PromoteStep, us: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match step {
+        PromoteStep::Finalise => PROMOTE_FINALISE_US.fetch_add(us, Relaxed),
+        PromoteStep::Reprefill => PROMOTE_REPREFILL_US.fetch_add(us, Relaxed),
+        PromoteStep::Compression => PROMOTE_COMPRESSION_US.fetch_add(us, Relaxed),
+    };
+}
+
+static REPREFILL_WRITE_US: AtomicU64 = AtomicU64::new(0);
+static REPREFILL_TRUNC_US: AtomicU64 = AtomicU64::new(0);
+
+/// Record one turn-reprefill seal's split: the substrate write vs the slot
+/// truncate that follows it.
+pub(super) fn note_reprefill_split(write_us: u64, trunc_us: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    REPREFILL_WRITE_US.fetch_add(write_us, Relaxed);
+    REPREFILL_TRUNC_US.fetch_add(trunc_us, Relaxed);
+}
+
+/// Drain the reprefill-seal split, in ms, as `(write, truncate)`.
+pub(super) fn take_reprefill_split() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        REPREFILL_WRITE_US.swap(0, Relaxed) / 1000,
+        REPREFILL_TRUNC_US.swap(0, Relaxed) / 1000,
+    )
+}
+
+/// Drain the promote-path sub-timers, in ms, as
+/// `(finalise, reprefill, compression)`.
+pub(super) fn take_promote_split() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PROMOTE_FINALISE_US.swap(0, Relaxed) / 1000,
+        PROMOTE_REPREFILL_US.swap(0, Relaxed) / 1000,
+        PROMOTE_COMPRESSION_US.swap(0, Relaxed) / 1000,
+    )
+}
+
+/// Drain the housekeeping sub-timers, in milliseconds, as
+/// `(promote, admit, demote, gpu_drain)`.
+pub(super) fn take_housekeeping_split() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        HOUSE_PROMOTE_US.swap(0, Relaxed) / 1000,
+        HOUSE_ADMIT_US.swap(0, Relaxed) / 1000,
+        HOUSE_DEMOTE_US.swap(0, Relaxed) / 1000,
+        HOUSE_GPUDRAIN_US.swap(0, Relaxed) / 1000,
+    )
+}
 
 /// Wall-clock ceiling for one decode quantum ("wave"). The quantum is CLIPPED to
 /// this whether or not decode has finished — unfinished sequences persist in
@@ -315,7 +390,13 @@ impl Scheduler {
                 };
                 self.wave_stats
                     .add_idle(t_idle.elapsed().as_millis() as u64);
-                if !self.handle_request(req) {
+                // The handling itself is Requests, not Idle — it is work, and
+                // leaving it untimed put it in the Blocked remainder.
+                let t_req = Instant::now();
+                let keep_going = self.handle_request(req);
+                self.wave_stats
+                    .add_requests(t_req.elapsed().as_micros() as u64);
+                if !keep_going {
                     break;
                 }
                 continue;
@@ -361,6 +442,13 @@ impl Scheduler {
                 self.timed_section();
                 self.timed_decode();
             }
+            // Everything from here to the bottom of the iteration is per-wave
+            // housekeeping that runs OUTSIDE the five timed quanta: promotion of
+            // finished prefills, ingest admission regulation, cold-ingest demote,
+            // the AIMD budget walk, and the GPU span harvest. None of it was
+            // timed, so all of it fell into the unattributed remainder and drew
+            // as "blocked" — which is what made that band large and unexplained.
+            let t_house = Instant::now();
             let (no_ticket, arena_full) = declines.bytes_since();
             publish_wave_declines(no_ticket, arena_full);
             #[cfg(feature = "forbidden_allocations")]
@@ -388,7 +476,12 @@ impl Scheduler {
             // "no forwards". Idempotent and cheap when nothing finished.
             {
                 let _g = profile::span("loop:promote_finished");
+                let t = Instant::now();
                 self.promote_finished_prefills_to_decodes();
+                HOUSE_PROMOTE_US.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
 
             // Per-wave ingest backpressure + gentle demote. These are cheap (an
@@ -405,11 +498,21 @@ impl Scheduler {
             // `used` holds at the demote watermark instead of climbing.
             {
                 let _g = profile::span("loop:ingest_admission");
+                let t = Instant::now();
                 self.regulate_ingest_admission();
+                HOUSE_ADMIT_US.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             {
                 let _g = profile::span("loop:demote_cold_ingest");
+                let t = Instant::now();
                 self.demote_cold_ingest_if_pressured();
+                HOUSE_DEMOTE_US.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
 
             // AIMD reopen (non-ingest): if a prior pressure episode cut the
@@ -467,7 +570,17 @@ impl Scheduler {
             // up to its high-water mark, and the span that was meant to cost two
             // enqueues starts blocking instead. The bench harness drains at its
             // config boundary; the wave loop is this process's equivalent.
+            let t_gpu = Instant::now();
             candle_transformers::models::profile::gpu_drain();
+            HOUSE_GPUDRAIN_US.fetch_add(
+                t_gpu.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // Closed BEFORE the flush block: the flush is the window boundary
+            // itself, and its own cost is already accounted (eviction/sync carve
+            // out of the remainder), so folding it in here would double-count.
+            self.wave_stats
+                .add_housekeeping(t_house.elapsed().as_micros() as u64);
 
             // Flush the wave summary + phase breakdown if its 2 s window
             // elapsed — even when no forward ran this iteration, so stalls still
