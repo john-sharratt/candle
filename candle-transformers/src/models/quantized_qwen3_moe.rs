@@ -2177,12 +2177,19 @@ impl ModelWeights {
                         .checked_div(slot_bytes)
                         .map_or(0, |n| n.min(total_experts))
                 };
-                let capacity = slots_in(initial_bytes);
-                let limit = slots_in(limit_bytes);
                 // The zone's floor, and the only bound on how much expert
                 // residency the KV side can buy — so it is the pinning rule's
                 // own arithmetic, not a fraction of wherever the boundary opened.
                 let floor = minimum_resident_slots(n_expert);
+                // **Opened at the floor at least**, as the qwen35 loader does.
+                // `PINNED_LAYERS` is a constant now, so a cache below the floor
+                // cannot shed pinned layers to cope — it fills with experts the
+                // eviction scan may not touch and then fails every load. Ground
+                // taken here is given back by the elastic boundary once the KV
+                // side shows what it really uses; opening below the floor is not
+                // a slower engine but a stopped one.
+                let capacity = slots_in(initial_bytes).max(floor).min(total_experts);
+                let limit = slots_in(limit_bytes).max(capacity);
                 let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit, floor);
                 // Place the boundary. Everything left of it belongs to the KV
                 // side, and the region count is re-derived from it here rather

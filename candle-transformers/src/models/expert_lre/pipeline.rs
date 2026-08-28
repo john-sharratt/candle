@@ -68,7 +68,7 @@
 //! when the mmap is *not* fully pinned (e.g. insufficient system RAM to
 //! pin the entire file).
 
-use super::cache::ExpertCacheInner;
+use super::cache::{pinned_layer_count, ExpertCacheInner};
 #[cfg(not(feature = "cuda"))]
 use super::compute::compute_expert_contribution_gpu_weights;
 #[cfg(feature = "cuda")]
@@ -102,7 +102,7 @@ use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, weight_floor_after
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaEvent, CudaStream};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 // ============================================================================
@@ -189,31 +189,43 @@ pub(crate) struct StartupTargets<'a> {
     pub geoms: &'a [LayerGeometry],
     pub layouts: &'a [RecordLayout],
     pub stride: usize,
+    /// The checkpoint, and where each expert's projections sit in it.
+    ///
+    /// Both entry points repack from here: the first-boot path for every expert,
+    /// the restart path for the pinned prefix alone — those experts have no
+    /// record in the pack, so the GGUF is the only place their bytes exist.
+    pub mmap: &'a [u8],
+    pub host_refs: &'a [Vec<MmapExpertRef>],
 }
 
 /// Repack every expert out of the GGUF, write the pack, and fill both resident
 /// tiers from the bytes as they pass through.
 ///
 /// This is the first-boot path and the only one that pays the ~42 s repack. It
-/// writes every expert to the pack — including the ones that go straight to
-/// VRAM — because the pack is authoritative: an expert that exists only in a
-/// VRAM slot could not be evicted without losing it, which is the defect this
-/// whole design removes.
+/// writes every **evictable** expert to the pack, including ones that also go
+/// straight to VRAM: an expert that exists only in a VRAM slot could not be
+/// evicted without losing it, which is the defect this whole design removes.
+///
+/// The exception is the pinned prefix (`cache::PINNED_LAYERS` leading layers),
+/// which is never evicted and so is never reloaded. Those experts are repacked
+/// and installed in VRAM here like any other, and then dropped rather than
+/// written — the pack's invariant is that it holds every expert *that can be
+/// evicted*, and storing the rest is dead disk and a dead warm slot.
 #[cfg(feature = "cuda")]
 pub(crate) fn startup_repack(
     t: StartupTargets<'_>,
     writer: &mut PackWriter,
-    mmap: &[u8],
-    host_refs: &[Vec<MmapExpertRef>],
     cuda_dev: &candle::CudaDevice,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<()> {
+    let (mmap, host_refs) = (t.mmap, t.host_refs);
     let num_moe_layers = host_refs.len();
     let num_experts = host_refs.first().map_or(0, |l| l.len());
     if num_moe_layers == 0 || num_experts == 0 {
         return Ok(());
     }
     let total_experts = num_moe_layers * num_experts;
+    let pinned = pinned_layer_count(num_moe_layers);
     // Warm slot for each expert, so the fill can place bytes as they go by
     // rather than re-reading them afterwards.
     let mut warm_slot_of: Vec<Vec<Option<usize>>> = vec![vec![None; num_experts]; num_moe_layers];
@@ -242,7 +254,11 @@ pub(crate) fn startup_repack(
             // record of zeroes reads back as a plausible expert. There is no
             // partial answer here: the pack is authoritative or it is nothing.
             let (gate, up, down) = repack_expert_projections(mmap, r, geom, cuda_dev)?;
-            writer.write_expert(moe_idx, expert_idx, &gate, &up, &down)?;
+            // The pinned prefix goes straight to VRAM and stays there, so it
+            // gets no record: nothing can ever ask the pack for it.
+            if moe_idx >= pinned {
+                writer.write_expert(moe_idx, expert_idx, &gate, &up, &down)?;
+            }
 
             let mut res = ExpertResidency::default();
             if let Some(warm_slot) = warm_slot_of[moe_idx][expert_idx] {
@@ -309,10 +325,24 @@ pub(crate) fn startup_from_pack(
     cuda_dev: &candle::CudaDevice,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<()> {
+    let (mmap, host_refs) = (t.mmap, t.host_refs);
     if num_moe_layers == 0 || num_experts == 0 {
         return Ok(());
     }
     let total_experts = num_moe_layers * num_experts;
+    let pinned = pinned_layer_count(num_moe_layers);
+    // The pack was written by a build that agreed on the pinned depth. If it
+    // does not, its record indices are shifted against ours and every read past
+    // the prefix would return a neighbouring expert's weights — plausible
+    // numbers, wrong model. `open_or_create` rebuilds on an identity mismatch;
+    // this is the one field that is ours rather than the checkpoint's.
+    if pack.pinned_layers() != pinned {
+        candle::bail!(
+            "expert pack pins {} leading layers, this build pins {pinned} — the record \
+             indices disagree. Delete the pack to rebuild it.",
+            pack.pinned_layers(),
+        );
+    }
     let t0 = std::time::Instant::now();
 
     // ── Warm tier: every membership record at once, at full queue depth ──
@@ -350,6 +380,12 @@ pub(crate) fn startup_from_pack(
     let stream = cuda_dev.cuda_stream();
     let mut vram_count = 0usize;
     let mut cold_reads = 0usize;
+    let mut repacked = 0usize;
+    // The indices address four parallel collections (`geoms`, `layouts`,
+    // `host_refs`, `residency`) and identify the expert in the progress callback
+    // and the slot install, so they are the subject here rather than an artefact
+    // of iterating one of them.
+    #[allow(clippy::needless_range_loop)]
     'fill: for moe_idx in 0..num_moe_layers {
         let geom = &t.geoms[moe_idx];
         let layout = t.layouts[moe_idx];
@@ -358,6 +394,28 @@ pub(crate) fn startup_from_pack(
                 break 'fill;
             };
             let slot_base = t.inner.slot_base(slot_idx);
+            // The pinned prefix has no record in either host tier — it is
+            // permanently resident, so nothing ever reloads it and storing it
+            // would be dead bytes. Its one load is here, from the checkpoint.
+            if moe_idx < pinned {
+                let r = &host_refs[moe_idx][expert_idx];
+                let (gate, up, down) = repack_expert_projections(mmap, r, geom, cuda_dev)?;
+                // SAFETY: `slot_idx` was just handed out by the zone and is not
+                // reclaimed while this runs.
+                let slot = unsafe {
+                    build_slot_from_repacked_with_device(
+                        &gate, &up, &down, geom, cuda_dev, slot_base,
+                    )?
+                };
+                t.inner.install(slot_idx, moe_idx, expert_idx, slot);
+                t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
+                vram_count += 1;
+                repacked += 1;
+                if let Some(cb) = progress {
+                    cb(moe_idx * num_experts + expert_idx + 1, total_experts);
+                }
+                continue;
+            }
             // SAFETY (both arms): `slot_idx` was just handed out by the zone and
             // is not reclaimed while this runs.
             let slot = match t.residency[moe_idx][expert_idx].ram {
@@ -411,11 +469,12 @@ pub(crate) fn startup_from_pack(
         secs = t0.elapsed().as_secs_f64(),
         vram_count,
         cold_reads,
+        repacked,
         warm_slots = t.membership.len(),
         warm_gib = t.warm.total_bytes() as f64 / 1e9,
         staging_mib = staging.total_bytes() as f64 / 1e6,
         pack = %pack.path().display(),
-        "startup: filled from the pack — no repack this boot"
+        "startup: filled from the pack — only the resident prefix was repacked"
     );
     Ok(())
 }
@@ -542,6 +601,52 @@ pub(crate) fn slot_bytes_for(geoms: &[LayerGeometry]) -> usize {
 /// offered nothing at all.
 #[cfg(feature = "cuda")]
 const KV_REGION_SLACK: usize = 32;
+
+/// Why a growth negotiation ended where it did.
+///
+/// The boundary is asked to grow once per wave and answers zero almost every
+/// time, and the reasons are not interchangeable: "the KV side reports no spare"
+/// wants the spare calculation looked at, "the floor refused" wants the call
+/// site moved, and "the target did not change" wants the region→slot conversion
+/// looked at. Without the split, all three read as "growth does not work".
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+pub(crate) enum GrowOutcome {
+    Asked,
+    NoSpare,
+    SpareOffered(usize),
+    TargetUnchanged,
+    TargetWentBackwards,
+    FloorRefused,
+    AtLimit,
+    Gained(usize),
+}
+
+/// Tallies for [`GrowOutcome`], in its variant order.
+#[cfg(feature = "cuda")]
+static GROW_TALLY: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+#[cfg(feature = "cuda")]
+pub(crate) fn grow_note(outcome: GrowOutcome) {
+    let (idx, add) = match outcome {
+        GrowOutcome::Asked => (0, 1),
+        GrowOutcome::NoSpare => (1, 1),
+        GrowOutcome::SpareOffered(n) => (2, n as u64),
+        GrowOutcome::TargetUnchanged => (3, 1),
+        GrowOutcome::TargetWentBackwards => (4, 1),
+        GrowOutcome::FloorRefused => (5, 1),
+        GrowOutcome::AtLimit => (6, 1),
+        GrowOutcome::Gained(n) => (7, n as u64),
+    };
+    GROW_TALLY[idx].fetch_add(add, Ordering::Relaxed);
+}
+
+/// `(asked, no_spare, spare_regions_offered, target_unchanged, target_backwards,
+/// floor_refused, at_limit, slots_gained)` since boot.
+#[cfg(feature = "cuda")]
+pub fn grow_tally() -> [u64; 8] {
+    std::array::from_fn(|i| GROW_TALLY[i].load(Ordering::Relaxed))
+}
 
 /// Wrap an already-populated slot at `slot_base` as an `ExpertSlot`, without
 /// moving any bytes.
@@ -2313,12 +2418,18 @@ impl PipelineState {
         // One conversion, one direction: regions the KV side is short (positive
         // ⇒ the floor moves right, the weight side shrinks) or holding spare
         // (negative ⇒ the floor moves left, the weight side grows).
+        let growing = matches!(want, Some(0) | None);
+        if growing {
+            grow_note(GrowOutcome::Asked);
+        }
         let delta = match want {
             Some(0) | None => {
                 let spare = kv_spare_regions(&stream, KV_REGION_SLACK)?;
                 if spare == 0 {
+                    grow_note(GrowOutcome::NoSpare);
                     return Ok(0);
                 }
+                grow_note(GrowOutcome::SpareOffered(spare));
                 -(spare as isize)
             }
             Some(wanted) => wanted as isize,
@@ -2327,7 +2438,13 @@ impl PipelineState {
         let before = self.inner.zone.capacity();
         let target = self.inner.zone.capacity_for_frontier(floor);
         if target == before {
+            if growing {
+                grow_note(GrowOutcome::TargetUnchanged);
+            }
             return Ok(0);
+        }
+        if growing && target < before {
+            grow_note(GrowOutcome::TargetWentBackwards);
         }
 
         if target > self.inner.zone.capacity() {
@@ -2358,13 +2475,24 @@ impl PipelineState {
             // nothing yet moved, and the next pass tries again.
             let grown_floor = self.inner.zone.frontier_after_growth(target);
             let gained = if grown_floor < self.inner.zone.frontier_for_capacity() {
-                set_weight_floor(&stream, grown_floor)?;
-                self.inner.grow_zone(target)
+                match set_weight_floor(&stream, grown_floor) {
+                    Ok(_) => self.inner.grow_zone(target),
+                    Err(e) => {
+                        // The one refusal that lands here: a wave generation is
+                        // open on the span. Counted rather than swallowed —
+                        // "asked and was refused" and "asked and there was
+                        // nothing" are different diagnoses with different fixes.
+                        grow_note(GrowOutcome::FloorRefused);
+                        return Err(e);
+                    }
+                }
             } else {
                 // `grow_to` clamps to the zone's limit, so a target past it moves
                 // no boundary and must publish none.
+                grow_note(GrowOutcome::AtLimit);
                 0
             };
+            grow_note(GrowOutcome::Gained(gained));
             if gained > 0 {
                 tracing::debug!(
                     target: "candle_transformers::expert_lre",
@@ -2817,13 +2945,11 @@ impl PipelineState {
                 // chain the next hop from.
                 break;
             }
-            // Don't LOAD into a pinned layer — its experts are always
-            // resident (the pinned head layers run first every pass with no
-            // compute to hide a reload, so they stay permanently pinned). The
-            // prediction still chains through it. The count is the cache's own
-            // (`affordable_pinned_layers` of the current capacity), not the
-            // constant — on a cache too small to pin three layers it can be
-            // fewer, or zero, and then every layer is prefetchable.
+            // Don't LOAD into a pinned layer — every one of its experts is
+            // already resident and cannot be otherwise (the head layers run
+            // first every pass with no compute to hide a reload, so they stay
+            // permanently pinned, and neither host tier even holds a copy to
+            // reload from). The prediction still chains through it.
             if target_layer >= self.inner.pinned_layers {
                 let fence = self.prefetch_into(moe_layer_idx, target_layer, &predicted)?;
                 self.record_prefetch_fence(target_layer, fence);

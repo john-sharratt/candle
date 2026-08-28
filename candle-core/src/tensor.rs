@@ -387,6 +387,24 @@ impl<'w> LiveTensor<'w> {
         Ok(from_storage(storage, shape, none, is_variable))
     }
 
+    /// Report a device allocation that **cannot** carry wave provenance.
+    ///
+    /// `zeros`, `ones`, `full`, `arange`, `new` and `from_vec` build a tensor
+    /// from nothing — there is no operand to inherit a ticket from, so the
+    /// result is always `Backing::Owned`. Outside a wave that is exactly right
+    /// (weights, masks, tables). Inside one it is a root provenance break: the
+    /// tensor comes from the driver rather than the reservation, and every
+    /// tensor derived from it afterwards inherits `Owned` and does the same.
+    ///
+    /// `#[track_caller]` means the location reported is the *caller's* — the
+    /// model line that built the tensor — with no stack walk and no symbol
+    /// resolution, and correct under inlining. The detector is armed only around
+    /// a wave, so this is one relaxed load everywhere else.
+    #[track_caller]
+    fn note_ticketless(what: &'static str, bytes: usize) {
+        crate::forbidden_alloc::record_at(std::panic::Location::caller(), what, bytes);
+    }
+
     /// Creates a new tensor filled with ones.
     ///
     /// ```rust
@@ -396,7 +414,10 @@ impl<'w> LiveTensor<'w> {
     /// // a == b
     /// # Ok::<(), candle_core::Error>(())
     /// ```
+    #[track_caller]
     pub fn ones<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
+        let shape = shape.into();
+        Self::note_ticketless("Tensor::ones", shape.elem_count() * dtype.size_in_bytes());
         Self::ones_impl(shape, dtype, device, false)
     }
 
@@ -421,6 +442,7 @@ impl<'w> LiveTensor<'w> {
     /// // b == a + 1
     /// # Ok::<(), candle_core::Error>(())
     /// ```
+    #[track_caller]
     pub fn ones_like(&self) -> Result<Self> {
         Tensor::ones(self.shape(), self.dtype(), self.device())
     }
@@ -448,7 +470,10 @@ impl<'w> LiveTensor<'w> {
     /// // a == b
     /// # Ok::<(), candle_core::Error>(())
     /// ```
+    #[track_caller]
     pub fn zeros<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
+        let shape = shape.into();
+        Self::note_ticketless("Tensor::zeros", shape.elem_count() * dtype.size_in_bytes());
         Self::zeros_impl(shape, dtype, device, false)
     }
 
@@ -462,6 +487,7 @@ impl<'w> LiveTensor<'w> {
     /// // b is on CPU f32.
     /// # Ok::<(), candle_core::Error>(())
     /// ```
+    #[track_caller]
     pub fn zeros_like(&self) -> Result<Self> {
         Tensor::zeros(self.shape(), self.dtype(), self.device())
     }
@@ -495,14 +521,28 @@ impl<'w> LiveTensor<'w> {
     /// into.
     ///
     /// Carries the same write-before-read contract as [`Self::empty`].
+    #[track_caller]
     pub fn empty_beside<S: Into<Shape>>(&self, shape: S, dtype: DType) -> Result<Self> {
         let shape = shape.into();
+        let ticket = self.wave_ticket();
+        // **"Beside" is a request, not a guarantee.** The output lands on the
+        // wave span only if the operand is itself leased from it; an operand
+        // that is `Owned` silently yields an owned output, and every tensor
+        // derived from it afterwards is owned too. That is how one broken
+        // provenance root becomes dozens of "sites" in a report.
+        //
+        // Named here, with the caller's own file and line, because that is the
+        // only place the answer is cheap and exact.
+        if ticket.is_none() {
+            crate::forbidden_alloc::record_at(
+                std::panic::Location::caller(),
+                "empty_beside on an operand with no wave ticket",
+                shape.elem_count() * dtype.size_in_bytes(),
+            );
+        }
         // SAFETY: as `empty` — the caller's kernel writes every element before
         // anything reads it.
-        let storage = unsafe {
-            self.device()
-                .alloc_uninit_from(&shape, dtype, self.wave_ticket())?
-        };
+        let storage = unsafe { self.device().alloc_uninit_from(&shape, dtype, ticket)? };
         Ok(from_storage(storage, shape, BackpropOp::none(), false))
     }
 
@@ -596,6 +636,10 @@ impl<'w> LiveTensor<'w> {
         Self::randn_impl(mean, std, s, device, false)
     }
 
+    /// `#[track_caller]` so the site reported from inside is the model's, not
+    /// `Tensor::new`'s — the attribute only propagates through functions that
+    /// carry it.
+    #[track_caller]
     pub(crate) fn new_impl<A: crate::device::NdArray>(
         array: A,
         shape: Shape,
@@ -608,11 +652,17 @@ impl<'w> LiveTensor<'w> {
             return Err(Error::ShapeMismatch { buffer_size, shape }.bt());
         }
         let storage = device.storage(array)?;
+        // Reported here rather than in `new`: `NdArray` carries no dtype, so the
+        // element size is not knowable until the storage exists. Reporting the
+        // element *count* as bytes instead was 4x under for F32 — in the very
+        // report the rest of this work is justified by.
+        Self::note_ticketless("Tensor::new", n * storage.dtype().size_in_bytes());
         let none = BackpropOp::none();
         Ok(from_storage(storage, shape, none, is_variable))
     }
 
     /// Creates a new tensor on the specified device using the content and shape of the input.
+    #[track_caller]
     pub fn new<A: crate::device::NdArray>(array: A, device: &Device) -> Result<Self> {
         let shape = array.shape()?;
         Self::new_impl(array, shape, device, false)
@@ -628,6 +678,7 @@ impl<'w> LiveTensor<'w> {
     ///     [3.5, 3.5, 3.5, 3.5],
     /// ]);
     /// # Ok::<(), candle_core::Error>(())
+    #[track_caller]
     pub fn full<D: crate::WithDType, S: Into<Shape>>(
         value: D,
         shape: S,
@@ -635,6 +686,10 @@ impl<'w> LiveTensor<'w> {
     ) -> Result<Self> {
         let none = BackpropOp::none();
         let shape = shape.into();
+        Self::note_ticketless(
+            "Tensor::full",
+            shape.elem_count() * D::DTYPE.size_in_bytes(),
+        );
         let mut storage = unsafe { device.alloc_uninit(&shape, D::DTYPE)? };
         let layout = Layout::contiguous(shape.clone());
         storage.const_set(value.to_scalar(), &layout)?;
@@ -667,6 +722,7 @@ impl<'w> LiveTensor<'w> {
     /// assert_eq!(a.to_vec1::<f64>()?, &[2., 3., 4.]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
+    #[track_caller]
     pub fn arange<D: crate::WithDType>(start: D, end: D, device: &Device) -> Result<Self> {
         Self::arange_step(start, end, D::one(), device)
     }
@@ -680,6 +736,7 @@ impl<'w> LiveTensor<'w> {
     /// assert_eq!(a.to_vec1::<f64>()?, &[2.0, 2.5, 3.0, 3.5]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
+    #[track_caller]
     pub fn arange_step<D: crate::WithDType>(
         start: D,
         end: D,
@@ -689,6 +746,11 @@ impl<'w> LiveTensor<'w> {
         if D::is_zero(&step) {
             bail!("step cannot be zero")
         }
+        // Reported below, where the length is known: an arange's element count
+        // falls out of building it, and both of its paths (the native integer
+        // generator and the host loop) end at a `len` this can be taken from.
+        // Reporting a literal `0` here instead made the tally's arange rows
+        // unreadable.
         // Integer aranges generate ON DEVICE where the backend supports it: these are
         // hot-path gather indices, and building them on the host costs a tiny H2D
         // upload per call (a measured WDDM submission storm). `start + i*step` is
@@ -719,6 +781,7 @@ impl<'w> LiveTensor<'w> {
                 }
             }
             if let Some(storage) = device.arange_int_native(D::DTYPE, start_bits, step_bits, len)? {
+                Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes());
                 return Ok(from_storage(storage, len, BackpropOp::none(), false));
             }
         }
@@ -736,6 +799,7 @@ impl<'w> LiveTensor<'w> {
             }
         }
         let len = data.len();
+        Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes());
         Self::from_vec_impl(data, len, device, false)
     }
 
@@ -764,12 +828,46 @@ impl<'w> LiveTensor<'w> {
     /// ]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
+    #[track_caller]
     pub fn from_vec<S: ShapeWithOneHole, D: crate::WithDType>(
         data: Vec<D>,
         shape: S,
         device: &Device,
     ) -> Result<Self> {
+        Self::note_ticketless("Tensor::from_vec", data.len() * D::DTYPE.size_in_bytes());
         Self::from_vec_impl(data, shape, device, false)
+    }
+
+    /// [`Self::from_vec`], placed on the same wave span as `self`.
+    ///
+    /// The host-upload counterpart to [`Self::empty_beside`]. A table built on
+    /// the host — a pointer array, a row map, a rotary layout — has no device
+    /// operand to inherit provenance from, so `from_vec` can only ever produce
+    /// an `Owned` tensor: a driver allocation, inside the wave, from the memory
+    /// the reservation deliberately does not cover. Naming an operand that is
+    /// already on the span is what puts the upload there instead.
+    ///
+    /// `self` need only identify the span; its shape and dtype are irrelevant.
+    /// If `self` is itself owned this is exactly [`Self::from_vec`] — the report
+    /// then names *this* call site, which is the honest answer, because the
+    /// provenance was already lost upstream.
+    #[cfg(feature = "cuda")]
+    #[track_caller]
+    pub fn from_vec_beside<S: ShapeWithOneHole, D: crate::WithDType>(
+        &self,
+        data: Vec<D>,
+        shape: S,
+    ) -> Result<Self> {
+        let ticket = self.wave_ticket();
+        if ticket.is_none() {
+            Self::note_ticketless(
+                "from_vec_beside on an operand with no wave ticket",
+                data.len() * D::DTYPE.size_in_bytes(),
+            );
+        }
+        let shape = shape.into_shape(data.len())?;
+        let storage = self.device().storage_owned_on(data, ticket)?;
+        Ok(from_storage(storage, shape, BackpropOp::none(), false))
     }
 
     /// Creates a new tensor initialized with values from the input slice. The number of elements

@@ -138,10 +138,11 @@ pub use bump_arena::{
 pub use guard::{expect_kv_range, expect_kv_range_in};
 #[cfg(feature = "cuda")]
 pub use region_pool::{
-    claim_dense, claim_span_region, dense_bytes, ensure_reservation, freeze_dense,
-    initial_weight_bytes, kv_spare_regions, region_stats, set_ground_broker, set_weight_floor,
-    span_end, span_layout, span_region_refusal, weight_capacity_bytes, weight_floor_after,
-    RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,
+    claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
+    freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas, region_stats,
+    set_ground_broker, set_weight_floor, span_end, span_layout, span_region_refusal, spare_tally,
+    weight_capacity_bytes, weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion,
+    REGION_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;

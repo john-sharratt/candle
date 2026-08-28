@@ -43,33 +43,37 @@ use std::collections::HashMap;
 ///
 /// These layers run first every pass and have zero compute to overlap
 /// with DMA — evicting them guarantees cold misses with maximum stall.
-/// A single decode step routes top-8 per layer, so pinning layers 0–2 holds
-/// ~24 experts; a batch wide enough to route everywhere holds all of them, which
+/// A single decode step routes top-8 per layer, so pinning layers 0–1 holds
+/// ~16 experts; a batch wide enough to route everywhere holds all of them, which
 /// is what [`minimum_resident_slots`] prices.
-pub(crate) const PINNED_LAYERS: usize = 3;
+///
+/// # Why this is a constant and not a function of capacity
+///
+/// It used to be derived from the zone's live capacity, so a small card
+/// degraded to less pinning rather than to a cache that could not evict. That
+/// is no longer available, because the pinned set is now **the set of experts
+/// with no host or disk copy at all**: a permanently-resident expert is never
+/// reloaded, so [`pack`](super::pack) omits its record and the warm tier omits
+/// it from the draw. A pinned count that varied with capacity would make a
+/// pack built on one machine unreadable on another — the second machine would
+/// unpin a layer whose records were never written and then fail every load
+/// against it.
+///
+/// So the depth is fixed, and the *floor* is what guarantees it can be paid:
+/// [`minimum_resident_slots`] prices the pinned set plus a full working layer,
+/// and the zone may never retract below it.
+pub(crate) const PINNED_LAYERS: usize = 2;
 
-/// How many early layers this cache can afford to pin, given its size.
+/// How many layers this model actually pins.
 ///
-/// [`PINNED_LAYERS`] is what pinning is *worth*; this is what it may cost.
-/// Pinned experts are un-evictable, so the pinned set is capacity the cache
-/// can never reuse — and the layer currently executing needs room for its own
-/// routed set, which in the worst case is every expert in the layer. Pinning
-/// more layers than `capacity - experts_per_layer` can pay for produces a
-/// cache that fills with un-evictable experts and then fails every load for
-/// the life of the process.
+/// [`PINNED_LAYERS`], except for a model with fewer MoE layers than that — in
+/// which case every layer is pinned and there is no evictable set, the
+/// all-resident case the cache already handles inline.
 ///
-/// On a wide card the reservation is noise and this returns [`PINNED_LAYERS`]
-/// unchanged. It bites on the combination of many experts per layer and a
-/// small card — Qwen3.5-35B-A3B has 256 experts in every one of its 40 layers,
-/// where a 16 GB card affords ~567 slots: three pinned layers would want 769
-/// before serving a token, two would leave the working layer 55 slots against
-/// a possible 256, and one fits with room to run.
-pub(crate) fn affordable_pinned_layers(capacity: usize, experts_per_layer: usize) -> usize {
-    if experts_per_layer == 0 {
-        return 0;
-    }
-    let spare = capacity.saturating_sub(experts_per_layer + 1);
-    PINNED_LAYERS.min(spare / experts_per_layer)
+/// Both the pack writer and the warm-tier draw derive their skip from this, so
+/// a single number decides which experts have a reload path.
+pub(crate) fn pinned_layer_count(num_moe_layers: usize) -> usize {
+    PINNED_LAYERS.min(num_moe_layers)
 }
 
 /// The fewest slots the cache can serve a token with, for a model with
@@ -84,23 +88,26 @@ pub(crate) fn affordable_pinned_layers(capacity: usize, experts_per_layer: usize
 /// from then on fails with "Expert cache full, cannot evict (all pinned)" — for
 /// the life of the process, because nothing in that state can ever free a slot.
 ///
-/// The daemon reached it: the boundary retracted to 297 slots against
-/// 3 × 128 = 384 pinned-eligible, and the next 1,774 wave steps all failed
+/// The daemon reached it: the boundary retracted to 297 slots against a
+/// pinned-eligible set of 384, and the next 1,774 wave steps all failed
 /// identically. This is the number that must never be crossed, and since the
 /// boundary is otherwise free to trade expert residency for KV ground on demand,
 /// it is the **only** thing standing between a hungry KV side and a dead engine.
 ///
-/// One slot on top of the pinned set, so the load that triggered an eviction has
-/// somewhere to land.
+/// Priced as the pinned set **plus a full working layer, plus one**, because
+/// [`PINNED_LAYERS`] is fixed: nothing sheds pinned layers under pressure, so
+/// this floor is all that keeps the eviction scan supplied with candidates. A
+/// zone sitting exactly on it holds every pinned expert, a worst-case routed set
+/// for the layer executing, and one slot for the load that triggered the
+/// eviction to land in.
 ///
-/// Priced from the [`PINNED_LAYERS`] constant — the worst case the pinned set
-/// can ever be — while the live pinned count re-derives from the current
-/// capacity on every boundary move. So this floor is deliberately
-/// conservative: a zone sitting on it always affords at least one pinned
-/// layer plus a full routed set, and a zone retracted toward it sheds pinned
-/// layers before the eviction filter can starve.
+/// The arithmetic is unchanged from when pinning was three capacity-derived
+/// layers and this priced only `3 × n + 1`: two pinned layers plus a working
+/// layer is the same `3 × n`. So no model's boundary placement moves — which
+/// matters, because this number feeds the opening size of every MoE model and
+/// raising it starves the KV side (Qwen3-30B OOMs at load).
 pub fn minimum_resident_slots(experts_per_layer: usize) -> usize {
-    PINNED_LAYERS * experts_per_layer + 1
+    (PINNED_LAYERS + 1) * experts_per_layer + 1
 }
 
 /// How much more an expert with no warm copy is worth keeping, per unit of
@@ -178,12 +185,13 @@ pub struct ExpertCacheInner {
     pub(crate) num_moe_layers: usize,
     /// Experts per MoE layer (e.g. 128).
     pub(crate) experts_per_layer: usize,
-    /// Early MoE layers exempt from eviction — [`affordable_pinned_layers`]
-    /// of this cache's **current** capacity, not the constant and not the
-    /// opening size: re-derived on every boundary move (`grow_zone` /
-    /// `retract_zone`), so a small card running a many-expert model — or a
-    /// wide zone the KV side later shrinks — degrades to less pinning instead
-    /// of to a cache that cannot evict anything.
+    /// Early MoE layers exempt from eviction — [`pinned_layer_count`], fixed
+    /// for the life of the cache and independent of capacity.
+    ///
+    /// It cannot track the boundary, because these are exactly the experts the
+    /// pack and the warm tier do not store: unpinning one would leave it with
+    /// nowhere to reload from. The zone's floor ([`minimum_resident_slots`]) is
+    /// what guarantees the cache can always afford it.
     pub(crate) pinned_layers: usize,
     /// Flat `layer * experts_per_layer + expert` → does a warm (pinned host)
     /// copy of this expert exist?
@@ -211,7 +219,7 @@ impl ExpertCacheInner {
             expert_scores: vec![0.0f32; num_moe_layers * experts_per_layer],
             num_moe_layers,
             experts_per_layer,
-            pinned_layers: affordable_pinned_layers(num_slots, experts_per_layer),
+            pinned_layers: pinned_layer_count(num_moe_layers),
             warm_backed: vec![false; num_moe_layers * experts_per_layer],
         }
     }
@@ -261,6 +269,11 @@ impl ExpertCacheInner {
         self.zone.capacity()
     }
 
+    /// Experts in the model — every MoE layer's full complement.
+    pub(crate) fn total_experts(&self) -> usize {
+        self.num_moe_layers * self.experts_per_layer
+    }
+
     /// Slots not currently holding an expert.
     pub(crate) fn free_len(&self) -> usize {
         self.zone.free_count()
@@ -298,9 +311,6 @@ impl ExpertCacheInner {
             self.slots.resize_with(n, || None);
             self.last_used.resize(n, 0);
             self.slot_to_key.resize(n, None);
-            // The pinned set is a function of capacity, not of the opening
-            // size: a zone that grew can afford to protect more head layers.
-            self.pinned_layers = affordable_pinned_layers(n, self.experts_per_layer);
         }
         gained
     }
@@ -313,17 +323,20 @@ impl ExpertCacheInner {
     /// here are truncated once the caller has moved what it is going to move,
     /// which is why this returns before touching them.
     pub(crate) fn retract_zone(&mut self, target: usize) -> candle_nn::kv_cache::RetractPlan {
-        // Re-derive the pinned set for the capacity the zone is shrinking TO,
-        // before the plan is built. Frozen at the opening size, a retraction
-        // could leave every surviving slot holding a pinned-layer expert — the
-        // `layer >= pinned_layers` eviction filter then matches nothing and the
-        // cache serves the working layer through whatever unpinned remnant is
-        // left (measured on the constant-floor variant of this bug: 1,774
-        // consecutive allocate_slot failures). Shrinking the pinned count only
-        // ever makes more slots evictable, so this is safe in the direction
-        // retraction moves.
-        self.pinned_layers =
-            affordable_pinned_layers(target.max(self.zone.min_capacity()), self.experts_per_layer);
+        // The pinned set does not move with the boundary — those experts have no
+        // record in the pack and no warm slot, so unpinning one under pressure
+        // would strand it. What keeps the eviction scan supplied instead is the
+        // zone's floor: `minimum_resident_slots` prices the pinned set plus a
+        // full working layer, and `WeightZone::retract_to` will not go below it.
+        // (The failure this guards against is measured: a zone that retracted to
+        // 297 slots against a 384-expert pinned set failed 1,774 consecutive
+        // `allocate_slot` calls, because `layer >= pinned_layers` matched
+        // nothing.)
+        debug_assert!(
+            target.max(self.zone.min_capacity())
+                >= minimum_resident_slots(self.experts_per_layer).min(self.total_experts()),
+            "retraction target is below the floor that prices the fixed pinned set"
+        );
         let scores: Vec<f32> = (0..self.zone.capacity())
             .map(|i| self.slot_to_key[i].map_or(0.0, |(layer, expert)| self.score(layer, expert)))
             .collect();
@@ -729,21 +742,12 @@ mod tests {
     /// The zone is pure arithmetic — addresses and indices — so the whole
     /// eviction policy still exercises with no GPU and no model load, exactly as
     /// it did when the free list was a local `Vec`.
-    /// Pins the standard three head layers regardless of size.
-    ///
-    /// [`affordable_pinned_layers`] would give a cache this small none at all —
-    /// with 128 experts a layer it takes 513 slots before three layers of
-    /// pinning are affordable. These fixtures are about what the eviction
-    /// policy *does* with a pinned set, not about how large that set is
-    /// allowed to be, so the count is set directly here and
-    /// [`pinning_never_consumes_the_whole_cache`] covers the sizing rule.
+    /// Pins the standard head layers, as every cache now does.
     fn cache(n: usize) -> ExpertCacheInner {
-        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, n, n, 0), 48, 128);
-        inner.pinned_layers = PINNED_LAYERS;
-        inner
+        ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, n, n, 0), 48, 128)
     }
 
-    /// A cache sized as the loader would size it, pinning what it can afford.
+    /// A cache sized as the loader would size it.
     fn sized_cache(n: usize, experts_per_layer: usize) -> ExpertCacheInner {
         ExpertCacheInner::new(
             WeightZone::new(1 << 30, 4096, n, n, 0),
@@ -752,7 +756,7 @@ mod tests {
         )
     }
 
-    /// **Pinning can never consume the whole cache**, at any size.
+    /// **A cache at or above the floor can always evict**, at any size.
     ///
     /// The failure this rules out is not a slow cache, it is a dead one: once
     /// every resident slot holds a pinned-layer expert, the `layer >= pinned`
@@ -761,31 +765,24 @@ mod tests {
     /// daemon reached it with 297 slots against a 384-expert pinned set and
     /// failed 1,774 consecutive forwards.
     ///
-    /// A fixed pinned-layer count made that reachable whenever the zone was
-    /// small relative to `experts_per_layer`, so the loader had to defend it
-    /// with a floor. Deriving the count from the capacity removes the state
-    /// instead: the pinned set is by construction at least one layer's routed
-    /// set short of the whole cache. Swept over sizes either side of every
-    /// pinning step, and over both models' expert counts.
+    /// The pinned count is fixed, so the *floor* is what rules the state out:
+    /// [`minimum_resident_slots`] prices the pinned set plus a full working
+    /// layer. Swept over sizes from the floor upward, and over every model's
+    /// expert count.
     #[test]
-    fn pinning_never_consumes_the_whole_cache() {
+    fn a_cache_above_the_floor_always_has_a_victim() {
         for experts_per_layer in [8usize, 128, 256] {
+            let floor = minimum_resident_slots(experts_per_layer);
             for capacity in [
-                experts_per_layer + 1,
-                experts_per_layer + 2,
-                2 * experts_per_layer,
-                2 * experts_per_layer + 1,
-                3 * experts_per_layer,
-                4 * experts_per_layer + 1,
+                floor,
+                floor + 1,
+                4 * experts_per_layer,
                 9 * experts_per_layer,
             ] {
-                let pinned = affordable_pinned_layers(capacity, experts_per_layer);
                 assert!(
-                    pinned * experts_per_layer + experts_per_layer <= capacity,
-                    "pinned set ({pinned} × {experts_per_layer}) leaves the working \
-                     layer no room in {capacity} slots"
+                    PINNED_LAYERS * experts_per_layer + experts_per_layer <= capacity,
+                    "the floor must leave the working layer room in {capacity} slots"
                 );
-                assert!(pinned <= PINNED_LAYERS, "never pins more than it is worth");
 
                 // The worst case that actually produced the deadlock: a batch
                 // wide enough to fill every slot from layer 0 upward.
@@ -799,10 +796,35 @@ mod tests {
                         .allocate_slot(capacity / experts_per_layer, &Default::default())
                         .is_ok(),
                     "a full cache of {capacity} slots at {experts_per_layer} experts \
-                     a layer ({pinned} pinned) had no evictable slot"
+                     a layer had no evictable slot"
                 );
             }
         }
+    }
+
+    /// **The pinned depth never varies.** A pack omits the pinned layers'
+    /// records, so a cache that unpinned a layer under pressure would strand it
+    /// with nowhere to reload from — and a pack written on one machine would be
+    /// unreadable on a smaller one. Capacity must not enter into it.
+    #[test]
+    fn the_pinned_depth_is_fixed_across_every_capacity() {
+        for experts_per_layer in [8usize, 128, 256] {
+            for capacity in [
+                minimum_resident_slots(experts_per_layer),
+                4 * experts_per_layer,
+                9 * experts_per_layer,
+                48 * experts_per_layer,
+            ] {
+                let inner = sized_cache(capacity, experts_per_layer);
+                assert_eq!(
+                    inner.pinned_layers, PINNED_LAYERS,
+                    "{capacity} slots at {experts_per_layer}/layer changed the pinned depth"
+                );
+            }
+        }
+        // A model with fewer layers than the constant pins all of them.
+        let tiny = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 64, 64, 0), 1, 8);
+        assert_eq!(tiny.pinned_layers, 1);
     }
 
     /// **A zone at the floor still has a victim**, which is the entire reason
@@ -813,17 +835,13 @@ mod tests {
     /// must still find something to evict. Below this size it cannot: the
     /// pinned-layer filter matches nothing and every load from then on fails,
     /// permanently, because escaping the state requires an eviction the state
-    /// forbids. The daemon sat at 297 slots against a 384-expert pinned set and
-    /// failed 1,774 consecutive forwards that way. (The `cache` fixture forces
-    /// `pinned_layers` to the constant; a cache built through the constructor
-    /// derives a smaller pinned set at these capacities and never reaches the
-    /// starved state — the asserts cover the eviction filter's refusal, not
-    /// the construction path.)
+    /// forbids. The daemon sat at 297 slots against a 384-slot floor and failed
+    /// 1,774 consecutive forwards that way.
     #[test]
     fn a_cache_at_its_floor_can_still_evict() {
         let experts_per_layer = 128;
         let floor = minimum_resident_slots(experts_per_layer);
-        assert_eq!(floor, PINNED_LAYERS * experts_per_layer + 1);
+        assert_eq!(floor, (PINNED_LAYERS + 1) * experts_per_layer + 1);
 
         let mut inner = cache(floor);
         // Every pinned-layer expert resident, and one slot beyond them.
@@ -839,10 +857,14 @@ mod tests {
              scan is allowed to take"
         );
 
-        // One slot short, the same fill leaves nothing evictable — the state
-        // the floor exists to keep the boundary out of.
-        let mut starved = cache(floor - 1);
-        for slot in 0..floor - 1 {
+        // A cache with room for only the pinned set reaches the dead state: the
+        // same fill leaves every resident slot holding a pinned-layer expert and
+        // nothing can be freed. This is what the floor keeps the boundary out
+        // of, with a full working layer of margin on top.
+        let pinned_only = PINNED_LAYERS * experts_per_layer;
+        assert!(pinned_only < floor, "the floor must clear the pinned set");
+        let mut starved = cache(pinned_only);
+        for slot in 0..pinned_only {
             let layer = slot / experts_per_layer;
             occupy(&mut starved, slot, layer, slot % experts_per_layer, 0, 0.0);
         }
@@ -850,23 +872,27 @@ mod tests {
             starved
                 .allocate_slot(PINNED_LAYERS, &Default::default())
                 .is_err(),
-            "below the floor every resident slot is pinned and nothing can be freed"
+            "a cache holding only pinned-layer experts has nothing it may free"
         );
     }
 
-    /// A wide card still gets the full head-layer optimisation.
+    /// **The floor's arithmetic did not move when the pinned depth did.**
+    ///
+    /// This number feeds the opening boundary placement of every MoE model, and
+    /// raising it starves the KV side (Qwen3-30B OOMs at load). Two pinned
+    /// layers plus a working layer prices the same `3 × n + 1` that three
+    /// capacity-derived layers did, so every model's placement is untouched.
     #[test]
-    fn pinning_is_unchanged_when_the_cache_can_afford_it() {
-        // Qwen3-30B-A3B: 128 experts a layer, thousands of slots.
-        assert_eq!(affordable_pinned_layers(2000, 128), PINNED_LAYERS);
-        // Exactly enough for three pinned layers plus a working layer.
-        assert_eq!(affordable_pinned_layers(4 * 128 + 1, 128), PINNED_LAYERS);
-        // One slot short of that, and it gives up the third.
-        assert_eq!(affordable_pinned_layers(4 * 128, 128), PINNED_LAYERS - 1);
-        // Qwen3.5-35B-A3B on a 16 GB card: 256 experts a layer, ~567 slots.
-        assert_eq!(affordable_pinned_layers(567, 256), 1);
-        // A cache with only the working layer's room pins nothing at all.
-        assert_eq!(affordable_pinned_layers(257, 256), 0);
+    fn the_floor_is_arithmetically_unchanged() {
+        for experts_per_layer in [8usize, 128, 256] {
+            assert_eq!(
+                minimum_resident_slots(experts_per_layer),
+                3 * experts_per_layer + 1
+            );
+        }
+        // The two models this actually places.
+        assert_eq!(minimum_resident_slots(128), 385); // Qwen3-30B-A3B
+        assert_eq!(minimum_resident_slots(256), 769); // Qwen3.5/3.6-35B-A3B
     }
 
     /// Mark a slot occupied by `(layer, expert)` without a real `ExpertSlot`
@@ -1117,21 +1143,24 @@ mod tests {
         assert!(inner.key_to_slot.contains_key(&(7, 102)), "hot expert kept");
     }
 
+    /// A cache holding nothing but pinned-layer experts offers the prefetcher no
+    /// victims — sized off [`PINNED_LAYERS`] so it stays the "all pinned" case
+    /// if the depth ever changes.
     #[test]
     fn prefetch_evict_none_when_all_pinned() {
-        let mut inner = cache(3);
-        occupy(&mut inner, 0, 0, 100, 1, 0.0);
-        occupy(&mut inner, 1, 1, 101, 2, 0.0);
-        occupy(&mut inner, 2, 2, 102, 3, 0.0);
+        let mut inner = cache(PINNED_LAYERS);
+        for layer in 0..PINNED_LAYERS {
+            occupy(&mut inner, layer, layer, 100 + layer, layer as u32 + 1, 0.0);
+        }
         assert!(inner.evict_for_prefetch_batch(5, 1).is_empty());
     }
 
     #[test]
     fn pinned_layers_never_evicted() {
-        let mut inner = cache(3);
-        occupy(&mut inner, 0, 0, 100, 1, 0.0);
-        occupy(&mut inner, 1, 1, 101, 2, 0.0);
-        occupy(&mut inner, 2, 2, 102, 3, 0.0);
+        let mut inner = cache(PINNED_LAYERS);
+        for layer in 0..PINNED_LAYERS {
+            occupy(&mut inner, layer, layer, 100 + layer, layer as u32 + 1, 0.0);
+        }
         // Every resident expert is pinned → no legal victim → error.
         assert!(inner.allocate_slot(5, &Default::default()).is_err());
     }

@@ -61,14 +61,16 @@ pub use chunked::{
     expect_kv_range_in, freeze_dense, span_layout, span_region_refusal, SpanClaims, SpanLayout,
     SpanRegion,
 };
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    empty_sweep_stats, reclaim_empty_arenas, region_stats, spare_tally, RegionStats, REGION_BYTES,
+};
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
 pub use chunked::{
     initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
     weight_capacity_bytes, weight_floor_after,
 };
-#[cfg(feature = "cuda")]
-pub use chunked::{region_stats, RegionStats, REGION_BYTES};
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.
 pub use chunked::{

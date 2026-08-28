@@ -173,6 +173,81 @@ pub fn available_physical_ram() -> Option<u64> {
     None
 }
 
+/// Physical RAM that was available when this process started, latched once.
+///
+/// # Why the live reading is the wrong input for a long-lived allocation
+///
+/// [`available_physical_ram`] answers "what is free at this instant", and the
+/// instant the expert cache asks is the worst one in the process: the loader has
+/// the checkpoint mapped and has been reading it, so the reading is depressed by
+/// the engine's own transient footprint. Measured on the 16 GB dev box across
+/// one gate run — 15.65 GiB free before the process, **12.18 GiB at the moment
+/// the warm tier was sized**, over 20 GiB free again once it exited. The tier is
+/// the largest and longest-lived allocation the engine makes, and it was being
+/// sized from the bottom of a trough it had dug itself, then never revisited.
+///
+/// This is the same measurement taken before any of that: what the machine was
+/// willing to give, rather than what it had left mid-load. The pages the live
+/// reading was missing are mostly the mapped checkpoint's, which are file-backed
+/// and droppable — so they were never the warm tier's competitors in the first
+/// place.
+///
+/// Latched with `get_or_init`, so the first caller decides. [`snapshot_launch`]
+/// makes that caller be process start rather than whoever happens to ask first.
+pub fn launch_available_ram() -> Option<u64> {
+    static LAUNCH_AVAIL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LAUNCH_AVAIL.get_or_init(available_physical_ram)
+}
+
+/// The least host RAM seen free since the process started, or `u64::MAX` if
+/// nothing has sampled yet.
+///
+/// The number that says how close the warm tier's headroom came to the edge.
+/// Sizing rules can only be tuned against it: the tier is allocated once and
+/// the pressure it creates shows up later, in whatever allocates next, so a
+/// headroom that "worked" is indistinguishable from one that missed by 40 MB
+/// unless the trough is recorded as it happens.
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static AVAIL_LOW_WATER: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Sample free host RAM now and keep it if it is the lowest yet.
+///
+/// Cheap (one `GlobalMemoryStatusEx` / one `/proc/meminfo` read), but not free —
+/// call it at phase boundaries, not per token.
+pub fn sample_available_low_water() {
+    let Some(now) = available_physical_ram() else {
+        return;
+    };
+    let mut cur = AVAIL_LOW_WATER.load(Ordering::Relaxed);
+    while now < cur {
+        match AVAIL_LOW_WATER.compare_exchange_weak(cur, now, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// The lowest free-RAM reading any [`sample_available_low_water`] call has seen,
+/// or `None` if none has run.
+pub fn available_low_water() -> Option<u64> {
+    match AVAIL_LOW_WATER.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        v => Some(v),
+    }
+}
+
+/// Take the launch reading now, before the process has allocated anything worth
+/// counting.
+///
+/// Called from CUDA device creation, which every path that can reach a warm tier
+/// passes through first — a device has to exist before weights can be loaded
+/// onto it. Idempotent, and cheap enough to call from anywhere earlier.
+pub fn snapshot_launch() {
+    let _ = launch_available_ram();
+}
+
 /// One field of `/proc/meminfo`, in bytes.
 #[cfg(target_os = "linux")]
 fn meminfo_field(key: &str) -> Option<u64> {

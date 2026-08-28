@@ -273,7 +273,7 @@ impl PinnedBuf {
                 .result()
                 .map_err(|e| crate::Error::Msg(format!("cuMemHostAlloc failed: {:?}", e)))?;
         }
-        crate::vram::note_host_pinned_alloc(len as u64);
+        crate::vram::note_host_pinned_alloc(crate::vram::PinnedUse::Staging, len as u64);
         Ok(Self::Owned {
             ptr: host_ptr as *mut u8,
             len,
@@ -320,7 +320,7 @@ impl Drop for PinnedBuf {
                 unsafe {
                     let _ = sys::cuMemFreeHost(*ptr as *mut std::ffi::c_void).result();
                 }
-                crate::vram::note_host_pinned_free(*len as u64);
+                crate::vram::note_host_pinned_free(crate::vram::PinnedUse::Staging, *len as u64);
             }
         }
         // Bump variants do nothing — the arena owns the memory.
@@ -384,7 +384,7 @@ impl PinnedArena {
                     ))
                 })?;
         }
-        crate::vram::note_host_pinned_alloc(capacity as u64);
+        crate::vram::note_host_pinned_alloc(crate::vram::PinnedUse::Staging, capacity as u64);
         Ok(Self {
             ptr: host_ptr as *mut u8,
             dev_ptr,
@@ -421,7 +421,10 @@ impl Drop for PinnedArena {
         if self.capacity > 0 {
             unsafe {
                 let _ = sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void).result();
-                crate::vram::note_host_pinned_free(self.capacity as u64);
+                crate::vram::note_host_pinned_free(
+                    crate::vram::PinnedUse::Staging,
+                    self.capacity as u64,
+                );
             }
         }
     }

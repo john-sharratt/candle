@@ -179,12 +179,23 @@ pub(crate) fn stratified_membership(
     experts_per_layer: usize,
     warm_slots: usize,
     vram_prefix: usize,
+    pinned_layers: usize,
     seed: u64,
 ) -> Vec<(usize, usize)> {
     if num_layers == 0 || experts_per_layer == 0 || warm_slots == 0 {
         return Vec::new();
     }
-    let total = num_layers * experts_per_layer;
+    // Layers `0..pinned_layers` are permanently VRAM-resident and never evicted,
+    // so a warm copy of one could only ever be read by a load that cannot
+    // happen. They are excluded from the draw entirely rather than sorted to the
+    // back of it: on the 3.6-35B that is 512 experts, 943 MiB of pinned host
+    // memory that would otherwise sit unread for the life of the process while
+    // the evictable set — the only set that generates misses — went short.
+    let drawable = num_layers.saturating_sub(pinned_layers);
+    if drawable == 0 {
+        return Vec::new();
+    }
+    let total = drawable * experts_per_layer;
     let mut remaining = warm_slots.min(total);
 
     // Per layer, how many of its experts fall inside the VRAM prefix. The
@@ -197,9 +208,10 @@ pub(crate) fn stratified_membership(
 
     let mut out = Vec::with_capacity(remaining);
     let mut rng = SplitMix64::new(seed);
-    // Per layer, the experts not yet drawn, partitioned so that the ones outside
-    // the VRAM prefix are taken first.
-    let mut decks: Vec<(Vec<usize>, Vec<usize>)> = (0..num_layers)
+    // Per drawable layer, the experts not yet drawn, partitioned so that the
+    // ones outside the VRAM prefix are taken first. Index `i` here is MoE layer
+    // `pinned_layers + i`.
+    let mut decks: Vec<(Vec<usize>, Vec<usize>)> = (pinned_layers..num_layers)
         .map(|layer| {
             let covered = in_vram(layer);
             (
@@ -214,7 +226,8 @@ pub(crate) fn stratified_membership(
     for pass in 0..2 {
         loop {
             let mut handed_out = 0usize;
-            for (layer, pair) in decks.iter_mut().enumerate().take(num_layers) {
+            for (deck_idx, pair) in decks.iter_mut().enumerate() {
+                let layer = pinned_layers + deck_idx;
                 if remaining == 0 {
                     break;
                 }
@@ -338,7 +351,15 @@ impl WarmPool {
         }
         // Feed the process-wide gauge: pinned memory is non-pageable, so the
         // host-RAM availability measurement must treat it as structural.
-        candle::vram::note_host_pinned_alloc(total_size as u64);
+        candle::vram::note_host_pinned_alloc(
+            candle::vram::PinnedUse::ExpertWarmTier,
+            total_size as u64,
+        );
+        // The deepest point of the run for free host RAM: the tier is the
+        // largest pinned claim the engine makes and everything it needs after
+        // this has to fit in what is left. Sampling here is what makes the
+        // headroom tunable against a measurement instead of a guess.
+        candle::vram::sample_available_low_water();
         tracing::info!(
             target: "candle_transformers::expert_lre",
             slots = num_slots,
@@ -425,7 +446,10 @@ impl Drop for WarmPool {
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 tracing::warn!("WarmPool: cuMemFreeHost failed: {:?}", result);
             }
-            candle::vram::note_host_pinned_free(self.total_size as u64);
+            candle::vram::note_host_pinned_free(
+                candle::vram::PinnedUse::ExpertWarmTier,
+                self.total_size as u64,
+            );
         }
     }
 }
@@ -464,7 +488,7 @@ mod tests {
     /// count, so no layer is left permanently short by a coin flip at startup.
     #[test]
     fn every_layer_gets_the_same_share() {
-        let m = stratified_membership(48, 128, 48 * 40, 0, 0xC0FFEE);
+        let m = stratified_membership(48, 128, 48 * 40, 0, 0, 0xC0FFEE);
         assert_eq!(m.len(), 48 * 40);
         assert!(per_layer_counts(&m, 48).iter().all(|&c| c == 40));
     }
@@ -473,7 +497,7 @@ mod tests {
     /// so the spread between the fullest and emptiest layer is never above one.
     #[test]
     fn a_remainder_is_spread_one_per_layer() {
-        let m = stratified_membership(48, 128, 48 * 40 + 7, 0, 1);
+        let m = stratified_membership(48, 128, 48 * 40 + 7, 0, 0, 1);
         let counts = per_layer_counts(&m, 48);
         assert_eq!(m.len(), 48 * 40 + 7);
         assert_eq!(counts.iter().filter(|&&c| c == 41).count(), 7);
@@ -484,7 +508,7 @@ mod tests {
     /// waste a slot and leave `ram` pointing at whichever was written last.
     #[test]
     fn no_expert_is_drawn_twice() {
-        let m = stratified_membership(8, 16, 8 * 9, 0, 42);
+        let m = stratified_membership(8, 16, 8 * 9, 0, 0, 42);
         let unique: HashSet<(usize, usize)> = m.iter().copied().collect();
         assert_eq!(unique.len(), m.len());
     }
@@ -493,9 +517,9 @@ mod tests {
     /// so a warm-tier measurement is attributable to a change, not to luck.
     #[test]
     fn the_draw_is_deterministic_in_the_seed() {
-        let a = stratified_membership(8, 64, 8 * 10, 0, 7);
-        let b = stratified_membership(8, 64, 8 * 10, 0, 7);
-        let c = stratified_membership(8, 64, 8 * 10, 0, 8);
+        let a = stratified_membership(8, 64, 8 * 10, 0, 0, 7);
+        let b = stratified_membership(8, 64, 8 * 10, 0, 0, 7);
+        let c = stratified_membership(8, 64, 8 * 10, 0, 0, 8);
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
@@ -504,7 +528,7 @@ mod tests {
     /// list with repeats or an over-long one.
     #[test]
     fn asking_for_everything_yields_each_expert_once() {
-        let m = stratified_membership(4, 8, 999, 0, 3);
+        let m = stratified_membership(4, 8, 999, 0, 0, 3);
         assert_eq!(m.len(), 32);
         let unique: HashSet<(usize, usize)> = m.iter().copied().collect();
         assert_eq!(unique.len(), 32);
@@ -514,20 +538,66 @@ mod tests {
     /// must produce an empty membership rather than a panic.
     #[test]
     fn a_zero_sized_warm_tier_is_empty_not_an_error() {
-        assert!(stratified_membership(48, 128, 0, 0, 1).is_empty());
-        assert!(stratified_membership(0, 128, 100, 0, 1).is_empty());
-        assert!(stratified_membership(48, 0, 100, 0, 1).is_empty());
+        assert!(stratified_membership(48, 128, 0, 0, 0, 1).is_empty());
+        assert!(stratified_membership(0, 128, 100, 0, 0, 1).is_empty());
+        assert!(stratified_membership(48, 0, 100, 0, 0, 1).is_empty());
+        // Every layer pinned: nothing is evictable, so nothing is drawable.
+        assert!(stratified_membership(2, 128, 100, 0, 2, 1).is_empty());
     }
 
     /// The draw covers the whole expert range rather than clustering at the
     /// front — a sampler that always took `0..take` would pass every test above.
     #[test]
     fn the_draw_reaches_the_far_end_of_a_layer() {
-        let m = stratified_membership(1, 128, 16, 0, 99);
+        let m = stratified_membership(1, 128, 16, 0, 0, 99);
         assert!(
             m.iter().any(|&(_, e)| e >= 64),
             "every drawn expert came from the first half: {m:?}"
         );
+    }
+
+    /// **The pinned prefix is never drawn, in either pass.**
+    ///
+    /// Those experts are permanently VRAM-resident, so a warm copy could only be
+    /// read by a load that cannot happen — and unlike the VRAM prefix, which
+    /// pass 2 legitimately insures against eviction, there is no eviction to
+    /// insure against. A slot spent here is a slot the evictable set does not
+    /// get. Asking for more than the drawable set holds must therefore return
+    /// only the drawable set, not fall back to the pinned layers.
+    #[test]
+    fn the_pinned_prefix_is_never_drawn() {
+        // 4 layers × 8 experts, layers 0–1 pinned: 16 drawable, ask for all 32.
+        let m = stratified_membership(4, 8, 32, 0, 2, 5);
+        assert_eq!(m.len(), 16, "the draw reached past the drawable set");
+        for &(layer, expert) in &m {
+            assert!(
+                layer >= 2,
+                "warm slot spent on L{layer}E{expert}, which is permanently resident"
+            );
+        }
+        let unique: HashSet<(usize, usize)> = m.iter().copied().collect();
+        assert_eq!(unique.len(), 16);
+        // Both drawable layers get an equal share, as they do without pinning.
+        let counts = per_layer_counts(&m, 4);
+        assert_eq!(counts, vec![0, 0, 8, 8]);
+    }
+
+    /// The pinned skip composes with the VRAM prefix rather than replacing it:
+    /// the prefix still orders *which* evictable experts are taken first.
+    #[test]
+    fn pinning_and_the_vram_prefix_compose() {
+        // 4 layers × 8; layers 0–1 pinned; VRAM holds the first 20 (so layer 2
+        // is entirely inside the prefix and layer 3 has 4 inside, 4 outside).
+        let m = stratified_membership(4, 8, 4, 20, 2, 9);
+        assert_eq!(m.len(), 4);
+        for &(layer, expert) in &m {
+            assert!(layer >= 2, "drew pinned L{layer}E{expert}");
+            assert!(
+                layer * 8 + expert >= 20,
+                "drew L{layer}E{expert}, which VRAM already holds, while the \
+                 complement still had candidates"
+            );
+        }
     }
 
     /// **The point of the VRAM prefix.** With room for exactly the complement of
@@ -537,7 +607,7 @@ mod tests {
     #[test]
     fn the_complement_of_vram_is_taken_first() {
         // 4 layers × 8 experts; VRAM takes the first 12 (layers 0–1 entirely).
-        let m = stratified_membership(4, 8, 20, 12, 5);
+        let m = stratified_membership(4, 8, 20, 12, 0, 5);
         assert_eq!(m.len(), 20);
         for &(layer, expert) in &m {
             assert!(
@@ -551,7 +621,7 @@ mod tests {
     /// VRAM-resident experts against eviction rather than going unused.
     #[test]
     fn slots_past_the_complement_fall_back_to_the_vram_resident() {
-        let m = stratified_membership(4, 8, 28, 12, 5);
+        let m = stratified_membership(4, 8, 28, 12, 0, 5);
         assert_eq!(m.len(), 28);
         let unique: HashSet<(usize, usize)> = m.iter().copied().collect();
         assert_eq!(unique.len(), 28, "an expert was drawn twice across passes");
@@ -566,7 +636,7 @@ mod tests {
     #[test]
     fn the_complement_pass_stays_level_across_layers() {
         // VRAM takes layers 0–1 entirely, so only layers 2–3 have candidates.
-        let m = stratified_membership(4, 8, 9, 16, 11);
+        let m = stratified_membership(4, 8, 9, 16, 0, 11);
         let counts = per_layer_counts(&m, 4);
         assert_eq!(counts[0], 0);
         assert_eq!(counts[1], 0);
@@ -583,7 +653,7 @@ mod tests {
     #[test]
     fn a_prefix_ending_mid_layer_splits_that_layer() {
         // 4 layers × 8; prefix 10 ⇒ layer 1 has 2 covered, 6 not.
-        let m = stratified_membership(4, 8, 22, 10, 3);
+        let m = stratified_membership(4, 8, 22, 10, 0, 3);
         assert_eq!(m.len(), 22);
         for &(layer, expert) in &m {
             assert!(layer * 8 + expert >= 10, "L{layer}E{expert} is inside");
