@@ -342,6 +342,21 @@ struct RegionPool {
     /// a block that changes size can absorb both sides' movement without one.
     transient_base: Option<u64>,
     transient_bytes: usize,
+    /// The largest tier placed since boot, in bytes — **not** cleared on
+    /// release.
+    ///
+    /// `transient_bytes` is live occupancy and reads zero between forwards,
+    /// which is precisely when `spare_regions` runs: every caller of
+    /// `reclaim_spare_ground` invokes it on the line after `end_wave_transient`.
+    /// So the demand series never once contained the tier, and the weight side
+    /// was free to take the ground the very next wave's tier needs — ground it
+    /// cannot give back mid-forward, because `set_weight_floor` refuses while a
+    /// wave generation is open.
+    ///
+    /// The old `total` seed masked this by making the first two windows report
+    /// no spare at all. Removing the seed exposed it, and a geometric grow step
+    /// made it reachable within a few waves rather than dozens.
+    transient_high_water: usize,
     /// Persistence-staging bytes carved from the fixed left block.
     persist_carved: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
@@ -366,20 +381,78 @@ struct RegionPool {
     /// that runs out with no tier standing is ordinary pressure and buys more
     /// (`set_ground_broker`).
     refusals_during_wave: usize,
-    /// Highest demand seen in the window that is closing, and in the one before
-    /// it. The mark the weight side measures "spare" against is the larger of
-    /// the two — see [`RegionPool::spare_regions`].
+    /// Highest demand **observed** in the window that is closing, and in the one
+    /// before it. The mark the weight side measures "spare" against is the larger
+    /// of the two — see [`RegionPool::spare_regions`].
+    ///
+    /// Both hold measurements only. They used to be seeded at `total` to make the
+    /// mechanism refuse before any workload had run, and that cost two windows
+    /// rather than one: the roll copies `kv_peak_window` into
+    /// `kv_peak_prev_window`, so the seed outlived its own window and
+    /// `total − max(peak, prev)` stayed zero for 120 s. Measured on the 3.6-35B
+    /// gate, which runs for 110 s: 127 growth negotiations, 127 answered
+    /// "no spare", the boundary never moved once. The refusal that seed was
+    /// standing in for is now [`RegionPool::observing_until`], which says what it
+    /// means and expires on schedule.
     kv_peak_window: usize,
     kv_peak_prev_window: usize,
     /// When the current window opened.
     kv_peak_window_opened: Instant,
-    /// When the KV side was last refused a region.
+    /// Whether any demand has ever been observed. No spare is reported until it
+    /// has.
     ///
-    /// The one signal that is neither history nor occupancy: a refusal is the KV
-    /// side *saying* it wanted more. Neither of the other two catches an ingest,
-    /// where demand only ever grows — at any instant there is room, and a moment
-    /// later there is not.
-    last_pressure_at: Option<Instant>,
+    /// **A measurement not yet made is not a measurement of zero.** At pool
+    /// creation `live` is 0, and an unguarded first negotiation reads that as the
+    /// whole span being spare — handing it to the weight side before the first
+    /// workload has claimed a byte. Measured, and it failed every config of the
+    /// gate.
+    ///
+    /// # Why this is a fact about the workload and not a clock
+    ///
+    /// It was a sixty-second deadline, on the reasoning that one window must
+    /// close before a sliding maximum describes anything. But the thing being
+    /// guarded against is not "too soon", it is "nothing has happened yet" — and
+    /// those only coincide on a process that starts working the instant it opens.
+    /// Sixty seconds of a 110-second gate is not a safety margin, it is most of
+    /// the run: measured, 89 of 127 growth negotiations were refused here and
+    /// nowhere else, while `by_history` and `by_occupancy` refused none.
+    ///
+    /// The honest predicate is the one the doc above already states. Once demand
+    /// has been non-zero the peak holds a real observation, the sliding maximum
+    /// means what it says, and there is nothing left for a clock to add. The call
+    /// that first observes demand still reports no spare, so a value is always in
+    /// the window before anything is granted from it.
+    seen_demand: bool,
+    /// Demand at the previous negotiation, so this one can see which way it is
+    /// moving.
+    ///
+    /// The one signal that is neither history nor occupancy: **the derivative**.
+    /// Neither of the other two catches an ingest, where demand only ever grows —
+    /// history lags it by up to a window, and at any instant there is room while
+    /// a moment later there is not. Ground is only genuinely spare when demand
+    /// has stopped climbing, and that is a comparison, not a clock.
+    ///
+    /// This replaces a sixty-second stand-down stamped whenever the KV side
+    /// bought ground. Same intent, but the clock was a proxy for the wrong thing:
+    /// it refused for a fixed minute after a purchase whether demand was still
+    /// rising or had gone flat immediately, and on a 110-second gate that is a
+    /// quarter of the run spent refusing on the strength of one event. Measured:
+    /// 24 of 127 negotiations, every one of them with `by_history` and
+    /// `by_occupancy` both reporting room.
+    last_demand: usize,
+    /// Set when the KV side asks for more ground — a completed purchase, or a
+    /// claim that found the pool exhausted. Cleared by the next negotiation.
+    ///
+    /// Either is the KV side saying it wanted more *between* two negotiations,
+    /// where the demand series cannot see it. Exhaustion is the stronger of the
+    /// two and must count: stamping only on a completed purchase would leave this
+    /// dead in the case that matters most — the KV side refused and the weight
+    /// side unwilling to sell — and let the weight side take ground from a side
+    /// that had just been turned down.
+    ///
+    /// Costs exactly one refusal, which is what it takes for the event to land in
+    /// `last_demand` and be compared against like anything else.
+    kv_asked_since_negotiation: bool,
 }
 
 /// How far back the KV side's high-water mark looks.
@@ -417,16 +490,43 @@ struct RegionPool {
 /// failing anything.
 const KV_PEAK_WINDOW: Duration = Duration::from_secs(60);
 
-/// Most regions the weight side may take in one pass.
+/// Most regions the weight side may take in one negotiation.
 ///
-/// Growth is a step, not a jump, because each region it takes may have to be
-/// given back — and giving back costs an eviction or a relocation, while not
-/// taking costs only the residency it would have bought for one more pass.
-const KV_GROW_STEP: usize = 8;
+/// **Half of what the guards found spare, never fewer than eight.**
+///
+/// This was a flat eight, on the reasoning that "growth is a step, not a jump,
+/// because each region it takes may have to be given back — and giving back
+/// costs an eviction or a relocation, while not taking costs only the residency
+/// it would have bought for one more pass". Both halves of that turned out to be
+/// measurably wrong on the 3.6-35B gate:
+///
+/// - **Giving back is free in practice.** Instrumented over a full gate: twelve
+///   KV purchases, *zero* refused. Every time the KV side wanted ground back it
+///   got it, and the give-back path is a reload, not a loss.
+/// - **Not taking costs the whole workload, not one pass.** [`spare_regions`]
+///   found ~143 regions genuinely spare on each of the twenty-one negotiations
+///   that got past the guards, and handed over eight. At that rate the boundary
+///   converges long after the run it was supposed to help has finished.
+///
+/// So the step is geometric rather than fixed. The spare figure is already the
+/// conservative product of three independent guards — an observation window, a
+/// sliding-demand maximum, and live occupancy, less a slack margin — and
+/// clamping their answer to a constant is a fourth safety argument stacked on
+/// three that produced the number. Halving keeps the hedge (a negotiation never
+/// takes everything it is offered) while letting it shrink as evidence
+/// accumulates: each pass that takes ground without the KV side buying it back
+/// is evidence the last one was safe.
+///
+/// The safety net underneath is admission, not this constant: the scheduler's
+/// ceiling is read live from free regions, so ground given to the weights
+/// narrows what admission accepts rather than failing anything.
+fn kv_grow_step(spare: usize) -> usize {
+    (spare / 2).max(8).min(spare)
+}
 
 /// Regions bought in one go when a claim runs the KV side out of ground.
 ///
-/// Symmetric with [`KV_GROW_STEP`], and for the same reason inverted: a purchase
+/// The buy-side counterpart to [`kv_grow_step`], inverted for the same reason: a purchase
 /// costs a device-wide quiesce (the weight side cannot hand over ground while a
 /// kernel might still be reading it), so buying one region per claim would pay
 /// that sync per arena. A section-quantize drain claimed eighteen regions in one
@@ -529,13 +629,28 @@ fn buy_ground(stream: &std::sync::Arc<CudaStream>, regions: usize) -> Result<u64
     }
     let _buying = Buying;
     let conceded = broker(regions);
+    // Whether the weight side can be made to concede is the question a blocking
+    // claim would exist to answer: a claim only has something to wait *for* if
+    // concessions are being refused for a reason that passes. Counted so that is
+    // measured rather than assumed.
+    SPARE_TALLY[if conceded > 0 { 5 } else { 6 }].fetch_add(1, Ordering::Relaxed);
     if conceded > 0 {
-        // The KV side just proved it wants everything it has and more. Stamping
-        // the moment keeps the weight side from reading the ground it has only
-        // just handed over as spare on its very next pass.
+        // The KV side just proved it wants more than it holds. Stamping the
+        // moment keeps the weight side from reading the ground it has only just
+        // handed over as spare on its very next pass.
+        //
+        // The peak records **what was actually wanted** — everything live, the
+        // tier standing on it, and the regions this purchase was for. It used to
+        // be set to `pool.total`, which is not a measurement: a single
+        // eight-region purchase asserted demand for the entire KV side, and
+        // `total − peak` then read zero for a full window however small the real
+        // demand had been. The window is a maximum over observations, so an
+        // observation is what belongs in it.
         with_pool(stream, |pool| {
-            pool.last_pressure_at = Some(Instant::now());
-            pool.kv_peak_window = pool.total;
+            pool.kv_asked_since_negotiation = true;
+            let tier = pool.transient_bytes.max(pool.transient_high_water);
+            let wanted = pool.live + tier.div_ceil(REGION_BYTES) + regions;
+            pool.kv_peak_window = pool.kv_peak_window.max(wanted.min(pool.total));
             Ok(())
         })?;
     }
@@ -852,17 +967,20 @@ impl RegionPool {
             dirty_epoch: vec![0; total],
             transient_base: None,
             transient_bytes: 0,
+            transient_high_water: 0,
             persist_carved: 0,
             fresh_claims_during_wave: 0,
             refusals_during_wave: 0,
-            // Opens at the top: the weight side must watch the KV side stay
-            // small before it may take anything, never assume it will.
-            // Both windows open at the top: the weight side must watch the KV
-            // side stay small before it may take anything, never assume it will.
-            kv_peak_window: total,
-            kv_peak_prev_window: total,
+            // Empty because nothing has been observed yet. The weight side must
+            // watch the KV side stay small before it may take anything, and what
+            // enforces that is `observing_until` below — not a fabricated peak,
+            // which the window roll would carry for a second window.
+            kv_peak_window: 0,
+            kv_peak_prev_window: 0,
             kv_peak_window_opened: Instant::now(),
-            last_pressure_at: None,
+            seen_demand: false,
+            last_demand: 0,
+            kv_asked_since_negotiation: false,
         })
     }
 
@@ -1114,19 +1232,34 @@ impl RegionPool {
     /// old fixed 912 MiB, so the mark it is added to is no longer inflated by a
     /// reservation nobody uses.
     fn spare_regions(&mut self, slack: usize) -> usize {
-        // Demand is arenas **plus the tier standing on top of them** — this runs
-        // at the pipeline's end of pass, while the tier is still reserved, so
-        // both are visible. Measuring against `live` alone would let the weight
-        // side grow into ground the very next wave's transient needs.
+        // Nothing is spare until something has been demanded — see
+        // [`Self::seen_demand`]. Demand is folded into the window below either
+        // way, so the first grant always reads a populated maximum.
+        let observing = !self.seen_demand;
+        // Demand is arenas **plus the tier that stands on top of them**, and the
+        // tier term is the high-water rather than the live one.
         //
-        // `transient_bytes` alone, now that there is no reserve outliving the
-        // placement. A call from between forwards therefore sees a tier of zero —
-        // and the sliding window below is what covers that, because it is a
-        // sixty-second maximum and the tier was in the sum every time one stood.
-        // A window is the better instrument in any case: it carries the *largest*
-        // tier of the last minute across the gap, where the reserve carried only
-        // the most recent one.
-        let demand = self.live + self.transient_bytes.div_ceil(REGION_BYTES);
+        // The live figure would be zero every time this runs: `spare_regions` is
+        // reachable only from `reclaim_spare_ground`, and every caller invokes
+        // that on the line *after* `end_wave_transient`. So a demand of
+        // `live + transient_bytes` never once contained a tier, and the weight
+        // side was free to take exactly the ground the next wave's tier needs —
+        // ground it cannot hand back mid-forward, because `set_weight_floor`
+        // refuses while a wave generation is open.
+        //
+        // The comment this replaces argued the sliding window covered it,
+        // "because the tier was in the sum every time one stood". It never was:
+        // no caller reaches here with one standing. What actually masked the gap
+        // was the `total` seed making the first two windows report no spare at
+        // all; removing that seed exposed it, and a geometric grow step made it
+        // reachable in a few waves instead of dozens.
+        let tier = self.transient_bytes.max(self.transient_high_water);
+        let demand = self.live + tier.div_ceil(REGION_BYTES);
+        if demand > 0 {
+            // A workload exists. From the next negotiation the sliding maximum
+            // is describing something, so the observation guard is done.
+            self.seen_demand = true;
+        }
         // Rises the instant demand does; falls exactly one window after the peak
         // that set it passes out of view.
         self.kv_peak_window = self.kv_peak_window.max(demand);
@@ -1163,10 +1296,18 @@ impl RegionPool {
         // more and being told no, and a side that has been refused inside the
         // last window has no spare ground by definition, whatever the other two
         // say.
-        if self
-            .last_pressure_at
-            .is_some_and(|t| t.elapsed() < KV_PEAK_WINDOW)
-        {
+        if observing {
+            SPARE_TALLY[0].fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        // Demand rising, or a purchase since the last look: the KV side is on its
+        // way up and whatever looks free now is what it is about to take. Both
+        // are one-negotiation refusals that clear as soon as the series flattens.
+        let rising = demand > self.last_demand;
+        let bought = std::mem::take(&mut self.kv_asked_since_negotiation);
+        self.last_demand = demand;
+        if rising || bought {
+            SPARE_TALLY[1].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
         let by_history = self
@@ -1180,7 +1321,18 @@ impl RegionPool {
         // ground as occupied here would charge the tier twice and pin the
         // boundary wherever a tier happened to be standing.
         let by_occupancy = self.free_count() + self.ceiling_blocked();
-        by_history.min(by_occupancy).saturating_sub(slack)
+        let spare = by_history.min(by_occupancy).saturating_sub(slack);
+        // Which of the two numeric ceilings decided, so a zero here is
+        // attributable rather than merely observed.
+        let idx = if spare > 0 {
+            4
+        } else if by_history <= by_occupancy {
+            2
+        } else {
+            3
+        };
+        SPARE_TALLY[idx].fetch_add(if spare > 0 { spare as u64 } else { 1 }, Ordering::Relaxed);
+        spare
     }
 }
 
@@ -1397,16 +1549,15 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
             // Exhausted with no tier standing. The caller buys ground and comes
             // back; this attempt only reports what it found.
             //
-            // **The weight side must hear about it.** A refusal is the
-            // KV side asking for more and being told no, and
-            // [`RegionPool::spare_regions`]'s third guard reads this stamp to
-            // decide that a side refused inside the last window has no spare
-            // ground whatever its occupancy says. Stamping only on a *completed*
-            // purchase would leave the guard dead in the one case that matters
-            // most — the KV side refused and the weight side unwilling to sell —
-            // and let the weight side take ground from a KV side that had just
-            // been turned down.
-            pool.last_pressure_at = Some(Instant::now());
+            // **The weight side must hear about it.** Exhaustion is the KV side
+            // asking for more and being told no, and
+            // [`RegionPool::spare_regions`] reads this flag to refuse the next
+            // negotiation whatever its occupancy says. Setting it only on a
+            // *completed* purchase would leave the guard dead in the one case
+            // that matters most — the KV side refused and the weight side
+            // unwilling to sell — and let the weight side take ground from a KV
+            // side that had just been turned down.
+            pool.kv_asked_since_negotiation = true;
             return Ok(Claim::Exhausted);
         };
         let base = pool.region_base(index);
@@ -1778,6 +1929,9 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         }
         pool.transient_base = Some(base);
         pool.transient_bytes = len;
+        // Survives the release, so the between-forwards demand reading still
+        // knows a tier of this size is about to want its ground back.
+        pool.transient_high_water = pool.transient_high_water.max(len);
         Ok(Placed::At(base))
     })
 }
@@ -2106,6 +2260,69 @@ pub fn set_weight_floor(stream: &std::sync::Arc<CudaStream>, floor: u64) -> Resu
     })
 }
 
+/// Arenas released by [`reclaim_empty_arenas`] since boot, and the calls that
+/// found nothing. The ratio is what says whether a per-wave cadence is earning
+/// its keep or just walking the registry.
+static SWEPT_ARENAS: AtomicU64 = AtomicU64::new(0);
+static SWEEP_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Why `spare_regions` answered as it did, plus whether the KV side's own
+/// purchases succeed:
+///
+/// `[observing, pressure, history_bound, occupancy_bound, regions_granted,
+///   buy_conceded, buy_refused]`
+///
+/// The first four attribute a zero to one of the four things that can produce
+/// it, which is the difference between "the mechanism is inert" and "the
+/// mechanism is working and the ground is genuinely spoken for". The last two
+/// say whether a claim that waited would ever have anything to wait for.
+static SPARE_TALLY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// See [`SPARE_TALLY`].
+pub fn spare_tally() -> [u64; 7] {
+    std::array::from_fn(|i| SPARE_TALLY[i].load(Ordering::Relaxed))
+}
+
+/// Return every fully-empty arena's regions to the pool, now.
+///
+/// # Why this must not wait for a claim to fail
+///
+/// `live` in the region ledger counts regions **held by an arena**, empty or
+/// not, and the elastic boundary's growth negotiation is built directly on it:
+/// `spare_regions` reads `live + tier` as *demand* and feeds it to a sliding
+/// window peak. An arena that went chunk-empty three waves ago and has not been
+/// swept is therefore indistinguishable, to the one mechanism that decides
+/// whether the weight side may take ground, from an arena under active use.
+///
+/// The reactive sweeps do not cover this. `claim_region` sweeps only when the
+/// free list is **empty**, and `place_transient` only when a placement has
+/// already come up short — both are "we ran out" paths, and a workload with
+/// spare regions never reaches either. It runs with `free 18` on the 3.6-35B
+/// gate, so the reactive sweep never fires and empty arenas accumulate for a
+/// whole config, inflating `live` and suppressing growth for the 60-second
+/// window that reads it.
+///
+/// Cheap enough for a per-wave cadence by construction: each backing's pool
+/// short-circuits on an atomic, so a registry with nothing to reclaim costs one
+/// load per backing.
+///
+/// Returns arenas freed.
+#[cfg(feature = "cuda")]
+pub fn reclaim_empty_arenas() -> usize {
+    let freed = super::backing::global_release_empty_arenas();
+    SWEPT_ARENAS.fetch_add(freed as u64, Ordering::Relaxed);
+    SWEEP_CALLS.fetch_add(1, Ordering::Relaxed);
+    freed
+}
+
+/// `(arenas released, sweeps run)` since boot — see [`reclaim_empty_arenas`].
+pub fn empty_sweep_stats() -> (u64, u64) {
+    (
+        SWEPT_ARENAS.load(Ordering::Relaxed),
+        SWEEP_CALLS.load(Ordering::Relaxed),
+    )
+}
+
 /// **The negotiation, from the KV side — and only in the growing direction.**
 ///
 /// Regions the KV side is holding free beyond `slack` that the weight side could
@@ -2123,7 +2340,8 @@ pub fn set_weight_floor(stream: &std::sync::Arc<CudaStream>, floor: u64) -> Resu
 /// and nothing to convert: the allocation *is* the measurement.
 pub fn kv_spare_regions(stream: &std::sync::Arc<CudaStream>, slack: usize) -> Result<usize> {
     with_pool(stream, |pool| {
-        Ok(pool.spare_regions(slack).min(KV_GROW_STEP))
+        let spare = pool.spare_regions(slack);
+        Ok(kv_grow_step(spare))
     })
 }
 
@@ -2375,9 +2593,36 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_region, place_transient, region_stats, release_transient, REGION_BYTES};
+    use super::{
+        claim_region, kv_grow_step, place_transient, region_stats, release_transient, REGION_BYTES,
+    };
     use candle::{Device, Result};
     use std::sync::Arc;
+
+    /// The growth step is geometric, but it may never invent ground that the
+    /// guards did not offer, and it may never round a genuine zero up to eight —
+    /// that would take regions the KV side is using.
+    #[test]
+    fn the_growth_step_never_exceeds_what_was_offered() {
+        assert_eq!(kv_grow_step(0), 0, "no spare must take nothing");
+        for spare in 1..=8 {
+            assert_eq!(
+                kv_grow_step(spare),
+                spare,
+                "a small offer is taken whole, never rounded up"
+            );
+        }
+        // Past the floor it halves, so convergence is a handful of negotiations
+        // rather than the dozens a flat step needed.
+        assert_eq!(kv_grow_step(20), 10);
+        assert_eq!(kv_grow_step(143), 71);
+        for spare in [0usize, 1, 7, 8, 9, 20, 143, 336, 4096] {
+            assert!(
+                kv_grow_step(spare) <= spare,
+                "took more than the {spare} offered"
+            );
+        }
+    }
 
     use candle::cuda_backend::cudarc::driver::CudaStream;
 

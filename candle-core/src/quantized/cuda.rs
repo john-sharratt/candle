@@ -134,7 +134,7 @@ impl Drop for HostMappedAlloc {
         unsafe {
             let _ = cudarc::driver::sys::cuMemFreeHost(self.host_ptr).result();
         }
-        crate::vram::note_host_pinned_free(self.size as u64);
+        crate::vram::note_host_pinned_free(crate::vram::PinnedUse::HostMapped, self.size as u64);
     }
 }
 
@@ -221,7 +221,7 @@ pub fn alloc_host_mapped(size: usize) -> Result<(*mut u8, u64, HostMappedAlloc)>
         // Non-pageable by construction, so the host-RAM budget must count it as
         // structural — tracked here rather than at each call site, so no caller
         // can allocate gigabytes of pinned RAM the budget reads as pageable.
-        crate::vram::note_host_pinned_alloc(size as u64);
+        crate::vram::note_host_pinned_alloc(crate::vram::PinnedUse::HostMapped, size as u64);
         let guard = HostMappedAlloc { host_ptr, size };
         Ok((host_ptr as *mut u8, dev_ptr, guard))
     }
@@ -2831,10 +2831,28 @@ fn dense_qmatmul_float(
         BF16(CudaSlice<bf16>),
         F32(CudaSlice<f32>),
     }
-    let dst_slice = match ytype {
-        YType::F16 => OutputSlice::F16(unsafe { device.alloc::<f16>(nrows * batch_size)? }),
-        YType::BF16 => OutputSlice::BF16(unsafe { device.alloc::<bf16>(nrows * batch_size)? }),
-        YType::F32 => OutputSlice::F32(unsafe { device.alloc::<f32>(nrows * batch_size)? }),
+    // **The output inherits the activation's provenance**, exactly as an
+    // elementwise op does (`Map2::map` takes `s1.backing`). It used to be a bare
+    // `device.alloc`, which made every dense quantized matmul output `Owned` —
+    // and since a projection's output is the next layer's input, that stranded
+    // the entire activation chain off the reservation. Measured on the 3.6-35B:
+    // the DeltaNet mixer's `qkv` had no wave ticket, so its span tables, its
+    // `empty_beside` temporaries and everything downstream allocated from the
+    // driver too. One dropped backing, dozens of reported sites.
+    let origin = rhs_storage.backing;
+    let (dst_slice, out_backing) = match ytype {
+        YType::F16 => {
+            let (s, b) = unsafe { alloc_inheriting::<f16>(device, nrows * batch_size, origin)? };
+            (OutputSlice::F16(s), b)
+        }
+        YType::BF16 => {
+            let (s, b) = unsafe { alloc_inheriting::<bf16>(device, nrows * batch_size, origin)? };
+            (OutputSlice::BF16(s), b)
+        }
+        YType::F32 => {
+            let (s, b) = unsafe { alloc_inheriting::<f32>(device, nrows * batch_size, origin)? };
+            (OutputSlice::F32(s), b)
+        }
         YType::Q8A128 => {
             crate::bail!("YType::Q8A128 is the int8 matmul INPUT format, not an FP output dtype")
         }
@@ -2917,10 +2935,16 @@ fn dense_qmatmul_float(
         }
     }
 
-    let out_storage = match dst_slice {
-        OutputSlice::F16(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
-        OutputSlice::BF16(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
-        OutputSlice::F32(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
+    // `wrap_cuda_slice` hardcodes `Backing::Owned`, which would throw away the
+    // provenance the allocation above just established.
+    let out_storage = CudaStorage {
+        slice: match dst_slice {
+            OutputSlice::F16(dst) => CudaStorageSlice::F16(dst),
+            OutputSlice::BF16(dst) => CudaStorageSlice::BF16(dst),
+            OutputSlice::F32(dst) => CudaStorageSlice::F32(dst),
+        },
+        device: device.clone(),
+        backing: out_backing,
     };
     let mut out_shape = rhs_l.shape().dims().to_vec();
     out_shape.pop();

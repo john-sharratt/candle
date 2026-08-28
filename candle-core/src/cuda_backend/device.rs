@@ -151,6 +151,31 @@ impl CudaDevice {
     /// span — so they pass that arena in explicitly.
     ///
     /// The copy itself is unchanged; only the destination moves.
+    /// Host upload placed on `origin`'s span, as a plain slice plus its backing.
+    ///
+    /// The same work as [`Self::memcpy_stod_from`], returning the pieces
+    /// `CudaStorage` is built from rather than an [`Uploaded`] guard — which is
+    /// what a *tensor* constructor needs, since `CudaStorageSlice` holds the
+    /// slice directly.
+    ///
+    /// This is the only way a host-built table can land on the reservation:
+    /// there is no device operand to inherit a ticket from, so the caller names
+    /// the span it belongs to. Without it every per-wave descriptor table — the
+    /// DeltaNet pointer tables, the rotary layouts, the batched row maps — is a
+    /// driver allocation inside the wave.
+    pub fn memcpy_stod_leased<
+        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
+        Src: cudarc::driver::HostSlice<T> + ?Sized,
+    >(
+        &self,
+        src: &Src,
+        origin: Backing,
+    ) -> Result<(cudarc::driver::CudaSlice<T>, Backing)> {
+        let (mut dst, backing) = unsafe { alloc_inheriting::<T>(self, src.len(), origin)? };
+        self.stream.memcpy_htod(src, &mut dst).w()?;
+        Ok((dst, backing))
+    }
+
     pub fn memcpy_stod_from<
         T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
         Src: cudarc::driver::HostSlice<T> + ?Sized,
@@ -733,6 +758,15 @@ impl BackendDevice for CudaDevice {
     type Storage = CudaStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        // Latch how much host RAM the machine had before this process took any
+        // of it. The expert cache's warm tier is sized from that reading rather
+        // than from a live one, because by the time it asks, the loader has the
+        // checkpoint mapped and the live figure is several GiB into a trough of
+        // the engine's own digging (see `vram::launch_available_ram`). A device
+        // has to exist before any weight can be loaded onto it, so this is the
+        // earliest point every path that can reach a warm tier shares.
+        crate::vram::snapshot_launch();
+
         // **One device per ordinal, for the life of the process.**
         //
         // Not for the context's sake — `CudaContext::new` retains the driver's
@@ -1143,6 +1177,40 @@ impl BackendDevice for CudaDevice {
 }
 
 impl CudaDevice {
+    /// [`BackendDevice::storage_from_cpu_storage_owned`], placed on the span
+    /// `origin` names instead of allocated from the driver.
+    ///
+    /// A host-built table has no device operand to inherit a ticket from, so the
+    /// caller states which wave it belongs to. `Backing::Owned` reproduces the
+    /// original behaviour exactly, which is what every load-time caller wants.
+    pub fn storage_from_cpu_storage_owned_on(
+        &self,
+        storage: CpuStorage,
+        origin: Backing,
+    ) -> Result<CudaStorage> {
+        macro_rules! up {
+            ($s:expr, $variant:ident) => {{
+                let (data, backing) = self.memcpy_stod_leased(&$s, origin)?;
+                (CudaStorageSlice::$variant(data), backing)
+            }};
+        }
+        let (slice, backing) = match storage {
+            CpuStorage::U8(s) => up!(s, U8),
+            CpuStorage::U32(s) => up!(s, U32),
+            CpuStorage::I64(s) => up!(s, I64),
+            CpuStorage::BF16(s) => up!(s, BF16),
+            CpuStorage::F16(s) => up!(s, F16),
+            CpuStorage::F32(s) => up!(s, F32),
+            CpuStorage::F64(s) => up!(s, F64),
+            CpuStorage::F8E4M3(s) => up!(s, F8E4M3),
+        };
+        Ok(CudaStorage {
+            slice,
+            device: self.clone(),
+            backing,
+        })
+    }
+
     /// Uninitialised storage taken from the arena `ticket` names, or from the
     /// pool when there is none.
     ///

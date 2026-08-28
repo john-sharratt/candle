@@ -974,9 +974,14 @@ impl TestParams {
             // is a throughput figure, not an error. Printing the region ledger
             // per config is what turns "the third config is slow" into "the third
             // config started with N fewer free regions than the first".
+            // Free host RAM at every config boundary, so the run's trough is
+            // recorded rather than inferred from the one reading at load.
+            candle::vram::sample_available_low_water();
             if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
+                let (swept, sweeps) = candle_nn::kv_cache::empty_sweep_stats();
                 println!(
-                    "  [regions] total {} | live {} | free {} | blocked {} | arenas {} MiB",
+                    "  [regions] total {} | live {} | free {} | blocked {} | arenas {} MiB \
+                     | swept {swept} arenas / {sweeps} sweeps",
                     rs.total,
                     rs.live,
                     rs.free,
@@ -2256,6 +2261,19 @@ impl TestParams {
                 "DMA loads (H2D)",
                 Box::new(|s: &PipelineStats| format!("{}", s.dma_loads)),
             ),
+            // The two gauges that turn the load counts into a tier decomposition:
+            // how much of the model is resident in VRAM, and how much of the KV
+            // side's ground the weight zone is still willing to concede. Without
+            // them a cold-load count says a tier is missing its target without
+            // saying which tier had the room.
+            (
+                "Hot VRAM (resident)",
+                Box::new(|s: &PipelineStats| format!("{} MiB", s.resident_vram_bytes >> 20)),
+            ),
+            (
+                "Zone cedeable",
+                Box::new(|s: &PipelineStats| format!("{} MiB", s.zone_cedeable_bytes >> 20)),
+            ),
             (
                 "Warm tier slots",
                 Box::new(|s: &PipelineStats| {
@@ -2365,7 +2383,190 @@ impl TestParams {
             print!("┴{:─<cw$}", "", cw = col_w + 2);
         }
         println!("┘");
+        Self::print_pinned_ram_report();
     }
+
+    /// Print what host RAM the engine page-locked, and what bounded it.
+    ///
+    /// The warm tier's size is the single largest lever on cold-load rate, and
+    /// it is decided once at load by whichever of three ceilings is lowest. The
+    /// expert table above reports the *outcome* (`Warm tier slots`) with no way
+    /// to tell a tier that took everything it could from one that was refused —
+    /// which is the difference between "buy more RAM" and "raise a cap".
+    #[cfg(feature = "cuda")]
+    fn print_pinned_ram_report() {
+        use crate::models::expert_lre::{
+            last_warm_tier_sizing, CEILING_AVAILABLE, CEILING_HOST_BUDGET, CEILING_PINNABLE,
+        };
+        use candle::vram::{host_pinned_breakdown, host_pinned_bytes};
+
+        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        println!("\n=== Host Pinned RAM ===");
+
+        let held = host_pinned_bytes();
+        let Some(s) = last_warm_tier_sizing() else {
+            println!("  (no warm tier was sized in this process)");
+            println!("  pinned held: {:.2} GiB", gib(held));
+            return;
+        };
+
+        println!(
+            "  Machine: {:.2} GiB total | {:.2} GiB free at launch (the baseline) | \
+             {:.2} GiB free mid-load | {:.2} GiB already pinned when sized",
+            gib(s.total_ram),
+            gib(s.launch_ram),
+            gib(s.available_ram),
+            gib(s.already_pinned),
+        );
+        println!("  Ceilings on the warm tier (lowest wins):");
+        for (name, v) in [
+            (CEILING_HOST_BUDGET, s.kv_warm_budget),
+            (CEILING_AVAILABLE, s.available_less_headroom),
+            (CEILING_PINNABLE, s.pinnable_cap),
+        ] {
+            println!(
+                "    {:<38} {:>8.2} GiB{}",
+                name,
+                gib(v),
+                if s.bound_by == name {
+                    "   ← binds"
+                } else {
+                    ""
+                }
+            );
+        }
+        println!("  Bound by: {}", s.bound_by);
+        println!(
+            "  Warm tier: {} of {} evictable experts ({:.0}%), {:.2} GiB at {:.2} MiB/slot",
+            s.slots,
+            s.wanted_slots,
+            100.0 * s.slots as f64 / s.wanted_slots.max(1) as f64,
+            gib(s.taken_bytes),
+            s.stride as f64 / (1024.0 * 1024.0),
+        );
+        let short = s.wanted_slots.saturating_sub(s.slots);
+        println!(
+            "  Shortfall: {short} experts with no warm copy, {:.2} GiB — every miss on \
+             one of these reads the pack",
+            gib(short as u64 * s.stride as u64),
+        );
+
+        match candle::vram::available_low_water() {
+            Some(low) => println!(
+                "  Free RAM low-water across the run: {:.2} GiB  (headroom asked for {:.2} GiB)",
+                gib(low),
+                gib(crate::models::expert_lre::WARM_TIER_HEADROOM),
+            ),
+            None => println!("  Free RAM low-water: not sampled"),
+        }
+        // **Is the wave transient tier being used at all?** A zero peak reads
+        // identically to "never seeded": if no tensor is ever carved from the
+        // arena, no operand carries a ticket, and every op on the wave path
+        // allocates from the driver however correctly each one propagates.
+        match candle_nn::kv_cache::wave_domain_stats(0) {
+            Some(d) => {
+                let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+                println!(
+                    "  Wave arenas (used/peak/cap MiB): fwd {:.1}/{:.1}/{:.1} | attn {:.1}/{:.1}/{:.1} \
+                     | ffn {:.1}/{:.1}/{:.1}",
+                    mib(d[0].0), mib(d[0].1), mib(d[0].2),
+                    mib(d[1].0), mib(d[1].1), mib(d[1].2),
+                    mib(d[2].0), mib(d[2].1), mib(d[2].2),
+                );
+            }
+            None => println!("  Wave arenas: no domain on device 0"),
+        }
+        // Which DeltaNet dispatch path each wave took, and what rejected it.
+        // Counts, not timings — see `docs/qwen36_performance_plan.md` T1.
+        let dt = crate::models::delta_net::mix::dispatch_tally();
+        if !dt.is_empty() {
+            println!("\n=== DeltaNet dispatch (path taken) ===");
+            for (path, outcome, n) in dt {
+                let tag = if outcome == "FUSED" {
+                    "fused"
+                } else {
+                    "FELL BACK on"
+                };
+                println!("  {path:<12} {tag:>13} {outcome:<14} {n:>8}");
+            }
+        }
+        let g = crate::models::expert_lre::grow_tally();
+        println!(
+            "  Boundary growth: asked {} | no-spare {} | spare offered {} regions | \
+             target-unchanged {} | target-backwards {} | floor-refused {} | at-limit {} | \
+             SLOTS GAINED {}",
+            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+        );
+        // The span's own accounting, so the whole-card decomposition is read off
+        // the reservation rather than reconstructed from slot and region counts —
+        // the two round in different units, and 80 boundary moves of rounding is
+        // exactly the sort of gap that gets inferred away.
+        if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
+            println!("\n=== Span (device 0) ===");
+            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+            if let Ok((free, total)) = candle::Device::new_cuda(0).and_then(|d| d.mem_get_info()) {
+                println!(
+                    "  CARD                {:>9.1} MiB total | {:>7.1} free | {:>7.1} in use",
+                    mib(total),
+                    mib(free),
+                    mib(total - free),
+                );
+            }
+            println!("  reserved            {:>9.1} MiB", mib(rs.reserved_bytes));
+            println!(
+                "    weight zone       {:>9.1} MiB   (the expert side of the boundary)",
+                mib(rs.weight_bytes)
+            );
+            let region = candle_nn::kv_cache::REGION_BYTES;
+            let kv = rs.total * region;
+            println!(
+                "    KV regions        {:>9.1} MiB   ({} x {:.0} MiB: live {}, free {}, blocked {})",
+                mib(kv),
+                rs.total,
+                mib(region),
+                rs.live,
+                rs.free,
+                rs.blocked,
+            );
+            println!(
+                "    unusable slack    {:>9.1} MiB   (span tail the region count rounds off)",
+                mib(rs.slack_bytes)
+            );
+            // Whatever the reservation holds that is neither side of the moving
+            // boundary: the dense weights, loaded before the boundary existed.
+            println!(
+                "    dense block       {:>9.1} MiB   (loaded before the boundary, immovable)",
+                mib(rs
+                    .reserved_bytes
+                    .saturating_sub(rs.weight_bytes)
+                    .saturating_sub(kv)
+                    .saturating_sub(rs.slack_bytes)),
+            );
+            println!(
+                "  peak KV live        {:>9.1} MiB   ({} regions)   granule {:.0} MiB",
+                mib(rs.peak_live * region),
+                rs.peak_live,
+                mib(rs.granularity),
+            );
+        }
+
+        let s = candle_nn::kv_cache::spare_tally();
+        println!(
+            "  Spare calc: observing {} | pressure {} | history-bound {} | occupancy-bound {} \
+             | granted {} regions || KV purchases: conceded {} / refused {}",
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6],
+        );
+        println!("  Pinned now, by consumer:");
+        for (use_, bytes) in host_pinned_breakdown() {
+            if bytes > 0 {
+                println!("    {:<38} {:>8.2} GiB", use_.label(), gib(bytes));
+            }
+        }
+        println!("    {:<38} {:>8.2} GiB", "TOTAL", gib(held));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn print_pinned_ram_report() {}
 
     /// Print a transposed profile-timing table.
     ///

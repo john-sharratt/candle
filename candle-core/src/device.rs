@@ -493,6 +493,27 @@ impl Device {
         }
     }
 
+    /// [`Self::storage_owned`], placed on the wave span `ticket` names.
+    ///
+    /// `None` — or any non-CUDA device — is exactly [`Self::storage_owned`].
+    #[cfg(feature = "cuda")]
+    pub(crate) fn storage_owned_on<S: WithDType>(
+        &self,
+        data: Vec<S>,
+        ticket: Option<crate::wave_provenance::WaveTicket>,
+    ) -> Result<Storage> {
+        match (self, ticket) {
+            (Device::Cuda(device), Some(_)) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let origin = crate::cuda_backend::Backing::from_ticket(ticket);
+                Ok(Storage::Cuda(
+                    device.storage_from_cpu_storage_owned_on(storage, origin)?,
+                ))
+            }
+            _ => self.storage_owned(data),
+        }
+    }
+
     pub(crate) fn storage_owned<S: WithDType>(&self, data: Vec<S>) -> Result<Storage> {
         match self {
             Device::Cpu => Ok(Storage::Cpu(S::to_cpu_storage_owned(data))),

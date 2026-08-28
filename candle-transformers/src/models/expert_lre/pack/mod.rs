@@ -246,6 +246,9 @@ pub(crate) struct ExpertPack {
     stride: usize,
     slot_bytes: usize,
     experts_per_layer: usize,
+    /// Leading MoE layers with no record in the file — permanently VRAM-resident
+    /// and never reloaded. Record `0` is layer `pinned_layers`, expert `0`.
+    pinned_layers: usize,
     layouts: Vec<RecordLayout>,
     /// One checksum per record, in index order, read from the trailer at open.
     ///
@@ -274,9 +277,34 @@ impl ExpertPack {
         &self.path
     }
 
+    /// Leading MoE layers this pack holds no records for — see
+    /// [`Self::record_index`].
+    pub(crate) fn pinned_layers(&self) -> usize {
+        self.pinned_layers
+    }
+
+    /// Flat record index of `(layer, expert)`, or an error for a layer the file
+    /// deliberately does not store.
+    ///
+    /// The pinned prefix is permanently VRAM-resident and never evicted, so a
+    /// read against it is not a cache miss — it is a bug in whatever decided the
+    /// expert was evictable, and it must say so here rather than silently
+    /// serving the record `pinned_layers` further along.
+    fn record_index(&self, layer: usize, expert: usize) -> Result<usize> {
+        let Some(rel) = layer.checked_sub(self.pinned_layers) else {
+            candle::bail!(
+                "expert pack: layer {layer} is one of the {} permanently resident \
+                 layers and has no record — it is never evicted, so nothing should \
+                 be reloading it",
+                self.pinned_layers,
+            );
+        };
+        Ok(rel * self.experts_per_layer + expert)
+    }
+
     /// Byte offset of `(layer, expert)`'s record.
-    fn offset_of(&self, layer: usize, expert: usize) -> u64 {
-        self.records_at + ((layer * self.experts_per_layer + expert) * self.stride) as u64
+    fn offset_of(&self, layer: usize, expert: usize) -> Result<u64> {
+        Ok(self.records_at + (self.record_index(layer, expert)? * self.stride) as u64)
     }
 
     /// Check a record against the checksum written with it.
@@ -307,7 +335,7 @@ impl ExpertPack {
     /// medium failure the checkpoint it derives from is not itself insured
     /// against — the GGUF has no per-tensor checksum either.
     fn verify(&self, layer: usize, expert: usize, record: &[u8]) -> Result<()> {
-        let idx = layer * self.experts_per_layer + expert;
+        let idx = self.record_index(layer, expert)?;
         let Some(&want) = self.sums.get(idx) else {
             return Ok(());
         };
@@ -338,12 +366,12 @@ impl ExpertPack {
                 dest.len()
             );
         }
-        let idx = layer * self.experts_per_layer + expert;
+        let idx = self.record_index(layer, expert)?;
         if self.cold_cache.fill(idx, dest) {
             return Ok(());
         }
         self.reader
-            .read_at(self.offset_of(layer, expert), dest)
+            .read_at(self.offset_of(layer, expert)?, dest)
             .map_err(|e| {
                 candle::Error::Msg(format!(
                     "expert pack read L{layer}E{expert} from {}: {e}",
@@ -394,17 +422,19 @@ impl ExpertPack {
         // cache both ways — it reads every record exactly once and most of
         // what it reads lands pinned in the warm tier.
         let mut hits: Vec<(usize, &mut [u8])> = Vec::new();
-        let mut ids: Vec<(usize, usize)> = Vec::with_capacity(targets.len());
+        // `(record index, (layer, expert))` — the index for the cold cache, the
+        // pair for the error message a checksum failure prints.
+        let mut ids: Vec<(usize, (usize, usize))> = Vec::with_capacity(targets.len());
         let mut stripes: Vec<StripeRead<'_>> = Vec::with_capacity(targets.len());
         for t in targets {
-            let idx = t.layer * self.experts_per_layer + t.expert;
+            let idx = self.record_index(t.layer, t.expert)?;
             if !verify && self.cold_cache.contains(idx) {
                 hits.push((idx, t.dest));
                 continue;
             }
-            ids.push((t.layer, t.expert));
+            ids.push((idx, (t.layer, t.expert)));
             stripes.push(StripeRead {
-                file_offset: self.offset_of(t.layer, t.expert),
+                file_offset: self.records_at + (idx * self.stride) as u64,
                 dest: t.dest,
             });
         }
@@ -436,9 +466,8 @@ impl ExpertPack {
             // map lock, so the copies spread across the pool.
             ids.par_iter()
                 .zip(stripes.par_iter())
-                .for_each(|(&(layer, expert), stripe)| {
-                    self.cold_cache
-                        .store(layer * self.experts_per_layer + expert, stripe.dest);
+                .for_each(|(&(idx, _), stripe)| {
+                    self.cold_cache.store(idx, stripe.dest);
                 });
             return Ok(());
         }
@@ -447,7 +476,7 @@ impl ExpertPack {
         // where the cores are otherwise idle waiting on the drive.
         ids.par_iter()
             .zip(stripes.par_iter())
-            .try_for_each(|(&(layer, expert), stripe)| self.verify(layer, expert, stripe.dest))
+            .try_for_each(|(&(_, (layer, expert)), stripe)| self.verify(layer, expert, stripe.dest))
     }
 
     /// Open `path` if it is a pack this build can use for this checkpoint.
@@ -510,6 +539,7 @@ impl ExpertPack {
             stride: got.stride as usize,
             slot_bytes: got.slot_bytes as usize,
             experts_per_layer: got.experts_per_layer as usize,
+            pinned_layers: got.pinned_layers as usize,
             layouts: got.layers.iter().copied().map(RecordLayout::from).collect(),
             sums,
         })
@@ -525,6 +555,7 @@ impl ExpertPack {
             .field("slot_bytes", &self.slot_bytes)
             .field("layers", &self.layouts.len())
             .field("experts_per_layer", &self.experts_per_layer)
+            .field("pinned_layers", &self.pinned_layers)
             .finish()
     }
 
@@ -625,7 +656,11 @@ impl PackWriter {
     }
 
     /// Append `(layer, expert)`'s record. Must be called in ascending index
-    /// order, once per expert, for every expert.
+    /// order, once per expert, for every expert **outside the pinned prefix**.
+    ///
+    /// Pinned-layer experts are permanently VRAM-resident and never reloaded, so
+    /// the caller must not offer them: doing so is caught here rather than
+    /// silently writing a record the reader's index arithmetic does not expect.
     pub(crate) fn write_expert(
         &mut self,
         layer: usize,
@@ -634,7 +669,14 @@ impl PackWriter {
         up: &[u8],
         down: &[u8],
     ) -> Result<()> {
-        let expect = layer * self.header.experts_per_layer as usize + expert;
+        let pinned = self.header.pinned_layers as usize;
+        let Some(rel) = layer.checked_sub(pinned) else {
+            candle::bail!(
+                "expert pack writer: L{layer}E{expert} is inside the {pinned} permanently \
+                 resident layers, which this pack deliberately holds no records for"
+            );
+        };
+        let expect = rel * self.header.experts_per_layer as usize + expert;
         if expect != self.written {
             candle::bail!(
                 "expert pack writes must be sequential: L{layer}E{expert} is index {expect}, \
@@ -753,6 +795,7 @@ pub(crate) fn open_or_create(spec: PackSpec<'_>) -> Result<PackSource> {
         identity,
         num_layers,
         experts_per_layer,
+        pinned_layers,
         slot_bytes,
         layers,
     } = spec;
@@ -765,6 +808,7 @@ pub(crate) fn open_or_create(spec: PackSpec<'_>) -> Result<PackSource> {
         source_sum: identity.source_sum,
         int8_mode: identity.int8_mode,
         repack_fp: identity.repack_fp,
+        pinned_layers: pinned_layers as u32,
         layers: layers.into_iter().map(LayerSpans::from).collect(),
     };
     let stem = gguf_path
@@ -829,6 +873,9 @@ pub(crate) struct PackSpec<'a> {
     pub identity: PackIdentity,
     pub num_layers: usize,
     pub experts_per_layer: usize,
+    /// Leading MoE layers to hold **no records** for, because the cache pins
+    /// them in VRAM permanently and never reloads them.
+    pub pinned_layers: usize,
     /// The slot image: three projections at their aligned offsets.
     pub slot_bytes: usize,
     pub layers: Vec<LayerSpansInput>,
@@ -884,6 +931,7 @@ fn open_header_len(num_layers: usize) -> usize {
         source_sum: 0,
         int8_mode: 0,
         repack_fp: 0,
+        pinned_layers: 0,
         layers: vec![
             LayerSpans {
                 gate: ProjectionSpan {
@@ -971,6 +1019,10 @@ mod tests {
             identity: identity(),
             num_layers: 2,
             experts_per_layer: 2,
+            // The fixture stores every layer, so the record indices are the
+            // plain flat ones and the pinned-prefix arithmetic is exercised
+            // separately by `a_pinned_prefix_shifts_every_record_index`.
+            pinned_layers: 0,
             slot_bytes: SLOT_BYTES,
             layers: spans(),
         }
@@ -1010,7 +1062,10 @@ mod tests {
         assert_eq!(pack.stride() % DIRECT_IO_SECTOR, 0);
         for layer in 0..2 {
             for expert in 0..2 {
-                assert_eq!(pack.offset_of(layer, expert) % DIRECT_IO_SECTOR as u64, 0);
+                assert_eq!(
+                    pack.offset_of(layer, expert).unwrap() % DIRECT_IO_SECTOR as u64,
+                    0
+                );
             }
         }
         drop(pack);
@@ -1522,10 +1577,68 @@ mod tests {
             source_sum: identity().source_sum,
             int8_mode: identity().int8_mode,
             repack_fp: identity().repack_fp,
+            pinned_layers: 0,
             layers: spans().into_iter().map(LayerSpans::from).collect(),
         };
         drop(pack);
         assert_eq!(peek_header(&path, want.encoded_len()).unwrap(), want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A pinned prefix shifts every record index**, and the pack must refuse
+    /// the prefix outright rather than serve the record `pinned_layers` further
+    /// along — which would be a real expert, of the wrong layer, with no error.
+    ///
+    /// Written as bytes rather than a round trip: layer 1 expert 1 is the last
+    /// record of a 3-layer model that pins 1, so it must land at flat index 3,
+    /// not 5.
+    #[test]
+    fn a_pinned_prefix_shifts_every_record_index() {
+        let dir = tmp_dir("pinned");
+        let mut s = spec(&dir);
+        s.num_layers = 3;
+        s.pinned_layers = 1;
+        let g = spans()[0];
+        s.layers = vec![g, g, g];
+        let PackSource::Build(mut w) = super::open_or_create(s).unwrap() else {
+            panic!("a fresh directory must yield a writer");
+        };
+        // The pinned layer is refused, and refusing it does not consume an index.
+        assert!(w
+            .write_expert(
+                0,
+                0,
+                &vec![0u8; g.gate.1],
+                &vec![0u8; g.up.1],
+                &vec![0u8; g.down.1]
+            )
+            .is_err());
+        for layer in 1..3 {
+            for expert in 0..2 {
+                let tag = (layer * 2 + expert) as u8;
+                w.write_expert(
+                    layer,
+                    expert,
+                    &vec![tag; g.gate.1],
+                    &vec![tag; g.up.1],
+                    &vec![tag; g.down.1],
+                )
+                .unwrap();
+            }
+        }
+        let pack = w.finish().unwrap();
+        assert_eq!(pack.pinned_layers(), 1);
+        // Four records, starting at layer 1 — not six.
+        assert_eq!(pack.record_index(1, 0).unwrap(), 0);
+        assert_eq!(pack.record_index(2, 1).unwrap(), 3);
+        assert!(pack.record_index(0, 0).is_err(), "served a pinned layer");
+
+        // And the bytes at that offset are the ones written for it.
+        let mut got = vec![0u8; pack.stride()];
+        pack.read_into(2, 1, &mut got).unwrap();
+        assert_eq!(got[0], 5, "L2E1 read back another layer's record");
+
+        drop(pack);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -930,8 +930,23 @@ fn sweep_layers(
     // here where the launch queue is still empty. Each layer takes its slice;
     // a per-layer upload would sync the stream mid-sweep and serialise the
     // pipeline. `None` when the wave carries no decode span.
+    // **Owned, not on the forward span — deliberately.**
+    //
+    // The table is built once and read by every DeltaNet layer, which is exactly
+    // what `LayerPhase::Forward` describes, and an earlier version claimed that
+    // generation here and held it across the sweep. That is unsafe for a reason
+    // the phase doc does not mention: the head's own `Forward` guard is handed
+    // back to the caller in the wave result, so it can still be live when the
+    // next wave starts — and `begin_wave` refuses a phase that is already open
+    // rather than waiting. Holding the span for the whole sweep removes the
+    // sweep as slack for that guard to drop in, and an overlapping wave fails
+    // outright instead of merely allocating.
+    //
+    // 68 KB + 40 KB per forward is not worth that. Left as a driver allocation
+    // until the head guard's lifetime is pinned down; `wave_from_vec` takes the
+    // generation, so the fix is passing one rather than rewriting this.
     #[cfg(feature = "cuda")]
-    let dn_table = crate::models::delta_net::cuda::build_wave_table(&spans, stores)?;
+    let dn_table = crate::models::delta_net::cuda::build_wave_table(&spans, stores, None)?;
 
     // Spans a speculative verify will have to rewind stash each DeltaNet
     // layer's recurrence operands as the sweep passes through it — every

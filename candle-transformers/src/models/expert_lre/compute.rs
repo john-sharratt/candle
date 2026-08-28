@@ -441,8 +441,13 @@ pub fn compute_experts_grouped(
                 inter_acts.backing(),
             )?;
             profile.record("gemm_down", t);
-            // The int8 matmul emits F32; the fused scatter requires the compute dtype (= ys).
-            down_out.to_dtype(ys.dtype())?
+            // Handed on as F32, the type the int8 matmul emits. The fused scatter
+            // is selected by where it *writes* — `ys` — and reads this operand as
+            // the GEMM's native F32, so converting here would be a full-tensor
+            // pass per expert group per layer to hand the kernel a type it does
+            // not want. `fused_deterministic_scatter` validates rather than
+            // converts, and says so by name.
+            down_out
         }
         MoeInput::Float(xs) => {
             let t = profile_now();

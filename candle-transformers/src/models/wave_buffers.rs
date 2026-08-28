@@ -227,6 +227,82 @@ pub(crate) fn wave_zeros<'w, S: Into<Shape>>(
     }
 }
 
+/// A host-built table uploaded onto the wave's half.
+///
+/// The upload counterpart of [`wave_zeros`], and the one the per-forward
+/// descriptor tables need: a pointer array, a row map, a rotary layout. They are
+/// built on the host, so there is no device operand whose provenance they could
+/// inherit — `Tensor::from_vec` can only ever produce an `Owned` tensor, i.e. a
+/// driver allocation inside the wave, from the memory the reservation
+/// deliberately does not cover.
+///
+/// Takes the guard rather than a ticket so the result borrows it: the tensor
+/// cannot be named after the generation whose reset reclaims the range. That is
+/// the whole reason this is safe where handing out a `Tensor` would not be.
+///
+/// The copy is issued **on the device's stream**, and is not waited for.
+///
+/// Stream-ordered because the destination is recycled wave memory: the legacy
+/// NULL stream does not order against a `NonBlocking` stream (which is what
+/// cudarc creates), so an unordered copy can land on addresses the previous
+/// generation's kernels are still reading. Every other H2D in this tree is
+/// stream-ordered for the same reason.
+///
+/// **No host wait**, matching `memcpy_stod_leased` and every other upload here.
+/// An earlier version synchronized on the theory that `data` — an ordinary `Vec`
+/// that dies at the end of the caller's statement — could still be read. It
+/// cannot: for a transfer *from pageable host memory* the driver stages through
+/// its own pinned buffer and `cuMemcpyHtoDAsync` returns only once `data` has
+/// been copied into it. The DMA to the device may still be outstanding, which is
+/// what the stream ordering covers. The wait bought nothing and blocked the
+/// forward on the previous wave's in-flight kernels.
+pub(crate) fn wave_from_vec<'w, D: CudaDType + candle::WithDType, S: Into<Shape>>(
+    data: Vec<D>,
+    shape: S,
+    device: &Device,
+    wave: Option<&'w WaveGeneration>,
+) -> Result<LiveTensor<'w>> {
+    let shape = shape.into();
+    if shape.elem_count() != data.len() {
+        candle::bail!(
+            "wave_from_vec: {} elements for a shape of {}",
+            data.len(),
+            shape.elem_count()
+        );
+    }
+    let (Device::Cuda(cuda), Some(wave)) = (device, wave) else {
+        return Tensor::from_vec(data, shape, device);
+    };
+    let bytes = std::mem::size_of_val(data.as_slice());
+    let ticket = wave.ticket();
+    let range = wave.alloc(bytes, WAVE_ALIGN)?;
+    let stream = cuda.cuda_stream();
+    // SAFETY: `range` is `bytes` of the half pinned by `wave`, nothing else
+    // addresses it within this generation, and the call returns only once `data`
+    // has been staged out of the pageable `Vec` (see the doc above).
+    unsafe {
+        candle::cuda_backend::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            range.ptr,
+            data.as_ptr() as *const std::ffi::c_void,
+            bytes,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| candle::Error::Msg(format!("uploading a wave table: {e}")))?;
+    }
+    // SAFETY: as above, and the returned tensor borrows `wave`, so it cannot be
+    // named after the guard that reclaims the range has dropped.
+    unsafe {
+        LiveTensor::from_leased_cuda_ptr(
+            range.ptr,
+            D::DTYPE,
+            shape,
+            device,
+            LeaseOrigin::Wave(ticket),
+        )
+    }
+}
+
 /// [`wave_zeros`] for a holder of a [`WaveTicket`] rather than of the guard.
 ///
 /// The expert-pipeline thread is the caller that needs this. It cannot borrow

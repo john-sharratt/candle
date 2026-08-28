@@ -81,11 +81,17 @@
 //! run first every pass with no compute ahead of them to overlap a DMA
 //! against, so evicting them guarantees a cold miss at maximum stall.
 //!
-//! The depth is what pinning is *worth*; what it may **cost** is derived from
-//! capacity by `cache::affordable_pinned_layers`, because pinned experts are
-//! capacity the cache can never reuse.  On a wide card the reservation is
-//! noise.  It bites on many experts per layer against a small card — see that
-//! function for the worked case.
+//! The depth is a **constant**, not a function of capacity, because these are
+//! also the experts that have no copy anywhere else: [`pack`] writes no record
+//! for them and the warm tier's draw skips them, so a cache that unpinned one
+//! under pressure would strand it with nowhere to reload from.  What guarantees
+//! the cache can always pay for them is the zone's floor —
+//! `cache::minimum_resident_slots` prices the pinned set plus a full working
+//! layer, and the elastic boundary may not retract below it.
+//!
+//! Dropping their host and disk copies is the point, not a side effect: on the
+//! 3.6-35B it returns 943 MiB of pinned host RAM to the evictable set — the
+//! only set that generates misses — and the same again on disk.
 //!
 //! ### 5. Windowed prefetch eviction
 //!
@@ -189,6 +195,11 @@ pub use gpu_dispatch::GpuDispatchTables;
 pub use handle::ExpertCache;
 #[cfg(feature = "cuda")]
 pub use handle::ExpertCacheSetup;
+#[cfg(feature = "cuda")]
+pub use handle::{
+    last_warm_tier_sizing, WarmTierSizing, CEILING_AVAILABLE, CEILING_HOST_BUDGET, CEILING_NONE,
+    CEILING_PINNABLE, WARM_TIER_HEADROOM,
+};
 /// What the weight zone must be carved into to hold one expert.
 ///
 /// The model loader needs this **before** the cache exists: the zone's slot size
@@ -196,6 +207,8 @@ pub use handle::ExpertCacheSetup;
 /// and the boundary has to be placed before a single expert is uploaded into it.
 #[cfg(feature = "cuda")]
 pub(crate) use pinned::layer_geometries;
+#[cfg(feature = "cuda")]
+pub use pipeline::grow_tally;
 #[cfg(feature = "cuda")]
 pub(crate) use pipeline::slot_bytes_for;
 pub use types::{

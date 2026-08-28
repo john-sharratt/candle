@@ -39,7 +39,8 @@ mod probe_dxgi;
 pub use budget::GovernorConfig;
 pub use diag::{BudgetRow, BudgetTable};
 pub use host_probe::{
-    available_physical_ram, host_perf, host_ram_budget, host_ram_budget_from, pages_in_per_sec,
+    available_low_water, available_physical_ram, host_perf, host_ram_budget, host_ram_budget_from,
+    launch_available_ram, pages_in_per_sec, sample_available_low_water, snapshot_launch,
     total_physical_ram, HostPerf, HostRamBudget,
 };
 pub use managed::is_oom;
@@ -344,31 +345,104 @@ pub fn remove(gpu_id: usize) {
 
 static HOST_PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Record `bytes` of newly allocated host-pinned memory.
-pub fn note_host_pinned_alloc(bytes: u64) {
-    HOST_PINNED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+/// What a pinned allocation is *for*.
+///
+/// The total alone cannot answer the question a pinned-memory decision actually
+/// asks — "the tier is short, who else is holding the pages?" — because every
+/// consumer here is claiming from the same half-of-RAM ceiling
+/// ([`host_probe::PINNABLE_FRACTION`]). One 11 GB claimant and six small ones
+/// need telling apart before any of them is resized.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinnedUse {
+    /// The MoE expert warm tier — the dominant claimant by an order of
+    /// magnitude, and the one whose size is a tuning decision.
+    ExpertWarmTier,
+    /// Staging buffers for host↔device transfers that are not the warm tier:
+    /// the cold pack's read ring, the KV migration scratch.
+    Staging,
+    /// Host-mapped allocations the GPU reads in place — the embedding table's
+    /// quantized rows, and anything else gathered rather than copied.
+    HostMapped,
+    /// Device-visible descriptor rings: the kernel dispatch table ring.
+    DispatchTables,
 }
 
-/// Record `bytes` of host-pinned memory returned to the OS.
-pub fn note_host_pinned_free(bytes: u64) {
-    let mut cur = HOST_PINNED_BYTES.load(Ordering::Relaxed);
+impl PinnedUse {
+    /// Every variant, for reporting.
+    pub const ALL: [PinnedUse; 4] = [
+        PinnedUse::ExpertWarmTier,
+        PinnedUse::Staging,
+        PinnedUse::HostMapped,
+        PinnedUse::DispatchTables,
+    ];
+
+    /// A short label for a report line.
+    pub fn label(self) -> &'static str {
+        match self {
+            PinnedUse::ExpertWarmTier => "expert warm tier",
+            PinnedUse::Staging => "staging buffers",
+            PinnedUse::HostMapped => "host-mapped weights",
+            PinnedUse::DispatchTables => "dispatch tables",
+        }
+    }
+
+    fn slot(self) -> &'static AtomicU64 {
+        match self {
+            PinnedUse::ExpertWarmTier => &PINNED_BY_USE[0],
+            PinnedUse::Staging => &PINNED_BY_USE[1],
+            PinnedUse::HostMapped => &PINNED_BY_USE[2],
+            PinnedUse::DispatchTables => &PINNED_BY_USE[3],
+        }
+    }
+}
+
+static PINNED_BY_USE: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Subtract `bytes` from `at`, saturating — pinned frees can outrun their
+/// allocs across the two gauges during teardown, and a wrap would read as
+/// terabytes held.
+fn saturating_sub_at(at: &AtomicU64, bytes: u64) {
+    let mut cur = at.load(Ordering::Relaxed);
     loop {
         let next = cur.saturating_sub(bytes);
-        match HOST_PINNED_BYTES.compare_exchange_weak(
-            cur,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match at.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => cur = observed,
         }
     }
 }
 
+/// Record `bytes` of newly allocated host-pinned memory, attributed to `use_`.
+pub fn note_host_pinned_alloc(use_: PinnedUse, bytes: u64) {
+    HOST_PINNED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    use_.slot().fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` of host-pinned memory returned to the OS.
+pub fn note_host_pinned_free(use_: PinnedUse, bytes: u64) {
+    saturating_sub_at(&HOST_PINNED_BYTES, bytes);
+    saturating_sub_at(use_.slot(), bytes);
+}
+
 /// Total host-pinned bytes currently allocated process-wide.
 pub fn host_pinned_bytes() -> u64 {
     HOST_PINNED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Host-pinned bytes held by one consumer.
+pub fn host_pinned_bytes_for(use_: PinnedUse) -> u64 {
+    use_.slot().load(Ordering::Relaxed)
+}
+
+/// Every consumer's current holding, for a report. Sums to
+/// [`host_pinned_bytes`].
+pub fn host_pinned_breakdown() -> [(PinnedUse, u64); 4] {
+    PinnedUse::ALL.map(|u| (u, host_pinned_bytes_for(u)))
 }
 
 /// Return the CUDA async pool's reserved-but-unused memory to the OS, once

@@ -391,9 +391,13 @@ impl Engine {
                     .checked_div(slot_bytes)
                     .map_or(0, |n| n.min(total_experts))
             };
-            let capacity = slots_in(initial_bytes);
-            let limit = slots_in(limit_bytes);
             let floor = minimum_resident_slots(n_expert);
+            // Opened at the floor at least — see the same clamp in
+            // `quantized_qwen3_moe` and `qwen35::expert_loader`. With a fixed
+            // `PINNED_LAYERS` a cache below the floor cannot degrade; it fills
+            // with un-evictable experts and fails every load.
+            let capacity = slots_in(initial_bytes).max(floor).min(total_experts);
+            let limit = slots_in(limit_bytes).max(capacity);
             let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit, floor);
             let regions = set_weight_floor(&stream, zone.frontier_for_capacity())?;
             eprintln!(

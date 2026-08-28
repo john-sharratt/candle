@@ -85,7 +85,10 @@ impl TableRing {
                     ))
                 })?;
         }
-        crate::vram::note_host_pinned_alloc(RING_BYTES as u64);
+        crate::vram::note_host_pinned_alloc(
+            crate::vram::PinnedUse::DispatchTables,
+            RING_BYTES as u64,
+        );
         Ok(Self {
             host_base: host_ptr as *mut u8,
             dev_base: dev_ptr,
@@ -141,7 +144,10 @@ impl Drop for TableRing {
         unsafe {
             let _ = sys::cuMemFreeHost(self.host_base as *mut std::ffi::c_void);
         }
-        crate::vram::note_host_pinned_free(RING_BYTES as u64);
+        crate::vram::note_host_pinned_free(
+            crate::vram::PinnedUse::DispatchTables,
+            RING_BYTES as u64,
+        );
     }
 }
 
