@@ -30,6 +30,7 @@ pub fn router() -> Router {
         // status / telemetry
         .route("/v1/status", get(|| async { Json(data::status()) }))
         .route("/v1/telemetry", get(|| async { Json(data::telemetry()) }))
+        .route("/v1/memory", get(|| async { Json(data::memory()) }))
         // Identity only. Signing in and out are the gateway's `/auth/*`, which
         // is served ahead of site routing on every hostname, so `npcd` has no
         // `/v1/auth/*` of its own and this mock must not invent one.
@@ -72,19 +73,19 @@ pub fn router() -> Router {
         .route("/v1/interaction/:ix", get(get_ix).delete(|| async { StatusCode::NO_CONTENT }))
         .route("/v1/interaction/:ix/inject", post(ok))
         .route("/v1/interaction/:ix/stream", get(stream_ix))
-        // worlds / archetypes
+        // worlds / personalities
         .route("/v1/world", get(|| async { Json(json!({ "worlds": data::worlds() })) }).post(ok))
         .route("/v1/world/:wid", get(get_world).put(ok))
         .route("/v1/world/:wid/time", put(ok))
-        .route("/v1/archetype", get(|| async { Json(json!({ "archetypes": data::archetypes() })) }))
-        .route("/v1/archetype/:aid", get(get_archetype).put(ok))
+        .route("/v1/personality", get(|| async { Json(json!({ "personalities": data::personalities() })) }))
+        .route("/v1/personality/:aid", get(get_personality).put(ok))
         // schema: layers + section collections (a world IS its schema)
 
         .route("/v1/schema/layers", get(|| async { Json(schema::layers()) }))
 
         .route("/v1/world/:wid/collections", get(|| async { Json(schema::world_collections()) }))
 
-        .route("/v1/archetype/:aid/collections", get(|| async { Json(schema::archetype_collections()) }))
+        .route("/v1/personality/:aid/collections", get(|| async { Json(schema::personality_collections()) }))
 
         // Push streams. The panes they feed do not poll — `/ws/logs` replays
         // the backlog on connect, so there is no seed-then-subscribe gap.
@@ -383,13 +384,13 @@ async fn get_world(Path(wid): Path<String>) -> Response {
     }
 }
 
-async fn get_archetype(Path(aid): Path<String>) -> Response {
-    match data::archetypes()
+async fn get_personality(Path(aid): Path<String>) -> Response {
+    match data::personalities()
         .into_iter()
-        .find(|a| a["archetype_id"] == json!(aid))
+        .find(|a| a["personality_id"] == json!(aid))
     {
         Some(a) => Json(a).into_response(),
-        None => not_found("archetype_not_found", &format!("no archetype {aid}")),
+        None => not_found("personality_not_found", &format!("no personality {aid}")),
     }
 }
 

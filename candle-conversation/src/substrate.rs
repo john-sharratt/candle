@@ -3592,6 +3592,12 @@ impl Substrate {
             | RecordType::Template
             | RecordType::Tokenizer
             | RecordType::HeaderIndex
+            // NPC records are not the substrate's to interpret. They share its
+            // log because a character must outlive the process, but the
+            // registry that owns them lives in `npcd`, which reads them from
+            // the same walk through its own sink. The substrate holds no
+            // opinion about a character.
+            | RecordType::Npc
             | RecordType::Unknown => {}
         }
     }
@@ -6730,6 +6736,114 @@ mod tests {
         // code tag does not leak into tl2.
         assert_eq!(sub.turn_with_tag(tl2, "."), Some(TurnIndex(0)));
         assert_eq!(sub.turn_with_tag(tl2, "foo.rs"), None);
+    }
+
+    /// Gather-scope tag semantics, pinned.
+    ///
+    /// `SelectionPolicy.tags` documents an empty list as "all projections in
+    /// scope", and the gather in `projection::resolver` implements the
+    /// opposite — an empty filter admits only turns that are themselves
+    /// untagged:
+    ///
+    /// ```ignore
+    /// let in_scope = if tags.is_empty() {
+    ///     d.tags.is_empty()
+    /// } else {
+    ///     d.tags.iter().any(|t| tags.contains(t))
+    /// };
+    /// ```
+    ///
+    /// The implementation is the useful behaviour and this test fixes it, so
+    /// the doc comment is what needs correcting rather than the code. It is
+    /// what lets one corpus serve many scopes: content ingested UNTAGGED is
+    /// shared by every node that declares no filter, and content ingested with
+    /// a tag is reachable only from a node naming it. A change to "empty means
+    /// everything" would make every tagged turn visible everywhere, silently.
+    #[test]
+    fn an_empty_tag_filter_admits_only_untagged_turns() {
+        let admits = |filter: &[&str], turn: &[&str]| -> bool {
+            let d: Vec<String> = turn.iter().map(|t| t.to_string()).collect();
+            if filter.is_empty() {
+                d.is_empty()
+            } else {
+                d.iter().any(|t| filter.contains(&t.as_str()))
+            }
+        };
+
+        // Empty filter: untagged content only. A tagged turn is NOT admitted —
+        // this is the half the doc comment gets wrong.
+        assert!(admits(&[], &[]), "untagged content is the shared corpus");
+        assert!(
+            !admits(&[], &["ardh"]),
+            "an empty filter must not sweep in tagged content"
+        );
+
+        // Named filter: that tag only. Untagged content is excluded here, so a
+        // node that names a scope sees that scope and nothing else.
+        assert!(admits(&["ardh"], &["ardh"]));
+        assert!(!admits(&["ardh"], &["battle-cities"]));
+        assert!(!admits(&["ardh"], &[]));
+
+        // Multi-valued on both sides is an intersection test, so one document
+        // can belong to two scopes at once.
+        assert!(admits(&["ardh"], &["ardh", "battle-cities"]));
+        assert!(admits(&["ardh", "low-fen"], &["low-fen"]));
+    }
+
+    /// `turn_with_tag` resolves ONE member — a group's declared default — and
+    /// is not a bulk filter. Two properties make that binding rather than
+    /// stylistic, and both are easy to discover the expensive way:
+    ///
+    /// 1. **It is a linear scan** over every stream decl. Selecting a whole
+    ///    scope through it is a scan per turn, i.e. quadratic in the corpus.
+    /// 2. **With more than one match the winner is arbitrary.** The scan is
+    ///    `all_streams().find_map(..)` over a map, so iteration order is not
+    ///    insertion or index order — this test originally asserted `TurnIndex(0)`
+    ///    and got `TurnIndex(1)`. The doc's "expected to identify a unique turn"
+    ///    is a precondition, not a hint: violate it and the answer is
+    ///    nondeterministic rather than merely surprising.
+    ///
+    /// Anything selecting many turns by tag needs an index built once at ingest.
+    #[test]
+    fn turn_with_tag_finds_one_arbitrary_member_by_scanning() {
+        let mut sub = Substrate::new();
+        let decl = |tl: u64, idx: u32, tags: &[&str]| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: tl,
+                turn_index: idx,
+                turn_id_day: 0,
+                turn_id_seq: idx + 1,
+                role: 1,
+                block_start: 0,
+                block_end: 1,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        // Three turns sharing one tag — a scope with more than one document in
+        // it, which is the ordinary case for a corpus.
+        for i in 0..3u32 {
+            sub.apply_stream_decl(turn_stream_id(1, i), decl(1, i, &["ardh"]));
+        }
+        let tl = TimelineId::from_raw(1).unwrap();
+
+        // It answers with A member, not THE members — and which one is not
+        // ordered. Asserting a specific index here would be asserting a hash
+        // seed.
+        let got = sub.turn_with_tag(tl, "ardh").expect("some member matches");
+        assert!(
+            (0..3).contains(&got.0),
+            "returned a member of the tagged set, but an arbitrary one: {got:?}"
+        );
+        assert_eq!(sub.turn_with_tag(tl, "absent"), None);
+
+        // Sole match: deterministic, which is the contract it is built for.
+        sub.apply_stream_decl(turn_stream_id(1, 9), decl(1, 9, &["unique"]));
+        assert_eq!(sub.turn_with_tag(tl, "unique"), Some(TurnIndex(9)));
     }
 
     /// The decoded-signature memo serves a stable `Arc` on repeat reads, and

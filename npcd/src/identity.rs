@@ -23,9 +23,11 @@
 
 use axum::http::HeaderMap;
 use web::auth::session::Identity;
+use web::auth::{Role, Roles};
 
 /// The headers the gateway speaks identity in.
 const USER: &str = "x-tokera-user";
+const PROVIDER: &str = "x-tokera-provider";
 const EMAIL: &str = "x-tokera-email";
 const NAME: &str = "x-tokera-name";
 const PICTURE: &str = "x-tokera-picture";
@@ -54,6 +56,22 @@ pub fn identify(headers: &HeaderMap) -> Result<Identity, NotSignedIn> {
     };
 
     let sub = get(USER);
+    let provider = get(PROVIDER);
+    // The issuer half of the account key. Refused when absent rather than
+    // assumed to be Google.
+    //
+    // Assuming would put every provider that ever forgets this header into one
+    // namespace, which is the collision the field exists to prevent — and it
+    // would do it silently, which is how the two accounts would stay merged.
+    // A gateway that has not been updated fails sign-in visibly instead, and
+    // is fixed by deploying it.
+    if provider.is_empty() && !sub.is_empty() {
+        tracing::warn!(
+            "identity carried a subject but no provider — the gateway in front of this daemon \
+             is older than the account key it is being asked for"
+        );
+        return Err(NotSignedIn);
+    }
     // An empty subject is not an identity. The gateway omits the whole set for
     // an anonymous caller, but it also skips any single field whose value will
     // not fit in a header — so the absence of a *subject* is the only reliable
@@ -63,6 +81,7 @@ pub fn identify(headers: &HeaderMap) -> Result<Identity, NotSignedIn> {
     }
 
     Ok(Identity {
+        provider,
         sub,
         email: get(EMAIL),
         name: get(NAME),
@@ -72,6 +91,92 @@ pub fn identify(headers: &HeaderMap) -> Result<Identity, NotSignedIn> {
         // exists because `Identity` is also the session cookie's payload.
         exp: 0,
     })
+}
+
+/// The caller: who the gateway said they are, and what that lets them do.
+///
+/// Every route in this daemon starts by building one. Nothing reads the
+/// headers directly and nothing decides access from anything else, so "what may
+/// this request do" has exactly one answer computed in exactly one place.
+pub struct Caller {
+    identity: Option<Identity>,
+    pub role: Role,
+}
+
+impl Caller {
+    /// Read the gateway's headers and resolve the role from the config.
+    ///
+    /// Never fails: not being signed in is [`Role::Unauthenticated`], which is
+    /// a role like any other and enough for every read route.
+    pub fn read(headers: &HeaderMap, roles: &Roles) -> Self {
+        let identity = identify(headers).ok();
+        let role = roles.of(identity.as_ref());
+        Self { identity, role }
+    }
+
+    /// The identity, consumed. `None` exactly when the role is
+    /// [`Role::Unauthenticated`] — the two cannot disagree, because the role
+    /// was derived from this field — so a caller that has already cleared a bar
+    /// of [`Role::User`] can rely on it being `Some`.
+    pub fn into_identity(self) -> Option<Identity> {
+        self.identity
+    }
+}
+
+/// Establish the caller, or produce the refusal that says why not.
+///
+/// The two refusals are different answers and are not interchangeable:
+///
+/// - **401** — nobody is signed in. Signing in would fix it.
+/// - **403** — somebody is signed in and it is not enough. Signing in again
+///   will not fix it, and telling them to try is how an operator wastes an
+///   afternoon on a permissions problem that was never a session problem.
+///
+/// Boxed because a `Response` is large and this is the cold path.
+pub fn require(
+    headers: &HeaderMap,
+    roles: &Roles,
+    min: Role,
+) -> Result<Caller, Box<axum::response::Response>> {
+    let caller = Caller::read(headers, roles);
+    if caller.role.at_least(min) {
+        return Ok(caller);
+    }
+    Err(Box::new(refuse(caller.role, min)))
+}
+
+/// The body for a refused request.
+///
+/// It names the role required and the role held, because the alternative is an
+/// operator guessing which of the two they got wrong. Neither is a secret: the
+/// caller already knows who they signed in as, and the required level is in the
+/// documented API surface.
+fn refuse(held: Role, min: Role) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::Json;
+    use serde_json::json;
+
+    let status = if held == Role::Unauthenticated {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::FORBIDDEN
+    };
+    let error = if status == StatusCode::UNAUTHORIZED {
+        "unauthorized"
+    } else {
+        "forbidden"
+    };
+    (
+        status,
+        Json(json!({
+            "error": error,
+            "detail": format!("this needs the `{min}` role; you have `{held}`"),
+            "required_role": min,
+            "role": held,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -93,6 +198,7 @@ mod tests {
     fn the_gateways_headers_name_the_caller() {
         let id = identify(&headers(&[
             (USER, "google-oauth2|1234"),
+            (PROVIDER, "google"),
             (EMAIL, "wren@example.com"),
             (NAME, "Wren S"),
             (PICTURE, "https://example.com/a.png"),
@@ -100,6 +206,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(id.sub, "google-oauth2|1234");
+        assert_eq!(id.provider, "google");
         assert_eq!(id.email, "wren@example.com");
         assert_eq!(id.name, "Wren S");
         assert_eq!(id.picture, "https://example.com/a.png");
@@ -124,12 +231,37 @@ mod tests {
         );
     }
 
-    /// The descriptive fields are optional; only the subject is not.
+    /// The descriptive fields are optional; the subject and its issuer are not.
     #[test]
     fn an_identity_survives_a_field_the_gateway_could_not_forward() {
-        let id = identify(&headers(&[(USER, "google-1")])).unwrap();
+        let id = identify(&headers(&[(USER, "google-1"), (PROVIDER, "google")])).unwrap();
         assert_eq!(id.sub, "google-1");
+        assert_eq!(id.provider, "google");
         assert!(id.email.is_empty());
         assert!(id.picture.is_empty());
+    }
+
+    /// **The account key is issuer and subject.** A subject arriving without
+    /// its issuer is refused rather than assumed to be Google.
+    ///
+    /// Assuming would put every provider that ever forgets this header into
+    /// one namespace — the collision the field exists to prevent — and would do
+    /// it silently. A gateway older than this daemon fails sign-in visibly
+    /// instead, which is fixed by deploying it.
+    #[test]
+    fn a_subject_without_its_issuer_is_not_an_identity() {
+        assert_eq!(
+            identify(&headers(&[(USER, "google-1"), (EMAIL, "a@b.c")])),
+            Err(NotSignedIn)
+        );
+        assert_eq!(
+            identify(&headers(&[(USER, "google-1"), (PROVIDER, "")])),
+            Err(NotSignedIn)
+        );
+        // And an issuer with no subject is still just anonymous.
+        assert_eq!(
+            identify(&headers(&[(PROVIDER, "google")])),
+            Err(NotSignedIn)
+        );
     }
 }

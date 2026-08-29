@@ -973,6 +973,16 @@ impl SubstratePersistence {
         for (_sid, loc) in substrate.recurrent_snapshot_entries() {
             *live.entry(loc.segment).or_default() += loc.record_size;
         }
+        // Characters. Tracked persistence-side rather than on the substrate
+        // index — the substrate holds no opinion about an NPC — and the map is
+        // last-writer-wins, so only each character's current record is here and
+        // every superseded one correctly reads as dead. Counting these is what
+        // stops the segment holding the live cast from looking reclaimable:
+        // without it the dead ratio is overstated, maintenance re-emits the
+        // whole cast forward on every pass, and the log churns.
+        for loc in self.npc_locs.values() {
+            *live.entry(loc.segment).or_default() += loc.record_size;
+        }
         live
     }
 }

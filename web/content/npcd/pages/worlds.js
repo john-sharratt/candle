@@ -11,32 +11,107 @@
 import { API } from '../lib/api.js';
 import { h, mount, fmtK, worldTime } from '../lib/dom.js';
 import { go } from '../lib/router.js';
-import { empty, toast, confirmDialog, layerColor, bar, modal } from '../lib/ui.js';
+import { empty, toast, confirmDialog, layerColor, bar, modal, mayEdit, ro, roChip, only, roNote } from '../lib/ui.js';
+
+/* The filter box and the world selector, together.
+ *
+ * Filters as you type. It is safe to, because the WHOLE-WORD rule is what keeps
+ * a hidden world hidden, not the moment the query is sent: `e`, `ea`, `ear` and
+ * `eart` all return nothing from the daemon, so typing letters and watching
+ * reveals nothing. Only the complete word does, and that is true whether it
+ * arrives a character at a time or all at once.
+ *
+ * These two live in one function because the input must SURVIVE a result. The
+ * page-level `go()` rebuilds everything and takes the caret with it, so a
+ * keystroke here fetches and re-fills the select in place; only choosing a
+ * world navigates. The URL is kept in step with `replaceState`, which does not
+ * fire `hashchange` — so a reload or a shared link still opens on the same
+ * filter without the router re-rendering under the typist.
+ */
+function finder(find, wid, tab) {
+  const sel = h('select', {
+    class: 'select', style: 'width:auto',
+    onChange: (e) => go('/world/' + e.target.value + '?tab=' + tab
+      + (box.value.trim() ? '&find=' + encodeURIComponent(box.value.trim()) : '')),
+  });
+
+  const fill = (worlds) => {
+    mount(sel, worlds.map((x) => h('option', {
+      value: x.world_id, selected: x.world_id === wid,
+    }, x.name || x.world_id)));
+    // Hidden only when there is nothing to choose *and* nobody is choosing. A
+    // filter that narrowed to one result and then hid the control would leave
+    // the reader unable to see what they had just found — which is the moment
+    // the whole-word reveal exists for.
+    sel.hidden = worlds.length < 2 && !box.value.trim();
+  };
+
+  let timer = null;
+  let seq = 0;
+  const search = async (v) => {
+    // Results can arrive out of order when one request is slower than the next
+    // keystroke's. The stale one would overwrite the fresh list, so a sequence
+    // number decides which answer is still wanted.
+    const mine = ++seq;
+    const r = await API.listWorlds(v).catch(() => null);
+    if (!r || mine !== seq) return;
+    fill(r.worlds || []);
+    const at = (wid ? '/world/' + wid : '/worlds') + '?tab=' + tab
+      + (v ? '&find=' + encodeURIComponent(v) : '');
+    history.replaceState(null, '', '#' + at);
+  };
+
+  const box = h('input', {
+    class: 'input', style: 'width:150px', placeholder: 'find…', value: find,
+    onInput: () => {
+      // Debounced, so a word is one request rather than five. Short enough that
+      // the list feels live under a normal typing speed.
+      clearTimeout(timer);
+      timer = setTimeout(() => search(box.value.trim()), 180);
+    },
+  });
+
+  const clear = h('button', {
+    class: 'btn sm ghost', title: 'clear the filter',
+    onClick: () => { box.value = ''; clearTimeout(timer); search(''); box.focus(); },
+  }, '✕');
+
+  return { el: h('div', { class: 'row', style: 'gap:6px' }, box, clear, sel), fill };
+}
 
 export async function render(params, q) {
-  const worlds = (await API.listWorlds().catch(() => ({ worlds: [] }))).worlds || [];
+  // The filter travels in the URL so a reveal survives a reload and can be
+  // linked. A hidden world is not in the listing until a whole word of `find`
+  // names it — see `npcd::visibility` — so this has to reach the server.
+  const find = q.find || '';
+  const worlds = (await API.listWorlds(find).catch(() => ({ worlds: [] }))).worlds || [];
   const wid = params.wid || (worlds[0] && worlds[0].world_id);
   const w = worlds.find((x) => x.world_id === wid);
   const tab = q.tab || 'layers';
 
   const el = h('div', { class: 'page wide' });
+  const find_ = finder(find, wid, tab);
 
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, w ? w.name : 'Worlds'),
       h('div', { class: 'sub' },
         'A world is the substrate schema its characters run under: the layers they think through, and the ' +
         'authored sections their lens is built from.')),
-    h('div', { class: 'row' },
-      worlds.length > 1
-        ? h('select', { class: 'select', style: 'width:auto', onChange: (e) => go('/world/' + e.target.value) },
-          worlds.map((x) => h('option', { value: x.world_id, selected: x.world_id === wid }, x.name)))
-        : null,
-      h('button', { class: 'btn primary', onClick: () => toast('creating a world — engine required', 'err') }, '+ New world'))));
+    // No "+ New world". An empty world is non-functional — no canon means the
+    // `world` layer projects nothing — so a button that creates a container
+    // hands back something broken and calls it success. A world is a YAML file
+    // in the mind and a tag over the corpus: making one is a file operation and
+    // a commit, which is what authored content should be. Characters are what
+    // users create; worlds are written.
+    find_.el));
+  // Seeded with the list this render already fetched, so the first paint costs
+  // no second request.
+  find_.fill(worlds);
 
   if (!w) {
-    el.appendChild(empty('◍', 'No worlds yet',
-      'A character needs a world to live in — and a world is the schema that character thinks through.',
-      h('button', { class: 'btn primary' }, '+ New world')));
+    el.appendChild(empty('◍', 'No worlds',
+      'A world is a YAML file in the mind, beside the corpus it indexes. Point the daemon at a mind with ' +
+      '--mind, or add a file to its worlds/ directory.'));
     return { el };
   }
 
@@ -68,7 +143,8 @@ export async function render(params, q) {
         h('div', { class: 'tiny dim' },
           'Layer geometry is the calibration surface: window, budget priority and floor, score threshold, ' +
           'and the selection rule. It is data rather than code precisely so it can be moved without a rebuild — ' +
-          `and every change here reaches all ${w.npc_count} characters in ${w.name}.`)),
+          `and every change here reaches every character in ${w.name}` +
+          (w.npc_count ? `, all ${w.npc_count} of them.` : ' — none yet.'))),
 
       h('div', { class: 'list' }, (s.layers || []).map((l) => h('div', {
         style: 'padding:14px 18px',
@@ -122,7 +198,10 @@ export async function render(params, q) {
         h('div', { class: 'tiny dim' },
           'Cross-timeline masking lets this layer be read across characters. Only the world layer should ever use it — ' +
           'on a private layer it is the scope leak the isolation test exists to catch.')),
-      footer: [h('button', { class: 'btn primary', onClick: () => toast('layer schema edit — engine required', 'err') }, 'Save')],
+      footer: [only('admin', () => h('button', {
+        class: 'btn primary',
+        onClick: () => toast('layer schema edit — engine required', 'err'),
+      }, 'Save'))],
     });
   }
 
@@ -152,7 +231,11 @@ export async function render(params, q) {
           h('code', { class: 'mono', style: 'color:var(--accent);font-size:.8rem' }, s.id),
           h('span', { class: 'chip' }, s.category),
           h('span', { style: 'flex:1' }),
-          h('span', { class: 'tiny dim mono' }, s.tokens + ' tok'),
+          // Characters, not tokens. There is no tokenizer in the daemon, so a
+          // token count here would be a plausible-looking guess — which is the
+          // habit that let six invented templates stand in for 596 real ones.
+          h('span', { class: 'tiny dim mono', title: 'characters in the template' },
+            (s.chars ?? 0).toLocaleString() + ' ch'),
           s.examples
             ? h('span', { class: 'chip ok', title: 'calibration lead-ins' }, s.examples + ' examples')
             : h('span', { class: 'chip warn' }, 'uncalibrated'),
@@ -182,35 +265,78 @@ export async function render(params, q) {
           `Selected by: ${col.rule}. ` + (s.examples
             ? `${s.examples} calibration lead-ins train this section’s selection.`
             : 'No calibration examples — this section will be selected worse than its neighbours.'))),
-      footer: [h('button', { class: 'btn primary', onClick: () => toast('section edit — engine required', 'err') }, 'Save')],
+      footer: [only('admin', () => h('button', {
+        class: 'btn primary',
+        onClick: () => toast('section edit — engine required', 'err'),
+      }, 'Save'))],
     });
   }
 
   // ── setting / clock ───────────────────────────────────────────────────────
 
+  /* The world's own document, edited in place. A PUT replaces
+   * `worlds/<id>.yaml` whole, so the object read back goes with it and only the
+   * three edited fields are overwritten — `selects` and anything else an author
+   * put in the file rides through untouched. */
   function setting() {
+    const count = w.npc_count || 0;
+    // Editing a world is an admin's. The daemon refuses the PUT either way;
+    // this is so the page says so before somebody types a paragraph into it.
+    const editable = mayEdit('admin');
+    const name = h('input', { class: 'input', value: w.name || '', ...ro('admin') });
+    const pub = h('input', { type: 'checkbox', checked: w.public, ...ro('admin', 'toggle') });
+    const text = h('textarea', { class: 'textarea', rows: 8, ...ro('admin') }, w.setting || '');
+
+    const save = only('admin', () => h('button', { class: 'btn primary' }, 'Save'));
+    if (save) save.onclick = async () => {
+      const next = { ...w, name: name.value.trim(), public: pub.checked, setting: text.value };
+      delete next.world_id;
+      delete next.npc_count;
+      try {
+        await API.setWorld(w.world_id, next);
+        toast('worlds/' + w.world_id + '.yaml written', 'ok');
+        go('/world/' + w.world_id + '?tab=setting');
+      } catch (e) { toast(e.detail || e.message || 'save failed', 'err'); }
+    };
+
     mount(host,
       h('div', { class: 'panel' },
-        h('div', { class: 'grid g2' },
-          h('label', { class: 'field' }, h('span', {}, 'Name'), h('input', { class: 'input', value: w.name })),
-          h('label', { class: 'row', style: 'gap:9px;margin-top:22px;cursor:pointer' },
-            h('input', { type: 'checkbox', checked: w.public }),
+        h('div', { class: 'row', style: 'justify-content:space-between' },
+          h('h3', { style: 'margin:0' }, 'The world document'),
+          h('div', { class: 'row', style: 'gap:6px' }, roChip('admin'),
+            h('code', { class: 'mono tiny dim' }, `worlds/${w.world_id}.yaml`))),
+        h('div', { class: 'grid g2', style: 'margin-top:10px' },
+          h('label', { class: 'field' }, h('span', {}, 'Name'), name),
+          h('label', { class: 'row', style: 'gap:9px;margin-top:22px;cursor:pointer' }, pub,
             h('div', {}, h('div', { style: 'font-size:.86rem;font-weight:600' }, 'Public'),
               h('div', { class: 'tiny dim' }, 'anyone may spawn characters here')))),
         h('label', { class: 'field' },
-          h('span', {}, 'World knowledge — the shared immutable core'),
-          h('textarea', { class: 'textarea', rows: 6 }, w.setting)),
-        h('div', { class: 'tiny dim' },
-          `Read by every character in ${w.name}. Editing it changes what all ${w.npc_count} of them know.`)),
+          h('span', {}, 'World knowledge — the shared immutable core'), text),
+        h('div', { class: 'row', style: 'justify-content:space-between;margin-top:9px' },
+          h('div', { class: 'tiny dim' },
+            !editable
+              ? roNote('a world')
+              : count
+                ? `Read by every character here. Editing it changes what all ${count} of them know.`
+                : 'Read by every character here. Nobody lives here yet.'),
+          save)),
 
-      h('h2', {}, 'Map zoom bands'),
+      h('h2', {}, 'What this world selects'),
       h('div', { class: 'panel' },
-        h('div', { class: 'row wrap', style: 'gap:6px' },
-          (w.zoom_bands || []).map((b) => h('span', { class: 'chip accent' }, b)),
-          h('input', { class: 'input', placeholder: 'add band…', style: 'width:130px' })),
-        h('div', { class: 'tiny dim', style: 'margin-top:9px' },
-          'The `zoom` values perception maps may declare. Declared per world, because a city game and a ' +
-          'campaign game want different granularities.')));
+        h('div', { class: 'tiny dim', style: 'max-width:88ch' },
+          'A world is a tag-filter over one shared corpus, not a corpus of its own. These are the tags its ' +
+          '`world` layer admits — canon ingested under them is visible here and nowhere else, while craft ' +
+          '(responses, moods, personalities) is ingested untagged and shared by every world, sharing its KV ' +
+          'as well as its text.'),
+        (w.selects || []).length
+          ? h('div', { class: 'row wrap', style: 'gap:6px;margin-top:11px' },
+            (w.selects || []).map((t) => h('span', { class: 'chip accent' }, t)))
+          : h('div', { class: 'tiny dim', style: 'margin-top:11px' },
+            'Nothing selected — this world admits only untagged content. An empty filter is not "everything"; ' +
+            'it is the shared craft and no canon at all.'),
+        h('div', { class: 'tiny dim', style: 'margin-top:11px' },
+          'Edited in the file, not here: the tag set decides what every character in this world can know, ' +
+          'and it belongs in a diff.')));
   }
 
   function clock() {
@@ -220,20 +346,23 @@ export async function render(params, q) {
         h('div', {}, h('div', { class: 'tiny dim' }, 'now'),
           h('div', { class: 'mono', style: 'font-size:1.3rem;font-weight:700' }, worldTime(t.world_ms))),
         h('div', {}, h('div', { class: 'tiny dim' }, 'scale'),
-          h('select', { class: 'select', style: 'width:auto' },
+          h('select', { class: 'select', style: 'width:auto', ...ro('admin', 'toggle') },
             [0, 1, 10, 60, 360, 1440].map((s) => h('option', { value: s, selected: s === t.scale },
               s === 0 ? 'paused' : s + '× real time')))),
-        h('div', {}, h('div', { class: 'tiny dim' }, ' '),
+        // Jumping the clock moves narrative time for every character in the
+        // world, so it belongs with the other world edits: admin.
+        only('admin', () => h('div', {}, h('div', { class: 'tiny dim' }, ' '),
           h('button', { class: 'btn', onClick: () => confirmDialog({
             title: 'Jump the world clock',
             message: `This affects every character in ${w.name}. They will experience the gap, and the ` +
               'consolidation folds will have it to reconcile.',
             confirmText: 'Jump',
             onConfirm: () => toast('clock jumped', 'ok'),
-          }) }, 'Jump to…'))),
+          }) }, 'Jump to…')))),
       h('div', { class: 'tiny dim', style: 'margin-top:14px' },
-        'Scale is world-seconds per real second; 0 pauses. Narrative time is what characters date their ' +
-        'memories by — wall time is only ever a diagnostic.')));
+        (mayEdit('admin') ? '' : roNote('the narrative clock') + ' ')
+        + 'Scale is world-seconds per real second; 0 pauses. Narrative time is what characters date their '
+        + 'memories by — wall time is only ever a diagnostic.')));
   }
 
   return { el };

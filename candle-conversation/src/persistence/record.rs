@@ -165,6 +165,20 @@ pub enum RecordType {
     /// the last-writer-wins accounting *is* the tombstone. Binary payload
     /// [`SnapshotPayload`]; the header CRC covers it like any metadata record.
     Snapshot = 20,
+    /// One NPC's durable identity and configuration — the `npcd` product's
+    /// characters, stored here so a character outlives the process that made
+    /// it. JSON payload [`NpcPayload`], keyed **in the payload** by `npc_id`,
+    /// last-writer-wins on replay: the newest record for an id is that
+    /// character, and every earlier one is dead weight the compactor reclaims.
+    /// No explicit tombstone is written for an edit; supersession is the
+    /// tombstone. Deletion is a state transition (`state: "tombstoned"`),
+    /// which is still just another superseding record.
+    ///
+    /// Payload-keyed, so — like `Label` and `ConvState` — compaction does not
+    /// copy these forward. It re-emits them from the live in-memory registry.
+    /// A holder of NPCs that does not re-emit loses all of them on the first
+    /// compaction; see [`super::compaction`].
+    Npc = 21,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -203,6 +217,7 @@ impl RecordType {
             18 => RecordType::HeaderIndex,
             19 => RecordType::TurnCoupling,
             20 => RecordType::Snapshot,
+            21 => RecordType::Npc,
             _ => RecordType::Unknown,
         }
     }
@@ -826,6 +841,103 @@ impl DebugIdPayload {
     }
 }
 
+/// JSON payload for a [`RecordType::Npc`] record — one character, as it
+/// durably is. One entry per `npc_id`, last-writer-wins on replay.
+///
+/// # Durable configuration only
+///
+/// This is deliberately *not* the whole `Npc` object the API serves. The wire
+/// object (`docs/npc_api_gui_design.md` §10) also carries values that move
+/// every tick — `tick.last_tick_ms`, `tick.pending_events`, `monitor.overlap`,
+/// `monitor.band` — and one that is computed per caller (`access`, which is a
+/// function of `owner_id` and who is asking).
+///
+/// Storing those would mean a record per tick per character: a write
+/// amplification that turns an idle population into continuous log growth, to
+/// persist numbers that are meaningless a second later and are recomputed at
+/// load anyway. Keeping them out is what lets the write policy be
+/// *on change to durable state*, which for a resting character is never.
+///
+/// So: what an author set, plus what the engine must remember across a restart.
+/// Nothing that a running engine can derive.
+///
+/// `PartialEq` but not `Eq`: `salience_gate` is an `f32`, and a threshold read
+/// from a slider is a float whether or not that is convenient here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NpcPayload {
+    /// Decimal-string id on the wire, `u64` here — the same treatment
+    /// `timeline_id` gets, and for the same reason: JSON numbers above 2^53
+    /// are not safely representable in a browser.
+    pub npc_id: u64,
+    /// The account that owns this character. Ownership is authorization
+    /// (§8.2), so this is the field every access check reads.
+    ///
+    /// A string, not a `u64`, because that is what an account id *is* — the
+    /// normative object in §10 gives it as `"u_8812"`, a prefixed handle rather
+    /// than a number. `npc_id` beside it is a genuine `u64` written as a
+    /// decimal string; the two look alike on the wire and are not the same kind
+    /// of thing.
+    pub owner_id: String,
+    /// Monotonic per-character edit counter. Replay is in log order, so the
+    /// last record already wins; this makes that deterministic when a
+    /// compaction re-emits several characters in one pass, and gives an edit a
+    /// stable identity to log.
+    pub revision: u64,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+    /// `active` | `idle` | `asleep` | `suspended` | `tombstoned`. A deleted
+    /// character is `tombstoned` and keeps its record: the id must stay taken,
+    /// and the acts it already committed still name it.
+    pub state: String,
+    pub name: String,
+    /// The authored world and personality this character belongs to, named by
+    /// the slug that IS their file name — `"battle-cities"`, `"commander"`.
+    ///
+    /// These were `u64`s, from a design where both were numbered rows. They are
+    /// files now (`worlds/<id>.yaml`, `personalities/<id>.yaml`), and a file's
+    /// identity is its name; a number beside it would be a second identity for
+    /// the same thing, needing a table to reconcile them and free to disagree.
+    /// Validity is `registry::id::check` — the same rule that decides what may
+    /// become a file name, so a reference can always be resolved to one.
+    pub world_id: String,
+    pub personality_id: String,
+    /// Omitted from default listings (§8.3). Never counted in a total — the
+    /// count is what gives a hidden character away.
+    pub hidden: bool,
+    pub environment_enabled: bool,
+    /// Idle metabolism in milliseconds, and the salience level below which an
+    /// event does not wake the character. Authored configuration, not a
+    /// measurement — the *live* tick figures are excluded, see above.
+    pub heartbeat_ms: u64,
+    pub salience_gate: f32,
+    pub tags: Vec<String>,
+    pub persona_description: String,
+    /// `authored` | `generated`.
+    pub persona_origin: String,
+    /// Absent until a portrait exists.
+    pub portrait_image_id: Option<String>,
+    /// `uploaded` | `generated`; absent with the image.
+    pub portrait_origin: Option<String>,
+}
+
+impl NpcPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("NpcPayload serialise infallible")
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        serde_json::from_slice(buf)
+            .map_err(|e| PersistenceError::Corrupt(format!("Npc JSON parse: {e}")))
+    }
+
+    /// Whether this record marks the character as deleted. A tombstoned
+    /// character is still a record — the id stays taken and its committed acts
+    /// still name it — but it is gone from every listing.
+    pub fn is_tombstoned(&self) -> bool {
+        self.state == "tombstoned"
+    }
+}
+
 /// JSON payload for a [`RecordType::Tombstone`] record.  Naming
 /// `timeline_id` marks it as logically deleted: every
 /// `StreamDecl::Turn`, `Chunk`, `Tokens`, `Commit`,
@@ -1299,6 +1411,144 @@ mod tests {
         let bytes = p.encode();
         let back = DebugIdPayload::decode(&bytes).unwrap();
         assert_eq!(p, back);
+    }
+
+    fn npc_fixture() -> NpcPayload {
+        NpcPayload {
+            npc_id: 10_237_749_914_772_934_281,
+            owner_id: "u_8812".to_string(),
+            revision: 3,
+            created_ms: 1_740_200_000_000,
+            updated_ms: 1_740_300_112_340,
+            state: "active".to_string(),
+            name: "Varek".to_string(),
+            world_id: "battle-cities".to_string(),
+            personality_id: "commander".to_string(),
+            hidden: false,
+            environment_enabled: true,
+            heartbeat_ms: 30_000,
+            salience_gate: 0.5,
+            tags: vec!["campaign-2".to_string(), "north".to_string()],
+            persona_description: "Fifty-three, a former staff sergeant.".to_string(),
+            persona_origin: "generated".to_string(),
+            portrait_image_id: Some("img_4471".to_string()),
+            portrait_origin: Some("uploaded".to_string()),
+        }
+    }
+
+    /// The exact bytes, not a round trip. A field silently renamed by an edit
+    /// to the struct round-trips perfectly against itself while making every
+    /// record already on disk undecodable — asserting the encoding against
+    /// itself cannot catch that, and this is the format's compatibility
+    /// boundary.
+    #[test]
+    fn npc_payload_encodes_exact_bytes() {
+        let bytes = npc_fixture().encode();
+        let expected = concat!(
+            r#"{"npc_id":10237749914772934281,"owner_id":"u_8812","revision":3,"#,
+            r#""created_ms":1740200000000,"updated_ms":1740300112340,"#,
+            r#""state":"active","name":"Varek","world_id":"battle-cities","#,
+            r#""personality_id":"commander","#,
+            r#""hidden":false,"environment_enabled":true,"heartbeat_ms":30000,"#,
+            r#""salience_gate":0.5,"tags":["campaign-2","north"],"#,
+            r#""persona_description":"Fifty-three, a former staff sergeant.","#,
+            r#""persona_origin":"generated","portrait_image_id":"img_4471","#,
+            r#""portrait_origin":"uploaded"}"#,
+        );
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            expected,
+            "the on-disk field names or their order changed"
+        );
+    }
+
+    #[test]
+    fn npc_payload_round_trips_through_a_record_frame() {
+        let p = npc_fixture();
+        let bytes = p.encode();
+        let header = RecordHeader {
+            record_type: RecordType::Npc,
+            format: 0,
+            payload_len: bytes.len() as u64,
+            crc: crc32(&bytes),
+            stream_id: 0,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let frame = encode_record(&header, &bytes);
+        let (hdr, payload, _total) = decode_record(&frame).unwrap();
+        assert_eq!(hdr.record_type, RecordType::Npc);
+        assert_eq!(NpcPayload::decode(payload).unwrap(), p);
+    }
+
+    /// An id above 2^53 must survive exactly. These are u64 on the wire as
+    /// decimal strings precisely because a browser would round them; the same
+    /// value must not be mangled on the way to disk either.
+    #[test]
+    fn a_large_npc_id_survives_encoding() {
+        let mut p = npc_fixture();
+        p.npc_id = u64::MAX;
+        let back = NpcPayload::decode(&p.encode()).unwrap();
+        assert_eq!(back.npc_id, u64::MAX);
+        assert_eq!(back.owner_id, "u_8812");
+    }
+
+    #[test]
+    fn a_character_without_a_portrait_omits_neither_field_nor_meaning() {
+        let mut p = npc_fixture();
+        p.portrait_image_id = None;
+        p.portrait_origin = None;
+        let bytes = p.encode();
+        // Present as explicit nulls: absent-by-omission and absent-by-null
+        // decode the same here, but a reader diffing two records should see
+        // the field disappear only when the schema changes.
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains(r#""portrait_image_id":null"#));
+        assert_eq!(NpcPayload::decode(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn tombstoned_is_recognised_from_the_state_field() {
+        let mut p = npc_fixture();
+        assert!(!p.is_tombstoned());
+        p.state = "tombstoned".to_string();
+        assert!(p.is_tombstoned());
+        // Deletion is a superseding record, not a removal: the payload still
+        // carries the name and owner, so the id stays taken.
+        let back = NpcPayload::decode(&p.encode()).unwrap();
+        assert!(back.is_tombstoned());
+        assert_eq!(back.name, "Varek");
+    }
+
+    /// The wire tag is the compatibility contract for `HeaderIndex` digests:
+    /// change it and every index entry already written points at the wrong
+    /// type.
+    #[test]
+    fn the_npc_record_tag_is_pinned() {
+        assert_eq!(RecordType::Npc.tag(), 21);
+        assert_eq!(RecordType::from_tag(21), RecordType::Npc);
+        // And an unrecognised tag still degrades rather than erroring, which is
+        // what lets an older build read a log containing NPC records.
+        assert_eq!(RecordType::from_tag(200), RecordType::Unknown);
+    }
+
+    #[test]
+    fn the_npc_header_variant_round_trips_as_json() {
+        let h = RecordHeader {
+            record_type: RecordType::Npc,
+            format: 0,
+            payload_len: 0,
+            crc: 0,
+            stream_id: 0,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let js = serde_json::to_string(&h).unwrap();
+        // The header serialises the discriminant as `type`, not `record_type`.
+        assert!(js.contains(r#""type":"npc""#), "{js}");
+        let back: RecordHeader = serde_json::from_str(&js).unwrap();
+        assert_eq!(back.record_type, RecordType::Npc);
     }
 
     #[test]

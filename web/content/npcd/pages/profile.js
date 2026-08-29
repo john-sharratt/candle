@@ -115,39 +115,111 @@ export async function render() {
         },
       }, 'Save'))));
 
-  /* The claim above is only worth making if you can see it happen. Every
-   * superseded revision stays readable, because a character that gathered your
-   * profile last month attended over what it said then. */
-  const history = h('div', {});
-  const paintHistory = async () => {
+  /* Earlier wording, and a way to bring it back.
+   *
+   * A chooser, not a list. Every save appends a revision, so an author who
+   * edits often has hundreds — a panel per revision grows without bound and
+   * buries the rest of the page under text they already know they wrote. One
+   * `<select>` stays the same height at two revisions or five hundred, sorts
+   * itself newest-first, and is searchable by typing, which no stack of cards
+   * is.
+   *
+   * The index carries only a one-line preview; the prose arrives when a
+   * revision is actually picked. That is the difference between opening this
+   * page costing one small request and costing every paragraph ever written. */
+  const pick = h('select', { class: 'select' });
+  const shown = h('div', { class: 'tiny', style: 'white-space:pre-wrap;min-height:2.4em' });
+  const restore = h('button', { class: 'btn sm', disabled: true }, 'Restore this wording');
+  const when = h('span', { class: 'tiny dim' });
+  let chosen = null;
+
+  const show = async () => {
+    const n = Number(pick.value);
+    const meta = (pick.selectedOptions[0] || {}).__rev;
+    if (!Number.isFinite(n) || !meta) {
+      chosen = null;
+      restore.disabled = true;
+      mount(shown, h('span', { class: 'dim' }, 'Pick a revision to read it.'));
+      when.textContent = '';
+      return;
+    }
+    when.textContent = meta.live ? 'this is the live wording'
+      : meta.tombstoned_ms ? 'superseded ' + ago(meta.tombstoned_ms) : '';
+    mount(shown, h('span', { class: 'dim' }, 'loading…'));
+    try {
+      chosen = await API.getProfileRevision(n);
+    } catch (e) {
+      chosen = null;
+      mount(shown, h('span', { class: 'dim' }, 'could not read it: ' + (e.detail || e.message)));
+      restore.disabled = true;
+      return;
+    }
+    mount(shown, chosen.description || h('span', { class: 'dim' }, '(no description)'));
+    // Restoring the live wording would append a revision identical to the one
+    // already current — a no-op that costs a revision, so it is not offered.
+    restore.disabled = !!meta.live;
+  };
+
+  const loadHistory = async (selectRevision) => {
     let revisions;
     try {
       revisions = (await API.getProfileHistory()).revisions || [];
     } catch (e) {
-      mount(history, h('div', { class: 'tiny dim' }, 'history unavailable: ' + (e.detail || e.message)));
+      mount(pick.parentNode || pick, h('div', { class: 'tiny dim' },
+        'history unavailable: ' + (e.detail || e.message)));
       return;
     }
-    mount(history, ...revisions.map((r) => h('div', {
-      class: 'panel',
-      style: r.live ? '' : 'opacity:.62',
-    },
-      h('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:6px' },
-        h('span', { class: 'chip' + (r.live ? ' accent' : '') },
-          'revision ' + (r.revision ?? 0) + (r.live ? ' · live' : '')),
-        r.tombstoned_ms
-          ? h('span', { class: 'tiny dim' }, 'superseded ' + ago(r.tombstoned_ms))
-          : null),
-      h('div', { class: 'tiny' }, r.description || h('span', { class: 'dim' }, '(no description)')))));
+    mount(pick, ...revisions.map((r) => {
+      const label = `revision ${r.revision}`
+        + (r.live ? ' · live' : r.tombstoned_ms ? ' · ' + ago(r.tombstoned_ms) : '')
+        + (r.preview ? ' — ' + r.preview : '');
+      const o = h('option', { value: String(r.revision) }, label);
+      o.__rev = r;
+      return o;
+    }));
+    if (selectRevision != null) pick.value = String(selectRevision);
+    await show();
   };
-  el.appendChild(h('h2', {}, 'Revisions'));
-  el.appendChild(history);
-  paintHistory();
 
+  pick.addEventListener('change', show);
+  restore.addEventListener('click', async () => {
+    if (!chosen) return;
+    restore.disabled = true;
+    try {
+      const now = await API.restoreProfile(chosen.revision);
+      // The restored text is live, so the form must show it — leaving the old
+      // values in the boxes would make the next Save silently undo the restore.
+      for (const [k, ctl] of Object.entries(f)) ctl.value = now[k] ?? '';
+      rev.textContent = 'revision ' + (now.revision ?? '?');
+      await loadHistory(now.revision);
+      toast('restored — brought back as revision ' + now.revision, 'ok');
+    } catch (e) {
+      restore.disabled = false;
+      toast('restore failed: ' + (e.detail || e.message), 'err');
+    }
+  });
+
+  el.appendChild(h('h2', {}, 'Earlier wording'));
+  el.appendChild(h('div', { class: 'panel' },
+    h('div', { class: 'tiny dim', style: 'margin-bottom:10px' },
+      'Every save keeps what it replaced. Pick one to read it, and bring it back if you want it — '
+      + 'restoring appends it as a new revision rather than erasing the ones since.'),
+    h('div', { class: 'row', style: 'gap:10px;align-items:center' }, pick, when),
+    h('div', { style: 'margin:12px 0' }, shown),
+    h('div', { class: 'row' }, restore)));
+  loadHistory();
+
+  /* No total. §8.3: hidden characters are never enumerated, counted or
+   * suggested — and a count of *everything* you own is exactly the figure that
+   * gives them away, since anyone can subtract it from the roster in front of
+   * them. A count of the visible ones only would be safe but would disagree
+   * with what its owner knows they have, which reads as a bug.
+   *
+   * The roster says it better anyway, so there is nothing to replace. */
   el.appendChild(h('h2', {}, 'Characters'));
   el.appendChild(h('div', { class: 'panel' },
     h('div', { class: 'row', style: 'justify-content:space-between' },
-      h('div', {}, h('div', { class: 'mono', style: 'font-size:1.3rem;font-weight:700' }, String(me.npc_count ?? 0)),
-        h('div', { class: 'tiny dim' }, 'characters you own')),
+      h('div', { class: 'tiny dim' }, 'Your characters, their beliefs and their memories.'),
       h('button', { class: 'btn', onClick: () => go('/') }, 'View roster'))));
 
   return { el };

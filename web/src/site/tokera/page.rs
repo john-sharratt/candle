@@ -81,10 +81,12 @@ pub const LINKS: [(&str, &str, Nav); 3] = [
 /// colour painted behind it as a fallback sat *through* Tokera's transparent
 /// mark, leaving a red triskelion on a red square.
 ///
-/// **This list exists three times** — here, in `content/common/lib/estate.js`
-/// for the npcd console, and in `zend/web/lib/estate.js` because zend embeds
-/// its own assets and cannot read the shared directory. Three copies of one
-/// list is exactly the thing that drifts, so
+/// **This list exists twice** — here, and in `content/common/lib/estate.js` for
+/// every page that renders the menu in JavaScript. zend has a whole copy of
+/// `content/common` under `zend/web/common/`, because it embeds its assets with
+/// `include_dir!` and cannot reach this crate's content directory; that copy is
+/// pinned wholesale by [`tests::zend_carries_the_shared_framework_unchanged`].
+/// Two copies of one list is exactly the thing that drifts, so
 /// [`tests::the_estate_list_matches_the_shared_module`] compares this against
 /// the JavaScript rather than trusting them to stay level.
 pub const ESTATE: [(&str, &str, &str, &str); 4] = [
@@ -318,7 +320,26 @@ pub fn esc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    /// Every file under `dir`, depth first. Sorted, so a failure names the same
+    /// file on every machine rather than whichever the filesystem yielded first.
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
 
     fn meta() -> Meta<'static> {
         Meta {
@@ -471,46 +492,131 @@ mod tests {
         }
     }
 
-    /// zend's copy is byte-identical to the shared module.
+    /// zend carries the whole shared framework, byte for byte.
     ///
-    /// It is a copy because zend embeds `zend/web` and cannot read this crate's
-    /// content directory. That is a deployment fact rather than a choice, so
-    /// what is left is to make the divergence impossible to land.
+    /// It is a copy because zend embeds `zend/web` with `include_dir!` and
+    /// cannot reach this crate's content directory — a deployment fact rather
+    /// than a choice. What is left is to make divergence impossible to land, so
+    /// this compares the *directory* rather than a hand-written list of files:
+    /// a list is one more thing to remember, and the failure it misses is a new
+    /// module that zend silently does not have.
+    ///
+    /// `/brand` sits at zend's web root rather than under `common/`, because
+    /// the switcher addresses icons as `/brand/<id>` on every host and that
+    /// path has to resolve the same way here.
+    /// Bytes with `\r\n` collapsed to `\n`, so a comparison sees content rather
+    /// than the line endings a checkout happened to produce.
+    fn nolf(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            if b != b'\r' {
+                out.push(b);
+            }
+        }
+        out
+    }
+
     #[test]
-    fn zends_copy_of_the_module_is_identical() {
+    fn zend_carries_the_shared_framework_unchanged() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        for file in ["estate.js", "estate.css"] {
-            let shared = root.join("content").join("common").join("lib").join(file);
-            let zend = root
-                .join("..")
-                .join("zend")
-                .join("web")
-                .join("lib")
-                .join(file);
+        let shared = root.join("content").join("common");
+        let zend_web = root.join("..").join("zend").join("web");
 
-            let a = std::fs::read_to_string(&shared)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", shared.display()));
-            let b = std::fs::read_to_string(&zend)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", zend.display()));
-            // Line endings are the checkout's business, not the content's.
+        let mut checked = 0;
+        for entry in walk(&shared) {
+            let rel = entry.strip_prefix(&shared).expect("under the shared root");
+            // `brand/` is the one part that lives at zend's root instead.
+            let mine = match rel.starts_with("brand") {
+                true => zend_web.join(rel),
+                false => zend_web.join("common").join(rel),
+            };
+            let a = std::fs::read(&entry).unwrap();
+            let b = std::fs::read(&mine).unwrap_or_else(|e| {
+                panic!(
+                    "zend is missing {} ({e}) — copy `web/content/common` into `zend/web/common`",
+                    rel.display()
+                )
+            });
+            // Compared with line endings normalised, because a `\r\n` here is
+            // not drift — it is `core.autocrlf`. Git stores these files with
+            // LF and checks them out with CRLF on Windows, so whether two
+            // copies agree byte-for-byte in the working tree depends on the
+            // developer's git config and on whether each file happens to be
+            // tracked yet. That is a property of the checkout, not of the code,
+            // and it made this test fail for a reason it does not exist to
+            // catch. Any real difference in content still fails.
             assert_eq!(
-                a.replace("\r\n", "\n"),
-                b.replace("\r\n", "\n"),
-                "zend's copy of {file} has drifted from the shared one"
+                nolf(&a),
+                nolf(&b),
+                "zend's copy of {} has drifted",
+                rel.display()
             );
+            checked += 1;
         }
+        assert!(
+            checked > 8,
+            "only {checked} files compared — walk is broken"
+        );
+    }
 
-        // The icons too — compared as bytes, since these are images.
-        for (_, name, _, icon) in ESTATE {
-            let rel = icon.strip_prefix('/').expect("root-relative");
-            let shared = root.join("content").join("common").join(rel);
-            let zend = root.join("..").join("zend").join("web").join(rel);
-            let a = std::fs::read(&shared)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", shared.display()));
-            let b =
-                std::fs::read(&zend).unwrap_or_else(|e| panic!("reading {}: {e}", zend.display()));
-            assert_eq!(a, b, "zend's copy of {name}'s icon has drifted");
+    /// Every asset zend's pages ask for exists in the directory it embeds.
+    ///
+    /// zend cannot be compiled on every machine that touches this repo — it
+    /// pulls in `candle-kernels`, which needs a CUDA toolchain — so its pages
+    /// cannot be opened as part of an ordinary check. A mistyped import is then
+    /// invisible: the module 404s, the page renders as a blank shell, and
+    /// nothing says why. This is the cheapest thing that catches it.
+    #[test]
+    fn zends_pages_only_reference_files_it_ships() {
+        let web = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("zend")
+            .join("web");
+
+        let mut pages = 0;
+        for page in walk(&web) {
+            if page.extension().is_some_and(|e| e == "html") {
+                let html = std::fs::read_to_string(&page).unwrap();
+                let name = page.file_name().unwrap().to_string_lossy().into_owned();
+                for reference in asset_refs(&html) {
+                    // Relative references only. A root-relative path is a route
+                    // the daemon serves — `/substrate` is a page, not a file —
+                    // and an absolute URL belongs to somebody else entirely.
+                    if reference.starts_with("http")
+                        || reference.starts_with("//")
+                        || reference.starts_with('/')
+                    {
+                        continue;
+                    }
+                    let target = web.join(reference.trim_start_matches("./"));
+                    assert!(
+                        target.is_file(),
+                        "{name} references `{reference}`, which is not in zend/web"
+                    );
+                }
+                pages += 1;
+            }
         }
+        assert!(pages >= 3, "only {pages} pages scanned — the walk is wrong");
+    }
+
+    /// The `src`, `href` and `import … from` targets in a page.
+    fn asset_refs(html: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (marker, close) in [("src=\"", '"'), ("href=\"", '"'), ("from '", '\'')] {
+            let mut rest = html;
+            while let Some(i) = rest.find(marker) {
+                rest = &rest[i + marker.len()..];
+                if let Some(end) = rest.find(close) {
+                    let v = &rest[..end];
+                    // A bare `/` is the site root, and `#…` is in-page.
+                    if !v.is_empty() && v != "/" && !v.starts_with('#') {
+                        out.push(v.to_owned());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Sign-in sends where to come back to as a whole URL, host included.

@@ -3,7 +3,7 @@
 
 import { API } from '../lib/api.js';
 import { h } from '../lib/dom.js';
-import { toast, modal } from '../lib/ui.js';
+import { toast, modal, only } from '../lib/ui.js';
 
 const MODE_SHORT = { physical: 'phys', video_call: 'video', voice_call: 'voice', instant_message: 'im' };
 
@@ -16,11 +16,18 @@ export async function render() {
       h('div', { class: 'sub' },
         'The act vocabulary. Every tool carries intent, not output — the narrator renders the words.')),
     h('div', { class: 'row' },
+      // Reading the catalog is every signed-in operator's; running a
+      // calibration pass is not. It is a daemon-wide side effect that changes
+      // how every character on this machine selects a tool — the only write on
+      // this page that is not scoped to the caller's own characters, which is
+      // what puts it with the admin controls rather than beside them.
       r.uncalibrated
-        ? h('button', {
+        ? (only('admin', () => h('button', {
           class: 'btn primary',
           onClick: async () => { await API.calibrateTools(); toast('calibration pass queued', 'ok'); },
-        }, `Calibrate ${r.uncalibrated} tool${r.uncalibrated === 1 ? '' : 's'}`)
+        }, `Calibrate ${r.uncalibrated} tool${r.uncalibrated === 1 ? '' : 's'}`))
+          || h('span', { class: 'chip warn', title: 'calibration is an admin’s to run' },
+            `${r.uncalibrated} uncalibrated`))
         : h('span', { class: 'chip ok' }, 'all calibrated'))));
 
   const groups = new Map();

@@ -19,6 +19,49 @@ server:
   bind: "127.0.0.1:8081"
   cache_control: "no-store"
 
+# ----------------------------------------------------------------------------
+# Roles.
+#
+# Three levels — unauthenticated, user, admin — and they are how the daemon
+# decides everything. Reading is open; **only an admin may change authored
+# content on disk** (worlds, personalities), because those are files in a mind
+# that is not under version control and a bad write is not recoverable.
+#
+# Admin is deployment configuration, not a user record, and there is no API to
+# grant it. Whoever can edit this file and restart the process is already the
+# person who can edit the files it grants power over, so a database row would
+# be a weaker way to grant the same thing.
+#
+# An entry says which field it matches. `sub` is Google's subject id: opaque,
+# and the key every account here is stored under, so it survives an email
+# change. `email` is readable and inherits whatever reassignment risk the
+# provider has. Both are exact (email case-insensitively); nothing is guessed.
+#
+# An empty list means nobody can edit anything, which is the right way for a
+# misconfigured deployment to fail.
+# ----------------------------------------------------------------------------
+# Matched on `email` and not `sub`, deliberately, because THIS REPOSITORY IS
+# PUBLIC.
+#
+# `sub` is the durable half — it survives an email change, and it is the key
+# every account here is stored under. It is also a stable identifier for a real
+# Google account, and `npcd/.gitignore` excludes `accounts/` for exactly that
+# reason: "git history is the one place you cannot quietly remove something from
+# later, so the decision has to hold before the first write". A subject id
+# committed here would be published permanently, which is the same mistake with
+# a different file name.
+#
+# The email is already public — it is the author address on every commit in this
+# repository — so naming it costs nothing that is not already spent, and it
+# grants exactly the same access.
+#
+# The trade is that admin follows the address rather than the account: change
+# the email at the provider and this line stops matching until it is edited. For
+# one admin on a personal estate that is a line in a file, not an outage.
+roles:
+  admins:
+    - email: johnathan.sharratt@gmail.com
+
 sites:
   - name: npcd
     default: true

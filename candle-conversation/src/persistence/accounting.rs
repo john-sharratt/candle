@@ -56,6 +56,12 @@ impl RecordAccounting {
             | RecordType::Commit
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
+            // `Npc` carries its `npc_id` in the header's `stream_id`, so the
+            // newest record for a character supersedes every earlier one here
+            // mechanically — the same trick `Snapshot` uses for its per-timeline
+            // tail. Putting the key in the header rather than the payload is
+            // what lets supersession be seen without decoding anything.
+            | RecordType::Npc
             | RecordType::Snapshot => (header.record_type, header.stream_id, 0),
             RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => {
                 (header.record_type, 0, 0)

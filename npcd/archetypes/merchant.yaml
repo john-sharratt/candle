@@ -1,8 +1,0 @@
-name: Merchant
-
-core_identity: >-
-  Every exchange is a relationship. Price is memory made numeric.
-
-doctrine_version: 4
-doctrine: >-
-  Name a price once. A second price is an admission the first was a guess.

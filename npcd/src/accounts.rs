@@ -28,7 +28,14 @@ use web::auth::session::Identity;
 
 use crate::registry::Registry;
 
-/// The provider's subject id, as a file name.
+/// The account key: **issuer and subject**, as a file name.
+///
+/// A subject is unique per issuer, not globally. Keying on the subject alone
+/// worked only because exactly one provider was configured; the day a second
+/// arrives, two issuers could emit the same subject string and two people would
+/// share one account — silently, and with no way to separate them afterwards
+/// because the records would already be merged. Both halves go into the hash so
+/// that day is a configuration change instead.
 ///
 /// Hashed rather than used directly, for two reasons that are both about not
 /// depending on what a provider happens to emit. Google's `sub` is digits;
@@ -39,8 +46,16 @@ use crate::registry::Registry;
 ///
 /// It also keeps the raw provider id out of a directory listing, which costs
 /// nothing and is one less place for it to be read from.
-fn file_id(sub: &str) -> String {
-    let digest = Sha256::digest(sub.as_bytes());
+fn file_id(provider: &str, sub: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(provider.as_bytes());
+    // A NUL separator, because it cannot occur in either half. Concatenating
+    // them plainly would make `("goog", "le1")` and `("google", "1")` the same
+    // account — an unlikely pair today and a real one across providers whose id
+    // formats nobody controls.
+    hasher.update([0u8]);
+    hasher.update(sub.as_bytes());
+    let digest = hasher.finalize();
     // 128 bits of a 256-bit digest. Collisions are not a security boundary here
     // — the subject inside the file is authoritative and is checked on load —
     // so this is about a name of workable length.
@@ -73,13 +88,17 @@ impl Accounts {
     /// written here and never overwritten by a sign-in, or a name someone chose
     /// would be silently reverted every time they logged in.
     pub fn upsert(&mut self, id: &Identity, now_ms: u64) -> anyhow::Result<Value> {
-        let key = file_id(&id.sub);
+        let key = file_id(&id.provider, &id.sub);
 
         let existing = self.reg.get(&key).map(|r| r.body.clone());
         let mut body = existing.clone().unwrap_or_else(|| {
             json!({
                 "sub": id.sub,
-                "provider": "google",
+                // From the identity, not a literal. It is half of the key this
+                // record is filed under, so a hardcoded value here would be a
+                // second answer to the same question, free to disagree with the
+                // file name the moment a second provider exists.
+                "provider": id.provider,
                 "created_ms": now_ms,
                 // A display name the author can change without touching the
                 // one the provider gave them.
@@ -98,17 +117,29 @@ impl Accounts {
         });
 
         if let Some(map) = body.as_object_mut() {
-            // The provider's fields, refreshed every time.
-            map.insert("email".into(), json!(id.email));
-            map.insert("display".into(), json!(id.name));
-            map.insert(
-                "avatar_url".into(),
-                if id.picture.is_empty() {
-                    Value::Null
+            // The provider's fields, refreshed every time — but only from a
+            // value that actually arrived.
+            //
+            // An absent header is "the gateway did not forward this", not "the
+            // provider says it is empty". `identify` defaults a missing one to
+            // `""`, and the gateway itself skips any field whose value will not
+            // fit in a header — so overwriting unconditionally means one
+            // oversized display name blanks the stored one, permanently, on a
+            // sign-in that otherwise succeeded. Keeping the last known good
+            // value is the right answer to not being told.
+            for (field, value) in [
+                ("email", id.email.as_str()),
+                ("display", id.name.as_str()),
+                ("avatar_url", id.picture.as_str()),
+            ] {
+                if !value.trim().is_empty() {
+                    map.insert(field.into(), json!(value));
                 } else {
-                    json!(id.picture)
-                },
-            );
+                    // Present but empty stays present-and-empty rather than
+                    // becoming absent, so the shape of the record is stable.
+                    map.entry(field.to_string()).or_insert(Value::Null);
+                }
+            }
             // The subject is the identity of the record. A file whose `sub` has
             // drifted from its name is a corrupted record, not a rename.
             map.insert("sub".into(), json!(id.sub));
@@ -148,11 +179,11 @@ impl Accounts {
     /// the same number while the file grew on every repeat.
     pub fn put_profile(
         &mut self,
-        sub: &str,
+        id: &Identity,
         patch: &Map<String, Value>,
         now_ms: u64,
     ) -> anyhow::Result<Option<Value>> {
-        let key = file_id(sub);
+        let key = file_id(&id.provider, &id.sub);
         let Some(mut body) = self.reg.get(&key).map(|r| r.body.clone()) else {
             return Ok(None);
         };
@@ -202,6 +233,12 @@ impl Accounts {
                 _ => Vec::new(),
             };
             history.push(retired);
+            // Oldest first, so dropping the front drops the least useful. The
+            // file is read into memory whole at start, and every entry is a
+            // full copy of a profile.
+            if history.len() > KEEP_REVISIONS {
+                history.drain(..history.len() - KEEP_REVISIONS);
+            }
             map.insert("profile_history".into(), Value::Array(history));
             map.insert("profile".into(), profile);
         }
@@ -215,27 +252,75 @@ impl Accounts {
     /// The live revision is marked and carries no `tombstoned_ms`; that is the
     /// only difference between it and the rest, because a tombstoned turn is
     /// still readable — it is superseded, not deleted.
-    pub fn profile_history(&self, sub: &str) -> Option<Vec<Value>> {
-        let body = &self.reg.get(&file_id(sub))?.body;
+    /// An index of every revision — enough to choose one, not to read it.
+    ///
+    /// Summaries rather than whole revisions, because this is the payload a
+    /// chooser needs and there can be hundreds of them: an author who edits
+    /// often would otherwise download every paragraph they have ever written
+    /// each time they open the page, to render a list of dates. The full text
+    /// arrives from [`profile_revision`] when one is actually picked.
+    pub fn profile_history(&self, id: &Identity) -> Option<Vec<Value>> {
+        let body = &self.reg.get(&file_id(&id.provider, &id.sub))?.body;
+
+        let summarise = |v: &Value, live: bool| {
+            json!({
+                "revision": v.get("revision").and_then(Value::as_u64).unwrap_or(0),
+                "tombstoned_ms": v.get("tombstoned_ms").cloned().unwrap_or(Value::Null),
+                "live": live,
+                "preview": preview(v.get("description").and_then(Value::as_str).unwrap_or("")),
+            })
+        };
 
         let mut out = Vec::new();
         if let Some(live) = body.get("profile") {
-            let mut v = live.clone();
-            if let Some(m) = v.as_object_mut() {
-                m.insert("live".into(), json!(true));
-            }
-            out.push(v);
+            out.push(summarise(live, true));
         }
         if let Some(Value::Array(past)) = body.get("profile_history") {
-            for v in past.iter().rev() {
-                let mut v = v.clone();
-                if let Some(m) = v.as_object_mut() {
-                    m.insert("live".into(), json!(false));
-                }
-                out.push(v);
-            }
+            out.extend(past.iter().rev().map(|v| summarise(v, false)));
         }
         Some(out)
+    }
+
+    /// One revision in full, live or superseded.
+    pub fn profile_revision(&self, id: &Identity, revision: u64) -> Option<Value> {
+        let body = &self.reg.get(&file_id(&id.provider, &id.sub))?.body;
+        let at = |v: &Value| v.get("revision").and_then(Value::as_u64) == Some(revision);
+
+        if body.get("profile").is_some_and(at) {
+            return body.get("profile").cloned();
+        }
+        match body.get("profile_history") {
+            Some(Value::Array(past)) => past.iter().find(|v| at(v)).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Bring a superseded revision back as the live one.
+    ///
+    /// An append, not a rewind: the text returns as a *new* revision and the
+    /// one it replaced is tombstoned like any other edit. Rewinding the counter
+    /// would leave two different profiles claiming the same revision number,
+    /// and an NPC citing the earlier one would be pointing at text it never
+    /// read. Restoring is just another way of saying what you want to say now.
+    pub fn restore_profile(
+        &mut self,
+        id: &Identity,
+        revision: u64,
+        now_ms: u64,
+    ) -> anyhow::Result<Option<Value>> {
+        let Some(old) = self.profile_revision(id, revision) else {
+            return Ok(None);
+        };
+        // Only the authored text comes back. The counters belong to the store,
+        // and `tombstoned_ms` describes when *that* revision died — carrying it
+        // forward would mark the new live profile as already superseded.
+        let mut patch = Map::new();
+        for field in AUTHORED_TEXT.iter().chain(std::iter::once(&"gender")) {
+            if let Some(v) = old.get(*field) {
+                patch.insert((*field).to_string(), v.clone());
+            }
+        }
+        self.put_profile(id, &patch, now_ms)
     }
 
     /// Change the name characters know this author by.
@@ -246,11 +331,11 @@ impl Accounts {
     /// sharing one would make a target ambiguous rather than merely confusing.
     /// It is checked for shape and for uniqueness, and a clash is the caller's
     /// to resolve, not this function's to paper over by appending a digit.
-    pub fn put_unique_name(&mut self, sub: &str, name: &str) -> Result<Value, NameError> {
+    pub fn put_unique_name(&mut self, id: &Identity, name: &str) -> Result<Value, NameError> {
         let name = name.trim();
         check_unique_name(name)?;
 
-        let key = file_id(sub);
+        let key = file_id(&id.provider, &id.sub);
         // Uniqueness is case-insensitive: two authors called `Wren` and `wren`
         // are the same address to anyone typing it.
         let folded = name.to_ascii_lowercase();
@@ -277,13 +362,15 @@ impl Accounts {
         };
         map.insert("unique_name".into(), json!(name));
 
-        self.reg.put(&key, body.clone()).map_err(NameError::Io)?;
+        self.reg
+            .put(&key, body.clone())
+            .map_err(|e| NameError::Io(anyhow::Error::new(e)))?;
         Ok(with_public_id(&key, &body))
     }
 
     /// What the console sees for a verified identity, without creating anything.
-    pub fn get(&self, sub: &str) -> Option<Value> {
-        let key = file_id(sub);
+    pub fn get(&self, id: &Identity) -> Option<Value> {
+        let key = file_id(&id.provider, &id.sub);
         self.reg.get(&key).map(|r| with_public_id(&key, &r.body))
     }
 }
@@ -341,6 +428,31 @@ pub fn gender_ok(v: &str) -> bool {
 
 /// The profile fields a caller writes, all of them free text.
 const AUTHORED_TEXT: [&str; 2] = ["description", "history"];
+
+/// How many superseded revisions are kept.
+///
+/// Bounded because the whole account file is read into memory at start, and
+/// every save appends a full copy of the outgoing profile — paragraphs of it.
+/// Unbounded, an author who edits often eventually carries their entire writing
+/// history resident, forever, for a feature that reaches back a few steps.
+///
+/// Generous on purpose: two hundred is far past any real use of *undo*, so the
+/// bound should never be the thing a person notices.
+const KEEP_REVISIONS: usize = 200;
+
+/// One line of a revision, for choosing between them.
+///
+/// Enough to recognise which edit this was, not to read it. Cut on a character
+/// boundary — `&s[..N]` panics mid-codepoint, and a profile is the one place
+/// somebody is most likely to have written their name in their own script.
+fn preview(s: &str) -> String {
+    const MAX: usize = 90;
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(MAX) {
+        None => flat,
+        Some((cut, _)) => format!("{}…", flat[..cut].trim_end()),
+    }
+}
 
 /// Why a profile patch was refused.
 #[derive(Debug, PartialEq, Eq)]
@@ -499,12 +611,23 @@ mod tests {
 
     fn ident(sub: &str, email: &str, name: &str) -> Identity {
         Identity {
+            provider: "google".into(),
             sub: sub.into(),
             email: email.into(),
             name: name.into(),
             picture: String::new(),
             exp: 9_999_999_999,
         }
+    }
+
+    /// A subject, as the identity the account methods now take.
+    ///
+    /// They take a whole `Identity` rather than a `sub` because the account key
+    /// is issuer *and* subject: two arguments that must agree are two arguments
+    /// that can disagree, and the identity is the thing that already holds a
+    /// matched pair.
+    fn who(sub: &str) -> Identity {
+        ident(sub, "a@b.c", "A B")
     }
 
     #[test]
@@ -519,7 +642,7 @@ mod tests {
 
         let again = Accounts::load(&dir).unwrap();
         assert_eq!(again.len(), 1);
-        assert_eq!(again.get("google-1").unwrap()["display"], "Wren S");
+        assert_eq!(again.get(&who("google-1")).unwrap()["display"], "Wren S");
     }
 
     /// The provider is the authority on email and display name.
@@ -544,8 +667,12 @@ mod tests {
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "wren@example.com", "Wren"), 1)
             .unwrap();
-        a.put_profile("g1", &patch(json!({"description": "Ex-surveyor."})), 2)
-            .unwrap();
+        a.put_profile(
+            &who("g1"),
+            &patch(json!({"description": "Ex-surveyor."})),
+            2,
+        )
+        .unwrap();
 
         let me = a
             .upsert(&ident("g1", "wren@example.com", "Wren"), 2)
@@ -562,7 +689,7 @@ mod tests {
         let id = ident("g1", "wren@example.com", "Wren");
         a.upsert(&id, 1).unwrap();
 
-        let path = dir.join(format!("{}.yaml", file_id("g1")));
+        let path = dir.join(format!("{}.yaml", file_id("google", "g1")));
         let first = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         a.upsert(&id, 2).unwrap();
@@ -579,7 +706,7 @@ mod tests {
             .unwrap();
         let me = a
             .put_profile(
-                "g1",
+                &who("g1"),
                 &patch(json!({"description": "x", "email": "attacker@evil.com", "sub": "someone-else"})),
                 2,
             )
@@ -598,13 +725,17 @@ mod tests {
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let one = a
-            .put_profile("g1", &patch(json!({"description": "a"})), 2)
+            .put_profile(&who("g1"), &patch(json!({"description": "a"})), 2)
             .unwrap()
             .unwrap();
         assert_eq!(one["profile"]["revision"], 1);
         // A caller cannot set it.
         let two = a
-            .put_profile("g1", &patch(json!({"description": "b", "revision": 99})), 3)
+            .put_profile(
+                &who("g1"),
+                &patch(json!({"description": "b", "revision": 99})),
+                3,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(two["profile"]["revision"], 2);
@@ -618,30 +749,108 @@ mod tests {
         let dir = tmp();
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
-        a.put_profile("g1", &patch(json!({"description": "Surveyor."})), 100)
+        a.put_profile(&who("g1"), &patch(json!({"description": "Surveyor."})), 100)
             .unwrap();
-        a.put_profile("g1", &patch(json!({"description": "Ex-surveyor."})), 200)
-            .unwrap();
+        a.put_profile(
+            &who("g1"),
+            &patch(json!({"description": "Ex-surveyor."})),
+            200,
+        )
+        .unwrap();
 
-        let h = a.profile_history("g1").unwrap();
+        // The index is summaries — enough to choose one, not to read it.
+        let h = a.profile_history(&who("g1")).unwrap();
         assert_eq!(h.len(), 3, "live revision plus its two predecessors");
 
         // Newest first, and exactly one is live.
-        assert_eq!(h[0]["description"], "Ex-surveyor.");
+        assert_eq!(h[0]["preview"], "Ex-surveyor.");
+        assert_eq!(h[0]["revision"], 2);
         assert_eq!(h[0]["live"], true);
-        assert!(h[0].get("tombstoned_ms").is_none());
+        assert_eq!(h[0]["tombstoned_ms"], Value::Null);
 
-        assert_eq!(h[1]["description"], "Surveyor.");
+        assert_eq!(h[1]["preview"], "Surveyor.");
+        assert_eq!(h[1]["revision"], 1);
         assert_eq!(h[1]["live"], false);
         assert_eq!(h[1]["tombstoned_ms"], 200);
 
         // The empty profile the account was born with.
-        assert_eq!(h[2]["description"], "");
+        assert_eq!(h[2]["preview"], "");
+        assert_eq!(h[2]["revision"], 0);
         assert_eq!(h[2]["tombstoned_ms"], 100);
+
+        // The index carries no prose — that is the point of it being an index.
+        assert!(h[1].get("description").is_none(), "{:?}", h[1]);
+        assert!(h[1].get("history").is_none(), "{:?}", h[1]);
+        // And the full text is one fetch away.
+        let full = a.profile_revision(&who("g1"), 1).unwrap();
+        assert_eq!(full["description"], "Surveyor.");
 
         // And it survives a restart, because the file carries it.
         let again = Accounts::load(&dir).unwrap();
-        assert_eq!(again.profile_history("g1").unwrap().len(), 3);
+        assert_eq!(again.profile_history(&who("g1")).unwrap().len(), 3);
+    }
+
+    /// History is bounded, because the whole file is resident.
+    ///
+    /// Every save appends a full copy of the outgoing profile — paragraphs of
+    /// it — and `Registry::load` reads every account into memory at start.
+    /// Unbounded, an author who edits often carries their entire writing
+    /// history forever to support an undo that reaches back a few steps.
+    #[test]
+    fn the_kept_history_is_bounded_and_keeps_the_newest() {
+        let dir = tmp();
+        let mut a = Accounts::load(&dir).unwrap();
+        a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
+
+        let n = KEEP_REVISIONS + 25;
+        for i in 0..n {
+            a.put_profile(
+                &who("g1"),
+                &patch(json!({ "description": format!("v{i}") })),
+                i as u64,
+            )
+            .unwrap();
+        }
+
+        // The live one plus the cap, and no more.
+        let h = a.profile_history(&who("g1")).unwrap();
+        assert_eq!(h.len(), KEEP_REVISIONS + 1);
+
+        // What survives is the newest. The most recent edit is live; the oldest
+        // kept is far enough back to be a real undo and no further.
+        assert_eq!(h[0]["preview"], format!("v{}", n - 1));
+        assert_eq!(h[0]["live"], true);
+        assert_eq!(h[h.len() - 1]["revision"], (n - KEEP_REVISIONS) as u64);
+
+        // The dropped ones are gone from lookup too, not merely hidden.
+        assert!(a.profile_revision(&who("g1"), 0).is_none());
+        assert!(a.profile_revision(&who("g1"), n as u64).is_some());
+    }
+
+    /// A preview is one line, and cutting it must not split a character.
+    #[test]
+    fn a_preview_is_short_and_never_splits_a_character() {
+        assert_eq!(preview(""), "");
+        assert_eq!(preview("short"), "short");
+        // Newlines and runs of spaces collapse — this is one line in a chooser.
+        assert_eq!(preview("two\n\nlines   here"), "two lines here");
+
+        // Multi-byte throughout: `&s[..90]` would land mid-codepoint and panic.
+        let wide = "日".repeat(300);
+        let cut = preview(&wide);
+        assert!(cut.ends_with('…'));
+        assert_eq!(cut.chars().count(), 91, "90 characters plus the ellipsis");
+
+        // A boundary case either side of the limit.
+        for n in [89, 90, 91] {
+            let s = "é".repeat(n);
+            let p = preview(&s);
+            assert!(
+                p.chars().count() <= 91,
+                "{n} produced {}",
+                p.chars().count()
+            );
+        }
     }
 
     /// The history is the larger half of the record and is asked for rarely.
@@ -651,11 +860,11 @@ mod tests {
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let me = a
-            .put_profile("g1", &patch(json!({"description": "a"})), 2)
+            .put_profile(&who("g1"), &patch(json!({"description": "a"})), 2)
             .unwrap()
             .unwrap();
         assert!(me.get("profile_history").is_none());
-        assert!(a.get("g1").unwrap().get("profile_history").is_none());
+        assert!(a.get(&who("g1")).unwrap().get("profile_history").is_none());
     }
 
     /// Every provider's subject shape has to become a usable file name.
@@ -668,13 +877,80 @@ mod tests {
             "user@example.com",                     // an email as a subject
             "日本語",
         ] {
-            let key = file_id(sub);
+            let key = file_id("google", sub);
             assert_eq!(
                 crate::registry::id::check(&key),
                 Ok(()),
                 "`{sub}` → `{key}`"
             );
         }
+    }
+
+    /// A field the gateway could not forward must not blank the stored one.
+    ///
+    /// `identify` defaults a missing header to `""`, and the gateway skips any
+    /// field whose value will not fit in one — so an overlong display name
+    /// would have wiped the account's, permanently, on a sign-in that otherwise
+    /// worked. Not being told something is not being told it is empty.
+    #[test]
+    fn a_field_the_gateway_did_not_send_keeps_its_stored_value() {
+        let dir = tmp();
+        let mut a = Accounts::load(&dir).unwrap();
+        let full = ident("g1", "wren@example.com", "Wren S");
+        a.upsert(&full, 1_000).unwrap();
+
+        // The same person, signing in through a gateway that could not forward
+        // the descriptive fields.
+        let bare = ident("g1", "", "");
+        let me = a.upsert(&bare, 2_000).unwrap();
+        assert_eq!(me["email"], "wren@example.com", "the email was blanked");
+        assert_eq!(me["display"], "Wren S", "the display name was blanked");
+
+        // And it is durable, not just what this call returned.
+        let again = Accounts::load(&dir).unwrap();
+        assert_eq!(again.get(&full).unwrap()["display"], "Wren S");
+
+        // A real change still lands.
+        let renamed = ident("g1", "wren@example.com", "Wren Sharratt");
+        let me = a.upsert(&renamed, 3_000).unwrap();
+        assert_eq!(me["display"], "Wren Sharratt");
+    }
+
+    /// **The account key is issuer AND subject.**
+    ///
+    /// A subject is unique per issuer, not globally. Keyed on the subject
+    /// alone, two providers emitting the same string would land on one account
+    /// — silently, and unseparably, because by then the records would already
+    /// be merged.
+    #[test]
+    fn the_same_subject_from_two_providers_is_two_accounts() {
+        let a = file_id("google", "1234");
+        let b = file_id("github", "1234");
+        assert_ne!(a, b, "two issuers collided on one account");
+
+        // And the separator does its job: without it, `("goog", "le1234")` and
+        // `("google", "1234")` would hash the same bytes and be one account.
+        assert_ne!(file_id("goog", "le1234"), file_id("google", "1234"));
+        assert_ne!(file_id("a", "bc"), file_id("ab", "c"));
+    }
+
+    /// An account is reached only by the pair that created it. Keying on one
+    /// half is what the previous design did, so this pins the other.
+    #[test]
+    fn an_account_is_not_reachable_from_another_provider() {
+        let dir = tmp();
+        let mut a = Accounts::load(&dir).unwrap();
+        let mut google = ident("1234", "wren@example.com", "Wren");
+        google.provider = "google".into();
+        a.upsert(&google, 1_000).unwrap();
+
+        let mut elsewhere = google.clone();
+        elsewhere.provider = "github".into();
+        assert!(
+            a.get(&elsewhere).is_none(),
+            "the same subject from another issuer reached this account"
+        );
+        assert!(a.get(&google).is_some());
     }
 
     /// A record written under an older profile shape corrects itself the next
@@ -684,7 +960,7 @@ mod tests {
     #[test]
     fn an_older_shape_is_corrected_on_the_next_sign_in() {
         let dir = tmp();
-        let key = file_id("g1");
+        let key = file_id("google", "g1");
         std::fs::write(
             dir.join(format!("{key}.yaml")),
             serde_yaml::to_string(&json!({
@@ -717,7 +993,7 @@ mod tests {
 
         // Durable, not re-derived on every read.
         let again = Accounts::load(&dir).unwrap();
-        let stored = &again.get("g1").unwrap()["profile"];
+        let stored = &again.get(&who("g1")).unwrap()["profile"];
         assert!(stored.get("pronouns").is_none(), "{stored}");
         assert_eq!(stored["gender"], "");
     }
@@ -787,9 +1063,12 @@ mod tests {
         let dir = tmp();
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
-        let me = a.put_profile("g1", &patch(json!({})), 2).unwrap().unwrap();
+        let me = a
+            .put_profile(&who("g1"), &patch(json!({})), 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(me["profile"]["revision"], 1);
-        assert_eq!(a.profile_history("g1").unwrap().len(), 2);
+        assert_eq!(a.profile_history(&who("g1")).unwrap().len(), 2);
     }
 
     /// A caller cannot add one back, either.
@@ -800,7 +1079,7 @@ mod tests {
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let me = a
             .put_profile(
-                "g1",
+                &who("g1"),
                 &patch(json!({"description": "x", "pronouns": "they/them", "nickname": "boss"})),
                 2,
             )
@@ -838,12 +1117,15 @@ mod tests {
         let mut a = Accounts::load(&dir).unwrap();
         a.upsert(&ident("g1", "wren@example.com", "Wren S"), 1)
             .unwrap();
-        a.put_unique_name("g1", "  ridge-walker  ").unwrap();
+        a.put_unique_name(&who("g1"), "  ridge-walker  ").unwrap();
 
         let again = Accounts::load(&dir).unwrap();
         // Trimmed on the way in, so the file holds the address and not the
         // author's stray whitespace.
-        assert_eq!(again.get("g1").unwrap()["unique_name"], "ridge-walker");
+        assert_eq!(
+            again.get(&who("g1")).unwrap()["unique_name"],
+            "ridge-walker"
+        );
     }
 
     #[test]

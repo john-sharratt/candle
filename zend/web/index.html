@@ -147,7 +147,7 @@
      byte so the copy cannot drift. Every colour in it is a `var(--x, fallback)`
      and this app defines none of those tokens, so it takes the fallbacks, which
      are tuned to this palette. -->
-<link rel="stylesheet" href="lib/estate.css">
+<link rel="stylesheet" href="common/lib/estate.css">
 </head>
 <body>
 <div id="app"></div>
@@ -168,7 +168,7 @@
  * already private) and is kept only so this diff is a wrapper change rather
  * than a re-indent of two thousand lines.
  * ========================================================================== */
-import { estateSwitcher } from './lib/estate.js';
+import { estateSwitcher } from './common/lib/estate.js';
 
 (function () {
   'use strict';

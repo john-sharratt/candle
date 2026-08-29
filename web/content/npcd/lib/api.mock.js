@@ -17,8 +17,21 @@ const clock = (s) => `${pad2(Math.floor(s / 3600) % 24)}:${pad2(Math.floor(s / 6
 const WORLD_EPOCH = 412 * 86400000 + 6 * 3600000 + 14 * 60000;
 const worldMs = () => WORLD_EPOCH + (Date.now() % 3600000) * 60;
 
+/* Narrow a listing by the console's filter box.
+ *
+ * A substring match, which is looser than the daemon's whole-word rule — and
+ * that difference is deliberate rather than an oversight. The daemon's rule
+ * exists to stop a HIDDEN document being discovered by typing letters and
+ * watching; nothing in this fixture is hidden, so there is nothing here for it
+ * to protect and a substring is what a person expects a filter to do. */
+const narrow = (rows, q, fields) => {
+  const t = (q || '').trim().toLowerCase();
+  if (!t) return rows;
+  return rows.filter((r) => fields(r).some((f) => String(f || '').toLowerCase().includes(t)));
+};
+
 const mk = (id, name, arch, archName, state, pending, band, overlap, hb, hidden, tags, desc) => ({
-  npc_id: id, name, world_id: '1', archetype_id: arch, archetype_name: archName, state,
+  npc_id: id, name, world_id: 'ardh', personality_id: arch, personality_name: archName, state,
   tick: { heartbeat_ms: hb, last_tick_ms: Date.now() - pending * 900 - 400, pending_events: pending, salience_gate: 0.42 },
   environment_enabled: true, monitor: { overlap, band }, owner_id: 'u_8812', access: 'owner',
   hidden, tags, portrait: null, persona: { description: desc, origin: 'generated' },
@@ -27,17 +40,17 @@ const mk = (id, name, arch, archName, state, pending, band, overlap, hb, hidden,
 });
 
 const NPCS = EMPTY ? [] : [
-  mk('10237749914772934281', 'Varek', '1', 'Loyal Soldier', 'active', 3, 'healthy', 0.19, 30000, false, ['campaign-2', 'north'],
+  mk('10237749914772934281', 'Varek', 'loyal-soldier', 'Loyal Soldier', 'active', 3, 'healthy', 0.19, 30000, false, ['campaign-2', 'north'],
     'Fifty-three, a former staff sergeant who now runs the night shift on a loading dock. Precise about time to the point of rudeness. Comfortable giving orders, uneasy in conversations with no clear purpose.'),
-  mk('10237749914772934282', 'Ilse', '2', 'Merchant', 'active', 0, 'healthy', 0.11, 120000, false, ['campaign-2', 'market'],
+  mk('10237749914772934282', 'Ilse', 'merchant', 'Merchant', 'active', 0, 'healthy', 0.11, 120000, false, ['campaign-2', 'market'],
     'Late thirties, runs a stall she inherited and has quietly doubled. Friendly in a way that is also a negotiation. Remembers every price anyone ever quoted her.'),
-  mk('10237749914772934283', 'Hess', '3', 'Commander', 'ticking', 11, 'fixated', 0.38, 5000, false, ['campaign-2', 'north', 'command'],
+  mk('10237749914772934283', 'Hess', 'commander', 'Commander', 'ticking', 11, 'fixated', 0.38, 5000, false, ['campaign-2', 'north', 'command'],
     'Sixty, career officer, recently passed over. Speaks in complete paragraphs. Has started reading disloyalty into ordinary delays.'),
-  mk('10237749914772934284', 'Bramble', '4', 'Gardener', 'asleep', 0, 'healthy', 0.08, 300000, false, ['ambient'],
+  mk('10237749914772934284', 'Bramble', 'gardener', 'Gardener', 'asleep', 0, 'healthy', 0.08, 300000, false, ['ambient'],
     'Seventy-one, keeps the allotment behind the church. Cheerful, digressive, and occasionally stops mid-sentence when something reminds him of the campaign.'),
-  mk('10237749914772934285', 'Sable', '5', 'Drifter', 'idle', 0, 'healthy', 0.14, 90000, true, ['moonlight'],
+  mk('10237749914772934285', 'Sable', 'drifter', 'Drifter', 'idle', 0, 'healthy', 0.14, 90000, true, ['moonlight'],
     'Thirties, no fixed trade, arrives places slightly before she is expected. Answers questions with questions.'),
-  mk('10237749914772934286', 'Toll-keeper', '5', 'Drifter', 'suspended', 0, 'healthy', 0.05, 600000, false, ['north'],
+  mk('10237749914772934286', 'Toll-keeper', 'drifter', 'Drifter', 'suspended', 0, 'healthy', 0.05, 600000, false, ['north'],
     'Ageless in the way of people who sit in booths. Has opinions about everyone who crosses, and shares them for a fee.'),
 ];
 
@@ -97,18 +110,85 @@ export const MockAPI = {
       build: 'npcd-mock', mode: 'server-headless',
       loading: { current: 'Ready', progress: 1, completed: ['Mock store'] } };
   },
+  /* A synthetic hour, in the column shape the daemon serves. This one DOES
+   * fabricate — that is what `?mock` is for, and the header chip says "backend:
+   * mock" while it is on. It exists so the performance page can be built
+   * against a full engine without one running; the live path reports absence
+   * instead, and the two must not be confused. */
   async getTelemetry() {
-    return { vram: { total_mib: 24576, used_mib: 1876, free_mib: 22451, weights_mib: 0, kv_mib: 0, image_mib: 0 },
-      gpu: { name: 'mock device', compute_cap: '—', pcie_gen: 3, pcie_width: 16 },
-      ticks: { per_sec: 0.4, npcs_active: 3, inbox_depth_p50: 1, inbox_depth_p99: 11 },
-      batch: { mean_npcs_per_decode: 2.4, max: 6 },
-      image_queue: { depth: 2, state: 'waiting_for_vram', current: null },
-      throughput: { decode_tps: 0, prefill_tps: 0 } };
+    const n = 900, period = 2;                    // 30 minutes at the real cadence
+    const t = Array.from({ length: n }, (_, i) => i * period);
+    const wave = (i, a, b, f) => a + b * Math.sin(i / f);
+    const used = t.map((_, i) => Math.round(wave(i, 9000, 1800, 90)));
+    const weights = t.map(() => 5400);
+    const kv = t.map((_, i) => Math.round(wave(i, 2200, 900, 70)));
+    const image = t.map((_, i) => (i % 130 < 40 ? 640 : 0));
+    return {
+      gpu: { name: 'mock device', compute_cap: '8.6', pcie_gen: 3, pcie_width: 16 },
+      model: {
+        name: 'Qwen3-30B-A3B', quant: 'Q6_K', params_total: '30B', params_active: '3B',
+        repo: 'unsloth/Qwen3-30B-A3B-GGUF', filename: 'Qwen3-30B-A3B-Q6_K.gguf',
+        bytes: 25092532800,
+      },
+      host: { total_mib: 65457, free_mib: 41000, rss_mib: 820 },
+      sample_period_s: period,
+      engine_connected: true,
+      image_queue_state: 'waiting_for_vram',
+      uptime_s: 4820,
+      series: {
+        t,
+        vram_total_mib: t.map(() => 24576),
+        vram_used_mib: used,
+        vram_free_mib: used.map((u) => 24576 - u),
+        host_total_mib: t.map(() => 65457),
+        host_used_mib: t.map((_, i) => Math.round(wave(i, 24000, 2600, 140))),
+        rss_mib: t.map(() => 820),
+        weights_mib: weights,
+        kv_mib: kv,
+        image_mib: image,
+        decode_tps: t.map((_, i) => Math.round(wave(i, 430, 90, 55))),
+        prefill_tps: t.map((_, i) => Math.round(wave(i, 1100, 320, 33))),
+        mean_npcs_per_decode: t.map((_, i) => +wave(i, 3.1, 1.1, 61).toFixed(1)),
+        max_batch: t.map(() => 6),
+        npcs_active: t.map((_, i) => Math.round(wave(i, 7, 4, 77))),
+        ticks_per_sec: t.map((_, i) => +wave(i, 0.45, 0.2, 48).toFixed(2)),
+        inbox_depth_p50: t.map((_, i) => Math.round(Math.abs(wave(i, 1, 2, 40)))),
+        inbox_depth_p99: t.map((_, i) => Math.round(Math.abs(wave(i, 11, 9, 95)))),
+        image_queue_depth: image.map((v) => (v ? 2 : 0)),
+      },
+    };
+  },
+  async getSubstrateStorage() {
+    const seg = (id, bytes, active) => ({ id, bytes, active: !!active });
+    return {
+      open: true,
+      path: '.substrate',
+      listed: true,
+      segment_count: 4,
+      segments: [seg(1, 67108864), seg(2, 67108864), seg(3, 67108864), seg(4, 21402112, true)],
+      total_bytes: 222728704,
+      live_chunks: 41882,
+      dead_ratio: 0.18,
+    };
+  },
+  /* `getMemoryDump`, not `getMemory`: a character's memory layer claims that
+   * name below, and a duplicate key in an object literal silently keeps the
+   * last one. */
+  async getMemoryDump() {
+    const mib = 1024 * 1024;
+    return {
+      report: null,
+      report_age_ms: null,
+      host_now: { total_bytes: 65457 * mib, available_bytes: 41000 * mib, free_bytes: 38200 * mib },
+      process: { working_set_bytes: 820 * mib, virtual_bytes: 41000 * mib },
+    };
   },
   async getMe() {
     if (flag('loggedout')) return null;
     return { user_id: 'u_8812', unique_name: 'Wren', display: 'Johnathan', email: 'you@example.com',
-      provider: 'google', npc_count: NPCS.length,
+      // No `npc_count` — see §8.3. A total of everything you own is the figure
+      // that gives your hidden characters away.
+      provider: 'google',
       profile: { description: 'Reads people quickly, talks slowly. Ex-surveyor, so tends to describe places by their edges.',
         gender: 'Male', history: 'Grew up on the coast. Came inland for work and stayed.',
         turn_index: 7, revision: 3 } };
@@ -116,13 +196,28 @@ export const MockAPI = {
   async getProfile() { return (await this.getMe()).profile; },
   async putProfile(b) { return { ...(await this.getProfile()), ...b, revision: 4 }; },
   async putUniqueName(n) { return { ...(await this.getMe()), unique_name: n }; },
+  /* Enough of them to exercise the chooser rather than a list of two: with
+   * hundreds, anything that renders every revision at once is the wrong shape. */
   async getProfileHistory() {
     const live = await this.getProfile();
-    return { revisions: [
-      { ...live, live: true },
-      { ...live, live: false, revision: 2, tombstoned_ms: Date.now() - 864e5,
-        description: 'Ex-surveyor. Talks slowly.' },
-    ] };
+    const revs = [{ revision: live.revision, live: true, tombstoned_ms: null,
+      preview: live.description.slice(0, 90) }];
+    for (let r = live.revision - 1; r >= 0; r--) {
+      revs.push({ revision: r, live: false,
+        tombstoned_ms: Date.now() - (live.revision - r) * 36e5,
+        preview: `Earlier wording, revision ${r}. Ex-surveyor; talks slowly.` });
+    }
+    return { revisions: revs };
+  },
+  async getProfileRevision(n) {
+    const live = await this.getProfile();
+    if (n === live.revision) return live;
+    return { ...live, revision: n, tombstoned_ms: Date.now() - 36e5,
+      description: `Earlier wording, revision ${n}. Ex-surveyor; talks slowly.` };
+  },
+  async restoreProfile(n) {
+    const old = await this.getProfileRevision(n);
+    return { ...old, revision: (await this.getProfile()).revision + 1, tombstoned_ms: null };
   },
 
   async listNpcs(f = {}) {
@@ -146,8 +241,8 @@ export const MockAPI = {
     return n;
   },
   async createNpc(b) {
-    const n = mk(String(Date.now()), b.name || 'New character', b.archetype_id || '1', 'Loyal Soldier',
-      'idle', 0, 'healthy', 0.1, 60000, false, [], b.description || '');
+    const n = mk(String(Date.now()), b.name || 'New character', b.personality_id || 'loyal-soldier', 'Loyal Soldier',
+      'idle', 0, 'healthy', 0.1, 60000, false, [], b.persona_description || '');
     NPCS.push(n); return n;
   },
   async patchNpc(id, b) { const n = await this.getNpc(id); Object.assign(n, b); return n; },
@@ -300,26 +395,50 @@ export const MockAPI = {
     return { cancel: () => { stop = true; } };
   },
 
-  async listWorlds() {
-    return { worlds: EMPTY ? [] : [{ world_id: '1', name: 'Ardh', public: false,
+  // `q` narrows the listing, as the daemon's does. Nothing in this fixture is
+  // `hidden`, so the whole-word reveal has nothing to reveal here — what the
+  // argument buys is that the console's filter box is not dead against the
+  // mock, which is the kind of difference that gets mistaken for a bug.
+  async listWorlds(q) {
+    const all = EMPTY ? [] : [{ world_id: 'ardh', name: 'Ardh', public: false,
       setting: 'A kingdom of hill villages on a northern frontier, three years after a war nobody won. Roads are unsafe after dark. The crown is distant and the garrisons are underpaid.',
       npc_count: NPCS.length, time: { world_ms: worldMs(), scale: 60, paused: false },
       zoom_bands: ['strategic', 'regional', 'tactical', 'local'],
-      templates: { responses: 'override', moods: 'default' } }] };
+      templates: { responses: 'override', moods: 'default' } }];
+    return { worlds: narrow(all, q, (x) => [x.world_id, x.name]) };
   },
   async getWorld(w) { return (await this.listWorlds()).worlds.find((x) => x.world_id === w); },
   async setWorld() { return { ok: true }; },
   async setWorldTime() { return { ok: true }; },
-  async listArchetypes() {
-    return { archetypes: [
-      { archetype_id: '1', name: 'Loyal Soldier', core_identity: 'Betrayal is unforgivable. Orders are a contract, not a request.', npc_count: 3, doctrine_version: 4, doctrine: 'Flank at 2:1 or not at all. Cross open ground only with a fallback named.' },
-      { archetype_id: '2', name: 'Merchant', core_identity: 'Every exchange is a relationship. Price is memory made numeric.', npc_count: 1, doctrine_version: 2, doctrine: 'Never the first number.' },
-      { archetype_id: '3', name: 'Commander', core_identity: 'Position is read before people are. Loyalty is assessed, not assumed.', npc_count: 1, doctrine_version: 3, doctrine: 'Name a fallback before committing.' },
-      { archetype_id: '4', name: 'Gardener', core_identity: 'Things grow at their own rate. Patience is not passivity.', npc_count: 1, doctrine_version: 1, doctrine: 'Prune in the cold.' },
-      { archetype_id: '5', name: 'Drifter', core_identity: 'Attachment is a cost. Observation is free.', npc_count: 2, doctrine_version: 1, doctrine: 'Leave before asked.' },
-    ] };
+  async listPersonalities(q) {
+    // Ids are slugs and the anchor is `anchor`, matching
+    // `personalities/<id>.yaml`. Both were invented shapes — numbered rows and
+    // a `core_identity` field that existed only on the wire — and a console
+    // exercised against them is a console tested against nothing real.
+    const P = (id, name, anchor, npc_count, doctrine_version, doctrine) => ({
+      personality_id: id, name, anchor, npc_count, doctrine_version, doctrine,
+      personality: {
+        voice: 'Short sentences. Rank and role before names. Silence rather than a guess.',
+        processing: 'Weight direct observation over second-hand intel. Distrust a plan with no named fallback.',
+        under_pressure: 'Get narrower, not louder. Reduce the problem until one action is obviously next.',
+      },
+    });
+    const all = [
+      P('loyal-soldier', 'Loyal Soldier', 'Betrayal is unforgivable. Orders are a contract, not a request.', 3, 4,
+        'Flank at 2:1 or not at all. Cross open ground only with a fallback named.'),
+      P('merchant', 'Merchant', 'Every exchange is a relationship. Price is memory made numeric.', 1, 2,
+        'Never the first number.'),
+      P('commander', 'Commander', 'Position is read before people are. Loyalty is assessed, not assumed.', 1, 3,
+        'Name a fallback before committing.'),
+      P('gardener', 'Gardener', 'Things grow at their own rate. Patience is not passivity.', 1, 1,
+        'Prune in the cold.'),
+      P('drifter', 'Drifter', 'Attachment is a cost. Observation is free.', 2, 1,
+        'Leave before asked.'),
+    ];
+    return { personalities: narrow(all, q, (x) => [x.personality_id, x.name]) };
   },
-  async getArchetype(a) { return (await this.listArchetypes()).archetypes.find((x) => x.archetype_id === a); },
+  async getPersonality(a) { return (await this.listPersonalities()).personalities.find((x) => x.personality_id === a); },
+  async setPersonality() { return { ok: true }; },
 
   async getLayerSchema() {
     const L = (layer, window, priority, min_percent, selection, masking, score_threshold,
@@ -440,16 +559,16 @@ export const MockAPI = {
         ] },
     ] };
   },
-  async getArchetypeCollections() {
+  async getPersonalityCollections() {
     const S = (id, category, tokens, examples, template) => ({ id, category, tokens, examples, template });
     return { collections: [
       { name: 'identity_anchor', folder: 'identities/<name>/anchor.yaml', rule: 'always-visible',
-        locked: true, source: 'archetype',
+        locked: true, source: 'personality',
         description: 'The always-on compressed self. Structurally resident — it never competes for the gather budget, because it is the prefix the budget is read inside.',
         sections: [S('anchor', 'identity', 186, 0,
           'You are a soldier before you are anything else. An order is a contract. Betrayal is not a setback, it is a category.')] },
       { name: 'identity', folder: 'identities/<name>/*.yaml', rule: 'top-k 3',
-        locked: true, source: 'archetype',
+        locked: true, source: 'personality',
         description: 'Detail facets of the same self, surfaced only when relevant to the exchange.',
         sections: [
           S('voice', 'identity', 132, 2, 'Short sentences. Rank and role before names. Silence rather than a guess.'),
@@ -458,7 +577,7 @@ export const MockAPI = {
           S('under_pressure', 'identity', 121, 2, 'Get narrower, not louder. Reduce the problem until one action is obviously next.'),
         ] },
       { name: 'doctrine', folder: 'doctrine.yaml', rule: 'always-visible',
-        locked: false, source: 'archetype · evolves',
+        locked: false, source: 'personality · evolves',
         description: 'The one part of the shared layer designed to change. Aggregated from strategic learning across every NPC of this type, then published as a version.',
         sections: [S('current', 'doctrine', 142, 0, 'Flank at 2:1 or not at all. Cross open ground only with a fallback named.')] },
     ] };

@@ -188,9 +188,23 @@ impl PolicyConfig {
 }
 
 /// A node's full selection policy: the [`PolicyConfig`] plus the gather-scope tag
-/// filter. An empty `tags` list means "all projections in scope" (the
-/// self-reinforcing default); a non-empty list restricts the gallery to
-/// projections whose source turn carries one of the tags.
+/// filter.
+///
+/// # What an empty list means
+///
+/// An empty `tags` list admits **only turns that are themselves untagged** — it
+/// is not "everything". A non-empty list admits only turns carrying one of the
+/// named tags, and excludes untagged ones. See the gather in
+/// [`super::resolver`], and `substrate::tests::an_empty_tag_filter_admits_only_untagged_turns`
+/// which pins both halves.
+///
+/// This comment previously read "all projections in scope", which is the
+/// opposite of what the code does, and the difference is not cosmetic: it is
+/// what lets one corpus serve many scopes. Content ingested untagged is shared
+/// by every node declaring no filter; content ingested with a tag is reachable
+/// only from a node naming it. Were "empty" to mean everything, every tagged
+/// turn would be visible from every unfiltered node — silently, since nothing
+/// about the result would look wrong.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectionPolicy {
     pub config: PolicyConfig,

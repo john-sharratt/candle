@@ -21,7 +21,7 @@
 use std::fmt;
 
 /// Longest id we will write. Well inside every filesystem's limit even after
-/// the extension, and long enough that no real world or archetype needs to be
+/// the extension, and long enough that no real world or personality needs to be
 /// abbreviated.
 const MAX_LEN: usize = 64;
 
@@ -93,37 +93,11 @@ pub fn check(id: &str) -> Result<(), IdError> {
     Ok(())
 }
 
-/// Turn a human name into a candidate id. Lossy on purpose — the caller shows
-/// the result and lets the author correct it, rather than the author guessing
-/// what survived.
-pub fn from_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut last_hyphen = true; // suppresses a leading hyphen
-    for c in name.chars() {
-        let c = c.to_ascii_lowercase();
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            out.push(c);
-            last_hyphen = false;
-        } else if !last_hyphen {
-            out.push('-');
-            last_hyphen = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out.truncate(MAX_LEN);
-    while out.ends_with('-') {
-        out.pop();
-    }
-    // A world called "Con" is a perfectly reasonable thing to want, and the
-    // author should not have to learn why Win32 disagrees. Disambiguate rather
-    // than hand back a suggestion that the save path will refuse.
-    if RESERVED.contains(&out.as_str()) {
-        out.push_str("-1");
-    }
-    out
-}
+// There was a `from_name` here, turning a typed display name into a candidate
+// id. It existed for the "+ New world" and "+ New personality" buttons, and
+// those are gone: worlds and personalities are files an author writes into the
+// mind, so an id is chosen by naming a file rather than derived from a form.
+// Nothing suggests ids any more, so nothing needs to.
 
 #[cfg(test)]
 mod tests {
@@ -207,45 +181,22 @@ mod tests {
         );
     }
 
+    /// The ids the mind actually holds all pass, which is the case that matters
+    /// most: a file already on disk whose name this gate would refuse is a
+    /// document the console can read and never save back.
     #[test]
-    fn a_name_becomes_a_usable_id() {
-        assert_eq!(from_name("Ardh"), "ardh");
-        assert_eq!(from_name("Hill Villages"), "hill-villages");
-        assert_eq!(from_name("  The North!  "), "the-north");
-        assert_eq!(from_name("a/b\\c"), "a-b-c");
-        assert_eq!(from_name("café"), "caf");
-        // Reserved names are disambiguated rather than handed back to be
-        // rejected later.
-        assert_eq!(from_name("CON"), "con-1");
-    }
-
-    /// Whatever `from_name` produces must pass `check`, or the GUI can suggest
-    /// an id its own save will reject.
-    #[test]
-    fn a_derived_id_always_passes_the_gate() {
-        let long = "a".repeat(200);
-        for name in [
-            "Ardh",
-            "Hill Villages",
-            "  spaces  ",
-            "!!!weird!!!",
-            "CON",
-            "Nul",
-            "com1",
-            long.as_str(),
-            "---",
-            "",
-            "🙂",
+    fn every_authored_id_in_use_is_writable() {
+        for id in [
+            "battle-cities",
+            "earth",
+            "sandbox",
+            "commander",
+            "loyal-soldier",
+            "anchor-the-protector",
+            "cindy-tan",
+            "babel-the-polyglot-parrot",
         ] {
-            let id = from_name(name);
-            if id.is_empty() {
-                continue; // caller must ask for a name; nothing to write
-            }
-            assert!(
-                check(&id).is_ok(),
-                "`{name}` produced `{id}`, which the gate rejects: {:?}",
-                check(&id)
-            );
+            assert_eq!(check(id), Ok(()), "`{id}` is on disk and unsaveable");
         }
     }
 }

@@ -61,8 +61,8 @@ use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
-    decode_record, encode_record, ChunkPayload, DebugIdPayload, Record, RecordHeader, RecordType,
-    TombstonePayload, TreeMetadataPayload,
+    decode_record, encode_record, ChunkPayload, DebugIdPayload, NpcPayload, Record, RecordHeader,
+    RecordType, TombstonePayload, TreeMetadataPayload,
 };
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -173,6 +173,19 @@ pub struct SubstratePersistence {
     /// (a dead conversation has no live tail). Populated on every append
     /// (both encode and verbatim paths) and rebuilt on load / compact.
     snapshot_locs: HashMap<u64, RecordLoc>,
+
+    /// On-disk location of each character's CURRENT [`RecordType::Npc`] record,
+    /// keyed by `npc_id` (which the header carries as its `stream_id`) —
+    /// last-writer-wins.
+    ///
+    /// This map is what keeps characters alive. NPC payloads do not live in the
+    /// substrate's RAM — the substrate holds no opinion about a character, and
+    /// the registry that does is in another process's memory — so compaction
+    /// cannot re-synthesise them the way it re-synthesises a `Label`. Instead
+    /// the winner is relocated verbatim, exactly as `Snapshot` is, and this map
+    /// says which record that is. Without it, `collect_live_records` would omit
+    /// every NPC and the first compaction would delete the entire cast.
+    npc_locs: HashMap<u64, RecordLoc>,
 }
 
 /// Whether a record type is a per-stream metadata record whose current-copy
@@ -218,6 +231,29 @@ fn record_metadata_loc(map: &mut HashMap<(RecordType, u64), RecordLoc>, entry: &
 /// this before the `SubstratePersistence` exists; the runtime append path
 /// uses [`SubstratePersistence::track_snapshot_loc`] plus the removal in
 /// [`SubstratePersistence::write_tombstone`].
+/// Mirror one walked record into the NPC-location map (LWW). Keyed by the
+/// header's `stream_id`, which for an `Npc` record is the `npc_id` — so the
+/// walk never has to decode a payload to know which character it belongs to.
+///
+/// A tombstoned character keeps its entry: `state: "tombstoned"` is a
+/// superseding record like any other, and the id must stay taken so the acts
+/// that already name it still resolve. Dropping it here would let a later
+/// character reuse the id.
+fn record_npc_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
+    let h = &entry.record.header;
+    if h.record_type == RecordType::Npc {
+        map.insert(
+            h.stream_id,
+            RecordLoc {
+                segment: entry.segment,
+                offset: entry.offset,
+                payload_len: h.payload_len,
+                record_size: entry.size,
+            },
+        );
+    }
+}
+
 fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     match h.record_type {
@@ -311,6 +347,31 @@ impl SubstratePersistence {
         })
     }
 
+    /// As [`Self::open_in_with_substrate`], but the caller also sees every
+    /// record as it is walked.
+    ///
+    /// For record classes the substrate does not interpret — [`RecordType::Npc`]
+    /// is the one that exists today — this is how their owner rebuilds its
+    /// index without a second pass over the log. Reading them back through
+    /// [`Self::npc_locs`] afterwards would work too, but costs one seek per
+    /// character where this costs none: the bytes are already in hand.
+    ///
+    /// The sink sees records in log order, so last-writer-wins is simply the
+    /// last value the sink is handed for a key.
+    pub fn open_in_with_substrate_and_sink<F>(
+        dir: &Path,
+        substrate: &mut Substrate,
+        mut sink: F,
+    ) -> Result<SubstratePersistence>
+    where
+        F: FnMut(&WalkEntry),
+    {
+        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], |entry| {
+            substrate.apply_walker_entry(entry);
+            sink(entry);
+        })
+    }
+
     /// Open over an ordered list of paths. The last entry is the active,
     /// writable **segment directory** (`.substrate/`); every earlier entry is
     /// an inherited read-only single-file log, loaded through the shared
@@ -345,6 +406,7 @@ impl SubstratePersistence {
         let mut accounting = RecordAccounting::new();
         let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
         let mut snapshot_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
         let segmented_log::OpenedSegments {
             mut segments,
             manifest,
@@ -355,6 +417,7 @@ impl SubstratePersistence {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(&mut metadata_locs, entry);
             record_snapshot_loc(&mut snapshot_locs, entry);
+            record_npc_loc(&mut npc_locs, entry);
             sink(entry);
         })?;
 
@@ -397,6 +460,7 @@ impl SubstratePersistence {
             resident_reemit_floor: None,
             metadata_locs,
             snapshot_locs,
+            npc_locs,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -514,6 +578,7 @@ impl SubstratePersistence {
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_snapshot_loc(&header, segment, offset, size);
+        self.track_npc_loc(&header, segment, offset, size);
         let entry = WalkEntry {
             segment,
             offset,
@@ -559,6 +624,9 @@ impl SubstratePersistence {
         // pass would mis-read the relocated (live) copy as superseded and skip
         // carrying it out of a segment about to be dropped.
         self.track_snapshot_loc(header, segment, offset, size);
+        // A relocated `Npc` record is that character's new on-disk home, for
+        // exactly the same reason.
+        self.track_npc_loc(header, segment, offset, size);
         // `Chunk` / `Tokens` are indexed on the substrate, not the manifest, so
         // no `manifest.ingest` — the caller repoints the substrate index.
         if header.record_type != RecordType::HeaderIndex {
@@ -672,6 +740,62 @@ impl SubstratePersistence {
                 },
             );
         }
+    }
+
+    /// The runtime-append twin of [`record_npc_loc`].
+    fn track_npc_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
+        if h.record_type == RecordType::Npc {
+            self.npc_locs.insert(
+                h.stream_id,
+                RecordLoc {
+                    segment,
+                    offset,
+                    payload_len: h.payload_len,
+                    record_size: size,
+                },
+            );
+        }
+    }
+
+    /// Append one character's durable state.
+    ///
+    /// The `npc_id` goes in the header's `stream_id`, which is what makes this
+    /// supersede the character's previous record mechanically: the accounting
+    /// credits the old copy as dead the moment this one lands, and
+    /// [`Self::npc_locs`] now points here. There is no delete record — an edit
+    /// supersedes, and a deletion is an edit that sets `state: "tombstoned"`.
+    ///
+    /// Writes are expected to be rare: the payload is durable configuration
+    /// only, so a character that is merely *running* never writes at all.
+    pub fn write_npc(&mut self, npc: &NpcPayload) -> Result<()> {
+        let bytes = npc.encode();
+        self.append_record(RecordType::Npc, 0, npc.npc_id, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
+    /// Every character's current record location, keyed by `npc_id`.
+    ///
+    /// Locations rather than payloads, because the payloads are not held here —
+    /// the registry that owns them lives in the daemon. Compaction and segment
+    /// liveness both read this to know which bytes are still worth keeping.
+    pub fn npc_locs(&self) -> &HashMap<u64, RecordLoc> {
+        &self.npc_locs
+    }
+
+    /// Read back one character's current record.
+    ///
+    /// The load path does not use this — it collects payloads from the recovery
+    /// walk's sink in one sweep, which is a great deal cheaper than a seek per
+    /// character. This exists for the one-off: re-reading a single character
+    /// after a write, or a diagnostic.
+    pub fn read_npc(&mut self, npc_id: u64) -> Result<Option<NpcPayload>> {
+        let Some(loc) = self.npc_locs.get(&npc_id).copied() else {
+            return Ok(None);
+        };
+        let record = self
+            .segments
+            .read_record_at(loc.segment, loc.offset, loc.record_size)?;
+        Ok(Some(NpcPayload::decode(&record.payload)?))
     }
 
     /// Append a stream's `Tokens` record, returning `(segment, offset,
@@ -1442,7 +1566,7 @@ impl SubstratePersistence {
         let dir = self.segments.dir().to_path_buf();
         // Planning only — no disk reads; each read-back record carries its
         // source location, read back coalesced + staged verbatim in step 3.
-        let live = compaction::collect_live_records(&self.manifest, substrate);
+        let live = compaction::collect_live_records(&self.manifest, substrate, &self.npc_locs);
         report(2);
 
         // 3. Write the live set into a compacted scratch file (a fresh index
@@ -1522,13 +1646,16 @@ impl SubstratePersistence {
         // (mirrors the load walk in `from_dir_with_sink`).
         self.metadata_locs.clear();
         self.snapshot_locs.clear();
+        self.npc_locs.clear();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
         let snapshot_locs = &mut self.snapshot_locs;
+        let npc_locs = &mut self.npc_locs;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(metadata_locs, entry);
             record_snapshot_loc(snapshot_locs, entry);
+            record_npc_loc(npc_locs, entry);
             substrate.apply_walker_entry(entry);
         })?;
         // The compacted segment carries a fresh index chain; chain the next

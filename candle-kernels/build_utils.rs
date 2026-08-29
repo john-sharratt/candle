@@ -743,6 +743,7 @@ fn compile_kernel_nvcc(
     let out_obj = build_dir.join(format!("{}.o", kernel_name));
 
     let mut cmd = std::process::Command::new("nvcc");
+    with_host_compiler(&mut cmd);
     cmd.arg("-c")
         .arg(kernel_path)
         .arg("-o")
@@ -933,7 +934,10 @@ fn create_archive(
     let lib_file = build_dir.join(format!("lib{}.a", lib_name));
 
     if is_msvc {
+        // Same directory as `cl.exe`, and the same problem: reachable from a
+        // Developer Command Prompt and from nowhere else.
         let mut cmd = std::process::Command::new("lib.exe");
+        with_host_compiler(&mut cmd);
         cmd.arg(format!("/OUT:{}", lib_file.display()));
         for obj in object_files {
             cmd.arg(obj);
@@ -1021,5 +1025,88 @@ fn detect_is_msvc() -> bool {
         target.contains("msvc")
     } else {
         cfg!(windows)
+    }
+}
+
+/// The directory holding `cl.exe`, found the way MSVC itself expects.
+///
+/// `nvcc` compiles device code but hands the host half to the platform
+/// compiler, which it locates **on `PATH`** — not through anything cargo sets
+/// up. So a build that links perfectly well still dies with
+/// `nvcc fatal : Cannot find compiler 'cl.exe' in PATH` in any shell that is
+/// not a Developer Command Prompt: an ordinary terminal, a CI step, an editor's
+/// integrated shell. The usual answer is "remember to open the right prompt",
+/// which is a requirement nobody can see and everybody forgets.
+///
+/// So the build finds it. `vswhere.exe` ships at a fixed location with every
+/// Visual Studio since 2017 and reports the newest installation carrying the
+/// C++ toolset; the toolset version underneath moves with each VS update, so
+/// the highest directory is taken rather than any pinned number.
+///
+/// Deliberately *not* solved by putting MSVC on the global `PATH`: that pins a
+/// toolset version machine-wide and puts Microsoft's `link.exe` ahead of every
+/// other `link` on the system, which is its own long-running confusion.
+#[cfg(windows)]
+fn msvc_bin_dir() -> Option<std::path::PathBuf> {
+    // Already reachable — a Developer Command Prompt, or someone's own PATH.
+    if std::process::Command::new("cl.exe")
+        .arg("/?")
+        .output()
+        .is_ok()
+    {
+        return None;
+    }
+
+    let pf86 = std::env::var("ProgramFiles(x86)")
+        .unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+    let vswhere =
+        std::path::Path::new(&pf86).join(r"Microsoft Visual Studio\Installer\vswhere.exe");
+    let out = std::process::Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()?;
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+
+    // Newest toolset present, by directory name — these sort correctly as
+    // strings because the components are zero-padded (14.44.35207).
+    let mut versions: Vec<_> = std::fs::read_dir(std::path::Path::new(&root).join(r"VC\Tools\MSVC"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    versions.sort();
+    let bin = versions.pop()?.join(r"bin\Hostx64\x64");
+    bin.join("cl.exe").is_file().then_some(bin)
+}
+
+#[cfg(not(windows))]
+fn msvc_bin_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Put `cl.exe` within nvcc's reach, if it is not already.
+///
+/// Applied to the child process only. Editing the build's own `PATH` would
+/// leak into every other tool it shells out to, for a requirement that belongs
+/// to one of them.
+fn with_host_compiler(cmd: &mut std::process::Command) {
+    let Some(bin) = msvc_bin_dir() else { return };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![bin];
+    dirs.extend(std::env::split_paths(&path));
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        cmd.env("PATH", joined);
     }
 }

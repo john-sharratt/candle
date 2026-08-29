@@ -19,6 +19,16 @@ const MAX = 600;
 
 export async function render() {
   const el = h('div', { class: 'page wide' });
+
+  /* No role check here: the page is declared `role: 'admin'` in `app.js`, so
+   * the router refused it before this ran and the nav link was never shown.
+   *
+   * That matters for this page specifically. The daemon refuses the upgrade
+   * with a 401 or 403, which is right on the wire — but a browser's
+   * `WebSocket` does not expose the status of a failed handshake, so the socket
+   * would simply not open and the page would sit on "reconnecting…" forever,
+   * looking like an outage rather than a permission. The declaration is what
+   * stops a non-admin ever reaching the socket. */
   let minLevel = 'DEBUG';
   let filter = '';
 
@@ -40,13 +50,40 @@ export async function render() {
     visible().map((l) => `${l.ts} ${l.level} ${l.target} ${l.msg}`).join('\n'), copyBtn));
 
   const live = h('span', { class: 'chip ok' }, '● live');
+  const tally = h('span', { class: 'tiny dim' });
+  const pauseBtn = h('button', { class: 'btn sm' }, '⏸ pause');
+
+  /* Paused holds arriving lines rather than dropping them. Pausing is for
+   * reading something that just went past, not for missing what came next —
+   * a pane that discards while you read is worse than one that never stopped.
+   * The hold is capped like the buffer, so a pause left running overnight
+   * cannot grow without limit. */
+  let paused = false;
+  const held = [];
+
+  pauseBtn.addEventListener('click', () => {
+    paused = !paused;
+    pauseBtn.textContent = paused ? '▶ resume' : '⏸ pause';
+    pauseBtn.classList.toggle('primary', paused);
+    if (!paused) {
+      while (held.length) accept(held.shift());   // in arrival order
+      repaint();
+    }
+    count();
+  });
+
+  const count = () => {
+    tally.textContent = paused
+      ? `paused · ${held.length} held`
+      : `${ring.items.length} buffered`;
+  };
 
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'Logs'),
       h('div', { class: 'sub' },
         'Structured lines from the daemon — filtering is a property test, not a regex over formatted text.')),
-    h('div', { class: 'row' }, live, search, levelSel, copyBtn,
-      h('button', { class: 'btn sm ghost', onClick: () => { ring.clear(); } }, 'Clear'))));
+    h('div', { class: 'row' }, live, tally, search, levelSel, pauseBtn, copyBtn,
+      h('button', { class: 'btn sm ghost', onClick: () => { held.length = 0; ring.clear(); count(); } }, 'Clear'))));
   el.appendChild(scroller);
 
   const row = (l) => h('div', { class: 'log-row' },
@@ -70,12 +107,35 @@ export async function render() {
     scroller.scrollTop = scroller.scrollHeight;
   }
 
+  /* Lines the filter excludes still enter `items` — they are what a widened
+   * filter has to be able to show without re-fetching anything.
+   *
+   * Trimmed here as well as in `ring.push`, because pushing straight to
+   * `ring.items` bypasses the ring's own cap: with a filter active, every
+   * excluded line took that path and the buffer grew without bound for as long
+   * as the pane stayed open. Only the *rendered* rows were ever capped, so
+   * nothing on screen showed it happening. */
+  function accept(l) {
+    if (passes(l)) {
+      ring.push(l);
+    } else {
+      ring.items.push(l);
+      if (ring.items.length > MAX) ring.items.splice(0, ring.items.length - MAX);
+    }
+  }
+
   // The backlog arrives on the same socket as the tail, so there is no window
   // in which a line can be both "already seeded" and "not yet subscribed".
-  // Lines the filter excludes still enter `items` — they are what a widened
-  // filter has to be able to show without re-fetching anything.
   const sub = API.subscribeLogs(
-    (l) => { if (passes(l)) ring.push(l); else ring.items.push(l); },
+    (l) => {
+      if (paused) {
+        held.push(l);
+        if (held.length > MAX) held.splice(0, held.length - MAX);
+      } else {
+        accept(l);
+      }
+      count();
+    },
     (state) => {
       const ok = state === 'live';
       live.className = 'chip ' + (ok ? 'ok' : 'warn');
@@ -84,6 +144,7 @@ export async function render() {
   );
 
   repaint();
+  count();
 
   return { el, teardown: () => sub.close() };
 }

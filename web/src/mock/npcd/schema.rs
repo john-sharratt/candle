@@ -3,7 +3,7 @@
 //!
 //! A world is not "a name and a blurb" — it is the substrate layers its NPCs
 //! think through (window, budget, selection rule, masking) plus the section
-//! collections the lens is assembled from. An archetype owns collections of its
+//! collections the lens is assembled from. A personality owns collections of its
 //! own: the identity anchor and its detail facets, which are read-only by
 //! construction because they are the CoW prefix.
 
@@ -110,32 +110,44 @@ pub fn world_collections() -> Value {
     ]})
 }
 
-/// Collections owned by an archetype: the immutable half. Read-only by
-/// construction — they are the shared CoW prefix, and mutating one would break
-/// the sharing that makes it free.
-pub fn archetype_collections() -> Value {
+/// Collections owned by a personality: what a character IS before it has lived
+/// anything.
+///
+/// The anchor and its traits are read-only in the console by construction —
+/// they are the shared CoW prefix, and mutating one would break the sharing
+/// that makes it free. Doctrine is the one part designed to change.
+///
+/// The folder paths here are the real ones after the restructure: a personality
+/// is ONE file, `personalities/<name>.yaml`, carrying its anchor and its traits
+/// inline. It was a directory of per-facet files; both collections pointed into
+/// it and `identity` selected `top-k 3` of them.
+///
+/// Traits are `always-visible` now, not selected. A character is not
+/// situationally itself: choosing three traits per turn made it partly itself,
+/// differently each turn. Biography — the part that genuinely IS situational —
+/// moved to the `memory` layer, where provenance retrieves it.
+pub fn personality_collections() -> Value {
     json!({ "collections": [
-        collection("identity_anchor", "identities/<name>/anchor.yaml", "always-visible", true, "archetype",
+        collection("identity_anchor", "personalities/<name>.yaml · anchor", "always-visible", true, "personality",
             "The always-on compressed self. Structurally resident — it never competes for the gather \
              budget, because it is the prefix the budget is read inside.",
             json!([
                 section("anchor", "identity", 186, 0,
                     "You are a soldier before you are anything else. An order is a contract. Betrayal is not a setback, it is a category."),
             ])),
-        collection("identity", "identities/<name>/*.yaml", "top-k 3", true, "archetype",
-            "Detail facets of the same self, surfaced only when relevant to the exchange.",
+        collection("identity", "personalities/<name>.yaml · personality", "always-visible", true, "personality",
+            "Constant traits of the same self. Always resident alongside the anchor — a character is \
+             formal in a fight and formal at dinner, so these do not compete for a slot.",
             json!([
                 section("voice", "identity", 132, 2, "Short sentences. Rank and role before names. Silence rather than a guess."),
                 section("processing", "identity", 148, 2,
                     "Weight direct observation over second-hand intel. Distrust a plan with no named fallback."),
-                section("history", "identity", 164, 1,
-                    "Twenty years in, three campaigns, one of them the kind nobody writes down."),
                 section("under_pressure", "identity", 121, 2,
                     "Get narrower, not louder. Reduce the problem until one action is obviously next."),
             ])),
-        collection("doctrine", "doctrine.yaml", "always-visible", false, "archetype · evolves",
-            "The one part of the shared layer designed to change. Aggregated from strategic learning \
-             across every NPC of this type, then published as a version.",
+        collection("doctrine", "personalities/<name>.yaml · doctrine", "always-visible", false, "personality · evolves",
+            "The one part of the shared layer designed to change. Reaches every living character of this \
+             type at next spawn or fork refresh, which is why it carries a version and the anchor does not.",
             json!([
                 section("current", "doctrine", 142, 0,
                     "Flank at 2:1 or not at all. Cross open ground only with a fallback named."),

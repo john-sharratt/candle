@@ -22,7 +22,8 @@ const KIND_COLOR = {
 };
 
 export async function render(_params, q) {
-  const el = h('div', { class: 'page wide' });
+  // `subs` scopes this page's styling — see the block in `app.css`.
+  const el = h('div', { class: 'page wide subs' });
   const npcs = (await API.listNpcs({}).catch(() => ({ items: [] }))).items || [];
   let npcId = q.npc || (npcs[0] && npcs[0].npc_id);
 
@@ -30,6 +31,7 @@ export async function render(_params, q) {
   const turnCache = cache();
 
   const kpiHost = h('div', { class: 'grid g4', style: 'margin-bottom:16px' });
+  const storageHost = h('div', { style: 'margin-bottom:16px' });
   const treeHost = h('div', {});
   const liveBtn = h('button', { class: 'chip', title: 'polling every 6s' }, '● live');
 
@@ -44,6 +46,7 @@ export async function render(_params, q) {
         'Layer occupancy, then conversations, then turns, then the K/V segment vector. Each level loads when you open it.')),
     h('div', { class: 'row' }, liveBtn, h('span', { class: 'tiny dim' }, 'character'), sel)));
   el.appendChild(kpiHost);
+  el.appendChild(storageHost);
   el.appendChild(treeHost);
 
   let lastShape = null;
@@ -70,9 +73,85 @@ export async function render(_params, q) {
       note ? h('div', { class: 'tiny dim' }, note) : null);
   }
 
+  // ── storage ───────────────────────────────────────────────────────────────
+
+  /* The redo log every character's memory is written into.
+   *
+   * Daemon-scoped rather than per-character, and the one part of this page that
+   * does not wait on the engine: a segmented append-only log is a directory of
+   * files, so `/v1/substrate/storage` reads it straight off disk. The layer
+   * tree below is still the console's fixture until an engine opens a
+   * substrate; this is not. */
+  async function paintStorage() {
+    let s;
+    try {
+      s = await API.getSubstrateStorage();
+    } catch (_) {
+      // The whole page is declared `role: 'admin'` in `app.js` — it names the
+      // redo log's absolute path — so a refusal here is not a permission
+      // problem, it is the daemon being unreachable. Nothing to explain that
+      // the page's other panels will not already be showing.
+      mount(storageHost);
+      return;
+    }
+    if (!s || !s.open) {
+      mount(storageHost, h('div', { class: 'panel' },
+        h('div', { class: 'row', style: 'justify-content:space-between;align-items:baseline' },
+          h('h3', { style: 'margin:0' }, 'Storage'),
+          h('span', { class: 'chip' }, 'not opened')),
+        h('div', { class: 'tiny dim', style: 'margin-top:8px' },
+          'No substrate has been written yet — nothing has run an engine against this daemon. '
+          + 'It would live at ', h('code', { class: 'mono' }, (s && s.path) || '.substrate'), '.')));
+      return;
+    }
+
+    const segs = s.segments || [];
+    const total = s.total_bytes || 0;
+    /* Width by share of the log, so the strip reads as the file it describes:
+     * a long tail of sealed segments and one growing head. */
+    const strip = segs.map((g) => h('i', {
+      class: g.active ? 'seg active' : 'seg',
+      style: `flex:${Math.max(1, g.bytes || 1)}`,
+      title: `seg-${g.id} · ${fmtBytes(g.bytes)}${g.active ? ' · active' : ''}`,
+    }));
+
+    mount(storageHost, h('div', { class: 'panel' },
+      h('div', { class: 'row', style: 'justify-content:space-between;align-items:baseline' },
+        h('h3', { style: 'margin:0' }, 'Storage ',
+          h('span', { class: 'tiny dim' }, '· the redo log on disk')),
+        h('span', { class: 'mono tiny' }, fmtBytes(total))),
+      h('div', { class: 'segstrip', style: 'margin-top:10px' }, ...strip),
+      h('div', { class: 'row wrap', style: 'gap:6px;margin-top:10px' },
+        h('span', { class: 'chip' }, fmtNum(s.segment_count || segs.length) + ' segments'),
+        s.listed === false
+          // Say so rather than showing 512 of 900 as though it were all of them.
+          ? h('span', { class: 'chip warn' }, 'showing newest ' + segs.length) : null,
+        h('span', { class: 'chip' }, 'live chunks '
+          + (s.live_chunks == null ? '—' : fmtNum(s.live_chunks))),
+        h('span', { class: 'chip' + (s.dead_ratio > 0.5 ? ' warn' : '') }, 'dead '
+          + (s.dead_ratio == null ? '—' : Math.round(s.dead_ratio * 100) + '%')),
+        h('span', { class: 'tiny dim mono', style: 'margin-left:auto' }, s.path || '')),
+      s.live_chunks == null
+        ? h('div', { class: 'tiny st-na', style: 'margin-top:8px' },
+          'Live chunk count and reclaimable fraction live in the substrate’s in-memory '
+          + 'index, so they appear when an engine holds one open.')
+        : null));
+  }
+
+  function fmtBytes(b) {
+    if (b == null) return '—';
+    const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let i = 0, v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i += 1; }
+    return v.toFixed(i >= 2 ? 1 : 0) + ' ' + u[i];
+  }
+
   // ── tree ──────────────────────────────────────────────────────────────────
 
   async function paintAll() {
+    // Storage is daemon-scoped, so it paints whether or not a character is
+    // selected — and it is the only real thing on the page today.
+    paintStorage();
     if (!npcId) return mount(treeHost, empty('◌', 'No characters', 'Create one to see its substrate.'));
     const [sub, schema] = await Promise.all([
       API.getSubstrate(npcId).catch(() => ({ layers: [] })),

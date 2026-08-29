@@ -30,6 +30,18 @@ const qs = (o) => {
 export const LiveAPI = {
   getStatus:    () => j('/v1/status'),
   getTelemetry: () => j('/v1/telemetry'),
+  /* Full memory accounting. Separate from telemetry because it is a fresh OS
+   * read rather than a slice of the retained series, and the performance page
+   * wants it at a slower cadence than the charts. */
+  /* `getMemoryDump`, not `getMemory` — that name is taken further down by a
+   * character's memory layer, and an object literal silently keeps the LAST
+   * definition of a duplicated key. The daemon's memory accounting would have
+   * been shadowed by a character's memory turns, with no error anywhere. */
+  getMemoryDump: () => j('/v1/memory'),
+  /* The redo log on disk. Daemon-scoped, not per-character: it is the storage
+   * every character's memory is written into, and it is real today because a
+   * segmented log is a directory of files. */
+  getSubstrateStorage: () => j('/v1/substrate/storage'),
 
   /* No sign-in or sign-out here. The gateway owns both — its `/auth/*` is
    * served ahead of site routing on every hostname, and the cookie it issues is
@@ -39,6 +51,8 @@ export const LiveAPI = {
   getProfile:     () => j('/v1/me/profile'),
   putProfile:     (b) => j('/v1/me/profile', { method: 'PUT', body: b }),
   getProfileHistory: () => j('/v1/me/profile/history'),
+  getProfileRevision: (n) => j(`/v1/me/profile/history/${n}`),
+  restoreProfile: (n) => j(`/v1/me/profile/restore/${n}`, { method: 'POST' }),
   putUniqueName:  (n) => j('/v1/me/unique-name', { method: 'PUT', body: { unique_name: n } }),
 
   listNpcs:  (f) => j('/v1/npc' + qs(f)),
@@ -89,18 +103,28 @@ export const LiveAPI = {
     return { cancel: () => es.close() };
   },
 
-  listWorlds:    () => j('/v1/world'),
+  /* `q` is the filter box, and it goes to the SERVER rather than narrowing a
+   * list the browser already holds. A hidden world is not sent at all until a
+   * whole word of `q` names it, so filtering here would have nothing to reveal
+   * — and a list the client narrows is a list the client was first sent whole. */
+  listWorlds:    (q) => j('/v1/world' + qs({ q })),
   getWorld:      (w) => j(`/v1/world/${w}`),
   setWorld:      (w, c) => j(`/v1/world/${w}`, { method: 'PUT', body: c }),
   setWorldTime:  (w, t) => j(`/v1/world/${w}/time`, { method: 'PUT', body: t }),
-  listArchetypes:() => j('/v1/archetype'),
-  getArchetype:  (a) => j(`/v1/archetype/${a}`),
+  /* `q` as for `listWorlds`: a hidden personality is not sent until a whole
+   * word of it names one, so the filter has to reach the server. */
+  listPersonalities: (q) => j('/v1/personality' + qs({ q })),
+  getPersonality:    (a) => j(`/v1/personality/${a}`),
+  /* A PUT replaces the whole document — the daemon rewrites
+   * `personalities/<a>.yaml` from the body. Send the object you read back, not
+   * the fields you changed. */
+  setPersonality:    (a, c) => j(`/v1/personality/${a}`, { method: 'PUT', body: c }),
 
   getLayerSchema:          () => j('/v1/schema/layers'),
   getTurn:     (id, layer, turn) => j('/v1/npc/' + id + '/substrate/turn/' + layer + '/' + turn),
   probe:       (id, text) => j('/v1/npc/' + id + '/project', { method: 'POST', body: { text } }),
   getWorldCollections:     (w) => j('/v1/world/' + w + '/collections'),
-  getArchetypeCollections: (a) => j('/v1/archetype/' + a + '/collections'),
+  getPersonalityCollections: (a) => j('/v1/personality/' + a + '/collections'),
   /* Push streams. Both hand back `{close}`; a caller that forgets to call it
    * leaks a socket that keeps reconnecting after its page is gone. */
   subscribeLogs:   (onLine, onState) => subscribe('/ws/logs', { onMessage: onLine, onState }),

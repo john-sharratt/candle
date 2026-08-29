@@ -21,8 +21,23 @@ type HmacSha256 = Hmac<Sha256>;
 /// Who the browser is. The claims a signed session carries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Identity {
-    /// The provider's stable subject id. The only field safe to key on: an
-    /// email address can be reassigned, a name is not unique.
+    /// Which identity provider issued [`sub`](Self::sub).
+    ///
+    /// A subject is unique **per issuer**, not globally — so `sub` alone is not
+    /// an account key, it is half of one. With a single provider configured the
+    /// distinction never shows; the day a second is added, two issuers could
+    /// emit the same subject string and land on one account. Carrying the
+    /// issuer means that day is a configuration change rather than a silent
+    /// merge of two people.
+    ///
+    /// `#[serde(default)]` so a session cookie signed before this field existed
+    /// still deserialises. Such a cookie yields an empty provider, which
+    /// `identify` refuses — see `npcd::identity`.
+    #[serde(default)]
+    pub provider: String,
+    /// The provider's stable subject id. Unique within [`provider`](Self::provider)
+    /// and never reused there. The only field safe to key on: an email address
+    /// can be reassigned, a name is not unique.
     pub sub: String,
     #[serde(default)]
     pub email: String,
@@ -147,6 +162,7 @@ mod tests {
 
     fn ident(exp: u64) -> Identity {
         Identity {
+            provider: "google".into(),
             sub: "1234".into(),
             email: "a@b.c".into(),
             name: "A B".into(),

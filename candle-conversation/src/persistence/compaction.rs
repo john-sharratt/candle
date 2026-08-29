@@ -22,6 +22,7 @@
 //! [`SubstratePersistence::compact`]: super::SubstratePersistence::compact
 //! [`SubstratePersistence::should_compact`]: super::SubstratePersistence::should_compact
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
@@ -127,8 +128,48 @@ fn raw_loc(it: &CompactItem) -> (u64, u64) {
 /// `ProjectionEvents`, `WideQSig`, `TreeMetadata`, `DebugId`, `Distilled`) is a
 /// `Synth` item carrying its freshly-encoded payload. [`write_compacted_log`]
 /// reads the `Raw` bytes back coalesced and stages them verbatim.
-pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<CompactItem> {
+pub fn collect_live_records(
+    manifest: &Manifest,
+    substrate: &Substrate,
+    npc_locs: &HashMap<u64, RecordLoc>,
+) -> Vec<CompactItem> {
     let mut out: Vec<CompactItem> = Vec::new();
+
+    // Characters, staged verbatim from wherever they physically live.
+    //
+    // `Raw`, not `Synth`, and this is the one record class where that is forced
+    // rather than chosen: every other payload-keyed record on this page is
+    // re-encoded from the substrate's RAM, but an NPC's payload is not in this
+    // process's RAM at all — the registry that owns it lives in the daemon
+    // above. So the winner is carried across byte-for-byte, exactly as
+    // `Snapshot` is.
+    //
+    // Omitting this loop does not fail a test or log a warning. It deletes
+    // every character in the store, at the next compaction, silently.
+    //
+    // Tombstoned characters are carried too: a deleted character's id must stay
+    // taken, because the acts it already committed still name it.
+    let mut npcs: Vec<(&u64, &RecordLoc)> = npc_locs.iter().collect();
+    // Deterministic order — a compaction that shuffles the cast produces a
+    // different file from the same inputs, which makes the output impossible to
+    // diff between runs.
+    npcs.sort_unstable_by_key(|(id, _)| **id);
+    for (npc_id, loc) in npcs {
+        out.push(CompactItem::raw(
+            RecordHeader {
+                record_type: RecordType::Npc,
+                format: 0,
+                payload_len: loc.payload_len,
+                crc: 0,
+                stream_id: *npc_id,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            loc.segment,
+            loc.offset,
+            loc.record_size,
+        ));
+    }
 
     // Singletons — staged verbatim from wherever they physically live.
     for (rt, loc) in [
@@ -726,7 +767,7 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
         // Exactly: 1 ModelSpec + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
         assert_eq!(live.len(), 3);
         // Each read-back item points at the live winner's on-disk location — the
@@ -777,7 +818,7 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
         assert!(
             !has_type(&live, RecordType::Chunk),
             "orphan chunks (no StreamDecl) must be reclaimed, not kept forever",
@@ -821,7 +862,7 @@ mod tests {
         let (before, before_sub, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&before, &before_sub);
+        let live = collect_live_records(&before, &before_sub, &HashMap::new());
         let path = std::env::temp_dir().join(format!(
             "kvtier_compact_{}.log",
             std::time::SystemTime::now()
@@ -921,7 +962,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
 
         // The marker survives, at its mode — without it the exemption is lost.
         assert!(
@@ -1049,7 +1090,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
 
         let has_label = |needle: &str| {
             live.iter().any(|it| {
@@ -1149,7 +1190,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
 
         // The dead timeline's records are physically gone from the live set.
         // Chunks are read-back (`Raw`) items keyed by stream id; the dead
@@ -1216,7 +1257,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
 
         assert!(
             has_synth(&live, RecordType::ProjectionEvents, &proj_payload),
@@ -1257,7 +1298,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
 
         assert!(
             has_synth(&live, RecordType::WideQSig, &wide_payload),
@@ -1314,7 +1355,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
 
         // The declaration and the sig survive — the belief gallery still finds it.
         assert!(
@@ -1403,7 +1444,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
 
         assert!(
             has_type(&live, RecordType::StreamDecl),
@@ -1442,6 +1483,81 @@ mod tests {
                         .map(|d| d.mode)
                         == Some(DistillMode::TextOnly)),
             "text-only marker re-emitted with its mode",
+        );
+    }
+
+    /// The failure this guards against is silent and total: NPC payloads are
+    /// not in this process's RAM, so nothing can re-synthesise them, and a
+    /// compaction that does not carry them forward deletes every character in
+    /// the store without an error, a warning, or a failing test anywhere else.
+    /// An empty store, for tests whose subject is the NPC map rather than the
+    /// log. `collect_live_records` is planning-only and reads no bytes, so the
+    /// locations it echoes need not point at anything real.
+    fn empty_store() -> (Manifest, Substrate) {
+        let mut mem = MemLog::with_records(&[]);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        (manifest, substrate)
+    }
+
+    fn loc_at(offset: u64, size: u64) -> RecordLoc {
+        RecordLoc {
+            segment: FIRST_SEGMENT,
+            offset,
+            payload_len: size - 64,
+            record_size: size,
+        }
+    }
+
+    #[test]
+    fn collect_carries_the_live_cast_forward() {
+        let (manifest, substrate) = empty_store();
+        // What the persistence layer tracks after a walk: one location per
+        // character, already resolved last-writer-wins.
+        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        npc_locs.insert(701, loc_at(4_096, 256));
+        npc_locs.insert(700, loc_at(8_192, 320));
+
+        let live = collect_live_records(&manifest, &substrate, &npc_locs);
+        let npcs: Vec<&CompactItem> = live
+            .iter()
+            .filter(|it| it.header().record_type == RecordType::Npc)
+            .collect();
+
+        assert_eq!(npcs.len(), 2, "both characters survive, neither duplicated");
+        // Sorted by id despite the reverse insertion order, so the same inputs
+        // always produce the same file.
+        assert_eq!(npcs[0].header().stream_id, 700);
+        assert_eq!(npcs[1].header().stream_id, 701);
+        // Each stages the exact bytes the map named.
+        assert_eq!(raw_loc(npcs[0]), (8_192, 320));
+        assert_eq!(raw_loc(npcs[1]), (4_096, 256));
+    }
+
+    /// With no characters, nothing is emitted — the loop must not invent an
+    /// empty record or disturb an existing store.
+    #[test]
+    fn collect_emits_nothing_for_an_empty_cast() {
+        let (manifest, substrate) = empty_store();
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        assert!(!has_type(&live, RecordType::Npc));
+    }
+
+    /// A deleted character keeps its record. The id must stay taken — acts it
+    /// already committed still name it — so tombstoning is a superseding
+    /// record, never a removal from the map.
+    #[test]
+    fn collect_carries_a_tombstoned_character_forward_too() {
+        let (manifest, substrate) = empty_store();
+        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        npc_locs.insert(900, loc_at(4_096, 192));
+
+        let live = collect_live_records(&manifest, &substrate, &npc_locs);
+        assert!(
+            live.iter().any(
+                |it| it.header().record_type == RecordType::Npc && it.header().stream_id == 900
+            ),
+            "a tombstoned character is still a record",
         );
     }
 }

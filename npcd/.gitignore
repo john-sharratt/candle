@@ -1,14 +1,16 @@
 # Accounts are durable but NOT publishable.
 #
-# They survive a substrate wipe for the same reason worlds and archetypes do —
+# They survive a substrate wipe for the same reason worlds and personalities do —
 # they are read once at start and written back on change — but they must never
 # reach the remote. This repository is public, and an account record carries a
 # real email address and the identity provider's stable subject id. Git history
 # is the one place you cannot quietly remove something from later, so the
 # decision has to be made before the first write, not after the first user.
 #
-# Worlds and archetypes have no such problem: they are fiction, and being
-# diffable and reviewable is the whole point of putting them here.
+# Worlds and personalities have no such problem: they are fiction, and being
+# diffable and reviewable is the whole point of putting them here. They live in
+# a mind now (`--mind`), so what lands here is whatever a daemon run without one
+# is given.
 accounts/
 
 # `npcd` holds no key — sign-in belongs to the gateway, which never shares the
@@ -19,3 +21,9 @@ secrets/
 # The narrative clock and anything else that moves on its own. Committing a
 # value that advances 60× per second would leave the tree permanently dirty.
 state/
+
+# The conversation substrate's redo log — the segmented append-only files
+# `/v1/substrate/storage` reports on. An engine running here writes it into the
+# data directory, which defaults to this one. Segments reach hundreds of MB and
+# rewrite continuously, so they are the worst possible thing to have tracked.
+.substrate/
