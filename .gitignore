@@ -62,8 +62,12 @@ candle-kernels/build_tool/
 # Raw R16 KV tensor dumps (large; signatures.prov and MANIFEST.json are tracked)
 **/raw_kvq.prov
 
-# Substrate persistence redo log — created at runtime under any workspace root
+# Substrate persistence redo log — created at runtime under any workspace root.
+# The glob covers renamed copies too: a substrate set aside before a model
+# change (`.substrate.qwen3-30b-a3b/`) is hundreds of gigabytes and is exactly
+# as unwelcome in a commit as the live one.
 .substrate/
+.substrate.*/
 
 # Endpoint-managed upload staging dir — the zend daemon writes user-uploaded
 # files here at runtime; they are workspace content, never repo content.

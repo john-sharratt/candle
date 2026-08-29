@@ -29,5 +29,5 @@ pub use quantized::{
     quantized_delta_net_layer_forward, quantized_delta_net_layer_forward_spans,
     QuantDeltaNetWeights,
 };
-pub use state_store::RecurrentStateStore;
+pub use state_store::{ExportedLayerState, RecurrentStateStore};
 pub use types::{DeltaNetDims, LayerKind};

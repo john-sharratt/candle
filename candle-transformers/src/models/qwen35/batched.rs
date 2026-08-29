@@ -28,6 +28,7 @@ use super::spec::{replay_accepted_prefixes, StashSpan, VerifyStash};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ModelCoreProperties, ProvenanceLayerIndices,
 };
+use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::RecurrentStateStore;
 use crate::models::draft_ladder::DraftLadder;
@@ -345,7 +346,15 @@ impl HybridBatched {
                     slot.insert(fresh()?);
                 }
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    if offset == 0 {
+                    // The seeded flag is consumed on the FIRST wave either
+                    // way. It protects the one wave that follows a fork or a
+                    // restore — the wave whose slot legitimately stands at
+                    // offset 0 while holding state that was put there on
+                    // purpose. A flag that outlived that wave would go on to
+                    // suppress a later, genuine reset, which is the recycled
+                    // slot defect wearing the fix's own clothes.
+                    let seeded = slot.get_mut().take_seeded();
+                    if offset == 0 && !seeded {
                         slot.insert(fresh()?);
                     }
                 }
@@ -370,6 +379,136 @@ impl HybridBatched {
         self.drop_verify_stashes(&[seq]);
         self.release_draft(seq);
         Ok(())
+    }
+
+    /// Give `child` a copy of `parent`'s recurrent state.
+    ///
+    /// Reservation bytes every live sequence's recurrent state holds together.
+    ///
+    /// Summed over the map rather than derived from a per-sequence constant:
+    /// a store's region count depends on how its buffers packed, and a forked
+    /// child's need not match its parent's. A poisoned lock reports zero rather
+    /// than failing — this is a report, and a wrong number in it is preferable
+    /// to a scheduler that cannot answer how much memory it is using.
+    pub fn recurrent_reserved_bytes(&self) -> usize {
+        self.recurrent
+            .lock()
+            .map(|m| m.values().map(|s| s.reserved_bytes()).sum())
+            .unwrap_or(0)
+    }
+
+    /// The turn loop carves a child slot per turn and decodes on it, borrowing
+    /// the parent's KV blocks zero-copy. State cannot be borrowed the same way
+    /// — the child advances it — so it is copied device-to-device
+    /// ([`RecurrentStateStore::fork_from`]), and the copy is seeded so the
+    /// child's first wave does not reset it back to zero.
+    ///
+    /// Errors when the parent carries no state: a fork of nothing is a caller
+    /// bug, and returning quietly would hand the child zeros — which is the
+    /// defect this whole path exists to remove, reintroduced as an error path.
+    pub fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        let forked = map
+            .get(&parent)
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "qwen35: fork_recurrent from sequence {parent}, which carries no \
+                     recurrent state — handing {child} zeros here is the amnesia this \
+                     path exists to prevent"
+                ))
+            })?
+            .fork_from()?;
+        map.insert(child, forked);
+        Ok(())
+    }
+
+    /// Move `child`'s state onto `parent` — the linear join at `finalize_view`.
+    ///
+    /// A move, so the child's entry is gone afterwards and the parent's old
+    /// state is dropped. That is correct precisely because a view is a linear
+    /// continuation: it entered with a copy of the parent's state and advanced
+    /// it over the turn's tokens, so what it holds now is what the parent's
+    /// state becomes.
+    ///
+    /// Errors when the child carries none, for the same reason as
+    /// [`Self::fork_recurrent`]: silently leaving the parent's stale state in
+    /// place would lose the turn without saying so.
+    pub fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        let store = map.remove(&child).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "qwen35: move_recurrent from sequence {child}, which carries no \
+                 recurrent state — the turn's decode would be silently lost"
+            ))
+        })?;
+        map.insert(parent, store);
+        Ok(())
+    }
+
+    /// Read a sequence's state back as the snapshot record's layer rows.
+    ///
+    /// `None` when the sequence carries no state — a slot that has never run a
+    /// wave has nothing worth persisting, and writing a zero snapshot would be
+    /// worse than writing none: resume would install it and report success.
+    pub fn export_recurrent(&self, seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
+        let map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        let Some(store) = map.get(&seq) else {
+            return Ok(None);
+        };
+        // `export` refuses mid-wave itself; the seal runs outside the wave, so
+        // reaching that error means the ordering broke, not that the caller
+        // needs a retry.
+        let layers = store.export()?;
+        Ok(Some((store.schedule_hash(), layers)))
+    }
+
+    /// Scatter a snapshot into a sequence's state — the resume path.
+    ///
+    /// Creates the store if the slot has none yet (the normal case: resume runs
+    /// at `create_sequence`, before any wave). `import` validates the schedule
+    /// hash and every layer's geometry before touching a tensor, and marks the
+    /// store seeded so the first wave's `offset == 0` reset does not undo it.
+    pub fn restore_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: &[ExportedLayerState],
+    ) -> Result<()> {
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        let store = match map.entry(seq) {
+            std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(RecurrentStateStore::new(
+                    &self.model.cfg.layer_kinds,
+                    &self.model.cfg.delta_net,
+                    &self.model.device,
+                )?)
+            }
+        };
+        store.import(schedule_hash, layers)
+    }
+
+    /// Whether a sequence currently carries recurrent state — for the
+    /// scheduler's fork/move wiring, which must not call either on a slot the
+    /// model has never seen (a view carved before the parent's first wave).
+    pub fn has_recurrent(&self, seq: usize) -> Result<bool> {
+        Ok(self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?
+            .contains_key(&seq))
     }
 
     /// How many sequences currently carry recurrent state.
@@ -891,6 +1030,11 @@ impl HybridBatched {
         config.k_low_error_threshold_factor *= self.kv_factors.k_low;
         config.v_hi_error_threshold_factor *= self.kv_factors.v_hi;
         config.v_low_error_threshold_factor *= self.kv_factors.v_low;
+        // **This duplicates the generic `create_batched_session`.** It reads
+        // `kv_factors` directly rather than `model_core_properties()`, so any
+        // per-model property added to that struct lands there and is silently
+        // dropped here — a new field looks wired, builds clean, and simply never
+        // reaches this model. Extend both when adding one.
         let session = create_session(&self.model.cfg, &self.model.device, config)?;
         self.maybe_change_dtype(session.activation_dtype())?;
         Ok(session)
@@ -915,6 +1059,17 @@ impl HybridBatched {
             k_low_error_threshold_factor: self.kv_factors.k_low,
             v_hi_error_threshold_factor: self.kv_factors.v_hi,
             v_low_error_threshold_factor: self.kv_factors.v_low,
+            // **No.** Three quarters of this stack mixes tokens through a
+            // recurrence, and a recurrence cannot compute the output of a token
+            // inserted mid-sequence: its state has already accumulated past the
+            // hole and there is no way to re-enter it there. The planner has to
+            // know before it plans, not discover it from a bail.
+            // **Attention layers only.** Three quarters of this stack is
+            // recurrent and has no Q in a KV cache to capture, so the fold's
+            // `[n − 2, 1, 1]` groups over 10 layers here, not 40.
+            provenance_capture_layers: self.kv_map.num_kv_layers(),
+            can_gap_fill: false,
+            carries_recurrent_state: true,
         }
     }
 

@@ -325,6 +325,28 @@ All weight loading uses `VarBuilder`:
 3. Add FFI binding in `candle-kernels/src/lib.rs`
 4. Call from `candle-core/src/cuda_backend/` via `unsafe`
 
+### Debugging a faulting kernel — `kernel-lineinfo`
+
+The kernels build **without** `--generate-line-info`, so a device-side fault
+gives you an address and no source location. When you need the file and line —
+an illegal access whose origin is not obvious, a `compute-sanitizer` run — build
+with the feature for that session and drop it again afterwards:
+
+```bash
+cargo test -p candle-transformers --features cuda,kernel-lineinfo <test> -- --nocapture
+```
+
+**Do not leave it on.** It costs nothing at runtime and two thirds of the build
+on disk: a measured cubin holds 175 KB of `.text` SASS against 592 KB of debug
+sections, `.nv_debug_ptx_txt` (the embedded PTX source text) being 490 KB of
+that. Those archives are statically linked into *every* CUDA test binary, and
+cargo keeps every generation of every binary it has ever produced.
+
+Which is the other half of the same story: `target/` grows tens of GB per build
+generation and cargo has no garbage collector. `cargo prune` (`target-prune`)
+sweeps superseded generations — it keeps the two newest of each artifact, so
+alternating feature sets do not thrash. `cargo prune -- --dry-run` reports first.
+
 ---
 
 ## Platform Notes

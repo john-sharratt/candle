@@ -39,7 +39,8 @@ mod probe_dxgi;
 pub use budget::GovernorConfig;
 pub use diag::{BudgetRow, BudgetTable};
 pub use host_probe::{
-    available_physical_ram, host_perf, host_ram_budget, host_ram_budget_from, pages_in_per_sec,
+    available_low_water, available_physical_ram, host_perf, host_ram_budget, host_ram_budget_from,
+    launch_available_ram, pages_in_per_sec, sample_available_low_water, snapshot_launch,
     total_physical_ram, HostPerf, HostRamBudget,
 };
 pub use managed::is_oom;
@@ -51,7 +52,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::Result;
+use crate::{Device, Result};
 use balloon::BalloonAllocator;
 use reading::VramReading as Reading;
 
@@ -344,31 +345,160 @@ pub fn remove(gpu_id: usize) {
 
 static HOST_PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Record `bytes` of newly allocated host-pinned memory.
-pub fn note_host_pinned_alloc(bytes: u64) {
-    HOST_PINNED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+/// What a pinned allocation is *for*.
+///
+/// The total alone cannot answer the question a pinned-memory decision actually
+/// asks — "the tier is short, who else is holding the pages?" — because every
+/// consumer here is claiming from the same half-of-RAM ceiling
+/// ([`host_probe::PINNABLE_FRACTION`]). One 11 GB claimant and six small ones
+/// need telling apart before any of them is resized.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinnedUse {
+    /// The MoE expert warm tier — the dominant claimant by an order of
+    /// magnitude, and the one whose size is a tuning decision.
+    ExpertWarmTier,
+    /// Staging buffers for host↔device transfers that are not the warm tier:
+    /// the cold pack's read ring, the KV migration scratch.
+    Staging,
+    /// Host-mapped allocations the GPU reads in place — the embedding table's
+    /// quantized rows, and anything else gathered rather than copied.
+    HostMapped,
+    /// Device-visible descriptor rings: the kernel dispatch table ring.
+    DispatchTables,
 }
 
-/// Record `bytes` of host-pinned memory returned to the OS.
-pub fn note_host_pinned_free(bytes: u64) {
-    let mut cur = HOST_PINNED_BYTES.load(Ordering::Relaxed);
+impl PinnedUse {
+    /// Every variant, for reporting.
+    pub const ALL: [PinnedUse; 4] = [
+        PinnedUse::ExpertWarmTier,
+        PinnedUse::Staging,
+        PinnedUse::HostMapped,
+        PinnedUse::DispatchTables,
+    ];
+
+    /// A short label for a report line.
+    pub fn label(self) -> &'static str {
+        match self {
+            PinnedUse::ExpertWarmTier => "expert warm tier",
+            PinnedUse::Staging => "staging buffers",
+            PinnedUse::HostMapped => "host-mapped weights",
+            PinnedUse::DispatchTables => "dispatch tables",
+        }
+    }
+
+    fn slot(self) -> &'static AtomicU64 {
+        match self {
+            PinnedUse::ExpertWarmTier => &PINNED_BY_USE[0],
+            PinnedUse::Staging => &PINNED_BY_USE[1],
+            PinnedUse::HostMapped => &PINNED_BY_USE[2],
+            PinnedUse::DispatchTables => &PINNED_BY_USE[3],
+        }
+    }
+}
+
+static PINNED_BY_USE: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Subtract `bytes` from `at`, saturating — pinned frees can outrun their
+/// allocs across the two gauges during teardown, and a wrap would read as
+/// terabytes held.
+fn saturating_sub_at(at: &AtomicU64, bytes: u64) {
+    let mut cur = at.load(Ordering::Relaxed);
     loop {
         let next = cur.saturating_sub(bytes);
-        match HOST_PINNED_BYTES.compare_exchange_weak(
-            cur,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match at.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => cur = observed,
         }
     }
 }
 
+/// Record `bytes` of newly allocated host-pinned memory, attributed to `use_`.
+pub fn note_host_pinned_alloc(use_: PinnedUse, bytes: u64) {
+    HOST_PINNED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    use_.slot().fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` of host-pinned memory returned to the OS.
+pub fn note_host_pinned_free(use_: PinnedUse, bytes: u64) {
+    saturating_sub_at(&HOST_PINNED_BYTES, bytes);
+    saturating_sub_at(use_.slot(), bytes);
+}
+
 /// Total host-pinned bytes currently allocated process-wide.
 pub fn host_pinned_bytes() -> u64 {
     HOST_PINNED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Host-pinned bytes held by one consumer.
+pub fn host_pinned_bytes_for(use_: PinnedUse) -> u64 {
+    use_.slot().load(Ordering::Relaxed)
+}
+
+/// Every consumer's current holding, for a report. Sums to
+/// [`host_pinned_bytes`].
+pub fn host_pinned_breakdown() -> [(PinnedUse, u64); 4] {
+    PinnedUse::ALL.map(|u| (u, host_pinned_bytes_for(u)))
+}
+
+/// Return the CUDA async pool's reserved-but-unused memory to the OS, once
+/// loading is done. `(reserved_before, reserved_after)`, or `None` off CUDA.
+///
+/// The pool reserves its peak from the OS and by design never gives it back, so
+/// whatever it holds sits for the life of the daemon OUTSIDE the KV reservation
+/// — and it is the first thing WDDM spills to host RAM when the card fills.
+/// Measured on the 3.6-35B under load: 4.75 GiB reserved against 3.03 GiB live,
+/// and the 1.72 GiB gap matched what the driver had demoted almost exactly.
+///
+/// **On that model this reclaims nothing, and the reason is worth keeping.**
+/// Loading is *not* where the pool peaks: right after the weights and experts
+/// are staged it holds 1,952 MiB with no free blocks at all. The gap opens
+/// later, as wave width grows during calibration and ingest, which is exactly
+/// where `cuMemPoolTrimTo`'s synchronous unmap is unsafe. So this is the right
+/// reclaim at the only safe moment, and for a workload whose pool peaks at
+/// runtime it is a no-op — the fix for that one is to stop routing large
+/// runtime allocations through this pool, not to trim it harder.
+///
+/// **Call this only between load and serving.** `cuMemPoolTrimTo` unmaps
+/// synchronously rather than stream-ordered, so it needs a moment when no
+/// kernel holds a pointer into the freed blocks; the synchronize below makes
+/// that true rather than assumed. Only blocks nothing is using are released —
+/// live allocations, weights and staged experts included, are untouched.
+///
+/// Lives here rather than in the caller because `feature = "cuda"` is a
+/// candle-core feature: a `#[cfg(feature = "cuda")]` written in a crate that
+/// has no such feature is not a guard, it is an unconditional deletion of the
+/// code it wraps.
+pub fn trim_pool_after_load(device: &Device) -> Option<(usize, usize)> {
+    #[cfg(feature = "cuda")]
+    {
+        let Device::Cuda(cuda) = device else {
+            return None;
+        };
+        let before = cuda.pool_reserved_bytes().ok()?;
+        if let Err(e) = device.synchronize() {
+            tracing::warn!(
+                target: "candle_core::vram",
+                "post-load pool trim: device sync failed ({e}); leaving the pool alone"
+            );
+            return None;
+        }
+        if let Err(e) = cuda.trim_pool(0) {
+            tracing::warn!(target: "candle_core::vram", "post-load pool trim failed: {e}");
+            return None;
+        }
+        let after = cuda.pool_reserved_bytes().unwrap_or(before);
+        Some((before, after))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+        None
+    }
 }
 
 /// Size of the mmap-backed model weights, recorded once at load.

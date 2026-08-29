@@ -412,20 +412,35 @@ pub const LLAMA3_KV_FACTOR: f32 = 0.9;
 
 /// Qwen3.5-0.8B (dense hybrid) — attention layers at `head_dim 256`.
 ///
-/// **Derived 2026-08-23** on the 0.8B C-ladder gate
+/// **Re-derived 2026-08-25** on the 0.8B C-ladder gate
 /// (`quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b`) to the
 /// lineage's calibration target: **the whole range C0–C10 passes**, with the
-/// C10×10 rung sitting just under the breaking edge. Sweep facts that
-/// remain true for the next re-derivation: the critical blocks respond to
-/// the geometric mean of an axis's hi·lo pair, not to either factor alone
-/// (single-sided probes barely move them), and V is the sensitive axis on
-/// this model — K-only tightening made a second session diverge in the
-/// wide-rung sweep.
+/// C10×10 rung sitting just under the breaking edge. Green twice with identical
+/// ratios (C8 3.88×, C9 4.15×, C10 4.68×).
+///
+/// **The row it replaces was fit to a different numeric path.** The 2026-08-23
+/// row (k 0.85, v 0.60) was derived while the gate pinned the *unquantized* BF16
+/// conversion, which forced `Int8Mode::Off` and left this the only model in the
+/// lineage on the FP matmul path. The gate now pins Q8_0 and takes `auto`, so it
+/// runs int8 like its siblings — and like a deployment. Only V needed moving:
+/// 0.60 fails C10 by one session, 0.55 and 0.45 both pass, and the whole usable
+/// band is 4.64×–4.68× against the failing row's 4.71%. K stays at 0.85.
+///
+/// Sweep facts for the next re-derivation:
+/// * **V is the lever at the top rung, K is not** — C8 passes at k 0.85
+///   throughout, and C10 moves on V alone. (On the old FP path the opposite held,
+///   which is a warning that these facts belong to a numeric path, not a model.)
+/// * V barely moves compression here — 0.10 of factor is ~0.9% of ratio — so
+///   margin is nearly free. Prefer a value that passes repeatably over the
+///   largest one that passes once; a rung sitting *on* the edge flips with any
+///   numerical change, and this ladder is statistical, not deterministic.
+/// * The critical blocks respond to the geometric mean of an axis's hi·lo pair,
+///   not to either factor alone.
 pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 0.85,
     k_low: 0.85,
-    v_hi: 0.6,
-    v_low: 0.6,
+    v_hi: 0.55,
+    v_low: 0.55,
 };
 
 /// Qwen3.5-9B (dense hybrid).
@@ -435,13 +450,28 @@ pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFact
 /// lineage target: C0–C10 all pass, C10×10 just under the breaking edge.
 /// The 9B has real headroom over the 0.8B (its ladder passes at identity
 /// with room to spare), so the row loosens to sell that headroom for
-/// compression. Sweep facts that remain true: V alone saturates before it
-/// breaks the top rungs — K is this model's edge axis — and a
-/// hi-tight/low-loose redistribution at the same geometric means measured
-/// strictly worse than the symmetric split.
+/// compression. A hi-tight/low-loose redistribution at the same geometric
+/// means measured strictly worse than the symmetric split.
+///
+/// **Re-derived 2026-08-28, k 1.1 → 1.09**, after the dense weights moved into
+/// the device reservation. That change shifts wave widths and therefore
+/// accumulation order, which is exactly the drift the rows below warn about:
+/// C10×10 had gone red at k 1.1 with nothing else altered.
+///
+/// Each axis was walked separately and both edges are now bracketed, so a
+/// future retune starts from measurements rather than a sweep:
+///
+/// * **K edge 1.09 ✓ / 1.1 ✗** at v 1.9. The margin is one hundredth — this row
+///   sits as close to the break as the lineage target asks for, and is
+///   correspondingly fragile.
+/// * **V edge 1.9 ✓ / 2.0 ✗** at k 1.075. V is no longer the inert axis the
+///   earlier note claimed: it breaks the top rung one notch above its current
+///   value, so probe both axes here rather than K alone.
+///
+/// C10×10 at 6.30×, identical across two confirmation runs.
 pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.1,
-    k_low: 1.1,
+    k_hi: 1.09,
+    k_low: 1.09,
     v_hi: 1.9,
     v_low: 1.9,
 };
@@ -508,11 +538,35 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// is a red KV gate caused by a speculation constant, with neither file naming
 /// the other — so re-verify this row after a ladder change, exactly as after an
 /// admission or width change.
+///
+/// **Re-derived 2026-08-28, K 1.2 → 1.1 and V 2.5 → 2.35**, after the dense
+/// weights moved into the device reservation — the width/accumulation drift
+/// this row has now been caught by three times. C10×64 had gone red.
+///
+/// Both axes walked separately, both edges bracketed:
+///
+/// * **K edge 1.1 ✓ / 1.15 ✗** at v 2.35.
+/// * **V edge 2.35 ✓ / 2.43 ✗** at k 1.1.
+///
+/// **The "K moves it, V is inert" note above is now false**, and the way it
+/// failed is worth keeping. Walking V alone 2.5 → 2.2 did not merely fail to
+/// help — it made the gate *worse*, losing ×32 as well as ×64 while costing
+/// half a turn of ratio (7.55× → 7.07×). Walking K alone 1.2 → 1.1 → 1.0 never
+/// cleared ×64 either, at 0.47× of ratio. Only a joint move clears it, and the
+/// axes are not separable near the edge: the pair (1.1, 2.35) passes while both
+/// (1.15, 2.35) and (1.1, 2.43) fail.
+///
+/// The lesson generalises past this row — a single-axis sweep here can read as
+/// "inert" when the truth is that the other axis had to move too, and stopping
+/// at that reading leaves ratio on the table.
+///
+/// C10 at 7.13/7.08/7.09/7.10× (×8/16/32/64), identical across two
+/// confirmation runs.
 pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.2,
-    k_low: 1.2,
-    v_hi: 2.5,
-    v_low: 2.5,
+    k_hi: 1.1,
+    k_low: 1.1,
+    v_hi: 2.35,
+    v_low: 2.35,
 };
 
 /// Qwen3.6-35B-A3B (routed hybrid point release).
@@ -532,29 +586,83 @@ pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// share its base model's edge axis: **3.5 is V-limited, 3.6 is K-limited.**
 /// 3.6's failing session is inert to V — 2.2, 2.0 and 1.9 all fail it at the
 /// same session and character while costing ratio — and inert to a one-notch
-/// K step (1.4 fails). K at 1.2 is what clears it. Probe K first on this
-/// model; a V sweep here measures nothing but lost compression.
+/// K step (1.4 fails). K at 1.2 cleared it *then*; it no longer does, see the
+/// 2026-08-28 entry below. Probe K first on this model; a V sweep here
+/// measures nothing but lost compression.
+///
+/// **Re-derived 2026-08-28, K 1.2 → 1.15**, after the dense weights moved into
+/// the device reservation. C10×64 had gone red; V stayed at 2.0.
+///
+/// Both axes walked separately, both edges bracketed:
+///
+/// * **K edge 1.15 ✓ / 1.2 ✗** at v 2.0.
+/// * **V edge 2.0 ✓ / 2.1 ✗** at k 1.15 — so V is *not* inert here either, it
+///   simply had no room left to give above its current value.
+///
+/// The "probe K first on this model" advice above still holds, and this time it
+/// was enough on its own — unlike the 3.5, which needed both axes together.
+///
+/// C10 at 6.67/6.65/6.65/6.65× (×8/16/32/64), identical across two
+/// confirmation runs.
 pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.2,
-    k_low: 1.2,
+    k_hi: 1.15,
+    k_low: 1.15,
     v_hi: 2.0,
     v_low: 2.0,
 };
 
-/// Qwen3.8-27B (dense flagship hybrid). **Extrapolated, not derived**: the
-/// dense 27B is build-only on the 16 GB dev card, so this row cannot be
-/// measured here. The measured lineage rows order by capacity — the 0.8B
-/// tightest, the 9B looser, the 35B/3.6 MoE loosest — and the 27B sits
-/// between the 9B and the MoE pair in capacity, so this row sits just above
-/// the 9B's, deliberately conservative (thresholds err tight, quality errs
-/// safe). The derivation gate
-/// (`quantized_qwen38::tests::test_parallel_batched_forwarding_27b`)
-/// replaces it with a measured row on the workstation, tuned to the same
-/// target as the rest of the lineage: C0–C10 all pass with C10×10 just
-/// under the breaking edge.
+/// Qwen3.8-27B (dense flagship hybrid).
+///
+/// The 27B is dense — no expert streaming to shrink the resident set — and its
+/// Q4_K_M weighs 16.5 GB before KV, so it is build-only on the **16 GB** dev
+/// card and measurable on anything larger. The gate is
+/// `quantized_qwen38::tests::test_parallel_batched_forwarding_27b`, tuned to
+/// the same target as the rest of the lineage: C0–C10 all pass with the top
+/// rung just under the breaking edge.
+///
+/// **Derived 2026-08-28 — the first measured row this model has had.** Both
+/// axes walked to failure on the C10 rung and bracketed:
+///
+/// * **K edge 1.3 ✓ / 1.4 ✗** at v 2.3.
+/// * **V edge 2.3 ✓ / 2.4 ✗** at k 1.3.
+///
+/// C0–C10 all pass, C10×10 at 7.03×, identical across two confirmation runs.
+///
+/// # Two things had to be corrected before it could be measured at all
+///
+/// The row read "cannot be measured *here*", where *here* meant the 16 GB card
+/// — a qualifier that does not travel with the file and reads on any larger
+/// machine as a claim the row is underivable. It is not: the gate runs on a
+/// 72 GB card. Anchoring a constant's provenance to the machine that happened
+/// to write it is how a row stays extrapolated long after the reason expired.
+///
+/// The real blocker was the checkpoint. The pinned `UD-Q4_K_M` is an Unsloth
+/// *Dynamic* quant — per-tensor type choice — and this model's recipe mixes in
+/// **IQ4_XS**, gguf dtype 23, which this codebase does not implement. It
+/// downloads 16.5 GB and then fails to load, on any machine. The gate now pins
+/// single-type files (`quantized_qwen38::checkpoint_for_this_card`), chosen by
+/// card size: Q6_K above 32 GB, Q4_K_M below.
+///
+/// # Weight precision is not a term in this calibration
+///
+/// The row was derived twice, on Q4_0 and on Q6_K — two bits of weight
+/// precision apart. **The ladder moved 6.27× → 6.30× at identical thresholds**,
+/// inside run-to-run noise, while bulk throughput fell 5.5% on the heavier
+/// weights. So the KV thresholds are what bind the C10 rung, not the weight
+/// quant, and the earlier worry that deriving above production quant would
+/// yield a too-loose row does not materialise. Deriving on either is sound;
+/// Q6_K is pinned because it matches the lineage's other **dense** gate (the
+/// 9B), the MoE gates being the Q4_K_M ones.
+///
+/// # It is the loosest row in the lineage, and that is now measured
+///
+/// K 1.3 sits above the 9B's 1.09 and the MoE pair's 1.1/1.15 — the ordering
+/// the old extrapolation asserted but got backwards when its anchors moved
+/// (it sat at 1.5, looser than every measured row). The 27B genuinely does
+/// have the most headroom here; it simply had to be measured to know it.
 pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.5,
-    k_low: 1.5,
-    v_hi: 2.0,
-    v_low: 2.0,
+    k_hi: 1.3,
+    k_low: 1.3,
+    v_hi: 2.3,
+    v_low: 2.3,
 };

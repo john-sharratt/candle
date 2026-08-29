@@ -768,6 +768,31 @@ impl ModelBuilder {
                     BatchedEngine::new(engine).map_err(ConversationError::Model)?,
                 ))
             }
+            ModelArch::Qwen35Hybrid => {
+                use candle_transformers::models::quantized_qwen36_moe;
+                use candle_transformers::models::qwen35::Qwen35LoadOptions;
+                // Per-layer progress not yet wired for this arch.
+                let _ = progress;
+                // KV is allocated per ATTENTION layer, not per transformer layer,
+                // and the window budget is derived from the config — see
+                // `qwen35::engine::create_session`.
+                let _ = max_seq;
+                let model = quantized_qwen36_moe::from_gguf_path(
+                    model_path,
+                    device,
+                    Qwen35LoadOptions {
+                        // Without a directory the pack is EPHEMERAL — written to
+                        // the system temp dir and unlinked as soon as it is
+                        // published, so every boot repacks all 41 layers (53 s
+                        // measured on the 3.6-35B) instead of reading the one
+                        // beside the checkpoint.
+                        expert_pack_dir: self.expert_pack_dir.clone(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(ConversationError::Model)?;
+                Ok(Box::new(model))
+            }
         }
     }
 
@@ -944,6 +969,18 @@ impl ModelBuilder {
 
         let model = self.load_model(&model_path, device, progress)?;
 
+        // Hand the load's pool high-water back before serving starts — it is
+        // several GiB held outside the KV reservation and never used again.
+        // See `candle::vram::trim_pool_after_load` for why here and nowhere
+        // later.
+        if let Some((before, after)) = candle::vram::trim_pool_after_load(device) {
+            tracing::info!(
+                reclaimed_mib = before.saturating_sub(after) >> 20,
+                pool_reserved_mib = after >> 20,
+                "post-load: returned the load's pool high-water to the OS"
+            );
+        }
+
         // Auto-derive max_hot_turns from arena geometry unless the caller
         // overrode it. Must happen before conversation_config() is called below.
         if self.max_hot_turns == 0 {
@@ -1031,6 +1068,9 @@ impl ModelBuilder {
         // Map GGUF architecture string to ModelArch for weight loading.
         let detected_arch = match arch_str.as_str() {
             "qwen3" => Some(ModelArch::Qwen3),
+            // Qwen3.6 is a point release of the Qwen3.5 architecture and ships
+            // the same arch string, so both land on the hybrid loader.
+            "qwen35moe" => Some(ModelArch::Qwen35Hybrid),
             "qwen3moe" | "qwen2moe" => Some(ModelArch::Qwen3Moe),
             "qwen2" => Some(ModelArch::Qwen2),
             "llama" => Some(ModelArch::Llama),
@@ -1104,22 +1144,35 @@ impl ModelBuilder {
         }
     }
 
+    /// Resolve a repo file, **preferring the local cache over the network**.
+    ///
+    /// `Api::get` consults the cache too, but only after asking the hub which
+    /// revision it should be holding — so a checkpoint sitting complete on disk
+    /// still cannot be opened while the hub is unreachable, and an unanswered
+    /// socket stalls the load for as long as the HTTP client will wait rather
+    /// than failing. These are pinned files: one filename in one repo, whose
+    /// exact length the spec records. A cache hit is the answer, and asking
+    /// anyway only makes startup depend on the network.
+    #[cfg(feature = "hub")]
+    fn resolve_repo_file(&self, repo: &str, filename: &str) -> crate::Result<PathBuf> {
+        use hf_hub::api::sync::Api;
+        use hf_hub::Cache;
+
+        if let Some(hit) = cached_repo_file(&Cache::default(), repo, filename) {
+            return Ok(hit);
+        }
+        Api::new()
+            .map_err(|e| ConversationError::Download(e.to_string()))?
+            .model(repo.to_string())
+            .get(filename)
+            .map_err(|e| ConversationError::Download(e.to_string()))
+    }
+
     #[cfg(feature = "hub")]
     fn download_or_fail(&self) -> crate::Result<(PathBuf, PathBuf)> {
-        use hf_hub::api::sync::Api;
-
-        let api = Api::new().map_err(|e| ConversationError::Download(e.to_string()))?;
-
-        let model_path = api
-            .model(self.spec.model_repo.clone())
-            .get(&self.spec.model_filename)
-            .map_err(|e| ConversationError::Download(e.to_string()))?;
-
-        let tokenizer_path = api
-            .model(self.spec.tokenizer_repo.clone())
-            .get("tokenizer.json")
-            .map_err(|e| ConversationError::Download(e.to_string()))?;
-
+        let model_path =
+            self.resolve_repo_file(&self.spec.model_repo, &self.spec.model_filename)?;
+        let tokenizer_path = self.resolve_repo_file(&self.spec.tokenizer_repo, "tokenizer.json")?;
         Ok((model_path, tokenizer_path))
     }
 
@@ -1130,6 +1183,62 @@ impl ModelBuilder {
              or call .model_path()/.tokenizer_path() / .model_dir()"
                 .into(),
         ))
+    }
+}
+
+/// A repo file's path in `cache`, or `None` if it is not there.
+///
+/// Split out from [`ModelBuilder::resolve_repo_file`] so the cache-first rule
+/// can be tested against a temporary cache instead of the machine's real one —
+/// the rule is what keeps a daemon startable when the hub is unreachable, and
+/// it is worth a test that does not depend on what happens to be downloaded.
+#[cfg(feature = "hub")]
+fn cached_repo_file(cache: &hf_hub::Cache, repo: &str, filename: &str) -> Option<PathBuf> {
+    cache.model(repo.to_string()).get(filename)
+}
+
+#[cfg(all(test, feature = "hub"))]
+mod cache_first_tests {
+    use super::cached_repo_file;
+
+    /// **A cached file resolves without the network, and a miss says so.**
+    ///
+    /// `Api::get` ends at the cache too, but only after asking the hub which
+    /// revision it should be holding — so before this, a checkpoint sitting
+    /// complete on disk could not be opened while the hub was unreachable, and
+    /// an unanswered socket stalled the load for as long as the HTTP client
+    /// would wait. That is not hypothetical: it cost an 18-minute hang on 20
+    /// seconds of CPU, with the model never opened.
+    #[test]
+    fn a_cached_file_is_found_without_touching_the_network() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = hf_hub::Cache::new(tmp.path().to_path_buf());
+        let repo = "acme/widget-GGUF";
+
+        assert!(
+            cached_repo_file(&cache, repo, "widget.gguf").is_none(),
+            "an empty cache must report a miss, not a phantom hit"
+        );
+
+        // Lay the file down the way hf-hub itself does — a ref pointing at a
+        // commit, and the file under that commit's snapshot — so this exercises
+        // the real lookup rather than a re-implementation of its path rules.
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let repo_cache = cache.model(repo.to_string());
+        repo_cache.create_ref(commit).expect("create ref");
+        let snapshot = tmp
+            .path()
+            .join(hf_hub::Repo::model(repo.to_string()).folder_name())
+            .join("snapshots")
+            .join(commit);
+        std::fs::create_dir_all(&snapshot).expect("mkdir");
+        std::fs::write(snapshot.join("widget.gguf"), b"weights").expect("write");
+
+        assert_eq!(
+            cached_repo_file(&cache, repo, "widget.gguf"),
+            Some(snapshot.join("widget.gguf")),
+            "a file already in the cache must resolve from it"
+        );
     }
 }
 

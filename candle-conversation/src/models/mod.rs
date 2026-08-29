@@ -50,6 +50,7 @@ mod dialect;
 mod hermes3;
 mod qwen2;
 mod qwen3;
+mod qwen36_moe;
 mod qwen3_moe;
 
 pub use builder::ModelBuilder;
@@ -77,6 +78,13 @@ pub enum ModelArch {
     /// `latent_moe::BatchedEngine` over the resident `latent_moe::Engine`
     /// (offline KO-repacked GGUF; paged-latent kernel attention).
     DeepSeekV4,
+    /// `qwen35::HybridBatched` — the gated-DeltaNet ⁄ attention hybrid lineage
+    /// (Qwen3.5 and its Qwen3.6 point release; GGUF arch string `qwen35moe`).
+    ///
+    /// The only arch here that carries per-sequence state **outside** the paged
+    /// K/V, which is why it declares
+    /// `ManagedBatchedModel::carries_recurrent_state`.
+    Qwen35Hybrid,
 }
 
 /// Pre-configured model presets.
@@ -100,6 +108,7 @@ pub enum ModelArch {
 /// | `Hermes3_70B_Q4` | 70 B | Q4_K_M | Llama | ChatML | ~40 GB |
 /// | `Qwen3_30B_A3B_Q4` | 30 B (3B active) | Q4_K_M | Qwen3Moe | ChatML | ~17 GB (LRU) |
 /// | `Qwen3_30B_A3B_Q6` | 30 B (3B active) | Q6_K | Qwen3Moe | ChatML | ~25 GB (LRU) |
+/// | `Qwen36_35B_A3B_Q4` | 35 B (3B active) | UD-Q4_K_M | Qwen35Hybrid | ChatML | ~22 GB (tiered) |
 /// | `Custom(_)` | — | — | any | any | — |
 #[derive(Debug, Clone)]
 #[allow(non_camel_case_types)]
@@ -122,6 +131,17 @@ pub enum Model {
     Qwen3_30B_A3B_Q4,
     /// Qwen3-30B-A3B Q6_K — MoE, 128 experts, 8 active (~25 GB with LRU).
     Qwen3_30B_A3B_Q6,
+
+    // ── Qwen3.5 / 3.6 hybrid MoE ───────────────────────────────────────
+    /// Qwen3.6-35B-A3B UD-Q4_K_M — the **hybrid**: 40 layers at 3:1, so 30
+    /// gated-DeltaNet layers carrying a recurrent state and 10 attention layers
+    /// carrying paged K/V. 256 experts, 8 active (~22 GB file; runs sub-24 GB
+    /// through the three-tier expert cache).
+    ///
+    /// Three quarters of this stack has no K/V to splice, so a conversation's
+    /// history cannot be reconstructed from sealed chunks alone — see
+    /// `docs/deltanet_state_persistence.md`.
+    Qwen36_35B_A3B_Q4,
 
     // ── Qwen2 ──────────────────────────────────────────────────────────
     /// Qwen2-0.5B-Instruct Q4_0 — tiny, great for CI and testing (~0.4 GB).
@@ -229,6 +249,7 @@ impl Model {
             Model::Qwen3_14B_Q5 => qwen3::qwen3_14b_q5(),
             Model::Qwen3_14B_Q6 => qwen3::qwen3_14b_q6(),
             // Qwen3 MoE
+            Model::Qwen36_35B_A3B_Q4 => qwen36_moe::qwen36_35b_a3b_q4(),
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),
             Model::Qwen3_30B_A3B_Q6 => qwen3_moe::qwen3_30b_a3b_q6(),
             // Qwen2
@@ -310,6 +331,7 @@ impl std::fmt::Display for ModelArch {
             ModelArch::Qwen2 => write!(f, "Qwen2"),
             ModelArch::Llama => write!(f, "Llama"),
             ModelArch::DeepSeekV4 => write!(f, "DeepSeekV4"),
+            ModelArch::Qwen35Hybrid => write!(f, "Qwen35Hybrid"),
         }
     }
 }

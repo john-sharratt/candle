@@ -79,11 +79,13 @@ const last = (a) => a[a.length - 1] || {};
 
 /* One hue per scheduler phase, so the flip between small-batch decode and
  * large-batch prefill reads at a glance rather than by hunting a legend. */
-const PHASES = ['decode', 'prefill', 'section', 'projection', 'sealing', 'eviction', 'allocation', 'blocked', 'sync', 'idle'];
+const PHASES = ['decode', 'prefill', 'section', 'projection', 'sealing', 'eviction', 'allocation',
+  'requests', 'housekeeping', 'blocked', 'sync', 'idle'];
 const PH = {
   decode: 'var(--ok)', prefill: 'var(--info)', section: '#818cf8',
   projection: '#c084fc', sealing: 'var(--warn)', eviction: 'var(--crit)',
-  allocation: '#94a3b8', blocked: '#ec4899', sync: '#e11d48', idle: 'var(--line-2)',
+  allocation: '#94a3b8', requests: '#2dd4bf', housekeeping: '#a3e635',
+  blocked: '#ec4899', sync: '#e11d48', idle: 'var(--line-2)',
 };
 
 mount(document.getElementById('estate'), estateSwitcher('zend', { homeHref: '/' }));

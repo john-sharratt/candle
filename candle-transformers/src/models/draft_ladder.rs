@@ -199,10 +199,11 @@ impl DraftLadder {
 ///
 /// # Changing it re-opens a KV calibration in another crate
 ///
-/// `candle_nn`'s `QWEN35_MOE_KV_FACTORS` was tuned against C10 rungs at ×8 and
-/// ×16 that speculate *because* this bracket reaches 16. Pulling it in below
-/// that turns those rungs into plain decode and moves the marginal session, so
-/// the KV gate goes red for a reason that lives here.
+/// `candle_nn`'s `QWEN35_MOE_KV_FACTORS` was tuned against C10 rungs — ×8, ×16,
+/// ×32 and ×64 as the gate now sweeps them — of which ×8 and ×16 speculate
+/// *because* this bracket reaches 16. Pulling it in below that turns those
+/// rungs into plain decode and moves the marginal session, so the KV gate goes
+/// red for a reason that lives here.
 const LINEAGE_START: &[(usize, usize)] = &[(16, 2)];
 
 /// Qwen3.5-9B (dense). Has a NextN head.

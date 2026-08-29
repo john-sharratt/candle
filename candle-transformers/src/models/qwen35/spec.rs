@@ -63,6 +63,15 @@ pub struct VerifyStash {
     pub layers: Vec<SpanOperands>,
     /// Per verifying sequence.
     pub spans: Vec<StashSpan>,
+    /// Which recurrent layers this cohort's sweep has actually captured, by the
+    /// same ordinal that indexes `layers`.
+    ///
+    /// A sweep split into layer windows fills its own ordinals and leaves the
+    /// rest to the window that follows, so the buffers being *allocated* says
+    /// nothing about whether they were *written* — and a replay from a
+    /// half-written stash advances some layers and not others, silently. This
+    /// is the record that makes the difference checkable.
+    pub filled: Vec<bool>,
 }
 
 /// One sequence's rows within the cohort stash.
@@ -105,6 +114,7 @@ impl VerifyStash {
         Ok(Self {
             layers,
             spans: Vec::new(),
+            filled: vec![false; n],
         })
     }
 
@@ -129,6 +139,8 @@ impl VerifyStash {
             candle::bail!("qwen35 verify stash: a {total}-row cohort against {cap}-row buffers");
         }
         self.spans.clear();
+        // A new cohort has captured nothing yet, whatever the last one left.
+        self.filled.iter_mut().for_each(|f| *f = false);
         let mut row = 0usize;
         for &(seq, len) in blocks {
             self.spans.push(StashSpan {
@@ -202,6 +214,19 @@ pub fn replay_accepted_prefixes(
              verify wave did not stash every DeltaNet layer it swept",
             stash.layers.len(),
             layer_indices.len()
+        );
+    }
+    // Allocated is not written. A sweep split into layer windows fills the
+    // ordinals of the window it ran, and the windows accumulate into one stash
+    // — so a missing ordinal here means some window never ran, and replaying
+    // would advance the layers that were captured while leaving the rest at the
+    // block's entering state.
+    if let Some(ord) = stash.filled.iter().position(|f| !f) {
+        candle::bail!(
+            "qwen35 verify replay: recurrent layer {ord} of {} was never captured — the \
+             verify's sweep did not cover every DeltaNet layer, so a rewind would advance \
+             some layers and not others",
+            stash.filled.len(),
         );
     }
     let dims: &DeltaNetDims = &model.cfg.delta_net;

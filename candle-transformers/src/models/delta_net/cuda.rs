@@ -18,6 +18,8 @@ use candle_kernels::delta_net::{
 
 use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, SeqSpan};
 use super::state_store::RecurrentStateStore;
+use crate::models::wave_buffers::wave_from_vec;
+use candle_nn::kv_cache::WaveGeneration;
 
 /// The wave tensors every fused DeltaNet kernel reads through strides, plus
 /// the geometry derived from them — validated once per layer, not once per
@@ -201,19 +203,23 @@ pub fn f32_ptr(t: &LiveTensor<'_>, what: &str) -> Result<u64> {
 /// Pointers stay valid for the whole forward because a sequence's state
 /// buffers are allocated once and mutated in place — the store's standing
 /// rule, which `begin_wave`/`rollback_wave` also rely on.
-pub struct DeltaNetWaveTable {
+/// Built once per forward and read by **every** layer, which is what
+/// [`LayerPhase::Forward`] exists for: a buffer carved from the attention span
+/// is reclaimed when layer 0's guard drops, and layer 1 would overwrite the
+/// table it is still reading. The `'w` ties it to that guard.
+pub struct DeltaNetWaveTable<'w> {
     /// `[n_dn_layers, 4, n_decode]` I64 — per layer, the entering and advanced
     /// halves of both carried buffers: tail-in, tail-out, state-in, state-out.
-    ptrs: Tensor,
+    ptrs: LiveTensor<'w>,
     /// `[n_decode]` U32 wave rows, shared by every layer.
-    rows: Tensor,
+    rows: LiveTensor<'w>,
     /// Trunk layer index per table row, in slot order.
     layers: Vec<usize>,
 }
 
-impl DeltaNetWaveTable {
+impl DeltaNetWaveTable<'_> {
     /// This layer's slice, as the view type the mixer consumes.
-    pub fn layer_slice(&self, layer_idx: usize) -> Result<DeltaNetLayerTable> {
+    pub fn layer_slice(&self, layer_idx: usize) -> Result<DeltaNetLayerTable<'_>> {
         let Some(ord) = self.layers.iter().position(|&l| l == layer_idx) else {
             candle::bail!("delta_net cuda: layer {layer_idx} has no slot in the decode table");
         };
@@ -230,10 +236,14 @@ impl DeltaNetWaveTable {
 /// Build the forward's decode table from the wave's spans and state stores —
 /// `None` when the wave carries no decode span. Called once per forward,
 /// before any launch, so its two small uploads land on an empty queue.
-pub fn build_wave_table(
+/// `forward_wave` is the [`LayerPhase::Forward`] generation the two uploads land
+/// on — held by the caller across the whole layer sweep, which is exactly as
+/// long as the table is read for.
+pub fn build_wave_table<'w>(
     spans: &[SeqSpan],
     stores: &[&mut RecurrentStateStore],
-) -> Result<Option<DeltaNetWaveTable>> {
+    forward_wave: Option<&'w WaveGeneration>,
+) -> Result<Option<DeltaNetWaveTable<'w>>> {
     let decode: Vec<usize> = (0..spans.len()).filter(|&i| spans[i].len == 1).collect();
     if decode.is_empty() {
         return Ok(None);
@@ -272,10 +282,16 @@ pub fn build_wave_table(
         }
     }
     let rows: Vec<u32> = decode.iter().map(|&i| spans[i].start as u32).collect();
+    // Onto the forward-phase span. There is no device operand to inherit from —
+    // both tables are built on the host — so the generation is named directly.
+    //
+    // The recurrent state cannot serve as an anchor: it is arena memory tagged
+    // `LeaseOrigin::Foreign`, which carries no ticket by design, and anchoring
+    // on it yields a driver allocation while implying otherwise.
     let dev = stores[decode[0]].layer_state(layers[0])?.s.device().clone();
     Ok(Some(DeltaNetWaveTable {
-        ptrs: Tensor::from_vec(ptrs, (layers.len(), 4, n), &dev)?,
-        rows: Tensor::from_vec(rows, n, &dev)?,
+        ptrs: wave_from_vec(ptrs, (layers.len(), 4, n), &dev, forward_wave)?,
+        rows: wave_from_vec(rows, n, &dev, forward_wave)?,
         layers,
     }))
 }
@@ -283,7 +299,7 @@ pub fn build_wave_table(
 /// A single layer's table built straight from the mixer's spans — the form
 /// the reference path and unit tests use when no wave table was supplied.
 /// Same layout, same kernels; the upload merely happens closer to the launch.
-pub fn build_layer_table(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetLayerTable> {
+pub fn build_layer_table(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetLayerTable<'static>> {
     let decode: Vec<&DeltaNetSeq<'_>> = seqs.iter().filter(|s| s.len == 1).collect();
     if decode.is_empty() {
         candle::bail!("delta_net cuda: no decode spans to table");
@@ -325,12 +341,18 @@ pub fn build_layer_table(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetLayerTable>
 /// The pointer rows are built exactly as [`build_layer_table`] builds them, and
 /// for the same reason: a span's conv tail and state live in that sequence's own
 /// allocation, so batching needs their addresses where the kernel can read them.
-pub fn build_span_table(seqs: &[DeltaNetSeq<'_>]) -> Result<Option<DeltaNetSpanTable>> {
+/// `anchor` names the wave whose transient tier the two uploads land on — the
+/// packed activation the spans index into, which is carved from that same tier.
+/// It is read for its provenance only; its shape and dtype are irrelevant.
+pub fn build_span_table<'w>(
+    seqs: &[DeltaNetSeq<'_>],
+    anchor: &LiveTensor<'w>,
+) -> Result<Option<DeltaNetSpanTable<'w>>> {
     let spans: Vec<&DeltaNetSeq<'_>> = seqs.iter().filter(|s| s.len > 1).collect();
     if spans.is_empty() {
         return Ok(None);
     }
-    build_span_rows(&spans).map(Some)
+    build_span_rows(&spans, anchor).map(Some)
 }
 
 /// [`build_span_table`] over EVERY span, single-row spans included.
@@ -340,15 +362,21 @@ pub fn build_span_table(seqs: &[DeltaNetSeq<'_>]) -> Result<Option<DeltaNetSpanT
 /// PREFILL kernels whatever the count, and a rewind that retraced a one-row
 /// accept through the decode kernels instead would be a different reduction
 /// order where bit-identity to the wave is the contract.
-pub fn build_span_table_all(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetSpanTable> {
+pub fn build_span_table_all<'w>(
+    seqs: &[DeltaNetSeq<'_>],
+    anchor: &LiveTensor<'w>,
+) -> Result<DeltaNetSpanTable<'w>> {
     if seqs.is_empty() {
         candle::bail!("delta_net cuda: no spans to table");
     }
     let spans: Vec<&DeltaNetSeq<'_>> = seqs.iter().collect();
-    build_span_rows(&spans)
+    build_span_rows(&spans, anchor)
 }
 
-fn build_span_rows(spans: &[&DeltaNetSeq<'_>]) -> Result<DeltaNetSpanTable> {
+fn build_span_rows<'w>(
+    spans: &[&DeltaNetSeq<'_>],
+    anchor: &LiveTensor<'w>,
+) -> Result<DeltaNetSpanTable<'w>> {
     let n = spans.len();
     let mut ptrs: Vec<i64> = Vec::with_capacity(4 * n);
     for s in spans {
@@ -396,10 +424,18 @@ fn build_span_rows(spans: &[&DeltaNetSeq<'_>]) -> Result<DeltaNetSpanTable> {
     extents.extend(spans.iter().map(|s| s.start as u32));
     extents.extend(spans.iter().map(|s| s.len as u32));
     let max_len = spans.iter().map(|s| s.len).max().unwrap_or(0);
-    let dev = spans[0].state.s.device().clone();
+    // Uploaded onto the wave's transient tier, named by `anchor`. These tables
+    // are rebuilt every wave — the pointers and extents are what changes — so
+    // they are transients, and `Tensor::from_vec` would put them in driver
+    // memory the reservation does not cover.
+    //
+    // **Not `spans[0].state.s`**, which was tried: the recurrent state is arena
+    // memory tagged `LeaseOrigin::Foreign`, and `Foreign` carries no ticket by
+    // design — a KV arena slot is not a scratch space, and its `'static` handle
+    // must not be able to hand out wave-scoped memory.
     Ok(DeltaNetSpanTable {
-        ptrs: Tensor::from_vec(ptrs, (4, n), &dev)?,
-        spans: Tensor::from_vec(extents, (2, n), &dev)?,
+        ptrs: anchor.from_vec_beside(ptrs, (4, n))?,
+        spans: anchor.from_vec_beside(extents, (2, n))?,
         n,
         max_len,
     })
@@ -884,7 +920,7 @@ mod tests {
     /// The table [`build_span_table`] produces, from tensors rather than from
     /// `DeltaNetSeq`s. Same layout, so a divergence between them is a
     /// compile-time break rather than a silent one.
-    fn span_table(rows: &[TestSpan<'_>]) -> DeltaNetSpanTable {
+    fn span_table(rows: &[TestSpan<'_>]) -> DeltaNetSpanTable<'static> {
         let n = rows.len();
         let mut ptrs: Vec<i64> = Vec::with_capacity(4 * n);
         for r in rows {

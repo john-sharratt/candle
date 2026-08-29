@@ -120,62 +120,28 @@ extern "C" __global__ void moe_gather_u8(
 //
 // ACCUMULATES into ys (+=). Initialize ys to zero before the first call.
 
-extern "C" __global__ void deterministic_scatter_bf16(
-    __nv_bfloat16* __restrict__ ys,
-    const __nv_bfloat16* __restrict__ down_out,
-    const uint32_t* __restrict__ perm,
-    const float* __restrict__ weights_flat,
-    const uint32_t* __restrict__ reordered_weight_ids,
-    const int* __restrict__ token_starts,
-    int num_tokens, int hidden
-) {
-    const int t = (int)blockIdx.x;
-    if (t >= num_tokens) return;
-    const int start = token_starts[t];
-    const int end   = token_starts[t + 1];
-    __nv_bfloat16* dst = ys + (size_t)t * hidden;
-    for (int col = (int)(blockIdx.y * blockDim.x + threadIdx.x);
-         col < hidden;
-         col += (int)(blockDim.x * gridDim.y)) {
-        float sum = __bfloat162float(dst[col]);
-        for (int idx = start; idx < end; idx++) {
-            float w = weights_flat[reordered_weight_ids[idx]];
-            float v = __bfloat162float(down_out[(size_t)perm[idx] * hidden + col]);
-            sum += w * v;
-        }
-        dst[col] = __float2bfloat16(sum);
-    }
-}
+// **`down_out` is ALWAYS F32, whatever `ys` is.** The grouped int8 GEMM that
+// produces it emits F32, and this kernel already accumulates in float — so it
+// reads the producer's type directly and narrows once, at the store, into the
+// type the residual stream wants. The alternative, converting the GEMM's whole
+// output to `ys`'s type before the call, is a full-tensor pass per layer per
+// forward to hand this loop a value it would immediately widen back to float
+// (hot-path invariant 1: the kernel emits the final type).
+//
+// It also loses nothing numerically: the accumulation was always float, and the
+// narrowing now happens after the sum rather than before it.
 
-extern "C" __global__ void deterministic_scatter_f16(
-    __half* __restrict__ ys,
-    const __half* __restrict__ down_out,
-    const uint32_t* __restrict__ perm,
-    const float* __restrict__ weights_flat,
-    const uint32_t* __restrict__ reordered_weight_ids,
-    const int* __restrict__ token_starts,
-    int num_tokens, int hidden
-) {
-    const int t = (int)blockIdx.x;
-    if (t >= num_tokens) return;
-    const int start = token_starts[t];
-    const int end   = token_starts[t + 1];
-    __half* dst = ys + (size_t)t * hidden;
-    for (int col = (int)(blockIdx.y * blockDim.x + threadIdx.x);
-         col < hidden;
-         col += (int)(blockDim.x * gridDim.y)) {
-        float sum = __half2float(dst[col]);
-        for (int idx = start; idx < end; idx++) {
-            float w = weights_flat[reordered_weight_ids[idx]];
-            float v = __half2float(down_out[(size_t)perm[idx] * hidden + col]);
-            sum += w * v;
-        }
-        dst[col] = __float2half(sum);
-    }
-}
+__device__ __forceinline__ float scatter_load(float x)          { return x; }
+__device__ __forceinline__ float scatter_load(__half x)         { return __half2float(x); }
+__device__ __forceinline__ float scatter_load(__nv_bfloat16 x)  { return __bfloat162float(x); }
 
-extern "C" __global__ void deterministic_scatter_f32(
-    float* __restrict__ ys,
+__device__ __forceinline__ void scatter_store(float* p, float v)         { *p = v; }
+__device__ __forceinline__ void scatter_store(__half* p, float v)        { *p = __float2half(v); }
+__device__ __forceinline__ void scatter_store(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+
+template<typename YS>
+__device__ __forceinline__ void deterministic_scatter_impl(
+    YS* __restrict__ ys,
     const float* __restrict__ down_out,
     const uint32_t* __restrict__ perm,
     const float* __restrict__ weights_flat,
@@ -187,17 +153,56 @@ extern "C" __global__ void deterministic_scatter_f32(
     if (t >= num_tokens) return;
     const int start = token_starts[t];
     const int end   = token_starts[t + 1];
-    float* dst = ys + (size_t)t * hidden;
+    YS* dst = ys + (size_t)t * hidden;
     for (int col = (int)(blockIdx.y * blockDim.x + threadIdx.x);
          col < hidden;
          col += (int)(blockDim.x * gridDim.y)) {
-        float sum = dst[col];
+        float sum = scatter_load(dst[col]);
         for (int idx = start; idx < end; idx++) {
             float w = weights_flat[reordered_weight_ids[idx]];
             sum += w * down_out[(size_t)perm[idx] * hidden + col];
         }
-        dst[col] = sum;
+        scatter_store(&dst[col], sum);
     }
+}
+
+extern "C" __global__ void deterministic_scatter_bf16(
+    __nv_bfloat16* __restrict__ ys,
+    const float* __restrict__ down_out,
+    const uint32_t* __restrict__ perm,
+    const float* __restrict__ weights_flat,
+    const uint32_t* __restrict__ reordered_weight_ids,
+    const int* __restrict__ token_starts,
+    int num_tokens, int hidden
+) {
+    deterministic_scatter_impl(ys, down_out, perm, weights_flat,
+                               reordered_weight_ids, token_starts, num_tokens, hidden);
+}
+
+extern "C" __global__ void deterministic_scatter_f16(
+    __half* __restrict__ ys,
+    const float* __restrict__ down_out,
+    const uint32_t* __restrict__ perm,
+    const float* __restrict__ weights_flat,
+    const uint32_t* __restrict__ reordered_weight_ids,
+    const int* __restrict__ token_starts,
+    int num_tokens, int hidden
+) {
+    deterministic_scatter_impl(ys, down_out, perm, weights_flat,
+                               reordered_weight_ids, token_starts, num_tokens, hidden);
+}
+
+extern "C" __global__ void deterministic_scatter_f32(
+    float* __restrict__ ys,
+    const float* __restrict__ down_out,
+    const uint32_t* __restrict__ perm,
+    const float* __restrict__ weights_flat,
+    const uint32_t* __restrict__ reordered_weight_ids,
+    const int* __restrict__ token_starts,
+    int num_tokens, int hidden
+) {
+    deterministic_scatter_impl(ys, down_out, perm, weights_flat,
+                               reordered_weight_ids, token_starts, num_tokens, hidden);
 }
 
 // =============================================================================

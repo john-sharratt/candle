@@ -14,7 +14,7 @@
 //! Extending to the affine KO twins (`Q4_K → Q4_KO`, …) is a matter of adding their repack in
 //! [`repack_matrix`].
 
-use crate::quantized::ko_quant::{mxfp4_native_to_ko_gpu_chunk, quantize_ko};
+use crate::quantized::ko_quant::{ko_tileable, mxfp4_native_to_ko_gpu_chunk, quantize_ko};
 use crate::quantized::{gguf_file, GgmlDType, Int8Mode};
 use crate::{Result, Shape};
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -35,8 +35,8 @@ fn pad32(size: usize) -> usize {
 
 /// The KO twin this tensor repacks to, or `None` to pass it through unchanged.
 ///
-/// Rule: a quantized **matmul weight** whose innermost 2-D matrix fits the KO tiling
-/// (`nrows % 8 == 0`, `ncols % 128 == 0`). Embeddings are lookup tables, never matmul'd, so
+/// Rule: a quantized **matmul weight** whose innermost 2-D matrix fits the KO matmul tiling
+/// ([`ko_tileable`]). Embeddings are lookup tables, never matmul'd, so
 /// they are excluded by the standard `token_embd` name (a llama.cpp convention, not a per-model
 /// list). 2-D weights repack directly; 3-D MoE expert banks `[n_expert, nrows, ncols]` repack
 /// per expert. Only MXFP4 is handled today; extend here for the affine twins.
@@ -65,11 +65,9 @@ fn ko_target(name: &str, shape: &Shape, dtype: GgmlDType, mode: Int8Mode) -> Opt
         3 => (d[1], d[2]),
         _ => return None,
     };
-    // The q8a128/MXFP4 KO matmul kernel tiles N in blocks of 32 (K in blocks of 128), a stricter
-    // bound than the KO *storage* chunk (8 rows). A weight with `nrows` in {8,16,24} mod 32 packs
-    // fine but the matmul kernel rejects it — leave those dense (e.g. the tiny mHC `fn_w`,
-    // `mix_hc=24`). See `repack_ko` / `q8a128_dense_matmul`.
-    if nrows % 32 != 0 || ncols % 128 != 0 {
+    // The matmul kernel's tiling is stricter than the KO storage chunk's, so a weight can pack
+    // and still be rejected — leave those dense. See `ko_tileable`.
+    if !ko_tileable(nrows, ncols) {
         return None;
     }
     if float_src {

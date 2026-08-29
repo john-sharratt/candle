@@ -7,9 +7,30 @@
 // and batched-M paths are unchanged.
 // =============================================================================
 
+// **This file names no head dim.** Each lives in its own translation unit
+// (`paged_decode_bf16_hd*.cu`) so nvcc compiles them concurrently instead of
+// walking four dispatch trees in one process; see `paged_decode_hd_bf16.cuh`.
+// The kernel header stays included because the MMA fragment-loader test kernel
+// at the bottom of this file uses it — a template that is never given arguments
+// costs nothing to declare.
 #include "int8_decode_kernel.cuh"
 
 #include <cuda_bf16.h>
+
+extern "C" {
+int32_t run_paged_decode_bf16_hd64(const void*, const uint8_t*, void*, int32_t, int32_t,
+                                   int32_t, float, const void*, const void*, const float*,
+                                   int32_t, void*, void*, const void*, int64_t);
+int32_t run_paged_decode_bf16_hd96(const void*, const uint8_t*, void*, int32_t, int32_t,
+                                   int32_t, float, const void*, const void*, const float*,
+                                   int32_t, void*, void*, const void*, int64_t);
+int32_t run_paged_decode_bf16_hd128(const void*, const uint8_t*, void*, int32_t, int32_t,
+                                    int32_t, float, const void*, const void*, const float*,
+                                    int32_t, void*, void*, const void*, int64_t);
+int32_t run_paged_decode_bf16_hd256(const void*, const uint8_t*, void*, int32_t, int32_t,
+                                    int32_t, float, const void*, const void*, const float*,
+                                    int32_t, void*, void*, const void*, int64_t);
+}
 
 // Returns 0 on success, nonzero when the launch needed the split-KV partial
 // pool and its allocation failed (VRAM exhausted) — nothing was launched.
@@ -28,12 +49,12 @@ extern "C" int32_t run_paged_decode_bf16(
     int32_t rope_interleaved,
     void* stream_ptr
 ) {
-    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    // Null q8/gate: the plain path, writing through `o_ptr`.
     #define LAUNCH_INT8(HD) \
-        return fused_attn::launch_int8_decode_attn<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, HD>( \
-            (const __nv_bfloat16*)q_ptr, headers_ptr, (__nv_bfloat16*)o_ptr, \
-            num_active_slots, n_q_head, n_kv_head, softmax_scale, \
-            (const __nv_bfloat16*)k_new, (const __nv_bfloat16*)v_new, rope_cs, rope_interleaved, stream)
+        return run_paged_decode_bf16_hd##HD( \
+            q_ptr, headers_ptr, o_ptr, num_active_slots, n_q_head, n_kv_head, \
+            softmax_scale, k_new, v_new, rope_cs, rope_interleaved, stream_ptr, \
+            nullptr, nullptr, 0)
     switch (head_dim) {
         case 64:  LAUNCH_INT8(64);
         case 96:  LAUNCH_INT8(96);
@@ -70,15 +91,12 @@ extern "C" int32_t run_paged_decode_bf16_q8(
     int32_t rope_interleaved,
     void* stream_ptr
 ) {
-    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    // Non-null q8_out: the combine kernel is the only emitter, so `out` is null.
     #define LAUNCH_Q8(HD)                                                                  \
-        return fused_attn::launch_int8_decode_attn<__nv_bfloat16, __nv_bfloat16,           \
-                                                   __nv_bfloat16, HD>(                     \
-            (const __nv_bfloat16*)q_ptr, headers_ptr, (__nv_bfloat16*)nullptr,             \
-            num_active_slots, n_q_head, n_kv_head, softmax_scale,                          \
-            (const __nv_bfloat16*)k_new, (const __nv_bfloat16*)v_new, rope_cs,             \
-            rope_interleaved, stream, (uint8_t*)q8_out, (const __nv_bfloat16*)gate,        \
-            gate_slot_stride)
+        return run_paged_decode_bf16_hd##HD(                                               \
+            q_ptr, headers_ptr, nullptr, num_active_slots, n_q_head, n_kv_head,            \
+            softmax_scale, k_new, v_new, rope_cs, rope_interleaved, stream_ptr,            \
+            q8_out, gate, gate_slot_stride)
     switch (head_dim) {
         case 128: LAUNCH_Q8(128);
         case 256: LAUNCH_Q8(256);

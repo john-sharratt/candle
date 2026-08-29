@@ -185,9 +185,9 @@ impl WeightZone {
     ///
     /// It was a fraction — an eighth of the opening capacity — on the reasoning
     /// that "an eighth is enough that every layer's routed experts have somewhere
-    /// to land". That was never measured and it is false for a wide batch: with
-    /// three pinned layers of 128 experts, 384 slots can be occupied by experts
-    /// the eviction scan is forbidden to touch, and an eighth of a 2,377-slot
+    /// to land". That was never measured and it is false for a wide batch: on a
+    /// 128-expert model the caller's floor is 384 slots — the pinned head layers
+    /// plus one layer's worst-case routed set — and an eighth of a 2,377-slot
     /// opening is 297. The daemon reached exactly that number, every resident
     /// slot held a pinned-layer expert, and every load afterwards failed with
     /// `cannot evict (all pinned)` — 1,774 times, until it was killed.

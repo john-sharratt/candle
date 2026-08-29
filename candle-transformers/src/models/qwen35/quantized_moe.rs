@@ -53,7 +53,10 @@ pub fn shared_expert_contribution<'w>(
     acts: &DynamicActs<'w>,
     out_dtype: DType,
 ) -> Result<LiveTensor<'w>> {
-    let y = shared.forward_dynamic(acts, out_dtype)?;
+    // One width for both: the shared expert's result is summed into the MoE
+    // combine, which runs at the experts' working dtype, so there is no
+    // narrower store to ask for here.
+    let y = shared.forward_dynamic(acts, out_dtype, out_dtype)?;
     // The gate weight is padded to a full KO tile (see `SHARED_GATE_TILE`), so
     // the projection yields a tile's worth of outputs and only the first is the
     // gate — the rest are the zero rows. Narrowing unconditionally is also

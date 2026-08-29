@@ -525,8 +525,16 @@ impl Cache {
                 CacheStorage::Contiguous { all_data: Some(ad) } => ad.dtype(),
                 CacheStorage::Chunked(c) => {
                     // For chunked caches, get dtype from the backing storage.
-                    // If quantized, return F16 as that's what dequantize_f16 produces
-                    // and what prepare_for_kernel uses for GPU float arenas.
+                    //
+                    // F16 for a quantized backing is **not** an arbitrary
+                    // fallback: the quantized formats are the *sealed* storage,
+                    // while a live sequence's K sits in `R16` — raw F16 with
+                    // Q-capture space — and its V in plain F16. So this reports
+                    // the dtype of the bytes the forward actually reads.
+                    // Answering BF16 here instead makes the declared activation
+                    // dtype disagree with the live arena, which the engine
+                    // refuses outright: "K and V arena formats require different
+                    // compute dtypes: K=R16(BF16) V=F16(F16)".
                     c.backing.dtype().unwrap_or(DType::F16)
                 }
                 _ => DType::F32,

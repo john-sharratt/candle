@@ -4,6 +4,11 @@ rustflags = ["-C", "target-cpu=native"]
 [alias]
 nt = "nextest run"
 nti = "nextest run --run-ignored all"
+# Reclaim the generations cargo never collects. Every CUDA test binary carries
+# its own ~900 MB copy of the kernel archive, so a rebuild leaves tens of GB of
+# superseded artifacts behind; cargo has no post-build hook to do this itself.
+# `cargo prune -- --dry-run` reports without deleting.
+prune = "run -q -p target-prune --"
 
 [target.wasm32-unknown-unknown]
 rustflags = [

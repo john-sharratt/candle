@@ -16,6 +16,7 @@ use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
+use crate::models::operand_guard::expect_dtype;
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn;
 #[cfg(feature = "cuda")]
@@ -280,7 +281,10 @@ fn apply_attention_gate<'w>(
             ctx.elem_count()
         );
     }
-    let gate = gate.reshape(ctx.shape())?.to_dtype(ctx.dtype())?;
+    // The gate is the `wq` projection's second half, stored at the same width as
+    // the context it multiplies — validated, not converted (invariant 1b).
+    let gate = gate.reshape(ctx.shape())?;
+    expect_dtype(&gate, ctx.dtype(), "attention gate vs the context it gates")?;
     &ctx * &candle_nn::ops::sigmoid(&gate)?
 }
 
@@ -333,8 +337,15 @@ pub trait BatchedAttentionLayer {
     ) -> Result<DynamicActs<'w>>;
 
     /// FFN/MoE module consuming the producer-prepared `DynamicActs` (the fused `ffn_norm`): the
-    /// router + expert gather take the q8a128 directly (no standalone quantize). `mlp_dtype` is the
-    /// FP-stable accumulation dtype for the `Float` path.
+    /// router + expert gather take the q8a128 directly (no standalone quantize).
+    ///
+    /// Two widths, because they are two different questions. `work_dtype` is the
+    /// FP-stable width the SwiGLU intermediates need — an F16 activation runs
+    /// them in BF16, whose range they can exceed F16's. `out_dtype` is what the
+    /// residual stream wants back, and the implementation **returns that**: the
+    /// down projection stores it, so nothing narrows a full tensor per layer per
+    /// wave to undo a widening only the intermediates needed.
+    ///
     /// `'w` bounds the *result*, not the input: the FFN activations always come
     /// from [`Self::ffn_norm`], which allocates, while the MoE combine target is
     /// taken from the wave. A dense MLP hands its activations to a `Module` and
@@ -342,7 +353,8 @@ pub trait BatchedAttentionLayer {
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
-        mlp_dtype: DType,
+        work_dtype: DType,
+        out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>>;
 
@@ -508,7 +520,17 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
 
         // First residual: x = x + attn(h). `add_mut` reads `h_attn` in place, so
         // the residual stream never takes a wave allocation and never escapes.
-        x.to_dtype_mut(h_attn.dtype())?;
+        //
+        // VALIDATED, not converted: both output-projection sites store the
+        // residual's own dtype, so the two agree by construction. Rewriting `x`
+        // here to meet the attention output would be a full-tensor pass per
+        // layer per wave, and one that silently absorbs a producer that later
+        // starts emitting the wrong width (hot-path invariant 1b).
+        expect_dtype(
+            &h_attn,
+            orig_dtype,
+            "attention residual: attn(x) vs the residual stream",
+        )?;
         x.add_mut(&h_attn)?;
         // No `drop(h_attn)` / `drop(attn_wave)`: `h_attn` borrows the guard, so
         // the compiler refuses any order but this one. Both die at the brace.
@@ -534,12 +556,21 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     };
     #[cfg(not(feature = "cuda"))]
     let ffn_wave: Option<()> = None;
-    let mut h2 = {
+    // `ffn_forward` returns `orig_dtype` — its down projection stores it — so
+    // the residual add takes the result as it stands. Narrowing here instead
+    // cost a full-tensor pass per layer per wave to undo the widening only the
+    // SwiGLU intermediates needed.
+    let h2 = {
         let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode(), ffn_wave.as_ref())?;
-        layer.ffn_forward(acts, mlp_dtype, ffn_wave.as_ref())?
+        layer.ffn_forward(acts, mlp_dtype, orig_dtype, ffn_wave.as_ref())?
     };
-    h2.to_dtype_mut(orig_dtype)?;
-    x.to_dtype_mut(orig_dtype)?;
+    // Same contract as the attention residual above: `ffn_forward` stores
+    // `orig_dtype`, and the residual never left it, so this is an assertion.
+    expect_dtype(
+        &h2,
+        orig_dtype,
+        "ffn residual: ffn(x) vs the residual stream",
+    )?;
     x.add_mut(&h2)?;
     // No `drop(h2)` / `drop(ffn_wave)` here: `h2` borrows `ffn_wave`, so the
     // compiler already refuses any order but this one. The guard falls out of
@@ -987,8 +1018,12 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     let g_out_proj = gpu_span("prefill:out_proj", reshaped_ctx.device());
     let output = {
         let gated = apply_attention_gate(reshaped_ctx, gate)?;
-        let dt = gated.dtype();
-        layer.output_projection(DynamicActs::Float(gated), dt)?
+        // Store the RESIDUAL STREAM's width, as the decode path does — not the
+        // context's own. `x + attn(x)` needs one dtype, and naming it here means
+        // the projection's store performs the conversion instead of a
+        // full-tensor pass rewriting the residual to meet the attention output
+        // (hot-path invariant 1).
+        layer.output_projection(DynamicActs::Float(gated), x.dtype())?
     };
     g_out_proj.end();
     // Restore the flat-packed [1, total_q, hidden_out] activation.
@@ -1120,16 +1155,27 @@ fn paged_prefill_float_fallback(
             (ks.clone(), vs.clone())
         } else {
             let (kp, vp) = cache.chunked_read_kv(0, offset)?;
+            // Per the note above: the arena stores at the cache dtype and the
+            // activations arrive at `activation_dtype` of it, so the prefix
+            // comes back in the width the new tokens are already in. All four
+            // conversions here were no-ops that would have silently absorbed a
+            // producer handing over the wrong width (invariant 1b) — on the
+            // dominant per-layer prefill cost for every head_dim-256 model,
+            // which is this whole lineage.
+            expect_dtype(&kp, ks.dtype(), "prefill fallback: cached K prefix")?;
+            expect_dtype(&vp, vs.dtype(), "prefill fallback: cached V prefix")?;
             (
-                Tensor::cat(&[kp.to_dtype(ks.dtype())?, ks.clone()], 2)?,
-                Tensor::cat(&[vp.to_dtype(vs.dtype())?, vs.clone()], 2)?,
+                Tensor::cat(&[kp, ks.clone()], 2)?,
+                Tensor::cat(&[vp, vs.clone()], 2)?,
             )
         };
         let t_rope = profile_now();
-        let k_rot = rot(&k_all.to_dtype(qs.dtype())?, 0, total)?;
+        expect_dtype(&k_all, qs.dtype(), "prefill fallback: K vs Q")?;
+        expect_dtype(&v_all, qs.dtype(), "prefill fallback: V vs Q")?;
+        let k_rot = rot(&k_all, 0, total)?;
         let q_rot = rot(&qs, offset, len)?;
         let k_rep = repeat_kv(k_rot, n_rep)?;
-        let v_rep = repeat_kv(v_all.to_dtype(qs.dtype())?, n_rep)?;
+        let v_rep = repeat_kv(v_all, n_rep)?;
         pipeline_record("prefill_fb:rope_repeat", t_rope);
 
         let t_attn = profile_now();

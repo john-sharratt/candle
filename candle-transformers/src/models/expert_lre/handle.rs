@@ -8,7 +8,7 @@
 //! - **Inline** (reader path): all experts are pre-loaded to VRAM.  No
 //!   thread, no DMA.  A Mutex provides interior mutability (uncontended).
 
-use super::cache::ExpertCacheInner;
+use super::cache::{minimum_resident_slots, pinned_layer_count, ExpertCacheInner};
 #[cfg(not(feature = "cuda"))]
 use super::compute::compute_expert_contribution_gpu_weights;
 #[cfg(feature = "cuda")]
@@ -36,6 +36,26 @@ use super::types::{
     PipelineMessage, PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
+
+/// Report, once per distinct reason, that a call could not use the device
+/// dispatch tables. Once because the caller is a per-layer hot path — the point
+/// is that the reason is *stated*, not that it is repeated 40 times a token.
+#[cfg(feature = "cuda")]
+fn log_dispatch_refusal(reason: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut s) = seen.lock() {
+        if s.insert(reason.to_string()) {
+            tracing::warn!(
+                reason,
+                "expert cache: this MoE layer takes the host path's blocking routing \
+                 readback instead of the device tables"
+            );
+        }
+    }
+}
 use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
@@ -73,16 +93,52 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// immediately after a warm pool sized against *total* RAM took every free page
 /// on a machine with 12 GB already in use by other processes.
 ///
-/// **3 GiB rather than the ~250 MiB those allocations actually total, because
-/// the tier is past its knee well before it runs out of room.** Lowering this to
-/// 1 GiB was measured: the tier grew from 4,979 slots to 5,090, cold loads
+/// **4 GiB, and that figure is measured rather than reasoned.** The run's
+/// non-pinned transient — everything the process takes after the tier is
+/// pinned — is **3.30 GiB** on the 3.6-35B gate: launch 16.45 GiB, tier 12.14,
+/// other pinned 0.62, and a free-RAM low-water of 0.39 GiB
+/// (`vram::available_low_water`). At the old 3 GiB this was *under*-provisioned:
+/// the reserve promised 3 GiB of daylight and delivered 0.39.
+///
+/// It is far above the ~250 MiB those allocations nominally total because the
+/// mapped checkpoint's touched pages dominate them, and because the tier is past
+/// its knee well before it runs out of room. Lowering it to 1 GiB was measured
+/// on an earlier build: the tier grew from 4,979 slots to 5,090, cold loads
 /// halved (986 → 435), and throughput did not improve — flat to 1–2 % down, with
 /// single-stream t/s falling further (204.5 → 197.0). Once the draw covers
-/// VRAM's complement (§6.1) the remaining cold reads are not the bottleneck, and
-/// pinned pages taken past that point are taken from the page cache and the warm
-/// KV tier, which this gate barely exercises and a daemon workload does. When
-/// the performance argument is a wash, the safety argument decides.
-const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
+/// VRAM's complement the remaining cold reads are not the bottleneck, and pinned
+/// pages taken past that point come out of the page cache and the warm KV tier,
+/// which this gate barely exercises and a daemon workload does. When the
+/// performance argument is a wash, the safety argument decides.
+pub const WARM_TIER_HEADROOM: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Host RAM that must stay pageable, whatever else happens.
+///
+/// The page cache, the mapped checkpoint, every other process's working set,
+/// and the engine's own non-pinned allocations all live here. Pinning into it
+/// does not fail — measured directly: a probe took the entire pinnable half of
+/// a 31.5 GiB box without the driver once refusing, and free RAM ended at
+/// 0.02 GiB. **There is no natural stopping point**, which is why this bound is
+/// stated rather than discovered, and why an allocate-until-refusal probe cannot
+/// find it: refusal never comes, the machine just starts thrashing.
+/// `candle-core/tests/pinned_ceiling_probe.rs` re-measures it on any machine
+/// this needs revisiting on.
+///
+/// # An absolute floor, not a fraction
+///
+/// This was `total / 2`, from a measured failure at 76 % on a 194 GB machine
+/// (148 GB locked, 66 GB of other commit pushed to pagefile). A fraction reads
+/// the right way on that machine and the wrong way on a small one: on a 31.5 GiB
+/// box half is 15.76 GiB reserved against an OS and application set measured at
+/// 9.5 GiB, so the rule bound the warm tier for no reason anyone could point
+/// at — the tier stopped growing while 6 GiB sat unused and unusable.
+///
+/// What the OS and the surrounding applications need does not scale with how
+/// much RAM is installed, so the reserve is an absolute quantity. 10 GiB covers
+/// the 9.5 GiB measured here with room, and on a large machine it lets pinning
+/// go far past half — which is correct, and is what the 194 GB case was really
+/// telling us: 46 GB pageable was too little there too.
+const PAGEABLE_RESERVE: u64 = 10 * 1024 * 1024 * 1024;
 
 /// How many warm slots to ask for: **every expert the machine will actually
 /// give room for.**
@@ -104,6 +160,161 @@ const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
 /// `cuMemAllocHost` remains the authority — [`WarmPool::new`] halves on refusal
 /// — but a refusal costs half the tier, so the first ask should be one that can
 /// succeed.
+/// The warm tier's sizing decision, kept so a report can name **which** ceiling
+/// bound it.
+///
+/// Three independent limits compete for the tier (see [`warm_slots_for`]) and
+/// they are not close to each other on every machine — on a 32 GB Windows box
+/// the pinnable half is the binder, on a 194 GB box it is the weights
+/// reservation. Reading three numbers off a log line and inferring the minimum
+/// is exactly the step that got skipped when a tier sized at a third of the
+/// model went unnoticed while it sent two thirds of every miss to disk.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WarmTierSizing {
+    pub total_ram: u64,
+    /// Free RAM at the instant the tier was sized — mid-load, and reported only
+    /// so the gap against `launch_ram` is visible.
+    pub available_ram: u64,
+    /// Free RAM at process launch: the baseline ceiling 2 is actually built on.
+    pub launch_ram: u64,
+    /// Host RAM this process had already page-locked when the tier was sized.
+    pub already_pinned: u64,
+    /// Ceiling 1: what the machine is big enough for once the mmap'd weights
+    /// and the OS floor are reserved.
+    pub kv_warm_budget: u64,
+    /// Ceiling 2: what is free this second, less the headroom the rest of the
+    /// process needs after the tier.
+    pub available_less_headroom: u64,
+    /// Ceiling 3: how much of the machine may be page-locked at all, less what
+    /// is already pinned.
+    pub pinnable_cap: u64,
+    /// The binding ceiling, by name.
+    pub bound_by: &'static str,
+    /// Bytes the tier actually took, and the slots that bought.
+    pub taken_bytes: u64,
+    pub slots: usize,
+    /// Slots it would have taken with no ceiling at all — one per evictable
+    /// expert. The gap against `slots` is the tier's shortfall.
+    pub wanted_slots: usize,
+    pub stride: usize,
+}
+
+/// The three ceilings, named once so [`WarmTierSizing::bound_by`] and any
+/// report of it agree by construction rather than by matching prose.
+pub const CEILING_HOST_BUDGET: &str = "host RAM budget (weights + OS floor)";
+pub const CEILING_AVAILABLE: &str = "available RAM less headroom";
+pub const CEILING_PINNABLE: &str = "pinnable region (total less pageable reserve)";
+pub const CEILING_NONE: &str = "nothing — the tier holds every evictable expert";
+
+static WARM_SIZING: Mutex<Option<WarmTierSizing>> = Mutex::new(None);
+
+/// The warm tier's sizing decision from this process's model load, if one has
+/// happened.
+pub fn last_warm_tier_sizing() -> Option<WarmTierSizing> {
+    WARM_SIZING.lock().ok().and_then(|g| *g)
+}
+
+/// The sizing arithmetic, with every machine reading passed in.
+///
+/// Split out of [`warm_slots_for`] the way `host_ram_budget_from` is split out
+/// of `host_ram_budget`: both machines' numbers, and the shape of every ceiling,
+/// pin down in unit tests without touching a process-global gauge or needing a
+/// GPU.
+///
+/// Three ceilings, all real: what the machine is big enough for, what it had
+/// free before this process started, and how much of it may be PAGE-LOCKED at
+/// all.
+///
+/// The third is the one the first two cannot see. Availability counts droppable
+/// page cache (a 156 GB GGUF mmap reads as "available"), and the warm budget only
+/// nets out pinned memory that already exists — so on a model whose experts
+/// nearly fill host RAM, both ceilings happily size the tier to the whole expert
+/// set. Pinning that much (measured: 148 GB locked of 194 GB, 66 GB of other
+/// commit pushed to pagefile) leaves the OS thrashing everything that is not the
+/// warm tier. Page-locked memory is capped at HALF the machine: the other half
+/// stays pageable for the page cache (which serves the cold pack reads),
+/// activations' host shadows, and everything else alive on the box.
+#[allow(clippy::too_many_arguments)]
+fn warm_sizing_from(
+    stride: usize,
+    total_experts: usize,
+    total_ram: u64,
+    available: u64,
+    launch_available: u64,
+    already_pinned: u64,
+    kv_warm_budget: u64,
+) -> WarmTierSizing {
+    // **The headroom bounds this ceiling too, and that is not cosmetic.**
+    //
+    // It used to be subtracted only from the availability ceiling, which was
+    // safe by accident: availability was measured mid-load and so was always the
+    // lowest of the three, and this one never bound. Sizing from the launch
+    // baseline raised availability above it for the first time, this ceiling
+    // bound, and the tier took the entire pinnable half — 15.14 GiB plus the
+    // 0.62 GiB already pinned is exactly half of a 31.5 GiB machine, with no
+    // reserve at all. The first forward then died on `CUDA_ERROR_OUT_OF_MEMORY`.
+    //
+    // A ceiling that can bind has to leave the same room as the ones beside it.
+    let pinnable_cap = total_ram
+        .saturating_sub(PAGEABLE_RESERVE)
+        .saturating_sub(already_pinned)
+        .saturating_sub(WARM_TIER_HEADROOM);
+    // **What the machine had free before this process started, not what is left
+    // now.** The live figure is taken with the checkpoint mapped and being read,
+    // so it is depressed by the engine's own transient footprint — and those
+    // pages are file-backed and droppable, so they were never this tier's
+    // competitors. Measured across one gate run on the 16 GB box: 15.65 GiB free
+    // before the process, 12.18 GiB at the moment of this call, over 20 GiB once
+    // it exited. Sizing the process's largest and longest-lived allocation from
+    // the bottom of that trough cost the tier 3,030 experts.
+    //
+    // **Both readings are normalised to "free, excluding what we have pinned"
+    // before the max.** They are not on the same scale otherwise: the live
+    // figure was taken *after* this process page-locked `already_pinned`, so it
+    // already excludes those bytes, while the launch figure predates them and
+    // does not. Subtracting from whichever won would double-count the pinned
+    // bytes on every machine where the live reading is the larger — which is
+    // exactly the case this `max` exists to serve, a box that freed RAM since
+    // launch.
+    let baseline = launch_available
+        .saturating_sub(already_pinned)
+        .max(available);
+    // The headroom is what the rest of the process needs *after* this tier, and
+    // stays a constant because it is a guess (see `WARM_TIER_HEADROOM`) rather
+    // than a measurement like the term above.
+    let available_less_headroom = baseline.saturating_sub(WARM_TIER_HEADROOM);
+    let affordable = kv_warm_budget
+        .min(available_less_headroom)
+        .min(pinnable_cap);
+    let slots = if stride == 0 {
+        0
+    } else {
+        ((affordable / stride as u64) as usize).min(total_experts)
+    };
+    WarmTierSizing {
+        total_ram,
+        available_ram: available,
+        launch_ram: baseline,
+        already_pinned,
+        kv_warm_budget,
+        available_less_headroom,
+        pinnable_cap,
+        bound_by: if slots == total_experts {
+            CEILING_NONE
+        } else if affordable == kv_warm_budget {
+            CEILING_HOST_BUDGET
+        } else if affordable == available_less_headroom {
+            CEILING_AVAILABLE
+        } else {
+            CEILING_PINNABLE
+        },
+        taken_bytes: (slots * stride) as u64,
+        slots,
+        wanted_slots: total_experts,
+        stride,
+    }
+}
+
 fn warm_slots_for(stride: usize, total_experts: usize) -> usize {
     if stride == 0 {
         return 0;
@@ -122,25 +333,19 @@ fn warm_slots_for(stride: usize, total_experts: usize) -> usize {
         return 0;
     };
     let budget = candle::vram::host_ram_budget(total_ram);
-    // Three ceilings, all real: what the machine is big enough for, what it
-    // has free this second, and how much of it may be PAGE-LOCKED at all.
-    //
-    // The third is the one the first two cannot see. `available` counts
-    // droppable page cache (a 156 GB GGUF mmap reads as "available"), and the
-    // warm budget only nets out pinned memory that already exists — so on a
-    // model whose experts nearly fill host RAM, both ceilings happily size the
-    // tier to the whole expert set. Pinning that much (measured: 148 GB locked
-    // of 194 GB, 66 GB of other commit pushed to pagefile) leaves the OS
-    // thrashing everything that is not the warm tier. Page-locked memory is
-    // capped at HALF the machine: the other half stays pageable for the page
-    // cache (which serves the cold pack reads), activations' host shadows, and
-    // everything else alive on the box.
-    let pinned_cap = (total_ram / 2).saturating_sub(candle::vram::host_pinned_bytes());
-    let affordable = budget
-        .kv_warm_budget_bytes
-        .min(available.saturating_sub(WARM_TIER_HEADROOM))
-        .min(pinned_cap) as usize;
-    let slots = (affordable / stride).min(total_experts);
+    let sizing = warm_sizing_from(
+        stride,
+        total_experts,
+        total_ram,
+        available,
+        candle::vram::launch_available_ram().unwrap_or(available),
+        candle::vram::host_pinned_bytes(),
+        budget.kv_warm_budget_bytes,
+    );
+    let slots = sizing.slots;
+    if let Ok(mut g) = WARM_SIZING.lock() {
+        *g = Some(sizing);
+    }
     tracing::info!(
         target: "candle_transformers::expert_lre",
         total_gib = total_ram as f64 / 1e9,
@@ -349,6 +554,34 @@ impl ExpertCache {
         }
         let num_moe_layers = host_refs.len();
         let num_slots = zone.capacity();
+        // **The pinned set must be affordable before anything is loaded.**
+        //
+        // `PINNED_LAYERS` is fixed, and those layers have no record in the pack
+        // and no slot in the warm tier — so a zone too small to hold them plus
+        // one layer's worst-case routed set does not degrade, it stops: every
+        // resident slot ends up holding an expert the eviction scan is forbidden
+        // to touch, and every load from then on fails permanently. The zone's
+        // floor states the requirement but `WeightZone::new` does not raise a
+        // smaller opening to meet it, and only one of the three MoE loaders
+        // clamps its own capacity — so the check belongs here, on the path all
+        // of them take.
+        //
+        // **CUDA only**, because a zone of zero slots is what a CPU device
+        // always produces — there is no weight zone off the GPU. Checking it
+        // first turned the deliberate "this build has CUDA compiled in but was
+        // given a CPU device" message below into "affords 0 expert slots, below
+        // the floor of 385", which names the symptom and hides the cause.
+        let floor =
+            minimum_resident_slots(experts_per_layer).min(num_moe_layers * experts_per_layer);
+        if matches!(device, Device::Cuda(_)) && num_slots < floor {
+            candle::bail!(
+                "MoE expert cache: this device affords {num_slots} expert slots, below the \
+                 floor of {floor} — {} permanently resident layers of {experts_per_layer} \
+                 experts plus one layer's worst-case routed set. Below it the eviction scan \
+                 has no candidates and every load fails.",
+                pinned_layer_count(num_moe_layers),
+            );
+        }
         let mut inner = ExpertCacheInner::new(zone, num_moe_layers, experts_per_layer);
 
         // ── CUDA copy stream (pipeline thread) ──
@@ -474,6 +707,10 @@ impl ExpertCache {
                     identity: PackIdentity::of(&mmap, int8mode, repack_fingerprint(cuda_dev)),
                     num_layers: num_moe_layers,
                     experts_per_layer,
+                    // The leading layers the cache pins permanently. They are
+                    // never evicted, so they are never reloaded, so the pack
+                    // holds no records for them.
+                    pinned_layers: pinned_layer_count(num_moe_layers),
                     slot_bytes,
                     layers,
                 })?;
@@ -496,10 +733,17 @@ impl ExpertCache {
                 // slot could only ever be read if a load missed, and no load
                 // does. Sizing it anyway would pin the model's size in host RAM
                 // to serve nothing, and pay a full-pack read at startup for it.
+                // The warm tier's job is covering **misses**, and the pinned
+                // prefix never generates one, so it is sized against the
+                // evictable set rather than the model. On the 3.6-35B that is
+                // 512 fewer experts to aim at — 943 MiB of pinned host memory
+                // that used to be spent on experts no load could ever ask for.
+                let pinned = pinned_layer_count(num_moe_layers);
+                let evictable = total_experts - pinned * experts_per_layer;
                 let want_warm = if all_resident {
                     0
                 } else {
-                    warm_slots_for(stride, total_experts)
+                    warm_slots_for(stride, evictable)
                 };
                 // `num_slots` is exactly what the startup fill will take into
                 // VRAM, in flat order, so it is the prefix the draw skips over.
@@ -508,6 +752,7 @@ impl ExpertCache {
                     experts_per_layer,
                     want_warm,
                     num_slots,
+                    pinned,
                     WARM_DRAW_SEED,
                 );
                 let mut warm = WarmPool::new(membership.len(), stride);
@@ -529,6 +774,8 @@ impl ExpertCache {
                     geoms: &geoms,
                     layouts: &layouts,
                     stride,
+                    mmap: &mmap,
+                    host_refs: &host_refs,
                 };
                 let pack = match source {
                     PackSource::Ready(pack) => {
@@ -543,14 +790,7 @@ impl ExpertCache {
                         pack
                     }
                     PackSource::Build(mut writer) => {
-                        startup_repack(
-                            targets,
-                            &mut writer,
-                            &mmap,
-                            &host_refs,
-                            cuda_dev,
-                            progress,
-                        )?;
+                        startup_repack(targets, &mut writer, cuda_dev, progress)?;
                         writer.finish()?
                     }
                 };
@@ -1161,11 +1401,35 @@ impl ExpertCache {
         moe_layer_idx: usize,
         n_experts: usize,
     ) -> Option<&GpuDispatchTables> {
-        let gd = self.gpu_dispatch.as_ref()?;
-        if gd.expert_base(moe_layer_idx).is_none()
-            || gd.n_experts != n_experts
-            || self.pipeline_dead()
-        {
+        // Each refusal names itself, ONCE. `GpuDispatchTables::build` already
+        // reports why the tables could not be made; this is the other half —
+        // tables that exist but are not usable for this call — and it was the
+        // silent half. Costing decode a multiple because a per-layer condition
+        // quietly disagreed is not something to learn from a profiler three
+        // crates away.
+        let Some(gd) = self.gpu_dispatch.as_ref() else {
+            // Deliberately does NOT guess why. A paged cache never builds
+            // tables by design, and an all-resident one that failed to has
+            // already said so with the actual reason — asserting one of those
+            // here would put a confident wrong answer next to the right one.
+            log_dispatch_refusal("no dispatch tables were built for this cache");
+            return None;
+        };
+        if gd.expert_base(moe_layer_idx).is_none() {
+            log_dispatch_refusal(&format!(
+                "MoE layer {moe_layer_idx} is outside the covered table range"
+            ));
+            return None;
+        }
+        if gd.n_experts != n_experts {
+            log_dispatch_refusal(&format!(
+                "router width {n_experts} disagrees with the tables' {}",
+                gd.n_experts
+            ));
+            return None;
+        }
+        if self.pipeline_dead() {
+            log_dispatch_refusal("expert pipeline thread is dead");
             return None;
         }
         Some(gd)
@@ -1272,6 +1536,25 @@ impl ExpertCache {
         let PipelineMode::Threaded { tx } = &self.mode else {
             return 0;
         };
+        // **Sweep before asking, because the answer is computed from `live`.**
+        //
+        // `spare_regions` reads `live + tier` as the KV side's demand and feeds
+        // it to a sixty-second window peak. A region whose arena went chunk-empty
+        // several waves ago is still `live` until something sweeps it, so without
+        // this the negotiation is answered from a demand figure that includes
+        // arenas holding nothing — and the inflated peak then suppresses growth
+        // for a full window after the ground actually came free.
+        //
+        // The reactive sweeps cannot cover it: `claim_region` sweeps only when
+        // the free list is empty and `place_transient` only after a placement
+        // came up short, and a workload with spare regions reaches neither. The
+        // 3.6-35B gate runs at `free 18` throughout, so nothing swept between
+        // configs at all.
+        //
+        // Here rather than in each model's wave loop so every MoE model gets it,
+        // and so the sweep and the question it informs cannot drift apart.
+        #[cfg(feature = "cuda")]
+        candle_nn::kv_cache::reclaim_empty_arenas();
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         // Zero regions is the growth question — "how much is the KV side holding
         // that I could take?" — as against a positive count, which is the KV side
@@ -1360,12 +1643,20 @@ impl ExpertCache {
 
     /// Record a profiling span from external callers (e.g. SparseMoeBlock).
     ///
+    /// Recorded twice, into two tables that answer two questions. This cache's
+    /// own is per-instance and is what the bench harness snapshots per config;
+    /// the pipeline profiler is process-wide and is what a running daemon serves
+    /// over its API, where an expert-routing cost that appeared in neither the
+    /// scheduler's phases nor the kernel spans would otherwise be a hole in the
+    /// breakdown exactly where the MoE lives.
+    ///
     /// When profiling is disabled, this is an inline no-op.
     #[cfg(feature = "profile")]
     pub fn record_profile(&self, name: &'static str, start: ProfileMark) {
         if let Ok(mut prof) = self.forward_profile.lock() {
             prof.record(name, start);
         }
+        crate::models::profile::pipeline_record(name, start);
     }
 
     /// No-op when profiling is disabled.
@@ -1386,5 +1677,317 @@ impl Drop for ExpertCache {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod warm_sizing_tests {
+    use super::{
+        warm_sizing_from, CEILING_AVAILABLE, CEILING_HOST_BUDGET, CEILING_NONE, CEILING_PINNABLE,
+        PAGEABLE_RESERVE, WARM_TIER_HEADROOM,
+    };
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// The 3.6-35B's slot: three projections at their aligned offsets.
+    const SLOT: usize = 1_933_312;
+    /// Its evictable set — 39 unpinned layers of 256.
+    const EVICTABLE: usize = 9_984;
+
+    /// A budget generous enough not to be the binder, so a case can isolate one
+    /// of the other two ceilings.
+    const LOOSE_BUDGET: u64 = 1024 * GIB;
+
+    /// **The regression this exists for.** The 16 GB dev box, sized from the
+    /// mid-load trough (12.18 GiB) against the launch reading (20.45 GiB).
+    ///
+    /// The live figure is depressed by the engine's own mapped checkpoint, and
+    /// sizing from it cost 3,030 experts — every one of which then reads the
+    /// pack on a miss, for the life of the process.
+    #[test]
+    fn the_launch_baseline_beats_the_mid_load_trough() {
+        let args = |launch: u64| {
+            warm_sizing_from(
+                SLOT,
+                EVICTABLE,
+                31 * GIB + GIB / 2,
+                12 * GIB + GIB / 5, // 12.18 GiB free mid-load
+                launch,
+                640 * 1024 * 1024, // embedding + staging already pinned
+                27 * GIB,
+            )
+        };
+        let trough = args(12 * GIB + GIB / 5);
+        let launch = args(20 * GIB + GIB / 2);
+        assert!(
+            launch.slots > trough.slots + 3000,
+            "launch baseline bought only {} slots over the trough's {}",
+            launch.slots,
+            trough.slots
+        );
+        // Availability is the ceiling that is *supposed* to decide on a machine
+        // like this — the pinnable reserve is a backstop, not the everyday
+        // binder. Both cases are availability-bound; the launch reading simply
+        // gives it a truthful number to work from.
+        assert_eq!(trough.bound_by, CEILING_AVAILABLE);
+        assert_eq!(launch.bound_by, CEILING_AVAILABLE);
+    }
+
+    /// **Every ceiling leaves the headroom, including the pinnable one.**
+    ///
+    /// The regression: on a settled 31.5 GiB box the launch baseline (20.05 GiB)
+    /// lifted the availability ceiling above the pinnable one for the first
+    /// time, the pinnable ceiling bound, and — having no reserve subtracted from
+    /// it — handed the tier the entire pinnable region with nothing left over.
+    /// The first forward died on `CUDA_ERROR_OUT_OF_MEMORY`.
+    ///
+    /// The invariant: whatever binds, total pinned must stay a headroom clear of
+    /// the pinnable limit. Exercised on a machine small enough that the pinnable
+    /// ceiling is the one that wins.
+    #[test]
+    fn no_ceiling_may_take_the_whole_pinnable_region() {
+        let total = 16 * GIB;
+        let already = 640 * 1024 * 1024;
+        let s = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            total,
+            60 * GIB, // free RAM is not the constraint here
+            60 * GIB,
+            already,
+            LOOSE_BUDGET,
+        );
+        assert_eq!(s.bound_by, CEILING_PINNABLE);
+        assert!(
+            s.taken_bytes + already + WARM_TIER_HEADROOM + PAGEABLE_RESERVE <= total,
+            "tier {:.2} GiB + {:.2} GiB already pinned does not leave the {:.2} GiB headroom \
+             and {:.2} GiB pageable reserve inside {:.2} GiB",
+            s.taken_bytes as f64 / GIB as f64,
+            already as f64 / GIB as f64,
+            WARM_TIER_HEADROOM as f64 / GIB as f64,
+            PAGEABLE_RESERVE as f64 / GIB as f64,
+            total as f64 / GIB as f64,
+        );
+    }
+
+    /// A machine with no room left over after the pageable reserve takes no
+    /// warm tier at all, rather than underflowing into an enormous one.
+    #[test]
+    fn a_machine_smaller_than_the_pageable_reserve_takes_nothing() {
+        for total_gib in [4u64, 8, 10, 12] {
+            let s = warm_sizing_from(
+                SLOT,
+                EVICTABLE,
+                total_gib * GIB,
+                60 * GIB,
+                60 * GIB,
+                0,
+                LOOSE_BUDGET,
+            );
+            assert_eq!(
+                s.slots, 0,
+                "{total_gib} GiB machine has no pinnable room past the reserve"
+            );
+        }
+    }
+
+    /// The same invariant, swept: no combination of machine size, free RAM or
+    /// standing pinned bytes may leave the pageable reserve short. A ceiling
+    /// that can bind has to leave the same room as its neighbours, so this holds
+    /// whichever one wins.
+    #[test]
+    fn the_pageable_reserve_holds_across_machines() {
+        for total_gib in [8u64, 16, 31, 64, 194] {
+            for free_gib in [2u64, 8, 30, 120] {
+                for pinned_gib in [0u64, 1, 6] {
+                    let total = total_gib * GIB;
+                    let already = pinned_gib * GIB;
+                    let s = warm_sizing_from(
+                        SLOT,
+                        EVICTABLE,
+                        total,
+                        free_gib * GIB,
+                        free_gib * GIB,
+                        already,
+                        LOOSE_BUDGET,
+                    );
+                    // Stated as what the tier may take, not as what total pinned
+                    // must be: a process that has *already* pinned past the
+                    // limit is not something this function can undo, and the
+                    // only correct answer there is to take nothing — which
+                    // `saturating_sub` gives.
+                    assert!(
+                        s.taken_bytes
+                            <= total
+                                .saturating_sub(PAGEABLE_RESERVE)
+                                .saturating_sub(already)
+                                .saturating_sub(WARM_TIER_HEADROOM),
+                        "{total_gib} GiB machine, {free_gib} GiB free, {pinned_gib} GiB pinned: \
+                         tier took {} bytes",
+                        s.taken_bytes
+                    );
+                }
+            }
+        }
+    }
+
+    /// A machine that gained free RAM since launch is sized on the larger, newer
+    /// figure — the baseline is a floor on optimism, not a cap.
+    #[test]
+    fn a_machine_that_freed_ram_is_not_held_to_its_launch_reading() {
+        let s = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            64 * GIB,
+            40 * GIB, // plenty free now
+            8 * GIB,  // but the process launched on a busy machine
+            0,
+            LOOSE_BUDGET,
+        );
+        assert_eq!(s.launch_ram, 40 * GIB);
+        assert_eq!(s.available_less_headroom, 40 * GIB - WARM_TIER_HEADROOM);
+    }
+
+    /// **Pinned bytes are subtracted exactly once, whichever reading wins.**
+    ///
+    /// The live figure is taken after the process page-locked them, so it
+    /// already excludes them; the launch figure predates them and does not.
+    /// Subtracting from the winner double-counts on every machine where the live
+    /// reading is larger — the case the `max` exists for. The two tests either
+    /// side of this one are both blind to it: one passes `already_pinned = 0`,
+    /// the other makes launch and live equal.
+    #[test]
+    fn pinned_bytes_are_not_double_subtracted_when_the_live_reading_wins() {
+        let already = 4 * GIB;
+        // Live is the larger *and* already nets out `already`; launch predates
+        // it. Normalised, both describe the same 40 GiB of usable ground.
+        let s = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            64 * GIB,
+            40 * GIB,
+            44 * GIB,
+            already,
+            LOOSE_BUDGET,
+        );
+        assert_eq!(
+            s.available_less_headroom,
+            40 * GIB - WARM_TIER_HEADROOM,
+            "the pinned bytes were counted twice"
+        );
+    }
+
+    /// **Already-pinned bytes come out of the LAUNCH reading, which predates
+    /// them — never out of the live one, which already excludes them.**
+    ///
+    /// This test used to hold launch and live equal and demand the ceiling move
+    /// one-for-one, which is the double-count: with both at 40 GiB and 4 GiB
+    /// pinned, the live figure says 40 GiB is free *now, after* the pinning, and
+    /// subtracting again invents a shortage. The pinnable cap is different and
+    /// does subtract, because it is derived from `total_ram` — a constant, not a
+    /// reading, so nothing has netted the pinned bytes out of it.
+    #[test]
+    fn what_is_already_pinned_is_subtracted_from_the_launch_reading() {
+        // Live is stale (smaller), so the launch reading wins and must pay.
+        let none = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            64 * GIB,
+            8 * GIB,
+            40 * GIB,
+            0,
+            LOOSE_BUDGET,
+        );
+        let some = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            64 * GIB,
+            8 * GIB,
+            40 * GIB,
+            4 * GIB,
+            LOOSE_BUDGET,
+        );
+        assert_eq!(
+            none.available_less_headroom - some.available_less_headroom,
+            4 * GIB,
+            "pinned bytes must move a launch-derived ceiling one-for-one"
+        );
+        // The pinnable cap always subtracts: `total_ram` is a constant.
+        assert_eq!(none.pinnable_cap - some.pinnable_cap, 4 * GIB);
+    }
+
+    /// Each ceiling binds when it is the lowest, and says so by name — the whole
+    /// point of reporting `bound_by` rather than three numbers to compare.
+    #[test]
+    fn the_lowest_ceiling_binds_and_is_named() {
+        // Host budget lowest.
+        let s = warm_sizing_from(SLOT, EVICTABLE, 64 * GIB, 60 * GIB, 60 * GIB, 0, 5 * GIB);
+        assert_eq!(s.bound_by, CEILING_HOST_BUDGET);
+        assert_eq!(s.slots, (5 * GIB / SLOT as u64) as usize);
+
+        // Availability lowest.
+        let s = warm_sizing_from(SLOT, EVICTABLE, 64 * GIB, 6 * GIB, 6 * GIB, 0, LOOSE_BUDGET);
+        assert_eq!(s.bound_by, CEILING_AVAILABLE);
+
+        // Pinnable half lowest — and it leaves the headroom like the others, so
+        // an 8 GiB machine offers a 4 GiB pinnable region of which the tier may
+        // take 1 GiB.
+        let s = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            8 * GIB,
+            60 * GIB,
+            60 * GIB,
+            0,
+            LOOSE_BUDGET,
+        );
+        assert_eq!(s.bound_by, CEILING_PINNABLE);
+        assert_eq!(
+            s.slots,
+            ((4 * GIB - WARM_TIER_HEADROOM) / SLOT as u64) as usize
+        );
+
+        // Nothing binds: the tier covers every evictable expert.
+        let s = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            512 * GIB,
+            400 * GIB,
+            400 * GIB,
+            0,
+            LOOSE_BUDGET,
+        );
+        assert_eq!(s.bound_by, CEILING_NONE);
+        assert_eq!(s.slots, EVICTABLE);
+    }
+
+    /// A machine with less free than the headroom asks for takes no tier rather
+    /// than underflowing into an enormous one.
+    #[test]
+    fn a_machine_below_the_headroom_takes_nothing() {
+        let s = warm_sizing_from(SLOT, EVICTABLE, 8 * GIB, GIB, GIB, 0, LOOSE_BUDGET);
+        assert_eq!(s.available_less_headroom, 0);
+        assert_eq!(s.slots, 0);
+        assert_eq!(s.taken_bytes, 0);
+
+        // Same for a process already pinning more than the baseline.
+        let s = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            64 * GIB,
+            40 * GIB,
+            40 * GIB,
+            60 * GIB,
+            LOOSE_BUDGET,
+        );
+        assert_eq!(s.slots, 0);
+    }
+
+    /// The reported bytes are what the slots actually cost, never the ceiling
+    /// they were cut from — a report that rounded up would hide a shortfall.
+    #[test]
+    fn taken_bytes_follows_the_slot_count() {
+        let s = warm_sizing_from(SLOT, EVICTABLE, 31 * GIB, 20 * GIB, 20 * GIB, 0, 27 * GIB);
+        assert_eq!(s.taken_bytes, (s.slots * SLOT) as u64);
+        assert!(s.taken_bytes <= s.available_less_headroom.min(s.pinnable_cap));
     }
 }

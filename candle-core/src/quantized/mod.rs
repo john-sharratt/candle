@@ -596,8 +596,21 @@ impl Int8Mode {
 
     /// Auto-select the numeric mode for `device`: [`Int8Mode::Precision`] when the device can run
     /// the int8 `m16n8k32` tensor-core MMA (CUDA, compute capability >= 8.0 / Ampere+), otherwise
-    /// [`Int8Mode::Off`] (the FP16 reference). Precision is chosen over Performance because its
-    /// stepped-up KO twin is near-lossless versus the source quant at no measurable decode cost.
+    /// [`Int8Mode::Off`] (the FP16 reference).
+    ///
+    /// **Precision, and the margin is model-dependent — do not generalise it from one model.**
+    /// The two modes differ only in the weight twin (the q8a128 activation is identical), so the
+    /// choice is a throughput/accuracy dial. Measured on an RTX PRO 5000 Blackwell (sm_120):
+    ///
+    /// * Qwen3.5-9B is **insensitive** — every C-ladder rung valid in both, identical compression
+    ///   ratios, throughput inside the run-to-run band (C8 5823 vs 5831 bulk).
+    /// * Llama-3 is **not** — the same swap takes its ladder from green to C6 0/1, C7 0/1 and
+    ///   C8 9/10. Precision's stepped-up twin is doing real work there.
+    ///
+    /// So a model that shows no difference says nothing about the next one, and the default holds
+    /// the accurate twin. `Performance` stays available where a gate has measured it safe (the
+    /// DeepSeek-V4 engine pins it) or where the larger twin does not fit — see
+    /// [`Int8Mode::auto_sized`].
     pub fn auto(device: &crate::Device) -> Self {
         match device {
             #[cfg(feature = "cuda")]
@@ -607,12 +620,16 @@ impl Int8Mode {
     }
 
     /// VRAM-aware [`Int8Mode::auto`]: on an int8-MMA-capable CUDA device, picks
-    /// [`Int8Mode::Precision`] (near-lossless, but the *larger* stepped-up weight
+    /// [`Int8Mode::Precision`] (the accurate, but *larger* stepped-up weight
     /// twin) only when the weights leave comfortable headroom — the model is at
     /// most ~70% of free VRAM, so the KV cache, activations, and (MoE) hot
     /// experts still fit — and otherwise drops to [`Int8Mode::Performance`] (the
     /// smaller same-width twin) so a tight model still fits. `Off` (FP16) on CPU
     /// / non-int8 devices, or [`Int8Mode::Performance`] if VRAM can't be queried.
+    ///
+    /// The fallback is a **capability** judgement, not a quality one: dropping to
+    /// the smaller twin costs accuracy on some models (see [`Int8Mode::auto`]),
+    /// and is worth it only when the accurate twin would not fit at all.
     ///
     /// `model_bytes` is the on-disk quantized weight size (e.g. the GGUF length).
     // `model_bytes` is only weighed against free VRAM, which is a CUDA query;
@@ -2383,6 +2400,24 @@ impl QMatMul {
 
     #[cfg(feature = "cuda")]
     pub fn repack_for_optimization(&self, mode: Int8Mode) -> Result<QMatMul> {
+        self.repack_for_optimization_into(mode, None)
+    }
+
+    /// [`Self::repack_for_optimization`], placing the repacked weight at `dst`.
+    ///
+    /// The seam that puts a model's weights inside the device reservation. The
+    /// repacked weight is the one that stays resident — the compact source is
+    /// dropped as this returns — so this is the allocation worth placing, and
+    /// the caller sizes `dst` with `cuda::ko_repacked_bytes`.
+    ///
+    /// `None` allocates from the pool, which is the right answer with no
+    /// reservation to carve from.
+    #[cfg(feature = "cuda")]
+    pub fn repack_for_optimization_into(
+        &self,
+        mode: Int8Mode,
+        dst: Option<(u64, crate::cuda_backend::wave_provenance::LeaseOrigin)>,
+    ) -> Result<QMatMul> {
         let qt = self
             .qtensor()
             .ok_or_else(|| crate::Error::Msg("repack_for_optimization: not a QTensor".into()))?;
@@ -2399,8 +2434,18 @@ impl QMatMul {
         let new_storage = match &qt.storage {
             QStorage::Cuda(cs) => {
                 if mode.is_int8() {
-                    QStorage::Cuda(cs.repack_ko(&shape, qt.dtype().to_ko(mode)?)?)
+                    QStorage::Cuda(cs.repack_ko_into(&shape, qt.dtype().to_ko(mode)?, dst)?)
                 } else {
+                    // The GEMX repack has no destination form: it is the
+                    // measurement path (`repack_gemx`'s own docs), not a path a
+                    // model load takes, so there is no weight here to place.
+                    if dst.is_some() {
+                        crate::bail!(
+                            "repack_for_optimization_into: a destination was supplied for a \
+                             non-int8 mode, which repacks through GEMX and allocates its own \
+                             output. The reservation would be left holding an unwritten hole."
+                        );
+                    }
                     QStorage::Cuda(cs.repack_gemx(&shape)?)
                 }
             }

@@ -129,7 +129,55 @@ fn mm_layout(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// A GEMM with a zero extent must not reach the BLAS library.
+///
+/// cuBLAS derives its launch grid from the problem shape, so a zero dimension
+/// asks it to launch `(0,1,1)` — which the CUDA runtime refuses with
+/// `cudaErrorInvalidConfiguration` and leaves as sticky state for whatever calls
+/// `cudaGetLastError` next. compute-sanitizer counted 41 of these in one short
+/// daemon run, planted by calls that had no work to do.
+///
+/// Both shapes below are reachable in ordinary operation, not just in tests: a
+/// wave quantum with no rows produces the first, an empty group in a grouped
+/// GEMM the second.
+///
+/// Registered through `test_device!` so the CPU backend has to agree — the two
+/// must produce the same tensor for a shape neither of them multiplies.
+fn degenerate_matmul(device: &Device) -> Result<()> {
+    // No output elements: `[0,4] @ [4,3]` is a `[0,3]` tensor and there is
+    // nothing to compute.
+    let a = Tensor::zeros((0usize, 4usize), DType::F32, device)?;
+    let b = Tensor::zeros((4usize, 3usize), DType::F32, device)?;
+    let c = a.matmul(&b)?;
+    assert_eq!(c.dims(), &[0, 3]);
+    assert_eq!(c.elem_count(), 0);
+
+    // **`k == 0` is the case that must not return uninitialised memory.** Every
+    // output element is an empty sum, so the answer is a materialised zero — the
+    // value cuBLAS itself would have written with `beta = 0`, and the reason the
+    // early return allocates zeroed rather than uninitialised.
+    let a = Tensor::zeros((2usize, 0usize), DType::F32, device)?;
+    let b = Tensor::zeros((0usize, 3usize), DType::F32, device)?;
+    let c = a.matmul(&b)?;
+    assert_eq!(c.dims(), &[2, 3]);
+    assert_eq!(c.to_vec2::<f32>()?, &[[0.0f32, 0.0, 0.0], [0.0, 0.0, 0.0]]);
+
+    // Batched, so the guard is exercised through the strided-batched path too.
+    let a = Tensor::zeros((2usize, 3usize, 0usize), DType::F32, device)?;
+    let b = Tensor::zeros((2usize, 0usize, 5usize), DType::F32, device)?;
+    let c = a.matmul(&b)?;
+    assert_eq!(c.dims(), &[2, 3, 5]);
+    assert_eq!(c.sum_all()?.to_vec0::<f32>()?, 0.0);
+    Ok(())
+}
+
 test_device!(matmul, matmul_cpu, matmul_gpu, matmul_metal);
+test_device!(
+    degenerate_matmul,
+    degenerate_matmul_cpu,
+    degenerate_matmul_gpu,
+    degenerate_matmul_metal
+);
 test_device!(
     matmul_bf16,
     matmul_bf16_cpu,

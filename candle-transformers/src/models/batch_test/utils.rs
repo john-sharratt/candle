@@ -544,11 +544,20 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
 /// per-layer instrument must clear that same control before its output means
 /// anything.
 ///
-/// **Shared across models on purpose, as the harness control.** This replays
-/// through `truncate_sequence_to_tokens`, and if that did not restore
-/// byte-identical state the probe would report its own drift as model
-/// non-determinism. Running the identical code against a model known to be
-/// reproducible is what rules that out.
+/// **Shared across models on purpose, as the harness control.** The probe's own
+/// reset has to restore byte-identical state, or it reports its own drift as
+/// model non-determinism. Running the identical code against a model known to
+/// be reproducible is what rules that out.
+///
+/// **Each replay runs on a FRESH SEQUENCE.** It used to rewind one sequence with
+/// `truncate_sequence_to_tokens`, which restores the K/V and nothing else —
+/// correct exactly as long as the K/V is the whole of a sequence's memory. On a
+/// model carrying recurrent state it is not: the probe's decode wave commits,
+/// the state advances by a token, and a K/V rewind cannot reach it, so every
+/// replay would enter from a state one token further along and the divergence
+/// reported would be the harness's own. Allocating a sequence per replay
+/// restores identical state on *every* model rather than only on models that
+/// have no state to restore, at the cost of one prefill per replay.
 ///
 /// Returns the number of replays that diverged from their predecessor.
 pub fn decode_replay_probe<M: ManagedBatchedModel>(
@@ -563,12 +572,16 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
     let n_layers = model.num_layers();
     let prompt_len = prompt_ids.len();
     let mut session = model.create_batched_session(BatchedConfig::default())?;
-    let seq = session.create_sequence()?;
-
     let prompt = Tensor::new(prompt_ids, device)?.unsqueeze(0)?;
-    let first = {
+
+    // Prefill a sequence and return it alongside the prompt's own next-token
+    // argmax. Each `WaveResult` is scoped so it drops: it holds the arena's
+    // forward-span guard, and a step still in scope makes the next
+    // `forward_wave` fail.
+    let prefill = |session: &mut BatchedInferenceSession| -> Result<(usize, u32)> {
+        let seq = session.create_sequence()?;
         let step = model.forward_wave(
-            &mut session,
+            session,
             &[],
             &[],
             &[seq],
@@ -580,16 +593,22 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
             None,
         )?;
         session.advance_sequence(seq, prompt_len)?;
-        step.logits_owned()?[0]
+        let tok = step.logits_owned()?[0]
             .i(0)?
             .argmax(0)?
-            .to_scalar::<u32>()?
+            .to_scalar::<u32>()?;
+        Ok((seq, tok))
     };
 
-    // Run the decode row through `[0, d)` and roll the KV back. Each `WaveResult`
-    // is scoped so it drops: it holds the arena's forward-span guard, and a step
-    // still in scope makes the next `forward_wave` fail.
+    let (warm_seq, first) = prefill(&mut session)?;
+    session.free_sequence(warm_seq)?;
+    model.release_sequence(warm_seq)?;
+
+    // One replay: a fresh sequence, prefilled from scratch, decoding the same
+    // single token — so every sample starts from a state that is identical by
+    // construction rather than by a rewind that only covers the K/V.
     let mut probe = || -> Result<Vec<u32>> {
+        let (seq, _) = prefill(&mut session)?;
         let tok = Tensor::new(&[first][..], device)?.unsqueeze(0)?;
         let t = {
             let step = model.forward_wave(
@@ -610,7 +629,8 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
                 .ok_or_else(|| candle::Error::msg("decode wave produced no logits"))?
         };
         let v = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-        session.truncate_sequence_to_tokens(seq, prompt_len)?;
+        session.free_sequence(seq)?;
+        model.release_sequence(seq)?;
         Ok(v.iter().map(|x| x.to_bits()).collect())
     };
 
@@ -954,9 +974,14 @@ impl TestParams {
             // is a throughput figure, not an error. Printing the region ledger
             // per config is what turns "the third config is slow" into "the third
             // config started with N fewer free regions than the first".
+            // Free host RAM at every config boundary, so the run's trough is
+            // recorded rather than inferred from the one reading at load.
+            candle::vram::sample_available_low_water();
             if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
+                let (swept, sweeps) = candle_nn::kv_cache::empty_sweep_stats();
                 println!(
-                    "  [regions] total {} | live {} | free {} | blocked {} | arenas {} MiB",
+                    "  [regions] total {} | live {} | free {} | blocked {} | arenas {} MiB \
+                     | swept {swept} arenas / {sweeps} sweeps",
                     rs.total,
                     rs.live,
                     rs.free,
@@ -1218,17 +1243,46 @@ impl TestParams {
         // attention window. Truncate each sequence back to its pre-prompt
         // length between repeats so every repeat is a true re-prefill from
         // identical state; the final repeat leaves exactly one prompt in KV.
+        //
+        // **"Identical state" has to mean all of it.** The truncation restores
+        // the K/V, which is the whole of a sequence's memory only for a model
+        // that keeps nothing else. On a model carrying recurrent state, repeat
+        // N would enter having absorbed the previous N−1 prompts — the story
+        // read N times after all, just invisibly, and attributed to the model
+        // rather than to this loop. So each sequence's state is forked aside at
+        // the base offset and forked back between repeats, which is exactly the
+        // snapshot the K/V gets for free by being append-only. Both calls are
+        // no-ops on a model with no such state.
         let repeat_base_offsets: Vec<usize> = sequence_indices
             .iter()
             .map(|&i| session.sequence_offset(i).unwrap_or(0))
             .collect();
+        // Only when the loop will actually repeat: the shadows cost a slot each.
+        let repeat_shadows: Vec<usize> = if config.num_repeats.max(1) > 1 {
+            let mut shadows = Vec::with_capacity(sequence_indices.len());
+            for &seq_idx in &sequence_indices {
+                let shadow = session.create_sequence()?;
+                model.fork_recurrent(seq_idx, shadow)?;
+                shadows.push(shadow);
+            }
+            shadows
+        } else {
+            Vec::new()
+        };
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
         let mut repeat_base_logits: Option<Vec<Tensor>> = None;
         for repeat in 0..config.num_repeats.max(1) {
             if repeat > 0 {
-                for (&seq_idx, &base) in sequence_indices.iter().zip(repeat_base_offsets.iter()) {
+                for (i, (&seq_idx, &base)) in sequence_indices
+                    .iter()
+                    .zip(repeat_base_offsets.iter())
+                    .enumerate()
+                {
                     session.truncate_sequence_to_tokens(seq_idx, base)?;
+                    if let Some(&shadow) = repeat_shadows.get(i) {
+                        model.fork_recurrent(shadow, seq_idx)?;
+                    }
                 }
             }
             let nl = model.num_layers();
@@ -1276,6 +1330,11 @@ impl TestParams {
             for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {
                 run.logits = logits;
             }
+        }
+        // The shadows exist only to hold the base state across the repeats.
+        for &shadow in &repeat_shadows {
+            session.free_sequence(shadow)?;
+            model.release_sequence(shadow)?;
         }
         // Advance each sequence by its own (ragged) prompt length.
         for (&seq_idx, &ulen) in sequence_indices.iter().zip(user_lens.iter()) {
@@ -2202,6 +2261,19 @@ impl TestParams {
                 "DMA loads (H2D)",
                 Box::new(|s: &PipelineStats| format!("{}", s.dma_loads)),
             ),
+            // The two gauges that turn the load counts into a tier decomposition:
+            // how much of the model is resident in VRAM, and how much of the KV
+            // side's ground the weight zone is still willing to concede. Without
+            // them a cold-load count says a tier is missing its target without
+            // saying which tier had the room.
+            (
+                "Hot VRAM (resident)",
+                Box::new(|s: &PipelineStats| format!("{} MiB", s.resident_vram_bytes >> 20)),
+            ),
+            (
+                "Zone cedeable",
+                Box::new(|s: &PipelineStats| format!("{} MiB", s.zone_cedeable_bytes >> 20)),
+            ),
             (
                 "Warm tier slots",
                 Box::new(|s: &PipelineStats| {
@@ -2311,7 +2383,190 @@ impl TestParams {
             print!("┴{:─<cw$}", "", cw = col_w + 2);
         }
         println!("┘");
+        Self::print_pinned_ram_report();
     }
+
+    /// Print what host RAM the engine page-locked, and what bounded it.
+    ///
+    /// The warm tier's size is the single largest lever on cold-load rate, and
+    /// it is decided once at load by whichever of three ceilings is lowest. The
+    /// expert table above reports the *outcome* (`Warm tier slots`) with no way
+    /// to tell a tier that took everything it could from one that was refused —
+    /// which is the difference between "buy more RAM" and "raise a cap".
+    #[cfg(feature = "cuda")]
+    fn print_pinned_ram_report() {
+        use crate::models::expert_lre::{
+            last_warm_tier_sizing, CEILING_AVAILABLE, CEILING_HOST_BUDGET, CEILING_PINNABLE,
+        };
+        use candle::vram::{host_pinned_breakdown, host_pinned_bytes};
+
+        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        println!("\n=== Host Pinned RAM ===");
+
+        let held = host_pinned_bytes();
+        let Some(s) = last_warm_tier_sizing() else {
+            println!("  (no warm tier was sized in this process)");
+            println!("  pinned held: {:.2} GiB", gib(held));
+            return;
+        };
+
+        println!(
+            "  Machine: {:.2} GiB total | {:.2} GiB free at launch (the baseline) | \
+             {:.2} GiB free mid-load | {:.2} GiB already pinned when sized",
+            gib(s.total_ram),
+            gib(s.launch_ram),
+            gib(s.available_ram),
+            gib(s.already_pinned),
+        );
+        println!("  Ceilings on the warm tier (lowest wins):");
+        for (name, v) in [
+            (CEILING_HOST_BUDGET, s.kv_warm_budget),
+            (CEILING_AVAILABLE, s.available_less_headroom),
+            (CEILING_PINNABLE, s.pinnable_cap),
+        ] {
+            println!(
+                "    {:<38} {:>8.2} GiB{}",
+                name,
+                gib(v),
+                if s.bound_by == name {
+                    "   ← binds"
+                } else {
+                    ""
+                }
+            );
+        }
+        println!("  Bound by: {}", s.bound_by);
+        println!(
+            "  Warm tier: {} of {} evictable experts ({:.0}%), {:.2} GiB at {:.2} MiB/slot",
+            s.slots,
+            s.wanted_slots,
+            100.0 * s.slots as f64 / s.wanted_slots.max(1) as f64,
+            gib(s.taken_bytes),
+            s.stride as f64 / (1024.0 * 1024.0),
+        );
+        let short = s.wanted_slots.saturating_sub(s.slots);
+        println!(
+            "  Shortfall: {short} experts with no warm copy, {:.2} GiB — every miss on \
+             one of these reads the pack",
+            gib(short as u64 * s.stride as u64),
+        );
+
+        match candle::vram::available_low_water() {
+            Some(low) => println!(
+                "  Free RAM low-water across the run: {:.2} GiB  (headroom asked for {:.2} GiB)",
+                gib(low),
+                gib(crate::models::expert_lre::WARM_TIER_HEADROOM),
+            ),
+            None => println!("  Free RAM low-water: not sampled"),
+        }
+        // **Is the wave transient tier being used at all?** A zero peak reads
+        // identically to "never seeded": if no tensor is ever carved from the
+        // arena, no operand carries a ticket, and every op on the wave path
+        // allocates from the driver however correctly each one propagates.
+        match candle_nn::kv_cache::wave_domain_stats(0) {
+            Some(d) => {
+                let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+                println!(
+                    "  Wave arenas (used/peak/cap MiB): fwd {:.1}/{:.1}/{:.1} | attn {:.1}/{:.1}/{:.1} \
+                     | ffn {:.1}/{:.1}/{:.1}",
+                    mib(d[0].0), mib(d[0].1), mib(d[0].2),
+                    mib(d[1].0), mib(d[1].1), mib(d[1].2),
+                    mib(d[2].0), mib(d[2].1), mib(d[2].2),
+                );
+            }
+            None => println!("  Wave arenas: no domain on device 0"),
+        }
+        // Which DeltaNet dispatch path each wave took, and what rejected it.
+        // Counts, not timings — see `docs/qwen36_performance_plan.md` T1.
+        let dt = crate::models::delta_net::mix::dispatch_tally();
+        if !dt.is_empty() {
+            println!("\n=== DeltaNet dispatch (path taken) ===");
+            for (path, outcome, n) in dt {
+                let tag = if outcome == "FUSED" {
+                    "fused"
+                } else {
+                    "FELL BACK on"
+                };
+                println!("  {path:<12} {tag:>13} {outcome:<14} {n:>8}");
+            }
+        }
+        let g = crate::models::expert_lre::grow_tally();
+        println!(
+            "  Boundary growth: asked {} | no-spare {} | spare offered {} regions | \
+             target-unchanged {} | target-backwards {} | floor-refused {} | at-limit {} | \
+             SLOTS GAINED {}",
+            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+        );
+        // The span's own accounting, so the whole-card decomposition is read off
+        // the reservation rather than reconstructed from slot and region counts —
+        // the two round in different units, and 80 boundary moves of rounding is
+        // exactly the sort of gap that gets inferred away.
+        if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
+            println!("\n=== Span (device 0) ===");
+            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+            if let Ok((free, total)) = candle::Device::new_cuda(0).and_then(|d| d.mem_get_info()) {
+                println!(
+                    "  CARD                {:>9.1} MiB total | {:>7.1} free | {:>7.1} in use",
+                    mib(total),
+                    mib(free),
+                    mib(total - free),
+                );
+            }
+            println!("  reserved            {:>9.1} MiB", mib(rs.reserved_bytes));
+            println!(
+                "    weight zone       {:>9.1} MiB   (the expert side of the boundary)",
+                mib(rs.weight_bytes)
+            );
+            let region = candle_nn::kv_cache::REGION_BYTES;
+            let kv = rs.total * region;
+            println!(
+                "    KV regions        {:>9.1} MiB   ({} x {:.0} MiB: live {}, free {}, blocked {})",
+                mib(kv),
+                rs.total,
+                mib(region),
+                rs.live,
+                rs.free,
+                rs.blocked,
+            );
+            println!(
+                "    unusable slack    {:>9.1} MiB   (span tail the region count rounds off)",
+                mib(rs.slack_bytes)
+            );
+            // Whatever the reservation holds that is neither side of the moving
+            // boundary: the dense weights, loaded before the boundary existed.
+            println!(
+                "    dense block       {:>9.1} MiB   (loaded before the boundary, immovable)",
+                mib(rs
+                    .reserved_bytes
+                    .saturating_sub(rs.weight_bytes)
+                    .saturating_sub(kv)
+                    .saturating_sub(rs.slack_bytes)),
+            );
+            println!(
+                "  peak KV live        {:>9.1} MiB   ({} regions)   granule {:.0} MiB",
+                mib(rs.peak_live * region),
+                rs.peak_live,
+                mib(rs.granularity),
+            );
+        }
+
+        let s = candle_nn::kv_cache::spare_tally();
+        println!(
+            "  Spare calc: observing {} | pressure {} | history-bound {} | occupancy-bound {} \
+             | granted {} regions || KV purchases: conceded {} / refused {}",
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6],
+        );
+        println!("  Pinned now, by consumer:");
+        for (use_, bytes) in host_pinned_breakdown() {
+            if bytes > 0 {
+                println!("    {:<38} {:>8.2} GiB", use_.label(), gib(bytes));
+            }
+        }
+        println!("    {:<38} {:>8.2} GiB", "TOTAL", gib(held));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn print_pinned_ram_report() {}
 
     /// Print a transposed profile-timing table.
     ///

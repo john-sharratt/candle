@@ -2607,17 +2607,20 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
     elem_count: usize,
     from: Backing,
 ) -> Result<(CudaSlice<T>, Backing)> {
-    if let Some(ticket) = from.inherit_ticket() {
-        let bytes = elem_count * std::mem::size_of::<T>();
-        if let Some(ptr) = wave_provenance::wave_alloc(ticket, bytes, INHERIT_ALIGN) {
-            // Dropping this slice bare would `cuMemFreeAsync` an address inside
-            // the VMM reservation the wave arenas are carved from — memory the
-            // stream-ordered pool never allocated — so the driver rejects it and
-            // nothing is freed. That is what makes the window between here and
-            // the caller stamping `Backing::Lease` harmless.
-            let slice = dev.cuda_stream().upgrade_device_ptr::<T>(ptr, elem_count);
-            return Ok((slice, Backing::Lease(LeaseOrigin::Wave(ticket))));
-        }
+    let ticket = from.inherit_ticket();
+    let bytes = elem_count * std::mem::size_of::<T>();
+    // Attributed, so the fall-through below is not silent: a site that lost its
+    // provenance and a site whose arena overflowed both end up on `dev.alloc`
+    // and are otherwise indistinguishable in any report.
+    if let Some(ptr) = wave_provenance::wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN) {
+        // Dropping this slice bare would `cuMemFreeAsync` an address inside
+        // the VMM reservation the wave arenas are carved from — memory the
+        // stream-ordered pool never allocated — so the driver rejects it and
+        // nothing is freed. That is what makes the window between here and
+        // the caller stamping `Backing::Lease` harmless.
+        let slice = dev.cuda_stream().upgrade_device_ptr::<T>(ptr, elem_count);
+        let ticket = ticket.expect("a carved range implies a ticket");
+        return Ok((slice, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
     Ok((dev.alloc::<T>(elem_count)?, Backing::Owned))
 }
@@ -4697,6 +4700,68 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let elem_count = b * m * n;
         let dev = &self.device;
+
+        // **A degenerate GEMM never reaches cuBLAS.**
+        //
+        // With any of `b`, `m`, `n` zero there is no output element to compute,
+        // and with `k == 0` every output is the empty sum. cuBLAS handles
+        // neither: it derives its grid from the problem shape, so a zero
+        // dimension launches `(0,1,1)` and the runtime rejects it with
+        // `cudaErrorInvalidConfiguration`. compute-sanitizer counted **41** such
+        // launches in one short run, alongside the `cudaGetLastError` that then
+        // picks the sticky error up somewhere unrelated — a real error planted
+        // in the runtime's state by a call that had no work to do.
+        //
+        // These shapes are reachable in ordinary operation, not just in tests: a
+        // wave with no rows for a quantum (the deferred-glue drain runs
+        // `decode_forward_cobatched(&[], &[], &[], &[])`) and a grouped GEMM
+        // whose group came out empty both arrive here with a zero extent.
+        //
+        // The allocation still happens — `alloc_zeros` for `elem_count`, which
+        // is a 0-byte request in the common case and still shows up in the
+        // forbidden-allocation report as its own call site. What is avoided is
+        // the cuBLAS call, and that is the whole point; a 0-byte allocation is
+        // cheap and wrong to elide, because the result must be a real
+        // `CudaStorage` for the caller to go on using.
+        //
+        // The result is pool-backed (`Backing::Owned`) rather than inheriting
+        // the activation's arena the way the live path below does. That is
+        // honest rather than convenient — these bytes genuinely come from the
+        // pool — and it costs nothing, because a zero-extent result has no
+        // elements for a later `empty_beside` to inherit a span from.
+        if elem_count == 0 || k == 0 {
+            // `k == 0` with real output elements is an empty SUM, which is zero
+            // — the value cuBLAS itself would have written with `beta = 0`. It
+            // has to be materialised rather than left uninitialised, so this is
+            // one of the few places `alloc_zeros` is right (CLAUDE.md invariant
+            // 6 excepts buffers read before they are written, and every element
+            // here is read without any kernel writing it).
+            let slice = match (&self.slice, &rhs.slice) {
+                (CudaStorageSlice::BF16(_), CudaStorageSlice::BF16(_)) => {
+                    CudaStorageSlice::BF16(dev.alloc_zeros::<bf16>(elem_count)?)
+                }
+                (CudaStorageSlice::F16(_), CudaStorageSlice::F16(_)) => {
+                    CudaStorageSlice::F16(dev.alloc_zeros::<f16>(elem_count)?)
+                }
+                (CudaStorageSlice::F32(_), CudaStorageSlice::F32(_)) => {
+                    CudaStorageSlice::F32(dev.alloc_zeros::<f32>(elem_count)?)
+                }
+                (CudaStorageSlice::F64(_), CudaStorageSlice::F64(_)) => {
+                    CudaStorageSlice::F64(dev.alloc_zeros::<f64>(elem_count)?)
+                }
+                _ => {
+                    return Err(
+                        CudaError::InternalError("dtype mismatch in matmul op".to_string()).into(),
+                    )
+                }
+            };
+            return Ok(Self {
+                slice,
+                device: dev.clone(),
+                backing: Backing::Owned,
+            });
+        }
+
         // The activation's arena, not the weight's: `self` is the left operand,
         // which for every `x @ W` in a forward is the value flowing through the
         // layer, while `rhs` is a model parameter that names no arena. Assigned

@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::{BatchedModelCore, WaveShapes};
+use super::dense_span;
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::rope_tables::CisPrecomputations;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
@@ -315,12 +316,13 @@ impl BatchedAttentionLayer for LayerWeights {
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
-        mlp_dtype: DType,
+        work_dtype: DType,
+        out_dtype: DType,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
         _wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
-        self.mlp.forward_dynamic(&acts, mlp_dtype)
+        self.mlp.forward_dynamic(&acts, work_dtype, out_dtype)
     }
 
     /// B1 producer: fuse attention_norm -> q8a128 (int8) or FP rms_norm (Off).
@@ -576,6 +578,10 @@ impl ModelWeights {
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct = gguf_file::Content::read(&mut cursor)?;
 
+        // Before the baseline, so the span's own mapping is not read as weight
+        // bytes, and before any tensor, so the weights can be carved from it.
+        dense_span::open_for_load(device, &ct)?;
+
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]
         let used_before = super::batched_model::driver_used_bytes(device);
@@ -721,11 +727,16 @@ impl ModelWeights {
 
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        // Both halves: the driver delta sees only what went to the CUDA pool,
+        // and whatever was carved from the span sits inside the mapping the
+        // baseline already counted, so it has to be added rather than inferred.
+        let dense_in_span = dense_span::close_load(device)?;
         #[cfg(feature = "cuda")]
-        let base_weight_bytes =
-            super::batched_model::driver_used_bytes(device).saturating_sub(used_before);
+        let base_weight_bytes = super::batched_model::driver_used_bytes(device)
+            .saturating_sub(used_before)
+            + dense_in_span;
         #[cfg(not(feature = "cuda"))]
-        let base_weight_bytes = 0usize;
+        let base_weight_bytes = dense_in_span;
 
         Ok(Self {
             embeddings: Embedding::new(tok_embeddings, embedding_length)?,
@@ -745,6 +756,8 @@ impl ModelWeights {
         device: &Device,
         max_kv_cache_len: Option<usize>,
     ) -> Result<Self> {
+        // Before the baseline and before any tensor — see the sibling loader.
+        dense_span::open_for_load(device, &ct)?;
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]
         let used_before = super::batched_model::driver_used_bytes(device);
@@ -865,11 +878,16 @@ impl ModelWeights {
 
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        // Both halves: the driver delta sees only what went to the CUDA pool,
+        // and whatever was carved from the span sits inside the mapping the
+        // baseline already counted, so it has to be added rather than inferred.
+        let dense_in_span = dense_span::close_load(device)?;
         #[cfg(feature = "cuda")]
-        let base_weight_bytes =
-            super::batched_model::driver_used_bytes(device).saturating_sub(used_before);
+        let base_weight_bytes = super::batched_model::driver_used_bytes(device)
+            .saturating_sub(used_before)
+            + dense_in_span;
         #[cfg(not(feature = "cuda"))]
-        let base_weight_bytes = 0usize;
+        let base_weight_bytes = dense_in_span;
 
         Ok(Self {
             embeddings: Embedding::new(tok_embeddings, embedding_length)?,

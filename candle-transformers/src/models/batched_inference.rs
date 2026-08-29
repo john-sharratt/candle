@@ -561,13 +561,14 @@ pub struct ProvSignPacked {
     /// set iff Q dim `d` of that sub-band is `>= 0` (`d` in `0..sub_head_dim`).
     /// Warp index = `((layer*n_blocks + block_pos)*n_kv_head + head)*n_palette + palette`,
     /// where `block_pos` indexes [`Self::block_indices`].
-    pub packed: Vec<u32>,
+    pub packed: Vec<u64>,
     /// Absolute chunk indices captured (identical across all layers).
     pub block_indices: Vec<usize>,
     pub n_layers: usize,
     pub n_kv_head: usize,
     pub n_palette: usize,
-    /// `head_dim / n_palette` — bits packed per palette sub-band (`<= 32`).
+    /// `head_dim / n_palette` — bits packed per palette sub-band (`<= 64`, the
+    /// width of a physical R16 band at `head_dim` 256).
     pub sub_head_dim: usize,
 }
 
@@ -1278,6 +1279,22 @@ impl BatchedInferenceSession {
     /// Lets the scheduler reset a persistent conversation sequence to
     /// its system-prompt baseline before injecting the next turn's
     /// projection.
+    /// Cut a sequence's chunk list back to `block_count` blocks.
+    ///
+    /// **A non-zero target is not automatically a rewind of live state.** Two
+    /// callers legitimately pass one, and neither leaves a model's per-sequence
+    /// state describing tokens the K/V no longer holds:
+    ///
+    /// - the clean-turn re-prefill, which truncates to the turn boundary *and*
+    ///   discards the view's recurrent state in the same step, so both sides
+    ///   move together;
+    /// - `reserve_glue_gap`'s error-path rollback, which releases chunks a
+    ///   failed call had just reserved and that nothing has decoded into.
+    ///
+    /// The operation that *is* a state-corrupting rewind is the token-granular
+    /// [`Self::truncate_sequence_to_tokens`], reached only from speculative
+    /// decode, and it is refused up front for a model that
+    /// [`ManagedBatchedModel::carries_recurrent_state`].
     pub fn truncate_sequence_to_blocks(
         &mut self,
         seq_idx: usize,
@@ -1573,11 +1590,29 @@ impl BatchedInferenceSession {
     /// Allocates a new sequence slot and populates it with Arc-shared refs to
     /// the specified parent blocks.  Callers write new tokens into the view, then
     /// call [`finalize_view`] to transfer those blocks back to the parent.
+    ///
+    /// **`visible_block_ranges` must be non-empty.** It names the blocks to
+    /// borrow, so an empty slice borrows nothing and yields a view whose K/V is
+    /// empty while it decodes at its parent's position — fluent, plausible text
+    /// with no relation to the prompt, and no error anywhere. "Empty means every
+    /// block" is the *scheduler wrapper's* convention; it expands to
+    /// `[(0, total_blocks)]` before calling here. A caller that genuinely wants
+    /// to borrow nothing wants [`Self::create_sequence`]. A zero-length range
+    /// (`[(0, 0)]`) is still accepted: that is a parent with no blocks yet.
     pub fn create_view_sequence(
         &mut self,
         parent_idx: usize,
         visible_block_ranges: &[(usize, usize)],
     ) -> Result<ViewSequence> {
+        if visible_block_ranges.is_empty() {
+            candle::bail!(
+                "create_view_sequence: no visible block ranges for a view of sequence \
+                 {parent_idx}. Pass the ranges to borrow — `[(0, block_count)]` for the \
+                 whole parent — or use `create_sequence` for a child that starts empty. \
+                 A view that borrows nothing decodes from an empty context and reads \
+                 perfectly."
+            );
+        }
         let view_idx = self.create_sequence()?;
         let mut borrowed_block_count = 0;
         let mut borrowed_token_count = 0;
@@ -1841,8 +1876,9 @@ impl BatchedInferenceSession {
     /// format, which is right for the accounting it feeds. The forward instead
     /// derives its activation dtype from the sequence's live caches, and
     /// [`candle_nn::kv_cache::KvCache::dtype`] reports **F16** for a quantized
-    /// backing — that is the dtype the norms will actually see. Reading `dtype`
-    /// here yields BF16 weights for an F16 forward, which the norm refuses.
+    /// backing — the live arena really is F16 (K in `R16`, V in plain F16), so
+    /// that is the dtype the norms will actually see. Reading `dtype` here
+    /// yields BF16 weights for an F16 forward, which the norm refuses.
     pub fn activation_dtype(&self) -> DType {
         crate::models::batched_model::activation_dtype(
             self.config.k_format.dtype().unwrap_or(DType::F16),
@@ -1953,7 +1989,7 @@ impl BatchedInferenceSession {
     /// per-token `WideQSig` from `packed` and folds it — bit-identical to the CPU
     /// path. Returns `None` (caller falls back to the CPU gather) when not CUDA,
     /// when any layer has no R16 blocks, when the layers' block sets disagree, or
-    /// when `sub_head_dim > 32` (can't pack into a u32).
+    /// when `sub_head_dim > 64` (can't pack into a u64).
     pub fn gather_provenance_sign_packed(
         &self,
         seq_idx: usize,
@@ -1974,21 +2010,63 @@ impl BatchedInferenceSession {
             block_indices,
             n_layers: self.backings.len(),
             n_kv_head: self.n_kv_head(),
-            n_palette: candle_nn::kv_cache::N_PALETTE,
+            // Derived from the same rule as `sub_head_dim` above, and it has to
+            // be: the two travel together in this struct, and a consumer that
+            // reconstructs `head_dim = n_palette * sub_head_dim` from a derived
+            // width beside a constant band count reads 128 for a 256-wide head.
+            n_palette: self.prov_n_palette(),
             sub_head_dim,
         }))
     }
 
-    /// The provenance sign-pack sub-band width (`head_dim / N_PALETTE`), or 0 when
-    /// the geometry can't be packed into a u32 (`> 32`) — callers treat 0 as "use
-    /// the CPU path".
+    /// How many palette bands a head is **physically stored in** — the number
+    /// of Q pointers `provenance_q_ptrs` emits per head.
+    ///
+    /// **This is a property of the arena, not a free choice.** The R16 chunk
+    /// lays each head out in `N_PALETTE` bands of `head_dim / N_PALETTE` dims, the
+    /// pointer resolution walks exactly that many bands, and the sign-pack
+    /// kernel's contract is `sub_head_dim = head_dim / N_PALETTE`. Deriving a
+    /// different band count here does not re-band the storage — it only makes
+    /// this side disagree with it.
+    ///
+    /// It was briefly derived as "the smallest power of two with
+    /// `head_dim / p <= 32`" to stop the fast path declining at `head_dim`
+    /// 256. That reasoning was right about the symptom and wrong about the
+    /// fix: at 256 it yields 8 bands of 32, so the kernel reads only the low
+    /// 32 dims of each physical 64-dim band and the host lays band `p` at
+    /// `p * 32` instead of `p * 64` — half of every signature dropped, the
+    /// rest dim-permuted, and no longer bit-identical to the CPU fold it is
+    /// documented to match.
+    ///
+    /// The band count was never the thing to change. What declined at 256 was
+    /// the kernel's **word width**: it packed a band into a `u32`, and the
+    /// physical band there is 64 dims. It packs a `u64` now, so a 256-wide head
+    /// takes the fast path with its real banding intact.
+    pub fn prov_n_palette(&self) -> usize {
+        candle_nn::kv_cache::N_PALETTE
+    }
+
+    /// The provenance sign-pack sub-band width (`head_dim / n_palette`), or 0
+    /// when the geometry cannot be packed into one word — callers treat 0 as
+    /// "use the CPU path".
+    ///
+    /// The bound is 64, the kernel's word width and the width of a physical R16
+    /// band at `head_dim` 256 — so both production geometries (128 → 32-dim
+    /// bands, 256 → 64-dim bands) take the GPU path. It was 32, which declined
+    /// at 256 and sent every seal of the hybrid through a full R16 device→host
+    /// copy; the signatures were correct, so nothing but a path assertion could
+    /// see it (`hybrid_capture_takes_the_gpu_sign_pack_path`).
+    ///
+    /// A wider band than 64 still declines rather than silently truncating: the
+    /// band is the arena's, not this function's, and narrowing it here would
+    /// drop dims (see [`Self::prov_n_palette`]).
     pub fn prov_sub_head_dim(&self) -> usize {
         let head_dim = self.head_dim();
         if head_dim == 0 {
             return 0;
         }
-        let sub = head_dim / candle_nn::kv_cache::N_PALETTE;
-        if sub == 0 || sub > 32 {
+        let sub = head_dim / self.prov_n_palette();
+        if sub == 0 || sub > candle_kernels::simple::prov_sign_pack::MAX_SUB_HEAD_DIM {
             0
         } else {
             sub
@@ -2036,7 +2114,7 @@ impl BatchedInferenceSession {
         &self,
         all_ptrs: &[i64],
         sub_head_dim: usize,
-    ) -> candle::Result<Vec<u32>> {
+    ) -> candle::Result<Vec<u64>> {
         match self.backings.first() {
             Some(b) => b.run_prov_sign_pack(all_ptrs, sub_head_dim),
             None => Ok(Vec::new()),
@@ -2937,6 +3015,43 @@ pub struct ModelCoreProperties {
     pub v_hi_error_threshold_factor: f32,
     /// Per-model multiplier for the V low (lenient) adaptive threshold.
     pub v_low_error_threshold_factor: f32,
+    /// How many layers actually have a Q to capture — the fold's layer count.
+    ///
+    /// Equal to `num_layers` on a uniform transformer and to the **attention**
+    /// layer count on a hybrid, where three quarters of the stack is recurrent
+    /// and has no Q in a KV cache to read. The provenance fold groups
+    /// `[n − 2, 1, 1]` over this, so passing transformer depth on a hybrid
+    /// would size the lower group for layers that contribute nothing.
+    pub provenance_capture_layers: usize,
+    /// Whether this model can compute K/V for tokens inserted **mid-sequence**
+    /// — a glue island the projection reserves a gap chunk for.
+    ///
+    /// **Gap-fill is not the same as prefill.** Appending at the writer tail is
+    /// ordinary prefill and every model does it; filling a hole in the middle of
+    /// a sequence requires each inserted token's output to depend only on what
+    /// precedes it *positionally*, which attention gives for free and a
+    /// recurrence cannot give at all — token *t*'s output depends on the
+    /// accumulated state over everything before it, in order, and that state has
+    /// already moved past the hole.
+    ///
+    /// A real model property, like `head_dim`. The planner reads it **before**
+    /// planning rather than discovering it from a bail inside `forward_wave`,
+    /// because by then the projection has already been built around islands the
+    /// model cannot fill.
+    pub can_gap_fill: bool,
+    /// Whether this model keeps per-sequence state outside the KV cache — the
+    /// recurrent matrices and conv tails of a hybrid stack.
+    ///
+    /// The mirror of [`Self::can_gap_fill`], and needed at the same altitude:
+    /// the prompt builder has to know, before it starts, whether a branch
+    /// checkpoint is something it must compute. A conversation on a model that
+    /// carries no such state needs none, and the pass must not run — 96
+    /// full-prompt prefills for a quantity nothing will read.
+    ///
+    /// [`ManagedBatchedModel::carries_recurrent_state`] answers the same
+    /// question where a `&dyn` model is in hand; this carries it to code that
+    /// only has the copied properties.
+    pub carries_recurrent_state: bool,
 }
 
 /// Result of a re-entrant [`ManagedBatchedModel::forward_batched_layers`] wave.
@@ -3192,6 +3307,14 @@ pub trait ManagedBatchedModel {
             k_low_error_threshold_factor: 1.0,
             v_hi_error_threshold_factor: 1.0,
             v_low_error_threshold_factor: 1.0,
+            // Attention computes each token's output from what precedes it
+            // positionally, so a hole in the middle of a sequence is fillable.
+            // The default is the uniform-transformer answer; a model whose
+            // per-sequence memory is a recurrence overrides it.
+            // Uniform transformer: every layer attends, so every layer has a Q.
+            provenance_capture_layers: self.num_layers(),
+            can_gap_fill: !self.carries_recurrent_state(),
+            carries_recurrent_state: self.carries_recurrent_state(),
         }
     }
 
@@ -3330,12 +3453,76 @@ pub trait ManagedBatchedModel {
         Ok(out)
     }
 
+    /// Whether this model carries per-sequence state that **cannot be rewound**.
+    ///
+    /// A recurrent state is an accumulated sum with no per-token decomposition:
+    /// there is no suffix to remove and no inverse to apply. Rewinding the K/V
+    /// under one is silent corruption — the model answers from tokens the cache
+    /// no longer holds, fluently and without an error.
+    ///
+    /// This is a real model property, like `head_dim`, not a feature flag. It
+    /// gates the one operation in the engine that means "put this sequence back
+    /// the way it was `n` tokens ago" ([`Self::truncate_sequence`], reached
+    /// only from speculative decode), refusing it up front rather than letting
+    /// it corrupt state a layer down. `false` for every model whose entire
+    /// per-sequence memory is the paged K/V.
+    ///
+    /// It also gates the snapshot / fork / branch-checkpoint machinery, so what
+    /// qualifies matters. **Per-sequence state outside the K/V is not enough —
+    /// the state must be irrecoverable.** `latent_moe`'s engine (DeepSeek-V4)
+    /// carries a per-sequence compressor and provenance gallery, and answers
+    /// `false` deliberately: both are *derived*, rebuildable from the corpus
+    /// that is already durable, so there is nothing to snapshot that a replay
+    /// could not reproduce. A delta-rule matrix has no such source — it is the
+    /// only record of the tokens that built it — which is why the hybrid is the
+    /// one lineage that answers `true`.
+    ///
+    /// The consequence of getting this wrong is asymmetric. A model that
+    /// answers `true` without needing to pays ~63 MiB of export per seal for
+    /// bytes nothing reads. One that answers `false` when it should not gets
+    /// silently zeroed state and reads fluently, which is the failure this whole
+    /// path exists to remove.
+    fn carries_recurrent_state(&self) -> bool {
+        false
+    }
+
+    /// Whether a speculative block's rejected tail can be rolled back on this model.
+    ///
+    /// **Distinct from [`Self::carries_recurrent_state`], which used to answer both.**
+    /// Carrying recurrent state means there is something outside the session's KV to
+    /// snapshot; for as long as no model could rewind such a state, one declaration
+    /// served for both questions and the speculative entry point refused on it. The
+    /// hybrid's verify replay separates them. It still carries state — nothing else
+    /// records the tokens that built `S` — and it can now rewind *inside a block it
+    /// just verified*, by replaying the mixer over the accepted prefix from the
+    /// ping-pong entering state the wave left untouched (`qwen35::spec`).
+    ///
+    /// Default: a model carrying recurrent state cannot rewind, which keeps every
+    /// model that has not implemented a replay refused exactly as before.
+    ///
+    /// Overriding to `true` is a claim about [`Self::truncate_sequences`], not about
+    /// the state: that it restores the recurrence exactly for the targets it accepts.
+    /// It is not a claim that every offset is rewindable — a replay covers the block
+    /// it stashed operands for and nothing else, so `truncate_sequences` is what
+    /// refuses a target with no rewind point, at the one place that knows.
+    fn can_rewind_speculative_block(&self) -> bool {
+        !self.carries_recurrent_state()
+    }
+
     /// Roll `seq` back to exactly `tokens` tokens after a speculative verify — called by the
     /// driver with `pos + kept` once the accepted prefix is known. Default: the session-level KV
     /// truncation. A model whose forward maintains per-sequence streaming state OUTSIDE the
     /// session's KV (compressors, corpus galleries) overrides this to roll that state back in the
     /// same call — otherwise a partial accept leaves rejected draft tokens absorbed in state the
     /// truncation can't see, and later attention reads corrupted context.
+    ///
+    /// **Reached only by the speculative verify path**, despite the broad name.
+    /// A model that cannot express a rewind at all leaves
+    /// [`Self::can_rewind_speculative_block`] at its default `false` and is
+    /// refused at the entry point, so it never arrives here — the guard is the
+    /// declaration, not a bail inside an override raised after the driver has
+    /// committed. A model that *can* rewind, but only within a block it stashed
+    /// operands for, accepts here and refuses the uncovered offsets itself.
     fn truncate_sequence(
         &self,
         session: &mut BatchedInferenceSession,
@@ -3369,6 +3556,104 @@ pub trait ManagedBatchedModel {
         for &(seq, tokens) in targets {
             self.truncate_sequence(session, seq, tokens)?;
         }
+        Ok(())
+    }
+
+    /// A sequence id is going away: release whatever per-sequence state this
+    /// model keeps OUTSIDE the session's KV.
+    ///
+    /// The session owns the KV and frees it with the slot. A model whose
+    /// forward carries per-sequence state of its own — a recurrent store, a
+    /// streaming compressor, a corpus gallery — owns that separately and
+    /// outlives every session, so nothing else can free it.
+    ///
+    /// Slot ids are pool indices and **are recycled**, which is what makes this
+    /// a correctness hook rather than a leak fix: a recycled id whose first
+    /// wave carries a non-zero offset finds the previous conversation's entry
+    /// still sitting in the map and inherits it. The model then answers from a
+    /// history the cache never had, fluently and without an error.
+    fn release_sequence(&self, _seq: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// How many sequences this model currently holds recurrent memory for.
+    ///
+    /// The leak gauge for [`Self::release_sequence`]. Slot ids are recycled pool
+    /// indices, so memory that outlives its sequence is not merely wasted VRAM:
+    /// the next conversation to land on that id inherits it. `0` for a model
+    /// that carries none.
+    fn recurrent_memory_count(&self) -> usize {
+        0
+    }
+
+    /// `child` begins as a copy of `parent`'s per-sequence model state.
+    ///
+    /// The KV analogue is `create_view_sequence`, which lets a child slot
+    /// borrow the parent's blocks zero-copy. State cannot be borrowed — the
+    /// child is about to advance it — so it is copied, device-to-device.
+    ///
+    /// Called at every turn's view carve, not only on an explicit user fork:
+    /// the turn loop decodes on a child slot, and a child that starts from
+    /// nothing is a model running on whatever fraction of its stack is not
+    /// recurrent.
+    fn fork_recurrent(&self, _parent: usize, _child: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read `seq`'s recurrent state back for the turn-seal snapshot record.
+    ///
+    /// Returns `(schedule_hash, layers)`, or `None` for a model that carries no
+    /// such state — so the seal site is model-agnostic and a non-recurrent model
+    /// pays nothing.
+    ///
+    /// **The layer rows, not the record.** `candle-conversation` depends on this
+    /// crate and not the reverse, so `SnapshotPayload` cannot be named here; the
+    /// scheduler assembles it from these rows, which are field-for-field its
+    /// `SnapshotLayer`. Moving the record type down into the model crate would
+    /// invert the dependency to save one struct literal.
+    ///
+    /// Refuses mid-wave — a snapshot must capture a sealed boundary, never a
+    /// wave in flight. The seal runs outside the wave, so this is an assertion
+    /// on that ordering rather than a case to handle.
+    fn export_recurrent(
+        &self,
+        _seq: usize,
+    ) -> Result<Option<(u64, Vec<crate::models::delta_net::ExportedLayerState>)>> {
+        Ok(None)
+    }
+
+    /// Scatter a snapshot back into `seq`'s recurrent state — the resume path.
+    ///
+    /// Returns `true` when the state was installed, `false` when this model
+    /// carries none. **Errors** on a hash or geometry mismatch rather than
+    /// silently starting from zero: falling back to zeros is the same fluent
+    /// amnesia this whole path exists to remove, so the caller has to see it
+    /// and log it distinguishably.
+    fn restore_recurrent(
+        &self,
+        _seq: usize,
+        _schedule_hash: u64,
+        _layers: &[crate::models::delta_net::ExportedLayerState],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// `child`'s state becomes `parent`'s — the linear join.
+    ///
+    /// A **move**, not a merge. A view is a linear continuation of its parent:
+    /// it saw exactly the parent's tokens plus its own, so its state simply
+    /// *is* the parent's new state. (Merging two divergent children has no
+    /// defined arithmetic and is out of scope — `S` is an accumulated sum over
+    /// one token order, and there is no operation meaning "and also these
+    /// other tokens".)
+    ///
+    /// The rule for when to call it: **the state follows the K/V.** Wherever
+    /// the view's decoded blocks transfer to the parent, this transfers with
+    /// them; wherever the blocks are abandoned, this is not called and the
+    /// state is dropped with them. Getting that backwards is silent in both
+    /// directions — a missing move loses a turn's decode, and a spurious one
+    /// re-introduces the `<think>` skew.
+    fn move_recurrent(&self, _child: usize, _parent: usize) -> Result<()> {
         Ok(())
     }
 
@@ -3648,6 +3933,34 @@ pub trait ManagedBatchedModel {
         if seqs.is_empty() {
             return Ok(Vec::new());
         }
+        // **Refused up front for a model that cannot rewind.**
+        //
+        // Speculative decode is built on "decode the whole draft block, then put
+        // the sequence back to the accepted prefix". The check belongs here, at
+        // the one entry point, and not inside the rewind: by the time the driver
+        // has drafted and verified, refusing is an error raised against work
+        // already done, and *not* refusing is a state that has absorbed rejected
+        // tokens the K/V no longer holds.
+        //
+        // The question is whether the model can REWIND, not whether it carries
+        // recurrent state — the hybrid does both. Its verify replay re-runs the
+        // mixer over the accepted prefix from the entering state the wave's
+        // ping-pong left intact, which reconstructs exactly the state those
+        // tokens alone would have produced (`qwen35::spec`,
+        // `docs/deltanet_state_persistence.md` §5.4). Which offsets are
+        // rewindable is a property of the stashed block, so `truncate_sequences`
+        // is what refuses one it has no rewind point for.
+        if !self.can_rewind_speculative_block() {
+            candle::bail!(
+                "speculative decode is unavailable on this model: accepting k of n \
+                 drafted tokens requires rewinding the sequence, and this model \
+                 carries recurrent state with no per-token decomposition to rewind \
+                 to. A model whose `truncate_sequences` can restore the recurrence \
+                 — as the qwen35 lineage's replay does — declares \
+                 `can_rewind_speculative_block`; without that, run it without a \
+                 drafter."
+            );
+        }
         // Draft per sequence. A sequence whose drafter proposes NOTHING (no
         // drafter, or the acceptance fallback holding it back) takes a PLAIN
         // decode wave instead of a 1-token verify: the verify path's
@@ -3869,6 +4182,21 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// Reservation bytes held by per-sequence recurrent state, for the same
+    /// decomposition.
+    ///
+    /// Zero is the honest answer for a model with no recurrent layers, which is
+    /// why this is not an `Option`: a pure-attention stack holds none, it does
+    /// not fail to know.
+    ///
+    /// Reported because it is large and moves: a hybrid stack's recurrent memory
+    /// is ~126 MiB per sequence, so a wide wave puts several GiB of the
+    /// reservation here, and a total that omits it makes the span look emptier
+    /// than it is — the same class of blindness that let the dense weights hide.
+    fn recurrent_reserved_bytes(&self) -> usize {
+        0
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 
@@ -4007,6 +4335,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             k_low_error_threshold_factor: self.model().k_low_error_threshold_factor(),
             v_hi_error_threshold_factor: self.model().v_hi_error_threshold_factor(),
             v_low_error_threshold_factor: self.model().v_low_error_threshold_factor(),
+            // Uniform transformer: every layer attends, so every layer has a Q.
+            provenance_capture_layers: ManagedBatchedModel::num_layers(self),
+            can_gap_fill: !self.carries_recurrent_state(),
+            carries_recurrent_state: self.carries_recurrent_state(),
         }
     }
 
@@ -4052,6 +4384,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn resident_weight_bytes(&self) -> Option<usize> {
         self.model().resident_weight_bytes()
+    }
+
+    fn recurrent_reserved_bytes(&self) -> usize {
+        self.model().recurrent_reserved_bytes()
     }
 
     fn reset_expert_stats(&self) {

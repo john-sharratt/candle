@@ -236,6 +236,53 @@ mod imp {
         }
     }
 
+    /// Note an allocation whose call site is known **exactly**, from a
+    /// `#[track_caller]` caller.
+    ///
+    /// The cheap twin of [`record`], and the accurate one. A release backtrace
+    /// names the nearest surviving symbol, which after inlining is often a
+    /// *neighbour* of the real allocator — measured here: an entry attributed to
+    /// `lower_tri_mask` was 344,064 B per call, which is no square mask but a
+    /// `[84, 2048]` BF16 activation. Fixing what such a stack names is fixing the
+    /// wrong function.
+    ///
+    /// `Location` is a compile-time constant threaded through by the attribute,
+    /// so this walks nothing and symbolises nothing, and it survives inlining
+    /// because it never depended on the frame surviving.
+    pub fn record_at(
+        loc: &'static std::panic::Location<'static>,
+        what: &'static str,
+        bytes: usize,
+    ) {
+        if !is_enabled() {
+            return;
+        }
+        let mut hasher = DefaultHasher::new();
+        loc.file().hash(&mut hasher);
+        loc.line().hash(&mut hasher);
+        what.hash(&mut hasher);
+        let key = hasher.finish();
+
+        let mut reg = registry();
+        match reg.sites.entry(key) {
+            Entry::Occupied(mut o) => {
+                let s = o.get_mut();
+                s.calls += 1;
+                s.bytes += bytes as u64;
+            }
+            Entry::Vacant(v) => {
+                let at = format!("{}:{}", loc.file(), loc.line());
+                eprintln!("forbidden allocation: {what} {bytes} B at {at}");
+                v.insert(SiteReport {
+                    site: what,
+                    calls: 1,
+                    bytes: bytes as u64,
+                    backtrace: at,
+                });
+            }
+        }
+    }
+
     /// Drain and return everything recorded since the last call.
     pub fn take_report() -> Report {
         let mut sites: Vec<SiteReport> = registry().sites.drain().map(|(_, v)| v).collect();
@@ -254,12 +301,6 @@ mod imp {
         registry().sites.clear();
     }
 
-    /// The first frame in `backtrace` that belongs to neither the capture
-    /// machinery nor the allocator itself — a one-line label for the summary
-    /// table, where a full stack would not fit.
-    ///
-    /// Best-effort: symbol text depends on the build's debug info, so an
-    /// unrecognisable stack yields `<unknown>` rather than a wrong attribution.
     /// How many user frames make up a site's label.
     ///
     /// **One is not enough, and the reason cost real time.** Symbolisation maps
@@ -267,9 +308,17 @@ mod imp {
     /// merged callee is reported under whichever neighbour owns that address —
     /// `qkv_segmented_matmul` surfaced as `grouped_matmul_gemx`, its neighbour in
     /// the same object, and a whole diagnosis was built on the wrong function.
-    /// A short chain is self-correcting: even when the innermost symbol is
+    /// A chain is self-correcting: even when the innermost symbol is
     /// misattributed, its callers place it unambiguously.
-    const LABEL_FRAMES: usize = 3;
+    ///
+    /// **Six rather than three**, because three stopped short of the answer on
+    /// the sites that mattered. The `delta_net` cluster labels its top five
+    /// entries `empty_beside <- {mix,cuda}::{...}` — five distinct call sites
+    /// that agree on their innermost three frames and diverge only above them,
+    /// so a three-frame label collapsed them into one row and hid which root was
+    /// feeding the cascade. The cost is table width, paid once per report, on a
+    /// diagnostic that is off by default.
+    const LABEL_FRAMES: usize = 6;
 
     /// The innermost few frames that belong to this codebase rather than to the
     /// allocator plumbing, innermost first, joined by ` <- `.
@@ -519,6 +568,14 @@ mod imp {
     #[inline(always)]
     pub fn record(_site: &'static str, _bytes: usize) {}
 
+    #[inline(always)]
+    pub fn record_at(
+        _loc: &'static std::panic::Location<'static>,
+        _what: &'static str,
+        _bytes: usize,
+    ) {
+    }
+
     pub fn take_report() -> Report {
         Report::default()
     }
@@ -526,4 +583,6 @@ mod imp {
     pub fn reset() {}
 }
 
-pub use imp::{disable, enable, is_enabled, record, reset, take_report, Report, SiteReport};
+pub use imp::{
+    disable, enable, is_enabled, record, record_at, reset, take_report, Report, SiteReport,
+};

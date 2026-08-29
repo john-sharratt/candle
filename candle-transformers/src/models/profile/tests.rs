@@ -183,3 +183,81 @@ fn the_event_pool_recycles_across_drains() {
         .expect("recycled pairs must keep recording");
     assert_eq!(row.2, 3, "every pass records once");
 }
+
+/// The readout must see spans recorded on OTHER threads.
+///
+/// This is the whole reason the store is per-thread with a process-wide
+/// aggregate rather than a plain thread-local: a daemon records from its
+/// scheduler thread and serves the numbers from a request handler, and a
+/// thread-local readout answers that request with an empty table — which reads
+/// as "the hot path was free" rather than "you asked the wrong thread".
+#[cfg(feature = "profile")]
+#[test]
+fn the_readout_sees_spans_from_every_thread() {
+    let _ = pipeline_snapshot_and_reset();
+
+    std::thread::spawn(|| {
+        let _s = span("probe:other_thread");
+    })
+    .join()
+    .expect("worker thread");
+
+    {
+        let _s = span("probe:this_thread");
+    }
+
+    let snap = pipeline_snapshot_and_reset();
+    for name in ["probe:other_thread", "probe:this_thread"] {
+        assert!(
+            snap.entries.iter().any(|(n, _, c)| n == name && *c == 1),
+            "{name} missing from the aggregate readout: {:?}",
+            snap.entries,
+        );
+    }
+}
+
+/// A thread that has already exited must not take its totals with it — its work
+/// happened, and a table that silently omits it under-reports exactly the
+/// short-lived pool threads a daemon does its background work on.
+#[cfg(feature = "profile")]
+#[test]
+fn a_finished_threads_totals_survive_it() {
+    let _ = pipeline_snapshot_and_reset();
+
+    std::thread::spawn(|| {
+        let _s = span("probe:retired");
+    })
+    .join()
+    .expect("worker thread");
+    // The thread is joined, so its accumulator has already been dropped and
+    // folded into the retired table by the time this reads.
+    let snap = pipeline_snapshot_and_reset();
+    assert!(
+        snap.entries
+            .iter()
+            .any(|(n, _, c)| n == "probe:retired" && *c == 1),
+        "a joined thread's span was lost: {:?}",
+        snap.entries,
+    );
+}
+
+/// Reading resets, so the second of two consecutive reads describes only what
+/// happened between them. That property is what lets a caller bracket the exact
+/// window a rate collapsed in, so it is worth a gate of its own.
+#[cfg(feature = "profile")]
+#[test]
+fn reading_resets_so_two_reads_bracket_a_window() {
+    let _ = pipeline_snapshot_and_reset();
+    {
+        let _s = span("probe:window");
+    }
+    let first = pipeline_snapshot_and_reset();
+    assert!(first.entries.iter().any(|(n, _, _)| n == "probe:window"));
+
+    let second = pipeline_snapshot_and_reset();
+    assert!(
+        !second.entries.iter().any(|(n, _, _)| n == "probe:window"),
+        "the first read must have cleared the counter: {:?}",
+        second.entries,
+    );
+}

@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::content_hash::snapshot_stream_id;
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use super::log_file::LogFile;
 use super::manifest::{encode_conv_state_payload, ConvState, Manifest, RecordLoc};
@@ -33,6 +34,7 @@ use super::record::{
     TombstonePayload,
 };
 use super::segment::{SegmentId, FIRST_SEGMENT};
+use super::streams::StreamId;
 use super::Result;
 use crate::projection::TimelineId;
 use crate::substrate::Substrate;
@@ -120,6 +122,37 @@ fn raw_loc(it: &CompactItem) -> (u64, u64) {
     }
 }
 
+/// How many prompt branch checkpoints survive a compaction.
+///
+/// A bound rather than a policy: they are a cache, they are ~63 MiB each, and
+/// nothing else reclaims them. Sized so a workspace that switches between a
+/// handful of selector assignments never loses one it is actually using, while
+/// a schema edited many times cannot grow the log without limit.
+pub(super) const MAX_BRANCH_CHECKPOINTS: usize = 8;
+
+/// The branch checkpoints a compaction carries forward — the newest
+/// [`MAX_BRANCH_CHECKPOINTS`] by write position, and the ids of those dropped.
+///
+/// "Newest by write position" is the closest thing to recently-used available
+/// from the index, which holds locations and no timestamps. A checkpoint that is
+/// re-read but not rewritten does not refresh, so an actively-used branch can in
+/// principle age out — it costs one prefill and is written back, which is the
+/// whole reason a cache can be evicted on a rough signal.
+pub(super) fn partition_branch_checkpoints(
+    substrate: &Substrate,
+) -> (Vec<(StreamId, RecordLoc)>, Vec<StreamId>) {
+    let mut all: Vec<(StreamId, RecordLoc)> = substrate.branch_checkpoint_entries().collect();
+    // Newest last in write order, so sort ascending and keep the tail.
+    all.sort_by_key(|(_, loc)| (loc.segment, loc.offset));
+    let dropped_n = all.len().saturating_sub(MAX_BRANCH_CHECKPOINTS);
+    let dropped: Vec<StreamId> = all[..dropped_n].iter().map(|(sid, _)| *sid).collect();
+    (all.split_off(dropped_n), dropped)
+}
+
+fn branch_checkpoints_to_keep(substrate: &Substrate) -> Vec<(StreamId, RecordLoc)> {
+    partition_branch_checkpoints(substrate).0
+}
+
 /// Collect every **live** record, in dependency order, as [`CompactItem`]s —
 /// planning only, **no disk reads**. `ModelSpec` / `Template` / `Tokenizer` /
 /// `Chunk` / `Tokens` become `Raw` items carrying their source `(segment,
@@ -187,12 +220,47 @@ pub fn collect_live_records(
         }
     }
 
+    // Tombstoned timelines drop out of the compacted log entirely
+    // — their records are physically gone, not merely hidden.  This
+    // is what reclaims disk after a refresh cycle replaces a
+    // timeline.
+    let tombstoned: std::collections::HashSet<u64> = substrate
+        .tombstoned_timelines()
+        .iter()
+        .map(|t| t.raw())
+        .collect();
+    let distilled: std::collections::HashMap<u64, DistillMode> = substrate
+        .distilled_timelines()
+        .iter()
+        .map(|(t, m)| (t.raw(), *m))
+        .collect();
+
     // Recurrent-state snapshots: one live tail per conversation, staged
     // verbatim (`Raw`, the `Tokens` shape — the payload is a multi-MB state
-    // blob nothing holds in RAM). The map only ever holds live conversations'
-    // snapshots — a timeline tombstone removes its entry on apply — so no
-    // gate is needed here.
+    // blob nothing holds in RAM).
+    //
+    // **Distilled timelines shed theirs.** Distillation keeps the provenance
+    // signatures and drops the content; the recurrent state IS content —
+    // derived from the token stream, and useless without the K/V that was shed
+    // alongside it. Without this gate a distilled timeline sheds megabytes of
+    // K/V and carries ~63 MiB of state forward on every compaction pass,
+    // forever, for a conversation that is never resumed. That a distilled
+    // conversation becomes unresumable is correct: distillation is for
+    // calibration exemplars.
+    //
+    // Tombstoned timelines are already handled on apply (the tombstone removes
+    // the map entry), but a timeline that is tombstoned AND distilled
+    // deliberately escapes the wholesale drop below, so the same set is checked
+    // here rather than assumed.
+    let snapshot_drop: std::collections::HashSet<u64> = distilled
+        .keys()
+        .chain(tombstoned.iter())
+        .map(|&t| snapshot_stream_id(t).0)
+        .collect();
     for (stream_id, loc) in substrate.recurrent_snapshot_entries() {
+        if snapshot_drop.contains(&stream_id.0) {
+            continue;
+        }
         out.push(CompactItem::raw(
             RecordHeader {
                 record_type: RecordType::Snapshot,
@@ -208,20 +276,38 @@ pub fn collect_live_records(
             loc.record_size,
         ));
     }
-    // Tombstoned timelines drop out of the compacted log entirely
-    // — their records are physically gone, not merely hidden.  This
-    // is what reclaims disk after a refresh cycle replaces a
-    // timeline.
-    let tombstoned: std::collections::HashSet<u64> = substrate
-        .tombstoned_timelines()
-        .iter()
-        .map(|t| t.raw())
-        .collect();
-    let distilled: std::collections::HashMap<u64, DistillMode> = substrate
-        .distilled_timelines()
-        .iter()
-        .map(|(t, m)| (t.raw(), *m))
-        .collect();
+
+    // Prompt branch checkpoints, **capped**.
+    //
+    // The only record here that is a cache rather than durable state: a
+    // checkpoint is a pure function of a prompt that is still on disk, so
+    // dropping one costs a single prefill on next use, and keeping one costs
+    // ~63 MiB in every future segment. Nothing else reclaims them — they are
+    // keyed by content, so a prompt edit supersedes nothing and orphans the old
+    // branch, and no timeline tombstone names them. Without this the log grows
+    // by one orphan per prompt edit, forever.
+    //
+    // Newest-first by write position, which is the closest thing to
+    // recently-used the compactor can see. A workspace exercises few branches at
+    // a time, so the cap is generous relative to real use and still bounds the
+    // worst case (the live schema's tree has 200) at a fixed size.
+    let kept = branch_checkpoints_to_keep(substrate);
+    for (stream_id, loc) in kept {
+        out.push(CompactItem::raw(
+            RecordHeader {
+                record_type: RecordType::BranchCheckpoint,
+                format: 0,
+                payload_len: loc.payload_len,
+                crc: 0,
+                stream_id: stream_id.0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            loc.segment,
+            loc.offset,
+            loc.record_size,
+        ));
+    }
 
     // Per-stream live records — sourced from the substrate's in-RAM
     // stream index, the authoritative source.
@@ -1385,6 +1471,300 @@ mod tests {
                         .map(|d| d.mode)
                         == Some(DistillMode::ProvenanceOnly)),
             "distilled marker re-emitted with its mode",
+        );
+    }
+
+    /// Encoded snapshot payload for `timeline` at `turn` with a recognisable
+    /// `fill` byte — the same fixture shape the maintenance relocation tests
+    /// use, kept local because that module's test helpers are private to it.
+    fn snapshot_payload(timeline: u64, turn: u32, fill: u8) -> Vec<u8> {
+        use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
+        SnapshotPayload {
+            timeline_id: timeline,
+            turn_index: turn,
+            schedule_hash: 0xA5A5,
+            layers: vec![SnapshotLayer {
+                layer_index: 0,
+                n_v_heads: 1,
+                d_v: 4,
+                d_k: 4,
+                state: vec![fill; 64],
+                conv_channels: 2,
+                conv_tail_cols: 2,
+                conv_tail: vec![fill; 16],
+            }],
+        }
+        .encode()
+    }
+
+    /// **A distilled timeline sheds its recurrent snapshot; its sig survives.**
+    ///
+    /// The inverse of the test above, on the axis that was missing a gate.
+    /// Distillation keeps the provenance signatures and drops the content, and
+    /// the recurrent state is content — derived from the token stream, useless
+    /// without the K/V shed alongside it. Ungated, a distilled timeline sheds
+    /// megabytes of K/V and carries ~63 MiB of state forward on every pass, for
+    /// a conversation that is never resumed.
+    #[test]
+    fn a_distilled_timelines_recurrent_snapshot_is_dropped() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::{DistillMode, DistillPayload};
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let tl = 131u64;
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: tl,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 0,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: vec!["tool".to_string()],
+        });
+        let sid = 13131u64;
+        let wide_payload =
+            crate::provenance::encode_wide_sigs(&[crate::provenance::WideQSig::from_band(
+                &vec![1.0f32; 4 * 128],
+                128,
+            )]);
+        let snap = snapshot_payload(tl, 0, 0xAB);
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(RecordType::StreamDecl, sid, 0, &decl.encode()));
+        blob.extend_from_slice(&record(RecordType::Chunk, sid, 0, b"kv-chunk-content"));
+        blob.extend_from_slice(&record(RecordType::WideQSig, sid, 0, &wide_payload));
+        blob.extend_from_slice(&record(
+            RecordType::Snapshot,
+            snapshot_stream_id(tl).0,
+            0,
+            &snap,
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Distilled,
+            0,
+            0,
+            &DistillPayload {
+                timeline_id: tl,
+                mode: DistillMode::ProvenanceOnly,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+
+        assert!(
+            !has_type(&live, RecordType::Snapshot),
+            "a distilled timeline kept its recurrent snapshot — megabytes of \
+             state carried forward on every compaction pass, for a conversation \
+             that can never be resumed because its K/V is gone"
+        );
+        assert!(
+            has_synth(&live, RecordType::WideQSig, &wide_payload),
+            "the provenance signature must survive — that is what distillation \
+             is for"
+        );
+    }
+
+    /// A tombstoned timeline's snapshot is dropped too. The tombstone already
+    /// removes the map entry on apply, but a timeline that is tombstoned AND
+    /// distilled deliberately escapes the wholesale drop, so the snapshot gate
+    /// checks the set rather than assuming the entry is gone.
+    #[test]
+    fn a_tombstoned_timelines_recurrent_snapshot_is_dropped() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::TombstonePayload;
+
+        let tl = 132u64;
+        let snap = snapshot_payload(tl, 3, 0xCD);
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::Snapshot,
+            snapshot_stream_id(tl).0,
+            0,
+            &snap,
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: tl,
+                turn_index: None,
+                reason: None,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        assert!(
+            !has_type(&live, RecordType::Snapshot),
+            "a tombstoned timeline's recurrent snapshot survived compaction"
+        );
+    }
+
+    /// **Branch checkpoints are capped; conversation snapshots are not.**
+    ///
+    /// The one record here that is a cache: a checkpoint is a pure function of a
+    /// prompt still on disk, so dropping one costs a prefill on next use, while
+    /// keeping one costs ~63 MiB in every future segment. Nothing else reclaims
+    /// them — they are keyed by *content*, so editing the prompt supersedes
+    /// nothing and orphans the old branch, and no timeline tombstone names it.
+    /// Without the cap the log grows by one orphan per prompt edit, forever.
+    ///
+    /// The newest survive: the drop is oldest-first by write position.
+    #[test]
+    fn branch_checkpoints_are_capped_and_the_newest_survive() {
+        use crate::persistence::content_hash::{branch_checkpoint_stream_id, ContentHash};
+
+        let n = MAX_BRANCH_CHECKPOINTS + 3;
+        let mut blob = Vec::new();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let sid = branch_checkpoint_stream_id(ContentHash {
+                lo: 1000 + i as u64,
+                hi: 0,
+            });
+            ids.push(sid.0);
+            // Payload contents are irrelevant to the cap — it reads the index.
+            blob.extend_from_slice(&record(
+                RecordType::BranchCheckpoint,
+                sid.0,
+                0,
+                &snapshot_payload(0, 0, i as u8),
+            ));
+        }
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+
+        let kept: Vec<u64> = live
+            .iter()
+            .filter(|it| it.header().record_type == RecordType::BranchCheckpoint)
+            .map(|it| it.header().stream_id)
+            .collect();
+        assert_eq!(
+            kept.len(),
+            MAX_BRANCH_CHECKPOINTS,
+            "{n} checkpoints compacted to {} — the cap did not apply, and the log \
+             grows without bound as the prompt is edited",
+            kept.len()
+        );
+        // The three oldest are the ones dropped.
+        for old in &ids[..3] {
+            assert!(
+                !kept.contains(old),
+                "an older checkpoint survived while a newer one was dropped"
+            );
+        }
+        for recent in &ids[3..] {
+            assert!(
+                kept.contains(recent),
+                "a recent checkpoint was dropped while older ones survived — the \
+                 branch a conversation is most likely to be using is the one that \
+                 would have to be recomputed"
+            );
+        }
+    }
+
+    /// A checkpoint is not a conversation snapshot: distilling or tombstoning a
+    /// timeline must not touch one, because it belongs to the *prompt* and
+    /// outlives every conversation that used it.
+    #[test]
+    fn a_branch_checkpoint_survives_a_tombstoned_timeline() {
+        use crate::persistence::content_hash::{
+            branch_checkpoint_stream_id, snapshot_stream_id, ContentHash,
+        };
+        use crate::persistence::record::TombstonePayload;
+
+        let tl = 141u64;
+        let branch = branch_checkpoint_stream_id(ContentHash { lo: 77, hi: 0 });
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::Snapshot,
+            snapshot_stream_id(tl).0,
+            0,
+            &snapshot_payload(tl, 1, 0xAB),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::BranchCheckpoint,
+            branch.0,
+            0,
+            &snapshot_payload(0, 0, 0xCD),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: tl,
+                turn_index: None,
+                reason: None,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+
+        assert!(
+            !has_type(&live, RecordType::Snapshot),
+            "the tombstoned conversation's snapshot should be gone"
+        );
+        assert!(
+            has_type(&live, RecordType::BranchCheckpoint),
+            "the prompt's branch checkpoint was dropped with the conversation — \
+             it belongs to the prompt, and every other conversation on that \
+             branch would have to recompute it"
+        );
+    }
+
+    /// A live timeline keeps exactly one snapshot — the newest. The header key
+    /// is a synthetic per-timeline stream id, so the last writer wins by append
+    /// order and the accounting *is* the tombstone; this pins that the surviving
+    /// bytes are the SECOND write, not merely that one survived.
+    #[test]
+    fn a_live_timeline_keeps_exactly_its_newest_snapshot() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+
+        let tl = 133u64;
+        let first = snapshot_payload(tl, 0, 0x11);
+        let second = snapshot_payload(tl, 1, 0x22);
+        let sid = snapshot_stream_id(tl).0;
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(RecordType::Snapshot, sid, 0, &first));
+        blob.extend_from_slice(&record(RecordType::Snapshot, sid, 0, &second));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+
+        let snaps: Vec<_> = live
+            .iter()
+            .filter(|it| it.header().record_type == RecordType::Snapshot)
+            .collect();
+        assert_eq!(snaps.len(), 1, "exactly one snapshot survives per timeline");
+        assert_eq!(
+            snaps[0].header().payload_len as usize,
+            second.len(),
+            "the surviving snapshot must be the newest write"
         );
     }
 

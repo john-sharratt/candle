@@ -105,6 +105,57 @@ impl DeltaNetState {
         })
     }
 
+    /// Bytes one state's two buffers occupy, in the order [`Self::at`] lays
+    /// them out. `(s_bytes, conv_bytes)`.
+    pub fn byte_sizes(dims: &DeltaNetDims) -> (usize, usize) {
+        let f32_bytes = DType::F32.size_in_bytes();
+        (
+            dims.n_v_heads * dims.head_dim * dims.head_dim * f32_bytes,
+            dims.conv_dim() * (dims.conv_kernel - 1) * f32_bytes,
+        )
+    }
+
+    /// A state whose two buffers are **views** over memory owned elsewhere —
+    /// `s` at `s_ptr`, the conv tail at `conv_ptr`.
+    ///
+    /// This is how a sequence's recurrent memory lives inside the device
+    /// reservation instead of the CUDA pool. It is a per-sequence, fixed-size,
+    /// uniform allocation — the same shape as a KV arena's regions or an expert
+    /// slot — and allocating it from the pool instead put ~126 MiB per sequence
+    /// outside the reservation, which is memory the span was never sized for
+    /// and which WDDM demotes to host RAM rather than refusing. On a hybrid
+    /// stack that is three quarters of the model's per-sequence memory.
+    ///
+    /// [`LeaseOrigin::Foreign`] because the owner is not an allocator to carve
+    /// from: an op reading this state takes its output from the wave arena, not
+    /// from the sequence's state block, and `Foreign` is what says so.
+    ///
+    /// # Safety
+    ///
+    /// Both pointers must name at least [`Self::byte_sizes`] bytes of live,
+    /// correctly aligned memory that outlives this state and every view of it,
+    /// and that nothing else writes through another alias.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn at(dims: &DeltaNetDims, dev: &Device, s_ptr: u64, conv_ptr: u64) -> Result<Self> {
+        use candle::cuda_backend::wave_provenance::LeaseOrigin;
+        Ok(Self {
+            s: Tensor::from_leased_cuda_ptr(
+                s_ptr,
+                DType::F32,
+                (dims.n_v_heads, dims.head_dim, dims.head_dim),
+                dev,
+                LeaseOrigin::Foreign,
+            )?,
+            conv_tail: Tensor::from_leased_cuda_ptr(
+                conv_ptr,
+                DType::F32,
+                (dims.conv_dim(), dims.conv_kernel - 1),
+                dev,
+                LeaseOrigin::Foreign,
+            )?,
+        })
+    }
+
     /// Handles onto both buffers, as the half a wave WRITES.
     ///
     /// A `DeltaNetState` is the pair of allocations; which of a slot's two is
@@ -138,6 +189,33 @@ impl DeltaNetState {
     /// its buffer and is already current; the conv tail is the copy back.
     pub fn absorb_solo(&mut self, out: &DeltaNetOut) -> Result<()> {
         self.conv_tail.slice_set(&out.conv_tail, 0, 0)
+    }
+
+    /// Allocate the buffers **without zeroing** — for a write half the kernels
+    /// fully overwrite before anything reads it.
+    ///
+    /// Hot-path invariant 6 (`CLAUDE.md`): a buffer a kernel stamps end to end
+    /// must not be memset first. The zeroed twin costs a full-width device
+    /// memset per layer (~2 MB × 30 layers ≈ 63 MiB per fork) on the exact
+    /// bytes the next wave overwrites, and forks run ~3× per turn.
+    ///
+    /// Sound for BOTH halves under the current ping-pong: [`commit_wave`]
+    /// installs `s` and the conv tail together because the wave's kernels write
+    /// both into the backup half (the conv kernels take the entering and
+    /// advanced tails as two pointers). [`Self::zeros`] remains the constructor
+    /// for a state that is genuinely read at zero — a sequence-start value —
+    /// and [`Self::solo_out`] keeps its zeroed scratch tail deliberately.
+    ///
+    /// [`commit_wave`]: super::state_store::RecurrentStateStore::commit_wave
+    pub fn uninit(dims: &DeltaNetDims, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            s: Tensor::empty(
+                (dims.n_v_heads, dims.head_dim, dims.head_dim),
+                DType::F32,
+                dev,
+            )?,
+            conv_tail: Tensor::empty((dims.conv_dim(), dims.conv_kernel - 1), DType::F32, dev)?,
+        })
     }
 }
 
@@ -429,13 +507,138 @@ fn solve_pseudo_values<'w>(
     Ok((t_inv.matmul(v_b)?, t_inv.matmul(kg)?))
 }
 
+/// Whether a fused-path guard admitted the wave, recording **which condition
+/// rejected it** when it did not.
+///
+/// The guards are long conjunctions, and a miss on any one silently drops the
+/// whole wave to the tensor-op fallback — the same arithmetic at a fraction of
+/// the speed. That is a cliff you cannot see in a timing: the span table shows
+/// `dn:mix` inflated ~89× per call and says nothing about why, and
+/// `docs/qwen36_performance_plan.md` T1 is explicit that timings are the wrong
+/// instrument here (the profile feature's own sync distorts width rows ~2×).
+///
+/// So this counts paths taken, not time spent, and names the first failing
+/// condition. "The fused path ran 40 times and fell back 200" is a different
+/// problem from "it never ran", and "it fell back on `qkv:f32`" is a different
+/// problem again from "it fell back on `head_dim`".
+///
+/// # Cost, on a per-layer per-wave path
+///
+/// The conditions arrive as a slice of **thunks**, not of `bool`s, so the walk
+/// short-circuits exactly as the `&&` chain it replaced did — the `state:cuda`
+/// predicate is `O(n_seqs)` and must not run once the cheap dtype checks have
+/// already rejected. The tally is a fixed array of atomics indexed by position,
+/// so recording is one relaxed `fetch_add`: no hashing, no map, no lock. An
+/// earlier version took a global `Mutex<HashMap>` and hashed a string pair on
+/// every call while claiming to be free; it was neither.
+#[cfg(feature = "cuda")]
+const MAX_DISPATCH_CONDS: usize = 12;
+
+/// `[path][0]` is the fused count; `[path][i + 1]` counts rejections by
+/// condition `i`. Two paths, so two rows.
+#[cfg(feature = "cuda")]
+static DISPATCH_TALLY: [[std::sync::atomic::AtomicU64; MAX_DISPATCH_CONDS + 1]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; MAX_DISPATCH_CONDS + 1] }; 2];
+
+/// The paths, in `DISPATCH_TALLY` row order.
+#[cfg(feature = "cuda")]
+const DISPATCH_PATHS: [&str; 2] = ["dn:mix", "dn:replay"];
+
+#[cfg(feature = "cuda")]
+fn dispatch_verdict(row: usize, conds: &[(&'static str, &dyn Fn() -> bool)]) -> bool {
+    debug_assert!(conds.len() <= MAX_DISPATCH_CONDS);
+    let reject = conds.iter().position(|(_, ok)| !ok());
+    let slot = reject.map_or(0, |i| i + 1);
+    DISPATCH_TALLY[row][slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    reject.is_none()
+}
+
+/// The tally [`dispatch_verdict`] has accumulated: `(path, outcome, count)`,
+/// where the outcome is `FUSED` or the first condition that rejected. Sorted
+/// most-frequent first. Zero rows are omitted.
+#[cfg(feature = "cuda")]
+pub fn dispatch_tally() -> Vec<(&'static str, &'static str, u64)> {
+    let names: [&[&str]; 2] = [
+        &[
+            "device",
+            "head_dim",
+            "qkv:f32",
+            "alpha:f32",
+            "beta:f32",
+            "z:f32",
+            "dt_bias:f32",
+            "a:f32",
+            "norm:f32",
+            "state:cuda",
+        ],
+        &[
+            "device",
+            "head_dim",
+            "qkv:f32",
+            "alpha:f32",
+            "beta:f32",
+            "dt_bias:f32",
+            "a:f32",
+            "state:cuda",
+        ],
+    ];
+    let mut v = Vec::new();
+    for (row, path) in DISPATCH_PATHS.iter().enumerate() {
+        for (slot, cell) in DISPATCH_TALLY[row].iter().enumerate() {
+            let n = cell.load(std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            let outcome = if slot == 0 {
+                "FUSED"
+            } else {
+                names[row].get(slot - 1).copied().unwrap_or("?")
+            };
+            v.push((*path, outcome, n));
+        }
+    }
+    v.sort_by(|a, b| b.2.cmp(&a.2));
+    v
+}
+
 /// `[c, c]` mask with 1 where `j ≤ i` (or `j < i` when `strict`), else 0.
+///
+/// **Built once per `(device, c, strict)` and kept.** The mask is a pure
+/// function of its arguments — it depends on nothing the wave carries — so
+/// rebuilding it is not a temporary, it is recomputing a constant.
+///
+/// The call site already avoided rebuilding it per *chunk*; what it could not
+/// see is that it is rebuilt per layer, per wave. Measured by the
+/// forbidden-allocation detector on the 3.6-35B gate: **120 calls, 41.3 MB per
+/// config, the single largest source of device allocations made outside the
+/// reservation.** Those allocations come from the free space the span
+/// deliberately does not cover, which is the memory a load-time repack was
+/// found competing for.
+///
+/// Keyed by device ordinal as well as shape: two devices need two masks, and a
+/// mask handed to the wrong one is an illegal address rather than a wrong
+/// answer. Bounded by construction — a model has one chunk width and two
+/// strictness values, so the map holds a handful of entries a few KiB each for
+/// the life of the process.
 fn lower_tri_mask(c: usize, strict: bool, dev: &Device) -> Result<Tensor> {
-    // Built on the device from two index vectors rather than as a host `Vec`.
-    // At the production chunk width this is a `[64, 64]` mask, but it is built
-    // twice for every chunk of every DeltaNet layer — 396 host allocations and
-    // uploads per forward on the 0.8B at 649 tokens — and the host round trip
-    // costs more than the comparison it is avoiding.
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static MASKS: OnceLock<Mutex<HashMap<(candle::DeviceLocation, usize, bool), Tensor>>> =
+        OnceLock::new();
+
+    // Keyed by the device's own location, not by a CUDA ordinal with one
+    // sentinel for "everything else" — that collapsed CPU and Metal onto a
+    // single entry, so a CPU mask could be handed to a Metal caller.
+    let key = (dev.location(), c, strict);
+    let cache = MASKS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(m) = map.get(&key) {
+            return Ok(m.clone());
+        }
+    }
+    // Built on the device from two index vectors rather than as a host `Vec`:
+    // the host round trip costs more than the comparison it is avoiding.
     let rows = Tensor::arange(0u32, c as u32, dev)?.reshape((c, 1))?;
     let cols = Tensor::arange(0u32, c as u32, dev)?.reshape((1, c))?;
     let keep = if strict {
@@ -443,7 +646,11 @@ fn lower_tri_mask(c: usize, strict: bool, dev: &Device) -> Result<Tensor> {
     } else {
         cols.broadcast_le(&rows)?
     };
-    keep.to_dtype(DType::F32)
+    let mask = keep.to_dtype(DType::F32)?;
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, mask.clone());
+    }
+    Ok(mask)
 }
 
 /// Invert `I + A` for a strictly-lower-triangular `A [H, c, c]` by forward
@@ -872,12 +1079,16 @@ pub fn seq_spans(seqs: &[usize], q_lens: &[usize]) -> Result<Vec<SeqSpan>> {
 /// pipeline — and each layer receives its slice. State pointers are stable
 /// across the forward because a sequence's state buffers are allocated once
 /// and keep their identity (the store's standing rule).
-pub struct DeltaNetLayerTable {
+/// `'w` because a slice of [`super::cuda::DeltaNetWaveTable`] borrows it, and
+/// that table lives on the forward-phase span — so this must not outlive the
+/// generation whose reset reclaims it. A per-layer table built standalone is
+/// `'static`, which this still admits.
+pub struct DeltaNetLayerTable<'w> {
     /// `[4, n_decode]` I64 device tensor (or a view of the wave table): conv
     /// tail in, conv tail out, state in, state out.
-    pub ptrs: Tensor,
+    pub ptrs: LiveTensor<'w>,
     /// `[n_decode]` U32 wave rows.
-    pub rows: Tensor,
+    pub rows: LiveTensor<'w>,
 }
 
 /// The same table for the wave's **multi-row** spans — prefilling sequences and
@@ -892,13 +1103,22 @@ pub struct DeltaNetLayerTable {
 /// The saving is launches, not arithmetic: each span still walks its own rows
 /// in order, because `S` is a running sum within a sequence. What changes is
 /// that four sequences no longer serialise behind each other to do it.
-pub struct DeltaNetSpanTable {
+/// The table is **wave-scoped**, and the lifetime says so.
+///
+/// Its two uploads are rebuilt every wave (the pointers and the packing extents
+/// are what change), so they belong on the wave's transient tier rather than in
+/// driver memory the reservation does not cover. Placing them there means they
+/// die when the generation's cursor rewinds — which is precisely what `'w`
+/// encodes, and why the fields cannot be plain `Tensor`: `Tensor` is
+/// `LiveTensor<'static>`, and a `'static` handle onto recycled arena memory is
+/// the use-after-reset the lifetimes exist to prevent.
+pub struct DeltaNetSpanTable<'w> {
     /// `[4, n]` I64: conv tail in, conv tail out, state in, state out — the
     /// same row order as [`DeltaNetLayerTable::ptrs`], so one builder serves
     /// both.
-    pub ptrs: Tensor,
+    pub ptrs: LiveTensor<'w>,
     /// `[2, n]` U32: first row in the packed wave buffer, then row count.
-    pub spans: Tensor,
+    pub spans: LiveTensor<'w>,
     pub n: usize,
     /// Rows in the longest span — the launch's grid extent over tokens.
     pub max_len: usize,
@@ -1128,17 +1348,25 @@ pub fn delta_net_mix_spans<'w>(
     // parity-locked to it) and serves CPU, reference dtypes, and any other
     // head geometry.
     #[cfg(feature = "cuda")]
-    if qkv.device().is_cuda()
-        && d == super::cuda::DELTA_NET_PREFILL_DIM
-        && qkv.dtype() == DType::F32
-        && p.alpha_lin.dtype() == DType::F32
-        && p.beta_lin.dtype() == DType::F32
-        && p.z.dtype() == DType::F32
-        && c.dt_bias.dtype() == DType::F32
-        && c.a.dtype() == DType::F32
-        && c.norm.dtype() == DType::F32
-        && seqs.iter().all(|s| s.state.s.device().is_cuda())
-    {
+    let fused_ok = dispatch_verdict(
+        0,
+        &[
+            ("device", &|| qkv.device().is_cuda()),
+            ("head_dim", &|| d == super::cuda::DELTA_NET_PREFILL_DIM),
+            ("qkv:f32", &|| qkv.dtype() == DType::F32),
+            ("alpha:f32", &|| p.alpha_lin.dtype() == DType::F32),
+            ("beta:f32", &|| p.beta_lin.dtype() == DType::F32),
+            ("z:f32", &|| p.z.dtype() == DType::F32),
+            ("dt_bias:f32", &|| c.dt_bias.dtype() == DType::F32),
+            ("a:f32", &|| c.a.dtype() == DType::F32),
+            ("norm:f32", &|| c.norm.dtype() == DType::F32),
+            ("state:cuda", &|| {
+                seqs.iter().all(|s| s.state.s.device().is_cuda())
+            }),
+        ],
+    );
+    #[cfg(feature = "cuda")]
+    if fused_ok {
         // The decode spans run as ONE conv launch and ONE step launch however
         // many sessions the wave carries, through the pointer table. The hot
         // path receives the table from the wave driver (built once per
@@ -1155,7 +1383,7 @@ pub fn delta_net_mix_spans<'w>(
         // the decode table their extents are a property of THIS wave's packing
         // rather than of the sequences, so there is nothing for the driver to
         // hoist out of the layer sweep.
-        let spans = super::cuda::build_span_table(seqs)?;
+        let spans = super::cuda::build_span_table(seqs, qkv)?;
 
         let conved = conv_fused_spans(
             qkv,
@@ -1363,16 +1591,24 @@ pub fn delta_net_advance_spans(
     #[cfg(feature = "cuda")]
     let d = dims.head_dim;
     #[cfg(feature = "cuda")]
-    if p.qkv.device().is_cuda()
-        && d == super::cuda::DELTA_NET_PREFILL_DIM
-        && p.qkv.dtype() == DType::F32
-        && p.alpha_lin.dtype() == DType::F32
-        && p.beta_lin.dtype() == DType::F32
-        && c.dt_bias.dtype() == DType::F32
-        && c.a.dtype() == DType::F32
-        && seqs.iter().all(|s| s.state.s.device().is_cuda())
-    {
-        let spans = super::cuda::build_span_table_all(seqs)?;
+    let replay_ok = dispatch_verdict(
+        1,
+        &[
+            ("device", &|| p.qkv.device().is_cuda()),
+            ("head_dim", &|| d == super::cuda::DELTA_NET_PREFILL_DIM),
+            ("qkv:f32", &|| p.qkv.dtype() == DType::F32),
+            ("alpha:f32", &|| p.alpha_lin.dtype() == DType::F32),
+            ("beta:f32", &|| p.beta_lin.dtype() == DType::F32),
+            ("dt_bias:f32", &|| c.dt_bias.dtype() == DType::F32),
+            ("a:f32", &|| c.a.dtype() == DType::F32),
+            ("state:cuda", &|| {
+                seqs.iter().all(|s| s.state.s.device().is_cuda())
+            }),
+        ],
+    );
+    #[cfg(feature = "cuda")]
+    if replay_ok {
+        let spans = super::cuda::build_span_table_all(seqs, &p.qkv)?;
         // Fully kernel-written within the spans and read only within them, so
         // uninitialised (invariant 6); the gap rows are never touched.
         let conved = Tensor::empty((t, dims.conv_dim()), DType::F32, p.qkv.device())?;

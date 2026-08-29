@@ -54,6 +54,7 @@ pub mod draft_ladder;
 // it shares that engine's gating.
 #[cfg(feature = "cuda")]
 pub mod deepseek4;
+pub mod dense_span;
 pub mod depth_anything_v2;
 pub mod dialect;
 pub mod dinov2;

@@ -26,7 +26,15 @@ use std::time::Instant;
 #[test]
 fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
     let dev = CudaDevice::new(0)?;
-    let ncols = 3072usize; // K (hidden)
+    // **N is the dimension under test; K is only the dot-product length.** The
+    // bug this pins is row indexing at large N, so `nrows` stays at the size that
+    // failed. `ncols` was 3072, which made the fixture 50M elements — and
+    // `QTensor::quantize` on CUDA runs on the *host* (it downloads, quantizes,
+    // uploads), so that was two 100 MB round trips through a debug-build
+    // quantizer for a test that never looks at K. At 512 the separation between
+    // the halves is ~92 against a 0.5 threshold, so nothing is being run close to
+    // the edge.
+    let ncols = 512usize; // K (hidden)
     let half_n = 8192usize; // ffn
     let nrows = 2 * half_n; // N = 2*ffn (the failing size)
     let device = crate::Device::Cuda(dev.clone());
@@ -34,14 +42,24 @@ fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
     // Build the gate (rows 0..ffn) and up (rows ffn..2ffn) weights SEPARATELY,
     // quantize each, then fuse via concat_rows_cuda — exactly how the MLP builds
     // its fused ffn_gate+ffn_up weight. Distinct patterns so the halves differ.
-    let gate_w: Vec<f32> = (0..ncols * half_n)
-        .map(|v| (((v / ncols) as f32 * 7.0 + (v % ncols) as f32 * 11.0) * 0.001).sin())
-        .collect();
-    let up_w: Vec<f32> = (0..ncols * half_n)
-        .map(|v| (((v / ncols) as f32 * 13.0 + (v % ncols) as f32 * 5.0) * 0.001).cos())
-        .collect();
-    let gate_t = crate::Tensor::from_vec(gate_w, (half_n, ncols), &device)?;
-    let up_t = crate::Tensor::from_vec(up_w, (half_n, ncols), &device)?;
+    //
+    // Generated on the device from a row and a column ramp, rather than by a host
+    // loop. The fixture is 2 × 8192 × 3072 = 50M elements, and a `sin` each on
+    // the host in a debug build is most of a ten-second test — for data whose
+    // only requirement is that the two halves differ and quantize sensibly. The
+    // broadcast below is the same function of (row, col) the loop computed.
+    let rows = crate::Tensor::arange(0f32, half_n as f32, &device)?.reshape((half_n, 1))?;
+    let cols = crate::Tensor::arange(0f32, ncols as f32, &device)?.reshape((1, ncols))?;
+    let gate_t = rows
+        .affine(7.0, 0.0)?
+        .broadcast_add(&cols.affine(11.0, 0.0)?)?
+        .affine(0.001, 0.0)?
+        .sin()?;
+    let up_t = rows
+        .affine(13.0, 0.0)?
+        .broadcast_add(&cols.affine(5.0, 0.0)?)?
+        .affine(0.001, 0.0)?
+        .cos()?;
     let wg = crate::quantized::QTensor::quantize(&gate_t, GgmlDType::Q4_K)?;
     let wu = crate::quantized::QTensor::quantize(&up_t, GgmlDType::Q4_K)?;
     let fused = crate::quantized::QTensor::concat_rows_cuda(&[&wg, &wu])?;
@@ -7057,31 +7075,53 @@ fn grouped_int8_vs_legacy_bench() -> Result<()> {
 }
 
 /// Test grouped_matmul_gemx with down-projection dimensions (nrows > ncols).
-/// Validates at model scale: 109 experts with varying batch sizes.
+///
+/// **What is at model scale here is the expert *count* and the ragged batches**,
+/// not the per-expert matrix. 109 experts with batches varying 1–23 is what
+/// exercises the grouped kernel's offset table and its pointer indirection; the
+/// weights themselves only have to be a legal Q4_K shape with `nrows > ncols`.
+/// They were `[2048, 768]`, making the fixture 171M host-generated randoms pushed
+/// through a quantizer that — on CUDA — runs on the *host*, downloading and
+/// re-uploading every expert: ten seconds to assert the output holds no NaN.
+///
+/// What is left after shrinking them is ~20ms of fixed per-quantize overhead,
+/// once per expert, and shrinking further does not touch it — `[512, 256]` and
+/// `[384, 256]` measure the same. So the floor here *is* the expert count, which
+/// is the one thing this test may not trade away.
 #[test]
 fn grouped_matmul_matches_direct_down() -> Result<()> {
     use crate::Shape;
     use half::bf16;
 
     let dev = CudaDevice::new(0)?;
-    // Down projection: [2048, 768] â€” nrows > ncols
-    // Test at model scale: 109 experts, ~992 total batch
-    let nrows = 2048;
-    let ncols = 768;
+    // Down projection: `nrows > ncols`, which is the shape relation under test.
+    // Only `ncols` is constrained by the format — it is the row length, so it
+    // carries Q4_K's 256-element block — and 256 is its smallest legal value.
+    let nrows = 384;
+    let ncols = 256;
     let num_experts = 109;
     // Vary batch sizes 1-23 to match real workload
     let expert_batches: Vec<usize> = (0..num_experts).map(|i| 1 + (i * 7 + 3) % 23).collect();
     println!("Testing: {} experts", num_experts);
 
-    let mut rng = rand::rng();
     let mut expert_storages = Vec::new();
     let mut weight_ptrs = Vec::new();
     let shape = Shape::from((nrows, ncols));
 
-    for _ in 0..num_experts {
-        let weights: Vec<f32> = (0..nrows * ncols)
-            .map(|_| rng.random_range(-1.0..1.0))
-            .collect();
+    // Deterministic, and distinct per expert. This was `rng.random_range` per
+    // element, which is both a large share of the fixture's cost in a debug build
+    // and the reason a failure here could not be reproduced — a regression test
+    // whose input changes every run tells you that it broke without telling you
+    // what on.
+    let element = |expert: usize, i: usize| -> f32 {
+        let h = (expert as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((i as u32).wrapping_mul(40_503));
+        (h >> 20) as f32 / 2048.0 - 1.0
+    };
+
+    for expert in 0..num_experts {
+        let weights: Vec<f32> = (0..nrows * ncols).map(|i| element(expert, i)).collect();
         let mut xs = QCudaStorage::zeros(&dev, ncols * nrows, GgmlDType::Q4_K)?;
         xs.quantize(&CudaStorage::wrap_cuda_slice(
             dev.memcpy_stod(&weights)?,
@@ -7093,10 +7133,9 @@ fn grouped_matmul_matches_direct_down() -> Result<()> {
     }
 
     let total_batch: usize = expert_batches.iter().sum();
-    let act_data: Vec<f32> = (0..total_batch * ncols)
-        .map(|_| rng.random_range(-1.0..1.0))
+    let act_bf16: Vec<bf16> = (0..total_batch * ncols)
+        .map(|i| bf16::from_f32(element(num_experts + 1, i)))
         .collect();
-    let act_bf16: Vec<bf16> = act_data.iter().map(|&v| bf16::from_f32(v)).collect();
     let act_gpu = dev.memcpy_stod(&act_bf16)?;
     let act_storage = CudaStorage::wrap_cuda_slice(act_gpu.clone(), dev.clone());
     let act_layout = crate::Layout::contiguous(Shape::from(vec![total_batch, ncols]));
@@ -8211,22 +8250,37 @@ fn qkv_segmented_matches_separate() -> Result<()> {
         (512, GgmlDType::Q6_KO, (63, 256, 0)),
     ];
     let n_total: usize = dims.iter().map(|d| d.0).sum();
-    let mut rng = rand::rng();
+
+    // Deterministic rather than `rng.random_range` per element: this fixture is
+    // ~10M weights plus the activations, and a regression test whose input
+    // changes every run reports that it broke without reporting what on.
+    let fill = |salt: usize, i: usize, scale: f32| -> f32 {
+        let h = (salt as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((i as u32).wrapping_mul(40_503));
+        ((h >> 20) as f32 / 2048.0 - 1.0) * scale
+    };
+
+    // **The weights do not depend on M.** They were built inside the loop below,
+    // so all three M values paid for the same 10M-element generation and the same
+    // `requant_ko_per128` over it — three times the fixture for one test.
+    let mut slices = Vec::new();
+    let mut segs: Vec<(u64, GgmlDType, usize)> = Vec::new();
+    for (s, &(n, dtype, (maxq, crumb, hi))) in dims.iter().enumerate() {
+        let wf32: Vec<f32> = (0..n * k).map(|i| fill(s + 1, i, 0.1)).collect();
+        let ob = requant_ko_per128(&wf32, n, k, maxq, crumb, hi);
+        let ko = dev.memcpy_stod(&ob)?;
+        slices.push(ko);
+        let (ptr, _g) = slices.last().unwrap().device_ptr(&stream);
+        segs.push((ptr, dtype, n));
+    }
 
     for &m in &[4usize, 64, 256] {
-        let act: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+        let act: Vec<f32> = (0..m * k).map(|i| fill(0, i, 1.0)).collect();
         let op = quantize_acts_q8a128_test(&dev, &act, m, k)?;
 
-        let mut slices = Vec::new();
-        let mut segs: Vec<(u64, GgmlDType, usize)> = Vec::new();
         let mut sep_refs: Vec<Vec<f32>> = Vec::new();
-        for &(n, dtype, (maxq, crumb, hi)) in &dims {
-            let wf32: Vec<f32> = (0..n * k).map(|_| rng.random_range(-0.1f32..0.1)).collect();
-            let ob = requant_ko_per128(&wf32, n, k, maxq, crumb, hi);
-            let ko = dev.memcpy_stod(&ob)?;
-            slices.push(ko);
-            let (ptr, _g) = slices.last().unwrap().device_ptr(&stream);
-            segs.push((ptr, dtype, n));
+        for &(ptr, dtype, n) in &segs {
             let r = dense_qmatmul(
                 DynamicTensor::Int8(&op),
                 ptr,

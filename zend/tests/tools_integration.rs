@@ -62,6 +62,14 @@ mod tool_scenarios {
             .try_init();
     }
 
+    // A shared, process-wide daemon was tried here and reverted: one engine for
+    // all ten scenarios saves nine boots but accumulates every scenario into one
+    // substrate and KV pool, so each successive query scans a larger corpus under
+    // more relief pressure. Measured 758 s across ten fresh sessions against
+    // 952 s shared (and 958 s shared on a temp workspace, which additionally
+    // discards the calibration exemplars selection depends on). The per-query
+    // growth outruns the boot cost it removes.
+
     /// Boot a ZendSession, wait for ready, send `prompt`, return the
     /// concatenated assistant text.  Used by every scenario test.
     async fn run_query(prompt: &str, conv_id: &str) -> String {

@@ -13,7 +13,7 @@ use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
 #[cfg(test)]
 use crate::kv_cache::arena_table::N_PALETTE;
-use candle::cuda_backend::cudarc::driver::CudaStream;
+use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream};
 use candle::cuda_backend::WrapErr;
 use candle::quantized::pinned_staging::PinnedBuf;
 use std::sync::Arc;
@@ -47,6 +47,42 @@ pub(crate) struct GpuChunks {
     /// host buffer is grow-only and the device slot is a class width, so
     /// neither length divides down to the entry count any more.
     n_chunks: usize,
+    /// The event the most recent `memcpy_htod_async` out of [`Self::buf`] was
+    /// recorded on — the handle for retiring a copy that may still be in flight.
+    ///
+    /// Created on the first upload and re-recorded thereafter, so its presence
+    /// means "this object has uploaded at least once", not "a copy is pending";
+    /// a completed recording synchronises for free, which is what makes keeping
+    /// it cheaper than recreating it.
+    ///
+    /// The copy reads the pinned host buffer **after** the call that issued it
+    /// returns, so `buf` is live storage for the GPU until the stream drains —
+    /// and the slot it targets is live storage too. Two things must therefore
+    /// not happen while this is set: rewriting `buf` (the next `rebuild_decode`
+    /// fills it from index 0), and returning the destination slot to the
+    /// `slot_state_arena` free list where another sequence claims it.
+    ///
+    /// Either one silently corrupts the transfer. The second is the worse of the
+    /// two, because the damage lands in a **different** sequence's slot: the
+    /// pending copy writes this sequence's record layout over whatever claimed
+    /// the slot, and that sequence's attention kernel then dereferences the
+    /// `kvheads_ptr` fields inside those records. They are not its pointers, and
+    /// they need not be pointers at all — which is a device-side out-of-range
+    /// access on every warp at once, poisoning the context and killing the
+    /// process at whatever unrelated call synchronises next.
+    ///
+    /// This buffer's *reallocation* was already fenced, with the reason spelled
+    /// out at that site ("the old buffer cannot be dropped until the stream
+    /// drains"). Its *reuse in place* — far commoner, since the ladder keeps the
+    /// allocation and refills it — was not, and neither was the slot handover.
+    ///
+    /// **An event, not a stream sync.** The debt is one specific transfer, and
+    /// it is normally 32 tokens old by the time anything collides with it, so
+    /// waiting on it costs nothing. Draining the whole stream instead would also
+    /// retire every kernel enqueued *since* — the decode currently in flight —
+    /// which is the per-32-token pipeline stall audit A13 removed. An event
+    /// waits for exactly the copy and lets the rest of the stream run.
+    upload_done: Option<CudaEvent>,
 }
 
 /// A records-section copy living in a stager generation's arena.
@@ -82,6 +118,29 @@ impl GpuChunks {
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,
+            upload_done: None,
+        }
+    }
+
+    /// Retire any `memcpy_htod_async` still reading [`Self::buf`] or still
+    /// writing the slot.
+    ///
+    /// Call before the host buffer is rewritten or its destination slot is
+    /// handed back — see [`Self::upload_done`] for what goes wrong otherwise.
+    ///
+    /// Waits on the copy's own event, so it retires that transfer and nothing
+    /// else; the decode kernels enqueued since keep running. In the ordinary
+    /// case the copy completed 32 tokens ago and this returns immediately.
+    ///
+    /// The event is **kept**, not taken. Synchronising one whose recording has
+    /// already completed — or which was never recorded — returns immediately, so
+    /// holding it costs nothing and saves recreating it on the next upload.
+    fn fence_pending_upload(&mut self) {
+        let Some(event) = self.upload_done.as_ref() else {
+            return;
+        };
+        if let Err(e) = event.synchronize().w() {
+            log::warn!("GpuChunks: fencing a pending slot-state upload failed: {e:?}");
         }
     }
 
@@ -100,11 +159,12 @@ impl GpuChunks {
 
     /// Release the device slot back to its class, if one is held.
     ///
-    /// No fence. Every sequence's copies run on the device's *primary* stream,
-    /// so a slot handed straight back out cannot be written before the copies
-    /// that read it have run — they are enqueued ahead. This is what lets the
-    /// full `stream.synchronize()` this path used to perform on every
-    /// structural mutation disappear rather than merely move (audit A13).
+    /// **The caller must have fenced any pending upload first**
+    /// ([`Self::fence_pending_upload`]). Stream ordering covers the copies that
+    /// were *enqueued before* this slot changes hands — that much of the A13
+    /// argument holds — but it says nothing about a copy already in flight whose
+    /// DESTINATION is this slot. Handing that slot to another sequence lets the
+    /// pending transfer land in a buffer it does not own.
     fn release_slot(&mut self) {
         if let (Some(slot), Some(stream)) = (self.slot.take(), self.stream.as_ref()) {
             slot_state_arena::release(stream, slot);
@@ -362,6 +422,12 @@ impl GpuChunksGuard<'_> {
         let byte_len = n_chunks
             .checked_mul(chunk_byte_size)
             .expect("overflow in resize");
+        // `rebuild_decode` refills the pinned buffer from index 0 the moment
+        // this returns, and may swap the slot below. A transfer still reading
+        // that buffer, or still writing that slot, has to be retired first —
+        // the grow branch below fences for the narrower case of *dropping* the
+        // allocation, which is the same hazard seen only from one side.
+        self.inner.fence_pending_upload();
         self.inner.chunk_byte_size = chunk_byte_size;
         self.inner.n_chunks = n_chunks;
 
@@ -561,14 +627,20 @@ impl GpuChunksGuard<'_> {
     /// Drops the GPU-side allocation and zeroes the chunk count.  Called when
     /// a sequence's slot-state is fully invalidated (e.g. evicted or freed).
     pub(crate) fn clear(&mut self) {
+        // Dropping the dirty list cancels uploads not yet ISSUED; it does
+        // nothing about one already enqueued, which is still reading the pinned
+        // buffer and still writing this slot. Both become another owner's
+        // storage on the next two lines, so retire it first.
         self.dirty_chunks.clear();
-        // No sync and no free: the device side goes back to its class free
-        // list (see `GpuChunks::release_slot`), and the pinned host buffer is
-        // kept for the next fill rather than unpinned and re-pinned. `clear`
-        // is called by *every* structural mutation — `push_chunk` alone fires
-        // each time a sequence crosses a 32-token boundary — so what used to
-        // happen here was the bulk of audit A13's ~3,000 alloc/free/sync
-        // cycles per 32 decoded tokens at batch 64.
+        self.inner.fence_pending_upload();
+        // No free: the device side goes back to its class free list and the
+        // pinned host buffer is kept for the next fill rather than unpinned and
+        // re-pinned. `clear` is called by *every* structural mutation —
+        // `push_chunk` alone fires each time a sequence crosses a 32-token
+        // boundary — so what used to happen here was the bulk of audit A13's
+        // ~3,000 alloc/free/sync cycles per 32 decoded tokens at batch 64. The
+        // fence above is not that sync returning: it fires only when a transfer
+        // is genuinely outstanding, which the common `clear` is not.
         self.inner.release_slot();
         self.inner.chunk_byte_size = 0;
         // The cached generation records described the old chunk set; drop it so
@@ -597,6 +669,8 @@ impl Drop for GpuChunksGuard<'_> {
             chunk_byte_size,
             gen_records: _,
             n_chunks,
+            // Set below, once the copies this scope enqueues are in flight.
+            upload_done: _,
         } = &mut *self.inner;
         let chunk_byte_size = *chunk_byte_size;
         let n_chunks = *n_chunks;
@@ -658,17 +732,64 @@ impl Drop for GpuChunksGuard<'_> {
             }
         }
         upload_run(start, end);
+        // Owned handle, so the destructuring borrow of `*self.inner` ends here
+        // and the event bookkeeping below can write back into it.
+        let stream = stream.clone();
+
+        // These copies outlive this scope: they read the pinned buffer and write
+        // the slot on their own schedule. Record the point they finish at, so
+        // whoever next reuses either one retires exactly them
+        // (`GpuChunks::fence_pending_upload`) rather than draining the stream.
+        //
+        // **The event is created once and re-recorded**, never created per drop.
+        // `cuEventRecord` overwrites the previous recording, which is precisely
+        // the semantics wanted here: the debt is always the most recent upload,
+        // and an earlier one is retired by definition once a later one on the
+        // same stream completes. Creating a fresh event instead would put a
+        // `cuEventCreate`/`cuEventDestroy` pair on the path `push_chunk` takes
+        // every time a sequence crosses a 32-token boundary — at wave width 64,
+        // ~64 driver object lifecycles per 32 decoded tokens, which is the same
+        // churn audit A13 removed from this exact site.
+        if self.inner.upload_done.is_none() {
+            match stream.context().new_event(None) {
+                Ok(event) => self.inner.upload_done = Some(event),
+                Err(e) => log::warn!("GpuChunks: could not create an upload event: {e:?}"),
+            }
+        }
+        let recorded = self
+            .inner
+            .upload_done
+            .as_ref()
+            .is_some_and(|event| event.record(&stream).is_ok());
+        if !recorded {
+            // No event means no cheap fence. Fall back to the correct-but-blunt
+            // ordering rather than leaving the transfer unguarded: a stall is
+            // recoverable, a slot handed away mid-copy is not. The drain settles
+            // the debt outright, so a stale recording left on the event cannot
+            // make a later `fence_pending_upload` return early over a transfer
+            // that is still live — there is none.
+            log::warn!("GpuChunks: no slot-state upload event; draining the stream instead");
+            if let Err(e) = stream.synchronize() {
+                log::warn!("GpuChunks: fallback stream drain failed: {e:?}");
+            }
+        }
     }
 }
 
 impl Drop for GpuChunks {
     fn drop(&mut self) {
-        // The device slot goes back to its class free list, which needs no
-        // fence (see `release_slot`). The pinned host buffer still needs one:
-        // `cuMemFreeHost` unpins pages an in-flight `memcpy_htod_async` may
-        // still be reading, and unlike the device side there is no free list
-        // holding it until the stream catches up. That half moves to the
-        // pinned host reservation in step 7.
+        // **Fence BEFORE releasing, not after.** Both halves of this object are
+        // storage a pending `memcpy_htod_async` is still using — the pinned
+        // buffer it reads and the slot it writes — and both stop being ours on
+        // the next two lines: `cuMemFreeHost` unpins the pages, and the slot
+        // goes to a free list another sequence claims from immediately.
+        //
+        // The sync used to sit after `release_slot`, guarding only the host
+        // half, on the reasoning that the device half "needs no fence". Stream
+        // ordering does cover the copies enqueued *before* the handover, which
+        // is what that reasoning was about; it does not cover one already in
+        // flight toward a slot that has just changed owner.
+        self.fence_pending_upload();
         self.release_slot();
         if !self.buf.is_empty() {
             if let Some(stream) = self.stream.as_ref() {
@@ -691,6 +812,8 @@ impl Clone for GpuChunks {
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,
+            // Nothing was copied into this one; it owns no buffer and no slot.
+            upload_done: None,
         }
     }
 }

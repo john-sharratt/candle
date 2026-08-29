@@ -437,10 +437,18 @@ impl GalleryArena {
     /// **This is what bounds gallery growth.** `alloc_and_upload` adds a slab
     /// whenever the page pool is empty and the arena never evicts itself, so
     /// without a ceiling here the only limit was an outside `evict_lru` call
-    /// from the scheduler's KV-pressure relief — a signal this arena cannot
-    /// move (its slabs come from the CUDA pool and are never returned), so that
-    /// call fired on every pressure episode and shed belief-scan residency the
-    /// next scan had to rebuild from the substrate.
+    /// from the scheduler's KV-pressure relief — which shed belief-scan
+    /// residency the next scan had to rebuild from the substrate, on every
+    /// pressure episode.
+    ///
+    /// That relief call was doubly wrong while the slabs came from the CUDA
+    /// pool, because the memory it shed was never returned to the pressured
+    /// side: it left the pool's reserved footprint and came back to the gallery
+    /// on the next scan. Now that a slab is a claimed region
+    /// (`GalleryStorage::add_slab`), eviction does hand ground back to the KV
+    /// side — but the ceiling is still what does the routine bounding, and
+    /// still for the reason above: the cheap limit is the one that never
+    /// discards a working set.
     ///
     /// Enforced at admission in `ensure_locked`, where no lock is held that
     /// eviction needs.

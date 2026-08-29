@@ -221,6 +221,143 @@ mod tests {
         assert_eq!(decl.kind(), StreamKind::Turn);
     }
 
+    /// **A baked turn's boundaries survive the redo log with their spans.**
+    ///
+    /// A reload rebuilds `TurnPart::layout` from these persisted segments, so a
+    /// boundary that was real at seal has to come back real and at the same
+    /// offset. The failure this catches is a layout claiming a K/V-bearing
+    /// marker the turn's chunks do not contain: the tiling still validates
+    /// against the stored grid length, every projection after it is shifted by
+    /// the marker's width, and the text reads fine.
+    #[test]
+    fn baked_boundary_glue_survives_the_redo_log_with_its_spans() {
+        use crate::turn_layout::{GlueKind, KvSpan};
+
+        // [user_start(2)][/no_think(1)][user(3)][im_end(1)][a_start(1)][answer(2)][im_end(1)]
+        let segments = vec![
+            TurnSegment::Glue {
+                marker: GlueKind::UserStart,
+                kv: Some(KvSpan::new(0, 3)),
+            },
+            TurnSegment::User {
+                text: "hi".into(),
+                kv: KvSpan::new(3, 3),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(KvSpan::new(6, 1)),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::AssistantStart,
+                kv: Some(KvSpan::new(7, 1)),
+            },
+            TurnSegment::Assistant {
+                text: Some("ok".into()),
+                kv: KvSpan::new(8, 2),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(KvSpan::new(10, 1)),
+            },
+        ];
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 42,
+            turn_index: 7,
+            segments: segments.clone(),
+            ..TurnDecl {
+                timeline_id: 0,
+                turn_index: 0,
+                turn_id_day: 0,
+                turn_id_seq: 0,
+                role: 2,
+                block_start: 0,
+                block_end: 0,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: Vec::new(),
+            }
+        });
+
+        let decoded = StreamDecl::decode(&decl.encode()).unwrap();
+        let StreamDecl::Turn(t) = decoded else {
+            panic!("expected a Turn decl");
+        };
+        assert_eq!(t.segments, segments, "segments must round-trip verbatim");
+
+        // Rebuilt layout: both boundaries real, at the same spans, tiling the
+        // same 11-token grid.
+        let layout = t.layout();
+        assert_eq!(layout.validate_tiling(11), Ok(()));
+        assert!(
+            matches!(
+                layout.segments.first(),
+                Some(TurnSegment::Glue {
+                    marker: GlueKind::UserStart,
+                    kv: Some(s),
+                }) if *s == KvSpan::new(0, 3)
+            ),
+            "the leading boundary came back ethereal or moved: {:?}",
+            layout.segments.first(),
+        );
+        assert!(
+            matches!(
+                layout.segments.last(),
+                Some(TurnSegment::Glue {
+                    marker: GlueKind::ImEnd,
+                    kv: Some(s),
+                }) if *s == KvSpan::new(10, 1)
+            ),
+            "the trailing boundary came back ethereal or moved: {:?}",
+            layout.segments.last(),
+        );
+        // The user body still starts past the opener, so a turn-half injection
+        // does not pick the marker up.
+        assert_eq!(layout.user_content_start(), 3);
+    }
+
+    /// An ETHEREAL boundary round-trips as ethereal — `kv: None` is a real
+    /// absent value (a `Thinking` block whose K/V was dropped uses the same
+    /// axis), so serde must not confuse "no span" with "span zero".
+    #[test]
+    fn an_ethereal_boundary_round_trips_as_ethereal() {
+        use crate::turn_layout::{GlueKind, KvSpan};
+
+        let segments = vec![
+            TurnSegment::Glue {
+                marker: GlueKind::UserStart,
+                kv: None,
+            },
+            TurnSegment::User {
+                text: "q".into(),
+                kv: KvSpan::new(0, 2),
+            },
+        ];
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 1,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 0,
+            role: 1,
+            block_start: 0,
+            block_end: 0,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: segments.clone(),
+            tags: Vec::new(),
+        });
+        let decoded = StreamDecl::decode(&decl.encode()).unwrap();
+        let StreamDecl::Turn(t) = decoded else {
+            panic!("expected a Turn decl");
+        };
+        assert_eq!(t.segments, segments);
+        assert_eq!(t.layout().kv_len(), 2, "the ethereal opener adds no K/V");
+    }
+
     #[test]
     fn turn_decl_empty_vecs_roundtrip() {
         let decl = StreamDecl::Turn(TurnDecl {

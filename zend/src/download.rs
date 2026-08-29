@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::model_choice::qwen30;
+use crate::model_choice::model;
 
 // ── Model coordinates ─────────────────────────────────────────────────────────
 //
-// The model repo/filename/size all come from the VRAM-adaptive choice in
-// `model_choice::qwen30()` via the library spec — the downloader never names a
-// quant itself, so it cannot drift from what the session loads.
+// The model repo/filename/size all come from `model_choice::model()` via the
+// library spec — the downloader never names a checkpoint itself, so it cannot
+// drift from what the session loads.
 
 const TOK_FILE: &str = "tokenizer.json";
 
@@ -33,7 +33,7 @@ pub async fn ensure_model(
     let dir = cache_dir();
     tokio::fs::create_dir_all(&dir).await?;
 
-    let spec = qwen30().spec();
+    let spec = model().spec();
     let model_path = resolve_file(
         &spec.model_repo,
         &spec.model_filename,
@@ -57,19 +57,33 @@ async fn resolve_file(
     our_dir: &Path,
     status: &tokio::sync::watch::Sender<String>,
 ) -> anyhow::Result<PathBuf> {
-    // 1. Our own cache.
+    // 1. Our own cache, keyed on filename alone — so the length is checked when
+    //    the spec states one. Two repos may publish the SAME filename and differ
+    //    only in content: the hybrid's plain and `-MTP-` conversions are the same
+    //    quant, one carrying the speculative head. A stale copy of the wrong one
+    //    would shadow the right one here forever, and the symptom is decode
+    //    quietly running at half rate rather than anything failing.
     let our_path = our_dir.join(filename);
     if our_path.exists() {
-        let gb = tokio::fs::metadata(&our_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0) as f64
-            / 1e9;
-        tracing::info!("cache hit: {} ({:.2} GB)", filename, gb);
-        status
-            .send(format!("Found {} ({:.1} GB)", filename, gb))
-            .ok();
-        return Ok(our_path);
+        let len = tokio::fs::metadata(&our_path).await.map(|m| m.len()).ok();
+        let gb = len.unwrap_or(0) as f64 / 1e9;
+        match (len, size_hint) {
+            (Some(len), Some(want)) if len != want => {
+                tracing::warn!(
+                    "cached {} is {} B, expected {} B — ignoring it and re-resolving",
+                    filename,
+                    len,
+                    want,
+                );
+            }
+            _ => {
+                tracing::info!("cache hit: {} ({:.2} GB)", filename, gb);
+                status
+                    .send(format!("Found {} ({:.1} GB)", filename, gb))
+                    .ok();
+                return Ok(our_path);
+            }
+        }
     }
 
     // 2. HuggingFace hub cache (hf-hub or huggingface-cli may have already downloaded it).
@@ -93,25 +107,55 @@ async fn resolve_file(
 
 /// Look up a file in the standard HuggingFace hub cache.
 ///
-/// Reads `refs/main` for the commit hash, then checks
+/// Prefers `refs/main` for the commit hash, then checks
 /// `snapshots/{commit}/{filename}`.
+///
+/// Falls back to searching the snapshot directories when there is no
+/// `refs/main`. A repo fetched **by pinned revision** — which is how this
+/// codebase pins every checkpoint it gates on, so the upstream cannot drift
+/// under a test — never writes that ref, so a `refs/main`-only lookup reports
+/// a 22 GB file that is already on disk as missing and downloads it a second
+/// time under a different path.
 fn hf_hub_path(repo: &str, filename: &str) -> Option<PathBuf> {
     let dir_name = format!("models--{}", repo.replace('/', "--"));
-    let hub_root = hf_hub_root();
-    let model_dir = hub_root.join(&dir_name);
+    cached_in_model_dir(&hf_hub_root().join(&dir_name), filename)
+}
 
-    let commit = std::fs::read_to_string(model_dir.join("refs").join("main"))
-        .ok()?
-        .trim()
-        .to_owned();
+/// The lookup itself, against one `models--*` directory.
+fn cached_in_model_dir(model_dir: &Path, filename: &str) -> Option<PathBuf> {
+    let snapshots = model_dir.join("snapshots");
 
-    let path = model_dir.join("snapshots").join(&commit).join(filename);
-    // Sanity-check: must exist and be non-trivially sized (> 1 KB).
-    if path.exists() && path.metadata().map(|m| m.len()).unwrap_or(0) > 1024 {
-        Some(path)
-    } else {
-        None
+    let usable = |p: PathBuf| -> Option<PathBuf> {
+        // Must exist and be non-trivially sized (> 1 KB).
+        (p.exists() && p.metadata().map(|m| m.len()).unwrap_or(0) > 1024).then_some(p)
+    };
+
+    if let Some(commit) = std::fs::read_to_string(model_dir.join("refs").join("main"))
+        .ok()
+        .map(|c| c.trim().to_owned())
+    {
+        if let Some(p) = usable(snapshots.join(&commit).join(filename)) {
+            return Some(p);
+        }
     }
+
+    // No usable `refs/main`: take the newest snapshot holding the file, so a
+    // repo pinned by revision resolves and a later re-pin wins over an older
+    // one still on disk.
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&snapshots)
+        .ok()?
+        .flatten()
+        .filter_map(|e| usable(e.path().join(filename)))
+        .map(|p| {
+            let t = p
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (t, p)
+        })
+        .collect();
+    found.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    found.into_iter().next().map(|(_, p)| p)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -383,5 +427,67 @@ mod deepseek_tests {
             "https://huggingface.co/bartowski/DeepSeek-V4-Flash-0731-GGUF/resolve/main/\
              dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf"
         );
+    }
+}
+
+/// The hub-cache lookup, which is model-agnostic.
+#[cfg(test)]
+mod hub_cache_tests {
+    use super::cached_in_model_dir;
+
+    /// Build a `models--*` dir holding `filename` in one snapshot, optionally
+    /// with a `refs/main` pointing at `main_ref`. Files are 2 KB — over the
+    /// 1 KB "non-trivially sized" floor.
+    fn hub_dir(snapshots: &[&str], filename: &str, main_ref: Option<&str>) -> tempfile::TempDir {
+        let td = tempfile::tempdir().unwrap();
+        for s in snapshots {
+            let dir = td.path().join("snapshots").join(s);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(filename), vec![0u8; 2048]).unwrap();
+        }
+        if let Some(r) = main_ref {
+            std::fs::create_dir_all(td.path().join("refs")).unwrap();
+            std::fs::write(td.path().join("refs").join("main"), r).unwrap();
+        }
+        td
+    }
+
+    #[test]
+    fn refs_main_is_used_when_present() {
+        let td = hub_dir(&["aaa", "bbb"], "m.gguf", Some("bbb\n"));
+        let got = cached_in_model_dir(td.path(), "m.gguf").expect("resolves");
+        assert!(got.ends_with("snapshots/bbb/m.gguf") || got.ends_with(r"snapshots\bbb\m.gguf"));
+    }
+
+    /// A repo fetched by pinned revision writes no `refs/main`. Before this
+    /// fallback the file was reported missing and re-downloaded — 22 GB for the
+    /// hybrid, which is pinned exactly that way.
+    #[test]
+    fn a_revision_pinned_snapshot_resolves_without_refs_main() {
+        let td = hub_dir(&["5bc3e238"], "m.gguf", None);
+        let got = cached_in_model_dir(td.path(), "m.gguf").expect("resolves without refs/main");
+        assert!(got.exists());
+    }
+
+    #[test]
+    fn a_dangling_refs_main_falls_back_rather_than_missing_the_file() {
+        // Ref names a snapshot that was garbage-collected; the file is elsewhere.
+        let td = hub_dir(&["aaa"], "m.gguf", Some("deadbeef"));
+        assert!(cached_in_model_dir(td.path(), "m.gguf").is_some());
+    }
+
+    #[test]
+    fn an_absent_file_is_none_not_a_wrong_path() {
+        let td = hub_dir(&["aaa"], "m.gguf", None);
+        assert!(cached_in_model_dir(td.path(), "other.gguf").is_none());
+    }
+
+    #[test]
+    fn a_truncated_file_is_not_a_cache_hit() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("snapshots").join("aaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.gguf"), b"stub").unwrap(); // under the 1 KB floor
+        assert!(cached_in_model_dir(td.path(), "m.gguf").is_none());
     }
 }

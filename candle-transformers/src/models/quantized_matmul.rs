@@ -1,16 +1,56 @@
 #[cfg(feature = "cuda")]
+use candle::quantized::ko_quant::ko_tileable;
+#[cfg(feature = "cuda")]
 use candle::quantized::GgmlDType;
 use candle::quantized::{Int8Mode, QTensor};
 use candle::{DType, Module, Result, Tensor};
 
 use crate::models::profile::{pipeline_record, profile_now};
 
+/// Where a weight's KO twin should be written: the span's dense block, or the
+/// pool.
+///
+/// `None` whenever the dense block cannot serve the request, and every such case
+/// is legitimate rather than a failure — no CUDA device, no reservation, or a
+/// repack outside the load phase (a test, a second model, anything built after
+/// `freeze_dense`). The pool is the correct destination for all of them, which
+/// is exactly what the old code did unconditionally.
+///
+/// The refusal is logged at debug and not propagated: a model load reaching it
+/// would mean the weights quietly stayed in the pool, and that shows up in
+/// `dense_mib` at the freeze rather than as an error here.
+#[cfg(feature = "cuda")]
+fn dense_destination(
+    src: &QTensor,
+    mode: Int8Mode,
+) -> Option<(u64, candle::cuda_backend::wave_provenance::LeaseOrigin)> {
+    use candle::cuda_backend::wave_provenance::LeaseOrigin;
+    let candle::Device::Cuda(cuda) = src.device() else {
+        return None;
+    };
+    let ko_dtype = src.dtype().to_ko(mode).ok()?;
+    let bytes = candle::quantized::cuda::ko_repacked_bytes(src.shape(), ko_dtype).ok()?;
+    match candle_nn::kv_cache::claim_dense(&cuda.cuda_stream(), bytes) {
+        Ok(ptr) => Some((ptr, LeaseOrigin::Foreign)),
+        Err(e) => {
+            tracing::debug!(
+                bytes,
+                "dense block declined this weight ({e}); repacking to the CUDA pool"
+            );
+            None
+        }
+    }
+}
+
 /// Traced quantized matmul wrapper.
 ///
 /// Key behavior:
 /// - Adds a tracing span around matmul.
 /// - On CUDA, an int8 mode: repacks the weight to its KO twin at load and runs the q8a128 int8
-///   tensor-core matmul (the weight twin is chosen by the mode; see [`Int8Mode`]).
+///   tensor-core matmul (the weight twin is chosen by the mode; see [`Int8Mode`]). A weight whose
+///   shape does not fit the matmul tiling keeps the standard path and reports [`Int8Mode::Off`],
+///   so [`Self::int8mode`] — not the mode the caller asked for — is what a consumer must dispatch
+///   on.
 /// - [`Int8Mode::Off`] and CPU/Metal: standard GGML kernels. Off is the
 ///   diagnostic mode (`INT8MODE=off`) — correctness over speed; the FP-GEMX
 ///   fast path it used to take was deleted when production went int8-only
@@ -51,26 +91,80 @@ impl QMatMul {
         #[cfg(not(feature = "cuda"))]
         let _ = mode;
 
-        // int8 mode (CUDA): every matmul becomes a KO weight, so the q8a128 activations the fused
-        // producers emit always pair with a KO twin — a *float* weight must never receive a q8a128
-        // (that pairing has no kernel). A gemx-supported quantized source repacks to its KO twin
-        // directly; a float source (F32/F16/BF16 — e.g. the F32 router `ffn_gate_inp` or lm_head,
-        // which have no quantized GGUF form and would otherwise dequantize to a plain float weight)
-        // is first quantized to Q8_0 so it, too, gets a Q8_KO twin. Routing stays near-lossless at
-        // 8 bits, and ln2's two consumers — router and experts — are then both int8.
+        // int8 mode (CUDA): every matmul whose shape TILES becomes a KO weight, so the q8a128
+        // activations the fused producers emit pair with a KO twin — a *float* weight must never
+        // receive a q8a128 (that pairing has no kernel). A gemx-supported quantized source repacks
+        // to its KO twin directly; a float source (F32/F16/BF16 — e.g. the F32 router
+        // `ffn_gate_inp` or lm_head, which have no quantized GGUF form and would otherwise
+        // dequantize to a plain float weight) is first quantized to Q8_0 so it, too, gets a Q8_KO
+        // twin. Routing stays near-lossless at 8 bits, and ln2's two consumers — router and
+        // experts — are then both int8.
+        //
+        // **The tiling caveat is part of the invariant, not an exception to it.** A sub-tile
+        // weight stays dense and reports `Off`, so it must be consumed through `forward_live_as`
+        // (which dispatches on this weight's own mode) and never through a producer-fused
+        // `DynamicActs::Int8` — `ensure_qmatmul_pairing` would refuse that pairing at the first
+        // forward. Today's sub-tile weights are the narrow DeltaNet/mHC projections, all of which
+        // take `forward_live_as`; a new fused consumer must check `int8mode()` rather than assume.
         #[cfg(feature = "cuda")]
         if mode.is_int8() {
-            let ws = if ws.supports_gemx_repacking() {
-                ws
-            } else {
-                let f32 = ws.dequantize(&ws.device())?;
-                std::sync::Arc::new(QTensor::quantize(&f32, GgmlDType::Q8_0)?)
+            // **A shape that will not tile is a per-tensor fact, knowable up front — not a load
+            // failure.** The q8a128 matmul tiles N in blocks of 32, and a narrow projection can
+            // sit below it (Qwen3.5-0.8B's DeltaNet `w_alpha`/`w_beta` are `[16, hidden]` at 16
+            // linear-V heads). Refusing the whole model over one small weight is wrong;
+            // `latent_moe`'s `qlinear_int8` has always left that tensor on the dequant path, and
+            // this constructor is the reason every other family could not.
+            //
+            // Tested BEFORE the repack rather than caught after it: reading an `Err` as "did not
+            // tile" would also swallow a device OOM or a driver fault during `repack_ko`, silently
+            // downgrading the weight to the FP path with no way to tell the two apart. Anything
+            // that fails below is a real error and propagates.
+            let dims = ws.shape().dims();
+            let tileable = match dims {
+                [nrows, ncols] => ko_tileable(*nrows, *ncols),
+                // Only the 2-D case has a KO twin here: `repack_for_optimization` takes a single
+                // matrix. Expert banks are repacked per-expert offline (`quantized::prepare`) and
+                // arrive through `from_repacked`.
+                _ => false,
             };
-            let inner = candle::quantized::QMatMul::from_arc(ws)?.repack_for_optimization(mode)?;
+            if tileable {
+                let src = if ws.supports_gemx_repacking() {
+                    std::sync::Arc::clone(&ws)
+                } else {
+                    let f32 = ws.dequantize(&ws.device())?;
+                    std::sync::Arc::new(QTensor::quantize(&f32, GgmlDType::Q8_0)?)
+                };
+                // **Place the twin in the device reservation, not the pool.**
+                // The twin is what stays: `src` is dropped as this returns, so
+                // it is the twin's bytes that make up the model's resident
+                // footprint and the twin that has to be inside the span.
+                //
+                // A refusal is not fatal. The dense block is a load-phase
+                // allocator, so anything repacking outside that window — a test,
+                // a second model, a weight built after `freeze_dense` — has no
+                // address to be given and belongs on the pool, exactly as before.
+                // Reported at debug rather than swallowed silently, because a
+                // *model load* landing here would be the whole change quietly
+                // not happening.
+                let dst = dense_destination(&src, mode);
+                let inner = candle::quantized::QMatMul::from_arc(src)?
+                    .repack_for_optimization_into(mode, dst)?;
+                return Ok(Self {
+                    inner,
+                    span,
+                    int8mode: mode,
+                });
+            }
+            tracing::debug!(
+                shape = ?dims,
+                dtype = ?ws.dtype(),
+                "int8: weight does not fit the KO matmul tiling — dense fallback for this tensor"
+            );
+            let inner = candle::quantized::QMatMul::from_arc(ws)?;
             return Ok(Self {
                 inner,
                 span,
-                int8mode: mode,
+                int8mode: Int8Mode::Off,
             });
         }
 

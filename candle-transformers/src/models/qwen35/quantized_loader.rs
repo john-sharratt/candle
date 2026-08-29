@@ -34,8 +34,14 @@ pub struct Qwen35LoadOptions {
     /// Numeric path for every projection. `None` picks int8 on an int8-MMA
     /// GPU whose headroom allows it, sized by the checkpoint's length.
     pub int8mode: Option<Int8Mode>,
-    /// Where the authoritative expert pack file lives. `None` places it beside
-    /// the GGUF.
+    /// Where the authoritative expert pack file lives.
+    ///
+    /// `None` makes the pack **ephemeral**: it is written under the system temp
+    /// directory and unlinked the moment its writer publishes it, so nothing
+    /// reuses it and every load repacks every expert. That is the right default
+    /// for a test, and the wrong one for anything that restarts — name a
+    /// directory (the checkpoint's own is the usual answer, so the pack is
+    /// shared by every workspace on that model) to turn the repack into a read.
     pub expert_pack_dir: Option<PathBuf>,
 }
 

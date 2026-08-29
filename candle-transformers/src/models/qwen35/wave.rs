@@ -18,11 +18,10 @@
 //!   several sequences runs the mixer once per sequence over that sequence's
 //!   own row range, and only the FFN sees the whole packed buffer.
 
-use candle::{DType, Device, Result};
+use candle::{Device, Result};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
-use super::quantized_delta_net::quantized_delta_net_ffn;
 use super::quantized_weights::{QuantLayerMix, QuantModel};
 use crate::models::delta_net::{
     quantized_delta_net_layer_forward_spans, DeltaNetLayerTable, DeltaNetSeq, KvLayerMap,
@@ -175,20 +174,6 @@ impl HybridSweep<'_> {
     pub fn rotary(&self) -> &RotaryLayout {
         self.rotary
     }
-}
-
-/// Run the FFN half of a DeltaNet layer — see [`quantized_delta_net_ffn`].
-///
-/// Re-exported through this module so the wave loop reads as one sweep
-/// rather than reaching across modules mid-layer.
-pub fn delta_net_ffn_wave(
-    model: &QuantModel,
-    layer_idx: usize,
-    x: &mut TensorCat,
-    act_dtype: DType,
-    orig_dtype: DType,
-) -> Result<()> {
-    quantized_delta_net_ffn(&model.layers[layer_idx], x, act_dtype, orig_dtype)
 }
 
 /// The device every wave buffer of this model lives on.

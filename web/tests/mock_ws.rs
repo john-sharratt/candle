@@ -71,7 +71,9 @@ async fn frames(at: SocketAddr, path: &str, n: usize) -> Vec<Value> {
     out
 }
 
-#[tokio::test]
+// `start_paused` for the reason `events_name_the_npc_they_concern` gives: the
+// two frames past the backlog are real 1.4s ticks otherwise.
+#[tokio::test(start_paused = true)]
 async fn logs_replay_the_backlog_before_the_tail() {
     let d = spawn_daemon().await;
     // 13 backlog lines, so a 15th frame can only have come from the timer.
@@ -95,7 +97,13 @@ async fn logs_replay_the_backlog_before_the_tail() {
     }
 }
 
-#[tokio::test]
+/// `start_paused` because the mock's cadence is a *reading* speed, not a test
+/// clock. `/ws/events` has no backlog and ticks every 2.6s, so four frames is
+/// three real-time ticks — 7.8s of a test suite spent watching a demo pane fill
+/// up. Paused, tokio advances its clock whenever the runtime goes idle, so the
+/// ticks fire as fast as the frames are consumed and the assertions below are
+/// unchanged.
+#[tokio::test(start_paused = true)]
 async fn events_name_the_npc_they_concern() {
     let d = spawn_daemon().await;
     let got = frames(d, "/ws/events", 4).await;

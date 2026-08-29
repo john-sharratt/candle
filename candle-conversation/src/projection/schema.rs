@@ -160,6 +160,22 @@ impl SystemPromptSchema {
             _ => false,
         })
     }
+
+    /// Every [`SectionTree`] the schema declares, in item order.
+    ///
+    /// A schema may declare **more than one** — zend's bundled
+    /// `projection.yaml` declares two, and a branch entry naming a node in the
+    /// second is invisible to anything that reads only the first. That is not
+    /// hypothetical: this returned `Option<&SectionTree>` on the premise that
+    /// "a schema has at most one", and the ingest's summarizer validation
+    /// silently skipped `summarize_examples` — the exact option the validation
+    /// exists to pin — because it lives in the second tree.
+    pub fn section_trees(&self) -> impl Iterator<Item = &SectionTree> {
+        self.items.iter().filter_map(|it| match it {
+            SystemPromptItem::SectionTree(t) => Some(t),
+            _ => None,
+        })
+    }
 }
 
 /// One entry in a layer's system-prompt list.  Either a single
@@ -265,6 +281,40 @@ impl SectionTree {
             None => true,
             Some((g, v)) => selection[g] == v && self.dim_active(selection, g),
         }
+    }
+
+    /// The ordered sealed sections a branch's K/V is built from, for `selection`.
+    ///
+    /// This is the **state's** view of the prompt, and it differs from what
+    /// projection emits in exactly one place: a placeholder node
+    /// ([`TreeNode::inject_collection`]) contributes its own sealed anchor
+    /// content rather than the collection's runtime top-k. That is deliberate
+    /// and inherited, not a new decision — `SystemPrompt::is_collection_member`
+    /// already excludes collection members from the content-address prefix
+    /// chain because projection picks a subset at runtime, so every sealed K/V
+    /// below a collection is *already* conditioned on a prefix that ignores
+    /// which members are present. Computing the recurrent state over the same
+    /// placeholder-substituted prefix makes the state and the K/V approximate
+    /// the collection identically, instead of the state carrying an
+    /// approximation of its own.
+    ///
+    /// Prefix-transparent nodes (embedded collections, glue markers) contribute
+    /// nothing, exactly as they contribute nothing to the in-tree prefix the
+    /// variants below them were sealed against.
+    pub fn branch_prefix_ids(&self, selection: &[u8]) -> Vec<SectionId> {
+        let mut out = Vec::new();
+        for node in &self.nodes {
+            if node.glue.is_some() || node.collection.is_some() {
+                continue;
+            }
+            let Some(option) = node.options.get(node.chosen(selection)) else {
+                continue;
+            };
+            if let Some(v) = option.variant_for(self.pack(selection, node.ancestor_dims)) {
+                out.push(v.id);
+            }
+        }
+        out
     }
 }
 

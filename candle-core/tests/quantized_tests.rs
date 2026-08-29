@@ -14,6 +14,13 @@ use rand::prelude::*;
 
 /// Global mutex to serialize access to the FORCE_DMMV global flag in CUDA tests.
 /// Any test that reads or modifies FORCE_DMMV must hold this lock.
+///
+/// Poison is recovered rather than propagated: a holder that fails its own
+/// assertion has already reported the real defect, and every later test rebuilds
+/// its own tensors, so the flag's state is not what a poisoned lock would be
+/// warning about. Unwrapping instead turns one failure into as many as there are
+/// remaining CUDA tests — a single `qmm_batch` NaN was reported as 14 failures,
+/// 13 of them `PoisonError` with no hint of which test actually broke.
 static DMMV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const GGML_TEST_SIZE: usize = 32 * 128;
@@ -105,7 +112,7 @@ fn quantized_matmul(device: &Device) -> Result<()> {
     // for — "unexpected y size 192, ncols 64 4", reproducible only under the
     // full suite and never in isolation.
     let _dmmv_guard = if device.is_cuda() {
-        Some(crate::DMMV_LOCK.lock().unwrap())
+        Some(crate::DMMV_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
         None
     };
@@ -177,7 +184,7 @@ fn quantized_matmul(device: &Device) -> Result<()> {
 fn quantized_matmul_neg(device: &Device) -> Result<()> {
     // Same `FORCE_DMMV` exposure as `quantized_matmul` — same lock.
     let _dmmv_guard = if device.is_cuda() {
-        Some(crate::DMMV_LOCK.lock().unwrap())
+        Some(crate::DMMV_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
         None
     };
@@ -265,7 +272,7 @@ fn qmm_batch(dev: &Device) -> Result<()> {
     // Hold DMMV_LOCK for the duration of CUDA calls to prevent interference
     // from dmmv tests that temporarily set FORCE_DMMV=true in parallel threads.
     let _dmmv_guard = if dev.is_cuda() {
-        Some(crate::DMMV_LOCK.lock().unwrap())
+        Some(crate::DMMV_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
         None
     };
@@ -1758,7 +1765,7 @@ fn test_dmmv_path(
     let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
 
     // Force DMMV path – hold the global lock so no other test sees FORCE_DMMV=true.
-    let _dmmv_guard = crate::DMMV_LOCK.lock().unwrap();
+    let _dmmv_guard = crate::DMMV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     set_force_dmmv(true);
     let res_dmmv = matmul.forward(&lhs)?;
     set_force_dmmv(false);

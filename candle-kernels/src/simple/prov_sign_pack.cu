@@ -29,10 +29,20 @@
 //
 // OUTPUT
 // ------
-// out[warp * CHUNK_SIZE + token]: u32 with bit d set iff Q[token][d] >= 0, for
-//   d in 0..sub_head_dim. `sub_head_dim = head_dim / N_PALETTE` must be <= 32
-//   (one u32 per palette sub-band); the host packs palette p's bits into global
+// out[warp * CHUNK_SIZE + token]: u64 with bit d set iff Q[token][d] >= 0, for
+//   d in 0..sub_head_dim. `sub_head_dim = head_dim / N_PALETTE` must be <= 64
+//   (one u64 per palette sub-band); the host packs palette p's bits into global
 //   head-dims [p*sub_head_dim, (p+1)*sub_head_dim).
+//
+// The word is 64 bits because that is the width of a PHYSICAL band, which is
+// what lets a 256-wide head take this path at all. `N_PALETTE` describes the R16
+// arena layout — at head_dim 256 a head is stored as 4 bands of 64 dims — so the
+// band cannot be narrowed to fit a u32 without re-banding the arena. Packing 8
+// bands of 32 instead reads only the low half of each physical band and lays
+// band p at p*32 rather than p*64: half of every signature dropped and the rest
+// dim-permuted. Widening the word keeps the packing bit-identical to the CPU
+// fold. A head_dim 128 band (32 dims) leaves the upper 32 bits clear, and the
+// host's `bit_off = p * sub_head_dim` placement is already general over both.
 //
 // =============================================================================
 
@@ -45,7 +55,7 @@
 
 __global__ void prov_sign_pack_kernel(
     const int64_t* __restrict__ q_ptrs,
-    uint32_t* __restrict__ out,
+    uint64_t* __restrict__ out,
     int n_warps,
     int sub_head_dim
 ) {
@@ -54,7 +64,7 @@ __global__ void prov_sign_pack_kernel(
     const int token = threadIdx.x;  // 0 .. CHUNK_SIZE-1
     const int64_t base = q_ptrs[warp];
 
-    uint32_t bits = 0u;
+    uint64_t bits = 0ull;
     for (int d = 0; d < sub_head_dim; d++) {
         // Q lives at +64 within each 128-byte dim group; token*2 → coalesced.
         const __half q = *(const __half*)(base + (int64_t)d * 128 + 64 + (int64_t)token * 2);
@@ -62,7 +72,7 @@ __global__ void prov_sign_pack_kernel(
         // (`band[i] >= 0.0`), which correctly handles -0.0 (bit set) and NaN
         // (bit clear); the f16→f32 cast is exact for the comparison.
         if (__half2float(q) >= 0.0f) {
-            bits |= (1u << d);
+            bits |= (1ull << d);
         }
     }
     out[warp * CHUNK_SIZE + token] = bits;
@@ -75,12 +85,12 @@ extern "C" void run_prov_sign_pack(
     int            sub_head_dim,
     cudaStream_t   stream
 ) {
-    // sub_head_dim > 32 can't pack into a u32 — caller falls back to the CPU path.
-    if (n_warps <= 0 || sub_head_dim <= 0 || sub_head_dim > 32) return;
+    // sub_head_dim > 64 can't pack into a u64 — caller falls back to the CPU path.
+    if (n_warps <= 0 || sub_head_dim <= 0 || sub_head_dim > 64) return;
     const int wpb = PROV_WARPS_PER_BLOCK;
     const int grid = (n_warps + wpb - 1) / wpb;
     dim3 block(CHUNK_SIZE, wpb);
     prov_sign_pack_kernel<<<grid, block, 0, stream>>>(
-        q_ptrs, (uint32_t*)out, n_warps, sub_head_dim
+        q_ptrs, (uint64_t*)out, n_warps, sub_head_dim
     );
 }

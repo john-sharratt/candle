@@ -3759,6 +3759,9 @@ layers:
         &resolver,
     );
 
+    // Template sections seal like any other now, so they are identified by
+    // section id rather than by a `Generated` run's name.
+    let tools_open = b.id_for_system_section("tools_open").unwrap();
     let order: Vec<String> = proj
         .segments
         .iter()
@@ -3766,6 +3769,9 @@ layers:
             ProjectionSegment::Generated { identity, .. } => identity.name.clone(),
             ProjectionSegment::Sealed(SealedKind::Section(s)) if s.id == summary => {
                 "SUMMARY".to_string()
+            }
+            ProjectionSegment::Sealed(SealedKind::Section(s)) if s.id == tools_open => {
+                "tools_open".to_string()
             }
             _ => "_".to_string(),
         })
@@ -4983,6 +4989,7 @@ mod dialect_templates {
     use super::*;
     use crate::projection::builder::Builder;
     use crate::projection::error::ConstructionError;
+    use crate::projection::project::{ProjectionSegment, SealedKind};
     use crate::projection::schema::SystemPromptItem;
     use candle_transformers::models::dialect::Dialect;
 
@@ -5193,6 +5200,66 @@ layers:
         assert_eq!(template_deps, vec![Some(tools_cid), Some(tools_cid)]);
     }
 
+    /// **The feasibility gate, at the projection level: zero glue islands.**
+    ///
+    /// Every `ProjectionSegment::Generated` run is a hole the engine must
+    /// gap-fill, and a recurrence cannot compute the output of a token inserted
+    /// mid-sequence — its state has already accumulated past the hole. So a
+    /// projection that emits even one is a projection this lineage cannot run,
+    /// and the wave refuses it (`reserve_glue_island`).
+    ///
+    /// The structural envelope (`system_open` … `system_close`) around a content
+    /// section is the shape every system prompt has, and all three sections must
+    /// now arrive as sealed K/V.
+    #[test]
+    fn a_projection_reserves_no_glue_islands() {
+        let dlct = Dialect::chat_ml();
+        let mut b =
+            Builder::from_yaml_with_vars_and_dialect(TEMPLATE_YAML, &[], Some(&dlct)).unwrap();
+        b.tokenize_templates::<std::convert::Infallible, _>(|s| {
+            Ok(s.bytes().map(u32::from).collect())
+        })
+        .unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let convo = b.id_for_group("convo").unwrap();
+        let proj = b.project(
+            ProjectionTarget {
+                layer: dialogue,
+                group: convo,
+                timeline: TimelineId::for_test(1),
+            },
+            &MockResolver::new(),
+        );
+
+        let generated: Vec<&str> = proj
+            .segments
+            .iter()
+            .filter_map(|seg| match seg {
+                ProjectionSegment::Generated { identity, .. } => Some(identity.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            generated.is_empty(),
+            "projection reserved glue islands, which a recurrent model cannot \
+             fill: {generated:?}"
+        );
+
+        // All three — the two structural templates and the content section —
+        // arrive as sealed K/V.
+        let sealed = proj
+            .segments
+            .iter()
+            .filter(|seg| matches!(seg, ProjectionSegment::Sealed(SealedKind::Section(_))))
+            .count();
+        assert_eq!(
+            sealed,
+            3,
+            "system_open + frame + system_close must all seal: {:?}",
+            proj.segments.len()
+        );
+    }
+
     #[test]
     fn template_closing_after_collection_still_emits() {
         // Regression: `tools_close` is declared AFTER the `tools` collection
@@ -5267,7 +5334,32 @@ layers:
             &resolver,
         );
 
-        let glue: Vec<&str> = proj
+        // Template sections seal like any other, so they emit as
+        // `Sealed(Section)` and are identified by id. What this test is about is
+        // unchanged: a `depends_on` template emits exactly when its collection
+        // materialises, and one declared AFTER the collection still emits.
+        let tools_open = b.id_for_system_section("tools_open").unwrap();
+        let tools_close = b.id_for_system_section("tools_close").unwrap();
+        let sealed: Vec<SectionId> = proj
+            .segments
+            .iter()
+            .filter_map(|seg| match seg {
+                ProjectionSegment::Sealed(SealedKind::Section(s)) => Some(s.id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sealed.contains(&tools_open),
+            "tools_open should emit, got {sealed:?}",
+        );
+        assert!(
+            sealed.contains(&tools_close),
+            "tools_close (declared after the collection) must still emit, got {sealed:?}",
+        );
+
+        // And the whole projection is now gap-fill free: no `Generated` run
+        // means no island for the engine to fill mid-sequence.
+        let generated: Vec<&str> = proj
             .segments
             .iter()
             .filter_map(|seg| match seg {
@@ -5276,12 +5368,8 @@ layers:
             })
             .collect();
         assert!(
-            glue.contains(&"tools_open"),
-            "tools_open should emit, got {glue:?}",
-        );
-        assert!(
-            glue.contains(&"tools_close"),
-            "tools_close (declared after the collection) must still emit, got {glue:?}",
+            generated.is_empty(),
+            "a projection must reserve no glue islands: {generated:?}",
         );
     }
 
@@ -5416,12 +5504,8 @@ layers:
     fn dialogue_tree(b: &Builder) -> &crate::projection::SectionTree {
         b.schema()
             .system_prompt
-            .items
-            .iter()
-            .find_map(|it| match it {
-                crate::projection::SystemPromptItem::SectionTree(t) => Some(t),
-                _ => None,
-            })
+            .section_trees()
+            .next()
             .expect("dialogue layer has a section_tree")
     }
 
@@ -5433,6 +5517,225 @@ layers:
         o.variant_for(tree.pack(selection, n.ancestor_dims))
             .expect("variant sealed for this branch")
             .id
+    }
+
+    /// Two trees, with the interesting node declared only in the SECOND — the
+    /// shape zend's bundled schema has and the one a single-tree reader misses.
+    const TWO_TREE_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: selector
+          id: length
+          default: standard
+          options:
+            - id: terse
+              content: "Be terse."
+            - id: standard
+              content: "Be balanced."
+    - kind: section_tree
+      nodes:
+        - kind: selector
+          id: examples
+          default: absent
+          options:
+            - id: absent
+              content: ""
+            - id: folder
+              content: "Worked folder example."
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+
+    /// **Every declared section tree comes back, not just the first.**
+    ///
+    /// This accessor was `section_tree() -> Option<&SectionTree>` on the stated
+    /// premise that "a schema has at most one". zend's bundled schema declares
+    /// two, so every node in the second was invisible to all three callers —
+    /// and invisibly so, because reading the first tree succeeds. The ingest's
+    /// summarizer validation passed a schema missing `summarize_examples`, the
+    /// exact option it exists to pin, and its test asserted a valid schema was
+    /// rejected while the real one went unchecked.
+    #[test]
+    fn every_declared_section_tree_is_returned() {
+        let b = Builder::from_yaml(TWO_TREE_YAML).unwrap();
+        let trees: Vec<&crate::projection::SectionTree> =
+            b.schema().system_prompt.section_trees().collect();
+        assert_eq!(trees.len(), 2, "both declared trees must come back");
+        assert!(
+            trees[0].nodes.iter().all(|n| n.name != "examples"),
+            "the fixture must split the nodes across the two trees, or this \
+             test would pass against a single-tree schema",
+        );
+        assert!(
+            trees[1].nodes.iter().any(|n| n.name == "examples"),
+            "the second tree's nodes are reachable",
+        );
+    }
+
+    /// **T6.1 — branches share their prefix exactly as far as their dims agree.**
+    ///
+    /// A recurrent checkpoint is only valid for an *ordered prefix*: state does
+    /// not compose, so `state([A][B])` is not any function of `state([A])` and
+    /// `state([B])`. That makes the prefix identity the whole correctness
+    /// argument, and this is the assertion that pins it — two selections that
+    /// differ only in a later dim must produce the same section ids up to the
+    /// node that first sees the difference, and different ones from there.
+    ///
+    /// Catches a key derived from the raw `selection` instead of
+    /// `pack(selection, node.ancestor_dims)`: that version makes every node's id
+    /// depend on dims declared *after* it, so two branches that genuinely share a
+    /// prefix would be handed different checkpoints and the sharing in
+    /// [`SectionTree::leaf_selections`]'s ordering would silently buy nothing.
+    #[test]
+    fn branch_prefix_shares_up_to_the_first_differing_dim() {
+        let b = Builder::from_yaml(TREE_YAML).unwrap();
+        let tree = dialogue_tree(&b);
+        // dims: no_think (radix 2) then length (radix 3).
+        assert_eq!(tree.dims.len(), 2);
+
+        // Differ in the LAST dim only: everything above `length` is shared.
+        let terse = tree.branch_prefix_ids(&[0, 0]);
+        let verbose = tree.branch_prefix_ids(&[0, 2]);
+        assert_eq!(
+            terse.len(),
+            verbose.len(),
+            "same node count on both branches"
+        );
+        let first_diff = terse
+            .iter()
+            .zip(verbose.iter())
+            .position(|(a, b)| a != b)
+            .expect("the two branches must differ somewhere");
+        assert_eq!(
+            first_diff,
+            terse.len() - 1,
+            "only the `length` node itself should differ: {terse:?} vs {verbose:?}"
+        );
+
+        // Differ in the FIRST dim: the divergence starts at the top.
+        let no_think_off = tree.branch_prefix_ids(&[1, 0]);
+        assert_ne!(
+            terse.first(),
+            no_think_off.first(),
+            "flipping the first dim must change the branch from its first node"
+        );
+    }
+
+    /// **T6.2 — a branch's prefix is invariant to which collection members
+    /// projection selects.**
+    ///
+    /// The prefix carries the placeholder node's own sealed anchor (`noop
+    /// anchor`), never the collection's runtime top-k. That is what makes a
+    /// checkpoint keyable at all: members are scored and top-k selected per
+    /// turn, so a prefix that included them would be a different prefix on every
+    /// projection and no key could name it.
+    ///
+    /// It is also not a new concession. `is_collection_member` already excludes
+    /// members from the content-address prefix chain, so every sealed K/V below a
+    /// collection is *already* conditioned on a prefix that ignores which members
+    /// are present — this makes the state approximate the collection the same
+    /// way, rather than differently.
+    #[test]
+    fn branch_prefix_carries_the_placeholder_not_the_collection_members() {
+        let b = Builder::from_yaml(GROUP_TREE_YAML).unwrap();
+        let tree = dialogue_tree(&b);
+        let ids = tree.branch_prefix_ids(&tree.default_selection);
+
+        let anchor_node = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "noop_tool")
+            .expect("fixture has the placeholder node");
+        assert!(
+            anchor_node.inject_collection.is_some(),
+            "`noop_tool` is the inject_collection placeholder"
+        );
+        let anchor = anchor_node.options[0]
+            .variant_for(tree.pack(&tree.default_selection, anchor_node.ancestor_dims))
+            .expect("the placeholder seals its own anchor per branch")
+            .id;
+        assert!(
+            ids.contains(&anchor),
+            "the placeholder's sealed anchor is what nodes below it attend to, so \
+             the state has to be computed over it too"
+        );
+
+        // No member of the embedded collection may appear.
+        let members: Vec<SectionId> = tree
+            .nodes
+            .iter()
+            .filter_map(|n| n.collection.as_ref())
+            .flat_map(|tc| tc.variants.iter().flatten().map(|v| v.id))
+            .collect();
+        assert!(!members.is_empty(), "fixture has sealed collection members");
+        for m in &members {
+            assert!(
+                !ids.contains(m),
+                "collection member {m:?} leaked into the branch prefix — the \
+                 checkpoint would be valid only for the one top-k that produced it"
+            );
+        }
+    }
+
+    /// **An out-of-scope gated dim names the same branch whatever it says.**
+    ///
+    /// `inner` lives inside `grp`'s present branch, so the absent side was
+    /// sealed at `inner`'s default and never multiplied by it. Two selections
+    /// that differ only in an out-of-scope dim are therefore the *same* branch,
+    /// and `branch_prefix_ids` has to say so — a checkpoint keyed off a
+    /// distinction the sealed variants never made would be computed twice and
+    /// read once, or worse, read under the wrong key.
+    #[test]
+    fn an_out_of_scope_gated_dim_resolves_to_one_branch() {
+        let b = Builder::from_yaml(GATED_TREE_YAML).unwrap();
+        let tree = dialogue_tree(&b);
+        assert_eq!(tree.dims.len(), 2, "grp, inner");
+        let grp = tree
+            .dims
+            .iter()
+            .position(|d| d.selector_id == "grp")
+            .expect("grp dim");
+        let inner = 1 - grp;
+
+        let mut absent_a = vec![0u8; 2];
+        absent_a[grp] = 1; // group absent
+        absent_a[inner] = 0;
+        let mut absent_b = absent_a.clone();
+        absent_b[inner] = 1; // …and a non-default inner, which is out of scope
+
+        assert_eq!(
+            tree.branch_prefix_ids(&absent_a),
+            tree.branch_prefix_ids(&absent_b),
+            "the group is absent, so `inner` never multiplied this side — both \
+             selections are the one sealed branch"
+        );
+
+        // In scope, the same dim genuinely does select a different branch.
+        let mut present_a = vec![0u8; 2];
+        present_a[grp] = 0;
+        present_a[inner] = 0;
+        let mut present_b = present_a.clone();
+        present_b[inner] = 1;
+        assert_ne!(
+            tree.branch_prefix_ids(&present_a),
+            tree.branch_prefix_ids(&present_b),
+            "with the group present, `inner` is a real dimension"
+        );
     }
 
     #[test]
@@ -6243,10 +6546,9 @@ layers:
     /// selector's default, and `pack` masks an out-of-scope runtime value back to
     /// that default — so a node after the group projects correctly for EVERY
     /// combination, including the dangerous one (group absent + non-default inner).
-    #[test]
-    fn selector_inside_optional_group_is_gated() {
-        use crate::projection::{ProjectionMode, SelectionState};
-        let yaml = r#"
+    /// A `selector` (`inner`) declared inside an `optional_group`'s present
+    /// branch, so `inner` is a GATED dim: it multiplies only the present side.
+    const GATED_TREE_YAML: &str = r#"
 system_prompt:
   items:
     - kind: section_tree
@@ -6289,9 +6591,13 @@ layers:
       - id: convo
         selection: { kind: always_visible }
 "#;
+
+    #[test]
+    fn selector_inside_optional_group_is_gated() {
+        use crate::projection::{ProjectionMode, SelectionState};
         // No panic at build (the whole point) — the absent side never multiplied
         // by `inner`, yet every branch's assignment stays width-consistent.
-        let b = Builder::from_yaml(yaml).unwrap();
+        let b = Builder::from_yaml(GATED_TREE_YAML).unwrap();
         let tree = dialogue_tree(&b);
 
         // `inner` is gated by `grp` being present (option 0).

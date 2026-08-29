@@ -27,7 +27,10 @@
 # ============================================================================
 
 server:
-  bind: "0.0.0.0:8080"
+  # Cloudflare connects to :80 and terminates TLS itself, so this is the port
+  # the tunnel expects to find open. `--bind` overrides it for a local run that
+  # must not take the real one.
+  bind: "0.0.0.0:80"
 
   # `no-store` while iterating. The failure this prevents is a cached page
   # talking to a newer API; set a real max-age once assets are hashed.

@@ -22,6 +22,21 @@ use rayon::prelude::*;
 /// MXFP4 `qs`) + 32 B of per-sub E8M0 scales (4 per row).
 pub const MXFP4_KO_CHUNK_BYTES: usize = 512 + 32;
 
+/// Whether a weight `[nrows × ncols]` fits the KO **matmul** tiling.
+///
+/// A stricter bound than the KO *storage* chunk, which packs 8 rows × 128 K: the
+/// q8a128 / MXFP4_KO matmul kernels tile N in blocks of 32, so a weight whose
+/// `nrows` is 8, 16, or 24 mod 32 packs fine and the matmul still rejects it
+/// (Qwen3.5-0.8B's DeltaNet `w_alpha`/`w_beta` are `[16, hidden]`; the mHC `fn_w`
+/// is `mix_hc = 24`).
+///
+/// Whether a weight tiles is a **shape fact, knowable before any work happens** —
+/// callers test it up front to route a sub-tile weight to the dense path, which is
+/// what keeps an error out of `repack_ko` from having to double as that signal.
+pub const fn ko_tileable(nrows: usize, ncols: usize) -> bool {
+    nrows.is_multiple_of(32) && ncols.is_multiple_of(128)
+}
+
 /// Repack an F32 weight `[nrows × ncols]` into the **MXFP4_KO** int8-matmul layout: MXFP4
 /// per-32 quantization (E2M1 nibbles + E8M0 scale, symmetric) placed in the lane-major
 /// `ql` layout the int8 KO kernel reads, with the four per-sub E8M0 scales stored in the
@@ -598,6 +613,34 @@ fn dequant_q8_ko(chunk: &[u8], nrows: usize, ncols: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The matmul tiling rule, pinned at the boundary that separates it from the
+    /// storage chunk. Three call sites share this predicate — `repack_ko`'s bail,
+    /// `prepare::ko_target`, and `QMatMul::from_weights_with_mode`'s dense
+    /// fallback — and they only stay in agreement while it has one definition.
+    #[test]
+    fn ko_tileable_is_the_matmul_bound_not_the_storage_bound() {
+        // The storage chunk packs 8 rows; the matmul tiles 32. Every row count
+        // between them packs and is still rejected — the exact gap that decides
+        // whether a narrow projection loads int8 or dense.
+        assert!(!ko_tileable(8, 128), "8 rows pack but the matmul tiles 32");
+        assert!(
+            !ko_tileable(16, 128),
+            "Qwen3.5-0.8B w_alpha/w_beta [16, hidden]"
+        );
+        assert!(!ko_tileable(24, 128), "the mHC fn_w at mix_hc = 24");
+        assert!(ko_tileable(32, 128));
+
+        // K is bounded by the per-128 affine block, independently of N.
+        assert!(!ko_tileable(32, 64));
+        assert!(!ko_tileable(32, 129));
+        assert!(ko_tileable(32, 256));
+
+        // A production shape both ways round: tileable in N, and the same
+        // numbers transposed are not necessarily tileable in K.
+        assert!(ko_tileable(4096, 4096));
+        assert!(!ko_tileable(4096, 100));
+    }
 
     fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
         let (mut num, mut den) = (0f64, 0f64);

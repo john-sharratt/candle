@@ -325,6 +325,42 @@ pub fn draft_cohort(
         .iter()
         .map(|&s| session.sequence_offset(s).unwrap_or(0))
         .collect();
+
+    // **Allocate every drafted position's write chunk BEFORE the loop.**
+    //
+    // The loop below builds its slot headers with an empty `snapshot_seqs`, so
+    // each row carries the zero-copy LIVE pointer into its `GpuChunks` buffer.
+    // That is only sound under the precondition
+    // `build_decode_metadata_at` states for it — "a plain decode row, whose
+    // write chunk is pre-ensured so it never reallocs" — and a draft walk is
+    // not a plain decode row: it advances `max_len` positions, so a step that
+    // crosses a `CHUNK_SIZE` boundary would allocate a block mid-walk and
+    // REBUILD the very buffer the previous step's header still points at.
+    //
+    // Nothing would catch it. This loop deliberately never synchronises, so the
+    // earlier step's `paged_decode` kernel is still in flight reading that
+    // buffer when the rebuild frees it, and the freed block returns to a CUDA
+    // pool being churned tens of thousands of times per wave — so the address is
+    // reissued almost immediately and the kernel reads whatever now owns it.
+    // That is a device-side out-of-range access, not an error return: it
+    // poisons the context, and every later CUDA call in the process fails with
+    // it. It is also invisible to `CUDA_LAUNCH_BLOCKING=1` and to
+    // compute-sanitizer, because both serialise each step to completion before
+    // the next one builds metadata, which is exactly what removes the overlap.
+    //
+    // Ensuring the whole `[base, base + max_len)` range up front does not add an
+    // allocation — the same blocks are allocated either way — it only moves them
+    // to a point where no kernel is reading. This mirrors what the prefill path
+    // does for the same reason.
+    //
+    // It must also run BEFORE `max_blocks` is read below: `ensure_for_offset`
+    // can grow the backing's `max_blocks`, and the rope table is sized from it.
+    if let Some(backing) = session.backing(kv_layer) {
+        for (i, &s) in seqs.iter().enumerate() {
+            backing.ensure_for_offset(s, base[i], max_len)?;
+        }
+    }
+
     // The rope table spans the arena's whole addressable context, so it is
     // read from the head's own layer rather than assumed. Refused rather than
     // defaulted: a zero-block table is not a small table, it is one the paged

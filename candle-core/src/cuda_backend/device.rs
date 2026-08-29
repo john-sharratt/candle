@@ -151,6 +151,31 @@ impl CudaDevice {
     /// span — so they pass that arena in explicitly.
     ///
     /// The copy itself is unchanged; only the destination moves.
+    /// Host upload placed on `origin`'s span, as a plain slice plus its backing.
+    ///
+    /// The same work as [`Self::memcpy_stod_from`], returning the pieces
+    /// `CudaStorage` is built from rather than an [`Uploaded`] guard — which is
+    /// what a *tensor* constructor needs, since `CudaStorageSlice` holds the
+    /// slice directly.
+    ///
+    /// This is the only way a host-built table can land on the reservation:
+    /// there is no device operand to inherit a ticket from, so the caller names
+    /// the span it belongs to. Without it every per-wave descriptor table — the
+    /// DeltaNet pointer tables, the rotary layouts, the batched row maps — is a
+    /// driver allocation inside the wave.
+    pub fn memcpy_stod_leased<
+        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
+        Src: cudarc::driver::HostSlice<T> + ?Sized,
+    >(
+        &self,
+        src: &Src,
+        origin: Backing,
+    ) -> Result<(cudarc::driver::CudaSlice<T>, Backing)> {
+        let (mut dst, backing) = unsafe { alloc_inheriting::<T>(self, src.len(), origin)? };
+        self.stream.memcpy_htod(src, &mut dst).w()?;
+        Ok((dst, backing))
+    }
+
     pub fn memcpy_stod_from<
         T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
         Src: cudarc::driver::HostSlice<T> + ?Sized,
@@ -558,6 +583,39 @@ impl CudaDevice {
         })
     }
 
+    /// Give this handle its own cuBLAS handle and curand generator.
+    ///
+    /// **Everything stateful is rebuilt; everything memoised is shared.** The
+    /// caches on a `CudaDevice` are content- and shape-keyed tables of immutable
+    /// bytes, so two handles reading one entry is the point of keeping them.
+    /// These two are neither, and inheriting either is a silent wrong answer
+    /// rather than a failure:
+    ///
+    /// - **cuBLAS.** A handle carries internal workspace and stream state, and
+    ///   NVIDIA's contract is one handle per thread — sharing one is a data race
+    ///   between concurrent GEMMs, not merely contention. It cost `candle-core`'s
+    ///   `conv1d_gpu` a wrong result and two `conv2d_*_gpu` an illegal access,
+    ///   intermittently, only under a full parallel suite.
+    /// - **curand.** A device is built expecting to draw from [`DEFAULT_SEED`];
+    ///   one advancing generator makes what a caller draws a function of who
+    ///   drew before it, so a `Tensor::randn` fixture stops being a fixture. It
+    ///   cost two `candle-transformers` tests, each passing alone and failing in
+    ///   the suite.
+    ///
+    /// Both are cheap to build and neither is what leaked — 512 handles' worth of
+    /// each is a passing test (`cuda_device_reuse.rs`), which is how they were
+    /// ruled out as the cause of the exhaustion the cache exists to stop.
+    ///
+    /// Called on **both** paths out of the cache: the hit, and the loser of a
+    /// first-touch race, which is also handed a clone of a shared device.
+    fn give_own_stateful(&mut self) -> Result<()> {
+        self.blas = Arc::new(cudarc::cublas::CudaBlas::new(self.stream.clone()).w()?);
+        self.curand = Arc::new(Mutex::new(CudaRng(
+            cudarc::curand::CudaRng::new(DEFAULT_SEED, self.stream.clone()).w()?,
+        )));
+        Ok(())
+    }
+
     /// Returns the compute capability of this device as a (major, minor) tuple.
     pub fn compute_capability(&self) -> Result<(i32, i32)> {
         use cudarc::driver::sys::CUdevice_attribute;
@@ -700,6 +758,15 @@ impl BackendDevice for CudaDevice {
     type Storage = CudaStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        // Latch how much host RAM the machine had before this process took any
+        // of it. The expert cache's warm tier is sized from that reading rather
+        // than from a live one, because by the time it asks, the loader has the
+        // checkpoint mapped and the live figure is several GiB into a trough of
+        // the engine's own digging (see `vram::launch_available_ram`). A device
+        // has to exist before any weight can be loaded onto it, so this is the
+        // earliest point every path that can reach a warm tier shares.
+        crate::vram::snapshot_launch();
+
         // **One device per ordinal, for the life of the process.**
         //
         // Not for the context's sake — `CudaContext::new` retains the driver's
@@ -747,33 +814,8 @@ impl BackendDevice for CudaDevice {
             // this, because the construction did the binding.
             dev.context.bind_to_thread().w()?;
             let mut dev = dev.clone();
-
-            // **Everything stateful is rebuilt; everything memoised is shared.**
-            // The caches above are content- and shape-keyed tables of immutable
-            // bytes, so two handles reading one entry is the point of keeping
-            // them. These two are neither, and inheriting either is a silent
-            // wrong answer rather than a failure:
-            //
-            // - **cuBLAS.** A handle carries internal workspace and stream
-            //   state, and NVIDIA's contract is one handle per thread — sharing
-            //   one is a data race between concurrent GEMMs, not merely
-            //   contention. It cost `candle-core`'s `conv1d_gpu` a wrong result
-            //   and two `conv2d_*_gpu` an illegal access, intermittently, only
-            //   under a full parallel suite.
-            // - **curand.** A device is built expecting to draw from
-            //   `DEFAULT_SEED`; one advancing generator makes what a caller
-            //   draws a function of who drew before it, so a `Tensor::randn`
-            //   fixture stops being a fixture. It cost two
-            //   `candle-transformers` tests, each passing alone and failing in
-            //   the suite.
-            //
-            // Both are cheap to build and neither is what leaked — 512 handles'
-            // worth of each is a passing test (`cuda_device_reuse.rs`), which is
-            // how they were ruled out as the cause above.
-            dev.blas = Arc::new(cudarc::cublas::CudaBlas::new(dev.stream.clone()).w()?);
-            dev.curand = Arc::new(Mutex::new(CudaRng(
-                cudarc::curand::CudaRng::new(DEFAULT_SEED, dev.stream.clone()).w()?,
-            )));
+            // Everything memoised is shared; everything stateful is rebuilt.
+            dev.give_own_stateful()?;
             return Ok(dev);
         }
 
@@ -806,7 +848,15 @@ impl BackendDevice for CudaDevice {
         // which is why the winner is read back rather than `dev` returned. The
         // loser costs one device's worth of handles, once, at first touch —
         // where the leak this exists to stop is one per call, forever.
-        Ok(slot.get_or_init(|| dev).clone())
+        //
+        // **The loser still needs its own stateful parts.** Returning the
+        // winner's clone unmodified would hand two threads one cuBLAS handle and
+        // one curand generator — the exact sharing the cache-hit path above
+        // rebuilds to avoid, and the exact conditions (a parallel test suite at
+        // first touch) under which it was originally observed.
+        let mut dev = slot.get_or_init(|| dev).clone();
+        dev.give_own_stateful()?;
+        Ok(dev)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
@@ -1127,6 +1177,40 @@ impl BackendDevice for CudaDevice {
 }
 
 impl CudaDevice {
+    /// [`BackendDevice::storage_from_cpu_storage_owned`], placed on the span
+    /// `origin` names instead of allocated from the driver.
+    ///
+    /// A host-built table has no device operand to inherit a ticket from, so the
+    /// caller states which wave it belongs to. `Backing::Owned` reproduces the
+    /// original behaviour exactly, which is what every load-time caller wants.
+    pub fn storage_from_cpu_storage_owned_on(
+        &self,
+        storage: CpuStorage,
+        origin: Backing,
+    ) -> Result<CudaStorage> {
+        macro_rules! up {
+            ($s:expr, $variant:ident) => {{
+                let (data, backing) = self.memcpy_stod_leased(&$s, origin)?;
+                (CudaStorageSlice::$variant(data), backing)
+            }};
+        }
+        let (slice, backing) = match storage {
+            CpuStorage::U8(s) => up!(s, U8),
+            CpuStorage::U32(s) => up!(s, U32),
+            CpuStorage::I64(s) => up!(s, I64),
+            CpuStorage::BF16(s) => up!(s, BF16),
+            CpuStorage::F16(s) => up!(s, F16),
+            CpuStorage::F32(s) => up!(s, F32),
+            CpuStorage::F64(s) => up!(s, F64),
+            CpuStorage::F8E4M3(s) => up!(s, F8E4M3),
+        };
+        Ok(CudaStorage {
+            slice,
+            device: self.clone(),
+            backing,
+        })
+    }
+
     /// Uninitialised storage taken from the arena `ticket` names, or from the
     /// pool when there is none.
     ///

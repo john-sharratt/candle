@@ -15,6 +15,7 @@
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::{BatchedModelCore, WaveShapes};
+use super::dense_span;
 #[cfg(feature = "cuda")]
 use super::expert_lre::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
@@ -25,7 +26,7 @@ use super::expert_lre::{
     ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
 };
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
-use super::profile::{profile_now, ProfileMark};
+use super::profile::{gpu_span, profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::quantized_mlp::QuantizedMlp;
 use super::rope_tables::CisPrecomputations;
@@ -56,7 +57,6 @@ use candle_nn::kv_cache::{
 use candle_nn::{kv_cache::KvCache, Embedding, Module};
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
-use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 
 /// Initial number of RoPE positions to precompute.
@@ -262,37 +262,24 @@ impl SparseMoeBlock {
         // route → bucketize → gather → grouped GEMMs → scatter run entirely
         // on-device against the static resident pointer tables, so the routing
         // indices never round-trip to the CPU — the per-layer readback stall
-        // this eliminates is the dominant decode cost on WDDM. Routing-trace
-        // capture needs the CPU-side expert sets, so it keeps the host path.
-        // `ZEND_MOE_HOST_DISPATCH=1` (any value but `0`/empty) forces the host
-        // path on an all-resident cache — the A/B lever for verifying the
-        // GPU-native path produces bit-identical output (the host path itself
-        // is production for the paged/threaded cache, so this is a diagnostic
-        // switch, not a shim).
-        #[cfg(feature = "cuda")]
-        fn host_dispatch_forced() -> bool {
-            static V: OnceLock<bool> = OnceLock::new();
-            *V.get_or_init(|| {
-                std::env::var("ZEND_MOE_HOST_DISPATCH")
-                    .map(|v| !v.is_empty() && v != "0")
-                    .unwrap_or(false)
-            })
-        }
+        // this eliminates is the dominant decode cost on WDDM.
+        //
+        // The host path below is the design for a PAGED cache, whose expert
+        // pointers move under eviction, and for a routing-trace capture, which
+        // needs the CPU-side expert sets. It is not a safety net for this one:
+        // an all-resident cache that ends up there has lost the device path to
+        // a defect, and `GpuDispatchTables::build` says so at WARN rather than
+        // letting decode quietly run several times slower.
         #[cfg(feature = "cuda")]
         if matches!(&acts, DynamicActs::Int8(_)) {
-            // Every condition here degrades to the host path, never to an
-            // error. The cache-owned safety chain (table coverage, router
-            // width == table width, live pipeline thread) is
-            // `live_gpu_dispatch`; the model-level conditions are k inside
-            // the bucketize kernel's per-token sort bound, routing-trace
-            // capture (needs the CPU-side expert sets), and the diagnostic
-            // env override.
+            // The cache-owned safety chain (table coverage, router width ==
+            // table width, live pipeline thread) is `live_gpu_dispatch`; the
+            // model-level conditions are k inside the bucketize kernel's
+            // per-token sort bound and routing-trace capture.
             if let Some(gd) = self
                 .cache
                 .live_gpu_dispatch(self.moe_layer_idx, num_experts)
-                .filter(|_| {
-                    k <= MOE_MAX_TOPK && !routing_capture::is_enabled() && !host_dispatch_forced()
-                })
+                .filter(|_| k <= MOE_MAX_TOPK && !routing_capture::is_enabled())
             {
                 // Moved, not borrowed: the gather is the activation's last
                 // reader, and a borrow here would be a borrow of a local that
@@ -407,7 +394,9 @@ impl SparseMoeBlock {
             .workspace
             .lock()
             .map_err(|_| candle::Error::Msg("moe bucketize workspace poisoned".into()))?;
+        let g_moe = gpu_span("moe:bucketize", &device);
         moe_bucketize(&top_k_indices, num_experts, GROUPED_GEMM_TILE_W, &mut ws)?;
+        g_moe.end();
         let a_ub = num_tokens * k;
         // Tight data-independent tile bound: full tiles ≤ ⌈a_ub/tile_w⌉ and
         // each expert adds at most one partial tile, so launching `a_ub` blocks
@@ -416,15 +405,32 @@ impl SparseMoeBlock {
         let expert_base = gd
             .expert_base(self.moe_layer_idx)
             .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
+        // THIS layer's weight dtypes. A dynamically quantized checkpoint varies
+        // the bit-width per layer by sensitivity, and the GEMM takes the dtype
+        // per call, so the right one is fetched here rather than assumed
+        // grid-wide.
+        let (gate_dtype, down_dtype) = gd
+            .gate_dtype(self.moe_layer_idx)
+            .zip(gd.down_dtype(self.moe_layer_idx))
+            .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
 
         // 3. Gather → gate/up → fused SwiGLU → down, all device-table dispatched.
+        //
+        // Timed on the DEVICE, not the host: every call below is an enqueue, so a
+        // host timer around them measures the launches and reports the expert
+        // GEMMs as free. The grouped GEMM's cost tracks the number of expert
+        // groups the wave activated rather than its token count, which is the one
+        // thing a per-token rate cannot show you.
+        let g_moe = gpu_span("moe:gather", &device);
         let stacked = fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &cuda_dev, wave_root(wave))?;
+        g_moe.end();
+        let g_moe = gpu_span("moe:gate_up", &device);
         let gate_out = grouped_qmatmul_dev_q8a128(
             &stacked,
             &gd.gate_ptrs,
             expert_base,
             num_experts,
-            gd.gate_dtype,
+            gate_dtype,
             gd.gate_nrows,
             &ws.tile_expert,
             &ws.tile_b_start,
@@ -437,7 +443,7 @@ impl SparseMoeBlock {
             &gd.up_ptrs,
             expert_base,
             num_experts,
-            gd.gate_dtype, // up shares gate's KO dtype
+            gate_dtype, // up shares gate's KO dtype
             gd.gate_nrows,
             &ws.tile_expert,
             &ws.tile_b_start,
@@ -445,13 +451,17 @@ impl SparseMoeBlock {
             launch_tiles,
             &cuda_dev,
         )?;
+        g_moe.end();
+        let g_moe = gpu_span("moe:silu", &device);
         let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev, gate_out.cuda_backing())?;
+        g_moe.end();
+        let g_moe = gpu_span("moe:down", &device);
         let down_out = grouped_qmatmul_dev_q8a128(
             &inter_acts,
             &gd.down_ptrs,
             expert_base,
             num_experts,
-            gd.down_dtype,
+            down_dtype,
             gd.down_nrows,
             &ws.tile_expert,
             &ws.tile_b_start,
@@ -459,8 +469,12 @@ impl SparseMoeBlock {
             launch_tiles,
             &cuda_dev,
         )?;
-        // The int8 matmul emits F32; the fused scatter requires the compute dtype.
-        let down_out = down_out.to_dtype(out_dtype)?;
+        g_moe.end();
+        // No cast here. The int8 matmul emits F32 and the scatter reads F32,
+        // narrowing once at its store into `ys`'s dtype — so the down
+        // projection's whole output no longer makes a full-tensor pass per
+        // layer per forward just to change type on the way to a loop that
+        // widens it straight back (hot-path invariant 1).
 
         // 4. Deterministic scatter — identical accumulation order to the host path.
         // The combine target is the layer's largest transient, and it is
@@ -470,6 +484,7 @@ impl SparseMoeBlock {
         // does, spanning this call through the residual add that consumes the
         // result.
         let ys = wave_zeros((num_tokens, hidden_dim), out_dtype, &device, wave)?;
+        let g_moe = gpu_span("moe:scatter", &device);
         fused_deterministic_scatter(
             &ys,
             &down_out,
@@ -480,6 +495,7 @@ impl SparseMoeBlock {
             num_tokens,
             &cuda_dev,
         )?;
+        g_moe.end();
         self.cache.record_profile("fwd_expert_gpu", t);
         ys.reshape((b_size, seq_len, hidden_dim))
     }
@@ -961,19 +977,26 @@ impl BatchedAttentionLayer for LayerWeights {
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
-        mlp_dtype: DType,
+        work_dtype: DType,
+        out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.ffn {
             FeedForward::MoE(m) => {
                 // FP acts get the F16→BF16 stability cast; q8a128 is range-safe (no cast).
                 let acts = match acts {
-                    DynamicActs::Float(t) => DynamicActs::Float(t.to_dtype(mlp_dtype)?),
+                    DynamicActs::Float(t) => DynamicActs::Float(t.to_dtype(work_dtype)?),
                     int8 => int8,
                 };
-                m.forward_dynamic(acts, mlp_dtype, wave)
+                // The MoE combine writes the width its experts ran in — the
+                // router logits and the device dispatch share that one dtype —
+                // so this path narrows on return. Giving the combine its own
+                // store width is the same change one level down.
+                let mut out = m.forward_dynamic(acts, work_dtype, wave)?;
+                out.to_dtype_mut(out_dtype)?;
+                Ok(out)
             }
-            FeedForward::Mlp(m) => m.forward_dynamic(&acts, mlp_dtype),
+            FeedForward::Mlp(m) => m.forward_dynamic(&acts, work_dtype, out_dtype),
         }
     }
 }
@@ -1333,6 +1356,8 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        // Before any tensor — see `dense_span`.
+        dense_span::open_for_load(device, &ct)?;
         let mut gg = Gguf::new(ct, reader, device.clone());
         let md_get = |s: &str| match gg.metadata().get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -1626,6 +1651,10 @@ impl ModelWeights {
         // Parse GGUF
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct = gguf_file::Content::read(&mut cursor)?;
+
+        // Before any tensor, so the weights are carved from the reservation
+        // rather than from the CUDA pool (`dense_span`).
+        dense_span::open_for_load(device, &ct)?;
 
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -2096,6 +2125,13 @@ impl ModelWeights {
             g.set_class(candle::vram::AllocClass::Weights, dense_bytes.get() as u64);
         }
 
+        // The load phase closes here, before the expert cache sizes its zone from
+        // the span's free ground — that is not knowable while the dense block can
+        // still grow. `base_weight_bytes` below needs no adjustment: it is summed
+        // from the tensors themselves (`dense_bytes`), which is immune to where
+        // those tensors were placed, unlike the driver deltas the dense loaders use.
+        dense_span::close_load(device)?;
+
         let expert_cache = if has_experts {
             let total_experts = num_moe_layers * n_expert;
             //
@@ -2141,12 +2177,19 @@ impl ModelWeights {
                         .checked_div(slot_bytes)
                         .map_or(0, |n| n.min(total_experts))
                 };
-                let capacity = slots_in(initial_bytes);
-                let limit = slots_in(limit_bytes);
                 // The zone's floor, and the only bound on how much expert
                 // residency the KV side can buy — so it is the pinning rule's
                 // own arithmetic, not a fraction of wherever the boundary opened.
                 let floor = minimum_resident_slots(n_expert);
+                // **Opened at the floor at least**, as the qwen35 loader does.
+                // `PINNED_LAYERS` is a constant now, so a cache below the floor
+                // cannot shed pinned layers to cope — it fills with experts the
+                // eviction scan may not touch and then fails every load. Ground
+                // taken here is given back by the elastic boundary once the KV
+                // side shows what it really uses; opening below the floor is not
+                // a slower engine but a stopped one.
+                let capacity = slots_in(initial_bytes).max(floor).min(total_experts);
+                let limit = slots_in(limit_bytes).max(capacity);
                 let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit, floor);
                 // Place the boundary. Everything left of it belongs to the KV
                 // side, and the region count is re-derived from it here rather

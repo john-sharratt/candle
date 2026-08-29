@@ -172,20 +172,18 @@ pub fn build_expert_cache(
     let measured = slots_in(initial_weight_bytes(&stream)?);
     let limit = slots_in(weight_capacity_bytes(&stream)?);
     let floor = minimum_resident_slots(n_expert);
-    // `minimum_resident_slots` is what the zone may never retract *below*, and
-    // it is priced for a cache that pins three head layers. A model with 256
-    // experts in every layer wants 769 slots on that basis, which a 16 GB card
-    // does not have once the KV side has taken its cold-boot peak — but the
-    // zone cannot be given a retraction floor above the ground it actually
-    // opened with, and raising the opening size to meet it instead moves the
-    // elastic boundary and starves the KV side (that is not hypothetical: it
-    // OOMs Qwen3-30B at load).
+    // `minimum_resident_slots` is what the zone may never retract *below*: the
+    // pinned head layers plus a full working layer, 769 slots for a model with
+    // 256 experts in every layer. A 16 GB card affords it several times over
+    // (the 3.6-35B measures ~2,369), but the zone cannot be given a retraction
+    // floor above the ground it actually opened with, and raising the opening
+    // size to meet it instead moves the elastic boundary and starves the KV
+    // side (that is not hypothetical: it OOMs Qwen3-30B at load).
     //
-    // So the floor is clamped to what was measured, and the deadlock it used
-    // to guard against is handled where it belongs — `affordable_pinned_layers`
-    // derives the pinned count from the capacity the cache really has, so the
-    // pinned set is always at least one layer's routed set short of the whole
-    // cache and the eviction scan always has candidates.
+    // So the floor is clamped to what was measured. The pinned count itself is
+    // a constant and does not bend to capacity — it cannot, because the pinned
+    // layers are the ones with no record in the pack and no slot in the warm
+    // tier. What keeps the eviction scan supplied is this floor.
     // On this family the measurement can come back at *zero* — every one of the
     // 35B's 40 layers routes, so the dense weights plus the KV side's cold-boot
     // peak can leave no ground at all — and a cache of nothing cannot serve a
@@ -199,15 +197,13 @@ pub fn build_expert_cache(
     // at load).
     let capacity = measured.max(floor).min(total_experts);
     let zone_floor = floor.min(capacity);
-    // What no amount of pinning arithmetic can rescue: a cache too small to
-    // hold the routed set of the one layer it is executing.
-    if capacity < n_expert + 1 {
-        candle::bail!(
-            "qwen35: this device affords {capacity} expert slots but a single MoE \
-             layer can route to all {n_expert} of its experts at once — there is \
-             no wave narrow enough to fit, and no eviction order that helps"
-        );
-    }
+    // No bail here, deliberately. `capacity` is `measured.max(floor)` bounded by
+    // `total_experts`, so it is below the floor only when the model has fewer
+    // experts in total than the floor prices — the all-resident case, which is
+    // legal and needs no eviction at all. A guard for that condition reads as a
+    // safety check and can never fire; the real one is in `ExpertCache::new`,
+    // on the path every MoE loader takes.
+    debug_assert!(capacity >= floor.min(total_experts));
     let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit, zone_floor);
     // Place the boundary; everything left of it belongs to the KV side. The
     // region count is re-derived from the zone rather than assumed.

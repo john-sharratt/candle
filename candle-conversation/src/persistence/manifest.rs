@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::log_file::LogSource;
-use super::record::RecordType;
+use super::record::{RecordHeader, RecordType};
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::walker::{self, WalkEntry, WalkOutcome};
 use super::{PersistenceError, Result};
@@ -143,15 +143,39 @@ impl Manifest {
     /// substrate via
     /// [`crate::substrate::Substrate::apply_walker_entry`].
     pub fn ingest(&mut self, entry: &WalkEntry) -> Result<()> {
-        let h = &entry.record.header;
+        self.ingest_located(
+            &entry.record.header,
+            entry.segment,
+            entry.offset,
+            entry.size,
+        )
+    }
+
+    /// [`Self::ingest`] without a [`WalkEntry`] — the header and its location are
+    /// the whole input.
+    ///
+    /// The walk path has a `WalkEntry` in hand already and calls `ingest`. The
+    /// WRITE path does not: it was building one solely to satisfy that signature,
+    /// and the `Record` it needed carries an owned payload, so every appended
+    /// record cloned its own payload here and dropped it unread. That is a full
+    /// copy per record — and the records include multi-MB snapshots — for a
+    /// function that only ever reads the header.
+    pub fn ingest_located(
+        &mut self,
+        header: &RecordHeader,
+        segment: SegmentId,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        let h = header;
         let loc = RecordLoc {
             // The segment the walk stamped on this entry — which physical
             // file holds the record (§5.1). A read of this singleton routes
             // there.
-            segment: entry.segment,
-            offset: entry.offset,
+            segment,
+            offset,
             payload_len: h.payload_len,
-            record_size: entry.size,
+            record_size: size,
         };
         match h.record_type {
             RecordType::ModelSpec => self.model_spec = Some(loc),
@@ -178,6 +202,7 @@ impl Manifest {
             | RecordType::Npc
             | RecordType::WideQSig
             | RecordType::Snapshot
+            | RecordType::BranchCheckpoint
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }

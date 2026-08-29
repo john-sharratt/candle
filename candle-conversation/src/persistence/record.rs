@@ -49,6 +49,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::content_hash::ContentHash;
 use super::{PersistenceError, Result};
 
 /// Record / sector alignment. Every encoded record is padded to a
@@ -152,10 +153,21 @@ pub enum RecordType {
     /// durable before the turn it points at exists, which is what lets the
     /// summariser group an exchange without ever racing its own record.
     TurnCoupling = 19,
-    /// A conversation's recurrent-state snapshot, taken at a turn seal —
-    /// the Gated DeltaNet matrices and conv tails of every recurrent layer
-    /// as they stood after the sealed turn (hybrid Qwen3.5/3.8 models;
+    /// A recurrent-state snapshot — the Gated DeltaNet matrices and conv tails
+    /// of every recurrent layer (hybrid Qwen3.5/3.6/3.8 models;
     /// `docs/qwen35_qwen38_models.md` §5).
+    ///
+    /// **Two kinds, told apart by stream id, never by inspection.** A
+    /// *conversation's* snapshot ([`SnapshotPayload`]) is taken at a turn seal
+    /// and keyed by `snapshot_stream_id(timeline)`. A *prompt branch's*
+    /// checkpoint ([`BranchCheckpointPayload`]) is computed at build time for
+    /// one selector assignment and keyed by `branch_checkpoint_stream_id(prefix)`.
+    /// Everything below — the accounting supersede key, the recovery walk's
+    /// location map, the compactor's carry-forward — reads `header.stream_id`
+    /// and never the payload, so both kinds ride the identical single-tail
+    /// machinery. A reader computes the stream id before asking, so it always
+    /// knows which shape it will get; the payloads carry distinct leading magic
+    /// so a future mistake is an error rather than a plausible state.
     ///
     /// **Single tail per conversation**: keyed in the *header* by a synthetic
     /// per-timeline stream id, so the newest snapshot supersedes every
@@ -165,20 +177,42 @@ pub enum RecordType {
     /// the last-writer-wins accounting *is* the tombstone. Binary payload
     /// [`SnapshotPayload`]; the header CRC covers it like any metadata record.
     Snapshot = 20,
+    /// A **prompt branch's** recurrent checkpoint — the state after a whole
+    /// system prompt for one selector assignment, keyed by the branch's content
+    /// prefix ([`BranchCheckpointPayload`]).
+    ///
+    /// Structurally identical to [`Self::Snapshot`] — same single-tail rule,
+    /// same accounting, same relocation — and a separate type for one reason:
+    /// **a branch checkpoint is a cache and a conversation snapshot is not.**
+    /// Losing a snapshot loses history that cannot be recomputed. Losing a
+    /// checkpoint costs one prefill, because the prompt that produced it is
+    /// still on disk. Compaction has to treat them differently, and it reads
+    /// the header rather than the payload, so the difference has to live in the
+    /// type.
+    ///
+    /// That difference is load-bearing: checkpoints are keyed by content, so
+    /// nothing supersedes one when the prompt changes and no timeline tombstone
+    /// ever names it. Without a bound they accumulate one orphan per prompt
+    /// edit, ~63 MiB each, carried forward verbatim by every compaction.
+    BranchCheckpoint = 21,
     /// One NPC's durable identity and configuration — the `npcd` product's
     /// characters, stored here so a character outlives the process that made
-    /// it. JSON payload [`NpcPayload`], keyed **in the payload** by `npc_id`,
-    /// last-writer-wins on replay: the newest record for an id is that
-    /// character, and every earlier one is dead weight the compactor reclaims.
-    /// No explicit tombstone is written for an edit; supersession is the
-    /// tombstone. Deletion is a state transition (`state: "tombstoned"`),
-    /// which is still just another superseding record.
+    /// it. JSON payload [`NpcPayload`].
     ///
-    /// Payload-keyed, so — like `Label` and `ConvState` — compaction does not
-    /// copy these forward. It re-emits them from the live in-memory registry.
-    /// A holder of NPCs that does not re-emit loses all of them on the first
-    /// compaction; see [`super::compaction`].
-    Npc = 21,
+    /// **Single tail per character**, by the same rule as [`Self::Snapshot`]:
+    /// the `npc_id` goes in the *header's* `stream_id`, so the newest record
+    /// for an id supersedes every earlier one mechanically — the accounting
+    /// credits the old copy as dead the moment the new one lands. No explicit
+    /// tombstone is written for an edit; supersession is the tombstone.
+    /// Deletion is a state transition (`state: "tombstoned"`), which is still
+    /// just another superseding record.
+    ///
+    /// Header-keyed, so compaction carries the live tail forward verbatim from
+    /// wherever it physically lives (`npc_locs` → a `Raw` item) rather than
+    /// re-encoding it. It has to: unlike `Label` or `ConvState`, an NPC's
+    /// payload is owned by the daemon's registry and is not in this process's
+    /// RAM at all. See [`super::compaction`].
+    Npc = 22,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -217,7 +251,8 @@ impl RecordType {
             18 => RecordType::HeaderIndex,
             19 => RecordType::TurnCoupling,
             20 => RecordType::Snapshot,
-            21 => RecordType::Npc,
+            21 => RecordType::BranchCheckpoint,
+            22 => RecordType::Npc,
             _ => RecordType::Unknown,
         }
     }
@@ -304,12 +339,16 @@ pub fn encode_record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
     );
 
     let total = padded_record_len(header_line.len(), effective.payload_len);
-    let mut out = vec![0u8; total];
-    out[..header_line.len()].copy_from_slice(header_line.as_bytes());
-    out[header_line.len()] = b'\n';
-    let payload_start = header_line.len() + 1;
-    out[payload_start..payload_start + payload.len()].copy_from_slice(payload);
-    // The remaining bytes stay zero — the sector padding tail.
+    // Built by appending, not by zero-filling and overwriting. `vec![0u8; total]`
+    // memsets the header and payload span too, and both are then written in full
+    // — so a record cost a memset over its whole length plus the copy. Only the
+    // sector padding tail is genuinely zero-valued, and `resize` writes just that.
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(header_line.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(payload);
+    out.resize(total, 0);
+    debug_assert_eq!(out.len(), total, "encoded record must fill its padded span");
     out
 }
 
@@ -1133,6 +1172,25 @@ pub struct SnapshotLayer {
     pub conv_tail: Vec<u8>,
 }
 
+impl From<candle_transformers::models::delta_net::ExportedLayerState> for SnapshotLayer {
+    /// The model's export rows are field-for-field this record's layer rows —
+    /// `candle-conversation` depends on `candle-transformers` and not the
+    /// reverse, so the model hands back its own type and the record shape is
+    /// built here.
+    fn from(l: candle_transformers::models::delta_net::ExportedLayerState) -> Self {
+        Self {
+            layer_index: l.layer_index,
+            n_v_heads: l.n_v_heads,
+            d_v: l.d_v,
+            d_k: l.d_k,
+            state: l.state,
+            conv_channels: l.conv_channels,
+            conv_tail_cols: l.conv_tail_cols,
+            conv_tail: l.conv_tail,
+        }
+    }
+}
+
 /// Binary payload for a [`RecordType::Snapshot`] record — a conversation's
 /// full recurrent state at the seal of `turn_index`.
 ///
@@ -1164,15 +1222,7 @@ impl SnapshotPayload {
         w.put_u64(self.schedule_hash);
         w.put_u32(self.layers.len() as u32);
         for l in &self.layers {
-            w.put_u32(l.layer_index);
-            w.put_u8(0); // dtype tag: 0 = F32 (the only state dtype)
-            w.put_u32(l.n_v_heads);
-            w.put_u32(l.d_v);
-            w.put_u32(l.d_k);
-            w.put_blob(&l.state);
-            w.put_u32(l.conv_channels);
-            w.put_u32(l.conv_tail_cols);
-            w.put_blob(&l.conv_tail);
+            encode_snapshot_layer(&mut w, l);
         }
         w.into_bytes()
     }
@@ -1192,44 +1242,7 @@ impl SnapshotPayload {
         let n_layers = r.get_u32()? as usize;
         let mut layers = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            let layer_index = r.get_u32()?;
-            let dtype = r.get_u8()?;
-            if dtype != 0 {
-                return Err(PersistenceError::Corrupt(format!(
-                    "snapshot layer {layer_index}: unknown state dtype tag {dtype}"
-                )));
-            }
-            let n_v_heads = r.get_u32()?;
-            let d_v = r.get_u32()?;
-            let d_k = r.get_u32()?;
-            let state = r.get_blob()?.to_vec();
-            let expect = n_v_heads as usize * d_v as usize * d_k as usize * 4;
-            if state.len() != expect {
-                return Err(PersistenceError::Corrupt(format!(
-                    "snapshot layer {layer_index}: state blob {} bytes, dims say {expect}",
-                    state.len()
-                )));
-            }
-            let conv_channels = r.get_u32()?;
-            let conv_tail_cols = r.get_u32()?;
-            let conv_tail = r.get_blob()?.to_vec();
-            let expect_tail = conv_channels as usize * conv_tail_cols as usize * 4;
-            if conv_tail.len() != expect_tail {
-                return Err(PersistenceError::Corrupt(format!(
-                    "snapshot layer {layer_index}: conv tail {} bytes, dims say {expect_tail}",
-                    conv_tail.len()
-                )));
-            }
-            layers.push(SnapshotLayer {
-                layer_index,
-                n_v_heads,
-                d_v,
-                d_k,
-                state,
-                conv_channels,
-                conv_tail_cols,
-                conv_tail,
-            });
+            layers.push(decode_snapshot_layer(&mut r)?);
         }
         Ok(Self {
             timeline_id,
@@ -1238,6 +1251,162 @@ impl SnapshotPayload {
             layers,
         })
     }
+}
+
+/// Binary payload for a [`RecordType::Snapshot`] record written under a
+/// **branch checkpoint** stream — the recurrent state after a whole system
+/// prompt, for one selector assignment.
+///
+/// A new conversation does not prefill its system prompt: it Arc-injects sealed
+/// section K/V, so the wave never sees those tokens and the recurrent state
+/// would enter the first user turn at zero while the attention layers hold the
+/// entire prompt. This record is what removes that asymmetry, and it is the
+/// only place a conversation needs a state it did not compute
+/// (`docs/deltanet_state_persistence.md` §4.6).
+///
+/// **Two payload shapes share `RecordType::Snapshot`, distinguished by stream
+/// id.** That is not an overload: every piece of the single-tail machinery —
+/// the accounting supersede key, the recovery walk's location map, the
+/// compactor's carry-forward — keys on `header.stream_id` and never decodes the
+/// payload. The stream id *is* the identity of what the state belongs to, and a
+/// reader computes it before asking, so it always knows which shape it will get.
+/// A conversation's snapshot is keyed by `snapshot_stream_id(timeline)`, a
+/// branch's by [`branch_checkpoint_stream_id`](super::content_hash::branch_checkpoint_stream_id).
+///
+/// `prefix_hash` is stored as well as keyed on, so a read can confirm it got
+/// the branch it asked for rather than trusting a 64-bit stream id not to
+/// collide. `schedule_hash` fingerprints the model's layer schedule + DeltaNet
+/// dims exactly as it does for a conversation snapshot: a checkpoint computed
+/// under one geometry must never be scattered into another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BranchCheckpointPayload {
+    /// The branch's cumulative content prefix — its identity.
+    pub prefix_hash: ContentHash,
+    pub schedule_hash: u64,
+    pub layers: Vec<SnapshotLayer>,
+}
+
+/// Leading magic, so the two payloads sharing [`RecordType::Snapshot`] can
+/// never be mistaken for one another on the wire.
+///
+/// Without it they are not merely similar, they are **compatible**: a
+/// conversation snapshot decodes as a branch checkpoint without error, because
+/// `(version, timeline, turn, schedule, n_layers)` and
+/// `(version, prefix_lo, prefix_hi, schedule, n_layers)` are the same widths in
+/// the same order, so every field lands somewhere plausible. A misrouted read
+/// would then produce a *state*, not an error — the failure mode this whole
+/// area exists to remove. `SnapshotPayload`'s own version field is `1`, which
+/// this magic cannot collide with, so the refusal runs in both directions.
+const BRANCH_CHECKPOINT_MAGIC: &[u8; 4] = b"BRCK";
+
+/// Wire version of [`BranchCheckpointPayload`].
+const BRANCH_CHECKPOINT_VERSION: u32 = 1;
+
+impl BranchCheckpointPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = ByteWriter::new();
+        for &b in BRANCH_CHECKPOINT_MAGIC {
+            w.put_u8(b);
+        }
+        w.put_u32(BRANCH_CHECKPOINT_VERSION);
+        w.put_u64(self.prefix_hash.lo);
+        w.put_u64(self.prefix_hash.hi);
+        w.put_u64(self.schedule_hash);
+        w.put_u32(self.layers.len() as u32);
+        for l in &self.layers {
+            encode_snapshot_layer(&mut w, l);
+        }
+        w.into_bytes()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = ByteReader::new(buf);
+        for (i, &want) in BRANCH_CHECKPOINT_MAGIC.iter().enumerate() {
+            let got = r.get_u8()?;
+            if got != want {
+                return Err(PersistenceError::Corrupt(format!(
+                    "not a branch checkpoint: magic byte {i} is {got:#04x}, expected \
+                     {want:#04x}. A conversation snapshot has the same field widths \
+                     in the same order and would otherwise decode as a plausible \
+                     branch state."
+                )));
+            }
+        }
+        let version = r.get_u32()?;
+        if version != BRANCH_CHECKPOINT_VERSION {
+            return Err(PersistenceError::Corrupt(format!(
+                "branch checkpoint payload version {version} unknown (this build \
+                 reads {BRANCH_CHECKPOINT_VERSION})"
+            )));
+        }
+        let lo = r.get_u64()?;
+        let hi = r.get_u64()?;
+        let schedule_hash = r.get_u64()?;
+        let n_layers = r.get_u32()? as usize;
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            layers.push(decode_snapshot_layer(&mut r)?);
+        }
+        Ok(Self {
+            prefix_hash: ContentHash { lo, hi },
+            schedule_hash,
+            layers,
+        })
+    }
+}
+
+/// One layer's state, in the shared on-wire form both recurrent payloads use.
+fn encode_snapshot_layer(w: &mut ByteWriter, l: &SnapshotLayer) {
+    w.put_u32(l.layer_index);
+    w.put_u8(0); // dtype tag: 0 = F32 (the only state dtype)
+    w.put_u32(l.n_v_heads);
+    w.put_u32(l.d_v);
+    w.put_u32(l.d_k);
+    w.put_blob(&l.state);
+    w.put_u32(l.conv_channels);
+    w.put_u32(l.conv_tail_cols);
+    w.put_blob(&l.conv_tail);
+}
+
+fn decode_snapshot_layer(r: &mut ByteReader<'_>) -> Result<SnapshotLayer> {
+    let layer_index = r.get_u32()?;
+    let dtype = r.get_u8()?;
+    if dtype != 0 {
+        return Err(PersistenceError::Corrupt(format!(
+            "snapshot layer {layer_index}: unknown state dtype tag {dtype}"
+        )));
+    }
+    let n_v_heads = r.get_u32()?;
+    let d_v = r.get_u32()?;
+    let d_k = r.get_u32()?;
+    let state = r.get_blob()?.to_vec();
+    let expect = n_v_heads as usize * d_v as usize * d_k as usize * 4;
+    if state.len() != expect {
+        return Err(PersistenceError::Corrupt(format!(
+            "snapshot layer {layer_index}: state blob {} bytes, dims say {expect}",
+            state.len()
+        )));
+    }
+    let conv_channels = r.get_u32()?;
+    let conv_tail_cols = r.get_u32()?;
+    let conv_tail = r.get_blob()?.to_vec();
+    let expect_tail = conv_channels as usize * conv_tail_cols as usize * 4;
+    if conv_tail.len() != expect_tail {
+        return Err(PersistenceError::Corrupt(format!(
+            "snapshot layer {layer_index}: conv tail {} bytes, dims say {expect_tail}",
+            conv_tail.len()
+        )));
+    }
+    Ok(SnapshotLayer {
+        layer_index,
+        n_v_heads,
+        d_v,
+        d_k,
+        state,
+        conv_channels,
+        conv_tail_cols,
+        conv_tail,
+    })
 }
 
 #[cfg(test)]
@@ -1303,6 +1472,113 @@ mod snapshot_payload_tests {
     fn wire_tag_is_twenty() {
         assert_eq!(RecordType::Snapshot as u8, 20);
         assert_eq!(RecordType::from_tag(20), RecordType::Snapshot);
+    }
+
+    /// The branch checkpoint's own tag. Durable, so it is pinned like every
+    /// other: a tag that moved would make old records decode as a different
+    /// kind of state.
+    #[test]
+    fn branch_checkpoint_wire_tag_is_twenty_one() {
+        assert_eq!(RecordType::BranchCheckpoint as u8, 21);
+        assert_eq!(RecordType::from_tag(21), RecordType::BranchCheckpoint);
+        assert_ne!(RecordType::BranchCheckpoint, RecordType::Snapshot);
+    }
+}
+
+#[cfg(test)]
+mod branch_checkpoint_tests {
+    use super::*;
+
+    /// One layer at the 35B's real DeltaNet geometry — 32 V heads, d_v 128,
+    /// d_k 128, conv_dim 8192 with a 3-column tail. 2 MiB of state and 96 KiB of
+    /// tail per layer, which is what makes the whole-stack figure ~63 MiB.
+    fn real_layer(idx: u32) -> SnapshotLayer {
+        SnapshotLayer {
+            layer_index: idx,
+            n_v_heads: 32,
+            d_v: 128,
+            d_k: 128,
+            state: vec![idx as u8; 32 * 128 * 128 * 4],
+            conv_channels: 8192,
+            conv_tail_cols: 3,
+            conv_tail: vec![!(idx as u8); 8192 * 3 * 4],
+        }
+    }
+
+    fn real_checkpoint() -> BranchCheckpointPayload {
+        BranchCheckpointPayload {
+            prefix_hash: ContentHash {
+                lo: 0x0123_4567_89AB_CDEF,
+                hi: 0xFEDC_BA98_7654_3210,
+            },
+            schedule_hash: 0xDEAD_BEEF_CAFE_F00D,
+            layers: (0..30).map(real_layer).collect(),
+        }
+    }
+
+    /// Byte-exact header pin. The body reuses the layer encoding
+    /// [`SnapshotPayload`] already pins byte-for-byte, so only the fields this
+    /// payload adds need their own assertion — and they need it for the same
+    /// reason: this is durable state, and a silently-shifted field decodes as a
+    /// plausible state rather than as an error.
+    #[test]
+    fn header_encodes_to_exact_bytes() {
+        let p = real_checkpoint();
+        let bytes = p.encode();
+        let mut expect: Vec<u8> = Vec::new();
+        expect.extend_from_slice(b"BRCK"); // magic
+        expect.extend_from_slice(&1u32.to_le_bytes()); // version
+        expect.extend_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes()); // prefix lo
+        expect.extend_from_slice(&0xFEDC_BA98_7654_3210u64.to_le_bytes()); // prefix hi
+        expect.extend_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes()); // schedule
+        expect.extend_from_slice(&30u32.to_le_bytes()); // n_layers
+        assert_eq!(&bytes[..expect.len()], &expect[..]);
+    }
+
+    /// Round-trip at the real geometry, byte-identical. Not a tolerance: the
+    /// state is copied, never recomputed, so any difference is a layout bug.
+    #[test]
+    fn round_trips_at_real_35b_geometry() {
+        let p = real_checkpoint();
+        let back = BranchCheckpointPayload::decode(&p.encode()).unwrap();
+        assert_eq!(p, back);
+        assert_eq!(back.layers.len(), 30, "every recurrent layer survives");
+    }
+
+    /// A truncated state blob is corrupt, not clamped — restoring a partial
+    /// state would seed a conversation with a prompt memory that is real for
+    /// some layers and zero for others, which is invisible from the outside.
+    #[test]
+    fn a_short_state_blob_is_refused() {
+        let mut bad = real_checkpoint();
+        bad.layers[0].state.pop();
+        let err = BranchCheckpointPayload::decode(&bad.encode()).unwrap_err();
+        assert!(err.to_string().contains("state blob"), "{err}");
+    }
+
+    /// The two payloads that share `RecordType::Snapshot` do **not** decode as
+    /// each other.
+    ///
+    /// They are told apart by stream id, so nothing routes a conversation
+    /// snapshot into a branch read today. This is the guard for the day
+    /// something does — and it is not hypothetical tidiness: without the magic
+    /// byte the two are wire-*compatible*. `(version, timeline, turn, schedule,
+    /// n_layers)` and `(version, prefix_lo, prefix_hi, schedule, n_layers)` are
+    /// the same widths in the same order, so a conversation snapshot decoded as
+    /// a branch checkpoint cleanly, with every field landing somewhere
+    /// plausible. The first version of this test asserted the refusal and
+    /// failed, which is how the magic came to exist.
+    #[test]
+    fn the_two_snapshot_payloads_do_not_decode_as_each_other() {
+        let conv = SnapshotPayload {
+            timeline_id: 7,
+            turn_index: 3,
+            schedule_hash: 11,
+            layers: vec![real_layer(0)],
+        };
+        let err = BranchCheckpointPayload::decode(&conv.encode()).unwrap_err();
+        assert!(err.to_string().contains("not a branch checkpoint"), "{err}");
+        assert!(SnapshotPayload::decode(&real_checkpoint().encode()).is_err());
     }
 }
 
@@ -1526,8 +1802,12 @@ mod tests {
     /// type.
     #[test]
     fn the_npc_record_tag_is_pinned() {
-        assert_eq!(RecordType::Npc.tag(), 21);
-        assert_eq!(RecordType::from_tag(21), RecordType::Npc);
+        assert_eq!(RecordType::Npc.tag(), 22);
+        assert_eq!(RecordType::from_tag(22), RecordType::Npc);
+        // 21 belongs to `BranchCheckpoint`, which claimed it first. Asserted
+        // here as well as in that type's own test because the two were authored
+        // on separate branches and both reached for the same free tag.
+        assert_eq!(RecordType::from_tag(21), RecordType::BranchCheckpoint);
         // And an unrecognised tag still degrades rather than erroring, which is
         // what lets an older build read a log containing NPC records.
         assert_eq!(RecordType::from_tag(200), RecordType::Unknown);

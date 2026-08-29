@@ -33,6 +33,21 @@ use candle_transformers::models::prefill_utils::compute_rope_cs;
 use candle_transformers::models::slot_state::{
     tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
 };
+use std::sync::{Mutex, MutexGuard};
+
+// These tests share one GPU and the process-global quantized arena table, so
+// they must not run concurrently. Each test acquires this guard first; poison
+// from a panicking sibling is recovered (the next test rebuilds its own state).
+//
+// Without it the split-KV cases fail nondeterministically — a sibling's arena
+// teardown lands under this test's flash-state accumulation and the golden
+// comparison reads a partly-freed prefix, so the diff comes back as anything
+// from ~3e-2 to `inf` while every one of these tests passes on its own.
+static GPU_SERIAL: Mutex<()> = Mutex::new(());
+
+fn gpu_serial() -> MutexGuard<'static, ()> {
+    GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const N_KV_HEAD: usize = 2;
 const N_HEAD: usize = 8; // hpg = 4
@@ -550,6 +565,7 @@ fn reference_attn_positioned(
 /// A/B gate: glue kernel == normal prefill over the same sealed prefix.
 #[test]
 fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -618,6 +634,7 @@ fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
 /// matching `fwd_ahead`.
 #[test]
 fn paged_glue_fwd_ahead_f16() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -684,6 +701,7 @@ fn paged_glue_fwd_ahead_f16() -> Result<()> {
 #[test]
 #[ignore]
 fn paged_glue_kernel_timing() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -753,6 +771,7 @@ fn paged_glue_kernel_timing() -> Result<()> {
 /// the smem-launch failure showed at 0.36).
 #[test]
 fn paged_glue_matches_golden_quant() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -1053,6 +1072,7 @@ fn run_glue_batched(
 /// testable statement of the batched-boundary requirement.
 #[test]
 fn paged_glue_batched_isolation_f16() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -1141,6 +1161,7 @@ fn paged_glue_batched_isolation_f16() -> Result<()> {
 /// per-token forward bridges across that same boundary.
 #[test]
 fn paged_glue_split_kv_matches_reference_f16() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -1209,6 +1230,7 @@ fn paged_glue_split_kv_matches_reference_f16() -> Result<()> {
 /// through partials + combine.
 #[test]
 fn paged_glue_split_kv_batched_isolation_f16() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {

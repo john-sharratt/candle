@@ -200,8 +200,9 @@ pub(crate) struct BackingInner {
 pub(crate) struct ProvSignScratch {
     /// Concatenated Q-chunk pointers (capacity ≥ the batch's `n_warps`).
     ptrs: candle::cuda_backend::cudarc::driver::CudaSlice<i64>,
-    /// Packed sign bits (capacity ≥ `n_warps × CHUNK_SIZE`).
-    out: candle::cuda_backend::cudarc::driver::CudaSlice<u32>,
+    /// Packed sign bits (capacity ≥ `n_warps × CHUNK_SIZE`), one u64 per
+    /// (sub-band, token) — wide enough for a 64-dim physical band.
+    out: candle::cuda_backend::cudarc::driver::CudaSlice<u64>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2243,21 +2244,27 @@ impl ChunkedKvBacking {
 
     /// Launch the provenance sign-pack kernel over R16 Q-chunk pointers spanning
     /// ALL layers of a scope, returning the packed sign bits (`n_warps ×
-    /// CHUNK_SIZE` u32, warp-major: `out[warp*CHUNK_SIZE + token]` has bit `d`
+    /// CHUNK_SIZE` u64, warp-major: `out[warp*CHUNK_SIZE + token]` has bit `d`
     /// set iff Q dim `d` of that sub-band is `>= 0`). `all_q_ptrs` is the
     /// concatenation of every layer's [`Self::provenance_q_ptrs`] output; all
     /// layers share this backing's device, so any backing can launch for the
     /// whole set. One HtoD (pointers) + one launch + one DtoH (packed bits) —
     /// replaces the per-layer f16 K/Q/V round-trips. CUDA only.
     #[cfg(feature = "cuda")]
-    pub fn run_prov_sign_pack(&self, all_q_ptrs: &[i64], sub_head_dim: usize) -> Result<Vec<u32>> {
+    pub fn run_prov_sign_pack(&self, all_q_ptrs: &[i64], sub_head_dim: usize) -> Result<Vec<u64>> {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::cuda_backend::kernels;
 
         let Device::Cuda(cuda_dev) = &self.inner.device else {
             return Ok(Vec::new());
         };
-        if all_q_ptrs.is_empty() || sub_head_dim == 0 || sub_head_dim > 32 {
+        // Gate on the kernel's own declared width. An out-of-range launch is a
+        // silent no-op there, so the buffer below would be D2H'd uninitialised and
+        // folded into signatures — this return is what makes that unreachable.
+        if all_q_ptrs.is_empty()
+            || sub_head_dim == 0
+            || sub_head_dim > kernels::simple::prov_sign_pack::MAX_SUB_HEAD_DIM
+        {
             return Ok(Vec::new());
         }
         let n_warps = all_q_ptrs.len();
@@ -2280,7 +2287,7 @@ impl ChunkedKvBacking {
                 .map_or(n_warps, |s| s.ptrs.len().max(n_warps));
             let out_cap = guard.as_ref().map_or(out_len, |s| s.out.len().max(out_len));
             let ptrs = unsafe { cuda_dev.alloc::<i64>(ptrs_cap)? };
-            let out = unsafe { cuda_dev.alloc::<u32>(out_cap)? };
+            let out = unsafe { cuda_dev.alloc::<u64>(out_cap)? };
             *guard = Some(ProvSignScratch { ptrs, out });
         }
         let scratch = guard.as_mut().unwrap();
@@ -2308,7 +2315,7 @@ impl ChunkedKvBacking {
 
         // DtoH only the packed bits into a fresh host Vec — host allocation is
         // cheap; the reused device buffers are what mattered.
-        let mut out = vec![0u32; out_len];
+        let mut out = vec![0u64; out_len];
         stream
             .memcpy_dtoh(&out_view, &mut out)
             .map_err(candle::Error::wrap)?;
@@ -2322,7 +2329,7 @@ impl ChunkedKvBacking {
         &self,
         _all_q_ptrs: &[i64],
         _sub_head_dim: usize,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Vec<u64>> {
         Ok(Vec::new())
     }
 

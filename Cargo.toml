@@ -13,6 +13,7 @@ members = [
     "web",
     "tensor-tools",
     "zend-tools",
+    "target-prune",
 ]
 exclude = [
     "candle-book",
@@ -145,3 +146,51 @@ validator = { version = "0.18", features = ["derive"] }
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+# Tests are compute-bound, so an unoptimised build measures rustc rather than
+# the code.
+#
+# Almost every slow test in this workspace builds its fixture on the host — a few
+# million elements through a `sin`, an RNG, or a quantizer — and
+# `QTensor::quantize` runs the quantization on the *CPU* even for a CUDA tensor.
+# At `opt-level = 0` those loops are an order of magnitude off, which is the
+# difference between a suite you run and one you avoid: `candle-core`'s unit
+# tests go from 28.8s to 4.2s on this alone.
+#
+# **Named packages rather than `[profile.dev]` wholesale.** Optimising everything
+# rebuilds every crate in the workspace and every dependency, which costs more
+# build time than it saves in run time for the crates that have no hot loops —
+# and, on this machine, filled the disk. These four are where the compute is: the
+# tensor ops, the KV cache, the model code, and the test binaries that link them.
+#
+# `debug` is left at the profile default, so backtraces and debugger support are
+# unaffected; overflow checks and `debug_assert!` are `dev` settings and stay on.
+# Both profiles, because a crate is built twice for a test run and only one of
+# them is the `test` profile: `cargo test -p candle-core` compiles candle-core's
+# own unit-test binary under `test`, while a `candle-nn` test binary links a
+# candle-core built under `dev`. Setting only `dev` leaves the unit tests
+# unoptimised — measured: 28.8s unoptimised, 14.9s with `dev` alone, 4.2s with
+# both.
+[profile.dev.package.candle-core]
+opt-level = 2
+
+[profile.dev.package.candle-nn]
+opt-level = 2
+
+[profile.dev.package.candle-transformers]
+opt-level = 2
+
+[profile.dev.package.half]
+opt-level = 2
+
+[profile.test.package.candle-core]
+opt-level = 2
+
+[profile.test.package.candle-nn]
+opt-level = 2
+
+[profile.test.package.candle-transformers]
+opt-level = 2
+
+[profile.test.package.half]
+opt-level = 2

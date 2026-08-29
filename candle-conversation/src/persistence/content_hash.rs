@@ -238,6 +238,28 @@ pub fn snapshot_stream_id(timeline_id: u64) -> StreamId {
     StreamId(if raw == 0 { 1 } else { raw })
 }
 
+/// Derive the [`StreamId`] of a **prompt branch's** recurrent checkpoint — the
+/// state after the whole system prompt, for one selector assignment.
+///
+/// Keyed by the branch's cumulative content prefix, not by
+/// `SectionTree::pack`. The pack names a branch only within one build of one
+/// schema: `SectionId`s are assigned in declaration order, so editing a
+/// section's text, or inserting one above it, leaves every pack key pointing at
+/// a branch whose tokens have changed. Restoring under that key would seed a
+/// conversation with the state of a prompt it is not running — which reads as a
+/// perfectly fluent model that has quietly misremembered its instructions.
+///
+/// The content prefix is the same chain the sealed K/V is addressed by
+/// ([`ContentChain`]), so a checkpoint and the K/V it accompanies go stale
+/// together, by construction.
+pub fn branch_checkpoint_stream_id(prefix: ContentHash) -> StreamId {
+    let mut h = ContentHasher::new();
+    h.update(b"branch-checkpoint");
+    h.update(&prefix.to_bytes());
+    let raw = h.finish().lo;
+    StreamId(if raw == 0 { 1 } else { raw })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +276,43 @@ mod tests {
         assert_ne!(hash_bytes(b"hello"), hash_bytes(b"hello "));
         assert_ne!(hash_tokens(&[1, 2, 3]), hash_tokens(&[1, 3, 2]));
         assert_ne!(hash_tokens(&[1, 2, 3]), hash_tokens(&[1, 2, 3, 0]));
+    }
+
+    /// A branch checkpoint's stream id follows its **content**, which is the
+    /// whole reason it is not keyed by `SectionTree::pack`: a pack key survives
+    /// an edit to the prompt it names, and restoring under it would seed a
+    /// conversation with the state of a prompt it is not running.
+    #[test]
+    fn branch_checkpoint_stream_id_follows_the_content_prefix() {
+        let a = hash_tokens(&[1, 2, 3]);
+        let b = hash_tokens(&[1, 2, 4]);
+        assert_ne!(
+            branch_checkpoint_stream_id(a),
+            branch_checkpoint_stream_id(b),
+            "a one-token prompt change must land on a different checkpoint"
+        );
+        assert_eq!(
+            branch_checkpoint_stream_id(a),
+            branch_checkpoint_stream_id(a),
+            "the same branch must resolve to the same record every time, or every \
+             restart recomputes the whole pass"
+        );
+    }
+
+    /// The two recurrent-state streams share `RecordType::Snapshot` and are told
+    /// apart **only** by stream id, so a collision between their namespaces
+    /// would cross a conversation's snapshot with a prompt branch's checkpoint.
+    #[test]
+    fn branch_and_conversation_snapshot_streams_do_not_collide() {
+        // The same underlying number fed to both derivations.
+        let n = 0x1234_5678_9ABC_DEF0u64;
+        let conv = snapshot_stream_id(n);
+        let branch = branch_checkpoint_stream_id(ContentHash { lo: n, hi: 0 });
+        assert_ne!(
+            conv, branch,
+            "the two snapshot namespaces overlap — one kind of record would \
+             supersede the other under the single-tail rule"
+        );
     }
 
     #[test]

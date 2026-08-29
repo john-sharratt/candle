@@ -60,11 +60,13 @@ const HOP_BY_HOP: [header::HeaderName; 7] = [
 /// headers is sound. A daemon that would rather verify than trust can check
 /// `X-Tokera-Assertion` — the signed session token itself — against the same
 /// key the gateway signs with.
-/// The headers this gateway uses to tell a daemon who the caller is.
 ///
-/// Cleared from every inbound request on ingress (`server::dispatch`) — a client
-/// that sets one is claiming to be someone — and set again here only from an
-/// identity this gateway itself resolved.
+/// Cleared from every inbound request on ingress (`server::dispatch`) unless
+/// [`Builder::behind_gateway`] declares the network makes that unnecessary — a
+/// client that sets one is otherwise claiming to be someone — and set again here
+/// only from an identity this gateway itself resolved.
+///
+/// [`Builder::behind_gateway`]: crate::server::Builder::behind_gateway
 pub(crate) const IDENTITY_HEADERS: [&str; 6] = [
     "x-tokera-user",
     // The issuer half of the account key. In this list because it decides

@@ -18,8 +18,15 @@
 //! 40   4   source_sum  u32 LE   fletcher32 over the GGUF's identity sample
 //! 44   4   int8_mode   u32 LE   the numeric mode the repack targeted
 //! 48   8   repack_fp   u64 LE   fingerprint of the repack formula itself
-//! 56  ...  per-layer geometry, `num_layers` × 36 bytes
+//! 56   4   pinned      u32 LE   leading MoE layers with NO record in the file
+//! 60  ...  per-layer geometry, `num_layers` × 36 bytes
 //! ```
+//!
+//! `num_layers` counts the model's MoE layers and the geometry table describes
+//! all of them, so the identity check keeps its full strength. `pinned` says how
+//! many of those leading layers the file holds no *records* for: they are
+//! permanently VRAM-resident and never reloaded, so storing them would be dead
+//! disk. Record `0` is therefore layer `pinned`, expert `0`.
 //!
 //! Each per-layer record is three projections in gate, up, down order, and
 //! each projection is `offset: u32, bytes: u32, dtype: u32` — the dtype being
@@ -53,7 +60,7 @@ use candle::Result;
 pub(crate) const MAGIC: &[u8; 8] = b"CNDLXPK1";
 
 /// Bytes before the per-layer table.
-const FIXED_BYTES: usize = 56;
+const FIXED_BYTES: usize = 60;
 
 /// Bytes per layer in the geometry table: three projections × three u32s.
 const LAYER_BYTES: usize = 36;
@@ -96,6 +103,10 @@ pub(crate) struct PackHeader {
     /// reference sweep, as opposed to the geometry, which is only where it puts
     /// the results.
     pub repack_fp: u64,
+    /// Leading MoE layers the file holds **no records** for, because they are
+    /// permanently VRAM-resident and never reloaded. Record `0` is layer
+    /// `pinned_layers`, expert `0`.
+    pub pinned_layers: u32,
     pub layers: Vec<LayerSpans>,
 }
 
@@ -105,9 +116,14 @@ impl PackHeader {
         FIXED_BYTES + self.layers.len() * LAYER_BYTES
     }
 
+    /// Layers the file holds records for — the evictable set.
+    pub(crate) fn stored_layers(&self) -> usize {
+        (self.num_layers as usize).saturating_sub(self.pinned_layers as usize)
+    }
+
     /// Total experts the file holds a record for.
     pub(crate) fn total_experts(&self) -> usize {
-        self.num_layers as usize * self.experts_per_layer as usize
+        self.stored_layers() * self.experts_per_layer as usize
     }
 
     /// Serialize to exactly [`Self::encoded_len`] bytes.
@@ -123,6 +139,7 @@ impl PackHeader {
         out.extend_from_slice(&self.source_sum.to_le_bytes());
         out.extend_from_slice(&self.int8_mode.to_le_bytes());
         out.extend_from_slice(&self.repack_fp.to_le_bytes());
+        out.extend_from_slice(&self.pinned_layers.to_le_bytes());
         for l in &self.layers {
             for p in [l.gate, l.up, l.down] {
                 out.extend_from_slice(&p.offset.to_le_bytes());
@@ -199,6 +216,7 @@ impl PackHeader {
             source_sum: u32_at(40),
             int8_mode: u32_at(44),
             repack_fp: u64_at(48),
+            pinned_layers: u32_at(56),
             layers,
         })
     }
@@ -207,7 +225,7 @@ impl PackHeader {
 /// Bumped whenever the record layout or the header's own shape changes. There
 /// is no reader for an older version — a mismatch rewrites the pack, which
 /// costs one repack and nothing else.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -223,6 +241,7 @@ mod tests {
             source_sum: 0xDEAD_BEEF,
             int8_mode: 3,
             repack_fp: 0x1122_3344_5566_7788,
+            pinned_layers: 0,
             layers: vec![LayerSpans {
                 gate: ProjectionSpan {
                     offset: 0,
@@ -252,7 +271,7 @@ mod tests {
         #[rustfmt::skip]
         let want: Vec<u8> = vec![
             b'C', b'N', b'D', b'L', b'X', b'P', b'K', b'1',
-            0x02, 0x00, 0x00, 0x00,                          // version 2
+            0x03, 0x00, 0x00, 0x00,                          // version 3
             0x01, 0x00, 0x00, 0x00,                          // num_layers 1
             0x02, 0x00, 0x00, 0x00,                          // experts_per_layer 2
             0x00, 0x03, 0x00, 0x00,                          // slot_bytes 0x300
@@ -261,6 +280,7 @@ mod tests {
             0xEF, 0xBE, 0xAD, 0xDE,                          // source_sum
             0x03, 0x00, 0x00, 0x00,                          // int8_mode 3
             0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // repack_fp
+            0x00, 0x00, 0x00, 0x00,                          // pinned_layers 0
             // layer 0: gate
             0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
             // layer 0: up
@@ -289,6 +309,42 @@ mod tests {
     fn decode_inverts_encode() {
         let h = one_layer();
         assert_eq!(PackHeader::decode(&h.encode()).unwrap(), h);
+    }
+
+    /// `pinned_layers` lands at offset 56, ahead of the geometry table, and
+    /// survives the round trip. Its raw position is asserted because a shift
+    /// here reads a projection offset as a layer count.
+    #[test]
+    fn pinned_layers_encodes_at_offset_56() {
+        let mut h = one_layer();
+        h.num_layers = 3;
+        h.pinned_layers = 2;
+        h.layers = vec![h.layers[0]; 3];
+        let bytes = h.encode();
+        assert_eq!(&bytes[56..60], &[0x02, 0x00, 0x00, 0x00]);
+        assert_eq!(PackHeader::decode(&bytes).unwrap(), h);
+    }
+
+    /// The record count is over the **stored** layers, not the model's. Getting
+    /// this wrong sizes the file for experts it does not hold and every read
+    /// past the pinned prefix lands one layer early.
+    #[test]
+    fn record_counts_exclude_the_pinned_prefix() {
+        let mut h = one_layer();
+        h.num_layers = 40;
+        h.experts_per_layer = 256;
+        h.pinned_layers = 2;
+        assert_eq!(h.stored_layers(), 38);
+        assert_eq!(h.total_experts(), 38 * 256);
+
+        // A pack that pins nothing still holds everything.
+        h.pinned_layers = 0;
+        assert_eq!(h.total_experts(), 40 * 256);
+
+        // Pinning every layer leaves no records at all.
+        h.pinned_layers = 40;
+        assert_eq!(h.stored_layers(), 0);
+        assert_eq!(h.total_experts(), 0);
     }
 
     /// Trailing bytes past the header are the records; decoding must ignore
