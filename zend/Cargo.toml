@@ -44,20 +44,29 @@ tokenizers          = { workspace = true }
 ignore                  = "0.4"
 notify                  = "6"
 sha2                    = "0.10"
-tree-sitter             = "0.22"
-tree-sitter-rust        = "0.21"
-tree-sitter-python      = "0.21"
-tree-sitter-typescript  = "0.21"
-tree-sitter-javascript  = "0.21"
-tree-sitter-go          = "0.21"
-tree-sitter-c           = "0.21"
-tree-sitter-cpp         = "0.22"
-tree-sitter-java        = "0.21"
-tree-sitter-ruby        = "0.21"
-tree-sitter-php         = "0.22"
-tree-sitter-bash        = "0.21"
-tree-sitter-html        = "0.20"
-tree-sitter-css         = "0.21"
+#
+# `tree-sitter` sets `links = "tree-sitter"`, so exactly ONE version may exist
+# in the whole workspace — which makes this pin a workspace-wide decision rather
+# than zend's alone. It was 0.22, and that pin is what blocked `npcd` from using
+# `yamlpatch` (which needs 0.26) to save an authored file without destroying its
+# comments. Bumping it here is what unblocks that.
+#
+# The grammars moved to `LANGUAGE`, a `LanguageFn` constant, in place of the old
+# `language()` function — see `parsers/tree_sitter_util.rs`.
+tree-sitter             = "0.26"
+tree-sitter-rust        = "0.24"
+tree-sitter-python      = "0.25"
+tree-sitter-typescript  = "0.23"
+tree-sitter-javascript  = "0.25"
+tree-sitter-go          = "0.25"
+tree-sitter-c           = "0.24"
+tree-sitter-cpp         = "0.23"
+tree-sitter-java        = "0.23"
+tree-sitter-ruby        = "0.23"
+tree-sitter-php         = "0.24"
+tree-sitter-bash        = "0.25"
+tree-sitter-html        = "0.23"
+tree-sitter-css         = "0.25"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -9,7 +9,9 @@ use crate::code_read::types::{ChunkKind, Scope};
 
 pub fn carve(source: &[u8]) -> Option<Vec<Scope>> {
     let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_python::language()).ok()?;
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .ok()?;
     let mut rules = LanguageRules {
         kind_to_chunk: HashMap::new(),
         identifier_for,

@@ -12,9 +12,9 @@ use crate::code_read::types::{ChunkKind, Scope};
 /// TypeScript grammar.
 pub fn carve(source: &[u8], is_tsx: bool) -> Option<Vec<Scope>> {
     let language: Language = if is_tsx {
-        tree_sitter_typescript::language_tsx()
+        tree_sitter_typescript::LANGUAGE_TSX.into()
     } else {
-        tree_sitter_typescript::language_typescript()
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     };
     let mut parser = Parser::new();
     parser.set_language(&language).ok()?;
