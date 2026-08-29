@@ -500,21 +500,48 @@ impl CudaDevice {
 }
 
 impl CudaDevice {
-    /// Validates that the device meets the minimum compute capability (SM 8.0 / Ampere).
-    /// All precompiled CUDA kernels target SM80; older GPUs will produce incorrect results.
+    /// Refuses a device this build carries no kernel image for.
+    ///
+    /// The kernels are compiled to native SASS for the architectures in
+    /// `candle_kernels::BUILT_ARCHES` and **no PTX is emitted**, so a card
+    /// outside that set has nothing to run and nothing to JIT from.
+    ///
+    /// # Why this panics
+    ///
+    /// Every launch on such a card fails with `cudaErrorNoKernelImageForDevice`,
+    /// and the kernel launchers return `void` — so nothing observes the error.
+    /// The caller reads back the `alloc_zeros` buffer it passed in and carries
+    /// on, which means the entire KV data path (writes, migration,
+    /// quantization, format selection, provenance) silently produces zeros.
+    /// There is no numerical answer to give and no partial mode worth running:
+    /// the machine cannot execute this build at all. A `Result` here would be a
+    /// value some caller could log and continue past, and continuing produces
+    /// confidently wrong output — so this is the one place a hard stop is
+    /// correct.
+    ///
+    /// Adding the card is one entry in `KERNEL_ARCHES` (`candle-kernels/build_utils.rs`).
     fn validate_compute_capability(context: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
         use cudarc::driver::sys::CUdevice_attribute;
         let major = context
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .w()?;
+            .w()? as u32;
         let minor = context
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .w()?;
-        if major < 8 {
-            crate::bail!(
-                "CUDA device (SM {major}.{minor}) does not meet the minimum requirement of \
-                 SM 8.0 (Ampere). Precompiled kernels target SM80 and will not run correctly \
-                 on older hardware."
+            .w()? as u32;
+        if !candle_kernels::has_kernel_image(major, minor) {
+            let built = candle_kernels::BUILT_ARCHES
+                .iter()
+                .map(|sm| format!("sm_{sm}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            panic!(
+                "CUDA device is SM {major}.{minor}, and this build carries kernel images only \
+                 for [{built}] (native SASS, no PTX). Nothing would execute on this card: every \
+                 kernel launch fails with cudaErrorNoKernelImageForDevice and returns \
+                 zero-filled buffers instead of an error. Add {major}{minor} to KERNEL_ARCHES \
+                 in candle-kernels/build_utils.rs and rebuild.\n\
+                 (A cubin for X.y runs on X.z only when z >= y — so sm_86 does not cover an \
+                 8.0 device such as the A100.)"
             );
         }
         Ok(())
