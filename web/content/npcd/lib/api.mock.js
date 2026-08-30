@@ -103,6 +103,205 @@ const T = (name, category, description, source, calibrated, modes) =>
 const C = (name, group, summary, emits, properties, required) =>
   ({ name, group, summary, emits, aliases: [], parameters: { type: 'object', properties }, required });
 
+/* ── the mind, in miniature ───────────────────────────────────────────────────
+ *
+ * Keyed by address. A node with `doc` is a mapping and opens as fields; one
+ * with `text` is prose and opens as text; one with neither is a place you walk
+ * into. `notes` are the author's comments — the thing the field form shows
+ * beside each input — and `stubborn` marks the one document that refuses a
+ * field-by-field save, so the console's `cannot_patch` path is reachable.
+ *
+ * The root's children are the sections, which is why they have no parent in
+ * their address. */
+const MIND = {
+  canon: { title: 'Canon' },
+  'canon/ammo': {
+    title: 'Ammo',
+    blurb: 'What the guns eat, and what it costs',
+    text: '# Ammo\n\nEvery round is machined, and nobody in the cities machines rounds any more.\n',
+  },
+  'canon/ammo/bolt': {
+    title: 'Bolt',
+    text: '# Bolt\n\nA hand-loaded slug. Cheap, loud, and it will jam a rail gun if you are\ndesperate enough to try it.\n',
+  },
+  'canon/ammo/slug': {
+    title: 'Slug',
+    text: '# Slug\n\nThe standard round. Scarce enough that a full magazine is a statement.\n',
+  },
+  responses: { title: 'Responses' },
+  'responses/accept_then_move_on': {
+    title: 'Accept then move on',
+    blurb: 'accept',
+    notes: {
+      template: 'The frozen structural mode — its KV is loaded; the model decodes the NEXT turn into this once the section is selected.',
+      examples: 'Provenance lead-ins — the context that PRODUCES the next (accepting) reply. FIXED SHAPE: 4 turns, user → assistant → user → assistant. Final assistant turn is the decode point.',
+    },
+    doc: {
+      id: 'accept_then_move_on',
+      category: 'accept',
+      description: 'Accepting what the interlocutor offered, admitted, or refused, then letting the moment close without extracting more.',
+      template: 'Accept what the interlocutor just offered, admitted, refused, or decided, and let the\nmoment close without demanding more.\n\nTone: settled, unhurried, generous, unbothered.\n',
+      examples: [
+        {
+          note: 'Late apology, no toll charged for it.',
+          turns: [
+            { role: 'user', content: '"I\'m late — sorry, the train—" I stop myself, exhaling.\n' },
+            { role: 'assistant', content: 'A small tip of their head, already unbothered — the seat beside them is patted once, an answer in itself.\n' },
+            { role: 'user', content: '"Thank you for not making me grovel through the whole excuse."\n' },
+            { role: 'assistant', thinking: 'They will take the thanks lightly and steer straight into the evening, so lateness never becomes a debt you owe.\n' },
+          ],
+        },
+        {
+          note: 'A boundary named plainly, respected without probing.',
+          turns: [
+            { role: 'user', content: '"Can we just— not talk about my ex tonight."\n' },
+            { role: 'assistant', content: "The subject drops the instant it's named; their attention simply resettles on you.\n" },
+          ],
+        },
+      ],
+    },
+  },
+  'responses/admit_then_explain': {
+    title: 'Admit then explain',
+    blurb: 'admit',
+    // The one that cannot be patched, so the console's refusal has something to
+    // refuse. A real one is a document whose edit failed its own read-back.
+    stubborn: true,
+    doc: {
+      id: 'admit_then_explain',
+      category: 'admit',
+      description: 'Owning the thing first, without the explanation doing the owning.',
+      tags: ['fault', 'repair'],
+      template: 'Say the thing you did. Then, and only then, say why.\n',
+      examples: [],
+    },
+  },
+  settings: { title: 'Settings' },
+  // The projection schema is a collection *and* an entry: it reads whole, and
+  // its layers are addressable underneath it. Two of the nine, with the shape
+  // the real ones have — a nested budget, a summarisation prompt, and a list of
+  // selection groups.
+  'settings/projection': {
+    title: 'Projection schema',
+    text: 'default_policy:\n  preset: high_recall_scope\n\nlayers:\n  # ── World ──\n  - name: world\n    window: 8000\n',
+  },
+  'settings/projection/world': {
+    title: 'World',
+    blurb: 'the only cross-timeline layer',
+    notes: { description: 'Ingested from the canon topics a world admits.' },
+    doc: {
+      name: 'world',
+      description: 'Shared knowledge about the setting — places, factions, history.\n\nTHE ONLY CROSS-TIMELINE LAYER: one tree across every conversation.\n',
+      window: 8000,
+      score_threshold: 0.3,
+      gather_scope: 'shared',
+      decode_priority: 'low',
+      ingest_unit: 'documents',
+      budget: { priority: 70, max_percent: 20, adaptive: { gain: 2.0, max_percent: 40 } },
+      summary: {
+        turns: {
+          max_tokens: 384,
+          scope: 'union',
+          assistant: {
+            system_prompt: 'You compress documents about a world into one faithful digest.\n',
+            user_prompt: 'Digest the documents above, keeping every name exactly.\n',
+          },
+        },
+      },
+      groups: [{ id: 'canon', selection: { kind: 'top_k', k: 6 }, budget: { priority: 100 } }],
+    },
+  },
+  'settings/projection/beliefs': {
+    title: 'Beliefs',
+    doc: {
+      name: 'beliefs',
+      description: 'What the character holds to be true about the world and itself.\n',
+      window: 4000,
+      score_threshold: 0.4,
+      gather_scope: 'conversation',
+      decode_priority: 'normal',
+      ingest_unit: 'beliefs',
+      budget: { priority: 90, max_percent: 15 },
+      groups: [{ id: 'held', selection: { kind: 'top_k', k: 5 }, budget: { priority: 100 } }],
+    },
+  },
+};
+
+/* The keys with a fixed vocabulary, mirroring the daemon's — and, like it,
+ * offered only where the value is already one of them. */
+const MIND_CHOICES = {
+  gather_scope: ['conversation', 'shared'],
+  decode_priority: ['low', 'normal', 'high'],
+  on_corrupt_turn: ['drop_turn', 'drop_conversation'],
+  kind: ['conversation', 'top_k'],
+};
+
+const mindNode = (id) => (id ? MIND[id] : { title: 'The mind' });
+const mindChildren = (id) => {
+  const prefix = id ? id + '/' : '';
+  return Object.keys(MIND).filter(
+    (k) => k.startsWith(prefix) && !k.slice(prefix.length).includes('/') && k !== id,
+  );
+};
+/* A document as the text it would be stored as. Rough on purpose: the mock's
+ * job is to give the text editor something real-shaped to open, not to be a
+ * second YAML writer that can disagree with the daemon's. */
+const mindText = (node) => {
+  if (!node) return '';
+  if (node.text != null) return node.text;
+  if (!node.doc) return '';
+  return Object.entries(node.doc)
+    .map(([k, v]) => (typeof v === 'string' && v.includes('\n')
+      ? `${k}: |\n${v.replace(/\n$/, '').split('\n').map((l) => '  ' + l).join('\n')}\n`
+      : `${k}: ${JSON.stringify(v)}\n`))
+    .join('');
+};
+const mindLabel = (key) => {
+  const s = key.replace(/[_-]/g, ' ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
+};
+const mindKind = (key, v) => {
+  if (typeof v === 'string') {
+    if ((MIND_CHOICES[key] || []).includes(v)) return 'choice';
+    return v.includes('\n') || v.length > 90 ? 'text' : 'line';
+  }
+  if (typeof v === 'number') return 'number';
+  if (typeof v === 'boolean') return 'bool';
+  if (Array.isArray(v)) {
+    if (!v.length || v.every((i) => typeof i === 'string')) return 'list';
+    if (v.every((i) => i && Array.isArray(i.turns))) return 'conversations';
+    if (v.every((i) => i && typeof i === 'object')) return 'rows';
+  }
+  if (v && typeof v === 'object' && Object.keys(v).length) return 'group';
+  return 'raw';
+};
+
+/* One field, the same shape the daemon sends — including the nesting, so the
+ * recursive controls are reachable with no daemon. */
+const mindField = (key, value, notes) => {
+  const kind = mindKind(key, value);
+  return {
+    key,
+    label: mindLabel(key),
+    kind,
+    value,
+    note: (notes || {})[key] || null,
+    readonly: key === 'id' || key === 'name',
+    yaml: kind === 'raw' ? JSON.stringify(value, null, 2) : null,
+    choices: kind === 'choice' ? MIND_CHOICES[key] : null,
+    fields: kind === 'group'
+      ? Object.entries(value).map(([k, v]) => mindField(k, v))
+      : null,
+    rows: kind === 'rows'
+      ? value.map((row) => Object.entries(row).map(([k, v]) => mindField(k, v)))
+      : null,
+  };
+};
+/* The same shape the live client throws, so a caller branching on `e.error`
+ * cannot tell the two apart. */
+const mindErr = (error, detail, status) =>
+  Object.assign(new Error(detail), { error, detail, status: status || 404 });
+
 export const MockAPI = {
   async getStatus() {
     await sleep(60);
@@ -582,6 +781,128 @@ export const MockAPI = {
         sections: [S('current', 'doctrine', 142, 0, 'Flank at 2:1 or not at all. Cross open ground only with a fallback named.')] },
     ] };
   },
+  /* ── the authored corpus ──────────────────────────────────────────────────
+   *
+   * A miniature mind: two sections, a topic with an overview and entries under
+   * it, and one response section with the shape the real ones have. Enough that
+   * the browser, the text editor, the field form and the conversation editor
+   * are all reachable with no daemon — including the two refusals the console
+   * branches on, `not_fields` and `cannot_patch`, which are the paths a mock
+   * that only ever succeeds would leave untested.
+   *
+   * Addresses, never paths, exactly as the daemon has it: nothing here knows
+   * where a file would live or which extension it would take. */
+  async mindList(id) {
+    await sleep(60);
+    const node = mindNode(id);
+    if (!node) throw mindErr('not_found', 'no such place');
+    return {
+      id: id || '',
+      title: node.title,
+      has_text: node.doc != null || node.text != null,
+      scoped: false,
+      children: mindChildren(id).map((cid) => {
+        const c = MIND[cid];
+        const count = mindChildren(cid).length;
+        return {
+          id: cid,
+          title: c.title,
+          // Anything holding something is a collection, whether or not it also
+          // has text of its own — a canon topic has both, and so does the
+          // projection schema.
+          kind: count ? 'collection' : 'entry',
+          count,
+          chars: mindText(c).length,
+          has_text: c.doc != null || c.text != null,
+          blurb: c.blurb || null,
+        };
+      }),
+    };
+  },
+
+  /* A portrait upload, accepted and forgotten. The fixture has no store, so it
+   * gives back an id shaped like a real one — enough for the create flow to
+   * finish without a daemon, which is what `?mock=1` is for. */
+  async putPortrait(id, file) {
+    await sleep(120);
+    if (!file || !/^image\//.test(file.type || '')) {
+      throw Object.assign(new Error('that is not an image'), { error: 'not_an_image' });
+    }
+    return { npc_id: id, portrait: { image_id: 'img_0011223344556677.png', origin: 'uploaded' } };
+  },
+
+  async getWorldKnowledge() {
+    await sleep(60);
+    return (await this.mindList('canon')).children;
+  },
+
+  async mindEntry(id) {
+    await sleep(60);
+    const node = mindNode(id);
+    if (!node || (node.doc == null && node.text == null)) {
+      throw mindErr('not_found', 'nothing written here');
+    }
+    const text = mindText(node);
+    return { id, title: node.title, text, chars: text.length };
+  },
+
+  async saveMindEntry(id, text, world, isNew) {
+    await sleep(90);
+    let node = mindNode(id);
+    // `isNew` refuses to land on something that already exists, which is what
+    // separates an add from a save.
+    if (isNew) {
+      if (node) throw mindErr('name_taken', 'something is already called that', 409);
+      const name = id.split('/').pop();
+      node = MIND[id] = { title: name.charAt(0).toUpperCase() + name.slice(1).replace(/[_-]/g, ' ') };
+    }
+    if (!node) throw mindErr('not_found', 'no such place');
+    // Saving text over a document that has fields drops the field view, which
+    // is what editing the file itself means.
+    delete node.doc;
+    node.text = text;
+    return { id, title: node.title };
+  },
+
+  async deleteMindEntry(id) {
+    await sleep(90);
+    const node = mindNode(id);
+    if (!node) throw mindErr('not_found', 'no such place');
+    delete node.doc;
+    delete node.text;
+    return null;
+  },
+
+  async mindFields(id) {
+    await sleep(60);
+    const node = mindNode(id);
+    if (!node) throw mindErr('not_found', 'no such place');
+    if (!node.doc) {
+      throw mindErr('not_fields', 'this document is not a set of fields, so it opens as text', 422);
+    }
+    return {
+      id,
+      title: node.title,
+      fields: Object.entries(node.doc).map(([key, value]) =>
+        mindField(key, value, node.notes)),
+    };
+  },
+
+  async saveMindFields(id, values) {
+    await sleep(90);
+    const node = mindNode(id);
+    if (!node || !node.doc) throw mindErr('not_found', 'no such place');
+    if (node.stubborn) {
+      throw mindErr(
+        'cannot_patch',
+        'this document could not be edited field by field without rewriting it',
+        409,
+      );
+    }
+    node.doc = { ...values };
+    return { id, title: node.title };
+  },
+
   /* Push streams, on a timer. Same contract as the live socket — backlog
    * first, then one frame at a time, and a handle that stops it — so the pane
    * has no idea which side it is talking to. */
@@ -687,12 +1008,6 @@ export const MockAPI = {
   },
 
   async generateDescription() { await sleep(650); return { description: PERSONAS[personaIdx++ % PERSONAS.length], seed: 88213 + personaIdx }; },
-  async generateAttributes() {
-    await sleep(850);
-    return { beliefs: (await this.getBeliefs()).beliefs,
-      relationships: (await this.getRelationships()).relationships,
-      agency: (await this.getAgency()).agency };
-  },
   async generateImage() { return { job_id: 'job_img_1', kind: 'image', state: 'queued', progress: 0, queue_position: 2, eta_secs: null }; },
   async listImageModels() {
     return { models: [

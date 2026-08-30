@@ -957,6 +957,100 @@ pub struct NpcPayload {
     pub portrait_image_id: Option<String>,
     /// `uploaded` | `generated`; absent with the image.
     pub portrait_origin: Option<String>,
+
+    /* ── the authoring plane (§16) ──────────────────────────────────────────
+     *
+     * What an operator says a character believes, who they know, what they are
+     * trying to do, and the dials their affect starts at. Every write here is
+     * an authoring act — `origin: "authored"` — as distinct from what the
+     * evidence process later earns.
+     *
+     * Carried on the character's own record rather than in record types of
+     * their own, for three reasons. It is operator-scale: tens of entries, not
+     * the thousands an engine would accumulate. It supersedes with the
+     * character it belongs to, which is the lifetime it actually has. And the
+     * write path is the one already here, already tested, already handled by
+     * compaction — where a new header-keyed type would need all three again.
+     *
+     * The engine's own belief traffic is a different problem with a different
+     * volume, and will want its own records. This is not that; this is what
+     * somebody types when they build a world. */
+    /// Beliefs an operator wrote. Never written by the action plane — a tool
+    /// declaring `beliefs` in `writes_layers` is refused at registration.
+    pub beliefs: Vec<AuthoredBelief>,
+    /// Who this character knows, and how they hold them.
+    pub relationships: Vec<AuthoredRelationship>,
+    /// What they are trying to do, as a tree.
+    pub agency: Vec<AuthoredStrategy>,
+    /// The affect dials an operator set.
+    pub modulation: Modulation,
+    /// The simulated environment's own instructions, when one is enabled.
+    pub environment_prompt: String,
+}
+
+/// One authored belief.
+///
+/// Only what an operator states. `disconfirmation`, whether it is under
+/// pressure, and its confidence history are all measurements the evidence
+/// process makes, so they are not stored here and are absent on the wire until
+/// something has measured them — the same rule the live tick fields follow.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredBelief {
+    pub belief_id: String,
+    pub statement: String,
+    /// How strongly it is held, 0..1.
+    pub confidence: f32,
+    /// How much contrary evidence it takes to break it, 0..1.
+    pub threshold: f32,
+}
+
+/// One authored relationship.
+///
+/// A relationship is a calibration trajectory and is meant to move easily —
+/// §16 notes it carries none of the write-protection beliefs do, on either
+/// plane.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredRelationship {
+    pub entity_id: String,
+    /// What this character calls them.
+    pub display: String,
+    pub trust: f32,
+    pub affect: f32,
+    pub familiarity: f32,
+    pub notes: String,
+}
+
+/// One authored strategy, in a tree by `parent_id`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredStrategy {
+    pub strategy_id: String,
+    pub statement: String,
+    /// `None` for a root strategy.
+    pub parent_id: Option<String>,
+    /// `active` | `finished` | `abandoned`.
+    pub state: String,
+}
+
+/// The affect dials, as set. Each is −1..1 except `threat` and `curiosity`,
+/// which are 0..1 — bounds the daemon checks, not this record.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Modulation {
+    pub affect: f32,
+    pub threat: f32,
+    pub curiosity: f32,
+}
+
+impl Default for Modulation {
+    /// Neutral. A character nobody has tuned is not sad, not threatened, and
+    /// mildly curious — which is what an author who has not touched the dials
+    /// means, and is a real position rather than an absence.
+    fn default() -> Self {
+        Self {
+            affect: 0.0,
+            threat: 0.0,
+            curiosity: 0.5,
+        }
+    }
 }
 
 impl NpcPayload {
@@ -1709,6 +1803,32 @@ mod tests {
             persona_origin: "generated".to_string(),
             portrait_image_id: Some("img_4471".to_string()),
             portrait_origin: Some("uploaded".to_string()),
+            beliefs: vec![AuthoredBelief {
+                belief_id: "hess_word".to_string(),
+                statement: "Hess keeps his word.".to_string(),
+                confidence: 0.72,
+                threshold: 0.6,
+            }],
+            relationships: vec![AuthoredRelationship {
+                entity_id: "p_17".to_string(),
+                display: "Ilse".to_string(),
+                trust: 0.4,
+                affect: 0.1,
+                familiarity: 0.8,
+                notes: "Met at the crossing.".to_string(),
+            }],
+            agency: vec![AuthoredStrategy {
+                strategy_id: "hold_ridge".to_string(),
+                statement: "Hold the eastern ridge.".to_string(),
+                parent_id: None,
+                state: "active".to_string(),
+            }],
+            modulation: Modulation {
+                affect: -0.2,
+                threat: 0.66,
+                curiosity: 0.3,
+            },
+            environment_prompt: "A ridge at dusk.".to_string(),
         }
     }
 
@@ -1729,7 +1849,15 @@ mod tests {
             r#""salience_gate":0.5,"tags":["campaign-2","north"],"#,
             r#""persona_description":"Fifty-three, a former staff sergeant.","#,
             r#""persona_origin":"generated","portrait_image_id":"img_4471","#,
-            r#""portrait_origin":"uploaded"}"#,
+            r#""portrait_origin":"uploaded","#,
+            r#""beliefs":[{"belief_id":"hess_word","statement":"Hess keeps his word.","#,
+            r#""confidence":0.72,"threshold":0.6}],"#,
+            r#""relationships":[{"entity_id":"p_17","display":"Ilse","trust":0.4,"#,
+            r#""affect":0.1,"familiarity":0.8,"notes":"Met at the crossing."}],"#,
+            r#""agency":[{"strategy_id":"hold_ridge","statement":"Hold the eastern ridge.","#,
+            r#""parent_id":null,"state":"active"}],"#,
+            r#""modulation":{"affect":-0.2,"threat":0.66,"curiosity":0.3},"#,
+            r#""environment_prompt":"A ridge at dusk."}"#,
         );
         assert_eq!(
             std::str::from_utf8(&bytes).unwrap(),

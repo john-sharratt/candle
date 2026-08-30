@@ -31,7 +31,11 @@
 //! does when a document is one it cannot edit.
 
 pub mod id;
-mod yaml_edit;
+/// Public because the mind's field editor patches documents the registry does
+/// not own — a canon page, a response section — and both need the same
+/// comment-preserving splice. One implementation, two callers, rather than a
+/// second one that would be free to lose comments differently.
+pub mod yaml_edit;
 
 use std::collections::BTreeMap;
 use std::fmt;

@@ -55,6 +55,24 @@ pub struct Source {
     pub label: String,
 }
 
+/// The layers the mind's schema declares, in the order it writes them.
+///
+/// Read through the mind's own address for `settings/projection`, so this and
+/// the layer editor are the same document read the same way — there is no
+/// second copy of the nine layers to drift from the first. `None` when the
+/// daemon has no mind, or its schema declares no layers.
+///
+/// Used by `/v1/schema/layers`, and by the substrate view, which needs to know
+/// what the layers *are* before it can report that every one of them is empty.
+pub fn layers(mind: &crate::mind::Mind) -> Option<Vec<serde_json::Value>> {
+    let root = mind.root()?;
+    let addr = crate::mind::Address::parse("settings/projection").ok()??;
+    let (list_key, id_key) = addr.parts()?;
+    let doc = crate::mind::catalog::read(root, &addr).ok()?;
+    let items = crate::mind::parts::list(&doc.text, list_key, id_key).ok()?;
+    Some(items.into_iter().map(|(_, v)| v).collect())
+}
+
 #[derive(Debug)]
 pub enum SchemaError {
     /// `--mind` named a directory that does not exist, or is a file.

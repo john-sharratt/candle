@@ -1,0 +1,20 @@
+# npcd — the console for the NPC engine.
+#
+# The front door is worth indexing; the application behind it is not, and the
+# API behind that is not something to crawl at all.
+User-agent: *
+Allow: /$
+Allow: /favicon.svg
+
+# The API and the push streams. Not secret — every one of them refuses an
+# unauthenticated caller — but there is nothing here a reader would want in a
+# search result, and a crawler working through them is load for no return.
+Disallow: /v1/
+Disallow: /ws/
+
+# Sign-in belongs to the gateway and every path under it is a redirect into a
+# provider. A crawler following one learns nothing and may be handed a state
+# token minted for it.
+Disallow: /auth/
+
+Sitemap: https://bot.tokera.com/sitemap.xml

@@ -3,7 +3,34 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Zend</title>
+<title>Zend — a coding assistant that keeps the whole project in mind</title>
+<!-- Metadata on an application shell. The console renders itself, so this will
+     never rank on content; what it does is make the link render when somebody
+     shares it. The description is the one tokera.com uses for Zend, so the two
+     say the same thing about the same product. -->
+<meta name="description"
+  content="Most assistants forget between sessions and re-read the same files to re-derive the same conclusions. Zend keeps the codebase, the decisions and the reasons for them in a substrate that survives a restart.">
+<link rel="canonical" href="https://code.tokera.com/">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta property="og:site_name" content="Tokera">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Zend — a coding assistant that keeps the whole project in mind">
+<meta property="og:description"
+  content="Institutional memory for a codebase: why a module is shaped the way it is, months later. One shared KV prefix across every developer working from the same fork.">
+<meta property="og:url" content="https://code.tokera.com/">
+<meta property="og:locale" content="en">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Zend — a coding assistant that keeps the whole project in mind">
+<meta name="twitter:description"
+  content="Keeps the codebase, the decisions and the reasons for them in a substrate that survives a restart.">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Zend",
+"url":"https://code.tokera.com/","applicationCategory":"DeveloperApplication",
+"operatingSystem":"Linux, Windows, macOS",
+"description":"A coding assistant with institutional memory — the codebase, the decisions and the reasons for them in a substrate that survives a restart.",
+"publisher":{"@type":"Organization","name":"Tokera","url":"https://tokera.com/"},
+"isPartOf":{"@type":"WebSite","name":"Tokera","url":"https://tokera.com/"}}
+</script>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -150,7 +177,28 @@
 <link rel="stylesheet" href="common/lib/estate.css">
 </head>
 <body>
-<div id="app"></div>
+<div id="app">
+  <!-- What a reader with no JavaScript gets, and what a crawler finds instead
+       of an empty element. The same claim the product page makes, in fewer
+       words — showing a crawler something the reader never sees is cloaking,
+       and is penalised as such. -->
+  <noscript>
+    <div style="max-width:34rem;margin:3rem auto;padding:0 1.25rem">
+      <h1>A coding assistant that keeps the whole project in mind.</h1>
+      <p>
+        Most assistants forget between sessions and re-read the same files to
+        re-derive the same conclusions. Zend keeps the codebase, the decisions and
+        the reasons for them in a substrate that survives a restart — so it can
+        tell you months later why a module is shaped the way it is.
+      </p>
+      <p>
+        The console needs JavaScript. The
+        <a href="https://tokera.com/papers">papers</a> and the
+        <a href="https://tokera.com/blog">writing</a> behind it do not.
+      </p>
+    </div>
+  </noscript>
+</div>
 
 <script src="zend-api.mock.js"></script>
 <script src="zend-api.live.js"></script>

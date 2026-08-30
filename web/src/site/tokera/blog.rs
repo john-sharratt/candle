@@ -17,7 +17,7 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::markdown::{frontmatter, Post};
 
-use super::page::{self, Meta, Nav, Width};
+use super::page::{self, Kind, Meta, Nav, Width};
 use super::State;
 
 pub const DIR: &str = "blog";
@@ -25,6 +25,19 @@ pub const DIR: &str = "blog";
 struct Listed {
     slug: String,
     meta: Post,
+}
+
+/// Every published post — slug, title, date and summary.
+///
+/// `pub(super)` so the sitemap and the feed are built from the same walk the
+/// index is. A second enumeration would be a second definition of "published",
+/// free to disagree about a draft.
+pub(super) async fn published(state: &State) -> Vec<(String, Post)> {
+    listing(state)
+        .await
+        .into_iter()
+        .map(|l| (l.slug, l.meta))
+        .collect()
 }
 
 async fn listing(state: &State) -> Vec<Listed> {
@@ -136,6 +149,10 @@ pub async fn index(state: Arc<State>) -> Response {
         description: "Writing from Tokera on inference, memory and agent architecture.",
         nav: Nav::Blog,
         width: Width::Split,
+        path: "/blog",
+        kind: Kind::Site,
+        image: None,
+        published: None,
     };
     // Unlike the papers section, `/blog` renders an index rather than
     // redirecting to the newest post: with summaries to read, choosing what to
@@ -189,6 +206,9 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
         None => Arc::new(crate::markdown::render(frontmatter::split(&text).1)),
     };
 
+    // The social card is the post's own opening illustration, pulled out of the
+    // rendered body rather than named a second time in the frontmatter.
+    let path = format!("/blog/{slug}");
     let meta = Meta {
         heading: &post.title,
         subtitle: None,
@@ -196,6 +216,10 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
         description: &post.summary,
         nav: Nav::Blog,
         width: Width::Split,
+        path: &path,
+        kind: Kind::Article,
+        image: page::first_image(&doc.html),
+        published: Some(&post.date),
     };
     // The tint goes on a wrapper around the whole document, so the heading
     // rules, links and callouts inside it all resolve `--post` to the same

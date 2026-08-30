@@ -6,7 +6,39 @@
      env(safe-area-inset-bottom) instead of sitting under it. -->
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
-<title>npcd</title>
+<title>npcd — NPCs that remember you</title>
+<!-- Metadata on an application shell, which is worth being clear about.
+     The console renders itself, so a crawler arriving here sees this head and
+     an empty body — none of it will ever rank on the strength of its content.
+     What these tags do is make the link *render* when somebody shares it, in a
+     chat, an issue or a post, which is how a developer tool actually spreads.
+     The description is the landing page's own words, so the card and the page
+     say the same thing. -->
+<meta name="description"
+  content="A mind per character. Years of lived history, convictions that hold under pressure, and a hundred of them thinking at once — on a single graphics card. npcd is the NPC engine behind Battle Cities, and it runs headless on your own hardware.">
+<link rel="canonical" href="https://bot.tokera.com/">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta property="og:site_name" content="Tokera">
+<meta property="og:type" content="website">
+<meta property="og:title" content="npcd — NPCs that remember you">
+<meta property="og:description"
+  content="A mind per character. Years of lived history, convictions that hold under pressure, and a hundred of them thinking at once — on a single graphics card.">
+<meta property="og:url" content="https://bot.tokera.com/">
+<meta property="og:image" content="https://tokera.com/img/blog/prr.jpg">
+<meta property="og:locale" content="en">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="npcd — NPCs that remember you">
+<meta name="twitter:description"
+  content="A mind per character, on a single graphics card. The NPC engine behind Battle Cities.">
+<meta name="twitter:image" content="https://tokera.com/img/blog/prr.jpg">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"npcd",
+"alternateName":"Tokera NPC engine","url":"https://bot.tokera.com/",
+"applicationCategory":"DeveloperApplication","operatingSystem":"Linux, Windows",
+"description":"An NPC engine giving each character its own mind and unbounded memory, run headless on your own hardware.",
+"publisher":{"@type":"Organization","name":"Tokera","url":"https://tokera.com/"},
+"isPartOf":{"@type":"WebSite","name":"Tokera","url":"https://tokera.com/"}}
+</script>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <!-- base.css is the shared design system (themes, reset, shell, controls,
      modal, disclosure, responsive); app.css is what only the console needs.
@@ -14,6 +46,27 @@
 <link rel="stylesheet" href="/base.css">
 <link rel="stylesheet" href="/lib/estate.css">
 <link rel="stylesheet" href="/app.css">
+<!-- The shell's module graph, fetched alongside the stylesheets instead of
+     after them.
+
+     A browser cannot know a module's imports until it has parsed the module, so
+     this graph arrives in three waves on its own: `app.js`, then the seven it
+     imports, then `api.live.js` and `ws.js` below those. Three round trips
+     where one would do — and a conditional request costs a round trip even when
+     the answer is 304 and no bytes, so this matters as much on a refresh as on
+     a first load.
+
+     Kept honest by a test (`npcd/src/console.rs`): every href here must exist,
+     and every module the shell imports must be here. -->
+<link rel="modulepreload" href="/lib/api.js">
+<link rel="modulepreload" href="/lib/api.live.js">
+<link rel="modulepreload" href="/lib/ws.js">
+<link rel="modulepreload" href="/lib/router.js">
+<link rel="modulepreload" href="/lib/dom.js">
+<link rel="modulepreload" href="/lib/ui.js">
+<link rel="modulepreload" href="/lib/build.js">
+<link rel="modulepreload" href="/lib/viewport.js">
+<link rel="modulepreload" href="/lib/estate.js">
 <script>
   /* Apply the stored appearance before first paint so there is no flash.
      Each theme is a full token set on the root element (see app.css) — light
@@ -57,7 +110,31 @@
     <div class="body">
       <div id="scrim" class="rail-scrim" hidden></div>
       <aside id="rail" class="rail"></aside>
-      <main id="outlet" class="outlet"></main>
+      <main id="outlet" class="outlet">
+        <!-- What a reader with no JavaScript gets, and what a crawler finds
+             instead of an empty element.
+
+             Deliberately the same claim the page makes once it renders, in
+             fewer words. Anything else here would be showing one thing to a
+             crawler and another to a reader, which is the definition of
+             cloaking and is penalised as such — and rightly, since it is a lie
+             told to a machine on the reader's behalf. -->
+        <noscript>
+          <div class="page" style="max-width:34rem;margin:3rem auto;padding:0 1.25rem">
+            <h1>NPCs that remember you.</h1>
+            <p>
+              A mind per character. Years of lived history, convictions that hold under
+              pressure, and a hundred of them thinking at once — on a single graphics card.
+            </p>
+            <p>
+              npcd is the NPC engine behind <a href="https://battlecities.net/">Battle
+                Cities</a>, and it runs headless on your own hardware. The console needs
+              JavaScript; the <a href="https://tokera.com/papers">papers</a> and the
+              <a href="https://tokera.com/blog">writing</a> behind it do not.
+            </p>
+          </div>
+        </noscript>
+      </main>
     </div>
 
     <footer class="statusbar">

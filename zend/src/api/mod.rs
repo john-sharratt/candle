@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{header, Request, StatusCode},
+    http::{Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -137,21 +137,26 @@ async fn embedded_asset(req: Request<Body>) -> Response {
     };
 
     match WEB.get_file(&name) {
-        Some(f) => {
-            let mime = mime_guess::from_path(&name).first_or_octet_stream();
-            // `no-store` so a hot rebuild never leaves the browser running a
-            // cached `index.html` against a stale `zend-api.*.js` (or vice
-            // versa) — the two would disagree on the API surface and silently
-            // break (e.g. a method the new HTML calls is absent in old JS).
-            (
-                [
-                    (header::CONTENT_TYPE, mime.as_ref()),
-                    (header::CACHE_CONTROL, "no-store"),
-                ],
-                f.contents(),
-            )
-                .into_response()
-        }
+        /* Served by `web::asset`, the same code the gateway and `npcd` use.
+         *
+         * That brings an entity tag, a conditional answer and gzip, none of
+         * which this had — and it replaces a hardcoded `no-store`. The reason
+         * for `no-store` was real: a hot rebuild must never leave the browser
+         * running a cached `index.html` against a stale `zend-api.*.js`, since
+         * the two would disagree about the API surface and break silently.
+         *
+         * A short age keeps that bounded rather than absolute, and the tag is
+         * what makes it cheap: past the age the request is conditional and an
+         * unchanged file comes back as `304` with no body. The window in which
+         * the pair can disagree is one minute, not for ever — and it was never
+         * zero anyway, since a page already loaded holds its modules until it
+         * is reloaded. */
+        Some(f) => web::asset::respond(
+            &name,
+            f.contents().to_vec(),
+            web::config::Cache::default(),
+            req.headers(),
+        ),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }

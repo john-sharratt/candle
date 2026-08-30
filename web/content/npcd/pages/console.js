@@ -186,6 +186,20 @@ export async function render(params) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   }
 
+  /* One injection, and whether it landed.
+   *
+   * The caller paints the line onto the stage only on `true`, so a refusal is
+   * visible as the message not appearing, with the reason in a toast. */
+  async function deliver(payload) {
+    try {
+      await API.inject(ix, payload);
+      return true;
+    } catch (e) {
+      toast(e.detail || e.message || 'the daemon did not take that', 'err');
+      return false;
+    }
+  }
+
   async function send() {
     const line = input.value.trim();
     if (!line) return;
@@ -193,11 +207,17 @@ export async function render(params) {
       const p = parseLine(line, commands);
       if (!p.command) return toast('Unknown command', 'err');
       if (!p.complete) return toast('Missing: ' + (p.missing || []).join(', '), 'err');
-      await API.inject(ix, { command: p.command.name, args: p.args }).catch(() => {});
+      /* Painted only once it was accepted.
+       *
+       * The error used to be swallowed and the line added regardless, so a
+       * message the daemon never took looked exactly like one it did — the
+       * operator reads their own words on the stage and believes the character
+       * heard them. */
+      if (!(await deliver({ command: p.command.name, args: p.args }))) return;
       addLocal(p.command.name === 'say' ? p.args.text : '/' + p.command.name,
         p.command.name === 'say' ? 'say' : p.command.name === 'beat' ? 'beat_' : 'cue', true);
     } else {
-      await API.inject(ix, { text: line }).catch(() => {});
+      if (!(await deliver({ text: line }))) return;
       addLocal(line, 'say', true);
     }
     input.value = '';

@@ -41,9 +41,27 @@ const title = (id) => String(id || '').split('-').map(label).join(' ');
 const named = (a) => a.name || title(a.personality_id);
 
 export async function render(params, q) {
-  const list = (await API.listPersonalities().catch(() => ({ personalities: [] }))).personalities || [];
-  const aid = params.aid || q.a || (list[0] && list[0].personality_id);
-  const a = list.find((x) => x.personality_id === aid);
+  const listed = (await API.listPersonalities().catch(() => ({ personalities: [] }))).personalities || [];
+  const aid = params.aid || q.a || (listed[0] && listed[0].personality_id);
+
+  /* A personality named directly is fetched directly.
+   *
+   * The listing leaves out anything `hidden` — that is what the flag means, and
+   * the daemon only includes one when a whole word of `q` names it. So picking
+   * a hidden personality out of the filter and then landing on this page found
+   * it missing from the unfiltered list and rendered "No personalities", for a
+   * document that reads perfectly well by id.
+   *
+   * The reveal is not lost by navigating, because it was never the listing that
+   * carried it: the address does. */
+  let a = listed.find((x) => x.personality_id === aid);
+  if (!a && aid) {
+    a = await API.getPersonality(aid).catch(() => null);
+  }
+  // Added to the picker so the one being read is in the list it is chosen from.
+  const list = a && !listed.some((x) => x.personality_id === a.personality_id)
+    ? [...listed, a]
+    : listed;
 
   const el = h('div', { class: 'page wide' });
 
@@ -56,9 +74,18 @@ export async function render(params, q) {
     list.length > 1 ? picker(list, aid) : null));
 
   if (!a) {
-    el.appendChild(empty('◈', 'No personalities',
-      'Personalities are YAML files in the mind. Point the daemon at one with --mind, or add a file to ' +
-      'its personalities/ directory.'));
+    /* Two different absences, said differently.
+     *
+     * One message covered both, and told somebody who had followed a link to a
+     * personality that does not exist to point their daemon at a mind — which
+     * it already is, with seventy-three others in it.
+     */
+    el.appendChild(aid
+      ? empty('⊘', 'No such personality',
+        `Nothing in this mind is called “${aid}”. It may have been renamed, or the link may be old.`)
+      : empty('◈', 'No personalities',
+        'Personalities are YAML files in the mind. Point the daemon at one with --mind, or add a file to '
+        + 'its personalities/ directory.'));
     return { el };
   }
 
@@ -134,10 +161,28 @@ function picker(list, aid) {
   });
 
   const fill = (rows) => {
+    if (!rows.length) {
+      // Visible, and saying so. An emptied select would look like the filter
+      // had not been typed yet.
+      mount(sel, h('option', { disabled: true, selected: true }, 'no match'));
+      sel.hidden = false;
+      return;
+    }
     mount(sel, rows.map((x) => h('option', {
       value: x.personality_id, selected: x.personality_id === aid,
     }, `${named(x)} · ${x.npc_count || 0}`)));
-    sel.hidden = rows.length < 2;
+    /* Hidden only when there is nothing to pick.
+     *
+     * This was `rows.length < 2`, which reads as "no picker for a single
+     * personality" — true of the *initial* list, and already decided by the
+     * caller. Applied to a search result it meant that narrowing the filter to
+     * exactly one match hid the control showing it, so the closer you got the
+     * less you saw.
+     *
+     * Worst for the case the filter exists to serve: a hidden document is
+     * revealed by typing a **whole word** of its name, which by design matches
+     * exactly one. Typing `cindy` fetched `cindy-tan` and then hid it. */
+    sel.hidden = false;
   };
   fill(list);
 

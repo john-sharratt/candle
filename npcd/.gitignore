@@ -18,6 +18,13 @@ accounts/
 # stays out of a public repository by default rather than by remembering.
 secrets/
 
+# Portraits, as uploaded. Content-addressed, so the name is the hash and a
+# re-upload of the same picture is the same file — but they are still whatever a
+# user chose to send, at whatever size they chose to send it, which is neither
+# reviewable nor something a public repository should carry. A character's
+# record names the id; the bytes stay on the machine that received them.
+images/
+
 # The narrative clock and anything else that moves on its own. Committing a
 # value that advances 60× per second would leave the tree permanently dirty.
 state/

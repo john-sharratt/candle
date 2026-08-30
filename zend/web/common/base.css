@@ -178,6 +178,22 @@ a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 code, pre { font-family: var(--mono); }
 
+/* `hidden` means hidden, whatever else says otherwise.
+ *
+ * The attribute is enforced by one UA rule, `[hidden] { display: none }`, and
+ * ANY author rule that sets `display` on the same element beats it — author
+ * styles win over the UA stylesheet regardless of specificity. So `.icon-btn
+ * { display: flex }` below silently un-hid the rail toggle on every narrow
+ * screen, on every page, including the ones with no rail: pressing it darkened
+ * the scrim over an empty drawer and nothing appeared. `#shell { display: flex }`
+ * had the same hole, masked only because the boot overlay covers it.
+ *
+ * This is the one place `!important` is the right tool: `hidden` is a statement
+ * that the element is not relevant, and nothing layout-related should be able
+ * to overrule it. Three elements in the shell depend on it — see the test in
+ * `npcd/src/console.rs`. */
+[hidden] { display: none !important; }
+
 ::-webkit-scrollbar { width: 11px; height: 11px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 7px; border: 3px solid var(--bg); }

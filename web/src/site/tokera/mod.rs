@@ -22,11 +22,12 @@ use crate::content::Roots;
 use crate::markdown::Cache;
 
 pub mod blog;
+pub mod discovery;
 pub mod home;
 pub mod page;
 pub mod papers;
 
-use page::{Meta, Nav, Width};
+use page::{Kind, Meta, Nav, Width};
 
 pub struct State {
     pub roots: Roots,
@@ -72,6 +73,17 @@ pub fn router(roots: Roots, papers_dir: Option<PathBuf>) -> Router {
                 },
             ),
         )
+        // What a crawler and a feed reader ask for before a page — generated
+        // from the same walk the index uses, so they cannot fall behind it.
+        .route("/robots.txt", get(discovery::robots))
+        .route(
+            "/sitemap.xml",
+            get(|AxState(s): AxState<Arc<State>>| discovery::sitemap(s)),
+        )
+        .route(
+            "/blog/feed.xml",
+            get(|AxState(s): AxState<Arc<State>>| discovery::feed(s)),
+        )
         .fallback(|| async { not_found(Nav::Home, "There is nothing at that address.") })
         .with_state(state)
 }
@@ -99,6 +111,11 @@ fn message(nav: Nav, heading: &str, detail: &str) -> Html<String> {
         description: detail,
         nav,
         width: Width::Reading,
+        // An error page has no address of its own — see [`Kind::Error`].
+        path: "/",
+        kind: Kind::Error,
+        image: None,
+        published: None,
     };
     Html(format!(
         "{}{}<p class=\"empty\">{}</p>{}",

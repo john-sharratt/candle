@@ -3,13 +3,29 @@
 
 import { API } from '../lib/api.js';
 import { h } from '../lib/dom.js';
-import { toast, modal, only } from '../lib/ui.js';
+import { toast, modal, only, empty } from '../lib/ui.js';
 
 const MODE_SHORT = { physical: 'phys', video_call: 'video', voice_call: 'voice', instant_message: 'im' };
 
 export async function render() {
-  const r = await API.listTools().catch(() => ({ tools: [], uncalibrated: 0 }));
   const el = h('div', { class: 'page', style: 'max-width:1100px' });
+
+  /* A failure is reported, not defaulted.
+   *
+   * This was `.catch(() => ({ tools: [], uncalibrated: 0 }))`, and zero
+   * uncalibrated tools is exactly the value that renders a green **all
+   * calibrated** chip. So a daemon that could not be reached at all came back
+   * as the reassuring answer, over an empty table. */
+  let r;
+  try {
+    r = await API.listTools();
+  } catch (e) {
+    el.appendChild(h('div', { class: 'hd' }, h('div', {}, h('h1', {}, 'Tools'))));
+    el.appendChild(h('div', { class: 'panel' },
+      empty('⊘', 'The tool catalog could not be read',
+        e.detail || e.message || 'the daemon did not answer')));
+    return el;
+  }
 
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'Tools'),
@@ -21,10 +37,25 @@ export async function render() {
       // how every character on this machine selects a tool — the only write on
       // this page that is not scoped to the caller's own characters, which is
       // what puts it with the admin controls rather than beside them.
-      r.uncalibrated
+      /* `null` means nothing has counted, and there is no tool registry to
+       * count — the engine registers tools with the layers each may write. Only
+       * a real number gets a chip; the empty-state panel below says why the
+       * table is empty. */
+      r.uncalibrated == null
+        ? null
+        : r.uncalibrated
         ? (only('admin', () => h('button', {
           class: 'btn primary',
-          onClick: async () => { await API.calibrateTools(); toast('calibration pass queued', 'ok'); },
+          onClick: async () => {
+            // Awaited and reported. It used to toast success whatever came
+            // back, which is the same failure as the chip above.
+            try {
+              await API.calibrateTools();
+              toast('calibration pass queued', 'ok');
+            } catch (e) {
+              toast(e.detail || e.message || 'could not queue a calibration pass', 'err');
+            }
+          },
         }, `Calibrate ${r.uncalibrated} tool${r.uncalibrated === 1 ? '' : 's'}`))
           || h('span', { class: 'chip warn', title: 'calibration is an admin’s to run' },
             `${r.uncalibrated} uncalibrated`))
@@ -34,6 +65,18 @@ export async function render() {
   for (const t of r.tools) {
     if (!groups.has(t.category)) groups.set(t.category, []);
     groups.get(t.category).push(t);
+  }
+
+  // An empty catalog with a reason. Without this the page is a heading over
+  // nothing, which reads as a daemon that lost its tools rather than one that
+  // has never had any.
+  if (!r.tools.length) {
+    el.appendChild(h('div', { class: 'panel' },
+      empty('◌', 'No tools registered',
+        r.engine_connected === false
+          ? 'Tools are registered by the engine, with the layers each one may write. This daemon '
+            + 'is not running one, so the catalog is empty and there is nothing to calibrate.'
+          : 'This daemon has registered no tools.')));
   }
 
   for (const [cat, ts] of groups) {

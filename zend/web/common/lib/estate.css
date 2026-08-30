@@ -59,10 +59,18 @@
   color: var(--ink-dim, #6a8098); font-weight: 600;
 }
 
-/* The menu is wider than a phone's brand corner; pin it to the viewport edge
-   rather than letting it push a horizontal scrollbar onto the page. */
+/* A phone narrower than the menu: cap the width against the viewport, so the
+   menu cannot push a horizontal scrollbar onto the page.
+
+   Capped, not anchored. This was `left: -4px; right: -4px`, meant to pin the
+   menu to the viewport edges — but those offsets resolve against the *switcher*,
+   which is the containing block and is about fifty pixels wide once the name is
+   hidden below 860px. So on every phone at or under 420px the menu collapsed to
+   a sliver barely wider than the chip, with its rows overflowing it: the brand
+   darkened on the press, and nothing legible appeared. `max-width` needs no
+   containing block to be the right size. */
 @media (max-width: 420px) {
-  .estate-menu { left: -4px; right: -4px; min-width: 0; }
+  .estate-menu { min-width: 0; max-width: calc(100vw - 24px); }
 }
 
 /* Narrow: the chip alone carries the summary — but the menu rows keep their

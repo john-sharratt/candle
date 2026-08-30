@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One entry, because the console has one indexable address.
+     Everything else here is a hash route inside a signed-in application: not a
+     URL a crawler can fetch, and not a page anybody outside would want to
+     land on. Listing them would be asking to have an empty app shell indexed
+     a dozen times over. -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://bot.tokera.com/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>

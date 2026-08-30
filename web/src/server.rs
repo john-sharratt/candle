@@ -26,6 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use tower::Service;
 
+use crate::asset;
 use crate::auth::Auth;
 use crate::config::{Config, Site, Upstream};
 use crate::content::{self, Roots};
@@ -216,6 +217,123 @@ impl Builder {
     }
 }
 
+/// One permanent redirect, carrying the path and query across.
+///
+/// `301`, because these are alternate names for one brand and that is the
+/// status that tells a search engine to move the address rather than note a
+/// detour. It is worth knowing that browsers cache a `301` hard and for a long
+/// time — a host redirected by mistake stays redirected in every browser that
+/// saw it, so this is a decision to make deliberately and rarely.
+///
+/// The tail is taken from the request line, which is a client's to choose, so
+/// the `Location` is built through `HeaderValue::from_str` — it rejects the
+/// control characters that would otherwise let a crafted path inject a second
+/// header. A tail that will not go in a header is dropped and the redirect
+/// lands on the target's root, which is the safe direction to be wrong in.
+fn redirect(to: &str, req: &Request) -> Response {
+    let tail = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let location = format!("{}{tail}", to.trim_end_matches('/'));
+    let mut res = Response::new(Body::empty());
+    *res.status_mut() = StatusCode::MOVED_PERMANENTLY;
+    let value = HeaderValue::from_str(&location)
+        .or_else(|_| HeaderValue::from_str(to.trim_end_matches('/')))
+        .ok();
+    if let Some(v) = value {
+        res.headers_mut().insert(header::LOCATION, v);
+    }
+    // A redirect that never changes may be kept, but not for ever: these are
+    // the one thing here somebody might need to undo, and a browser holding a
+    // permanent redirect it can no longer re-check is how that becomes hard.
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=900"),
+    );
+    res
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+
+    fn to(uri: &str) -> String {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        redirect("https://tokera.com", &req)
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// **A redirect keeps the address somebody typed.**
+    ///
+    /// Dropping the path sends every deep link to the front page, which for a
+    /// consolidated domain means every inbound link to a paper or a post
+    /// arrives nowhere in particular — and a search engine following one learns
+    /// only that the old address is gone.
+    #[test]
+    fn the_path_and_query_come_across() {
+        assert_eq!(to("/"), "https://tokera.com/");
+        assert_eq!(to("/papers/o1"), "https://tokera.com/papers/o1");
+        assert_eq!(
+            to("/blog/x?utm=1&b=2"),
+            "https://tokera.com/blog/x?utm=1&b=2"
+        );
+        assert_eq!(to("/a/b/c/"), "https://tokera.com/a/b/c/");
+    }
+
+    /// A target written with a trailing slash must not produce `//`.
+    #[test]
+    fn the_target_is_joined_without_doubling_the_slash() {
+        let req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        let res = redirect("https://tokera.com/", &req);
+        assert_eq!(res.headers()[header::LOCATION], "https://tokera.com/x");
+    }
+
+    #[test]
+    fn it_is_permanent() {
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert_eq!(
+            redirect("https://tokera.com", &req).status(),
+            StatusCode::MOVED_PERMANENTLY
+        );
+    }
+
+    /// **The tail is the client's to choose, so it must not be able to write a
+    /// second header.**
+    ///
+    /// A `Location` carrying a carriage return is header injection. The URI
+    /// parser rejects most of it before this is reached, and `from_str` is the
+    /// backstop — anything it will not take falls back to the target's root,
+    /// which is the safe direction to be wrong in.
+    #[test]
+    fn a_crafted_path_cannot_inject_a_header() {
+        for raw in [
+            "/x%0d%0aSet-Cookie:%20a=b",
+            "/x%0aLocation:%20https://evil.example",
+            "/x%00y",
+        ] {
+            let Ok(req) = Request::builder().uri(raw).body(Body::empty()) else {
+                continue; // refused before it got here, which is also correct
+            };
+            let res = redirect("https://tokera.com", &req);
+            let loc = res.headers()[header::LOCATION].to_str().unwrap();
+            assert!(
+                !loc.contains('\r') && !loc.contains('\n') && !loc.contains('\0'),
+                "`{raw}` produced `{loc}`"
+            );
+            assert!(
+                loc.starts_with("https://tokera.com"),
+                "`{raw}` escaped the target"
+            );
+        }
+    }
+}
+
 fn announce(cfg: &Config, roots: &HashMap<String, Roots>, local: &HashMap<String, Router>) {
     for site in &cfg.sites {
         let hosts = if site.hosts.is_empty() {
@@ -224,8 +342,11 @@ fn announce(cfg: &Config, roots: &HashMap<String, Roots>, local: &HashMap<String
             site.hosts.join(", ")
         };
         let r = roots.get(&site.name);
-        let where_ = match r {
-            Some(rs) if !rs.is_empty() => format!("{:?}", rs.0),
+        let where_ = match (&site.redirect, r) {
+            // Said plainly, because a redirected host silently serving nothing
+            // looks identical to a misconfigured one in this table.
+            (Some(to), _) => format!("→ {to} (301)"),
+            (None, Some(rs)) if !rs.is_empty() => format!("{:?}", rs.0),
             _ => "(no content)".into(),
         };
         tracing::info!(
@@ -264,6 +385,17 @@ async fn handle(
         .map(str::to_owned);
     let site = app.cfg.site_for(host.as_deref());
     let path = req.uri().path().to_owned();
+
+    /* A redirected host is answered before anything else happens to the
+     * request.
+     *
+     * Before identity, before sign-in, before routing — none of it applies to a
+     * name that serves nothing. It also means an alternate domain costs one
+     * response and never touches a content root or an upstream, so adding one
+     * cannot affect what the real site does. */
+    if let Some(to) = &site.redirect {
+        return redirect(to, &req);
+    }
 
     // **Strip inbound identity headers here, before anything is dispatched.**
     //
@@ -345,6 +477,9 @@ async fn handle(
                         identity: identity.as_ref(),
                         assertion: assertion.as_deref(),
                         secure: app.auth.as_ref().is_some_and(|a| a.is_secure()),
+                        // Applied only where the upstream said nothing — a
+                        // daemon that states its own policy keeps it.
+                        cache: app.cfg.server.cache,
                     },
                     req,
                 )
@@ -408,7 +543,9 @@ async fn serve_files(app: &App, site: &Site, path: &str, headers: &header::Heade
 
     for candidate in &tried {
         if let Some(bytes) = roots.read(candidate).await {
-            return file(candidate, bytes, &app.cfg.server.cache_control);
+            // The request's own headers decide the answer: what it already
+            // holds, and what encodings it will take. See [`crate::asset`].
+            return asset::respond(candidate, bytes, app.cfg.server.cache, headers);
         }
     }
 
@@ -416,18 +553,4 @@ async fn serve_files(app: &App, site: &Site, path: &str, headers: &header::Heade
         Problem::not_found(format!("no such file in site `{}`", site.name)),
         want_html,
     )
-}
-
-fn file(name: &str, bytes: Vec<u8>, cache_control: &str) -> Response {
-    let mime = mime_guess::from_path(name).first_or_octet_stream();
-    let mut res = Response::new(Body::from(bytes));
-    let h = res.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(mime.as_ref()) {
-        h.insert(header::CONTENT_TYPE, v);
-    }
-    if let Ok(v) = HeaderValue::from_str(cache_control) {
-        h.insert(header::CACHE_CONTROL, v);
-    }
-    *res.status_mut() = StatusCode::OK;
-    res
 }

@@ -74,7 +74,11 @@ export async function render(params) {
       h('div', { class: 'row', style: 'gap:9px' },
         h('h1', {}, npc.name),
         h('span', { class: 'chip' }, npc.personality_name || ''),
-        bandChip(npc.monitor?.band || 'healthy'),
+        // `?? null`, not `|| 'healthy'`. A band is an engine measurement, and
+        // the daemon returns null for a character it has never run — asserting
+        // health for one nothing has looked at is the fabrication `roster.js`
+        // and `lib/ui.js` both go out of their way to avoid.
+        bandChip(npc.monitor?.band ?? null),
         npc.hidden ? h('span', { class: 'chip' }, 'hidden') : null),
       h('div', { class: 'sub row', style: 'gap:8px' },
         idBadge(npc.npc_id), '·', pending(npc.tick?.pending_events || 0),
@@ -220,7 +224,12 @@ export async function render(params) {
         h('div', { class: 'tiny dim', style: 'max-width:640px' },
           'Beliefs are readable by the action layer but never writable by it. Everything you edit here is an ' +
           'authoring-plane write and is recorded as such.'),
-        h('button', { class: 'btn sm', onClick: () => toast('authoring a belief — engine required', 'err') }, '+ Author')),
+        /* A real write. It was `toast('authoring a belief — engine required')`,
+         * which was wrong twice: the daemon refused because the route was a
+         * fixture, and §16 calls this the *authoring* plane precisely because
+         * stating what a character believes is what a person does, not what an
+         * engine produces. */
+        h('button', { class: 'btn sm', onClick: () => authorBelief() }, '+ Author')),
       bs.map((b) => {
         const frac = b.threshold ? b.disconfirmation / b.threshold : 0;
         return h('div', { class: 'panel' },
@@ -242,6 +251,54 @@ export async function render(params) {
                 { height: 120, min: 0, max: 1, color: 'var(--l-beliefs)' }))
             : null);
       }));
+  }
+
+  /* State a belief, or edit one.
+   *
+   * The id is derived from the statement rather than asked for — it is a key,
+   * not something an author should have to invent, and one typed by hand is
+   * one more thing to get wrong on a form whose real content is the sentence.
+   */
+  function authorBelief(existing) {
+    const statement = h('textarea', { class: 'textarea', rows: 3 },
+      existing ? existing.statement : '');
+    const confidence = h('input', { class: 'input', type: 'number', step: '0.01', min: '0', max: '1' });
+    confidence.value = existing ? existing.confidence : 0.6;
+    const threshold = h('input', { class: 'input', type: 'number', step: '0.01', min: '0', max: '1' });
+    threshold.value = existing ? existing.threshold : 0.5;
+
+    modal({
+      title: existing ? 'Edit a belief' : 'Author a belief',
+      body: h('div', {},
+        h('div', { class: 'tiny dim', style: 'margin-bottom:10px;max-width:60ch' },
+          'Written in the character\'s own voice, as something they hold true. Confidence is how '
+          + 'strongly; threshold is how much contrary evidence it would take to break it.'),
+        h('label', { class: 'field' }, h('span', {}, 'Statement'), statement),
+        h('div', { class: 'grid g2' },
+          h('label', { class: 'field' }, h('span', {}, 'Confidence'), confidence),
+          h('label', { class: 'field' }, h('span', {}, 'Threshold'), threshold))),
+      confirmText: existing ? 'Save' : 'Author',
+      onConfirm: async () => {
+        const text = statement.value.trim();
+        if (!text) return toast('a belief needs a statement', 'err');
+        // Derived from the sentence, and stable for an edit.
+        const bid = existing ? existing.belief_id
+          : text.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 48)
+            || 'belief_' + Date.now();
+        try {
+          await API.authorBelief(id, {
+            belief_id: bid,
+            statement: text,
+            confidence: Number(confidence.value),
+            threshold: Number(threshold.value),
+          });
+          toast('belief authored', 'ok');
+          beliefs();
+        } catch (e) {
+          toast(e.detail || e.message || 'could not author that', 'err');
+        }
+      },
+    });
   }
 
   async function relationships() {
@@ -358,22 +415,59 @@ export async function render(params) {
         : empty('◍', 'No live interactions', 'Open one to talk to this character.'));
   }
 
+  /* The environment: config that saves, and a record that is empty until
+   * something runs.
+   *
+   * The checkbox had no `onChange` and the prompt had no save control at all —
+   * both were scenery over a fixture. They are the character's own record now,
+   * so both write. */
   async function environmentTab() {
-    const e = await API.getEnvironment(id).catch(() => null);
-    if (!e) return mount(bodyHost, empty('◌', 'No environment simulator'));
+    let e;
+    try {
+      e = await API.getEnvironment(id);
+    } catch (err) {
+      return mount(bodyHost, empty('⊘', 'The environment could not be read',
+        err.detail || err.message || 'the daemon did not answer'));
+    }
+
+    const enabled = h('input', { type: 'checkbox', checked: e.enabled,
+      onChange: async (ev) => {
+        try {
+          await API.setEnvironment(id, { enabled: ev.target.checked });
+          toast(ev.target.checked ? 'simulator on' : 'simulator off', 'ok');
+        } catch (err) {
+          ev.target.checked = !ev.target.checked;
+          toast(err.detail || err.message || 'could not save', 'err');
+        }
+      } });
+    const prompt = h('textarea', { class: 'textarea', rows: 5 }, e.system_prompt || '');
+
     mount(bodyHost,
       h('div', { class: 'panel' },
-        h('label', { class: 'row', style: 'gap:9px;cursor:pointer' },
-          h('input', { type: 'checkbox', checked: e.enabled }),
+        h('label', { class: 'row', style: 'gap:9px;cursor:pointer' }, enabled,
           h('div', {}, h('div', { style: 'font-weight:600;font-size:.87rem' }, 'Environment simulator'),
-            h('div', { class: 'tiny dim' }, 'Its own conversation with its own system prompt and a sliding window of ' + e.window_turns + ' turns.'))),
+            h('div', { class: 'tiny dim' }, 'Its own conversation with its own system prompt, gathered alongside the character\'s.'))),
         h('label', { class: 'field', style: 'margin-top:14px' },
-          h('span', {}, 'System prompt'),
-          h('textarea', { class: 'textarea', rows: 5 }, e.system_prompt))),
+          h('span', {}, 'System prompt'), prompt),
+        h('div', { class: 'row', style: 'justify-content:flex-end;margin-top:9px' },
+          h('button', { class: 'btn primary sm', onClick: async () => {
+            try {
+              await API.setEnvironment(id, { system_prompt: prompt.value });
+              toast('saved', 'ok');
+            } catch (err) {
+              toast(err.detail || err.message || 'could not save', 'err');
+            }
+          } }, 'Save'))),
       h('h2', {}, 'Recent'),
-      h('div', { class: 'panel' }, (e.recent || []).map((r) => h('div', { style: 'padding:5px 0;border-bottom:1px solid var(--line)' },
-        h('span', { class: 'tiny mono dim', style: 'margin-right:10px' }, worldTime(r.world_ms)),
-        h('span', { style: 'font-size:.86rem;font-style:italic;color:var(--ink-mid)' }, r.text)))),
+      h('div', { class: 'panel' },
+        // `null` from the daemon means the simulator has not run, which is not
+        // the same as having run and done nothing.
+        e.events === null
+          ? h('div', { class: 'tiny dim' },
+            'Nothing has run here yet — the simulator writes into the perception layer, and that needs an engine.')
+          : (e.events || []).map((r) => h('div', { style: 'padding:5px 0;border-bottom:1px solid var(--line)' },
+            h('span', { class: 'tiny mono dim', style: 'margin-right:10px' }, worldTime(r.world_ms)),
+            h('span', { style: 'font-size:.86rem;font-style:italic;color:var(--ink-mid)' }, r.text)))),
       h('div', { class: 'row', style: 'margin-top:11px;gap:8px' },
         h('input', { class: 'input', placeholder: 'inject a world event…' }),
         // Says so rather than doing nothing. Injecting an event means writing a
@@ -613,5 +707,16 @@ export async function render(params) {
     });
   }
 
-  return { el, teardown: () => { const r = document.getElementById('rail'); if (r) r.replaceChildren(); } };
+  /* No `teardown` clearing the rail, deliberately.
+   *
+   * Clearing it here emptied the rail the instant a tab was clicked, and the
+   * replacement only arrived after `getNpc` and `getSubstrate` had both come
+   * back — so the rail visibly vanished for the length of two round trips on
+   * every click within a character. `paintRail` swaps the children in one go
+   * when the new data is ready, which is the same end state without the gap.
+   *
+   * Nothing is left stale: `/npc/:id` and `/npc/:id/:tab` are the only routes
+   * marked `keepsRail`, so leaving the character for any other page clears the
+   * rail in `app.js` on the way out. */
+  return { el };
 }

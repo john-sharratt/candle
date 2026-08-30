@@ -11,7 +11,7 @@
 import { API } from '../lib/api.js';
 import { h, mount, fmtK, worldTime } from '../lib/dom.js';
 import { go } from '../lib/router.js';
-import { empty, toast, confirmDialog, layerColor, bar, modal, mayEdit, ro, roChip, only, roNote } from '../lib/ui.js';
+import { empty, toast, confirmDialog, layerColor, bar, mayEdit, ro, roChip, only, roNote } from '../lib/ui.js';
 
 /* The filter box and the world selector, together.
  *
@@ -87,7 +87,8 @@ export async function render(params, q) {
   const worlds = (await API.listWorlds(find).catch(() => ({ worlds: [] }))).worlds || [];
   const wid = params.wid || (worlds[0] && worlds[0].world_id);
   const w = worlds.find((x) => x.world_id === wid);
-  const tab = q.tab || 'layers';
+  // Opens on the sections, which is what a world is mostly looked at for.
+  const tab = q.tab || 'collections';
 
   const el = h('div', { class: 'page wide' });
   const find_ = finder(find, wid, tab);
@@ -115,63 +116,155 @@ export async function render(params, q) {
     return { el };
   }
 
+  /* Ordered by how often somebody comes here to do it.
+   *
+   * `layers` used to be first and was also the default, so the page opened on
+   * the one thing nobody edits: layer geometry is calibration data, re-derived
+   * by measurement rather than typed into a form. It is now last, and reached
+   * through a quieter control below rather than sitting level with the three
+   * things people actually came for. */
   const TABS = [
-    ['layers', 'Substrate layers'],
-    ['collections', 'Section collections'],
-    ['setting', 'Setting & world knowledge'],
+    ['collections', 'Sections'],
+    ['setting', 'Setting & knowledge'],
     ['clock', 'Narrative clock'],
   ];
-  el.appendChild(h('div', { class: 'row', style: 'gap:4px;margin-bottom:18px' },
+  el.appendChild(h('div', { class: 'row', style: 'gap:4px;margin-bottom:18px;flex-wrap:wrap' },
     TABS.map(([k, label]) => h('button', {
-      class: 'btn sm' + (tab === k ? ' primary' : ' ghost'),
+      class: 'btn' + (tab === k ? ' primary' : ' ghost'),
       onClick: () => go(`/world/${wid}?tab=${k}`),
-    }, label))));
+    }, label)),
+    h('span', { class: 'spacer', style: 'flex:1' }),
+    /* The corpus behind all of it, as one editable tree.
+     *
+     * Not in `TABS`, because it leaves this page: the tabs are views of one
+     * world's settings, and this is the whole mind with that world held over it
+     * as a lens. Carrying `wid` opens it already filtered to what this world
+     * admits. */
+    wid
+      ? h('button', {
+        class: 'btn sm ghost',
+        title: 'Browse and edit everything this world draws on',
+        onClick: () => go(`/mind?world=${wid}`),
+      }, 'Edit the corpus →')
+      : null,
+    /* Rarely wanted, so a quiet link rather than a peer of the tabs — but it
+     * reaches a real editor now, not a reading of a fixture. */
+    h('button', {
+      class: 'btn sm ghost' + (tab === 'layers' ? ' primary' : ''),
+      title: 'The nine layers this mind projects through',
+      onClick: () => go(`/world/${wid}?tab=layers`),
+    }, 'Layer geometry')));
 
   const host = h('div', {});
   el.appendChild(host);
 
-  ({ layers, collections, setting, clock }[tab] || layers)();
+  // An unknown tab lands on the sections, the same place a bare URL does.
+  ({ layers, collections, setting, clock }[tab] || collections)();
 
   // ── substrate layers ──────────────────────────────────────────────────────
 
+  /* The nine layers, read from the projection schema itself.
+   *
+   * From the mind, not from a `/v1/schema/layers` of its own: the schema is an
+   * authored document like the rest of the corpus, and a second endpoint
+   * serving the same nine layers is a second set of numbers to drift. It did —
+   * the fixture this page used to read had `action` at priority 95 while the
+   * schema said 100, and nothing could have noticed.
+   *
+   * Each layer is a *part* of `settings/projection` (`npcd/src/mind/parts.rs`),
+   * so it lists and opens like any other entry. Which is also why the Edit
+   * button below is real. */
   async function layers() {
-    const s = await API.getLayerSchema().catch(() => ({ layers: [] }));
-    const maxWindow = Math.max(...(s.layers || []).map((l) => l.window || 0), 1);
+    mount(host, h('div', { class: 'tiny dim' }, 'reading the schema…'));
+    let found = [];
+    try {
+      const listing = await API.mindList('settings/projection');
+      found = await Promise.all((listing.children || []).map(async (c) => ({
+        id: c.id,
+        name: c.title,
+        fields: (await API.mindFields(c.id)).fields || [],
+      })));
+    } catch (e) {
+      mount(host, h('div', { class: 'panel' },
+        empty('◌', 'No projection schema',
+          e.detail || e.message || 'this mind declares no layers')));
+      return;
+    }
+
+    /* A value out of a field list, following nested groups: `at(f, 'budget',
+     * 'adaptive', 'gain')`. The form and this view read the same shape, so
+     * there is nowhere for the two to disagree about what a layer says. */
+    const at = (fields, ...path) => {
+      let list = fields;
+      let value;
+      for (const key of path) {
+        const f = (list || []).find((x) => x.key === key);
+        if (!f) return undefined;
+        value = f.value;
+        list = f.fields;
+      }
+      return value;
+    };
+    const rowsOf = (fields, key) =>
+      ((fields || []).find((f) => f.key === key) || {}).rows || [];
+
+    const maxWindow = Math.max(...found.map((l) => at(l.fields, 'window') || 0), 1);
 
     mount(host,
       h('div', { class: 'panel', style: 'margin-bottom:12px' },
         h('div', { class: 'tiny dim' },
-          'Layer geometry is the calibration surface: window, budget priority and floor, score threshold, ' +
-          'and the selection rule. It is data rather than code precisely so it can be moved without a rebuild — ' +
-          `and every change here reaches every character in ${w.name}` +
-          (w.npc_count ? `, all ${w.npc_count} of them.` : ' — none yet.'))),
+          'Layer geometry is the calibration surface: window, budget, score threshold, and the '
+          + 'selection rule. It is data rather than code precisely so it can be moved without a '
+          + `rebuild — and every change here reaches every character in ${w.name}`
+          + (w.npc_count ? `, all ${w.npc_count} of them.` : ' — none yet.'))),
 
-      h('div', { class: 'list' }, (s.layers || []).map((l) => h('div', {
-        style: 'padding:14px 18px',
-      },
-        h('div', { class: 'row', style: 'gap:10px;margin-bottom:8px' },
-          h('span', { style: `width:3px;height:16px;border-radius:2px;background:${layerColor(l.layer)}` }),
-          h('strong', { style: 'font-size:.9rem' }, l.layer),
-          l.masking === 'cross-timeline'
-            ? h('span', { class: 'chip warn', title: 'shared across characters' }, 'cross-timeline')
-            : h('span', { class: 'chip' }, 'self-local'),
-          l.summarize ? h('span', { class: 'chip' }, 'summarised') : null,
-          h('span', { style: 'flex:1' }),
-          h('span', { class: 'chip accent' }, l.decode_priority + ' priority')),
+      h('div', { class: 'list' }, found.map((l) => {
+        const window = at(l.fields, 'window');
+        const shared = at(l.fields, 'gather_scope') === 'shared';
+        const summarised = (l.fields || []).some((f) => f.key === 'summary');
+        return h('div', { style: 'padding:14px 18px' },
+          h('div', { class: 'row', style: 'gap:10px;margin-bottom:8px' },
+            h('span', { style: `width:3px;height:16px;border-radius:2px;background:${layerColor(l.name.toLowerCase())}` }),
+            h('strong', { style: 'font-size:.9rem' }, l.name),
+            shared
+              ? h('span', { class: 'chip warn', title: 'one tree across every conversation' }, 'cross-timeline')
+              : h('span', { class: 'chip' }, 'self-local'),
+            summarised ? h('span', { class: 'chip' }, 'summarised') : null,
+            h('span', { style: 'flex:1' }),
+            h('span', { class: 'chip accent' }, (at(l.fields, 'decode_priority') || '—') + ' priority'),
+            h('button', {
+              class: 'btn sm ghost',
+              title: 'Edit this layer',
+              onClick: () => go(`/mind?id=${encodeURIComponent(l.id)}`),
+            }, 'Edit')),
 
-        h('div', { class: 'tiny dim', style: 'margin-bottom:10px;max-width:74ch' }, l.description),
+          h('div', { class: 'tiny dim', style: 'margin-bottom:10px;max-width:74ch;white-space:pre-line' },
+            (at(l.fields, 'description') || '').trim()),
 
-        h('div', { class: 'grid g4' },
-          field('window', fmtK(l.window), bar((l.window || 0) / maxWindow, layerColor(l.layer))),
-          field('budget priority', String(l.budget?.priority ?? '—')),
-          field('budget floor', (l.budget?.min_percent ?? 0) + '%'),
-          field('score threshold', String(l.score_threshold ?? 0))),
+          h('div', { class: 'grid g4' },
+            field('window', fmtK(window), bar((window || 0) / maxWindow, layerColor(l.name.toLowerCase()))),
+            field('budget priority', String(at(l.fields, 'budget', 'priority') ?? '—')),
+            field('budget ceiling', (at(l.fields, 'budget', 'max_percent')
+              ?? at(l.fields, 'budget', 'min_percent') ?? 0) + '%'),
+            field('score threshold', String(at(l.fields, 'score_threshold') ?? 0))),
 
-        h('div', { class: 'row', style: 'gap:9px;margin-top:10px' },
-          h('span', { class: 'tiny dim' }, 'selection'),
-          h('code', { class: 'mono tiny', style: 'color:var(--ink-dim)' }, l.selection),
-          h('span', { style: 'flex:1' }),
-          h('button', { class: 'btn sm ghost', onClick: () => editLayer(l) }, 'Edit'))))));
+          // The selection groups, as the document states them rather than as a
+          // pre-rendered sentence somebody has to keep in step with it.
+          h('div', { class: 'row', style: 'gap:9px;margin-top:10px;flex-wrap:wrap' },
+            h('span', { class: 'tiny dim' }, 'selection'),
+            rowsOf(l.fields, 'groups').map((row) => {
+              const cell = (k) => (row.find((f) => f.key === k) || {}).value;
+              const sel = (row.find((f) => f.key === 'selection') || {}).fields || [];
+              const part = (k) => (sel.find((f) => f.key === k) || {}).value;
+              const rule = part('kind') === 'top_k'
+                ? `top-k ${part('k')}`
+                : [part('recent') != null ? `recent ${part('recent')}` : null,
+                  part('history_top_k') != null ? `top-k ${part('history_top_k')}` : null]
+                  .filter(Boolean).join(', ') || part('kind') || '';
+              return h('code', { class: 'mono tiny', style: 'color:var(--ink-dim)' },
+                `${cell('id')}(${rule})`);
+            })));
+      })));
   }
 
   function field(label, value, extra) {
@@ -179,30 +272,6 @@ export async function render(params, q) {
       h('div', { class: 'tiny dim' }, label),
       h('div', { class: 'mono', style: 'font-size:.9rem;font-weight:700' }, value),
       extra || null);
-  }
-
-  function editLayer(l) {
-    modal({
-      title: 'Layer · ' + l.layer,
-      body: h('div', {},
-        h('div', { class: 'grid g2' },
-          h('label', { class: 'field' }, h('span', {}, 'Window (tokens)'), h('input', { class: 'input', value: l.window })),
-          h('label', { class: 'field' }, h('span', {}, 'Score threshold'), h('input', { class: 'input', value: l.score_threshold }))),
-        h('div', { class: 'grid g2' },
-          h('label', { class: 'field' }, h('span', {}, 'Budget priority'), h('input', { class: 'input', value: l.budget?.priority })),
-          h('label', { class: 'field' }, h('span', {}, 'Budget floor %'), h('input', { class: 'input', value: l.budget?.min_percent }))),
-        h('label', { class: 'field' }, h('span', {}, 'Selection rule'), h('input', { class: 'input', value: l.selection })),
-        h('label', { class: 'field' }, h('span', {}, 'Masking'),
-          h('select', { class: 'select' },
-            ['self-local', 'cross-timeline'].map((m) => h('option', { selected: m === l.masking }, m)))),
-        h('div', { class: 'tiny dim' },
-          'Cross-timeline masking lets this layer be read across characters. Only the world layer should ever use it — ' +
-          'on a private layer it is the scope leak the isolation test exists to catch.')),
-      footer: [only('admin', () => h('button', {
-        class: 'btn primary',
-        onClick: () => toast('layer schema edit — engine required', 'err'),
-      }, 'Save'))],
-    });
   }
 
   // ── section collections ───────────────────────────────────────────────────
@@ -218,58 +287,90 @@ export async function render(params, q) {
       (c.collections || []).map(collectionCard));
   }
 
+  /* A section's address in the corpus.
+   *
+   * `col.folder` is `responses/` or `moods/`, which is the section slug plus a
+   * separator — the one place this page touches the corpus's vocabulary, and it
+   * is a slice rather than a mapping table so it cannot drift. */
+  const addressOf = (col, s) => `${col.folder.replace(/\/$/, '')}/${s.id}`;
+
+  /* `blush_then_own` → `Blush then own`. Display only; the id is untouched. */
+  const readable = (id) => {
+    const s = String(id).replace(/[_-]/g, ' ');
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  };
+
   function collectionCard(col) {
     const body = h('div', { hidden: true });
-    const toggle = h('button', { class: 'btn sm ghost', onClick: () => {
-      body.hidden = !body.hidden;
-      toggle.textContent = body.hidden ? '▸ ' + col.sections.length + ' sections' : '▾ hide';
-    } }, '▸ ' + col.sections.length + ' sections');
-
-    mount(body, h('div', { class: 'list', style: 'margin-top:10px' },
-      col.sections.map((s) => h('div', { style: 'padding:11px 15px' },
-        h('div', { class: 'row', style: 'gap:9px' },
-          h('code', { class: 'mono', style: 'color:var(--accent);font-size:.8rem' }, s.id),
-          h('span', { class: 'chip' }, s.category),
-          h('span', { style: 'flex:1' }),
-          // Characters, not tokens. There is no tokenizer in the daemon, so a
-          // token count here would be a plausible-looking guess — which is the
-          // habit that let six invented templates stand in for 596 real ones.
-          h('span', { class: 'tiny dim mono', title: 'characters in the template' },
-            (s.chars ?? 0).toLocaleString() + ' ch'),
-          s.examples
-            ? h('span', { class: 'chip ok', title: 'calibration lead-ins' }, s.examples + ' examples')
-            : h('span', { class: 'chip warn' }, 'uncalibrated'),
-          col.locked ? null : h('button', { class: 'btn sm ghost', onClick: () => editSection(col, s) }, 'Edit')),
-        h('div', { class: 'tiny', style: 'color:var(--ink-soft);margin-top:5px;max-width:88ch' }, s.template)))));
+    const n = col.sections.length;
+    const caret = h('span', { class: 'caret' }, '▸');
+    const label = h('span', {}, `Show all ${n} ${col.name} sections`);
+    const toggle = h('button', {
+      class: 'sec-open',
+      onClick: () => {
+        body.hidden = !body.hidden;
+        caret.textContent = body.hidden ? '▸' : '▾';
+        label.textContent = body.hidden
+          ? `Show all ${n} ${col.name} sections`
+          : `Hide the ${n} ${col.name} sections`;
+        // Built on first open. Six hundred tiles is not work to do for a card
+        // nobody expanded.
+        if (!body.hidden && !body.dataset.built) {
+          body.dataset.built = '1';
+          mount(body, h('div', { class: 'sec-tiles', style: 'margin-top:11px' },
+            col.sections.map((s) => tile(col, s))));
+        }
+      },
+    }, caret, label, h('span', { style: 'flex:1' }),
+      h('span', { class: 'tiny dim' }, 'each opens for editing'));
 
     return h('div', { class: 'panel' },
-      h('div', { class: 'row', style: 'gap:9px' },
-        h('strong', { style: 'font-size:.9rem' }, col.name),
-        h('code', { class: 'mono tiny dim' }, col.folder),
-        col.locked ? h('span', { class: 'chip', title: 'read-only by construction' }, 'immutable') : null,
-        h('span', { class: 'chip accent' }, col.source),
-        h('span', { style: 'flex:1' }),
+      h('div', { class: 'row', style: 'gap:9px;flex-wrap:wrap' },
+        h('strong', { style: 'font-size:.95rem' }, readable(col.name) + ' sections'),
         h('span', { class: 'chip' }, col.rule),
-        toggle),
+        h('span', { style: 'flex:1' }),
+        h('span', { class: 'tiny dim' }, col.source)),
       h('div', { class: 'tiny dim', style: 'margin-top:7px;max-width:80ch' }, col.description),
+      toggle,
       body);
   }
 
-  function editSection(col, s) {
-    modal({
-      title: col.name + ' · ' + s.id, wide: true,
-      body: h('div', {},
-        h('label', { class: 'field' }, h('span', {}, 'Template — installed as this section’s content'),
-          h('textarea', { class: 'textarea', rows: 5 }, s.template)),
-        h('div', { class: 'tiny dim' },
-          `Selected by: ${col.rule}. ` + (s.examples
-            ? `${s.examples} calibration lead-ins train this section’s selection.`
-            : 'No calibration examples — this section will be selected worse than its neighbours.'))),
-      footer: [only('admin', () => h('button', {
-        class: 'btn primary',
-        onClick: () => toast('section edit — engine required', 'err'),
-      }, 'Save'))],
-    });
+  /* One section, as a tile.
+   *
+   * The whole tile is the control. An `Edit` button in the corner was the old
+   * shape and it was both hard to find and never shown — collections are marked
+   * `locked`, so the button was never rendered at all and the editor behind it
+   * was unreachable code whose Save only ever raised an error.
+   *
+   * `locked` was right about one thing and wrong about another: these files are
+   * shared by every world, so editing them *from a world* would be editing
+   * every other world's copy from a page that names only this one. But they are
+   * not immutable, and the place they are edited now exists — so the tile goes
+   * there, carrying the world so the corpus opens through the same lens. */
+  function tile(col, s) {
+    const id = addressOf(col, s);
+    return h('button', {
+      class: 'sec-tile',
+      title: 'Open ' + id,
+      onClick: () => go(`/mind?id=${encodeURIComponent(id)}&world=${wid}`),
+    },
+      h('div', { class: 'nm' }, readable(s.id)),
+      h('div', { class: 'why' }, s.description || s.template),
+      h('div', { class: 'row', style: 'gap:6px;flex-wrap:wrap;align-items:center' },
+        h('span', { class: 'chip' }, s.category),
+        h('span', { style: 'flex:1' }),
+        // Characters, not tokens. There is no tokenizer in the daemon, so a
+        // token count here would be a plausible-looking guess — which is the
+        // habit that let six invented templates stand in for 596 real ones.
+        h('span', { class: 'tiny dim mono', title: 'characters in the template' },
+          (s.chars ?? 0).toLocaleString() + ' ch'),
+        s.examples
+          ? h('span', {
+            class: 'chip ok',
+            title: 'authored lead-ins that train this section’s selection — editable with it',
+          }, s.examples + ' examples')
+          : h('span', { class: 'chip warn', title: 'nothing trains this section’s selection' },
+            'uncalibrated')));
   }
 
   // ── setting / clock ───────────────────────────────────────────────────────
@@ -278,7 +379,7 @@ export async function render(params, q) {
    * `worlds/<id>.yaml` whole, so the object read back goes with it and only the
    * three edited fields are overwritten — `selects` and anything else an author
    * put in the file rides through untouched. */
-  function setting() {
+  async function setting() {
     const count = w.npc_count || 0;
     // Editing a world is an admin's. The daemon refuses the PUT either way;
     // this is so the page says so before somebody types a paragraph into it.
@@ -286,6 +387,11 @@ export async function render(params, q) {
     const name = h('input', { class: 'input', value: w.name || '', ...ro('admin') });
     const pub = h('input', { type: 'checkbox', checked: w.public, ...ro('admin', 'toggle') });
     const text = h('textarea', { class: 'textarea', rows: 8, ...ro('admin') }, w.setting || '');
+
+    // Filled in below, after the corpus answers. Mounted empty first so the
+    // world document is editable immediately rather than waiting on a listing.
+    const knowledge = h('div', { class: 'panel' },
+      h('div', { class: 'tiny dim' }, 'reading the corpus…'));
 
     const save = only('admin', () => h('button', { class: 'btn primary' }, 'Save'));
     if (save) save.onclick = async () => {
@@ -310,8 +416,15 @@ export async function render(params, q) {
           h('label', { class: 'row', style: 'gap:9px;margin-top:22px;cursor:pointer' }, pub,
             h('div', {}, h('div', { style: 'font-size:.86rem;font-weight:600' }, 'Public'),
               h('div', { class: 'tiny dim' }, 'anyone may spawn characters here')))),
+        /* "Setting", not "World knowledge".
+         *
+         * It was the second, which named the same thing as the 1,267-page canon
+         * corpus below — so this eight-line box looked like the place the
+         * world's knowledge lived, and the history and the technology tree
+         * looked like they were missing. They were not; they were one label
+         * away. */
         h('label', { class: 'field' },
-          h('span', {}, 'World knowledge — the shared immutable core'), text),
+          h('span', {}, 'Setting — the paragraph every character here opens with'), text),
         h('div', { class: 'row', style: 'justify-content:space-between;margin-top:9px' },
           h('div', { class: 'tiny dim' },
             !editable
@@ -321,44 +434,107 @@ export async function render(params, q) {
                 : 'Read by every character here. Nobody lives here yet.'),
           save)),
 
-      h('h2', {}, 'What this world selects'),
-      h('div', { class: 'panel' },
-        h('div', { class: 'tiny dim', style: 'max-width:88ch' },
-          'A world is a tag-filter over one shared corpus, not a corpus of its own. These are the tags its ' +
-          '`world` layer admits — canon ingested under them is visible here and nowhere else, while craft ' +
-          '(responses, moods, personalities) is ingested untagged and shared by every world, sharing its KV ' +
-          'as well as its text.'),
-        (w.selects || []).length
-          ? h('div', { class: 'row wrap', style: 'gap:6px;margin-top:11px' },
-            (w.selects || []).map((t) => h('span', { class: 'chip accent' }, t)))
-          : h('div', { class: 'tiny dim', style: 'margin-top:11px' },
-            'Nothing selected — this world admits only untagged content. An empty filter is not "everything"; ' +
-            'it is the shared craft and no canon at all.'),
-        h('div', { class: 'tiny dim', style: 'margin-top:11px' },
-          'Edited in the file, not here: the tag set decides what every character in this world can know, ' +
-          'and it belongs in a diff.')));
+      h('h2', {}, 'What this world knows'),
+      knowledge);
+
+    /* The knowledge itself, and the way in to editing it.
+     *
+     * This panel used to be a row of grey chips — the raw `selects` tags, with
+     * a note saying they are edited in the file. True, and useless: it named
+     * `history` and `technology` without saying that each is a folder of pages,
+     * how many, or where to change one. The corpus was reachable only through a
+     * generic "Edit the corpus" button that gave no reason to think the game's
+     * history was behind it.
+     *
+     * So the tags are asked of the daemon instead, which answers with the
+     * topics this world actually admits — its own filter applied — and each one
+     * is a link into the editor with the world already held over it. */
+    const admitted = await API.getWorldKnowledge(w.world_id).catch(() => null);
+    mount(knowledge,
+      h('div', { class: 'tiny dim', style: 'max-width:88ch' },
+        'A world is a tag-filter over one shared corpus, not a corpus of its own. These are the topics its '
+        + '`world` layer admits — canon tagged under them is visible here and nowhere else, while craft '
+        + '(responses, moods, personalities) is ingested untagged and shared by every world, sharing its KV '
+        + 'as well as its text.'),
+      !admitted
+        ? h('div', { class: 'tiny dim', style: 'margin-top:11px' }, 'could not read the corpus')
+        : !admitted.length
+          ? h('div', { class: 'tiny dim', style: 'margin-top:11px' },
+            'Nothing selected — this world admits only untagged content. An empty filter is not "everything"; '
+            + 'it is the shared craft and no canon at all.')
+          : h('div', { class: 'topic-grid' }, admitted.map((t) => h('button', {
+            class: 'topic',
+            title: `Edit ${t.title}`,
+            onClick: () => go(`/mind?id=${encodeURIComponent(t.id)}&world=${w.world_id}`),
+          },
+            h('div', { class: 'nm' }, t.title),
+            h('div', { class: 'ct' },
+              t.count ? `${t.count} page${t.count === 1 ? '' : 's'}` : 'one page')))),
+      h('div', { class: 'tiny dim', style: 'margin-top:12px' },
+        'Which topics are admitted is edited in the world file, not here: the tag set decides what every '
+        + 'character in this world can know, and it belongs in a diff. What is written *inside* each topic '
+        + 'is edited by opening it.'));
   }
 
+  /* The narrative clock, which now writes.
+   *
+   * Both controls here used to be scenery: the `<select>` had no `onChange` at
+   * all, and Jump ended in `toast('clock jumped', 'ok')` under a dialog warning
+   * that it affected every character in the world. It claimed a write it never
+   * made, which is the worst thing a control can do. */
   function clock() {
     const t = w.time || {};
+    const now = h('div', { class: 'mono', style: 'font-size:1.3rem;font-weight:700' },
+      worldTime(t.world_ms));
+
+    // Re-read after every write, because the answer is computed from an anchor
+    // and the daemon is the only thing that knows what time it is there.
+    const settle = async (body, said) => {
+      try {
+        const next = await API.setWorldTime(w.world_id, body);
+        w.time = next;
+        mount(now, worldTime(next.world_ms));
+        toast(said, 'ok');
+      } catch (e) {
+        toast(e.detail || e.message || 'the clock did not move', 'err');
+      }
+    };
+
+    const scale = h('select', { class: 'select', style: 'width:auto', ...ro('admin', 'toggle'),
+      onChange: (e) => {
+        const s = Number(e.target.value);
+        // `0` is how the console spells paused, and the daemon keeps the pace
+        // a paused world was running at — so this sends both.
+        settle(s === 0 ? { paused: true } : { scale: s, paused: false },
+          s === 0 ? 'clock paused' : `running at ${s}× real time`);
+      } },
+      [0, 1, 10, 60, 360, 1440].map((s) => h('option', {
+        value: s,
+        selected: t.paused ? s === 0 : s === t.scale,
+      }, s === 0 ? 'paused' : s + '× real time')));
+
     mount(host, h('div', { class: 'panel' },
       h('div', { class: 'row wrap', style: 'gap:26px' },
-        h('div', {}, h('div', { class: 'tiny dim' }, 'now'),
-          h('div', { class: 'mono', style: 'font-size:1.3rem;font-weight:700' }, worldTime(t.world_ms))),
-        h('div', {}, h('div', { class: 'tiny dim' }, 'scale'),
-          h('select', { class: 'select', style: 'width:auto', ...ro('admin', 'toggle') },
-            [0, 1, 10, 60, 360, 1440].map((s) => h('option', { value: s, selected: s === t.scale },
-              s === 0 ? 'paused' : s + '× real time')))),
+        h('div', {}, h('div', { class: 'tiny dim' }, 'now'), now),
+        h('div', {}, h('div', { class: 'tiny dim' }, 'scale'), scale),
         // Jumping the clock moves narrative time for every character in the
         // world, so it belongs with the other world edits: admin.
-        only('admin', () => h('div', {}, h('div', { class: 'tiny dim' }, ' '),
-          h('button', { class: 'btn', onClick: () => confirmDialog({
-            title: 'Jump the world clock',
-            message: `This affects every character in ${w.name}. They will experience the gap, and the ` +
-              'consolidation folds will have it to reconcile.',
-            confirmText: 'Jump',
-            onConfirm: () => toast('clock jumped', 'ok'),
-          }) }, 'Jump to…')))),
+        only('admin', () => {
+          const to = h('input', { class: 'input', type: 'datetime-local', style: 'width:auto' });
+          return h('div', {}, h('div', { class: 'tiny dim' }, 'jump to'),
+            h('div', { class: 'row', style: 'gap:6px' }, to,
+              h('button', { class: 'btn', onClick: () => {
+                const at = Date.parse(to.value);
+                if (!Number.isFinite(at)) return toast('pick a date and time first', 'err');
+                confirmDialog({
+                  title: 'Jump the world clock',
+                  message: `This affects every character in ${w.name}. They will experience the gap, and the `
+                    + 'consolidation folds will have it to reconcile.',
+                  confirmText: 'Jump',
+                  onConfirm: () => settle({ world_ms: at }, 'clock jumped'),
+                });
+              } }, 'Jump')));
+        })),
       h('div', { class: 'tiny dim', style: 'margin-top:14px' },
         (mayEdit('admin') ? '' : roNote('the narrative clock') + ' ')
         + 'Scale is world-seconds per real second; 0 pauses. Narrative time is what characters date their '

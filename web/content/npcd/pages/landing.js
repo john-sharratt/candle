@@ -5,7 +5,6 @@
  * while narration is still assembling — cannot be faked by a wrapper around
  * someone else's API, and it is visible in about four seconds. */
 
-import { API } from '../lib/api.js';
 import { h, mount } from '../lib/dom.js';
 import { AUTH_UNAVAILABLE } from '../app.js';
 
@@ -24,8 +23,10 @@ const MARK = `<svg viewBox="0 0 32 32" width="100%" height="100%">
 function signIn(label) {
   return AUTH_UNAVAILABLE
     ? h('div', { class: 'tiny dim', style: 'align-self:center;max-width:320px' },
+      // Not "everything below is live regardless" — the exchange below is a
+      // written sample and says so, and the rest of this page is copy.
       'Sign-in is not configured on this deployment yet — the daemon has no session key, so nobody can be ' +
-      'signed in. Everything below is live regardless.')
+      'signed in. The console itself is unreachable until it is.')
     : h('button', { class: 'btn primary lg', onClick: () => window.__npcdSignIn() }, label);
 }
 
@@ -134,24 +135,56 @@ export async function render() {
 
   // ── drive the demo ────────────────────────────────────────────────────────
 
-  const stream = API.streamInteraction('demo', {
-    onAct: (a) => {
-      const hidden = a.observable_in && a.observable_in.length === 0;
+  /* The sample plays from here, not from the daemon.
+   *
+   * It used to open an SSE stream on interaction `demo`, which is a
+   * fall-through route — and the whole fixture surface sits behind `user`. So
+   * on the one page that exists to be read by somebody who is *not* signed in,
+   * the request came back `401` and the pane sat on "waiting for the tick to
+   * close…" for ever. Every first-time visitor saw a dead frame.
+   *
+   * A network round trip was never buying anything here: the label already
+   * reads "a sample exchange", so the only thing the stream added was a way for
+   * it to be empty. Playing it locally makes it work signed out, which is the
+   * entire audience for this page. */
+  let at = 0;
+  const beat = () => {
+    const frame = SAMPLE[at % SAMPLE.length];
+    at += 1;
+    if (frame.act) {
+      const hidden = frame.act.observable === false;
       acts.appendChild(h('div', { class: 'demo-act' + (hidden ? ' hidden-act' : '') },
-        h('span', { class: 'tk' }, 't' + a.tick),
-        h('span', { class: 'tool' }, a.tool),
-        h('span', { class: 'intent' }, hidden ? 'no observable trace' : (a.intent || ''))));
+        h('span', { class: 'tk' }, 't' + frame.act.tick),
+        h('span', { class: 'tool' }, frame.act.tool),
+        h('span', { class: 'intent' }, hidden ? 'no observable trace' : frame.act.intent)));
       while (acts.children.length > 7) acts.removeChild(acts.firstChild);
-    },
-    onNarration: (n) => {
-      mount(narration, n.text);
+    }
+    if (frame.narration) {
+      mount(narration, frame.narration);
       narration.animate?.([{ opacity: 0.25 }, { opacity: 1 }], { duration: 420, easing: 'ease-out' });
-    },
-    onTick: () => {},
-  });
+    }
+  };
+  beat();
+  const timer = setInterval(beat, 2600);
 
-  return { el, teardown: () => stream.cancel() };
+  return { el, teardown: () => clearInterval(timer) };
 }
+
+/* The sample exchange, written out.
+ *
+ * One turn of a character deciding, acting, and having the narrator render it —
+ * including an act with no observable trace, which is the point the page is
+ * making. Content, like the copy around it, and labelled as a sample on screen.
+ */
+const SAMPLE = [
+  { act: { tick: 411, tool: 'face', intent: 'check the eastern line' },
+    narration: 'He turns east, and the ridge line resolves out of the dusk.' },
+  { act: { tick: 412, tool: 'consider', intent: 'weigh the gap in the rotation', observable: false } },
+  { act: { tick: 413, tool: 'say', intent: 'ask who has the second watch' },
+    narration: '"Who has second watch tonight?" — asked lightly, the way a man asks a thing he already suspects.' },
+  { act: { tick: 414, tool: 'move_to', intent: 'walk the line rather than send someone' },
+    narration: 'He goes himself. The fire is somebody else\'s to keep for an hour.' },
+];
 
 function feature(title, body, stat) {
   return h('div', { class: 'feat-card' },

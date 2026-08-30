@@ -25,7 +25,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use candle_conversation::persistence::record::{NpcPayload, RecordType};
+use candle_conversation::persistence::record::{
+    AuthoredBelief, AuthoredRelationship, AuthoredStrategy, Modulation, NpcPayload, RecordType,
+};
 use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::substrate::Substrate;
 use serde_json::{json, Value};
@@ -279,6 +281,14 @@ impl Npcs {
             persona_origin: "authored".to_string(),
             portrait_image_id: None,
             portrait_origin: None,
+            // The authoring plane starts empty. A character nobody has written
+            // beliefs for holds none — which is different from one whose
+            // beliefs could not be read, and is what the console shows.
+            beliefs: Vec::new(),
+            relationships: Vec::new(),
+            agency: Vec::new(),
+            modulation: Modulation::default(),
+            environment_prompt: String::new(),
         };
         self.commit(npc, owner)
     }
@@ -341,6 +351,241 @@ impl Npcs {
             npc.salience_gate = g as f32;
         }
 
+        npc.revision += 1;
+        npc.updated_ms = now_ms;
+        self.commit(npc, owner)
+    }
+
+    /* ── the authoring plane (§16) ──────────────────────────────────────────
+     *
+     * What an operator says a character believes, who they know, what they are
+     * trying to do, and where their affect sits. Every one of these is a write
+     * to the character's record and supersedes it, exactly as an edit to their
+     * name does — one write path, one supersession rule, one place a change is
+     * durable.
+     *
+     * Each is an upsert keyed by the caller's own id, so a `PUT` is idempotent
+     * and the console can save a row without knowing whether it exists. */
+
+    /// State an operator's belief. Replaces the one with that id, or adds it.
+    pub fn put_belief(
+        &mut self,
+        npc_id: u64,
+        owner: &str,
+        belief_id: &str,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value, NpcError> {
+        let mut npc = self.owned(npc_id, owner)?;
+        let existing = npc.beliefs.iter().position(|b| b.belief_id == belief_id);
+        let mut belief = existing
+            .map(|i| npc.beliefs[i].clone())
+            .unwrap_or(AuthoredBelief {
+                belief_id: belief_id.to_string(),
+                statement: String::new(),
+                confidence: 0.5,
+                threshold: 0.5,
+            });
+        if let Some(v) = body.get("statement") {
+            belief.statement = clean_line(v, "statement")?;
+        }
+        belief.confidence = unit(body, "confidence", belief.confidence)?;
+        belief.threshold = unit(body, "threshold", belief.threshold)?;
+        // A belief with nothing said in it is not a belief.
+        if belief.statement.trim().is_empty() {
+            return Err(NpcError::Invalid("statement"));
+        }
+        match existing {
+            Some(i) => npc.beliefs[i] = belief,
+            None => npc.beliefs.push(belief),
+        }
+        self.bump(npc, owner, now_ms)
+    }
+
+    pub fn delete_belief(
+        &mut self,
+        npc_id: u64,
+        owner: &str,
+        belief_id: &str,
+        now_ms: u64,
+    ) -> Result<bool, NpcError> {
+        let mut npc = self.owned(npc_id, owner)?;
+        let before = npc.beliefs.len();
+        npc.beliefs.retain(|b| b.belief_id != belief_id);
+        if npc.beliefs.len() == before {
+            return Ok(false);
+        }
+        self.bump(npc, owner, now_ms)?;
+        Ok(true)
+    }
+
+    /// Set how this character holds somebody.
+    pub fn put_relationship(
+        &mut self,
+        npc_id: u64,
+        owner: &str,
+        entity_id: &str,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value, NpcError> {
+        let mut npc = self.owned(npc_id, owner)?;
+        let existing = npc
+            .relationships
+            .iter()
+            .position(|r| r.entity_id == entity_id);
+        let mut rel =
+            existing
+                .map(|i| npc.relationships[i].clone())
+                .unwrap_or(AuthoredRelationship {
+                    entity_id: entity_id.to_string(),
+                    display: entity_id.to_string(),
+                    trust: 0.0,
+                    affect: 0.0,
+                    familiarity: 0.0,
+                    notes: String::new(),
+                });
+        if let Some(v) = body.get("display") {
+            rel.display = clean_line(v, "display")?;
+        }
+        if let Some(v) = body.get("notes") {
+            rel.notes = clean_line(v, "notes")?;
+        }
+        // Trust and affect run −1..1; familiarity only accumulates.
+        rel.trust = signed(body, "trust", rel.trust)?;
+        rel.affect = signed(body, "affect", rel.affect)?;
+        rel.familiarity = unit(body, "familiarity", rel.familiarity)?;
+        match existing {
+            Some(i) => npc.relationships[i] = rel,
+            None => npc.relationships.push(rel),
+        }
+        self.bump(npc, owner, now_ms)
+    }
+
+    /// State a strategy, optionally under another.
+    pub fn put_strategy(
+        &mut self,
+        npc_id: u64,
+        owner: &str,
+        strategy_id: &str,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value, NpcError> {
+        let mut npc = self.owned(npc_id, owner)?;
+        let existing = npc.agency.iter().position(|a| a.strategy_id == strategy_id);
+        let mut st = existing
+            .map(|i| npc.agency[i].clone())
+            .unwrap_or(AuthoredStrategy {
+                strategy_id: strategy_id.to_string(),
+                statement: String::new(),
+                parent_id: None,
+                state: "active".to_string(),
+            });
+        if let Some(v) = body.get("statement") {
+            st.statement = clean_line(v, "statement")?;
+        }
+        if let Some(v) = body.get("state") {
+            let s = v.as_str().ok_or(NpcError::Invalid("state"))?;
+            if !["active", "finished", "abandoned"].contains(&s) {
+                return Err(NpcError::Invalid("state"));
+            }
+            st.state = s.to_string();
+        }
+        if let Some(v) = body.get("parent_id") {
+            st.parent_id = match v {
+                Value::Null => None,
+                v => {
+                    let p = v.as_str().ok_or(NpcError::Invalid("parent_id"))?;
+                    // A strategy cannot be its own parent, and a parent has to
+                    // exist — a tree with a dangling edge renders as a root,
+                    // which silently loses the child.
+                    if p == strategy_id || !npc.agency.iter().any(|a| a.strategy_id == p) {
+                        return Err(NpcError::Invalid("parent_id"));
+                    }
+                    Some(p.to_string())
+                }
+            };
+        }
+        if st.statement.trim().is_empty() {
+            return Err(NpcError::Invalid("statement"));
+        }
+        match existing {
+            Some(i) => npc.agency[i] = st,
+            None => npc.agency.push(st),
+        }
+        self.bump(npc, owner, now_ms)
+    }
+
+    /// Attach an uploaded portrait.
+    ///
+    /// Deliberately **not** part of [`Self::patch`]. That takes the fields a
+    /// person edits in a form, and an image id is not one of them: it is minted
+    /// by the daemon from the bytes it just stored. Accepting one through
+    /// `PATCH /v1/npc/:id` would let a caller point their character at an id
+    /// they did not upload — every id in the store is a valid one, so there
+    /// would be nothing to reject.
+    pub fn set_portrait(
+        &mut self,
+        npc_id: u64,
+        owner: &str,
+        image_id: String,
+        origin: &str,
+        now_ms: u64,
+    ) -> Result<Value, NpcError> {
+        let mut npc = self.owned(npc_id, owner)?;
+        npc.portrait_image_id = Some(image_id);
+        npc.portrait_origin = Some(origin.to_string());
+        self.bump(npc, owner, now_ms)
+    }
+
+    /// Set the affect dials.
+    pub fn put_modulation(
+        &mut self,
+        npc_id: u64,
+        owner: &str,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value, NpcError> {
+        let mut npc = self.owned(npc_id, owner)?;
+        npc.modulation.affect = signed(body, "affect", npc.modulation.affect)?;
+        npc.modulation.threat = unit(body, "threat", npc.modulation.threat)?;
+        npc.modulation.curiosity = unit(body, "curiosity", npc.modulation.curiosity)?;
+        self.bump(npc, owner, now_ms)
+    }
+
+    /// Set the simulated environment: whether it runs, and what it says.
+    pub fn put_environment(
+        &mut self,
+        npc_id: u64,
+        owner: &str,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value, NpcError> {
+        let mut npc = self.owned(npc_id, owner)?;
+        if let Some(v) = body.get("enabled") {
+            npc.environment_enabled = v.as_bool().ok_or(NpcError::Invalid("enabled"))?;
+        }
+        if let Some(v) = body.get("system_prompt") {
+            let s = v.as_str().ok_or(NpcError::Invalid("system_prompt"))?;
+            if s.chars().count() > MAX_PROMPT_CHARS {
+                return Err(NpcError::Invalid("system_prompt"));
+            }
+            npc.environment_prompt = s.to_string();
+        }
+        self.bump(npc, owner, now_ms)
+    }
+
+    /// The character, if the caller owns it. Every authoring write starts here:
+    /// ownership is authorization (§8.2), and a role cannot express "yours".
+    fn owned(&self, npc_id: u64, owner: &str) -> Result<NpcPayload, NpcError> {
+        let npc = self.visible_to(npc_id, owner).ok_or(NpcError::NotFound)?;
+        if npc.owner_id != owner {
+            return Err(NpcError::NotFound);
+        }
+        Ok(npc.clone())
+    }
+
+    /// One superseding record, with the revision moved on.
+    fn bump(&mut self, mut npc: NpcPayload, owner: &str, now_ms: u64) -> Result<Value, NpcError> {
         npc.revision += 1;
         npc.updated_ms = now_ms;
         self.commit(npc, owner)
@@ -438,6 +683,11 @@ fn wire(n: &NpcPayload, caller: &str) -> Value {
         "environment_enabled": n.environment_enabled,
         // Same reason: the monitor is an engine measurement.
         "monitor": Value::Null,
+        "modulation": {
+            "affect": round3(n.modulation.affect),
+            "threat": round3(n.modulation.threat),
+            "curiosity": round3(n.modulation.curiosity),
+        },
         "owner_id": n.owner_id,
         "access": if n.owner_id == caller { "owner" } else { "viewer" },
         "hidden": n.hidden,
@@ -451,6 +701,132 @@ fn wire(n: &NpcPayload, caller: &str) -> Value {
         "updated_ms": n.updated_ms,
         "revision": n.revision,
     })
+}
+
+/// An `f32` on the wire, without the widening noise.
+///
+/// `json!` widens to `f64`, and `0.42f32` widens to `0.41999998688697815` — a
+/// dial somebody typed as 0.42 coming back as noise, which reads as the daemon
+/// having changed it.
+fn round3(v: f32) -> f64 {
+    (f64::from(v) * 1_000.0).round() / 1_000.0
+}
+
+/// The authoring plane, as the console reads it.
+///
+/// The engine's measurements are **absent**, not zero. A belief has no
+/// `disconfirmation` until something has weighed evidence against it, and a
+/// strategy has no `salience` until something has scored it — reporting either
+/// as 0 would be a measurement this daemon has not made.
+pub fn beliefs_wire(n: &NpcPayload) -> Value {
+    json!({ "beliefs": n.beliefs.iter().map(|b| json!({
+        "belief_id": b.belief_id,
+        "statement": b.statement,
+        "confidence": round3(b.confidence),
+        "threshold": round3(b.threshold),
+        "origin": "authored",
+        "disconfirmation": Value::Null,
+        "under_pressure": Value::Null,
+        "history": Value::Null,
+    })).collect::<Vec<_>>() })
+}
+
+pub fn relationships_wire(n: &NpcPayload) -> Value {
+    json!({ "relationships": n.relationships.iter().map(|r| json!({
+        "entity_id": r.entity_id,
+        "display": r.display,
+        "trust": round3(r.trust),
+        "affect": round3(r.affect),
+        "familiarity": round3(r.familiarity),
+        "notes": r.notes,
+        "origin": "authored",
+    })).collect::<Vec<_>>() })
+}
+
+pub fn agency_wire(n: &NpcPayload) -> Value {
+    json!({ "agency": n.agency.iter().map(|a| json!({
+        "strategy_id": a.strategy_id,
+        "statement": a.statement,
+        "parent_id": a.parent_id,
+        "state": a.state,
+        "origin": "authored",
+        // Scored by the engine against what is happening; nothing here has.
+        "salience": Value::Null,
+        "progress_notes": Value::Null,
+    })).collect::<Vec<_>>() })
+}
+
+pub fn modulation_wire(n: &NpcPayload) -> Value {
+    json!({
+        "affect": round3(n.modulation.affect),
+        "threat": round3(n.modulation.threat),
+        "curiosity": round3(n.modulation.curiosity),
+    })
+}
+
+pub fn environment_wire(n: &NpcPayload) -> Value {
+    json!({
+        "enabled": n.environment_enabled,
+        "system_prompt": n.environment_prompt,
+        // What the simulated environment has actually done. It has not run.
+        "last_event_ms": Value::Null,
+        "events": Value::Null,
+    })
+}
+
+/// The longest a simulated environment's instructions may be. Generous for
+/// prose, short of a way to fill a disk one save at a time.
+const MAX_PROMPT_CHARS: usize = 8_000;
+
+/// A field that must be 0..1, or the value it already had.
+///
+/// Absent means unchanged, never zero: a `PUT` that sets one dial must not
+/// silently reset the other two, which is the whole reason these take the
+/// current value rather than a default.
+fn unit(body: &Value, key: &str, current: f32) -> Result<f32, NpcError> {
+    bounded(body, key, current, 0.0, 1.0)
+}
+
+/// A field that must be −1..1, on the same terms.
+fn signed(body: &Value, key: &str, current: f32) -> Result<f32, NpcError> {
+    bounded(body, key, current, -1.0, 1.0)
+}
+
+fn bounded(body: &Value, key: &str, current: f32, lo: f64, hi: f64) -> Result<f32, NpcError> {
+    let Some(v) = body.get(key) else {
+        return Ok(current);
+    };
+    let n = v.as_f64().ok_or(NpcError::Invalid(leak(key)))?;
+    if !n.is_finite() || !(lo..=hi).contains(&n) {
+        return Err(NpcError::Invalid(leak(key)));
+    }
+    Ok(n as f32)
+}
+
+/// One line of authored text, trimmed and bounded.
+fn clean_line(v: &Value, key: &'static str) -> Result<String, NpcError> {
+    let s = v.as_str().ok_or(NpcError::Invalid(key))?.trim();
+    if s.chars().count() > MAX_PROMPT_CHARS {
+        return Err(NpcError::Invalid(key));
+    }
+    Ok(s.to_string())
+}
+
+/// `NpcError::Invalid` names the field in a `&'static str`, and these come from
+/// a runtime key. The set is closed and small, so it is matched rather than
+/// leaked — a `Box::leak` here would grow the binary's heap by one string per
+/// bad request, for ever.
+fn leak(key: &str) -> &'static str {
+    match key {
+        "confidence" => "confidence",
+        "threshold" => "threshold",
+        "trust" => "trust",
+        "affect" => "affect",
+        "familiarity" => "familiarity",
+        "threat" => "threat",
+        "curiosity" => "curiosity",
+        _ => "value",
+    }
 }
 
 /// Ids arrive as decimal strings; accept a number too, since a hand-written

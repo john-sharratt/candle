@@ -6,13 +6,28 @@
 //! runs the identical crate with `upstream:` URLs instead of `local`. Nothing
 //! here knows which of the two it is part of.
 //!
-//! That router is currently [`web::mock::npcd`] — the console's own fixture,
-//! which is the entire daemon until there is an engine to put behind it. When
-//! there is, this line names `npcd::api::router()` instead and nothing else in
-//! the file changes.
+//! That router is three, merged and with no fallback under them:
+//!
+//! | | |
+//! |---|---|
+//! | [`api`] | the authored corpus, the mind, the cast, the authoring plane, accounts, portraits |
+//! | [`ops`] | status, telemetry, memory, substrate storage, the log stream |
+//! | [`engine`] | everything an inference engine would answer — wired, and honest that there is none |
+//!
+//! **Nothing is a fixture.** Every one of these routes either does its real job
+//! or reports the absence: empty where empty is the measurement, `null` where
+//! nothing has measured, and `503 no_engine` where the request asks for work.
+//! A path none of them claims is a genuine `404`.
+//!
+//! It was not always. `main.rs` used to end in a `fallback_service` holding
+//! `web::mock::npcd` — the console's own fixture — which answered every
+//! unclaimed path with invented data, for any character id, including ones that
+//! did not exist. That fixture is still built and still served by
+//! `web --authoritative`, which is what it was written for.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use include_dir::{include_dir, Dir};
@@ -21,10 +36,15 @@ use web::{Builder, Config, Roots};
 
 mod accounts;
 mod api;
+mod clock;
 mod collections;
+mod console;
+mod engine;
 mod guard;
 mod identity;
+mod images;
 mod logs;
+mod mind;
 mod model;
 mod npcs;
 mod ops;
@@ -41,7 +61,10 @@ static SITE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../web/content/npcd");
 static COMMON: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../web/content/common");
 
 #[derive(Parser, Debug)]
-#[command(name = "npcd", about = "NPC engine daemon (mock API + console)")]
+#[command(
+    name = "npcd",
+    about = "NPC engine daemon — authored content, the cast and the console; no engine yet"
+)]
 struct Cli {
     /// Address to bind. Loopback by default — see the auth note in
     /// `docs/npc_api_gui_design.md` §8 before binding anything wider.
@@ -77,6 +100,24 @@ struct Cli {
     /// Increase log verbosity (-v debug, -vv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Log the identity the gateway put on each request, and the role it
+    /// resolved to.
+    ///
+    /// Sign-in crosses two processes on two machines, and when it fails both
+    /// sides look correct in isolation: the gateway holds a session, the daemon
+    /// answers `401`, and neither says what arrived on the wire between them.
+    /// This prints exactly that, per request.
+    ///
+    /// Header **values are never logged** — the subject is a durable account
+    /// identifier and the assertion is a bearer token, so both would be a
+    /// credential sitting in a log file. Each header reports only `set`,
+    /// `EMPTY` or absent, which is the whole of what a routing question needs.
+    ///
+    /// Off by default and noisy when on: every request, including the
+    /// console's polls.
+    #[arg(long)]
+    log_identity: bool,
 }
 
 /// How many routes across both tables sit at exactly this role, for the
@@ -199,8 +240,14 @@ async fn main() -> anyhow::Result<()> {
         accounts.len(),
         data.join("accounts").display()
     );
+    // Named the other way round, because the exception list is now the longer
+    // one and a reader takes "MOCK for everything except …" as exhaustive. It
+    // was not: it omitted the cast on the substrate, the whole mind editor,
+    // `/v1/substrate/storage` and `/v1/world/:wid/collections`, all of which
+    // are real.
     tracing::info!(
-        "backend: MOCK for everything except authored content, accounts, telemetry and logs"
+        "backend: real for authored content, the mind, the cast, accounts, telemetry, \
+         storage and logs — FIXTURE for everything an engine would produce"
     );
 
     // The real routes sit *over* the mock rather than beside it: `npcd` owns
@@ -247,6 +294,16 @@ async fn main() -> anyhow::Result<()> {
         libraries.moods.with_examples(),
     );
 
+    // The mind directory, for the file editor. Taken from the resolved schema
+    // rather than from `--mind` directly, so the editor and the collections
+    // read the same root — a second answer to "where is the mind" would be
+    // free to disagree the day the layout changes.
+    let mind = mind::Mind::new(schema.dir.clone());
+    match mind.root() {
+        Some(root) => tracing::info!("mind: editable at {}", root.display()),
+        None => tracing::info!("mind: none — the file editor will report it has nothing to edit"),
+    }
+
     let authored = api::Authored::new(
         worlds,
         personalities,
@@ -254,6 +311,10 @@ async fn main() -> anyhow::Result<()> {
         npcs,
         roles.clone(),
         libraries,
+        mind,
+        // Portraits, beside the accounts and the substrate — things this daemon
+        // writes, rather than things a person authored.
+        images::Images::new(&data),
     );
     let ops_state = ops::Ops::new(logs, &data, roles.clone());
 
@@ -265,30 +326,80 @@ async fn main() -> anyhow::Result<()> {
     // here — a write route sitting at `unauthenticated` — is the one that
     // matters, and it is the one that used to be invisible.
     let (api_routes, ops_routes) = (api::api(authored.clone()), ops::api(ops_state.clone()));
-    for r in api_routes.declared().iter().chain(ops_routes.declared()) {
+    // The surface an engine would answer — wired, and honest that there is no
+    // engine behind it. Separate from `api` because the two become true at
+    // different times: everything in `api` is real today.
+    let engine_routes = engine::api(authored.clone());
+    for r in api_routes
+        .declared()
+        .iter()
+        .chain(ops_routes.declared())
+        .chain(engine_routes.declared())
+    {
         tracing::debug!("route {r}");
     }
     tracing::info!(
-        "routes: {} guarded ({} open, {} user, {} admin), everything else behind `user`",
-        api_routes.declared().len() + ops_routes.declared().len(),
+        "routes: {} guarded ({} open, {} user, {} admin), {} awaiting an engine",
+        api_routes.declared().len() + ops_routes.declared().len() + engine_routes.declared().len(),
         count(&api_routes, &ops_routes, web::auth::Role::Unauthenticated),
         count(&api_routes, &ops_routes, web::auth::Role::User),
         count(&api_routes, &ops_routes, web::auth::Role::Admin),
+        engine_routes.declared().len(),
     );
 
-    let router = api_routes
-        .into_router(authored)
+    // Shared with the logging layer below, which needs the table on every
+    // request while the fallback owns it. `Arc` so that per-request sharing is
+    // a refcount bump rather than a copy of the admin list, and `None` when the
+    // flag is off so nothing is paid for a layer that is not installed.
+    let log_roles = cli.log_identity.then(|| Arc::new(roles.clone()));
+
+    let mut router = api_routes
+        .into_router(authored.clone())
         .merge(ops_routes.into_router(ops_state))
-        // The fallback is the quietest surface there is: it answers every path
-        // the real routes did not claim, which today is the console's fixture
-        // and tomorrow is whatever has not been migrated yet. Signed-in is the
-        // floor — the console is a signed-in tool — so a route that has not
-        // been written yet cannot be reached by a stranger before it is.
-        .fallback_service(guard::behind(
-            roles,
-            web::auth::Role::User,
-            web::mock::npcd::router(),
+        .merge(engine_routes.into_router(authored));
+
+    /* **There is no fallback.**
+     *
+     * There was, and it was `web::mock::npcd::router()` — the console's
+     * fixture, answering every path the real routes had not claimed. It
+     * answered them well: correctly-shaped, plausible, and invented. A
+     * character's beliefs came back for ids that did not exist; the world clock
+     * reported `{"ok":true}` and moved nothing; the tool catalog listed tools
+     * this daemon has never had.
+     *
+     * Every one of those paths is now a route of its own — real where the thing
+     * is real, and `no_engine` where it is not (see [`engine`]). So an
+     * unclaimed path is a genuine 404 again, which is what a 404 is for.
+     *
+     * The fixture still exists and is still built: `web --authoritative` serves
+     * it, which is what it was written for. What it no longer does is stand
+     * behind a daemon that means it. */
+
+    // Applied to the assembled router, so it covers the guarded routes, the ops
+    // routes and the fallback alike — a layer on any one of them would report
+    // only what reached that one. It does **not** see static content: the
+    // console's files are served by the builder and never enter this router, so
+    // the log is `/v1` traffic, which is the whole of what carries identity.
+    if let Some(log_roles) = log_roles {
+        tracing::info!("--log-identity: logging the gateway's headers on every API request");
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let roles = Arc::clone(&log_roles);
+                async move {
+                    // Borrowed straight from the request rather than copied out
+                    // of it: three shared borrows that all end before `req` is
+                    // moved into `next`, so the line costs no allocation.
+                    identity::log_identity(
+                        req.headers(),
+                        &roles,
+                        req.method().as_str(),
+                        req.uri().path(),
+                    );
+                    next.run(req).await
+                }
+            },
         ));
+    }
 
     Builder::new(cfg)
         .content("npcd", roots)

@@ -271,6 +271,122 @@ impl Libraries {
     }
 }
 
+/// What a personality contributes to a projection, read from its own document.
+///
+/// The counterpart of [`Libraries::world_wire`], and the same idea: the console
+/// asks what a character's shared layer is made of, and the answer is in the
+/// files. This one takes the document rather than a library, because a
+/// personality's sections are *in* it — `anchor` is the always-resident self,
+/// `personality:` is a map of facets, and `doctrine` is the part that evolves.
+///
+/// This replaced a fixture that invented an anchor, four identity facets and a
+/// doctrine for every character alike — the same failure the module header
+/// describes for worlds, on the page where an author checks what they wrote.
+/// Of the mind's 74 personalities, all 74 carry an `anchor`, 69 carry facets
+/// and 5 carry a doctrine; a document without one gets a collection with no
+/// sections, which is the truth and is visibly different from a failure.
+pub fn personality_wire(body: &Value) -> Value {
+    let mut out = vec![collection_of(
+        "identity_anchor",
+        "personalities/<id>.yaml · anchor",
+        "always-visible",
+        "The always-on compressed self. Structurally resident — it never competes for the \
+         gather budget, because it is the prefix the budget is read inside.",
+        anchor_sections(body),
+    )];
+
+    let facets = facet_sections(body);
+    out.push(collection_of(
+        "identity",
+        "personalities/<id>.yaml · personality",
+        "top-k 3",
+        "Detail facets of the same self, surfaced only when relevant to the exchange.",
+        facets,
+    ));
+
+    // Only the documents that have one. An empty doctrine collection on the 69
+    // characters without a doctrine would be five rows of nothing to read.
+    if body.get("doctrine").and_then(Value::as_str).is_some() {
+        out.push(collection_of(
+            "doctrine",
+            "personalities/<id>.yaml · doctrine",
+            "always-visible",
+            "The one part of the shared layer designed to change, aggregated from strategic \
+             learning and published as a version.",
+            doctrine_sections(body),
+        ));
+    }
+
+    json!({ "collections": out })
+}
+
+fn collection_of(
+    name: &str,
+    folder: &str,
+    rule: &str,
+    description: &str,
+    sections: Vec<Value>,
+) -> Value {
+    json!({
+        "name": name,
+        "folder": folder,
+        "rule": rule,
+        // Authored in a file, and edited on the personality page rather than
+        // here — the same rule the world libraries follow.
+        "locked": true,
+        "source": "personality",
+        "description": description,
+        "excluded": 0,
+        "excludes": Vec::<String>::new(),
+        "sections": sections,
+    })
+}
+
+/// One section per named facet under `personality:`, in the document's order.
+fn facet_sections(body: &Value) -> Vec<Value> {
+    let Some(map) = body.get("personality").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(key, value)| {
+            let text = value.as_str()?;
+            Some(section_wire(key, "identity", text))
+        })
+        .collect()
+}
+
+fn anchor_sections(body: &Value) -> Vec<Value> {
+    body.get("anchor")
+        .and_then(Value::as_str)
+        .map(|t| vec![section_wire("anchor", "identity", t)])
+        .unwrap_or_default()
+}
+
+fn doctrine_sections(body: &Value) -> Vec<Value> {
+    body.get("doctrine")
+        .and_then(Value::as_str)
+        .map(|t| vec![section_wire("current", "doctrine", t)])
+        .unwrap_or_default()
+}
+
+/// The same shape [`Section::wire`] produces, so the console renders a
+/// personality's collections with the code it already has.
+///
+/// `chars`, never tokens — there is no tokenizer here, and the module header
+/// says why a plausible-looking guess is the thing to avoid. `examples` is 0
+/// rather than absent: a personality facet has no provenance lead-ins at all,
+/// which is a real zero and not a missing measurement.
+fn section_wire(id: &str, category: &str, text: &str) -> Value {
+    json!({
+        "id": id,
+        "category": category,
+        "chars": text.chars().count(),
+        "examples": 0,
+        "template": text,
+        "description": "",
+    })
+}
+
 /// Whether a section's category is one this world does not admit.
 ///
 /// Compared case-insensitively and trimmed, because the list is hand-written in

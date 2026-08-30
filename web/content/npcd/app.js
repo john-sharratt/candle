@@ -1,7 +1,7 @@
 /* npcd shell — boot, theme, nav, routing. */
 
 import { API, BACKEND } from './lib/api.js';
-import { definePage, navFor, start, go, path, link, setViewerRole, can } from './lib/router.js';
+import { definePage, navFor, navOwner, start, go, path, link, setViewerRole, can } from './lib/router.js';
 import { h, mount } from './lib/dom.js';
 import { toast } from './lib/ui.js';
 import { checkBuild, takeReloadState } from './lib/build.js';
@@ -37,22 +37,29 @@ import { estateSwitcher } from './lib/estate.js';
  */
 definePage({ path: '/', role: 'user', nav: { section: 'main', order: 10, label: 'My NPCs' },
   load: () => import('./pages/roster.js') });
-definePage({ path: '/npc/new', role: 'user',
+definePage({ path: '/npc/new', role: 'user', under: '/',
   load: () => import('./pages/create.js') });
-definePage({ path: '/npc/:id', role: 'user', keepsRail: true,
+definePage({ path: '/npc/:id', role: 'user', keepsRail: true, under: '/',
   load: () => import('./pages/npc.js') });
-definePage({ path: '/npc/:id/:tab', role: 'user', keepsRail: true,
+definePage({ path: '/npc/:id/:tab', role: 'user', keepsRail: true, under: '/',
   load: () => import('./pages/npc.js') });
-definePage({ path: '/interaction/:ix', role: 'user',
+definePage({ path: '/interaction/:ix', role: 'user', under: '/',
   load: () => import('./pages/console.js') });
 // Worlds and personalities are READABLE by anyone — the daemon serves their
 // GETs unauthenticated — and the pages render read-only below `admin`.
 definePage({ path: '/worlds', role: 'unauthenticated', nav: { section: 'main', order: 20, label: 'Worlds' },
   load: () => import('./pages/worlds.js') });
-definePage({ path: '/world/:wid', role: 'unauthenticated',
+definePage({ path: '/world/:wid', role: 'unauthenticated', under: '/worlds',
   load: () => import('./pages/worlds.js') });
 definePage({ path: '/personalities', role: 'unauthenticated', nav: { section: 'main', order: 30, label: 'Personalities' },
   load: () => import('./pages/personalities.js') });
+/* The authored corpus as files. `user` rather than `unauthenticated` unlike the
+ * two pages above, and the daemon agrees: those answer somebody who already
+ * knows an id, while this one ENUMERATES — it hands out the mind a directory at
+ * a time, which is the browsing the `hidden` flag exists to prevent. Writing
+ * still needs `admin`; the page renders read-only below it. */
+definePage({ path: '/mind', role: 'user', nav: { section: 'main', order: 35, label: 'Mind' },
+  load: () => import('./pages/mind.js') });
 definePage({ path: '/tools', role: 'user', nav: { section: 'main', order: 40, label: 'Tools' },
   load: () => import('./pages/tools.js') });
 // Names the redo log's absolute path, so it matches `/v1/substrate/storage`.
@@ -65,7 +72,10 @@ definePage({ path: '/probe', role: 'user', nav: { section: 'main', order: 55, la
 // Carries every save's full path and the account ids — matches `/ws/logs`.
 definePage({ path: '/logs', role: 'admin', nav: { section: 'main', order: 70, label: 'Logs' },
   load: () => import('./pages/logs.js') });
-definePage({ path: '/system', role: 'user', load: () => import('./pages/system.js') });
+// The same page as `/performance`, under an older address, so it belongs to the
+// same nav entry.
+definePage({ path: '/system', role: 'user', under: '/performance',
+  load: () => import('./pages/system.js') });
 definePage({ path: '/me', role: 'user', load: () => import('./pages/profile.js') });
 // The signed-out landing page. Necessarily reachable by nobody in particular.
 definePage({ path: '/welcome', role: 'unauthenticated', load: () => import('./pages/landing.js') });
@@ -86,12 +96,48 @@ function setTheme(t) {
 
 let menuOpen = false;
 
+/* ── one popover at a time ──────────────────────────────────────────────────
+ *
+ * The topbar holds three: the estate switcher on the left, the collapsed nav
+ * beside it, and the appearance menu on the right. Only one of them may be
+ * open, and opening one closes the rest.
+ *
+ * Each used to dismiss only *itself*, with a one-shot document click listener —
+ * and each trigger calls `stopPropagation`, so that the click which opens a
+ * popover does not immediately reach the document and close it again. Those two
+ * together meant a trigger's click never reached the document at all, so the
+ * listener that would have closed the *other* popover never ran: opening the
+ * appearance menu while the nav menu was open left both on screen, overlapping.
+ *
+ * Closing them here, at the moment of opening, needs no event to travel
+ * anywhere and so cannot be stopped by anything. */
+function closeOtherPopovers(keep) {
+  if (keep !== 'nav' && navMenuOpen) {
+    navMenuOpen = false;
+    renderNav();
+  }
+  if (keep !== 'theme' && menuOpen) {
+    menuOpen = false;
+    renderChrome();
+  }
+  if (keep !== 'estate') {
+    // A `<details>`: closing it is setting the attribute, and it owns its own
+    // open state rather than a flag here.
+    for (const d of document.querySelectorAll('details.estate[open]')) d.open = false;
+  }
+}
+
 function themeButton() {
   const t = readTheme();
   const meta = THEMES.find((x) => x[0] === t) || THEMES[0];
   const btn = h('button', {
     class: 'btn sm', title: 'Appearance',
-    onClick: (e) => { e.stopPropagation(); menuOpen = !menuOpen; renderChrome(); },
+    onClick: (e) => {
+      e.stopPropagation();
+      closeOtherPopovers('theme');
+      menuOpen = !menuOpen;
+      renderChrome();
+    },
   }, h('span', {
     class: 'sw',
     style: 'width:12px;height:12px;border-radius:4px;background:' + meta[2]
@@ -194,7 +240,11 @@ function renderNav(activePage) {
   if (!ME) { navMenuOpen = false; return mount(host); }
 
   const items = navFor('main');
-  const current = items.find((p) => activeNavPage && activeNavPage.path === p.path);
+  // Not an exact path match: a detail page is not a nav entry, so opening one
+  // used to blank the bar — you were two levels into a world with nothing on
+  // screen saying which section you were in. `navOwner` follows the page's
+  // `under` to the entry it belongs to.
+  const current = navOwner(activeNavPage, 'main');
 
   // Wide enough for the full tab strip.
   if (!vp.narrow) {
@@ -210,7 +260,12 @@ function renderNav(activePage) {
   // names where you are. Same decision zend makes for its top-right actions.
   const btn = h('button', {
     class: 'navlink nav-collapsed' + (navMenuOpen ? ' on' : ''),
-    onClick: (e) => { e.stopPropagation(); navMenuOpen = !navMenuOpen; renderNav(); },
+    onClick: (e) => {
+      e.stopPropagation();
+      closeOtherPopovers('nav');
+      navMenuOpen = !navMenuOpen;
+      renderNav();
+    },
   }, current ? current.nav.label : 'Menu', h('span', { class: 'caret' }, '▾'));
 
   mount(host, btn);
@@ -376,7 +431,16 @@ async function boot() {
    * console's own front page rather than to `https://bot.tokera.com/`, which
    * would be a full page load to arrive where you already are. */
   const estate = document.getElementById('estate');
-  if (estate) mount(estate, estateSwitcher('npcd', { homeHref: '#/welcome' }));
+  if (estate) {
+    const switcher = estateSwitcher('npcd', { homeHref: '#/welcome' });
+    mount(estate, switcher);
+    /* The switcher is a `<details>`, so it opens itself and there is no click
+     * handler to hang this on. `toggle` does not bubble, hence the listener on
+     * the element rather than on the document. */
+    switcher.addEventListener('toggle', () => {
+      if (switcher.open) closeOtherPopovers('estate');
+    });
+  }
 
   renderChrome();
   renderNav(null);   // tabs appear immediately, even if the first page fails to render
@@ -400,10 +464,14 @@ async function boot() {
   onBreakpoint(() => { renderNav(); renderChrome(); syncRailButton(); });
   syncRailButton();
 
+  // Escape closes whatever is over the page: the drawer first, since it is the
+  // one that covers everything, then any open popover. It used to close the nav
+  // menu alone, so the appearance menu and the switcher had to be dismissed by
+  // clicking away from them.
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (drawerOpen) return setDrawer(false);
-    if (navMenuOpen) { navMenuOpen = false; renderNav(); }
+    closeOtherPopovers(null);
   });
 
   // Not signed in → the landing page owns the viewport.

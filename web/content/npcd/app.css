@@ -281,6 +281,143 @@ table.t tr.click:hover td { background: var(--panel-2); }
 .closer .foot { margin-top: 36px; }
 
 
+/* ── section collections ─────────────────────────────────────────────────────
+ *
+ * A grid that reflows to the width it is given, rather than a list pinned to
+ * the left of a wide screen. `auto-fill` and not `auto-fit`: with `auto-fit` a
+ * collection holding three sections stretches them across the whole row, so the
+ * same tile is a different size on every collection. `auto-fill` keeps a tile a
+ * tile and leaves the remainder empty, which is what makes a wall of six
+ * hundred of them scannable.
+ *
+ * `content-visibility` because a collection really does hold 596 of these: the
+ * ones scrolled past are not laid out until they approach the viewport, and
+ * `contain-intrinsic-size` keeps the scrollbar honest while they are skipped. */
+.sec-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: 10px; }
+.sec-tile {
+  background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: var(--radius); padding: 11px 13px; cursor: pointer; text-align: left;
+  display: flex; flex-direction: column; gap: 7px; min-width: 0; width: 100%;
+  content-visibility: auto; contain-intrinsic-size: auto 108px;
+  transition: transform var(--t), border-color var(--t);
+}
+.sec-tile:hover { transform: translateY(-1px); border-color: var(--accent); }
+.sec-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sec-tile .nm {
+  font-size: .84rem; font-weight: 650; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.sec-tile .why {
+  font-size: .72rem; color: var(--ink-soft); line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+/* The expander is a control people hunt for, so it is a real row rather than a
+ * small ghost button in a corner. */
+.sec-open {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 11px 14px;
+  margin-top: 10px; border: 1px dashed var(--line-2); border-radius: var(--radius);
+  background: none; color: var(--ink); cursor: pointer; font-size: .84rem; font-weight: 600;
+  transition: border-color var(--t), background var(--t);
+}
+.sec-open:hover { border-color: var(--accent); background: var(--panel-2); }
+.sec-open .caret { font-size: .9rem; color: var(--accent); }
+
+/* ── the mind: browsing and editing the corpus ────────────────────────────── */
+
+/* The browser pane. One row shape for everything — a section, a topic, an
+ * entry — so the eye learns it once. The old pane mixed a bordered list, ad-hoc
+ * inline padding and three different meta treatments. */
+.mind-row {
+  display: flex; align-items: center; gap: 11px; width: 100%;
+  padding: 9px 12px; border: 0; border-bottom: 1px solid var(--line);
+  background: none; color: var(--ink); text-align: left; cursor: pointer;
+  transition: background var(--t);
+}
+.mind-row:last-child { border-bottom: 0; }
+.mind-row:hover { background: var(--panel-2); }
+.mind-row.on { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--accent); }
+.mind-row .ic {
+  width: 22px; height: 22px; flex: none; border-radius: 6px;
+  display: grid; place-items: center; font-size: .72rem;
+  background: var(--panel-2); color: var(--ink-faint);
+}
+.mind-row.on .ic, .mind-row:hover .ic { color: var(--accent); }
+.mind-row .nm { font-size: .85rem; font-weight: 550; overflow-wrap: anywhere; }
+.mind-row .sub { font-size: .72rem; color: var(--ink-faint); margin-top: 1px; }
+.mind-row .meta { font-family: var(--mono); font-size: .7rem; color: var(--ink-faint); flex: none; }
+
+/* One field of a document. The author's own comment sits under the label, so
+ * the guidance is where the editing is. */
+.fld { margin-bottom: 18px; }
+.fld > .lb { font-size: .78rem; font-weight: 650; letter-spacing: .01em; }
+.fld > .nt {
+  font-size: .72rem; color: var(--ink-soft); line-height: 1.5;
+  margin: 3px 0 7px; max-width: 82ch; border-left: 2px solid var(--line-2); padding-left: 9px;
+}
+.fld > .nt p { margin: 0 0 6px; }
+.fld > .nt p:last-child { margin-bottom: 0; }
+
+/* A mapping inside a field: the same controls, set in from the key that holds
+ * them, so the nesting is read from the page rather than from indentation in a
+ * YAML box. */
+.fld .sub { border-left: 1px solid var(--line); padding-left: 12px; margin-top: 4px; }
+.fld .sub .fld { margin-bottom: 11px; }
+.fld .sub .fld > .lb { font-size: .74rem; font-weight: 550; color: var(--ink-dim); }
+
+/* One entry of a list of mappings — a layer's selection groups. */
+.rows { display: grid; gap: 9px; margin-top: 4px; }
+.row-card { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; }
+.row-card > .hd {
+  font-family: var(--mono); font-size: .72rem; color: var(--accent);
+  margin-bottom: 8px;
+}
+.row-card .fld:last-child { margin-bottom: 0; }
+
+.chk { display: inline-flex; align-items: center; gap: 6px; font-size: .82rem; cursor: pointer; }
+
+/* The canon topics a world admits. A grid of things to open, rather than a row
+ * of tags to read: each one is a folder of pages and the count says so. */
+.topic-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px; margin-top: 12px;
+}
+.topic {
+  display: block; width: 100%; text-align: left; cursor: pointer;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 9px 11px; color: var(--ink); transition: border-color var(--t), transform var(--t);
+}
+.topic:hover { border-color: var(--accent); transform: translateY(-1px); }
+.topic > .nm { font-size: .84rem; font-weight: 600; overflow-wrap: anywhere; }
+.topic > .ct { font-family: var(--mono); font-size: .68rem; color: var(--ink-faint); margin-top: 2px; }
+
+/* A conversation. Turns are stacked and sided so the shape of the exchange is
+ * legible before a word is read. */
+.turn { border: 1px solid var(--line); border-radius: var(--radius); padding: 9px 11px; background: var(--panel); }
+.turn.user { border-left: 3px solid var(--info); }
+.turn.assistant { border-left: 3px solid var(--ok); }
+.turn textarea { width: 100%; background: none; border: 0; color: var(--ink); resize: vertical;
+  font: inherit; font-size: .82rem; line-height: 1.55; padding: 4px 0 0; }
+.turn textarea:focus { outline: none; }
+.turn .think { color: var(--ink-soft); font-style: italic; }
+
+/* The insert point between turns: invisible until wanted, so a conversation
+ * reads as a conversation rather than as a form with buttons in it. */
+.tween { height: 14px; display: grid; place-items: center; opacity: 0; transition: opacity var(--t); }
+.tween:hover, .tween:focus-within { opacity: 1; }
+.tween button {
+  font-size: .68rem; padding: 1px 9px; border-radius: 999px;
+  border: 1px dashed var(--line-2); background: var(--bg); color: var(--ink-dim); cursor: pointer;
+}
+.tween button:hover { border-color: var(--accent); color: var(--accent); }
+
+.convo { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 13px; margin-bottom: 11px; }
+.convo > .hd { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; }
+.convo > .hd input {
+  flex: 1; background: none; border: 0; border-bottom: 1px dashed var(--line-2);
+  color: var(--ink); font: inherit; font-size: .8rem; font-weight: 600; padding: 2px 0;
+}
+.convo > .hd input:focus { outline: none; border-bottom-color: var(--accent); }
+
 /* ── retrieval probe ─────────────────────────────────────────────────────── */
 
 .probe-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(272px, 1fr)); gap: 11px; }

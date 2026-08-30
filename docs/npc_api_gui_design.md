@@ -174,10 +174,24 @@ That gives two mocks, at different depths, and both are wanted:
 | `web --authoritative` (`web::mock`) | the daemon | routing, error pages, the ws tunnel, real sockets | console development against real HTTP |
 
 The server-side mock lives in `web/src/mock/npcd/` — beside the files it serves, for the same
-reason `api.mock.js` does: a console and its fixtures ship together. `npcd` calls the same
-router today, because a mock daemon is all `npcd` is until there is an engine to put behind it.
-When there is, `npcd` grows its own `api.rs` against these routes and the fixture stays where it
-is, still serving `--authoritative`.
+reason `api.mock.js` does: a console and its fixtures ship together.
+
+**`npcd` no longer calls it.** It did, as a `fallback_service` under its own routers, so every
+path the real ones had not claimed was answered with invented data — for any character id,
+including ones that did not exist. `npcd` now answers its whole `/v1` surface itself, in three
+routers (`api`, `ops`, `engine`) with no fallback beneath them, and a path none of them claims
+is a genuine `404`. The fixture is still built and still serves `web --authoritative`, which is
+what it was written for.
+
+That split is worth stating as a rule, because it is what keeps the console honest:
+
+| | |
+|---|---|
+| `api` | real today — the corpus, the mind, the cast, the authoring plane, accounts, portraits |
+| `ops` | real today — status, telemetry, memory, substrate storage, the log stream |
+| `engine` | wired, and honest: **empty** where empty is the measurement, **`null`** where nothing has measured, **`503 no_engine`** where the request asks for work |
+
+Nothing in any of the three answers with something it did not measure.
 
 ### Extensionless paths fall back; assets do not
 
@@ -1200,6 +1214,20 @@ PUT  /v1/npc/{id}/modulation                    { affect?, threat?, curiosity? }
 Every write here is an **authoring** act and is recorded as such — `origin: "authored"` — so
 an operator can always tell an authored belief from one the evidence process earned.
 
+> **Where this is stored, and why it is not a record type of its own.** All of it lives on the
+> character's own `NpcPayload` and supersedes with it (`npcd/src/npcs.rs`). Three reasons: it is
+> operator-scale — tens of entries, not the thousands an engine accumulates; its lifetime *is*
+> the character's; and the write path, the supersession rule and the compaction handling are
+> the ones already there and already tested. The engine's own belief traffic is a different
+> problem with a different volume and will want its own records; this is what somebody types
+> when they build a world.
+>
+> **The engine's half is absent, not zero.** A belief carries the `confidence` and `threshold`
+> an operator stated; its `disconfirmation`, whether it is `under_pressure`, and its confidence
+> `history` are measurements the evidence process makes, and come back `null` until it has made
+> them. Same for a strategy's `salience`. A `disconfirmation: 0` would read as *weighed and
+> unshaken*, which is a claim a daemon with no engine cannot make.
+
 > **The invariant these endpoints depend on.** The belief write-protection in the mind
 > document is against the *model*, not the *operator*. The action plane — what the NPC's own
 > decode can emit — has no path to the belief layer at all. The authoring plane does, because
@@ -1489,6 +1517,29 @@ instrument that makes answering them possible.
 > nothing. Both listings are read-only in that one respect: they show what the
 > mind holds, and gain an entry when an author writes a file.
 
+**A world may name its cast.** Craft being shared by every world is the standing default and
+stays it — a world that declares no cast admits every personality, which is what keeps adding
+the key to one world from emptying the rest.
+
+```yaml
+# worlds/<id>.yaml
+personalities: [cindy-tan]        # only these may be created in this world
+```
+
+It sits on the world, beside `selects` and `excludes`, for the reason those do: **a world is a
+filter, and what it admits is written on the world.** One file answers "who belongs to this
+setting", rather than the answer being assembled by reading seventy-four personality files.
+
+This is **not** the `hidden` flag and does not overlap with it. `hidden` answers "should this
+appear in a listing" — a question about screen shares, revealed by naming the document in the
+filter or by an admin holding RIGHT ALT. A cast answers which world a character is *of*, which
+no keypress should be able to change. The two are read at different moments and neither
+substitutes for the other.
+
+The daemon is the authority: it refuses a create naming a personality the world does not cast
+(`personality_not_of_world`), so the form's filtering exists to keep a refused pairing from
+being offered, not to enforce anything.
+
 ```
 GET        /v1/world                     GET|PUT|DELETE /v1/world/{wid}
 GET|PUT    /v1/world/{wid}/time          { "world_ms", "scale", "paused" }
@@ -1500,6 +1551,185 @@ Every `GET` here is open; every `PUT` and `DELETE` needs `admin` (§8.1a). A doc
 than 256 KiB is refused — twenty times the biggest real personality, and small enough that the
 API is not a way to fill a disk one save at a time. A name already taken by something that is
 not a plain file is refused rather than followed, because `write` follows a symlink.
+
+### The corpus — browsing and editing everything that was authored
+
+The documents above are the ones with a *shape*: a world and a personality are parsed,
+validated, and patched key-by-key so an author's comments survive a save. That covers two
+folders. The mind holds far more that has no schema at all — **1,818 pages** of canon, the 596
+responses and 116 moods, and the settings — and until this existed the only way to change any
+of it was a text editor on the machine the daemon runs on.
+
+```
+GET    /v1/mind/list?world=&id=        what is inside a place
+GET    /v1/mind/entry?id=              { id, title, text, chars }
+PUT    /v1/mind/entry?id=&new=1        { text }  →  201 created / 200 updated
+DELETE /v1/mind/entry?id=              204
+GET    /v1/mind/fields?id=             { id, title, fields[] }  —  422 not_fields
+PUT    /v1/mind/fields?id=             { values }  —  409 cannot_patch
+```
+
+**`id` is an address, not a path.** `canon/ammo/bolt`, never
+`layers/world/ammo/bolt.md`. This is the whole design and it is worth being plain about why:
+an API that says the second has published its storage as its contract, and every token in it
+is a promise — that canon lives under `layers/`, that a topic is a directory, that prose is
+markdown. `npcd/src/mind/address.rs` is the only place that knows any of that.
+
+An address is a **section** and a chain of **names**. There are nine sections and a client
+cannot invent a tenth:
+
+| Section | Holds | Stored as |
+|---|---|---|
+| `canon` | the setting itself | Markdown |
+| `agency` `beliefs` `memory` | what characters want, hold true, remember | Markdown |
+| `responses` `moods` | the shapes and registers of a reply | YAML |
+| `characters` `worlds` | who they are, and where | YAML |
+| `settings` | how the mind is configured | a named set |
+
+Three things follow, and each removes a class of mistake rather than merely tidying:
+
+- **The section supplies the extension**, so a caller never states a storage question and can
+  never get it wrong. `canon/x` becomes Markdown; `characters/x` becomes YAML. There is no
+  address that can name an executable, because there is nowhere in an address to put one.
+- **Anything that is not a section is unaddressable.** `node_modules`, the daemon's own
+  `.substrate`, a scratch folder — these are not filtered out of a listing, they cannot be
+  *named*. That is a stronger guarantee than a deny-list, and it does not need maintaining.
+- **A topic is one thing.** `ammo.md` is the overview and `ammo/` holds the entries — one idea
+  stored as two files — so `canon/ammo` addresses both: listing it gives the entries, reading
+  it gives the overview, and `has_text` says whether there is one. Nothing suggests two files,
+  because to a reader there are not.
+
+**Reading needs `user`, not `unauthenticated`** — the one place this surface is stricter than
+the documents above, and the reason is enumeration. `GET /v1/personality/cindy-tan` answers
+somebody who already knows the id; listing hands out the corpus a level at a time, which is
+exactly the browsing `hidden` exists to prevent. Writing needs `admin`, like every other change
+to something on disk.
+
+**A world is a lens, and the daemon holds it.** `?world=` narrows by that world's own three
+fields — `selects` gates the canon topics, `excludes` gates the section categories in
+`responses` and `moods`, the cast gates `characters` and the per-character `beliefs` and
+`memory`. The filter is applied as each level is read, so anything a world excludes is never
+named on the wire, and addressing an excluded topic directly is refused rather than served.
+Omitting `?world=` shows the whole corpus, which is what editing it wants.
+
+A canon topic exists twice on disk and `selects` names it once, so the extension comes off
+before the comparison. Getting that wrong hid 37 of a real world's 66 topics while leaving
+every folder in place.
+
+### A document as fields, not as a file
+
+`/v1/mind/entry` hands over a document's text, and for prose that is the right answer — a canon
+page is prose from its first byte to its last. A section is not. `responses/accept_then_move_on`
+is five keys, one of which is sixteen four-turn conversations, and showing that as a textarea of
+YAML asks the person editing the wording of a reply to also be a serialisation format's
+proof-reader: their job becomes indentation, block scalars, and not breaking the `examples:`
+list.
+
+So `/v1/mind/fields` answers the same document as a list of fields, in the order the file writes
+them, and `422 not_fields` for one that is not a mapping. Each field is a `key`, a `label`, a
+`kind`, a `value`, and a `note`:
+
+| Kind | Value | Edited as |
+|---|---|---|
+| `line` | a short string | an input |
+| `text` | prose | a textarea |
+| `number` | a number | a numeric input — and a **number** on the way back |
+| `bool` | true or false | a checkbox |
+| `choice` | one of a fixed vocabulary | a select |
+| `list` | short strings | chips, add and remove |
+| `conversations` | `[{ note, turns: [{ role, content, thinking }] }]` | the conversation editor |
+| `group` | a mapping | these same controls, nested |
+| `rows` | a list of mappings | one titled card each |
+| `raw` | anything unmodelled | that value's YAML, and only that value |
+
+`group` and `rows` make the form recursive, and that is what carries a value
+with structure. A projection layer's `budget` is a priority and a ceiling and
+sometimes an `adaptive` pair inside that; its `groups` are a list of mappings
+with a `selection` inside each. Flat, they are two YAML boxes. As themselves,
+they are a dozen inputs with names on them.
+
+`number` is not cosmetic. A window typed into a text input comes back as the
+string `"8000"`, which is a different document that looks identical — and the
+splice below would faithfully write the quotes.
+
+`choice` is offered **only where the value is already one of the vocabulary's
+words**. `gather_scope` and `decode_priority` are fixed by the engine and a typo
+in either is a layer it cannot load, so a select is right; but these are also
+ordinary words, and a document elsewhere with its own `kind` must not be told
+its value is invalid by a form that has never heard of it.
+
+`raw` is the honest escape hatch. A form that silently dropped the part of a document it did not
+understand would be worse than one that admits it, so an unmodelled shape round-trips as its own
+YAML text and a malformed edit is refused with its key named — never written out as a quoted
+string that changes the value's type.
+
+**The `note` is the author's own comment.** 701 of the 712 section files carry one above a key,
+and they are the best documentation the corpus has — *"FIXED SHAPE: 4 turns, user → assistant →
+user → assistant. Final assistant turn is the decode point"*. The field carries it, so the
+guidance is where the editing happens instead of only in a file nobody opens.
+
+**A save patches; it never re-serialises.** The values go through
+`npcd/src/registry/yaml_edit.rs`, which compares the new document to the old one *all the way
+down* and emits an op at the deepest node that differs — editing one turn's wording is a change
+to `examples[1].turns[0].content`, so the diff is that block scalar and every other byte of the
+file is untouched. Where the shape itself changed, and there is no entry-for-entry
+correspondence left to walk, that collection is rewritten as **block** YAML in the key order the
+file already used, with prose as the literal blocks it was written as. Both halves matter for
+the same reason: a save whose diff is the whole file cannot be reviewed by the person whose file
+it is.
+
+The result is then parsed and compared to what was asked for, and a mismatch **refuses the save**
+with `409 cannot_patch` rather than falling back to writing the document out whole. That fallback
+is precisely what would cost the file its comments, which is the thing this path exists to
+protect; the console offers the text editor instead.
+
+### A document can have addressable parts — the projection layers
+
+Most of the corpus is a file per thing. The projection schema is not: its **nine
+layers** live in one seven-hundred-line document, and each is a window, a score
+threshold, a budget, a summarisation prompt and a set of selection groups. As
+one document the only way to change a layer's budget is to find it in a
+textarea.
+
+So a settings document may declare that one of its keys holds *parts*, and each
+part gets an address:
+
+```
+settings/projection            the schema — lists its layers, and reads whole
+settings/projection/world       one layer, which opens as fields
+```
+
+This is the same idea as a canon topic having both entries and a body. Nothing
+about the routes is special: `list`, `entry` and `fields` all work through the
+address, and `npcd/src/mind/parts.rs` is the only place that knows a layer is an
+item in a list rather than a file.
+
+**A save is spliced into the document that holds it.** The whole schema goes
+through `yaml_edit` with just that layer replaced, so changing one layer's
+`window` is a one-line diff and the other six hundred and ninety lines are the
+bytes they were — including the `# ── Environment ──` banner the author wrote
+above each layer.
+
+**A part can be edited but not added or removed**, and the address model is what
+enforces it: an address names a part that exists, so there is no address for a
+tenth layer and none for deleting the ninth. That is deliberate rather than
+missing. Adding or removing an item changes the length of the list, which leaves
+no entry-for-entry correspondence to walk and so rewrites the list whole —
+taking every banner comment with it. Adding a layer is an act for the whole
+document, where the author can see the comments they are moving; `settings/projection`
+still opens as text for exactly that.
+
+Delete on a part is refused rather than falling through to the document. A layer
+is not `projection.yaml`, and deleting the schema because somebody pressed Delete
+on a layer would be the worst kind of surprise.
+
+**Three rules bound what can be touched**, enforced in `npcd/src/mind/`:
+
+| Rule | Why |
+|---|---|
+| Names still have to survive becoming a file name | `..`, `\`, `:`, NUL, control characters and reserved device names are refused, and the resolved path is checked to still be under the mind — an address is a nicer spelling of a path, never a way around one |
+| Writes are atomic | a temporary beside the target, `fsync`, then rename — the mind is not under version control, and a truncating write that is interrupted leaves the file *gone* rather than unchanged |
+| Deleting takes only what was named | removing a topic's text keeps everything inside it; those have addresses of their own. One button must never become a recursive delete |
 
 ### Hidden documents, and the whole word that reveals them
 

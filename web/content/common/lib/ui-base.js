@@ -58,7 +58,15 @@ export function toast(text, kind) {
 
 /** A modal. Returns { el, close }. Esc and scrim click both close. */
 export function modal({ title, body, footer, wide }) {
-  const close = () => el.remove();
+  const close = () => {
+    el.remove();
+    // Removed here rather than only inside the handler: closing by ✕, by the
+    // scrim, or by a caller's own `close()` used to leave the listener on
+    // `document` forever, so every dialog ever opened kept answering Escape
+    // for the rest of the session.
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
   const box = h('div', { class: 'modal', style: wide ? 'width:min(960px,100%)' : '' },
     h('div', { class: 'modal-hd' },
       h('div', { style: 'font-weight:700' }, title),
@@ -66,18 +74,52 @@ export function modal({ title, body, footer, wide }) {
       h('button', { class: 'btn ghost sm', onClick: close }, '✕')),
     h('div', { class: 'modal-bd' }, body),
     footer ? h('div', { class: 'modal-ft' }, footer) : null);
-  const el = h('div', { class: 'scrim', onClick: (e) => { if (e.target === el) close(); } }, box);
-  document.addEventListener('keydown', function esc(e) {
-    if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); }
-  });
+
+  /* The scrim closes on a click that both STARTED and ended on it.
+   *
+   * A `click` fires on the nearest common ancestor of where the press began and
+   * where it was released — so selecting text inside the dialog and letting go
+   * a few pixels outside it delivered a click whose target was the scrim, and
+   * the dialog vanished mid-selection, taking what had been typed with it.
+   * That is ordinary behaviour when dragging across a text field, not a
+   * request to dismiss anything. Requiring the press to have begun on the
+   * scrim keeps "click the backdrop to close" while making a drag that merely
+   * ends there do nothing. */
+  let pressedScrim = false;
+  const el = h('div', {
+    class: 'scrim',
+    onPointerdown: (e) => { pressedScrim = e.target === el; },
+    onClick: (e) => { if (pressedScrim && e.target === el) close(); },
+  }, box);
+  document.addEventListener('keydown', onKey);
   document.body.appendChild(el);
   return { el, close };
 }
 
 export function confirmDialog({ title, message, confirmText, danger, requireText, onConfirm }) {
   let input = null;
+  /* What counts as having typed the name.
+   *
+   * Trimmed and case-insensitive, deliberately. The gate exists to make the
+   * action deliberate — to stop a misclick deleting a character — and a
+   * trailing space or a lowercase first letter is not a misclick. Strict
+   * equality failed exactly there: `Cindy Tan ` looks correct on screen, and
+   * the button stayed dead with nothing on the page explaining why, which
+   * reads as the console being broken rather than as the reader being one
+   * space out.
+   *
+   * `Intl`-free on purpose: this compares a name against itself, not two
+   * different strings, so the ASCII fold is the whole job. */
+  const matches = () => {
+    if (!requireText) return true;
+    if (!input) return false;
+    return input.value.trim().toLowerCase() === String(requireText).trim().toLowerCase();
+  };
   const go = () => {
-    if (requireText && (!input || input.value !== requireText)) return;
+    // The same predicate the button's enabled state is driven by, so a click
+    // that arrives some other way — Enter, a script — cannot get past a gate
+    // the button was still showing as closed.
+    if (!matches()) return;
     m.close(); onConfirm();
   };
   const btn = h('button', { class: 'btn ' + (danger ? 'danger' : 'primary'), onClick: go },
@@ -90,7 +132,14 @@ export function confirmDialog({ title, message, confirmText, danger, requireText
         h('span', {}, `type “${requireText}” to confirm`),
         (input = h('input', {
           class: 'input', placeholder: requireText,
-          onInput: () => { if (input.value === requireText) btn.removeAttribute('disabled'); else btn.setAttribute('disabled', ''); },
+          // Enter submits, so the name can be typed and confirmed without
+          // reaching for the mouse — the button is the only other way in and
+          // it is one tab stop away.
+          onKeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } },
+          onInput: () => {
+            if (matches()) btn.removeAttribute('disabled');
+            else btn.setAttribute('disabled', '');
+          },
         })))
       : null);
   const m = modal({

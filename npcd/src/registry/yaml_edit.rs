@@ -32,42 +32,62 @@
 //!
 //! The registry's API replaces a whole document — a `PUT` hands over the new
 //! state — while `yamlpatch` takes operations. So the work here is deciding
-//! *which* keys actually changed and emitting one op each: a `Replace` for a
-//! changed value, an `Add` for a new key, a `Remove` for a departed one, and
-//! nothing at all for the keys that match, which is the common case and the
-//! reason a save is usually a one-line diff.
+//! *what* actually changed and emitting one op each: a `Replace` for a changed
+//! value, an `Add` for a new key, a `Remove` for a departed one, and nothing at
+//! all for what matches, which is the common case and the reason a save is
+//! usually a one-line diff.
+//!
+//! That comparison runs all the way down. A section's `examples:` is sixteen
+//! conversations of four turns each, and editing the wording of one turn is a
+//! change to `examples[1].turns[0].content` — so that is where the patch routes
+//! and the diff is that block scalar. Stopping at the top-level keys instead
+//! would replace the value of `examples`, rewriting all sixteen conversations
+//! to change one line of one of them.
+//!
+//! # What happens when the shape changes
+//!
+//! A sequence that gained or lost an entry has no entry-for-entry
+//! correspondence to walk — entry 3 of the new list is not entry 3 of the old
+//! one — so that collection is rewritten whole. It is rewritten as *block*
+//! YAML, in the key order the file already used, with prose as the literal
+//! blocks it was written as and bare scalars left bare. The alternative is one
+//! four-thousand-character flow line: correct YAML, and the end of the file's
+//! life as something a person reads. Getting this right is what makes "add an
+//! example" a diff of the added lines rather than of the file.
 //!
 //! # Why the result is verified before it is returned
 //!
 //! Editing text is a place to be wrong quietly. Rather than trust the op set,
 //! [`splice`] parses what came out and compares it to what was asked for; if
-//! they differ by so much as a field it discards the result and the caller
-//! falls back to a plain full serialisation. The failure mode is then losing
-//! comments — which is where this module started — and never a file that says
-//! something the author did not.
+//! they differ by so much as a field it discards the result and answers `None`.
+//! The caller then refuses the save rather than rewriting the document whole —
+//! that fallback would cost the file its comments, which is where this module
+//! started. A file that says something the author did not is never a possible
+//! outcome.
 
 use serde_json::{Map, Value};
 use subfeature::{Fragment, Subfeature};
 use yamlpatch::{Op, Patch};
-use yamlpath::{Document, Route};
+use yamlpath::{Component, Document, Route};
 
 /// Rewrite `original` so it holds `next`, changing as little as possible.
 ///
-/// Keys present in both and unchanged keep their exact original bytes. Changed
-/// values are replaced in place. Keys only in `next` are added; keys only in
-/// `original` are removed.
+/// Anything present in both and unchanged keeps its exact original bytes, at
+/// any depth. Changed values are replaced in place; keys only in `next` are
+/// added and keys only in `original` are removed.
 ///
 /// Returns `None` when the original cannot be edited — it does not parse, it is
-/// not a top-level mapping, or the edit failed its own read-back check — and
-/// the caller should fall back to serialising the document whole.
+/// not a top-level mapping, or the edit failed its own read-back check. The
+/// caller must then refuse the save: serialising the document whole is what
+/// this exists to prevent.
 pub fn splice(original: &str, next: &Map<String, Value>) -> Option<String> {
     match edit(original, next) {
         Ok(out) => Some(out),
         Err(why) => {
-            // Why it could not be edited, at debug. The caller logs the
-            // consequence — the file is about to be rewritten whole and its
-            // comments lost — but not the cause, and "which document, and what
-            // about it" is the question anybody investigating that will have.
+            // Why it could not be edited, at debug. The caller reports the
+            // consequence — the save is refused — but not the cause, and
+            // "which document, and what about it" is the question anybody
+            // investigating a refusal will have.
             tracing::debug!("yaml edit declined: {why}");
             None
         }
@@ -85,8 +105,28 @@ fn edit(original: &str, next: &Map<String, Value>) -> Result<String, String> {
         .as_object()
         .ok_or_else(|| "the document root is not a mapping".to_string())?;
 
+    // The same document a second time, as YAML rather than JSON — `Mapping`
+    // keeps its keys in the order the file writes them and `serde_json::Map`
+    // does not. Nothing is *read* from it; it is the shape a rewritten
+    // collection is rendered to match, so an edit comes out looking like the
+    // file it went into. See [`block_lines`].
+    let shape: serde_yaml::Value =
+        serde_yaml::from_str(original).map_err(|e| format!("does not parse: {e}"))?;
+
     let doc = Document::new(original).map_err(|e| format!("tree-sitter parse: {e}"))?;
-    let patches = plan(&doc, current, next)?;
+    let (patches, touched) = plan(
+        &doc,
+        &Value::Object(current.clone()),
+        &Value::Object(next.clone()),
+        &shape,
+    )?;
+    // Which keys an edit actually touched. A save is supposed to be a one-line
+    // diff, so "it patched three keys when I changed one" is the first question
+    // worth asking when a file comes out looking different from expected — and
+    // the answer is otherwise unobtainable from outside this function.
+    if !patches.is_empty() {
+        tracing::debug!(keys = ?touched, "yaml edit patching");
+    }
 
     // No patch means no change: hand back the original bytes rather than
     // re-emitting them. `apply_yaml_patches` refuses an empty patch set anyway,
@@ -95,8 +135,26 @@ fn edit(original: &str, next: &Map<String, Value>) -> Result<String, String> {
         return Ok(original.to_string());
     }
 
-    let edited = yamlpatch::apply_yaml_patches(&doc, &patches)
-        .map_err(|e| format!("applying {} patch(es): {e}", patches.len()))?;
+    /* Applied inside a `catch_unwind`, because it can panic.
+     *
+     * `yamlpath::Document::block_removal_span` indexes a line table with a
+     * range it did not check, and panics in `line-index` for some shapes of
+     * key removal — reached from here by a save that drops several keys at
+     * once, which is an ordinary thing for the field editor to be asked to do.
+     *
+     * A panic in an axum handler is a dead request and a stack trace in the
+     * log, for an input the caller is allowed to send. Turning it into the
+     * refusal this function already has a word for is both the honest answer
+     * and the same one every other failure gets.
+     *
+     * `AssertUnwindSafe` is sound here: the inputs are borrowed immutably, the
+     * output is discarded on panic, and nothing outside this call is left
+     * half-written. */
+    let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        yamlpatch::apply_yaml_patches(&doc, &patches)
+    }))
+    .map_err(|_| format!("the patcher panicked applying {} patch(es)", patches.len()))?;
+    let edited = applied.map_err(|e| format!("applying {} patch(es): {e}", patches.len()))?;
     let out = edited.source().to_string();
 
     // The read-back check. An op set that did something other than what it said
@@ -109,56 +167,169 @@ fn edit(original: &str, next: &Map<String, Value>) -> Result<String, String> {
     Ok(out)
 }
 
-/// One op per key that actually differs, in a stable order.
+/// One op per node that actually differs, and a readable path for each.
 ///
-/// `None` when a value cannot be expressed as a replacement — the caller then
-/// serialises whole rather than writing a partial edit.
+/// The paths are carried out rather than derived from the patches because
+/// `Route` is opaque — and "what did this save actually change" is the question
+/// every investigation of a surprising diff starts from.
 fn plan<'a>(
     doc: &'a Document,
-    current: &Map<String, Value>,
-    next: &'a Map<String, Value>,
-) -> Result<Vec<Patch<'a>>, String> {
+    current: &Value,
+    next: &Value,
+    shape: &Shape,
+) -> Result<(Vec<Patch<'a>>, Vec<String>), String> {
     let mut patches = Vec::new();
+    let mut touched = Vec::new();
+    descend(
+        doc,
+        Route::from(vec![]),
+        String::new(),
+        current,
+        next,
+        Some(shape),
+        &mut patches,
+        &mut touched,
+    )?;
+    Ok((patches, touched))
+}
 
-    for (key, want) in next {
-        match current.get(key) {
-            // Unchanged. The whole point: no op, so the bytes are untouched and
-            // the author's block scalar, wrapping and inline comments survive
-            // exactly as written.
-            Some(have) if have == want => {}
-            Some(_) if is_collection(want) => patches.push(Patch {
-                route: route(key),
-                operation: rewrite_collection(doc, key, want)?,
-            }),
-            Some(_) => patches.push(Patch {
-                route: route(key),
-                operation: Op::Replace(to_yaml(want)?),
-            }),
-            None => patches.push(Patch {
-                // `Add` routes to the *mapping* that gains the key, which for a
-                // top-level key is the document root — an empty route.
-                route: Route::from(vec![]),
-                operation: Op::Add {
-                    key: key.clone(),
-                    value: to_yaml(want)?,
-                },
-            }),
-        }
+/// The original document as YAML, used only for the order and spelling a
+/// rewritten value should come out in.
+type Shape = serde_yaml::Value;
+
+/// Walk both documents together and emit an op at the **deepest** node that
+/// differs.
+///
+/// This is what makes a save reviewable. A section's `examples:` is sixteen
+/// conversations of four turns; editing the wording of one turn is a change to
+/// `examples[1].turns[0].content` and nothing else, so that is the node the
+/// patch routes to and the diff is that block scalar. Replacing the value of
+/// `examples` instead — which is what a top-level-keys-only plan can do —
+/// rewrites all sixteen, and the one line that changed is then buried in three
+/// hundred that did not.
+///
+/// The descent stops where the *shape* changes rather than the content: a
+/// sequence that gained or lost an entry, or a mapping whose key set moved, has
+/// no node-for-node correspondence to walk, so the collection is rewritten
+/// whole — as block YAML, so an authored list stays an authored list.
+fn descend<'a>(
+    doc: &'a Document,
+    route: Route<'a>,
+    path: String,
+    have: &Value,
+    want: &Value,
+    shape: Option<&Shape>,
+    patches: &mut Vec<Patch<'a>>,
+    touched: &mut Vec<String>,
+) -> Result<(), String> {
+    // Unchanged. The whole point: no op, so the bytes are untouched and the
+    // author's block scalar, wrapping and inline comments survive exactly as
+    // written.
+    if have == want {
+        return Ok(());
     }
 
-    // Departures. A `PUT` replaces the document, so a key the caller did not
-    // send is one they removed — the same rule the console relies on to drop a
-    // field, and indistinguishable here from a field they never knew about.
-    for key in current.keys() {
-        if !next.contains_key(key) {
+    match (have, want) {
+        // Same key set: recurse per key, so only the values that moved are
+        // touched. A differing key set is handled here too — an arrival is an
+        // `Add` to this mapping and a departure a `Remove` from it — because a
+        // `PUT` replaces the document, so a key the caller did not send is one
+        // they removed.
+        (Value::Object(h), Value::Object(w)) => {
+            for (key, wv) in w {
+                let child = route.with_key(Component::Key(key.clone().into()));
+                let child_path = join(&path, key);
+                match h.get(key) {
+                    Some(hv) => descend(
+                        doc,
+                        child,
+                        child_path,
+                        hv,
+                        wv,
+                        at_key(shape, key),
+                        patches,
+                        touched,
+                    )?,
+                    None => {
+                        patches.push(Patch {
+                            // `Add` routes to the *mapping* that gains the key,
+                            // not to the key itself.
+                            route: route.clone(),
+                            operation: Op::Add {
+                                key: key.clone(),
+                                value: to_yaml(wv)?,
+                            },
+                        });
+                        touched.push(child_path);
+                    }
+                }
+            }
+            for key in h.keys() {
+                if !w.contains_key(key) {
+                    patches.push(Patch {
+                        route: route.with_key(Component::Key(key.clone().into())),
+                        operation: Op::Remove,
+                    });
+                    touched.push(format!("-{}", join(&path, key)));
+                }
+            }
+            Ok(())
+        }
+        // Same length: recurse per entry. A different length has no
+        // correspondence — entry 3 of the new list is not entry 3 of the old
+        // one once something was inserted — so it falls through to a rewrite.
+        (Value::Array(h), Value::Array(w)) if h.len() == w.len() => {
+            for (i, (hv, wv)) in h.iter().zip(w).enumerate() {
+                descend(
+                    doc,
+                    route.with_key(Component::Index(i)),
+                    format!("{path}[{i}]"),
+                    hv,
+                    wv,
+                    at_index(shape, i),
+                    patches,
+                    touched,
+                )?;
+            }
+            Ok(())
+        }
+        _ => {
             patches.push(Patch {
-                route: route(key),
-                operation: Op::Remove,
+                operation: if is_collection(want) {
+                    rewrite_collection(doc, &route, &path, want, shape)?
+                } else {
+                    replace_scalar(doc, &route, &path, want)?
+                },
+                route,
             });
+            touched.push(path);
+            Ok(())
         }
     }
+}
 
-    Ok(patches)
+/// `examples` + `turns` → `examples.turns`, and an empty parent stays out of
+/// the way so a top-level key is just its own name.
+fn join(parent: &str, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{parent}.{key}")
+    }
+}
+
+/// The shape under a mapping key.
+fn at_key<'s>(shape: Option<&'s Shape>, key: &str) -> Option<&'s Shape> {
+    shape?.as_mapping()?.get(serde_yaml::Value::from(key))
+}
+
+/// The shape of a sequence entry — **the first entry when there is no entry
+/// `i`**, because a conversation appended to `examples` should be written the
+/// way the fifteen already there are written, not the way a serialiser would
+/// choose on its own.
+fn at_index(shape: Option<&Shape>, i: usize) -> Option<&Shape> {
+    let seq = shape?.as_sequence()?;
+    seq.get(i).or_else(|| seq.first())
 }
 
 /// Whether a value is a sequence or mapping, which `Op::Replace` cannot render
@@ -189,38 +360,52 @@ fn is_collection(v: &Value) -> bool {
 /// reflowed a forty-six entry list onto one line would bury the one entry that
 /// changed under a diff of the whole file. That is the same reason the whole
 /// module exists.
-fn rewrite_collection<'a>(doc: &'a Document, key: &str, want: &Value) -> Result<Op<'a>, String> {
+fn rewrite_collection<'a>(
+    doc: &'a Document,
+    route: &Route<'a>,
+    path: &str,
+    want: &Value,
+    shape: Option<&Shape>,
+) -> Result<Op<'a>, String> {
     // `query_exact`, not `query_pretty`: `RewriteFragment` searches within the
     // *exact* feature, which for a key route is the value alone. A `from` that
     // included the key would never match, and the patch fails with "no match
     // for … in feature" rather than doing something wrong quietly.
     let feature = doc
-        .query_exact(&route(key))
-        .map_err(|e| format!("locating `{key}`: {e}"))?
-        .ok_or_else(|| format!("`{key}` has no value to rewrite"))?;
+        .query_exact(route)
+        .map_err(|e| format!("locating `{path}`: {e}"))?
+        .ok_or_else(|| format!("`{path}` has no value to rewrite"))?;
     // Borrowed from the document rather than copied, because `Fragment` keeps
     // the borrow and the patch outlives this call.
     let current = doc.extract(&feature);
 
-    let to = match block_items(want) {
-        // A block list, at the indent its neighbours already use.
-        Some(items) if !items.is_empty() && !is_flow(current) => {
-            let indent = block_indent(current);
-            let mut out = String::new();
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push('\n');
-                    out.push_str(&indent);
+    let to = match blocks(want, shape) {
+        // Block, at the column the value already starts at.
+        //
+        // The column comes from the parse rather than from reading a
+        // continuation line: for a flat list the two agree, but for a list of
+        // mappings the first continuation line is a nested key at a deeper
+        // indent, and rendering the entries there produces a document that no
+        // longer parses.
+        Some(groups) if !is_flow(current) => {
+            let indent = " ".repeat(feature.location.point_span.0 .1);
+            // A blank line between entries where the author left blank lines
+            // between them. The corpus separates its conversations that way and
+            // an edit that closed the gaps would rewrite every line of the list.
+            let spaced = matches!(want, Value::Array(_)) && current.contains("\n\n");
+            let mut lines = Vec::new();
+            for (i, group) in groups.into_iter().enumerate() {
+                if spaced && i > 0 {
+                    lines.push(String::new());
                 }
-                out.push_str("- ");
-                out.push_str(item.trim_end());
+                lines.extend(group);
             }
-            out
+            indented(&lines, &indent)
         }
         // Flow: what the file already used, and the only form an empty
-        // collection or a mapping has here.
+        // collection has.
         _ => yamlpatch::serialize_flow(&to_yaml(want)?)
-            .map_err(|e| format!("flow-rendering `{key}`: {e}"))?,
+            .map_err(|e| format!("flow-rendering `{path}`: {e}"))?,
     };
 
     Ok(Op::RewriteFragment {
@@ -231,51 +416,268 @@ fn rewrite_collection<'a>(doc: &'a Document, key: &str, want: &Value) -> Result<
     })
 }
 
+/// Replace a scalar, writing prose as the literal block the corpus writes it
+/// as.
+///
+/// `Op::Replace` renders through `yaml_serde`, which for a multi-line string
+/// nested inside a sequence produces text the patcher then rejects as invalid
+/// YAML — and a section's turns are multi-line strings nested inside a sequence,
+/// so that is the ordinary case rather than an edge. Rendering the block here
+/// also means an edited turn stays a `|` block instead of becoming one long
+/// line of `\n` escapes.
+fn replace_scalar<'a>(
+    doc: &'a Document,
+    route: &Route<'a>,
+    path: &str,
+    want: &Value,
+) -> Result<Op<'a>, String> {
+    let Some((header, body)) = literal_block(want) else {
+        return Ok(Op::Replace(to_yaml(want)?));
+    };
+    // A literal block's content is indented against its **key**, not against
+    // where the old value happened to start — `body: x` has the value eight
+    // columns in and the key at two.
+    let key_col = doc
+        .query_pretty(route)
+        .map_err(|e| format!("locating `{path}`: {e}"))?
+        .location
+        .point_span
+        .0
+         .1;
+    let feature = doc
+        .query_exact(route)
+        .map_err(|e| format!("locating `{path}`: {e}"))?
+        .ok_or_else(|| format!("`{path}` has no value to rewrite"))?;
+    let current = doc.extract(&feature);
+
+    let indent = " ".repeat(key_col + 2);
+    let mut lines = vec![header.to_string()];
+    lines.extend(body.into_iter().map(str::to_owned));
+    let to = indented(&lines, &indent);
+
+    Ok(Op::RewriteFragment {
+        from: Subfeature::new(0, Fragment::new(current)),
+        to: to.into(),
+    })
+}
+
+/// A collection as block YAML, one entry per line, relative to the column the
+/// value starts at — the caller indents every line after the first.
+///
+/// `None` for anything that has no block form here: an empty collection (`[]`
+/// and `{}` are the only spellings), or a shape carrying a key or a scalar this
+/// cannot render safely. The caller falls back to flow, and the read-back check
+/// in [`edit`] refuses the result if either was wrong.
+///
+/// This exists because the corpus is authored. `examples:` is sixteen
+/// conversations written as block sequences of block scalars; the alternative —
+/// `serialize_flow` on the whole value — is correct YAML and a single
+/// four-thousand-character line, which ends the file's life as something a
+/// person reads or reviews.
+fn blocks(v: &Value, shape: Option<&Shape>) -> Option<Vec<Vec<String>>> {
+    match v {
+        Value::Array(items) if !items.is_empty() => {
+            let mut out = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                let mut lines = block_lines(item, at_index(shape, i))?;
+                let first = lines.remove(0);
+                let mut group = vec![format!("- {first}")];
+                group.extend(lines.into_iter().map(indent_by_two));
+                out.push(group);
+            }
+            Some(out)
+        }
+        Value::Object(map) if !map.is_empty() => {
+            let mut out = Vec::new();
+            for key in ordered(map, shape) {
+                let val = &map[&key];
+                if !plain_key(&key) {
+                    return None;
+                }
+                match literal_block(val) {
+                    // A multi-line string as the literal block the author wrote
+                    // it as, rather than one line of `\n` escapes.
+                    Some((header, body)) => {
+                        let mut group = vec![format!("{key}: {header}")];
+                        group.extend(body.into_iter().map(|l| indent_by_two(l.to_owned())));
+                        out.push(group);
+                    }
+                    None if is_collection(val) && !is_empty_collection(val) => {
+                        let mut group = vec![format!("{key}:")];
+                        for lines in blocks(val, at_key(shape, &key))? {
+                            group.extend(lines.into_iter().map(indent_by_two));
+                        }
+                        out.push(group);
+                    }
+                    None => out.push(vec![format!("{key}: {}", scalar(val)?)]),
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The same thing flattened, for a caller that does not care where one entry
+/// ends and the next begins.
+fn block_lines(v: &Value, shape: Option<&Shape>) -> Option<Vec<String>> {
+    match v {
+        Value::Array(_) | Value::Object(_) if !is_empty_collection(v) => {
+            Some(blocks(v, shape)?.concat())
+        }
+        // An empty collection has exactly one spelling and it is flow; so does
+        // a scalar standing where a collection could have been.
+        _ => Some(vec![scalar(v)?]),
+    }
+}
+
+/// A value on one line — bare where the author could have written it bare,
+/// quoted where it needs to be.
+///
+/// `serialize_flow` quotes every string. That is always correct and, on a
+/// rewritten list, always visible: sixteen `note:` lines gaining quotes they
+/// never had is a diff over the whole file for an edit to one of them. So a
+/// string that YAML reads back as itself is written plain, and everything else
+/// goes to the serialiser.
+fn scalar(v: &Value) -> Option<String> {
+    if let Value::String(s) = v {
+        return Some(if plain_scalar(s) {
+            s.clone()
+        } else {
+            // Quoted here rather than by `serialize_flow`, which writes the
+            // string `12` as a bare `12` — a value that reads back as a number.
+            // The read-back check catches it and the save is then refused, so
+            // the difference is between a field that saves and one that cannot.
+            //
+            // JSON's string escaping is a subset of YAML's double-quoted style
+            // (`\n`, `\t`, `\"`, `\\`, `\uXXXX`), so the serialiser for it is
+            // the right one and there is no hand-rolled escaping here.
+            serde_json::to_string(s).ok()?
+        });
+    }
+    yamlpatch::serialize_flow(&to_yaml(v).ok()?)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Whether a string can be written as a bare YAML scalar and read back
+/// unchanged.
+///
+/// Deliberately narrow: prose that starts with a letter or a digit and holds
+/// nothing that would restructure its line. An indicator character in the first
+/// position, a `: ` or ` #`, edge whitespace, or a word a YAML reader resolves
+/// to a bool or a number all take the quotes.
+///
+/// A quote **inside** the text does not. `note: A disagreement about the
+/// evening's plan` is a plain scalar, and rejecting it over the apostrophe put
+/// quotes on a line the author wrote bare — a change to a line nobody edited.
+fn plain_scalar(s: &str) -> bool {
+    if s.is_empty() || s.contains('\n') || s.trim() != s {
+        return false;
+    }
+    if !s.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    if s.contains(": ") || s.contains(" #") || s.ends_with(':') {
+        return false;
+    }
+    if s.chars().any(char::is_control) {
+        return false;
+    }
+    // A bare `12`, `true`, or `null` reads back as something other than a
+    // string, which would change the value's type rather than its spelling. The
+    // test is the reader itself, so it stays right if the schema does.
+    !matches!(
+        serde_yaml::from_str::<serde_yaml::Value>(s),
+        Ok(serde_yaml::Value::Bool(_) | serde_yaml::Value::Number(_) | serde_yaml::Value::Null)
+    )
+}
+
+/// A mapping's keys in the order the file writes them, with anything the file
+/// does not have after them. Alphabetical is what `serde_json::Map` gives, and
+/// `role` before `content` is what the author wrote.
+fn ordered(map: &Map<String, Value>, shape: Option<&Shape>) -> Vec<String> {
+    let mut out = Vec::with_capacity(map.len());
+    if let Some(m) = shape.and_then(Shape::as_mapping) {
+        for key in m.keys().filter_map(|k| k.as_str()) {
+            if map.contains_key(key) {
+                out.push(key.to_owned());
+            }
+        }
+    }
+    let rest: Vec<String> = map.keys().filter(|k| !out.contains(k)).cloned().collect();
+    out.extend(rest);
+    out
+}
+
+fn indent_by_two(line: String) -> String {
+    if line.is_empty() {
+        line
+    } else {
+        format!("  {line}")
+    }
+}
+
+/// Lines joined at an indent, leaving blank lines blank rather than turning
+/// them into runs of trailing whitespace.
+fn indented(lines: &[String], indent: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+            if !line.is_empty() {
+                out.push_str(indent);
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// A multi-line string as a literal block: its indicator, and its lines.
+///
+/// `None` where a literal block would not round-trip. Leading whitespace on the
+/// first line needs an explicit indentation indicator, trailing whitespace on
+/// any line is eaten by the parser, and more than one trailing newline needs
+/// `|+` and its own care — all rare enough in prose that a quoted one-liner is
+/// the better answer than a renderer that has to be right about them.
+fn literal_block(v: &Value) -> Option<(&'static str, Vec<&str>)> {
+    let s = v.as_str()?;
+    if !s.contains('\n') || s.chars().any(|c| c.is_control() && c != '\n') {
+        return None;
+    }
+    // The indicator is the only thing that says whether the value ends in a
+    // newline, so it is chosen from the value rather than assumed.
+    let (header, body) = match s.strip_suffix('\n') {
+        None => ("|-", s),
+        Some(rest) if rest.is_empty() || rest.ends_with('\n') => return None,
+        Some(rest) => ("|", rest),
+    };
+    let lines: Vec<&str> = body.split('\n').collect();
+    if lines[0].starts_with(' ') || lines.iter().any(|l| l.ends_with(' ')) {
+        return None;
+    }
+    Some((header, lines))
+}
+
+/// A key that can be written bare. Anything else — a space, a colon, something
+/// that would read back as a number — sends the whole mapping to flow, where
+/// the serialiser decides the quoting.
+fn plain_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn is_empty_collection(v: &Value) -> bool {
+    matches!(v, Value::Array(a) if a.is_empty()) || matches!(v, Value::Object(o) if o.is_empty())
+}
+
 /// Whether the existing value text is written in flow style.
 fn is_flow(current: &str) -> bool {
     let t = current.trim_start();
     t.starts_with('[') || t.starts_with('{')
-}
-
-/// A sequence's entries, each rendered as a single-line YAML scalar, or `None`
-/// when the value is not a sequence of scalars.
-///
-/// Only flat sequences take the block treatment. A list of mappings is rare
-/// here and renders correctly in flow, so it takes that path rather than
-/// growing an indentation-aware renderer this file does not otherwise need.
-fn block_items(v: &Value) -> Option<Vec<String>> {
-    let arr = v.as_array()?;
-    if arr.iter().any(is_collection) {
-        return None;
-    }
-    arr.iter()
-        .map(|item| {
-            yamlpatch::serialize_flow(&to_yaml(item).ok()?)
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
-        .collect()
-}
-
-/// The indent a block sequence's items sit at, read from the text being
-/// replaced so a rewrite lines up with what is already there.
-///
-/// The first item carries no indent of its own — it follows the key's newline —
-/// so the answer comes from a continuation line, and two spaces is the fallback
-/// for a one-item list that has none.
-fn block_indent(current: &str) -> String {
-    current
-        .lines()
-        .skip(1)
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.chars().take_while(|c| *c == ' ').collect::<String>())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "  ".to_string())
-}
-
-/// The route to a top-level key.
-fn route(key: &str) -> Route<'static> {
-    Route::from(vec![yamlpath::Component::Key(key.to_owned().into())])
 }
 
 /// Convert a JSON value into the YAML value `yamlpatch` replaces with.
@@ -534,6 +936,40 @@ name: Ardh
         }
     }
 
+    /// **A save that drops several keys must be refused, not fatal.**
+    ///
+    /// `yamlpath` panics inside its line table computing the removal span for
+    /// some shapes of key removal. Reached from the field editor — which sends
+    /// the values it holds, so a document that lost keys is an ordinary
+    /// request — that was a panicking HTTP handler. It is a `None` now, which
+    /// the caller already renders as `409 cannot_patch`.
+    #[test]
+    fn a_patcher_panic_is_a_refusal_rather_than_a_crash() {
+        let original = "\
+id: world
+description: |
+  Shared knowledge about the setting.
+window: 8000
+score_threshold: 0.30
+gather_scope: shared
+budget:
+  priority: 70
+groups:
+  - id: canon
+";
+        // Everything but two keys removed at once.
+        let out = splice(original, &obj(json!({ "id": "world", "window": 9000 })));
+        match out {
+            // Whichever way the crate behaves, the contract here is the same:
+            // an answer, and a correct one.
+            Some(text) => {
+                let back: Value = serde_yaml::from_str(&text).expect("parses");
+                assert_eq!(back, json!({ "id": "world", "window": 9000 }), "{text}");
+            }
+            None => {}
+        }
+    }
+
     /// Not every document can be edited, and the honest answer is to say so and
     /// let the caller serialise it whole.
     #[test]
@@ -608,6 +1044,203 @@ name: Ardh
                 "{evil:?} added a key:\n{out}"
             );
         }
+    }
+
+    /// A section's `examples:`, cut to two conversations of two turns. The
+    /// shape every response file in the corpus has.
+    const EXAMPLES: &str = r#"id: accept_then_move_on
+
+# Provenance lead-ins. FIXED SHAPE: 4 turns. Target: 16.
+examples:
+  - note: Late apology, no toll charged.
+    turns:
+      - role: user
+        content: |
+          "I'm late — sorry."
+      - role: assistant
+        thinking: |
+          They will take it lightly.
+
+  - note: A boundary named plainly.
+    turns:
+      - role: user
+        content: |
+          "Can we not talk about it."
+      - role: assistant
+        thinking: |
+          The subject drops.
+"#;
+
+    /// **The property that makes the examples editor usable.**
+    ///
+    /// Editing the wording of one turn must change that turn and nothing else.
+    /// A plan that could only route to top-level keys replaced the whole of
+    /// `examples`, so a one-word fix arrived as a three-hundred-line diff with
+    /// every other conversation rewritten around it — correct YAML, and an
+    /// unreviewable change to a file a person wrote.
+    #[test]
+    fn editing_one_turn_changes_that_turn_and_nothing_else() {
+        let mut want: Value = serde_yaml::from_str(EXAMPLES).unwrap();
+        want["examples"][1]["turns"][0]["content"] =
+            json!("\"Let's talk about something else.\"\n");
+        let out = splice(EXAMPLES, &obj(want.clone())).expect("editable");
+
+        assert_eq!(
+            serde_yaml::from_str::<Value>(&out).unwrap(),
+            want,
+            "\n{out}"
+        );
+        // Every line but the one edited is byte-identical, in place.
+        let before: Vec<&str> = EXAMPLES.lines().collect();
+        let after: Vec<&str> = out.lines().collect();
+        assert_eq!(after.len(), before.len(), "line count moved:\n{out}");
+        let moved: Vec<usize> = (0..before.len())
+            .filter(|&i| before[i] != after[i])
+            .collect();
+        assert_eq!(moved.len(), 1, "changed lines {moved:?}:\n{out}");
+        assert!(after[moved[0]].contains("something else"), "{out}");
+        // Including the comment and the block scalars around it.
+        assert!(out.contains("# Provenance lead-ins"), "{out}");
+        assert!(out.contains("        content: |\n"), "{out}");
+    }
+
+    /// A conversation added to the list rewrites the list — there is no
+    /// entry-for-entry correspondence once the length moves — but it comes back
+    /// as the block sequence it was, not as one flow line.
+    ///
+    /// `serialize_flow` on this value is valid YAML and a single
+    /// four-thousand-character line. That ends the file's life as something a
+    /// person reads, which is the same thing losing the comments would do.
+    #[test]
+    fn adding_a_conversation_keeps_the_list_a_block() {
+        let mut want: Value = serde_yaml::from_str(EXAMPLES).unwrap();
+        want["examples"].as_array_mut().unwrap().push(json!({
+            "note": "A third.",
+            "turns": [{ "role": "user", "content": "\"Something new.\"\n" }],
+        }));
+        let out = edit(EXAMPLES, &obj(want.clone())).unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(
+            serde_yaml::from_str::<Value>(&out).unwrap(),
+            want,
+            "\n{out}"
+        );
+        assert!(out.contains("# Provenance lead-ins"), "{out}");
+        // A block list of block scalars, at the indent the file already used.
+        assert!(out.contains("\n  - note: A third.\n"), "{out}");
+        assert!(out.contains("\n      - role: user\n"), "{out}");
+        assert!(
+            out.contains("        content: |\n          \"Something new.\"\n"),
+            "the block scalar flattened:\n{out}"
+        );
+        assert!(
+            !out.contains("\\n"),
+            "escaped newlines in the output:\n{out}"
+        );
+
+        // **And every line that was already there is still there, unchanged and
+        // in order.** The rewrite re-renders the whole list, so this is what
+        // says the rendering matches the author's: same key order (`role`
+        // before `content`, not the serialiser's alphabetical), same bare
+        // scalars, same blank line between conversations. Without it the diff
+        // for adding one example is every line of the file.
+        let before: Vec<&str> = EXAMPLES.lines().collect();
+        let after: Vec<&str> = out.lines().collect();
+        assert_eq!(after[..before.len()], before[..], "\n{out}");
+        assert_eq!(
+            after[before.len()..],
+            [
+                "",
+                "  - note: A third.",
+                "    turns:",
+                "      - role: user",
+                "        content: |",
+                "          \"Something new.\""
+            ],
+            "\n{out}"
+        );
+    }
+
+    /// A rewritten list must not re-spell the entries it did not change.
+    ///
+    /// Every one of these is written bare in the corpus, and a renderer that
+    /// quoted them would turn "add one example" into a diff over every `note:`
+    /// line in the file. The ones that genuinely cannot be written bare are
+    /// here too, because guessing wrong in that direction is a document that no
+    /// longer says what it said.
+    #[test]
+    fn a_rewritten_entry_keeps_the_spelling_the_author_used() {
+        let bare = [
+            "A disagreement about the evening's plan, dropped gracefully.",
+            "Wine declined; the glass simply moves on.",
+            "Late apology, no toll charged for it.",
+            "A fact corrected mid-story, taken without defense.",
+            "3 turns, then the decode point",
+            // A YAML 1.1 boolean. Under the 1.2 core schema this reads back as
+            // the string it is, so it stays bare — and quoting it would be this
+            // renderer disagreeing with the serialiser beside it about what
+            // needs quotes.
+            "yes",
+        ];
+        let quoted = [
+            "12",
+            "null",
+            "- not a list",
+            "#not a comment",
+            "a: colon",
+            "trailing ",
+            "*alias",
+            "ends with a colon:",
+            "a word # then a comment",
+        ];
+        for note in bare.iter().chain(&quoted) {
+            let want = json!({ "items": [{ "note": note }, { "note": "second" }] });
+            let out = edit("items:\n  - note: x\n", &obj(want.clone()))
+                .unwrap_or_else(|e| panic!("{note:?}: {e}"));
+            assert_eq!(
+                serde_yaml::from_str::<Value>(&out).unwrap(),
+                want,
+                "{note:?} came back wrong:\n{out}"
+            );
+            let plain = out.contains(&format!("note: {note}\n"));
+            assert_eq!(
+                plain,
+                bare.contains(note),
+                "{note:?} was spelled the other way:\n{out}"
+            );
+        }
+    }
+
+    /// The literal-block indicator is chosen from the value, because it is the
+    /// only thing that says whether the string ends in a newline. Getting it
+    /// wrong is a silent one-character change to authored prose.
+    #[test]
+    fn a_rewritten_block_scalar_keeps_its_trailing_newline_or_lack_of_one() {
+        for (text, indicator) in [("a\nb\n", "|"), ("a\nb", "|-")] {
+            let want = json!({ "items": [{ "body": text }] });
+            let out = edit("items:\n  - body: x\n", &obj(want.clone()))
+                .unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert!(out.contains(&format!("body: {indicator}")), "{out}");
+            assert_eq!(
+                serde_yaml::from_str::<Value>(&out).unwrap(),
+                want,
+                "\n{out}"
+            );
+        }
+    }
+
+    /// Prose the literal block cannot hold — a line ending in a space, which
+    /// the parser eats — falls back to a quoted scalar rather than being
+    /// written out a character short.
+    #[test]
+    fn text_a_literal_block_would_damage_is_quoted_instead() {
+        let want = json!({ "items": [{ "body": "trailing space \nand more\n" }] });
+        let out = splice("items:\n  - body: x\n", &obj(want.clone())).expect("editable");
+        assert_eq!(
+            serde_yaml::from_str::<Value>(&out).unwrap(),
+            want,
+            "\n{out}"
+        );
     }
 
     /// A tag in the text must stay text. `serde_yaml` does not construct

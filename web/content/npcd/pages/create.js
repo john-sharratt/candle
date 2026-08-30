@@ -8,8 +8,14 @@
 
 import { API } from '../lib/api.js';
 import { h, mount } from '../lib/dom.js';
-import { go } from '../lib/router.js';
+import { can, go } from '../lib/router.js';
+import { onReveal, revealing } from '../lib/reveal.js';
 import { toast, empty } from '../lib/ui.js';
+
+/* Stable ids, so the selector that was open can be found again after a repaint
+ * and re-opened over the new list — see the `onReveal` handler at the foot. */
+const SEL_WORLD = 'create-world';
+const SEL_PERSONALITY = 'create-personality';
 
 export async function render() {
   const el = h('div', { class: 'page', style: 'max-width:900px' });
@@ -22,36 +28,90 @@ export async function render() {
     description: '', description_origin: 'generated',
     portrait: null, portrait_origin: null,
     environment_enabled: true,
-    beliefs: [], relationships: [], agency: [],
-    picked: { beliefs: new Set(), relationships: new Set(), agency: new Set() },
   };
   let step = 1;
 
+  /* Fetched **once**, hidden documents and all when the viewer is an admin.
+   *
+   * Holding RIGHT ALT then only changes which of them are rendered, so the
+   * reveal is instant and needs no round trip — an earlier version refetched on
+   * every press and release, which made the key feel broken while the request
+   * was in flight. A non-admin gets the discreet list from the daemon whatever
+   * this asks for, so there is nothing here for one to hold.
+   *
+   * The hidden entries do sit in an admin's page memory unrevealed. That is the
+   * same bargain the flag already makes: this is discretion — keeping them out
+   * of a dropdown on a screen share — and never secrecy, since the same admin
+   * can reveal them with a keypress and fetch any of them by id regardless. */
   const [worlds, personalities] = await Promise.all([
-    API.listWorlds().then((r) => r.worlds || []).catch(() => []),
-    API.listPersonalities().then((r) => r.personalities || []).catch(() => []),
+    API.listWorlds('', can('admin')).then((r) => r.worlds || []).catch(() => []),
+    API.listPersonalities('', can('admin')).then((r) => r.personalities || []).catch(() => []),
   ]);
-  if (worlds[0]) draft.world_id = worlds[0].world_id;
-  if (personalities[0]) draft.personality_id = personalities[0].personality_id;
+
+  /* Which **worlds** to render, given whether the key is down.
+   *
+   * A hidden world that is *already selected* stays in the list either way.
+   * Releasing the key must not silently undo a choice the admin deliberately
+   * made — the selection would fall back to the first entry and the form would
+   * quietly point at a different world than the one on screen a moment ago. */
+  const shownWorlds = () =>
+    worlds.filter((w) => revealing() || !w.hidden || w.world_id === draft.world_id);
+
+  /* Which **personalities** the selected world casts.
+   *
+   * The world names its cast in `personalities:`, the same place and the same
+   * shape as `selects` — a world is a filter, and what it admits is written on
+   * the world. Changing the world therefore changes the cast entirely rather
+   * than narrowing it.
+   *
+   * Not `hidden`, deliberately: that flag answers "should this appear in a
+   * listing", a question about screen shares, revealed by a keypress. This
+   * answers which world a character is *of*, which no keypress should change —
+   * Cindy is Earth's whether or not a key is held.
+   *
+   * A world that names no cast admits everyone. That is the standing default,
+   * and it is what keeps adding the key to one world from stranding every
+   * other: a world nobody has cast yet still offers a full list rather than an
+   * empty one. */
+  const hostable = (p, worldId) => {
+    const world = worlds.find((w) => w.world_id === worldId);
+    const cast = world && world.personalities;
+    return !Array.isArray(cast) || cast.includes(p.personality_id);
+  };
+  const shownPersonalities = () => personalities.filter((p) => hostable(p, draft.world_id));
+  /* The default is the first **visible** entry, never a hidden one.
+   *
+   * `worlds` now holds the hidden entries too, so taking `[0]` would pick one
+   * whenever a hidden id sorts first — and a form that opens with `earth`
+   * already chosen defeats the flag entirely, since the name would sit in the
+   * closed selector with nobody holding a key. Only if every entry is hidden
+   * does the first of those stand, which is an authored state, not an
+   * accident. */
+  const firstWorld = worlds.find((w) => !w.hidden) || worlds[0];
+  if (firstWorld) draft.world_id = firstWorld.world_id;
+  // The personality default follows the world, by the same rule the list does:
+  // opening on a pairing the daemon would refuse is a form that starts wrong.
+  const firstPersonality = personalities.find((p) => hostable(p, draft.world_id)) || personalities[0];
+  if (firstPersonality) draft.personality_id = firstPersonality.personality_id;
 
   const body = h('div', {});
   const foot = h('div', { class: 'row', style: 'justify-content:flex-end;gap:9px;margin-top:22px' });
 
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'New character'),
-      h('div', { class: 'sub' }, 'Three steps. Every one has a default, so Next three times is a valid character.')),
+      h('div', { class: 'sub' }, 'Two steps. Both have a default, so Next then Create is a valid character.')),
     h('div', { class: 'steps' },
-      ['Identity', 'Face', 'Inner life'].map((s, i) =>
+      ['Identity', 'Face'].map((s, i) =>
         h('span', { class: 'step' + (step === i + 1 ? ' on' : step > i + 1 ? ' done' : '') },
-          (step > i + 1 ? '✓' : '①②③'[i]) + ' ' + s)))));
+          (step > i + 1 ? '✓' : '①②'[i]) + ' ' + s)))));
   el.appendChild(body);
   el.appendChild(foot);
 
   const redrawSteps = () => {
     const host = el.querySelector('.steps');
-    mount(host, ['Identity', 'Face', 'Inner life'].map((s, i) =>
+    mount(host, ['Identity', 'Face'].map((s, i) =>
       h('span', { class: 'step' + (step === i + 1 ? ' on' : step > i + 1 ? ' done' : '') },
-        (step > i + 1 ? '✓' : '①②③'[i]) + ' ' + s)));
+        (step > i + 1 ? '✓' : '①②'[i]) + ' ' + s)));
   };
 
   // ── step 1 ────────────────────────────────────────────────────────────────
@@ -82,8 +142,24 @@ export async function render() {
     }
 
     const worldSel = worlds.length
-      ? h('select', { class: 'select', onChange: (e) => { draft.world_id = e.target.value; } },
-        worlds.map((w) => h('option', { value: w.world_id, selected: w.world_id === draft.world_id }, w.name)))
+      ? h('select', {
+        class: 'select',
+        id: SEL_WORLD,
+        /* Redraws, because the personality list is a function of this. Changing
+         * to a world that cannot host the chosen personality has to drop her
+         * from the list *and* move the selection off her — leaving a submitted
+         * pairing the world refuses would fail at the daemon with a message
+         * about categories, for a choice the form had already shown as made. */
+        onChange: (e) => {
+          draft.world_id = e.target.value;
+          const ok = shownPersonalities();
+          if (!ok.some((p) => p.personality_id === draft.personality_id)) {
+            draft.personality_id = ok[0] ? ok[0].personality_id : '';
+          }
+          draw();
+        },
+      },
+        shownWorlds().map((w) => h('option', { value: w.world_id, selected: w.world_id === draft.world_id }, w.name)))
       : h('div', { class: 'tiny dim' }, 'no worlds — point the daemon at a mind');
 
     mount(body,
@@ -94,8 +170,8 @@ export async function render() {
             h('label', { class: 'field' }, h('span', {}, 'World'), worldSel),
             h('label', { class: 'field' }, h('span', {}, 'Personality'),
               personalities.length
-                ? h('select', { class: 'select', onChange: (e) => { draft.personality_id = e.target.value; } },
-                  personalities.map((a) => h('option', {
+                ? h('select', { class: 'select', id: SEL_PERSONALITY, onChange: (e) => { draft.personality_id = e.target.value; } },
+                  shownPersonalities().map((a) => h('option', {
                     value: a.personality_id, selected: a.personality_id === draft.personality_id,
                   }, a.name || a.personality_id.split('-').map((w) => w.replace(/^./, (c) => c.toUpperCase())).join(' '))))
                 // No "+" beside either selector: worlds and personalities are
@@ -153,12 +229,30 @@ export async function render() {
     const file = h('input', { type: 'file', accept: 'image/*', style: 'display:none',
       onChange: (e) => useFile(e.target.files[0]) });
 
+    /* Held as the FILE, not as an object URL.
+     *
+     * It used to keep `URL.createObjectURL(f)` in `draft.portrait` and call
+     * that "uploaded" — but `create()` never sent it, and an object URL is a
+     * handle to a blob in this tab that goes away with the tab. The image was
+     * discarded on submit, every time, silently.
+     *
+     * The upload is a second request after the character exists, because it is
+     * addressed to one: `PUT /v1/npc/:id/portrait`. So it happens in `create()`
+     * once there is an id, and this step only holds the bytes and the preview.
+     */
     function useFile(f) {
       if (!f) return;
-      const url = URL.createObjectURL(f);
-      mount(art, h('img', { src: url, style: 'width:100%;height:100%;object-fit:cover;border-radius:12px' }));
-      draft.portrait = url;
+      draft.portrait_file = f;
       draft.portrait_origin = 'uploaded';
+      const url = URL.createObjectURL(f);
+      mount(art, h('img', {
+        src: url,
+        style: 'width:100%;height:100%;object-fit:cover;border-radius:12px',
+        // Released once the browser has decoded it; the preview keeps painting
+        // from the decoded image and the blob does not sit in memory until the
+        // page is closed.
+        onLoad: () => URL.revokeObjectURL(url),
+      }));
       label.textContent = 'uploaded — this outranks the generator permanently';
       prog.style.width = '100%';
     }
@@ -193,79 +287,29 @@ export async function render() {
             'Generation needs an image model on this daemon, and there is none. Uploading works now and '
             + 'outranks the generator permanently, so a portrait you choose is never replaced by one it '
             + 'invents. A character with no portrait shows its initial.'),
-          h('div', { style: 'margin-top:14px' }, drop, file)))));
+          h('div', { style: 'margin-top:14px' }, drop, file))),
+      /* The environment simulator lives here because it is a field on the
+       * record, and this is now the last step that has any. It sat on a third
+       * step alongside generated beliefs, relationships and goals — none of
+       * which were ever written — so removing those would have taken this real
+       * setting with them. */
+      h('label', { class: 'row', style: 'gap:9px;margin-top:16px;cursor:pointer' },
+        h('input', {
+          type: 'checkbox',
+          checked: draft.environment_enabled,
+          onChange: (e) => { draft.environment_enabled = e.target.checked; },
+        }),
+        h('div', {},
+          h('div', { style: 'font-size:.85rem;font-weight:600' }, 'Environment simulator'),
+          h('div', { class: 'tiny dim' },
+            'No world simulation is attached, so this generates what happens around the character. '
+            + 'Turn it off if your own game drives events.')))));
 
     mount(foot,
       h('button', { class: 'btn ghost', onClick: () => { step = 1; draw(); } }, '← Back'),
-      h('button', { class: 'btn', onClick: () => { step = 3; draw(); } }, 'Skip'),
-      h('button', { class: 'btn primary', onClick: () => { step = 3; draw(); } }, 'Next →'));
-  }
-
-  // ── step 3 ────────────────────────────────────────────────────────────────
-
-  async function stepInner() {
-    const host = h('div', {});
-    mount(body, h('div', { class: 'panel' },
-      h('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:4px' },
-        h('div', { style: 'font-weight:700' }, 'Inner life'),
-        h('button', { class: 'btn sm', onClick: load }, '⟳ Regenerate')),
-      h('div', { class: 'tiny dim', style: 'margin-bottom:12px;max-width:80ch' },
-        'Beliefs, relationships and goals are substrate layer content — turns, not fields on the record — '
-        + 'so writing them needs the engine that gathers them, and this daemon has none. What you pick here '
-        + 'is a preview of the shape; it is not saved with the character, and the confirmation will say so '
-        + 'rather than reporting success over work that vanished.'),
-      host));
-
-    async function load() {
-      mount(host, h('div', { class: 'tiny dim' }, 'generating beliefs, relationships and goals…'));
-      const r = await API.generateAttributes({ description: draft.description, personality_id: draft.personality_id });
-      draft.beliefs = r.beliefs || []; draft.relationships = r.relationships || []; draft.agency = r.agency || [];
-      draft.picked.beliefs = new Set(draft.beliefs.slice(0, 2).map((b) => b.belief_id));
-      draft.picked.relationships = new Set(draft.relationships.map((x) => x.entity_id));
-      draft.picked.agency = new Set(draft.agency.filter((a) => a.state === 'active').map((a) => a.strategy_id));
-      paint();
-    }
-
-    function group(title, items, keyOf, labelOf, metaOf, set) {
-      return h('div', { style: 'margin-bottom:16px' },
-        h('div', { class: 'row', style: 'gap:8px;margin-bottom:6px' },
-          h('h3', { style: 'margin:0' }, title), h('span', { class: 'chip' }, 'generated')),
-        items.length ? items.map((it) => {
-          const k = keyOf(it);
-          const cb = h('input', { type: 'checkbox', checked: set.has(k),
-            onChange: (e) => { e.target.checked ? set.add(k) : set.delete(k); } });
-          return h('label', {
-            class: 'row', style: 'gap:9px;padding:6px 8px;border-bottom:1px solid var(--line);align-items:flex-start;cursor:pointer',
-          }, cb,
-            h('div', { style: 'flex:1;min-width:0' },
-              h('div', { style: 'font-size:.85rem' }, labelOf(it)),
-              h('div', { class: 'tiny dim mono' }, metaOf(it))));
-        }) : h('div', { class: 'tiny dim' }, 'none'));
-    }
-
-    function paint() {
-      mount(host,
-        group('Beliefs', draft.beliefs, (b) => b.belief_id, (b) => b.statement,
-          (b) => `conf ${b.confidence} · threshold ${b.threshold}`, draft.picked.beliefs),
-        group('Relationships', draft.relationships, (r) => r.entity_id, (r) => r.display,
-          (r) => `trust ${r.trust} · affect ${r.affect}`, draft.picked.relationships),
-        group('Goals', draft.agency, (a) => a.strategy_id, (a) => a.statement,
-          (a) => `${a.state} · salience ${a.salience}`, draft.picked.agency),
-        h('label', { class: 'row', style: 'gap:9px;margin-top:12px;cursor:pointer' },
-          h('input', { type: 'checkbox', checked: draft.environment_enabled,
-            onChange: (e) => { draft.environment_enabled = e.target.checked; } }),
-          h('div', {},
-            h('div', { style: 'font-size:.85rem;font-weight:600' }, 'Environment simulator'),
-            h('div', { class: 'tiny dim' },
-              'No world simulation is attached, so this generates what happens around the character. Turn it off if your own game drives events.'))));
-    }
-
-    mount(foot,
-      h('button', { class: 'btn ghost', onClick: () => { step = 2; draw(); } }, '← Back'),
       h('button', { class: 'btn primary', onClick: create }, 'Create'));
-
-    await load();
   }
+
 
   /* Write the character.
    *
@@ -273,17 +317,16 @@ export async function render() {
    * flushed and fsynced before this returns — so a character the page says was
    * created is one that survives the daemon being killed a second later.
    *
-   * What lands is the record's own fields. The inner-life picks from step 3 are
-   * substrate *layer* content — beliefs, relationships and goals are turns, not
-   * columns — and writing them needs the engine that gathers them. They are not
-   * sent: a `seed` the daemon silently discards is worse than one it refuses,
-   * because the wizard would report success over work that vanished. The step
-   * says so, and the toast below says what actually happened. */
+   * What lands is the record's own fields, and they are all this wizard now
+   * collects. There used to be a third step offering beliefs, relationships
+   * and goals to pick from: those are substrate *layer* content — turns, not
+   * columns — so none of them were ever written, and the ones on offer came
+   * from a fixture that returned the same three for every character whatever
+   * was typed. A step whose Regenerate button could not regenerate, over
+   * choices that could not be saved, is worse than no step. It is gone, and it
+   * comes back when there is an engine to gather them. */
   async function create() {
     if (!draft.name.trim()) return toast('Give the character a name', 'err');
-    const picked = draft.picked.beliefs.size
-      + draft.picked.relationships.size
-      + draft.picked.agency.size;
     try {
       const npc = await API.createNpc({
         name: draft.name, world_id: draft.world_id, personality_id: draft.personality_id,
@@ -294,21 +337,47 @@ export async function render() {
         persona_description: draft.description,
         environment_enabled: draft.environment_enabled,
       });
-      toast(
-        picked
-          ? `${draft.name} created — the ${picked} seeded attributes need an engine and were not written`
-          : `${draft.name} created`,
-        picked ? 'warn' : 'ok',
-      );
+      /* The portrait, now that there is a character to attach it to.
+       *
+       * Its failure does not fail the create: the character exists, and losing
+       * it over a picture would be the wrong trade. The toast says which
+       * happened rather than reporting plain success over a portrait that did
+       * not land — which is the mistake this whole step is a fix for.
+       */
+      if (draft.portrait_file) {
+        try {
+          await API.putPortrait(npc.npc_id, draft.portrait_file);
+          toast(`${draft.name} created`, 'ok');
+        } catch (e) {
+          toast(`${draft.name} created, but the portrait did not upload: `
+            + (e.detail || e.message || 'unknown error'), 'err');
+        }
+      } else {
+        toast(`${draft.name} created`, 'ok');
+      }
       go('/npc/' + npc.npc_id);
     } catch (e) { toast(e.detail || e.message || 'could not create', 'err'); }
   }
 
   function draw() {
     redrawSteps();
-    ({ 1: stepIdentity, 2: stepFace, 3: stepInner }[step])();
+    ({ 1: stepIdentity, 2: stepFace }[step])();
   }
 
+  /* Repaint on every press and release of RIGHT ALT — and **only** repaint.
+   *
+   * The key changes what is in the world list. It does not open the list, does
+   * not move focus, and does not decide anything on the reader's behalf: an
+   * earlier version re-opened the selector so a press with the popup already
+   * open would show the new options, and the cure was worse than the disease —
+   * holding the key made a dropdown appear out of nowhere.
+   *
+   * The cost is that a popup already open keeps showing the options it opened
+   * with, because a native `<select>` does not re-render one and there is no
+   * way to make it. Closing and opening it shows the new list. That is a
+   * smaller surprise than a control that opens itself. */
+  const stopReveal = onReveal(() => draw());
+
   draw();
-  return { el };
+  return { el, teardown: stopReveal };
 }

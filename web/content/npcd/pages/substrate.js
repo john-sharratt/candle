@@ -60,7 +60,12 @@ export async function render(_params, q) {
     const resident = layers.length
       ? Math.round(layers.reduce((a, l) => a + (l.resident || 0), 0) / layers.length) : 0;
     mount(kpiHost,
-      stat('layers', layers.length, (schema.layers || []).filter((l) => l.masking === 'cross-timeline').length + ' cross-timeline'),
+      // `gather_scope`, the schema's own word. This read `l.masking ===
+      // 'cross-timeline'`, which was the fixture's vocabulary and matched
+      // nothing in `projection.yaml` — so the count was silently always zero
+      // once the route became real.
+      stat('layers', layers.length,
+        (schema.layers || []).filter((l) => l.gather_scope === 'shared').length + ' cross-timeline'),
       stat('turns', fmtNum(totTurns)),
       stat('tokens', fmtK(totTok)),
       stat('mean resident', resident + '%', resident < 50 ? 'paged out' : 'warm'));
@@ -159,7 +164,9 @@ export async function render(_params, q) {
     ]);
     lastShape = JSON.stringify((sub.layers || []).map((l) => [l.layer, l.turns]));
     paintKpis(sub, schema);
-    const byName = Object.fromEntries((schema.layers || []).map((l) => [l.layer, l]));
+    // Keyed by `name` — the schema names a layer that way; the occupancy rows
+    // from the substrate call the same thing `layer`.
+    const byName = Object.fromEntries((schema.layers || []).map((l) => [l.name, l]));
     mount(treeHost, (sub.layers || []).map((l) => layerCard(l, byName[l.layer] || {})));
   }
 
@@ -169,7 +176,7 @@ export async function render(_params, q) {
       h('span', { class: 'disc-swatch', style: `background:${layerColor(l.layer)}` }),
       h('span', { class: 'disc-title mono' }, l.layer),
       h('div', { class: 'disc-meta' },
-        s.masking === 'cross-timeline'
+        s.gather_scope === 'shared'
           ? h('span', { class: 'chip warn' }, 'cross-timeline')
           : h('span', { class: 'chip' }, 'self-local'),
         h('span', { class: 'chip' }, fmtNum(l.turns) + ' turns'),

@@ -28,6 +28,11 @@ futures      = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 include_dir  = { version = "0.7" }
 mime_guess   = { version = "2" }
+# For `web::asset` only — one implementation of how a static file goes on the
+# wire (entity tag, conditional answer, gzip, cache tier), shared by the
+# gateway, `npcd` and this. Three servers agreeing by construction rather than
+# by three copies of the same intent.
+web          = { path = "../web" }
 reqwest      = { version = "0.12", features = ["stream"] }
 
 candle              = { workspace = true, features = ["cuda"] }

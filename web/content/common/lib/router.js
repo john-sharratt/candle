@@ -32,6 +32,9 @@ export function can(need) { return RANK[viewerRole()] >= RANK[need]; }
  *
  * The value must match what the API will actually allow. A page shown to a user
  * whose every request 403s is worse than no page at all.
+ *
+ * `under` names the nav entry this page sits beneath, for the pages that are not
+ * nav entries themselves — see [`navOwner`].
  */
 export function definePage(def) {
   if (!def || !(def.role in RANK)) {
@@ -58,6 +61,28 @@ export function roleTable() {
 export function navFor(section) {
   return PAGES.filter((p) => p.nav && p.nav.section === section && can(p.role))
     .sort((a, b) => (a.nav.order || 0) - (b.nav.order || 0));
+}
+
+/**
+ * Which nav entry a page belongs to — the one to mark as current.
+ *
+ * A nav entry is a page, but most pages are not nav entries: `/world/:wid` is
+ * one world, `/npc/:id` is one character. Matching the current path against the
+ * nav list alone therefore finds nothing the moment anybody opens something,
+ * and the bar goes blank exactly when it is most useful — you are two levels
+ * into a world with nothing on screen saying so.
+ *
+ * So a page may declare `under: '/worlds'`, naming the entry it sits beneath.
+ * Declared rather than derived: `/world/:wid` under `/worlds` and `/npc/:id`
+ * under `/` are not a prefix rule, and a rule that got them right by accident
+ * would get the next one wrong.
+ */
+export function navOwner(page, section) {
+  if (!page) return null;
+  const items = navFor(section);
+  return items.find((p) => p.path === page.path)
+    || items.find((p) => p.path === page.under)
+    || null;
 }
 
 function compile(pattern) {

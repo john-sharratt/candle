@@ -107,13 +107,17 @@ export const LiveAPI = {
    * list the browser already holds. A hidden world is not sent at all until a
    * whole word of `q` names it, so filtering here would have nothing to reveal
    * — and a list the client narrows is a list the client was first sent whole. */
-  listWorlds:    (q) => j('/v1/world' + qs({ q })),
+  /* `reveal` asks the daemon to include hidden documents. It is a request, not
+   * a grant: the daemon honours it only for an admin, so sending it from
+   * anywhere else changes nothing. */
+  listWorlds:    (q, reveal) => j('/v1/world' + qs({ q, reveal: reveal ? 1 : '' })),
   getWorld:      (w) => j(`/v1/world/${w}`),
   setWorld:      (w, c) => j(`/v1/world/${w}`, { method: 'PUT', body: c }),
   setWorldTime:  (w, t) => j(`/v1/world/${w}/time`, { method: 'PUT', body: t }),
   /* `q` as for `listWorlds`: a hidden personality is not sent until a whole
    * word of it names one, so the filter has to reach the server. */
-  listPersonalities: (q) => j('/v1/personality' + qs({ q })),
+  listPersonalities: (q, reveal) =>
+    j('/v1/personality' + qs({ q, reveal: reveal ? 1 : '' })),
   getPersonality:    (a) => j(`/v1/personality/${a}`),
   /* A PUT replaces the whole document — the daemon rewrites
    * `personalities/<a>.yaml` from the body. Send the object you read back, not
@@ -134,8 +138,69 @@ export const LiveAPI = {
   calibrateTools: () => j('/v1/tools/calibrate', { method: 'POST' }),
   listCommands:   () => j('/v1/commands'),
 
+  /* The authored corpus.
+   *
+   * `id` is an ADDRESS — `canon/ammo/bolt` — not a path. Nothing here knows
+   * where the mind keeps its files, which extension a section uses, or that
+   * there is a filesystem at all; the daemon owns all of it. An empty id is the
+   * corpus itself, which lists its sections.
+   *
+   * `world` is optional and narrows by that world's own filters — `selects` for
+   * the canon topics, `excludes` for the section categories, its cast for the
+   * characters. The daemon applies it, so anything a world excludes is never
+   * sent and there is nothing here to leak by forgetting to filter. */
+  mindList:  (id, world) => j('/v1/mind/list' + qs({ id, world })),
+  /* The canon topics a world admits — history, technology, factions — with how
+   * many pages each holds.
+   *
+   * A listing of `canon` under that world's lens, not a route of its own: the
+   * daemon already applies `selects` on the way down, so this is the same
+   * answer the mind browser gets and there is no second filter to disagree with
+   * it. It exists as a named method because "what does this world know" is a
+   * question the world page asks, and spelling it out at the call site there
+   * would put the address `canon` in a file that should not know one. */
+  getWorldKnowledge: async (world) =>
+    (await j('/v1/mind/list' + qs({ id: 'canon', world }))).children || [],
+  mindEntry: (id, world) => j('/v1/mind/entry' + qs({ id, world })),
+  /* The same entry as fields rather than as text, so it can be edited without
+   * knowing YAML. Answers `not_fields` for a document that is not a mapping —
+   * a canon page is prose, and prose has no fields — and the console falls back
+   * to the text editor for those.
+   *
+   * A save patches the values into the document already on disk, so the
+   * authoring comments above each key survive. That is the whole reason this
+   * is not "parse, edit, write out again": 701 of the 712 section files carry
+   * comments, and a re-serialise would delete every one. */
+  mindFields: (id, world) => j('/v1/mind/fields' + qs({ id, world })),
+  saveMindFields: (id, values, world) =>
+    j('/v1/mind/fields' + qs({ id, world }), { method: 'PUT', body: { values } }),
+  /* `isNew` refuses to land on something that already exists, which is what
+   * separates "add" from "save" — a create that overwrote somebody's work would
+   * do it with no error to say so. */
+  saveMindEntry: (id, text, world, isNew) =>
+    j('/v1/mind/entry' + qs({ id, world, new: isNew ? 1 : '' }), { method: 'PUT', body: { text } }),
+  deleteMindEntry: (id, world) =>
+    j('/v1/mind/entry' + qs({ id, world }), { method: 'DELETE' }),
+
+  /* A portrait: the raw image as the body, not a multipart form. There is one
+   * file and no other fields, so an envelope would be ceremony around a byte
+   * string — and the daemon decides the format from the bytes anyway, so the
+   * `Content-Type` here is a courtesy rather than a claim it trusts. */
+  async putPortrait(id, file) {
+    const r = await fetch(`/v1/npc/${id}/portrait`, {
+      method: 'PUT',
+      headers: { 'content-type': file.type || 'application/octet-stream' },
+      body: file,
+    });
+    if (!r.ok) {
+      let e = { error: 'http_' + r.status, detail: r.statusText };
+      try { e = await r.json(); } catch (_) {}
+      throw Object.assign(new Error(e.detail || e.error), e, { status: r.status });
+    }
+    return r.json();
+  },
+
   generateDescription: (b) => j('/v1/generate/description', { method: 'POST', body: b || {} }),
-  generateAttributes:  (b) => j('/v1/generate/attributes', { method: 'POST', body: b || {} }),
   generateImage:       (b) => j('/v1/image/generate', { method: 'POST', body: b || {} }),
   listImageModels:     () => j('/v1/image/models'),
   getImageQueue:       () => j('/v1/image/queue'),

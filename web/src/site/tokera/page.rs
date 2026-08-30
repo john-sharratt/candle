@@ -7,12 +7,14 @@
 //! that swap "Sign in" for your name, and the page is complete without it.
 
 pub struct Meta<'a> {
-    /// The `<h1>`.
+    /// The `<h1>`, and the first half of the `<title>`.
     ///
-    /// There is deliberately no separate browser title beside it. Every page
-    /// here is titled `Tokera` and stays that way while you read — a tab that
-    /// renames itself as you click is restless, and the page already says what
-    /// it is in letters an inch tall.
+    /// This used to be the whole story: every page was titled `Tokera`, on the
+    /// reasoning that a tab renaming itself as you click is restless. That is
+    /// true of the tab and wrong about everything else — the `<title>` is the
+    /// line a search engine prints as the result, and fifteen posts sharing one
+    /// makes every one of them unfindable by its own name. So the tab reads
+    /// `<heading> · Tokera` and the brand is still on it.
     pub heading: &'a str,
     pub subtitle: Option<&'a str>,
     /// Small text under the heading — a date, authors.
@@ -22,6 +24,71 @@ pub struct Meta<'a> {
     pub nav: Nav,
     /// Extra stylesheet beyond the shared base.
     pub width: Width,
+    /// This page's absolute path on the site, for the canonical URL.
+    ///
+    /// One address per page, stated by the page. Without it the same document
+    /// reached through a trailing slash, a query string a link carried, or one
+    /// of the redirected domains is a *different* page to a search engine, and
+    /// they divide the credit between them.
+    pub path: &'a str,
+    /// What this page is, for Open Graph and for the structured data below.
+    pub kind: Kind,
+    /// A representative image, as an absolute path on this site.
+    ///
+    /// Not authored: [`first_image`] takes the first one out of the rendered
+    /// body, because every post already opens with one and a second place to
+    /// name it is a second place for it to be wrong.
+    pub image: Option<&'a str>,
+    /// `YYYY-MM-DD`, for an article.
+    pub published: Option<&'a str>,
+}
+
+/// What a page is, which decides its Open Graph type and its JSON-LD.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum Kind {
+    /// The home page and the two index pages.
+    Site,
+    /// A blog post.
+    Article,
+    /// A paper.
+    Paper,
+    /// A 404 or a 500.
+    ///
+    /// Not indexable and, more importantly, **not canonical**. Giving an error
+    /// page `canonical: /` would tell a search engine that every wrong address
+    /// on the site is really the home page — which invites it to treat the home
+    /// page as a soft duplicate of a hundred dead URLs. The status code already
+    /// says what happened; this stops the markup contradicting it.
+    Error,
+}
+
+/// This site's own origin, for absolute URLs.
+///
+/// Open Graph and JSON-LD both require them — a relative `og:image` is ignored
+/// by most readers, which is how a shared link ends up as a grey box. It is a
+/// constant rather than something read from the request's `Host`, because that
+/// header is the client's: a crafted one would otherwise put an attacker's
+/// domain into this site's own canonical tag, and a search engine reading it
+/// would take that as this page's address.
+pub const ORIGIN: &str = "https://tokera.com";
+
+/// The card image for a page that has none of its own.
+const DEFAULT_CARD: &str = "/img/blog/prr.jpg";
+
+/// The first image in a rendered document, if it has one.
+///
+/// Used for the social card. Deliberately a scan of the output rather than a
+/// frontmatter field: every post already opens with an illustration, and a
+/// field beside it would be a second source of truth that silently drifts the
+/// first time somebody changes the picture without changing the header.
+pub fn first_image(html: &str) -> Option<&str> {
+    let at = html.find("<img ")?;
+    let rest = &html[at..];
+    let src = rest.find("src=\"")? + 5;
+    let tail = &rest[src..];
+    let end = tail.find('"')?;
+    let url = &tail[..end];
+    url.starts_with('/').then_some(url)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -116,6 +183,33 @@ const ME: &str = "tokera";
 
 /// Everything from the doctype to the end of the nav bar.
 fn doc_open(m: &Meta) -> String {
+    let title = if m.kind == Kind::Site && m.path == "/" {
+        "Tokera".to_string()
+    } else {
+        format!("{} · Tokera", esc(m.heading))
+    };
+    let canonical = format!("{ORIGIN}{}", m.path);
+    let image = format!("{ORIGIN}{}", m.image.unwrap_or(DEFAULT_CARD));
+    let og_type = match m.kind {
+        Kind::Site | Kind::Error => "website",
+        Kind::Article | Kind::Paper => "article",
+    };
+    // An error page states neither an address nor an indexing invitation.
+    let (canonical_tag, robots) = if m.kind == Kind::Error {
+        (String::new(), "noindex, follow")
+    } else {
+        (
+            format!("\n<link rel=\"canonical\" href=\"{canonical}\">"),
+            "index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1",
+        )
+    };
+    // `article:published_time` only where there is one, rather than an empty
+    // attribute a parser has to decide what to do with.
+    let published = m
+        .published
+        .map(|d| format!("\n<meta property=\"article:published_time\" content=\"{}\">", esc(d)))
+        .unwrap_or_default();
+
     format!(
         r#"<!doctype html>
 <html lang="en" class="{root}" data-theme="dark">
@@ -123,12 +217,26 @@ fn doc_open(m: &Meta) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<title>Tokera</title>
-<meta name="description" content="{description}">
+<title>{title}</title>
+<meta name="description" content="{description}">{canonical_tag}
+<meta name="robots" content="{robots}">
+<meta property="og:site_name" content="Tokera">
+<meta property="og:type" content="{og_type}">
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{description}">
+<meta property="og:url" content="{canonical}">
+<meta property="og:image" content="{image}">
+<meta property="og:locale" content="en">{published}
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{title}">
+<meta name="twitter:description" content="{description}">
+<meta name="twitter:image" content="{image}">
 <link rel="icon" type="image/png" href="/favicon.png">
+<link rel="alternate" type="application/rss+xml" title="Tokera — the blog" href="/blog/feed.xml">
 <link rel="stylesheet" href="/base.css">
 <link rel="stylesheet" href="/lib/estate.css">
 <link rel="stylesheet" href="/site.css">
+<script type="application/ld+json">{ld}</script>
 </head>
 <body class="tokera">
 {nav}
@@ -136,7 +244,90 @@ fn doc_open(m: &Meta) -> String {
         root = m.width.root_class(),
         description = esc(m.description),
         nav = nav_bar(m.nav),
+        ld = json_ld(m, &canonical, &image),
     )
+}
+
+/// The structured data for this page.
+///
+/// Two things, always: the page itself, and the organisation that publishes it.
+///
+/// The organisation is the half that matters most here and is the least
+/// obvious. `sameAs` is how a search engine learns that this domain, the GitHub
+/// organisation, the crates.io packages and the LinkedIn page are **one
+/// entity** — which is the whole problem when somebody else turns up using the
+/// name. A thin site on another TLD can copy the word; it cannot produce a
+/// corroborating trail of accounts that have used it since 2022.
+fn json_ld(m: &Meta, canonical: &str, image: &str) -> String {
+    let org = format!(
+        r#"{{"@type":"Organization","@id":"{ORIGIN}/#org","name":"Tokera","url":"{ORIGIN}/",
+"logo":"{ORIGIN}/favicon.png",
+"sameAs":["https://github.com/tokera-xyz","https://crates.io/crates/tokera",
+"https://wasmer.io/tokera","https://code.tokera.com/","https://bot.tokera.com/",
+"https://battlecities.net/"]}}"#
+    )
+    .replace('\n', "");
+
+    let page = match m.kind {
+        // An error page describes nothing, so it claims to be nothing. The
+        // organisation still goes out — it is true of the site whatever page
+        // you landed on.
+        Kind::Error => return format!(r#"{{"@context":"https://schema.org","@graph":[{org}]}}"#),
+        Kind::Site => format!(
+            r#"{{"@type":"WebSite","@id":"{ORIGIN}/#site","name":"Tokera","url":"{ORIGIN}/",
+"description":"{desc}","publisher":{{"@id":"{ORIGIN}/#org"}}}}"#,
+            desc = json_str(m.description),
+        )
+        .replace('\n', ""),
+        // A paper is a `ScholarlyArticle`, which is not decoration: it is what
+        // puts one in Google Scholar's vocabulary rather than a blog's.
+        Kind::Article | Kind::Paper => {
+            let ty = if m.kind == Kind::Paper {
+                "ScholarlyArticle"
+            } else {
+                "BlogPosting"
+            };
+            let date = m
+                .published
+                .map(|d| format!(r#","datePublished":"{}""#, json_str(d)))
+                .unwrap_or_default();
+            format!(
+                r#"{{"@type":"{ty}","@id":"{canonical}#page","headline":"{head}",
+"description":"{desc}","url":"{canonical}","image":"{image}"{date},
+"author":{{"@id":"{ORIGIN}/#org"}},"publisher":{{"@id":"{ORIGIN}/#org"}},
+"mainEntityOfPage":"{canonical}"}}"#,
+                head = json_str(m.heading),
+                desc = json_str(m.description),
+            )
+            .replace('\n', "")
+        }
+    };
+
+    format!(r#"{{"@context":"https://schema.org","@graph":[{org},{page}]}}"#)
+}
+
+/// A string safe to sit inside the JSON-LD block.
+///
+/// Two escapes at once, and both are needed. JSON's own — quotes, backslashes,
+/// control characters — and `</`, because this JSON lives inside a `<script>`
+/// element: a summary containing `</script>` would otherwise close the block
+/// early and the rest of it would be parsed as markup.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' | '\r' => out.push(' '),
+            '\t' => out.push(' '),
+            '<' => out.push_str("\\u003C"),
+            '>' => out.push_str("\\u003E"),
+            '&' => out.push_str("\\u0026"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn head(m: &Meta) -> String {
@@ -349,6 +540,10 @@ mod tests {
             description: "D",
             nav: Nav::Blog,
             width: Width::Reading,
+            path: "/blog/h",
+            kind: Kind::Article,
+            image: None,
+            published: Some("2026-01-02"),
         }
     }
 
@@ -416,7 +611,7 @@ mod tests {
     /// three.
     ///
     /// Rust renders it here, `content/common/lib/estate.js` renders it for the
-    /// npcd console, and `zend/web/lib/estate.js` is a copy because zend embeds
+    /// npcd console, and `zend/web/common/lib/estate.js` is a copy because zend embeds
     /// its own assets. Nothing forces them to agree, and a switcher that offers
     /// a different set of sites depending on which site you opened it from is
     /// worse than no switcher — so the copies are compared rather than trusted.

@@ -17,7 +17,13 @@
 
 server:
   bind: "127.0.0.1:8081"
-  cache_control: "no-store"
+  # A minute for code, fifteen for pictures — see the note in `web/web.yaml`.
+  # Both keep their ETag, so once the age is up an unchanged file still costs a
+  # conditional request and no body, and `--content` editing shows up on the
+  # first refresh after a minute.
+  cache:
+    short_secs: 60
+    long_secs: 900
 
 # ----------------------------------------------------------------------------
 # Roles.
