@@ -167,7 +167,10 @@ mod tests {
     use super::*;
     use crate::models::batch_test::test_helpers::hf_get;
     use crate::models::delta_net::mix::{delta_net_layer_forward, DeltaNetWeights};
-    use crate::models::qwen35::quantized_weights::{load_quantized_model, QuantLayerMix};
+    use crate::models::delta_net::LayerKind;
+    use crate::models::qwen35::quantized_weights::{
+        load_quantized_model, LoadInputs, QuantLayerMix,
+    };
     use candle::quantized::{gguf_file::Content, Int8Mode};
     use candle::{DType, Device, Tensor};
     use hf_hub::RepoType;
@@ -198,13 +201,15 @@ mod tests {
         let content = Content::read(&mut reader)?;
         reader.seek(SeekFrom::Start(0))?;
         // The 9B is dense, so it needs no expert cache.
+        // Resident: this test dequantizes the projections to build the
+        // reference, which wants the weights in hand rather than a slot's
+        // view of them.
         let model = load_quantized_model(
             &content,
             &mut reader,
             &device,
             Int8Mode::Off,
-            None,
-            |_, _| Ok(None),
+            LoadInputs::resident(),
         )?;
 
         let dims = model.cfg.delta_net;
@@ -225,14 +230,16 @@ mod tests {
             dims.n_v_heads
         );
 
-        let qw = model
-            .layers
+        let dn = model
+            .cfg
+            .layer_kinds
             .iter()
-            .find_map(|l| match &l.mix {
-                QuantLayerMix::DeltaNet(w) => Some(w),
-                _ => None,
-            })
+            .position(|k| matches!(k, LayerKind::DeltaNet))
             .expect("the stack has DeltaNet layers");
+        let layer = model.layers.ensure(dn)?;
+        let QuantLayerMix::DeltaNet(qw) = &layer.mix else {
+            unreachable!("layer {dn} is DeltaNet by its kind")
+        };
 
         // Same numbers on both sides; only the projection kernel differs.
         let reference = DeltaNetWeights {

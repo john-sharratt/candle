@@ -310,6 +310,14 @@ pub(crate) struct WarmPool {
     slot_size: usize,
     /// Number of slots.
     num_slots: usize,
+    /// What this pool is *for*, as the process-wide pinned gauge records it.
+    ///
+    /// Carried rather than assumed because the same pool serves two consumers
+    /// with very different sizes and lifetimes: a weight warm tier is gigabytes
+    /// chosen by policy, and a cold-read staging ring is a handful of buffers
+    /// that are structurally required. Booking the ring as warm tier makes the
+    /// host-RAM report attribute a mandatory cost to a discretionary one.
+    use_: candle::vram::PinnedUse,
 }
 
 #[cfg(feature = "cuda")]
@@ -319,31 +327,61 @@ impl WarmPool {
     /// The warm tier is a **performance** choice, not a correctness one — the
     /// cold tier holds every expert at any warm size, including zero — so it is
     /// sized by what the machine can spare and `cuMemAllocHost` refusing is the
-    /// answer to "was that too much". A refusal halves the request and tries
+    /// answer to "was that too much". A refusal steps the request down and tries
     /// again rather than failing the load: pinned pages are non-pageable, so a
     /// refusal is a real answer about the machine and not a hint, but it is an
     /// answer about *this size*, and the next size down is still worth having.
-    pub(crate) fn new(want_slots: usize, slot_size: usize) -> Self {
+    ///
+    /// # The step is 1/8, not a half
+    ///
+    /// `want_slots` is already the policy answer — three host-RAM ceilings, one
+    /// of which is a hard cap on how much of the machine may be page-locked
+    /// (`handle::warm_sizing_from`). The allocator refusing is a *fourth* limit
+    /// that the policy cannot see, and the only thing this loop is doing is
+    /// finding it. Halving overshoots it wildly: measured on the 27B, a budget of
+    /// 50 slots was refused and the tier dropped to **25** — 6.5 GiB of pinning
+    /// the policy had already found affordable, discarded on one refusal, and
+    /// worth 23 synchronous NVMe reads per forward in the layers it could no
+    /// longer hold.
+    ///
+    /// Stepping down by an eighth converges on the true ceiling from above in a
+    /// handful of tries — a refused `cuMemAllocHost` is cheap — and can never
+    /// exceed the budget, so the over-pinning guard the ceilings exist for still
+    /// holds. `min(slots - 1)` keeps it strictly decreasing so the loop
+    /// terminates at small sizes where `7/8` would round to a fixed point.
+    pub(crate) fn new(want_slots: usize, slot_size: usize, use_: candle::vram::PinnedUse) -> Self {
         let mut slots = want_slots;
         while slots > 0 && slot_size > 0 {
-            match Self::try_alloc(slots, slot_size) {
+            match Self::try_alloc(slots, slot_size, use_) {
                 Some(pool) => return pool,
                 None => {
+                    let next = (slots * 7 / 8).min(slots - 1);
                     tracing::warn!(
                         target: "candle_transformers::expert_lre",
                         slots,
-                        gib = (slots * slot_size) as f64 / 1e9,
-                        "warm tier: cuMemAllocHost refused; halving"
+                        next,
+                        gib = slots.saturating_mul(slot_size) as f64 / 1e9,
+                        "warm tier: cuMemAllocHost refused; stepping down"
                     );
-                    slots /= 2;
+                    slots = next;
                 }
             }
         }
-        Self::empty()
+        Self::empty(use_)
     }
 
-    fn try_alloc(num_slots: usize, slot_size: usize) -> Option<Self> {
-        let total_size = num_slots * slot_size;
+    fn try_alloc(
+        num_slots: usize,
+        slot_size: usize,
+        use_: candle::vram::PinnedUse,
+    ) -> Option<Self> {
+        // A wrapped product would ask `cuMemAllocHost` for a small buffer and
+        // then hand out `num_slots` slots over it, which is the same
+        // out-of-bounds write the accessors above refuse — reached through
+        // arithmetic instead of through an index. `None` is the honest answer
+        // and puts it on the halving path in [`Self::new`], which converges on
+        // a size that does not wrap.
+        let total_size = num_slots.checked_mul(slot_size)?;
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let result = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, total_size) };
         if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
@@ -351,10 +389,7 @@ impl WarmPool {
         }
         // Feed the process-wide gauge: pinned memory is non-pageable, so the
         // host-RAM availability measurement must treat it as structural.
-        candle::vram::note_host_pinned_alloc(
-            candle::vram::PinnedUse::ExpertWarmTier,
-            total_size as u64,
-        );
+        candle::vram::note_host_pinned_alloc(use_, total_size as u64);
         // The deepest point of the run for free host RAM: the tier is the
         // largest pinned claim the engine makes and everything it needs after
         // this has to fit in what is left. Sampling here is what makes the
@@ -372,15 +407,42 @@ impl WarmPool {
             total_size,
             slot_size,
             num_slots,
+            use_,
         })
     }
 
     /// A mutable byte slice for a slot — the destination of the one fill it
     /// ever receives.
+    ///
+    /// # The bounds hold in release
+    ///
+    /// This hands out a raw slice over `cuMemAllocHost` memory, so an index or
+    /// length past the pool writes into whatever the process has after it —
+    /// silently, with no fault to catch it, because pinned host pages are as
+    /// writable as any other part of the address space. Every other bound in
+    /// this cache is enforced rather than assumed (`claim_dense` against the
+    /// weight floor, `copy_to_host_on_stream` against `dst.len()`), and a
+    /// `debug_assert` here would be exactly the one that is absent from the
+    /// builds that run: the gates and the daemon are `--release`.
+    ///
+    /// A violation is a bookkeeping bug — `slot_idx` comes from the residency
+    /// map and `len` is the pack's record stride, which is also what
+    /// `slot_size` was cut to — so it panics rather than returning a `Result`.
+    /// There is no recovery to offer a caller whose own indices are wrong, and
+    /// a loud abort at the offending call is worth far more than a corrupted
+    /// heap discovered later somewhere else.
     #[inline]
     pub(crate) fn slot_mut(&mut self, slot_idx: usize, len: usize) -> &mut [u8] {
-        debug_assert!(slot_idx < self.num_slots);
-        debug_assert!(len <= self.slot_size);
+        assert!(
+            slot_idx < self.num_slots,
+            "warm tier: slot {slot_idx} is past the pool's {} slots",
+            self.num_slots,
+        );
+        assert!(
+            len <= self.slot_size,
+            "warm tier: a {len} B write does not fit slot {slot_idx}'s {} B",
+            self.slot_size,
+        );
         unsafe {
             let ptr = self.base.add(slot_idx * self.slot_size);
             std::slice::from_raw_parts_mut(ptr, len)
@@ -394,9 +456,20 @@ impl WarmPool {
     /// one batch of positioned reads rather than one call per expert.
     /// [`Self::slot_mut`] would be a lie here — it promises a single slot's
     /// worth and asserts it.
+    ///
+    /// Bounds-checked in release for the reason given on [`Self::slot_mut`],
+    /// and the sum is checked too: `first + n_slots` is the one arithmetic in
+    /// this file that can wrap on its way to being compared.
     #[inline]
     pub(crate) fn span_mut(&mut self, first: usize, n_slots: usize) -> &mut [u8] {
-        debug_assert!(first + n_slots <= self.num_slots);
+        let end = first
+            .checked_add(n_slots)
+            .expect("warm tier: span end overflows usize");
+        assert!(
+            end <= self.num_slots,
+            "warm tier: span [{first}, {end}) is past the pool's {} slots",
+            self.num_slots,
+        );
         unsafe {
             let ptr = self.base.add(first * self.slot_size);
             std::slice::from_raw_parts_mut(ptr, n_slots * self.slot_size)
@@ -404,10 +477,23 @@ impl WarmPool {
     }
 
     /// A shared byte slice for a slot — the source of every promotion.
+    ///
+    /// Bounds-checked in release for the reason given on [`Self::slot_mut`].
+    /// A read past the pool is the milder half of the same bug — it feeds an
+    /// H2D copy, so it turns unrelated process memory into expert weights
+    /// rather than the other way round.
     #[inline]
     pub(crate) fn slot_ref(&self, slot_idx: usize, len: usize) -> &[u8] {
-        debug_assert!(slot_idx < self.num_slots);
-        debug_assert!(len <= self.slot_size);
+        assert!(
+            slot_idx < self.num_slots,
+            "warm tier: slot {slot_idx} is past the pool's {} slots",
+            self.num_slots,
+        );
+        assert!(
+            len <= self.slot_size,
+            "warm tier: a {len} B read exceeds slot {slot_idx}'s {} B",
+            self.slot_size,
+        );
         unsafe {
             let ptr = self.base.add(slot_idx * self.slot_size);
             std::slice::from_raw_parts(ptr, len)
@@ -427,12 +513,13 @@ impl WarmPool {
     }
 
     /// An empty pool — no warm tier at all, which the invariant permits.
-    pub(crate) fn empty() -> Self {
+    pub(crate) fn empty(use_: candle::vram::PinnedUse) -> Self {
         Self {
             base: std::ptr::null_mut(),
             total_size: 0,
             slot_size: 0,
             num_slots: 0,
+            use_,
         }
     }
 }
@@ -446,10 +533,7 @@ impl Drop for WarmPool {
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 tracing::warn!("WarmPool: cuMemFreeHost failed: {:?}", result);
             }
-            candle::vram::note_host_pinned_free(
-                candle::vram::PinnedUse::ExpertWarmTier,
-                self.total_size as u64,
-            );
+            candle::vram::note_host_pinned_free(self.use_, self.total_size as u64);
         }
     }
 }
@@ -697,13 +781,17 @@ mod tests {
             unreachable!("new_cuda yields a cuda device")
         };
 
-        let Some(pool) = WarmPool::try_alloc(1, SLOT_BYTES) else {
+        let Some(mut pool) =
+            WarmPool::try_alloc(1, SLOT_BYTES, candle::vram::PinnedUse::WeightWarmTier)
+        else {
             eprintln!("[skip] could not pin {SLOT_BYTES} bytes");
             return;
         };
         // Touch the source so the pages are resident and the first copy is not
         // paying for a fault that belongs to setup rather than to the link.
-        let src = unsafe { std::slice::from_raw_parts_mut(pool.base, SLOT_BYTES) };
+        // Through the accessor, so the benchmark measures the same bounded path
+        // the pipeline takes rather than a raw slice beside it.
+        let src = pool.slot_mut(0, SLOT_BYTES);
         src.fill(0xA5);
 
         let elems = SLOT_BYTES / 4;
@@ -794,5 +882,95 @@ mod tests {
             SLOT_BYTES as f64 / per_copy / 1e6
         );
         eprintln!("[h2d] pageable, back-to-back = {pageable:.1} GB/s");
+    }
+
+    // ── Pinned-memory bounds ──────────────────────────────────────────────
+    //
+    // The accessors hand out raw slices over `cuMemAllocHost` memory, where an
+    // overrun is a silent write into unrelated process memory rather than a
+    // fault. These run in the same `--release` configuration the gates do,
+    // which is the whole point of them: a `debug_assert` is absent from every
+    // build that matters.
+    //
+    // The first four need no device — an empty pool has zero slots, so every
+    // index is out of bounds, and the overflow is refused before
+    // `cuMemAllocHost` is reached.
+
+    #[test]
+    #[should_panic(expected = "past the pool's 0 slots")]
+    fn an_empty_pool_refuses_a_slot_read() {
+        let pool = WarmPool::empty(candle::vram::PinnedUse::WeightWarmTier);
+        let _ = pool.slot_ref(0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "past the pool's 0 slots")]
+    fn an_empty_pool_refuses_a_slot_write() {
+        let mut pool = WarmPool::empty(candle::vram::PinnedUse::WeightWarmTier);
+        let _ = pool.slot_mut(0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "span [0, 1) is past the pool's 0 slots")]
+    fn an_empty_pool_refuses_a_span() {
+        let mut pool = WarmPool::empty(candle::vram::PinnedUse::WeightWarmTier);
+        let _ = pool.span_mut(0, 1);
+    }
+
+    #[test]
+    fn a_wrapping_slot_count_is_refused_before_allocating() {
+        // `num_slots * slot_size` wraps to a small number; the checked multiply
+        // must answer `None` rather than pin that small buffer and then hand
+        // out `num_slots` slots over it.
+        assert!(WarmPool::try_alloc(
+            usize::MAX / 4 + 1,
+            8,
+            candle::vram::PinnedUse::WeightWarmTier
+        )
+        .is_none());
+        assert!(
+            WarmPool::try_alloc(usize::MAX, 2, candle::vram::PinnedUse::WeightWarmTier).is_none()
+        );
+    }
+
+    /// The length bound, which needs real pinned memory to have a slot size at
+    /// all — hence the device, without which `cuMemAllocHost` answers
+    /// `NOT_INITIALIZED` and the test would pass by skipping the thing it
+    /// exists to check. Skips only where there is no CUDA device: the bound is
+    /// the property under test, not the machine's ability to pin.
+    #[test]
+    fn a_write_wider_than_its_slot_panics() {
+        const SLOT: usize = 4096;
+        let Ok(_device) = candle::Device::new_cuda(0) else {
+            eprintln!("[skip] no CUDA device");
+            return;
+        };
+        let Some(mut pool) = WarmPool::try_alloc(2, SLOT, candle::vram::PinnedUse::WeightWarmTier)
+        else {
+            eprintln!("[skip] could not pin {} B", 2 * SLOT);
+            return;
+        };
+        // Exactly a slot is fine, and so is the last slot.
+        assert_eq!(pool.slot_mut(0, SLOT).len(), SLOT);
+        assert_eq!(pool.slot_mut(1, SLOT).len(), SLOT);
+        assert_eq!(pool.span_mut(0, 2).len(), 2 * SLOT);
+
+        // One byte past, and one slot past, both refused. `catch_unwind` rather
+        // than `#[should_panic]` so the pool stays alive across both probes and
+        // is freed once, by its own `Drop`, at the end of the test.
+        let too_wide = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.slot_mut(0, SLOT + 1);
+        }));
+        assert!(
+            too_wide.is_err(),
+            "a write one byte past the slot must panic, not run"
+        );
+        let too_far = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.slot_mut(2, SLOT);
+        }));
+        assert!(
+            too_far.is_err(),
+            "a write to the slot after the last must panic, not run"
+        );
     }
 }

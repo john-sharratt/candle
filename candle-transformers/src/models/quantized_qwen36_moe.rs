@@ -285,6 +285,7 @@ mod tests {
                 Qwen35LoadOptions {
                     int8mode: Some(int8mode),
                     expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                    mtp_path: None,
                 },
             )?;
             let cfg = &m.model().cfg;
@@ -342,6 +343,7 @@ mod tests {
                             Qwen35LoadOptions {
                                 int8mode: Some(int8mode),
                                 expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                                mtp_path: None,
                             },
                         )
                     },
@@ -416,6 +418,7 @@ mod tests {
                 Qwen35LoadOptions {
                     int8mode: Some(int8mode),
                     expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                    mtp_path: None,
                 },
             )?;
             // A gate that silently fell back to plain decode would still pass

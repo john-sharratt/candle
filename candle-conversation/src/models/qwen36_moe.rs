@@ -14,6 +14,7 @@
 
 use super::{ModelArch, ModelSpec};
 use crate::{config::SamplingConfig, models::DialectType};
+use candle_transformers::models::quantized_qwen36_moe;
 
 const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
 
@@ -42,7 +43,13 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
         // server omits Content-Length, so a guess shows a wrong bar. The MTP
         // file is the larger of the two by the size of the head.
         model_bytes: 22_663_387_424,
-        tokenizer_repo: "Qwen/Qwen3.6-35B-A3B".into(),
+        // The gate's own pin, not a copy of it. `quantized_qwen36_moe` is where
+        // the claim "this tokenizer and the GGUF's `tokenizer.ggml.tokens`
+        // agree token for token" was established; serving and gating reading
+        // the same two constants is what stops them drifting apart, which is
+        // the only way that claim stays true of what actually runs.
+        tokenizer_repo: quantized_qwen36_moe::TOKENIZER_REPO.into(),
+        tokenizer_rev: quantized_qwen36_moe::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 4096,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),

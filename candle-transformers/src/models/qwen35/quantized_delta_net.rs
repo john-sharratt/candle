@@ -58,6 +58,9 @@ pub fn quantized_delta_net_ffn(
     // intermediates needed. The MoE combine still writes its working width.
     let h = {
         let mode = layer.ffn_int8mode();
+        // The FFN's input, before the norm quantizes it. Everything downstream
+        // in this block is bounded by whether this was already bad.
+        x.as_cat_tensor().assert("ffn.in");
         let acts = layer.post_attn_norm.forward_dynamic(
             x.as_cat_tensor(),
             mode,
@@ -67,7 +70,17 @@ pub fn quantized_delta_net_ffn(
             QuantFfn::Dense(m) => m.forward_dynamic(&acts, mlp_dtype, orig_dtype)?,
             QuantFfn::Moe(m) => {
                 let mut out = m.forward_dynamic(acts, mlp_dtype, ffn_wave.as_ref())?;
+                // Straddles the narrowing. The FFN computes its intermediates
+                // in a promoted dtype precisely because "MLP intermediates can
+                // exceed F16's range", and whether narrowing back is lossless
+                // is a property of the DATA, not the shapes — nothing in the
+                // type system or the operand guards can catch an out-of-range
+                // value silently becoming `inf`. The pair of asserts can: bad
+                // only on the second side is the narrowing, bad on both is
+                // upstream of it.
+                out.assert("ffn.moe_out.wide");
                 out.to_dtype_mut(orig_dtype)?;
+                out.assert("ffn.moe_out.narrowed");
                 out
             }
         }

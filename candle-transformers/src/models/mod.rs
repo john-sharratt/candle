@@ -92,6 +92,7 @@ pub mod kv_collect_utils;
 // and the wave scheduler are all kernel wrappers.
 #[cfg(feature = "cuda")]
 pub mod latent_moe;
+pub mod layer_stream;
 pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;
@@ -111,6 +112,10 @@ pub mod mobileone;
 pub mod modernbert;
 pub mod moondream;
 pub mod mpt;
+/// Same-pass checkpoints that capture and panic at the first corruption —
+/// `tensor-assert` only.
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+pub mod nan_capture;
 pub mod nvembed_v2;
 pub mod olmo;
 pub mod olmo2;

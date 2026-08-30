@@ -191,7 +191,9 @@ pub fn qtensor_from_ggml(
         // are already in the exact layout the int8 KO matmul reads (identical to
         // `QCudaStorage::repack_ko` output). Copy them straight to VRAM with no reinterpret and no
         // MATRIX_ROW_PADDING; `size_in_bytes` (from `type_size`) equals the emitted `ko_chunk_bytes`.
-        GgmlDType::Q8_KO
+        GgmlDType::Q2_KO
+        | GgmlDType::Q3_KO
+        | GgmlDType::Q8_KO
         | GgmlDType::Q4_KO
         | GgmlDType::Q5_KO
         | GgmlDType::Q6_KO
@@ -331,7 +333,9 @@ pub fn qtensor_from_ggml_on_stream(
         ),
         // KO twins: pre-repacked lane-major bytes → VRAM on the copy stream, no padding/reinterpret
         // (see the non-stream `qtensor_from_ggml` arm).
-        GgmlDType::Q8_KO
+        GgmlDType::Q2_KO
+        | GgmlDType::Q3_KO
+        | GgmlDType::Q8_KO
         | GgmlDType::Q4_KO
         | GgmlDType::Q5_KO
         | GgmlDType::Q6_KO

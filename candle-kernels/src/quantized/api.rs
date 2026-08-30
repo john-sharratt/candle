@@ -72,6 +72,10 @@ pub enum QType {
     /// as the 2-bit crumb region Q6_KO carries, used as the whole value). Value 51 mirrors
     /// QTYPE_Q2_KO. Read by the maintained per-128 int8 fold; GPU-only.
     Q2_KO = 51,
+    /// Lane-major per-128 affine KO twin at 3-bit (value 0..7) — `Q3_K`'s same-width twin: a
+    /// 2-bit crumb plane (Q2_KO's region) at bits 0-1 plus a 1-bit hi plane (Q5_KO's region)
+    /// at bit 2, and no `ql`. Value 52 mirrors QTYPE_Q3_KO. GPU-only.
+    Q3_KO = 52,
 }
 
 /// Y vector type enum (matches dispatcher ytype parameter).

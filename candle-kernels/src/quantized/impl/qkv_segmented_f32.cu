@@ -26,8 +26,15 @@
 #include "../loader/q5_K.cuh"
 #include "../loader/q6_K.cuh"
 #include "../loader/q8_K.cuh"
+// The narrow twins' unpack traits. A missing loader header here does NOT fall back to
+// something slower — the primary `gemx_dequant_traits` template has no
+// `dequant_all_subs_int8` at all, so the omission is a compile error rather than a wrong
+// answer. That is the only reason every format this file dispatches can be trusted to be the
+// format it names.
+#include "../loader/q2_KO.cuh"
+#include "../loader/q3_KO.cuh"
 
-// Per-format K/128 params (mirror the per-format *_f32.cu files): q4/q5/q6 use
+// Per-format K/128 params (mirror the per-format *_f32.cu files): q2/q3/q4/q5/q6 use
 // vdr=2 (16 threads / K-128 block); q8 uses qi=16, vdr=1.
 namespace {
 constexpr int QKV_QK = 128;
@@ -36,6 +43,13 @@ constexpr int QKV_VDR_KQ = 2;
 constexpr int QKV_QI_Q8 = 16;
 constexpr int QKV_VDR_Q8 = 1;
 } // namespace
+
+// KO formats this kernel dispatches, and the width of the `fmt` index. Must equal the arm
+// count of the switch in `qkv_segmented_impl` and the row count of `kuni` — and must match
+// `ko_fmt_code` in `candle-core/src/quantized/cuda.rs`, which is where a dtype becomes an
+// index. A dtype missing from either side is not a wrong answer, it is a **missing** one:
+// the mixed-format switch's default arm leaves that segment's columns unwritten.
+#define QKV_FMT_COUNT 6
 
 // Host-filled segment descriptor (must match the Rust `QkvSeg`).
 struct qkv_seg_t {
@@ -104,7 +118,24 @@ __device__ __forceinline__ void qkv_segmented_impl(
             ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
             smem_A_i8, smem_A_ds, smem_W_flat);
         break;
+    case 4:
+        grouped_matmul_impl_int8<QKV_QK, QKV_QI_KQ, block_c_q2_KO, QKV_VDR_KQ, dst_t, N_SUB>(
+            reinterpret_cast<const block_compact_t<block_c_q2_KO>*>(w), act, seg_dst,
+            ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
+            smem_A_i8, smem_A_ds, smem_W_flat);
+        break;
+    case 5:
+        grouped_matmul_impl_int8<QKV_QK, QKV_QI_KQ, block_c_q3_KO, QKV_VDR_KQ, dst_t, N_SUB>(
+            reinterpret_cast<const block_compact_t<block_c_q3_KO>*>(w), act, seg_dst,
+            ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
+            smem_A_i8, smem_A_ds, smem_W_flat);
+        break;
     default:
+        // Unreachable: `run_qkv_segmented_matmul` rejects an out-of-range `fmt` before the
+        // launch, and `ko_fmt_code` on the Rust side never produces one. Falling through
+        // silently would leave this segment's output columns **untouched** — the caller cannot
+        // distinguish that from a completed matmul, which is why the validation is at the host
+        // and this arm is only a compiler obligation.
         break;
     }
 }
@@ -184,6 +215,8 @@ QKV_UNIFORM_ALL(q4ko, block_c_q4_KO, QKV_QI_KQ, QKV_VDR_KQ)
 QKV_UNIFORM_ALL(q5ko, block_c_q5_KO, QKV_QI_KQ, QKV_VDR_KQ)
 QKV_UNIFORM_ALL(q6ko, block_c_q6_KO, QKV_QI_KQ, QKV_VDR_KQ)
 QKV_UNIFORM_ALL(q8ko, block_c_q8_KO, QKV_QI_Q8, QKV_VDR_Q8)
+QKV_UNIFORM_ALL(q2ko, block_c_q2_KO, QKV_QI_KQ, QKV_VDR_KQ)
+QKV_UNIFORM_ALL(q3ko, block_c_q3_KO, QKV_QI_KQ, QKV_VDR_KQ)
 #undef QKV_UNIFORM_ALL
 #undef QKV_UNIFORM_FMT
 #undef QKV_UNIFORM_KERNEL
@@ -221,29 +254,46 @@ extern "C" int run_qkv_segmented_matmul(
             break;
         }
     }
-    // [out_dtype][fmt][mode2] and [out_dtype][mode2] — same ordering as OutDType.
-    static void* const kuni[3][4][2] = {
+    // [out_dtype][fmt][mode2] and [out_dtype][mode2] — same ordering as OutDType. The `fmt`
+    // index is `ko_fmt_code`'s: 0=Q4_KO, 1=Q5_KO, 2=Q6_KO, 3=Q8_KO, 4=Q2_KO, 5=Q3_KO. The two
+    // small widths were appended rather than sorted in so the existing codes stay stable.
+    static void* const kuni[3][QKV_FMT_COUNT][2] = {
         {{(void*)qkv_seg_uniform_q4ko_f16_m1, (void*)qkv_seg_uniform_q4ko_f16_m2},
          {(void*)qkv_seg_uniform_q5ko_f16_m1, (void*)qkv_seg_uniform_q5ko_f16_m2},
          {(void*)qkv_seg_uniform_q6ko_f16_m1, (void*)qkv_seg_uniform_q6ko_f16_m2},
-         {(void*)qkv_seg_uniform_q8ko_f16_m1, (void*)qkv_seg_uniform_q8ko_f16_m2}},
+         {(void*)qkv_seg_uniform_q8ko_f16_m1, (void*)qkv_seg_uniform_q8ko_f16_m2},
+         {(void*)qkv_seg_uniform_q2ko_f16_m1, (void*)qkv_seg_uniform_q2ko_f16_m2},
+         {(void*)qkv_seg_uniform_q3ko_f16_m1, (void*)qkv_seg_uniform_q3ko_f16_m2}},
         {{(void*)qkv_seg_uniform_q4ko_bf16_m1, (void*)qkv_seg_uniform_q4ko_bf16_m2},
          {(void*)qkv_seg_uniform_q5ko_bf16_m1, (void*)qkv_seg_uniform_q5ko_bf16_m2},
          {(void*)qkv_seg_uniform_q6ko_bf16_m1, (void*)qkv_seg_uniform_q6ko_bf16_m2},
-         {(void*)qkv_seg_uniform_q8ko_bf16_m1, (void*)qkv_seg_uniform_q8ko_bf16_m2}},
+         {(void*)qkv_seg_uniform_q8ko_bf16_m1, (void*)qkv_seg_uniform_q8ko_bf16_m2},
+         {(void*)qkv_seg_uniform_q2ko_bf16_m1, (void*)qkv_seg_uniform_q2ko_bf16_m2},
+         {(void*)qkv_seg_uniform_q3ko_bf16_m1, (void*)qkv_seg_uniform_q3ko_bf16_m2}},
         {{(void*)qkv_seg_uniform_q4ko_f32_m1, (void*)qkv_seg_uniform_q4ko_f32_m2},
          {(void*)qkv_seg_uniform_q5ko_f32_m1, (void*)qkv_seg_uniform_q5ko_f32_m2},
          {(void*)qkv_seg_uniform_q6ko_f32_m1, (void*)qkv_seg_uniform_q6ko_f32_m2},
-         {(void*)qkv_seg_uniform_q8ko_f32_m1, (void*)qkv_seg_uniform_q8ko_f32_m2}},
+         {(void*)qkv_seg_uniform_q8ko_f32_m1, (void*)qkv_seg_uniform_q8ko_f32_m2},
+         {(void*)qkv_seg_uniform_q2ko_f32_m1, (void*)qkv_seg_uniform_q2ko_f32_m2},
+         {(void*)qkv_seg_uniform_q3ko_f32_m1, (void*)qkv_seg_uniform_q3ko_f32_m2}},
     };
     static void* const kmix[3][2] = {
         {(void*)qkv_segmented_int8_f16_dense_m1, (void*)qkv_segmented_int8_f16_dense_m2},
         {(void*)qkv_segmented_int8_bf16_dense_m1, (void*)qkv_segmented_int8_bf16_dense_m2},
         {(void*)qkv_segmented_int8_f32_dense_m1, (void*)qkv_segmented_int8_f32_dense_m2},
     };
+    // **An out-of-range `fmt` is refused here, not in the kernel.** The mixed-format switch's
+    // `default` arm can only fall through, which leaves that segment's output columns untouched
+    // — indistinguishable from a completed matmul at every level above. So the range check has
+    // to happen where a status can still be returned.
+    for (int i = 0; i < num_segs; ++i) {
+        if (segs[i].fmt < 0 || segs[i].fmt >= QKV_FMT_COUNT) {
+            return QMM_NO_KERNEL;
+        }
+    }
     const int mi = mode2 ? 1 : 0;
     void* kfn;
-    if (uniform_fmt >= 0 && uniform_fmt < 4) {
+    if (uniform_fmt >= 0 && uniform_fmt < QKV_FMT_COUNT) {
         kfn = kuni[out_dtype][uniform_fmt][mi];
     } else {
         kfn = kmix[out_dtype][mi];

@@ -90,7 +90,27 @@ use candle_nn::kv_cache::KvCache;
 /// ~59%, and the third essentially never. A one-block NextN head applied
 /// recurrently has that reach and no more, so budget 3 pays a full extra draft
 /// pass for nothing and measured *slower* end to end (77.5 t/s against 83.6).
-pub const MTP_MAX_DRAFT: usize = 2;
+/// **Raised from 2 for the streamed dense case, and the reason is worth
+/// stating because it inverts the argument above.**
+///
+/// Both objections to depth price a draft step against a verify step. On a
+/// resident model those are comparable — a draft pass is one block, a verify is
+/// the trunk, and the trunk is fast — so a third proposal that lands ~0% of the
+/// time is a real loss, which the 9B measured (77.5 t/s at budget 3 against
+/// 83.6 at 2). On a model whose layers **stream**, a verify forward drags
+/// ~18 GB across PCIe and a draft step touches one resident block: the ratio is
+/// roughly 45:1, so a proposal that lands even occasionally is nearly free and
+/// each one that does saves a whole trunk forward.
+///
+/// This is the cap on what a head is ever *asked* for. What each checkpoint
+/// actually uses is its own `DraftLadder` row, so raising the ceiling changes
+/// nothing for a model whose ladder still says 2 — which is every model but the
+/// 27B.
+/// Six was tried and is worse than four on the 27B (1.5 t/s against 2.6 at one
+/// context): the extra proposals stop landing, so they cost a draft pass each
+/// *and* widen every verify wave by a row that is discarded. The ceiling sits at
+/// the deepest value any ladder actually asks for.
+pub const MTP_MAX_DRAFT: usize = 4;
 
 // How far ahead it is worth drafting is a separate question from how far the
 // head can reach, and it lives in `crate::models::draft_ladder`: reach is a
@@ -402,7 +422,7 @@ mod tests {
                 -- --ignored --nocapture"]
     fn the_pinned_checkpoint_carries_a_draft_head() -> candle::Result<()> {
         use crate::models::batch_test::test_helpers::hf_get;
-        use crate::models::qwen35::quantized_weights::load_quantized_model;
+        use crate::models::qwen35::quantized_weights::{load_quantized_model, LoadInputs};
         use candle::quantized::{gguf_file::Content, Int8Mode};
         use std::io::{BufReader, Seek, SeekFrom};
 
@@ -417,8 +437,7 @@ mod tests {
             &mut reader,
             &device,
             Int8Mode::Off,
-            None,
-            |_, _| Ok(None),
+            LoadInputs::resident(),
         )?;
 
         assert_eq!(

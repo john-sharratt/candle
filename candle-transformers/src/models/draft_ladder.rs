@@ -219,8 +219,69 @@ pub const QWEN35_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
 /// Qwen3.6-35B-A3B (routed). Has a NextN head, itself a full routed block.
 pub const QWEN36_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
 
-/// Qwen3.8-27B (dense). Has a NextN head, dense rather than routed.
-pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
+/// Qwen3.8-27B (dense). Has a NextN head, dense rather than routed — shipped as
+/// a **sidecar** GGUF rather than embedded (`mtp-Qwen3.8-27B-Q4_0.gguf`).
+///
+/// **Its own row, deeper and wider than the lineage's.**
+///
+/// The lineage bracket is 2, set on the 9B where a third proposal cost more than
+/// it returned. The depth of 4 was set here against a *streaming* 27B, on the
+/// argument that a verify forward dragged ~18 GB over PCIe while a draft step
+/// touched one resident block — roughly 45:1, so depth was close to free.
+///
+/// **That argument no longer applies, and the depth is kept on new evidence
+/// rather than on it.** The two-tier weight zone (`docs/qwen38_layer_streaming.md`
+/// §14) holds all 64 layers resident on the 16 GB card, so a verify forward moves
+/// no weight bytes at all and the 45:1 is gone. Re-measured resident, tokens/sec
+/// at 1 / 4 contexts over two sweeps:
+///
+/// | budget | 1 ctx | 4 ctx |
+/// |--------|-------|-------|
+/// | 2      | 61.1 / 62.3 | 173.6 / 185.3 |
+/// | 3      | 58.1 / 75.9 | 179.1 / 226.9 |
+/// | 4      | 50.4 / 77.7 | 149.0 / 212.8 |
+///
+/// **Those are gate-sweep numbers, which this module's header says are the
+/// confounded instrument.** Several configs run against one loaded model, so
+/// position in the run is measured alongside the variable — and the divergence
+/// lands exactly where that predicts: the two sweeps agree within 2% at budgets
+/// 0–2, the early configs, and disagree by 31% and 54% at 3–4, the last ones, in
+/// opposite directions. One sweep read them as a curve turning over at 2; the
+/// other has it climbing to 4.
+///
+/// So **the knee is not resolved**, 4 is retained as the incumbent rather than
+/// re-derived, and the table above is recorded to show what is and is not known —
+/// not as a measurement. `cold_speculative_point` is the instrument that would
+/// settle it: one width, one budget, one process, card cooled between points.
+///
+/// # The width is 32, and it is a request rather than a measurement
+///
+/// The lineage's 16 comes from the 9B's cold points, where width 20 measured
+/// **0.39×** — speculation actively harmful past the bracket. That is the risk
+/// this row now runs toward: the 27B is resident like the 9B, so the mechanism
+/// that produced the 9B's cliff (a verify wave carrying rows that are discarded,
+/// with no streamed bytes to amortise them) applies here too, and the argument
+/// that used to exempt this checkpoint has gone with the streaming.
+///
+/// Widths 5–32 are **unmeasured on this checkpoint** — the gate samples 1, 4, 5,
+/// 10 and 20 contexts, and only 1 and 4 carry speculative points. If a wide rung
+/// regresses, this bracket is the first thing to pull back in.
+// **Width 16, not the 32 that was asked for — and this is a parked decision,
+// not a rejection.** Measured on the 16 GB card by direct control experiment:
+// at (32, 4) the gate's C8×20 config takes `CUDA_ERROR_OUT_OF_MEMORY`; at
+// (16, 4), with nothing else in the tree different, it passes 20/20. The cause
+// is the rewind stash, which is `contexts × (budget + 1)` rows across every
+// DeltaNet layer — 60.4 MiB at budget 0 against 301.8 MiB at budget 4, at 20
+// contexts.
+//
+// `HybridBatched::affordable_draft_budget` exists to make (32, 4) safe by
+// lowering the *depth* when a cohort is too wide to stash, so speculation
+// degrades instead of the wave failing. It does not yet bind: the budget it
+// reads reports ~1.4 GiB claimable where the device then refuses, so the clamp
+// permits a depth that does not fit. Until that disagreement is understood,
+// this row stays at the width that is measured to work.
+const QWEN38_27B_BRACKETS: &[(usize, usize)] = &[(16, 4)];
+pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS);
 
 #[cfg(test)]
 mod tests {
@@ -275,6 +336,39 @@ mod tests {
         for width in [0, 1, 4, 8, 16, 64] {
             assert_eq!(QWEN35_0_8B_DRAFT.budget(width), 0);
         }
+    }
+
+    /// **The 27B's row is its own, and widening it must not reach the others.**
+    ///
+    /// It carries its own *depth* (4 against the lineage's 2), and the two rows
+    /// are separate consts precisely so that stays true. A future edit that
+    /// "simplifies" them back onto `LINEAGE_START` would take the 27B's measured
+    /// depth away, and a future widening of the 27B's row must not hand three
+    /// other checkpoints a width measured at 0.39× past 16.
+    #[test]
+    fn only_the_27b_carries_its_own_depth() {
+        assert_eq!(QWEN38_27B_DRAFT.budget(16), 4, "the 27B's own depth");
+        // The width is parked at 16 pending the stash-affordability work — see
+        // the const's own note. Pinned so re-widening is a deliberate edit here
+        // rather than a number that drifts.
+        assert_eq!(QWEN38_27B_DRAFT.budget(17), 0, "parked at width 16");
+        for (name, ladder) in [
+            ("9B", QWEN35_9B_DRAFT),
+            ("35B-A3B", QWEN35_35B_A3B_DRAFT),
+            ("3.6-35B-A3B", QWEN36_35B_A3B_DRAFT),
+        ] {
+            assert_eq!(ladder.budget(16), 2, "{name} keeps the lineage budget");
+            assert_eq!(
+                ladder.budget(17),
+                0,
+                "{name} inherited the 27B's width — the rows have been merged"
+            );
+        }
+        assert_eq!(
+            QWEN35_0_8B_DRAFT.budget(17),
+            0,
+            "0.8B has no drafter at all"
+        );
     }
 
     /// A shadowed bracket answers the wrong budget rather than failing, which is

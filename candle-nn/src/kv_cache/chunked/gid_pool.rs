@@ -198,6 +198,29 @@ impl ArenaRefcounts {
         self.creation_pending.load(Ordering::Acquire)
     }
 
+    /// End the creation window without claiming a slot.
+    ///
+    /// The window keeps a tombstoner off an arena index whose creator is still
+    /// working on it — recycling the index under the creator leaves storage and
+    /// pool disagreeing about its format, which is cross-context KV
+    /// contamination rather than a clean fault. What closes the window is the
+    /// creator *finishing*, and for every allocate-on-demand path that is its
+    /// first [`Self::occupy`], so the two coincide and the flag can ride along
+    /// with the first claim.
+    ///
+    /// An arena created **ahead of** demand has no first claim to ride:
+    /// `create_deferred_arenas` stamps a slab for a class that asked for one
+    /// during a wave, and nothing occupies it until the demand arrives. Left to
+    /// `occupy`, its window never closes — and an arena that is empty is
+    /// counted by [`ArenaPool::has_reclaimable`] and refused by
+    /// [`ArenaPool::try_tombstone`] forever, which is exactly the "pool reports
+    /// memory it cannot hand over" wedge. So that creator closes the window
+    /// itself, once the slab is in storage and it is done with the index.
+    #[inline]
+    fn end_creation_window(&self) {
+        self.creation_pending.store(false, Ordering::Release);
+    }
+
     /// Unpack the recycle head into `(top_slot_idx, version)`; `top == arena_chunks`
     /// means the stack is empty.
     #[inline]
@@ -255,7 +278,7 @@ impl ArenaRefcounts {
         // tombstoner that Acquire-observes `creation_pending == false` also
         // sees `live ≥ 1` — there is no interleaving where the arena looks
         // both "past creation" and "empty" while its first chunk is in flight.
-        self.creation_pending.store(false, Ordering::Release);
+        self.end_creation_window();
     }
 
     /// Claim a free slot in O(1): pop the recycle stack, else bump the high-
@@ -910,6 +933,15 @@ impl ArenaPool {
         tables.values().any(|t| t.live_count() == 0)
     }
 
+    /// Close `arena_idx`'s creation window. No-op if the arena is already gone
+    /// or already past creation — see [`ArenaRefcounts::end_creation_window`].
+    fn finish_creation(&self, arena_idx: usize) {
+        let tables = self.tables.read().unwrap();
+        if let Some(t) = tables.get(&arena_idx) {
+            t.end_creation_window();
+        }
+    }
+
     fn free_count_for_arena(&self, arena_idx: usize) -> u32 {
         let tables = self.tables.read().unwrap();
         tables
@@ -1255,6 +1287,18 @@ impl ChunkGidPool {
         Some(arena_idx)
     }
 
+    /// Declare an arena created **ahead of demand** finished, so the empty
+    /// sweep may reclaim it once the demand it was stamped for goes away.
+    ///
+    /// Every other creator closes this window by allocating its first chunk.
+    /// See [`ArenaRefcounts::end_creation_window`] for why the pre-creation
+    /// path cannot, and what it costs when the window is left open.
+    pub fn finish_creation(&self, key: ArenaKey, arena_idx: usize) {
+        if let Some(pool) = self.inner.pools.get(&key) {
+            pool.finish_creation(arena_idx);
+        }
+    }
+
     /// Remove from `free_arenas` any indices >= `threshold`.
     pub fn drain_free_arenas_above(&self, threshold: usize) {
         let mut state = self.inner.metadata.lock().unwrap();
@@ -1435,6 +1479,80 @@ mod tests {
 
     fn test_arena_chunks() -> usize {
         TEST_CLASS.chunks_per_region()
+    }
+
+    /// **An arena created ahead of demand is reclaimable once its creator is
+    /// done with it.**
+    ///
+    /// The creation window keeps a tombstoner off an index whose creator is
+    /// still working on it, and every allocate-on-demand path closes that
+    /// window by claiming its first chunk — so for those, "past creation" and
+    /// "has been used" are the same instant and the flag can ride along with
+    /// the claim. `create_deferred_arenas` stamps a slab *before* the demand
+    /// arrives and has no first claim to ride, so left to `occupy` its window
+    /// never closes. An arena stuck inside its window is counted by
+    /// `has_reclaimable` and refused by `try_tombstone` for the life of the
+    /// process, which is the pool reporting memory it cannot hand over.
+    ///
+    /// Measured through the substrate before this closed: one 16 MiB region
+    /// stranded per pool per persistence pass, every slot in it free.
+    #[test]
+    fn an_arena_made_ahead_of_demand_is_reclaimable_once_its_creator_finishes() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let idx = pool.register_arena(key);
+
+        // Registered and never claimed from: the pool counts it as recoverable…
+        assert!(
+            pool.has_reclaimable(),
+            "an arena with every slot free is reported reclaimable"
+        );
+        // …and refuses to hand it over, because its creation window is open.
+        // That refusal is correct while a creator still holds the index — a
+        // recycled index under a live creator is cross-context contamination,
+        // not a clean fault.
+        assert_eq!(
+            pool.next_tombstone(key),
+            None,
+            "an arena inside its creation window must not be tombstoned"
+        );
+
+        // The creator finishes without ever claiming a chunk — exactly what
+        // pre-creating a slab for a class that asked for one looks like.
+        pool.finish_creation(key, idx);
+
+        assert_eq!(
+            pool.next_tombstone(key),
+            Some(idx),
+            "an empty arena whose creator has finished must be reclaimable, or \
+             it pins its region until the process exits"
+        );
+    }
+
+    /// The explicit close did not replace the implicit one: a creator that
+    /// claims a chunk still closes its own window, which is what every
+    /// allocate-on-demand path relies on.
+    #[test]
+    fn claiming_a_chunk_still_closes_the_creation_window() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let idx = pool.register_arena(key);
+
+        let gid = pool.allocate_for(key).expect("fresh arena serves a claim");
+        assert_eq!(gid.arena_idx(), idx);
+        assert_eq!(
+            pool.next_tombstone(key),
+            None,
+            "an occupied arena is not reclaimable"
+        );
+
+        drop(gid);
+        assert_eq!(
+            pool.next_tombstone(key),
+            Some(idx),
+            "a claimed-then-dropped arena is reclaimable with no explicit \
+             finish_creation — `occupy` closes the window for its creator"
+        );
     }
 
     /// The fix for the "fresh arena cannot fit palette run" race: a run claimed

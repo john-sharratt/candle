@@ -309,6 +309,24 @@ pub trait BatchedModelCore {
         None
     }
 
+    /// Snapshot the layer-streaming counters, if this model's weights are slot
+    /// tenants.
+    ///
+    /// The dense counterpart of [`Self::expert_stats`] and needed for the same
+    /// reason: a run whose layers never streamed says nothing about the path
+    /// that streams them, and the two regimes are indistinguishable from
+    /// throughput alone. `(hits, warm, cold, joins, evictions, homed, streaming)`.
+    ///
+    /// The last two are **current state, not totals**, and they are what makes
+    /// the rest readable: the weight zone grows into spare KV ground over the
+    /// first forwards, so the residency a load reports at its carve is not the
+    /// residency the run was measured at. Without them a low transfer count has
+    /// two explanations — the zone went whole, or nothing was ever asked of it —
+    /// and only arithmetic on the counters tells them apart.
+    fn layer_stream_stats(&self) -> Option<[usize; 7]> {
+        None
+    }
+
     /// Ask the weight side to hand ground to the KV side now, answering with the
     /// bytes conceded.
     ///
@@ -394,6 +412,21 @@ pub trait BatchedModelCore {
 const DEFAULT_ROPE_SEQ_LEN: usize = 4096;
 /// Chunk size for extending RoPE tables.
 const ROPE_EXTEND_CHUNK: usize = 1024;
+
+/// Free KV regions a wave wants beyond one per sequence, before phase 0 stops
+/// asking the weight side for ground.
+///
+/// The mirror of the weight side's own `KV_REGION_SLACK`, and the same number for
+/// the same reason: a partition trimmed to exactly what the last wave used has
+/// nothing for the next one to grow into, and every arena that then has to be
+/// created is a region claim mid-wave — which is the claim the transient tier's
+/// ceiling refuses.
+///
+/// The per-sequence term beside it is what makes the target a statement about
+/// *this* wave rather than a constant: ground is spare only if nobody needs it,
+/// and the sequence count is the best cheap estimate of who does.
+#[cfg(feature = "cuda")]
+const KV_FREE_SLACK_REGIONS: usize = 32;
 
 /// Concrete wrapper for batched inference with RoPE caching.
 ///
@@ -607,10 +640,50 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             // that the boundary cannot move, which would make the spare-region
             // count this reads an underestimate.
             //
-            // The KV side's direction is not here: a claim that runs out buys
-            // its ground on the spot (`request_kv_ground`) rather than waiting
-            // for a forward that its own failure is preventing.
             self.model.reclaim_spare_ground();
+
+            // **And the shrinking direction, which used to be missing entirely.**
+            //
+            // The comment that stood here said the KV side's direction was not
+            // needed, because "a claim that runs out buys its ground on the spot
+            // (`request_kv_ground`)". That is true only for a claim that runs out
+            // of *owned* ground. A claim refused by the transient tier's ceiling
+            // takes `Claim::TierBlocked`, which returns without buying anything —
+            // deliberately, because a tier standing on the ground wants a
+            // narrower wave rather than more ground. So the zone was never asked,
+            // and the two directions were not symmetric: growth ran here every
+            // forward while retraction ran only on a failure mode that could not
+            // reach it.
+            //
+            // Measured on the 27B: the zone grew to 10,498 MiB during the first
+            // 4-context config and held it across all ten, KV pinned at 162
+            // regions with 80 live at *one* context. C8 then arrived with twenty
+            // sessions and 24 free regions — 384 MiB — and took
+            // `CUDA_ERROR_OUT_OF_MEMORY` on a slot-state upload.
+            //
+            // The demand is scaled by the wave about to run rather than fixed:
+            // what makes ground spare is that no one needs it, and how many
+            // sequences are about to write KV is the best available statement of
+            // who needs it. Asking here is legal for the same reason growth is —
+            // every guard from the previous forward is dropped and this one has
+            // opened none, so `set_weight_floor` will not refuse.
+            let want_free = KV_FREE_SLACK_REGIONS + contexts.len();
+            if let candle::DeviceLocation::Cuda { gpu_id } = self.model.device().location() {
+                if let Some(rs) = candle_nn::kv_cache::region_stats(gpu_id) {
+                    let deficit = want_free.saturating_sub(rs.free);
+                    if deficit > 0 {
+                        let got = self.model.request_kv_ground(deficit);
+                        tracing::debug!(
+                            target: "candle_transformers::batched_model",
+                            free = rs.free,
+                            want_free,
+                            deficit,
+                            conceded_mib = got >> 20,
+                            "KV is short before the wave; asked the weight side for ground"
+                        );
+                    }
+                }
+            }
         }
 
         // **Phase 1: admit.** Claim every KV slot this wave will write, for

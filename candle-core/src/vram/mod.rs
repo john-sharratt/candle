@@ -354,9 +354,13 @@ static HOST_PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// need telling apart before any of them is resized.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PinnedUse {
-    /// The MoE expert warm tier — the dominant claimant by an order of
+    /// A model's weight warm tier — the dominant claimant by an order of
     /// magnitude, and the one whose size is a tuning decision.
-    ExpertWarmTier,
+    ///
+    /// A routed checkpoint's is its experts, a dense one's is its layers, and a
+    /// model is one or the other — so they share the name as they share the
+    /// sizing arithmetic (`expert_lre::handle::warm_slots_for`).
+    WeightWarmTier,
     /// Staging buffers for host↔device transfers that are not the warm tier:
     /// the cold pack's read ring, the KV migration scratch.
     Staging,
@@ -370,7 +374,7 @@ pub enum PinnedUse {
 impl PinnedUse {
     /// Every variant, for reporting.
     pub const ALL: [PinnedUse; 4] = [
-        PinnedUse::ExpertWarmTier,
+        PinnedUse::WeightWarmTier,
         PinnedUse::Staging,
         PinnedUse::HostMapped,
         PinnedUse::DispatchTables,
@@ -379,7 +383,7 @@ impl PinnedUse {
     /// A short label for a report line.
     pub fn label(self) -> &'static str {
         match self {
-            PinnedUse::ExpertWarmTier => "expert warm tier",
+            PinnedUse::WeightWarmTier => "weight warm tier",
             PinnedUse::Staging => "staging buffers",
             PinnedUse::HostMapped => "host-mapped weights",
             PinnedUse::DispatchTables => "dispatch tables",
@@ -388,7 +392,7 @@ impl PinnedUse {
 
     fn slot(self) -> &'static AtomicU64 {
         match self {
-            PinnedUse::ExpertWarmTier => &PINNED_BY_USE[0],
+            PinnedUse::WeightWarmTier => &PINNED_BY_USE[0],
             PinnedUse::Staging => &PINNED_BY_USE[1],
             PinnedUse::HostMapped => &PINNED_BY_USE[2],
             PinnedUse::DispatchTables => &PINNED_BY_USE[3],

@@ -36,7 +36,7 @@ pub mod pinned_staging {
     pub use super::dummy_pinned_staging::*;
 }
 #[cfg(not(feature = "cuda"))]
-mod cuda {
+pub mod cuda {
     pub use super::dummy_cuda::*;
 }
 
@@ -751,30 +751,73 @@ pub enum GgmlDType {
     /// on-device, like the other KO twins); read by the `q2_ko_int8_f32_grouped` int8 kernel.
     /// Value 51 mirrors `QTYPE_Q2_KO` / `QType::Q2_KO`. See `ko_quant::quantize_q2_ko`.
     Q2_KO = 51,
+
+    /// Lane-major per-128 affine KO twin at **3-bit** — `Q3_K`'s same-width twin, and the
+    /// reason it exists. Without it `Q3_K` had no KO form and `to_ko` rounded it *up* to
+    /// `Q4_KO`; under layer streaming that upcast is paid as PCIe bytes on every forward, and
+    /// on the 27B at Q3_K_M it inflated the layer pack by 12.8%.
+    ///
+    /// Carries no `ql` plane: the value is the 2-bit **crumb** (bits 0-1, `Q2_KO`'s whole-value
+    /// region) plus the 1-bit **hi** plane (bit 2, `Q5_KO`'s region) — so a chunk is
+    /// `256 + 128 + 32` = 416 B / 1024 elems (**3.25 bpw**) and both planes are layouts the
+    /// kernels already read. GPU-only, built by requantizing from F32 on-device like the other
+    /// KO twins; read by the `q3_ko_int8_f32_grouped` int8 kernel. Value 52 mirrors
+    /// `QTYPE_Q3_KO` / `QType::Q3_KO`. See [`ko_quant::ko_params`].
+    Q3_KO = 52,
 }
 
 impl GgmlDType {
-    /// True for the lane-major per-128 KO weight formats (`Q4_KO`/`Q5_KO`/`Q6_KO`/`Q8_KO`).
+    /// Storage cost in bits per weight, scales and all.
+    ///
+    /// `type_size × 8 / block_size` — the number that decides how many bytes a weight puts on
+    /// the bus, which under layer streaming is what decides decode. Named here because three
+    /// call sites compare widths (the `to_ko` table's test, the narrowing policy, and the
+    /// repack's refusal to widen) and a formula written out three times is one that drifts.
+    ///
+    /// It counts the *storage*, not the value grid: `Q4_1` is 5.0 bpw and `Q4_KO` 4.25, yet
+    /// both hold 4-bit values — the difference is a scale-and-min per 32 against one per 128.
+    /// So it bounds bandwidth exactly and precision only loosely.
+    pub fn bits_per_weight(self) -> f64 {
+        self.type_size() as f64 * 8.0 / self.block_size() as f64
+    }
+
+    /// True for the lane-major per-128 KO weight formats — every affine width
+    /// (`Q2_KO`/`Q3_KO`/`Q4_KO`/`Q5_KO`/`Q6_KO`/`Q8_KO`) plus `MXFP4_KO`.
     /// These are the only weight layouts the q8a128 int8 tensor-core matmul can read, so the
     /// `DynamicTensor::Int8` matmul path guards on this.
     pub fn is_ko(self) -> bool {
         matches!(
             self,
-            Self::Q2_KO | Self::Q4_KO | Self::Q5_KO | Self::Q6_KO | Self::Q8_KO | Self::MXFP4_KO
+            Self::Q2_KO
+                | Self::Q3_KO
+                | Self::Q4_KO
+                | Self::Q5_KO
+                | Self::Q6_KO
+                | Self::Q8_KO
+                | Self::MXFP4_KO
         )
     }
 
     /// The KO weight twin used for int8 optimization, selected by [`Int8Mode`].
     ///
-    /// [`Int8Mode::Performance`] picks the **same-width** twin (4-bit→`Q4_KO`, 5-bit→`Q5_KO`,
-    /// 6-bit→`Q6_KO`, 8-bit→`Q8_KO`; ≤3-bit→`Q4_KO`, the smallest KO form). It takes the
+    /// [`Int8Mode::Performance`] picks the **same-width** twin (2-bit→`Q2_KO`, 3-bit→`Q3_KO`,
+    /// 4-bit→`Q4_KO`, 5-bit→`Q5_KO`, 6-bit→`Q6_KO`, 8-bit→`Q8_KO`). It takes the
     /// per-32→per-128 granularity hit on the weight but is the fastest and smallest.
     ///
+    /// **Same-width is now a rule with no exceptions, and it did not used to be.** `Q2_K` and
+    /// `Q3_K` both mapped to `Q4_KO` because those twins did not exist — a 71% and a 31%
+    /// inflation respectively, invisible while weights were resident and paid VRAM once. Under
+    /// layer streaming a weight's width is PCIe bytes on *every forward*, and on the 27B at
+    /// Q3_K_M the `Q3_K → Q4_KO` upcast alone inflated the layer pack by 12.8%
+    /// (`docs/qwen38_layer_streaming.md` §2.3). Rounding *down* was never the alternative:
+    /// `Q2_KO`'s four levels floor at `rel_l2 ≈ 0.325`, a quality loss rather than a repack.
+    ///
     /// [`Int8Mode::Precision`] steps the source one notch up the ladder
-    /// (`Q4_KO` < `Q5_KO` < `Q6_KO` < `Q8_KO`): 4-bit→`Q5_KO`, 5-bit→`Q6_KO`, ≤3-bit→`Q4_KO`. The
-    /// extra bit absorbs the granularity loss so the re-quant of the already-quantized weight is
-    /// near-lossless. At the top of the ladder there is no finer twin, so 6-bit→`Q6_KO` and
-    /// 8-bit→`Q8_KO` are same-width in both modes.
+    /// (`Q2_KO` < `Q3_KO` < `Q4_KO` < `Q5_KO` < `Q6_KO` < `Q8_KO`): 2-bit→`Q3_KO`,
+    /// 3-bit→`Q4_KO`, 4-bit→`Q5_KO`, 5-bit→`Q6_KO`. The extra bit absorbs the granularity loss
+    /// so the re-quant of the already-quantized weight is near-lossless. At the top of the
+    /// ladder there is no finer twin, so 6-bit→`Q6_KO` and 8-bit→`Q8_KO` are same-width in both
+    /// modes.
     ///
     /// Errors for [`Int8Mode::Off`] (no KO twin) and for dtypes with no KO form.
     pub fn to_ko(self, mode: Int8Mode) -> Result<Self> {
@@ -786,7 +829,23 @@ impl GgmlDType {
         match mode {
             Int8Mode::Off => crate::bail!("to_ko: Int8Mode::Off has no KO weight twin"),
             Int8Mode::Performance => Ok(match self {
-                Self::Q2_K | Self::Q3_K => Self::Q4_KO,
+                // **The Q2_K row is the one to measure before trusting.** Q2_K
+                // carries a `(scale, min)` per *16* elements inside its
+                // 256-superblock; Q2_KO is a single per-128 affine over four
+                // levels, which the note above records as flooring at
+                // `rel_l2 ≈ 0.325`. Nothing currently gates the difference:
+                // `ko_quant`'s 0.400 ceiling scores Q2_KO **from f32** and never
+                // sees the Q2_K→Q2_KO requant, so this row would pass whatever it
+                // cost. Left as it is — the same-width rule is deliberate and
+                // pinned by `the_int8_twin_table_is_same_width_then_one_step_up`
+                // — but the gap between the ceiling and this path is real, and
+                // the fix is a measurement of the requant rather than a guess at
+                // the mapping.
+                Self::Q2_K => Self::Q2_KO,
+                // Q3_K → Q3_KO is the clearer of the two: eight levels against
+                // Q3_K's own 3-bit grid, and shrinking it is the stated PCIe
+                // motive.
+                Self::Q3_K => Self::Q3_KO,
                 Self::Q4_0 | Self::Q4_1 | Self::Q4_K => Self::Q4_KO,
                 Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q5_KO,
                 Self::Q6_K => Self::Q6_KO,
@@ -798,7 +857,8 @@ impl GgmlDType {
                 other => crate::bail!("no KO weight form for {other:?}"),
             }),
             Int8Mode::Precision => Ok(match self {
-                Self::Q2_K | Self::Q3_K => Self::Q4_KO,
+                Self::Q2_K => Self::Q3_KO,
+                Self::Q3_K => Self::Q4_KO,
                 Self::Q4_0 | Self::Q4_1 | Self::Q4_K => Self::Q5_KO,
                 Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q6_KO,
                 Self::Q6_K => Self::Q6_KO,
@@ -878,6 +938,7 @@ impl GgmlDType {
             49 => Self::MXFP4,
             50 => Self::MXFP4_KO,
             51 => Self::Q2_KO,
+            52 => Self::Q3_KO,
             _ => crate::bail!("unknown dtype discriminant {u}"),
         };
         Ok(dtype)
@@ -961,6 +1022,7 @@ impl GgmlDType {
             222 => Self::Q8_KO,
             223 => Self::MXFP4_KO,
             224 => Self::Q2_KO,
+            225 => Self::Q3_KO,
             230 => Self::F64,
             231 => Self::U8,
             232 => Self::I8,
@@ -1036,6 +1098,7 @@ impl GgmlDType {
             Self::Q8_KO => 222,
             Self::MXFP4_KO => 223,
             Self::Q2_KO => 224,
+            Self::Q3_KO => 225,
         }
     }
 
@@ -1126,6 +1189,11 @@ impl GgmlDType {
             Self::Q2_KO => {
                 panic!("Q2_KO has no CPU block form; build it via quantize_q2_ko / repack on CUDA")
             }
+            // Q3_KO likewise: a crumb+hi lane-major chunk with no `ql` plane, so there is no
+            // host block struct — `ko_quant::quantize_ko` emits it, or the on-device repack.
+            Self::Q3_KO => {
+                panic!("Q3_KO has no CPU block form; build it via quantize_ko / repack on CUDA")
+            }
         }
     }
     /// The type size for blocks in bytes.
@@ -1195,6 +1263,7 @@ impl GgmlDType {
             // 288-byte GPU chunk per 1024 elements (256 B of 2-bit crumbs + 32 dm) → 36 B per
             // 128. `ko_chunk_bytes(Q2_KO) = 288`.
             Self::Q2_KO => 36,
+            Self::Q3_KO => 52, // ko_chunk_bytes 416 / 8
         }
     }
 
@@ -1251,6 +1320,7 @@ impl GgmlDType {
             Self::MXFP4_KO => 128,
             // K/128 granularity like the other KO twins (per-128 affine).
             Self::Q2_KO => 128,
+            Self::Q3_KO => 128,
         }
     }
 }
@@ -1639,6 +1709,46 @@ impl<'w> LiveQTensor<'w> {
     /// Get a shared reference to the underlying storage.
     pub fn storage(&self) -> &QStorage {
         &self.storage
+    }
+
+    /// Fold this weight's DEQUANTIZED NaN count, Inf count and finite min/max
+    /// into `name`'s assert slot, returning the tensor so the call chains.
+    ///
+    /// The values a quantized weight contributes to a matmul are its
+    /// dequantized ones, so that is what this measures — a NaN scale and a
+    /// finite-but-enormous weight are different faults, and only the
+    /// dequantized view tells them apart.
+    ///
+    /// Unlike [`LiveTensor::assert`] this stages through the dequant kernels on
+    /// the default stream, so it belongs at load time or an epoch boundary
+    /// rather than inside a wave. Prefer [`Self::assert_once`] for weights.
+    #[cfg(feature = "tensor-assert")]
+    pub fn assert(&self, name: &str) -> &Self {
+        crate::tensor_assert::assert_qtensor(self, name);
+        self
+    }
+
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    pub fn assert(&self, _name: &str) -> &Self {
+        self
+    }
+
+    /// [`Self::assert`], but only the first time this name is seen in the
+    /// current epoch — the form weights should use, since a weight does not
+    /// change between forwards.
+    #[cfg(feature = "tensor-assert")]
+    pub fn assert_once(&self, name: &str) -> &Self {
+        if crate::tensor_assert::should_run_once(name) {
+            crate::tensor_assert::assert_qtensor(self, name);
+        }
+        self
+    }
+
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    pub fn assert_once(&self, _name: &str) -> &Self {
+        self
     }
 
     pub fn rank(&self) -> usize {
@@ -2418,6 +2528,31 @@ impl QMatMul {
         mode: Int8Mode,
         dst: Option<(u64, crate::cuda_backend::wave_provenance::LeaseOrigin)>,
     ) -> Result<QMatMul> {
+        self.repack_for_optimization_narrowed(mode, dst, None)
+    }
+
+    /// [`Self::repack_for_optimization_into`], with the twin's width chosen by the caller.
+    ///
+    /// `narrow` replaces what [`GgmlDType::to_ko`] would pick. It is **not** a second numeric
+    /// mode: the mode still decides whether the int8 path runs at all and still governs every
+    /// other tensor. This is a per-tensor residency decision, for the case where a weight is
+    /// worth carrying at lower precision because the alternative is not carrying the model.
+    ///
+    /// The repack narrows in the pass it already makes — it dequantizes the source and
+    /// requantizes it — so the only cost is precision. Requantizing the *source* to a narrower
+    /// quant first and letting `to_ko` follow would cost a whole extra dequant/quant round trip
+    /// per tensor at load, which for a 248320×5120 head is seconds, not milliseconds.
+    ///
+    /// A narrowing that would *widen* is refused: the caller asked for a smaller resident
+    /// footprint, and silently giving it a larger one is the failure it would never think to
+    /// check for.
+    #[cfg(feature = "cuda")]
+    pub fn repack_for_optimization_narrowed(
+        &self,
+        mode: Int8Mode,
+        dst: Option<(u64, crate::cuda_backend::wave_provenance::LeaseOrigin)>,
+        narrow: Option<GgmlDType>,
+    ) -> Result<QMatMul> {
         let qt = self
             .qtensor()
             .ok_or_else(|| crate::Error::Msg("repack_for_optimization: not a QTensor".into()))?;
@@ -2434,7 +2569,26 @@ impl QMatMul {
         let new_storage = match &qt.storage {
             QStorage::Cuda(cs) => {
                 if mode.is_int8() {
-                    QStorage::Cuda(cs.repack_ko_into(&shape, qt.dtype().to_ko(mode)?, dst)?)
+                    let picked = qt.dtype().to_ko(mode)?;
+                    let ko = match narrow {
+                        None => picked,
+                        Some(n) => {
+                            if !n.is_ko() {
+                                crate::bail!("repack_for_optimization: {n:?} is not a KO twin")
+                            }
+                            if n.bits_per_weight() > picked.bits_per_weight() {
+                                crate::bail!(
+                                    "repack_for_optimization: narrowing to {n:?} ({:.2} bpw) is \
+                                     wider than the {picked:?} ({:.2} bpw) this mode would pick \
+                                     — narrowing must not grow the resident footprint",
+                                    n.bits_per_weight(),
+                                    picked.bits_per_weight(),
+                                )
+                            }
+                            n
+                        }
+                    };
+                    QStorage::Cuda(cs.repack_ko_into(&shape, ko, dst)?)
                 } else {
                     // The GEMX repack has no destination form: it is the
                     // measurement path (`repack_gemx`'s own docs), not a path a
@@ -2761,7 +2915,7 @@ mod ggml_dtype_lock_tests {
     //!
     //! F32/F16/BF16 (0/1/2) are specific to GgmlDType — they do not appear in
     //! QType, which starts at R16=3.
-    use super::GgmlDType;
+    use super::{ko_quant, GgmlDType, Int8Mode};
 
     #[test]
     fn ggml_dtype_values_are_stable() {
@@ -2801,10 +2955,295 @@ mod ggml_dtype_lock_tests {
         assert_eq!(GgmlDType::Q0 as u32, 33);
         assert_eq!(GgmlDType::F8E4M3 as u32, 34);
         assert_eq!(GgmlDType::F8E5M2 as u32, 35);
-        // KO byte-permuted twins — must match QTYPE_Q*_KO / QType::Q*_KO (45-48).
+        // KO byte-permuted twins — must match QTYPE_Q*_KO / QType::Q*_KO (45-52).
         assert_eq!(GgmlDType::Q4_KO as u32, 45);
         assert_eq!(GgmlDType::Q5_KO as u32, 46);
         assert_eq!(GgmlDType::Q6_KO as u32, 47);
         assert_eq!(GgmlDType::Q8_KO as u32, 48);
+        assert_eq!(GgmlDType::MXFP4 as u32, 49);
+        assert_eq!(GgmlDType::MXFP4_KO as u32, 50);
+        assert_eq!(GgmlDType::Q2_KO as u32, 51);
+        assert_eq!(GgmlDType::Q3_KO as u32, 52);
+    }
+
+    /// Every `GgmlDType`, for the sweeps below.
+    ///
+    /// Held exhaustive by [`all_dtypes_covers_the_enum`], whose match the compiler breaks when
+    /// a variant is added — which is the signal to add it here. A sweep over a list that has
+    /// quietly stopped covering the enum is worse than no sweep, because it still passes.
+    const ALL_DTYPES: &[GgmlDType] = &[
+        GgmlDType::F32,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+        GgmlDType::R16,
+        GgmlDType::P2,
+        GgmlDType::QAWQ,
+        GgmlDType::QAWQ_G64,
+        GgmlDType::Q8_0,
+        GgmlDType::Q8_1,
+        GgmlDType::Q8_K,
+        GgmlDType::Q8_KS,
+        GgmlDType::Q6_K,
+        GgmlDType::Q5_0,
+        GgmlDType::Q5_1,
+        GgmlDType::Q5_K,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4_1,
+        GgmlDType::Q4_K,
+        GgmlDType::Q4_KS,
+        GgmlDType::Q3_0,
+        GgmlDType::Q3_1,
+        GgmlDType::Q3_K,
+        GgmlDType::Q2_0,
+        GgmlDType::Q2_1,
+        GgmlDType::Q2_K,
+        GgmlDType::Q2_S,
+        GgmlDType::Q2_A,
+        GgmlDType::Q1_S,
+        GgmlDType::Q0_V,
+        GgmlDType::Q1_A,
+        GgmlDType::Q0_X,
+        GgmlDType::Q0_M2,
+        GgmlDType::Q0_M4,
+        GgmlDType::Q0,
+        GgmlDType::F8E4M3,
+        GgmlDType::F8E5M2,
+        GgmlDType::U8,
+        GgmlDType::I8,
+        GgmlDType::U16,
+        GgmlDType::I16,
+        GgmlDType::U32,
+        GgmlDType::I32,
+        GgmlDType::U64,
+        GgmlDType::I64,
+        GgmlDType::F64,
+        GgmlDType::Q4_KO,
+        GgmlDType::Q5_KO,
+        GgmlDType::Q6_KO,
+        GgmlDType::Q8_KO,
+        GgmlDType::MXFP4,
+        GgmlDType::MXFP4_KO,
+        GgmlDType::Q2_KO,
+        GgmlDType::Q3_KO,
+    ];
+
+    /// [`ALL_DTYPES`] lists every variant, once.
+    ///
+    /// The `match` below exists only to be exhaustive: adding a variant to `GgmlDType` fails to
+    /// compile *here*, which is the prompt to add it to the list. The duplicate and count
+    /// checks catch the other direction — a paste that repeated an entry instead of adding one.
+    #[test]
+    fn all_dtypes_covers_the_enum() {
+        #[allow(clippy::match_like_matches_macro)]
+        fn is_a_variant(d: GgmlDType) -> bool {
+            match d {
+                GgmlDType::F32
+                | GgmlDType::F16
+                | GgmlDType::BF16
+                | GgmlDType::R16
+                | GgmlDType::P2
+                | GgmlDType::QAWQ
+                | GgmlDType::QAWQ_G64
+                | GgmlDType::Q8_0
+                | GgmlDType::Q8_1
+                | GgmlDType::Q8_K
+                | GgmlDType::Q8_KS
+                | GgmlDType::Q6_K
+                | GgmlDType::Q5_0
+                | GgmlDType::Q5_1
+                | GgmlDType::Q5_K
+                | GgmlDType::Q4_0
+                | GgmlDType::Q4_1
+                | GgmlDType::Q4_K
+                | GgmlDType::Q4_KS
+                | GgmlDType::Q3_0
+                | GgmlDType::Q3_1
+                | GgmlDType::Q3_K
+                | GgmlDType::Q2_0
+                | GgmlDType::Q2_1
+                | GgmlDType::Q2_K
+                | GgmlDType::Q2_S
+                | GgmlDType::Q2_A
+                | GgmlDType::Q1_S
+                | GgmlDType::Q0_V
+                | GgmlDType::Q1_A
+                | GgmlDType::Q0_X
+                | GgmlDType::Q0_M2
+                | GgmlDType::Q0_M4
+                | GgmlDType::Q0
+                | GgmlDType::F8E4M3
+                | GgmlDType::F8E5M2
+                | GgmlDType::U8
+                | GgmlDType::I8
+                | GgmlDType::U16
+                | GgmlDType::I16
+                | GgmlDType::U32
+                | GgmlDType::I32
+                | GgmlDType::U64
+                | GgmlDType::I64
+                | GgmlDType::F64
+                | GgmlDType::Q4_KO
+                | GgmlDType::Q5_KO
+                | GgmlDType::Q6_KO
+                | GgmlDType::Q8_KO
+                | GgmlDType::MXFP4
+                | GgmlDType::MXFP4_KO
+                | GgmlDType::Q2_KO
+                | GgmlDType::Q3_KO => true,
+            }
+        }
+        let mut seen: Vec<u32> = ALL_DTYPES
+            .iter()
+            .map(|d| {
+                assert!(is_a_variant(*d));
+                *d as u32
+            })
+            .collect();
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "ALL_DTYPES has a duplicate");
+        assert_eq!(n, 53, "ALL_DTYPES must list every variant exactly once");
+    }
+
+    /// Every dtype survives a GGUF file-code round trip.
+    ///
+    /// `to_gguf_file_code` and `from_gguf_file_code` are hand-written inverses over ~40 arms,
+    /// and nothing forced them to stay inverses: the compiler checks each is exhaustive, not
+    /// that they agree. A code added to one side only is a tensor that writes as one dtype and
+    /// reads back as another — or, for the KO twins whose codes are reserved rather than used,
+    /// a `from_gguf_file_code` that silently rejects a format the writer can emit.
+    #[test]
+    fn every_gguf_file_code_round_trips() {
+        for &d in ALL_DTYPES {
+            let code = d.to_gguf_file_code();
+            let back = GgmlDType::from_gguf_file_code(code).unwrap_or_else(|e| {
+                panic!("{d:?} writes code {code}, which does not read back: {e}")
+            });
+            assert_eq!(back, d, "{d:?} → {code} → {back:?}");
+        }
+    }
+
+    /// [`ko_quant::ALL_KO_DTYPES`] is exactly the set [`GgmlDType::is_ko`] accepts.
+    ///
+    /// The sweeps that cover KO formats iterate the list; the code that routes them tests the
+    /// predicate. If those two ever disagree, every sweep silently stops covering a format
+    /// while still passing — which is the failure this whole family of tests exists to end.
+    #[test]
+    fn ko_dtype_list_matches_is_ko() {
+        let from_predicate: Vec<GgmlDType> =
+            ALL_DTYPES.iter().copied().filter(|d| d.is_ko()).collect();
+        let mut listed = ko_quant::ALL_KO_DTYPES.to_vec();
+        let mut derived = from_predicate.clone();
+        listed.sort_by_key(|d| *d as u32);
+        derived.sort_by_key(|d| *d as u32);
+        assert_eq!(
+            listed, derived,
+            "ALL_KO_DTYPES and is_ko() disagree — a KO format is missing from one of them"
+        );
+    }
+
+    /// `type_size` × blocks must equal the bytes `quantize_ko` actually emits.
+    ///
+    /// **This is an offset invariant, not a size preference.** `type_size` is what the GGUF
+    /// header uses to lay out and slice tensor data — offset accounting on write, length on
+    /// read — so a KO twin whose `type_size` disagrees with its chunk width does not produce a
+    /// wrong tensor, it shifts every tensor after it and reads past the end of the file. The
+    /// two numbers are written down in different files (`mod.rs` and `ko_quant.rs`), which is
+    /// exactly the shape of thing that drifts.
+    #[test]
+    fn ko_type_size_matches_the_emitted_chunk() {
+        for &d in ALL_DTYPES {
+            if !d.is_ko() {
+                continue;
+            }
+            assert_eq!(d.block_size(), 128, "{d:?}: KO twins are per-128");
+            let chunk = if d == GgmlDType::MXFP4_KO {
+                ko_quant::MXFP4_KO_GPU_CHUNK_BYTES
+            } else {
+                ko_quant::ko_chunk_bytes(d)
+            };
+            assert_ne!(chunk, 0, "{d:?} has no chunk width");
+            // One chunk is 8 rows × 128 K = 8 blocks, so type_size is the chunk over 8.
+            assert_eq!(
+                d.type_size() * 8,
+                chunk,
+                "{d:?}: type_size {} × 8 must equal the {chunk}-byte chunk quantize_ko emits",
+                d.type_size(),
+            );
+        }
+    }
+
+    /// The `Int8Mode` twin table, pinned end to end.
+    ///
+    /// **The mapping this pins is the one that went wrong.** `Q2_K` and `Q3_K` mapped to
+    /// `Q4_KO` for as long as no narrower twin existed — a 71% and a 31% weight inflation that
+    /// read as a deliberate choice and was really a missing format. Nothing failed; the model
+    /// simply carried wider weights, which costs VRAM once when weights are resident and PCIe
+    /// bytes on *every forward* once they stream. A table with no test is how that survives.
+    #[test]
+    fn the_int8_twin_table_is_same_width_then_one_step_up() {
+        use Int8Mode::{Off, Performance, Precision};
+        // (source, Performance twin, Precision twin)
+        let table = [
+            (GgmlDType::Q2_K, GgmlDType::Q2_KO, GgmlDType::Q3_KO),
+            (GgmlDType::Q3_K, GgmlDType::Q3_KO, GgmlDType::Q4_KO),
+            (GgmlDType::Q4_0, GgmlDType::Q4_KO, GgmlDType::Q5_KO),
+            (GgmlDType::Q4_1, GgmlDType::Q4_KO, GgmlDType::Q5_KO),
+            (GgmlDType::Q4_K, GgmlDType::Q4_KO, GgmlDType::Q5_KO),
+            (GgmlDType::Q5_0, GgmlDType::Q5_KO, GgmlDType::Q6_KO),
+            (GgmlDType::Q5_1, GgmlDType::Q5_KO, GgmlDType::Q6_KO),
+            (GgmlDType::Q5_K, GgmlDType::Q5_KO, GgmlDType::Q6_KO),
+            // At the top of the ladder there is no finer twin, so both modes agree.
+            (GgmlDType::Q6_K, GgmlDType::Q6_KO, GgmlDType::Q6_KO),
+            (GgmlDType::Q8_0, GgmlDType::Q8_KO, GgmlDType::Q8_KO),
+            (GgmlDType::Q8_1, GgmlDType::Q8_KO, GgmlDType::Q8_KO),
+            (GgmlDType::Q8_K, GgmlDType::Q8_KO, GgmlDType::Q8_KO),
+            // MXFP4 keeps its native nibbles in both modes — an exact permutation, no requant.
+            (GgmlDType::MXFP4, GgmlDType::MXFP4_KO, GgmlDType::MXFP4_KO),
+        ];
+        for (src, perf, prec) in table {
+            assert_eq!(src.to_ko(Performance).unwrap(), perf, "{src:?} Performance");
+            assert_eq!(src.to_ko(Precision).unwrap(), prec, "{src:?} Precision");
+            assert!(src.to_ko(Off).is_err(), "{src:?}: Off has no twin");
+        }
+
+        // Performance is same-width for every affine source — no exceptions left. Stated one
+        // direction only: **the twin is never WIDER**.
+        //
+        // The other direction is not assertable from bits-per-weight, and trying cost a false
+        // failure worth recording. `Q4_1` is 5.0 bpw and its `Q4_KO` twin 4.25, which looks
+        // like three quarters of a bit thrown away — but `Q4_1` carries a scale *and* a min per
+        // 32 values where the twin carries one pair per 128. Both store 4-bit values; the whole
+        // gap is scale overhead, i.e. the per-32→per-128 collapse this mode exists to make.
+        // bpw cannot separate value precision from scale overhead, so a lower bound on it
+        // measures the wrong quantity.
+        //
+        // The upper bound has no such problem: scale overhead only ever *falls* across the
+        // repack, so a twin that comes out wider can only mean its value width grew — which is
+        // exactly a missing same-width twin. `Q3_K → Q4_KO` was +0.81 and `Q2_K → Q4_KO`
+        // +1.63; both are caught, and an `abs() < 1.0` band would have admitted the first.
+        let bpw = GgmlDType::bits_per_weight;
+        for (src, perf, _) in table {
+            if src == GgmlDType::MXFP4 {
+                continue; // 4-bit either way, but its chunk carries per-sub scales
+            }
+            let (s, p) = (bpw(src), bpw(perf));
+            assert!(
+                p <= s + 0.01,
+                "{src:?} ({s:.4} bpw) → {perf:?} ({p:.4} bpw): Performance widened the weight, \
+                 which means no same-width twin exists for this source and `to_ko` rounded up. \
+                 Under layer streaming that is PCIe bytes on every forward."
+            );
+        }
+
+        // A KO twin is its own twin — repacking an already-repacked weight is a no-op, which is
+        // what lets a prepared GGUF load without a second pass.
+        for &d in ALL_DTYPES {
+            if d.is_ko() {
+                assert_eq!(d.to_ko(Performance).unwrap(), d, "{d:?} is already KO");
+                assert_eq!(d.to_ko(Precision).unwrap(), d, "{d:?} is already KO");
+            }
+        }
     }
 }

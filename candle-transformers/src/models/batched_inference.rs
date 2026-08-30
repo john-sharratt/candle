@@ -350,6 +350,15 @@ pub struct BatchedConfig {
     /// `None` because V's decode path already honors selection's full
     /// adaptive state correctly; provided for symmetry / diagnostic use.
     pub override_v_quant: Option<QuantFormat>,
+
+    /// The width activations flow between layers in, when the model's own
+    /// reference implementation names one.
+    ///
+    /// `None` derives it from [`Self::k_format`], which is where it came from
+    /// historically — see [`BatchedInferenceSession::activation_dtype`] for why
+    /// that derivation is only right when K is stored float, and why a model
+    /// that knows its own compute width must be able to say so instead.
+    pub activation_dtype: Option<DType>,
 }
 
 impl Default for BatchedConfig {
@@ -365,6 +374,7 @@ impl Default for BatchedConfig {
             v_low_error_threshold_factor: 1.0,
             override_k_quant: None,
             override_v_quant: None,
+            activation_dtype: None,
         }
     }
 }
@@ -1873,16 +1883,43 @@ impl BatchedInferenceSession {
     ///
     /// Deliberately **not** [`Self::dtype`], and the difference is not cosmetic.
     /// `dtype` describes *sealed storage* and falls back to BF16 for a quantized
-    /// format, which is right for the accounting it feeds. The forward instead
-    /// derives its activation dtype from the sequence's live caches, and
-    /// [`candle_nn::kv_cache::KvCache::dtype`] reports **F16** for a quantized
-    /// backing — the live arena really is F16 (K in `R16`, V in plain F16), so
-    /// that is the dtype the norms will actually see. Reading `dtype` here
-    /// yields BF16 weights for an F16 forward, which the norm refuses.
+    /// format, which is right for the accounting it feeds.
+    ///
+    /// When [`BatchedConfig::activation_dtype`] is set, that is the answer: a
+    /// model that knows the width its own reference implementation computes in
+    /// states it, and nothing about KV storage overrides it.
+    ///
+    /// Otherwise the width is derived from the KV format, which is right only
+    /// while K is stored float. For a quantized backing the live arena really
+    /// is F16 (K in `R16`, V in plain F16), so the derivation yields F16 — and
+    /// that is a statement about the *arena*, not about the residual stream.
+    /// The two are unrelated, and conflating them costs range: F16 and BF16 are
+    /// both 16 bits, but F16 stops at 65504 where BF16 carries F32's exponent.
+    /// A model whose blocks legitimately produce 1e5–1e6 outputs has them
+    /// silently become `inf` at the narrowing, and the next layer turns the
+    /// `inf` into a NaN.
     pub fn activation_dtype(&self) -> DType {
         crate::models::batched_model::activation_dtype(
-            self.config.k_format.dtype().unwrap_or(DType::F16),
+            self.config
+                .activation_dtype
+                .or_else(|| self.config.k_format.dtype())
+                .unwrap_or(DType::F16),
         )
+    }
+
+    /// The width a live sequence's K/V bytes are actually held in.
+    ///
+    /// Not the sealed format and not the activation width: while a sequence is
+    /// live its K sits in `R16` — raw F16 with Q-capture space — and its V in
+    /// plain F16, whatever the sealed storage will later be. So a quantized
+    /// format answers F16 here, and a float format answers itself.
+    ///
+    /// This is what Q/K/V are projected in, because K and V *become* these
+    /// bytes. It equals [`Self::activation_dtype`] for every model whose
+    /// activations and KV agree, and differs for one that computes wider than
+    /// it stores.
+    pub fn kv_live_dtype(&self) -> DType {
+        self.config.k_format.dtype().unwrap_or(DType::F16)
     }
 
     /// Get the number of layers.
@@ -4168,6 +4205,12 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// Snapshot the layer-streaming counters, if this model's weights are slot
+    /// tenants. See `BatchedModelCore::layer_stream_stats`.
+    fn layer_stream_stats(&self) -> Option<[usize; 7]> {
+        None
+    }
+
     /// Buy `regions` of weight-side ground for the KV side, answering with the
     /// bytes conceded. See `BatchedModel::request_kv_ground` — this is the path a
     /// stalled scheduler uses to break a wave that cannot allocate.
@@ -4376,6 +4419,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.model().expert_stats()
+    }
+
+    fn layer_stream_stats(&self) -> Option<[usize; 7]> {
+        self.model().layer_stream_stats()
     }
 
     fn request_kv_ground(&self, regions: usize) -> u64 {

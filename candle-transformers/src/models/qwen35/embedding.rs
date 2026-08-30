@@ -33,7 +33,7 @@
 //! ids as tokens.
 
 use candle::cuda_backend::Backing;
-use candle::quantized::gguf_file::Content;
+use candle::quantized::gguf_file::{Content, TensorInfo};
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::host_embedding::HostEmbedding;
@@ -48,6 +48,32 @@ pub enum EmbeddingTable {
 }
 
 impl EmbeddingTable {
+    /// The widest `token_embd.weight` among the files this load has open.
+    ///
+    /// **The embedding is the one tensor where taking the wider copy is nearly free.** It is
+    /// host-resident by construction — gathered from a `cuMemHostAlloc` mapping, never made
+    /// resident — so its width costs host RAM and no VRAM at all. The trunk descends a quant
+    /// ladder to fit the card; the MTP sidecar is published at a single quant and does not. Below
+    /// the ladder's upper rungs the sidecar's copy is therefore the better one, and it is already
+    /// on disk because the drafter needs the file regardless.
+    ///
+    /// It pays in two places that are easy to miss. The draft head steps by
+    /// `embed(argmax(...))`, so embedding error feeds the proposals whose acceptance rate *is*
+    /// the throughput — this is a speed change, not only a quality one. And a 248,320-row
+    /// vocabulary has a long rare-token tail whose rows saw the fewest updates and are the
+    /// worst-conditioned in the table, which is exactly where the narrow quant hurts.
+    ///
+    /// `sources[0]` is the checkpoint and decides the table's **shape**; a later source is
+    /// considered only if its table is the same `[vocab, hidden]`, because a sidecar converted
+    /// against a different vocabulary would gather the wrong rows rather than fail. Ties keep the
+    /// earlier source, so the checkpoint wins where the two are equal and is displaced only by a
+    /// genuine improvement.
+    pub fn widest_host_mapped(sources: &[(&Content, &memmap2::Mmap)]) -> Option<HostEmbedding> {
+        let contents: Vec<&Content> = sources.iter().map(|(c, _)| *c).collect();
+        let (content, mmap) = sources[widest_embedding(&contents)?];
+        Self::host_mapped(content, mmap)
+    }
+
     /// Bind `token_embd.weight` to host-mapped memory, or `None` if it cannot be
     /// pinned.
     ///
@@ -151,9 +177,124 @@ impl EmbeddingTable {
     }
 }
 
+/// Which of `sources` carries the best `token_embd.weight`, by index.
+///
+/// Split out from [`EmbeddingTable::widest_host_mapped`] because the choice is header arithmetic
+/// and the mapping is not: this runs anywhere, the pinning it feeds needs a CUDA device and a
+/// file on disk.
+///
+/// `sources[0]` is the checkpoint and fixes the table's **shape**. A later source is considered
+/// only if its table is the same `[vocab, hidden]` — a sidecar converted against a different
+/// vocabulary would gather the wrong rows rather than fail, which is the one way this can be
+/// silently wrong. Ties keep the earlier source, so the checkpoint is displaced only by a genuine
+/// improvement.
+fn widest_embedding(sources: &[&Content]) -> Option<usize> {
+    fn info(c: &Content) -> Option<&TensorInfo> {
+        c.tensor_infos.get("token_embd.weight")
+    }
+    let first = info(sources.first()?)?;
+    let shape = first.shape.dims();
+    let mut best = 0usize;
+    let mut best_bpw = first.ggml_dtype.bits_per_weight();
+    for (i, c) in sources.iter().enumerate().skip(1) {
+        let Some(t) = info(c) else { continue };
+        if t.shape.dims() != shape {
+            continue;
+        }
+        let bpw = t.ggml_dtype.bits_per_weight();
+        if bpw > best_bpw {
+            best = i;
+            best_bpw = bpw;
+        }
+    }
+    Some(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle::quantized::gguf_file::VersionedMagic;
+    use candle::quantized::GgmlDType;
+    use candle::Shape;
+    use std::collections::HashMap;
+
+    /// A header carrying nothing but a `token_embd.weight` of the given form.
+    fn header(dtype: GgmlDType, dims: &[usize]) -> Content {
+        let mut tensor_infos = HashMap::new();
+        tensor_infos.insert(
+            "token_embd.weight".to_string(),
+            TensorInfo {
+                ggml_dtype: dtype,
+                shape: Shape::from_dims(dims),
+                offset: 0,
+            },
+        );
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata: HashMap::new(),
+            tensor_infos,
+            tensor_data_offset: 0,
+        }
+    }
+
+    const V: &[usize] = &[248320, 5120];
+
+    /// The 27B's actual case: a Q3_K_M trunk beside the sidecar's Q4_0 copy.
+    #[test]
+    fn a_wider_sidecar_displaces_the_checkpoint() {
+        let trunk = header(GgmlDType::Q3_K, V);
+        let side = header(GgmlDType::Q4_0, V);
+        assert_eq!(widest_embedding(&[&trunk, &side]), Some(1));
+    }
+
+    /// Upper rungs of the same ladder: the trunk is already wider, so the sidecar is ignored.
+    #[test]
+    fn a_narrower_sidecar_is_ignored() {
+        let trunk = header(GgmlDType::Q6_K, V);
+        let side = header(GgmlDType::Q4_0, V);
+        assert_eq!(widest_embedding(&[&trunk, &side]), Some(0));
+    }
+
+    /// Equal width keeps the checkpoint — the two formats are not interchangeable at equal bits
+    /// (Q4_K's per-sub-block scales beat Q4_0's single one), and the checkpoint is the copy the
+    /// rest of the model was converted with.
+    #[test]
+    fn an_equal_width_sidecar_does_not_displace_the_checkpoint() {
+        let trunk = header(GgmlDType::Q4_K, V);
+        let side = header(GgmlDType::Q4_0, V);
+        assert_eq!(GgmlDType::Q4_K.bits_per_weight(), 4.5);
+        assert_eq!(GgmlDType::Q4_0.bits_per_weight(), 4.5);
+        assert_eq!(widest_embedding(&[&trunk, &side]), Some(0));
+    }
+
+    /// **A different vocabulary is refused, not preferred.** This is the only way the choice can
+    /// be silently wrong: a wider table of the wrong shape would gather the wrong rows for every
+    /// token, and nothing downstream checks a row index against a vocabulary it did not choose.
+    #[test]
+    fn a_sidecar_with_another_vocabulary_is_never_taken() {
+        let trunk = header(GgmlDType::Q3_K, V);
+        for dims in [&[151936, 5120][..], &[248320, 4096][..], &[248320][..]] {
+            let side = header(GgmlDType::Q8_0, dims);
+            assert_eq!(widest_embedding(&[&trunk, &side]), Some(0), "{dims:?}");
+        }
+    }
+
+    /// A sidecar without the tensor at all, and a checkpoint without it.
+    #[test]
+    fn a_source_with_no_table_is_skipped() {
+        let trunk = header(GgmlDType::Q3_K, V);
+        let empty = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata: HashMap::new(),
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        };
+        assert_eq!(widest_embedding(&[&trunk, &empty]), Some(0));
+        // No table in the checkpoint is no table at all: the shape it would be checked against
+        // does not exist, so there is nothing to prefer.
+        assert_eq!(widest_embedding(&[&empty, &trunk]), None);
+        assert_eq!(widest_embedding(&[]), None);
+    }
 
     fn table(vocab: usize, hidden: usize) -> Result<EmbeddingTable> {
         let n = vocab * hidden;

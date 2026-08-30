@@ -30,6 +30,9 @@ pub(super) fn qwen3_30b_a3b_q6() -> ModelSpec {
         model_filename: "Qwen3-30B-A3B-Q6_K.gguf".into(),
         model_bytes: 25_092_532_800,
         tokenizer_repo: "Qwen/Qwen3-30B-A3B".into(),
+        // Unpinned: no revision verified against this checkpoint's own token
+        // table. The load-time check against it guards the pairing meanwhile.
+        tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 4096,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),

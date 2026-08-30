@@ -1634,8 +1634,17 @@ mod tests {
         assert!(pack.record_index(0, 0).is_err(), "served a pinned layer");
 
         // And the bytes at that offset are the ones written for it.
-        let mut got = vec![0u8; pack.stride()];
-        pack.read_into(2, 1, &mut got).unwrap();
+        //
+        // Through `AlignedScratch`, as every other read here does: `read_into`
+        // lands a positioned direct read, whose destination must be 4 KiB
+        // aligned. A `vec![0u8; _]` is aligned to 1, so it passed only for as
+        // long as the allocator happened to hand back an aligned block, and
+        // tripped the direct-I/O assertion the moment surrounding allocations
+        // shifted — a test that reports on malloc rather than on the pack.
+        let mut scratch = AlignedScratch::new();
+        scratch.ensure(pack.stride()).unwrap();
+        let got = scratch.as_mut_slice(pack.stride());
+        pack.read_into(2, 1, got).unwrap();
         assert_eq!(got[0], 5, "L2E1 read back another layer's record");
 
         drop(pack);

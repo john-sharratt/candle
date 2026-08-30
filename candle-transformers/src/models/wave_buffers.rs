@@ -227,6 +227,46 @@ pub(crate) fn wave_zeros<'w, S: Into<Shape>>(
     }
 }
 
+/// An **uninitialised** buffer on the wave's half, or an ordinary one when there
+/// is no wave.
+///
+/// [`wave_zeros`] without the `memset`, for a buffer the caller fully overwrites
+/// — hot-path invariant 6. The distinction matters here rather than being a
+/// micro-optimisation: this exists to give a *root* operand wave provenance, and
+/// a root is by definition something whose every byte is about to be written
+/// from somewhere else.
+///
+/// **This is the constructor for a provenance root that has no device operand to
+/// inherit from.** `Tensor::empty` can only produce an `Owned` tensor, and
+/// `empty_beside` only relays provenance an operand already has — so a chain
+/// starting from a buffer the sequence owns across waves (a rewind stash, a
+/// carried conv tail) lands wholly on the pool unless it is staged through this
+/// first. See [`Tensor::empty_beside`]'s note that "one broken provenance root
+/// becomes dozens of sites in a report".
+///
+/// SAFETY / CONTRACT: as [`candle::Tensor::empty`] — every element must be
+/// written before it is read.
+pub(crate) fn wave_empty<'w, S: Into<Shape>>(
+    shape: S,
+    dtype: DType,
+    device: &Device,
+    wave: Option<&'w WaveGeneration>,
+) -> Result<LiveTensor<'w>> {
+    let shape = shape.into();
+    let (Device::Cuda(_), Some(wave)) = (device, wave) else {
+        return Tensor::empty(shape, dtype, device);
+    };
+    let bytes = shape.elem_count() * dtype.size_in_bytes();
+    let ticket = wave.ticket();
+    let range = wave.alloc(bytes, WAVE_ALIGN)?;
+    // SAFETY: `range` is `bytes` of the half pinned by `wave`, nothing else
+    // addresses it within this generation, and the returned tensor borrows
+    // `wave` so it cannot be named after the guard that reclaims the range.
+    unsafe {
+        LiveTensor::from_leased_cuda_ptr(range.ptr, dtype, shape, device, LeaseOrigin::Wave(ticket))
+    }
+}
+
 /// A host-built table uploaded onto the wave's half.
 ///
 /// The upload counterpart of [`wave_zeros`], and the one the per-forward

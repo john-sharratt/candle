@@ -2000,6 +2000,10 @@ pub enum QType {
     /// Lane-major per-128 affine KO twin at 2-bit — the smallest KO weight (value 0..3, the
     /// 2-bit crumb region Q6_KO carries, used as the whole value). Value 51 mirrors QTYPE_Q2_KO.
     Q2_KO = 51,
+    /// Lane-major per-128 affine KO twin at 3-bit (value 0..7) — `Q3_K`'s same-width twin: the
+    /// 2-bit crumb plane at bits 0-1 plus the 1-bit hi plane at bit 2, no `ql` plane. Value 52
+    /// mirrors QTYPE_Q3_KO.
+    Q3_KO = 52,
 }
 
 #[cfg(test)]
@@ -2055,6 +2059,8 @@ mod kv_qtype_lock_tests {
         assert_eq!(QType::Q6_KO as i32, 47);
         assert_eq!(QType::Q8_KO as i32, 48);
         assert_eq!(QType::MXFP4_KO as i32, 50);
+        assert_eq!(QType::Q2_KO as i32, 51);
+        assert_eq!(QType::Q3_KO as i32, 52);
     }
 }
 

@@ -24,6 +24,9 @@ pub(super) fn hermes3_3b_q6() -> ModelSpec {
         model_filename: "Hermes-3-Llama-3.2-3B-Q6_K.gguf".into(),
         model_bytes: 2_643_850_336,
         tokenizer_repo: "NousResearch/Hermes-3-Llama-3.2-3B".into(),
+        // Unpinned: no revision verified against this checkpoint's own token
+        // table. The load-time check against it guards the pairing meanwhile.
+        tokenizer_rev: String::new(),
         default_system_prompt: "You are a helpful assistant.".into(),
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("llama"),
@@ -47,6 +50,7 @@ pub(super) fn hermes3_70b_q4() -> ModelSpec {
         model_filename: "Hermes-3-Llama-3.1-70B-Q4_K_M.gguf".into(),
         model_bytes: 42_520_393_792,
         tokenizer_repo: "NousResearch/Hermes-3-Llama-3.1-70B".into(),
+        tokenizer_rev: String::new(),
         default_system_prompt: "You are a helpful assistant.".into(),
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("llama"),

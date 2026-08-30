@@ -85,6 +85,34 @@ impl Qwen35MoeBlock {
         // Shared expert first — see the module note on ownership.
         let gated = shared_expert_contribution(&self.shared, &self.shared_gate, &acts, out_dtype)?;
         let routed = self.routed.forward_dynamic(acts, out_dtype, wave)?;
+        // The three values the layer's output is made of, checked where they
+        // are still separable.
+        //
+        // The routed half is instrumented all the way down; the SHARED half was
+        // not instrumented at all, and it is the other half of the sum. Its
+        // `sigmoid` and its per-token broadcast are the only broadcast ops in
+        // the FFN — and a broadcast add is what the fault's kernel breadcrumb
+        // named. Checking `gated` and `routed` apart, then their sum, is what
+        // separates "one of the addends was already bad" from "the combine
+        // produced it".
+        #[cfg(feature = "tensor-assert")]
+        {
+            use crate::models::nan_capture::checkpoint;
+            use candle::tensor_assert::site;
+            if let candle::Device::Cuda(d) = routed.device() {
+                let li = self.routed.moe_layer_idx;
+                checkpoint(site("moe.shared_gated.L", li), &gated, &[], d)?;
+                checkpoint(site("moe.routed_sum_in.L", li), &routed, &[], d)?;
+                let sum = (&routed + &gated)?;
+                checkpoint(
+                    site("moe.combined.L", li),
+                    &sum,
+                    &[("routed", &routed), ("gated", &gated)],
+                    d,
+                )?;
+                return Ok(sum);
+            }
+        }
         &routed + &gated
     }
 }

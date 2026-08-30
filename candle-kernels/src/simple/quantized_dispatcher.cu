@@ -317,6 +317,7 @@ extern "C" void run_quantize_ko(
         case QTYPE_Q6_KO: quantize_ko_affine_kernel<63, 256, 0><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
         case QTYPE_Q8_KO: quantize_q8_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
         case QTYPE_Q2_KO: quantize_q2_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q3_KO: quantize_q3_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
         // NOTE: deliberately no QTYPE_MXFP4_KO arm — MXFP4 repacks by an exact host-side
         // byte permutation (ko_quant::mxfp4_native_to_ko_gpu_chunk), never a requant.
         default: return; // Invalid qtype — callers must not reach here
@@ -337,6 +338,7 @@ extern "C" void run_dequantize_ko(
         case QTYPE_Q6_KO: dequantize_ko_affine_kernel<256, 0><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
         case QTYPE_Q8_KO: dequantize_q8_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
         case QTYPE_Q2_KO: dequantize_q2_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q3_KO: dequantize_q3_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
         default: return; // Invalid qtype — callers must not reach here
     }
 }

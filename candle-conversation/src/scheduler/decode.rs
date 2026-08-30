@@ -711,6 +711,25 @@ impl Scheduler {
         // the states go back.
         let captured: Vec<Vec<Tensor>> = chooser.rows().to_vec();
         for (id, state) in state_ids.into_iter().zip(chooser.into_states()) {
+            // A sequence that has just started emitting token 0 gets its
+            // recurrent state described, once.
+            //
+            // The logits are the far end of a forty-layer forward, so a NaN
+            // there names nothing: every candidate explanation produces exactly
+            // that observation. What separates them is whether the sequence's
+            // PERSISTENT state is already non-finite — corruption that will
+            // outlive this wave and that names the layer it entered at — or
+            // whether the state is clean and only this wave's activations went
+            // bad. Those are different bugs in different code, and the logits
+            // cannot tell them apart.
+            //
+            // Fires at the guard bar, not on the first zero. Token 0 is `!` in
+            // these vocabularies and ordinary prose contains it, so triggering
+            // on a single one reports healthy turns as faults — measured, 16
+            // such reports in a clean ingest. A RUN of them is the signal.
+            if state.degenerate_run == crate::batched_sampler::DEGENERATE_TOKEN_RUN {
+                describe_recurrent_state(self.model.as_ref(), id);
+            }
             self.sampling_states.insert(id, state);
         }
 
@@ -1621,5 +1640,78 @@ impl Scheduler {
                 state.finished = true;
             }
         }
+    }
+}
+
+/// Report whether a sequence's persistent recurrent state is finite, per layer.
+///
+/// Called when a sequence first emits token 0 — the point at which its logits
+/// have gone unusable but nothing yet says why. A NaN in the logits is the far
+/// end of the whole stack and is equally consistent with corrupted persistent
+/// state and with one bad wave of activations; this separates them, and where
+/// it is the state, names the first layer holding it.
+///
+/// Reports rather than fails: this runs on a fault path to make the fault
+/// legible, and a probe that could itself error would just replace one
+/// unexplained failure with another.
+fn describe_recurrent_state(model: &(dyn ManagedBatchedModel + Send), seq: SequenceId) {
+    let exported = match model.export_recurrent(seq.0) {
+        Ok(Some((_, layers))) => layers,
+        // A stack with no recurrent state answers `None`; that is itself the
+        // answer for this model, so say so rather than staying silent.
+        Ok(None) => {
+            tracing::error!(
+                target: "candle_conversation::eos",
+                seq = seq.0,
+                "degenerate decode: model carries no recurrent state to inspect"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "candle_conversation::eos",
+                seq = seq.0,
+                "degenerate decode: recurrent state unreadable ({e})"
+            );
+            return;
+        }
+    };
+
+    let non_finite = |bytes: &[u8]| -> usize {
+        bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .filter(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+            .count()
+    };
+    let mut bad_layers = 0usize;
+    let mut first: Option<(u32, usize, usize)> = None;
+    for l in &exported {
+        let s = non_finite(&l.state);
+        let tail = non_finite(&l.conv_tail);
+        if s + tail > 0 {
+            bad_layers += 1;
+            if first.is_none() {
+                first = Some((l.layer_index, s, tail));
+            }
+        }
+    }
+    match first {
+        Some((layer, s, tail)) => tracing::error!(
+            target: "candle_conversation::eos",
+            seq = seq.0,
+            layers = exported.len(),
+            bad_layers,
+            first_bad_layer = layer,
+            state_non_finite = s,
+            conv_tail_non_finite = tail,
+            "degenerate decode: PERSISTENT recurrent state is non-finite"
+        ),
+        None => tracing::error!(
+            target: "candle_conversation::eos",
+            seq = seq.0,
+            layers = exported.len(),
+            "degenerate decode: recurrent state is entirely FINITE — the fault is in \
+             this wave's activations, not in carried state"
+        ),
     }
 }

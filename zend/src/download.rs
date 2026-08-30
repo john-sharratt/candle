@@ -36,13 +36,24 @@ pub async fn ensure_model(
     let spec = model().spec();
     let model_path = resolve_file(
         &spec.model_repo,
+        // The checkpoint carries no pinned revision on the spec; its published
+        // length is what distinguishes it here.
+        "",
         &spec.model_filename,
         Some(spec.model_bytes),
         &dir,
         status,
     )
     .await?;
-    let tok_path = resolve_file(&spec.tokenizer_repo, TOK_FILE, None, &dir, status).await?;
+    let tok_path = resolve_file(
+        &spec.tokenizer_repo,
+        &spec.tokenizer_rev,
+        TOK_FILE,
+        None,
+        &dir,
+        status,
+    )
+    .await?;
 
     Ok((model_path, tok_path))
 }
@@ -52,18 +63,30 @@ pub async fn ensure_model(
 /// Resolve a model file: our cache → HF hub cache → download.
 async fn resolve_file(
     repo: &str,
+    revision: &str,
     filename: &str,
     size_hint: Option<u64>,
     our_dir: &Path,
     status: &tokio::sync::watch::Sender<String>,
 ) -> anyhow::Result<PathBuf> {
-    // 1. Our own cache, keyed on filename alone — so the length is checked when
-    //    the spec states one. Two repos may publish the SAME filename and differ
-    //    only in content: the hybrid's plain and `-MTP-` conversions are the same
-    //    quant, one carrying the speculative head. A stale copy of the wrong one
-    //    would shadow the right one here forever, and the symptom is decode
-    //    quietly running at half rate rather than anything failing.
-    let our_path = our_dir.join(filename);
+    // 1. Our own cache, keyed on REPO **and** filename, and the length is
+    //    checked on top when the spec states one.
+    //
+    //    Keying on the filename alone let one model's file shadow another's
+    //    forever. `tokenizer.json` is the same name in every repo and has no
+    //    published length to check, so a Qwen3-30B tokenizer left here by an
+    //    earlier model was served to Qwen3.6-35B — a completely different
+    //    vocabulary (`<|endoftext|>` is 151643 there and 248044 here). Every
+    //    prompt was then encoded to token ids that meant something else, so the
+    //    model was fed token soup, answered incoherently, and the substrate
+    //    filled with 349 folder summaries written against garbage. Nothing
+    //    failed; the daemon reported a clean load throughout.
+    //
+    //    Scoping by repo makes that unrepresentable rather than guarded against.
+    let our_path = our_dir.join(repo.replace('/', "--")).join(filename);
+    if let Some(parent) = our_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     if our_path.exists() {
         let len = tokio::fs::metadata(&our_path).await.map(|m| m.len()).ok();
         let gb = len.unwrap_or(0) as f64 / 1e9;
@@ -86,8 +109,11 @@ async fn resolve_file(
         }
     }
 
-    // 2. HuggingFace hub cache (hf-hub or huggingface-cli may have already downloaded it).
-    if let Some(hf_path) = hf_hub_path(repo, filename) {
+    // 2. HuggingFace hub cache (hf-hub or huggingface-cli may have already
+    //    downloaded it). A pinned revision selects its snapshot directly, so
+    //    the resolved file is the one the gates verified rather than whichever
+    //    snapshot `refs/main` currently names.
+    if let Some(hf_path) = hf_hub_path(repo, revision, filename) {
         let gb = hf_path.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
         tracing::info!(
             "found in HF hub cache: {} ({:.2} GB)",
@@ -100,8 +126,14 @@ async fn resolve_file(
         return Ok(hf_path);
     }
 
-    // 3. Download.
-    fetch(&hf_url(repo, filename), &our_path, size_hint, status).await?;
+    // 3. Download, from the pinned revision when there is one.
+    fetch(
+        &hf_url(repo, revision, filename),
+        &our_path,
+        size_hint,
+        status,
+    )
+    .await?;
     Ok(our_path)
 }
 
@@ -116,9 +148,19 @@ async fn resolve_file(
 /// under a test — never writes that ref, so a `refs/main`-only lookup reports
 /// a 22 GB file that is already on disk as missing and downloads it a second
 /// time under a different path.
-fn hf_hub_path(repo: &str, filename: &str) -> Option<PathBuf> {
+fn hf_hub_path(repo: &str, revision: &str, filename: &str) -> Option<PathBuf> {
     let dir_name = format!("models--{}", repo.replace('/', "--"));
-    cached_in_model_dir(&hf_hub_root().join(&dir_name), filename)
+    let model_dir = hf_hub_root().join(&dir_name);
+    // A pinned revision names its snapshot outright. Falling through to the
+    // `refs/main`-or-search path below would resolve to whatever else happens
+    // to be cached, which is the drift the pin exists to prevent.
+    if !revision.is_empty() {
+        let pinned = model_dir.join("snapshots").join(revision).join(filename);
+        if pinned.exists() && pinned.metadata().map(|m| m.len()).unwrap_or(0) > 1024 {
+            return Some(pinned);
+        }
+    }
+    cached_in_model_dir(&model_dir, filename)
 }
 
 /// The lookup itself, against one `models--*` directory.
@@ -160,8 +202,14 @@ fn cached_in_model_dir(model_dir: &Path, filename: &str) -> Option<PathBuf> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn hf_url(repo: &str, file: &str) -> String {
-    format!("https://huggingface.co/{repo}/resolve/main/{file}")
+fn hf_url(repo: &str, revision: &str, file: &str) -> String {
+    // `main` moves; a pinned revision is what makes a download reproducible.
+    let rev = if revision.is_empty() {
+        "main"
+    } else {
+        revision
+    };
+    format!("https://huggingface.co/{repo}/resolve/{rev}/{file}")
 }
 
 /// `~/.cache/zend/models/`
@@ -370,7 +418,9 @@ async fn ensure_remote_file(
             .ok();
         return Ok(local);
     }
-    fetch(&hf_url(&f.repo, &f.path_in_repo), &local, None, status).await?;
+    // The DeepSeek manifest names no revision; `main` is the only coordinate
+    // this path has.
+    fetch(&hf_url(&f.repo, "", &f.path_in_repo), &local, None, status).await?;
     Ok(local)
 }
 
@@ -418,14 +468,29 @@ mod deepseek_tests {
     fn resolve_url_matches_verified_endpoint() {
         // The exact URLs confirmed (HTTP 200) against the HF resolve endpoint.
         assert_eq!(
-            hf_url(&dsv4_split(1).repo, &dsv4_split(1).path_in_repo),
+            hf_url(&dsv4_split(1).repo, "", &dsv4_split(1).path_in_repo),
             "https://huggingface.co/bartowski/DeepSeek-V4-Flash-0731-GGUF/resolve/main/\
              DeepSeek-V4-Flash-0731-MXFP4/DeepSeek-V4-Flash-0731-MXFP4-00001-of-00004.gguf"
         );
         assert_eq!(
-            hf_url(&dspark_file().repo, &dspark_file().path_in_repo),
+            hf_url(&dspark_file().repo, "", &dspark_file().path_in_repo),
             "https://huggingface.co/bartowski/DeepSeek-V4-Flash-0731-GGUF/resolve/main/\
              dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf"
+        );
+    }
+
+    /// A pinned revision replaces `main` in the resolve URL, so a download is
+    /// reproducible rather than whatever the branch points at today.
+    #[test]
+    fn a_pinned_revision_replaces_main_in_the_resolve_url() {
+        assert_eq!(
+            hf_url("Qwen/Qwen3.6-35B-A3B", "995ad96eac", "tokenizer.json"),
+            "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/995ad96eac/tokenizer.json"
+        );
+        assert_eq!(
+            hf_url("Qwen/Qwen3.6-35B-A3B", "", "tokenizer.json"),
+            "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/tokenizer.json",
+            "an unpinned spec still resolves, against main"
         );
     }
 }

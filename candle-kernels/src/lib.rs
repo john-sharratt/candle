@@ -88,7 +88,10 @@ mod built_arch_tests {
     /// is not covered despite Ampere being "the same generation".
     #[test]
     fn coverage_runs_forward_across_minors_and_never_backward() {
-        assert!(BUILT_ARCHES.contains(&86), "this test assumes sm_86 is built");
+        assert!(
+            BUILT_ARCHES.contains(&86),
+            "this test assumes sm_86 is built"
+        );
         assert!(has_kernel_image(8, 6));
         assert!(has_kernel_image(8, 7), "Jetson Orin inherits the 8.6 image");
         assert!(has_kernel_image(8, 9), "Ada is covered natively and by 8.6");

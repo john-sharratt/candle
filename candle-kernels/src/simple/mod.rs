@@ -95,3 +95,8 @@ pub mod rows_scatter;
 // NVTX3 range shim, so an nsys trace names the pipeline span that launched each
 // kernel (header-only NVTX3; nothing to link against)
 pub mod nvtx;
+
+// In-place finiteness/range statistics: folds NaN count, Inf count and the
+// finite min/max of a tensor into a preallocated device slot, allocating
+// nothing and reading nothing back
+pub mod tensor_assert;

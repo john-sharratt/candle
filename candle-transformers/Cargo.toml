@@ -38,7 +38,11 @@ tokenizers = { workspace = true, optional = true }
 [dev-dependencies]
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }
-tracing-subscriber = { workspace = true }
+# `env-filter` so the gate's subscriber takes its level and targets from
+# RUST_LOG. Without it the only thing expressible is a hard max level, which
+# cannot reach a per-target `debug` — and the elastic boundary reports every
+# move at debug, so a residency collapse becomes unattributable.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 flate2 = "1.1"
 # Direct HTTP client for the IPv6->IPv4 download fallback (test_helpers::hf_get).
 # native-tls matches hf-hub's backend (uses the system cert store).
@@ -51,6 +55,8 @@ cuda = ["candle/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-kernels"]
 # Kernel source-line info for `compute-sanitizer`/`cuda-gdb`. One debugging
 # session, not a default — see `candle-kernels/Cargo.toml`.
 kernel-lineinfo = ["cuda", "candle/kernel-lineinfo", "candle-nn/kernel-lineinfo"]
+# `Tensor::assert` / `QTensor::assert` — see `candle-core/Cargo.toml`.
+tensor-assert = ["cuda", "candle/tensor-assert", "candle-nn/tensor-assert"]
 forbidden_allocations = [
     "candle/forbidden_allocations",
     "candle-nn/forbidden_allocations",

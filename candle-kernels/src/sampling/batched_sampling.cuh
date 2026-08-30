@@ -2859,169 +2859,94 @@ batched_penalty_sampling_kernel(
     // Processing strategy based on penalties and top-k
     // =========================================================
     if constexpr (USE_PENALTIES) {
-        // Always use radix select when top_k is specified to avoid bias
-        // toward low token IDs that threshold-based collection causes
-        bool use_radix = (top_k > 0);
-        
-        if (!use_radix) {
-            num_topk = tiled_sampling_pass<T, THREADS, MAX_K>(
-                my_logits, vocab_size, batch_idx, k,
-                effective_penalties, recent_bitset, dry_cache_ptr,
-                smem.tile_buffer,
-                smem.reduction_max, smem.reduction_idx,
-                global_max, global_sum,
-                smem.topk_vals, smem.topk_idxs, &smem.topk_count,
-                inv_temp
-            );
-            
-            if (tid == 0) {
-                smem.global_max = global_max;
-                smem.global_sum = global_sum;
-                smem.best_idx = smem.reduction_idx[0];
-            }
-            __syncthreads();
-        } else {
-            // =========================================================
-            // OPTIMIZED TOP-K + PENALTY PATH: 5 passes instead of 8
-            // Radix select on RAW LOGITS (no exp), then local softmax
-            // over only the ~k collected candidates in shared memory.
-            // =========================================================
-            
-            // Step 1: Radix select on raw (penalized) logits — 4 vocab passes, NO exp()
-            float logit_threshold = radix_select_logit_threshold<T, THREADS>(
-                my_logits, vocab_size, batch_idx, k,
-                effective_penalties, recent_bitset, dry_cache_ptr,
-                smem.radix_histogram, smem.reduction_max
-            );
-            
-            // Broadcast threshold to ensure all threads agree
-            if (tid == 0) smem.global_max = logit_threshold;
-            __syncthreads();
-            logit_threshold = smem.global_max;
-            
-            // Step 2: Collect + local softmax — 1 vocab pass, probs computed in smem
-            num_topk = collect_and_locally_normalize<T, THREADS>(
-                my_logits, vocab_size, batch_idx, logit_threshold, inv_temp,
-                effective_penalties, recent_bitset, dry_cache_ptr,
-                smem.topk_vals, smem.topk_idxs, k, &smem.topk_count,
-                smem.reduction_max
-            );
-            
-            // Probabilities are already locally normalized (sum to 1.0)
-            if (tid == 0) {
-                smem.global_sum = 1.0f;
-                smem.best_idx = (num_topk > 0) ? smem.topk_idxs[0] : 0;
-            }
-            __syncthreads();
+        // =========================================================
+        // TOP-K + PENALTY PATH: 5 passes instead of 8. Radix select on
+        // RAW LOGITS (no exp), then local softmax over only the ~k
+        // collected candidates in shared memory.
+        //
+        // This runs for `top_k <= 0` as well, where `k` is MAX_K. The
+        // threshold-based collector that used to serve that case gathered on
+        // `prob >= 0.0f` — true for every token — and kept whichever
+        // `atomicAdd` tickets landed under `k`. The vocabulary is walked in
+        // ascending token order, so the first tile claimed every slot and the
+        // candidate set was tokens `0..k`: the byte-level and punctuation range
+        // of a BPE vocabulary. "No top-k limit" therefore meant "only the
+        // lowest token ids", and a decode whose real answer lived above that
+        // window could not emit it — live, the whole response collapsed onto
+        // token 0, `!` in the Qwen vocabulary. Radix select is unbiased, so
+        // `top_k <= 0` now honestly means "the top MAX_K by logit".
+        // =========================================================
+
+        // Step 1: Radix select on raw (penalized) logits — 4 vocab passes, NO exp()
+        float logit_threshold = radix_select_logit_threshold<T, THREADS>(
+            my_logits, vocab_size, batch_idx, k,
+            effective_penalties, recent_bitset, dry_cache_ptr,
+            smem.radix_histogram, smem.reduction_max
+        );
+
+        // Broadcast threshold to ensure all threads agree
+        if (tid == 0) smem.global_max = logit_threshold;
+        __syncthreads();
+        logit_threshold = smem.global_max;
+
+        // Step 2: Collect + local softmax — 1 vocab pass, probs computed in smem
+        num_topk = collect_and_locally_normalize<T, THREADS>(
+            my_logits, vocab_size, batch_idx, logit_threshold, inv_temp,
+            effective_penalties, recent_bitset, dry_cache_ptr,
+            smem.topk_vals, smem.topk_idxs, k, &smem.topk_count,
+            smem.reduction_max
+        );
+
+        // Probabilities are already locally normalized (sum to 1.0)
+        if (tid == 0) {
+            smem.global_sum = 1.0f;
+            smem.best_idx = (num_topk > 0) ? smem.topk_idxs[0] : 0;
         }
+        __syncthreads();
     } else {
         // =========================================================
         // NO-PENALTY PATH
         // =========================================================
         
-        if (top_k > 0) {
-            // =========================================================
-            // OPTIMIZED TOP-K PATH: 5 passes instead of 8, no exp()
-            // Radix select on raw logits, then local softmax over ~k items
-            // =========================================================
-            
-            // Step 1: Radix select on raw logits — 4 vocab passes, NO exp()
-            float logit_threshold = radix_select_logit_threshold<T, THREADS>(
-                my_logits, vocab_size, batch_idx, k,
-                nullptr, recent_bitset, nullptr,  // No penalties, no DRY
-                smem.radix_histogram, smem.reduction_max
-            );
-            
-            // Broadcast threshold
-            if (tid == 0) smem.global_max = logit_threshold;
-            __syncthreads();
-            logit_threshold = smem.global_max;
-            
-            // Step 2: Collect + local softmax — 1 vocab pass
-            num_topk = collect_and_locally_normalize<T, THREADS>(
-                my_logits, vocab_size, batch_idx, logit_threshold, inv_temp,
-                nullptr, recent_bitset, nullptr,
-                smem.topk_vals, smem.topk_idxs, k, &smem.topk_count,
-                smem.reduction_max
-            );
-            
-            // Probabilities are already locally normalized (sum to 1.0)
-            if (tid == 0) {
-                smem.global_sum = 1.0f;
-                smem.best_idx = (num_topk > 0) ? smem.topk_idxs[0] : 0;
-            }
-            __syncthreads();
-            
-        } else {
-            // =========================================================
-            // NO TOP-K: need global max + sum for full softmax
-            // (2-pass approach, then threshold collect)
-            // =========================================================
-            
-            float local_max = -INFINITY;
-            int local_best = 0;
-            
-            if constexpr (std::is_same_v<T, float>) {
-                find_max_vectorized<THREADS>(
-                    my_logits, vocab_size, batch_idx,
-                    nullptr, nullptr,
-                    local_max, local_best
-                );
-            } else {
-                for (int i = tid; i < vocab_size; i += THREADS) {
-                    float logit = load_as_float(my_logits, i);
-                    int is_better = (int)(logit > local_max);
-                    local_max = fmaxf(local_max, logit);
-                    local_best = is_better * i + (1 - is_better) * local_best;
-                }
-            }
-            
-            smem.reduction_max[tid] = local_max;
-            smem.reduction_idx[tid] = local_best;
-            __syncthreads();
-            
-            block_reduce_max_with_idx<THREADS>(
-                smem.reduction_max, smem.reduction_idx,
-                smem.global_max, smem.best_idx
-            );
-            __syncthreads();
-            
-            global_max = smem.global_max;
-            
-            float local_sum = 0.f;
-            if constexpr (std::is_same_v<T, float>) {
-                local_sum = compute_softmax_sum_vectorized<THREADS>(
-                    my_logits, vocab_size, batch_idx,
-                    nullptr, nullptr,
-                    global_max, inv_temp
-                );
-            } else {
-                for (int i = tid; i < vocab_size; i += THREADS) {
-                    float logit = load_as_float(my_logits, i);
-                    float prob = fast_exp::exp<float, fast_exp::Softmax>((logit - global_max) * inv_temp);
-                    local_sum += prob;
-                }
-            }
-            
-            global_sum = block_reduce_sum<THREADS>(local_sum, smem.reduction_max);
-            if (tid == 0) {
-                smem.global_max = global_max;
-                smem.global_sum = global_sum;
-            }
-            __syncthreads();
-            
-            // Collect all tokens above threshold
-            float prob_threshold = 0.0f;
-            float inv_sum = 1.0f / global_sum;
-            
-            num_topk = collect_topk_tokens_typed<T, THREADS>(
-                my_logits, vocab_size, batch_idx, prob_threshold,
-                global_max, inv_temp, inv_sum,
-                nullptr, recent_bitset,
-                smem.topk_vals, smem.topk_idxs, k,
-                &smem.topk_count
-            );
+        // =========================================================
+        // TOP-K PATH: 5 passes instead of 8, no exp(). Radix select on
+        // raw logits, then local softmax over ~k items.
+        //
+        // As on the penalty side above, this runs for `top_k <= 0` too,
+        // where `k` is MAX_K. The global-softmax-then-threshold-collect
+        // branch that used to serve that case gathered on `prob >= 0.0f`,
+        // which every token satisfies, and kept whichever `atomicAdd`
+        // tickets landed under `k` — the vocabulary is walked in ascending
+        // token order, so the candidate set was tokens `0..k`. Sampling
+        // could then only ever return a low token id.
+        // =========================================================
+
+        // Step 1: Radix select on raw logits — 4 vocab passes, NO exp()
+        float logit_threshold = radix_select_logit_threshold<T, THREADS>(
+            my_logits, vocab_size, batch_idx, k,
+            nullptr, recent_bitset, nullptr,  // No penalties, no DRY
+            smem.radix_histogram, smem.reduction_max
+        );
+
+        // Broadcast threshold
+        if (tid == 0) smem.global_max = logit_threshold;
+        __syncthreads();
+        logit_threshold = smem.global_max;
+
+        // Step 2: Collect + local softmax — 1 vocab pass
+        num_topk = collect_and_locally_normalize<T, THREADS>(
+            my_logits, vocab_size, batch_idx, logit_threshold, inv_temp,
+            nullptr, recent_bitset, nullptr,
+            smem.topk_vals, smem.topk_idxs, k, &smem.topk_count,
+            smem.reduction_max
+        );
+
+        // Probabilities are already locally normalized (sum to 1.0)
+        if (tid == 0) {
+            smem.global_sum = 1.0f;
+            smem.best_idx = (num_topk > 0) ? smem.topk_idxs[0] : 0;
         }
+        __syncthreads();
     }
     
     const float inv_sum = 1.0f / smem.global_sum;
@@ -3083,6 +3008,87 @@ batched_penalty_sampling_kernel(
 // ============================================================================
 // Kernel Launch Wrappers with Compile-Time Dispatch
 // ============================================================================
+
+/// Raise a sampling kernel's dynamic shared-memory ceiling to exactly what this
+/// vocabulary needs — and ONLY when the default ceiling is too small.
+///
+/// The recent-token bitset is dynamic and VOCAB-SIZED — `ceil(vocab/32)*4`
+/// bytes — and the kernel's static block is ~19 KiB once the DRY cache is in
+/// it. A block gets 48 KiB by default, so the pair crosses the ceiling at a
+/// vocabulary of roughly 240,000: measured, a 28.9 KiB bitset launches and a
+/// 29.3 KiB one does not. Qwen3.6-35B-A3B's 248,320-token vocabulary is past
+/// that line, and the rejection was invisible — this translation unit's entry
+/// points return `void`, so the caller kept its zero-initialised output buffer
+/// and every row "sampled" token 0, which is `!` in the Qwen vocabularies.
+///
+/// **Ask for the need, not the device maximum.** Opting into the full allowance
+/// pushes the kernel past the 48 KiB line unconditionally, and crossing it makes
+/// the driver shift the SM's L1/shared carveout toward shared memory. That guts
+/// L1 for a kernel whose whole job is scanning a 248,320-entry vocabulary, and
+/// it is charged on every sampling call — including the small-vocabulary ones
+/// that never needed a byte of it. Measured on the 3.6-35B forward gate: bulk
+/// throughput fell from ~6,900 t/s to ~2,150, a 3.3x loss, restored in full by
+/// sizing the request. A launch that already fits keeps the default carveout and
+/// its L1.
+///
+/// The stored high-water mark only ever GROWS, so a small-vocabulary caller can
+/// never lower a ceiling a large-vocabulary launch on another thread is relying
+/// on — the raise is monotonic, never an assignment.
+///
+/// The mark is per-`T`, not per-device: a process driving two GPUs would treat
+/// a raise applied on one as applied on both. Every deployment here is one
+/// device per process, and widening it to a `device -> bytes` map is the fix if
+/// that stops being true.
+template <typename T>
+static inline void raise_dynamic_smem_for(size_t dynamic_bytes) {
+    static size_t applied = 0;
+    if (dynamic_bytes <= applied) {
+        return;
+    }
+
+    const void* kernels[] = {
+        (const void*)batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, true, true>,
+        (const void*)batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, true, false>,
+        (const void*)batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, false, true>,
+        (const void*)batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, false, false>,
+        (const void*)batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, false, false, true>,
+        (const void*)batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, false, false, false>,
+    };
+
+    // Per-block default, below which the carveout is left alone entirely.
+    constexpr size_t DEFAULT_BLOCK_SMEM = 48 * 1024;
+    // **Every variant that needed raising, or the mark does not move.**
+    //
+    // Recording the high-water mark when merely SOME variant was raised is
+    // worse than not recording it: the early-out at the top then skips the
+    // whole function, so a variant whose `cudaFuncSetAttribute` failed is never
+    // retried. Its launch is rejected for exceeding the block ceiling, the
+    // `void` entry point reports nothing, and the caller reads back the
+    // `output_tokens` it passed in — which is token 0 for every sequence. That
+    // is the silent degenerate-decode signature this function exists to
+    // prevent, reintroduced by its own bookkeeping.
+    bool all_ok = true;
+    for (const void* k : kernels) {
+        cudaFuncAttributes attrs{};
+        if (cudaFuncGetAttributes(&attrs, k) != cudaSuccess) {
+            all_ok = false;
+            continue;
+        }
+        if (attrs.sharedSizeBytes + dynamic_bytes <= DEFAULT_BLOCK_SMEM) {
+            continue; // Fits as-is; touching the attribute would only cost L1.
+        }
+        // A device that declines leaves the previous limit in place; the launch
+        // then fails as it did before rather than reading garbage.
+        if (cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(dynamic_bytes))
+            != cudaSuccess) {
+            all_ok = false;
+        }
+    }
+    if (all_ok) {
+        applied = dynamic_bytes;
+    }
+}
 
 // Internal dispatch helper - selects kernel variant based on runtime flags
 template <typename T>
@@ -3152,7 +3158,13 @@ inline void dispatch_batched_sampling(
     // USE_DRY is set to true when penalties are enabled AND dry_multiplier != 0
     // This allows eliminating 4KB shared memory when DRY is not used
     const bool use_dry = use_penalties && (dry_multiplier != 0.0f);
-    
+
+    // A large vocabulary's recent-token bitset does not fit under the default
+    // 48 KiB block ceiling alongside this kernel's static block; opt into the
+    // device maximum before any launch can be rejected for it.
+    // Raise the ceiling only if this vocabulary's bitset does not already fit.
+    raise_dynamic_smem_for<T>(bitset_bytes);
+
     if (use_penalties && use_dry && use_top_p) {
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, true, true>
             <<<grid, block, bitset_bytes, stream>>>(

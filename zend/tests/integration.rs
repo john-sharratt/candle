@@ -10,6 +10,14 @@
 ///
 /// The test is gated on the `cuda` feature because it requires a real GPU
 /// and the GGUF model file on disk.  It is skipped in CPU-only CI.
+///
+/// **It is also `#[ignore]`d, and the `cuda` gate is not a substitute for that.**
+/// A feature gate says "this build can compile it"; it says nothing about
+/// whether the machine has a 22.7 GB checkpoint or the tens of minutes the boot
+/// takes. Left un-ignored it ran in the default `--workspace --features cuda`
+/// suite and failed on time alone — a red suite that says nothing about the code
+/// under test, which is precisely what every other model-loading test in this
+/// repo avoids by stating its cost in an `#[ignore]` message.
 #[cfg(feature = "cuda")]
 mod conversation {
     use std::sync::Arc;
@@ -21,7 +29,17 @@ mod conversation {
     use zend::session::{StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
-    const TIMEOUT_SECS: u64 = 600;
+    /// **Thirty minutes, because the work is a daemon boot and not a forward.**
+    ///
+    /// This was 600 s and that is not enough on a 16 GB card: measured, the run
+    /// reached ten minutes still healthy — model loaded, waves completing,
+    /// boundary moves succeeding, hot→warm demotion firing — and was killed
+    /// mid-ingest with `backlog=658tok`. Nothing was wrong; the budget was for a
+    /// different machine. What the timeout has to cover is a 22.7 GB MoE
+    /// checkpoint read from disk, a 93-tool catalog, and the collection prefill
+    /// the session does before it answers anything, on a card that streams its
+    /// experts.
+    const TIMEOUT_SECS: u64 = 1800;
 
     /// Submits immediately after `start_loading()` so the stream must carry
     /// status events while the inference engine initialises.
@@ -37,6 +55,10 @@ mod conversation {
     }
 
     #[test]
+    #[ignore = "Tier 3: boots a whole daemon and loads the workspace's GGUF \
+                (Qwen3.6-35B-A3B, 22.7 GB) — tens of minutes on a 16 GB card, and it \
+                needs that checkpoint on disk. Run with: \
+                cargo test -p zend --test integration --features cuda -- --ignored --nocapture"]
     fn streams_status_messages_then_answer() {
         init_tracing();
 

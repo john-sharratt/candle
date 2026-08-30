@@ -34,7 +34,7 @@ impl LogitsProcessor {
         top_p: Option<f64>,
         top_k: Option<usize>,
     ) -> Self {
-        let temperature = temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
+        let temperature = temperature.filter(|&v| v >= 1e-7);
         let sampling = match temperature {
             None => Sampling::ArgMax,
             Some(temperature) => match top_p {

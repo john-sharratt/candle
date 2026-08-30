@@ -24,6 +24,9 @@ pub(super) fn qwen2_0_5b() -> ModelSpec {
         model_filename: "qwen2-0_5b-instruct-q4_0.gguf".into(),
         model_bytes: 352_969_408,
         tokenizer_repo: "Qwen/Qwen2-0.5B-Instruct".into(),
+        // Unpinned: no revision verified against this checkpoint's own token
+        // table. The load-time check against it guards the pairing meanwhile.
+        tokenizer_rev: String::new(),
         default_system_prompt: "You are a helpful assistant.".into(),
         max_seq_len: 4096,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2"),

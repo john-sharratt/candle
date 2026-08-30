@@ -49,6 +49,9 @@ mod gpu_chunks;
 mod gpu_chunks;
 #[cfg(all(test, feature = "cuda"))]
 mod gpu_test_lock;
+/// The growth direction's decision, split out so a trajectory can be run without
+/// a device — see `docs/vram_partition_behavioural_tests.md`.
+pub mod growth_policy;
 #[cfg(feature = "cuda")]
 pub mod guard;
 mod head_gids;
@@ -65,6 +68,9 @@ mod sequence_ops;
 mod size_class;
 #[cfg(feature = "cuda")]
 pub(crate) mod slot_state_arena;
+/// Where the tier may stand and what the KV side may reach. Pure arithmetic, and
+/// outside the `cuda` gate so it can be exercised on any machine.
+pub mod span_geometry;
 mod types;
 // Instrumentation for the bump arenas' high-water marks: its only caller is
 // `bump_arena`, so it shares that module's gating.
@@ -131,17 +137,18 @@ pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use bump_arena::{
     begin_forward, begin_wave, end_wave_transient, persistence_domain_stats, plan_wave_transient,
-    wave_domain_stats, BumpRange, ForwardOpen, Generation as WaveGeneration, KV_ARENA_MID_WAVE,
+    wave_domain_stats, wave_is_live, BumpRange, ForwardOpen, Generation as WaveGeneration,
+    KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
 pub use guard::{expect_kv_range, expect_kv_range_in};
 #[cfg(feature = "cuda")]
 pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
-    freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas, region_stats,
-    set_ground_broker, set_weight_floor, span_end, span_layout, span_region_refusal, spare_tally,
-    weight_capacity_bytes, weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion,
-    REGION_BYTES,
+    freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas,
+    reclaim_load_headroom, region_stats, set_ground_broker, set_weight_floor, span_end,
+    span_layout, span_region_refusal, spare_tally, weight_capacity_bytes, weight_floor_after,
+    RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;

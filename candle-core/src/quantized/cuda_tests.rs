@@ -1708,7 +1708,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
             "CPU block: d={:?}, dmin={:?}",
             cpu_block[0].d, cpu_block[0].dmin
         );
-        println!("CPU scales[0..16]: {:02x?}", &cpu_block[0].scales);
+        println!("CPU scales[0..16]: {:02x?}", cpu_block[0].scales);
 
         // GPU quantize the SAME raw data
         let test_data_gpu = dev.memcpy_stod(&test_data)?;
@@ -1793,7 +1793,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
             "CPU block: d={:?}, dmin={:?}",
             cpu_block[0].d, cpu_block[0].dmin
         );
-        println!("CPU scales[0..12]: {:?}", &cpu_block[0].scales);
+        println!("CPU scales[0..12]: {:?}", cpu_block[0].scales);
 
         // Upload baseline to GPU and quantize
         let baseline_gpu = dev.memcpy_stod(&baseline)?;
@@ -3148,6 +3148,7 @@ fn ko_gpu_quantize_dequant_matches_cpu() -> Result<()> {
         .collect();
     for dtype in [
         GgmlDType::Q2_KO,
+        GgmlDType::Q3_KO,
         GgmlDType::Q4_KO,
         GgmlDType::Q5_KO,
         GgmlDType::Q6_KO,
@@ -3442,8 +3443,17 @@ fn dense_int8_narrow_output_matches_f32_bitwise() -> Result<()> {
     let nrows = 512usize; // N
     let mut rng = rand::rng();
 
-    // Every KO format the dense table carries, with its requant parameters.
-    let formats: [(GgmlDType, (i32, usize, usize)); 3] = [
+    // Every affine KO format the dense table carries, with its requant parameters.
+    //
+    // **The narrow widths are here because their absence hid a real defect.** This sweep is the
+    // only gate on `dense_kernels_int8_m2`, and that table was reached by a literal
+    // `kernel_row <= 19` — so when a format landed past 19 it silently fell back to mode-1 and
+    // no test noticed, because no test ran a format past 19. Covering every row is what makes
+    // this a gate rather than a spot check. MXFP4_KO is absent for a different reason: it is not
+    // affine, so `requant_ko_per128` cannot produce it.
+    let formats: [(GgmlDType, (i32, usize, usize)); 5] = [
+        (GgmlDType::Q2_KO, (3, 256, 0)),
+        (GgmlDType::Q3_KO, (7, 256, 128)),
         (GgmlDType::Q4_KO, (15, 0, 0)),
         (GgmlDType::Q5_KO, (31, 0, 128)),
         (GgmlDType::Q6_KO, (63, 256, 0)),
@@ -3529,8 +3539,23 @@ fn qkv_segmented_narrow_output_matches_f32_bitwise() -> Result<()> {
         (256, GgmlDType::Q6_KO, (63, 256, 0)),
         (256, GgmlDType::Q6_KO, (63, 256, 0)),
     ];
+    // The narrow twins, in both dispatch paths. `ko_fmt_code` appended them as codes 4 and 5,
+    // so they sit past every index the two configurations above reach — and the mixed-format
+    // kernel's `default` arm does not fault on an unknown code, it leaves that segment's output
+    // columns **unwritten**. A wrong or missing row here is therefore silence, not a crash,
+    // which is precisely what a bitwise gate is for.
+    let uniform_narrow: [(usize, GgmlDType, (i32, usize, usize)); 3] = [
+        (1024, GgmlDType::Q3_KO, (7, 256, 128)),
+        (256, GgmlDType::Q3_KO, (7, 256, 128)),
+        (256, GgmlDType::Q3_KO, (7, 256, 128)),
+    ];
+    let mixed_narrow: [(usize, GgmlDType, (i32, usize, usize)); 3] = [
+        (1024, GgmlDType::Q3_KO, (7, 256, 128)),
+        (256, GgmlDType::Q2_KO, (3, 256, 0)),
+        (256, GgmlDType::Q4_KO, (15, 0, 0)),
+    ];
 
-    for dims in [&uniform, &mixed] {
+    for dims in [&uniform, &mixed, &uniform_narrow, &mixed_narrow] {
         for &m in &[8usize, 512] {
             let act: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0f32..1.0)).collect();
             let op = quantize_acts_q8a128_test(&dev, &act, m, k)?;
@@ -3836,6 +3861,410 @@ fn q2_ko_int8_grouped_matches_f32_ref() -> Result<()> {
     assert!(
         rel < 0.03,
         "Q2_KO int8 grouped diverged (rel_l2 = {rel:.5})"
+    );
+    Ok(())
+}
+
+/// A repack that fails part-way must not free the destination it was lent.
+///
+/// **The highest-consequence shape of bug this file can have.** `repack_ko_into` takes an
+/// optional `dst`, and on the load path that is an address inside the device reservation — the
+/// dense block. `dest_slice` wraps it with `upgrade_device_ptr`, which produces a `CudaSlice`
+/// that *owns* its pointer, so anything that drops that slice calls `cuMemFreeAsync` on memory
+/// the caller does not own. Every weight placed after it would then be sitting on ground the
+/// pool believes is free.
+///
+/// For a long time that was safe by accident: there was no `?` between `dest_slice` and the
+/// constructor, so the slice could not be dropped. Banding the repack added two fallible steps
+/// inside that window, and nothing failed — because nothing exercised the window. This does.
+///
+/// The provocation is an `F16` source: it has no `QType`, so `dequantize_f32_into` refuses on
+/// the first band, which is *after* `dest_slice` and before the destination is written. The
+/// detector is recycling pressure — a freed block goes back to the CUDA pool, and a same-sized
+/// request immediately afterwards is very likely to be handed it, so a lease that was wrongly
+/// freed shows up as a clobbered sentinel rather than as a silent success.
+#[test]
+fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
+    use crate::cuda_backend::wave_provenance::LeaseOrigin;
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let stream = dev.cuda_stream();
+    let (nrows, ncols) = (2048usize, 2048usize);
+    let shape = crate::Shape::from((nrows, ncols));
+
+    // Stand-in for the dense block: memory this test owns, which the repack is lent and must
+    // return untouched. Big enough that the allocator will recycle it on a matching request.
+    let dst_len = crate::quantized::cuda::ko_repacked_bytes(&shape, GgmlDType::Q4_KO)?;
+    let sentinel = vec![0xA5u8; dst_len];
+    let mut lease = unsafe { dev.alloc::<u8>(dst_len)? };
+    dev.memcpy_htod(&sentinel, &mut lease)?;
+    let lease_ptr = {
+        let (p, _g) = lease.device_ptr(&stream);
+        p
+    };
+
+    // An F16 source: tileable shape, so it reaches the band loop, and no `QType`, so the loop's
+    // first dequantize refuses.
+    let w = crate::Tensor::zeros((nrows, ncols), crate::DType::F32, &device)?;
+    let src = crate::quantized::QTensor::quantize(&w, GgmlDType::F16)?;
+    let storage = match src.storage() {
+        crate::quantized::QStorage::Cuda(s) => s,
+        _ => panic!("expected CUDA storage"),
+    };
+
+    let err = storage
+        .repack_ko_into(
+            &shape,
+            GgmlDType::Q4_KO,
+            Some((lease_ptr, LeaseOrigin::Foreign)),
+        )
+        .expect_err("an F16 source has no QType and must not repack");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsupported dtype"),
+        "expected the failure to come from the band loop's dequantize, got: {msg}"
+    );
+
+    // Recycling pressure. If the lease was freed, this request is the one that takes it.
+    let clobber = vec![0x5Au8; dst_len];
+    let mut probe = unsafe { dev.alloc::<u8>(dst_len)? };
+    dev.memcpy_htod(&clobber, &mut probe)?;
+    dev.synchronize()?;
+
+    let back: Vec<u8> = dev
+        .memcpy_dtov(&lease.slice(..))
+        .map_err(crate::Error::wrap)?;
+    assert_eq!(
+        back, sentinel,
+        "the failed repack freed the destination it was lent — on the load path that address \
+         is inside the device reservation, and the pool has just handed it to someone else"
+    );
+    Ok(())
+}
+
+/// The KO repack's scratch is a bounded band, not the whole tensor — and the bytes are the same.
+///
+/// **Two assertions, and the first is the point of the change.** `repack_ko` is
+/// dequantize-then-requantize composed through an f32 buffer, and that buffer used to be the
+/// whole tensor: 4,850 MiB for the 27B's `[248320, 5120]` head. Not merely large but
+/// *permanent* — `dense_span` sized the span's `cuMemAddressReserve` smaller by exactly that
+/// figure, and a reservation cannot grow, so a buffer alive for one tensor during load cost a
+/// third of the card until the process exited. Repacking a row band at a time caps the
+/// intermediate at `REPACK_BAND_BYTES` whatever the tensor's size.
+///
+/// So this measures free VRAM across the repack and requires the dip to stay near the twin.
+/// The tensor is deliberately shaped so a whole-tensor f32 (256 MiB) dwarfs both the twin
+/// (34 MiB) and the band (48 MiB) — a regression that reinstated the old buffer could not hide
+/// inside the bound, and one that merely enlarged the band would have to grow it fivefold.
+///
+/// The second assertion is that the output did not change: byte-identical to the CPU codec
+/// over the same dequantized source. Banding rearranges *when* each chunk is written and
+/// scatters the results into place, which is exactly the kind of change that can produce a
+/// correctly-sized, plausibly-valued, wrong tensor — so the comparison is on bytes.
+#[test]
+fn ko_repack_scratch_is_a_bounded_band() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    // Big enough that a whole-tensor f32 dwarfs both the source and the twin, so the bound
+    // below is not competing with allocator granularity: 8192×8192 is 256 MiB of f32 against a
+    // 37.7 MiB Q4_K source and a 35.7 MiB Q4_KO twin.
+    let (nrows, ncols) = (8192usize, 8192usize);
+    let n = nrows * ncols;
+    let f32_bytes = n * 4;
+
+    let device = crate::Device::Cuda(dev.clone());
+    let w: Vec<f32> = (0..n).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
+    let w_t = crate::Tensor::from_vec(w, (nrows, ncols), &device)?;
+    let src = crate::quantized::QTensor::quantize(&w_t, GgmlDType::Q4_K)?;
+    let shape = src.shape().clone();
+    let storage = match src.storage() {
+        crate::quantized::QStorage::Cuda(s) => s,
+        _ => panic!("expected CUDA storage"),
+    };
+
+    dev.cuda_stream()
+        .synchronize()
+        .map_err(crate::Error::wrap)?;
+    let (free_before, _) = crate::quantized::get_vram_info()?;
+    let twin = storage.repack_ko(&shape, GgmlDType::Q4_KO)?;
+    dev.cuda_stream()
+        .synchronize()
+        .map_err(crate::Error::wrap)?;
+    let (free_after, _) = crate::quantized::get_vram_info()?;
+
+    // What the device is *entitled* to hold across the repack: the twin it produced, plus the
+    // f32 band and the KO band that produced it. The source was already resident before the
+    // measurement, so it is not in the delta. Slack covers CUDA pool granularity, which rounds
+    // allocations up generously.
+    const SLACK: usize = 2 * crate::quantized::cuda::REPACK_BAND_BYTES;
+    let twin_bytes = crate::quantized::cuda::ko_repacked_bytes(&shape, GgmlDType::Q4_KO)?;
+    let used = free_before.saturating_sub(free_after);
+    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "repack VRAM delta {:.1} MiB | twin {:.1} | an on-device f32 would add {:.1}",
+        mib(used),
+        mib(twin_bytes),
+        mib(f32_bytes),
+    );
+    assert!(
+        used <= twin_bytes + SLACK,
+        "repack held {:.1} MiB of VRAM; the twin is {:.1} MiB and the f32 intermediate would \
+         be {:.1} MiB. The scratch is back on the card — and the span concedes that much \
+         permanently, because `cuMemAddressReserve` sizes it once and cannot grow.",
+        mib(used),
+        mib(twin_bytes),
+        mib(f32_bytes),
+    );
+
+    // And the twin is still what the CPU codec produces from the same dequantized source —
+    // byte for byte. Moving where the intermediate lives must not move a single output bit,
+    // and only a byte comparison says so; a size check would pass on any kernel at all.
+    assert_eq!(twin.dtype(), GgmlDType::Q4_KO);
+    let got: Vec<u8> = twin.data()?;
+    let deq = storage.dequantize(n)?;
+    let src_f32: Vec<f32> = dev
+        .memcpy_dtov(deq.as_cuda_slice::<f32>()?)
+        .map_err(crate::Error::wrap)?;
+    let want = crate::quantized::ko_quant::quantize_ko(&src_f32, nrows, ncols, GgmlDType::Q4_KO);
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "twin byte length changed: {} vs {}",
+        got.len(),
+        want.len()
+    );
+    assert_eq!(
+        got, want,
+        "the host-mapped intermediate changed the repack's output bytes"
+    );
+    Ok(())
+}
+
+/// Every affine KO twin has a fused-QKV format code, and every code is in the kernel's range.
+///
+/// **The failure mode here is silence, which is why it needs its own test.** `ko_fmt_code`
+/// turns a dtype into the `fmt` index the segmented kernel switches on, and that switch's
+/// `default` arm cannot fault — it falls through, leaving that segment's output columns
+/// unwritten. A caller sees a completed launch and plausible numbers for the other two
+/// segments. So an unmapped dtype must be refused in Rust, before a code is ever produced, and
+/// a mapped one must land inside `QKV_FMT_COUNT`.
+///
+/// `MXFP4_KO` is the one KO format deliberately without a code: it is not affine, its per-sub
+/// scale fold is a different kernel, and the fused-QKV path never carries it.
+#[test]
+fn every_affine_ko_twin_has_a_qkv_format_code() -> Result<()> {
+    // Must equal `QKV_FMT_COUNT` in `candle-kernels/src/quantized/impl/qkv_segmented_f32.cu`,
+    // which bounds both the `kuni` dispatch table and the launcher's range check.
+    const QKV_FMT_COUNT: i32 = 6;
+
+    let mut codes = Vec::new();
+    for &dtype in crate::quantized::ko_quant::ALL_KO_DTYPES {
+        let got = super::ko_fmt_code(dtype);
+        if dtype == GgmlDType::MXFP4_KO {
+            assert!(
+                got.is_err(),
+                "MXFP4_KO is not affine and the fused-QKV path does not carry it"
+            );
+            continue;
+        }
+        let code = got.map_err(|e| {
+            crate::Error::Msg(format!(
+                "{dtype:?} has no fused-QKV format code, so a q/k/v projection at that width \
+                 fails the whole model: {e}"
+            ))
+        })?;
+        assert!(
+            (0..QKV_FMT_COUNT).contains(&code),
+            "{dtype:?} maps to fmt {code}, outside the kernel's 0..{QKV_FMT_COUNT} switch — \
+             the default arm leaves that segment's columns unwritten"
+        );
+        codes.push(code);
+    }
+
+    // Distinct codes: two dtypes sharing one index is a segment silently multiplied by another
+    // format's weights, which produces plausible numbers rather than an error.
+    let n = codes.len();
+    codes.sort_unstable();
+    codes.dedup();
+    assert_eq!(
+        n,
+        codes.len(),
+        "two KO dtypes share a fused-QKV format code"
+    );
+
+    // A non-KO dtype must be refused rather than coerced onto some default index.
+    for d in [GgmlDType::Q4_K, GgmlDType::Q8_0, GgmlDType::F16] {
+        assert!(
+            super::ko_fmt_code(d).is_err(),
+            "{d:?} is not a KO twin and must not receive a format code"
+        );
+    }
+    Ok(())
+}
+
+/// Every KO twin loads from GGUF bytes, and the loaded tensor is byte-identical to what was
+/// written.
+///
+/// **The gap this closes was a hard refusal, not a slow path.** `qtensor_from_ggml`'s KO arm
+/// listed the formats by name and its fallback is `bail!`, so a prepared GGUF carrying a format
+/// missing from that list could not be opened at all — and `Q2_KO` was missing from the day it
+/// was added, because nothing here swept the set. Listing the dtypes in a test is no better
+/// than listing them in the loader unless the list is derived, so this sweeps every `is_ko()`
+/// dtype and skips only what it cannot synthesise.
+///
+/// The byte comparison matters as much as the acceptance: this path is the one that must copy
+/// straight to VRAM with **no** `MATRIX_ROW_PADDING` and no reinterpret, so a tensor that
+/// loaded but grew a padding tail would still be wrong for the KO matmul, which reads chunks.
+#[test]
+fn every_ko_twin_loads_from_ggml_bytes() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let (nrows, ncols) = (64usize, 256usize);
+    let w: Vec<f32> = (0..nrows * ncols)
+        .map(|i| ((i % 251) as f32 - 125.0) * 0.004)
+        .collect();
+
+    let mut covered = 0usize;
+    for &dtype in crate::quantized::ko_quant::ALL_KO_DTYPES {
+        // MXFP4_KO is not affine — `quantize_ko` cannot produce it, and its GGUF form comes
+        // from `mxfp4_native_to_ko_gpu_chunk` over native MXFP4 blocks instead.
+        let bytes = if dtype == GgmlDType::MXFP4_KO {
+            crate::quantized::ko_quant::mxfp4_ko_to_gpu_chunk(
+                &crate::quantized::ko_quant::quantize_mxfp4_ko(&w, nrows, ncols),
+                nrows,
+                ncols,
+            )
+        } else {
+            crate::quantized::ko_quant::quantize_ko(&w, nrows, ncols, dtype)
+        };
+
+        // What the GGUF header would compute for this tensor must equal the bytes we hold, or
+        // the loader slices the wrong length out of the file.
+        let expect = nrows * ncols / dtype.block_size() * dtype.type_size();
+        assert_eq!(
+            bytes.len(),
+            expect,
+            "{dtype:?}: type_size accounting disagrees with the emitted chunk"
+        );
+
+        let qt = crate::quantized::ggml_file::qtensor_from_ggml(
+            dtype,
+            &bytes,
+            vec![nrows, ncols],
+            &device,
+        )
+        .map_err(|e| crate::Error::Msg(format!("{dtype:?} failed to load from GGUF bytes: {e}")))?;
+        assert_eq!(qt.dtype(), dtype, "{dtype:?} loaded as another dtype");
+        assert_eq!(
+            qt.storage_size_in_bytes(),
+            bytes.len(),
+            "{dtype:?}: the KO load path must not pad — the matmul reads whole chunks"
+        );
+        let back = qt.data()?;
+        assert_eq!(
+            &back[..],
+            &bytes[..],
+            "{dtype:?} round trip is not byte-exact"
+        );
+        covered += 1;
+    }
+    assert_eq!(
+        covered,
+        crate::quantized::ko_quant::ALL_KO_DTYPES.len(),
+        "every KO dtype must be exercised"
+    );
+    Ok(())
+}
+
+/// Q3_KO (3-bit affine KO twin) int8 grouped GEMM correctness, the same construction as
+/// [`q2_ko_int8_grouped_matches_f32_ref`]: the `q3_ko_int8_f32_grouped` kernel and its
+/// crumb+hi unpack (`loader/q3_KO.cuh`) must reproduce a CPU f32 reference matmul over the
+/// SAME weights, so the 3-bit weight is identical on both sides and only the int8 activation
+/// quant can differ.
+///
+/// **This is the test that catches the one thing Q3_KO could plausibly get wrong.** Its value
+/// is split across two planes at two different shifts, and the crumb plane alone reconstructs a
+/// *plausible* weight — every value simply mod 4. A dropped or mis-shifted `hi` bit therefore
+/// does not produce NaN or garbage; it produces a smoothly wrong matmul that a tolerance check
+/// on the output could easily pass. Eight levels against four moves `rel_l2` from ~1% to ~15%,
+/// far outside the bound below, which is why the bound is tight rather than generous.
+#[test]
+fn q3_ko_int8_grouped_matches_f32_ref() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let nrows = 256usize; // N (output features, mult of 32)
+    let ncols = 512usize; // K (input features, mult of 128)
+    let expert_batches = [1usize, 8, 16, 24];
+    let total_batch: usize = expert_batches.iter().sum();
+    let mut rng = rand::rng();
+    let stream = dev.cuda_stream();
+
+    // Per-expert Q3_KO weights (CPU codec == GPU layout) + their exact f32 dequant.
+    let mut weight_ptrs: Vec<u64> = Vec::new();
+    let mut _storages = Vec::new(); // keep device buffers alive for the launch
+    let mut ref_w: Vec<Vec<f32>> = Vec::new();
+    for _ in 0..expert_batches.len() {
+        let w: Vec<f32> = (0..nrows * ncols)
+            .map(|_| rng.random_range(-0.5f32..0.5))
+            .collect();
+        let q3ko = crate::quantized::ko_quant::quantize_ko(&w, nrows, ncols, GgmlDType::Q3_KO);
+        ref_w.push(crate::quantized::ko_quant::dequant_ko(
+            &q3ko,
+            nrows,
+            ncols,
+            GgmlDType::Q3_KO,
+        ));
+        let slice = dev.memcpy_stod(&q3ko)?;
+        let p = {
+            let (p, _g) = slice.device_ptr(&stream);
+            p // guard drops here; the pointer stays valid while `slice` lives in `_storages`
+        };
+        weight_ptrs.push(p);
+        _storages.push(slice);
+    }
+
+    let act_data: Vec<f32> = (0..total_batch * ncols)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
+    let q8a128 = quantize_acts_q8a128_test(&dev, &act_data, total_batch, ncols)?;
+    let mut expert_offsets: Vec<i32> = vec![0];
+    for &b in &expert_batches {
+        expert_offsets.push(expert_offsets.last().unwrap() + b as i32);
+    }
+
+    let int8 = grouped_qmatmul(
+        DynamicTensor::Int8(&q8a128),
+        &weight_ptrs,
+        GgmlDType::Q3_KO,
+        nrows,
+        &expert_offsets,
+        &dev,
+        Backing::Owned,
+    )?;
+    let vi = read_f32_tensor(&dev, &int8)?; // [total_batch, nrows] row-major
+
+    // CPU f32 reference over the same dequantized weights (raw f32 activations).
+    let mut vref = vec![0f32; total_batch * nrows];
+    for (e, _) in expert_batches.iter().enumerate() {
+        let (lo, hi) = (expert_offsets[e] as usize, expert_offsets[e + 1] as usize);
+        for t in lo..hi {
+            for n in 0..nrows {
+                let mut acc = 0f32;
+                for k in 0..ncols {
+                    acc += ref_w[e][n * ncols + k] * act_data[t * ncols + k];
+                }
+                vref[t * nrows + n] = acc;
+            }
+        }
+    }
+    assert_eq!(vi.len(), vref.len());
+    assert!(
+        vi.iter().all(|x| x.is_finite()),
+        "Q3_KO int8 grouped produced non-finite output (broken unpack/fold)"
+    );
+    let rel = rel_l2(&vi, &vref);
+    println!("Q3_KO int8 grouped vs f32 ref: rel_l2 = {rel:.5}");
+    assert!(
+        rel < 0.03,
+        "Q3_KO int8 grouped diverged (rel_l2 = {rel:.5}) — a dropped `hi` bit reads as ~0.15"
     );
     Ok(())
 }
@@ -5744,7 +6173,12 @@ fn requant_ko_per128(
     crumb_bytes: usize,
     hi_bytes: usize,
 ) -> Vec<u8> {
+    // The triple is a format *name* rather than a parameter set: `ko_quant::KoPlanes` owns the
+    // plane widths and shifts, and this only maps back to the dtype it describes. Kept because
+    // fifteen call sites spell their format this way; new ones should pass the dtype.
     let dtype = match (maxq, crumb_bytes, hi_bytes) {
+        (3, 256, 0) => GgmlDType::Q2_KO,
+        (7, 256, 128) => GgmlDType::Q3_KO,
         (15, 0, 0) => GgmlDType::Q4_KO,
         (31, 0, 128) => GgmlDType::Q5_KO,
         (63, 256, 0) => GgmlDType::Q6_KO,

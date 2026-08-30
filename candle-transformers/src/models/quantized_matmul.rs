@@ -1,8 +1,6 @@
 #[cfg(feature = "cuda")]
 use candle::quantized::ko_quant::ko_tileable;
-#[cfg(feature = "cuda")]
-use candle::quantized::GgmlDType;
-use candle::quantized::{Int8Mode, QTensor};
+use candle::quantized::{GgmlDType, Int8Mode, QTensor};
 use candle::{DType, Module, Result, Tensor};
 
 use crate::models::profile::{pipeline_record, profile_now};
@@ -23,12 +21,13 @@ use crate::models::profile::{pipeline_record, profile_now};
 fn dense_destination(
     src: &QTensor,
     mode: Int8Mode,
+    narrow: Option<GgmlDType>,
 ) -> Option<(u64, candle::cuda_backend::wave_provenance::LeaseOrigin)> {
     use candle::cuda_backend::wave_provenance::LeaseOrigin;
     let candle::Device::Cuda(cuda) = src.device() else {
         return None;
     };
-    let ko_dtype = src.dtype().to_ko(mode).ok()?;
+    let ko_dtype = narrow.or_else(|| src.dtype().to_ko(mode).ok())?;
     let bytes = candle::quantized::cuda::ko_repacked_bytes(src.shape(), ko_dtype).ok()?;
     match candle_nn::kv_cache::claim_dense(&cuda.cuda_stream(), bytes) {
         Ok(ptr) => Some((ptr, LeaseOrigin::Foreign)),
@@ -40,6 +39,31 @@ fn dense_destination(
             None
         }
     }
+}
+
+/// Where a repacked weight's bytes should live.
+///
+/// Not a tuning knob: it is a statement about the weight's **lifetime**, and it
+/// is threaded from whoever is doing the loading because only they know it.
+///
+/// The dense block is a bump allocator with no free, so a weight claimed from it
+/// holds its ground for the life of the process. That is right for a resident
+/// tensor and wrong for one the caller is only materialising in order to copy it
+/// somewhere else — the layer-streaming pack build
+/// (`docs/qwen38_layer_streaming.md` §12.2) repacks each layer, writes its
+/// record and lets it go, and claiming span ground for all 64 would defeat the
+/// point: the model does not fit, which is why the pack exists.
+///
+/// Everything else about the repack — the KO twin, the tiling rule, the
+/// numerics — is identical either way, which is why this is a parameter rather
+/// than a second constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeightResidency {
+    /// The device reservation's dense block — resident, never freed.
+    #[default]
+    Span,
+    /// The CUDA pool — freed on drop.
+    Pool,
 }
 
 /// Traced quantized matmul wrapper.
@@ -73,11 +97,37 @@ impl QMatMul {
 
     /// Build from an owned source QTensor, repacking for the given numeric `mode`.
     pub fn from_qtensor_with_mode(qtensor: QTensor, mode: Int8Mode) -> Result<Self> {
-        // One source of truth for mode→weight resolution: `from_weights_with_mode`. The only
-        // difference is owned vs `Arc` source, so delegate rather than duplicate the branch —
-        // that is what let the int8 "every weight becomes a KO twin (never a float weight fed a
-        // q8a128)" guarantee silently differ between the two constructors before.
-        Self::from_weights_with_mode(std::sync::Arc::new(qtensor), mode)
+        Self::from_qtensor_in(qtensor, mode, WeightResidency::Span)
+    }
+
+    /// Build from an owned source QTensor, repacked for `mode` into `residency`.
+    ///
+    /// One source of truth for mode→weight resolution: [`Self::build`]. The only
+    /// difference between the constructors is owned vs `Arc` source, so they
+    /// delegate rather than duplicate the branch — that is what let the int8
+    /// "every weight becomes a KO twin (never a float weight fed a q8a128)"
+    /// guarantee silently differ between them before.
+    pub fn from_qtensor_in(
+        qtensor: QTensor,
+        mode: Int8Mode,
+        residency: WeightResidency,
+    ) -> Result<Self> {
+        Self::build(std::sync::Arc::new(qtensor), mode, residency, None)
+    }
+
+    /// [`Self::from_qtensor_in`], with this weight's KO twin narrowed to `narrow`.
+    ///
+    /// A per-tensor residency decision, not a numeric mode: see
+    /// `QMatMul::repack_for_optimization_narrowed`. Used for the handful of weights that stay
+    /// resident on a card that cannot hold the model, where a narrower twin is the difference
+    /// between a layer slot existing and not.
+    pub fn from_qtensor_narrowed(
+        qtensor: QTensor,
+        mode: Int8Mode,
+        residency: WeightResidency,
+        narrow: GgmlDType,
+    ) -> Result<Self> {
+        Self::build(std::sync::Arc::new(qtensor), mode, residency, Some(narrow))
     }
 
     pub fn from_weights(ws: std::sync::Arc<QTensor>) -> Result<Self> {
@@ -86,10 +136,24 @@ impl QMatMul {
 
     /// Build from a shared source QTensor, repacking for the given numeric `mode`.
     pub fn from_weights_with_mode(ws: std::sync::Arc<QTensor>, mode: Int8Mode) -> Result<Self> {
+        Self::build(ws, mode, WeightResidency::Span, None)
+    }
+
+    fn build(
+        ws: std::sync::Arc<QTensor>,
+        mode: Int8Mode,
+        residency: WeightResidency,
+        narrow: Option<GgmlDType>,
+    ) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
+        #[cfg(not(feature = "cuda"))]
+        let _ = residency;
         // The int8 path is CUDA-only; on other backends the mode is ignored (always Off).
         #[cfg(not(feature = "cuda"))]
         let _ = mode;
+        // Streaming narrowing is a property of the KO repack, so it too is CUDA-only.
+        #[cfg(not(feature = "cuda"))]
+        let _ = narrow;
 
         // int8 mode (CUDA): every matmul whose shape TILES becomes a KO weight, so the q8a128
         // activations the fused producers emit pair with a KO twin — a *float* weight must never
@@ -146,9 +210,14 @@ impl QMatMul {
                 // Reported at debug rather than swallowed silently, because a
                 // *model load* landing here would be the whole change quietly
                 // not happening.
-                let dst = dense_destination(&src, mode);
+                let dst = match residency {
+                    WeightResidency::Span => dense_destination(&src, mode, narrow),
+                    // Materialised only to be copied out; see
+                    // [`WeightResidency`].
+                    WeightResidency::Pool => None,
+                };
                 let inner = candle::quantized::QMatMul::from_arc(src)?
-                    .repack_for_optimization_into(mode, dst)?;
+                    .repack_for_optimization_narrowed(mode, dst, narrow)?;
                 return Ok(Self {
                     inner,
                     span,
@@ -177,12 +246,46 @@ impl QMatMul {
         })
     }
 
+    /// Wrap a QTensor that **views** memory someone else owns, reporting the
+    /// numeric mode the weight was placed for.
+    ///
+    /// How a layer-streaming slot's projections are built. Unlike
+    /// [`Self::from_qtensor_repacked`] this accepts a source quant as well as a
+    /// KO twin, because a slot holds whichever form the load produced: at
+    /// `Int8Mode::Off` there is no twin, and even at an int8 mode a projection
+    /// whose shape the matmul cannot tile keeps its source form (see
+    /// `layer_stream::build::slot_form`, which makes the same choice from the
+    /// header).
+    ///
+    /// The dtype and the mode must agree, and disagreeing is a bug rather than a
+    /// fallback: a source quant reporting int8 would be handed q8a128
+    /// activations with no kernel to receive them, and a KO twin reporting `Off`
+    /// would take the GGML path over bytes in the wrong layout — silently wrong
+    /// numbers in one direction and a hard fault in the other.
+    pub fn from_qtensor_view(view: QTensor, int8mode: Int8Mode) -> Result<Self> {
+        if view.dtype().is_ko() != int8mode.is_int8() {
+            candle::bail!(
+                "from_qtensor_view: a {:?} weight cannot report {int8mode:?} — the KO twin \
+                 and the int8 path imply each other",
+                view.dtype()
+            );
+        }
+        Ok(Self {
+            inner: candle::quantized::QMatMul::from_qtensor(view)?,
+            span: tracing::span!(tracing::Level::TRACE, "qmatmul"),
+            int8mode,
+        })
+    }
+
     /// Create from an already-repacked KO twin — how expert slots are wrapped
     /// from the pinned-pool's pre-repacked KO bytes, so they report int8 to
     /// `compute_experts_grouped`. The KO twin is baked into the dtype, and it
     /// is the only runnable repacked form: the FP GEMX K/128 kernel no longer
     /// exists, so a non-KO tensor is refused here rather than constructed into
     /// a matmul that cannot run.
+    ///
+    /// A layer-streaming slot may hold a source quant instead and takes
+    /// [`Self::from_qtensor_view`]; an expert slot never can.
     pub fn from_qtensor_repacked(repacked: QTensor) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         if !repacked.dtype().is_ko() {
@@ -241,8 +344,18 @@ impl QMatMul {
         use candle::quantized::cuda::DynamicTensor;
         // Float activation → the ordinary path (handles Off gemx and any non-int8 weight). It tags
         // its own profile bucket, so don't double-record here.
+        //
+        // `out_dtype` is honoured here as well as on the int8 arm. It used to be
+        // dropped, so a Float operand silently produced the ACTIVATION's width
+        // whatever the caller asked for — which is invisible while the two
+        // agree, and is exactly the case the attention out-projection is not:
+        // it consumes a context at the KV arena's width and must store the
+        // residual stream's. Honouring it costs nothing (see `forward_live_as`:
+        // the kernel accumulates in F32 and the width only selects which store
+        // variant runs), where the alternative is a full-tensor conversion per
+        // layer per wave.
         if let DynamicTensor::Float(t) = input {
-            return self.forward_live(t);
+            return self.forward_live_as(t, out_dtype);
         }
         // Int8 (pre-quantized) activation × KO weight, stored at the compute dtype.
         let t_mm = profile_now();

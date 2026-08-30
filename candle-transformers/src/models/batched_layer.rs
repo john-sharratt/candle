@@ -256,6 +256,29 @@ pub struct QkvProjection<'w> {
     pub gate: Option<LiveTensor<'w>>,
 }
 
+/// The width Q/K/V and the output gate are projected in.
+///
+/// **The KV arena's, not the residual stream's** — and the distinction only has
+/// teeth when a model computes in a width its KV storage does not use.
+///
+/// K and V *become* the cache: they are appended to the live arena, and the
+/// attention kernel then reads them back alongside Q. So the projection that
+/// produces them has to emit the width the arena holds, or the append converts
+/// a full tensor per layer per wave (hot-path invariant 1) — or, worse, writes
+/// one width's bits into a buffer read as another's. Q and the gate follow K
+/// and V because the kernel consumes all of them together.
+///
+/// The residual stream is a separate question with a separate answer: the
+/// output projection stores *its* width, which is where the two meet, and the
+/// `expect_dtype` on that boundary is what holds the pair honest.
+///
+/// A cache with no float dtype of its own falls back to the residual's, which
+/// is every model whose activations and KV agree — for those this is the
+/// identity and nothing changes.
+fn attention_operand_dtype(caches: &[&mut KvCache], residual: DType) -> DType {
+    caches.first().map(|c| c.dtype()).unwrap_or(residual)
+}
+
 /// Apply a gated-attention layer's output gate to the attention context.
 ///
 /// `sigmoid(gate) ⊙ context`, matching `qwen35.cpp`'s
@@ -669,13 +692,13 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     let x_tensor = x.as_cat_tensor();
     let (b_sz, seq_len, _n_embd) = x_tensor.dims3()?;
     debug_assert_eq!(seq_len, 1);
-    let _act_dtype = x_tensor.dtype();
 
     // Project Q/K/V over the fused attention_norm (q8a128 on int8, FP on Off / non-CUDA).
     let g_qkv = gpu_span("decode:qkv_proj", x_tensor.device());
+    let kv_dtype = attention_operand_dtype(caches, x_tensor.dtype());
     let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
-        layer.project_qkv(&acts, x_tensor.dtype())?
+        layer.project_qkv(&acts, kv_dtype)?
     };
 
     // Reshape for attention: (B, seq_len, H*D) -> (B, H, seq_len, D)
@@ -841,9 +864,10 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // are stream-ordered, so the span measures the work between its own two
     // records and nothing earlier.
     let g_qkv = gpu_span("prefill:qkv_proj", x_tensor.device());
+    let kv_dtype = attention_operand_dtype(caches, x_tensor.dtype());
     let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
-        layer.project_qkv(&acts, x_tensor.dtype())?
+        layer.project_qkv(&acts, kv_dtype)?
     };
 
     let n_head = layer.n_head();

@@ -120,6 +120,14 @@ against weight bytes and bandwidth:
 | Q6_K | `Q6_KO` | `Q6_KO` |
 | Q8_0/1, Q8_K | `Q8_KO` | `Q8_KO` |
 
+> **Superseded — the first row is no longer what the code does.** `Q2_KO` and `Q3_KO` were
+> built afterwards, so `Q2_K` and `Q3_K` now take same-width twins like every other source and
+> Performance has no exceptions left. That row is the reason this note exists rather than a
+> silent edit: it read as a considered choice, and it was really "no narrower twin exists yet" —
+> which cost a 71% and a 31% weight inflation, invisible while weights were resident and paid as
+> PCIe bytes on every forward once they streamed. `GgmlDType::to_ko` is the authority; the rest
+> of this document is a record of the state it describes.
+
 - **Performance** takes the **same-width** twin and eats the per-32→per-128 granularity
   hit on the weight. Smallest and fastest (e.g. `Q4_K → Q4_KO` keeps 4-bit weights).
 - **Precision** steps **one notch up the ladder** so the extra bit absorbs the
