@@ -42,12 +42,18 @@
 
 use candle::{Device, Result, Tensor};
 
+#[cfg(feature = "cuda")]
+use crate::models::delta_net::state_store::RegionBump;
 use crate::models::delta_net::{
-    delta_net_advance_spans, DeltaNetConstants, DeltaNetDims, DeltaNetOut, DeltaNetSeq,
-    DeltaNetState, LayerKind, RecurrentStateStore, SpanOperands,
+    delta_net_advance_spans, DeltaNetConstants, DeltaNetDims, DeltaNetOut, DeltaNetProjections,
+    DeltaNetSeq, DeltaNetState, LayerKind, RecurrentStateStore, SpanOperands,
 };
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::wave_empty;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
 
-use super::quantized_weights::{QuantLayerMix, QuantModel};
+use super::quantized_weights::QuantModel;
 
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
 /// one set of shared buffers, so the replay that consumes them advances every
@@ -72,6 +78,28 @@ pub struct VerifyStash {
     /// half-written stash advances some layers and not others, silently. This
     /// is the record that makes the difference checkable.
     pub filled: Vec<bool>,
+    /// The reservation regions `layers` is carved from.
+    ///
+    /// **The regions, not the allocator that claimed them.** Keeping the
+    /// `RegionBump` would keep its `SpanClaims` alive, and that is an open arena
+    /// window — every later wave blocks in `wave_gate` waiting for it to close.
+    /// Measured as a 58-minute hang with the process alive and not one line of
+    /// output. `RegionBump::into_regions` is the handover.
+    ///
+    /// **Declared last, and that is load-bearing.** Struct fields drop in
+    /// declaration order, so `layers` — whose tensors are `Foreign` leases
+    /// pointing into these regions — must be gone before the regions return to
+    /// the free list. Moving this field up would leave every buffer above it
+    /// naming ground another claimant may already hold.
+    ///
+    /// Empty on a device with no reservation to carve from: a CPU device, or a
+    /// unit test. Those fall back to driver memory, which is what the whole
+    /// stash used to do.
+    ///
+    /// Never read: it is an RAII holder and dropping it is the whole of its job.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    regions: Vec<candle_nn::kv_cache::SpanRegion>,
 }
 
 /// One sequence's rows within the cohort stash.
@@ -107,14 +135,32 @@ impl VerifyStash {
             .iter()
             .filter(|k| **k == LayerKind::DeltaNet)
             .count();
+        // From the reservation where there is one, so the stash trades against
+        // KV and weights like every other long-lived buffer instead of
+        // competing invisibly for the card outside the span. See
+        // [`SpanOperands::in_regions`] for the measurement that made this
+        // necessary.
+        #[cfg(feature = "cuda")]
+        let mut regions = RegionBump::for_device(dev)?;
         let mut layers = Vec::with_capacity(n);
         for _ in 0..n {
-            layers.push(SpanOperands::zeros(dims, cap, dev)?);
+            #[cfg(feature = "cuda")]
+            let ops = match regions.as_mut() {
+                Some(bump) => SpanOperands::in_regions(dims, cap, dev, bump)?,
+                None => SpanOperands::zeros(dims, cap, dev)?,
+            };
+            #[cfg(not(feature = "cuda"))]
+            let ops = SpanOperands::zeros(dims, cap, dev)?;
+            layers.push(ops);
         }
         Ok(Self {
             layers,
             spans: Vec::new(),
             filled: vec![false; n],
+            // Takes the regions and drops the bump, closing the arena window
+            // before this returns — see the field's own note.
+            #[cfg(feature = "cuda")]
+            regions: regions.map_or_else(Vec::new, RegionBump::into_regions),
         })
     }
 
@@ -165,6 +211,18 @@ impl VerifyStash {
     pub fn remove(&mut self, seq: usize) {
         self.spans.retain(|s| s.seq != seq);
     }
+
+    /// Whether any sequence still names a span in this stash.
+    ///
+    /// **The buffers outlive a span deliberately and must not outlive every
+    /// span.** Keeping them across steps is the point — they are reallocated
+    /// only when a wider cohort arrives — but once no sequence names one, the
+    /// stash is holding reservation regions on behalf of nobody, and it holds
+    /// them for the life of the process. It is not KV, so no arena sweep sees
+    /// it and every KV-side diagnostic reports the pool as healthy.
+    pub fn is_unused(&self) -> bool {
+        self.spans.is_empty()
+    }
 }
 
 /// Re-advance every job's store from the state it entered its stashed block
@@ -178,6 +236,50 @@ impl VerifyStash {
 ///
 /// A job whose `kept == span.len` is a full accept and is skipped without
 /// touching anything — its live state already covers exactly those tokens.
+/// One layer's stashed operands, copied onto the wave's half.
+///
+/// The **provenance root** for a replay. Every buffer the mixer allocates is
+/// placed beside one of these, so leasing them here is what keeps the whole
+/// chain off the pool — see [`replay_accepted_prefixes`] for the measurement
+/// that made it necessary.
+///
+/// Without a wave (no CUDA, or a caller that could not open a generation) this
+/// hands back the stash's own tensors unchanged: the replay is still correct,
+/// it simply allocates the way it always did.
+#[cfg(feature = "cuda")]
+fn stage_on_wave<'w>(
+    ops: &SpanOperands,
+    device: &Device,
+    wave: Option<&'w WaveGeneration>,
+) -> Result<DeltaNetProjections<'w>> {
+    let Some(_) = wave else {
+        return Ok(ops.all_rows());
+    };
+    // Uninitialised, not zeroed: the `slice_set` below writes every element, and
+    // a `memset` first would be a full-width pass per operand per layer that
+    // nothing reads (hot-path invariant 6).
+    let stage = |src: &Tensor| -> Result<candle::LiveTensor<'w>> {
+        let dst = wave_empty(src.shape(), src.dtype(), device, wave)?;
+        dst.slice_set(src, 0, 0)?;
+        Ok(dst)
+    };
+    Ok(DeltaNetProjections {
+        qkv: stage(&ops.qkv)?,
+        z: stage(&ops.z)?,
+        beta_lin: stage(&ops.beta_lin)?,
+        alpha_lin: stage(&ops.alpha_lin)?,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn stage_on_wave<'w>(
+    ops: &SpanOperands,
+    _device: &Device,
+    _wave: Option<&'w ()>,
+) -> Result<DeltaNetProjections<'static>> {
+    Ok(ops.all_rows())
+}
+
 pub fn replay_accepted_prefixes(
     model: &QuantModel,
     stash: &VerifyStash,
@@ -231,13 +333,63 @@ pub fn replay_accepted_prefixes(
     }
     let dims: &DeltaNetDims = &model.cfg.delta_net;
     let eps = model.cfg.rms_norm_eps;
+
+    // **A generation for the replay, because the stash has no provenance to
+    // lend.**
+    //
+    // `SpanOperands` is allocated with `Tensor::zeros` outside any forward — the
+    // sequence owns it across waves, which is the whole point of a rewind stash —
+    // so its tensors are `Owned` and name no arena. The mixer then builds every
+    // intermediate with `empty_beside`, and beside an `Owned` operand is the
+    // pool: `conved`, then `u`/`w`/`kq`/`g_cs`, then everything downstream, per
+    // DeltaNet layer, per rewinding sequence, on every accept.
+    //
+    // Measured with `--features forbidden_allocations` on the 27B: **20.0 GB** of
+    // driver allocation at 20 contexts against 921 MB at one, on a card with
+    // ~258 MiB outside the reservation. It surfaced as
+    // `CUDA_ERROR_OUT_OF_MEMORY` on an unrelated event record, because by then
+    // the device was simply full — and no region-pool diagnostic showed distress,
+    // since none of it went through the pool.
+    //
+    // Speculation is what made it reachable at that scale: a rewind happens
+    // exactly when proposals are rejected, so enabling drafting at width 20
+    // multiplied this path by the cohort.
+    //
+    // Opening a generation is not sufficient on its own — `empty_beside` relays
+    // provenance rather than creating it, so the *root* must be leased. Hence the
+    // staging copy below.
+    //
+    // **The generation is per layer, not per replay.** The span is sized for one
+    // layer's attention phase; holding one guard across the sweep accumulates
+    // every layer's staging in it and exhausts it — measured, at layer 48 of the
+    // first config: *"transient span exhausted — 491520 B at offset 23240704
+    // exceeds the 23638784 B budget"*. Dropping the guard each iteration returns
+    // the staging **and** the mixer's own intermediates before the next layer
+    // asks, which is the same lifetime a forward gives its phases.
     for (ord, &li) in layer_indices.iter().enumerate() {
-        let QuantLayerMix::DeltaNet(w) = &model.layers[li].mix else {
-            candle::bail!(
+        // The **residue**, not the layer. The replay runs at accept time, well
+        // after the sweep that captured the stash, so on a streamed checkpoint
+        // this layer may long since have been evicted — and `ensure`ing it would
+        // pull ~240 MB over PCIe to read four small constants that never left
+        // VRAM. The residue holds exactly those four.
+        let residue = model.layers.residue(li)?;
+        let w = residue.delta_net().map_err(|_| {
+            candle::Error::Msg(format!(
                 "qwen35 verify replay: layer {li} carries recurrent state but is not DeltaNet"
-            );
+            ))
+        })?;
+        #[cfg(feature = "cuda")]
+        let wave: Option<WaveGeneration> = match &model.device {
+            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
+            _ => None,
         };
-        let p = stash.layers[ord].all_rows();
+        #[cfg(not(feature = "cuda"))]
+        let wave: Option<()> = None;
+        // The stash staged onto the wave's half, so the chain the mixer builds
+        // from it has a leased root. Four copies per layer of buffers the
+        // capture already copied once — against the pool traffic above, and
+        // against a `contiguous()` the `rows()` path would have paid anyway.
+        let p = stage_on_wave(&stash.layers[ord], &model.device, wave.as_ref())?;
         let c = DeltaNetConstants {
             dt_bias: &w.dt_bias,
             a: &w.a,

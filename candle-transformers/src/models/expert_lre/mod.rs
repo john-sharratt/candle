@@ -175,11 +175,22 @@ pub(crate) mod compute;
 mod eval;
 #[cfg(feature = "cuda")]
 mod gpu_dispatch;
-mod handle;
+/// `pub(crate)` so the layer warm tier can size itself through the same three
+/// host-RAM ceilings this one does — see `handle::warm_slots_for`.
+pub(crate) mod handle;
 #[cfg(all(test, feature = "cuda"))]
 mod matmul_baseline;
-mod pack;
-mod pinned;
+/// `pub(crate)` so the layer pack shares this one's repack fingerprint rather
+/// than growing a second definition of the same sweep — the two packs hold
+/// weights repacked by identical code, so a change that invalidates one must
+/// invalidate the other.
+pub(crate) mod pack;
+/// `pub(crate)` for [`WarmPool`](pinned::WarmPool) alone, which is a generic
+/// pinned-slot allocator with nothing expert-specific in it and is shared with
+/// [`layer_stream`](crate::models::layer_stream). Its neighbour
+/// `stratified_membership` *is* expert-specific — see
+/// `layer_stream::warm` on why a layer tier draws a contiguous run instead.
+pub(crate) mod pinned;
 mod pipeline;
 #[cfg(feature = "cuda")]
 mod streamer;
@@ -190,6 +201,10 @@ mod types;
 pub use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
 pub use cache::minimum_resident_slots;
+/// Shared with the layer cache, which pins the same count for the same reason:
+/// the leading layers are reached first on every forward and have the least
+/// time to be fetched, so they are the ones worth never fetching at all.
+pub use cache::PINNED_LAYERS;
 #[cfg(feature = "cuda")]
 pub use gpu_dispatch::GpuDispatchTables;
 pub use handle::ExpertCache;

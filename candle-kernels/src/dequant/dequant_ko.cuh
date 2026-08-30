@@ -126,6 +126,53 @@ __global__ void dequantize_q2_ko_kernel(
     }
 }
 
+// Q3_KO: 3-bit affine, min ≠ 0. value 0..7 = crumb (bits 0-1, at lane*8 + sub*2, bit 2j) plus
+// the hi bit (bit 2, at 256 + lane*4 + sub, low nibble for the low-half values and high nibble
+// for the high-half). No 512 B ql region; dm at 384. Inverse of quantize_q3_ko_kernel,
+// byte-identical to CPU `ko_quant::dequant_ko(.., Q3_KO)`.
+__global__ void dequantize_q3_ko_kernel(
+    const uint8_t* __restrict__ chunk, float* __restrict__ out, int nrows, int ncols)
+{
+    const int HI_BASE = 256;
+    const int DM_BASE = 384;
+    const int CHUNK_BYTES = DM_BASE + 32;
+    const int k_blocks = ncols / 128;
+    const int row_groups = nrows / 8;
+    const int total_chunks = k_blocks * row_groups;
+    const int total_warps = (gridDim.x * blockDim.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int r = lane >> 2;
+    const int q3 = lane & 3;
+
+    for (int chunk_idx = (int)(((int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+         chunk_idx < total_chunks; chunk_idx += total_warps) {
+        const int k_blk = chunk_idx / row_groups;
+        const int g = chunk_idx % row_groups;
+        const int64_t obase = (int64_t)(g * 8 + r) * ncols + (int64_t)k_blk * 128;
+        const int cbase = chunk_idx * CHUNK_BYTES;
+        const half2 dm = *(const half2*)(chunk + cbase + DM_BASE + r * 4);
+        const float scale = __half2float(dm.x);
+        const float mn = __half2float(dm.y);
+
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            const uint32_t cr0 = chunk[cbase + lane * 8 + sub * 2];
+            const uint32_t cr1 = chunk[cbase + lane * 8 + sub * 2 + 1];
+            const uint32_t hbb = chunk[cbase + HI_BASE + lane * 4 + sub];
+            float lo[4], hi[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t qlo = ((cr0 >> (2 * i)) & 0x3) | (((hbb >> i) & 1) << 2);
+                const uint32_t qhi = ((cr1 >> (2 * i)) & 0x3) | (((hbb >> (4 + i)) & 1) << 2);
+                lo[i] = __fadd_rn(__fmul_rn(scale, (float)qlo), mn);
+                hi[i] = __fadd_rn(__fmul_rn(scale, (float)qhi), mn);
+            }
+            __stcs((float4*)(out + obase + sub * 32 + q3 * 4), make_float4(lo[0], lo[1], lo[2], lo[3]));
+            __stcs((float4*)(out + obase + sub * 32 + 16 + q3 * 4), make_float4(hi[0], hi[1], hi[2], hi[3]));
+        }
+    }
+}
+
 // Q8_KO: symmetric, min = 0. lo quant in b_frag[0] [0,512), hi quant in b_frag[1] [512,1024).
 __global__ void dequantize_q8_ko_kernel(
     const uint8_t* __restrict__ chunk, float* __restrict__ out, int nrows, int ncols)

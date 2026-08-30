@@ -23,13 +23,14 @@ use super::engine::{
     create_session, mtp_kv_layer, provenance_layer_indices, session_kv_layers, wave_geometry,
     wave_kv_range,
 };
-use super::quantized_weights::{QuantLayer, QuantLayerMix, QuantModel};
+use super::quantized_weights::QuantModel;
 use super::spec::{replay_accepted_prefixes, StashSpan, VerifyStash};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ModelCoreProperties, ProvenanceLayerIndices,
 };
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
+use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::RecurrentStateStore;
 use crate::models::draft_ladder::DraftLadder;
 use crate::models::rotary_layout::RotaryLayout;
@@ -204,6 +205,15 @@ impl HybridBatched {
             None => true,
         };
         if grow {
+            // **Release the old stash before claiming the new one.** Both are
+            // carved from the reservation now, not the driver, so building the
+            // replacement in place would hold two cohorts' regions at once at
+            // exactly the moment the wider one is hardest to satisfy — ~302 MiB
+            // asked for while ~241 MiB is still held, at 20 contexts and budget
+            // 4 on the 27B. Dropping first costs nothing: `grow` has already
+            // decided these buffers are too small to keep, and `begin` below
+            // rebuilds every span.
+            drop(slot.take());
             *slot = Some(VerifyStash::new(
                 &self.model.cfg.layer_kinds,
                 &self.model.cfg.delta_net,
@@ -245,6 +255,18 @@ impl HybridBatched {
                 for s in seqs {
                     st.remove(*s);
                 }
+                // **A stash with no spans left is holding ground for nobody.**
+                // The buffers are meant to outlive a span — they are kept across
+                // steps and reallocated only for a wider cohort — but not to
+                // outlive every span. They are carved from the reservation, so
+                // once the last sequence goes they pin regions the weight side
+                // could be using, for the life of the process, and no arena
+                // sweep can see them because they are not KV. Measured on the
+                // 27B: one region left behind by every config, on top of the
+                // twenty the recurrent stores held.
+                if st.is_unused() {
+                    *slot = None;
+                }
             }
         }
     }
@@ -280,8 +302,15 @@ impl HybridBatched {
     /// using. Legal only between forwards, which is where phase 0 calls it.
     pub fn reclaim_spare_ground(&self) {
         #[cfg(feature = "cuda")]
-        if let Some(cache) = self.model.experts.as_ref() {
-            cache.reclaim_spare_ground();
+        {
+            if let Some(cache) = self.model.experts.as_ref() {
+                cache.reclaim_spare_ground();
+            }
+            // The dense counterpart: a streamed model's layer slots are the same
+            // kind of tradeable ground its experts would be, and this is the
+            // direction that takes ground back once the KV side's peak has
+            // passed. A resident store returns without asking.
+            self.model.layers.reclaim_spare_ground();
         }
     }
 
@@ -596,11 +625,64 @@ impl HybridBatched {
     /// otherwise have every wave pay a drafting call that can only return
     /// nothing.
     pub fn draft_budget_for(&self, width: usize) -> usize {
-        if self.has_drafter() {
-            self.draft.budget(width)
-        } else {
-            0
+        if !self.has_drafter() {
+            return 0;
         }
+        // **Bounded by what its own rewind machinery costs.**
+        //
+        // A verify block of `k` proposals makes each sequence stash `k + 1` rows
+        // of post-projection operands for every DeltaNet layer, because a
+        // recurrence cannot be truncated and has to be replayed (`super::spec`).
+        // So the stash is `width × (k + 1)` rows, and the ladder alone prices
+        // only the *throughput* side of `k` — it has no term for the memory the
+        // rewind needs.
+        //
+        // Measured on the 27B at 20 contexts: 60.4 MiB of stash at budget 0
+        // against 301.8 MiB at budget 4. Widening the ladder to reach width 20
+        // therefore took a config that fit and made it not fit, and the failure
+        // arrived as a device OOM rather than as a refusal — the stash is
+        // allocated between forwards, where nothing is left to concede to.
+        //
+        // Clamping here rather than refusing later is what lets the ladder ask
+        // for depth at *any* width: a narrow cohort still gets the full budget,
+        // and a wide one gets the deepest budget its stash can afford instead of
+        // the whole wave failing. Speculation is lossless, so a shallower budget
+        // costs throughput and never a token.
+        self.draft
+            .budget(width)
+            .min(self.affordable_draft_budget(width))
+    }
+
+    /// The deepest budget whose rewind stash the KV side can currently hold.
+    ///
+    /// `usize::MAX` when the question does not arise — no reservation to measure
+    /// (a CPU device or a test), or a model with no recurrent layers to stash.
+    /// The caller `min`s with the ladder, so an unmeasurable bound never *raises*
+    /// a budget.
+    fn affordable_draft_budget(&self, width: usize) -> usize {
+        let dims = &self.model.cfg.delta_net;
+        let layers = self
+            .model
+            .cfg
+            .layer_kinds
+            .iter()
+            .filter(|k| **k == LayerKind::DeltaNet)
+            .count();
+        // The four operands `SpanOperands` holds, per row, per DeltaNet layer.
+        let per_row = (dims.conv_dim() + dims.value_dim() + 2 * dims.n_v_heads)
+            * std::mem::size_of::<f32>()
+            * layers;
+        if per_row == 0 || width == 0 {
+            return usize::MAX;
+        }
+        let Some(budget) = candle_nn::kv_cache::vram_budget_available(&self.model.device) else {
+            return usize::MAX;
+        };
+        // Half of what is claimable, not all of it: the stash is one tenant among
+        // several and a wave that spends every free region on its own rewind
+        // buffer has nothing left to decode into.
+        let rows = (budget / 2) / per_row;
+        (rows / width).saturating_sub(1)
     }
 
     /// The KV layer the draft head writes, past every trunk attention layer.
@@ -991,23 +1073,17 @@ impl HybridBatched {
                 m.clear();
             }
         }
-        let block = |l: &QuantLayer| -> Result<()> {
-            l.attn_norm.maybe_change_dtype(dtype)?;
-            l.post_attn_norm.maybe_change_dtype(dtype)?;
-            if let QuantLayerMix::Attention(a) = &l.mix {
-                a.q_norm.maybe_change_dtype(dtype)?;
-                a.k_norm.maybe_change_dtype(dtype)?;
-            }
-            Ok(())
-        };
-        for layer in &self.model.layers {
-            block(layer)?;
+        // Through the residue, which is where every norm of every layer lives —
+        // resident in both stores, so this reaches a streamed checkpoint's
+        // layers without pulling one of them over PCIe.
+        for li in 0..self.model.layers.len() {
+            self.model.layers.residue(li)?.set_activation_dtype(dtype)?;
         }
         // The draft head's block runs in the wave's dtype like any other, so
         // its norms are materialised with the trunk's — the head is a layer of
         // this model, not a sidecar that got to keep the loader's dtype.
         if let Some(head) = &self.model.mtp {
-            block(&head.block)?;
+            head.block.residue().set_activation_dtype(dtype)?;
             head.input.enorm.maybe_change_dtype(dtype)?;
             head.input.hnorm.maybe_change_dtype(dtype)?;
             head.head_norm.maybe_change_dtype(dtype)?;

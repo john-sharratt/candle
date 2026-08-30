@@ -313,5 +313,30 @@ extern "C" int64_t get_repacked_size_bytes(
 ///
 /// Returns: 1 if supported, 0 if not
 extern "C" int32_t is_gemx_supported(int32_t qtype) {
+    // **A KO type is the repack's OUTPUT, never its input.** `run_repack_gemx`
+    // has no arm for any of them and cannot: they are already in the tiled
+    // layout it produces. They appear in `qtype_output_block_size` because that
+    // table answers "how wide is this format's output block", which every KO
+    // twin has and which the tile traits need.
+    //
+    // Answering this question from that table conflated the two, and the effect
+    // was to make a whole format unreachable: `QMatMul::build` reads
+    // `supports_gemx_repacking()`, saw true for a Q3_KO source loaded straight
+    // from a GGUF, handed it to `repack_for_optimization_narrowed`, and got
+    // "weight is already KO-optimized" — so the GGUF path for KO weights failed
+    // on every model, while the `from_qtensor_repacked` route used by the expert
+    // and layer-stream caches worked and hid it.
+    switch (qtype) {
+        case QTYPE_Q2_KO:
+        case QTYPE_Q3_KO:
+        case QTYPE_Q4_KO:
+        case QTYPE_Q5_KO:
+        case QTYPE_Q6_KO:
+        case QTYPE_Q8_KO:
+        case QTYPE_MXFP4_KO:
+            return 0;
+        default:
+            break;
+    }
     return qtype_output_block_size((int)qtype) > 0 ? 1 : 0;
 }

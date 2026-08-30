@@ -1140,6 +1140,7 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         | GgmlDType::Q2_0
         | GgmlDType::Q3_0
         | GgmlDType::Q2_KO
+        | GgmlDType::Q3_KO
         | GgmlDType::Q4_KO
         | GgmlDType::Q5_KO
         | GgmlDType::Q6_KO

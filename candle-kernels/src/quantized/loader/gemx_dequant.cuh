@@ -199,6 +199,10 @@ template <>
 struct is_scale_separate<block_c_q2_KO> {
     static constexpr bool value = true;
 };
+template <>
+struct is_scale_separate<block_c_q3_KO> {
+    static constexpr bool value = true;
+};
 // k1024 chunk blocks carry their scales inline (blk.dm) — the int8 fold reads them from
 // the chunk, the only "scale-separate" (non-staged) path now used.
 template <> struct is_scale_separate<block_c_q4_KO_k1024> { static constexpr bool value = true; };
@@ -206,6 +210,7 @@ template <> struct is_scale_separate<block_c_q5_KO_k1024> { static constexpr boo
 template <> struct is_scale_separate<block_c_q6_KO_k1024> { static constexpr bool value = true; };
 template <> struct is_scale_separate<block_c_q8_KO_k1024> { static constexpr bool value = true; };
 template <> struct is_scale_separate<block_c_q2_KO_k1024> { static constexpr bool value = true; };
+template <> struct is_scale_separate<block_c_q3_KO_k1024> { static constexpr bool value = true; };
 template <> struct is_scale_separate<block_c_mxfp4_k1024> { static constexpr bool value = true; };
 
 // =============================================================================

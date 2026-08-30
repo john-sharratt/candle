@@ -128,6 +128,11 @@ fn repack_matrix(
         }
         // Affine KO twins (Q8_KO/Q4_KO/…): dequantize the source, then quantize to the lane-major
         // per-128 KO layout the int8 kernel reads. Near-lossless for Q8→Q8_KO.
+        //
+        // `Q2_KO`/`Q3_KO` are deliberately absent, and it is not an omission: `ko_target` admits
+        // only MXFP4, Q8_0, BF16 and F16 sources, none of which has either as its twin. The
+        // narrow twins become reachable here the moment a K-quant source is admitted — which
+        // needs a `dequant_source` codec for it first, and that is the actual limit.
         GgmlDType::Q8_KO | GgmlDType::Q4_KO | GgmlDType::Q5_KO | GgmlDType::Q6_KO => {
             let f32 = dequant_source(src, nrows * ncols, src_dtype)?;
             let ko_bytes = quantize_ko(&f32, nrows, ncols, ko);

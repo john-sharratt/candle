@@ -117,6 +117,7 @@ template <> struct block_compact<block_c_q6_K> { using type = block_c_q6_K; };
 template <> struct block_compact<block_c_q6_KO> { using type = block_c_q6_KO_k1024; };
 template <> struct block_compact<block_c_q8_KO> { using type = block_c_q8_KO_k1024; };
 template <> struct block_compact<block_c_q2_KO> { using type = block_c_q2_KO_k1024; };
+template <> struct block_compact<block_c_q3_KO> { using type = block_c_q3_KO_k1024; };
 template <> struct block_compact<block_c_mxfp4> { using type = block_c_mxfp4_k1024; };
 
 // AWQ mappings — compact forms only, as above.

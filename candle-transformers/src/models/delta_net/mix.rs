@@ -38,7 +38,12 @@
 //! recurrence is a running sum and half precision drifts (§8 of
 //! `docs/qwen35_qwen38_models.md`).
 
-use candle::{DType, Device, LiveTensor, Result, Tensor};
+#[cfg(feature = "cuda")]
+use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
 
 use super::types::DeltaNetDims;
 
@@ -597,9 +602,12 @@ pub fn dispatch_tally() -> Vec<(&'static str, &'static str, u64)> {
             v.push((*path, outcome, n));
         }
     }
-    v.sort_by(|a, b| b.2.cmp(&a.2));
+    v.sort_by_key(|e| Reverse(e.2));
     v
 }
+
+/// [`lower_tri_mask`]'s cache, keyed by `(device location, chunk width, strict)`.
+type MaskCache = Mutex<HashMap<(DeviceLocation, usize, bool), Tensor>>;
 
 /// `[c, c]` mask with 1 where `j ≤ i` (or `j < i` when `strict`), else 0.
 ///
@@ -621,11 +629,7 @@ pub fn dispatch_tally() -> Vec<(&'static str, &'static str, u64)> {
 /// strictness values, so the map holds a handful of entries a few KiB each for
 /// the life of the process.
 fn lower_tri_mask(c: usize, strict: bool, dev: &Device) -> Result<Tensor> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    static MASKS: OnceLock<Mutex<HashMap<(candle::DeviceLocation, usize, bool), Tensor>>> =
-        OnceLock::new();
+    static MASKS: OnceLock<MaskCache> = OnceLock::new();
 
     // Keyed by the device's own location, not by a CUDA ordinal with one
     // sentinel for "everything else" — that collapsed CPU and Metal onto a
@@ -952,8 +956,55 @@ pub struct SpanOperands {
 impl SpanOperands {
     /// Buffers for a block of up to `cap` rows. **Allocate outside a forward**
     /// — see [`DeltaNetSeq::stash`].
+    ///
+    /// Driver memory, for a caller with no reservation to carve from — a CPU
+    /// device, or a unit test. Production takes [`Self::in_regions`]; see there
+    /// for why the difference matters.
     pub fn zeros(dims: &DeltaNetDims, cap: usize, dev: &Device) -> Result<Self> {
         let f = |cols: usize| Tensor::zeros((cap, cols), DType::F32, dev);
+        Ok(Self {
+            qkv: f(dims.conv_dim())?,
+            z: f(dims.value_dim())?,
+            beta_lin: f(dims.n_v_heads)?,
+            alpha_lin: f(dims.n_v_heads)?,
+        })
+    }
+
+    /// [`Self::zeros`], carved from the **reservation** rather than the driver.
+    ///
+    /// The stash is long-lived per-cohort state: it must outlive the wave (that
+    /// is what it is *for*), so it cannot come from the wave arena, and until
+    /// this existed it came from `Tensor::zeros` — i.e. the gap outside the
+    /// reservation, which nothing accounts for.
+    ///
+    /// **That gap is small and the stash is not.** Its size is
+    /// `cap × (2·key_dim + value_dim + 2·n_v_heads) × 4` per DeltaNet layer, and
+    /// `cap` is `contexts × (draft_budget + 1)` — so it scales with both the
+    /// cohort and the ladder. Measured on the 27B at 20 contexts: **60.4 MiB at
+    /// budget 0 against 301.8 MiB at budget 4**, into ~258 MiB of card outside a
+    /// 13,840 MiB span. Widening the draft ladder to reach width 20 walked
+    /// straight through it, and the failure surfaced as
+    /// `CUDA_ERROR_OUT_OF_MEMORY` on an unrelated event sync — a *sticky*
+    /// context error reported by innocent code, with the real allocation named
+    /// only in the backtrace.
+    ///
+    /// Inside the reservation it is visible to the partition instead of
+    /// competing with it: the region claim is counted, and a claim that runs
+    /// short asks the weight side to concede layers rather than failing the
+    /// device. Same tier, same lifetime class, and the same allocator as the
+    /// recurrent state it exists to rewind.
+    ///
+    /// `pub(crate)` rather than `pub`: it takes the region allocator, which is
+    /// this crate's own partition machinery and not something an external caller
+    /// could hold.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn in_regions(
+        dims: &DeltaNetDims,
+        cap: usize,
+        dev: &Device,
+        bump: &mut super::state_store::RegionBump,
+    ) -> Result<Self> {
+        let mut f = |cols: usize| bump.take_zeroed((cap, cols), DType::F32, dev);
         Ok(Self {
             qkv: f(dims.conv_dim())?,
             z: f(dims.value_dim())?,

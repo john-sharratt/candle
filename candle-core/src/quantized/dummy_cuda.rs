@@ -2,6 +2,11 @@
 use super::GgmlDType;
 use crate::{CudaDevice, CudaStorage, Error, Result};
 
+/// Mirrors the CUDA repack's band size so the load-time pool arithmetic
+/// (`dense_span::peak_load_pool_bytes`) is one expression on both builds. Nothing here repacks,
+/// so nothing here reads it for its own sake.
+pub const REPACK_BAND_BYTES: usize = 48 * 1024 * 1024;
+
 pub fn set_force_dmmv(_f: bool) {}
 
 /// Dummy implementation for non-CUDA builds

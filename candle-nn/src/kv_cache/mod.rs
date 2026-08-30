@@ -43,23 +43,33 @@ pub use cache::{Cache, CacheIntegrityResult, KvCache};
 pub use chunked::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, GoldenRecord};
+/// Whether the weight side may take KV ground. Pure arithmetic for the same
+/// reason as the zone above, and public for a further one: the partition's
+/// defects are trajectory defects, so the decision has to be runnable over a
+/// simulated workload with no device in reach
+/// (`docs/vram_partition_behavioural_tests.md`).
+pub use chunked::growth_policy::{kv_grow_step, GrowthPolicy, Occupancy, Refusal};
 #[cfg(feature = "cuda")]
 pub use chunked::persistence_domain_stats;
 #[cfg(feature = "cuda")]
 pub use chunked::slot_state_stats;
+/// Where the tier may stand and what the KV side may reach — the span's
+/// arithmetic. Pure, and public for the same reason: three of the partition's
+/// worst defects were geometry, and none of them needed a GPU to find.
+pub use chunked::span_geometry;
 pub use chunked::wave_plan::{
     BufferShape, Encoding, LayerPhase, ModelGeometry, WaveBuffer, WavePlan, BUMP_ALIGNMENT,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
     begin_forward, begin_wave, end_wave_transient, plan_wave_transient, wave_domain_stats,
-    BumpRange, ForwardOpen, WaveGeneration, KV_ARENA_MID_WAVE,
+    wave_is_live, BumpRange, ForwardOpen, WaveGeneration, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
     claim_dense, claim_span_region, dense_bytes, ensure_reservation, expect_kv_range,
-    expect_kv_range_in, freeze_dense, span_layout, span_region_refusal, SpanClaims, SpanLayout,
-    SpanRegion,
+    expect_kv_range_in, freeze_dense, reclaim_load_headroom, span_layout, span_region_refusal,
+    SpanClaims, SpanLayout, SpanRegion,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

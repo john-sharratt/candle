@@ -50,13 +50,14 @@ pub fn open_for_load(device: &Device, content: &gguf_file::Content) -> Result<bo
     #[cfg(feature = "cuda")]
     {
         if matches!(device, Device::Cuda(_)) {
-            let headroom = peak_repack_scratch(content);
+            let headroom = peak_load_pool_bytes(content);
             let claimed = candle_nn::kv_cache::ensure_reservation(device, headroom)?;
             if claimed {
                 tracing::info!(
                     target: "candle_transformers::dense_span",
                     headroom_mib = headroom >> 20,
-                    "device reservation claimed before load; the repack peak stays with the pool"
+                    "device reservation claimed before load; the largest source tensor and the \
+                     repack's bounded f32 band stay with the pool"
                 );
             } else {
                 tracing::info!(
@@ -85,6 +86,20 @@ pub fn open_for_load(device: &Device, content: &gguf_file::Content) -> Result<bo
 /// A no-op off CUDA, and harmless when [`open_for_load`] returned `false`: the
 /// block is empty, so freezing it locks nothing.
 pub fn close_load(device: &Device) -> Result<usize> {
+    let dense = freeze(device)?;
+    reclaim_headroom(device)?;
+    Ok(dense)
+}
+
+/// Lock the dense block's right edge. Every weight-side address is measured from
+/// it, so nothing may size a zone until this has run.
+///
+/// Split from [`reclaim_headroom`] because the two have different deadlines: the
+/// freeze must happen *before* anything carves a zone, and the reclaim must
+/// happen *after* the last repack that draws on the CUDA pool. For a resident
+/// model there is nothing in between and [`close_load`] does both; a streamed one
+/// builds its layer pack in the gap.
+pub fn freeze(device: &Device) -> Result<usize> {
     #[cfg(feature = "cuda")]
     {
         if let Device::Cuda(cuda) = device {
@@ -92,7 +107,7 @@ pub fn close_load(device: &Device) -> Result<usize> {
             tracing::info!(
                 target: "candle_transformers::dense_span",
                 dense_mib = dense >> 20,
-                "load phase closed; the dense block is locked and the remainder is runtime ground"
+                "dense block locked; every weight-side address is now fixed"
             );
             return Ok(dense);
         }
@@ -101,37 +116,95 @@ pub fn close_load(device: &Device) -> Result<usize> {
     Ok(0)
 }
 
-/// Device scratch the largest single weight's repack needs, in bytes.
+/// Give the load headroom back to the span.
 ///
-/// **An arithmetic bound, not an estimate.** `QCudaStorage::repack_ko`
-/// dequantizes a whole tensor to F32 before quantizing it into its KO twin —
-/// `let f32_storage = self.dequantize(nrows * ncols)?` — so the transient is
-/// `nrows × ncols × 4` regardless of how few bits the source or the twin use. On
-/// Qwen3.6-35B that is `output.weight` at `[248320, 2048]`: ~1,940 MiB of
-/// scratch to produce a few hundred MiB of weight.
+/// **Only once every repack that draws on the CUDA pool has finished.**
+/// `open_for_load` conceded this ground so the pool could hold the largest source
+/// tensor and the repack's bands ([`peak_load_pool_bytes`]); taking it back while
+/// a repack still needs it leaves that pass with nothing but the governor's
+/// cushion.
 ///
-/// That scratch comes from the CUDA pool, so the span gives up exactly this much
-/// and no more. Read from the GGUF header, so it costs nothing and is known
-/// before a byte of tensor data is touched — which is what lets the span be
-/// claimed first.
+/// That is not hypothetical — it was the ordering in-tree. `close_load` reclaimed
+/// here and was then called *before* `build_layers`, which repacks a whole layer
+/// at a time through `WeightResidency::Pool` to build the layer pack. Both
+/// `layer_stream::build`'s header and `docs/qwen38_layer_streaming.md` §12.2 say
+/// `peak_load_pool_bytes` is what reserves room for exactly that pass, so the
+/// invariant was stated in two places and violated in one.
 ///
-/// Two-dimensional tensors only. Expert banks are 3-D and are repacked
-/// per-expert by the expert cache; norms are 1-D and are never repacked. The max
-/// over 2-D covers both the weights that repack and the embedding, which does
-/// not repack but is read to the device at the same size — so the bound holds
-/// for whichever is larger without having to model the difference.
+/// Growing the span moves its right edge and the weight side is placed downward
+/// from it, so this must still precede anything that carves a zone.
+/// `reclaim_load_headroom` re-checks that for itself.
+pub fn reclaim_headroom(device: &Device) -> Result<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        if let Device::Cuda(cuda) = device {
+            let reclaimed = candle_nn::kv_cache::reclaim_load_headroom(&cuda.cuda_stream())?;
+            tracing::info!(
+                target: "candle_transformers::dense_span",
+                reclaimed_mib = reclaimed >> 20,
+                "load headroom returned to the span; the remainder is runtime ground"
+            );
+            return Ok(reclaimed);
+        }
+    }
+    let _ = device;
+    Ok(0)
+}
+
+/// CUDA-pool room the load needs, in bytes: the largest single tensor's **quantized** size,
+/// plus the repack's two bands.
 ///
-/// Goes to zero once the repack is chunked: the peak becomes one chunk, and this
-/// ground returns to the KV side.
-pub fn peak_repack_scratch(content: &gguf_file::Content) -> usize {
-    content
+/// **An arithmetic bound, not an estimate**, read from the GGUF header — so it costs nothing
+/// and is known before a byte of tensor data is touched, which is what lets the span be claimed
+/// first. The load reads one tensor at a time and drops it, so the pool's peak is one source
+/// tensor — `elems / block_size × type_size` — and the bands the repack holds beside it.
+///
+/// # This used to be the f32 expansion, and that was the largest claim on the card
+///
+/// `repack_ko` composes dequantize-then-requantize through a buffer, and that buffer is the
+/// whole tensor in f32 — `nrows × ncols × 4` however few bits the source and twin use. On the
+/// 27B's `[248320, 5120]` head it was **4,850 MiB** to produce a 993 MiB twin, and the span
+/// conceded exactly that much. Not for the load: *permanently*. `cuMemAddressReserve` sizes the
+/// span once and cannot grow, and the weight zone and KV regions are carved from the span — so
+/// a buffer that lived for one tensor during load held a third of the card until the process
+/// exited.
+///
+/// The repack now runs a row band at a time (see `QCudaStorage::repack_ko_into`), so the
+/// intermediate is `REPACK_BAND_BYTES` whatever the tensor's size and what remains is the
+/// source tensor plus that constant. On that same head: **995 MiB instead of 4,850**, returning
+/// ~3.8 GiB to the span. Host-mapping the intermediate was tried first and does not work at
+/// these sizes — the band stays in VRAM.
+///
+/// # Why it is not zero
+///
+/// Two reasons, and both terms are load-bearing. The source arrives through `dev.alloc` — the
+/// CUDA pool — before anything repacks it; and the bands are device memory, live at the same
+/// time as that source. Sizing this at zero, or dropping the band term as "small", leaves the
+/// pool nothing but the governor's cushion and OOMs on the first large repack. Getting to zero
+/// means fusing the dequant into `quantize_ko` and dequantizing straight from the mapped GGUF,
+/// so neither the source nor an intermediate reaches VRAM; that is a further change to the
+/// loader and the kernels, not to this bound.
+///
+/// Two-dimensional tensors only. Expert banks are 3-D and are repacked per-expert by the expert
+/// cache; norms are 1-D and are never repacked. The max over 2-D covers both the weights that
+/// repack and the embedding, which does not repack but is read to the device at the same size.
+pub fn peak_load_pool_bytes(content: &gguf_file::Content) -> usize {
+    let largest_source = content
         .tensor_infos
         .values()
         .filter_map(|info| match info.shape.dims() {
-            [rows, cols] => Some(rows * cols),
+            [rows, cols] => {
+                let elems = rows * cols;
+                let d = info.ggml_dtype;
+                Some(elems / d.block_size() * d.type_size())
+            }
             _ => None,
         })
         .max()
-        .unwrap_or(0)
-        * std::mem::size_of::<f32>()
+        .unwrap_or(0);
+    // The repack's f32 band and the KO band it fills are live at the same time as the source
+    // they are repacking, so they add rather than overlap. The KO band is the smaller of the
+    // two by construction (it is the quantized form of the same rows), so one band's worth of
+    // allowance on top covers both.
+    largest_source + 2 * candle::quantized::cuda::REPACK_BAND_BYTES
 }

@@ -22,6 +22,24 @@ use rayon::prelude::*;
 /// MXFP4 `qs`) + 32 B of per-sub E8M0 scales (4 per row).
 pub const MXFP4_KO_CHUNK_BYTES: usize = 512 + 32;
 
+/// Every KO weight format — exactly the set [`GgmlDType::is_ko`] answers `true` for.
+///
+/// **A list, because a predicate cannot be iterated**, and several places need to sweep the
+/// formats rather than test one: the GGUF load path, the dispatch-table gates, the fused-QKV
+/// format map. Each of those used to carry its own hand-written list, and each list stopped
+/// covering the set at a different point — which is how `Q2_KO` shipped unable to load from a
+/// GGUF at all. `ko_dtype_list_matches_is_ko` holds this in step with the predicate, so the
+/// sweeps derive their coverage instead of restating it.
+pub const ALL_KO_DTYPES: &[GgmlDType] = &[
+    GgmlDType::Q2_KO,
+    GgmlDType::Q3_KO,
+    GgmlDType::Q4_KO,
+    GgmlDType::Q5_KO,
+    GgmlDType::Q6_KO,
+    GgmlDType::Q8_KO,
+    GgmlDType::MXFP4_KO,
+];
+
 /// Whether a weight `[nrows × ncols]` fits the KO **matmul** tiling.
 ///
 /// A stricter bound than the KO *storage* chunk, which packs 8 rows × 128 K: the
@@ -285,13 +303,74 @@ pub fn dequant_mxfp4_ko(chunk: &[u8], nrows: usize, ncols: usize) -> Vec<f32> {
     out
 }
 
-/// (maxq, crumb_bytes, hi_bytes) for the affine KO formats. Q8_KO is handled separately.
-fn ko_params(dtype: GgmlDType) -> Option<(i32, usize, usize)> {
+/// The plane set of an affine KO format: `(maxq, ql_bytes, crumb_bytes, hi_bytes)`.
+///
+/// **Every affine KO width is a prefix of one plane stack.** A chunk is 8 rows × 128 K = 1024
+/// values, and a format spends its bits across at most three planes, stacked from the LSB in a
+/// fixed order:
+///
+/// | plane | bits | bytes / chunk | address |
+/// |---|---|---|---|
+/// | `ql` | 4 | 512 | `lane*16 + sub*4 + i`, nibble per half |
+/// | `crumb` | 2 | 256 | `lane*8 + sub*2 (+1)`, 2 bits at `2i` |
+/// | `hi` | 1 | 128 | `lane*4 + sub`, nibble per half, bit `i` |
+///
+/// A value's bit position is therefore decided by which planes are *present* below it, not by
+/// the format: `crumb` sits at bit 4 when `ql` is present and at bit 0 when it is not, and `hi`
+/// sits above whichever of the two are there. That one rule reproduces all five layouts
+/// bit-for-bit, which is why adding a width is a row in this table rather than a codec.
+///
+/// Q8_KO is not here: it is symmetric (min = 0) with a different lane split, and has its own
+/// pair of functions.
+fn ko_params(dtype: GgmlDType) -> Option<(i32, usize, usize, usize)> {
     match dtype {
-        GgmlDType::Q4_KO => Some((15, 0, 0)),
-        GgmlDType::Q5_KO => Some((31, 0, 128)),
-        GgmlDType::Q6_KO => Some((63, 256, 0)),
+        //                        maxq   ql  crumb   hi     bits           bpw
+        GgmlDType::Q2_KO => Some((3, 0, 256, 0)), //   crumb              2.25
+        GgmlDType::Q3_KO => Some((7, 0, 256, 128)), // crumb + hi         3.25
+        GgmlDType::Q4_KO => Some((15, 512, 0, 0)), //  ql                 4.25
+        GgmlDType::Q5_KO => Some((31, 512, 0, 128)), // ql + hi           5.25
+        GgmlDType::Q6_KO => Some((63, 512, 256, 0)), // ql + crumb        6.25
         _ => None,
+    }
+}
+
+/// Where each plane starts inside a chunk, and where the value's bits live.
+///
+/// Derived from [`ko_params`] alone — see its table for why the shifts are a function of which
+/// planes are present rather than of the dtype.
+struct KoPlanes {
+    maxq: i32,
+    ql_bytes: usize,
+    crumb_base: usize,
+    crumb_bytes: usize,
+    hi_base: usize,
+    hi_bytes: usize,
+    dm_base: usize,
+    chunk_bytes: usize,
+    /// Bit position of the crumb plane within the value.
+    crumb_shift: u32,
+    /// Bit position of the `hi` plane within the value.
+    hi_shift: u32,
+}
+
+impl KoPlanes {
+    fn of(dtype: GgmlDType) -> Self {
+        let (maxq, ql_bytes, crumb_bytes, hi_bytes) =
+            ko_params(dtype).unwrap_or_else(|| panic!("not an affine KO dtype: {dtype:?}"));
+        let crumb_shift = if ql_bytes > 0 { 4 } else { 0 };
+        let hi_shift = crumb_shift + if crumb_bytes > 0 { 2 } else { 0 };
+        Self {
+            maxq,
+            ql_bytes,
+            crumb_base: ql_bytes,
+            crumb_bytes,
+            hi_base: ql_bytes + crumb_bytes,
+            hi_bytes,
+            dm_base: ql_bytes + crumb_bytes + hi_bytes,
+            chunk_bytes: ql_bytes + crumb_bytes + hi_bytes + 32,
+            crumb_shift,
+            hi_shift,
+        }
     }
 }
 
@@ -299,6 +378,7 @@ fn ko_params(dtype: GgmlDType) -> Option<(i32, usize, usize)> {
 pub fn ko_chunk_bytes(dtype: GgmlDType) -> usize {
     match dtype {
         GgmlDType::Q2_KO => 256 + 32,       // crumb (2-bit values) + dm
+        GgmlDType::Q3_KO => 256 + 128 + 32, // crumb + hi + dm
         GgmlDType::Q4_KO => 512 + 32,       // ql + dm
         GgmlDType::Q5_KO => 512 + 128 + 32, // ql + hi + dm
         GgmlDType::Q6_KO => 512 + 256 + 32, // ql + crumb + dm
@@ -322,17 +402,12 @@ pub fn quantize_ko(w: &[f32], nrows: usize, ncols: usize, dtype: GgmlDType) -> V
     if dtype == GgmlDType::Q8_KO {
         return quantize_q8_ko(w, nrows, ncols);
     }
-    if dtype == GgmlDType::Q2_KO {
-        return quantize_q2_ko(w, nrows, ncols);
-    }
-    let (maxq, crumb_bytes, hi_bytes) =
-        ko_params(dtype).unwrap_or_else(|| panic!("not a KO dtype: {dtype:?}"));
+    let p = KoPlanes::of(dtype);
+    let (maxq, crumb_bytes, hi_bytes) = (p.maxq, p.crumb_bytes, p.hi_bytes);
+    let (crumb_base, hi_base, dm_base, chunk_bytes) =
+        (p.crumb_base, p.hi_base, p.dm_base, p.chunk_bytes);
     let k_blocks = ncols / 128;
     let row_groups = nrows / 8;
-    let crumb_base = 512;
-    let hi_base = 512 + crumb_bytes;
-    let dm_base = 512 + crumb_bytes + hi_bytes;
-    let chunk_bytes = dm_base + 32;
     let mut ob = vec![0u8; k_blocks * row_groups * chunk_bytes];
     for k_blk in 0..k_blocks {
         for g in 0..row_groups {
@@ -351,19 +426,22 @@ pub fn quantize_ko(w: &[f32], nrows: usize, ncols: usize, dtype: GgmlDType) -> V
                 for kk in 0..128 {
                     q[kk] = (((w[wbase + kk] - mn) / scale).round() as i32).clamp(0, maxq) as u8;
                 }
+                let (cs, hs) = (p.crumb_shift, p.hi_shift);
                 for sub in 0..4 {
-                    for p in 0..16 {
-                        let lo = q[sub * 32 + p] & 0xF;
-                        let hi = q[sub * 32 + 16 + p] & 0xF;
-                        ob[cbase + (r * 4 + p / 4) * 16 + sub * 4 + (p % 4)] = lo | (hi << 4);
+                    if p.ql_bytes > 0 {
+                        for i in 0..16 {
+                            let lo = q[sub * 32 + i] & 0xF;
+                            let hi = q[sub * 32 + 16 + i] & 0xF;
+                            ob[cbase + (r * 4 + i / 4) * 16 + sub * 4 + (i % 4)] = lo | (hi << 4);
+                        }
                     }
                     for q3 in 0..4 {
                         let lane = r * 4 + q3;
                         if crumb_bytes > 0 {
                             let (mut cr0, mut cr1) = (0u8, 0u8);
                             for j in 0..4 {
-                                cr0 |= ((q[sub * 32 + q3 * 4 + j] >> 4) & 0x3) << (2 * j);
-                                cr1 |= ((q[sub * 32 + 16 + q3 * 4 + j] >> 4) & 0x3) << (2 * j);
+                                cr0 |= ((q[sub * 32 + q3 * 4 + j] >> cs) & 0x3) << (2 * j);
+                                cr1 |= ((q[sub * 32 + 16 + q3 * 4 + j] >> cs) & 0x3) << (2 * j);
                             }
                             ob[cbase + crumb_base + lane * 8 + sub * 2] = cr0;
                             ob[cbase + crumb_base + lane * 8 + sub * 2 + 1] = cr1;
@@ -371,8 +449,8 @@ pub fn quantize_ko(w: &[f32], nrows: usize, ncols: usize, dtype: GgmlDType) -> V
                         if hi_bytes > 0 {
                             let (mut hb0, mut hb1) = (0u8, 0u8);
                             for j in 0..4 {
-                                hb0 |= ((q[sub * 32 + q3 * 4 + j] >> 4) & 1) << j;
-                                hb1 |= ((q[sub * 32 + 16 + q3 * 4 + j] >> 4) & 1) << j;
+                                hb0 |= ((q[sub * 32 + q3 * 4 + j] >> hs) & 1) << j;
+                                hb1 |= ((q[sub * 32 + 16 + q3 * 4 + j] >> hs) & 1) << j;
                             }
                             ob[cbase + hi_base + lane * 4 + sub] = hb0 | (hb1 << 4);
                         }
@@ -434,18 +512,12 @@ pub fn dequant_ko(chunk: &[u8], nrows: usize, ncols: usize, dtype: GgmlDType) ->
     if dtype == GgmlDType::Q8_KO {
         return dequant_q8_ko(chunk, nrows, ncols);
     }
-    if dtype == GgmlDType::Q2_KO {
-        return dequant_q2_ko(chunk, nrows, ncols);
-    }
-    let (maxq, crumb_bytes, hi_bytes) =
-        ko_params(dtype).unwrap_or_else(|| panic!("not a KO dtype: {dtype:?}"));
-    let _ = maxq;
+    let pl = KoPlanes::of(dtype);
+    let (crumb_bytes, hi_bytes) = (pl.crumb_bytes, pl.hi_bytes);
+    let (crumb_base, hi_base, dm_base, chunk_bytes) =
+        (pl.crumb_base, pl.hi_base, pl.dm_base, pl.chunk_bytes);
     let k_blocks = ncols / 128;
     let row_groups = nrows / 8;
-    let crumb_base = 512;
-    let hi_base = 512 + crumb_bytes;
-    let dm_base = 512 + crumb_bytes + hi_bytes;
-    let chunk_bytes = dm_base + 32;
     let mut out = vec![0f32; nrows * ncols];
     for k_blk in 0..k_blocks {
         for g in 0..row_groups {
@@ -462,11 +534,15 @@ pub fn dequant_ko(chunk: &[u8], nrows: usize, ncols: usize, dtype: GgmlDType) ->
                         let q3 = p / 4;
                         let i = p % 4;
                         let lane = r * 4 + q3;
-                        let qlb = chunk[cbase + lane * 16 + sub * 4 + i] as u32;
-                        let mut qv = if half == 0 {
-                            qlb & 0xF
+                        let mut qv = if pl.ql_bytes > 0 {
+                            let qlb = chunk[cbase + lane * 16 + sub * 4 + i] as u32;
+                            if half == 0 {
+                                qlb & 0xF
+                            } else {
+                                (qlb >> 4) & 0xF
+                            }
                         } else {
-                            (qlb >> 4) & 0xF
+                            0
                         };
                         if crumb_bytes > 0 {
                             let off = cbase + crumb_base + lane * 8 + sub * 2;
@@ -475,12 +551,12 @@ pub fn dequant_ko(chunk: &[u8], nrows: usize, ncols: usize, dtype: GgmlDType) ->
                             } else {
                                 chunk[off + 1]
                             } as u32;
-                            qv |= ((cr >> (2 * i)) & 0x3) << 4;
+                            qv |= ((cr >> (2 * i)) & 0x3) << pl.crumb_shift;
                         }
                         if hi_bytes > 0 {
                             let hb = chunk[cbase + hi_base + lane * 4 + sub] as u32;
                             let nib = if half == 0 { hb & 0xF } else { (hb >> 4) & 0xF };
-                            qv |= ((nib >> i) & 1) << 4;
+                            qv |= ((nib >> i) & 1) << pl.hi_shift;
                         }
                         let k = sub * 32 + kk;
                         out[row * ncols + k_blk * 128 + k] = scale * qv as f32 + mn;
@@ -492,6 +568,7 @@ pub fn dequant_ko(chunk: &[u8], nrows: usize, ncols: usize, dtype: GgmlDType) ->
     out
 }
 
+#[cfg(test)]
 /// Q2_KO: 2-bit affine KO twin — per-128 `(scale, min)`, value 0..3. Layout per 8-row × 128-K
 /// chunk (288 B): a 256 B **crumb** region + 32 B `dm`. The crumb region is byte-identical to the
 /// high-2-bit crumb region `Q6_KO` already carries — for `(lane = r*4 + q3, sub)`, `cr0` at
@@ -499,6 +576,12 @@ pub fn dequant_ko(chunk: &[u8], nrows: usize, ncols: usize, dtype: GgmlDType) ->
 /// `cr1` at `+1` the 4 HIGH-half values (`q[sub*32 + 16 + q3*4 + j]`) — but here the crumb IS the
 /// whole value (Q6 stores only the high 2 bits of a 6-bit value). One row's 32 B = one
 /// `block_c_q2_KO_k128`. `dm[r] = (scale, min)` f16 at `256 + r*4`.
+///
+/// **Kept as an independent oracle, not as a code path.** This was the production Q2_KO
+/// packer until [`KoPlanes`] generalised the plane stack and subsumed it. It survives because
+/// it is a second, differently-written statement of the same layout: `the_plane_stack_
+/// reproduces_the_hand_written_q2_ko` asserts the generic path equals it byte-for-byte, which
+/// is the proof that generalising did not move a single bit of an existing format.
 fn quantize_q2_ko(w: &[f32], nrows: usize, ncols: usize) -> Vec<u8> {
     let k_blocks = ncols / 128;
     let row_groups = nrows / 8;
@@ -543,7 +626,9 @@ fn quantize_q2_ko(w: &[f32], nrows: usize, ncols: usize) -> Vec<u8> {
     ob
 }
 
+#[cfg(test)]
 /// Inverse of [`quantize_q2_ko`] — reconstruct F32 `W = scale·q + min` from the crumb chunk.
+/// An oracle for the same reason its inverse is.
 fn dequant_q2_ko(chunk: &[u8], nrows: usize, ncols: usize) -> Vec<f32> {
     let k_blocks = ncols / 128;
     let row_groups = nrows / 8;
@@ -865,6 +950,7 @@ mod tests {
         // with bit width; matches the dense bench's "vs f32 ground truth" column.
         for &(dtype, ceil) in &[
             (GgmlDType::Q2_KO, 0.400), // ~0.325 (≈1/3, the 2-bit affine floor — 4 levels)
+            (GgmlDType::Q3_KO, 0.180), // ~0.14  (≈1/7, the 3-bit affine floor — 8 levels)
             (GgmlDType::Q4_KO, 0.080), // ~0.065
             (GgmlDType::Q5_KO, 0.050), // ~0.033
             (GgmlDType::Q6_KO, 0.025), // ~0.017
@@ -912,6 +998,138 @@ mod tests {
         // On-grid input → dequant is EXACT (scale·q + min with q ∈ {0,1,2,3}, scale=1, min=0).
         let de = dequant_ko(&chunk, nrows, ncols, GgmlDType::Q2_KO);
         assert_eq!(de, w, "Q2_KO dequant must be exact on the 4-level grid");
+    }
+
+    /// **The generalisation moved no bits.** [`KoPlanes`] replaced a hand-written Q2_KO packer
+    /// with a plane-stack rule shared by all five affine widths; `quantize_q2_ko` /
+    /// `dequant_q2_ko` survive as an independently written statement of the same layout, and
+    /// this asserts the two agree byte-for-byte on input that exercises every crumb value and a
+    /// non-trivial `dm`. A refactor of a codec that is only round-trip-tested proves nothing —
+    /// both halves can move together.
+    #[test]
+    fn the_plane_stack_reproduces_the_hand_written_q2_ko() {
+        let (nrows, ncols) = (24usize, 384usize);
+        let w = pseudo(nrows * ncols);
+        let generic = quantize_ko(&w, nrows, ncols, GgmlDType::Q2_KO);
+        let oracle = quantize_q2_ko(&w, nrows, ncols);
+        assert_eq!(
+            generic, oracle,
+            "KoPlanes must emit the hand-written Q2_KO bytes exactly"
+        );
+        assert_eq!(
+            dequant_ko(&generic, nrows, ncols, GgmlDType::Q2_KO),
+            dequant_q2_ko(&oracle, nrows, ncols),
+            "and the generic dequant must read them the same way"
+        );
+    }
+
+    /// Q3_KO RAW BYTES (per the codec rule — exact bytes, not a tolerance). One 8×128 chunk
+    /// whose every row is `0,1,…,7,0,1,…` → scale 1, min 0, `q[k] = k % 8`.
+    ///
+    /// Each (lane, sub) quad covers 4 consecutive K, so the quads see values `(0,1,2,3)` then
+    /// `(4,5,6,7)` alternating. The crumb plane holds bits 0-1 → `0,1,2,3` packs to `0xE4` and
+    /// `4,5,6,7` packs to `0xE4` as well (`q & 3` is the same). The hi plane holds bit 2 → the
+    /// first quad gives `0b0000` and the second `0b1111`. So the crumb region is uniformly
+    /// `0xE4` and the hi region alternates by the quad's parity, which is exactly what pins the
+    /// two planes apart: a bug that read hi at the wrong shift leaves the crumb bytes intact.
+    #[test]
+    fn q3_ko_raw_bytes() {
+        let (nrows, ncols) = (8usize, 128usize);
+        let w: Vec<f32> = (0..nrows * ncols)
+            .map(|i| ((i % ncols) % 8) as f32)
+            .collect();
+        let chunk = quantize_ko(&w, nrows, ncols, GgmlDType::Q3_KO);
+        assert_eq!(
+            chunk.len(),
+            416,
+            "one 8×128 chunk = 256 crumb + 128 hi + 32 dm"
+        );
+        assert_eq!(ko_chunk_bytes(GgmlDType::Q3_KO), 416);
+
+        for (i, b) in chunk[..256].iter().enumerate() {
+            assert_eq!(
+                *b, 0xE4,
+                "crumb byte {i}: bits 0-1 of 0,1,2,3 (and of 4,5,6,7)"
+            );
+        }
+        // hi byte at `256 + lane*4 + sub` packs the low-half quad in its low nibble and the
+        // high-half quad in its high nibble. For row r, lane = r*4 + q3, and the low half of
+        // sub s covers K = s*32 + q3*4 + {0..3}; bit 2 of `K % 8` is 1 exactly when
+        // `(K / 4)` is odd, i.e. when `q3` is odd (s*32 and 4 are both even multiples).
+        for r in 0..8 {
+            for q3 in 0..4 {
+                let lane = r * 4 + q3;
+                for sub in 0..4 {
+                    let got = chunk[256 + lane * 4 + sub];
+                    // low half: K = sub*32 + q3*4 + j  → bit2 set iff q3 odd
+                    // high half: K = sub*32 + 16 + q3*4 + j → +16 keeps K/4 parity, so same
+                    let want = if q3 % 2 == 1 { 0xFFu8 } else { 0x00u8 };
+                    assert_eq!(got, want, "hi byte r{r} q3{q3} sub{sub}");
+                }
+            }
+        }
+        for r in 0..8 {
+            let d = 384 + r * 4;
+            assert_eq!(
+                &chunk[d..d + 4],
+                &[0x00, 0x3C, 0x00, 0x00],
+                "dm row {r} = (scale 1.0, min 0.0) f16"
+            );
+        }
+        // On-grid input → dequant is EXACT (scale·q + min with q ∈ 0..=7, scale=1, min=0).
+        let de = dequant_ko(&chunk, nrows, ncols, GgmlDType::Q3_KO);
+        assert_eq!(de, w, "Q3_KO dequant must be exact on the 8-level grid");
+    }
+
+    /// Q3_KO's two planes carry **different** bits of the value, and a shift bug in either one
+    /// survives the uniform test above. Here every value in a quad is distinct mod 4 *and* mod
+    /// 8, so crumb and hi disagree.
+    #[test]
+    fn q3_ko_splits_the_value_across_crumb_and_hi() {
+        let (nrows, ncols) = (8usize, 128usize);
+        let mut w: Vec<f32> = vec![0.0; nrows * ncols];
+        for r in 0..nrows {
+            let base = r * ncols;
+            // K = 0..3 → 7,5,2,0: crumb bits (3,1,2,0) → 3|1<<2|2<<4|0<<6 = 0x27
+            //                      hi bits    (1,1,0,0) → 0b0011 = 0x3
+            for (k, v) in [7.0f32, 5.0, 2.0, 0.0].iter().enumerate() {
+                w[base + k] = *v;
+            }
+            // give the row full range so scale = 1, min = 0
+            for (k, v) in [0.0f32, 1.0, 2.0, 7.0].iter().enumerate() {
+                w[base + 4 + k] = *v;
+            }
+        }
+        let chunk = quantize_ko(&w, nrows, ncols, GgmlDType::Q3_KO);
+        assert_eq!(chunk[0], 0x27, "cr0 for K=0..3 values (7,5,2,0), bits 0-1");
+        // lane 0, sub 0 → hi byte at 256; low nibble = bit-2 of (7,5,2,0) = 1,1,0,0.
+        assert_eq!(chunk[256] & 0x0F, 0x03, "hi nibble for K=0..3");
+        let de = dequant_ko(&chunk, nrows, ncols, GgmlDType::Q3_KO);
+        assert_eq!(&de[0..4], &[7.0, 5.0, 2.0, 0.0], "round trip on the grid");
+    }
+
+    /// Every affine KO width round-trips exactly on its own grid, and each is the byte size
+    /// [`ko_chunk_bytes`] promises. One table, so a new width cannot be added without landing
+    /// here — which is the property [`KoPlanes`] exists to give.
+    #[test]
+    fn every_affine_ko_width_round_trips_on_its_grid() {
+        let (nrows, ncols) = (8usize, 128usize);
+        for (dtype, maxq, bytes) in [
+            (GgmlDType::Q2_KO, 3usize, 288usize),
+            (GgmlDType::Q3_KO, 7, 416),
+            (GgmlDType::Q4_KO, 15, 544),
+            (GgmlDType::Q5_KO, 31, 672),
+            (GgmlDType::Q6_KO, 63, 800),
+        ] {
+            let w: Vec<f32> = (0..nrows * ncols)
+                .map(|i| ((i % ncols) % (maxq + 1)) as f32)
+                .collect();
+            let chunk = quantize_ko(&w, nrows, ncols, dtype);
+            assert_eq!(chunk.len(), bytes, "{dtype:?} chunk bytes");
+            assert_eq!(ko_chunk_bytes(dtype), bytes, "{dtype:?} ko_chunk_bytes");
+            let de = dequant_ko(&chunk, nrows, ncols, dtype);
+            assert_eq!(de, w, "{dtype:?} must round-trip exactly on its own grid");
+        }
     }
 
     /// Q2_KO crumb byte varies correctly with the quantized values: a row whose 128 values step

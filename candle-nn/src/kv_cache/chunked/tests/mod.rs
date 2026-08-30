@@ -12,6 +12,7 @@
 //! - `selection_table_tests` - Tests for the selection table's (chunk, head) rows
 
 mod alloc_tests;
+mod arena_release_tests;
 mod arena_tests;
 mod backing_tests;
 mod chunk_ops_tests;

@@ -892,11 +892,21 @@ impl TestParams {
         // output — the sizing inputs are runtime facts of the machine and the
         // moment, and a gate that hides them cannot be used to diagnose a
         // mis-sized tier. `try_init` so a second `run` in one process is fine.
+        //
+        // **The level comes from `RUST_LOG`, defaulting to INFO.** A hard
+        // `with_max_level(INFO)` stood here and silently made this comment false
+        // for the most important item in its own list: every elastic-boundary
+        // move — both `concede_kv_ground` and `reclaim_spare_ground` — is a
+        // `debug!`, so the one class of event a gate needs in order to explain a
+        // residency collapse was the one class it could not print, and no
+        // `RUST_LOG` could turn it on. Targets are kept on for the same reason:
+        // filtering by target is the point of an env filter.
         #[cfg(feature = "verbose")]
         {
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
             let _ = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::INFO)
-                .with_target(false)
+                .with_env_filter(filter)
                 .compact()
                 .try_init();
         }
@@ -979,14 +989,41 @@ impl TestParams {
             candle::vram::sample_available_low_water();
             if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
                 let (swept, sweeps) = candle_nn::kv_cache::empty_sweep_stats();
+                // `blocked` is split, because its two halves call for opposite
+                // responses and reading the total alone cannot tell them apart:
+                // ground under a standing tier comes back at the end of the
+                // wave, ground above the weight floor comes back only if the
+                // weight side concedes. `ceiling` says which bound is binding.
+                // Driver-side free VRAM beside the pool's own view. The two
+                // answer different questions and the difference is the whole
+                // out-of-reservation story: the pool can report ground to spare
+                // while the *device* has none, because everything allocated
+                // outside the span — and everything an async free has not yet
+                // returned — is invisible to the pool.
+                let dev_free_mib = self
+                    .device
+                    .mem_get_info()
+                    .map(|(f, _)| f >> 20)
+                    .unwrap_or(0);
                 println!(
-                    "  [regions] total {} | live {} | free {} | blocked {} | arenas {} MiB \
+                    "  [regions] total {} | live {} | free {} | blocked {} \
+                     | ceiling {} | arenas {} MiB | weight {} MiB \
+                     | device free {dev_free_mib} MiB \
+                     | mid-wave claims {} refused {} \
                      | swept {swept} arenas / {sweeps} sweeps",
                     rs.total,
                     rs.live,
                     rs.free,
                     rs.blocked,
+                    rs.transient_ceiling,
                     arena_bytes >> 20,
+                    rs.weight_bytes >> 20,
+                    // Zero is the precondition for anchoring the tier at the
+                    // arena frontier: a claim that arrives after admit meets a
+                    // ceiling admit did not plan against, and is refused with
+                    // nowhere to go.
+                    rs.fresh_claims_during_wave,
+                    rs.refusals_during_wave,
                 );
             }
             let _ = candle::gpu_memory::snapshot(
@@ -1416,12 +1453,44 @@ impl TestParams {
                 // config saturates a span every later config reports the same
                 // number. Read it as "the worst this process ever saw", not as a
                 // per-config figure.
+                //
+                // **Capacity is instantaneous and is 0 here by design.** The wave
+                // tier is placed inside the span per forward and torn down when
+                // the last generation closes (`BumpArena::detached`), so between
+                // configs there is no span to report. This used to print
+                // "N B of 0 B", which reads as an arena with no budget — i.e. as
+                // an allocation escaping the reservation — and was misdiagnosed
+                // exactly that way. The peak is the number that means something.
+                let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
                 eprintln!(
-                    "[{:?}] wave arenas (peak is process-wide): attention {} B of {} B, \
-                     ffn {} B of {} B, forward {} B of {} B",
-                    config.mode, attn.1, attn.2, ffn.1, ffn.2, fwd.1, fwd.2
+                    "[{:?}] wave arena peaks (process-wide; tier is placed per forward and \
+                     absent between them): attention {:.1} MiB, ffn {:.1} MiB, forward {:.1} MiB",
+                    config.mode,
+                    mib(attn.1),
+                    mib(ffn.1),
+                    mib(fwd.1),
                 );
             }
+        }
+        // A dense model whose layers are slot tenants: which tier every layer
+        // read came from. Cumulative for the process, like the arena peaks
+        // above — the shape that matters is the ratio, not the absolute.
+        // `cold` is the expensive column: a pack read is a synchronous NVMe
+        // round trip on the forward thread, where a warm hit is one H2D.
+        if let Some([hits, warm, cold, joins, evictions, homed, streaming]) =
+            model.layer_stream_stats()
+        {
+            // `homed`/`streaming` are the zone's state **now**, not at its carve:
+            // the boundary grows into spare KV ground over the first forwards, so
+            // a run measured at full residency and a run that never streamed both
+            // show near-zero transfers and only this tells them apart.
+            eprintln!(
+                "[{:?}] layer stream: hits {hits} warm {warm} cold {cold} \
+                 joins {joins} evictions {evictions} | zone now {homed} homed, \
+                 {streaming} streaming{}",
+                config.mode,
+                if streaming == 0 { " (whole)" } else { "" }
+            );
         }
         pipeline_record("bench:decode_total", t_decode_total);
 
@@ -1508,8 +1577,20 @@ impl TestParams {
         }
 
         // Explicitly free sequences and compact to release GPU memory before next config
+        //
+        // **Both halves of a sequence, because they have different owners.** The
+        // session owns the KV slots; the *model* owns the recurrent state, keyed
+        // by sequence id, and `release_sequence` is the hook that ties the two
+        // lifetimes together (its own doc says so). Freeing only the KV half
+        // leaves the recurrent store — 48 DeltaNet layers of `s` and conv tails
+        // per sequence on the 27B — holding reservation regions for the life of
+        // the process. It is not KV, so the arena sweep cannot see it and every
+        // KV-side diagnostic reports the pool as healthy while the weight zone
+        // is squeezed: measured, 21 regions after one context, 84 after four,
+        // 404 after twenty, never falling.
         for &seq_idx in &sequence_indices {
             session.free_sequence(seq_idx)?;
+            model.release_sequence(seq_idx)?;
         }
         let t_cleanup_sweep = profile_now();
         // Return the freed sequences' regions to the pool before the next
@@ -1518,6 +1599,42 @@ impl TestParams {
         pipeline_record("bench:cleanup_sweep", t_cleanup_sweep);
         drop(session);
         self.device.synchronize()?;
+
+        // ── The KV must be gone before the next config starts ──
+        //
+        // **A gate, because the symptom is a throughput figure and not an
+        // error.** Every sequence has been freed and the session dropped, so
+        // nothing above holds a chunk; anything still live is held by a
+        // reference this cleanup does not reach, and it is held for the rest of
+        // the run. The weight zone is carved from what the KV side leaves, so a
+        // config that keeps its regions makes *every later config* slower —
+        // measured on the 27B, `live` went 21 → 84 → 404 and never fell, a
+        // single-context config holding 84 regions where the same config run
+        // first holds 21, and the zone stuck at half its size from C8 onward.
+        //
+        // Two assertions, because they fail for different reasons. Regions still
+        // live means a chunk is still referenced. An arena that a second sweep
+        // can still free means the first sweep did not run to completion — the
+        // ground was free and simply not collected.
+        let which = format!("{:?}×{}", config.mode, config.num_contexts);
+        let residual = candle_nn::kv_cache::reclaim_empty_arenas();
+        assert_eq!(
+            residual, 0,
+            "config {which}: a second sweep freed {residual} more arenas — the \
+             cleanup above left empty arenas holding regions"
+        );
+        if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
+            assert_eq!(
+                rs.live,
+                0,
+                "config {which}: {} KV regions ({} MiB) are still live after every \
+                 sequence was freed and the session dropped. Something outlives \
+                 the cleanup and holds them for the rest of the run, so the \
+                 weight zone can never grow back and every later config is slower.",
+                rs.live,
+                rs.live * (candle_nn::kv_cache::REGION_BYTES / (1024 * 1024)),
+            );
+        }
 
         // Snapshot single (generate) profile
         let single_profile = model.snapshot_profiles();
@@ -2041,7 +2158,7 @@ impl TestParams {
                                     if isolation_failed <= 3 {
                                         println!(
                                         "\n⚠ Session {} ({}) produced identical output to session {} ({}) — possible session isolation failure",
-                                        i, &self.names[name_i], i - 1, &self.names[name_prev]
+                                        i, self.names[name_i], i - 1, self.names[name_prev]
                                     );
                                         // Debug: show output tokens
                                         let decode_out = |tokens: &[u32]| -> String {
@@ -2221,6 +2338,16 @@ impl TestParams {
         }
 
         println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┘");
+        // **Here, not after the expert table.** The pinned-RAM report carries the
+        // boundary's `Spare calc:` attribution — which of the four gates refused
+        // the weight side ground — and it used to hang off
+        // `print_expert_stats_table`, which returns immediately when no config
+        // has expert stats. That is every dense model, so the one report that
+        // explains a streamed model's residency was unreachable for exactly the
+        // models whose whole decode rate is residency. A 10× decode collapse read
+        // as unexplained in this table while the number naming its cause was
+        // being computed and dropped.
+        Self::print_pinned_ram_report();
     }
 
     /// Print a transposed expert pipeline stats table.
@@ -2383,7 +2510,6 @@ impl TestParams {
             print!("┴{:─<cw$}", "", cw = col_w + 2);
         }
         println!("┘");
-        Self::print_pinned_ram_report();
     }
 
     /// Print what host RAM the engine page-locked, and what bounded it.
@@ -2552,9 +2678,19 @@ impl TestParams {
 
         let s = candle_nn::kv_cache::spare_tally();
         println!(
-            "  Spare calc: observing {} | pressure {} | history-bound {} | occupancy-bound {} \
+            "  Spare calc: observing {} | pressure {} | occupancy-bound {} \
              | granted {} regions || KV purchases: conceded {} / refused {}",
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6],
+            s[0], s[1], s[2], s[3], s[4], s[5],
+        );
+        // The other half of the same question. `Spare calc` says what the pool
+        // offered; this says what the layer zone did with it, and a collapse
+        // that shows spare being granted while the zone stays on its floor is
+        // only attributable with both.
+        let g = crate::models::layer_stream::growth_tally();
+        println!(
+            "  Zone growth: called {} | already whole {} | no spare {} | bought no layer {} \
+             | under step floor {} | wave live {} | APPLIED {}",
+            g[0], g[1], g[2], g[3], g[4], g[6], g[5],
         );
         println!("  Pinned now, by consumer:");
         for (use_, bytes) in host_pinned_breakdown() {

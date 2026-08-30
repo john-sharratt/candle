@@ -92,6 +92,7 @@ pub mod kv_collect_utils;
 // and the wave scheduler are all kernel wrappers.
 #[cfg(feature = "cuda")]
 pub mod latent_moe;
+pub mod layer_stream;
 pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;

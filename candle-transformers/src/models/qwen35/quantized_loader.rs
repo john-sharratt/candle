@@ -22,11 +22,16 @@ use std::sync::Arc;
 use candle::quantized::{gguf_file::Content, Int8Mode};
 use candle::{Device, Result};
 
+use super::config::Qwen35Config;
 use super::embedding::EmbeddingTable;
 use super::expert_loader::build_expert_cache;
-use super::quantized_weights::{load_quantized_model, QuantModel};
+use super::layer_loader::build_layer_cache;
+use super::layer_store::LayerStore;
+use super::quantized_weights::{load_quantized_model, LoadInputs, QuantModel};
 use crate::models::batched_model::ensure_vram_governor;
-use crate::models::expert_lre::ExpertCache;
+use crate::models::expert_lre::pack::repack_fingerprint;
+use crate::models::expert_lre::{ExpertCache, PINNED_LAYERS};
+use crate::models::layer_stream::PackIdentity;
 
 /// Load-time knobs.
 #[derive(Debug, Default, Clone)]
@@ -43,6 +48,19 @@ pub struct Qwen35LoadOptions {
     /// directory (the checkpoint's own is the usual answer, so the pack is
     /// shared by every workspace on that model) to turn the repack into a read.
     pub expert_pack_dir: Option<PathBuf>,
+    /// A GGUF holding the NextN / MTP draft head, when the checkpoint does not.
+    ///
+    /// Two conventions are in the wild. Unsloth embeds the head's tensors in the
+    /// main file, and nothing needs naming here. ggml-org ships them as a
+    /// sidecar — `mtp-Qwen3.8-27B-Q4_0.gguf` beside `Qwen3.8-27B-Q4_K_M.gguf` —
+    /// whose main file declares no `nextn_predict_layers` at all, so without
+    /// this the model loads perfectly and simply never drafts.
+    ///
+    /// That is worth a knob rather than a guess at a filename: what the head
+    /// costs is VRAM the layer zone would otherwise hold, and on a card where
+    /// the model already streams that is a trade the caller should make
+    /// explicitly.
+    pub mtp_path: Option<PathBuf>,
 }
 
 /// Load a hybrid checkpoint of this lineage.
@@ -111,22 +129,53 @@ pub fn load_hybrid_gguf(
     // than aliased out of it, so the mapping itself only has to outlive the
     // load — except on a routed checkpoint, where the expert cache keeps its own
     // `Arc` and streams from it for the life of the model.
-    // The embedding is the one dense tensor read per token rather than per
-    // forward, so it is bound to host-mapped memory here — where the mapping
-    // is — and the GPU gathers its rows from device-side ids. `None` falls back
-    // to the F32 host table inside the load.
-    let host_embed = EmbeddingTable::host_mapped(&content, &mmap);
+    // The draft head's own file, when the checkpoint keeps the head outside
+    // itself. Mapped here so its `Content` and bytes outlive the load, exactly
+    // as the checkpoint's do.
+    let mtp_mmap = match options.mtp_path.as_deref() {
+        None => None,
+        Some(p) => {
+            let f = std::fs::File::open(p)?;
+            let m = unsafe {
+                MmapOptions::new().map(&f).map_err(|e| {
+                    candle::Error::Msg(format!("qwen35: failed to mmap MTP head {p:?}: {e}"))
+                })?
+            };
+            let mut c = std::io::Cursor::new(&m[..]);
+            let content = Content::read(&mut c)?;
+            tracing::info!(
+                target: "candle_transformers::qwen35",
+                file = ?p,
+                "loading the MTP draft head from a sidecar"
+            );
+            Some((content, m))
+        }
+    };
+    let mtp_src = mtp_mmap.as_ref().map(|(c, m)| (c, &m[..]));
+
+    // The embedding is the one dense tensor read per token rather than per forward, so it is
+    // bound to host-mapped memory here — where the mappings are — and the GPU gathers its rows
+    // from device-side ids. `None` falls back to the F32 host table inside the load.
+    //
+    // Decided after the sidecar is mapped, because it is a candidate: the table costs host RAM
+    // and no VRAM, so the wider of the two copies is taken. See `widest_host_mapped`.
+    let mut embed_sources: Vec<(&Content, &memmap2::Mmap)> = vec![(&content, &mmap)];
+    if let Some((c, m)) = mtp_mmap.as_ref() {
+        embed_sources.push((c, m));
+    }
+    let host_embed = EmbeddingTable::widest_host_mapped(&embed_sources);
+    drop(embed_sources);
 
     let mut reader = std::io::Cursor::new(&mmap[..]);
     let pack_dir = options.expert_pack_dir.clone();
     let mmap_for_cache = mmap.clone();
-    load_quantized_model(
-        &content,
-        &mut reader,
-        device,
-        int8mode,
+    let mmap_for_layers = mmap.clone();
+    let inputs = LoadInputs {
         host_embed,
-        |content, cfg| -> Result<Option<Arc<ExpertCache>>> {
+        mtp_src,
+        build_experts: |content: &Content,
+                        cfg: &Qwen35Config|
+         -> Result<Option<Arc<ExpertCache>>> {
             build_expert_cache(
                 content,
                 cfg,
@@ -137,5 +186,40 @@ pub fn load_hybrid_gguf(
                 pack_dir.as_deref(),
             )
         },
-    )
+        // **Every dense checkpoint streams its layers** —
+        // `docs/qwen38_layer_streaming.md` §7. A model that fits is the
+        // degenerate case of the same mechanism: capacity covers the trunk,
+        // nothing is ever evicted, and no byte moves after load. A routed
+        // checkpoint is filtered out inside `load_quantized_model`, where the
+        // config is already parsed.
+        //
+        // Its own cursor over the same mapping, so the pack build and the
+        // pinned-head upload read the checkpoint without contending for the
+        // loader's reader.
+        build_layers: Some(
+            |content: &Content, cfg: &Qwen35Config, residues| -> Result<LayerStore> {
+                let Device::Cuda(cuda) = device else {
+                    candle::bail!("qwen35: layer streaming is a CUDA-only path")
+                };
+                let mut reader = std::io::Cursor::new(&mmap_for_layers[..]);
+                // The **same** fingerprint the expert pack uses: both hold
+                // weights repacked by identical code, so a change that
+                // invalidates one must invalidate the other.
+                let identity =
+                    PackIdentity::of(&mmap_for_layers[..], int8mode, repack_fingerprint(cuda));
+                build_layer_cache(
+                    content,
+                    &mut reader,
+                    device,
+                    cfg,
+                    int8mode,
+                    file_path,
+                    identity,
+                    PINNED_LAYERS,
+                    residues,
+                )
+            },
+        ),
+    };
+    load_quantized_model(&content, &mut reader, device, int8mode, inputs)
 }

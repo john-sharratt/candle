@@ -31,6 +31,10 @@ pub mod engine;
 pub mod expert_loader;
 #[cfg(feature = "cuda")]
 pub mod forward;
+/// Standing up the layer cache for a dense checkpoint larger than the card.
+#[cfg(feature = "cuda")]
+pub mod layer_loader;
+pub mod layer_store;
 pub mod loader;
 pub mod model;
 pub mod moe;

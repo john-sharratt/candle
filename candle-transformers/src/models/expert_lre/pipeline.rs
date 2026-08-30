@@ -602,6 +602,15 @@ pub(crate) fn slot_bytes_for(geoms: &[LayerGeometry]) -> usize {
 #[cfg(feature = "cuda")]
 const KV_REGION_SLACK: usize = 32;
 
+/// The smallest grant this cache can spend, in regions.
+///
+/// An expert slot is far smaller than a region, so every whole region handed
+/// over becomes residency — there is no grant this consumer has to discard.
+/// Eight is the value `kv_grow_step` used to hard-code for everyone; it belongs
+/// to this cache, and now says so.
+#[cfg(feature = "cuda")]
+const EXPERT_MIN_GRANT_REGIONS: usize = 8;
+
 /// Why a growth negotiation ended where it did.
 ///
 /// The boundary is asked to grow once per wave and answers zero almost every
@@ -667,8 +676,17 @@ unsafe fn build_slot_view(
 ) -> Result<ExpertSlot> {
     let (gate_off, up_off, down_off, _) = slot_offsets(geom);
     let view = |off: usize, bytes: usize, dtype, shape: &Vec<usize>| -> Result<_> {
-        let storage =
-            candle::quantized::view_repacked(cuda_dev, slot_base + off as u64, bytes, dtype)?;
+        // Extent == payload: an expert slot is cut to exactly its repacked
+        // bytes, and its KO twin's int8 kernel reads exactly those. (A slot
+        // holding a source quant would need the GGML kernels' row-padding tail
+        // as well — see `layer_stream::build::slot_extent`.)
+        let storage = candle::quantized::view_repacked(
+            cuda_dev,
+            slot_base + off as u64,
+            bytes,
+            bytes,
+            dtype,
+        )?;
         candle::quantized::QTensor::new(storage, shape.clone())
     };
     let gate_qt = view(
@@ -2424,7 +2442,11 @@ impl PipelineState {
         }
         let delta = match want {
             Some(0) | None => {
-                let spare = kv_spare_regions(&stream, KV_REGION_SLACK)?;
+                // An expert slot is this cache's allocation unit and it is well
+                // under a region, so any whole-region grant is spendable — the
+                // floor that used to be baked into `kv_grow_step` was this
+                // number, and passing it keeps the behaviour it always had.
+                let spare = kv_spare_regions(&stream, KV_REGION_SLACK, EXPERT_MIN_GRANT_REGIONS)?;
                 if spare == 0 {
                     grow_note(GrowOutcome::NoSpare);
                     return Ok(0);

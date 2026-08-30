@@ -62,6 +62,8 @@
 //! validates dims + [`schedule_hash`] before touching any tensor.
 
 #[cfg(feature = "cuda")]
+use candle::DType;
+#[cfg(feature = "cuda")]
 use candle::{cuda_backend::cudarc::driver::result::memcpy_dtod_sync, CudaDevice, Error, Storage};
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -212,8 +214,8 @@ fn tensor_device_ptr(cuda: &CudaDevice, t: &Tensor) -> Result<u64> {
 /// single contiguous range — which the kernels require, since they take a base
 /// pointer and a stride, not a scatter list.
 #[cfg(feature = "cuda")]
-struct RegionBump {
-    device: Device,
+pub(crate) struct RegionBump {
+    pub(crate) device: Device,
     /// The arena window, open for the whole store.
     ///
     /// One window rather than one per region: entering it hands back a standing
@@ -221,9 +223,28 @@ struct RegionBump {
     /// once per region, each carrying a device-wide quiesce. A store takes eight
     /// or so, and that much churn reaches the WDDM watchdog.
     claims: SpanClaims,
-    regions: Vec<SpanRegion>,
+    pub(crate) regions: Vec<SpanRegion>,
     /// Bytes used in the last region.
     cursor: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl RegionBump {
+    /// The claimed regions, dropping the bump — **and with it the arena
+    /// window**.
+    ///
+    /// A holder that keeps the whole bump keeps [`SpanClaims`] alive, and that
+    /// is an *open arena window*: every later wave blocks in `wave_gate`
+    /// waiting for it to close, and the engine simply stops. Measured as a
+    /// 58-minute hang with the process alive and no output.
+    ///
+    /// So a caller that needs the regions to outlive the allocation takes them
+    /// this way rather than storing the bump. `RecurrentStateStore` has always
+    /// done exactly this (`regions: bump.map_or_else(Vec::new, |b| b.regions)`);
+    /// this names the operation so the next caller does not have to notice.
+    pub(crate) fn into_regions(self) -> Vec<SpanRegion> {
+        self.regions
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -240,7 +261,7 @@ impl RegionBump {
 
     /// A bump for `device`, or `None` when there is no reservation to carve
     /// from — a CPU device in a CUDA build, which is every unit test here.
-    fn for_device(device: &Device) -> Result<Option<Self>> {
+    pub(crate) fn for_device(device: &Device) -> Result<Option<Self>> {
         match device {
             Device::Cuda(_) => Self::new(device).map(Some),
             _ => Ok(None),
@@ -268,6 +289,51 @@ impl RegionBump {
                 DeltaNetState::at(dims, device, backup_s, backup_conv)?,
             ))
         }
+    }
+
+    /// A **zeroed** tensor of `shape` on region memory.
+    ///
+    /// The general-purpose form of [`Self::take_state_pair`], for a buffer that
+    /// outlives the wave and so cannot come from the wave arena, but must still
+    /// be inside the reservation so the partition can see it. The rewind stash
+    /// is the other user (`qwen35::spec::VerifyStash`).
+    ///
+    /// **Zeroed, unlike a wave buffer.** Its consumers read rows they did not
+    /// write — the replay hands the mixer the whole `cap`-row buffer while only
+    /// the captured spans were filled — so this is one of the cases hot-path
+    /// invariant 6 explicitly exempts: a zero that is read before being written.
+    /// It replaces a `Tensor::zeros`, which zeroed for the same reason.
+    pub(crate) fn take_zeroed(
+        &mut self,
+        shape: impl Into<candle::Shape>,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
+        use candle::cuda_backend::wave_provenance::LeaseOrigin;
+        let shape = shape.into();
+        let bytes = shape.elem_count() * dtype.size_in_bytes();
+        // **An empty buffer needs no region.** A cohort with no blocks to verify
+        // builds a zero-row stash, which is legitimate — there is simply nothing
+        // to stash yet. `take` refuses a zero-byte request, and rightly: for its
+        // own caller a state with an empty half is a geometry fault. Here it is
+        // not, so the empty case is answered before the allocator sees it rather
+        // than by weakening a guard that is load-bearing elsewhere.
+        if bytes == 0 {
+            return Tensor::zeros(shape, dtype, device);
+        }
+        let at = self.take(bytes)?;
+        let Device::Cuda(cuda) = device else {
+            candle::bail!("region bump: a region buffer needs a CUDA device");
+        };
+        // SAFETY: `at` names `bytes` of a region this bump holds and nothing
+        // else addresses, and the stream orders the fill ahead of every reader.
+        unsafe { memset_d8_async(at, 0, bytes, cuda.cuda_stream().cu_stream()) }
+            .map_err(|e| candle::Error::Msg(format!("zeroing a region buffer: {e}")))?;
+        // `Foreign`: a lease the wave allocator did not issue and must not
+        // reclaim. Its ticket is absent deliberately — this buffer outlives
+        // every wave that reads it.
+        unsafe { Tensor::from_leased_cuda_ptr(at, dtype, shape, device, LeaseOrigin::Foreign) }
     }
 
     /// Address of `bytes` of region memory, claiming another region if this one

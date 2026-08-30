@@ -19,8 +19,12 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-// Affine KO formats: Q4_KO <15,0,0>, Q5_KO <31,0,128>, Q6_KO <63,256,0>.
-// CRUMB_BYTES carries bits 4-5 (Q6), HI_BYTES carries bit 4 (Q5); both zero for Q4.
+// The affine KO widths that carry a 512 B `ql` plane: Q4_KO <15,0,0>, Q5_KO <31,0,128>,
+// Q6_KO <63,256,0>. CRUMB_BYTES carries bits 4-5 (Q6), HI_BYTES carries bit 4 (Q5); both zero
+// for Q4. Q2_KO and Q3_KO have NO `ql` plane — their value starts at the crumb, so their bit
+// shifts differ and they have their own kernels below rather than instantiating this template.
+// The full plane stack and the shift rule live in `ko_quant::KoPlanes` (Rust), which is the
+// authority both sides are byte-checked against.
 template <int MAXQ, int CRUMB_BYTES, int HI_BYTES>
 __global__ void quantize_ko_affine_kernel(
     const float* __restrict__ w, uint8_t* __restrict__ ob, int nrows, int ncols)
@@ -231,6 +235,83 @@ __global__ void quantize_q2_ko_kernel(
             uint8_t cr1 = (uint8_t)((h0 & 3) | ((h1 & 3) << 2) | ((h2 & 3) << 4) | ((h3 & 3) << 6));
             ob[cbase + lane * 8 + sub * 2] = cr0;
             ob[cbase + lane * 8 + sub * 2 + 1] = cr1;
+        }
+        if (q3 == 0) { // one (scale, min) per row at dm[r].
+            *(half2*)(ob + cbase + DM_BASE + r * 4) =
+                __halves2half2(__float2half_rn(scale), __float2half_rn(mn));
+        }
+    }
+}
+
+// Q3_KO: 3-bit affine (per-128 scale, min), value 0..7. Two planes and no ql — bits 0-1 in the
+// 256 B crumb region at `lane*8 + sub*2` (byte-identical to Q2_KO's) and bit 2 in the 128 B hi
+// region at `256 + lane*4 + sub` (byte-identical to Q5_KO's 5th-bit region: low nibble = the 4
+// low-half values, high nibble = the 4 high-half). 416 B chunk (256 crumb + 128 hi + 32 dm).
+// Byte-identical to CPU `ko_quant::quantize_ko(.., Q3_KO)`.
+__global__ void quantize_q3_ko_kernel(
+    const float* __restrict__ w, uint8_t* __restrict__ ob, int nrows, int ncols)
+{
+    const int HI_BASE = 256;
+    const int DM_BASE = 384;
+    const int CHUNK_BYTES = DM_BASE + 32; // 416
+    const int k_blocks = ncols / 128;
+    const int row_groups = nrows / 8;
+    const int total_chunks = k_blocks * row_groups;
+    const int total_warps = (gridDim.x * blockDim.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int r = lane >> 2;
+    const int q3 = lane & 3;
+
+    for (int chunk = (int)(((int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+         chunk < total_chunks; chunk += total_warps) {
+        const int k_blk = chunk / row_groups;
+        const int g = chunk % row_groups;
+        const int64_t wbase = (int64_t)(g * 8 + r) * ncols + (int64_t)k_blk * 128;
+        const int cbase = chunk * CHUNK_BYTES;
+
+        float4 vlo[4], vhi[4];
+        float mn = INFINITY, mx = -INFINITY;
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            float4 a = *(const float4*)(w + wbase + sub * 32 + q3 * 4);
+            float4 b = *(const float4*)(w + wbase + sub * 32 + 16 + q3 * 4);
+            vlo[sub] = a;
+            vhi[sub] = b;
+            mn = fminf(mn, fminf(fminf(a.x, a.y), fminf(a.z, a.w)));
+            mn = fminf(mn, fminf(fminf(b.x, b.y), fminf(b.z, b.w)));
+            mx = fmaxf(mx, fmaxf(fmaxf(a.x, a.y), fmaxf(a.z, a.w)));
+            mx = fmaxf(mx, fmaxf(fmaxf(b.x, b.y), fmaxf(b.z, b.w)));
+        }
+        mn = fminf(mn, __shfl_xor_sync(0xffffffff, mn, 2));
+        mn = fminf(mn, __shfl_xor_sync(0xffffffff, mn, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+        const float scale = fmaxf((mx - mn) / 7.0f, 1e-12f);
+
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            // CPU uses (w - mn) / scale (division, not reciprocal-mul) — match it.
+            const float4 a = vlo[sub], b = vhi[sub];
+            int q[4], h[4];
+            q[0] = min(max((int)roundf((a.x - mn) / scale), 0), 7);
+            q[1] = min(max((int)roundf((a.y - mn) / scale), 0), 7);
+            q[2] = min(max((int)roundf((a.z - mn) / scale), 0), 7);
+            q[3] = min(max((int)roundf((a.w - mn) / scale), 0), 7);
+            h[0] = min(max((int)roundf((b.x - mn) / scale), 0), 7);
+            h[1] = min(max((int)roundf((b.y - mn) / scale), 0), 7);
+            h[2] = min(max((int)roundf((b.z - mn) / scale), 0), 7);
+            h[3] = min(max((int)roundf((b.w - mn) / scale), 0), 7);
+            uint8_t cr0 = 0, cr1 = 0, hb0 = 0, hb1 = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                cr0 |= (uint8_t)((q[j] & 3) << (2 * j));
+                cr1 |= (uint8_t)((h[j] & 3) << (2 * j));
+                hb0 |= (uint8_t)(((q[j] >> 2) & 1) << j);
+                hb1 |= (uint8_t)(((h[j] >> 2) & 1) << j);
+            }
+            ob[cbase + lane * 8 + sub * 2] = cr0;
+            ob[cbase + lane * 8 + sub * 2 + 1] = cr1;
+            ob[cbase + HI_BASE + lane * 4 + sub] = (uint8_t)(hb0 | (hb1 << 4));
         }
         if (q3 == 0) { // one (scale, min) per row at dm[r].
             *(half2*)(ob + cbase + DM_BASE + r * 4) =

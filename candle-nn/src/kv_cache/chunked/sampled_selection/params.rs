@@ -654,15 +654,48 @@ pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// Q6_K is pinned because it matches the lineage's other **dense** gate (the
 /// 9B), the MoE gates being the Q4_K_M ones.
 ///
-/// # It is the loosest row in the lineage, and that is now measured
+/// # Re-derived on Q3_K_M, and weight precision IS a term after all
 ///
-/// K 1.3 sits above the 9B's 1.09 and the MoE pair's 1.1/1.15 — the ordering
-/// the old extrapolation asserted but got backwards when its anchors moved
-/// (it sat at 1.5, looser than every measured row). The 27B genuinely does
-/// have the most headroom here; it simply had to be measured to know it.
+/// The section above concluded the opposite from Q4_0 against Q6_K, and it was
+/// right about that pair. It does not extend to **Q3_K_M**, which is what a
+/// 16 GB card runs: at the old row the gate's C10×10 scored **7/10** and C9 was
+/// intermittent. The failure is not garbage — the model emits fluent text and
+/// picks a *different character name* ("Marcus" where BF16 gives "Ian"), which
+/// is what a threshold one step too loose looks like when the KV it reads is
+/// still nearly right.
+///
+/// So the row is now derived per axis on the 16 GB card, Q3_K_M, against the
+/// full C0–C10 gate. Nine runs; each pair is one whole gate:
+///
+/// | K | V | C9 | C10 | compress |
+/// |---|---|----|-----|----------|
+/// | 1.3 | 2.3 | ✓ | 7/10 | 6.91× |
+/// | 1.0 | 2.3 | ✓ | 9/10 | 6.39× |
+/// | 0.8 | 2.3 | ✓ | 9/10 | 6.03× |
+/// | 1.3 | 1.8 | 4/5 | 9/10 | 6.27× |
+/// | 1.0 | 1.8 | 4/5 | 9/10 | 5.84× |
+/// | 0.85 | 1.8 | 4/5 | **✓** | 5.61× |
+/// | 0.7 | 2.3 | ✓ | 9/10 | 5.86× |
+/// | 0.7 | 2.0 | ✓ | 9/10 | 5.58× |
+/// | **0.7** | **1.8** | **✓** | **✓** | **5.39×** |
+/// | 0.7 | 1.4 | ✓ | ✓ | 5.04× |
+///
+/// **Both axes bind, and they bind on different rungs.** V's edge is C10: 1.8
+/// passes and 2.0 fails at any K. K's edge is **C9**, not C10 — 0.85 clears
+/// C10 outright and still loses C9, so tuning against the deepest rung alone
+/// would have shipped a row that fails a shallower one. That is the whole
+/// reason the two are walked separately.
+///
+/// `0.7 / 1.8` is the loosest pair that passes the entire gate, with 0.15 of
+/// margin on K and 0.2 on V below their measured edges. Retighten here rather
+/// than widening tolerances if the row ever goes red.
+///
+/// Ordering against the lineage has inverted with it: K 0.7 now sits *below*
+/// the 9B's 1.09 and the MoE pair's 1.1/1.15. The 27B has the least headroom
+/// here, not the most — at the quant a 16 GB card actually runs.
 pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.3,
-    k_low: 1.3,
-    v_hi: 2.3,
-    v_low: 2.3,
+    k_hi: 0.7,
+    k_low: 0.7,
+    v_hi: 1.8,
+    v_low: 1.8,
 };

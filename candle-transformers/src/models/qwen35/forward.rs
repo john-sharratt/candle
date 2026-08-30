@@ -42,10 +42,11 @@ use super::draft::{head_wave_pass, HeadWave};
 use super::mtp::MTP_MAX_DRAFT;
 use super::quantized_attention::Qwen35AttentionLayer;
 use super::quantized_delta_net::quantized_delta_net_ffn;
-use super::quantized_weights::{QuantLayerMix, QuantModel};
+use super::quantized_weights::QuantModel;
 use super::spec::{split_block_rows, StashSpan, VerifyStash};
 use super::wave::delta_net_mix_wave;
 use crate::models::delta_net::seq_spans;
+use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::{RecurrentStateStore, StashSlot};
 use crate::models::verify_wave::VerifyPlan;
 use candle_nn::kv_cache::ModelGeometry;
@@ -603,13 +604,39 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    fn layer_stream_stats(&self) -> Option<[usize; 7]> {
+        #[cfg(feature = "cuda")]
+        {
+            self.model().layers.stats().ok().flatten().map(|s| {
+                [
+                    s.hits,
+                    s.warm_hits,
+                    s.cold_reads,
+                    s.fence_joins,
+                    s.evictions,
+                    s.homed,
+                    s.streaming,
+                ]
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
     fn request_kv_ground(&self, regions: usize) -> u64 {
         #[cfg(feature = "cuda")]
         {
+            // Whichever side of this model holds tradeable ground. A checkpoint
+            // is routed or dense: a routed one's slack is in its expert slots, a
+            // dense one's in its layer slots, and neither has both. Asking both
+            // is how the caller stays ignorant of which it is holding.
             self.model()
                 .experts
                 .as_ref()
                 .map_or(0, |c| c.request_kv_ground(regions))
+                + self.model().layers.request_kv_ground(regions)
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -986,14 +1013,23 @@ fn sweep_layers(
     // Which recurrent layer each DeltaNet index is, counted the way
     // `RecurrentStateStore::recurrent_layer_indices` counts — the order the
     // replay walks the stash in.
-    let mut dn_ord = q.layers[..layer_start]
+    // Counted from the config rather than from the loaded layers. `layer_kinds`
+    // is what *built* each layer's mixer (`quantized_weights::load_layer`
+    // matches on it), so it is the primary fact and a layer's `mix` is derived
+    // from it — and on a streamed checkpoint the layers before `layer_start` are
+    // not resident to be counted.
+    let mut dn_ord = q.cfg.layer_kinds[..layer_start]
         .iter()
-        .filter(|l| matches!(l.mix, QuantLayerMix::DeltaNet(_)))
+        .filter(|k| matches!(k, LayerKind::DeltaNet))
         .count();
 
     for li in layer_start..layer_end {
-        match &q.layers[li].mix {
-            QuantLayerMix::Attention(_) => {
+        // The wave arrives at `li`: join its transfer if one is in flight, and
+        // hold the handle for as long as its compute is being issued. On a
+        // resident store this is an `Arc` bump.
+        let layer = q.layers.ensure(li)?;
+        match q.cfg.layer_kinds[li] {
+            LayerKind::Attention => {
                 let kv = model.kv_map().kv_index(li).ok_or_else(|| {
                     candle::Error::Msg(format!(
                         "qwen35 wave: layer {li} attends but has no KV index"
@@ -1024,7 +1060,7 @@ fn sweep_layers(
                     });
                 }
                 let layer = Qwen35AttentionLayer {
-                    layer: &q.layers[li],
+                    layer: &layer,
                     n_head: q.cfg.num_attention_heads,
                     n_kv_head: q.cfg.num_kv_heads,
                     head_dim: q.cfg.attn_head_dim,
@@ -1035,7 +1071,7 @@ fn sweep_layers(
                 // dispatch indexes by, and that bookkeeping is per cache.
                 forward_layer_batched_mixed(&layer, &mut wave_groups, &mut x, embed_dtype, kv)?;
             }
-            QuantLayerMix::DeltaNet(_) => {
+            LayerKind::DeltaNet => {
                 let orig = x.dtype();
                 #[cfg(feature = "cuda")]
                 let layer_table = match &dn_table {
@@ -1061,6 +1097,7 @@ fn sweep_layers(
                 let captured = slots.iter().any(|s| s.is_some());
                 delta_net_mix_wave(
                     q,
+                    &layer,
                     li,
                     &spans,
                     &mut x,
@@ -1079,9 +1116,16 @@ fn sweep_layers(
                     }
                 }
                 dn_ord += 1;
-                quantized_delta_net_ffn(&q.layers[li], &mut x, embed_dtype, orig)?;
+                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig)?;
             }
         }
+        // This layer's compute is issued, so the copy stream can overlap the
+        // next layers' transfers with it rather than serialising in front of
+        // them. Safe to evict from here: `issue` orders every copy behind an
+        // event recorded on the compute stream, so a slot whose GEMMs are still
+        // running cannot be overwritten under them. A resident store returns
+        // without touching anything.
+        q.layers.prefetch()?;
     }
 
     // File the stash back, whether this sweep was whole or one window of a
@@ -1383,6 +1427,7 @@ mod tests {
             Qwen35LoadOptions {
                 int8mode: Some(Int8Mode::Off),
                 expert_pack_dir: None,
+                mtp_path: None,
             },
         )?;
         let mut session = model.create_batched_session(BatchedConfig::default())?;
@@ -1623,6 +1668,7 @@ mod tests {
             Qwen35LoadOptions {
                 int8mode: Some(Int8Mode::Off),
                 expert_pack_dir: None,
+                mtp_path: None,
             },
         )?;
 

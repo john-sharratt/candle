@@ -62,7 +62,7 @@ use std::collections::HashMap;
 /// So the depth is fixed, and the *floor* is what guarantees it can be paid:
 /// [`minimum_resident_slots`] prices the pinned set plus a full working layer,
 /// and the zone may never retract below it.
-pub(crate) const PINNED_LAYERS: usize = 2;
+pub const PINNED_LAYERS: usize = 2;
 
 /// How many layers this model actually pins.
 ///

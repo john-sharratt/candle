@@ -157,9 +157,9 @@ const PAGEABLE_RESERVE: u64 = 10 * 1024 * 1024 * 1024;
 /// question about the machine. This one is "may I have these pages now", which
 /// is a question about this moment.
 ///
-/// `cuMemAllocHost` remains the authority — [`WarmPool::new`] halves on refusal
-/// — but a refusal costs half the tier, so the first ask should be one that can
-/// succeed.
+/// `cuMemAllocHost` remains the authority — [`WarmPool::new`] steps the request
+/// down by an eighth on refusal — but every refusal costs a slice of the tier
+/// and a round trip, so the first ask should be one that can succeed.
 /// The warm tier's sizing decision, kept so a report can name **which** ceiling
 /// bound it.
 ///
@@ -315,7 +315,18 @@ fn warm_sizing_from(
     }
 }
 
-fn warm_slots_for(stride: usize, total_experts: usize) -> usize {
+/// How many `stride`-byte pinned slots this host can afford, wanting
+/// `total_slots` of them.
+///
+/// `pub(crate)` and named for slots rather than experts because a **dense**
+/// model's warm tier asks the identical question of the identical machine — its
+/// slots hold layers instead of experts, and a checkpoint is one or the other,
+/// so the two tiers never coexist and never compete. `layer_stream` calls this;
+/// duplicating the three ceilings for it would be a second place for the
+/// page-lock cap to be forgotten, which is the one of the three that no
+/// availability reading can see.
+pub(crate) fn warm_slots_for(stride: usize, total_slots: usize) -> usize {
+    let total_experts = total_slots;
     if stride == 0 {
         return 0;
     }
@@ -755,7 +766,11 @@ impl ExpertCache {
                     pinned,
                     WARM_DRAW_SEED,
                 );
-                let mut warm = WarmPool::new(membership.len(), stride);
+                let mut warm = WarmPool::new(
+                    membership.len(),
+                    stride,
+                    candle::vram::PinnedUse::WeightWarmTier,
+                );
                 // A refusal shortens the draw rather than leaving slots the pool
                 // does not have: `ram` must never name a slot outside it.
                 let membership = &membership[..membership.len().min(warm.num_slots())];
@@ -1538,12 +1553,11 @@ impl ExpertCache {
         };
         // **Sweep before asking, because the answer is computed from `live`.**
         //
-        // `spare_regions` reads `live + tier` as the KV side's demand and feeds
-        // it to a sixty-second window peak. A region whose arena went chunk-empty
-        // several waves ago is still `live` until something sweeps it, so without
-        // this the negotiation is answered from a demand figure that includes
-        // arenas holding nothing — and the inflated peak then suppresses growth
-        // for a full window after the ground actually came free.
+        // `spare_regions` offers the weight side what occupancy says is free, and
+        // an unswept arena is counted neither free nor spare. A region whose
+        // arena went chunk-empty several waves ago is still `live` until
+        // something sweeps it, so without this the negotiation is answered
+        // against ground that came free some time ago and nobody has noticed.
         //
         // The reactive sweeps cannot cover it: `claim_region` sweeps only when
         // the free list is empty and `place_transient` only after a placement

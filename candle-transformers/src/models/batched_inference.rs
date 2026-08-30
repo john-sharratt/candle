@@ -4168,6 +4168,12 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// Snapshot the layer-streaming counters, if this model's weights are slot
+    /// tenants. See `BatchedModelCore::layer_stream_stats`.
+    fn layer_stream_stats(&self) -> Option<[usize; 7]> {
+        None
+    }
+
     /// Buy `regions` of weight-side ground for the KV side, answering with the
     /// bytes conceded. See `BatchedModel::request_kv_ground` — this is the path a
     /// stalled scheduler uses to break a wave that cannot allocate.
@@ -4376,6 +4382,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.model().expert_stats()
+    }
+
+    fn layer_stream_stats(&self) -> Option<[usize; 7]> {
+        self.model().layer_stream_stats()
     }
 
     fn request_kv_ground(&self, regions: usize) -> u64 {

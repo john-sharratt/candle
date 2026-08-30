@@ -31,6 +31,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use super::wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
+
 /// **The floor the weight side may never cross**: bytes always left to the
 /// elastic middle, whatever the expert cache would like.
 ///
@@ -39,9 +41,15 @@ use std::collections::BinaryHeap;
 ///
 /// | term | bytes |
 /// |---|---|
-/// | wave transient span | 912 MiB |
-/// | steady-state KV (measured, 70 regions) | 1,120 MiB |
-/// | **total** | **2,032 MiB** |
+/// | wave transient span (derived from the three phase spans) | 912 MiB |
+/// | [`MIN_FIRST_WAVE_KV`] | 384 MiB |
+/// | **total** | **1,296 MiB** |
+///
+/// **Derived, not written down.** It was a flat 2 GiB whose KV term was a steady-state
+/// measurement from another model, and on the 27B that pinned ~750 MiB idle: the boundary
+/// settled at exactly 125 regions — the floor — while the weight side still wanted ground.
+/// Deriving it from the phase spans means a change to the wave tier moves the floor with it,
+/// which a constant could not.
 ///
 /// A wave that needs more than this takes more, by retracting the weight side.
 /// This exists so that a weight fill at load time — when the arenas are empty
@@ -52,7 +60,26 @@ use std::collections::BinaryHeap;
 /// Lives here rather than with the region pool because it is a property of the
 /// *zone* (how far left it may reach), and because it must be readable on a
 /// build with no GPU backend.
-pub const MIN_ELASTIC_RESERVE: usize = 2 * 1024 * 1024 * 1024;
+pub const MIN_ELASTIC_RESERVE: usize =
+    WAVE_ATTN_BYTES + WAVE_FFN_BYTES + WAVE_FORWARD_BYTES + MIN_FIRST_WAVE_KV;
+
+/// KV ground the floor keeps beyond the wave transient span.
+///
+/// **Sized from what a first wave actually holds, not from a steady state.** The 2 GiB the
+/// floor used to be was `912 + 1,120`, and that 1,120 was a steady-state KV measurement from a
+/// different model. On the 27B the KV side runs at **320 MiB live** (20 regions) at width 4, so
+/// the old constant pinned ~750 MiB idle — measured, as the boundary settling at exactly 125
+/// regions against a 2,048 MiB floor while the weight side still wanted ground.
+///
+/// A first wave is all this has to cover. Growth beyond it is handled by retraction (see
+/// [`MIN_ELASTIC_RESERVE`]), so the floor's job is only to stop a load-time weight fill from
+/// leaving the engine unable to run *once* — not to pre-buy the steady state.
+///
+/// Halving the old constant to 1,024 MiB was the obvious move and is wrong: it lands below
+/// `912 + 320`, so every forward would retract the weight side to place its transient tier and
+/// then regrow it. That trades layer slots for boundary churn on the hot path, which is worse
+/// than the memory it frees.
+const MIN_FIRST_WAVE_KV: usize = 384 * 1024 * 1024;
 
 /// Where the boundary opens at model load — **a crutch, and it should not
 /// exist**.

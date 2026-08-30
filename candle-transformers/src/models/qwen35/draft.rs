@@ -571,6 +571,7 @@ mod tests {
             Qwen35LoadOptions {
                 int8mode: Some(Int8Mode::Off),
                 expert_pack_dir: None,
+                mtp_path: None,
             },
         )?;
         assert!(model.has_drafter(), "the pinned 9B carries an MTP head");

@@ -936,6 +936,26 @@ typedef struct __align__(16) {
 } block_c_q2_KO_k128;
 static_assert(sizeof(block_c_q2_KO_k128) == 32, "block_c_q2_KO_k128 must be 32 bytes (quant only; scales separate)");
 
+// Q3_KO K/128: `Q3_K`'s same-width twin. One row's 128 values × 3-bit = 48 B, spent across the
+// two auxiliary planes the other twins already carry and NO `ql` plane: a 32 B **crumb** region
+// holding bits 0-1 (byte-identical to Q2_KO's, which is Q6_KO's high-crumb region) and a 16 B
+// **hi** region holding bit 2 (byte-identical to Q5_KO's 5th-bit region). Chunk-flat that is
+// crumb[0,256) + hi[256,384) + dm[384,416) — see loader/q3_KO.cuh, which is the Q2_KO crumb read
+// plus the Q5_KO hi read with the bit landing at 2 instead of 4. Byte-identical to CPU
+// `ko_quant::quantize_ko(.., Q3_KO)`.
+typedef struct __align__(16) {
+    int qs[8];   // 0-31:  crumb — 4 subs × {cr0,cr1} uint16, at (q3-local) sub*2
+    int qh[4];   // 32-47: bit-2 ints, one per thread-quad
+    template<typename T>
+    __device__ __forceinline__ void copy_from(const T& src) {
+        const int4* s = reinterpret_cast<const int4*>(&src);
+        int4* d = reinterpret_cast<int4*>(this);
+        #pragma unroll
+        for (int i = 0; i < 3; i++) d[i] = s[i];
+    }
+} block_c_q3_KO_k128;
+static_assert(sizeof(block_c_q3_KO_k128) == 48, "block_c_q3_KO_k128 must be 48 bytes (quant only; scales separate)");
+
 // =============================================================================
 // KO K/1024 CHUNK BLOCKS — the strongly-typed unit the int8 (q8a128) path streams.
 // =============================================================================
@@ -959,6 +979,8 @@ typedef block_c_KO_k1024<block_c_q5_KO_k128> block_c_q5_KO_k1024;
 typedef block_c_KO_k1024<block_c_q6_KO_k128> block_c_q6_KO_k1024;
 typedef block_c_KO_k1024<block_c_q8_KO_k128> block_c_q8_KO_k1024;
 typedef block_c_KO_k1024<block_c_q2_KO_k128> block_c_q2_KO_k1024;
+typedef block_c_KO_k1024<block_c_q3_KO_k128> block_c_q3_KO_k1024;
+static_assert(sizeof(block_c_q3_KO_k1024) == 416, "block_c_q3_KO_k1024 must be 416 bytes (256 crumb + 128 hi + 32 dm)");
 
 // MXFP4_KO K/1024 chunk — the native-MXFP4 per-sub int8 format. The 512 B quant
 // region is the SAME lane-major layout as block_c_q4_KO_k1024 (byte for (lane, sub, i) at
@@ -985,6 +1007,7 @@ template <> struct int8_chunk_bytes<block_c_q5_KO_k1024> { static constexpr int 
 template <> struct int8_chunk_bytes<block_c_q6_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q6_KO_k1024); };
 template <> struct int8_chunk_bytes<block_c_q8_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q8_KO_k1024); };
 template <> struct int8_chunk_bytes<block_c_q2_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q2_KO_k1024); };
+template <> struct int8_chunk_bytes<block_c_q3_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q3_KO_k1024); };
 template <> struct int8_chunk_bytes<block_c_mxfp4_k1024> { static constexpr int value = (int)sizeof(block_c_mxfp4_k1024); };
 
 // =============================================================================
@@ -1155,6 +1178,14 @@ struct gemx_tile_traits<block_c_q2_KO_k128> {
     static constexpr int bits_per_element = 2;
     static constexpr int scales_per_ktile = 4;
 };
+template<>
+struct gemx_tile_traits<block_c_q3_KO_k128> {
+    static constexpr bool is_ktile_major = true;
+    static constexpr int stride = 64;             // 48 quant (32 crumb + 16 hi) + 16 scale
+    static constexpr int elements_per_tile = 128;
+    static constexpr int bits_per_element = 3;
+    static constexpr int scales_per_ktile = 4;
+};
 
 template<>
 struct gemx_tile_traits<block_c_q4_0_k128> {
@@ -1323,7 +1354,14 @@ enum QType {
     // here as the whole value. Read by the maintained per-128 int8 fold. First slot past MXFP4_KO.
     QTYPE_Q2_KO  = 51,
 
-    QTYPE_COUNT   = 52
+    // Lane-major per-128 affine KO twin at 3-bit (value 0..7) — `Q3_K`'s same-width twin. 48 B
+    // of quants per 128-K, spent as a 32 B crumb plane (bits 0-1, Q2_KO's region) plus a 16 B
+    // hi plane (bit 2, Q5_KO's region) and no `ql` at all. Exists because without it `to_ko`
+    // rounded Q3_K *up* to Q4_KO, which under layer streaming is PCIe bytes on every forward.
+    // First slot past Q2_KO.
+    QTYPE_Q3_KO  = 52,
+
+    QTYPE_COUNT   = 53
 };
 
 // =============================================================================
@@ -1378,7 +1416,8 @@ static_assert(QTYPE_Q8_KO   == 48, "QTYPE_Q8_KO must be 48");
 static_assert(QTYPE_MXFP4    == 49, "QTYPE_MXFP4 must be 49 to match GgmlDType::MXFP4");
 static_assert(QTYPE_MXFP4_KO == 50, "QTYPE_MXFP4_KO must be 50");
 static_assert(QTYPE_Q2_KO   == 51, "QTYPE_Q2_KO must be 51");
-static_assert(QTYPE_COUNT   == 52, "QTYPE_COUNT must be 52");
+static_assert(QTYPE_Q3_KO   == 52, "QTYPE_Q3_KO must be 52");
+static_assert(QTYPE_COUNT   == 53, "QTYPE_COUNT must be 53");
 
 // =============================================================================
 // QType -> matmul kernel index
@@ -1417,6 +1456,7 @@ __host__ __device__ inline int qtype_to_matmul_kernel_index(int qtype) {
         case QTYPE_Q8_KO:    return 17;
         case QTYPE_MXFP4_KO: return 18;
         case QTYPE_Q2_KO:    return 19;
+        case QTYPE_Q3_KO:    return 20;
         default:             return -1;
     }
 }
@@ -1499,6 +1539,7 @@ __host__ __device__ inline int qtype_output_block_size(int qtype) {
         case QTYPE_Q8_KO:    return gemx_tile_traits<block_c_q8_KO_k128>::stride;
         case QTYPE_MXFP4_KO: return gemx_tile_traits<block_c_mxfp4_k128>::stride;
         case QTYPE_Q2_KO:    return gemx_tile_traits<block_c_q2_KO_k128>::stride;
+        case QTYPE_Q3_KO:    return gemx_tile_traits<block_c_q3_KO_k128>::stride;
         default:             return -1;   // Unsupported by GEMX output layout
     }
 }
@@ -1538,6 +1579,7 @@ typedef block_c_q6_K_k128 block_c_q6_K;
 typedef block_c_q6_KO_k128 block_c_q6_KO;
 typedef block_c_q8_KO_k128 block_c_q8_KO;
 typedef block_c_q2_KO_k128 block_c_q2_KO;
+typedef block_c_q3_KO_k128 block_c_q3_KO;
 typedef block_c_mxfp4_k128 block_c_mxfp4;
 typedef block_c_q8_K_k128 block_c_q8_K;
 

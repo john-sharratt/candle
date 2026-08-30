@@ -364,6 +364,7 @@ pub(crate) mod tests {
             Qwen35LoadOptions {
                 int8mode: Some(Int8Mode::auto(&device)),
                 expert_pack_dir: None,
+                mtp_path: None,
             },
         )?;
 
@@ -463,6 +464,7 @@ pub(crate) mod tests {
                 Qwen35LoadOptions {
                     int8mode: Some(Int8Mode::Off),
                     expert_pack_dir: None,
+                    mtp_path: None,
                 },
             )?;
             println!("{label}:");
@@ -645,6 +647,7 @@ pub(crate) mod tests {
                     // not the model its int8 path.
                     int8mode: Some(int8mode),
                     expert_pack_dir: None,
+                    mtp_path: None,
                 },
             )?;
             println!("✓ Model loaded\n");
@@ -985,6 +988,7 @@ pub(crate) mod tests {
                 Qwen35LoadOptions {
                     int8mode: Some(int8mode),
                     expert_pack_dir: None,
+                    mtp_path: None,
                 },
             )?;
             // A gate that silently fell back to plain decode would still pass
@@ -1169,6 +1173,7 @@ pub(crate) mod tests {
                 Qwen35LoadOptions {
                     int8mode: Some(int8mode),
                     expert_pack_dir: None,
+                    mtp_path: None,
                 },
             )?;
             println!("✓ Model loaded\n");
@@ -1218,6 +1223,7 @@ pub(crate) mod tests {
             Qwen35LoadOptions {
                 int8mode: Some(Int8Mode::Off),
                 expert_pack_dir: None,
+                mtp_path: None,
             },
         )?;
         // BF16, not F32: the paged decode kernel is compiled for the half

@@ -79,6 +79,22 @@ pub struct MoeConfig {
 }
 
 impl Qwen35Config {
+    /// `{arch}.nextn_predict_layers` as some GGUF's metadata declares it.
+    ///
+    /// Split out because the draft head is not always in the checkpoint that
+    /// holds the trunk: ggml-org ships it as a sidecar file whose *own* metadata
+    /// carries this key, while the main file carries none at all. So the head's
+    /// count has to be read from whichever file the head is in, which is not
+    /// necessarily the one this config was parsed from.
+    ///
+    /// Zero for a source that declares nothing, which is the ordinary case and
+    /// not an error — the model simply has no drafter.
+    pub fn mtp_layers_in(md: &std::collections::HashMap<String, Value>, arch: &str) -> usize {
+        md.get(&format!("{arch}.nextn_predict_layers"))
+            .and_then(|v| value_to_usize(v, "nextn_predict_layers").ok())
+            .unwrap_or(0)
+    }
+
     /// The layer schedule from an explicit per-layer flag array, or derived
     /// from the interval rule: `(i + 1) % interval != 0` ⇒ DeltaNet.
     pub fn schedule_from_interval(num_layers: usize, interval: usize) -> Vec<LayerKind> {

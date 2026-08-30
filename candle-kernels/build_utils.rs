@@ -85,7 +85,7 @@ const SIMPLE_KERNELS: [&str; 51] = [
 ];
 
 // Quantized kernel instantiations (14 loaders × 3 Y_types: F16, BF16, F32)
-const QUANTIZED_KERNELS: [&str; 45] = [
+const QUANTIZED_KERNELS: [&str; 46] = [
     "src/quantized/impl/qkv_segmented_f32.cu",
     "src/quantized/impl/q2_K_f16.cu",
     "src/quantized/impl/q2_K_bf16.cu",
@@ -125,6 +125,7 @@ const QUANTIZED_KERNELS: [&str; 45] = [
     "src/quantized/impl/q8_k_f32.cu",
     "src/quantized/impl/mxfp4_f32.cu",
     "src/quantized/impl/q2_ko_f32.cu",
+    "src/quantized/impl/q3_ko_f32.cu",
     "src/quantized/impl/q_awq_f16.cu",
     "src/quantized/impl/q_awq_bf16.cu",
     "src/quantized/impl/q_awq_f32.cu",

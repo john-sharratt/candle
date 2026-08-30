@@ -22,7 +22,7 @@ use candle::{Device, Result};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
-use super::quantized_weights::{QuantLayerMix, QuantModel};
+use super::quantized_weights::{QuantLayer, QuantLayerMix, QuantModel};
 use crate::models::delta_net::{
     quantized_delta_net_layer_forward_spans, DeltaNetLayerTable, DeltaNetSeq, KvLayerMap,
     RecurrentStateStore, SeqSpan, StashSlot,
@@ -31,6 +31,13 @@ use crate::models::rotary_layout::RotaryLayout;
 use crate::models::tensor_cat::TensorCat;
 
 /// Run one DeltaNet layer's mixing half over a packed wave buffer.
+///
+/// `layer` is passed rather than looked up from `model` by `layer_idx`: on a
+/// streamed checkpoint the layer is a tenant of a weight-zone slot and the
+/// forward already holds the handle that keeps that tenancy alive, so
+/// re-deriving it here would be a second `ensure` for a layer the caller has in
+/// hand. `layer_idx` still names the layer, for the kernel's per-layer table and
+/// for error messages.
 ///
 /// `stores` is one [`RecurrentStateStore`] per span, in span order — the
 /// store is per *sequence*, holding every recurrent layer's `S` and conv
@@ -50,6 +57,7 @@ use crate::models::tensor_cat::TensorCat;
 #[allow(clippy::too_many_arguments)]
 pub fn delta_net_mix_wave(
     model: &QuantModel,
+    layer: &QuantLayer,
     layer_idx: usize,
     spans: &[SeqSpan],
     x: &mut TensorCat,
@@ -58,7 +66,6 @@ pub fn delta_net_mix_wave(
     table: Option<&DeltaNetLayerTable>,
     stash: &[Option<StashSlot<'_>>],
 ) -> Result<()> {
-    let layer = &model.layers[layer_idx];
     let QuantLayerMix::DeltaNet(w) = &layer.mix else {
         candle::bail!("delta_net_mix_wave called on a non-DeltaNet layer {layer_idx}");
     };
@@ -242,7 +249,7 @@ mod tests {
     #[test]
     #[ignore = "reads the pinned Qwen3.5-9B GGUF from the HF cache (7.5 GB) and needs a GPU"]
     fn batched_mixing_equals_mixing_each_sequence_alone() -> Result<()> {
-        use super::super::quantized_weights::load_quantized_model;
+        use super::super::quantized_weights::{load_quantized_model, LoadInputs};
         use crate::models::batch_test::test_helpers::hf_get;
         use crate::models::delta_net::quantized_delta_net_layer_forward;
         use crate::models::delta_net::RecurrentStateStore;
@@ -266,8 +273,7 @@ mod tests {
             &mut reader,
             &device,
             Int8Mode::Off,
-            None,
-            |_, _| Ok(None),
+            LoadInputs::resident(),
         )?;
 
         let li = 0usize; // DeltaNet under the 3:1 schedule
@@ -284,14 +290,15 @@ mod tests {
         // reference computed afterwards from the "same" tensor would be
         // reading the wave's own output. (That is a hazard of the test, not
         // of the engine, whose buffer is freshly embedded per wave.)
-        let QuantLayerMix::DeltaNet(w) = &model.layers[li].mix else {
+        let layer = model.layers.ensure(li)?;
+        let QuantLayerMix::DeltaNet(w) = &layer.mix else {
             panic!("layer {li} is not DeltaNet");
         };
         let flat = packed.reshape((total, hidden))?;
         let mut wants = Vec::new();
         for span in &spans {
             let rows = flat.narrow(0, span.start, span.len)?.contiguous()?;
-            let normed = model.layers[li].attn_norm.forward(&rows)?;
+            let normed = layer.attn_norm.forward(&rows)?;
             let mut solo =
                 RecurrentStateStore::new(&model.cfg.layer_kinds, &model.cfg.delta_net, &device)?;
             let y = quantized_delta_net_layer_forward(
@@ -323,7 +330,17 @@ mod tests {
             store_b.begin_wave()?;
             let mut stores = vec![&mut store_a, &mut store_b];
             let stash = vec![None, None];
-            delta_net_mix_wave(&model, li, &spans, &mut x, &mut stores, eps, None, &stash)?;
+            delta_net_mix_wave(
+                &model,
+                &layer,
+                li,
+                &spans,
+                &mut x,
+                &mut stores,
+                eps,
+                None,
+                &stash,
+            )?;
             store_a.commit_wave();
             store_b.commit_wave();
         }

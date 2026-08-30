@@ -877,6 +877,8 @@ DECL_DENSE_INT8_ALL(q8_ko_int8)
 DECL_DENSE_INT8_ALL(mxfp4_ko_int8)
 // Q2_KO 2-bit affine twin (row 19).
 DECL_DENSE_INT8_ALL(q2_ko_int8)
+// Q3_KO 3-bit affine twin (row 20).
+DECL_DENSE_INT8_ALL(q3_ko_int8)
 
 // q8a128 mode-1 → mode-2 (Bm=32 weight-reuse) crossover. The DENSE crossover is decided in Rust
 // (a weight-aware closed-form fit, see q8a128_dense_use_mode2) and passed in as `force_mode2`,
@@ -888,6 +890,7 @@ DECL_DENSE_INT8_M2_ALL(q6_ko_int8)
 DECL_DENSE_INT8_M2_ALL(q8_ko_int8)
 DECL_DENSE_INT8_M2_ALL(mxfp4_ko_int8)
 DECL_DENSE_INT8_M2_ALL(q2_ko_int8)
+DECL_DENSE_INT8_M2_ALL(q3_ko_int8)
 
 #undef DECL_DENSE_INT8_M2_ALL
 #undef DECL_DENSE_INT8_ALL
@@ -915,10 +918,11 @@ DECL_DENSE_INT8_M2_ALL(q2_ko_int8)
     (void*)q8_ko_int8_##tag##_dense,     /* 17  q8_KO */ \
     (void*)mxfp4_ko_int8_##tag##_dense,  /* 18  mxfp4_KO */ \
     (void*)q2_ko_int8_##tag##_dense,     /* 19  q2_KO */ \
+    (void*)q3_ko_int8_##tag##_dense,     /* 20  q3_KO */ \
 }
 
 // Indexed by [out_dtype][kernel_row].
-static void* dense_kernels_int8[3][20] = {
+static void* dense_kernels_int8[3][21] = {
     DENSE_INT8_ROW(f16),
     DENSE_INT8_ROW(bf16),
     DENSE_INT8_ROW(f32),
@@ -926,7 +930,7 @@ static void* dense_kernels_int8[3][20] = {
 #undef DENSE_INT8_ROW
 
 // Indexed by [out_dtype][kernel_row - 14]:
-// Q4_KO=14, Q5_KO=15, Q6_KO=16, Q8_KO=17, MXFP4_KO=18, Q2_KO=19.
+// Q4_KO=14, Q5_KO=15, Q6_KO=16, Q8_KO=17, MXFP4_KO=18, Q2_KO=19, Q3_KO=20.
 #define DENSE_INT8_M2_ROW(tag) { \
     (void*)q4_ko_int8_##tag##_dense_m2, \
     (void*)q5_ko_int8_##tag##_dense_m2, \
@@ -934,14 +938,30 @@ static void* dense_kernels_int8[3][20] = {
     (void*)q8_ko_int8_##tag##_dense_m2, \
     (void*)mxfp4_ko_int8_##tag##_dense_m2, \
     (void*)q2_ko_int8_##tag##_dense_m2, \
+    (void*)q3_ko_int8_##tag##_dense_m2, \
 }
 
-static void* dense_kernels_int8_m2[3][6] = {
+static void* dense_kernels_int8_m2[3][7] = {
     DENSE_INT8_M2_ROW(f16),
     DENSE_INT8_M2_ROW(bf16),
     DENSE_INT8_M2_ROW(f32),
 };
 #undef DENSE_INT8_M2_ROW
+
+// First kernel row with a mode-2 (Bm=32 weight-reuse) twin, and how many there are.
+//
+// **Derived from the m2 table's own width, not written down.** The count used to be a literal
+// `kernel_row <= 19` in the dense dispatch, and a KO format added past it stayed silently on
+// mode-1: the answer is still correct, the format simply never gets the prefill path, and
+// nothing anywhere reports it. The static_assert ties the two tables together so a row added
+// to one without the other fails the build instead.
+constexpr int KO_ROW_FIRST = 14;
+constexpr int KO_ROW_COUNT =
+    (int)(sizeof(dense_kernels_int8_m2[0]) / sizeof(dense_kernels_int8_m2[0][0]));
+static_assert(
+    KO_ROW_FIRST + KO_ROW_COUNT
+        == (int)(sizeof(dense_kernels_int8[0]) / sizeof(dense_kernels_int8[0][0])),
+    "every dense kernel row from KO_ROW_FIRST up must have a mode-2 twin");
 
 extern "C" int run_quantized_matmul(
     const vx_segment_t* segments,
@@ -1049,8 +1069,8 @@ extern "C" int run_quantized_matmul(
         const bool mode2 = (force_mode2 != 0);  // weight-reuse crossover decided in Rust
         void* kfn;
         int batch_div;
-        if (mode2 && kernel_row >= 14 && kernel_row <= 19) {
-            kfn = dense_kernels_int8_m2[out_dtype][kernel_row - 14];  // Bm=32 weight-reuse variant
+        if (mode2 && kernel_row >= KO_ROW_FIRST && kernel_row - KO_ROW_FIRST < KO_ROW_COUNT) {
+            kfn = dense_kernels_int8_m2[out_dtype][kernel_row - KO_ROW_FIRST];  // Bm=32 weight-reuse
             batch_div = 32;                               // Bm = 32 (mode-2, N_SUB=2)
         } else {
             kfn = dense_kernels_int8[out_dtype][kernel_row];
@@ -1338,6 +1358,10 @@ extern "C" __global__ void mxfp4_ko_int8_f32_grouped(
 extern "C" __global__ void q2_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
     void*, int, int, int, int, int);
+// Q3_KO 3-bit affine twin (row 20).
+extern "C" __global__ void q3_ko_int8_f32_grouped(
+    const void*, const void*, const void*, const void*, const void*,
+    void*, int, int, int, int, int);
 
 // Wide-Bm (mode-4 / mode-8) grouped twins — KO rows only (14-19): the int8
 // impl is KO-exclusive, and the wide tiles exist for the routed-expert
@@ -1357,9 +1381,10 @@ DECLARE_GROUPED_WIDE(q6_ko_int8_f32)
 DECLARE_GROUPED_WIDE(q8_ko_int8_f32)
 DECLARE_GROUPED_WIDE(mxfp4_ko_int8_f32)
 DECLARE_GROUPED_WIDE(q2_ko_int8_f32)
+DECLARE_GROUPED_WIDE(q3_ko_int8_f32)
 #undef DECLARE_GROUPED_WIDE
 
-static void* grouped_kernels_int8_m4[20] = {
+static void* grouped_kernels_int8_m4[21] = {
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     (void*)q4_ko_int8_f32_grouped_m4,    // 14  q4_KO
@@ -1368,8 +1393,9 @@ static void* grouped_kernels_int8_m4[20] = {
     (void*)q8_ko_int8_f32_grouped_m4,    // 17  q8_KO
     (void*)mxfp4_ko_int8_f32_grouped_m4, // 18  mxfp4_KO
     (void*)q2_ko_int8_f32_grouped_m4,    // 19  q2_KO
+    (void*)q3_ko_int8_f32_grouped_m4,    // 20  q3_KO
 };
-static void* grouped_kernels_int8_m8[20] = {
+static void* grouped_kernels_int8_m8[21] = {
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     (void*)q4_ko_int8_f32_grouped_m8,    // 14  q4_KO
@@ -1378,10 +1404,11 @@ static void* grouped_kernels_int8_m8[20] = {
     (void*)q8_ko_int8_f32_grouped_m8,    // 17  q8_KO
     (void*)mxfp4_ko_int8_f32_grouped_m8, // 18  mxfp4_KO
     (void*)q2_ko_int8_f32_grouped_m8,    // 19  q2_KO
+    (void*)q3_ko_int8_f32_grouped_m8,    // 20  q3_KO
 };
 
 // [qtype_kernel_row] — same row ordering as grouped_kernels above.
-static void* grouped_kernels_int8[20] = {
+static void* grouped_kernels_int8[21] = {
     (void*)q4_0_int8_f32_grouped,      // 0   q4_0
     (void*)q4_1_int8_f32_grouped,      // 1   q4_1
     (void*)q5_0_int8_f32_grouped,      // 2   q5_0
@@ -1402,6 +1429,7 @@ static void* grouped_kernels_int8[20] = {
     (void*)q8_ko_int8_f32_grouped,     // 17  q8_KO
     (void*)mxfp4_ko_int8_f32_grouped,  // 18  mxfp4_KO
     (void*)q2_ko_int8_f32_grouped,     // 19  q2_KO
+    (void*)q3_ko_int8_f32_grouped,     // 20  q3_KO
 };
 
 /// Single-launch grouped matmul over all expert tiles.
