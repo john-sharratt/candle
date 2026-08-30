@@ -405,7 +405,17 @@ impl BackingInner {
                     Ok(())
                 })
             }) {
-                Ok(()) => made += 1,
+                Ok(()) => {
+                    // The slab is in storage and this creator is done with the
+                    // index, so the window that keeps a tombstoner off it
+                    // closes here. There is no first `occupy` to close it the
+                    // way an allocate-on-demand creator's does: this arena was
+                    // stamped ahead of the demand that will fill it, and an
+                    // arena whose window never closes is counted as reclaimable
+                    // and then refused by the sweep for the life of the process.
+                    self.pool.finish_creation(key, idx);
+                    made += 1;
+                }
                 Err(e) => {
                     // The slab (if it was even created) never reached storage:
                     // release the registration so the index is not leaked, and

@@ -3204,3 +3204,359 @@ fn section_c0_q8ks_round_trip() {
         Some(quantize_fn),
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Does demotion give the VRAM back?
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Every test above this line asks whether the *bytes* survive a tier
+// transition. None asks whether the transition returned the memory, and the
+// two are independent claims. `evict_hot_except` drops the substrate's `hot`
+// handle; an arena returns to the pool only when it is **wholly** empty, and
+// a chunk's GIDs are refcounted. One surviving holder pins sixteen megabytes
+// while every byte assertion still passes, so a demotion that frees nothing
+// is indistinguishable from one that frees everything by the measures this
+// file had.
+//
+// That is not hypothetical. The batched gate measured `live` regions going
+// 21 → 84 → 404 → 405 across configs and never falling: the weight zone was
+// squeezed for the rest of the run, and both causes were holders nothing
+// looked at, because nothing counted them.
+//
+// `arena_release_tests.rs` in candle-nn proves the *backing's* drop path on
+// CPU arenas and states plainly what it cannot reach — the substrate, and a
+// device pool. These two close that half: real GPU arenas, real
+// `evict_from_hot`.
+
+/// Heads and head-dim for the demotion fixture, deliberately unlike the rest
+/// of the file's.
+///
+/// **A fixture that fits in one arena cannot observe whole-arena reclaim.**
+/// The shared geometry here (2 heads × 16) makes a 4 KiB turn, so all of
+/// `full_cold_warm_hot_round_trip`'s turns together sit in a single 16 MiB
+/// arena that is pinned from the first write to the last drop — an arena
+/// count taken across its phases never moves, and an assertion on it would
+/// hold no matter what the eviction did. At 16 × 128 a chunk is 256 KiB, so
+/// [`DEMOTE_TOKENS`] is an arena's worth per turn per layer and the count
+/// tracks the turns.
+const DEMOTE_KV_HEAD: usize = 16;
+const DEMOTE_HEAD_DIM: usize = 128;
+/// 64 chunks of 32 tokens — one 16 MiB arena per turn, per layer.
+const DEMOTE_TOKENS: usize = 2048;
+const DEMOTE_TURNS: usize = 4;
+
+fn make_backings_demote(device: &Device) -> Vec<ChunkedKvBacking> {
+    (0..N_LAYERS)
+        .map(|_| {
+            ChunkedKvBacking::new(
+                4,
+                DEMOTE_KV_HEAD,
+                DEMOTE_HEAD_DIM,
+                DType::BF16,
+                device,
+                DEMOTE_TOKENS,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// Seed one turn and **end its sequence**, so the substrate's hot handle is
+/// the only thing holding the chunks.
+///
+/// The file's other seeders leave the slot allocated. That is harmless when
+/// the question is whether bytes round-trip, and fatal when the question is
+/// whether memory comes back: `record_turn` *shares* the chunk GIDs rather
+/// than moving them, so a live slot and the sealed snapshot are two holders
+/// of one arena and no eviction could ever free it. Production ends the
+/// sequence when the turn ends; so does this.
+fn seed_turn_demote(
+    conv: &Conversation,
+    backings: &[ChunkedKvBacking],
+    device: &Device,
+    timeline: TimelineId,
+    pattern_base: u32,
+) -> TurnIndex {
+    let mut sealed_per_layer: Vec<SealedSequence> = Vec::with_capacity(backings.len());
+    for backing in backings {
+        let slot = backing.alloc_sequence().unwrap();
+        backing.ensure_for_offset(slot, 0, DEMOTE_TOKENS).unwrap();
+        let total = DEMOTE_KV_HEAD * DEMOTE_TOKENS * DEMOTE_HEAD_DIM;
+        let data: Vec<bf16> = (0..total)
+            .map(|i| bf16::from_f32(((pattern_base as usize + i) as f32) * 0.001))
+            .collect();
+        let k = Tensor::from_vec(
+            data,
+            (1, DEMOTE_KV_HEAD, DEMOTE_TOKENS, DEMOTE_HEAD_DIM),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .to_device(device)
+        .unwrap();
+        let v = k.clone();
+        backing.write_contiguous(slot, 0, &k, &v).unwrap();
+        backing.set_len(slot, DEMOTE_TOKENS);
+        sealed_per_layer.push(backing.record_turn(slot).unwrap());
+        backing.free_sequence(slot).unwrap();
+    }
+    let block_end = (DEMOTE_TOKENS / CHUNK_SIZE) as u64;
+    let idx = conv
+        .record_turn(
+            timeline,
+            Role::User,
+            candle_conversation::substrate::TurnPartWrite {
+                token_count: DEMOTE_TOKENS,
+                block_end,
+                sealed_gpu: Some(Arc::new(sealed_per_layer)),
+                ..Default::default()
+            },
+            |seqs| Ok(seqs.to_vec()),
+        )
+        .unwrap();
+    let ids: Vec<u32> = (0..DEMOTE_TOKENS as u32).collect();
+    conv.persist_tokens_only(turn_stream_id(timeline.raw(), idx.0), &ids)
+        .unwrap();
+    idx
+}
+
+/// **GPU** arenas held across every layer.
+///
+/// `arena_count()` is the obvious counter and the wrong one: it counts every
+/// arena in the backing's storage, GPU and CPU alike, and a warm CPU arena is
+/// precisely what a successful demotion *creates*. Measured against it, a
+/// working hot→warm transition reports a leak of the memory it just moved.
+/// `gpu_arena_class_stats` filters on `ArenaLocation::Gpu`, which is the side
+/// the question is about.
+///
+/// `ChunkedKvBacking::new` gives each backing its own `ChunkGidPool`, so this
+/// reads exactly this test's arenas — no other test in the binary can move
+/// it, and the reading is safe to assert on while they run alongside.
+fn gpu_arenas(backings: &[ChunkedKvBacking]) -> usize {
+    backings
+        .iter()
+        .map(|b| b.gpu_arena_class_stats().total_arenas())
+        .sum()
+}
+
+/// Bytes in **occupied** GPU slots — the direct reading of "is anything still
+/// holding this". Falls the moment the last holder of a chunk goes away,
+/// whether or not the arena around it has been handed back yet, which is what
+/// separates "the tier let go" from "the pool released the allocation".
+fn gpu_live_bytes(backings: &[ChunkedKvBacking]) -> usize {
+    backings
+        .iter()
+        .map(|b| b.gpu_arena_class_stats().total_live_bytes())
+        .sum()
+}
+
+/// The cheap half of compaction — return arenas that are wholly empty. This
+/// is what the scheduler's pressure path runs, so it is what the test runs.
+fn release_empty(backings: &[ChunkedKvBacking]) {
+    for b in backings {
+        b.release_empty_arenas().unwrap();
+    }
+}
+
+struct DemoteFixture {
+    /// Held for the test's lifetime: the redo log lives under it.
+    _tmpdir: tempfile::TempDir,
+    conv: Conversation,
+    backings: Vec<ChunkedKvBacking>,
+    timeline: TimelineId,
+    turn_keys: Vec<TurnKey>,
+    /// GPU arenas held before anything was seeded.
+    base: usize,
+    /// GPU bytes occupied before anything was seeded.
+    base_live: usize,
+    /// GPU arenas held with every turn hot+warm — what demotion must give back.
+    resident: usize,
+    /// GPU bytes occupied with every turn hot+warm.
+    resident_live: usize,
+}
+
+/// [`DEMOTE_TURNS`] turns, seeded and driven through one full persistence
+/// pass so every one is hot+warm+cold.
+///
+/// The warm copy is not incidental: `evict_hot_except` only evicts a
+/// residence that has one, so a fixture that skipped the persistence pass
+/// would evict nothing and both tests below would be measuring an eviction
+/// that never happened.
+fn demote_fixture(device: &Device) -> DemoteFixture {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let dir = tmpdir.path().to_path_buf();
+    let conv = open_conversation(&dir);
+    let backings = make_backings_demote(device);
+
+    let layer_id = LayerId::from_raw(1).unwrap();
+    let group_id = GroupId::from_raw(1).unwrap();
+    let timeline = TimelineAllocator::new().next();
+    conv.register_timeline(timeline, layer_id, group_id);
+
+    let base = gpu_arenas(&backings);
+    let base_live = gpu_live_bytes(&backings);
+
+    let turn_keys: Vec<TurnKey> = (0..DEMOTE_TURNS)
+        .map(|i| {
+            let idx = seed_turn_demote(
+                &conv,
+                &backings,
+                device,
+                timeline,
+                1000 + (i as u32) * 1_000_000,
+            );
+            TurnKey::new(timeline, idx)
+        })
+        .collect();
+
+    // Spawn → shutdown drains exactly one pass, as in the round-trip test.
+    let persist = PersistenceThread::spawn(
+        conv.clone(),
+        Arc::new(backings.clone()),
+        device.clone(),
+        None,
+    );
+    persist.shutdown();
+    for &key in &turn_keys {
+        let st = turn_state(&conv, key);
+        assert!(
+            st.hot && st.warm,
+            "a turn must be hot+warm before evict_hot_except will consider it, \
+             got {st:?} — the fixture would be measuring a no-op eviction"
+        );
+    }
+
+    // Measured after the persistence pass, because that is the state demotion
+    // acts on, and the guard has to describe the arenas actually at risk.
+    let resident = gpu_arenas(&backings);
+    let resident_live = gpu_live_bytes(&backings);
+    assert!(
+        resident - base >= 3,
+        "the fixture holds {} GPU arena(s) over its {base} baseline — too few \
+         for whole-arena reclaim to be under test at all",
+        resident - base
+    );
+
+    DemoteFixture {
+        _tmpdir: tmpdir,
+        conv,
+        backings,
+        timeline,
+        turn_keys,
+        base,
+        base_live,
+        resident,
+        resident_live,
+    }
+}
+
+/// **The claim the whole tier system rests on: a turn that leaves the hot
+/// tier gives its VRAM back.**
+///
+/// Every turn is demoted, so nothing is hot, so every arena is wholly empty
+/// and must be reclaimable. A failure here means the hot tier let go of the
+/// substrate handle but not of the memory — which is invisible to every
+/// other test in this file, and is what squeezes the weight zone shut over a
+/// long run.
+#[test]
+fn demoting_every_turn_returns_its_vram() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let f = demote_fixture(&device);
+
+    let purged = evict_from_hot(&f.conv, &[], &[]);
+    assert_eq!(
+        purged.count, DEMOTE_TURNS,
+        "an empty keep-set should demote every turn"
+    );
+    for &key in &f.turn_keys {
+        let st = turn_state(&f.conv, key);
+        assert!(!st.hot && st.warm, "post-demotion {key:?} is {st:?}");
+    }
+
+    // Nothing holds a GPU chunk any more. This is the claim about the *tier*,
+    // and it holds whether or not the pool has handed the arenas back yet.
+    let live_after = gpu_live_bytes(&f.backings);
+    assert_eq!(
+        live_after, f.base_live,
+        "every turn was demoted and {live_after} byte(s) of GPU slots are \
+         still occupied (baseline {}) — the hot tier released the substrate \
+         handle but something else is still holding the chunks",
+        f.base_live
+    );
+
+    // A separate claim: the emptied arenas are given back, not merely left on
+    // a free list. Whole-arena reclaim is what returns a region to the weight
+    // zone, so an implementation that emptied every slot and released no arena
+    // would satisfy the assertion above and still squeeze the partition shut.
+    release_empty(&f.backings);
+    let after = gpu_arenas(&f.backings);
+    assert_eq!(
+        after,
+        f.base,
+        "every GPU slot is free, yet {} of the {} arena(s) the turns held were \
+         not released",
+        after.saturating_sub(f.base),
+        f.resident - f.base
+    );
+}
+
+/// **A kept turn keeps its memory** — so the test above is measuring the
+/// eviction and not merely the passage of time.
+///
+/// Without this pair, `demoting_every_turn_returns_its_vram` would pass just
+/// as happily against an implementation that dropped every arena on any
+/// `evict_from_hot` call with the keep-set ignored. Here one turn is named:
+/// its arenas must survive, the other three must not, and its bytes must
+/// still read back exactly — a reclaim that freed the wrong arena would
+/// otherwise show up only as corruption much later.
+#[test]
+fn a_kept_turn_keeps_its_vram_while_the_rest_comes_back() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let f = demote_fixture(&device);
+
+    let keep = f.turn_keys[0];
+    let kept_bytes = snapshot_turn_bytes(&f.conv, &f.backings, &device, f.timeline, keep.index);
+
+    let purged = evict_from_hot(&f.conv, &[], &[keep]);
+    assert_eq!(
+        purged.count,
+        DEMOTE_TURNS - 1,
+        "every turn but the kept one should have been demoted"
+    );
+
+    release_empty(&f.backings);
+
+    let live_after = gpu_live_bytes(&f.backings);
+    assert!(
+        live_after > f.base_live,
+        "the kept turn is still hot, so its chunks must still occupy GPU \
+         slots — but occupancy fell all the way back to its {} byte baseline, \
+         so the keep-set is not being honoured",
+        f.base_live
+    );
+    assert!(
+        live_after < f.resident_live,
+        "{live_after} of {} occupied byte(s) survived a demotion of every turn \
+         but one — the demoted turns did not give their memory back",
+        f.resident_live
+    );
+    // Stated as occupancy and not as an arena count on purpose: whether the
+    // survivor's chunks need an arena beyond the protected baseline is a
+    // question about how the pool packed them, not about whether the keep-set
+    // was honoured, and asserting the count would make this test fail on a
+    // pool that packed *better*.
+
+    assert!(
+        turn_state(&f.conv, keep).hot,
+        "the kept turn stays hot through the demotion"
+    );
+    assert_eq!(
+        snapshot_turn_bytes(&f.conv, &f.backings, &device, f.timeline, keep.index),
+        kept_bytes,
+        "the kept turn's bytes changed while its neighbours were reclaimed — \
+         the release freed an arena the survivor was still using"
+    );
+}

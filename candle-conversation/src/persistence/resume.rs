@@ -709,7 +709,7 @@ mod tests {
     use super::*;
     use crate::persistence::record::ChunkPayload;
     use crate::persistence::SUBSTRATE_DIR;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -846,7 +846,7 @@ mod tests {
     /// Persist `turns` turns of `n_layers × chunks_per_layer`, optionally
     /// truncating one of them to `short_chunks` total records.
     fn substrate_with_turns(
-        dir: &PathBuf,
+        dir: &Path,
         turns: u32,
         n_layers: usize,
         chunks_per_layer: usize,
