@@ -1,7 +1,7 @@
 /* npcd shell — boot, theme, nav, routing. */
 
 import { API, BACKEND } from './lib/api.js';
-import { definePage, navFor, start, go, path, link } from './lib/router.js';
+import { definePage, navFor, start, go, path, link, setViewerRole, can } from './lib/router.js';
 import { h, mount } from './lib/dom.js';
 import { toast } from './lib/ui.js';
 import { checkBuild, takeReloadState } from './lib/build.js';
@@ -15,35 +15,60 @@ import { estateSwitcher } from './lib/estate.js';
  * navigation — where it sits there. No `title`: the tab keeps the name
  * `index.html` gave it, so a per-page title had no reader and was quietly
  * becoming a second, unmaintained set of labels beside `nav.label`. */
-definePage({ path: '/', nav: { section: 'main', order: 10, label: 'My NPCs' },
+/* The page table, and the role each page needs.
+ *
+ * `definePage` throws without a `role`, for the same reason the daemon's
+ * `guard::Api` will not compile without one: a page whose access nobody stated
+ * is a page that is open by accident.
+ *
+ * **Each role here mirrors the API route the page actually calls.** That is the
+ * property worth protecting — a page shown to somebody whose every request 403s
+ * is worse than no page, and a page hidden from somebody the API would have
+ * served is a feature quietly withdrawn. The daemon's table is in `api::api`
+ * and `ops::api`; when one moves, this moves.
+ *
+ *   /            → GET  /v1/npc                     user
+ *   /npc/*       → GET  /v1/npc/:nid                user
+ *   /worlds      → GET  /v1/world                   unauthenticated (writes are admin)
+ *   /personalities → GET /v1/personality            unauthenticated (writes are admin)
+ *   /performance → GET  /v1/telemetry, /v1/memory   user
+ *   /substrate   → GET  /v1/substrate/storage       admin
+ *   /logs        → WS   /ws/logs                    admin
+ */
+definePage({ path: '/', role: 'user', nav: { section: 'main', order: 10, label: 'My NPCs' },
   load: () => import('./pages/roster.js') });
-definePage({ path: '/npc/new',
+definePage({ path: '/npc/new', role: 'user',
   load: () => import('./pages/create.js') });
-definePage({ path: '/npc/:id', keepsRail: true,
+definePage({ path: '/npc/:id', role: 'user', keepsRail: true,
   load: () => import('./pages/npc.js') });
-definePage({ path: '/npc/:id/:tab', keepsRail: true,
+definePage({ path: '/npc/:id/:tab', role: 'user', keepsRail: true,
   load: () => import('./pages/npc.js') });
-definePage({ path: '/interaction/:ix',
+definePage({ path: '/interaction/:ix', role: 'user',
   load: () => import('./pages/console.js') });
-definePage({ path: '/worlds', nav: { section: 'main', order: 20, label: 'Worlds' },
+// Worlds and personalities are READABLE by anyone — the daemon serves their
+// GETs unauthenticated — and the pages render read-only below `admin`.
+definePage({ path: '/worlds', role: 'unauthenticated', nav: { section: 'main', order: 20, label: 'Worlds' },
   load: () => import('./pages/worlds.js') });
-definePage({ path: '/world/:wid',
+definePage({ path: '/world/:wid', role: 'unauthenticated',
   load: () => import('./pages/worlds.js') });
-definePage({ path: '/archetypes', nav: { section: 'main', order: 30, label: 'Archetypes' },
-  load: () => import('./pages/archetypes.js') });
-definePage({ path: '/tools', nav: { section: 'main', order: 40, label: 'Tools' },
+definePage({ path: '/personalities', role: 'unauthenticated', nav: { section: 'main', order: 30, label: 'Personalities' },
+  load: () => import('./pages/personalities.js') });
+definePage({ path: '/tools', role: 'user', nav: { section: 'main', order: 40, label: 'Tools' },
   load: () => import('./pages/tools.js') });
-definePage({ path: '/substrate', nav: { section: 'main', order: 50, label: 'Substrate' },
+// Names the redo log's absolute path, so it matches `/v1/substrate/storage`.
+definePage({ path: '/substrate', role: 'admin', nav: { section: 'main', order: 50, label: 'Substrate' },
   load: () => import('./pages/substrate.js') });
-definePage({ path: '/performance', nav: { section: 'main', order: 60, label: 'Performance' },
+definePage({ path: '/performance', role: 'user', nav: { section: 'main', order: 60, label: 'Performance' },
   load: () => import('./pages/system.js') });
-definePage({ path: '/probe', nav: { section: 'main', order: 55, label: 'Probe' },
+definePage({ path: '/probe', role: 'user', nav: { section: 'main', order: 55, label: 'Probe' },
   load: () => import('./pages/probe.js') });
-definePage({ path: '/logs', nav: { section: 'main', order: 70, label: 'Logs' },
+// Carries every save's full path and the account ids — matches `/ws/logs`.
+definePage({ path: '/logs', role: 'admin', nav: { section: 'main', order: 70, label: 'Logs' },
   load: () => import('./pages/logs.js') });
-definePage({ path: '/system', load: () => import('./pages/system.js') });
-definePage({ path: '/me', load: () => import('./pages/profile.js') });
-definePage({ path: '/welcome', load: () => import('./pages/landing.js') });
+definePage({ path: '/system', role: 'user', load: () => import('./pages/system.js') });
+definePage({ path: '/me', role: 'user', load: () => import('./pages/profile.js') });
+// The signed-out landing page. Necessarily reachable by nobody in particular.
+definePage({ path: '/welcome', role: 'unauthenticated', load: () => import('./pages/landing.js') });
 
 // ── theme ───────────────────────────────────────────────────────────────────
 
@@ -290,6 +315,14 @@ async function boot() {
   document.documentElement.setAttribute('data-theme', readTheme());
   const detail = document.getElementById('boot-detail');
 
+  /* Wait for the daemon — but only for the thing worth waiting for.
+   *
+   * A *refusal* is an answer. A 401 or a 403 means the daemon is up and has
+   * decided something about this caller, and no amount of retrying changes it;
+   * looping on one spent sixteen seconds saying "waiting for daemon…" before
+   * landing on the welcome page, which reads as an outage and is a permission.
+   *
+   * Only a network failure or a not-yet-ready state is worth another go. */
   let status = null;
   for (let i = 0; i < 40; i++) {
     try {
@@ -297,6 +330,12 @@ async function boot() {
       if (status.state === 'ready') break;
       if (detail) detail.textContent = status.detail || (status.loading && status.loading.current) || 'loading…';
     } catch (e) {
+      if (e && (e.status === 401 || e.status === 403)) {
+        // Up, and not answering this to us. Carry on to sign-in rather than
+        // pretending to wait for something that has already replied.
+        status = null;
+        break;
+      }
       if (detail) detail.textContent = 'waiting for daemon…';
     }
     await new Promise((r) => setTimeout(r, 400));
@@ -310,6 +349,11 @@ async function boot() {
   } catch (e) {
     ME = null;
   }
+  // Hand the router the server's answer, once. Everything role-shaped — which
+  // nav links appear, which pages open, which controls are writable — reads
+  // through this one function, so there is a single place that can be wrong
+  // and no page that can disagree with the router about who is looking.
+  setViewerRole(() => (ME && ME.role) || 'unauthenticated');
   // Whether anyone *could* sign in is the gateway's answer, and worth asking
   // only when nobody is: a live session is itself proof that it is configured.
   if (!ME && !(await gatewayHasSignIn())) AUTH_UNAVAILABLE = true;
@@ -396,7 +440,7 @@ async function boot() {
     if (e.key === 'g') { g = true; setTimeout(() => { g = false; }, 700); return; }
     if (g) {
       g = false;
-      const to = { r: '/', w: '/worlds', a: '/archetypes', t: '/tools', s: '/system' }[e.key];
+      const to = { r: '/', w: '/worlds', p: '/personalities', t: '/tools', s: '/system' }[e.key];
       if (to) { e.preventDefault(); go(to); }
       return;
     }
@@ -409,6 +453,22 @@ async function boot() {
 
 window.addEventListener('error', (e) => toast(String(e.message || e), 'err'));
 window.__npcd = { API, BACKEND, get me() { return ME; } };
+
+/* The caller's role, as the SERVER decided it.
+ *
+ * Read from `/v1/me`, never inferred and never stored — a page that decided for
+ * itself would be one more place the answer can be wrong, and the wrong
+ * direction is showing somebody a Save that will 403.
+ *
+ * This is presentation only. It hides controls the server would refuse; it is
+ * not the check. The check is `require(…, Role::Admin)` in the daemon, on the
+ * far side of a network hop where a browser cannot reach it.
+ *
+ * `can` is re-exported so a page asks the same question the router asked when
+ * it decided to show the page at all — one predicate, not two that can differ. */
+export const role = () => (ME && ME.role) || 'unauthenticated';
+export const isAdmin = () => can('admin');
+export { can };
 
 boot().catch((err) => {
   const b = document.getElementById('boot');

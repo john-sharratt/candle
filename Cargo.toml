@@ -102,6 +102,26 @@ serde = { version = "1.0.171", features = ["derive"] }
 serde_plain = "1.0.2"
 serde_json = "1.0.99"
 serde_yaml = "0.9"
+# Comment- and format-preserving YAML editing, for authored files a person wrote
+# and expects to still recognise after a save. `serde_yaml` can only
+# re-serialise a whole document, which deletes every comment in it; these work
+# over a tree-sitter concrete syntax tree where a comment is a node, so an edit
+# replaces one value and leaves the rest of the file's bytes alone.
+#
+# From `zizmor`, which rewrites people's checked-in GitHub Actions workflows and
+# has the same requirement: the diff has to be reviewable. They need
+# `tree-sitter` 0.26, which is why `zend`'s grammars were moved up to match —
+# `tree-sitter` sets `links = "tree-sitter"`, so the workspace gets exactly one
+# version and that pin is a shared decision rather than any one crate's.
+#
+# Pinned to 1.28 rather than tracking latest: 1.29 pulls `tree-sitter-iter`,
+# whose only release requires rustc 1.97 while this workspace builds on 1.93.
+# Moving up is a toolchain decision for the whole repository — CUDA and all —
+# and not one to make as a side effect of choosing a YAML editor.
+yamlpatch = "1.28"
+yamlpath = "1.28"
+yaml_serde = "0.10"
+subfeature = "1.29"
 strum = "0.26"
 strum_macros = "0.26"
 thiserror = "1"

@@ -9,7 +9,9 @@ use crate::code_read::types::{ChunkKind, Scope};
 
 pub fn carve(source: &[u8]) -> Option<Vec<Scope>> {
     let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_rust::language()).ok()?;
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
     let mut rules = LanguageRules {
         kind_to_chunk: HashMap::new(),
         identifier_for,
@@ -486,8 +488,12 @@ mod tests {
 
     #[test]
     fn splits_oversize_function_into_parts_under_max_lines() {
+        // One function comfortably past the line cap, sized from the constant so
+        // the case keeps testing the oversize split when the carve is retuned.
+        // The body lines are short, so the LINE cap is what trips — which is the
+        // point of this test, as distinct from the char-budget split in `carve`.
         let mut src = String::from("fn big() {\n");
-        for _ in 0..200 {
+        for _ in 0..(MAX_SCOPE_LINES + 50) {
             src.push_str("    let _ = 1;\n");
         }
         src.push_str("}\n");

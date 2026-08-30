@@ -1097,21 +1097,32 @@ func main() {
 
     #[test]
     fn refine_breaks_on_char_budget_at_member_boundary() {
-        // Five 10-line members of maximally dense (160-char) lines. Reaching the
-        // 50-line MIN would cost 50 × 161 = 8050 chars — over MAX_SCOPE_CHARS — so
+        // `MIN_SCOPE_LINES` worth of maximally dense (`MAX_LINE_CHARS`) lines,
+        // carved into ten equal members. Reaching the line MIN would cost
+        // MIN_SCOPE_LINES × (MAX_LINE_CHARS + 1) chars — over MAX_SCOPE_CHARS — so
         // the merge must stop on a whole-member edge before then, never mid-member.
-        let dense = "x".repeat(160);
+        //
+        // Derived from the constants rather than hardcoded, so the case keeps
+        // testing the char budget when the carve budgets are retuned. Assert the
+        // premise, since the whole test is vacuous if the line MIN fits in chars.
+        let member_lines = MIN_SCOPE_LINES / 10;
+        let total_lines = member_lines * 10;
+        assert!(
+            total_lines * (MAX_LINE_CHARS as u32 + 1) > MAX_SCOPE_CHARS,
+            "fixture no longer exceeds the char budget — the constants moved apart",
+        );
+        let dense = "x".repeat(MAX_LINE_CHARS);
         let mut src = String::new();
-        for _ in 0..50 {
+        for _ in 0..total_lines {
             src.push_str(&dense);
             src.push('\n');
         }
-        let members: Vec<Scope> = (0..5)
+        let members: Vec<Scope> = (0..10)
             .map(|m| Scope {
                 path: vec![format!("fn m{m}")],
                 kind: ChunkKind::Function,
-                start_line: m * 10 + 1,
-                end_line: m * 10 + 10,
+                start_line: m * member_lines + 1,
+                end_line: m * member_lines + member_lines,
             })
             .collect();
         let refined = refine(members, src.as_bytes());
@@ -1126,25 +1137,40 @@ func main() {
                 "scope {:?} exceeds char budget",
                 s.path
             );
-            // Every boundary lands on a 10-line member edge — nothing cut in half.
+            // Every boundary lands on a member edge — nothing cut in half.
             assert_eq!(
-                (s.start_line - 1) % 10,
+                (s.start_line - 1) % member_lines,
                 0,
                 "starts mid-member: {}",
                 s.start_line
             );
-            assert_eq!(s.end_line % 10, 0, "ends mid-member: {}", s.end_line);
+            assert_eq!(
+                s.end_line % member_lines,
+                0,
+                "ends mid-member: {}",
+                s.end_line
+            );
         }
     }
 
     #[test]
     fn cap_scope_size_splits_a_single_dense_scope_at_line_boundaries() {
-        // One 60-line function of 160-char lines: 60 × 161 = 9660 chars > the char
-        // budget but only 60 lines (< the line cap). The unavoidable single-item
-        // case — split by chars, at line boundaries, coverage preserved.
-        let dense = "y".repeat(160);
+        // One function of maximally dense lines, just long enough to exceed the
+        // CHAR budget while staying under the LINE cap — the unavoidable
+        // single-item case, split by chars at line boundaries, coverage preserved.
+        //
+        // Derived from the constants so the case survives a carve retune; the
+        // premise is asserted, because the test proves nothing if the fixture
+        // trips the line cap instead of the char cap.
+        let line_cost = MAX_LINE_CHARS as u32 + 1;
+        let n_lines = MAX_SCOPE_CHARS / line_cost + 10;
+        assert!(
+            n_lines < MAX_SCOPE_LINES,
+            "fixture trips the line cap before the char cap — the constants moved apart",
+        );
+        let dense = "y".repeat(MAX_LINE_CHARS);
         let mut src = String::new();
-        for _ in 0..60 {
+        for _ in 0..n_lines {
             src.push_str(&dense);
             src.push('\n');
         }
@@ -1152,7 +1178,7 @@ func main() {
             path: vec!["fn big".into()],
             kind: ChunkKind::Function,
             start_line: 1,
-            end_line: 60,
+            end_line: n_lines,
         };
         let out = cap_scope_size(vec![scope], src.as_bytes());
         assert!(out.len() >= 2, "dense single scope should split by chars");
@@ -1166,7 +1192,7 @@ func main() {
         }
         // Contiguous, gapless coverage of the whole original span.
         assert_eq!(out.first().unwrap().start_line, 1);
-        assert_eq!(out.last().unwrap().end_line, 60);
+        assert_eq!(out.last().unwrap().end_line, n_lines);
         for w in out.windows(2) {
             assert_eq!(w[0].end_line + 1, w[1].start_line, "parts not contiguous");
         }

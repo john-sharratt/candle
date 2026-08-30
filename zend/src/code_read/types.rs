@@ -65,6 +65,32 @@ impl Scope {
 }
 
 /// Maximum lines per chunk before the carve splits at sub-blocks.
+///
+/// **This is bounded by the wave's transient tier, and 150 is at that bound —
+/// raising it does not trade quality for speed, it loses files.** Measured on a
+/// 72 GB card over a full-workspace ingest (2311 files), holding
+/// [`crate::code_read::CODE_READ_PARALLELISM`] at its own 12:
+///
+/// | carve | transient-tier failures | files lost |
+/// |------:|------------------------:|-----------:|
+/// | 150 / 8000 (this) | **0** | **0** |
+/// | 300 / 16000 | 25 | 20 |
+/// | 450 / 24000 | 42 | 23 |
+/// | 450 / 24000, 24 workers | 55 | 35 |
+///
+/// Chunk size sets how large each concurrent sequence's prefill is, so it is
+/// what the wave must stage: `wave transient tier needs 37.7 GB below the weight
+/// floor … this wave is too wide for a partition that has nothing left to
+/// trade`, and the ingest aborts with `aborted=true`, leaving those files on
+/// their prior generation. Parallelism does not rescue it — halving workers only
+/// moved 3× from 55 failures to 42, because per-sequence size is the term that
+/// blew the budget.
+///
+/// It is tempting to raise this: unit count is the direct lever on the fixed
+/// host-side cost per scope (conversation create, tag, seal, projection-event
+/// persist), which is ~48% of the phase's wall clock. The room has to come from
+/// the engine's wave partition first; until then this constant is pinned by a
+/// measurement, not by preference.
 pub const MAX_SCOPE_LINES: u32 = 150;
 
 /// Maximum characters a single carved turn should carry, enforced alongside
@@ -77,7 +103,10 @@ pub const MAX_SCOPE_LINES: u32 = 150;
 /// its own (a giant generated table, a minified blob) is the unavoidable case and
 /// is split at line boundaries. Sized to ~2k tokens for code (≈ [`MAX_LINE_CHARS`]
 /// × [`MIN_SCOPE_LINES`]); ordinary ~40-char lines reach [`MAX_SCOPE_LINES`] well
-/// under this, so the char cap only binds on genuinely dense content.
+/// under this, so the char cap only binds on genuinely dense content. Tracks
+/// [`MAX_SCOPE_LINES`] and [`MIN_SCOPE_LINES`] — the three move together, since
+/// the char cap is what stops a dense run from turning a line budget into a much
+/// larger turn than the same line count of ordinary code.
 pub const MAX_SCOPE_CHARS: u32 = 8_000;
 
 /// Hard cap on characters per line fed to the carver. A single-line minified file
@@ -110,4 +139,11 @@ pub const MIN_FILE_HEADER_LINES: u32 = 2;
 /// forward into the next function / type / const run until it reaches this width
 /// (never past [`MAX_SCOPE_LINES`]). Split points stay real functions and types;
 /// small items are only ever absorbed, never split.
+///
+/// **This is the constant that actually sets typical chunk size, not
+/// [`MAX_SCOPE_LINES`].** The ceiling only clips the rare oversized item; this
+/// floor is the target the merge pass grows every ordinary scope toward, so
+/// raising the ceiling alone would leave most chunks unchanged — and raising
+/// this one is what pushes each sequence's prefill into the wave partition's
+/// ceiling. See [`MAX_SCOPE_LINES`] for the measured failure table.
 pub const MIN_SCOPE_LINES: u32 = 50;

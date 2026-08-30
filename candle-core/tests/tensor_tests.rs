@@ -2488,3 +2488,37 @@ fn tensor_norm() -> Result<()> {
     assert_eq!(norm.to_scalar::<f64>()?, 5.);
     Ok(())
 }
+
+/// `contiguous()` on an ALREADY-contiguous view shares the parent's storage;
+/// only `force_contiguous()` copies.
+///
+/// A dim-0 `narrow` of a contiguous tensor is itself contiguous, so
+/// `contiguous()` short-circuits to `self.clone()` and returns a view. Both
+/// halves of that are load-bearing and neither is obvious at a call site:
+/// reading `contiguous()` as "give me my own copy" is wrong, and reaching for
+/// `force_contiguous()` to *get* one is wrong too — CLAUDE.md's hot-path
+/// invariant 2 counts it as the same prohibited allocate-plus-copy as `cat`
+/// and `slice_set`. A consumer that needs its own storage needs a lifetime,
+/// not a layout operation.
+///
+/// Pinned here because the distinction is invisible in review: the two calls
+/// differ by one word and by whether the result aliases.
+#[test]
+fn contiguous_aliases_an_already_contiguous_view_but_force_contiguous_copies() -> Result<()> {
+    let dev = Device::Cpu;
+    let parent = Tensor::zeros((4, 3), DType::F32, &dev)?;
+    let row = parent.narrow(0, 1, 1)?;
+    assert!(
+        row.is_contiguous(),
+        "a dim-0 narrow of a contiguous tensor is contiguous — the premise of the trap"
+    );
+    assert!(
+        row.contiguous()?.same_storage(&parent),
+        "contiguous() must be recognised as a NO-OP here: it returns a view of the parent"
+    );
+    assert!(
+        !row.force_contiguous()?.same_storage(&parent),
+        "force_contiguous() must always copy, whatever the source layout"
+    );
+    Ok(())
+}

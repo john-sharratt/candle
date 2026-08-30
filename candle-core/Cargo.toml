@@ -92,6 +92,12 @@ vram-test-util = []
 # too slow for a production run, and the counters are a measurement tool, not a
 # guard rail.
 forbidden_allocations = ["dep:backtrace"]
+# `Tensor::assert("name")` / `QTensor::assert("name")`: fold a tensor's NaN
+# count, Inf count and finite min/max into a preallocated device slot with one
+# launch — no sync, no allocation, no copy. Off by default because the launches
+# are real work; the assert CALLS stay in the source and compile to nothing.
+# Implies `cuda`: the kernel is the whole mechanism.
+tensor-assert = ["cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]

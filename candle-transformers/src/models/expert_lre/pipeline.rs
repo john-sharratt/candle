@@ -80,6 +80,43 @@ use super::pack::{ExpertPack, PackRead, PackWriter, RecordLayout};
 use super::pinned::{ExpertResidency, LayerGeometry, WarmPool};
 #[cfg(feature = "cuda")]
 use super::streamer::{StreamDone, StreamJob, StreamPlan, StreamerHandle};
+
+/// Key a fence into the ring by `(target_layer, source)`.
+///
+/// Split out from the recording method so the keying — the part that broke —
+/// is testable without a device: a fence only orders its own stream, so an
+/// entry may be replaced by a later one from the SAME source and must never be
+/// replaced by one from another.
+fn insert_prefetch_fence(
+    ring: &mut Vec<(usize, FenceSource, CopyBatchFence)>,
+    target_layer: usize,
+    source: FenceSource,
+    fence: CopyBatchFence,
+) {
+    if let Some(entry) = ring
+        .iter_mut()
+        .find(|(l, s, _)| *l == target_layer && *s == source)
+    {
+        entry.2 = fence;
+    } else {
+        ring.push((target_layer, source, fence));
+    }
+}
+
+/// Which stream a prefetch fence was recorded on.
+///
+/// The fence ring keys on this as well as the target layer because a fence
+/// only orders work on its OWN stream. Two sources feed the ring — this
+/// thread's copy stream and the off-thread streamer's — and an event on one
+/// says nothing about copies enqueued on the other, so one source's fence can
+/// never stand in for the other's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FenceSource {
+    /// This thread's copy stream: demand misses, speculative prefetch, hints.
+    CopyStream,
+    /// The off-thread expert streamer's own stream (whole-layer prefill).
+    Streamer,
+}
 use super::transition::TransitionMatrix;
 #[cfg(not(feature = "cuda"))]
 use super::types::MoeInput;
@@ -1187,7 +1224,7 @@ pub(crate) struct PipelineState {
     /// fence with a later event is safe (a later event on the same stream
     /// implies completion of everything enqueued before it), and at most one
     /// entry per target layer ever exists.
-    pub(crate) prefetch_fences: Vec<(usize, CopyBatchFence)>,
+    pub(crate) prefetch_fences: Vec<(usize, FenceSource, CopyBatchFence)>,
     /// Dynamic load-ahead depth `N`: how many layers ahead of the wave the
     /// speculative prefetcher issues for. Starts at 1; adapted once per pass
     /// by [`PipelineState::adapt_prefetch_depth`] on the late-load /
@@ -1767,23 +1804,35 @@ impl PipelineState {
     }
 
     /// Record `fence` as covering the in-flight speculative DMAs whose
-    /// TARGET is `target_layer`. A no-op fence is dropped (nothing to
-    /// cover). A same-key entry is replaced — all speculative copies share
-    /// the one copy stream, so a later event implies completion of
-    /// everything enqueued before it.
-    fn record_prefetch_fence(&mut self, target_layer: usize, fence: CopyBatchFence) {
+    /// TARGET is `target_layer`. A no-op fence is dropped (nothing to cover).
+    ///
+    /// An entry is replaced only when the incoming fence comes from the SAME
+    /// source, because that is the only case where the replacement is sound: a
+    /// later event implies completion of everything enqueued before it *on its
+    /// own stream*, and each source owns one stream. Across sources it implies
+    /// nothing — the streamer's stream and this thread's copy stream are
+    /// unordered with respect to each other — so both are kept and both are
+    /// waited.
+    ///
+    /// Replacing across sources dropped a live fence: a layer with a pending
+    /// copy-stream prefetch that the streamer then reported for would keep only
+    /// the streamer's event, leaving the copy-stream DMA unfenced, and the
+    /// layer's GEMM would read expert weights that were still arriving. That is
+    /// the "half-copied expert bytes" this ring exists to prevent, and it needs
+    /// both paths live for one layer — whole-layer prefill streaming overlapping
+    /// decode demand misses — so it only appears in wide co-batched waves.
+    ///
+    /// At most one entry per (layer, source), so the ring stays bounded.
+    fn record_prefetch_fence(
+        &mut self,
+        target_layer: usize,
+        source: FenceSource,
+        fence: CopyBatchFence,
+    ) {
         if !fence.is_real() {
             return;
         }
-        if let Some(entry) = self
-            .prefetch_fences
-            .iter_mut()
-            .find(|(l, _)| *l == target_layer)
-        {
-            entry.1 = fence;
-        } else {
-            self.prefetch_fences.push((target_layer, fence));
-        }
+        insert_prefetch_fence(&mut self.prefetch_fences, target_layer, source, fence);
     }
 
     /// Wait (GPU-side) every prefetch fence whose target layer is at or
@@ -1797,7 +1846,7 @@ impl PipelineState {
         let mut i = 0;
         while i < self.prefetch_fences.len() {
             if self.prefetch_fences[i].0 <= layer {
-                let (l, fence) = self.prefetch_fences.swap_remove(i);
+                let (l, _, fence) = self.prefetch_fences.swap_remove(i);
                 if l == layer && !fence.is_complete() {
                     late = true;
                 }
@@ -1814,7 +1863,7 @@ impl PipelineState {
     /// unconsumed fence from the old pass would otherwise sit ahead of the
     /// wave and never be waited before its slots are computed as hits.
     fn drain_prefetch_fences(&mut self) -> Result<()> {
-        for (_, fence) in std::mem::take(&mut self.prefetch_fences) {
+        for (_, _, fence) in std::mem::take(&mut self.prefetch_fences) {
             fence.wait(&self.device)?;
         }
         Ok(())
@@ -1968,7 +2017,11 @@ impl PipelineState {
                     self.stream_loads.remove(&(layer, expert_idx));
                 }
                 self.pass_dma_bytes += done.bytes;
-                self.record_prefetch_fence(layer, CopyBatchFence { event: done.fence });
+                self.record_prefetch_fence(
+                    layer,
+                    FenceSource::Streamer,
+                    CopyBatchFence { event: done.fence },
+                );
             }
             Err(_) => {
                 // Streamer died mid-plan: nothing enqueued reliably — take
@@ -2893,6 +2946,7 @@ impl PipelineState {
                     Ok(event) => {
                         self.record_prefetch_fence(
                             layer_idx,
+                            FenceSource::CopyStream,
                             CopyBatchFence { event: Some(event) },
                         );
                     }
@@ -2974,7 +3028,7 @@ impl PipelineState {
             // reload from). The prediction still chains through it.
             if target_layer >= self.inner.pinned_layers {
                 let fence = self.prefetch_into(moe_layer_idx, target_layer, &predicted)?;
-                self.record_prefetch_fence(target_layer, fence);
+                self.record_prefetch_fence(target_layer, FenceSource::CopyStream, fence);
             }
             source = predicted;
         }
@@ -3210,4 +3264,65 @@ pub(crate) fn spawn_pipeline_thread(
         .expect("failed to spawn expert-pipeline thread");
 
     tx
+}
+
+#[cfg(test)]
+mod fence_ring_tests {
+    use super::{insert_prefetch_fence, CopyBatchFence, FenceSource};
+
+    /// A fence orders only its own stream, so the ring keys on the source as
+    /// well as the layer.
+    ///
+    /// The ring previously keyed on the layer alone, justified by "all
+    /// speculative copies share the one copy stream". Two sources feed it: this
+    /// thread's copy stream and the off-thread streamer's. When both reported
+    /// for one layer, the second silently replaced the first, and the dropped
+    /// fence's DMA went unwaited — the layer's GEMM then read expert weights
+    /// that were still arriving. It needs whole-layer prefill streaming to
+    /// overlap decode demand misses, so it only ever appeared in wide
+    /// co-batched waves, as NaN after the expert FFN.
+    #[test]
+    fn a_fence_never_replaces_one_from_another_stream() {
+        let mut ring = Vec::new();
+
+        insert_prefetch_fence(
+            &mut ring,
+            7,
+            FenceSource::CopyStream,
+            CopyBatchFence::noop(),
+        );
+        insert_prefetch_fence(&mut ring, 7, FenceSource::Streamer, CopyBatchFence::noop());
+        assert_eq!(
+            ring.len(),
+            2,
+            "both streams' fences for layer 7 must be kept — neither covers the other"
+        );
+
+        // Same source again: the later event does imply the earlier one on that
+        // one stream, so it replaces rather than accumulating.
+        insert_prefetch_fence(
+            &mut ring,
+            7,
+            FenceSource::CopyStream,
+            CopyBatchFence::noop(),
+        );
+        assert_eq!(
+            ring.len(),
+            2,
+            "a same-source fence replaces, so the ring stays bounded at one per (layer, source)"
+        );
+
+        // A different layer is a different key entirely.
+        insert_prefetch_fence(&mut ring, 8, FenceSource::Streamer, CopyBatchFence::noop());
+        assert_eq!(ring.len(), 3);
+        assert!(ring
+            .iter()
+            .any(|(l, s, _)| *l == 7 && *s == FenceSource::CopyStream));
+        assert!(ring
+            .iter()
+            .any(|(l, s, _)| *l == 7 && *s == FenceSource::Streamer));
+        assert!(ring
+            .iter()
+            .any(|(l, s, _)| *l == 8 && *s == FenceSource::Streamer));
+    }
 }

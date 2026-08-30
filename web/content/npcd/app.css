@@ -35,6 +35,10 @@
 .pend { display: inline-flex; gap: 2px; }
 .pend i { width: 3px; height: 12px; border-radius: 1px; background: var(--line-2); }
 .pend i.on { background: var(--accent); }
+/* Not measured. Dashed rather than merely dim, so "no engine has reported"
+ * cannot be mistaken at a glance for "measured, and nothing is waiting" — the
+ * two look identical when the only difference is which pips are lit. */
+.pend.na i { background: none; border-left: 3px dashed var(--line-2); border-radius: 0; }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 12px; }
 .npc-card {
@@ -325,4 +329,266 @@ table.t tr.click:hover td { background: var(--panel-2); }
   background: var(--bg-deep); border: 1px solid var(--line);
 }
 canvas { width: 100%; display: block; }
+
+/* ── the performance page's interpreted numbers ──────────────────────────────
+   A KPI is a `.stat` that also says whether its value is fine, so it reuses
+   `.lbl` / `.val` rather than restating them. What is added is the judgement:
+   a colour rail down the edge, an optional fill, and the three states those
+   two share with the verdict line. */
+.kpi { position: relative; overflow: hidden; padding-left: 16px; }
+.kpi-rail { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+.kpi-meter {
+  height: 3px; border-radius: 2px; background: var(--line-2);
+  margin-top: 9px; overflow: hidden;
+}
+.kpi-meter i { display: block; height: 100%; border-radius: 2px; }
+
+.st-ok { color: var(--ok); }      .bg-ok { background: var(--ok); }
+.st-warn { color: var(--warn); }  .bg-warn { background: var(--warn); }
+.st-crit { color: var(--crit); }  .bg-crit { background: var(--crit); }
+
+/* Not measured — a fourth state, and the reason the performance page can be
+ * trusted. Nothing has reported this number, which is different from having
+ * reported a zero. Deliberately colourless: green, amber and red are verdicts,
+ * and there is no verdict to give about a number nobody has taken. */
+.st-na { color: var(--ink-faint); }  .bg-na { background: var(--line-2); }
+
+/* ── Performance page ──────────────────────────────────────────────────────
+ *
+ * Everything here is scoped to `.perf`, the page's own root class. The panel
+ * and KPI rules below alter hover and spacing, and a bare `.panel:hover` would
+ * quietly change the roster, the substrate view and every other page that uses
+ * the same component.
+ */
+
+/* A figure that changes every four seconds must not change width as it does.
+ * With proportional digits a KPI twitches on each poll, which reads as
+ * instability in the daemon rather than in the typeface. */
+.perf .val, .perf .mono, .perf .dev-chip b { font-variant-numeric: tabular-nums; }
+
+/* The device banner — what this page is about, stated once at the top so the
+ * card's identity is not buried in a chart caption. */
+.perf .dev {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 13px 16px; margin-bottom: 14px; border-radius: var(--radius);
+  background:
+    linear-gradient(100deg, color-mix(in srgb, var(--accent) 9%, transparent), transparent 46%),
+    var(--panel);
+  border: 1px solid var(--line);
+}
+/* Card and model, side by side — the two facts every number below depends on. */
+.perf .dev-id { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.perf .dev-split {
+  width: 1px; align-self: stretch; background: var(--line); flex: none; margin: 0 2px;
+}
+.perf .dev-mark {
+  width: 30px; height: 30px; flex: none; border-radius: 8px;
+  display: grid; place-items: center; font-size: 15px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent);
+}
+.perf .dev-name { font-weight: 650; letter-spacing: -.01em; }
+/* Brighter than `.dim`, which is `--ink-faint` and disappears against the
+ * banner's gradient — this line carries the card's memory and the model's size,
+ * which are the two figures somebody actually reads here. */
+.perf .dev-sub { color: var(--ink-dim); }
+.perf .dev-chips { display: flex; gap: 7px; flex-wrap: wrap; margin-left: auto; }
+.perf .dev-chip {
+  font-family: var(--mono); font-size: 10.5px; padding: 3px 8px; border-radius: 6px;
+  background: var(--panel-2); color: var(--ink-dim); border: 1px solid var(--line);
+}
+.perf .dev-chip b { color: var(--ink); font-weight: 600; }
+
+/* Narrow: the blocks stack, so a full-height divider between them would be a
+ * rule across the middle of the banner rather than between two columns. */
+@media (max-width: 860px) {
+  .perf .dev-split { display: none; }
+  .perf .dev-chips { margin-left: 0; }
+}
+
+/* KPI cards. The rail is a gradient rather than a flat bar so a glance down the
+ * row reads as a row, and the card lifts on hover to say it is a live thing. */
+.perf .kpi { transition: transform .14s ease, box-shadow .14s ease; }
+.perf .kpi:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgb(0 0 0 / .17); }
+.perf .kpi-rail { width: 3px; opacity: .85; }
+.perf .kpi .val { font-size: 1.35rem; letter-spacing: -.02em; line-height: 1.15; }
+
+/* The sparkline under a KPI: the same metric's shape over the retained window.
+ * A number says where you are; this says which way you are going, which is the
+ * question a number on its own always provokes. */
+.perf .kpi-spark { margin-top: 9px; height: 26px; line-height: 0; }
+.perf .kpi-spark svg { width: 100%; height: 26px; display: block; overflow: visible; }
+
+/* Chart panels lift the same way, and their canvas gets a hairline floor so an
+ * empty-looking chart still reads as a plotted area. */
+.perf .panel { transition: box-shadow .14s ease; }
+.perf .panel:hover { box-shadow: 0 3px 14px rgb(0 0 0 / .13); }
+.perf canvas { border-radius: 6px; }
+
+/* The live chip breathes while it is live, and only while it is live — a
+ * stopped animation is the first thing you notice out of the corner of an eye,
+ * which is exactly the right signal for a daemon that stopped answering. */
+.perf .chip.ok .dot-live {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; margin-right: 6px; vertical-align: middle;
+  animation: perf-pulse 2.1s ease-in-out infinite;
+}
+@keyframes perf-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); }
+  50%      { opacity: .55; box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 0%, transparent); }
+}
+
+/* The verdict, led by a state pill so the answer is legible before the
+ * sentence explaining it is read. */
+.perf .verdict { display: flex; gap: 12px; align-items: flex-start; }
+.perf .verdict-pill {
+  flex: none; font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: .08em; padding: 4px 9px; border-radius: 6px; margin-top: 1px;
+}
+.perf .verdict-body { flex: 1; min-width: 0; }
+.pill-ok   { background: color-mix(in srgb, var(--ok) 15%, transparent);   color: var(--ok); }
+.pill-warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+.pill-crit { background: color-mix(in srgb, var(--crit) 16%, transparent); color: var(--crit); }
+.pill-na   { background: var(--panel-2); color: var(--ink-faint); }
+
+/* A legend row under a chart, so the colours mean something without hovering. */
+.perf .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 9px; }
+.perf .legend span { font-size: 10.5px; color: var(--ink-dim); display: inline-flex;
+  align-items: center; gap: 5px; font-family: var(--mono); }
+.perf .legend i { width: 9px; height: 3px; border-radius: 2px; display: inline-block; }
+
+/* Before the first sample lands. A shimmer says "coming", where an empty panel
+ * says "broken" and a spinner says nothing at all. */
+.perf .skel { border-radius: 8px; background: var(--panel-2); overflow: hidden; position: relative; }
+.perf .skel::after {
+  content: ""; position: absolute; inset: 0; transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent,
+    color-mix(in srgb, var(--ink) 7%, transparent), transparent);
+  animation: perf-shimmer 1.5s infinite;
+}
+@keyframes perf-shimmer { 100% { transform: translateX(100%); } }
+
+/* Somebody reading rather than watching gets the motion out of the way. */
+@media (prefers-reduced-motion: reduce) {
+  .perf .chip.ok .dot-live, .perf .skel::after { animation: none; }
+  .perf .kpi, .perf .panel { transition: none; }
+  .proj .gather-bar i, .subs .seg { transition: none; }
+}
+
+/* ── Substrate: the redo log on disk ───────────────────────────────────────
+ *
+ * One strip, segments sized by their share of the log — so it reads as the
+ * thing it describes: a long tail of sealed files and one growing head.
+ */
+.subs .segstrip {
+  display: flex; gap: 2px; height: 26px; border-radius: 6px; overflow: hidden;
+  background: var(--panel-2);
+}
+.subs .seg {
+  display: block; min-width: 3px; border-radius: 3px;
+  background: color-mix(in srgb, var(--l-perception) 45%, transparent);
+  transition: background .14s ease;
+}
+.subs .seg:hover { background: var(--l-perception); }
+/* The one being appended to. Striped rather than merely brighter, because
+ * "which file is growing" is a categorical fact, not a stronger version of the
+ * others — and a colour alone would not survive a colour-blind reader. */
+.subs .seg.active {
+  background: repeating-linear-gradient(115deg,
+    var(--accent) 0 6px, color-mix(in srgb, var(--accent) 55%, transparent) 6px 12px);
+}
+.subs .panel { transition: box-shadow .14s ease; }
+.subs .panel:hover { box-shadow: 0 3px 14px rgb(0 0 0 / .13); }
+
+/* ── A page with nothing in it yet ─────────────────────────────────────────
+ *
+ * Not `.empty`. That one is a small notice for a *region* of a working page —
+ * a chart with no series, a list that filtered to nothing — and it looks
+ * adrift when it is the only thing on screen: full-bleed on a wide page, with
+ * its text running the whole width and nothing anchoring it.
+ *
+ * This is for the other case: the page cannot do its job at all yet, and the
+ * reader has most likely never seen it working. So it is composed like a card
+ * rather than a warning — a medallion, a constrained measure, and the one
+ * action that leads somewhere.
+ */
+.blank {
+  max-width: 520px; margin: 8px auto 0; padding: 44px 36px 40px;
+  text-align: center; border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(120% 90% at 50% 0%,
+      color-mix(in srgb, var(--accent) 8%, transparent), transparent 62%),
+    var(--panel);
+}
+.blank-mark {
+  width: 54px; height: 54px; margin: 0 auto 18px; border-radius: 16px;
+  display: grid; place-items: center; font-size: 24px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.blank-title {
+  font-size: 1.05rem; font-weight: 650; letter-spacing: -.01em;
+  color: var(--ink); margin-bottom: 8px;
+}
+/* Held to a readable measure. The explanation is the point of this panel — it
+ * is the only place the page says what it is for — and a line that runs the
+ * full width of a wide monitor does not get read. */
+.blank-body {
+  font-size: .82rem; line-height: 1.65; color: var(--ink-soft);
+  max-width: 42ch; margin: 0 auto;
+}
+
+/* ── Projection inspector ──────────────────────────────────────────────────── */
+
+.proj .tickbar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.proj .tick-n {
+  font-size: 1.05rem; font-weight: 650; letter-spacing: -.01em;
+  font-variant-numeric: tabular-nums; min-width: 62px;
+}
+
+/* Gathered: a five-column grid so the numbers line up down the page. Reading
+ * "which layer ate the budget" is a vertical scan, and it only works if the
+ * columns do not shift per row. */
+.proj .gather { display: flex; flex-direction: column; gap: 7px; }
+.proj .gather-row {
+  display: grid; align-items: center; gap: 10px;
+  grid-template-columns: 108px 1fr 74px 122px 46px;
+}
+.proj .gather-nm { font-size: .78rem; font-weight: 600; }
+.proj .gather-bar {
+  height: 9px; border-radius: 5px; background: var(--panel-2); overflow: hidden;
+}
+.proj .gather-bar i {
+  display: block; height: 100%; border-radius: 5px; transition: width .22s ease;
+}
+.proj .gather-tok, .proj .gather-sel, .proj .gather-top {
+  font-size: .72rem; font-variant-numeric: tabular-nums;
+}
+.proj .gather-tok { text-align: right; color: var(--ink-dim); }
+.proj .gather-sel { text-align: right; color: var(--ink-soft); }
+.proj .gather-top { text-align: right; color: var(--accent); font-weight: 600; }
+
+.proj .drop-row {
+  display: flex; align-items: center; gap: 10px; padding: 8px 2px;
+  border-bottom: 1px solid var(--line); font-size: .78rem;
+}
+.proj .drop-row:last-child { border-bottom: 0; }
+
+@media (max-width: 720px) {
+  /* The bar is the first thing to go: the counts still say everything the bar
+   * was showing, and a 40px bar says nothing at all. */
+  .proj .gather-row { grid-template-columns: 92px 1fr 104px; }
+  .proj .gather-bar, .proj .gather-top { display: none; }
+}
+
+/* The sentence that says whether the charts below are good news. */
+.verdict {
+  border-left: 3px solid var(--accent); line-height: 1.7;
+  color: var(--ink-soft); margin-bottom: 16px;
+}
+.verdict b { color: var(--ink); }
+
+/* Paused: dimmed so the page cannot be mistaken for live at a glance, but not
+   so far that it stops being readable — reading is the reason it is paused. */
+.page.is-paused .grid, .page.is-paused .verdict { opacity: .62; transition: opacity .15s; }
 

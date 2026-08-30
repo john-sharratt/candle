@@ -1061,6 +1061,38 @@ impl RegionPool {
         if floor > span_end {
             candle::bail!("weight floor {floor:#x} is past the span end {span_end:#x}")
         }
+        // **The tier is the other occupant of the middle, and it was unguarded.**
+        //
+        // The check below refuses a floor that would cut live KV regions. It
+        // said nothing about the wave transient tier, which stands in the same
+        // ground between the arenas and the weights — so the weight side could
+        // grow DOWN onto a tier that was already placed. `tier_fits` had
+        // approved that tier against the floor as it stood a moment earlier;
+        // lowering the floor underneath it retroactively puts its top inside
+        // the weight zone, and the FFN span at the top of the tier then writes
+        // activations over resident expert slots.
+        //
+        // Measured, at the moment of the fault: tier `[0x4cf9800000, +0x502400000)`
+        // topping out at `0x51fbc00000` against a floor of `0x51f9c00000` — 32 MiB
+        // of the tier inside expert ground, with the `wave-ffn` span 275 KB past
+        // the line.
+        //
+        // A standing tier is not movable here (its ranges are named by live
+        // pointers), so the only sound answer is to refuse the floor and let the
+        // weight side ask again once the tier has gone — which it does between
+        // forwards, every forward.
+        if let (Some(base), bytes) = (self.transient_base, self.transient_bytes) {
+            let tier_top = base.saturating_add(bytes as u64);
+            if floor < tier_top {
+                candle::bail!(
+                    "weight floor {floor:#x} would fall below the standing wave transient \
+                     tier's top {tier_top:#x} (tier at {base:#x}, {bytes} B). That ground \
+                     is holding this forward's activations — taking it would put the FFN \
+                     span inside the expert weight zone. The tier is released between \
+                     forwards; ask again then."
+                )
+            }
+        }
         let layout = layout_span(self.span_base, self.span_bytes, self.dense_bytes, floor);
         let watermark = self.live_watermark();
         if layout.total < watermark {
@@ -2133,6 +2165,13 @@ pub fn set_weight_floor(stream: &std::sync::Arc<CudaStream>, floor: u64) -> Resu
              {total} regions to KV",
             (pool.span_end() - floor) / (1024 * 1024),
         );
+        // The boundary is the truth about what the weight side owns, so the
+        // read-only declaration follows it. Ground released to KV stops being
+        // immutable the instant it is released — the wave tier stands on it and
+        // writes there, entirely legitimately — and a declaration frozen at
+        // load reports exactly that as corruption. Diagnostic-only, and a no-op
+        // without `tensor-assert`.
+        candle::readonly_regions::release_below(floor);
         Ok(total)
     })
 }
@@ -2621,6 +2660,54 @@ mod tests {
             Ok(Device::Cuda(d)) => Some(d.cuda_stream()),
             _ => None,
         }
+    }
+
+    /// The weight side may not take ground a standing tier is holding.
+    ///
+    /// `set_weight_floor` refused a floor that would cut live KV regions and
+    /// said nothing about the wave transient tier, which occupies the same
+    /// middle. So the weight side could grow DOWN onto a tier already placed —
+    /// `tier_fits` having approved that tier against the floor as it stood a
+    /// moment earlier — and the FFN span at the tier's top then wrote
+    /// activations over resident expert slots.
+    ///
+    /// Measured at the fault: tier topping out at `0x51fbc00000` against a floor
+    /// of `0x51f9c00000`, 32 MiB of tier inside expert ground.
+    #[test]
+    fn the_weight_floor_may_not_cut_a_standing_transient_tier() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let before = match region_stats(s.context().ordinal()) {
+            Some(st) => st,
+            None => return Ok(()),
+        };
+        let _ = before;
+        let base = place_transient(&s, 4 * REGION_BYTES)?;
+        let layout = super::span_layout(s.context().ordinal()).expect("a placed span");
+        let tier_top = base + layout.transient_bytes as u64;
+        assert!(
+            tier_top <= layout.weight_floor,
+            "the placement itself must respect the floor: {tier_top:#x} vs {:#x}",
+            layout.weight_floor
+        );
+
+        // Any floor inside the standing tier must be refused — this is the
+        // direction that was unguarded.
+        for probe in [tier_top - 1, base + 1, base] {
+            assert!(
+                super::set_weight_floor(&s, probe).is_err(),
+                "a floor at {probe:#x} cuts the tier [{base:#x}, {tier_top:#x}) and must \
+                 be refused"
+            );
+        }
+        // A floor at or above the tier's top is still allowed, so the guard has
+        // not simply frozen the boundary.
+        assert!(
+            super::set_weight_floor(&s, layout.weight_floor).is_ok(),
+            "the floor where it already stands must remain settable"
+        );
+        release_transient(&s);
+        Ok(())
     }
 
     /// Regions come out of the span in ascending order and are disjoint at the

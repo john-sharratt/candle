@@ -69,6 +69,8 @@ default = []
 # Also enables candle-transformers' per-op pipeline profile (attn_core, mlp_ffn,
 # gemm_*) so the gap-fill forward's internal breakdown can be dumped.
 profile = ["candle-transformers/profile"]
+# `Tensor::assert` / `QTensor::assert` — see `candle-core/Cargo.toml`.
+tensor-assert = ["candle-transformers/tensor-assert"]
 # Report every device allocation that reaches the CUDA driver while a wave is
 # running — the ones the bump arena was supposed to serve. The span is sized for
 # the arena's budget, so an allocation outside it is memory the reservation was

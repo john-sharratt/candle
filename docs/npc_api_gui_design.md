@@ -336,12 +336,71 @@ Local development keeps zend's convenience: `--no-auth` binds loopback and injec
 local user. It **refuses to start on a non-loopback interface**, so the convenience cannot
 accidentally become the deployment.
 
+### 8.1a Roles
+
+Three levels, and they are how the daemon decides everything. `web/src/auth/role.rs` owns the
+type; every route resolves one before it does anything else.
+
+| Role | Who | May |
+|---|---|---|
+| `unauthenticated` | the gateway named nobody | read worlds, personalities, and the console |
+| `user` | signed in | everything above, plus **their own** characters and profile, plus the hardware telemetry |
+| `admin` | named in the config | everything above, plus **edit authored content on disk**, plus the substrate footprint and the log stream |
+
+`Role` derives `Ord` from declaration order, so `role >= Role::Admin` is the whole of an access
+check and there is no second spelling of the same question.
+
+**Only an admin may change a file on disk.** Worlds and personalities live in a mind that is
+not under version control, so a bad write is not a row to restore — it is prose somebody wrote,
+gone. Reading them is open, because the console is mostly a reading tool and the content is
+fiction.
+
+**Admin is deployment configuration, and there is no API to grant it.** It lives in
+`roles.admins:` in the config and is decided at startup. Whoever can edit that file and restart
+the process is already the person who can edit the files it grants power over, so a user record
+would be a *weaker* way to grant the same thing. An empty list means nobody can edit anything,
+which is the right way for a misconfigured deployment to fail — and it is logged at startup, so
+it is not discovered from a 403 an hour later.
+
+An entry names `sub` or `email` and says which:
+
+```yaml
+roles:
+  admins:
+    - sub: "108000000000000000000"    # durable: survives an email change
+    - email: someone@example.com      # readable: inherits the provider's reassignment risk
+```
+
+`sub` is the account key everywhere else in this estate, precisely because an email can be
+reassigned. It is therefore the durable answer — and a bare subject id in a config file is not
+a thing a human maintains, so both are allowed. Neither is guessed: an entry that matched
+"whichever field it looks like" would be a rule nobody can hold in their head, failing silently
+in the direction that grants access.
+
+> **A public repository is a reason to prefer `email` here.** A subject id is a stable
+> identifier for a real account, and `npcd/.gitignore` excludes `accounts/` on the grounds that
+> git history is the one place you cannot quietly remove something from later. Committing a
+> `sub:` line puts the same value in the same history under a different file name. `npcd`'s own
+> config therefore names an email — one already public as the author address on every commit —
+> and accepts that admin follows the address rather than the account. A private deployment, or
+> one that keeps its role table outside the tree the way `auth_file` keeps credentials, should
+> prefer `sub`.
+
+**401 and 403 are different answers.** Nobody signed in is 401 — signing in fixes it. Somebody
+signed in and not enough is 403 — signing in again will not, and telling them to try is how an
+operator loses an afternoon to a permissions problem that was never a session problem. The body
+names the role required and the role held; neither is a secret.
+
+`GET /v1/me` reports the caller's role so the console can hide a control the server would
+refuse. That is presentation only. The check is in the daemon, on the far side of a network hop
+a browser cannot reach.
+
 ### 8.2 Ownership is authorization, not substrate scope
 
 Every NPC has an owner. This creates a second scoping concept, and conflating it with the
 first would be a serious mistake:
 
-> **`OwnerId` decides who may call. The scope chain `(WorldId, ArchetypeId, NpcId)` decides
+> **`OwnerId` decides who may call. The scope chain `(WorldId, PersonalityId, NpcId)` decides
 > what the model gathers.** They are different questions and they are answered in different
 > layers.
 
@@ -366,7 +425,7 @@ fn access(user: &User, npc: &Npc) -> Access;
 the existence of other users' characters. The exception is a resource the user can see but not
 modify, where 403 is correct and non-leaking.
 
-Worlds and archetypes are owned too, and may be marked `public: true` — a shared world any
+Worlds and personalities are owned too, and may be marked `public: true` — a shared world any
 user can spawn NPCs into, while each NPC stays privately owned.
 
 ### 8.3 Tags and hidden characters
@@ -411,6 +470,27 @@ GET /v1/npc
 
 You surface a hidden character by knowing a tag it carries. Nothing in the interface reveals
 that there is anything to look for.
+
+**No "characters you own" total, anywhere.** `/v1/me` deliberately carries no `npc_count`, and
+the profile page shows none. It is the figure that defeats the whole rule by arithmetic: anyone
+who can see the roster in front of them subtracts it and learns exactly how many characters
+there are to go looking for. Counting only the visible ones would be safe but would disagree
+with what its owner knows they have, which reads as a fault rather than a policy — and the
+roster already says it better. A field carried "for later" is worse than none, because later it
+gets honoured by counting everything.
+
+The same arithmetic applies to the per-world and per-personality `npc_count` on those listings.
+It counts **every living character, hidden ones included**, across every owner. Global is the
+right scope, because the sentence it answers is global — publishing doctrine reaches every
+character of that personality, not only the publisher's.
+
+Including hidden characters is the part that looks wrong and is not. *Excluding* them is what
+would breach §8.3: the figure would drop the moment one was hidden, so anybody polling it learns
+that a character was just hidden and under which personality — a sharper signal than the roster
+gives, because the denominator is smaller. Including them makes hiding invisible here, which is
+the whole point of hiding. What remains answers "how many of these exist" and never "how many do
+*you* have"; the per-owner total is the one §8.3 forbids, and the roster still refuses to
+produce it.
 
 ### Why the tag is no longer hashed
 
@@ -468,9 +548,9 @@ defend against anyone with server access. The UI therefore says "hidden" and nev
   /v1/world/{wid}                             get, update, delete
   /v1/world/{wid}/time                        narrative clock: get, set, scale, pause
 
-  /v1/archetype                               list, create
-  /v1/archetype/{aid}                         get, update, delete
-  /v1/archetype/{aid}/doctrine                the one evolving part of the shared layer
+  /v1/personality                             list
+  /v1/personality/{aid}                       get, update, delete
+  /v1/personality/{aid}/doctrine              the one evolving part of the shared layer
 
   /v1/npc                                     list, create
   /v1/npc/{id}                                get, patch, delete
@@ -508,8 +588,15 @@ Normative. Both implementations conform.
 Npc {
   "npc_id":       "10237749914772934281",
   "name":         "Varek",
-  "world_id":     "1",
-  "archetype_id": "4",
+  // Slugs — the names of `worlds/<id>.yaml` and `personalities/<id>.yaml` in
+  // the mind. A file's identity is its name; a number beside it would be a
+  // second identity for the same document, free to disagree with the first.
+  "world_id":       "battle-cities",
+  "personality_id": "commander",
+  // Joined from the authored document at read time, absent when the slug no
+  // longer resolves. Never stored on the record: a copy of the name goes stale
+  // the moment the file is retitled.
+  "personality_name": "Commander",
   "state":        "active" | "idle" | "asleep" | "suspended" | "tombstoned",
   "tick": {
     "heartbeat_ms": 30000,        // idle metabolism; salience sets this
@@ -543,8 +630,7 @@ User {
     "turn_index":  7,                 // the live profile turn
     "revision":    3
   },
-  "npc_count": 14,
-  "created_ms": …
+  "created_ms": …                     // no npc_count — see §8.3
 }
 
 Act {                                 // one tool call the NPC actually made
@@ -693,8 +779,12 @@ POST /v1/npc
 ```jsonc
 {
   "name": "Varek",
-  "world_id": "1",
-  "archetype_id": "4",
+  "world_id": "battle-cities",
+  "personality_id": "commander",
+  // The record's own field name. A body that says `description` writes a
+  // character with an empty persona and no error, because an absent persona is
+  // legal — so the two names have to be the same one.
+  "persona_description": "Fifty-three, a former staff sergeant.",
   "environment_enabled": null,      // null → default by origin (see below)
   "seed": {
     "relationships": [ … ],
@@ -712,13 +802,31 @@ otherwise perceive nothing; an API caller presumably has its own world simulatio
 not want a second one inventing events underneath it. Clients that care set it explicitly.
 
 ```
-GET    /v1/npc?world_id=&archetype_id=&state=&tag=&q=&limit=&cursor=
+GET    /v1/npc?world_id=&personality_id=&state=&tag=&q=&limit=&cursor=
 GET    /v1/npc/{id}
-PATCH  /v1/npc/{id}          { name?, description?, state?, environment_enabled?, tick? }
+PATCH  /v1/npc/{id}          { name?, persona_description?, state?, environment_enabled?,
+                               heartbeat_ms?, salience_gate?, tags?, hidden? }
 PUT    /v1/npc/{id}/tags     { "tags": ["campaign-2", "moonlight"] }
 PUT    /v1/npc/{id}/hidden   { "hidden": true }
 DELETE /v1/npc/{id}          → 204, tombstones (irreversible)
 ```
+
+The two single-field routes are `PATCH` underneath — same validator, same record, same
+supersession. They exist because the console edits those fields from controls nowhere near the
+rest of the form, a tag chip and a checkbox, each saving on the spot; without them the console
+would have to send a whole character to add one tag. A route that wrote its own record would be
+a second answer to "what may a tag be".
+
+**Every write appends.** One record keyed by `npc_id`, newest wins on replay — an implicit
+tombstone, with no delete record to write and none to replay. So an edit does not mutate a
+character; it supersedes one, and `revision` advances. Deleting is the same operation with
+`state: "tombstoned"`: the record stays, because the id must stay taken and the acts it already
+committed still name it.
+
+`heartbeat_ms` and `salience_gate` are **authored settings**, not measurements — the resting
+rate an idle character thinks at, and the level below which an event does not wake it. The live
+tick figures beside them in the response (`last_tick_ms`, `pending_events`) are the engine's and
+are absent rather than zero when nothing has reported. Nothing in the console lets one be typed.
 
 Two behaviours on `GET /v1/npc` carry the whole discretion design (§8.3):
 
@@ -758,8 +866,29 @@ first request from an unknown sub  → creates the account, writes profile turn 
 GET  /v1/me/profile                 → { description, gender, history, turn_index, revision }
                                       gender is "Male", "Female", or "" — 400 bad_gender otherwise
 PUT  /v1/me/profile                 → appends a new turn, tombstones the previous
-GET  /v1/me/profile/history         → every revision, live and tombstoned
+GET  /v1/me/profile/history         → an index: {revision, live, tombstoned_ms, preview}
+GET  /v1/me/profile/history/{rev}   → that revision in full
+POST /v1/me/profile/restore/{rev}   → brings it back as a NEW revision — 404 if unknown
 ```
+
+**The index is summaries, and restoring is an edit.** Two decisions that go together.
+
+An author who edits often has hundreds of revisions, so the index carries a one-line preview
+and the prose arrives only when one is picked — otherwise opening the profile page downloads
+every paragraph that person has ever written in order to render a list of dates. The GUI is a
+single chooser for the same reason: a panel per revision grows without bound and buries the
+page under text the reader already knows they wrote, while one control is the same height at
+two revisions or five hundred.
+
+Restoring appends rather than rewinds. Moving the counter backwards would leave two different
+profiles claiming one revision number, and an NPC citing the earlier would be pointing at text
+it never read. So it is `POST` and it is not idempotent: restoring twice yields two revisions,
+because the second says *still this* a minute after the first, and both are true.
+
+Kept history is bounded at **200 superseded revisions**, oldest dropped first. The account file
+is read into memory whole at start and every entry is a full copy of a profile, so unbounded
+history means carrying an author's entire writing history resident forever to support an undo
+that reaches back a few steps. Two hundred is far past any real use of it.
 
 ### Editing appends and tombstones — it never rewrites
 
@@ -831,7 +960,7 @@ capability of its own.
 
 ```
 POST /v1/generate/description
-{ "archetype_id": "4", "world_id": "1", "hints": { "age_band": "50s", "gender": "any" } }
+{ "personality_id": "commander", "world_id": "battle-cities", "hints": { "age_band": "50s", "gender": "any" } }
 → { "description": "…", "seed": 88213 }
 ```
 
@@ -843,7 +972,7 @@ in unstructured conversation.
 This is not a stylistic flourish; it is a grounding technique. Models have vastly more
 purchase on ordinary contemporary people than on archetypal fantasy roles, and a persona
 written in that register produces more specific, less generic behaviour once it is read
-through the archetype lens. The fantasy framing comes from the immutable core; the human
+through the personality lens. The fantasy framing comes from the immutable core; the human
 texture comes from here. Two different jobs, kept apart.
 
 `seed` is returned so a generation can be reproduced or nudged.
@@ -852,7 +981,7 @@ texture comes from here. Two different jobs, kept apart.
 
 ```
 POST /v1/generate/attributes
-{ "npc_id": "…" | "description": "…", "archetype_id": "4",
+{ "npc_id": "…" | "description": "…", "personality_id": "commander",
   "want": ["beliefs", "relationships", "agency"],
   "counts": { "beliefs": 5, "relationships": 4, "agency": 2 } }
 → { "beliefs": [ Belief ], "relationships": [ Relationship ], "agency": [ Strategy ] }
@@ -870,7 +999,7 @@ Every generated attribute carries `origin: "generated"`, distinct from both `"au
 
 ```
 POST /v1/generate/npc
-{ "archetype_id": "4", "world_id": "1", "with_portrait": true }
+{ "personality_id": "commander", "world_id": "battle-cities", "with_portrait": true }
 → 202 { GenerationJob }        // kind: "npc"
 ```
 
@@ -1348,18 +1477,104 @@ mind document is a calibration question answerable only by watching real runs, a
 `/v1/npc/{id}/projection` — *what did this NPC actually gather on that tick* — is the
 instrument that makes answering them possible.
 
-### Worlds, archetypes, narrative time
+### Worlds, personalities, narrative time
+
+> **A world is a tag-filter over one shared corpus**, not a corpus of its own —
+> see `docs/npcd_worlds_and_layers.md` for the full design. In short: canon is
+> ingested tagged with its world and is visible only to it; craft (responses,
+> moods, identities) is ingested untagged and is shared by every world, sharing
+> its KV as well as its text. There is therefore **no** create button for either
+> in the GUI — a world and a personality are authored YAML files in the mind
+> directory beside the corpus they index, and an empty world would project
+> nothing. Both listings are read-only in that one respect: they show what the
+> mind holds, and gain an entry when an author writes a file.
 
 ```
-GET|POST   /v1/world                     GET|PUT|DELETE /v1/world/{wid}
+GET        /v1/world                     GET|PUT|DELETE /v1/world/{wid}
 GET|PUT    /v1/world/{wid}/time          { "world_ms", "scale", "paused" }
-GET|POST   /v1/archetype                 GET|PUT|DELETE /v1/archetype/{aid}
-GET|PUT    /v1/archetype/{aid}/doctrine
+GET        /v1/personality               GET|PUT|DELETE /v1/personality/{aid}
+GET|PUT    /v1/personality/{aid}/doctrine
 ```
 
-Doctrine is the **only** part of the archetype that changes — identity never propagates, lived
-experience never aggregates. `PUT` bumps a version; NPCs of that archetype pick it up at next
-spawn or fork refresh.
+Every `GET` here is open; every `PUT` and `DELETE` needs `admin` (§8.1a). A document larger
+than 256 KiB is refused — twenty times the biggest real personality, and small enough that the
+API is not a way to fill a disk one save at a time. A name already taken by something that is
+not a plain file is refused rather than followed, because `write` follows a symlink.
+
+### Hidden documents, and the whole word that reveals them
+
+An authored document may carry `hidden: true`. It is then left out of listings and revealed by
+typing a **whole word** of its id or name into the filter — `earth` reveals `earth`; `ear` does
+not. Both rules are server-side (`npcd/src/visibility.rs`), because a hidden document is never
+sent: a client-side filter would have nothing to reveal however completely it was typed.
+
+The listing has two rules on purpose. A **visible** document narrows on an ordinary
+case-insensitive substring, which is what a filter box should do. A **hidden** one needs a
+complete word, because a substring would reveal it one letter at a time — and that incremental
+discovery is the entire thing the flag prevents. It is what makes filtering-as-you-type safe
+here.
+
+**This is discretion, not access control**, and the code says so in those words. Anyone who
+knows the id can still `GET /v1/world/earth` — which is the same act as typing the word. What it
+buys is that the content is never *offered*: not in a dropdown, not in an autocomplete, not in a
+screenshot. It is also deliberately role-independent: an admin sees the same listing as anybody
+else, because the moment that matters is a demo, and during a demo the person at the keyboard is
+an admin.
+
+### A world admits a subset of the shared craft
+
+```
+GET  /v1/world/{wid}/collections
+```
+
+The response and mood libraries — 596 and 116 files in the mind — are ingested **untagged** and
+shared by every world, text and KV both. Which of them reach a given world is therefore a
+projection of one library rather than a second copy of it, and a world declares what it does not
+admit:
+
+```yaml
+selects: [combat, lore, …]     # canon, by tag
+excludes: [sexual, intimate]   # craft, by section category
+```
+
+A world that names nothing admits everything. The response reports `excluded` alongside the
+sections it kept, so a collection that is 546 of 596 says why rather than being quietly short.
+
+> This route used to fall through to the console's fixture, which answered with six invented
+> response templates and five invented moods — unlabelled, on the page somebody would open to
+> look at their own library. The reasonable conclusion from that screen was that seven hundred
+> files had been lost. Nothing had; the daemon never read them. A fixture that is not obviously
+> fake, standing where the real thing belongs, is the worst shape one can take.
+
+Sections report `chars`, not `tokens`. There is no tokenizer in this daemon, so a token count
+would be a plausible-looking guess — the same habit that produced the paragraph above.
+
+A `PUT` **replaces** the document, so a client sends back what it read rather than the fields it
+changed — sending only the doctrine would blank the anchor and every trait. The id comes from the
+URL and the body's own is discarded: a document that could name its own file could name somebody
+else's. `npc_count` is discarded the same way and for the same reason — it is computed at read
+time, and the obvious client sends back everything it was given, so a derived value has to be
+kept out of the file by the server rather than by the caller's good manners.
+
+> **Replacing the document does not mean rewriting the file.** The registry *edits*
+> (`npcd/src/registry/yaml_edit.rs`): the file on disk is the base, only the values that actually
+> differ are re-rendered, and every other byte — comments, blank lines, block scalars, key order,
+> the author's line wrapping — is copied through. A save that changes a name changes one line.
+>
+> This is not cosmetic. An authored world or personality carries its reasoning in its comments,
+> and none of that is data, so a `serde_yaml` round-trip silently deletes the half of the document
+> a person wrote — a file that still loads perfectly and has lost everything that explained it.
+> The base is re-read from disk at save time rather than taken from memory, so a file edited by
+> hand while the daemon is up keeps that edit in every field the console did not touch.
+>
+> The editor verifies its own output before returning it: it parses what it produced and compares
+> it to what was asked for, falling back to a whole-document serialisation (with a loud log) if
+> they differ. The worst case is losing comments; it is never a file that says something the
+> author did not.
+
+Doctrine is the **only** part of the personality that changes — identity never propagates, lived
+experience never aggregates. `PUT` bumps a version; characters of that personality pick it up at
+next spawn or fork refresh.
 
 `PUT /v1/world/{wid}/time` is the narrative clock: set an instant, set a scale (`0` pauses,
 `1.0` is real time, `60.0` is a minute per second), or jump. Every NPC in the world sees it.
@@ -1373,7 +1588,10 @@ spawn or fork refresh.
 | `unauthorized` | 401 | missing/bad bearer token |
 | `npc_not_found` | 404 | |
 | `interaction_not_found` | 404 | |
-| `world_not_found` / `archetype_not_found` | 404 | |
+| `forbidden` | 403 | signed in, and not the role this needs; carries `required_role` and `role` |
+| `world_not_found` / `personality_not_found` | 404 | |
+| `unknown_world` / `unknown_personality` | 400 | a character named a document the mind does not hold |
+| `write_failed` | 500 | the document could not be written; the reason is in the daemon log and deliberately not in the response |
 | `tool_not_found` | 404 | |
 | `duplicate_npc` | 409 | idempotency key reused with different body |
 | `mode_change_forbidden` | 409 | mode is immutable for a live interaction |
@@ -1919,7 +2137,7 @@ never sees this screen.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ ⬢ npcd  My NPCs  Worlds  Archetypes  Tools  System      ● ready     (JS)▾  │
+│ ⬢ npcd  My NPCs  Worlds  Personalities  Tools  System   ● ready     (JS)▾  │
 ├──────────────┬─────────────────────────────────────────────────────────────┤
 │              │                                                             │
 │  CONTEXT     │   PAGE BODY                                                 │
@@ -2045,8 +2263,8 @@ a working default so the whole thing can be completed by pressing Next three tim
 │  New character                            ① Identity  ② Face  ③ Inner life │
 ├────────────────────────────────────────────────────────────────────────────┤
 │                                                                            │
-│   Name      ┌──────────────────────┐   World      [ Ardh        ▾ ] [ + ]  │
-│             │ Varek                │   Archetype  [ Loyal Sold. ▾ ] [ + ]  │
+│   Name      ┌──────────────────────┐   World       [ Ardh       ▾ ]        │
+│             │ Varek                │   Personality [ Loyal Sold ▾ ]        │
 │             └──────────────────────┘                                       │
 │                                                                            │
 │   Description — who this character is             [ ⟳ Regenerate ]         │
@@ -2058,7 +2276,7 @@ a working default so the whole thing can be completed by pressing Next three tim
 │   └──────────────────────────────────────────────────────────────────┘    │
 │   ⓘ This becomes the character's identity in the system prompt, and the    │
 │     portrait is generated from it. Written as a present-day person: the    │
-│     archetype supplies the fantasy framing, this supplies the human        │
+│     personality supplies the anchor and the traits, this supplies the      │
 │     texture.                                                               │
 │                                                                            │
 │                                          [ Cancel ]        [ Next → ]      │
@@ -2066,7 +2284,7 @@ a working default so the whole thing can be completed by pressing Next three tim
 ```
 
 **The description is the character, not a prompt.** It is installed as the NPC's identity
-section in the system prompt — the mutable persona sitting above the immutable archetype — and
+section in the system prompt — the mutable persona sitting above the immutable personality — and
 it is *also* the source the portrait is generated from. One field, two consumers, no separate
 "image prompt" for the user to keep in sync with the character.
 
@@ -2074,9 +2292,10 @@ Pre-filled by generation on entry, not left blank beside a button. An empty box 
 work; a filled box the user can reject is an offer. Editing by hand flips `origin` to
 `authored`.
 
-**World and archetype are pickers with a `+`** that opens the world editor (§38) or archetype
-editor inline, so a first-time user is not blocked by having no world to select. A newly created
-world is selected on return.
+**World and personality are plain pickers, with no `+`.** Both list files in the mind, and a
+button that creates one from here would put a document in a directory the author is not looking
+at — the console and the mind would then disagree about what exists. A daemon started without a
+mind lists neither, and the picker says so rather than offering to invent one.
 
 Visibility and tags are **not** in the wizard. They are properties of an existing character,
 edited later (§30) — putting them here would make every creation a decision about concealment,
@@ -2562,7 +2781,7 @@ brooding character lives, and the point of the instrument is to let you push an 
 characterful near-edge *deliberately* while seeing when it is about to tip past character into
 incoherence.
 
-## 38. Environment, worlds, archetypes, tools
+## 38. Environment, worlds, personalities, tools
 
 **Environment panel** (`/npc/{id}/environment`) — a toggle with its consequence stated, a
 system-prompt editor, the sliding window's recent turns, and a world-event injector.
@@ -2619,10 +2838,18 @@ Four things live here, and each has a blast radius the form states plainly:
 
 Deleting a world is refused while characters live in it, naming how many.
 
-**Archetypes** (`/archetype/{aid}`) — the identity/voice/behavioural-model sections read-only
+**Personalities** (`/personalities?a={aid}`) — the anchor and the constant traits read-only
 (they are immutable by construction and the UI should not imply otherwise), and **doctrine**
-editable with its version history. The read-only rendering is a design statement: an operator
-who can edit identity in a text box will eventually believe identity is editable.
+editable with its version. The read-only rendering is a design statement: an operator who can
+edit identity in a text box will eventually believe identity is editable.
+
+The page renders the document, not a description of it. `personalities/<id>.yaml` carries the
+anchor and the traits inline, so there is no separate "section collections" view to keep in step
+with the file — a panel that described anchor, traits and doctrine as three folders of templates
+was narrating a structure that had stopped existing. Traits are **always visible**, not selected
+`top-k 3`: a character is not situationally itself, and choosing three traits per turn made it
+partly itself, differently each turn. Biography — the part that genuinely is situational — lives
+in the `memory` layer, where provenance retrieves it.
 
 **Tools** (`/tools`) — the catalog, grouped by category, showing source (generic/extension),
 the JSON Schema the model actually sees, and calibration state. Uncalibrated tools are flagged
@@ -2696,8 +2923,8 @@ porting three self-contained pages, not after twenty are committed to it.
 - **Narrative time is primary in every display**, wall time available on hover. An NPC's
   memory dated in wall time is unreadable.
 - **No destructive action without naming the object.** Tombstoning an NPC requires typing its
-  name; the archetype/doctrine editor warns that a doctrine change reaches every NPC of that
-  type worldwide.
+  name; the doctrine editor warns that a doctrine change reaches every character of that
+  personality worldwide.
 - **Keyboard**: `g r` roster, `g t` tools, `j/k` list nav, `Esc` close. `/` opens the command
   palette in a composer and search elsewhere — the same key, context-dependent, because in a
   composer `/` can only mean a command.
@@ -2744,8 +2971,8 @@ endInteraction(ix)
 getProjection(id, tick?) -> ProjectionSnapshot
 getMonitor(id, window) -> MonitorReport
 getEnvironment(id) / setEnvironment(id, cfg) / injectEnvironment(id, ev)
-listWorlds() / getWorld(wid) / createWorld(spec) / setWorld(wid, cfg) / setWorldTime(wid, t)
-listArchetypes() / getArchetype(aid) / setDoctrine(aid, d)
+listWorlds() / getWorld(wid) / setWorld(wid, cfg) / setWorldTime(wid, t)
+listPersonalities() / getPersonality(aid) / setPersonality(aid, doc)
 listTools() / calibrateTools()
 subscribeLogs(onLine, onState) -> { close() }      // backlog replays on the socket
 subscribeEvents(onEvent, onState) -> { close() }

@@ -61,8 +61,8 @@ use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
-    decode_record, encode_record, ChunkPayload, DebugIdPayload, Record, RecordHeader, RecordType,
-    TombstonePayload, TreeMetadataPayload,
+    decode_record, encode_record, ChunkPayload, DebugIdPayload, NpcPayload, RecordHeader,
+    RecordType, TombstonePayload, TreeMetadataPayload,
 };
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -173,6 +173,19 @@ pub struct SubstratePersistence {
     /// (a dead conversation has no live tail). Populated on every append
     /// (both encode and verbatim paths) and rebuilt on load / compact.
     snapshot_locs: HashMap<u64, RecordLoc>,
+
+    /// On-disk location of each character's CURRENT [`RecordType::Npc`] record,
+    /// keyed by `npc_id` (which the header carries as its `stream_id`) —
+    /// last-writer-wins.
+    ///
+    /// This map is what keeps characters alive. NPC payloads do not live in the
+    /// substrate's RAM — the substrate holds no opinion about a character, and
+    /// the registry that does is in another process's memory — so compaction
+    /// cannot re-synthesise them the way it re-synthesises a `Label`. Instead
+    /// the winner is relocated verbatim, exactly as `Snapshot` is, and this map
+    /// says which record that is. Without it, `collect_live_records` would omit
+    /// every NPC and the first compaction would delete the entire cast.
+    npc_locs: HashMap<u64, RecordLoc>,
 }
 
 /// Whether a record type is a per-stream metadata record whose current-copy
@@ -218,6 +231,29 @@ fn record_metadata_loc(map: &mut HashMap<(RecordType, u64), RecordLoc>, entry: &
 /// this before the `SubstratePersistence` exists; the runtime append path
 /// uses [`SubstratePersistence::track_snapshot_loc`] plus the removal in
 /// [`SubstratePersistence::write_tombstone`].
+/// Mirror one walked record into the NPC-location map (LWW). Keyed by the
+/// header's `stream_id`, which for an `Npc` record is the `npc_id` — so the
+/// walk never has to decode a payload to know which character it belongs to.
+///
+/// A tombstoned character keeps its entry: `state: "tombstoned"` is a
+/// superseding record like any other, and the id must stay taken so the acts
+/// that already name it still resolve. Dropping it here would let a later
+/// character reuse the id.
+fn record_npc_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
+    let h = &entry.record.header;
+    if h.record_type == RecordType::Npc {
+        map.insert(
+            h.stream_id,
+            RecordLoc {
+                segment: entry.segment,
+                offset: entry.offset,
+                payload_len: h.payload_len,
+                record_size: entry.size,
+            },
+        );
+    }
+}
+
 fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     match h.record_type {
@@ -243,7 +279,13 @@ fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEn
     }
 }
 
-/// SHA-256 of `bytes` — the tokenizer change-detection digest.
+/// The first eight bytes of a digest, hex — enough to name which tokenizer a
+/// substrate is bound to in an error a person has to act on.
+fn hex16(digest: &[u8; 32]) -> String {
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SHA-256 of `bytes` — the tokenizer identity digest.
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -311,6 +353,31 @@ impl SubstratePersistence {
         })
     }
 
+    /// As [`Self::open_in_with_substrate`], but the caller also sees every
+    /// record as it is walked.
+    ///
+    /// For record classes the substrate does not interpret — [`RecordType::Npc`]
+    /// is the one that exists today — this is how their owner rebuilds its
+    /// index without a second pass over the log. Reading them back through
+    /// [`Self::npc_locs`] afterwards would work too, but costs one seek per
+    /// character where this costs none: the bytes are already in hand.
+    ///
+    /// The sink sees records in log order, so last-writer-wins is simply the
+    /// last value the sink is handed for a key.
+    pub fn open_in_with_substrate_and_sink<F>(
+        dir: &Path,
+        substrate: &mut Substrate,
+        mut sink: F,
+    ) -> Result<SubstratePersistence>
+    where
+        F: FnMut(&WalkEntry),
+    {
+        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], |entry| {
+            substrate.apply_walker_entry(entry);
+            sink(entry);
+        })
+    }
+
     /// Open over an ordered list of paths. The last entry is the active,
     /// writable **segment directory** (`.substrate/`); every earlier entry is
     /// an inherited read-only single-file log, loaded through the shared
@@ -345,6 +412,7 @@ impl SubstratePersistence {
         let mut accounting = RecordAccounting::new();
         let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
         let mut snapshot_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
         let segmented_log::OpenedSegments {
             mut segments,
             manifest,
@@ -355,6 +423,7 @@ impl SubstratePersistence {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(&mut metadata_locs, entry);
             record_snapshot_loc(&mut snapshot_locs, entry);
+            record_npc_loc(&mut npc_locs, entry);
             sink(entry);
         })?;
 
@@ -397,6 +466,7 @@ impl SubstratePersistence {
             resident_reemit_floor: None,
             metadata_locs,
             snapshot_locs,
+            npc_locs,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -514,16 +584,12 @@ impl SubstratePersistence {
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_snapshot_loc(&header, segment, offset, size);
-        let entry = WalkEntry {
-            segment,
-            offset,
-            record: Record {
-                header,
-                payload: payload.to_vec(),
-            },
-            size,
-        };
-        self.manifest.ingest(&entry)?;
+        self.track_npc_loc(&header, segment, offset, size);
+        // Header + location only. This used to build a `WalkEntry`, whose
+        // `Record` owns its payload — so every appended record cloned its whole
+        // payload for a call that reads nothing but the header, then dropped it.
+        self.manifest
+            .ingest_located(&header, segment, offset, size)?;
         // Digest every data record for the header-index chain. Index
         // records themselves are self-describing via their `prev` links
         // and are never digested.
@@ -559,6 +625,9 @@ impl SubstratePersistence {
         // pass would mis-read the relocated (live) copy as superseded and skip
         // carrying it out of a segment about to be dropped.
         self.track_snapshot_loc(header, segment, offset, size);
+        // A relocated `Npc` record is that character's new on-disk home, for
+        // exactly the same reason.
+        self.track_npc_loc(header, segment, offset, size);
         // `Chunk` / `Tokens` are indexed on the substrate, not the manifest, so
         // no `manifest.ingest` — the caller repoints the substrate index.
         if header.record_type != RecordType::HeaderIndex {
@@ -677,6 +746,62 @@ impl SubstratePersistence {
         }
     }
 
+    /// The runtime-append twin of [`record_npc_loc`].
+    fn track_npc_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
+        if h.record_type == RecordType::Npc {
+            self.npc_locs.insert(
+                h.stream_id,
+                RecordLoc {
+                    segment,
+                    offset,
+                    payload_len: h.payload_len,
+                    record_size: size,
+                },
+            );
+        }
+    }
+
+    /// Append one character's durable state.
+    ///
+    /// The `npc_id` goes in the header's `stream_id`, which is what makes this
+    /// supersede the character's previous record mechanically: the accounting
+    /// credits the old copy as dead the moment this one lands, and
+    /// [`Self::npc_locs`] now points here. There is no delete record — an edit
+    /// supersedes, and a deletion is an edit that sets `state: "tombstoned"`.
+    ///
+    /// Writes are expected to be rare: the payload is durable configuration
+    /// only, so a character that is merely *running* never writes at all.
+    pub fn write_npc(&mut self, npc: &NpcPayload) -> Result<()> {
+        let bytes = npc.encode();
+        self.append_record(RecordType::Npc, 0, npc.npc_id, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
+    /// Every character's current record location, keyed by `npc_id`.
+    ///
+    /// Locations rather than payloads, because the payloads are not held here —
+    /// the registry that owns them lives in the daemon. Compaction and segment
+    /// liveness both read this to know which bytes are still worth keeping.
+    pub fn npc_locs(&self) -> &HashMap<u64, RecordLoc> {
+        &self.npc_locs
+    }
+
+    /// Read back one character's current record.
+    ///
+    /// The load path does not use this — it collects payloads from the recovery
+    /// walk's sink in one sweep, which is a great deal cheaper than a seek per
+    /// character. This exists for the one-off: re-reading a single character
+    /// after a write, or a diagnostic.
+    pub fn read_npc(&mut self, npc_id: u64) -> Result<Option<NpcPayload>> {
+        let Some(loc) = self.npc_locs.get(&npc_id).copied() else {
+            return Ok(None);
+        };
+        let record = self
+            .segments
+            .read_record_at(loc.segment, loc.offset, loc.record_size)?;
+        Ok(Some(NpcPayload::decode(&record.payload)?))
+    }
+
     /// Append a stream's `Tokens` record, returning `(segment, offset,
     /// record_size)` of the written record. The caller MUST fold this location
     /// into the substrate index (`apply_tokens_loc`) — otherwise the in-RAM index
@@ -753,48 +878,6 @@ impl SubstratePersistence {
         Ok(())
     }
 
-    /// Write a conversation-metadata record for `timeline_id`. The record
-    /// carries both the client-supplied `conv_id` string (used by the
-    /// daemon as the sidebar id) and the human-readable `label`.
-    ///
-    /// Last-write-wins on replay: the conv_id is written at first-submit
-    /// time with an empty label, then re-written with the title once the
-    /// titler finishes. This call is a no-op when the manifest already
-    /// holds the same `(conv_id, label)` tuple — cheap to invoke on
-    /// every submit.
-    pub fn write_conv_meta(
-        &mut self,
-        timeline_id: u64,
-        conv_id: &str,
-        label: &str,
-        custom: &std::collections::BTreeMap<String, String>,
-    ) -> Result<()> {
-        // Idempotency was previously checked against `manifest.labels`;
-        // after Phase 3 the substrate is the authority for live label
-        // state.  Callers are expected to check against substrate
-        // state before invoking this method (the Conversation-level
-        // setters already do; daemon writes are infrequent enough
-        // that an occasional duplicate log entry is negligible —
-        // compaction collapses them).
-        //
-        // The Label record carries the *full* ConvMeta (conv_id + label +
-        // custom), so each setter reads the sibling fields from the
-        // substrate and passes them through — a partial write would drop
-        // the others on reload/compaction.
-        let payload = manifest::encode_label_payload(timeline_id, conv_id, label, custom);
-        self.append_record(RecordType::Label, 0, 0, 0, 0, 0, &payload)?;
-        Ok(())
-    }
-
-    /// Append a `ConvState` record for `timeline_id`.  Idempotency on
-    /// the current value is now the caller's responsibility (see
-    /// `write_conv_meta`).
-    pub fn write_conv_state(&mut self, timeline_id: u64, state: manifest::ConvState) -> Result<()> {
-        let payload = manifest::encode_conv_state_payload(timeline_id, state);
-        self.append_record(RecordType::ConvState, 0, 0, 0, 0, 0, &payload)?;
-        Ok(())
-    }
-
     /// Append a `TreeMetadata` record for one `(timeline_id,
     /// turn_index)` summary-tree node.  Last-writer-wins on replay.
     /// Callers check idempotency against substrate state.
@@ -862,17 +945,6 @@ impl SubstratePersistence {
         };
         let bytes = payload.encode();
         self.append_record(RecordType::TurnCoupling, 0, 0, 0, 0, 0, &bytes)?;
-        Ok(())
-    }
-
-    /// Append a [`RecordType::Distilled`] record marking `timeline_id` for
-    /// distillation at `mode` — its turns shed content on the next compaction
-    /// pass. Idempotent for a fixed mode; a later record upgrades the mode
-    /// (last-writer-wins on replay).
-    pub fn write_distill(&mut self, timeline_id: u64, mode: record::DistillMode) -> Result<()> {
-        let payload = record::DistillPayload { timeline_id, mode };
-        let bytes = payload.encode();
-        self.append_record(RecordType::Distilled, 0, 0, 0, 0, 0, &bytes)?;
         Ok(())
     }
 
@@ -1316,20 +1388,39 @@ impl SubstratePersistence {
         Ok(true)
     }
 
-    /// Set the model's `tokenizer.json` bytes — last-writer-wins, like
-    /// [`SubstratePersistence::set_model_spec`]. Appends only when the
-    /// bytes differ from the latest on file (compared by SHA-256).
+    /// Bind the substrate to a model's `tokenizer.json` bytes.
+    ///
+    /// Writes once, on a substrate that has no tokenizer yet, and thereafter
+    /// **refuses** anything that does not hash identically. This is NOT
+    /// last-writer-wins like [`SubstratePersistence::set_model_spec`], and the
+    /// difference is deliberate: a spec is a description of the current run,
+    /// whereas the tokenizer is the vocabulary every turn already in this log
+    /// was sealed under. Token ids are only meaningful against it — accept a
+    /// second one and every stored turn silently means something else, while
+    /// the manifest points at the new record and reports success.
+    ///
+    /// Swapping models therefore needs a new substrate, not a new record. The
+    /// caller surfaces that as an instruction rather than a diagnosis.
     ///
     /// The full bytes are the `Tokenizer` record's payload, so the log is
     /// a self-contained substrate image (§5.7) — no companion files.
     /// Recovery never reads the payload (the walk skips it and the digest
     /// chain carries only its header), so the ~11 MB record costs one
-    /// on-demand read at open to compute the change-detection hash and
-    /// nothing else.
+    /// on-demand read at open to compute the identity hash and nothing else.
     pub fn set_tokenizer(&mut self, tokenizer: &[u8]) -> Result<bool> {
         let hash = sha256(tokenizer);
-        if self.tokenizer_sha256 == Some(hash) {
-            return Ok(false);
+        if let Some(existing) = self.tokenizer_sha256 {
+            if existing == hash {
+                return Ok(false);
+            }
+            return Err(PersistenceError::Corrupt(format!(
+                "this substrate is bound to a different tokenizer (recorded {}, offered {}). \
+                 Every turn in the log was sealed under the recorded vocabulary, so adopting \
+                 another would silently change what all of them say. Point this model at a \
+                 fresh substrate, or wipe this one.",
+                hex16(&existing),
+                hex16(&hash),
+            )));
         }
         self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, 0, tokenizer)?;
         self.tokenizer_sha256 = Some(hash);
@@ -1464,7 +1555,7 @@ impl SubstratePersistence {
         let dir = self.segments.dir().to_path_buf();
         // Planning only — no disk reads; each read-back record carries its
         // source location, read back coalesced + staged verbatim in step 3.
-        let live = compaction::collect_live_records(&self.manifest, substrate);
+        let live = compaction::collect_live_records(&self.manifest, substrate, &self.npc_locs);
         report(2);
 
         // 3. Write the live set into a compacted scratch file (a fresh index
@@ -1544,13 +1635,16 @@ impl SubstratePersistence {
         // (mirrors the load walk in `from_dir_with_sink`).
         self.metadata_locs.clear();
         self.snapshot_locs.clear();
+        self.npc_locs.clear();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
         let snapshot_locs = &mut self.snapshot_locs;
+        let npc_locs = &mut self.npc_locs;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(metadata_locs, entry);
             record_snapshot_loc(snapshot_locs, entry);
+            record_npc_loc(npc_locs, entry);
             substrate.apply_walker_entry(entry);
         })?;
         // The compacted segment carries a fresh index chain; chain the next
@@ -1639,8 +1733,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A substrate binds to one tokenizer, and a second one is refused.
+    ///
+    /// This used to assert that "changed bytes are re-embedded", which is the
+    /// behaviour that let a model swap rewrite the vocabulary out from under
+    /// every turn already sealed in the log — the ids stay, their meaning
+    /// changes, and nothing reports it. The binding is the invariant now.
     #[test]
-    fn tokenizer_embedded_once_by_hash() {
+    fn tokenizer_binds_the_substrate_and_a_second_one_is_refused() {
         let dir = tmp_dir("tok_hash");
         let v1 = vec![1u8; 4096];
         let v2 = vec![2u8; 4096];
@@ -1651,21 +1751,33 @@ mod tests {
                 !sp.set_tokenizer(&v1).unwrap(),
                 "identical bytes are a hash-match no-op"
             );
+            let err = sp
+                .set_tokenizer(&v2)
+                .expect_err("a different tokenizer must be refused, not appended");
+            let msg = err.to_string();
             assert!(
-                sp.set_tokenizer(&v2).unwrap(),
-                "changed bytes are re-embedded"
+                msg.contains("bound to a different tokenizer"),
+                "the refusal must name the cause: {msg}"
             );
-            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v2)));
+            assert_eq!(
+                sp.tokenizer_sha256(),
+                Some(sha256(&v1)),
+                "a refused binding leaves the recorded tokenizer untouched"
+            );
             sp.commit().unwrap();
         }
         {
-            // The hash is recovered from disk, so an unchanged tokenizer on a
-            // fresh open does not re-embed.
+            // The hash is recovered from disk, so the binding survives a
+            // reopen — including the refusal.
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v2)));
+            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v1)));
             assert!(
-                !sp.set_tokenizer(&v2).unwrap(),
+                !sp.set_tokenizer(&v1).unwrap(),
                 "reopened log recognises the unchanged tokenizer by hash"
+            );
+            assert!(
+                sp.set_tokenizer(&v2).is_err(),
+                "the binding is still enforced after a reopen"
             );
         }
         std::fs::remove_dir_all(&dir).ok();

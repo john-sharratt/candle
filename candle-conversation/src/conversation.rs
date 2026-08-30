@@ -308,6 +308,209 @@ pub struct GlueMarkers {
     pub no_think: String,
 }
 
+/// A freshly built conversation's prompt-branch state, still to be installed
+/// onto its slot. Returned by [`Sequence::new_with_projection`] instead of being
+/// installed there, so a caller building several conversations can install them
+/// as one group — see [`install_branch_states`] for why that matters.
+pub(crate) struct PendingBranchState {
+    sequence_id: SequenceId,
+    prefix: ContentHash,
+    /// The payload when the caller already holds it (just computed, or a memo
+    /// hit); `None` sends the installer to the substrate for it.
+    payload: Option<Arc<BranchCheckpointPayload>>,
+}
+
+/// Install each conversation's prompt-branch recurrent state onto its slot,
+/// one scheduler request per distinct branch.
+///
+/// Conversations born on the same prompt branch install byte-identical state,
+/// and the install's cost is overwhelmingly the wait for the scheduler to drain
+/// the request — measured at 157 ms of a 175 ms round-trip, against 17 ms of
+/// device scatter per slot and 8 ms to materialise the layers. So the layers are
+/// built ONCE per branch and every slot on that branch rides one request. A
+/// caller creating a window of conversations therefore pays one queue wait, not
+/// one per conversation.
+///
+/// `fresh` is the payload when the caller just computed or memo-hit it; `None`
+/// falls back to the substrate read. A branch with no checkpoint is an ordinary
+/// outcome (logged), not an error: the conversation starts with its prompt in
+/// K/V and nothing in the recurrent layers, and reads perfectly while doing so.
+pub(crate) fn install_branch_states(
+    scheduler_tx: &Sender<SchedulerRequest>,
+    pending: &[PendingBranchState],
+    substrate: &Conversation,
+) -> crate::Result<()> {
+    // Slots are grouped by branch FIRST, and the payload resolved per branch
+    // afterwards. Resolving inline while grouping means an entry whose own
+    // `payload` is `None` and whose substrate read misses is skipped without
+    // registering its slot — so a later entry on the SAME branch that does carry
+    // a payload builds a group excluding it, and that conversation silently
+    // starts with no recurrent state while an identical payload sits one
+    // iteration away. Grouping first makes the payload a property of the branch,
+    // which is what it actually is.
+    let mut groups: Vec<(
+        ContentHash,
+        Option<Arc<BranchCheckpointPayload>>,
+        Vec<SequenceId>,
+    )> = Vec::new();
+    for PendingBranchState {
+        sequence_id: id,
+        prefix,
+        payload: fresh,
+    } in pending
+    {
+        match groups.iter_mut().find(|(p, _, _)| p == prefix) {
+            Some(g) => {
+                g.2.push(*id);
+                // Any entry's payload serves the whole branch — take the first
+                // one offered rather than depending on which slot carried it.
+                if g.1.is_none() {
+                    g.1 = fresh.as_ref().map(Arc::clone);
+                }
+            }
+            None => groups.push((*prefix, fresh.as_ref().map(Arc::clone), vec![*id])),
+        }
+    }
+
+    // Resolve each branch's payload once, falling back to the substrate only for
+    // a branch no caller had in hand. Just computed ⇒ already there; only a
+    // branch this process did not compute needs the disk, and by then the record
+    // is durable.
+    let groups: Vec<(ContentHash, Arc<BranchCheckpointPayload>, Vec<SequenceId>)> = groups
+        .into_iter()
+        .filter_map(|(prefix, payload, ids)| {
+            let payload = match payload {
+                Some(p) => p,
+                None => match substrate.read_branch_checkpoint(prefix) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        tracing::warn!(
+                            slots = ids.len(),
+                            "no branch checkpoint for this prompt branch — the first turn \
+                             will run with the system prompt in K/V and nothing in the \
+                             recurrent layers, and will read perfectly while doing so"
+                        );
+                        return None;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            slots = ids.len(),
+                            "branch checkpoint unreadable ({e}) — starting from zero"
+                        );
+                        return None;
+                    }
+                },
+            };
+            Some((prefix, payload, ids))
+        })
+        .collect();
+
+    for (_, payload, sequence_ids) in groups {
+        // The scheduler installs from a shared slice, so the layers are
+        // materialised once for the whole group rather than per slot.
+        let layers: Arc<[ExportedLayerState]> = payload
+            .layers
+            .iter()
+            .map(|l| ExportedLayerState {
+                layer_index: l.layer_index,
+                n_v_heads: l.n_v_heads,
+                d_v: l.d_v,
+                d_k: l.d_k,
+                state: l.state.clone(),
+                conv_channels: l.conv_channels,
+                conv_tail_cols: l.conv_tail_cols,
+                conv_tail: l.conv_tail.clone(),
+            })
+            .collect();
+        let n_layers = layers.len();
+        let n_slots = sequence_ids.len();
+        // A transplanted state is never recomputed by the slot that receives it,
+        // so a non-finite one is invisible from the outside: the geometry checks
+        // pass, the install succeeds, and every subsequent forward on that
+        // sequence returns NaN logits while the daemon reports a healthy turn.
+        // Name it at the boundary that introduces it — the alternative is
+        // diagnosing it thirty layers downstream from a row of `!`.
+        if let Some((layer, kind)) = first_non_finite_layer(&layers) {
+            tracing::error!(
+                layer_index = layer,
+                buffer = kind,
+                layers = n_layers,
+                slots = n_slots,
+                "BRANCH CHECKPOINT IS NON-FINITE — refusing to install it. Installing \
+                 would give every one of these slots NaN logits for the rest of the \
+                 conversation. They start with no memory of their system prompt instead."
+            );
+            continue;
+        }
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        scheduler_tx
+            .send(SchedulerRequest::InstallRecurrentState {
+                sequence_ids,
+                schedule_hash: payload.schedule_hash,
+                layers,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
+            Ok(true) => {
+                for _ in 0..n_slots {
+                    note_branch_checkpoint_installed();
+                }
+                tracing::debug!(
+                    layers = n_layers,
+                    slots = n_slots,
+                    "installed prompt branch checkpoint"
+                );
+            }
+            // The scheduler reports `false` when no slot took the state — a
+            // refused import, which leaves the recurrent layers at zero while
+            // the K/V holds the whole system prompt. That conversation then
+            // reads perfectly while remembering nothing of its own prompt, so
+            // it has to be said out loud; silence here is what let it look like
+            // a successful install.
+            Ok(false) => tracing::error!(
+                layers = n_layers,
+                slots = n_slots,
+                "BRANCH CHECKPOINT NOT INSTALLED — no slot accepted the state (schedule \
+                 hash or geometry mismatch). These slots start with the system prompt in \
+                 K/V and nothing in the recurrent layers."
+            ),
+            Err(e) => tracing::warn!(
+                "BRANCH CHECKPOINT REFUSED (hash or geometry mismatch): {e} — the first \
+                 turn starts with no memory of its system prompt"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// The first layer of a checkpoint carrying a non-finite `S` or conv tail, with
+/// the name of the offending buffer.
+///
+/// `state` and `conv_tail` are raw little-endian `f32` bytes. A trailing partial
+/// element cannot be interpreted, so it is reported rather than silently
+/// ignored — a length that is not a multiple of four means the payload is
+/// already malformed.
+fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, &'static str)> {
+    fn bad(bytes: &[u8]) -> bool {
+        if !bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
+            return true;
+        }
+        bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .any(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+    }
+    layers.iter().find_map(|l| {
+        if bad(&l.state) {
+            Some((l.layer_index, "state"))
+        } else if bad(&l.conv_tail) {
+            Some((l.layer_index, "conv_tail"))
+        } else {
+            None
+        }
+    })
+}
+
 /// Which `summarize_examples` option matches a round-trip chain of
 /// `prefilled_pairs` prefilled `(user, assistant)` pairs: one pair is a
 /// `code_reading` scope read (request → call → excerpt → summary), more is the
@@ -354,7 +557,7 @@ impl Sequence {
         // per-turn `apply_projection` at submit materialises the projection
         // just the same (it must anyway, to select the pinned tool).
         prime_slot: bool,
-    ) -> crate::Result<Self> {
+    ) -> crate::Result<(Self, Option<PendingBranchState>)> {
         // Persistence is now a property of the workspace `Conversation`
         // (the substrate handle), wired in by the engine via
         // `Conversation::open(path)`.  The Sequence has nothing to do
@@ -397,6 +600,7 @@ impl Sequence {
         // for the system prompt has moved to the substrate side via
         // `insert_section` below — no need for a separate cold-store
         // write.
+        let t_prompt = std::time::Instant::now();
         let mut conv = conv;
         if !system_prompt.is_empty() {
             let text = conv.tree.system_prompt_text().to_string();
@@ -404,6 +608,7 @@ impl Sequence {
             conv.tree.set_system_prompt_tokens(token_ids);
             let _ = text;
         }
+        let prompt_ms = t_prompt.elapsed();
 
         // Eagerly seed every static system-side section into the
         // workspace substrate.  The slot itself stays empty — the
@@ -419,8 +624,11 @@ impl Sequence {
         // composed from these schema items — no separate monolithic
         // "system_section_id" pre-pinning, which used to double the
         // system content with an unwrapped fragment copy.
+        let t_items = std::time::Instant::now();
         let layer_items: Vec<SystemPromptItem> =
             conv.projection.schema().system_prompt.items.clone();
+        let items_ms = t_items.elapsed();
+        let t_ingest = std::time::Instant::now();
 
         // Cumulative-prefix ingest builds each content section's K/V
         // conditioned on the chain of previously-ingested content
@@ -708,11 +916,14 @@ impl Sequence {
         //
         // Nothing here runs on a plain transformer: `carries_recurrent_state`
         // is false, so the loop is skipped and no forward is paid.
+        let ingest_ms = t_ingest.elapsed();
+        let t_ckpt = std::time::Instant::now();
         let branch_checkpoint = if conv.model_core.carries_recurrent_state {
             conv.build_branch_checkpoint(&fixed_prefix, &branch_spans)?
         } else {
             None
         };
+        let ckpt_ms = t_ckpt.elapsed();
         // Retained for the first-turn branch re-key: the composer dials arrive
         // with the first `TurnOptions.selection`, which this create cannot
         // know, so the checkpoint installed below is the DEFAULT branch's. If
@@ -749,15 +960,33 @@ impl Sequence {
         // that goes with it. Order matters and is the reason this is not folded
         // into `create_sequence` alongside the timeline-snapshot restore — see
         // `restore_branch_checkpoint`.
-        if let Some((prefix, fresh)) = branch_checkpoint {
-            conv.restore_branch_checkpoint(prefix, fresh)?;
-        }
+        // NOT installed here: the install is a scheduler round-trip that is
+        // almost all queue wait, and that wait is per-request, not per-slot. The
+        // caller installs — one group per batch of conversations — via
+        // `install_branch_states`.
+        let pending = branch_checkpoint.map(|(prefix, payload)| PendingBranchState {
+            sequence_id: conv.id,
+            prefix,
+            payload,
+        });
+        // Per-conversation, so `debug`: a phase that opens hundreds of them
+        // would otherwise emit hundreds of info lines. The parts are split
+        // because they have very different characters — `ingest` is this
+        // thread's own walk of the schema and `ckpt` is a memo hit or a forward.
+        tracing::debug!(
+            target: "candle_conversation::sequence_construction",
+            prompt_ms = prompt_ms.as_millis() as u64,
+            items_ms = items_ms.as_millis() as u64,
+            ingest_ms = ingest_ms.as_millis() as u64,
+            ckpt_ms = ckpt_ms.as_millis() as u64,
+            "sequence construction"
+        );
         // From here until the first turn advances it, this conversation's
         // state is exactly the installed prompt checkpoint — the window in
         // which a dial-selected branch may swap it.
         conv.state_is_prompt_only = conv.model_core.carries_recurrent_state;
 
-        Ok(conv)
+        Ok((conv, pending))
     }
 
     /// The ordered sections this conversation's system prompt is built from,
@@ -862,7 +1091,7 @@ impl Sequence {
         &self,
         primed: &[SectionId],
         branch_spans: &[(usize, usize)],
-    ) -> crate::Result<Option<(ContentHash, Option<BranchCheckpointPayload>)>> {
+    ) -> crate::Result<Option<(ContentHash, Option<Arc<BranchCheckpointPayload>>)>> {
         let (prefix, tokens) = self.prompt_branch(primed, branch_spans);
         if tokens.is_empty() {
             return Ok(None);
@@ -901,6 +1130,11 @@ impl Sequence {
                 };
                 self.substrate
                     .enqueue_branch_checkpoint(prefix, payload.encode());
+                // Hold it decoded: the conversations opened next are on this
+                // same branch, and the durable record they would otherwise read
+                // is only just being written.
+                let payload = Arc::new(payload);
+                self.substrate.memo_branch_checkpoint(prefix, &payload);
                 note_branch_checkpoint_computed();
                 tracing::info!("computed the prompt branch checkpoint");
                 Ok(Some((prefix, Some(payload))))
@@ -933,64 +1167,17 @@ impl Sequence {
     fn restore_branch_checkpoint(
         &self,
         prefix: ContentHash,
-        fresh: Option<BranchCheckpointPayload>,
+        fresh: Option<Arc<BranchCheckpointPayload>>,
     ) -> crate::Result<()> {
-        // Just computed ⇒ already in hand. Only a branch this process did not
-        // compute needs the disk, and by then the record is durable.
-        let payload = match fresh {
-            Some(p) => p,
-            None => match self.substrate.read_branch_checkpoint(prefix) {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    tracing::warn!(
-                        "no branch checkpoint for this prompt branch — the first turn \
-                         will run with the system prompt in K/V and nothing in the \
-                         recurrent layers, and will read perfectly while doing so"
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!("branch checkpoint unreadable ({e}) — starting from zero");
-                    return Ok(());
-                }
-            },
-        };
-        let layers: Vec<ExportedLayerState> = payload
-            .layers
-            .into_iter()
-            .map(|l| ExportedLayerState {
-                layer_index: l.layer_index,
-                n_v_heads: l.n_v_heads,
-                d_v: l.d_v,
-                d_k: l.d_k,
-                state: l.state,
-                conv_channels: l.conv_channels,
-                conv_tail_cols: l.conv_tail_cols,
-                conv_tail: l.conv_tail,
-            })
-            .collect();
-        let n = layers.len();
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.scheduler_tx
-            .send(SchedulerRequest::InstallRecurrentState {
+        install_branch_states(
+            &self.scheduler_tx,
+            &[PendingBranchState {
                 sequence_id: self.id,
-                schedule_hash: payload.schedule_hash,
-                layers,
-                response_tx: tx,
-            })
-            .map_err(|_| ConversationError::SchedulerGone)?;
-        match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
-            Ok(true) => {
-                note_branch_checkpoint_installed();
-                tracing::debug!(layers = n, "installed prompt branch checkpoint");
-            }
-            Ok(false) => {}
-            Err(e) => tracing::warn!(
-                "BRANCH CHECKPOINT REFUSED (hash or geometry mismatch): {e} — the first \
-                 turn starts with no memory of its system prompt"
-            ),
-        }
-        Ok(())
+                prefix,
+                payload: fresh,
+            }],
+            &self.substrate,
+        )
     }
 
     /// Install an observer channel for cognitive task events (summarization,
@@ -1156,6 +1343,66 @@ impl Sequence {
         // ingested) — treating them as outside the content chain
         // matches that approximation and keeps minor catalog changes
         // local.
+        // ── Pass 1: already-present sections, by id alone ──────────────
+        // `section_exists` is broader than `section_is_hot`: it returns true for
+        // cold-marker sections that were restored on substrate reload but
+        // haven't been elevated yet.  Either way the substrate already knows
+        // about this section; the elevate path will lift it on the next
+        // projection that needs it.
+        //
+        // This runs BEFORE tokenising anything, because the test needs only the
+        // section id — not the tokens, the section hash, or the prefix hash. A
+        // caller that constructs many sequences against one shared schema (the
+        // calibration phase builds ~700 against the same tool catalog) re-walks
+        // that whole catalog per sequence, and every walk after the first is
+        // entirely skips. Tokenising first made each of those walks re-tokenise
+        // the full catalog to arrive at a hash it then threw away: measured at
+        // ~294 ms per sequence, 206 s of a 341 s phase, all of it on the calling
+        // thread with the GPU idle behind it.
+        let mut out_skip: Vec<(SectionId, usize)> = Vec::new();
+        let mut candidates: Vec<(SectionId, &str)> = Vec::with_capacity(sections.len());
+        // ONE read guard for the whole triage, not one per section. The substrate
+        // RwLock is writer-priority, so each reader taken while the persistence
+        // thread is queued to write blocks until that write lands — and a
+        // conversation opening against a large catalog runs this loop once per
+        // section. Profiled as the single largest source of contended lock time
+        // in the daemon (`RwLock::read_contended` under `insert_section_collection`).
+        //
+        // Holding one guard across the loop is also *less* blocking than
+        // re-taking it: a writer waits for one reader span instead of racing a
+        // rapid re-acquire cycle it can never win outright.
+        //
+        // `on_section_done` is caller-supplied, so it is deliberately NOT called
+        // under the guard: the substrate lock is writer-priority, and a callback
+        // that took a read while a writer was queued would deadlock against the
+        // guard we are already holding. The skips are collected here and reported
+        // below, after the guard drops — same callbacks, same order.
+        let mut skipped: Vec<(SectionId, usize, usize)> = Vec::new();
+        {
+            let view = self.substrate.read();
+            for &(section_id, content) in sections {
+                if content.is_empty() {
+                    continue;
+                }
+                if view.section_exists(section_id) {
+                    let block_count = view.section_block_count(section_id).unwrap_or(0);
+                    skipped.push((section_id, block_count, content.len()));
+                    continue;
+                }
+                candidates.push((section_id, content));
+            }
+        }
+        for (section_id, block_count, content_len) in skipped {
+            out_skip.push((section_id, block_count));
+            on_section_done(section_id, content_len);
+        }
+        // Every section was already present — nothing left needs a content
+        // address, so the prefix chain below (which reads each prefix section's
+        // tokens out of the substrate) is never built.
+        if candidates.is_empty() {
+            return Ok(out_skip);
+        }
+
         let prefix_hash = {
             let mut chain = ContentChain::new();
             let view = self.substrate.read();
@@ -1178,22 +1425,14 @@ impl Sequence {
             }
             chain.prefix()
         };
-        // Walk every requested section and triage into three buckets:
-        //   - Already hot in the substrate → skip entirely (a prior
-        //     `insert_section_*` call in this same daemon run already
-        //     pinned it).  Block-count contribution is its
-        //     `section_sealed_of` chunk count.
+        // ── Pass 2: triage what's left into two buckets ────────────────
         //   - Persisted in the redo log under its content-addressed
         //     stream id → restore from disk (`RestoreSection`).
         //   - Otherwise → ingest with a fresh prefill (`IngestSection`).
         let n_layers = self.model_core.num_layers;
-        let mut to_ingest: Vec<Pending<'_>> = Vec::with_capacity(sections.len());
-        let mut to_restore: Vec<Pending<'_>> = Vec::with_capacity(sections.len());
-        let mut out_skip: Vec<(SectionId, usize)> = Vec::new();
-        for &(section_id, content) in sections {
-            if content.is_empty() {
-                continue;
-            }
+        let mut to_ingest: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
+        let mut to_restore: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
+        for (section_id, content) in candidates {
             let tokens = self.tokenize(content)?;
             if tokens.is_empty() {
                 continue;
@@ -1204,23 +1443,6 @@ impl Sequence {
                 section_hash: hash_tokens(&tokens),
             };
             let debug_name = self.section_debug_name(section_id);
-            // Already-present check first — cheapest, no lock
-            // contention on the persistence mutex.  `section_exists`
-            // is broader than `section_is_hot`: it returns true for
-            // cold-marker sections that were restored on substrate
-            // reload but haven't been elevated yet.  Either way the
-            // substrate already knows about this section; the elevate
-            // path will lift it on the next projection that needs it.
-            if self.substrate.read().section_exists(section_id) {
-                let block_count = self
-                    .substrate
-                    .read()
-                    .section_block_count(section_id)
-                    .unwrap_or(0);
-                out_skip.push((section_id, block_count));
-                on_section_done(section_id, content.len());
-                continue;
-            }
             // Manifest check.  Only meaningful when the model's
             // layer count is known; without backings (test harnesses
             // that don't register a session) we can't compute
@@ -2716,12 +2938,10 @@ impl Sequence {
             staged_ingest_event(0, 0.0, system.clone(), turns.clone()),
             staged_ingest_event(assistant_content_start, seconds, system, turns),
         ];
-        self.substrate
-            .persist_projection_events(
-                turn_stream_id(timeline.raw(), turn_index),
-                &encode_events(&events),
-            )
-            .map_err(ConversationError::Model)?;
+        self.substrate.persist_projection_events(
+            turn_stream_id(timeline.raw(), turn_index),
+            encode_events(&events),
+        );
         Ok(())
     }
 
@@ -3578,9 +3798,8 @@ impl Sequence {
         }
         let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), count - 1);
         let payload = crate::projection::encode_events(events);
-        self.substrate
-            .persist_projection_events(stream_id, &payload)
-            .map_err(ConversationError::Model)
+        self.substrate.persist_projection_events(stream_id, payload);
+        Ok(())
     }
 
     /// Recovered projection-event timelines for a conversation, one `Vec` per

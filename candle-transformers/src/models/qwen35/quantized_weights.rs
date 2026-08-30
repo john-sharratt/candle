@@ -561,12 +561,24 @@ impl ResidentResidue {
     /// see the same change.
     ///
     /// Called when a session is created, never inside a wave.
-    pub fn set_activation_dtype(&self, dtype: candle::DType) -> Result<()> {
+    /// **Two widths, because these norms sit on two different tensors.**
+    ///
+    /// `attn_norm` and `post_attn_norm` read the RESIDUAL stream, so they are
+    /// materialised in the session's activation dtype. `q_norm` and `k_norm`
+    /// read Q and K, which are projected in the KV ARENA's dtype because they
+    /// become its contents (see `batched_layer::attention_operand_dtype`). The
+    /// two coincide for every model whose activations and KV agree, and diverge
+    /// for one that computes wider than it stores.
+    pub fn set_activation_dtype(
+        &self,
+        dtype: candle::DType,
+        kv_dtype: candle::DType,
+    ) -> Result<()> {
         self.attn_norm.maybe_change_dtype(dtype)?;
         self.post_attn_norm.maybe_change_dtype(dtype)?;
         if let ResidueMix::Attention(a) = &self.mix {
-            a.q_norm.maybe_change_dtype(dtype)?;
-            a.k_norm.maybe_change_dtype(dtype)?;
+            a.q_norm.maybe_change_dtype(kv_dtype)?;
+            a.k_norm.maybe_change_dtype(kv_dtype)?;
         }
         Ok(())
     }

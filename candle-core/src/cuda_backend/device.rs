@@ -81,12 +81,60 @@ impl std::fmt::Debug for CudaDevice {
 
 impl CudaDevice {
     #[allow(clippy::missing_safety_doc)]
+    /// Refuse an allocation that overlaps memory declared immutable after load.
+    ///
+    /// The pool is supposed to hand out disjoint blocks; a fresh allocation
+    /// landing on a resident weight means it handed one out twice, and the
+    /// weight is corrupted the moment anything writes through the new handle.
+    /// Catching it here names the allocation site instead of leaving a wrong
+    /// number to be found several layers downstream.
+    ///
+    /// Costs two atomic loads and two compares for an address outside every
+    /// declared region, which is every allocation in a healthy run — see
+    /// [`crate::readonly_regions`].
+    #[cfg(feature = "tensor-assert")]
+    fn guard_fresh_allocation<T>(what: &str, slice: &cudarc::driver::CudaSlice<T>, bytes: usize) {
+        use cudarc::driver::DevicePtr;
+        let stream = slice.stream().clone();
+        let (base, _g) = slice.device_ptr(&stream);
+        crate::readonly_regions::forbid_write(what, base, bytes);
+    }
+
+    /// No-op twin. Gated on the whole body rather than relying on
+    /// `forbid_write`'s stub, because reading the address is not free: it
+    /// clones a stream `Arc` and takes a sync guard, on a path that runs for
+    /// every device allocation in the process.
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    fn guard_fresh_allocation<T>(
+        _what: &str,
+        _slice: &cudarc::driver::CudaSlice<T>,
+        _bytes: usize,
+    ) {
+    }
+
+    /// `len` elements of device memory, **uninitialised**.
+    ///
+    /// # Safety
+    ///
+    /// The returned slice holds whatever the allocator last left there. The
+    /// caller must write every element it goes on to read — a kernel that fully
+    /// overwrites its output, or an explicit fill — because reading an
+    /// unwritten element is undefined behaviour and, on this backend, silently
+    /// returns another tenant's bytes rather than faulting.
+    ///
+    /// [`Self::alloc_zeros`] is the safe counterpart and is the right choice
+    /// unless the buffer is provably fully written: the hot-path rule is that a
+    /// buffer a kernel completely overwrites must come from here, so the zeroing
+    /// memset is not paid on bytes that are about to be stamped anyway.
     pub unsafe fn alloc<T: cudarc::driver::DeviceRepr>(
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc", len * std::mem::size_of::<T>());
-        self.stream.alloc::<T>(len).w()
+        let s = self.stream.alloc::<T>(len).w()?;
+        Self::guard_fresh_allocation("CudaDevice::alloc", &s, len * std::mem::size_of::<T>());
+        Ok(s)
     }
 
     pub fn alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
@@ -94,7 +142,13 @@ impl CudaDevice {
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc_zeros", len * std::mem::size_of::<T>());
-        self.stream.alloc_zeros::<T>(len).w()
+        let s = self.stream.alloc_zeros::<T>(len).w()?;
+        Self::guard_fresh_allocation(
+            "CudaDevice::alloc_zeros",
+            &s,
+            len * std::mem::size_of::<T>(),
+        );
+        Ok(s)
     }
 
     pub fn memcpy_htod<
@@ -106,7 +160,44 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        // A host→device copy is a bulk write, and its destination is computed
+        // by the caller rather than handed out by an allocator — which is why
+        // the guards on the allocation paths cannot see it. An upload aimed at
+        // the wrong slot writes a contiguous, slot-sized block of plausible
+        // bytes over whatever was there.
+        self.guard_copy_dst::<T, _>("CudaDevice::memcpy_htod", dst, src.len());
         self.stream.memcpy_htod(src, dst).w()
+    }
+
+    /// Refuse a copy whose destination overlaps memory declared immutable.
+    ///
+    /// Reads the destination's address through the same accessor the copy will,
+    /// so the range checked is the range written. Costs two atomic loads and two
+    /// compares when nothing is declared nearby — see
+    /// [`crate::readonly_regions`] — and compiles away entirely without the
+    /// `tensor-assert` feature.
+    #[cfg(feature = "tensor-assert")]
+    fn guard_copy_dst<T, D: cudarc::driver::DevicePtrMut<T>>(
+        &self,
+        what: &str,
+        dst: &mut D,
+        elems: usize,
+    ) {
+        let stream = self.stream.clone();
+        let (base, _g) = dst.device_ptr_mut(&stream);
+        crate::readonly_regions::forbid_write(what, base, elems * std::mem::size_of::<T>());
+    }
+
+    /// No-op twin — same reasoning as [`Self::guard_fresh_allocation`], on a
+    /// path that runs for every host↔device copy.
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    fn guard_copy_dst<T, D: cudarc::driver::DevicePtrMut<T>>(
+        &self,
+        _what: &str,
+        _dst: &mut D,
+        _elems: usize,
+    ) {
     }
 
     pub fn memcpy_dtov<T: cudarc::driver::DeviceRepr, Src: cudarc::driver::DevicePtr<T>>(
@@ -125,6 +216,9 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        // Same reasoning as `memcpy_htod`: a bulk write to a caller-computed
+        // destination, invisible to every allocation-path guard.
+        self.guard_copy_dst::<T, _>("CudaDevice::memcpy_dtod", dst, src.len());
         self.stream.memcpy_dtod(src, dst).w()
     }
 
@@ -138,7 +232,13 @@ impl CudaDevice {
         // Allocates as well as copying: the destination slice is fresh device
         // memory, so this is a driver allocation like the two above.
         forbidden_alloc::record("CudaDevice::memcpy_stod", std::mem::size_of_val(src));
-        self.stream.memcpy_stod(src).w()
+        let s = self.stream.memcpy_stod(src).w()?;
+        // Allocates as well as copying, so it is an allocation path like the
+        // two above and needs the same guard — and unlike them it writes to the
+        // range immediately, so a collision here corrupts before anything else
+        // gets a chance to notice.
+        Self::guard_fresh_allocation("CudaDevice::memcpy_stod", &s, std::mem::size_of_val(src));
+        Ok(s)
     }
 
     /// [`Self::memcpy_stod`] with the destination taken from `origin`'s arena.
@@ -500,21 +600,48 @@ impl CudaDevice {
 }
 
 impl CudaDevice {
-    /// Validates that the device meets the minimum compute capability (SM 8.0 / Ampere).
-    /// All precompiled CUDA kernels target SM80; older GPUs will produce incorrect results.
+    /// Refuses a device this build carries no kernel image for.
+    ///
+    /// The kernels are compiled to native SASS for the architectures in
+    /// `candle_kernels::BUILT_ARCHES` and **no PTX is emitted**, so a card
+    /// outside that set has nothing to run and nothing to JIT from.
+    ///
+    /// # Why this panics
+    ///
+    /// Every launch on such a card fails with `cudaErrorNoKernelImageForDevice`,
+    /// and the kernel launchers return `void` — so nothing observes the error.
+    /// The caller reads back the `alloc_zeros` buffer it passed in and carries
+    /// on, which means the entire KV data path (writes, migration,
+    /// quantization, format selection, provenance) silently produces zeros.
+    /// There is no numerical answer to give and no partial mode worth running:
+    /// the machine cannot execute this build at all. A `Result` here would be a
+    /// value some caller could log and continue past, and continuing produces
+    /// confidently wrong output — so this is the one place a hard stop is
+    /// correct.
+    ///
+    /// Adding the card is one entry in `KERNEL_ARCHES` (`candle-kernels/build_utils.rs`).
     fn validate_compute_capability(context: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
         use cudarc::driver::sys::CUdevice_attribute;
         let major = context
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .w()?;
+            .w()? as u32;
         let minor = context
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .w()?;
-        if major < 8 {
-            crate::bail!(
-                "CUDA device (SM {major}.{minor}) does not meet the minimum requirement of \
-                 SM 8.0 (Ampere). Precompiled kernels target SM80 and will not run correctly \
-                 on older hardware."
+            .w()? as u32;
+        if !candle_kernels::has_kernel_image(major, minor) {
+            let built = candle_kernels::BUILT_ARCHES
+                .iter()
+                .map(|sm| format!("sm_{sm}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            panic!(
+                "CUDA device is SM {major}.{minor}, and this build carries kernel images only \
+                 for [{built}] (native SASS, no PTX). Nothing would execute on this card: every \
+                 kernel launch fails with cudaErrorNoKernelImageForDevice and returns \
+                 zero-filled buffers instead of an error. Add {major}{minor} to KERNEL_ARCHES \
+                 in candle-kernels/build_utils.rs and rebuild.\n\
+                 (A cubin for X.y runs on X.z only when z >= y — so sm_86 does not cover an \
+                 8.0 device such as the A100.)"
             );
         }
         Ok(())

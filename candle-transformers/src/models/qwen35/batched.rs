@@ -1041,7 +1041,7 @@ impl HybridBatched {
     /// The forward *refuses* a dtype it was not prepared for, so this is the
     /// single place the conversion happens — at session creation, never
     /// inside a wave.
-    pub fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+    pub fn maybe_change_dtype(&self, dtype: DType, kv_dtype: DType) -> Result<()> {
         // A dtype change means a NEW session — this is the one place that
         // happens, and only a new session can change it. Every piece of draft
         // state is an activation captured under the old one, belonging to a
@@ -1075,15 +1075,20 @@ impl HybridBatched {
         }
         // Through the residue, which is where every norm of every layer lives —
         // resident in both stores, so this reaches a streamed checkpoint's
-        // layers without pulling one of them over PCIe.
+        // layers without pulling one of them over PCIe. It carries the two
+        // widths main introduced here: the residual-stream norms take the
+        // activation dtype, Q/K's take the KV arena's.
         for li in 0..self.model.layers.len() {
-            self.model.layers.residue(li)?.set_activation_dtype(dtype)?;
+            self.model
+                .layers
+                .residue(li)?
+                .set_activation_dtype(dtype, kv_dtype)?;
         }
         // The draft head's block runs in the wave's dtype like any other, so
         // its norms are materialised with the trunk's — the head is a layer of
         // this model, not a sidecar that got to keep the loader's dtype.
         if let Some(head) = &self.model.mtp {
-            head.block.residue().set_activation_dtype(dtype)?;
+            head.block.residue().set_activation_dtype(dtype, kv_dtype)?;
             head.input.enorm.maybe_change_dtype(dtype)?;
             head.input.hnorm.maybe_change_dtype(dtype)?;
             head.head_norm.maybe_change_dtype(dtype)?;
@@ -1112,7 +1117,7 @@ impl HybridBatched {
         // dropped here — a new field looks wired, builds clean, and simply never
         // reaches this model. Extend both when adding one.
         let session = create_session(&self.model.cfg, &self.model.device, config)?;
-        self.maybe_change_dtype(session.activation_dtype())?;
+        self.maybe_change_dtype(session.activation_dtype(), session.kv_live_dtype())?;
         Ok(session)
     }
 

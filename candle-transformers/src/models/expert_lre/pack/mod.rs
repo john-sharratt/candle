@@ -1635,13 +1635,12 @@ mod tests {
 
         // And the bytes at that offset are the ones written for it.
         //
-        // Through `AlignedScratch`, like every other reader here: `read_into`
-        // goes out as direct I/O, which requires a sector-aligned destination,
-        // and `Vec<u8>` only ever promises the allocator's natural 8- or 16-byte
-        // alignment. A `vec![]` here passed for as long as the allocator happened
-        // to hand back a 4 KiB-aligned block and tripped the debug assertion the
-        // moment surrounding allocations shifted — which is a test that reports
-        // on malloc rather than on the pack.
+        // Through `AlignedScratch`, as every other read here does: `read_into`
+        // lands a positioned direct read, whose destination must be 4 KiB
+        // aligned. A `vec![0u8; _]` is aligned to 1, so it passed only for as
+        // long as the allocator happened to hand back an aligned block, and
+        // tripped the direct-I/O assertion the moment surrounding allocations
+        // shifted — a test that reports on malloc rather than on the pack.
         let mut scratch = AlignedScratch::new();
         scratch.ensure(pack.stride()).unwrap();
         let got = scratch.as_mut_slice(pack.stride());

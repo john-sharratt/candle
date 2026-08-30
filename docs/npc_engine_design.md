@@ -129,19 +129,25 @@ three. The engine names them explicitly:
 | Scope | Cardinality | Mutability | Mechanism |
 |---|---|---|---|
 | **World** | 1 | fixed | CoW prefix, shared by every NPC |
-| **Archetype** | 1 per type (~300 NPCs) | doctrine only | CoW prefix, shared per type |
+| **Personality** | 1 per type (~300 NPCs) | doctrine only | CoW prefix, shared per type |
 | **NPC** | 1 per NPC | free | per-NPC timelines over shared groups |
 
 ```rust
-pub struct WorldId(NonZeroU32);
-pub struct ArchetypeId(NonZeroU32);
+pub struct WorldId(String);          // the slug that is `worlds/<id>.yaml`
+pub struct PersonalityId(String);    // the slug that is `personalities/<id>.yaml`
 pub struct NpcId(NonZeroU64);        // the "unique number"
 pub struct InteractionId(NonZeroU64);
 ```
 
+The first two are slugs, not numbers, because the documents they address are **files** in the
+mind and a file's identity is its name. A number beside the name would be a second identity
+for the same thing, needing a table to reconcile them and free to disagree; validity is
+`registry::id::check`, the same rule that decides what may become a file name, so a reference
+always resolves to a document or is refused at the boundary that introduced it.
+
 `NpcId` is the number the requirement names. It addresses the third scope only; world and
-archetype sharing is handled by prefix construction, not by the filter. An NPC's full scope
-is the **chain** `(WorldId, ArchetypeId, NpcId)` — resolved once at spawn into a projection
+personality sharing is handled by prefix construction, not by the filter. An NPC's full scope
+is the **chain** `(WorldId, PersonalityId, NpcId)` — resolved once at spawn into a projection
 `Builder` cached per chain, exactly as `IdentityBuilders` caches per `(name, ToolMode)`
 today.
 
@@ -502,7 +508,7 @@ Three changes:
    ```
 
 2. **The substitution vocabulary grows** beyond `{CHAR_NAME}`/`{USER_NAME}` to the NPC's
-   resolved scope chain — archetype, world, and the interlocutor of the current interaction.
+   resolved scope chain — personality, world, and the interlocutor of the current interaction.
    Substitution stays a flat string replace over a closed, validated key set; it does not
    become an expression language.
 
@@ -565,7 +571,7 @@ Versioned under `/v1`, mirroring zend's conventions.
 
 ```
   NPC lifecycle
-    POST   /v1/npc                          create (archetype, world, name, seed state)
+    POST   /v1/npc                          create (personality, world, name, seed state)
     GET    /v1/npc                          list
     GET    /v1/npc/{id}                     full state
     PATCH  /v1/npc/{id}                     update core fields
@@ -633,7 +639,7 @@ this NPC actually gather on that tick* — is the instrument that makes that pos
 The GUI manages many NPCs and is a pure API client. Its screens follow the substrate rather
 than inventing an organisation:
 
-- **Roster** — every NPC, archetype, world, tick rate, monitor health at a glance.
+- **Roster** — every NPC, personality, world, tick rate, monitor health at a glance.
 - **NPC detail** — the six layers as browsable streams, with the authoring plane exposed:
   edit relationships, author beliefs, set intent, adjust modulation parameters.
 - **Interaction console** — open an interaction in a chosen mode, inject, watch the two
@@ -855,7 +861,7 @@ asserting that the mocks work:
 1. **Refactor.** Move the shared modules to `candle-conversation`, convert zend to a consumer,
    keep zend green. No NPC code yet. This is the change that de-risks everything after it.
 2. **Skeleton.** `npcd` boots, loads a model, serves `/v1/status`, spawns one NPC from an
-   archetype, answers `/v1/npc/{id}/substrate`. No tick loop — turns submitted manually.
+   personality, answers `/v1/npc/{id}/substrate`. No tick loop — turns submitted manually.
 3. **The harness.** `tests/harness.rs` as the single binary, the shared-engine `OnceLock`, the
    base-substrate fixture, and the pure tier. Built here rather than later, because from step 4
    onward every phase's acceptance criterion is a test in it — and a harness retrofitted after
@@ -879,11 +885,11 @@ found at step 3 it is a test.
 
 ## Part XVI — Open questions
 
-**RESOLVED — the archetype is prefix only.** `ArchetypeId` addresses a shared CoW prefix and
+**RESOLVED — the personality is prefix only.** `PersonalityId` addresses a shared CoW prefix and
 never filters turns; **`NpcId` is the only number in the turn filter.** Doctrine therefore lives
 in the surfaced prompt rather than as substrate content, and `ScopeBuilders` resolves a single
 key rather than a pair. This keeps the scope resolver as narrow as possible, which matters
-because it is the one place a leak would put NPC A's life in NPC B's head. If archetype-level
+because it is the one place a leak would put NPC A's life in NPC B's head. If personality-level
 *turns* are ever genuinely needed, that is a schema change with its own isolation test, not a
 widening of the filter.
 

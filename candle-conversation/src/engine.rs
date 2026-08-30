@@ -1,7 +1,7 @@
 //! The conversation engine: entry point, spawns the scheduler thread.
 
 use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
-use crate::conversation::Sequence;
+use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
 use crate::persistence::record::DistillMode;
@@ -293,12 +293,18 @@ impl ConversationEngine {
                 })?;
             }
         }
-        // Embed the tokenizer.json (compare-and-insert) so the log can
-        // detokenize offline. ~11 MB for Qwen3, but written at most once per
-        // distinct model since identical bytes are a no-op.
+        // Bind the substrate to this model's tokenizer.json, so the log can
+        // detokenize offline and so no second vocabulary can ever be written
+        // over turns sealed under the first. ~11 MB for Qwen3, written at most
+        // once per substrate; identical bytes are a no-op, and different bytes
+        // are refused rather than appended.
         if let Some(tok) = &config.tokenizer {
             let wrote = persistence.set_tokenizer(tok).map_err(|e| {
-                ConversationError::from(candle::Error::Msg(format!("persist tokenizer: {e}")))
+                ConversationError::Tokenizer(format!(
+                    "{e}\n\nThe substrate at this working directory belongs to a different \
+                     model. Start this one against its own working directory (--working-dir), \
+                     or discard this substrate with --wipe-substrate."
+                ))
             })?;
             if wrote {
                 persistence.commit().map_err(|e| {
@@ -1067,7 +1073,7 @@ impl ConversationEngine {
             .recv()
             .map_err(|_| ConversationError::SchedulerGone)??;
 
-        let conv = Sequence::new_with_projection(
+        let (conv, pending) = Sequence::new_with_projection(
             self.scheduler_tx.clone(),
             sequence_id,
             Arc::clone(&self.tokenizer),
@@ -1082,6 +1088,9 @@ impl ConversationEngine {
             // Single-create path keeps the first-turn priming optimization.
             true,
         )?;
+        // A group of one — the same install path the batch create takes.
+        let pending: Vec<_> = pending.into_iter().collect();
+        install_branch_states(&self.scheduler_tx, &pending, &self.conversation)?;
 
         Ok(conv)
     }
@@ -1142,9 +1151,23 @@ impl ConversationEngine {
             target: ProjectionTarget,
             rx: channel::Receiver<crate::Result<SequenceId>>,
         }
+        // Split the call's wall time three ways, because the three parts have
+        // very different characters and a caller that batches creations needs to
+        // know which one it is paying for. `fire` and `build` are this thread's
+        // own work; `wait` is time blocked on the scheduler, which only drains
+        // its request queue between waves — so a `wait` of order one wave
+        // latency means the caller is stalling on a wave boundary rather than on
+        // the cost of creating anything.
+        let t_call = std::time::Instant::now();
+        let mut fire = std::time::Duration::ZERO;
+        let mut wait = std::time::Duration::ZERO;
         let mut fired: Vec<crate::Result<Fired>> = Vec::with_capacity(n);
-        for _ in 0..n {
-            let timeline = self.conversation.mint_timeline(layer, group);
+        let t_fire = std::time::Instant::now();
+        // All `n` timelines under one write-lock span, before the fire loop —
+        // minting per iteration took the substrate's exclusive lock once per
+        // conversation, right where conversations are opened in bursts.
+        let minted = self.conversation.mint_timelines(layer, group, n);
+        for timeline in minted {
             let target = ProjectionTarget {
                 layer,
                 group,
@@ -1176,18 +1199,28 @@ impl ConversationEngine {
             }
         }
 
+        fire += t_fire.elapsed();
+
         // Phase 2 — collect each slot id (already queued, so no extra wave wait)
         // and build its Sequence. After the warm-up case has pinned the shared
         // sections, `new_with_projection` only re-references already-hot sections
         // here, so it issues no further scheduler round-trip.
-        fired
+        // Collect the whole batch's pending branch states as the sequences are
+        // built, then install them in ONE request below. The install is
+        // overwhelmingly the wait for the scheduler to drain it, and that wait is
+        // per-request — installing per sequence here would put a queue wait
+        // between every pair of conversations in the burst.
+        let mut pending: Vec<PendingBranchState> = Vec::with_capacity(n);
+        let out: Vec<crate::Result<Sequence>> = fired
             .into_iter()
             .map(|f| {
                 let f = f?;
+                let t_wait = std::time::Instant::now();
                 let sequence_id =
                     f.rx.recv()
                         .map_err(|_| ConversationError::SchedulerGone)??;
-                Sequence::new_with_projection(
+                wait += t_wait.elapsed();
+                let (conv, p) = Sequence::new_with_projection(
                     self.scheduler_tx.clone(),
                     sequence_id,
                     Arc::clone(&self.tokenizer),
@@ -1203,9 +1236,35 @@ impl ConversationEngine {
                     // that would otherwise serialise the burst — `apply_projection`
                     // at first submit materialises the projection instead.
                     false,
-                )
+                )?;
+                pending.extend(p);
+                Ok(conv)
             })
-            .collect()
+            .collect();
+        // NOT downgraded to a warning. `install_branch_states` already handles
+        // every recoverable degradation internally (missing checkpoint, unreadable
+        // record, refused install) by warning and carrying on — so the only error
+        // it can return is `SchedulerGone`. Swallowing it would hand back a full
+        // batch of `Ok(Sequence)` values bound to a dead scheduler; this function
+        // reports per entry, so every entry fails.
+        if let Err(e) = install_branch_states(&self.scheduler_tx, &pending, &self.conversation) {
+            let msg = format!("batch branch-state install failed: {e}");
+            return (0..n)
+                .map(|_| Err(ConversationError::Channel(msg.clone())))
+                .collect();
+        }
+
+        let call = t_call.elapsed();
+        tracing::debug!(
+            target: "candle_conversation::batch_creation",
+            n,
+            call_ms = call.as_millis() as u64,
+            fire_ms = fire.as_millis() as u64,
+            wait_ms = wait.as_millis() as u64,
+            build_ms = call.saturating_sub(fire + wait).as_millis() as u64,
+            "batch conversation creation"
+        );
+        out
     }
 
     /// Get the shared tokenizer.

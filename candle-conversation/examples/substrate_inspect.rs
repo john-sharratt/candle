@@ -456,10 +456,16 @@ enum Cmd {
     /// partial / interrupted writes. Prints a CLEAN / CORRUPTION verdict and
     /// exits non-zero if anything failed.
     Validate {
-        /// Layer count for the chunk-count check — a turn stream stores
-        /// `layers × chunks_per_layer` chunks (the primary model has 48).
-        #[arg(long, default_value_t = 48)]
-        layers: usize,
+        /// Override the layer count for the chunk-count check. **Normally
+        /// omit it** — the count is derived from the substrate's own turns.
+        ///
+        /// A turn stream stores `layers × chunks_per_layer` chunks, one
+        /// sequence per *KV-bearing* layer — which is not the model's layer
+        /// count on a hybrid stack, where only the attention layers hold KV.
+        /// This used to default to 48 and reported 350 of 5,046 turns corrupt
+        /// on a healthy 109 GB substrate whose real count was 11.
+        #[arg(long)]
+        layers: Option<usize>,
     },
     /// Per-stream manifest view (turns and prompt sections).
     Streams,
@@ -873,6 +879,12 @@ fn main() -> Result<()> {
         }
         if matches!(cli.cmd, Cmd::Orphans) {
             return orphans(&segs);
+        }
+        // Validate across EVERY segment, for the same reason `dump` does: a
+        // turn's chunks are rotated between segments, so a per-segment check
+        // reports a straddling turn as a torn write.
+        if let Cmd::Validate { layers } = &cli.cmd {
+            return validate_merged(&segs, *layers);
         }
         if let Cmd::ExportReplay { timeline, tag, out } = &cli.cmd {
             return export_replay(&segs, timeline, tag, out);
@@ -4519,9 +4531,8 @@ fn headers(log: &mut LogFile) -> Result<()> {
 /// not kernel-side value corruption baked in before persist. Per-chunk KV
 /// verification against a golden checksum computed on-GPU (which does catch that)
 /// is the follow-on work; this same command verifies it once the golden lands.
-fn validate(log: &mut LogFile, n_layers: usize) -> Result<()> {
+fn validate(log: &mut LogFile, layers_override: Option<usize>) -> Result<()> {
     use candle_conversation::persistence::record::verify_record_crc;
-    use candle_conversation::persistence::resume::{recover_turn_cold_refs, recovered_turn_decls};
 
     // ── Pass 1: metadata-record CRC (streaming — no full-log RAM load) ────────
     let mut crc_ok = 0usize;
@@ -4557,31 +4568,21 @@ fn validate(log: &mut LogFile, n_layers: usize) -> Result<()> {
     }
     println!();
 
-    // ── Pass 2: per-turn chunk-count consistency (full substrate) ────────────
-    let substrate = build_substrate(log)?;
-    let decls = recovered_turn_decls(&substrate);
-    let mut turns_ok = 0usize;
-    let mut turns_bad = 0usize;
-    for decl in &decls {
-        match recover_turn_cold_refs(&substrate, decl, n_layers) {
-            Ok(_) => turns_ok += 1,
-            Err(err) => {
-                turns_bad += 1;
-                if turns_bad <= 30 {
-                    println!(
-                        "  CHUNK MISMATCH timeline={} turn={}: {err}",
-                        decl.timeline_id, decl.turn_index,
-                    );
-                }
-            }
-        }
-    }
+    // ── Pass 2: per-turn chunk-count consistency ─────────────────────────────
+    //
+    // **Scoped to this one segment, which is why it can lie.** A turn's chunks
+    // are rotated across segments like any other record, so a turn straddling a
+    // boundary has only part of its chunks here and reads as a torn write.
+    // Measured: two turns reported torn in BOTH seg-320 and seg-323 with
+    // *different* partial counts (233 vs 295) — a real torn write exists once.
+    // Point the tool at the `.substrate` DIRECTORY for the answer that counts.
     println!(
-        "── turn chunk counts (×{n_layers} layers, {} turns) ──",
-        decls.len()
+        "note: single-segment scope — a turn whose chunks straddle a segment boundary \
+         will read as a torn write here; run against the .substrate directory for the \
+         whole-substrate answer"
     );
-    println!("   {turns_ok} consistent · {turns_bad} corrupt");
-
+    let substrate = build_substrate(log)?;
+    let turns_bad = validate_turn_chunks(&substrate, layers_override)?;
     let clean = crc_bad == 0 && turns_bad == 0 && !outcome.torn;
     println!(
         "\nsubstrate validation: {}",
@@ -4591,10 +4592,170 @@ fn validate(log: &mut LogFile, n_layers: usize) -> Result<()> {
             "CORRUPTION DETECTED"
         }
     );
-    if !clean {
-        std::process::exit(1);
+    if clean {
+        Ok(())
+    } else {
+        std::process::exit(1)
     }
-    Ok(())
+}
+
+/// Whole-substrate validation: CRC over every segment, then ONE chunk-count
+/// pass over the merged substrate.
+///
+/// The merge is the point. `validate`'s per-segment pass 2 sees only the chunks
+/// that landed in one file, so every turn the daemon rotated across a boundary
+/// looks truncated. Merging first is what turns "this segment holds part of the
+/// turn" back into "the substrate holds the turn".
+fn validate_merged(segs: &[(u64, PathBuf, bool)], layers_override: Option<usize>) -> Result<()> {
+    use candle_conversation::persistence::record::verify_record_crc;
+
+    let mut crc_ok = 0usize;
+    let mut crc_bad = 0usize;
+    let mut any_torn = false;
+    for (id, path, _) in segs {
+        let mut log = match LogFile::open_read_only(path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("warn: segment {id} open failed (skipping): {e}");
+                continue;
+            }
+        };
+        let outcome = walker::walk(&mut log, SegmentId(*id), SUPERBLOCK_SIZE, |e| {
+            if e.record.payload.is_empty() {
+                return;
+            }
+            match verify_record_crc(&e.record.header, &e.record.payload) {
+                Ok(()) => crc_ok += 1,
+                Err(err) => {
+                    crc_bad += 1;
+                    if crc_bad <= 30 {
+                        println!(
+                            "  CRC FAIL  seg={id} off={} type={:?} stream={}: {err}",
+                            e.offset,
+                            e.record.header.record_type,
+                            stream_hex(e.record.header.stream_id),
+                        );
+                    }
+                }
+            }
+        })?;
+        if outcome.torn {
+            any_torn = true;
+            println!("  WALK TORN seg={id} at offset {}", outcome.tail_offset);
+        }
+    }
+    println!("── metadata-record CRC ({} segments) ──", segs.len());
+    println!("   {crc_ok} verified · {crc_bad} FAILED");
+
+    let (_logs, substrate) = build_merged_substrate(segs);
+    let turns_bad = validate_turn_chunks(&substrate, layers_override)?;
+    let clean = crc_bad == 0 && turns_bad == 0 && !any_torn;
+    println!(
+        "\nsubstrate validation: {}",
+        if clean {
+            "CLEAN"
+        } else {
+            "CORRUPTION DETECTED"
+        }
+    );
+    if clean {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
+}
+
+/// The chunk-count consistency pass, shared by both scopes. Returns the number
+/// of bad turns; prints its own findings.
+fn validate_turn_chunks(substrate: &Substrate, layers_override: Option<usize>) -> Result<usize> {
+    use candle_conversation::persistence::resume::{
+        derive_layer_count, recover_turn_cold_refs, recovered_turn_decls,
+    };
+    let decls = recovered_turn_decls(substrate);
+
+    // **Derived, not assumed.** The redo log never records `L`, so a checker
+    // that hard-codes it reports its own wrong constant as thousands of corrupt
+    // turns. See `derive_layer_count` for the measurement that established this.
+    let derived = derive_layer_count(substrate, &decls);
+    let n_layers = match (layers_override, derived) {
+        (Some(n), Some(d)) if n != d => {
+            println!(
+                "── layer count ──\n   {n} (--layers) — OVERRIDING the {d} derived from the turns"
+            );
+            n
+        }
+        (Some(n), _) => {
+            println!("── layer count ──\n   {n} (--layers)");
+            n
+        }
+        (None, Some(d)) => {
+            println!("── layer count ──\n   {d} (derived from this substrate's turns)");
+            d
+        }
+        (None, None) => {
+            // No verdict here — the caller owns it, and it also knows whether
+            // the CRC pass failed. Printing one from inside this pass is how
+            // this arm came to announce CLEAN and then exit non-zero on a
+            // CRC-failing substrate.
+            println!(
+                "── layer count ──\n   no turn carries enough structure to derive one — \
+                 the chunk-count check is SKIPPED (the verdict below covers CRC only)"
+            );
+            return Ok(0);
+        }
+    };
+
+    let mut turns_ok = 0usize;
+    let mut torn = 0usize;
+    let mut wrong_shape = 0usize;
+    for decl in &decls {
+        let Err(err) = recover_turn_cold_refs(substrate, decl, n_layers) else {
+            turns_ok += 1;
+            continue;
+        };
+        // **Torn and mis-shaped are different diagnoses.** A chunk count that
+        // is not a whole multiple of `chunks_per_layer` cannot describe any
+        // layer count — it is a turn whose write was interrupted, and the fix
+        // is to drop that turn. A count that IS a whole multiple but of the
+        // wrong number is a shape disagreement, which points at the layer count
+        // rather than at the disk. Printing both as "corrupt" is what made a
+        // wrong constant read as thousands of damaged turns.
+        let per_layer = (decl.block_end - decl.block_start) as usize;
+        let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+        let n = substrate
+            .stream_of(stream_id)
+            .map(|s| s.chunks.len())
+            .unwrap_or(0);
+        let ragged = per_layer == 0 || !n.is_multiple_of(per_layer);
+        if ragged {
+            torn += 1;
+        } else {
+            wrong_shape += 1;
+        }
+        if torn + wrong_shape <= 30 {
+            let kind = if ragged {
+                "TORN WRITE".to_string()
+            } else {
+                format!("WRONG SHAPE ({} layers)", n / per_layer)
+            };
+            println!(
+                "  {kind} timeline={} turn={}: {err}",
+                decl.timeline_id, decl.turn_index,
+            );
+        }
+    }
+    println!(
+        "── turn chunk counts (×{n_layers} layers, {} turns) ──",
+        decls.len()
+    );
+    println!("   {turns_ok} consistent · {torn} torn write(s) · {wrong_shape} wrong shape");
+    if wrong_shape > 0 {
+        println!(
+            "   note: a WRONG SHAPE turn holds a whole number of layers that is not \
+             {n_layers} — suspect the layer count before the disk"
+        );
+    }
+    Ok(torn + wrong_shape)
 }
 
 /// Summarise a turn's stored wide-Q signature window for the stream listing:

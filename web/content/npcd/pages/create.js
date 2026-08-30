@@ -15,7 +15,10 @@ export async function render() {
   const el = h('div', { class: 'page', style: 'max-width:900px' });
 
   const draft = {
-    name: '', world_id: '', archetype_id: '1',
+    // Both references start empty and are filled from the first listed
+    // document. A hardcoded default would name a personality this daemon may
+    // not have — they are files in the mind, not fixed rows.
+    name: '', world_id: '', personality_id: '',
     description: '', description_origin: 'generated',
     portrait: null, portrait_origin: null,
     environment_enabled: true,
@@ -24,11 +27,12 @@ export async function render() {
   };
   let step = 1;
 
-  const [worlds, archetypes] = await Promise.all([
+  const [worlds, personalities] = await Promise.all([
     API.listWorlds().then((r) => r.worlds || []).catch(() => []),
-    API.listArchetypes().then((r) => r.archetypes || []).catch(() => []),
+    API.listPersonalities().then((r) => r.personalities || []).catch(() => []),
   ]);
   if (worlds[0]) draft.world_id = worlds[0].world_id;
+  if (personalities[0]) draft.personality_id = personalities[0].personality_id;
 
   const body = h('div', {});
   const foot = h('div', { class: 'row', style: 'justify-content:flex-end;gap:9px;margin-top:22px' });
@@ -68,7 +72,7 @@ export async function render() {
       desc.value = '';
       desc.placeholder = 'generating…';
       try {
-        const r = await API.generateDescription({ archetype_id: draft.archetype_id, world_id: draft.world_id });
+        const r = await API.generateDescription({ personality_id: draft.personality_id, world_id: draft.world_id });
         draft.description = r.description;
         draft.description_origin = 'generated';
         desc.value = r.description;
@@ -80,21 +84,24 @@ export async function render() {
     const worldSel = worlds.length
       ? h('select', { class: 'select', onChange: (e) => { draft.world_id = e.target.value; } },
         worlds.map((w) => h('option', { value: w.world_id, selected: w.world_id === draft.world_id }, w.name)))
-      : h('div', { class: 'tiny dim' }, 'no worlds yet');
+      : h('div', { class: 'tiny dim' }, 'no worlds — point the daemon at a mind');
 
     mount(body,
       h('div', { class: 'panel' },
         h('div', { class: 'grid g2' },
           h('label', { class: 'field' }, h('span', {}, 'Name'), nameIn),
           h('div', {},
-            h('label', { class: 'field' }, h('span', {}, 'World'),
-              h('div', { class: 'row' }, worldSel,
-                h('button', { class: 'btn sm', title: 'Create a world', onClick: () => go('/worlds') }, '+'))),
-            h('label', { class: 'field' }, h('span', {}, 'Archetype'),
-              h('div', { class: 'row' },
-                h('select', { class: 'select', onChange: (e) => { draft.archetype_id = e.target.value; } },
-                  archetypes.map((a) => h('option', { value: a.archetype_id }, a.name))),
-                h('button', { class: 'btn sm', onClick: () => go('/archetypes') }, '+'))))),
+            h('label', { class: 'field' }, h('span', {}, 'World'), worldSel),
+            h('label', { class: 'field' }, h('span', {}, 'Personality'),
+              personalities.length
+                ? h('select', { class: 'select', onChange: (e) => { draft.personality_id = e.target.value; } },
+                  personalities.map((a) => h('option', {
+                    value: a.personality_id, selected: a.personality_id === draft.personality_id,
+                  }, a.name || a.personality_id.split('-').map((w) => w.replace(/^./, (c) => c.toUpperCase())).join(' '))))
+                // No "+" beside either selector: worlds and personalities are
+                // files an author writes into the mind, so a button here would
+                // make the console and the mind disagree about what exists.
+                : h('div', { class: 'tiny dim' }, 'no personalities — point the daemon at a mind')))),
 
         h('label', { class: 'field', style: 'margin-top:6px' },
           h('span', {}, h('span', {}, 'Description — who this character is '), originChip),
@@ -102,7 +109,8 @@ export async function render() {
         h('div', { class: 'row', style: 'justify-content:space-between' },
           h('div', { class: 'tiny dim', style: 'max-width:620px' },
             'This becomes the character’s identity in the system prompt, and the portrait is generated from it. ' +
-            'Written as a present-day person: the archetype supplies the fantasy framing, this supplies the human texture.'),
+            'Written as a present-day person: the personality supplies the anchor and the traits, this supplies ' +
+            'the human texture.'),
           regen))
     );
 
@@ -128,17 +136,11 @@ export async function render() {
         'font-size:2.6rem;color:var(--accent)',
     }, (draft.name || '?')[0] || '?');
 
-    let timer = null;
-    function fakeProgress() {
-      let p = 0;
-      timer = setInterval(() => {
-        p = Math.min(1, p + 0.04 + Math.random() * 0.03);
-        prog.style.width = (p * 100).toFixed(0) + '%';
-        label.textContent = p < 0.15 ? 'waiting for the wave boundary'
-          : p < 1 ? 'generating · ' + Math.round(p * 100) + '%' : 'done';
-        if (p >= 1) { clearInterval(timer); timer = null; draft.portrait_origin = 'generated'; }
-      }, 260);
-    }
+    /* There was a `fakeProgress()` here: a bar that crept to 100% on a timer
+     * and then set `portrait_origin = 'generated'`, having generated nothing.
+     * It is gone. No image model is loaded, so the honest states are "uploaded"
+     * and "none" — and a progress bar that completes over a thing that never
+     * ran is the same lie as a fixture standing in for a library. */
 
     const drop = h('div', {
       style: 'border:1px dashed var(--line-2);border-radius:10px;padding:14px;text-align:center;color:var(--ink-faint);font-size:.82rem;cursor:pointer',
@@ -153,7 +155,6 @@ export async function render() {
 
     function useFile(f) {
       if (!f) return;
-      if (timer) { clearInterval(timer); timer = null; }
       const url = URL.createObjectURL(f);
       mount(art, h('img', { src: url, style: 'width:100%;height:100%;object-fit:cover;border-radius:12px' }));
       draft.portrait = url;
@@ -162,20 +163,37 @@ export async function render() {
       prog.style.width = '100%';
     }
 
+    // `loaded`, not `length`. The catalog lists what this daemon *could* run;
+    // whether any of it is resident is the only thing that decides whether a
+    // portrait can be made. Keyed on `length`, the step offered a model picker
+    // and a progress bar and then refused — which is the contradiction the fake
+    // progress bar used to paper over.
+    const canGenerate = models.some((m) => m.loaded);
+    label.textContent = canGenerate ? 'ready' : 'no image model is loaded';
+
     mount(body, h('div', { class: 'panel' },
       h('div', { class: 'row', style: 'align-items:flex-start;gap:20px' },
         h('div', {}, art),
         h('div', { style: 'flex:1' },
-          h('div', { style: 'font-weight:700;margin-bottom:2px' }, 'Generating from the description'),
-          h('div', { class: 'tiny dim' }, 'There is no prompt field — the portrait derives from the description, so there is nowhere for the two to drift apart.'),
-          progWrap, label,
+          h('div', { style: 'font-weight:700;margin-bottom:2px' }, 'A portrait, from the description'),
+          h('div', { class: 'tiny dim' },
+            'There is no prompt field — the portrait derives from the description, so there is nowhere for '
+            + 'the two to drift apart.'),
+          canGenerate ? progWrap : null, label,
           h('div', { class: 'row', style: 'margin-top:12px;gap:8px' },
-            h('select', { class: 'select', style: 'width:auto' },
-              models.map((m) => h('option', { value: m.id, selected: m.default }, `${m.display} · ${m.vram_gib} GiB`))),
-            h('button', { class: 'btn sm', onClick: () => { prog.style.width = '0%'; fakeProgress(); } }, '⟳ seed')),
+            canGenerate
+              ? h('select', { class: 'select', style: 'width:auto' },
+                models.map((m) => h('option', { value: m.id, selected: m.default }, `${m.display} · ${m.vram_gib} GiB`)))
+              : null,
+            h('button', {
+              class: 'btn sm',
+              onClick: () => toast('generating a portrait — image model required', 'err'),
+            }, '⟳ Generate')),
+          h('div', { class: 'tiny dim', style: 'margin-top:10px;max-width:70ch' },
+            'Generation needs an image model on this daemon, and there is none. Uploading works now and '
+            + 'outranks the generator permanently, so a portrait you choose is never replaced by one it '
+            + 'invents. A character with no portrait shows its initial.'),
           h('div', { style: 'margin-top:14px' }, drop, file)))));
-
-    fakeProgress();
 
     mount(foot,
       h('button', { class: 'btn ghost', onClick: () => { step = 1; draw(); } }, '← Back'),
@@ -188,14 +206,19 @@ export async function render() {
   async function stepInner() {
     const host = h('div', {});
     mount(body, h('div', { class: 'panel' },
-      h('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:12px' },
+      h('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:4px' },
         h('div', { style: 'font-weight:700' }, 'Inner life'),
         h('button', { class: 'btn sm', onClick: load }, '⟳ Regenerate')),
+      h('div', { class: 'tiny dim', style: 'margin-bottom:12px;max-width:80ch' },
+        'Beliefs, relationships and goals are substrate layer content — turns, not fields on the record — '
+        + 'so writing them needs the engine that gathers them, and this daemon has none. What you pick here '
+        + 'is a preview of the shape; it is not saved with the character, and the confirmation will say so '
+        + 'rather than reporting success over work that vanished.'),
       host));
 
     async function load() {
       mount(host, h('div', { class: 'tiny dim' }, 'generating beliefs, relationships and goals…'));
-      const r = await API.generateAttributes({ description: draft.description, archetype_id: draft.archetype_id });
+      const r = await API.generateAttributes({ description: draft.description, personality_id: draft.personality_id });
       draft.beliefs = r.beliefs || []; draft.relationships = r.relationships || []; draft.agency = r.agency || [];
       draft.picked.beliefs = new Set(draft.beliefs.slice(0, 2).map((b) => b.belief_id));
       draft.picked.relationships = new Set(draft.relationships.map((x) => x.entity_id));
@@ -244,19 +267,39 @@ export async function render() {
     await load();
   }
 
+  /* Write the character.
+   *
+   * One record appended to the substrate, keyed by a freshly minted `npc_id`,
+   * flushed and fsynced before this returns — so a character the page says was
+   * created is one that survives the daemon being killed a second later.
+   *
+   * What lands is the record's own fields. The inner-life picks from step 3 are
+   * substrate *layer* content — beliefs, relationships and goals are turns, not
+   * columns — and writing them needs the engine that gathers them. They are not
+   * sent: a `seed` the daemon silently discards is worse than one it refuses,
+   * because the wizard would report success over work that vanished. The step
+   * says so, and the toast below says what actually happened. */
   async function create() {
     if (!draft.name.trim()) return toast('Give the character a name', 'err');
+    const picked = draft.picked.beliefs.size
+      + draft.picked.relationships.size
+      + draft.picked.agency.size;
     try {
       const npc = await API.createNpc({
-        name: draft.name, world_id: draft.world_id, archetype_id: draft.archetype_id,
-        description: draft.description, environment_enabled: draft.environment_enabled,
-        seed: {
-          beliefs: draft.beliefs.filter((b) => draft.picked.beliefs.has(b.belief_id)),
-          relationships: draft.relationships.filter((r) => draft.picked.relationships.has(r.entity_id)),
-          agency: draft.agency.filter((a) => draft.picked.agency.has(a.strategy_id)),
-        },
+        name: draft.name, world_id: draft.world_id, personality_id: draft.personality_id,
+        // `persona_description`, the record's own field name. It was
+        // `description`, which the daemon does not read — a character created
+        // through this page arrived with an empty persona and no error to say
+        // why, because an absent persona is legal.
+        persona_description: draft.description,
+        environment_enabled: draft.environment_enabled,
       });
-      toast(draft.name + ' created', 'ok');
+      toast(
+        picked
+          ? `${draft.name} created — the ${picked} seeded attributes need an engine and were not written`
+          : `${draft.name} created`,
+        picked ? 'warn' : 'ok',
+      );
       go('/npc/' + npc.npc_id);
     } catch (e) { toast(e.detail || e.message || 'could not create', 'err'); }
   }

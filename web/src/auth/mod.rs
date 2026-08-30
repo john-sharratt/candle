@@ -36,8 +36,10 @@ use serde_json::json;
 
 pub mod cookie;
 pub mod oidc;
+pub mod role;
 pub mod session;
 
+pub use role::{Principal, Role, Roles};
 pub use session::Identity;
 
 use crate::config::Auth as AuthConfig;
@@ -312,6 +314,11 @@ async fn callback(
 
     let ttl = auth.cfg.session_ttl_hours * 3600;
     let identity = Identity {
+        // The issuer that minted this subject. Half of the account key — see
+        // `Identity::provider`. One provider is configured today, so this is a
+        // constant; it is carried rather than assumed so that adding a second
+        // is a configuration change and not a collision.
+        provider: "google".to_string(),
         sub: claims.sub,
         email: claims.email,
         name: claims.name,

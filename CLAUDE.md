@@ -192,6 +192,78 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
    (a second full-width `memset` on the exact bytes the kernel is about to stamp). The only
    buffers that may be zeroed are ones whose zero value is read before being written: atomic
    accumulators (`atomicAdd`/`atomicMax` targets), scatter bases, and ragged padding.
+7. **The span's partition boundaries hold in BOTH directions, and every tenant re-checks the
+   one it is about to cross.** The device reservation is one contiguous span shared by four
+   tenants — `| persist | KV regions | wave transient tier | expert weights |` — with the
+   *elastic* boundary `weight_floor` between the middle two. Nothing in CUDA enforces it: every
+   address inside the span is mapped, so a tenant that walks past its boundary reads and writes
+   another tenant's live data and raises nothing at all. It surfaces as a wrong *number* many
+   layers later, never as a fault.
+
+   The rules, each of which has been violated in production at least once:
+
+   - **The tier may not be placed above `weight_floor`** — `region_pool::tier_fits`.
+   - **`weight_floor` may not move below a standing tier's top.** The floor guard refused a
+     floor that cut live KV regions and said nothing about the tier, so the weight side could
+     grow *down* onto ground a placed tier was already standing on. `tier_fits` had approved
+     that tier against the floor as it stood a moment earlier; lowering the floor underneath it
+     retroactively put its top inside the weight zone, and the `wave-ffn` span at the tier's
+     top wrote activations over resident expert slots. Measured: tier topping out at
+     `0x51fbc00000` against a floor of `0x51f9c00000` — 32 MiB of tier inside expert ground.
+   - **An arena layout may not cross `weight_floor`.** `plan_wave_transient` records a
+     forward's plan even when it cannot place a tier for it, so a wider forward arriving behind
+     a live one leaves its plan standing over the previous, narrower tier. The layout then
+     walks the wider plan from a base chosen for a smaller purchase.
+   - **A raw device address captured from one tenant is invalidated by any boundary move.**
+     The MoE dispatch tables cache one slot address per expert on the reasoning that an
+     all-resident cache's weights never move. They do: a concession evicts the slots at the
+     frontier, and the zone then *grows back* — so capacity and floor read exactly as they did
+     at load while the conceded slots hold something else. Compare a monotonic concession
+     count, never the geometry.
+
+   **The danger, stated plainly:** a boundary check that consults live occupancy
+   (`region_stats().transient_bytes`, a mid-wave snapshot) instead of the reservation, or that
+   compares two figures derived from the same array, passes while the invariant is broken. When
+   a symptom looks like bad arithmetic — NaN in a GEMM, an implausible magnitude — but the
+   operands and weights are individually finite, suspect the partition before the kernel.
+   `candle::readonly_regions` (behind `tensor-assert`) exists to catch exactly this: declare a
+   tenant's ground immutable and the guard names the writer at the moment of the write, instead
+   of leaving a wrong number to be found downstream.
+
+---
+
+## The `tensor-assert` Harness
+
+Everything below is behind the **`tensor-assert`** feature and compiles to nothing without it.
+Build it with `--features cuda,tensor-assert`; the call sites are `#[cfg]`-ed out, not
+branch-predicted away, so feature-off is genuinely zero cost — including the arguments, which is
+why no call site may pass a `&format!(...)`.
+
+| Piece | Where | Answers |
+|---|---|---|
+| `Tensor::assert("name")` / `QTensor::assert` | `candle-core/src/tensor_assert/` | Is this tensor finite? Async — one kernel, no sync, no readback. Stats land in a slot the drain reads later. |
+| `check_now` / `check_now_quant` | same | Same question, **synchronously**, for the one site a capture has armed. |
+| `on_bad(cb)` | `tensor_assert/callback.rs` | Fires per finding. Compose these: each new callback narrows the previous one's answer. |
+| `nan_capture::checkpoint` | `models/nan_capture.rs` | Async locate (free) → armed synchronous capture (fenced, one site) → dump operands → panic. |
+| `readonly_regions` | `candle-core/src/readonly_regions.rs` | Names the *writer* at the moment of the write. Lock-free `O(log n)` over non-overlapping ranges; `assert_writable` is plumbed through every FFI write site. |
+| `SlotIntegrity` | `models/expert_lre/slot_integrity.rs` | Did resident weights change since load? Three checks — whole grid, rotating shard, single watched slot — that narrow run → ~64 waves → one layer. |
+
+**The method, which is the actual deliverable.** Test, narrow, test, narrow. Each instrument
+bounds a window; the next instrument runs inside that window. Do not build a state machine that
+walks the narrowing itself — add another `on_bad` callback and let them compound.
+
+**Two dangers, both learned the hard way:**
+
+- **An instrument that fences suppresses the race it hunts.** These faults reproduce at ~10k t/s
+  and stop reproducing when the pipeline is drained: a heavily-fenced build ran 71 minutes clean
+  while the production build failed in 5. Every `SlotIntegrity` check synchronises the stream, so
+  they are budgeted in fences, not in bytes — the shard scan runs **once per sweep**, not once per
+  layer, for exactly this reason. Measure throughput after adding instrumentation; if it drops far
+  below production, the run proves nothing. The armed-capture design (async locate, synchronous
+  capture only at the one site already named) exists to keep that budget.
+- **A stale declared region reports a false positive.** `readonly_regions` must be told when ground
+  is legitimately released (`release_below`), or a zone that shrinks leaves declarations behind and
+  the guard blames an innocent allocation for reusing freed memory.
 
 ---
 

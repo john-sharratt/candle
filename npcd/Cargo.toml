@@ -8,25 +8,45 @@ description = "NPC engine daemon — persistent NPCs on one card"
 name = "npcd"
 path = "src/main.rs"
 
-# NOTE: no candle / CUDA dependency yet, and no API of its own. Every endpoint
-# is answered by the console's mock fixture (`web::mock::npcd`), so the GUI can
-# be built and iterated on with a fast `cargo build` and no GPU. The engine
-# lands here behind the same routes later — the wire contract in
-# `docs/npc_api_gui_design.md` does not change when it does.
+# NOTE: no candle / CUDA dependency, so the GUI is a fast `cargo build` and no
+# GPU. Authored content, accounts, telemetry and logs are answered by this
+# daemon; the routes that need an inference engine still fall through to the
+# console's mock fixture (`web::mock::npcd`). The engine lands behind those same
+# routes later — the wire contract in `docs/npc_api_gui_design.md` does not
+# change when it does.
 [dependencies]
 anyhow     = { workspace = true }
 clap       = { workspace = true }
 tracing    = { workspace = true }
-# Authored worlds and archetypes are YAML on disk and JSON on the wire. They are
+# Authored worlds and personalities are YAML on disk and JSON on the wire. They are
 # carried as `serde_json::Value` rather than typed structs so a field the daemon
 # does not understand yet survives a load/save round trip instead of being
 # dropped — the schema is still moving and an author's work must outlive it.
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+# A save must not cost an author their comments. `serde_yaml` can only
+# re-serialise a whole document, which flattens every comment and block scalar
+# in it; these two edit in place over a lossless syntax tree, so a save changes
+# one value and leaves every other byte of the file untouched.
+yamlpatch = { workspace = true }
+yamlpath = { workspace = true }
+# The `Value` type `yamlpatch::Op::Replace` takes. A separate crate from
+# `serde_yaml` — which is archived — and the one `yamlpatch` is built against,
+# so a replacement value has to be built with it rather than converted.
+yaml_serde = { workspace = true }
+# `yamlpatch::Op::RewriteFragment` takes one of these. A separate crate rather
+# than a re-export, so it has to be named here to be constructed.
+subfeature = { workspace = true }
+# Telemetry and log lines are the exception to the `Value` rule above: their
+# shape *is* the contract the console renders, so they are typed structs and a
+# renamed field is a compile error rather than a blank panel.
+serde      = { workspace = true }
 # Same axum the `web` crate builds its router from — the two are layered
 # together at startup, so they must be the same version or the `Router` types
 # do not unify.
-axum       = { version = "0.7", features = ["macros"] }
+# `ws` for `/ws/logs`: the console tails the daemon's own log lines rather than
+# polling for them.
+axum       = { version = "0.7", features = ["macros", "ws"] }
 # Hashing a provider's subject id into a file name that is valid whatever shape
 # the provider chose. Not a security boundary — the subject inside the file is
 # authoritative — but it has to be total over every possible input.
@@ -40,8 +60,35 @@ include_dir = { version = "0.7" }
 # does host routing, static serving, and — in the DMZ deployment of the very
 # same crate — proxying. One binary either way.
 web = { path = "../web" }
+# The conversation substrate — characters are durable artifacts in its redo log
+# (`RecordType::Npc`), so one outlives the process that made it.
+#
+# This is what makes npcd a CUDA build: the crate declares itself CUDA-only and
+# forces `candle` into cuda mode with no feature to turn it off, so linking it
+# takes the daemon from a ~30s build to ~23min. Accepted deliberately — npcd
+# links the engine eventually anyway, and the alternative was a second store
+# that would have to be migrated into this one later.
+#
+# Note it costs no CUDA *context*: the log machinery (`record`, `walker`,
+# `segmented_log`) touches no `Device`, so npcd reads and writes characters
+# without a GPU. Only the link needs the toolchain.
+candle-conversation = { path = "../candle-conversation" }
+# Real card and host numbers for `/v1/telemetry`, which otherwise had to invent
+# them. NVML is what `nvidia-smi` itself reads: a runtime link against the
+# installed driver, so it costs no CUDA toolkit build — pulling in `candle` for
+# this would have turned a thirty-second daemon build into a twenty-minute one
+# in order to report how much VRAM is free. An absent driver, an absent card,
+# and a machine with no NVIDIA hardware are ordinary answers here, not failures.
+nvml-wrapper = "0.12"
+# Host memory, and this process's own footprint. Pinned to the version already
+# in the workspace lockfile so npcd does not drag a second copy in.
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 
 [dev-dependencies]
+# `test-util` (not in `full`) for the paused clock. The telemetry sampler ticks
+# every 2s, so proving it runs unattended would otherwise mean a test that
+# genuinely sleeps for eight seconds.
+tokio = { version = "1", features = ["full", "test-util"] }
 # For forging a token in the identity tests — proving a tampered payload is
 # rejected requires assembling one by hand.
 base64 = { workspace = true }

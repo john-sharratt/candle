@@ -94,6 +94,27 @@ pub(crate) enum WriteJob {
         stream_id: StreamId,
         payload: Vec<u8>,
     },
+    /// A turn's projection-event trajectory (`ProjectionEvents` record,
+    /// last-writer-wins per stream). The in-RAM blob is mirrored synchronously
+    /// by the enqueuer; this appends only the durable copy.
+    ProjectionEvents {
+        stream_id: StreamId,
+        payload: Vec<u8>,
+    },
+    /// A pre-encoded conversation-metadata record — `Label` (the full ConvMeta:
+    /// conv_id + label + custom bag) or `ConvState` (the archived flag). Both
+    /// are small, last-writer-wins on replay, and need no index registration
+    /// after the append, so one job kind carries either.
+    ///
+    /// The payload is encoded by the enqueuer, which is the point: these used to
+    /// be written by taking the persistence mutex on the calling thread and
+    /// encoding inside it. Every conversation created or archived therefore
+    /// serialised against the writer and against a compaction holding that mutex
+    /// across its relocation I/O.
+    ConvMeta {
+        record: RecordType,
+        payload: Vec<u8>,
+    },
     /// Drain everything queued, fsync, ack, and stop the thread.
     Shutdown(Sender<()>),
 }
@@ -104,6 +125,8 @@ impl WriteJob {
             WriteJob::StreamDecl { payload, .. } => payload.len() as u64,
             WriteJob::Tokens { token_ids, .. } => (token_ids.len() * 4) as u64,
             WriteJob::WideQSigs { payload, .. } => payload.len() as u64,
+            WriteJob::ProjectionEvents { payload, .. } => payload.len() as u64,
+            WriteJob::ConvMeta { payload, .. } => payload.len() as u64,
             WriteJob::Snapshot { payload, .. } => payload.len() as u64,
             WriteJob::BranchCheckpoint { payload, .. } => payload.len() as u64,
             WriteJob::KvCold { grid, .. } => grid.bytes() as u64,
@@ -319,6 +342,26 @@ fn process_one(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
                     "wide-Q sigs append failed: {e}"
+                );
+            }
+        }
+        WriteJob::ProjectionEvents { stream_id, payload } => {
+            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = p.append_projection_events(stream_id, &payload) {
+                tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    stream_id = stream_id.0,
+                    "projection events append failed: {e}"
+                );
+            }
+        }
+        WriteJob::ConvMeta { record, payload } => {
+            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = p.append_record(record, 0, 0, 0, 0, 0, &payload) {
+                tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    ?record,
+                    "conversation metadata append failed: {e}"
                 );
             }
         }

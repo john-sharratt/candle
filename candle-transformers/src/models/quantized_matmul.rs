@@ -344,8 +344,18 @@ impl QMatMul {
         use candle::quantized::cuda::DynamicTensor;
         // Float activation → the ordinary path (handles Off gemx and any non-int8 weight). It tags
         // its own profile bucket, so don't double-record here.
+        //
+        // `out_dtype` is honoured here as well as on the int8 arm. It used to be
+        // dropped, so a Float operand silently produced the ACTIVATION's width
+        // whatever the caller asked for — which is invisible while the two
+        // agree, and is exactly the case the attention out-projection is not:
+        // it consumes a context at the KV arena's width and must store the
+        // residual stream's. Honouring it costs nothing (see `forward_live_as`:
+        // the kernel accumulates in F32 and the width only selects which store
+        // variant runs), where the alternative is a full-tensor conversion per
+        // layer per wave.
         if let DynamicTensor::Float(t) = input {
-            return self.forward_live(t);
+            return self.forward_live_as(t, out_dtype);
         }
         // Int8 (pre-quantized) activation × KO weight, stored at the compute dtype.
         let t_mm = profile_now();

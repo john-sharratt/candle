@@ -112,6 +112,10 @@ pub mod mobileone;
 pub mod modernbert;
 pub mod moondream;
 pub mod mpt;
+/// Same-pass checkpoints that capture and panic at the first corruption —
+/// `tensor-assert` only.
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+pub mod nan_capture;
 pub mod nvembed_v2;
 pub mod olmo;
 pub mod olmo2;

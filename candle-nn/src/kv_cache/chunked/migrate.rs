@@ -249,6 +249,24 @@ pub fn kv_migrate_on(
             std::ptr::null::<i64>(),
         ),
     };
+    // Every destination this launch will write, checked against memory declared
+    // immutable after load.
+    //
+    // This kernel is plan-driven: it writes `byte_len` bytes at `dst_ptr` for
+    // each record, with no bound of its own. A destination computed from the
+    // wrong arena base or the wrong slot index writes a contiguous block
+    // wherever it lands — and the weight zone shares one reservation with the
+    // KV arena, separated only by `weight_floor`, so "wherever" includes expert
+    // weights. Host-side, before the launch, so the offender is named instead
+    // of the victim being discovered several layers downstream.
+    #[cfg(feature = "tensor-assert")]
+    for r in &plan.records {
+        candle::readonly_regions::forbid_write(
+            "run_kv_migrate_copy destination",
+            r.dst_ptr as u64,
+            r.byte_len.max(0) as usize,
+        );
+    }
     unsafe {
         candle::set_kernel_breadcrumb("run_kv_migrate_copy", file!(), line!());
         kernels::simple::kv_migrate::run_kv_migrate_copy(

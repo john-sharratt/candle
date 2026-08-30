@@ -59,13 +59,64 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// batch. Sustaining four or more ready sequences takes roughly twice that many
 /// open conversations, since each spends part of its chain decoding.
 ///
-/// 24 matches the scheduler's own `MAX_PREFILL_WIDTH` ceiling, so the pool never
-/// asks for more concurrency than a wave can carry, and sits below `code_read`'s
-/// effective 48 (12 file workers × 4 forked scopes). The trade is VRAM: every
-/// admitted conversation pins its K/V, which feeds the same pressure that caps
-/// prefill — so on a tight card the useful width is bounded by eviction churn
-/// rather than by this constant.
-pub const REPO_MAP_PARALLELISM: usize = 24;
+/// **This is a ceiling on [`scan_width`], not the width itself.** The live value
+/// is derived from the card; this only stops that derivation running away. It
+/// was previously 24, matched to the scheduler's `MAX_PREFILL_WIDTH` on the
+/// reasoning that the pool should never ask for more concurrency than a wave can
+/// carry — but that ceiling is a *prefill* backstop, and it was sizing the pool
+/// for the wrong phase.
+///
+/// Measured over a full workspace ingest (Qwen3.6-35B-A3B, 201 waves): decode is
+/// **61% of the phase's wall time against prefill's 24%**, and decode has no
+/// width cap of its own. At a pool of 24 both phases averaged only ~9 wide
+/// (max 23) — roughly a third of workers in a forward at any instant, since each
+/// unit's chain is two prefills then a decode. Prefill is capped at 24 per wave
+/// regardless, so workers beyond that queue for prefill but still add to decode
+/// width, which is the phase that dominates.
+///
+/// Decode throughput is width-bound, not depth-bound: banding the same waves by
+/// width gives 35 t/s at 1.2 sequences, 124 at 8.7, and 429 at 18.4, while
+/// per-forward time FALLS from 338 ms to 43 ms — the MoE expert-weight load
+/// amortising across the batch, exactly as the prefill note above describes.
+///
+/// **96 is a measured optimum, not a headroom guess.** Swept on a 72 GB card
+/// (RTX PRO 5000, governor capacity 70.7 GB), whole-workspace ingest, decode
+/// rate measured against forward time:
+///
+/// | ceiling | decode t/s | decode width | ingest phase |
+/// |--------:|-----------:|-------------:|-------------:|
+/// |      24 |      122.3 |          8.6 |        563 s |
+/// |      64 |      240.2 |         32.6 |        453 s |
+/// |  **96** |  **288.4** |     **56.2** |    **446 s** |
+/// |     128 |      265.2 |         28.4 |        468 s |
+///
+/// 128 REGRESSES: the achieved width collapses to 28 because the extra workers
+/// contend for admission rather than adding concurrency, so more of them sit
+/// blocked than decoding. Past the knee, raising this number costs throughput.
+///
+/// The trade is still VRAM: every admitted conversation pins its K/V, so on a
+/// tight card the useful width is bounded by eviction churn — and by the
+/// warm-tier drain, which an over-wide ingest can outrun.
+///
+/// **Caveat worth knowing before changing this.** [`scan_width`]'s per-conversation
+/// costing is meant to be the real governor, with this constant only a backstop.
+/// On the 72 GB card it has never bound: the pool logged `n_workers == ceiling`
+/// at every value swept above (24, 64, 96, 128), so the ceiling — not the
+/// memory estimate — is what actually limits width here, and the 128 regression
+/// was found by throughput rather than refused by the costing. On a smaller card
+/// the estimate does bind and picks the width; on a large one, treat this
+/// constant as the live limit.
+pub const REPO_MAP_PARALLELISM: usize = 96;
+
+/// Width used when the card can say NOTHING — neither the memory report nor the
+/// governor is available, which is the normal state at scan start.
+///
+/// Deliberately not [`REPO_MAP_PARALLELISM`]: that is a measured ceiling for a
+/// 72 GB card, and using it as the blind default would open 96 conversations on
+/// a 16 GB one. This is the pre-tuning value, which ran without a single
+/// transient-tier failure on every card in the fleet; the runtime gate widens
+/// from here once the governor reports.
+const REPO_MAP_BLIND_PARALLELISM: usize = 24;
 
 /// Longest a worker will wait for VRAM before claiming its unit anyway.
 ///
@@ -673,9 +724,17 @@ fn run_dir_pool(
         // conversations were already open. Deciding the width once, up front,
         // removes the race entirely; the runtime gate then handles drift as
         // directories vary in size.
+        // The fallback is the BLIND width, taken when neither the memory report
+        // nor the governor can say anything — which the call site above notes is
+        // normal at scan start. It must NOT be `REPO_MAP_PARALLELISM`: that
+        // constant is a measured ceiling for a 72 GB card, and defaulting to it
+        // would open 96 conversations on any card with zero memory input.
+        // Over-subscription there is not a slowdown — the wave's transient tier
+        // fails and the ingest aborts, losing files (see the table on
+        // `MAX_SCOPE_LINES`). Start conservative and let the runtime gate widen.
         let n_workers = max_live_conversations()
             .or_else(scan_width_from_governor)
-            .unwrap_or(REPO_MAP_PARALLELISM);
+            .unwrap_or(REPO_MAP_BLIND_PARALLELISM);
         tracing::info!(
             target: "zend::repo_scan",
             n_workers,

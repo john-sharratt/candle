@@ -28,7 +28,7 @@ Before the mechanism, the shape. An NPC is four things stacked around a single a
 
 At the centre is **the gather**: each time the NPC thinks, provenance selection pulls the currently-relevant blocks from its layers into a bounded working set, the model attends over them, and the result fans out as acts and as new entries written back to the layers. This is the only place cognition happens. It runs as one **asynchronous loop** — events arrive in an inbox, the loop drains them, gathers, decodes one step, fans out, and waits for more. Conversation pace and world pace are decoupled because the loop ticks at the world's tempo while talking happens only when the act layer chooses to.
 
-Around that centre sit the other three things. **Below** is the immutable core: world knowledge and the archetype, a read-only shared prefix that is never changed and never gathered, the fixed lens at the base of the attention stack — it is the system prompt, the lowest tokens everything else is read against. **Above it** are the mutable conversation-layers, the substrate of the mind — perception, action, agency, relationships, beliefs, memory — each an append-only stream that drifts under selection. **Above those** is the Cortex: the heart of the mind, the thing that gathers across the layers, attends, decides, and acts. **On top** is the interaction layer, the surface between the mind and an operator. It does not fabricate the NPC's output — the words are always narrated from real acts — but it is not inert either: downward it *injects events* (an operator speaking becomes an event in the inbox), upward it *observes acts and narrates them*. Inject down, narrate up, never fabricate.
+Around that centre sit the other three things. **Below** is the immutable core: world knowledge and the personality, a read-only shared prefix that is never changed and never gathered, the fixed lens at the base of the attention stack — it is the system prompt, the lowest tokens everything else is read against. **Above it** are the mutable conversation-layers, the substrate of the mind — perception, action, agency, relationships, beliefs, memory — each an append-only stream that drifts under selection. **Above those** is the Cortex: the heart of the mind, the thing that gathers across the layers, attends, decides, and acts. **On top** is the interaction layer, the surface between the mind and an operator. It does not fabricate the NPC's output — the words are always narrated from real acts — but it is not inert either: downward it *injects events* (an operator speaking becomes an event in the inbox), upward it *observes acts and narrates them*. Inject down, narrate up, never fabricate.
 
 The naming is deliberate. The Cortex sits over the deeper structures, reads across all of them at once, and integrates them into a single response — which is exactly what a cortex does over subcortical material. The layers below are the standing dispositions, drives, and memory; the Cortex is the sheet that gathers across them and acts. Two kinds of thing touch the Cortex without being layers in it: **modulation parameters** (affect, threat, curiosity) bias its selection without contributing content, and a **monitor** (metacognition) watches its health from outside without participating.
 
@@ -60,7 +60,7 @@ The attention stack runs bottom to top — immutable core at the base, substrate
                        read through ▲  ▼ the lens
                   ┌────────────────────────────────────────────────┐
                   │  IMMUTABLE CORE — the lens (system prompt)     │
-                  │  world + archetype · read-only · CoW           │
+                  │  world + personality · read-only · CoW         │
                   │  never gathered · the base of the attention    │
                   │  stack — everything is read upward through it  │
                   └────────────────────────────────────────────────┘
@@ -88,15 +88,15 @@ What the two directions agree on, after the sorting in Part III that strips out 
 
 The deepest structural decision is the split between an **immutable core** and a **mutable lived substrate** — and the recognition that this split is the *same fact* as the copy-on-write sharing model, seen from the identity side rather than the memory side.
 
-The world knowledge and the archetype — core identity (values), voice (expression rules), and behavioral model (processing rules) — are a copy-on-write KV prefix shared by the world (all NPCs) and the archetype (~300 NPCs per type). Because that prefix is physically shared and read-only, it **cannot drift** — not because a rule forbids mutation, but because mutation would break the sharing. The identity guarantee the long-horizon vision needs, that an NPC is still recognisably *itself* after a year of play, is therefore free from the VRAM economy already adopted for cost. One mechanism, two payoffs: the shared archetype is cheap, and it is a hard identity floor that no accumulation of experience can erode.
+The world knowledge and the personality — core identity (values), voice (expression rules), and behavioral model (processing rules) — are a copy-on-write KV prefix shared by the world (all NPCs) and the personality (~300 NPCs per type). Because that prefix is physically shared and read-only, it **cannot drift** — not because a rule forbids mutation, but because mutation would break the sharing. The identity guarantee the long-horizon vision needs, that an NPC is still recognisably *itself* after a year of play, is therefore free from the VRAM economy already adopted for cost. One mechanism, two payoffs: the shared personality is cheap, and it is a hard identity floor that no accumulation of experience can erode.
 
 This resolves the tension between "everything is mutable substrate that selection governs" and "the core must hold." Both are right, about different layers, and the boundary between them is exactly the CoW boundary: **layers that are shared read-only are the layers that cannot be nudged and constitute identity; layers that are per-NPC and writable are the layers selection governs and constitute lived depth.**
 
 ### The core is a lens, not a store of conclusions
 
-The immutable core is not inert, and it stores no conclusions. It stores the value hierarchy and the behavioral processing model — the function that *weights what the mutable layers surface*. Experience is the input; the archetype is the processing.
+The immutable core is not inert, and it stores no conclusions. It stores the value hierarchy and the behavioral processing model — the function that *weights what the mutable layers surface*. Experience is the input; the personality is the processing.
 
-A betrayal lands in the relationship layer, which is mutable and drifts and accumulates. Whether it reads as "the unforgivable act" or "a cost of doing business" is the archetype doing the weighting, and that weighting never changes. A Loyal Soldier can lose faith in *this specific chain of command* without ceasing to be someone for whom betrayal is axiomatic: the belief about the commander drifted; the function that evaluates betrayal did not. The mutable layers change what the NPC knows and feels; the fixed core changes what those facts and feelings *mean to this person*. Depth comes from the layers; identity comes from the lens; and they cannot contaminate each other, because one is writable substrate and the other is read-only prefix.
+A betrayal lands in the relationship layer, which is mutable and drifts and accumulates. Whether it reads as "the unforgivable act" or "a cost of doing business" is the personality doing the weighting, and that weighting never changes. A Loyal Soldier can lose faith in *this specific chain of command* without ceasing to be someone for whom betrayal is axiomatic: the belief about the commander drifted; the function that evaluates betrayal did not. The mutable layers change what the NPC knows and feels; the fixed core changes what those facts and feelings *mean to this person*. Depth comes from the layers; identity comes from the lens; and they cannot contaminate each other, because one is writable substrate and the other is read-only prefix.
 
 ### The sorting razor
 
@@ -114,9 +114,9 @@ This gives a precise test for what belongs where, and it is the razor that separ
 
 ### The lens is always-on, and never competes for budget
 
-A fixed core that failed to be gathered on a given tick would weight nothing — immutability is not presence. The hazard is that a strong signal (a rage) could win the whole working-set budget and crowd the archetype out, leaving the NPC acting on raw feeling with no lens.
+A fixed core that failed to be gathered on a given tick would weight nothing — immutability is not presence. The hazard is that a strong signal (a rage) could win the whole working-set budget and crowd the personality out, leaving the NPC acting on raw feeling with no lens.
 
-The resolution requires no authored salience floor: because the archetype is the CoW prefix, **it does not compete for the gather budget at all.** It is structurally always resident — the fixed lens at the base of every assembly, not something selection chooses to include. Identity is not *in* the working set; it is the frame the working set is read *inside*. So what stops a rage from crowding out the soldier is that the rage competes for the *memory* budget, while the soldier was never in that budget — he is the prefix the rage is read through. An NPC in a rage is a Loyal Soldier raging, not a generic rage.
+The resolution requires no authored salience floor: because the personality is the CoW prefix, **it does not compete for the gather budget at all.** It is structurally always resident — the fixed lens at the base of every assembly, not something selection chooses to include. Identity is not *in* the working set; it is the frame the working set is read *inside*. So what stops a rage from crowding out the soldier is that the rage competes for the *memory* budget, while the soldier was never in that budget — he is the prefix the rage is read through. An NPC in a rage is a Loyal Soldier raging, not a generic rage.
 
 ---
 
@@ -174,7 +174,7 @@ selection        │  │BELIEFS                │ │MEMORY                 �
                  ┌──────────────────────────────────────────────────────┐
 IMMUTABLE        │  WORLD       geo · rules    CoW·1·all NPCs           │
                  ├──────────────────────────────────────────────────────┤
-CORE             │  ARCHETYPE   identity ·     CoW·1/type·~300          │
+CORE             │  PERSONALITY identity ·     CoW·1/type·~300          │
 the lens,        │              voice · model       READ-ONLY           │
                  └──────────────────────────────────────────────────────┘
                    surfaced per turn as the SYSTEM-PROMPT view (§II):
@@ -211,7 +211,7 @@ Beliefs are the one conversation-layer that does not behave like the others, and
 
 ### Why fade is the wrong mechanism for a premise
 
-Everything mutable fades by non-selection: a relationship nothing reinforces stops being gathered, a mood nothing feeds thins out. That is correct for feelings and conclusions, but it is exactly wrong for a *premise*. "Hess is a man of his word" is not a value like "betrayal is unforgivable" (that is immutable archetype) and it is not a drifting feeling (that is mood). It is something the NPC holds *true*, reasons *from*, and — crucially — should not be able to **talk itself out of under pressure.** Fade gives an NPC the worst failure mode of current agents: the test fails, so it concludes the test is wrong; the world contradicts the plan, so it concludes the world must be mistaken. A premise that erodes the moment attention drifts elsewhere is a premise the NPC can rationalise away whenever it is inconvenient — which is not conviction, it is convenience wearing conviction's clothes.
+Everything mutable fades by non-selection: a relationship nothing reinforces stops being gathered, a mood nothing feeds thins out. That is correct for feelings and conclusions, but it is exactly wrong for a *premise*. "Hess is a man of his word" is not a value like "betrayal is unforgivable" (that is immutable personality) and it is not a drifting feeling (that is mood). It is something the NPC holds *true*, reasons *from*, and — crucially — should not be able to **talk itself out of under pressure.** Fade gives an NPC the worst failure mode of current agents: the test fails, so it concludes the test is wrong; the world contradicts the plan, so it concludes the world must be mistaken. A premise that erodes the moment attention drifts elsewhere is a premise the NPC can rationalise away whenever it is inconvenient — which is not conviction, it is convenience wearing conviction's clothes.
 
 ### The mechanic: readable by action, writable only by evidence
 
@@ -486,7 +486,7 @@ The one question with teeth over a long-lived character is whether the sleep fol
 
 A mind without expression is invisible, and the difference between "impressively intelligent when you talk to it" and "I believe this NPC is alive" is the set of output channels that bridge internal state to visible behaviour. None of them is a triggered slot with an activation predicate. Each is an emergent consequence of the gather.
 
-Initiation — the NPC speaking first — is the NPC ticking on the event of a player entering its square, and whether it speaks first is whether a concern block wins the gather and outranks silence, with the resulting `speak` call narrated by the interaction layer; salience decay, having already voiced a concern, is non-selection rather than a state transition. Autonomous action is the action layer's decode fanning out world-acts through the arbiter, with the archetype lens biasing execution because the lens is the prefix every action is read through — a Paranoid Survivor scouts escape routes first not because a rule says so but because that disposition is in the lens the action is decoded through. Involuntary state is the distilled projection off gathered mood and conflict, published to the animation channel — a projection, not a lookup table. Curiosity is a low-confidence belief block, provenance-adjacent to the current exchange, out-competing assertion so the action layer calls `speak` with a question rather than an assertion — the NPC asks because the gap won the gather. Mind-changing is accumulated contradicting evidence — which always lands, never filtered at emission — reinforcing its cluster until it out-competes a prior resolution at the next dream tick, so the NPC's position shifts because selection shifted, not because a re-evaluation trigger fired.
+Initiation — the NPC speaking first — is the NPC ticking on the event of a player entering its square, and whether it speaks first is whether a concern block wins the gather and outranks silence, with the resulting `speak` call narrated by the interaction layer; salience decay, having already voiced a concern, is non-selection rather than a state transition. Autonomous action is the action layer's decode fanning out world-acts through the arbiter, with the personality lens biasing execution because the lens is the prefix every action is read through — a Paranoid Survivor scouts escape routes first not because a rule says so but because that disposition is in the lens the action is decoded through. Involuntary state is the distilled projection off gathered mood and conflict, published to the animation channel — a projection, not a lookup table. Curiosity is a low-confidence belief block, provenance-adjacent to the current exchange, out-competing assertion so the action layer calls `speak` with a question rather than an assertion — the NPC asks because the gap won the gather. Mind-changing is accumulated contradicting evidence — which always lands, never filtered at emission — reinforcing its cluster until it out-competes a prior resolution at the next dream tick, so the NPC's position shifts because selection shifted, not because a re-evaluation trigger fired.
 
 The common thread is that the behaviours are readings of one substrate, not modules bolted to it — which is the mark of the architecture being right. A procedural design describes these behaviours and then hard-codes a trigger for each; this architecture derives all of them from the single mechanism.
 
@@ -549,32 +549,32 @@ The discipline is that these must stay in the expressive band and remain recover
 
 ## Part XI — Propagating back: individual, collective, individual
 
-The learning loop is bidirectional, and the immutable-core decision is what keeps it simple. The hard constraint is that **the archetype core — values, voice, processing model — never propagates back, because it is immutable.** What propagates is the one part of the shared layer always designed to evolve: strategic doctrine. The individual's lived substrate stays local and never aggregates.
+The learning loop is bidirectional, and the immutable-core decision is what keeps it simple. The hard constraint is that **the personality core — values, voice, processing model — never propagates back, because it is immutable.** What propagates is the one part of the shared layer always designed to evolve: strategic doctrine. The individual's lived substrate stays local and never aggregates.
 
 ```
    PLAYER ── assigns novel mission ──▶ NPC (individual)
                                          │ executes through:
-                                         │   immutable archetype lens   (fixed)
+                                         │   immutable personality lens   (fixed)
                                          │ + personal lived substrate    (mutable, local)
                                          ▼
                                   outcome → MEMORY (strategic-learning block, local)
                                          │  sync learning upward
                                          ▼
                                   CORE SERVER  (aggregates, runs no AI)
-                                  counts outcomes across all NPCs of this archetype
+                                  counts outcomes across all NPCs of this personality
                                          │  statistical significance reached
                                          ▼
-                                  ARCHETYPE DOCTRINE updated worldwide
+                                  PERSONALITY DOCTRINE updated worldwide
                                   (the one evolving part of the shared layer)
                                          │  published to every node
                                          ▼
-                                  all NPCs of this archetype see new doctrine
+                                  all NPCs of this personality see new doctrine
                                   at next spawn / fork refresh
 ```
 
-Three things share that diagram and behave differently. Identity — what a Loyal Soldier *is* — is shared and fixed forever. Doctrine — how a Loyal Soldier *fights*, flanking ratios and crossing tactics — is shared and evolving, the part of the archetype explicitly marked mutable. Lived experience — this NPC's relationships, beliefs, grudges, and memories — is individual and evolving and never aggregates, and is what makes one NPC differ from another despite identical archetype and identical doctrine. The individual feeds the collective only through doctrine; the collective feeds new individuals through both fixed identity and current doctrine; the individual's lived depth stays its own.
+Three things share that diagram and behave differently. Identity — what a Loyal Soldier *is* — is shared and fixed forever. Doctrine — how a Loyal Soldier *fights*, flanking ratios and crossing tactics — is shared and evolving, the part of the personality explicitly marked mutable. Lived experience — this NPC's relationships, beliefs, grudges, and memories — is individual and evolving and never aggregates, and is what makes one NPC differ from another despite identical personality and identical doctrine. The individual feeds the collective only through doctrine; the collective feeds new individuals through both fixed identity and current doctrine; the individual's lived depth stays its own.
 
-Because the propagating quantity is doctrine only, the core server aggregates rather than computes cognition: it collects strategic-learning entries, computes statistical significance, and publishes doctrine updates over one authoritative channel. Intelligence is distributed — every player's idle GPU processes NPC lives from the global queue — while coordination is centralised. More players means more idle compute means smarter NPCs at zero marginal cost. A personal learning is promoted when it clears a significance threshold across enough NPCs of the same archetype; promotion copies the generalisable tactic into the mutable doctrine sub-layer, version-bumped, while the lived experience of discovering it stays in the originating NPC's local substrate. The immutable-core decision is precisely what lets propagation be a counting problem rather than a model merge.
+Because the propagating quantity is doctrine only, the core server aggregates rather than computes cognition: it collects strategic-learning entries, computes statistical significance, and publishes doctrine updates over one authoritative channel. Intelligence is distributed — every player's idle GPU processes NPC lives from the global queue — while coordination is centralised. More players means more idle compute means smarter NPCs at zero marginal cost. A personal learning is promoted when it clears a significance threshold across enough NPCs of the same personality; promotion copies the generalisable tactic into the mutable doctrine sub-layer, version-bumped, while the lived experience of discovering it stays in the originating NPC's local substrate. The immutable-core decision is precisely what lets propagation be a counting problem rather than a model merge.
 
 ---
 

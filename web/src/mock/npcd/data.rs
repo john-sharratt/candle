@@ -44,7 +44,11 @@ pub fn user() -> Value {
             "turn_index": 7,
             "revision": 3
         },
-        "npc_count": 6,
+        // Deliberately no `npc_count`. §8.3: hidden characters are never
+        // enumerated or counted, and a total of everything an author owns is
+        // the one figure that gives them away — subtract it from the roster in
+        // front of you. A field here would look like a contract waiting to be
+        // honoured, and the honouring would count everything.
         "created_ms": now_ms() - 86_400_000 * 40
     })
 }
@@ -85,12 +89,9 @@ fn npc(r: Row<'_>) -> Value {
     json!({
         "npc_id": id,
         "name": name,
-        "world_id": "1",
-        "archetype_id": arch,
-        "archetype_name": match arch {
-            "1" => "Loyal Soldier", "2" => "Merchant",
-            "3" => "Commander", "4" => "Gardener", _ => "Drifter"
-        },
+        "world_id": "ardh",
+        "personality_id": arch,
+        "personality_name": personality_name(arch),
         "state": state,
         "tick": {
             "heartbeat_ms": heartbeat,
@@ -117,7 +118,7 @@ pub fn npcs() -> Vec<Value> {
         npc(Row {
             id: "10237749914772934281",
             name: "Varek",
-            arch: "1",
+            arch: "loyal-soldier",
             state: "active",
             pending: 3,
             band: "healthy",
@@ -133,7 +134,7 @@ pub fn npcs() -> Vec<Value> {
         npc(Row {
             id: "10237749914772934282",
             name: "Ilse",
-            arch: "2",
+            arch: "merchant",
             state: "active",
             pending: 0,
             band: "healthy",
@@ -148,7 +149,7 @@ pub fn npcs() -> Vec<Value> {
         npc(Row {
             id: "10237749914772934283",
             name: "Hess",
-            arch: "3",
+            arch: "commander",
             state: "ticking",
             pending: 11,
             band: "fixated",
@@ -162,7 +163,7 @@ pub fn npcs() -> Vec<Value> {
         npc(Row {
             id: "10237749914772934284",
             name: "Bramble",
-            arch: "4",
+            arch: "gardener",
             state: "asleep",
             pending: 0,
             band: "healthy",
@@ -177,7 +178,7 @@ pub fn npcs() -> Vec<Value> {
         npc(Row {
             id: "10237749914772934285",
             name: "Sable",
-            arch: "5",
+            arch: "drifter",
             state: "idle",
             pending: 0,
             band: "healthy",
@@ -191,7 +192,7 @@ pub fn npcs() -> Vec<Value> {
         npc(Row {
             id: "10237749914772934286",
             name: "Toll-keeper",
-            arch: "5",
+            arch: "drifter",
             state: "suspended",
             pending: 0,
             band: "healthy",
@@ -205,9 +206,23 @@ pub fn npcs() -> Vec<Value> {
     ]
 }
 
+/// Ids here are slugs because that is what a reference IS — the name of the
+/// file the document lives in. The fixture used numbered rows; a console that
+/// works against `world_id: "1"` and then meets `battle-cities` is a console
+/// that was tested against a shape the daemon never serves.
+fn personality_name(id: &str) -> &'static str {
+    match id {
+        "loyal-soldier" => "Loyal Soldier",
+        "merchant" => "Merchant",
+        "commander" => "Commander",
+        "gardener" => "Gardener",
+        _ => "Drifter",
+    }
+}
+
 pub fn worlds() -> Vec<Value> {
     vec![json!({
-        "world_id": "1",
+        "world_id": "ardh",
         "name": "Ardh",
         "public": false,
         "setting": "A kingdom of hill villages on a northern frontier, three years after a war \
@@ -220,43 +235,45 @@ pub fn worlds() -> Vec<Value> {
     })]
 }
 
-pub fn archetypes() -> Vec<Value> {
+pub fn personalities() -> Vec<Value> {
     [
         (
-            "1",
-            "Loyal Soldier",
+            "loyal-soldier",
             "Betrayal is unforgivable. Orders are a contract, not a request.",
             3,
         ),
         (
-            "2",
-            "Merchant",
+            "merchant",
             "Every exchange is a relationship. Price is memory made numeric.",
             1,
         ),
         (
-            "3",
-            "Commander",
+            "commander",
             "Position is read before people are. Loyalty is assessed, not assumed.",
             1,
         ),
         (
-            "4",
-            "Gardener",
+            "gardener",
             "Things grow at their own rate. Patience is not passivity.",
             1,
         ),
-        (
-            "5",
-            "Drifter",
-            "Attachment is a cost. Observation is free.",
-            2,
-        ),
+        ("drifter", "Attachment is a cost. Observation is free.", 2),
     ]
     .iter()
-    .map(|(id, name, core, n)| {
+    .map(|(id, anchor, n)| {
         json!({
-            "archetype_id": id, "name": name, "core_identity": core,
+            "personality_id": id, "name": personality_name(id),
+            // `anchor`, matching `personalities/<id>.yaml`. It was
+            // `core_identity`, a second name for the same field that only ever
+            // appeared on the wire.
+            "anchor": anchor,
+            "personality": {
+                "voice": "Short sentences. Rank and role before names. Silence rather than a guess.",
+                "processing": "Weight direct observation over second-hand intel. Distrust a plan \
+                               with no named fallback.",
+                "under_pressure": "Get narrower, not louder. Reduce the problem until one action \
+                                   is obviously next.",
+            },
             "npc_count": n, "doctrine_version": 4,
             "doctrine": "Flank at 2:1 or not at all. Cross open ground only with a fallback named."
         })
@@ -584,14 +601,76 @@ pub fn status() -> Value {
     })
 }
 
+/// A synthetic half-hour in the column shape `npcd::telemetry` serves.
+///
+/// The real daemon answers this route itself, so this fixture is only reached
+/// when the console is served without one behind it. It still has to speak the
+/// current shape: a fixture that has drifted from the contract renders a broken
+/// page, which is a worse failure than an obviously fake one.
 pub fn telemetry() -> Value {
+    const N: usize = 900;
+    const PERIOD: f64 = 2.0;
+    let wave = |i: usize, a: f64, b: f64, f: f64| a + b * ((i as f64) / f).sin();
+
+    let t: Vec<f64> = (0..N).map(|i| i as f64 * PERIOD).collect();
+    let used: Vec<f64> = (0..N)
+        .map(|i| wave(i, 9_000.0, 1_800.0, 90.0).round())
+        .collect();
+    let free: Vec<f64> = used.iter().map(|u| 24_576.0 - u).collect();
+    let image: Vec<f64> = (0..N)
+        .map(|i| if i % 130 < 40 { 640.0 } else { 0.0 })
+        .collect();
+    let col = |f: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..N).map(f).collect() };
+
     json!({
-        "vram": { "total_mib": 24_576, "used_mib": 1_876, "free_mib": 22_451,
-                  "weights_mib": 0, "kv_mib": 0, "image_mib": 0 },
-        "gpu": { "name": "mock device", "compute_cap": "—", "pcie_gen": 3, "pcie_width": 16 },
-        "ticks": { "per_sec": 0.4, "npcs_active": 3, "inbox_depth_p50": 1, "inbox_depth_p99": 11 },
-        "batch": { "mean_npcs_per_decode": 2.4, "max": 6 },
-        "image_queue": { "depth": 2, "state": "waiting_for_vram", "current": null },
-        "throughput": { "decode_tps": 0.0, "prefill_tps": 0.0 }
+        "gpu": { "name": "mock device", "compute_cap": "8.6", "pcie_gen": 3, "pcie_width": 16 },
+        "model": {
+            "name": "Qwen3-30B-A3B", "quant": "Q6_K",
+            "params_total": "30B", "params_active": "3B",
+            "repo": "unsloth/Qwen3-30B-A3B-GGUF",
+            "filename": "Qwen3-30B-A3B-Q6_K.gguf",
+            "bytes": 25_092_532_800_u64
+        },
+        "host": { "total_mib": 65_457, "free_mib": 41_000, "rss_mib": 820 },
+        "sample_period_s": PERIOD,
+        "engine_connected": true,
+        "image_queue_state": "waiting_for_vram",
+        "uptime_s": 4_820,
+        "series": {
+            "t": t,
+            "vram_total_mib": col(&|_| 24_576.0),
+            "vram_used_mib": used,
+            "vram_free_mib": free,
+            "host_total_mib": col(&|_| 65_457.0),
+            "host_used_mib": col(&|i| wave(i, 24_000.0, 2_600.0, 140.0).round()),
+            "rss_mib": col(&|_| 820.0),
+            "weights_mib": col(&|_| 5_400.0),
+            "kv_mib": col(&|i| wave(i, 2_200.0, 900.0, 70.0).round()),
+            "image_mib": image,
+            "decode_tps": col(&|i| wave(i, 430.0, 90.0, 55.0).round()),
+            "prefill_tps": col(&|i| wave(i, 1_100.0, 320.0, 33.0).round()),
+            "mean_npcs_per_decode": col(&|i| (wave(i, 3.1, 1.1, 61.0) * 10.0).round() / 10.0),
+            "max_batch": col(&|_| 6.0),
+            "npcs_active": col(&|i| wave(i, 7.0, 4.0, 77.0).round()),
+            "ticks_per_sec": col(&|i| (wave(i, 0.45, 0.2, 48.0) * 100.0).round() / 100.0),
+            "inbox_depth_p50": col(&|i| wave(i, 1.0, 2.0, 40.0).abs().round()),
+            "inbox_depth_p99": col(&|i| wave(i, 11.0, 9.0, 95.0).abs().round()),
+            "image_queue_depth": col(&|i| if i % 130 < 40 { 2.0 } else { 0.0 })
+        }
+    })
+}
+
+/// `GET /v1/memory` — the fixture counterpart of `npcd::telemetry::memory`.
+pub fn memory() -> Value {
+    const MIB: u64 = 1024 * 1024;
+    json!({
+        "report": null,
+        "report_age_ms": null,
+        "host_now": {
+            "total_bytes": 65_457 * MIB,
+            "available_bytes": 41_000 * MIB,
+            "free_bytes": 38_200 * MIB
+        },
+        "process": { "working_set_bytes": 820 * MIB, "virtual_bytes": 41_000 * MIB }
     })
 }

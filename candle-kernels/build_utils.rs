@@ -23,9 +23,10 @@ use std::path::{Path, PathBuf};
 // (`src/simple/quantized_dispatcher.cu` — the seal-time quantize/select
 // kernels — compiles in its own group under the bit-exact mirror contract
 // flags; see the `quantize_dispatch` group below.)
-const SIMPLE_KERNELS: [&str; 51] = [
+const SIMPLE_KERNELS: [&str; 52] = [
     "src/api.cu", // FFI wrapper functions for all simple kernels
     "src/simple/nvtx.cu",
+    "src/simple/tensor_assert.cu",
     "src/simple/corpus_gather.cu",
     // Kernel implementations
     "src/simple/add_at_indices.cu",
@@ -187,6 +188,31 @@ const PROVENANCE_KERNELS: [&str; 3] = [
 // Archive group definition and construction
 // ============================================================================
 
+/// The GPU architectures every kernel is compiled for — the whole fleet.
+///
+/// Ampere (sm_86, RTX 3090), Ada (sm_89, RTX 4090 Mobile) and Blackwell
+/// (sm_120, RTX PRO 5000 and the ordered 5090s). All three, always, because the
+/// framework has to work on all three and none of them is "the" target — so the
+/// list is the fleet, not whichever card the build happened to run on, and an
+/// archive built anywhere runs everywhere.
+///
+/// **This is the single source of truth.** It generates the `-gencode` flags
+/// below *and* the `BUILT_ARCHES` constant the runtime check reads, so the two
+/// cannot disagree about what was actually built. A new card is one entry here.
+///
+/// **An omission does not fail loudly — it returns zeros.** Because
+/// `code=sm_NN` emits SASS and no PTX, a card outside this list has no image to
+/// load and no JIT to fall back on. Every launch fails with
+/// `cudaErrorNoKernelImageForDevice`, and the launchers return `void`, so the
+/// error is never seen: the caller reads back the `alloc_zeros` buffer it
+/// passed in, and the whole KV data path — writes, migration, quantization,
+/// format selection — quietly produces zero. That reads as a numerical bug
+/// anywhere but here. sm_86 was missing once and cost 17 red tests in
+/// `candle-nn` and 5 in `candle-conversation`, not one of which named a kernel.
+/// `CudaDevice::validate_compute_capability` now refuses such a card at device
+/// creation instead.
+const KERNEL_ARCHES: [u32; 3] = [86, 89, 120];
+
 /// An archive group: a set of kernels compiled with the same flags, linked into one .a
 struct ArchiveGroup {
     name: String,
@@ -210,22 +236,25 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         "--expt-relaxed-constexpr".to_string(),
         "--expt-extended-lambda".to_string(),
         "--use_fast_math".to_string(),
-        // Target archs: native SASS for Ada (sm_89) and Blackwell (sm_120).
-        // These live in the shared compile args (rather than hardcoded at the
-        // nvcc call) so that changing the target arch invalidates the per-kernel
-        // and archive caches — otherwise stale cubins of the wrong arch get
-        // reused.
+        // One `-gencode` per entry in [`KERNEL_ARCHES`], appended below.
+        //
+        // They live in the shared compile args (rather than at the nvcc call)
+        // so that changing the list invalidates the per-kernel and archive
+        // caches — otherwise stale cubins of the wrong arch get reused, which
+        // fails exactly the way an omitted arch does.
         //
         // **SASS only — no embedded PTX.** `code=[sm_120,compute_120]` also
         // emitted compute_120 PTX so a future architecture could JIT from it.
-        // That fallback costs a third code image in every cubin and the ptxas
+        // That fallback costs another code image in every cubin and the ptxas
         // work to produce it, for a card that does not exist yet; when one
-        // arrives it gets its own `-gencode` line here, which is a better answer
-        // than shipping a JIT path nobody has ever run. Every GPU this targets
-        // today — Ada and Blackwell — loads native SASS.
-        "-gencode=arch=compute_89,code=sm_89".to_string(),
-        "-gencode=arch=compute_120,code=sm_120".to_string(),
+        // arrives it gets its own entry in `KERNEL_ARCHES`, which is a better
+        // answer than shipping a JIT path nobody has ever run.
     ];
+    base_args.extend(
+        KERNEL_ARCHES
+            .iter()
+            .map(|sm| format!("-gencode=arch=compute_{sm},code=sm_{sm}")),
+    );
 
     // **`kernel-lineinfo` — off unless a kernel is faulting and the address does
     // not say where.**
@@ -781,14 +810,16 @@ fn compile_kernel_nvcc(
     let out_obj = build_dir.join(format!("{}.o", kernel_name));
 
     let mut cmd = std::process::Command::new("nvcc");
+    with_host_compiler(&mut cmd);
     cmd.arg("-c")
         .arg(kernel_path)
         .arg("-o")
         .arg(&out_obj)
-        // Compile the gencode arches (sm_89 + sm_120) in parallel within this
-        // nvcc invocation — halves the per-kernel tail now that we emit two.
+        // Compile the gencode arches (sm_86 + sm_89 + sm_120) in parallel within
+        // this nvcc invocation, so the per-kernel tail is one arch long rather
+        // than the sum of all three.
         .arg("--threads")
-        .arg("2");
+        .arg("3");
 
     for arg in build_args {
         cmd.arg(arg);
@@ -1012,7 +1043,10 @@ fn create_archive(
     let lib_file = build_dir.join(format!("lib{}.a", lib_name));
 
     if is_msvc {
+        // Same directory as `cl.exe`, and the same problem: reachable from a
+        // Developer Command Prompt and from nowhere else.
         let mut cmd = std::process::Command::new("lib.exe");
+        with_host_compiler(&mut cmd);
         cmd.arg(format!("/OUT:{}", lib_file.display()));
         for obj in object_files {
             cmd.arg(obj);
@@ -1100,5 +1134,305 @@ fn detect_is_msvc() -> bool {
         target.contains("msvc")
     } else {
         cfg!(windows)
+    }
+}
+
+/// The MSVC toolset a directory name like `14.44.35207` denotes, as the
+/// `_MSC_VER` the compiler itself reports (`1944`).
+///
+/// `_MSC_VER` is the number CUDA's guard tests, and it tracks the toolset
+/// directory exactly: `_MSC_VER == 1900 + minor` for every toolset since 14.0
+/// (VS 2015 → 1900, VS 2017's 14.16 → 1916, 14.44 → 1944). A major other than
+/// 14 has no published mapping, so this reports `None` rather than guess one.
+#[cfg(any(windows, test))]
+fn toolset_msc_ver(dir_name: &str) -> Option<u32> {
+    let mut parts = dir_name.split('.');
+    if parts.next()? != "14" {
+        return None;
+    }
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some(1900 + minor)
+}
+
+/// The integer immediately following `marker` in `line`.
+#[cfg(any(windows, test))]
+fn number_after(line: &str, marker: &str) -> Option<u32> {
+    let rest = line.split_once(marker)?.1;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// The `[low, high)` range of `_MSC_VER` a CUDA toolkit accepts, read out of
+/// its own `crt/host_config.h`.
+///
+/// The header states the whole rule as one guard —
+/// `#if _MSC_VER < 1910 || _MSC_VER >= 1950` — so the bounds come from the
+/// toolkit that will actually run. Tracking them here instead would go stale
+/// the first time CUDA is upgraded, and be wrong in the direction that picks a
+/// compiler nvcc refuses.
+#[cfg(any(windows, test))]
+fn parse_msvc_range(header: &str) -> Option<(u32, u32)> {
+    for line in header.lines() {
+        if !line.trim_start().starts_with("#if ") {
+            continue;
+        }
+        let (Some(low), Some(high)) = (
+            number_after(line, "_MSC_VER < "),
+            number_after(line, "_MSC_VER >= "),
+        ) else {
+            continue;
+        };
+        return Some((low, high));
+    }
+    None
+}
+
+/// The `_MSC_VER` a `cl.exe` startup banner reports.
+///
+/// Run with no arguments, `cl.exe` prints
+/// `Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64` on
+/// **stderr**. Only the first two components matter: `19.44` is `_MSC_VER`
+/// 1944, matching toolset directory `14.44` — the third component is a build
+/// number that moves independently of both.
+#[cfg(any(windows, test))]
+fn parse_cl_banner(banner: &str) -> Option<u32> {
+    let mut parts = banner.split_once("Version ")?.1.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some(major * 100 + minor)
+}
+
+/// `host_config.h` belonging to the CUDA that will compile the kernels.
+///
+/// Located from the `nvcc` on `PATH`, because that is the one
+/// [`compile_kernel_nvcc`] spawns. `CUDA_PATH` can name a different install
+/// entirely — it is consulted only as a fallback, since answering with the
+/// wrong toolkit's limits is worse than not answering.
+#[cfg(windows)]
+fn cuda_host_config() -> Option<PathBuf> {
+    let on_path = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("nvcc.exe"))
+                .find(|nvcc| nvcc.is_file())
+        })
+        .unwrap_or_default()
+        .and_then(|nvcc| Some(nvcc.parent()?.parent()?.join(r"include\crt\host_config.h")));
+
+    on_path
+        .into_iter()
+        .chain(
+            std::env::var_os("CUDA_PATH")
+                .map(|root| PathBuf::from(root).join(r"include\crt\host_config.h")),
+        )
+        .find(|header| header.is_file())
+}
+
+/// The directory holding a `cl.exe` **this CUDA will accept**.
+///
+/// `nvcc` compiles device code but hands the host half to the platform
+/// compiler, which it locates **on `PATH`** — not through anything cargo sets
+/// up. So a build that links perfectly well still dies with
+/// `nvcc fatal : Cannot find compiler 'cl.exe' in PATH` in any shell that is
+/// not a Developer Command Prompt: an ordinary terminal, a CI step, an editor's
+/// integrated shell. The usual answer is "remember to open the right prompt",
+/// which is a requirement nobody can see and everybody forgets.
+///
+/// So the build finds it. `vswhere.exe` ships at a fixed location with every
+/// Visual Studio since 2017 and can report every installation carrying the C++
+/// toolset.
+///
+/// **Every** installation, and not `-latest`, because newest and *usable* are
+/// different questions. Each CUDA release names an upper bound on the host
+/// compiler it will build against, and a Visual Studio newer than that bound
+/// fails the check in `crt/host_config.h` before a single line of device code
+/// is read. A machine carrying both — VS 2026's 14.51 alongside VS 2022's
+/// 14.44, with CUDA accepting `_MSC_VER < 1950` — has a perfectly good
+/// compiler that `-latest` walks straight past. So the toolsets are ranked and
+/// the newest one inside CUDA's range wins.
+///
+/// Deliberately *not* solved by putting MSVC on the global `PATH`: that pins a
+/// toolset version machine-wide and puts Microsoft's `link.exe` ahead of every
+/// other `link` on the system, which is its own long-running confusion.
+#[cfg(windows)]
+fn msvc_bin_dir() -> Option<PathBuf> {
+    let range = cuda_host_config()
+        .and_then(|header| fs::read_to_string(header).ok())
+        .and_then(|header| parse_msvc_range(&header));
+    let accepts = |ver: u32| range.is_none_or(|(low, high)| ver >= low && ver < high);
+
+    // Already reachable — a Developer Command Prompt, or someone's own PATH.
+    // Left alone unless CUDA demonstrably refuses it. A banner that will not
+    // parse is left alone too: overriding a deliberate choice on a guess is
+    // worse than letting nvcc report the mismatch in its own words.
+    if let Ok(out) = std::process::Command::new("cl.exe").output() {
+        match parse_cl_banner(&String::from_utf8_lossy(&out.stderr)) {
+            Some(ver) if !accepts(ver) => {}
+            _ => return None,
+        }
+    }
+
+    let pf86 = std::env::var("ProgramFiles(x86)")
+        .unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+    let vswhere = Path::new(&pf86).join(r"Microsoft Visual Studio\Installer\vswhere.exe");
+    let out = std::process::Command::new(vswhere)
+        .args([
+            "-all",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()?;
+
+    // Every toolset of every installation that actually carries a `cl.exe`.
+    let mut found: Vec<(u32, PathBuf)> = Vec::new();
+    for root in String::from_utf8_lossy(&out.stdout).lines() {
+        let root = root.trim();
+        if root.is_empty() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(Path::new(root).join(r"VC\Tools\MSVC")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ver) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(toolset_msc_ver)
+            else {
+                continue;
+            };
+            let bin = path.join(r"bin\Hostx64\x64");
+            if bin.join("cl.exe").is_file() {
+                found.push((ver, bin));
+            }
+        }
+    }
+    found.sort_by_key(|(ver, _)| *ver);
+
+    // Newest toolset CUDA accepts. Falling back to the newest present when
+    // none qualifies is no worse than choosing blindly, and it keeps the
+    // failure honest: nvcc names the version mismatch, where an empty result
+    // would fail with "cl.exe not in PATH" and send the reader hunting for a
+    // compiler that is sitting right there.
+    found
+        .iter()
+        .rev()
+        .find(|(ver, _)| accepts(*ver))
+        .or_else(|| found.last())
+        .map(|(_, bin)| bin.clone())
+}
+
+#[cfg(not(windows))]
+fn msvc_bin_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Put `cl.exe` within nvcc's reach, if it is not already.
+///
+/// Applied to the child process only. Editing the build's own `PATH` would
+/// leak into every other tool it shells out to, for a requirement that belongs
+/// to one of them.
+fn with_host_compiler(cmd: &mut std::process::Command) {
+    let Some(bin) = msvc_bin_dir() else { return };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![bin];
+    dirs.extend(std::env::split_paths(&path));
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        cmd.env("PATH", joined);
+    }
+}
+
+/// Host-compiler selection: the pure halves of [`msvc_bin_dir`].
+///
+/// Every fixture here is real text — the guard as CUDA 12.9 and 13.1 ship it,
+/// and the banner `cl.exe` 14.44 actually prints — because the whole point of
+/// this code is agreeing with two programs whose output nobody controls.
+#[cfg(test)]
+mod host_compiler_tests {
+    use super::*;
+
+    /// The guard, verbatim from `v12.9/include/crt/host_config.h`. The lines
+    /// around it also mention `_MSC_VER` and must not be mistaken for it.
+    const CUDA_129: &str = r#"
+#if defined(_MSC_VER)
+#if _MSC_VER < 1910 || _MSC_VER >= 1950
+#error -- unsupported Microsoft Visual Studio version!
+#elif _MSC_VER >= 1910 && _MSC_VER < 1910
+#error -- unsupported!
+#endif
+#if _MSC_VER >= 1500
+#endif
+"#;
+
+    /// CUDA 13.1 raises the floor and keeps the ceiling.
+    const CUDA_131: &str = "#if _MSC_VER < 1920 || _MSC_VER >= 1950\n";
+
+    #[test]
+    fn a_toolset_directory_maps_to_the_version_cudas_guard_tests() {
+        assert_eq!(toolset_msc_ver("14.44.35207"), Some(1944));
+        assert_eq!(toolset_msc_ver("14.51.36231"), Some(1951));
+        assert_eq!(toolset_msc_ver("14.16.27023"), Some(1916));
+        assert_eq!(toolset_msc_ver("14.0"), Some(1900));
+        // No published mapping — reported as unknown rather than guessed.
+        assert_eq!(toolset_msc_ver("15.0.1"), None);
+        assert_eq!(toolset_msc_ver("Auxiliary"), None);
+    }
+
+    #[test]
+    fn the_range_is_read_from_the_guard_and_not_from_its_neighbours() {
+        assert_eq!(parse_msvc_range(CUDA_129), Some((1910, 1950)));
+        assert_eq!(parse_msvc_range(CUDA_131), Some((1920, 1950)));
+        // A one-sided test is not the guard; a header without one says nothing.
+        assert_eq!(parse_msvc_range("#if _MSC_VER >= 1500\n"), None);
+        assert_eq!(parse_msvc_range("nothing here\n"), None);
+    }
+
+    #[test]
+    fn the_cl_banner_yields_the_same_number_as_its_toolset_directory() {
+        let banner = "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64\n\
+                      Copyright (C) Microsoft Corporation.  All rights reserved.";
+        assert_eq!(parse_cl_banner(banner), Some(1944));
+        // The build number moves independently of the toolset directory, so
+        // 19.44.35228 and 14.44.35207 must still agree on 1944.
+        assert_eq!(parse_cl_banner(banner), toolset_msc_ver("14.44.35207"));
+        assert_eq!(parse_cl_banner("usage: cl [ option... ]"), None);
+    }
+
+    /// The machine this was written on: VS 2026's 14.51 installed beside VS
+    /// 2022's 14.44, with CUDA accepting `[1910, 1950)`. Newest loses; newest
+    /// *acceptable* wins. Picking by `-latest` is what broke the build.
+    #[test]
+    fn the_newest_acceptable_toolset_wins_over_the_newest_one() {
+        let (low, high) = parse_msvc_range(CUDA_129).expect("guard parses");
+        let mut installed = [
+            toolset_msc_ver("14.51.36231").unwrap(),
+            toolset_msc_ver("14.44.35207").unwrap(),
+            toolset_msc_ver("14.29.30133").unwrap(),
+        ];
+        installed.sort();
+
+        let accepts = |ver: u32| ver >= low && ver < high;
+        assert_eq!(installed.iter().rev().find(|v| accepts(**v)), Some(&1944));
+        // The newest present is precisely the one CUDA refuses.
+        assert_eq!(installed.last(), Some(&1951));
+        assert!(!accepts(1951));
+    }
+
+    /// With no guard to read, nothing is ruled out — the newest present is
+    /// chosen, which is what this did before it learned to read the guard.
+    #[test]
+    fn an_unreadable_guard_rules_nothing_out() {
+        let range = parse_msvc_range("no guard here");
+        let accepts = |ver: u32| range.is_none_or(|(low, high)| ver >= low && ver < high);
+        assert!(accepts(1951));
+        assert!(accepts(1944));
     }
 }

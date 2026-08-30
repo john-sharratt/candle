@@ -34,12 +34,18 @@ export async function render(params) {
     label,
     count != null ? h('span', { class: 'n' }, fmtK(count)) : null);
 
-  mount(rail,
+  /* Painted from `npc`, and repainted whenever `npc` changes.
+   *
+   * Both of these read the character's name, state and metabolism — all of them
+   * editable on the Manage tab. Built once, an edit would save correctly and
+   * appear to do nothing until the page was left and come back to, which reads
+   * as a write that failed. */
+  const paintRail = () => mount(rail,
     h('div', { class: 'rail-head' },
       h('div', { class: 'row', style: 'gap:10px' }, avatar(npc),
         h('div', { style: 'min-width:0' },
           h('div', { style: 'font-weight:700' }, npc.name),
-          h('div', { class: 'tiny dim' }, npc.archetype_name || ''))),
+          h('div', { class: 'tiny dim' }, npc.personality_name || ''))),
       h('div', { class: 'row', style: 'gap:6px;margin-top:9px' },
         stateDot(npc.state), h('span', { class: 'tiny dim mono' },
           `tick ${Math.round((npc.tick?.heartbeat_ms || 0) / 1000)}s · ${ago(npc.tick?.last_tick_ms)}`))),
@@ -58,14 +64,16 @@ export async function render(params) {
 
     h('div', { class: 'rail-sec' }, 'manage'),
     railItem('manage', 'Manage'));
+  paintRail();
 
   const el = h('div', { class: 'page' });
 
-  const head = h('div', { class: 'hd' },
+  const head = h('div', { class: 'hd' });
+  const paintHead = () => mount(head,
     h('div', {},
       h('div', { class: 'row', style: 'gap:9px' },
         h('h1', {}, npc.name),
-        h('span', { class: 'chip' }, npc.archetype_name || ''),
+        h('span', { class: 'chip' }, npc.personality_name || ''),
         bandChip(npc.monitor?.band || 'healthy'),
         npc.hidden ? h('span', { class: 'chip' }, 'hidden') : null),
       h('div', { class: 'sub row', style: 'gap:8px' },
@@ -73,7 +81,11 @@ export async function render(params) {
         h('span', {}, `${npc.tick?.pending_events || 0} pending`))),
     h('div', { class: 'row' },
       h('button', { class: 'btn primary', onClick: openInteraction }, '▶ Open interaction')));
+  paintHead();
   el.appendChild(head);
+
+  /// Everything that reads `npc` outside the tab body.
+  const repaint = () => { paintRail(); paintHead(); };
 
   const bodyHost = h('div', {});
   el.appendChild(bodyHost);
@@ -364,43 +376,137 @@ export async function render(params) {
         h('span', { style: 'font-size:.86rem;font-style:italic;color:var(--ink-mid)' }, r.text)))),
       h('div', { class: 'row', style: 'margin-top:11px;gap:8px' },
         h('input', { class: 'input', placeholder: 'inject a world event…' }),
-        h('button', { class: 'btn' }, 'Inject')));
+        // Says so rather than doing nothing. Injecting an event means writing a
+        // turn into the perception layer for something to gather, and there is
+        // nothing here to gather it.
+        h('button', {
+          class: 'btn',
+          onClick: () => toast('injecting an event — engine required', 'err'),
+        }, 'Inject')));
   }
 
+  /* Everything a character IS, as opposed to what it has become.
+   *
+   * Every control here writes to the substrate. An edit appends one record
+   * keyed by `npc_id` and the newest wins on replay — an implicit tombstone,
+   * with no delete record to write and none to replay — so "saving" is
+   * appending, and the previous version stops being current rather than being
+   * overwritten.
+   *
+   * Fields the ENGINE owns are not here. Tick timings, pending counts and the
+   * monitor band are measurements, and a form that let somebody type one would
+   * be inviting them to state a fact instead of read it. */
   async function manage() {
+    // `npc` is refreshed from every write's response, so a second edit patches
+    // the version the server just confirmed rather than the one this page
+    // loaded with.
+    const patch = async (body, note) => {
+      try {
+        npc = await API.patchNpc(id, body);
+        repaint();
+        if (note) toast(note, 'ok');
+        return true;
+      } catch (e) {
+        toast(e.detail || e.message || 'could not save', 'err');
+        return false;
+      }
+    };
+
+    // ── identity ────────────────────────────────────────────────────────────
+    const nameIn = h('input', { class: 'input', value: npc.name || '' });
+    const descIn = h('textarea', { class: 'textarea', rows: 5 }, npc.persona?.description || '');
+    const saveBtn = h('button', { class: 'btn sm primary' }, 'Save');
+    saveBtn.onclick = async () => {
+      saveBtn.setAttribute('disabled', '');
+      await patch(
+        { name: nameIn.value.trim(), persona_description: descIn.value },
+        'saved',
+      );
+      saveBtn.removeAttribute('disabled');
+    };
+
+    // ── tags ────────────────────────────────────────────────────────────────
     const tags = new Set(npc.tags || []);
     const tagHost = h('div', { class: 'row wrap', style: 'gap:6px' });
+    const saveTags = async () => {
+      try {
+        npc = await API.setTags(id, [...tags]);
+        repaint();
+      } catch (e) {
+        toast(e.detail || e.message || 'could not save tags', 'err');
+      }
+    };
     const paintTags = () => mount(tagHost, [...tags].map((t) => h('span', { class: 'chip accent' }, t,
-      h('button', { class: 'btn ghost sm', style: 'height:16px;padding:0 3px', onClick: () => { tags.delete(t); paintTags(); save(); } }, '✕'))));
-    const save = () => API.setTags(id, [...tags]).catch(() => {});
+      h('button', { class: 'btn ghost sm', style: 'height:16px;padding:0 3px', onClick: () => { tags.delete(t); paintTags(); saveTags(); } }, '✕'))));
     paintTags();
 
     const tagIn = h('input', {
       class: 'input', placeholder: 'add a tag…', style: 'width:150px',
       onKeydown: (e) => {
         if (e.key === 'Enter' && e.target.value.trim()) {
-          tags.add(e.target.value.trim()); e.target.value = ''; paintTags(); save();
+          tags.add(e.target.value.trim()); e.target.value = ''; paintTags(); saveTags();
         }
       },
     });
 
+    // ── metabolism ──────────────────────────────────────────────────────────
+    // Authored configuration, not measurement: how often an idle character
+    // thinks, and how loud an event has to be to wake it.
+    const beat = h('select', { class: 'select', style: 'width:auto' },
+      [[5000, '5s'], [30000, '30s'], [60000, '1m'], [300000, '5m'], [600000, '10m'], [3600000, '1h']]
+        .map(([ms, label]) => h('option', { value: ms, selected: (npc.tick?.heartbeat_ms || 0) === ms }, label)));
+    beat.onchange = () => patch({ heartbeat_ms: Number(beat.value) }, 'metabolism saved');
+
+    const gate = h('input', {
+      type: 'range', min: '0', max: '1', step: '0.01',
+      value: String(npc.tick?.salience_gate ?? 0.42), style: 'width:180px',
+    });
+    const gateOut = h('span', { class: 'mono tiny' }, String(npc.tick?.salience_gate ?? 0.42));
+    gate.oninput = () => { gateOut.textContent = gate.value; };
+    gate.onchange = () => patch({ salience_gate: Number(gate.value) }, 'gate saved');
+
+    const envOn = h('input', {
+      type: 'checkbox', checked: !!npc.environment_enabled,
+      onChange: (e) => patch({ environment_enabled: e.target.checked }),
+    });
+
     mount(bodyHost,
       h('div', { class: 'panel' },
-        h('label', { class: 'field' }, h('span', {}, 'Description'),
-          h('textarea', { class: 'textarea', rows: 5 }, npc.persona?.description || '')),
+        h('div', { class: 'grid g2' },
+          h('label', { class: 'field' }, h('span', {}, 'Name'), nameIn),
+          h('div', { class: 'field' }, h('span', {}, 'Personality'),
+            h('div', { class: 'row', style: 'gap:6px;padding-top:6px' },
+              h('span', { class: 'chip' }, npc.personality_name || npc.personality_id || '—'),
+              h('span', { class: 'chip' }, npc.world_id || '—')),
+            h('div', { class: 'tiny dim', style: 'margin-top:5px' },
+              'Fixed at creation. A character is what it started as; the substrate is what it turned into.'))),
+        h('label', { class: 'field' }, h('span', {}, 'Description'), descIn),
         h('div', { class: 'tiny dim' },
-          'Changing this updates the character’s identity and regenerates the portrait — unless a portrait you uploaded is in use.'),
+          'This is the character’s identity section in the system prompt, and the source a portrait is ' +
+          'generated from. Written as a present-day person: the personality supplies the anchor, this ' +
+          'supplies the human texture.'),
         h('div', { class: 'row', style: 'margin-top:10px;gap:8px' },
-          h('button', { class: 'btn sm' }, '⟳ Regenerate description'),
-          h('button', { class: 'btn sm primary' }, 'Save'))),
+          h('button', {
+            class: 'btn sm',
+            onClick: () => toast('regenerating a description — engine required', 'err'),
+          }, '⟳ Regenerate description'),
+          saveBtn)),
 
       h('div', { class: 'panel' },
         h('h3', { style: 'margin-top:0' }, 'Tags'),
         h('div', { class: 'row', style: 'gap:9px;align-items:flex-start' }, tagHost, tagIn),
         h('label', { class: 'row', style: 'gap:9px;margin-top:16px;cursor:pointer' },
           h('input', { type: 'checkbox', checked: !!npc.hidden,
-            onChange: (e) => {
-              API.setHidden(id, e.target.checked).catch(() => {});
+            onChange: async (e) => {
+              try {
+                npc = await API.setHidden(id, e.target.checked);
+                // The header carries a `hidden` chip, so this one is visible.
+                repaint();
+              } catch (err) {
+                toast(err.detail || err.message || 'could not save', 'err');
+                e.target.checked = !e.target.checked;
+                return;
+              }
               if (e.target.checked && !tags.size) toast('Hidden with no tags — this character will be unreachable from the roster', 'err');
             } }),
           h('div', {},
@@ -410,11 +516,31 @@ export async function render(params) {
               'Hiding is discretion, not encryption.')))),
 
       h('div', { class: 'panel' },
+        h('h3', { style: 'margin-top:0' }, 'Metabolism'),
+        h('div', { class: 'row wrap', style: 'gap:26px;align-items:flex-end' },
+          h('label', { class: 'field', style: 'margin:0' }, h('span', {}, 'Heartbeat'), beat),
+          h('label', { class: 'field', style: 'margin:0' },
+            h('span', {}, 'Salience gate ', gateOut), gate),
+          h('label', { class: 'row', style: 'gap:9px;cursor:pointer' }, envOn,
+            h('div', {}, h('div', { style: 'font-size:.86rem;font-weight:600' }, 'Environment'),
+              h('div', { class: 'tiny dim' }, 'a simulator feeds it events')))),
+        h('div', { class: 'tiny dim', style: 'margin-top:11px;max-width:88ch' },
+          'The resting rate an idle character thinks at, and the level below which an event does not wake ' +
+          'it. Both are authored settings rather than measurements — what the character is actually doing ' +
+          'is on the Monitor tab, and nothing here can be typed into it.')),
+
+      h('div', { class: 'panel' },
         h('h3', { style: 'margin-top:0' }, 'Danger zone'),
         h('div', { class: 'row wrap', style: 'gap:8px' },
-          h('button', { class: 'btn sm' }, 'Duplicate'),
-          h('button', { class: 'btn sm' }, 'Export JSON'),
-          h('button', { class: 'btn sm' }, npc.state === 'suspended' ? 'Resume' : 'Suspend'),
+          h('button', { class: 'btn sm', onClick: duplicate }, 'Duplicate'),
+          h('button', { class: 'btn sm', onClick: exportJson }, 'Export JSON'),
+          h('button', {
+            class: 'btn sm',
+            onClick: () => patch(
+              { state: npc.state === 'suspended' ? 'idle' : 'suspended' },
+              npc.state === 'suspended' ? 'resumed' : 'suspended',
+            ).then((ok) => { if (ok) go('/npc/' + id + '/manage'); }),
+          }, npc.state === 'suspended' ? 'Resume' : 'Suspend'),
           h('button', {
             class: 'btn sm danger',
             onClick: () => confirmDialog({
@@ -424,6 +550,50 @@ export async function render(params) {
               onConfirm: async () => { await API.deleteNpc(id); toast('deleted', 'ok'); go('/'); },
             }),
           }, 'Delete'))));
+  }
+
+  /* A new character with this one's settings and none of its life.
+   *
+   * World, personality, description and tags carry; the substrate does not. A
+   * copy that inherited lived experience would be the same character twice,
+   * which is not what anybody means by duplicate — the point is a second one
+   * that starts where this one started. */
+  async function duplicate() {
+    try {
+      const made = await API.createNpc({
+        name: (npc.name || 'Character') + ' (copy)',
+        world_id: npc.world_id,
+        personality_id: npc.personality_id,
+        persona_description: npc.persona?.description || '',
+        environment_enabled: !!npc.environment_enabled,
+        tags: npc.tags || [],
+      });
+      toast('created ' + made.name, 'ok');
+      go('/npc/' + made.npc_id + '/manage');
+    } catch (e) {
+      toast(e.detail || e.message || 'could not duplicate', 'err');
+    }
+  }
+
+  /* The record as the daemon returned it.
+   *
+   * To the clipboard rather than a download: a script-driven save is inert in a
+   * sandboxed frame, so a download button would do nothing and look broken.
+   *
+   * Written against `navigator.clipboard` directly rather than through
+   * `lib/clip.js`, whose `copyText` is fire-and-forget and returns nothing —
+   * awaiting it yields `undefined`, so a toast keyed on the result would always
+   * claim failure. Here the promise is the answer. */
+  async function exportJson() {
+    const text = JSON.stringify(npc, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('record copied to the clipboard', 'ok');
+    } catch (_) {
+      // Denied permission, or an insecure origin. Say so rather than claiming
+      // a copy that did not happen.
+      toast('could not reach the clipboard', 'err');
+    }
   }
 
   async function openInteraction() {

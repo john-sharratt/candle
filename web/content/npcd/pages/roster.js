@@ -71,8 +71,8 @@ export async function render() {
           n.monitor = { overlap: ev.overlap ?? n.monitor?.overlap, band: ev.band || n.monitor?.band };
         }
         swap(nodes, 'dot', stateDot(n.state));
-        swap(nodes, 'pend', pending(n.tick?.pending_events || 0));
-        swap(nodes, 'band', bandChip(n.monitor?.band || 'healthy'));
+        swap(nodes, 'pend', pending(n.tick?.pending_events ?? null));
+        swap(nodes, 'band', bandChip(n.monitor?.band ?? null));
         if (nodes.meta) nodes.meta.textContent = metaLine(n);
       },
     });
@@ -111,8 +111,11 @@ export async function render() {
     return h('div', { class: 'list' }, items.map((n) => {
       const p = track(n, {
         dot: stateDot(n.state),
-        pend: pending(n.tick?.pending_events || 0),
-        band: bandChip(n.monitor?.band || 'healthy'),
+        // No `|| 0` / `|| 'healthy'`: both are engine measurements, and a
+        // character the engine has never run has neither. The helpers render
+        // absence as absence.
+        pend: pending(n.tick?.pending_events ?? null),
+        band: bandChip(n.monitor?.band ?? null),
         meta: h('div', { class: 'npc-meta' }, metaLine(n)),
       });
       return h('div', { class: 'npc-row', onClick: () => go('/npc/' + n.npc_id) },
@@ -121,7 +124,7 @@ export async function render() {
           h('div', { class: 'row', style: 'gap:7px' },
             p.dot,
             h('span', { class: 'npc-name' }, n.name),
-            h('span', { class: 'chip' }, n.archetype_name || 'archetype ' + n.archetype_id),
+            h('span', { class: 'chip' }, n.personality_name || n.personality_id),
             n.access && n.access !== 'owner' ? h('span', { class: 'chip' }, n.access) : null),
           p.meta),
         h('div', { class: 'row', style: 'gap:10px' }, p.pend, p.band));
@@ -132,14 +135,17 @@ export async function render() {
     return h('div', { class: 'cards' }, items.map((n) => {
       const p = track(n, {
         dot: stateDot(n.state),
-        pend: pending(n.tick?.pending_events || 0),
-        band: bandChip(n.monitor?.band || 'healthy'),
+        // No `|| 0` / `|| 'healthy'`: both are engine measurements, and a
+        // character the engine has never run has neither. The helpers render
+        // absence as absence.
+        pend: pending(n.tick?.pending_events ?? null),
+        band: bandChip(n.monitor?.band ?? null),
       });
       return h('div', { class: 'npc-card', onClick: () => go('/npc/' + n.npc_id) },
         h('div', { class: 'art' }, (n.name || '?')[0]),
         h('div', { class: 'meta' },
           h('div', { class: 'row', style: 'gap:6px' }, p.dot, h('span', { class: 'npc-name' }, n.name)),
-          h('div', { class: 'npc-meta' }, n.archetype_name || ''),
+          h('div', { class: 'npc-meta' }, n.personality_name || ''),
           h('div', { class: 'row', style: 'gap:8px;margin-top:8px' }, p.pend, p.band)));
     }));
   }

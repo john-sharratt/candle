@@ -70,6 +70,7 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
             .unwrap_or_default(),
         model_bytes,
         tokenizer_repo: "deepseek-ai/DeepSeek-V4-Flash-0731".to_string(),
+        tokenizer_rev: String::new(),
         default_system_prompt: "You are a concise, factual assistant.".to_string(),
         max_seq_len: 4096,
         default_sampling: SamplingConfig::argmax(),

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
@@ -323,13 +324,96 @@ fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
     ids
 }
 
-fn mark_calibration_distill(engine: &ConversationEngine, timeline: TimelineId, tool: &str) {
-    if engine.timeline_has_kv(timeline) && !engine.is_timeline_distilled(timeline) {
-        // Calibration exemplars stay retrievable by signature — provenance-only.
-        if let Err(e) = engine.distill_timeline(timeline, DistillMode::ProvenanceOnly) {
-            tracing::warn!(tool = tool, "calibration distill mark failed: {e}");
-        }
+/// Wall-time attribution for the calibration phase.
+///
+/// The phase drives a batched wave loop from a single thread, so every bucket
+/// below is time the GPU is *not* being fed: the window cannot refill and no
+/// forward is in flight while the loading thread sits in one of these calls.
+/// Measured against forward time the phase's prefill runs at ~6.9k tok/s — at
+/// the batched-forward gate's rate — so its wall-clock rate is set entirely by
+/// how much of the phase is spent here rather than by the model.
+///
+/// Each bucket names an engine call made once per calibration case. The
+/// substrate ones (`tag`, `archive`, `distill`) each take the substrate write
+/// lock and append a record under the persistence mutex, which is the same lock
+/// the scheduler's wave loop needs to admit the next case.
+#[derive(Default)]
+struct CalibTiming {
+    /// `new_conversations_with_projection_batch` — one pipelined round-trip per window.
+    create: Duration,
+    /// `set_conversation_metadata` — resume tag, per case.
+    tag: Duration,
+    /// `submit_prefilled_turn` / `submit_turn_with_options`, per case.
+    submit: Duration,
+    /// `finish_turn` — the seal, per case.
+    seal: Duration,
+    /// `persist_projection_events` — the trajectory's projection sequence, per case.
+    persist_events: Duration,
+    /// `set_conversation_archived` — the atomic done-marker, per case.
+    archive: Duration,
+    /// `distill_timeline` (+ its two state probes), per case.
+    distill: Duration,
+    /// `demote_timelines_hot` — incremental and boundary hot→warm sweeps.
+    demote: Duration,
+    /// The poll-loop yield taken when a pass retired nothing.
+    idle: Duration,
+}
+
+impl CalibTiming {
+    /// Run `f`, adding its wall time to the bucket `pick` selects.
+    fn time<T>(&mut self, pick: fn(&mut Self) -> &mut Duration, f: impl FnOnce() -> T) -> T {
+        let t = Instant::now();
+        let out = f();
+        *pick(self) += t.elapsed();
+        out
     }
+
+    fn log(&self, wall: Duration) {
+        let ms = |d: &Duration| d.as_millis() as u64;
+        let tracked = self.create
+            + self.tag
+            + self.submit
+            + self.seal
+            + self.persist_events
+            + self.archive
+            + self.distill
+            + self.demote
+            + self.idle;
+        tracing::info!(
+            wall_ms = ms(&wall),
+            create_ms = ms(&self.create),
+            tag_ms = ms(&self.tag),
+            submit_ms = ms(&self.submit),
+            seal_ms = ms(&self.seal),
+            persist_events_ms = ms(&self.persist_events),
+            archive_ms = ms(&self.archive),
+            distill_ms = ms(&self.distill),
+            demote_ms = ms(&self.demote),
+            idle_ms = ms(&self.idle),
+            tracked_ms = ms(&tracked),
+            untracked_ms = ms(&wall.saturating_sub(tracked)),
+            "calibration wall-time attribution"
+        );
+    }
+}
+
+fn mark_calibration_distill(
+    engine: &ConversationEngine,
+    timeline: TimelineId,
+    tool: &str,
+    timing: &mut CalibTiming,
+) {
+    timing.time(
+        |t| &mut t.distill,
+        || {
+            if engine.timeline_has_kv(timeline) && !engine.is_timeline_distilled(timeline) {
+                // Calibration exemplars stay retrievable by signature — provenance-only.
+                if let Err(e) = engine.distill_timeline(timeline, DistillMode::ProvenanceOnly) {
+                    tracing::warn!(tool = tool, "calibration distill mark failed: {e}");
+                }
+            }
+        },
+    );
 }
 
 fn seal_calibration_turn(
@@ -338,8 +422,9 @@ fn seal_calibration_turn(
     resp: &TurnResponse,
     tool: &str,
     mut events: Vec<ProjectionEvent>,
+    timing: &mut CalibTiming,
 ) {
-    if let Err(e) = conv.finish_turn(handle, resp) {
+    if let Err(e) = timing.time(|t| &mut t.seal, || conv.finish_turn(handle, resp)) {
         tracing::warn!(tool = tool, "calibration finish_turn failed: {e}");
         return;
     }
@@ -354,7 +439,10 @@ fn seal_calibration_turn(
         tracing::warn!(tool = tool, "calibration: no projection events to persist");
         return;
     }
-    if let Err(e) = conv.persist_projection_events(&events) {
+    if let Err(e) = timing.time(
+        |t| &mut t.persist_events,
+        || conv.persist_projection_events(&events),
+    ) {
         tracing::warn!(
             tool = tool,
             "calibration persist projection events failed: {e}"
@@ -372,6 +460,12 @@ fn seal_calibration_turn(
 /// batch (`new_conversations_with_projection_batch`), so it actually reaches
 /// this width instead of trickling in one case per wave-latency.
 const CALIBRATION_BATCH: usize = 16;
+/// How many of [`CALIBRATION_BATCH`]'s slots must be free before the window
+/// refills. Creation is served between waves, so every refill costs one wave
+/// boundary regardless of how many cases it creates — refilling at half the
+/// window amortises that boundary over eight cases rather than paying it for
+/// one. See the refill site for the measurement.
+const CALIBRATION_REFILL: usize = CALIBRATION_BATCH / 2;
 /// Conversation-metadata key tagging each calibration conversation with its
 /// `"{tool}|{example}"` case **at creation**, so it is findable by case on a
 /// later load — finished or half-finished. *Done* is signalled separately by
@@ -857,6 +951,9 @@ impl InferenceState {
         progress.set_step(LoadStep::CalibratingSections);
         // Skip entirely for a tool-free projection — nothing to calibrate.
         if !tool_sections.is_empty() {
+            // Wall-time attribution for the phase, logged once at its end.
+            let calib_start = Instant::now();
+            let mut timing = CalibTiming::default();
             let defs = crate::tool_def::all();
             let total: usize = defs.iter().map(|d| d.examples.len()).sum();
             tracing::info!(
@@ -960,7 +1057,7 @@ impl InferenceState {
                         .iter()
                         .filter(|t| engine.is_conversation_archived(**t))
                     {
-                        mark_calibration_distill(&engine, *t, name);
+                        mark_calibration_distill(&engine, *t, name, &mut timing);
                     }
                     done += 1;
                     progress.set_step_progress(done as u64, total as u64);
@@ -1004,7 +1101,8 @@ impl InferenceState {
             let retire_completed =
                 |inflight: &mut Vec<(Sequence, TurnHandle, &str, Vec<ProjectionEvent>, bool)>,
                  done: &mut usize,
-                 reclaim: &mut Vec<TimelineId>|
+                 reclaim: &mut Vec<TimelineId>,
+                 timing: &mut CalibTiming|
                  -> bool {
                     let mut retired = false;
                     let mut i = 0;
@@ -1029,11 +1127,17 @@ impl InferenceState {
                                         if is_prefill || resp.text.contains("</tool_call>") =>
                                     {
                                         seal_calibration_turn(
-                                            &mut conv, handle, &resp, name, events,
+                                            &mut conv, handle, &resp, name, events, timing,
                                         );
-                                        if let Err(e) = engine
-                                            .set_conversation_archived(conv.timeline_id(), true)
-                                        {
+                                        if let Err(e) = timing.time(
+                                            |t| &mut t.archive,
+                                            || {
+                                                engine.set_conversation_archived(
+                                                    conv.timeline_id(),
+                                                    true,
+                                                )
+                                            },
+                                        ) {
                                             tracing::warn!(
                                                 tool = name,
                                                 "calibration archive failed: {e}"
@@ -1042,7 +1146,12 @@ impl InferenceState {
                                         // Only the wide-Q sig is needed henceforth —
                                         // mark for distillation so compaction sheds
                                         // the trajectory content.
-                                        mark_calibration_distill(&engine, conv.timeline_id(), name);
+                                        mark_calibration_distill(
+                                            &engine,
+                                            conv.timeline_id(),
+                                            name,
+                                            timing,
+                                        );
                                         // Retired: its sealed K/V is never attended
                                         // again (only the persisted wide-Q sig is),
                                         // so queue its timeline for hot→warm demotion
@@ -1089,22 +1198,43 @@ impl InferenceState {
                 // per wave-latency (which starved the batch to 2–4 wide). The
                 // warm-up case is created alone first so the shared tool sections
                 // pin once before the concurrent window opens.
-                let want = if warmed {
-                    CALIBRATION_BATCH.saturating_sub(inflight.len())
-                } else {
+                // Refill in blocks, not per retired case. Slot allocation is
+                // served by the scheduler between waves, so ANY create call —
+                // for one case or sixteen — blocks the caller until the current
+                // wave ends. Topping the window up by one or two therefore pays
+                // a full wave boundary for one or two cases: measured at 29 such
+                // calls costing 67 s of the phase's 84 s of create-blocking,
+                // averaging 2.3 s each. Waiting until half the window is free
+                // amortises that same boundary over eight cases instead, and the
+                // GPU keeps working the remaining in-flight ones meanwhile.
+                //
+                // `inflight.is_empty()` is the tail case: fewer cases remain
+                // than the threshold, so nothing is running to wait behind and
+                // the block must be issued at whatever size is left.
+                let free = CALIBRATION_BATCH.saturating_sub(inflight.len());
+                let want = if !warmed {
                     1
+                } else if free >= CALIBRATION_REFILL || inflight.is_empty() {
+                    free
+                } else {
+                    0
                 };
                 let batch: Vec<(&str, &str, &str)> =
                     (0..want).map_while(|_| to_run_iter.next()).collect();
                 let created_any = !batch.is_empty();
                 let convs = if created_any {
-                    engine.new_conversations_with_projection_batch(
-                        batch.len(),
-                        &calib_prelude,
-                        &calib_builder,
-                        calib_layer,
-                        calib_group,
-                        &calib_config,
+                    timing.time(
+                        |t| &mut t.create,
+                        || {
+                            engine.new_conversations_with_projection_batch(
+                                batch.len(),
+                                &calib_prelude,
+                                &calib_builder,
+                                calib_layer,
+                                calib_group,
+                                &calib_config,
+                            )
+                        },
                     )
                 } else {
                     Vec::new()
@@ -1120,10 +1250,15 @@ impl InferenceState {
                         }
                     };
                     // Tag at creation so a half-finished case is findable next load.
-                    if let Err(e) = engine.set_conversation_metadata(
-                        conv.timeline_id(),
-                        CALIB_MARKER_KEY,
-                        marker,
+                    if let Err(e) = timing.time(
+                        |t| &mut t.tag,
+                        || {
+                            engine.set_conversation_metadata(
+                                conv.timeline_id(),
+                                CALIB_MARKER_KEY,
+                                marker,
+                            )
+                        },
                     ) {
                         tracing::warn!(tool = name, "calibration tag failed: {e}");
                     }
@@ -1161,19 +1296,22 @@ impl InferenceState {
                         } else {
                             (example.trim(), None)
                         };
-                    let (submit_result, is_prefill) = match body {
-                        Some(body) => (
-                            conv.submit_prefilled_turn(
-                                user_prompt,
-                                &body,
-                                crate::tool_def::PROJECTION_MARKER,
-                                opts.selection.clone(),
-                                opts.tags.clone(),
+                    let (submit_result, is_prefill) = timing.time(
+                        |t| &mut t.submit,
+                        || match body {
+                            Some(body) => (
+                                conv.submit_prefilled_turn(
+                                    user_prompt,
+                                    &body,
+                                    crate::tool_def::PROJECTION_MARKER,
+                                    opts.selection.clone(),
+                                    opts.tags.clone(),
+                                ),
+                                true,
                             ),
-                            true,
-                        ),
-                        None => (conv.submit_turn_with_options(user_prompt, opts), false),
-                    };
+                            None => (conv.submit_turn_with_options(user_prompt, opts), false),
+                        },
+                    );
                     match submit_result {
                         Ok(handle) => {
                             if !warmed {
@@ -1203,15 +1341,16 @@ impl InferenceState {
                                 }
                                 match done_resp {
                                     Some(resp) if is_prefill || resp.text.contains("</tool_call>") => {
-                                        seal_calibration_turn(&mut conv, handle, &resp, name, events);
-                                        if let Err(e) = engine
-                                            .set_conversation_archived(conv.timeline_id(), true)
-                                        {
+                                        seal_calibration_turn(&mut conv, handle, &resp, name, events, &mut timing);
+                                        if let Err(e) = timing.time(
+                                            |t| &mut t.archive,
+                                            || engine.set_conversation_archived(conv.timeline_id(), true),
+                                        ) {
                                             tracing::warn!(tool = name, "calibration archive failed: {e}");
                                         }
                                         // Sig captured — mark for distillation so
                                         // compaction sheds the trajectory content.
-                                        mark_calibration_distill(&engine, conv.timeline_id(), name);
+                                        mark_calibration_distill(&engine, conv.timeline_id(), name, &mut timing);
                                         // Queue for hot→warm demotion (see the retire
                                         // path) so the warm-up case's K/V is reclaimed
                                         // like every other case's.
@@ -1246,8 +1385,11 @@ impl InferenceState {
                 }
                 // Retire finished cases; if none finished this pass, yield briefly
                 // (the unbounded channels buffer, so this never starves the wave).
-                if !retire_completed(&mut inflight, &mut done, &mut calib_timelines) {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                if !retire_completed(&mut inflight, &mut done, &mut calib_timelines, &mut timing) {
+                    timing.time(
+                        |t| &mut t.idle,
+                        || std::thread::sleep(Duration::from_millis(2)),
+                    );
                 }
                 // Incremental hot→warm demotion: once a full window's worth of
                 // cases has retired since the last sweep, drop the hot K/V of just
@@ -1257,9 +1399,10 @@ impl InferenceState {
                 // flushing boundary sweep below (which re-demotes the whole list).
                 // The call is fire-and-forget, so case submission never stalls.
                 if calib_timelines.len() - reclaimed_up_to >= CALIBRATION_BATCH {
-                    if let Err(e) =
-                        engine.demote_timelines_hot(&calib_timelines[reclaimed_up_to..], false)
-                    {
+                    if let Err(e) = timing.time(
+                        |t| &mut t.demote,
+                        || engine.demote_timelines_hot(&calib_timelines[reclaimed_up_to..], false),
+                    ) {
                         tracing::warn!("calibration hot→warm demote failed: {e}");
                     }
                     reclaimed_up_to = calib_timelines.len();
@@ -1270,9 +1413,13 @@ impl InferenceState {
             // calibration timeline. This reclaims the tail before the repo-scan
             // phase's first prefill, which would otherwise hit a card still full
             // of the calibration corpus's hot K/V.
-            if let Err(e) = engine.demote_timelines_hot(&calib_timelines, true) {
+            if let Err(e) = timing.time(
+                |t| &mut t.demote,
+                || engine.demote_timelines_hot(&calib_timelines, true),
+            ) {
                 tracing::warn!("calibration boundary hot→warm demote failed: {e}");
             }
+            timing.log(calib_start.elapsed());
             progress.set_step_progress(total as u64, total as u64);
             tracing::info!(
                 cases = total,

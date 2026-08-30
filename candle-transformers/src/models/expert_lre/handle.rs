@@ -35,21 +35,34 @@ use super::types::{
     ClassifiedExperts, CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest,
     PipelineMessage, PipelineStats,
 };
+use super::zone_geometry::ZoneGeometry;
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
 
 /// Report, once per distinct reason, that a call could not use the device
 /// dispatch tables. Once because the caller is a per-layer hot path — the point
 /// is that the reason is *stated*, not that it is repeated 40 times a token.
 #[cfg(feature = "cuda")]
-fn log_dispatch_refusal(reason: &str) {
+/// Say once, per *kind* of refusal, why this layer fell off the device path.
+///
+/// **The key is a `&'static str` and the detail is lazy, and both matter.** This
+/// runs per MoE layer per wave. Keying the dedup on the fully formatted message
+/// — which is what it used to do — means any refusal carrying a varying number
+/// re-logs and inserts another `String` every time that number changes: the
+/// zone-retraction refusal interpolates the live capacity and floor, so it would
+/// have logged on every distinct geometry and grown the set without bound, on
+/// the hot path, while claiming in its own comment to speak once. Formatting the
+/// detail behind `FnOnce` also keeps the `format!` off every call that is about
+/// to be deduped away.
+fn log_dispatch_refusal(reason: &'static str, detail: impl FnOnce() -> String) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut s) = seen.lock() {
-        if s.insert(reason.to_string()) {
+        if s.insert(reason) {
             tracing::warn!(
                 reason,
+                detail = %detail(),
                 "expert cache: this MoE layer takes the host path's blocking routing \
                  readback instead of the device tables"
             );
@@ -419,6 +432,13 @@ pub struct ExpertCache {
     mode: PipelineMode,
     /// True when all experts fit in VRAM — hint sending is elided.
     all_resident: bool,
+    /// The weight zone's live shape, shared with whichever thread owns it.
+    ///
+    /// The handle cannot reach `ExpertCacheInner` in threaded mode — it is
+    /// moved into the pipeline thread's state — so a geometry check written
+    /// against `inner` silently does nothing there. This is the same three
+    /// numbers, published lock-free, readable in either mode.
+    geometry: Arc<ZoneGeometry>,
     /// Dedicated CUDA stream for async routing index DtoH.
     /// Lives on the forward thread — never crosses to the pipeline thread.
     #[cfg(feature = "cuda")]
@@ -977,12 +997,16 @@ impl ExpertCache {
             int8mode,
         };
 
+        // Cloned before `state` moves to the pipeline thread — this handle is
+        // the reader that could not otherwise see the zone at all.
+        let geometry = state.inner.geometry.clone();
         let pipeline_dead = Arc::new(AtomicBool::new(false));
         let tx = spawn_pipeline_thread(state, pipeline_dead.clone());
 
         Ok(Self {
             mode: PipelineMode::Threaded { tx },
             all_resident,
+            geometry,
             #[cfg(feature = "cuda")]
             routing_stream,
             #[cfg(feature = "cuda")]
@@ -1018,12 +1042,19 @@ impl ExpertCache {
         for _ in 0..slots.len() {
             zone.alloc();
         }
+        let slot_count = zone.capacity();
+        let zone_frontier = zone.slot_base(slot_count.saturating_sub(1));
         let inner = ExpertCacheInner {
             slots,
             zone,
             key_to_slot,
             last_used,
             generation,
+            // Nothing may retract a zone whose slot addresses it does not own,
+            // so this geometry is fixed for the object's life — published all
+            // the same, so the staleness check reads one shape of thing in both
+            // modes rather than being conditional on which constructor ran.
+            geometry: Arc::new(ZoneGeometry::new(slot_count, zone_frontier)),
             slot_to_key,
             expert_scores: vec![],
             num_moe_layers: 0,
@@ -1045,12 +1076,14 @@ impl ExpertCache {
         } else {
             None
         };
+        let geometry = inner.geometry.clone();
         Self {
             mode: PipelineMode::Inline {
                 inner: Mutex::new(inner),
                 device: device.clone(),
             },
             all_resident: true, // prepopulated = all in VRAM
+            geometry,
             #[cfg(feature = "cuda")]
             routing_stream: None,
             #[cfg(feature = "cuda")]
@@ -1427,24 +1460,89 @@ impl ExpertCache {
             // tables by design, and an all-resident one that failed to has
             // already said so with the actual reason — asserting one of those
             // here would put a confident wrong answer next to the right one.
-            log_dispatch_refusal("no dispatch tables were built for this cache");
+            log_dispatch_refusal("no dispatch tables were built for this cache", String::new);
             return None;
         };
         if gd.expert_base(moe_layer_idx).is_none() {
-            log_dispatch_refusal(&format!(
-                "MoE layer {moe_layer_idx} is outside the covered table range"
-            ));
+            log_dispatch_refusal("MoE layer is outside the covered table range", || {
+                format!("layer {moe_layer_idx}")
+            });
             return None;
         }
         if gd.n_experts != n_experts {
-            log_dispatch_refusal(&format!(
-                "router width {n_experts} disagrees with the tables' {}",
-                gd.n_experts
-            ));
+            log_dispatch_refusal("router width disagrees with the tables", || {
+                format!("router {n_experts} vs tables {}", gd.n_experts)
+            });
             return None;
         }
         if self.pipeline_dead() {
-            log_dispatch_refusal("expert pipeline thread is dead");
+            log_dispatch_refusal("expert pipeline thread is dead", String::new);
+            return None;
+        }
+        // **The tables' addresses are only valid while the zone still owns
+        // them.**
+        //
+        // They are captured once, on the reasoning that an all-resident cache's
+        // weight addresses are static. All-resident at startup is not resident
+        // for ever: `WeightZone::retract_to` concedes slots to the KV side under
+        // pressure, the KV arena allocates that ground and writes to it, and a
+        // table entry pointing there stops naming an expert weight. The GEMM
+        // then reads KV bytes as weights — finite, plausibly-shaped, and wrong,
+        // which is why it surfaces as a NaN several layers downstream rather
+        // than as a fault.
+        //
+        // The host path has always refused a weight pointer below the live
+        // `weight_floor` ("that is KV ground, not an expert slot"). This is the
+        // GPU-native half of the same rule, and its absence is what let a
+        // retraction corrupt a contiguous run of expert slots silently.
+        // Read through the shared `ZoneGeometry`, not through `inner`.
+        //
+        // This check was originally written as
+        // `if let PipelineMode::Inline { inner, .. } = &self.mode`, justified by
+        // "an all-resident cache is `Inline` by construction". It is not:
+        // `ExpertCache::new` builds the dispatch tables when `all_resident` and
+        // then returns `PipelineMode::Threaded`, having moved `inner` into the
+        // pipeline thread's state. The branch never matched, so the guard was
+        // dead code in exactly the configuration it was written for, and a
+        // retraction went undetected. Measured: an expert weight the tables
+        // still named sitting 31 MiB BELOW the live `weight_floor` — KV ground
+        // the arena had already allocated and written — read back by the GEMM as
+        // an expert weight and surfacing as NaN eleven layers later.
+        //
+        // The geometry is published lock-free by whichever thread owns the zone,
+        // so this is mode-independent and costs three relaxed loads per layer.
+        //
+        // **The refusal is permanent, and that is the correct behaviour — do not
+        // "fix" it by re-trusting the tables once the zone grows back.** The
+        // tempting reading is that a concede-then-regrow restores the geometry,
+        // so the cached addresses become valid again. The addresses do; the
+        // MAPPING does not. `ExpertCacheInner::evict` drops the key → slot
+        // entry, and re-admission takes the rightmost free slot
+        // (`allocate_slot`), so an expert comes back at a DIFFERENT address
+        // while the tables still name its old one. Re-taking them is the
+        // corruption this guard was written for, wearing a recovery's clothes.
+        //
+        // Rebuilding the tables against the live mapping would be sound at the
+        // instant of the rebuild, and is the only real recovery — but only
+        // while the cache is all-resident again, because in a paged cache every
+        // admission moves an expert and the tables would need invalidating per
+        // admission. So the cost of a concession is the host path for the rest
+        // of the process (measured elsewhere at roughly 18-19 ms → 26-28 ms per
+        // decode step). That is a real price, and it is the price of being
+        // right: before this check was reachable, the "faster" path was reading
+        // KV bytes as expert weights.
+        if let Some((now_capacity, now_floor)) = gd.zone_moved(&self.geometry) {
+            log_dispatch_refusal(
+                "the weight zone has retracted since the tables were built — their slot \
+                 addresses now name KV ground",
+                || {
+                    format!(
+                        "capacity {} → {now_capacity}, floor {:#x} → {now_floor:#x}",
+                        gd.built_capacity(),
+                        gd.built_floor(),
+                    )
+                },
+            );
             return None;
         }
         Some(gd)

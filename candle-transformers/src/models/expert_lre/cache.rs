@@ -35,9 +35,11 @@
 //! - **End-of-pass decay**: ×0.85 (recency-weighting of the frequency)
 
 use super::types::ExpertSlot;
+use super::zone_geometry::ZoneGeometry;
 use candle::Result;
 use candle_nn::kv_cache::WeightZone;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Number of early MoE layers whose experts are never evicted.
 ///
@@ -174,6 +176,25 @@ pub struct ExpertCacheInner {
     pub(crate) last_used: Vec<u32>,
     /// Monotonically increasing counter, bumped on each cache access.
     pub(crate) generation: u32,
+    /// The zone's live shape, published for readers that do not own the cache.
+    ///
+    /// **This is what invalidates the GPU dispatch tables, and comparing
+    /// capacities is not enough to replace it.** The tables capture a raw
+    /// address per expert once, on the reasoning that an all-resident cache's
+    /// weights never move. A concession breaks that: the slots at the frontier
+    /// are evicted or relocated so the wave transient tier can stand on their
+    /// ground, and the tier then writes activations over them.
+    ///
+    /// The reason a capacity check misses it is that the zone GROWS BACK. By
+    /// the time anything looks, capacity and floor read exactly as they did at
+    /// load — while the slots that were conceded now hold a different expert,
+    /// or nothing, and the tables still name them. A monotonic count of
+    /// concessions cannot be undone by a regrow, which is the whole point.
+    ///
+    /// Shared rather than a plain field because the reader is the *handle*, on
+    /// the forward thread, while this struct is moved into the pipeline
+    /// thread's state — see [`ZoneGeometry`] for the dead-code bug that cost.
+    pub(crate) geometry: Arc<ZoneGeometry>,
     /// Reverse map: `slot_idx -> (moe_layer_idx, expert_idx)` for eviction.
     pub(crate) slot_to_key: Vec<Option<(usize, usize)>>,
 
@@ -209,12 +230,17 @@ impl ExpertCacheInner {
     /// * `experts_per_layer` — experts per layer (e.g. 128)
     pub(crate) fn new(zone: WeightZone, num_moe_layers: usize, experts_per_layer: usize) -> Self {
         let num_slots = zone.capacity();
+        let geometry = Arc::new(ZoneGeometry::new(
+            num_slots,
+            zone.slot_base(num_slots.saturating_sub(1)),
+        ));
         Self {
             slots: (0..num_slots).map(|_| None).collect(),
             zone,
             key_to_slot: HashMap::new(),
             last_used: vec![0u32; num_slots],
             generation: 0,
+            geometry,
             slot_to_key: vec![None; num_slots],
             expert_scores: vec![0.0f32; num_moe_layers * experts_per_layer],
             num_moe_layers,
@@ -311,8 +337,21 @@ impl ExpertCacheInner {
             self.slots.resize_with(n, || None);
             self.last_used.resize(n, 0);
             self.slot_to_key.resize(n, None);
+            self.publish_geometry();
         }
         gained
+    }
+
+    /// Republish the zone's shape after it has changed.
+    ///
+    /// Every mutation of `zone` must reach this, because the GPU dispatch
+    /// tables' staleness check reads only what is published here — a zone that
+    /// moves without publishing is one whose cached slot addresses go stale
+    /// silently, which is the corruption this whole path exists to prevent.
+    fn publish_geometry(&self) {
+        let n = self.zone.capacity();
+        self.geometry
+            .publish(n, self.zone.slot_base(n.saturating_sub(1)));
     }
 
     /// Give `capacity - target` slots back to the KV side.
@@ -340,7 +379,40 @@ impl ExpertCacheInner {
         let scores: Vec<f32> = (0..self.zone.capacity())
             .map(|i| self.slot_to_key[i].map_or(0.0, |(layer, expert)| self.score(layer, expert)))
             .collect();
-        self.zone.retract_to(target, |i| scores[i])
+        let before = self.zone.capacity();
+        let plan = self.zone.retract_to(target, |i| scores[i]);
+        // Ground has left the weight side. Recorded monotonically — see
+        // `concede_epoch` for why comparing capacities later cannot stand in
+        // for this, since the zone grows back.
+        //
+        // Keyed on the CAPACITY changing, not on the plan being non-empty: a
+        // concession of slots that happened to be free moves the boundary and
+        // hands their addresses to the tier just the same, while asking nothing
+        // to be relocated or evicted. Those are precisely the slots a table
+        // would keep pointing at with no other sign anything happened.
+        if self.zone.capacity() != before {
+            // Shape first, then the epoch: a reader that sees the bumped epoch
+            // must not then read a pre-concession frontier and conclude the
+            // zone is where it left it.
+            self.publish_geometry();
+            self.geometry.concede();
+            // At INFO, not DEBUG. A concession retires expert slots and hands
+            // their ground to the KV side; it is the event that turns an
+            // all-resident grid into a paged one and invalidates every cached
+            // slot address. It went unnoticed for a whole campaign because it
+            // was logged at DEBUG while the daemon runs at INFO — 4.92 GiB of
+            // expert ground changed hands and the log said nothing.
+            tracing::info!(
+                before,
+                after = self.zone.capacity(),
+                conceded = before.saturating_sub(self.zone.capacity()),
+                frontier = format!("{:#x}", self.geometry.frontier()),
+                concede_epoch = self.geometry.concede_epoch(),
+                "expert cache: weight zone conceded ground to the KV side — cached slot \
+                 addresses are now stale and GPU-native dispatch is refused"
+            );
+        }
+        plan
     }
 
     /// Drop the per-slot tables to the zone's current capacity.

@@ -67,8 +67,13 @@ const HOP_BY_HOP: [header::HeaderName; 7] = [
 /// only from an identity this gateway itself resolved.
 ///
 /// [`Builder::behind_gateway`]: crate::server::Builder::behind_gateway
-pub(crate) const IDENTITY_HEADERS: [&str; 5] = [
+pub(crate) const IDENTITY_HEADERS: [&str; 6] = [
     "x-tokera-user",
+    // The issuer half of the account key. In this list because it decides
+    // *which* account a subject resolves to: a client able to set it could pick
+    // its own namespace and, with a subject it knows, land on somebody else's
+    // record. It is exactly as sensitive as the subject beside it.
+    "x-tokera-provider",
     "x-tokera-email",
     "x-tokera-name",
     "x-tokera-picture",
@@ -168,6 +173,7 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
     if let Some(id) = f.identity {
         for (name, value) in [
             ("x-tokera-user", id.sub.as_str()),
+            ("x-tokera-provider", id.provider.as_str()),
             ("x-tokera-email", id.email.as_str()),
             ("x-tokera-name", id.name.as_str()),
             ("x-tokera-picture", id.picture.as_str()),

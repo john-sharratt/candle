@@ -339,11 +339,18 @@ pub(crate) enum SchedulerRequest {
     /// request. So this arrives after, on a slot that exists and has not yet
     /// run a turn.
     ///
+    /// Installs onto EVERY slot in `sequence_ids` from one shared `layers`.
+    /// Conversations opened on the same prompt branch install byte-identical
+    /// state, and the request's cost is dominated by the queue wait before the
+    /// scheduler drains it — measured at 157 ms of a 175 ms round-trip, against
+    /// 17 ms of actual device work per slot. Paying that wait once per branch
+    /// instead of once per conversation is why this takes a list.
+    ///
     /// Replies `Ok(false)` when the model carries no recurrent state.
     InstallRecurrentState {
-        sequence_id: SequenceId,
+        sequence_ids: Vec<SequenceId>,
         schedule_hash: u64,
-        layers: Vec<ExportedLayerState>,
+        layers: Arc<[ExportedLayerState]>,
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 
@@ -1675,6 +1682,26 @@ struct WaveStats {
     /// window remainder so it isn't mislabeled as "blocked" (which is reserved for
     /// off-thread stalls *during* active work).
     idle_ms: u64,
+    /// Requests phase this window: wall-clock the loop spent INSIDE
+    /// [`Scheduler::handle_request`] — slot creation (with its snapshot/belief
+    /// restore), branch-state installs, section restores, turn submissions.
+    ///
+    /// This is scheduler-thread work between forwards, not a stall, and it used
+    /// to be invisible: only the `rx.recv()` block around it was timed, so every
+    /// request the scheduler serviced fell into the unattributed remainder and
+    /// the dashboard drew it as "blocked". A phase that ingests thousands of
+    /// scopes services thousands of requests, so that remainder was large and
+    /// unexplained — one `InstallRecurrentState` alone measured 17 ms of device
+    /// scatter, ×792 in a single calibration pass.
+    requests_us: u64,
+    /// Housekeeping phase this window: the per-wave work that runs between the
+    /// timed quanta and the next iteration — promoting finished prefills,
+    /// regulating ingest admission, demoting cold ingest under pressure, walking
+    /// the AIMD admit budget, and harvesting GPU spans.
+    ///
+    /// Real scheduler work, none of it inside a quantum, and none of it timed
+    /// before — so it landed in the unattributed remainder and drew as "blocked".
+    housekeeping_us: u64,
     /// Sync phase this window: deliberate GPU/persistence waits ([`WAIT_US`],
     /// swapped in at flush). Carved out of the compute phases + blocked so a
     /// device-sync / hot→warm flush stall is its own band, not hidden decode/prefill.
@@ -1714,6 +1741,8 @@ impl WaveStats {
             evict_count: 0,
             evict_ms: 0,
             idle_ms: 0,
+            requests_us: 0,
+            housekeeping_us: 0,
             wait_ms: 0,
             maint_ms: 0,
             drain_prefill_ms: 0,
@@ -1733,6 +1762,21 @@ impl WaveStats {
     /// Accumulate one idle wait — the loop blocked on `rx.recv()` with no work.
     fn add_idle(&mut self, ms: u64) {
         self.idle_ms += ms;
+    }
+
+    /// Accumulate one request-handling span — see [`Self::requests_us`].
+    /// Accumulated in MICROSECONDS. A single request is routinely sub-millisecond,
+    /// so millisecond spans truncated to 0 and thousands of them summed to
+    /// nothing — the band stayed empty and its time kept reading as `Blocked`,
+    /// which is the exact defect it was added to fix.
+    fn add_requests(&mut self, us: u64) {
+        self.requests_us += us;
+    }
+
+    /// Accumulate one per-wave housekeeping span, in MICROSECONDS — same
+    /// truncation hazard as [`Self::add_requests`].
+    fn add_housekeeping(&mut self, us: u64) {
+        self.housekeeping_us += us;
     }
 
     /// Accumulate one scope-ingest seal's sub-step timings (microseconds).
@@ -2000,6 +2044,8 @@ impl WaveStats {
         self.evict_count = 0;
         self.evict_ms = 0;
         self.idle_ms = 0;
+        self.requests_us = 0;
+        self.housekeeping_us = 0;
         self.wait_ms = 0;
         self.maint_ms = 0;
         self.drain_prefill_ms = 0;
@@ -2036,7 +2082,7 @@ impl WaveStats {
         // and INTO Prefill — with its tokens (below) — so ingest throughput isn't
         // hidden as token-less projection time.
         let drain_prefill = self.drain_prefill_ms.min(self.drain_ms);
-        let proj_dur = self.drain_ms.saturating_sub(drain_prefill) + self.reproj_ms;
+        let mut proj_dur = self.drain_ms.saturating_sub(drain_prefill) + self.reproj_ms;
         let mut decode_dur = self.decode_ms.saturating_sub(self.reproj_ms);
         // Continuous-fair-wave co-batching folds the prefill cohort and section
         // chunks INTO the decode quantum — one shared forward per wave — so their
@@ -2058,9 +2104,22 @@ impl WaveStats {
             self.drain_ms + self.promote_ms + self.decode_ms + self.prefill_ms + self.section_ms;
         let mut blocked_dur = (window_ms as u64).saturating_sub(accounted);
 
-        // Sealing lives inside prefill + decode; carve it out (prefill first).
+        // Housekeeping runs entirely outside the five quanta, so its time is only
+        // ever in the remainder. Carved BEFORE sealing, because the turn-reprefill
+        // seal runs inside it and sealing must be able to take from it.
+        let mut housekeeping_dur = carve_ms(self.housekeeping_us / 1000, &mut [&mut blocked_dur]);
+
+        // Sealing runs in three places: the turn-reprefill seal inside
+        // HOUSEKEEPING (`complete_turn_reprefill` → `perform_seal_and_write`,
+        // reached from `promote_finished_prefills_to_decodes`), and the immediate
+        // seals inside prefill and decode. Housekeeping first — that is where the
+        // per-turn K/V snapshot actually runs, and carving only from prefill/decode
+        // left it stranded in the housekeeping band no matter how well it was timed.
         let seal_ms = (self.seal_snapshot_us + self.seal_sig_us + self.seal_flush_us) / 1000;
-        let seal_dur = carve_ms(seal_ms, &mut [&mut prefill_dur, &mut decode_dur]);
+        let seal_dur = carve_ms(
+            seal_ms,
+            &mut [&mut housekeeping_dur, &mut prefill_dur, &mut decode_dur],
+        );
         // Eviction lives in the flush block (blocked) + relief inside the quanta;
         // carve blocked first, then the quanta.
         let evict_dur = carve_ms(
@@ -2093,6 +2152,17 @@ impl WaveStats {
         // `blocked_dur` is genuinely unattributed remainder (lock contention, the
         // cheap on-thread flush-block housekeeping).
         let idle_dur = carve_ms(self.idle_ms, &mut [&mut blocked_dur]);
+        // Request handling is a SUB-SLICE, and of two different buckets — so it is
+        // carved, never added, or it double-counts (see this function's contract).
+        // Most of it runs inside `drain_submissions`, whose wall-clock is already
+        // in `drain_ms` and therefore in the projection band; the rest runs on the
+        // idle path in `run()`, outside every quantum, and is in the remainder.
+        // Carve projection first, spilling to blocked, so each source is taken
+        // from the bucket that actually holds it.
+        let requests_dur = carve_ms(
+            self.requests_us / 1000,
+            &mut [&mut proj_dur, &mut blocked_dur],
+        );
 
         let mut phases: Vec<PhaseMeasure> = Vec::new();
         let mut inference = |kind: PhaseKind, ch: &WaveChannel, dur_ms: u64| {
@@ -2164,6 +2234,49 @@ impl WaveStats {
         }
         if sync_dur > 0 {
             push(&mut phases, PhaseKind::Sync, sync_dur, 0, 0);
+        }
+        if requests_dur > 0 {
+            push(&mut phases, PhaseKind::Requests, requests_dur, 0, 0);
+        }
+        // Drained EVERY window, unconditionally — the sub-timers accumulate on
+        // every wave, but the band they decompose is carved out of `blocked`,
+        // which is routinely 0 in a busy window. Draining only when the band is
+        // non-zero let the counters carry across windows, so the eventual log
+        // reported a multi-window sum against one window's total and `other_ms`
+        // saturated to 0 — destroying exactly the attribution the split exists
+        // for.
+        let (promote, admit, demote, gpu) = run::take_housekeeping_split();
+        let (finalise, reprefill, compression) = run::take_promote_split();
+        let (rp_write, rp_trunc) = run::take_reprefill_split();
+        if housekeeping_dur > 0 {
+            push(&mut phases, PhaseKind::Housekeeping, housekeeping_dur, 0, 0);
+            // Decompose the band for the log: the dashboard draws one
+            // housekeeping segment, but which of the five steps is responsible is
+            // what a regression needs.
+            tracing::info!(
+                target: "candle_conversation::scheduler::housekeeping",
+                // `total_ms` is the band AFTER the sealing carve took its share,
+                // but the sub-timers below are raw measurements taken before it.
+                // `raw_total_ms` is what they actually decompose — subtracting
+                // them from the carved total made `other_ms` saturate to 0
+                // whenever the reprefill seal was material.
+                total_ms = housekeeping_dur,
+                raw_total_ms = self.housekeeping_us / 1000,
+                promote_ms = promote,
+                admit_ms = admit,
+                demote_ms = demote,
+                gpu_drain_ms = gpu,
+                other_ms = (self.housekeeping_us / 1000)
+                    .saturating_sub(promote + admit + demote + gpu),
+                // Promote dominates the band, so it carries its own split.
+                promote_finalise_ms = finalise,
+                promote_reprefill_ms = reprefill,
+                promote_compression_ms = compression,
+                // …and the reprefill seal carries its own, since it is ~99% of promote.
+                reprefill_write_ms = rp_write,
+                reprefill_truncate_ms = rp_trunc,
+                "housekeeping split"
+            );
         }
         if idle_dur > 0 {
             push(&mut phases, PhaseKind::Idle, idle_dur, 0, 0);
@@ -2767,7 +2880,15 @@ impl Scheduler {
         loop {
             match self.rx.try_recv() {
                 Ok(req) => {
-                    if !self.handle_request(req) {
+                    // Timed for the same reason as the idle-path handler in
+                    // `run.rs`: this is the hot drain during active work, so an
+                    // ingest opening thousands of conversations spends real
+                    // scheduler time here and it must not read as Blocked.
+                    let t_req = Instant::now();
+                    let keep_going = self.handle_request(req);
+                    self.wave_stats
+                        .add_requests(t_req.elapsed().as_micros() as u64);
+                    if !keep_going {
                         return false;
                     }
                 }
@@ -3661,15 +3782,41 @@ impl Scheduler {
             }
 
             SchedulerRequest::InstallRecurrentState {
-                sequence_id,
+                sequence_ids,
                 schedule_hash,
                 layers,
                 response_tx,
             } => {
-                let result = self
-                    .model
-                    .restore_recurrent(sequence_id.0, schedule_hash, &layers)
-                    .map_err(ConversationError::Model);
+                // Every slot gets the same state, so the scatter is per-slot but
+                // the queue wait and the host payload are shared.
+                //
+                // EVERY slot is attempted, even after a failure. Stopping at the
+                // first error does not prevent a partial install — the slots
+                // already done stay done — it only adds arbitrarily-skipped slots
+                // on top, which is strictly worse: those conversations start from
+                // zero with no error of their own. There is no rollback here, so
+                // best-effort plus a reported error is the honest contract. The
+                // first error is kept and returned.
+                let mut installed = false;
+                let mut first_err = None;
+                for sequence_id in sequence_ids {
+                    match self
+                        .model
+                        .restore_recurrent(sequence_id.0, schedule_hash, &layers)
+                        .map_err(ConversationError::Model)
+                    {
+                        Ok(did) => installed |= did,
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+                let result = match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(installed),
+                };
                 let _ = response_tx.send(result);
                 true
             }
@@ -5044,6 +5191,7 @@ impl Scheduler {
             layout,
             token_ids: TokenBuffer::from(token_ids),
         };
+        let t_write = Instant::now();
         let seal_result = self
             .perform_seal_and_write(
                 parent_id,
@@ -5056,8 +5204,11 @@ impl Scheduler {
                 None
             });
 
+        let write_us = t_write.elapsed().as_micros() as u64;
+
         // Drop the slot's chunks now the residence owns them (the next projection
         // rebuilds from the substrate) — same housekeeping as the immediate seal.
+        let t_trunc = Instant::now();
         if let Err(e) = self.session.truncate_sequence_to_blocks(parent_id.0, 0) {
             tracing::warn!(
                 "post-seal slot truncate failed for slot {}: {}",
@@ -5065,6 +5216,12 @@ impl Scheduler {
                 e
             );
         }
+        // Splits the reprefill seal, which the sub-step timers pinned as ~99% of
+        // the housekeeping band, into its two candidate costs — the substrate
+        // write and the slot truncate. The snapshot and sig-gather inside
+        // `perform_seal_and_write` are already timed into the Sealing band and
+        // measure small, so whichever of these two dominates is the hot spot.
+        run::note_reprefill_split(write_us, t_trunc.elapsed().as_micros() as u64);
 
         let _ = event_tx.send(TurnEvent::Done(TurnResponse {
             text: done_text,
@@ -5225,11 +5382,7 @@ impl Scheduler {
                 (idx, pending.kind, token_count as u32),
                 children_meta,
             );
-            if let Err(e) =
-                conversation.persist_projection_events(stream_id, &encode_events(&[event]))
-            {
-                tracing::warn!("persist summary projection event failed: {e}");
-            }
+            conversation.persist_projection_events(stream_id, encode_events(&[event]));
         }
         self.persist_trigger.fire();
 
@@ -6982,6 +7135,11 @@ impl Scheduler {
         // the ingest slot is freed (RAII on `ChunkGid`).  Errors
         // abort the seal entirely — a missing snapshot would leave
         // the substrate entry without KV data.
+        // Timed into the Sealing band's snapshot slot. It had been passing 0 for
+        // this — the field existed and was never fed — so a full per-layer K/V
+        // snapshot, once per sealed turn, was invisible on the dashboard and its
+        // wall-clock fell through to the housekeeping remainder.
+        let t_snap = Instant::now();
         let sealed_per_layer = match self.session.snapshot_sequence_per_layer(seal_slot.0) {
             Ok(sealed) => std::sync::Arc::new(sealed),
             Err(e) => {
@@ -6993,6 +7151,7 @@ impl Scheduler {
                 return Ok(None);
             }
         };
+        let snapshot_us = t_snap.elapsed().as_micros() as u64;
 
         let chunk_size = self.chunk_size;
         let block_to = block_count.min(snapshot.chunks.len());
@@ -7012,7 +7171,7 @@ impl Scheduler {
         let t_sig = Instant::now();
         let wide_sigs = self.gather_wide_sigs(seal_slot, (block_from, block_to));
         self.wave_stats
-            .add_seal(0, t_sig.elapsed().as_micros() as u64, 0);
+            .add_seal(snapshot_us, t_sig.elapsed().as_micros() as u64, 0);
 
         // KV-zero check: scan the PARENT slot at the seal range, right before the
         // chunks are persisted — i.e. exactly what gets written to the substrate.
@@ -9607,9 +9766,9 @@ mod tests {
 
         let (tx, rx) = crossbeam::channel::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
-            sequence_id: slot,
+            sequence_ids: vec![slot],
             schedule_hash: hash,
-            layers,
+            layers: layers.into(),
             response_tx: tx,
         });
         assert!(
@@ -9617,6 +9776,41 @@ mod tests {
             "the install reported that no state was carried"
         );
         assert!(probe.get(slot.0).is_some(), "the slot has no state");
+    }
+
+    /// **One request installs the same branch state onto EVERY named slot.**
+    ///
+    /// This is what lets a batch of conversations born on one prompt branch pay
+    /// a single queue wait instead of one per conversation, so the multi-slot
+    /// case is asserted directly rather than inferred from the single-slot one.
+    #[test]
+    fn install_recurrent_state_request_installs_onto_every_named_slot() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let (hash, layers) = sched
+            .handle_branch_checkpoint_pass(&[2, 4, 6])
+            .expect("pass ran")
+            .expect("state");
+        let slots: Vec<SequenceId> = (0..3)
+            .map(|_| SequenceId(sched.session.create_sequence().expect("slot")))
+            .collect();
+
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        sched.handle_request(SchedulerRequest::InstallRecurrentState {
+            sequence_ids: slots.clone(),
+            schedule_hash: hash,
+            layers: layers.into(),
+            response_tx: tx,
+        });
+        assert!(
+            rx.recv().expect("reply").expect("install"),
+            "the install reported that no state was carried"
+        );
+        for slot in &slots {
+            assert!(
+                probe.get(slot.0).is_some(),
+                "slot {slot} was named in the request but has no state"
+            );
+        }
     }
 
     /// **T7.3 — a snapshot newer than the recovered history is rejected.**
@@ -10461,12 +10655,10 @@ mod tests {
                 },
                 ..Default::default()
             };
-            conversation
-                .persist_projection_events(
-                    turn_stream_id(timeline.raw(), idx.0),
-                    &encode_events(&[event]),
-                )
-                .expect("persist events");
+            conversation.persist_projection_events(
+                turn_stream_id(timeline.raw(), idx.0),
+                encode_events(&[event]),
+            );
         }
 
         let slot = SequenceId(scheduler.session.create_sequence().expect("slot"));

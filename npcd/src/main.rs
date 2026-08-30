@@ -16,12 +16,23 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use include_dir::{include_dir, Dir};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use web::{Builder, Config, Roots};
 
 mod accounts;
 mod api;
+mod collections;
+mod guard;
 mod identity;
+mod logs;
+mod model;
+mod npcs;
+mod ops;
+mod projection;
 mod registry;
+mod substrate;
+mod telemetry;
+mod visibility;
 
 /// The console, compiled in. Two directories, searched in order: a request for
 /// `/lib/dom.js` falls through to the shared framework, `/pages/roster.js` does
@@ -43,15 +54,39 @@ struct Cli {
     #[arg(long)]
     content: Option<PathBuf>,
 
-    /// Where authored content lives — `worlds/` and `archetypes/`, read once at
-    /// start and written back when the GUI saves. Defaults to the `npcd`
-    /// directory in the source tree, which is what makes a world edit a commit.
+    /// Where the engine's own state lives — `.substrate/` and `accounts/`, the
+    /// things the daemon writes rather than a person. Also the fallback source
+    /// for authored content (`worlds/`, `personalities/`) when no `--mind` is
+    /// named. Defaults to the `npcd` directory in the source tree.
     #[arg(long)]
     data: Option<PathBuf>,
+
+    /// Load the projection schema and its content libraries from this
+    /// directory instead of the compiled-in default.
+    ///
+    /// The directory must hold a `projection.yaml`; the folders beside it
+    /// (`responses/`, `moods/`, `personalities/`, `worlds/`, …) are what its
+    /// folder-backed collections and its authored registries read from. Schema
+    /// and libraries move together — see
+    /// `crate::projection`. `zend` spells the same idea `--working-dir`, which
+    /// for it also relocates the substrate; here `--data` already does that, so
+    /// this flag moves only the mind.
+    #[arg(long, value_name = "DIR")]
+    mind: Option<PathBuf>,
 
     /// Increase log verbosity (-v debug, -vv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+}
+
+/// How many routes across both tables sit at exactly this role, for the
+/// startup line.
+fn count<A, B>(a: &guard::Api<A>, b: &guard::Api<B>, min: web::auth::Role) -> usize {
+    a.declared()
+        .iter()
+        .chain(b.declared())
+        .filter(|r| r.min == min)
+        .count()
 }
 
 #[tokio::main]
@@ -63,12 +98,47 @@ async fn main() -> anyhow::Result<()> {
         1 => "npcd=debug,web=debug",
         _ => "npcd=trace,web=trace",
     };
+    // Every line goes two places: the terminal, and the bus the console reads
+    // from `/ws/logs`. One formatter feeds both, so what an operator sees on
+    // screen and what the console shows cannot drift — a second formatter is
+    // how those two end up disagreeing about what the daemon said.
+    let logs = logs::LogBus::new();
+    let bus = logs.clone();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()),
         )
-        .with_target(false)
+        // Targets on. They cost a prefix in the terminal and buy a column the
+        // console can filter by — and without them a message containing a colon
+        // is indistinguishable from `target: message`, so the viewer would
+        // file `world: 2 loaded` under a target called `world`.
+        .with_target(true)
+        .with_writer(std::io::stderr.and(move || logs::BusWriter::new(bus.clone())))
         .init();
+
+    // The projection schema, resolved before any I/O.
+    //
+    // First because a mistyped `--mind` should be refused on the spot, not
+    // after the substrate has been opened and half the daemon stood up — the
+    // error is about a command-line argument and nothing that happens in
+    // between can change the answer.
+    //
+    // Fatal rather than a fallback: a daemon that quietly reverted to the
+    // bundled placeholder would run with none of the named mind's content and
+    // give no sign of it, until characters behaved as though their libraries
+    // were empty. Which they would be.
+    let schema = projection::Source::resolve(cli.mind.as_deref())?;
+    match &schema.dir {
+        Some(dir) => tracing::info!(
+            "projection schema: {} (collections resolve under {})",
+            schema.label,
+            dir.display()
+        ),
+        None => tracing::info!(
+            "projection schema: {} — placeholder, no layers and no content libraries",
+            schema.label
+        ),
+    }
 
     let mut cfg = Config::from_yaml(
         include_str!("../npcd.web.yaml"),
@@ -94,18 +164,29 @@ async fn main() -> anyhow::Result<()> {
         None => Roots::embedded(&[&SITE, &COMMON]),
     };
 
-    // Authored content, read once. Everything after this answers from memory,
-    // so a URL id is a key rather than a path — see `registry`.
     let data = cli
         .data
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    let worlds = registry::Registry::load("world", data.join("worlds"))?;
-    let archetypes = registry::Registry::load("archetype", data.join("archetypes"))?;
+
+    // Authored content, read once. Everything after this answers from memory,
+    // so a URL id is a key rather than a path — see `registry`.
+    //
+    // It comes from the MIND when one is named, and from the data directory
+    // otherwise — the same override the schema itself uses. Worlds and
+    // personalities are written by a person and belong beside the corpus they
+    // index: a world names which canon it admits, and a personality is what a
+    // character is before it has lived anything. The data directory holds what
+    // the ENGINE wrote — the substrate and accounts — and reading a world from
+    // there would put the two on the wrong sides of that line.
+    let authored_dir = schema.dir.clone().unwrap_or_else(|| data.clone());
+    let worlds = registry::Registry::load("world", authored_dir.join("worlds"))?;
+    let personalities =
+        registry::Registry::load("personality", authored_dir.join("personalities"))?;
     tracing::info!(
-        "authored content: {} worlds, {} archetypes from {}",
+        "authored content: {} worlds, {} personalities from {}",
         worlds.len(),
-        archetypes.len(),
-        data.display()
+        personalities.len(),
+        authored_dir.display()
     );
 
     // Accounts are durable but never published — `npcd/.gitignore` keeps the
@@ -118,15 +199,96 @@ async fn main() -> anyhow::Result<()> {
         accounts.len(),
         data.join("accounts").display()
     );
-    tracing::info!("backend: MOCK for everything except authored content and accounts");
+    tracing::info!(
+        "backend: MOCK for everything except authored content, accounts, telemetry and logs"
+    );
 
     // The real routes sit *over* the mock rather than beside it: `npcd` owns
-    // `/v1/world*`, `/v1/archetype*` and `/v1/me*`, and anything it does not
-    // answer falls through. Merging the two would panic on the overlap;
-    // layering means each surface can become real one route at a time without
-    // the console noticing.
-    let authored = api::Authored::new(worlds, archetypes, accounts);
-    let router = api::router(authored).fallback_service(web::mock::npcd::router());
+    // `/v1/world*`, `/v1/personality*`, `/v1/me*`, `/v1/telemetry` and
+    // `/ws/logs`, and anything it does not answer falls through. Merging with
+    // the mock would panic on the overlap; layering means each surface can
+    // become real one route at a time without the console noticing.
+    //
+    // The two real routers *are* merged with each other — their paths are
+    // disjoint and their state is unrelated, so keeping them apart is what lets
+    // each hold exactly what it needs.
+    // The cast, rebuilt from the substrate's redo log. The one read of that log
+    // — every request after this is answered from memory.
+    let npcs = npcs::Npcs::load(&data)
+        .map_err(|e| anyhow::anyhow!("opening the substrate at {}: {e:?}", data.display()))?;
+
+    // Who may change what. Configuration, decided once at startup — there is
+    // deliberately no API that grants it, so it cannot drift from the file.
+    let roles = cfg.roles.clone();
+    if roles.is_empty() {
+        // Not fatal: a read-only daemon is a legitimate thing to run. But it is
+        // the difference between "the console has no Save" and "the console's
+        // Save is broken", and an operator should learn it here rather than
+        // from a 403 an hour later.
+        tracing::warn!(
+            "roles: no admins configured — worlds and personalities are read-only to everyone"
+        );
+    } else {
+        tracing::info!(
+            "roles: {} admin principal(s) configured",
+            roles.admins.len()
+        );
+    }
+
+    // The response and mood libraries, beside the schema. Read once: they are
+    // ingested untagged and shared by every world, so there is one copy and it
+    // does not change while the daemon runs.
+    let libraries = collections::Libraries::load(&schema);
+    tracing::info!(
+        "libraries: {} responses ({} with examples), {} moods ({} with examples)",
+        libraries.responses.len(),
+        libraries.responses.with_examples(),
+        libraries.moods.len(),
+        libraries.moods.with_examples(),
+    );
+
+    let authored = api::Authored::new(
+        worlds,
+        personalities,
+        accounts,
+        npcs,
+        roles.clone(),
+        libraries,
+    );
+    let ops_state = ops::Ops::new(logs, &data, roles.clone());
+
+    // The route table, at startup, with the role each route needs.
+    //
+    // Printed rather than assumed: `guard::Api` makes it impossible to register
+    // a route *without* a role, and this makes the resulting table something an
+    // operator can read on a line instead of inferring from source. A surprise
+    // here — a write route sitting at `unauthenticated` — is the one that
+    // matters, and it is the one that used to be invisible.
+    let (api_routes, ops_routes) = (api::api(authored.clone()), ops::api(ops_state.clone()));
+    for r in api_routes.declared().iter().chain(ops_routes.declared()) {
+        tracing::debug!("route {r}");
+    }
+    tracing::info!(
+        "routes: {} guarded ({} open, {} user, {} admin), everything else behind `user`",
+        api_routes.declared().len() + ops_routes.declared().len(),
+        count(&api_routes, &ops_routes, web::auth::Role::Unauthenticated),
+        count(&api_routes, &ops_routes, web::auth::Role::User),
+        count(&api_routes, &ops_routes, web::auth::Role::Admin),
+    );
+
+    let router = api_routes
+        .into_router(authored)
+        .merge(ops_routes.into_router(ops_state))
+        // The fallback is the quietest surface there is: it answers every path
+        // the real routes did not claim, which today is the console's fixture
+        // and tomorrow is whatever has not been migrated yet. Signed-in is the
+        // floor — the console is a signed-in tool — so a route that has not
+        // been written yet cannot be reached by a stranger before it is.
+        .fallback_service(guard::behind(
+            roles,
+            web::auth::Role::User,
+            web::mock::npcd::router(),
+        ));
 
     Builder::new(cfg)
         .content("npcd", roots)

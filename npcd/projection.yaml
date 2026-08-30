@@ -1,0 +1,529 @@
+# -----------------------------------------------------------------------------
+# npcd -- Projection schema
+# -----------------------------------------------------------------------------
+#
+# The cognitive substrate a character is projected from before it acts. Layers
+# are ordered low -> high: a higher layer attends to everything beneath it, and
+# siblings inside a layer are masked from each other.
+#
+# `world` is the ONE exception, and the whole worlds design turns on it. Every
+# other layer is `gather_scope: conversation` -- self-local, one private tree
+# per character, so one character never reads another's memory. `world` is
+# `shared`: a single tree across every conversation, which is what makes a fact
+# about the setting common knowledge rather than one character's recollection.
+#
+#
+# Per-target window
+# -----------------
+# Each layer's `window:` is the total turn-budget flexbox distributes across the
+# visible layers WHEN THAT LAYER IS THE PROJECTION TARGET. The target picks the
+# size of the pie; `budget.priority` slices it.
+#
+#   16 000   perception, action, interaction   the live surfaces
+#    8 000   memory, world                     the deep ones
+#    6 000   environment                       scene continuity only
+#    4 000   agency, relationships, beliefs    small, sharp, high-threshold
+#
+#
+# Content comes from folders, filtered by tag
+# -------------------------------------------
+# A layer ingests from `<mind>/layers/<name>/`, and the path under it becomes
+# the turn's gather-scope tag. A world is a YAML naming which tags it selects,
+# so worlds are a FILTER over one shared corpus rather than a corpus each.
+#
+# The tag rule is not obvious and is easy to get backwards, so, precisely:
+# an EMPTY filter admits only turns that are themselves UNTAGGED, and a NAMED
+# filter admits only turns carrying one of its tags. Untagged content is
+# therefore the shared library every world sees, and tagged content is scoped.
+# See `docs/npcd_worlds_and_layers.md` and
+# `substrate::tests::an_empty_tag_filter_admits_only_untagged_turns`.
+#
+#
+# Thresholds
+# ----------
+# `score_threshold` is a belief-score gate. It rises with the cost of being
+# wrong rather than with importance:
+#
+#   0.00  perception, action, interaction, environment -- observation. What
+#         happened, happened; there is nothing to be wrong about.
+#   0.25  memory -- recall is allowed to be associative.
+#   0.30  world, relationships -- a shared fact or a read on someone else
+#         needs support before it colours behaviour.
+#   0.35  agency -- acting on a goal is expensive.
+#   0.40  beliefs -- the highest, because a belief admitted on thin evidence
+#         then justifies everything downstream of it.
+# -----------------------------------------------------------------------------
+
+
+# The band every layer, group and collection inherits unless it says otherwise.
+default_policy:
+  preset: high_recall_scope
+
+
+# ── The shared system prompt ─────────────────────────────────────────────────
+#
+# ONE prompt. Every layer frames on it and differs only by its `dials`. The
+# collections here are folder-backed: they declare a discipline and leave
+# `sections: []`, and the daemon fills them from `<mind>/personalities/`,
+# `<mind>/responses/` and `<mind>/moods/` at startup.
+#
+# ORDER IS LOAD-BEARING. A section's KV is content-addressed on
+# `(prefix_hash, section_hash)`, so a shared member's KV is only actually shared
+# while everything BEFORE it matches too. World-specific material must therefore
+# come after `mood` -- put a world's setting above `identity_anchor` and every
+# world forks its own copy of all 596 response templates' KV, silently.
+system_prompt:
+  items:
+    - kind: template
+      id: system_open
+      dialect: system_start
+
+    - kind: section
+      id: frame
+      content: |+
+        You are a person in a place, not an assistant. You have your own history,
+        your own reasons, and your own stake in what happens next. Speak and act
+        from inside that life rather than describing it from outside.
+
+    # ── Identity: who this character is ──────────────────────────────────
+    # The anchor is structurally resident -- it never competes for the gather
+    # budget, because it is the prefix the budget is read inside. Personality
+    # sits beside it and is also always-on: a character is not situationally
+    # itself, and selecting four traits per turn would make it partly itself,
+    # differently each turn.
+    #
+    # Both are filled from `personalities/<name>.yaml` for the character being
+    # projected. Biography is NOT here -- it is content in the `memory` layer,
+    # retrieved when the moment calls for it.
+    - kind: collection
+      name: identity_anchor
+      selection: { kind: always_visible }
+      sections: []
+
+    - kind: collection
+      name: identity
+      selection: { kind: always_visible }
+      sections: []
+
+    # ── Response: the locked structural template ─────────────────────────
+    # The shape the whole reply takes. Chosen ONCE at turn start by top-k
+    # provenance match against the incoming exchange and frozen for the decode:
+    # structural mode cannot change mid-reply without breaking coherence, which
+    # is what separates it from mood below.
+    #
+    # Folder-backed from `responses/`, ingested UNTAGGED so every world shares
+    # both the text and its KV.
+    - kind: collection
+      name: response
+      policy:
+        preset: high_recall_scope
+        beta: 0.20
+        min_score: 500
+        evict_score: 300
+      selection: { kind: top_k, k: 1 }
+      sections: []
+
+    # ── Mood: the spiking register ───────────────────────────────────────
+    # Event-driven and threshold-gated, NOT drifting. Holds its register until
+    # provenance scores a different one above the spike threshold at a barrier,
+    # then snaps -- no blend. Re-evaluated at every barrier, which is what makes
+    # it spiking where response is locked.
+    #
+    # Low beta is sticky carry; the min-evict gap is the hysteresis that holds a
+    # register once snapped, so a character does not flicker between warm and
+    # cold within one exchange.
+    - kind: collection
+      name: mood
+      policy:
+        preset: high_recall_scope
+        beta: 0.15
+        min_score: 500
+        evict_score: 300
+      selection: { kind: top_k, k: 1 }
+      sections: []
+
+    - kind: section
+      id: grounding
+      content: |+
+        Answer from what your substrate actually holds -- the perceptions,
+        memories and beliefs in front of you -- not from how such things usually
+        go. If you do not know something, you do not know it.
+
+    - kind: template
+      id: system_close
+      dialect: system_end
+
+
+# ── Layers ───────────────────────────────────────────────────────────────────
+layers:
+
+  # ── Perception ─────────────────────────────────────────────────────────────
+  - name: perception
+    description: |
+      What the character can currently see, hear and sense. API-fed: maps
+      supersede at the same zoom band, descriptions accumulate. The most
+      recent frames matter most, so selection is sequence-weighted rather
+      than purely scored.
+    window: 16000
+    score_threshold: 0.0
+    gather_scope: conversation
+    decode_priority: high
+    on_corrupt_turn: drop_turn
+    budget:
+      priority: 100
+      max_percent: 40
+    summary:
+      turns:
+        max_tokens: 256
+        assistant:
+          system_prompt: |
+            You compress what was perceived into a shorter, faithful record. Keep
+            what was actually sensed -- objects, positions, people, changes -- in
+            the order it was noticed. Add nothing that was not observed; infer
+            nothing about causes. Stop when the scene is captured.
+          user_prompt: |
+            Compress the perceptions above into a faithful shorter record, keeping
+            what was sensed and adding nothing.
+      summaries:
+        max_tokens: 256
+        assistant:
+          system_prompt: |
+            The records below are already compressed. Merge them into one, keeping
+            what still holds and dropping what has since been superseded by a later
+            observation of the same thing. Invent nothing.
+          user_prompt: |
+            Merge the perception records above into one, keeping what still holds.
+    groups:
+      - id: sensed
+        selection:
+          kind: conversation
+          recent: 12
+          historical_top_k: 8
+        budget:
+          priority: 100
+
+  # ── Action ─────────────────────────────────────────────────────────────────
+  - name: action
+    description: |
+      The act stream -- what this character actually did. Ground truth: every
+      narration is read from here, never the reverse, so an act that is not in
+      this layer did not happen.
+    window: 16000
+    score_threshold: 0.0
+    gather_scope: conversation
+    decode_priority: high
+    on_corrupt_turn: drop_turn
+    budget:
+      priority: 100
+      max_percent: 40
+    summary:
+      turns:
+        max_tokens: 256
+        assistant:
+          system_prompt: |
+            You compress a sequence of acts into a faithful shorter account. Keep
+            what was done, to whom, and what followed, in order. Keep the intent
+            behind an act where it was stated; never invent one. Stop when the
+            sequence is captured.
+          user_prompt: |
+            Compress the acts above into a faithful shorter account, in order,
+            adding nothing.
+      summaries:
+        max_tokens: 256
+        assistant:
+          system_prompt: |
+            The accounts below are already compressed. Merge them into one,
+            preserving order and causation, dropping only repetition. Invent
+            nothing.
+          user_prompt: |
+            Merge the accounts above into one, preserving order and adding nothing.
+    groups:
+      - id: acts
+        selection:
+          kind: conversation
+          recent: 16
+          historical_top_k: 6
+        budget:
+          priority: 100
+
+  # ── Interaction ────────────────────────────────────────────────────────────
+  - name: interaction
+    description: |
+      The live exchange with another party. One timeline per interaction,
+      forked from the character's sealed prefix, so two conversations at once
+      never bleed into each other.
+    window: 16000
+    score_threshold: 0.0
+    gather_scope: conversation
+    decode_priority: high
+    on_corrupt_turn: drop_turn
+    budget:
+      priority: 100
+      min_percent: 40
+    summary:
+      turns:
+        max_tokens: 192
+        assistant:
+          system_prompt: |
+            You compress an exchange into a faithful, shorter version. Keep what
+            was actually said and decided, in the original voice, as if it were the
+            exchange only abridged. Add nothing; answer nothing that was not
+            answered. If there is little substance, one short sentence.
+          user_prompt: |
+            Compress the exchange above into a faithful shorter version in the
+            original voice, adding nothing.
+      summaries:
+        max_tokens: 192
+        assistant:
+          system_prompt: |
+            The sections below are already compressed. Merge them into one faithful
+            shorter section in the original voice, keeping what still matters and
+            dropping superseded detail. Represent every section. Invent nothing.
+          user_prompt: |
+            Merge the sections above into one faithful section in the original
+            voice, covering every section.
+    groups:
+      - id: exchange
+        selection:
+          kind: conversation
+          recent: 16
+          historical_top_k: 8
+        budget:
+          priority: 100
+
+  # ── Memory ─────────────────────────────────────────────────────────────────
+  - name: memory
+    description: |
+      Everything the character remembers -- authored biography seeded at
+      ingest and lived experience folded down by consolidation, deliberately
+      indistinguishable once stored. A character should not experience its
+      childhood differently from last Tuesday.
+
+      Unbounded, and the consolidation target for the daydream and sleep
+      folds. Recall is allowed to be associative, hence the low threshold and
+      the wide historical reach.
+    window: 8000
+    score_threshold: 0.25
+    gather_scope: conversation
+    decode_priority: low
+    ingest_unit: memories
+    budget:
+      priority: 60
+      max_percent: 25
+      adaptive:
+        gain: 2.0
+        max_percent: 45
+    summary:
+      turns:
+        max_tokens: 320
+        assistant:
+          system_prompt: |
+            You compress memories into one faithful, shorter memory in the first
+            person. Keep the specifics that make it this memory and not a
+            generality -- names, places, what was felt, what changed. Drop
+            circumstance that carries nothing. Never invent a detail to make the
+            memory cohere.
+          user_prompt: |
+            Compress the memories above into one faithful shorter memory, keeping
+            the specifics and inventing nothing.
+      summaries:
+        max_tokens: 320
+        assistant:
+          system_prompt: |
+            The memories below are already compressed. Merge them into one, keeping
+            every distinct event and the specifics that identify it, dropping only
+            repetition. A merged memory that has lost its names and places has lost
+            the thing that made it a memory.
+          user_prompt: |
+            Merge the memories above into one, keeping every distinct event and its
+            specifics.
+    groups:
+      - id: remembered
+        selection:
+          kind: conversation
+          recent: 4
+          historical_top_k: 12
+        budget:
+          priority: 100
+
+  # ── World ──────────────────────────────────────────────────────────────────
+  - name: world
+    description: |
+      Shared knowledge about the setting -- places, factions, history, the
+      rules the world runs by.
+
+      THE ONLY CROSS-TIMELINE LAYER. `gather_scope: shared` means one tree
+      across every conversation, so a fact here is common knowledge rather
+      than one character's recollection. That is precisely what makes it the
+      world: two characters who have never met still both know where the
+      river runs.
+
+      A world YAML selects which tags of this layer's corpus it admits, which
+      is how one ingested corpus serves several settings.
+    window: 8000
+    score_threshold: 0.30
+    gather_scope: shared
+    decode_priority: low
+    ingest_unit: documents
+    budget:
+      priority: 70
+      max_percent: 20
+      adaptive:
+        gain: 2.0
+        max_percent: 40
+    summary:
+      turns:
+        max_tokens: 384
+        scope: union
+        assistant:
+          system_prompt: |
+            You compress documents about a world into one faithful digest. Open by
+            naming what the digest covers -- it must stand alone. Keep every proper
+            noun exactly as written: a place, faction or event renamed is a
+            different fact. Never invent a connection the documents do not make.
+          user_prompt: |
+            Digest the documents above. Name what is covered, then what each says,
+            keeping every name exactly and adding nothing.
+      summaries:
+        max_tokens: 384
+        scope: union
+        assistant:
+          system_prompt: |
+            The digests below are already compressed. Merge them into one, keeping
+            every named place, faction and event, grouped by what they belong to,
+            dropping only duplicates. Never invent a fact to bridge two digests.
+          user_prompt: |
+            Merge the digests above into one, keeping every name and adding nothing.
+    groups:
+      - id: canon
+        selection: { kind: top_k, k: 6 }
+        budget:
+          priority: 100
+
+  # ── Environment ────────────────────────────────────────────────────────────
+  - name: environment
+    description: |
+      The immediate scene -- who is present, what the weather is, what is
+      within reach. A sliding window only: continuity, not recall. Nothing
+      here is retrieved by relevance, because a scene from last week is not
+      evidence about this one.
+    window: 6000
+    score_threshold: 0.0
+    gather_scope: conversation
+    decode_priority: low
+    budget:
+      priority: 50
+      max_percent: 15
+    summary:
+      turns:
+        max_tokens: 192
+        assistant:
+          system_prompt: |
+            You compress a run of scene descriptions into the current scene. Keep
+            what is still true now and drop what has been superseded -- this is a
+            statement of the present, not a history of it.
+          user_prompt: |
+            Compress the scenes above into the current scene, dropping what is no
+            longer true.
+    groups:
+      - id: scene
+        selection:
+          kind: conversation
+          recent: 24
+        budget:
+          priority: 100
+
+  # ── Agency ─────────────────────────────────────────────────────────────────
+  - name: agency
+    description: |
+      Missions, strategies and sub-goals -- what this character is trying to
+      bring about. Small and sharply gated: acting on a goal is expensive, so
+      a goal needs real support before it surfaces.
+    window: 4000
+    score_threshold: 0.35
+    gather_scope: conversation
+    decode_priority: normal
+    budget:
+      priority: 80
+      max_percent: 15
+    summary:
+      turns:
+        max_tokens: 192
+        assistant:
+          system_prompt: |
+            You compress goals into one faithful shorter statement of intent. Keep
+            what is being pursued and why, and any named condition for abandoning
+            it. Drop deliberation that led nowhere. Never invent a motive.
+          user_prompt: |
+            Compress the goals above into one statement of intent, keeping the aim
+            and its conditions.
+    groups:
+      - id: goals
+        selection: { kind: top_k, k: 4 }
+        budget:
+          priority: 100
+
+  # ── Relationships ──────────────────────────────────────────────────────────
+  - name: relationships
+    description: |
+      Per-entity calibration -- what this character has learned about each
+      person it deals with. Writable from both planes, unlike beliefs.
+    window: 4000
+    score_threshold: 0.30
+    gather_scope: conversation
+    decode_priority: normal
+    budget:
+      priority: 75
+      max_percent: 15
+    summary:
+      turns:
+        max_tokens: 192
+        assistant:
+          system_prompt: |
+            You compress a history with one person into a faithful shorter read on
+            them. Keep what they did and what it showed, named. Keep the evidence,
+            not only the conclusion -- a read without its grounds cannot be revised
+            when they act differently.
+          user_prompt: |
+            Compress the history above into a shorter read on this person, keeping
+            what they did as well as what it showed.
+    groups:
+      - id: entities
+        selection: { kind: top_k, k: 6 }
+        budget:
+          priority: 100
+
+  # ── Beliefs ────────────────────────────────────────────────────────────────
+  - name: beliefs
+    description: |
+      What the character holds to be true about the world and itself.
+
+      The highest threshold in the schema, and write-protected against the
+      action plane: a tool must never be able to install a belief. A belief
+      admitted on thin evidence then justifies every act downstream of it,
+      and nothing later in the pipeline re-examines it.
+    window: 4000
+    score_threshold: 0.40
+    gather_scope: conversation
+    decode_priority: normal
+    ingest_unit: beliefs
+    budget:
+      priority: 90
+      max_percent: 15
+    summary:
+      turns:
+        max_tokens: 192
+        assistant:
+          system_prompt: |
+            You compress beliefs into one faithful shorter statement of what is
+            held true, in the first person. Keep each distinct belief and the
+            grounds given for it. Never strengthen a belief in compressing it: a
+            hedged conviction stays hedged.
+          user_prompt: |
+            Compress the beliefs above into one statement of what is held true,
+            keeping the grounds and the hedging.
+    groups:
+      - id: held
+        selection: { kind: top_k, k: 5 }
+        budget:
+          priority: 100

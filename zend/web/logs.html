@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zend</title>
+<link rel="icon" href="favicon.svg">
+<link rel="stylesheet" href="common/base.css">
+<link rel="stylesheet" href="common/lib/estate.css">
+<style>
+  /* Only what the shared design system does not already say. Everything else —
+     colour, type, controls, the topbar — comes from `common/base.css`, which is
+     the whole reason this page is 120 lines instead of 900. */
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
+  .logwrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 var(--gutter) 16px; }
+  .logscroll {
+    flex: 1; min-height: 0; overflow-y: auto; background: var(--bg-deep);
+    border: 1px solid var(--line); border-radius: var(--radius-sm);
+    font-family: var(--mono); font-size: .78rem; line-height: 1.55; padding: 8px 10px;
+  }
+  .logline { display: flex; gap: 10px; white-space: pre-wrap; word-break: break-word; }
+  .logline .ts { color: var(--ink-ghost); flex: none; }
+  .logline .lvl { flex: none; width: 42px; font-weight: 700; }
+  .logline .tgt { color: var(--ink-faint); flex: none; max-width: 30ch; overflow: hidden; text-overflow: ellipsis; }
+  .logbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 12px 0; }
+  .logbar .grow { flex: 1; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div id="estate"></div>
+  <nav class="nav">
+    <a class="navlink" href="/">Chat</a>
+    <a class="navlink" href="perf.html">Telemetry</a>
+    <a class="navlink" href="logs.html" aria-current="page">Logs</a>
+  </nav>
+  <span class="spacer"></span>
+  <div class="row" id="chrome"></div>
+</header>
+
+<div class="logwrap">
+  <div class="logbar" id="bar"></div>
+  <div class="logscroll" id="scroll"><div id="list"></div></div>
+</div>
+
+<script type="module">
+/* Zend's log pane, rebuilt on the shared framework.
+ *
+ * Same stream as before — `/ws/logs`, which replays recent history on connect
+ * so the pane is never blank — and the same structured frame the daemon sends:
+ * `{ts, level, target, msg}`. Nothing here parses a formatted line, so
+ * filtering is a property test rather than a regex over presentation.
+ *
+ * What the framework supplies, and this file therefore does not:
+ *   `ringView`   — appends ONE row per arriving line rather than re-rendering
+ *                  the pane, caps the buffer, and follows the tail only while
+ *                  the reader is already at the bottom. Scrolling up to read
+ *                  something must not be yanked away by the next line.
+ *   `subscribe`  — reconnects with backoff and reports its state, so a daemon
+ *                  restart heals without a refresh.
+ *   `base.css`   — every colour, control and the topbar.
+ */
+import { h, mount } from './common/lib/dom.js';
+import { ringView } from './common/lib/live.js';
+import { subscribe } from './common/lib/ws.js';
+import { estateSwitcher } from './common/lib/estate.js';
+
+const MAX = 2000;
+const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
+const COLOR = {
+  TRACE: 'var(--ink-ghost)', DEBUG: 'var(--ink-faint)', INFO: 'var(--info)',
+  WARN: 'var(--warn)', ERROR: 'var(--crit)',
+};
+
+mount(document.getElementById('estate'), estateSwitcher('zend', { homeHref: '/' }));
+
+const scroller = document.getElementById('scroll');
+const list = document.getElementById('list');
+
+let minLevel = 'INFO';
+let needle = '';
+let paused = false;
+/* Lines that arrived while paused. Held rather than dropped: pausing is for
+ * reading something, not for missing what happened next. */
+const held = [];
+
+const passes = (l) =>
+  LEVELS.indexOf(l.level) >= LEVELS.indexOf(minLevel)
+  && (!needle || ((l.msg || '') + ' ' + (l.target || '')).toLowerCase().includes(needle));
+
+const row = (l) => h('div', { class: 'logline' },
+  h('span', { class: 'ts' }, (l.ts || '').replace('T', ' ').replace('Z', '')),
+  h('span', { class: 'lvl', style: 'color:' + (COLOR[l.level] || 'var(--ink-faint)') }, l.level || '—'),
+  h('span', { class: 'tgt', title: l.target || '' }, l.target || ''),
+  h('span', {}, l.msg || ''));
+
+const ring = ringView({ max: MAX, row, host: list, scroller });
+
+/* A filter change re-renders from the buffer rather than asking the daemon
+ * again: the lines are already here, and re-fetching would lose everything the
+ * stream delivered since. */
+const repaint = () => {
+  list.replaceChildren();
+  for (const l of ring.items.filter(passes)) list.appendChild(row(l));
+  scroller.scrollTop = scroller.scrollHeight;
+};
+
+const state = h('span', { class: 'chip' }, 'connecting…');
+const count = h('span', { class: 'tiny dim' });
+const pauseBtn = h('button', { class: 'btn sm' }, '⏸ pause');
+
+const levelSel = h('select', { class: 'select', style: 'width:auto',
+  onChange: (e) => { minLevel = e.target.value; repaint(); } },
+  ...LEVELS.map((l) => h('option', l === minLevel ? { value: l, selected: true } : { value: l }, l)));
+
+const search = h('input', { class: 'input', placeholder: 'filter…', style: 'width:240px',
+  onInput: (e) => { needle = e.target.value.trim().toLowerCase(); repaint(); } });
+
+pauseBtn.addEventListener('click', () => {
+  paused = !paused;
+  pauseBtn.textContent = paused ? '▶ resume' : '⏸ pause';
+  pauseBtn.classList.toggle('primary', paused);
+  if (!paused) {
+    // Drain in arrival order, so resuming reads as the stream catching up.
+    while (held.length) ring.push(held.shift());
+    repaint();
+  }
+  tally();
+});
+
+const tally = () => {
+  count.textContent = paused
+    ? `paused · ${held.length} held`
+    : `${ring.items.length} line${ring.items.length === 1 ? '' : 's'} buffered`;
+};
+
+mount(document.getElementById('bar'),
+  state, levelSel, search,
+  h('span', { class: 'grow' }), count, pauseBtn,
+  h('button', { class: 'btn sm ghost', onClick: () => { held.length = 0; ring.clear(); tally(); } }, 'Clear'),
+  h('button', { class: 'btn sm ghost', onClick: () => {
+    const text = ring.items.filter(passes)
+      .map((l) => `${l.ts} ${l.level} ${l.target} ${l.msg}`).join('\n');
+    navigator.clipboard?.writeText(text);
+  } }, 'Copy visible'));
+
+subscribe('/ws/logs', {
+  onMessage: (line) => {
+    if (paused) {
+      held.push(line);
+      // The hold is bounded by the same cap as the buffer: a pause left running
+      // overnight must not grow without limit.
+      if (held.length > MAX) held.splice(0, held.length - MAX);
+    } else if (passes(line)) {
+      ring.push(line);
+    } else {
+      // Keep it buffered even when filtered out — widening the filter must show
+      // what already arrived, not only what comes next.
+      ring.items.push(line);
+      if (ring.items.length > MAX) ring.items.splice(0, ring.items.length - MAX);
+    }
+    tally();
+  },
+  /* `subscribe` reports `live`, `reconnecting` or `closed` — its own vocabulary,
+   * not the socket's readyState, because reconnecting is a state the reader
+   * needs to see and `WebSocket` has no name for it. */
+  onState: (s) => {
+    state.textContent = s === 'live' ? '● live' : s === 'reconnecting' ? '◌ reconnecting…' : '○ closed';
+    state.className = 'chip' + (s === 'live' ? ' ok' : s === 'closed' ? ' crit' : '');
+  },
+});
+
+tally();
+</script>
+</body>
+</html>

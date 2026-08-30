@@ -47,7 +47,6 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result};
 
 #[cfg(feature = "cuda")]
-#[cfg(feature = "cuda")]
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
 use super::compression_policy::{

@@ -265,9 +265,21 @@ pub const PASS_NAME: &str = "code_read";
 ///
 /// Each file worker now parallelises its OWN scopes
 /// ([`crate::turn_sink::SCOPE_PARALLELISM`]), so the concurrent conversation
-/// count is `CODE_READ_PARALLELISM × SCOPE_PARALLELISM`. Keep the product near the
-/// engine's sequence-slot budget: 12 files × 4 scopes = 48, matching the prior
-/// file-only concurrency while adding within-file (large-file) parallelism.
+/// count is `CODE_READ_PARALLELISM × SCOPE_PARALLELISM` = 48.
+///
+/// **This does not scale independently of [`crate::code_read::types::MAX_SCOPE_LINES`].**
+/// Raising it to 24 (96 conversations) at the same time as the carve budgets
+/// tripled put ~6× the demand on the wave's transient tier and the ingest
+/// aborted mid-pass: `wave transient tier needs 41.5 GB below the weight floor …
+/// this wave is too wide for a partition that has nothing left to trade`, taking
+/// 35 of 2311 files down with it on a 72 GB card. Width and chunk size both
+/// multiply what one wave must stage, so they trade against each other — the
+/// carve tripling already widened each sequence, and this is what pays for it.
+///
+/// Unlike [`crate::repo_scan::REPO_MAP_PARALLELISM`], whose ceiling is clamped by
+/// a per-conversation VRAM estimate, this constant has no such governor: it is
+/// applied as given, so the partition failure is the only thing that reports an
+/// over-subscription, and it reports it by failing files.
 pub const CODE_READ_PARALLELISM: usize = 12;
 
 /// [`utility_config`] specialised for the `code_reading` layer: append-only

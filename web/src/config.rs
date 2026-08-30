@@ -18,6 +18,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::auth::Roles;
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -48,6 +50,15 @@ pub struct Config {
     /// it wants sign-in and a gateway that quietly has none is worse.
     #[serde(default)]
     pub auth_file: Option<PathBuf>,
+    /// Who is an admin. Estate-wide, like [`auth`](Self::auth), because a role
+    /// that meant something different on each hostname would be a role nobody
+    /// could reason about.
+    ///
+    /// Empty by default: no admins, and every write to authored content is
+    /// refused. See [`crate::auth::role`] for why this is configuration rather
+    /// than a user record, and why an entry names `sub` or `email` explicitly.
+    #[serde(default)]
+    pub roles: Roles,
     /// Directory the config was loaded from; relative roots resolve against it.
     #[serde(skip)]
     pub base: PathBuf,
