@@ -27,6 +27,7 @@ use super::record::{ChunkPayload, RecordType};
 use super::streams::{StreamDecl, StreamId, TurnDecl};
 use super::{PersistenceError, Result, SubstratePersistence};
 use crate::substrate::{StoredChunk, StoredSequence, Substrate};
+use std::collections::HashMap;
 
 /// One sealed chunk staged for the log: the `Chunk` record's `token_count`
 /// header field paired with its decoded [`ChunkPayload`] (which carries the
@@ -411,7 +412,6 @@ pub fn recover_turn_grid(
     // `ChunkImage`s once the batched read returns.  The chunk index →
     // token_count map is small (one u64 per chunk), so cloning is
     // cheap.
-    use std::collections::HashMap;
     let token_counts: HashMap<u64, u64> = substrate
         .stream_of(stream_id)
         .map(|s| s.chunks.iter().map(|(&i, l)| (i, l.token_count)).collect())
@@ -652,6 +652,58 @@ pub fn recovered_turn_decls(substrate: &Substrate) -> Vec<TurnDecl> {
     turns
 }
 
+/// The layer count `L` this substrate's turns were sealed with, read off the
+/// turns themselves.
+///
+/// `L` is a `ModelSpec` constant that the redo log never records: the flat grid
+/// stores `chunk_index = layer * chunks_per_layer + chunk`, and only
+/// `chunks_per_layer` survives in the `StreamDecl`. So a consistency check has
+/// to get `L` from somewhere, and the only honest source is the corpus.
+///
+/// **Assuming a constant is how a checker cries wolf.** `substrate_inspect
+/// validate` hard-coded 48 "for the primary model", but a turn stores one
+/// sequence per *KV-bearing* layer — and on the hybrid DeltaNet/attention stack
+/// only the attention layers hold KV. Measured against a real 109 GB substrate
+/// that mismatch reported **350 of 5,046 turns corrupt**; the true count, once
+/// `L` came from the data, was **7**. Every false positive was the same ratio
+/// (11 layers read as 48), because it was one wrong constant, not 350 bad
+/// turns.
+///
+/// Taken as the **mode** rather than the first or the maximum: a partially
+/// written turn is exactly a turn whose chunk count is wrong, so letting one
+/// define `L` would make the corrupt turns validate and the good ones fail.
+/// Turns whose chunk count is not a whole multiple of `chunks_per_layer` cannot
+/// name a layer count at all and are skipped here — they are the ragged writes
+/// the caller is looking for, and they get counted there.
+///
+/// `None` when no turn carries enough structure to say (an empty substrate, or
+/// one where every turn is chunkless).
+pub fn derive_layer_count(substrate: &Substrate, decls: &[TurnDecl]) -> Option<usize> {
+    let mut votes: HashMap<usize, usize> = HashMap::new();
+    for decl in decls {
+        let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
+        if chunks_per_layer == 0 {
+            continue;
+        }
+        let stream_id = super::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
+        let Some(stream) = substrate.stream_of(stream_id) else {
+            continue;
+        };
+        let n = stream.chunks.len();
+        if n == 0 || !n.is_multiple_of(chunks_per_layer) {
+            continue;
+        }
+        *votes.entry(n / chunks_per_layer).or_insert(0) += 1;
+    }
+    // Ties broken toward the larger count: of two layer counts equally
+    // represented, the larger one is the one that cannot be produced by a
+    // truncated write of the other.
+    votes
+        .into_iter()
+        .max_by_key(|&(layers, count)| (count, layers))
+        .map(|(layers, _)| layers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,6 +840,111 @@ mod tests {
             let grid = recover_turn_grid(&mut sp, &substrate, &decls[0], n_layers).unwrap();
             assert_eq!(grid, layers);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Persist `turns` turns of `n_layers × chunks_per_layer`, optionally
+    /// truncating one of them to `short_chunks` total records.
+    fn substrate_with_turns(
+        dir: &PathBuf,
+        turns: u32,
+        n_layers: usize,
+        chunks_per_layer: usize,
+        truncate: Option<(u32, usize)>,
+    ) -> Substrate {
+        {
+            let mut sp = SubstratePersistence::open_in(dir).unwrap();
+            for t in 0..turns {
+                let decl = turn_decl(7, t, chunks_per_layer as u64);
+                let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+                sp.declare_stream(&StreamDecl::Turn(decl)).unwrap();
+                let keep = match truncate {
+                    Some((which, n)) if which == t => n,
+                    _ => n_layers * chunks_per_layer,
+                };
+                // Written flat, so a truncation drops trailing records exactly
+                // the way an interrupted write does — which is why this bypasses
+                // `persist_turn_chunks` (it insists on a whole grid, and a whole
+                // grid is what a partial write does not have).
+                for i in 0..keep {
+                    let image = chunk_image(i as u8, 32);
+                    sp.write_chunk(
+                        stream_id,
+                        i as u64,
+                        image.token_count as u64,
+                        image.payload.k_formats.first().copied().unwrap_or(0),
+                        Some(image.golden),
+                        &image.payload,
+                    )
+                    .unwrap();
+                }
+            }
+            sp.commit().unwrap();
+        }
+        let mut substrate = Substrate::new();
+        SubstratePersistence::open_in_with_substrate(dir, &mut substrate).unwrap();
+        substrate
+    }
+
+    #[test]
+    fn the_layer_count_comes_from_the_turns_not_from_a_constant() {
+        // The false alarm this exists to prevent: a checker that assumes 48
+        // layers against a hybrid stack that seals KV for 11 of them calls
+        // every healthy turn corrupt. Derived, the answer is the truth.
+        let dir = tmp_dir("derive_layers");
+        let substrate = substrate_with_turns(&dir, 4, 11, 3, None);
+        let decls = recovered_turn_decls(&substrate);
+        assert_eq!(derive_layer_count(&substrate, &decls), Some(11));
+        for decl in &decls {
+            assert!(
+                recover_turn_cold_refs(&substrate, decl, 11).is_ok(),
+                "a turn sealed with 11 layers must validate against 11"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_truncated_turn_does_not_get_to_define_the_layer_count() {
+        // The trap in taking the first or the minimum: a partial write IS a
+        // turn with the wrong chunk count, so letting one vote decide would
+        // validate the corrupt turn and condemn every healthy one — the same
+        // false alarm, inverted. The mode keeps the majority's answer.
+        let dir = tmp_dir("derive_truncated");
+        // Turn 0 keeps only 4 layers' worth (12 of 33 records).
+        let substrate = substrate_with_turns(&dir, 4, 11, 3, Some((0, 12)));
+        let decls = recovered_turn_decls(&substrate);
+        assert_eq!(
+            derive_layer_count(&substrate, &decls),
+            Some(11),
+            "three healthy turns outvote one truncated one"
+        );
+        let n = derive_layer_count(&substrate, &decls).unwrap();
+        let bad = decls
+            .iter()
+            .filter(|d| recover_turn_cold_refs(&substrate, d, n).is_err())
+            .count();
+        assert_eq!(bad, 1, "exactly the truncated turn is reported");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_ragged_turn_names_no_layer_count_and_is_skipped() {
+        // 13 records against 3 chunks/layer is not a whole number of layers,
+        // so it cannot vote — it is the ragged write the caller is hunting.
+        let dir = tmp_dir("derive_ragged");
+        let substrate = substrate_with_turns(&dir, 3, 11, 3, Some((0, 13)));
+        let decls = recovered_turn_decls(&substrate);
+        assert_eq!(derive_layer_count(&substrate, &decls), Some(11));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_substrate_with_no_chunked_turns_derives_nothing() {
+        let dir = tmp_dir("derive_empty");
+        let substrate = substrate_with_turns(&dir, 0, 11, 3, None);
+        let decls = recovered_turn_decls(&substrate);
+        assert_eq!(derive_layer_count(&substrate, &decls), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -24,6 +24,10 @@ pub(super) fn qwen3_8b_q4() -> ModelSpec {
         model_filename: "Qwen3-8B-Q4_K_M.gguf".into(),
         model_bytes: 5_027_784_512,
         tokenizer_repo: "Qwen/Qwen3-8B".into(),
+        // Unpinned: no revision has been verified against this checkpoint's
+        // `tokenizer.ggml.tokens`. The load-time check against that table is
+        // what guards this pairing until one is.
+        tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
@@ -43,6 +47,10 @@ pub(super) fn qwen3_8b_q6() -> ModelSpec {
         model_filename: "Qwen3-8B-Q6_K.gguf".into(),
         model_bytes: 6_725_900_096,
         tokenizer_repo: "Qwen/Qwen3-8B".into(),
+        // Unpinned: no revision has been verified against this checkpoint's
+        // `tokenizer.ggml.tokens`. The load-time check against that table is
+        // what guards this pairing until one is.
+        tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
@@ -66,6 +74,7 @@ pub(super) fn qwen3_14b_q4() -> ModelSpec {
         model_filename: "Qwen3-14B-Q4_K_M.gguf".into(),
         model_bytes: 9_001_753_984,
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
+        tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
@@ -85,6 +94,7 @@ pub(super) fn qwen3_14b_q5() -> ModelSpec {
         model_filename: "Qwen3-14B-Q5_K_M.gguf".into(),
         model_bytes: 10_514_570_624,
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
+        tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
@@ -104,6 +114,7 @@ pub(super) fn qwen3_14b_q6() -> ModelSpec {
         model_filename: "Qwen3-14B-Q6_K.gguf".into(),
         model_bytes: 12_121_938_304,
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
+        tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),

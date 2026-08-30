@@ -959,7 +959,7 @@ impl HybridBatched {
     /// The forward *refuses* a dtype it was not prepared for, so this is the
     /// single place the conversion happens — at session creation, never
     /// inside a wave.
-    pub fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+    pub fn maybe_change_dtype(&self, dtype: DType, kv_dtype: DType) -> Result<()> {
         // A dtype change means a NEW session — this is the one place that
         // happens, and only a new session can change it. Every piece of draft
         // state is an activation captured under the old one, belonging to a
@@ -991,12 +991,20 @@ impl HybridBatched {
                 m.clear();
             }
         }
+        // Two widths, because these norms sit on two different tensors.
+        //
+        // `attn_norm` and `post_attn_norm` read the RESIDUAL stream, so they are
+        // materialised in the session's activation dtype. `q_norm` and `k_norm`
+        // read Q and K, which are projected in the KV ARENA's dtype because they
+        // become its contents (see `batched_layer::attention_operand_dtype`).
+        // The two coincide for every model whose activations and KV agree, and
+        // diverge for one that computes wider than it stores.
         let block = |l: &QuantLayer| -> Result<()> {
             l.attn_norm.maybe_change_dtype(dtype)?;
             l.post_attn_norm.maybe_change_dtype(dtype)?;
             if let QuantLayerMix::Attention(a) = &l.mix {
-                a.q_norm.maybe_change_dtype(dtype)?;
-                a.k_norm.maybe_change_dtype(dtype)?;
+                a.q_norm.maybe_change_dtype(kv_dtype)?;
+                a.k_norm.maybe_change_dtype(kv_dtype)?;
             }
             Ok(())
         };
@@ -1036,7 +1044,7 @@ impl HybridBatched {
         // dropped here — a new field looks wired, builds clean, and simply never
         // reaches this model. Extend both when adding one.
         let session = create_session(&self.model.cfg, &self.model.device, config)?;
-        self.maybe_change_dtype(session.activation_dtype())?;
+        self.maybe_change_dtype(session.activation_dtype(), session.kv_live_dtype())?;
         Ok(session)
     }
 

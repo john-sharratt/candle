@@ -279,7 +279,13 @@ fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEn
     }
 }
 
-/// SHA-256 of `bytes` — the tokenizer change-detection digest.
+/// The first eight bytes of a digest, hex — enough to name which tokenizer a
+/// substrate is bound to in an error a person has to act on.
+fn hex16(digest: &[u8; 32]) -> String {
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SHA-256 of `bytes` — the tokenizer identity digest.
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1382,20 +1388,39 @@ impl SubstratePersistence {
         Ok(true)
     }
 
-    /// Set the model's `tokenizer.json` bytes — last-writer-wins, like
-    /// [`SubstratePersistence::set_model_spec`]. Appends only when the
-    /// bytes differ from the latest on file (compared by SHA-256).
+    /// Bind the substrate to a model's `tokenizer.json` bytes.
+    ///
+    /// Writes once, on a substrate that has no tokenizer yet, and thereafter
+    /// **refuses** anything that does not hash identically. This is NOT
+    /// last-writer-wins like [`SubstratePersistence::set_model_spec`], and the
+    /// difference is deliberate: a spec is a description of the current run,
+    /// whereas the tokenizer is the vocabulary every turn already in this log
+    /// was sealed under. Token ids are only meaningful against it — accept a
+    /// second one and every stored turn silently means something else, while
+    /// the manifest points at the new record and reports success.
+    ///
+    /// Swapping models therefore needs a new substrate, not a new record. The
+    /// caller surfaces that as an instruction rather than a diagnosis.
     ///
     /// The full bytes are the `Tokenizer` record's payload, so the log is
     /// a self-contained substrate image (§5.7) — no companion files.
     /// Recovery never reads the payload (the walk skips it and the digest
     /// chain carries only its header), so the ~11 MB record costs one
-    /// on-demand read at open to compute the change-detection hash and
-    /// nothing else.
+    /// on-demand read at open to compute the identity hash and nothing else.
     pub fn set_tokenizer(&mut self, tokenizer: &[u8]) -> Result<bool> {
         let hash = sha256(tokenizer);
-        if self.tokenizer_sha256 == Some(hash) {
-            return Ok(false);
+        if let Some(existing) = self.tokenizer_sha256 {
+            if existing == hash {
+                return Ok(false);
+            }
+            return Err(PersistenceError::Corrupt(format!(
+                "this substrate is bound to a different tokenizer (recorded {}, offered {}). \
+                 Every turn in the log was sealed under the recorded vocabulary, so adopting \
+                 another would silently change what all of them say. Point this model at a \
+                 fresh substrate, or wipe this one.",
+                hex16(&existing),
+                hex16(&hash),
+            )));
         }
         self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, 0, tokenizer)?;
         self.tokenizer_sha256 = Some(hash);
@@ -1708,8 +1733,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A substrate binds to one tokenizer, and a second one is refused.
+    ///
+    /// This used to assert that "changed bytes are re-embedded", which is the
+    /// behaviour that let a model swap rewrite the vocabulary out from under
+    /// every turn already sealed in the log — the ids stay, their meaning
+    /// changes, and nothing reports it. The binding is the invariant now.
     #[test]
-    fn tokenizer_embedded_once_by_hash() {
+    fn tokenizer_binds_the_substrate_and_a_second_one_is_refused() {
         let dir = tmp_dir("tok_hash");
         let v1 = vec![1u8; 4096];
         let v2 = vec![2u8; 4096];
@@ -1720,21 +1751,33 @@ mod tests {
                 !sp.set_tokenizer(&v1).unwrap(),
                 "identical bytes are a hash-match no-op"
             );
+            let err = sp
+                .set_tokenizer(&v2)
+                .expect_err("a different tokenizer must be refused, not appended");
+            let msg = err.to_string();
             assert!(
-                sp.set_tokenizer(&v2).unwrap(),
-                "changed bytes are re-embedded"
+                msg.contains("bound to a different tokenizer"),
+                "the refusal must name the cause: {msg}"
             );
-            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v2)));
+            assert_eq!(
+                sp.tokenizer_sha256(),
+                Some(sha256(&v1)),
+                "a refused binding leaves the recorded tokenizer untouched"
+            );
             sp.commit().unwrap();
         }
         {
-            // The hash is recovered from disk, so an unchanged tokenizer on a
-            // fresh open does not re-embed.
+            // The hash is recovered from disk, so the binding survives a
+            // reopen — including the refusal.
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v2)));
+            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v1)));
             assert!(
-                !sp.set_tokenizer(&v2).unwrap(),
+                !sp.set_tokenizer(&v1).unwrap(),
                 "reopened log recognises the unchanged tokenizer by hash"
+            );
+            assert!(
+                sp.set_tokenizer(&v2).is_err(),
+                "the binding is still enforced after a reopen"
             );
         }
         std::fs::remove_dir_all(&dir).ok();

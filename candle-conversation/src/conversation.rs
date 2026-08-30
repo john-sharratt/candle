@@ -424,6 +424,24 @@ pub(crate) fn install_branch_states(
             .collect();
         let n_layers = layers.len();
         let n_slots = sequence_ids.len();
+        // A transplanted state is never recomputed by the slot that receives it,
+        // so a non-finite one is invisible from the outside: the geometry checks
+        // pass, the install succeeds, and every subsequent forward on that
+        // sequence returns NaN logits while the daemon reports a healthy turn.
+        // Name it at the boundary that introduces it — the alternative is
+        // diagnosing it thirty layers downstream from a row of `!`.
+        if let Some((layer, kind)) = first_non_finite_layer(&layers) {
+            tracing::error!(
+                layer_index = layer,
+                buffer = kind,
+                layers = n_layers,
+                slots = n_slots,
+                "BRANCH CHECKPOINT IS NON-FINITE — refusing to install it. Installing \
+                 would give every one of these slots NaN logits for the rest of the \
+                 conversation. They start with no memory of their system prompt instead."
+            );
+            continue;
+        }
         let (tx, rx) = crossbeam::channel::bounded(1);
         scheduler_tx
             .send(SchedulerRequest::InstallRecurrentState {
@@ -444,7 +462,19 @@ pub(crate) fn install_branch_states(
                     "installed prompt branch checkpoint"
                 );
             }
-            Ok(false) => {}
+            // The scheduler reports `false` when no slot took the state — a
+            // refused import, which leaves the recurrent layers at zero while
+            // the K/V holds the whole system prompt. That conversation then
+            // reads perfectly while remembering nothing of its own prompt, so
+            // it has to be said out loud; silence here is what let it look like
+            // a successful install.
+            Ok(false) => tracing::error!(
+                layers = n_layers,
+                slots = n_slots,
+                "BRANCH CHECKPOINT NOT INSTALLED — no slot accepted the state (schedule \
+                 hash or geometry mismatch). These slots start with the system prompt in \
+                 K/V and nothing in the recurrent layers."
+            ),
             Err(e) => tracing::warn!(
                 "BRANCH CHECKPOINT REFUSED (hash or geometry mismatch): {e} — the first \
                  turn starts with no memory of its system prompt"
@@ -452,6 +482,33 @@ pub(crate) fn install_branch_states(
         }
     }
     Ok(())
+}
+
+/// The first layer of a checkpoint carrying a non-finite `S` or conv tail, with
+/// the name of the offending buffer.
+///
+/// `state` and `conv_tail` are raw little-endian `f32` bytes. A trailing partial
+/// element cannot be interpreted, so it is reported rather than silently
+/// ignored — a length that is not a multiple of four means the payload is
+/// already malformed.
+fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, &'static str)> {
+    fn bad(bytes: &[u8]) -> bool {
+        if !bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
+            return true;
+        }
+        bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .any(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+    }
+    layers.iter().find_map(|l| {
+        if bad(&l.state) {
+            Some((l.layer_index, "state"))
+        } else if bad(&l.conv_tail) {
+            Some((l.layer_index, "conv_tail"))
+        } else {
+            None
+        }
+    })
 }
 
 /// Which `summarize_examples` option matches a round-trip chain of

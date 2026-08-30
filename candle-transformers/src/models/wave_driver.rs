@@ -58,6 +58,24 @@ pub struct WaveGroups<'a> {
     pub layer_end: usize,
     /// A paused wave's residual stream, already permuted into internal order.
     pub x_in: Option<TensorCat>,
+    /// The width every activation in this wave flows in.
+    ///
+    /// Decided ONCE, here, from the session's declared activation dtype, and
+    /// carried rather than re-derived. The embedding emits it and every kernel
+    /// downstream emits what its consumer reads, so no conversion appears on
+    /// the path (hot-path invariant 1); where two operands must agree, the
+    /// consumer VALIDATES with `expect_dtype` rather than rewriting them
+    /// (invariant 1b).
+    ///
+    /// It is on the wave rather than derived inside the sweep because the sweep
+    /// used to read it off the live KV cache — which answers a different
+    /// question. A quantized backing reports F16 because the arena really is
+    /// F16 (K in `R16`, V in plain F16); that is a fact about KV STORAGE and
+    /// says nothing about the width the model computes in. The two agreed only
+    /// until a model declared otherwise, and then they silently disagreed: the
+    /// norms were materialised BF16 from the session while the activations
+    /// arrived F16 from the cache.
+    pub act_dtype: DType,
 }
 
 /// The per-model half of a wave: run one layer range over assembled contexts.
@@ -370,6 +388,10 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
         .map(|t| t.dims().get(1).copied().unwrap_or(1))
         .collect();
 
+    // Read before the caches are borrowed mutably: this is the wave's declared
+    // activation width, and it belongs to the session, not to the caches.
+    let act_dtype = session.activation_dtype();
+
     let mut caches_data = session.caches_for_sequences_mut(&all_seqs);
     // `caches_for_sequences_mut` SILENTLY skips slots that are `None`, so a
     // sequence released between wave-group formation and this forward yields a
@@ -481,6 +503,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             layer_start,
             layer_end,
             x_in,
+            act_dtype,
         },
     );
     // **A failed wave leaves no trace.** The layer sweep advances each layer's
@@ -612,6 +635,39 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             }
         }
     };
+    // Read this wave's assert slots and start a fresh epoch, so each report
+    // describes one wave rather than the run so far.
+    //
+    // This is the ONE synchronisation the instrument costs, and it sits after
+    // every launch of the sweep is already enqueued — the caller syncs a moment
+    // later to sample anyway, so the wave's work is complete or nearly so by
+    // the time this waits on it. That is the whole difference from a probe that
+    // reads a scalar back per checkpoint: one fence at the end of a wave rather
+    // than a hundred inside it.
+    #[cfg(feature = "tensor-assert")]
+    {
+        let dev = decode_inputs
+            .first()
+            .or_else(|| prefill_inputs.first())
+            .or_else(|| glue_inputs.first())
+            .map(|t| t.device().clone());
+        if let Some(dev) = dev {
+            let bad = candle::tensor_assert::report(&dev)?;
+            if !bad.is_empty() {
+                tracing::error!(
+                    target: "candle_transformers::wave_driver",
+                    layer_start, layer_end,
+                    decode = decode_seqs.len(),
+                    prefill = prefill_seqs.len(),
+                    glue = glue_seqs.len(),
+                    origin = %bad[0].name,
+                    "tensor_assert: this wave produced non-finite values"
+                );
+            }
+            candle::tensor_assert::epoch(&dev)?;
+        }
+    }
+
     // The head's outputs sit on the forward span, so the guard goes back with
     // them: `WaveResult` is what stops the span being reclaimed while the caller
     // still holds the logits.

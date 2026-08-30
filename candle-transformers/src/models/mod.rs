@@ -105,6 +105,10 @@ pub mod mistral;
 pub mod mixformer;
 pub mod mixtral;
 pub mod mmdit;
+/// Same-pass checkpoints that capture and panic at the first corruption —
+/// `tensor-assert` only.
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+pub mod nan_capture;
 pub mod mobileclip;
 pub mod mobilenetv4;
 pub mod mobileone;

@@ -455,7 +455,7 @@ fn pad(p: usize, q: usize) -> usize {
 }
 
 /// Convert GgmlDType to QType for dispatcher
-fn dtype_to_qtype(dtype: GgmlDType) -> Result<QType> {
+pub(crate) fn dtype_to_qtype(dtype: GgmlDType) -> Result<QType> {
     Ok(match dtype {
         GgmlDType::Q4_0 => QType::Q4_0,
         GgmlDType::Q4_1 => QType::Q4_1,
@@ -3676,6 +3676,23 @@ impl QCudaStorage {
                 "copy_from_host_on_stream: expected {} bytes, got {}",
                 self.data.len,
                 src.len()
+            );
+        }
+        // Goes to the STREAM's `memcpy_htod`, not the device's, so the guard on
+        // `CudaDevice::memcpy_htod` never sees it. This is the expert cache's
+        // DMA-overlap upload — the one path that writes a whole expert slot at
+        // a caller-computed destination — so an off-by-one slot index here
+        // replaces a contiguous run of resident weights with another expert's
+        // bytes: finite, plausibly-shaped, and wrong.
+        #[cfg(feature = "tensor-assert")]
+        {
+            use cudarc::driver::DevicePtrMut;
+            let mut dst = self.data.inner.slice_mut(..src.len());
+            let (base, _g) = dst.device_ptr_mut(stream);
+            crate::readonly_regions::forbid_write(
+                "QCudaStorage::copy_from_host_on_stream",
+                base,
+                src.len(),
             );
         }
         stream

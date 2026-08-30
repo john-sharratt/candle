@@ -81,6 +81,58 @@ pub mod npy;
 pub mod op;
 pub mod pickle;
 pub mod quantized;
+/// VRAM that is immutable after load, and the guard that keeps it that way.
+///
+/// Switched at the module level rather than per function: without
+/// `tensor-assert` the table, its atomics and every call site compile to
+/// nothing at all, which is the only way a check that sits on the allocation
+/// path and on every write-capable kernel launch can be free. The stubs below
+/// are the whole of the production build.
+#[cfg(feature = "tensor-assert")]
+#[path = "readonly_regions.rs"]
+pub mod readonly_regions;
+
+#[cfg(not(feature = "tensor-assert"))]
+pub mod readonly_regions {
+    //! Stubs. See the gated module for what this is when it is armed.
+
+    /// No-op: nothing is ever declared, so nothing can be hit.
+    #[inline(always)]
+    pub fn declare(_name: impl Into<String>, _base: u64, _len: usize) {}
+
+    /// No-op, reporting that no regions were declared.
+    #[inline(always)]
+    pub fn declare_merged(_name: &str, _spans: &mut [(u64, usize)]) -> usize {
+        0
+    }
+
+    /// No-op: nothing was declared, so nothing can be released.
+    #[inline(always)]
+    pub fn release_below(_base: u64) {}
+
+    /// Always `(0, 0)` — nothing declared, nothing covered.
+    #[inline(always)]
+    pub fn coverage() -> (usize, u64) {
+        (0, 0)
+    }
+
+    /// Always `false`. The call and its arguments vanish at the call site.
+    #[inline(always)]
+    pub fn hits(_base: u64, _len: usize) -> bool {
+        false
+    }
+
+    /// Always `None`.
+    #[inline(always)]
+    pub fn overlapping(_base: u64, _len: usize) -> Option<String> {
+        None
+    }
+
+    /// Empty. This is the one on the allocation and kernel-launch paths, and
+    /// an empty `#[inline(always)]` function leaves no instruction behind.
+    #[inline(always)]
+    pub fn forbid_write(_what: &str, _base: u64, _len: usize) {}
+}
 pub mod safetensors;
 pub mod sampling;
 pub mod sampling_demo;
@@ -91,6 +143,9 @@ mod storage;
 pub mod streaming;
 mod strided_index;
 mod tensor;
+/// Zero-sync finiteness assertions — `Tensor::assert` / `QTensor::assert`.
+#[cfg(feature = "tensor-assert")]
+pub mod tensor_assert;
 mod tensor_cat;
 pub mod test_utils;
 pub mod utils;

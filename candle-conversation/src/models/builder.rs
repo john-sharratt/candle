@@ -292,6 +292,9 @@ impl ModelBuilder {
             model_filename: gguf_filename,
             model_bytes,
             tokenizer_repo: String::new(),
+            // A custom model is built from local files; there is no repo to
+            // pin a revision of.
+            tokenizer_rev: String::new(),
             default_system_prompt: "You are a helpful, accurate, and concise assistant.".into(),
             max_seq_len: info.context_length.unwrap_or(8192),
             default_sampling: info.sampling.clone(),
@@ -628,6 +631,7 @@ impl ModelBuilder {
             vocab_size
         );
 
+
         let mut ret = EngineConfig::new(eos_tokens.into());
         ret.disable_summariser = self.disable_summariser;
         ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
@@ -642,6 +646,13 @@ impl ModelBuilder {
         // not recall quality, so this isolates the straddle path.)
         ret.batched_config.override_k_quant = None;
         ret.batched_config.override_v_quant = None;
+        // The width this architecture's own reference implementation computes
+        // in, where it is known. Without it the session derives the activation
+        // width from the KV storage format — which reports F16 for the
+        // quantized backing this engine always uses, regardless of what the
+        // model was trained and published in. See
+        // `ModelArch::native_activation_dtype`.
+        ret.batched_config.activation_dtype = self.spec.arch.native_activation_dtype();
         ret.vocab_size = vocab_size;
         ret.max_concurrent_conversations = self.max_concurrent;
         ret.show_special_tokens = self.show_special_tokens;
@@ -882,6 +893,11 @@ impl ModelBuilder {
 
         let tokenizer = Model::load_tokenizer(&tokenizer_path)?;
 
+        // Before anything reads a token id: the checkpoint is the authority on
+        // what its own ids mean, so hold the tokenizer against it here rather
+        // than trusting the path it was resolved from.
+        Self::verify_tokenizer_matches_checkpoint(&tokenizer, &model_path)?;
+
         // ── Auto-detect thinking support from chat_template ───────────
         // The GGUF chat_template is the authoritative signal.  Many models
         // (e.g. non-thinking Qwen3 finetunes) have the <think> token in
@@ -1019,6 +1035,113 @@ impl ModelBuilder {
     /// Returns architecture, sampling defaults, vocab_size, thinking support,
     /// model name, and context length — everything needed to configure the
     /// builder from the GGUF file itself.
+    /// Check the loaded tokenizer against the checkpoint's **own** token table.
+    ///
+    /// `tokenizer.ggml.tokens` is the vocabulary the embedding and `lm_head`
+    /// rows were built against, so it — not any repo, pin or filename — is what
+    /// makes a `tokenizer.json` the right one. The GGUF ships the token list but
+    /// no merges or pretokenizer, which is why a separate `tokenizer.json` is
+    /// loaded at all; that copy has until now been trusted on the strength of a
+    /// pinned repo constant and a comment asserting the two agree. Nothing
+    /// re-established it at runtime, and zend does not pin revisions, so a
+    /// wrong-but-loadable tokenizer was accepted in silence: ids stayed in
+    /// range, decoded to real pieces, and the model was fed fluent-looking
+    /// nonsense while every sealed turn recorded it.
+    ///
+    /// The comparison is against ids the model actually reserves meaning for —
+    /// the whole special-token band plus a stride across the ordinary range —
+    /// rather than the entire vocabulary, which would cost a full string
+    /// compare of 248k entries on every boot to catch what any of these catch.
+    fn verify_tokenizer_matches_checkpoint(
+        tokenizer: &tokenizers::Tokenizer,
+        model_path: &Path,
+    ) -> crate::Result<()> {
+        use candle::quantized::gguf_file;
+
+        let mut file = std::fs::File::open(model_path).map_err(|e| {
+            ConversationError::Model(candle::Error::Msg(format!("open GGUF: {e}")))
+        })?;
+        let ct = gguf_file::Content::read(&mut file).map_err(ConversationError::Model)?;
+        let Some(tokens) = ct
+            .metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.to_vec().ok())
+        else {
+            // Not every conversion carries the table. Say so rather than
+            // implying the pair was checked.
+            tracing::warn!(
+                "checkpoint carries no `tokenizer.ggml.tokens`; the tokenizer cannot be \
+                 verified against it and is trusted on its resolved path alone"
+            );
+            return Ok(());
+        };
+
+        // The GGUF's table is padded out to the output projection's width
+        // (Qwen3.6-35B: 248,320 entries against the tokenizer's 248,070 real
+        // tokens), so the two lengths are NOT expected to be equal — only
+        // compatible. A tokenizer with MORE entries than the model has rows is
+        // the unambiguous error; short of that, the agreement of the ids
+        // themselves is what settles it.
+        let n = tokens.len();
+        let vocab = tokenizer.get_vocab(true);
+        // **The id space, not the entry count.** `get_vocab().len()` counts
+        // entries; added tokens sit at arbitrary high ids, so a tokenizer with
+        // few entries can still address an id past the checkpoint's last row.
+        // Bounding on the count would let exactly that through.
+        let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+        let tok_vocab = max_id + 1;
+        if tok_vocab > n {
+            return Err(ConversationError::Tokenizer(format!(
+                "tokenizer does not match the checkpoint: the tokenizer at {} defines \
+                 {tok_vocab} tokens but the checkpoint's table has only {n} — ids past the end \
+                 of the model's own vocabulary. This tokenizer was built for a different model.",
+                model_path.display(),
+            )));
+        }
+
+        // **The specials by id, not by position.** A mismatch on one of these
+        // is the difference between ending a turn and emitting a word, and they
+        // do not live at the bottom of the id space: Qwen puts `<|endoftext|>`
+        // at 151643 on one model and 248044 on another, which is precisely the
+        // pair this check exists to tell apart. A `0..1024` prefix — what this
+        // used to probe while its comment claimed "specials first" — reaches
+        // neither, and a 512-sample stride hits a given high id only by luck.
+        //
+        // `get_added_tokens_decoder` is the authoritative set: every special and
+        // every added token, keyed by the id it actually occupies.
+        let specials: Vec<usize> = tokenizer
+            .get_added_tokens_decoder()
+            .keys()
+            .map(|&id| id as usize)
+            .collect();
+        let stride = (tok_vocab / 512).max(1);
+        let probes = specials
+            .into_iter()
+            .chain(0..tok_vocab.min(1024))
+            .chain((0..tok_vocab).step_by(stride))
+            .filter(|&id| id < n);
+        for id in probes {
+            let Ok(want) = tokens[id].to_string() else {
+                continue;
+            };
+            let got = tokenizer.id_to_token(id as u32);
+            if got.as_deref() != Some(want.as_str()) {
+                return Err(ConversationError::Tokenizer(format!(
+                    "tokenizer does not match the checkpoint: at id {id} the GGUF's token table \
+                     has {want:?} but the tokenizer at {} has {got:?}. The two disagree about \
+                     what an id means, which no length check can see.",
+                    model_path.display(),
+                )));
+            }
+        }
+
+        tracing::info!(
+            vocab = n,
+            "tokenizer verified against the checkpoint's own token table"
+        );
+        Ok(())
+    }
+
     fn detect_sampling_from_gguf(model_path: &Path) -> crate::Result<GgufInfo> {
         use candle::quantized::gguf_file;
         let mut file = std::fs::File::open(model_path)

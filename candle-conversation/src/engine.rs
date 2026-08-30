@@ -293,12 +293,18 @@ impl ConversationEngine {
                 })?;
             }
         }
-        // Embed the tokenizer.json (compare-and-insert) so the log can
-        // detokenize offline. ~11 MB for Qwen3, but written at most once per
-        // distinct model since identical bytes are a no-op.
+        // Bind the substrate to this model's tokenizer.json, so the log can
+        // detokenize offline and so no second vocabulary can ever be written
+        // over turns sealed under the first. ~11 MB for Qwen3, written at most
+        // once per substrate; identical bytes are a no-op, and different bytes
+        // are refused rather than appended.
         if let Some(tok) = &config.tokenizer {
             let wrote = persistence.set_tokenizer(tok).map_err(|e| {
-                ConversationError::from(candle::Error::Msg(format!("persist tokenizer: {e}")))
+                ConversationError::Tokenizer(format!(
+                    "{e}\n\nThe substrate at this working directory belongs to a different \
+                     model. Start this one against its own working directory (--working-dir), \
+                     or discard this substrate with --wipe-substrate."
+                ))
             })?;
             if wrote {
                 persistence.commit().map_err(|e| {

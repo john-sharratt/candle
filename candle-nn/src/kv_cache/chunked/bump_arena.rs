@@ -274,6 +274,48 @@ impl BumpArena {
                 inner.live,
             )
         }
+        // **Where the arena is placed is the only bound its carves have.**
+        //
+        // `bump` refuses a carve past `capacity`, so every range this domain
+        // hands out lies inside `[base, base + capacity)` by construction. That
+        // makes the placement, not the carve, the thing that can be wrong: an
+        // arena rebased over the expert weight zone passes its own bound check
+        // on every allocation while handing out weights, and the activation
+        // written through the range replaces them.
+        //
+        // The two share one reservation — arenas carve upward from `span_base`,
+        // the weight zone downward from `span_end` — so an overlap is a
+        // placement that crossed `weight_floor`, not an impossible address.
+        // Checked once here rather than per carve: one comparison at a rebase
+        // covers every range the domain will ever produce.
+        // Diagnostic only, and gated so the production build evaluates none of
+        // it. `forbid_write` is a no-op without the feature, but its ARGUMENTS
+        // are still evaluated — a `format!` here allocated a `String` on every
+        // rebase, which is once per layer phase per wave, in a build that then
+        // threw it away.
+        #[cfg(feature = "tensor-assert")]
+        if candle::readonly_regions::hits(base, capacity) {
+            // The partition as it stands at the violation, not as it stood at
+            // load: an arena inside the declared region is only a fault if it
+            // is also at or above the LIVE `weight_floor`. The weight side
+            // releases ground legitimately, and a region declared once at load
+            // goes stale the moment it does.
+            let l = super::region_pool::span_layout(inner.stream.context().ordinal());
+            log::error!(
+                "arena {} rebase [{:#x}, {:#x}) hits the declared weight region. \
+                 Live partition: {l:?}",
+                self.name,
+                base,
+                base + capacity as u64,
+            );
+            if l.is_some_and(|l| base + capacity as u64 > l.weight_floor) {
+                candle::readonly_regions::forbid_write(
+                    &format!("bump arena rebase ({})", self.name),
+                    base,
+                    capacity,
+                );
+            }
+        }
         inner.base = base;
         inner.capacity = capacity;
         inner.cursor = 0;
@@ -600,6 +642,22 @@ struct WaveDomain {
     planned: Option<[usize; 3]>,
     /// Where the tier currently sits, while it exists.
     placed_at: Option<u64>,
+    /// **How much ground that placement bought**, which is the only figure the
+    /// layout may be checked against.
+    ///
+    /// Recorded because the alternative was reading
+    /// `region_stats(..).transient_bytes`, and that answers a different
+    /// question: it is live occupancy *right now* — explicitly "a snapshot
+    /// taken mid-wave, not a reservation" — and it is a property of the pool,
+    /// not of this domain's tier. When the snapshot happened to read at least
+    /// as large as the plan while this domain's own tier was narrower, the
+    /// replan was skipped, the arenas were laid out with the new plan's widths
+    /// on the old tier's base, and the spans ran off its top into the expert
+    /// weight zone. The reservation is what the layout has to fit inside, so
+    /// the reservation is what gets stored.
+    ///
+    /// `Some` exactly when `placed_at` is: the two are set and cleared together.
+    placed_bytes: Option<usize>,
     /// Whether that placement belongs to a **forward** or to a lone guard.
     ///
     /// [`plan_wave_transient`] reserves for the forward, so the reservation has
@@ -726,6 +784,7 @@ fn domain_entry<'a>(
             live_generations: 0,
             planned: None,
             placed_at: None,
+            placed_bytes: None,
             reserved_by_forward: false,
             arena_windows: 0,
             forward_open: false,
@@ -867,6 +926,7 @@ pub fn enter_arena_window(stream: &Arc<CudaStream>) -> Result<ArenaWindow> {
         // with it, and the ground under it is the ground this arena is about to
         // be carved from.
         let had_tier = domain.placed_at.take().is_some();
+        domain.placed_bytes = None;
         if had_tier {
             domain.reserved_by_forward = false;
         }
@@ -1026,6 +1086,7 @@ pub fn end_wave_transient(stream: &Arc<CudaStream>) {
             return Ok(());
         }
         if domain.placed_at.take().is_some() {
+            domain.placed_bytes = None;
             release_transient(&stream);
             domain.reserved_by_forward = false;
         }
@@ -1071,6 +1132,7 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
             false
         } else {
             if domain.placed_at.take().is_some() {
+                domain.placed_bytes = None;
                 release_transient(&stream);
             }
             true
@@ -1083,9 +1145,11 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
     // Outside the lock. A failure here leaves no tier standing and
     // `reserved_by_forward` clear, so the forward that fails takes nothing with
     // it — the next one starts against the whole partition.
-    let base = place_transient(&stream, per_phase.iter().sum())?;
+    let bought: usize = per_phase.iter().sum();
+    let base = place_transient(&stream, bought)?;
     with_wave_domain(&stream, |domain| {
         domain.placed_at = Some(base);
+        domain.placed_bytes = Some(bought);
         domain.reserved_by_forward = true;
         Ok(())
     })
@@ -1145,12 +1209,33 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
         } else {
             let plan = domain.planned.unwrap_or_else(fallback_plan);
             let wanted: usize = plan.iter().sum();
-            let standing = domain.placed_at.and_then(|_| {
-                super::region_pool::region_stats(stream.context().ordinal())
-                    .map(|s| s.transient_bytes)
+            // A tier whose top already crosses the weight floor must be
+            // re-placed however large it is, so the `bytes >= wanted` arm below
+            // cannot keep it. `plan_wave_transient` leaves exactly this state
+            // behind when a forward arrives while the previous one is still
+            // live: the wider plan is recorded, the narrower tier stays put, and
+            // the two are only reconciled here.
+            let crosses_floor = domain.placed_at.is_some_and(|b| {
+                super::region_pool::span_layout(stream.context().ordinal())
+                    .is_some_and(|l| b.saturating_add(wanted as u64) > l.weight_floor)
             });
+            // **The reservation this domain holds, not what the pool happens to
+            // be occupying.**
+            //
+            // This read `region_stats(..).transient_bytes`, which is a different
+            // quantity in two ways that both matter: it is *live occupancy* —
+            // its own docs call it "a snapshot taken mid-wave, not a
+            // reservation" — and it is a property of the POOL rather than of
+            // this domain's tier. So it could report a figure at least as large
+            // as the plan while this domain's own tier was narrower than the
+            // plan; the replan was then skipped, and the layout below wrote the
+            // new plan's widths onto the old tier's base and ran off its top
+            // into the expert weight zone. The comment above this block
+            // describes that failure exactly — the check simply was not asking
+            // the question the comment assumed.
+            let standing = domain.placed_at.and(domain.placed_bytes);
             match standing {
-                Some(bytes) if bytes >= wanted => None,
+                Some(bytes) if bytes >= wanted && !crosses_floor => None,
                 _ => Some(plan),
             }
         }
@@ -1161,7 +1246,8 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
             // Hand the old one back first when there is one, so its ground is
             // marked dirty and the next tenant cleans it.
             release_transient(&stream);
-            Some(place_transient(&stream, plan.iter().sum())?)
+            let bought: usize = plan.iter().sum();
+            Some((place_transient(&stream, bought)?, bought))
         }
         None => None,
     };
@@ -1205,8 +1291,9 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
             // extent). Silent corruption both ways, found independently by
             // three reviewers. The freshly returned address is authoritative
             // whenever it exists.
-            if let Some(base) = unplanned_base {
+            if let Some((base, bought)) = unplanned_base {
                 domain.placed_at = Some(base);
+                domain.placed_bytes = Some(bought);
                 // A replan belongs to the forward whose plan outgrew the tier;
                 // an unplanned guard's placement is its own. Preserve whichever
                 // ownership was already recorded when a tier stood, and default
@@ -1232,6 +1319,54 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                     ));
                 }
             };
+            // **Refuse a layout that does not fit the ground it was sold.**
+            //
+            // The replan above is what keeps these in step, so reaching this
+            // with a plan too large means that logic failed. Laying it out
+            // anyway is the corruption: the last span runs off the tier's top
+            // into whatever is above it, which on this span is the expert weight
+            // zone. Refusing costs one wave; the alternative cost a model.
+            let need: usize = plan.iter().sum();
+            match domain.placed_bytes {
+                Some(bytes) if need > bytes => {
+                    return Err(candle::Error::Msg(format!(
+                        "wave domain: the plan needs {need} B but the tier standing at \
+                         {base:#x} bought only {bytes} B. Laying the spans out would run \
+                         {} B past its top — into the expert weight zone.",
+                        need - bytes,
+                    )));
+                }
+                _ => {}
+            }
+            // **The floor is the invariant; the tier is only a proxy for it.**
+            //
+            // Comparing the plan against the bytes the tier bought cannot catch
+            // the case this guard exists for, because both figures are derived
+            // from the same `planned` array — they agree by construction and the
+            // comparison always passes. What actually went wrong is one step
+            // further out: `plan_wave_transient` records a forward's plan even
+            // when it cannot place a tier for it (`live_generations > 0`), so a
+            // wider forward arriving behind a live one leaves its plan standing
+            // over the previous, narrower tier. The layout below then walks
+            // `plan` widths from a base chosen for a smaller purchase, and the
+            // last span runs past the tier's top into the expert weight zone.
+            //
+            // So the layout is checked against the thing it must never cross,
+            // read live rather than inferred. `weight_floor` moves only through
+            // `set_weight_floor`, which refuses to cut live KV, so it is a
+            // sound bound at any instant.
+            if let Some(l) = super::region_pool::span_layout(stream.context().ordinal()) {
+                let top = base.saturating_add(need as u64);
+                if top > l.weight_floor {
+                    return Err(candle::Error::Msg(format!(
+                        "wave domain: laying {need} B of spans from {base:#x} reaches \
+                         {top:#x}, past the weight floor {:#x} — that is expert-slot \
+                         ground, and the FFN span would write activations over resident \
+                         weights. Refusing the wave; the plan needs a tier of its own.",
+                        l.weight_floor,
+                    )));
+                }
+            }
             let mut at = base;
             for (i, arena) in domain.arenas.iter().enumerate() {
                 arena.rebase(at, plan[i])?;
@@ -1290,6 +1425,7 @@ fn release_if_last_locked(ordinal: usize) {
         let _ = arena.rebase(0, 0);
     }
     if !domain.reserved_by_forward && domain.placed_at.take().is_some() {
+        domain.placed_bytes = None;
         release_transient(&stream_of(domain));
     }
 }
@@ -1486,6 +1622,56 @@ mod tests {
         // Already-rounded plans pass through unchanged.
         let exact = [4 * WAVE_SPAN_ALIGN, 512 * WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN];
         assert_eq!(align_phase_plan(exact), exact);
+    }
+
+    /// A plan is recorded even when no tier can be placed for it, so the
+    /// recorded plan and the standing tier can disagree — which is the state the
+    /// layout must not walk off the end of.
+    ///
+    /// This is the arithmetic of that disagreement, isolated from the domain
+    /// machinery: a base chosen for a narrow purchase, plus a later, wider
+    /// plan, reaches past the weight floor. The layout's job is to notice that
+    /// the SUM crosses the floor — not that the plan disagrees with the bytes
+    /// the tier bought, which are derived from the same array and always agree.
+    #[test]
+    fn a_wider_plan_over_a_narrower_tier_reaches_past_the_weight_floor() {
+        const FLOOR: u64 = 0x1_0000_0000;
+        // The tier was bought for this, and placed so that it just fits.
+        let bought: usize = 4 * WAVE_SPAN_ALIGN;
+        let base = FLOOR - bought as u64;
+
+        // The same plan the purchase was made from fits exactly, by
+        // construction — which is why comparing the two can never catch this.
+        let narrow = [WAVE_SPAN_ALIGN, 2 * WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN];
+        assert_eq!(narrow.iter().sum::<usize>(), bought);
+        assert!(base + narrow.iter().sum::<usize>() as u64 <= FLOOR);
+
+        // A later, wider forward records its plan while this tier still stands.
+        let wide = [WAVE_SPAN_ALIGN, 6 * WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN];
+        let need: usize = wide.iter().sum();
+        assert!(need > bought, "the wider plan is what makes this a hazard");
+        assert!(
+            base + need as u64 > FLOOR,
+            "laying the wider plan from the narrow tier's base crosses the floor \
+             by {} B — expert-slot ground",
+            base + need as u64 - FLOOR
+        );
+
+        // And the span that lands past it is the LAST one, which is the FFN's:
+        // walking the widths back-to-back, phases 0 and 1 stay below.
+        let mut at = base;
+        let mut first_past = None;
+        for (i, w) in wide.iter().enumerate() {
+            at += *w as u64;
+            if at > FLOOR && first_past.is_none() {
+                first_past = Some(i);
+            }
+        }
+        assert_eq!(
+            first_past,
+            Some(1),
+            "phase 1 is `LayerPhase::Ffn` — the span the corruption was always found in"
+        );
     }
 }
 

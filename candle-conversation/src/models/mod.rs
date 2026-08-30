@@ -58,6 +58,7 @@ pub use dialect::*;
 
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
+use candle::DType;
 use std::path::Path;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -85,6 +86,40 @@ pub enum ModelArch {
     /// K/V, which is why it declares
     /// `ManagedBatchedModel::carries_recurrent_state`.
     Qwen35Hybrid,
+}
+
+impl ModelArch {
+    /// The float width this architecture's reference implementation computes
+    /// in, when it is known to differ from what the KV storage format implies.
+    ///
+    /// `BatchedInferenceSession::activation_dtype` otherwise derives the
+    /// activation width from the KV cache's format, which reports F16 for a
+    /// quantized backing because the live arena really is F16 (K in `R16`, V in
+    /// plain F16). That is right for the arena and wrong for the residual
+    /// stream, and the two are unrelated: how KV is *stored* says nothing about
+    /// how wide the activations flowing between layers should be.
+    ///
+    /// It matters because F16 and BF16 are both 16 bits but not both able to
+    /// hold the same values — BF16 carries F32's exponent range while F16 stops
+    /// at 65504. The hybrid lineage's MoE routinely produces block outputs in
+    /// the 1e5–1e6 range, which BF16 holds and F16 turns into `inf`; the `inf`
+    /// then reaches the next layer's arithmetic as a NaN and, because this is
+    /// the one arch carrying recurrent state, is written into that state and
+    /// persists across waves.
+    ///
+    /// `Qwen3.5-0.8B`, `Qwen3.6-35B-A3B` and `Qwen3.8-27B` all declare
+    /// `"dtype": "bfloat16"` in their published `config.json`, and all three
+    /// share the `qwen35` GGUF arch string, so they share this arm.
+    ///
+    /// `None` for every other arch: their thresholds and gates were derived
+    /// under F16 activations, and changing the width under them would
+    /// invalidate that calibration without re-deriving it.
+    pub fn native_activation_dtype(self) -> Option<DType> {
+        match self {
+            Self::Qwen35Hybrid => Some(DType::BF16),
+            Self::Qwen3 | Self::Qwen3Moe | Self::Qwen2 | Self::Llama | Self::DeepSeekV4 => None,
+        }
+    }
 }
 
 /// Pre-configured model presets.
@@ -206,6 +241,17 @@ pub struct ModelSpec {
     pub model_bytes: u64,
     /// HuggingFace repository containing `tokenizer.json`.
     pub tokenizer_repo: String,
+    /// Pinned revision of [`Self::tokenizer_repo`], as the gates pin theirs.
+    ///
+    /// A repo alone names a moving target: resolution falls back to `refs/main`
+    /// or "whichever snapshot happens to be cached", so the vocabulary a run
+    /// encodes with can change without anything in this codebase changing. The
+    /// gates have always pinned a revision for exactly that reason — an
+    /// upstream re-upload once invalidated a threshold tuning silently — and
+    /// the serving path pinning nothing is the same exposure with a substrate
+    /// behind it. Empty means unpinned, which is only appropriate for a custom
+    /// model built from a local file.
+    pub tokenizer_rev: String,
     /// Default system prompt text (before chat-format wrapping).
     pub default_system_prompt: String,
     /// Maximum sequence length for KV cache allocation.

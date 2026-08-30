@@ -45,6 +45,7 @@ use super::quantized_delta_net::quantized_delta_net_ffn;
 use super::quantized_weights::{QuantLayerMix, QuantModel};
 use super::spec::{split_block_rows, StashSpan, VerifyStash};
 use super::wave::delta_net_mix_wave;
+
 use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::{RecurrentStateStore, StashSlot};
 use crate::models::verify_wave::VerifyPlan;
@@ -56,7 +57,7 @@ use crate::models::batched_inference::{
 use crate::models::batched_layer::{
     forward_layer_batched_mixed, BatchedAttentionParams, WaveAttnGroup,
 };
-use crate::models::batched_model::{activation_dtype, WaveGuard, WavePhase};
+use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::prefill_utils::SharedPm;
@@ -106,8 +107,14 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    /// The trait form carries one width, so it names the same one twice.
+    ///
+    /// The two-width call is [`HybridBatched::create_batched_session`], which
+    /// holds the session and can ask it for both. This arm is reached only by
+    /// the generic session helpers, where the caller has already decided that
+    /// activations and KV share a width.
     fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
-        HybridBatched::maybe_change_dtype(self, dtype)
+        HybridBatched::maybe_change_dtype(self, dtype, dtype)
     }
 
     fn num_layers(&self) -> usize {
@@ -762,6 +769,7 @@ fn sweep_layers(
         layer_start,
         layer_end,
         x_in,
+        act_dtype,
     } = groups;
     // Refused below, before it can be read — named here so the destructuring
     // stays exhaustive and a new group cannot be added without this seeing it.
@@ -798,12 +806,19 @@ fn sweep_layers(
     let pre_rows: usize = pre_q.iter().sum();
     let total_rows = n_decode + pre_rows;
 
-    let cache_dtype = contexts
-        .first()
-        .map(|c| c.kv_caches.dtype())
-        .unwrap_or(DType::F32);
-    let embed_dtype = activation_dtype(cache_dtype);
+    // The wave's declared width — carried, not re-derived. See
+    // `WaveGroups::act_dtype`. The embedding emits this and every kernel after
+    // it emits what its consumer reads, so nothing on the path converts.
+    let embed_dtype = act_dtype;
     let dev = model.device();
+    // The concrete device the same-pass checkpoints launch and fence on. Bound
+    // once here rather than matched at each site, so adding a checkpoint is one
+    // line.
+    #[cfg(feature = "tensor-assert")]
+    let capture_dev = match dev {
+        Device::Cuda(d) => d,
+        _ => candle::bail!("qwen35 wave: tensor-assert checkpoints require a CUDA device"),
+    };
 
     // **Phase 1: admit** — claim every KV chunk this wave will write before a
     // byte of it computes, so the arena frontier is final when the transient
@@ -991,7 +1006,22 @@ fn sweep_layers(
         .filter(|l| matches!(l.mix, QuantLayerMix::DeltaNet(_)))
         .count();
 
+    // The sweep's own input, before any layer has touched it. A fault reported
+    // downstream of here is this sweep's; a fault reported AT here arrived
+    // already formed, and the search belongs upstream of `layer_start`.
+    x.as_cat_tensor().assert("qwen35.sweep_in");
+
     for li in layer_start..layer_end {
+        // The residual ENTERING this layer — the first checkpoint of the layer,
+        // so it fires before anything inside can. Reaching layer N's body means
+        // every layer before it produced a finite residual.
+        #[cfg(feature = "tensor-assert")]
+        crate::models::nan_capture::checkpoint(
+            candle::tensor_assert::site("qwen35.layer_in.L", li),
+            x.as_cat_tensor(),
+            &[],
+            capture_dev,
+        )?;
         match &q.layers[li].mix {
             QuantLayerMix::Attention(_) => {
                 let kv = model.kv_map().kv_index(li).ok_or_else(|| {
@@ -1034,6 +1064,17 @@ fn sweep_layers(
                 // what the per-layer arena bookkeeping inside the mixed
                 // dispatch indexes by, and that bookkeeping is per cache.
                 forward_layer_batched_mixed(&layer, &mut wave_groups, &mut x, embed_dtype, kv)?;
+                // The attention arm's mixer output, which had no site of its
+                // own — only the DeltaNet arm was covered, so an attention
+                // layer could only ever be blamed at `layer_out`, after its FFN
+                // had already been folded in.
+                #[cfg(feature = "tensor-assert")]
+                crate::models::nan_capture::checkpoint(
+                    candle::tensor_assert::site("qwen35.attn_out.L", li),
+                    x.as_cat_tensor(),
+                    &[],
+                    capture_dev,
+                )?;
             }
             QuantLayerMix::DeltaNet(_) => {
                 let orig = x.dtype();
@@ -1059,6 +1100,26 @@ fn sweep_layers(
                 // is what `filled` records — a stash with no row on this wave
                 // captures nothing here and must not claim the ordinal.
                 let captured = slots.iter().any(|s| s.is_some());
+                // The recurrent state as it stands ENTERING this layer's scan.
+                //
+                // This is the one value on the path that survives between waves:
+                // everything else is rebuilt from the residual each time, so a
+                // NaN here was written by an earlier wave and has been carried,
+                // not produced. A report where `layer_in` is clean and this is
+                // not is the whole answer — and it is unreachable from the
+                // residual-only sites, which is why it needs its own.
+                #[cfg(feature = "tensor-assert")]
+                for st in stores.iter() {
+                    let Ok(state) = st.layer_state(li) else {
+                        continue;
+                    };
+                    crate::models::nan_capture::checkpoint(
+                        candle::tensor_assert::site("dn.state_in.s.L", li),
+                        &state.s,
+                        &[("conv_tail", &state.conv_tail)],
+                        capture_dev,
+                    )?;
+                }
                 delta_net_mix_wave(
                     q,
                     li,
@@ -1069,6 +1130,23 @@ fn sweep_layers(
                     layer_table.as_ref(),
                     &slots,
                 )?;
+                // And as the scan LEAVES it. Reaching here means the entering
+                // state and the entering residual were both finite, so a fault
+                // now was produced by the scan on this pass — where a fault at
+                // `state_in` was carried from an earlier wave, since the
+                // recurrent state is the one value that survives between them.
+                #[cfg(feature = "tensor-assert")]
+                for st in stores.iter() {
+                    let Ok(state) = st.layer_state(li) else {
+                        continue;
+                    };
+                    crate::models::nan_capture::checkpoint(
+                        candle::tensor_assert::site("dn.state_out.s.L", li),
+                        &state.s,
+                        &[("conv_tail", &state.conv_tail)],
+                        capture_dev,
+                    )?;
+                }
                 // Releases the borrow of `cohort_stash` the slots hold.
                 drop(slots);
                 if captured {
@@ -1079,9 +1157,33 @@ fn sweep_layers(
                     }
                 }
                 dn_ord += 1;
+                // Sampled BETWEEN the mixer and the FFN: "layer N is bad" is
+                // ambiguous while the expert FFN is inside the same layer, and
+                // a routed expert arriving late is as good a NaN candidate as
+                // the recurrent scan. Splitting them is the difference between
+                // naming a subsystem and naming a layer.
+                #[cfg(feature = "tensor-assert")]
+                crate::models::nan_capture::checkpoint(
+                    candle::tensor_assert::site("qwen35.mixer_out.L", li),
+                    x.as_cat_tensor(),
+                    &[],
+                    capture_dev,
+                )?;
                 quantized_delta_net_ffn(&q.layers[li], &mut x, embed_dtype, orig)?;
             }
         }
+        // The layer's result. Reaching this on a bad value means the mixer's
+        // own checkpoint passed, so the FFN produced it.
+        #[cfg(feature = "tensor-assert")]
+        crate::models::nan_capture::checkpoint(
+            candle::tensor_assert::site("qwen35.layer_out.L", li),
+            x.as_cat_tensor(),
+            &[],
+            capture_dev,
+        )?;
+        // Bisect *when* a narrowed weight changes, not merely *that* it did.
+        #[cfg(feature = "tensor-assert")]
+        crate::models::nan_capture::watch_layer(capture_dev, li);
     }
 
     // File the stash back, whether this sweep was whole or one window of a

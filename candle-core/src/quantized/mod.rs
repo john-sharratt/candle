@@ -1641,6 +1641,46 @@ impl<'w> LiveQTensor<'w> {
         &self.storage
     }
 
+    /// Fold this weight's DEQUANTIZED NaN count, Inf count and finite min/max
+    /// into `name`'s assert slot, returning the tensor so the call chains.
+    ///
+    /// The values a quantized weight contributes to a matmul are its
+    /// dequantized ones, so that is what this measures — a NaN scale and a
+    /// finite-but-enormous weight are different faults, and only the
+    /// dequantized view tells them apart.
+    ///
+    /// Unlike [`LiveTensor::assert`] this stages through the dequant kernels on
+    /// the default stream, so it belongs at load time or an epoch boundary
+    /// rather than inside a wave. Prefer [`Self::assert_once`] for weights.
+    #[cfg(feature = "tensor-assert")]
+    pub fn assert(&self, name: &str) -> &Self {
+        crate::tensor_assert::assert_qtensor(self, name);
+        self
+    }
+
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    pub fn assert(&self, _name: &str) -> &Self {
+        self
+    }
+
+    /// [`Self::assert`], but only the first time this name is seen in the
+    /// current epoch — the form weights should use, since a weight does not
+    /// change between forwards.
+    #[cfg(feature = "tensor-assert")]
+    pub fn assert_once(&self, name: &str) -> &Self {
+        if crate::tensor_assert::should_run_once(name) {
+            crate::tensor_assert::assert_qtensor(self, name);
+        }
+        self
+    }
+
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    pub fn assert_once(&self, _name: &str) -> &Self {
+        self
+    }
+
     pub fn rank(&self) -> usize {
         self.shape.rank()
     }

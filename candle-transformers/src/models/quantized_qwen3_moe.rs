@@ -384,7 +384,23 @@ impl SparseMoeBlock {
         };
 
         // 1. Fused GPU routing; the flattened weights feed the scatter directly.
+        //
+        // The router's own output is the first thing that can be bad here, and
+        // `moe_route` clamps a `bi = n_experts` sentinel out of `-inf`/NaN
+        // logits — so a NaN arriving in the logits is fixed up into a plausible
+        // route rather than propagating visibly. Assert BEFORE the clamp, or
+        // the evidence is gone.
+        #[cfg(feature = "tensor-assert")]
+        router_logits.assert(candle::tensor_assert::site(
+            "moe.router_logits.L",
+            self.moe_layer_idx,
+        ));
         let (top_k_weights, top_k_indices) = moe_route(router_logits, k, self.norm_topk_prob)?;
+        #[cfg(feature = "tensor-assert")]
+        top_k_weights.assert(candle::tensor_assert::site(
+            "moe.route_weights.L",
+            self.moe_layer_idx,
+        ));
         let weights_flat = top_k_weights.flatten_all()?.contiguous()?;
         self.cache.record_profile("fwd_routing", t);
 
@@ -421,9 +437,34 @@ impl SparseMoeBlock {
         // GEMMs as free. The grouped GEMM's cost tracks the number of expert
         // groups the wave activated rather than its token count, which is the one
         // thing a per-token rate cannot show you.
+        // The gather's SOURCE, before it is permuted into expert order. The
+        // residual entering this layer is already checked and clean, so if this
+        // is bad the norm/quantize between them produced it; if this is clean
+        // and `stacked` below is not, the gather read rows that were not these
+        // — which makes `tok_ids` the fault, not the data.
+        #[cfg(feature = "tensor-assert")]
+        {
+            use crate::models::nan_capture::checkpoint_q8a128;
+            let (r, c, n) = (op.rows, op.cols, op.byte_len());
+            let nm = candle::tensor_assert::site("moe.norm_out.L", self.moe_layer_idx);
+            op.with_device_ptr(&cuda_dev, |p| unsafe {
+                checkpoint_q8a128(nm, p, r, c, n, &cuda_dev)
+            })?;
+        }
         let g_moe = gpu_span("moe:gather", &device);
         let stacked = fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &cuda_dev, wave_root(wave))?;
         g_moe.end();
+        // The gather's RESULT. Bad here with the source clean isolates the
+        // fault to the gather itself.
+        #[cfg(feature = "tensor-assert")]
+        {
+            use crate::models::nan_capture::checkpoint_q8a128;
+            let (r, c, n) = (stacked.rows, stacked.cols, stacked.byte_len());
+            let nm = candle::tensor_assert::site("moe.gathered.L", self.moe_layer_idx);
+            stacked.with_device_ptr(&cuda_dev, |p| unsafe {
+                checkpoint_q8a128(nm, p, r, c, n, &cuda_dev)
+            })?;
+        }
         let g_moe = gpu_span("moe:gate_up", &device);
         let gate_out = grouped_qmatmul_dev_q8a128(
             &stacked,
@@ -438,6 +479,38 @@ impl SparseMoeBlock {
             launch_tiles,
             &cuda_dev,
         )?;
+        // Between the GEMM and everything that consumes its result, while
+        // `stacked`, the weight table and the tile tables are all still the ones
+        // this call read. Checking here costs a fence; checking anywhere later
+        // costs the operands, because the next pass through this site carries
+        // different ones and would dump a call that did not fail.
+        //
+        // This is the BACKSTOP of the checkpoint chain, not its head. The
+        // checkpoints upstream of it fire first when they fire at all, so
+        // reaching this one means the residual arrived here finite and the MoE
+        // really did produce the fault — which the replay has already shown it
+        // does not do on its own. See `nan_capture`.
+        #[cfg(feature = "tensor-assert")]
+        {
+            use crate::models::nan_capture::{capture_gate_gemm, GemmCall};
+            capture_gate_gemm(
+                &GemmCall {
+                    layer: self.moe_layer_idx,
+                    stacked: &stacked,
+                    weight_ptrs: &gd.gate_ptrs,
+                    expert_base,
+                    num_experts,
+                    weight_dtype: gate_dtype,
+                    weight_nrows: gd.gate_nrows,
+                    tile_expert: &ws.tile_expert,
+                    tile_b_start: &ws.tile_b_start,
+                    tile_b_cnt: &ws.tile_b_cnt,
+                    launch_tiles,
+                    out: &gate_out,
+                },
+                &cuda_dev,
+            )?;
+        }
         let up_out = grouped_qmatmul_dev_q8a128(
             &stacked,
             &gd.up_ptrs,
@@ -452,6 +525,17 @@ impl SparseMoeBlock {
             &cuda_dev,
         )?;
         g_moe.end();
+        // The two halves of the SwiGLU, separately. They read the SAME `stacked`
+        // operand and the same tile tables but different weights, so one bad and
+        // the other clean isolates the fault to that weight set; both bad points
+        // at the shared operand or the tables.
+        #[cfg(feature = "tensor-assert")]
+        {
+            use crate::models::nan_capture::checkpoint;
+            use candle::tensor_assert::site;
+            let li = self.moe_layer_idx;
+            checkpoint(site("moe.up_out.L", li), &up_out, &[("gate_out", &gate_out)], &cuda_dev)?;
+        }
         let g_moe = gpu_span("moe:silu", &device);
         let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev, gate_out.cuda_backing())?;
         g_moe.end();
@@ -470,6 +554,16 @@ impl SparseMoeBlock {
             &cuda_dev,
         )?;
         g_moe.end();
+        // Brackets the three grouped GEMMs and the SwiGLU between them: with
+        // `moe.router_logits` / `moe.route_weights` finite and this not, the
+        // fault is in the expert matmul chain rather than in routing.
+        #[cfg(feature = "tensor-assert")]
+        crate::models::nan_capture::checkpoint(
+            candle::tensor_assert::site("moe.down_out.L", self.moe_layer_idx),
+            &down_out,
+            &[],
+            &cuda_dev,
+        )?;
         // No cast here. The int8 matmul emits F32 and the scatter reads F32,
         // narrowing once at its store into `ys`'s dtype — so the down
         // projection's whole output no longer makes a full-tensor pass per
@@ -496,6 +590,16 @@ impl SparseMoeBlock {
             &cuda_dev,
         )?;
         g_moe.end();
+        // The routed block's result. Non-finite here with `down_out` finite
+        // puts the fault in the scatter — its only other float input is
+        // `weights_flat`, which `moe.route_weights` already covers.
+        #[cfg(feature = "tensor-assert")]
+        crate::models::nan_capture::checkpoint(
+            candle::tensor_assert::site("moe.routed_out.L", self.moe_layer_idx),
+            &ys,
+            &[("down_out", &down_out)],
+            &cuda_dev,
+        )?;
         self.cache.record_profile("fwd_expert_gpu", t);
         ys.reshape((b_size, seq_len, hidden_dim))
     }

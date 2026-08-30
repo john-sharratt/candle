@@ -51,6 +51,8 @@ cuda = ["candle/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-kernels"]
 # Kernel source-line info for `compute-sanitizer`/`cuda-gdb`. One debugging
 # session, not a default — see `candle-kernels/Cargo.toml`.
 kernel-lineinfo = ["cuda", "candle/kernel-lineinfo", "candle-nn/kernel-lineinfo"]
+# `Tensor::assert` / `QTensor::assert` — see `candle-core/Cargo.toml`.
+tensor-assert = ["cuda", "candle/tensor-assert", "candle-nn/tensor-assert"]
 forbidden_allocations = [
     "candle/forbidden_allocations",
     "candle-nn/forbidden_allocations",

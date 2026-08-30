@@ -181,10 +181,15 @@ mod matmul_baseline;
 mod pack;
 mod pinned;
 mod pipeline;
+/// Fletcher-32 fingerprints of the resident expert weights, taken once after
+/// the fill so a later corruption can be told from a bad fill.
+#[cfg(feature = "cuda")]
+pub mod slot_integrity;
 #[cfg(feature = "cuda")]
 mod streamer;
 mod transition;
 mod types;
+mod zone_geometry;
 
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;

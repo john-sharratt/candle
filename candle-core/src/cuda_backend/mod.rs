@@ -2613,6 +2613,21 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
     // provenance and a site whose arena overflowed both end up on `dev.alloc`
     // and are otherwise indistinguishable in any report.
     if let Some(ptr) = wave_provenance::wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN) {
+        // **The arena and the weight zone share one reservation.**
+        //
+        // Wave arenas are carved upward from `span_base`; the expert weight zone
+        // is carved downward from `span_end`; `weight_floor` is the boundary
+        // between them. Nothing in this path knows where that boundary is — it
+        // is handed a `ptr` and a length by the arena allocator and wraps them.
+        // So an arena whose frontier crosses the floor hands out a range that
+        // IS expert weights, and the activation written through it silently
+        // replaces them: contiguous, however many bytes the caller asked for,
+        // and finite-looking, which is why it surfaces as a NaN several layers
+        // downstream rather than as a fault.
+        //
+        // This is the one allocation path the pool never sees, so the check on
+        // `CudaDevice::alloc` cannot cover it.
+        crate::readonly_regions::forbid_write("wave arena lease (alloc_inheriting)", ptr, bytes);
         // Dropping this slice bare would `cuMemFreeAsync` an address inside
         // the VMM reservation the wave arenas are carved from — memory the
         // stream-ordered pool never allocated — so the driver rejects it and

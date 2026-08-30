@@ -315,6 +315,47 @@ impl SequenceSamplingState {
 /// When this returns `Some`, the token is authoritative for the step: the EOS
 /// failsafes must not replace it (they fire on a later step, once the segment
 /// is closed and `in_segment` is false).
+/// Summarise one `[batch, vocab]` logits row for the degenerate-decode report.
+///
+/// Names what the row actually is — how many entries are non-finite, its
+/// min/max, and whether every entry is identical — so the fault is diagnosable
+/// from the log alone. An all-equal row means the forward wrote nothing
+/// (argmax lands on index 0, which is `!` in the Qwen vocabularies); a
+/// non-finite row means the arithmetic blew up. Those have different causes and
+/// the guard cannot distinguish them without looking.
+fn describe_logit_row(logits2d: &Tensor, row: usize) -> candle::Result<String> {
+    let values = logits2d.i(row)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let n = values.len();
+    let non_finite = values.iter().filter(|v| !v.is_finite()).count();
+    let finite_min = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::INFINITY, f32::min);
+    let finite_max = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let first = values.first().copied().unwrap_or(0.0);
+    let all_equal = values.iter().all(|v| *v == first);
+    // The argmax names what the row actually wanted. A sampled token that is
+    // not this one, at a logit far below it, is the sampler disagreeing with
+    // the distribution rather than the forward producing a bad row — and those
+    // two faults are indistinguishable from the emitted text alone.
+    let argmax = values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    Ok(format!(
+        "logits row: vocab={n} non_finite={non_finite} finite_min={finite_min:.6} \
+         finite_max={finite_max:.6} first={first:.6} argmax={argmax} all_equal={all_equal}"
+    ))
+}
+
 fn segment_close_override(
     config: &SamplingConfig,
     state: &mut SequenceSamplingState,
@@ -477,6 +518,33 @@ impl BatchedSampler {
             }
         }
 
+        // A row that has just crossed the degenerate bar gets its logits
+        // described, once, in the log. `resolve_final_token` can only say the
+        // row was unusable — it never sees the logits — so without this the
+        // operator is left with the guard's own guess ("all-equal or
+        // non-finite") and no way to tell a dead forward from a NaN one. This
+        // reads one row off the device and runs only on the step the bar is
+        // crossed, so it costs nothing until something is already wrong.
+        for (i, state) in states.iter().enumerate() {
+            if state.degenerate_run == DEGENERATE_TOKEN_RUN {
+                let stencil = &configs[i].stencil;
+                match describe_logit_row(&logits2d, i) {
+                    Ok(desc) => tracing::error!(
+                        target: "candle_conversation::eos",
+                        row = i,
+                        stencil_len = stencil.len(),
+                        stencil_head = ?stencil.iter().take(4).collect::<Vec<_>>(),
+                        "degenerate decode: {desc}"
+                    ),
+                    Err(e) => tracing::error!(
+                        target: "candle_conversation::eos",
+                        row = i,
+                        "degenerate decode: logits row unreadable ({e})"
+                    ),
+                }
+            }
+        }
+
         Ok(results)
     }
 
@@ -531,6 +599,125 @@ impl BatchedSampler {
         state.record_token(token, self.max_recent_len);
         state.advance_rng();
         Ok(token)
+    }
+
+    /// Resolve a raw sampled token into the token the sequence actually commits.
+    ///
+    /// Applies, in priority order: the segment-close override (authoritative for
+    /// the step), the degenerate-decode abort, then the EOS length failsafes.
+    /// `row` names the batch row for the logs. `state` is taken by `&mut` for
+    /// `segment_close_override`, which flips `in_segment` as it closes a
+    /// segment; nothing here records the committed token, which stays with the
+    /// caller that owns the advance.
+    ///
+    /// Both sampling paths resolve through here because the two copies of this
+    /// logic drifted once already: the degenerate-decode abort was written into
+    /// the CPU fallback alone, and `sample_full_vocab` sends every unconstrained
+    /// row to the kernel whenever the device is CUDA — which is every
+    /// deployment that matters. A forward producing unusable logits therefore
+    /// ran to the length cap instead of stopping at
+    /// [`DEGENERATE_TOKEN_RUN`], writing hundreds of `!` into the conversation
+    /// and into the substrate, where the turn's signatures then polluted
+    /// retrieval. One authority means a guard added here holds on whichever
+    /// path the device selects.
+    fn resolve_final_token(
+        &self,
+        row: usize,
+        sampled: u32,
+        state: &mut SequenceSamplingState,
+        config: &SamplingConfig,
+    ) -> u32 {
+        let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
+
+        // One-shot: the dynamic EOS boost ramp begins as `current_len` reaches
+        // `eos_ramp_start` (it increments by one, so this fires exactly once per
+        // turn).  After this point EOS pressure builds toward the graceful/hard
+        // caps below.
+        if config.eos_boost != 0.0 && state.current_len == config.eos_ramp_start {
+            tracing::debug!(
+                target: "candle_conversation::eos",
+                row,
+                current_len = state.current_len,
+                eos_ramp_start = config.eos_ramp_start,
+                eos_ramp_len = config.eos_ramp_len,
+                graceful_eos_after = config.graceful_eos_after,
+                forced_eos_after = config.forced_eos_after,
+                "EOS boost ramp entered",
+            );
+        }
+
+        // Segment-close override: force the close token when the segment budget
+        // is exhausted.  Authoritative for the step — the EOS failsafes must not
+        // clobber the close token or a closer-script token (they fire on a later
+        // step, once the segment is closed).
+        if let Some(t) = segment_close_override(config, state) {
+            return t;
+        }
+
+        if state.degenerate_run >= DEGENERATE_TOKEN_RUN {
+            // Degenerate decode: the forward is producing token 0 repeatedly,
+            // which is what argmax returns from an all-equal or non-finite
+            // logit row. Left alone this runs to the length cap and lands
+            // hundreds of `!` in the conversation AND in the substrate, where
+            // the turn's signatures then pollute retrieval. Stop at the first
+            // sign of it and say so loudly — this is a fault, not an answer.
+            tracing::error!(
+                target: "candle_conversation::eos",
+                row,
+                current_len = state.current_len,
+                run = state.degenerate_run,
+                "degenerate decode: token 0 emitted {} times consecutively — \
+                 forcing EOS. The forward pass produced unusable logits \
+                 (all-equal or non-finite); the turn is truncated here.",
+                state.degenerate_run,
+            );
+            return eos_token_id;
+        }
+
+        if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
+            // Hard stop: unconditionally force EOS regardless of sentence position.
+            tracing::debug!(
+                target: "candle_conversation::eos",
+                row,
+                current_len = state.current_len,
+                forced_eos_after = config.forced_eos_after,
+                "hard EOS forced (length cap)",
+            );
+            return eos_token_id;
+        }
+
+        if config.graceful_eos_after > 0 && state.current_len >= config.graceful_eos_after {
+            if config.sentence_end_token_ids.is_empty() {
+                // No sentence-end tokens resolved (e.g. model loaded without
+                // tokenizer resolution): fall back to hard stop at the graceful
+                // threshold.
+                tracing::debug!(
+                    target: "candle_conversation::eos",
+                    row,
+                    current_len = state.current_len,
+                    graceful_eos_after = config.graceful_eos_after,
+                    "hard EOS forced (no sentence-end tokens)",
+                );
+                return eos_token_id;
+            }
+            // Graceful stop: emit EOS only when the last token was a
+            // sentence-ending token (`.`, `!`, `?`, `\n`).  This lets the current
+            // sentence complete before termination, preventing mid-sentence
+            // truncation.  `forced_eos_after` is the hard backstop if no boundary
+            // is ever seen.
+            if state.at_sentence_end(config) {
+                tracing::debug!(
+                    target: "candle_conversation::eos",
+                    row,
+                    current_len = state.current_len,
+                    graceful_eos_after = config.graceful_eos_after,
+                    "soft EOS forced (sentence boundary)",
+                );
+                return eos_token_id;
+            }
+        }
+
+        sampled
     }
 
     /// CPU fallback implementation using candle's built-in sampling.  Receives
@@ -600,81 +787,11 @@ impl BatchedSampler {
             };
             let seed = config.seed.wrapping_add(state.rng_offset);
             let mut processor = LogitsProcessor::from_sampling(seed, sampling);
-            let mut token = processor.sample(&seq_logits)?;
+            let sampled = processor.sample(&seq_logits)?;
 
-            // Segment-close overrides: force the close token when the segment
-            // budget is exhausted.  A segment override is authoritative for the
-            // step — the EOS failsafes below must not clobber the close token or
-            // a closer-script token (they fire on a later step, once the segment
-            // is closed).
-            let segment_override = segment_close_override(config, state);
-            if let Some(t) = segment_override {
-                token = t;
-            }
-
-            // EOS failsafe overrides (post-sampler)
-            let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
-            if segment_override.is_some() {
-                // Segment close in progress; EOS failsafes wait for the next step.
-            } else if state.degenerate_run >= DEGENERATE_TOKEN_RUN {
-                // Degenerate decode: the forward is producing token 0 repeatedly,
-                // which is what argmax returns from an all-equal or non-finite
-                // logit row. Left alone this runs to the length cap and lands
-                // hundreds of `!` in the conversation AND in the substrate, where
-                // the turn's signatures then pollute retrieval. Stop at the first
-                // sign of it and say so loudly — this is a fault, not an answer.
-                token = eos_token_id;
-                tracing::error!(
-                    target: "candle_conversation::eos",
-                    row = i,
-                    current_len = state.current_len,
-                    run = state.degenerate_run,
-                    "degenerate decode: token 0 emitted {} times consecutively —                      forcing EOS. The forward pass produced unusable logits                      (all-equal or non-finite); the turn is truncated here.",
-                    state.degenerate_run,
-                );
-            } else if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
-                // Hard stop: unconditionally force EOS regardless of sentence position.
-                token = eos_token_id;
-                tracing::debug!(
-                    target: "candle_conversation::eos",
-                    row = i,
-                    current_len = state.current_len,
-                    forced_eos_after = config.forced_eos_after,
-                    "hard EOS forced (length cap)",
-                );
-            } else if config.graceful_eos_after > 0
-                && state.current_len >= config.graceful_eos_after
-                && !config.sentence_end_token_ids.is_empty()
-            {
-                // Graceful stop: emit EOS only when the last token was a sentence-ending
-                // token (`.`, `!`, `?`, `\n`).  This lets the current sentence complete
-                // before termination, preventing mid-sentence truncation.
-                // `forced_eos_after` acts as the hard backstop if no boundary is seen.
-                if state.at_sentence_end(config) {
-                    token = eos_token_id;
-                    tracing::debug!(
-                        target: "candle_conversation::eos",
-                        row = i,
-                        current_len = state.current_len,
-                        graceful_eos_after = config.graceful_eos_after,
-                        "soft EOS forced (sentence boundary)",
-                    );
-                }
-            } else if config.graceful_eos_after > 0
-                && state.current_len >= config.graceful_eos_after
-                && config.sentence_end_token_ids.is_empty()
-            {
-                // No sentence-end tokens resolved (e.g. model loaded without tokenizer
-                // resolution): fall back to hard stop at the graceful threshold.
-                token = eos_token_id;
-                tracing::debug!(
-                    target: "candle_conversation::eos",
-                    row = i,
-                    current_len = state.current_len,
-                    graceful_eos_after = config.graceful_eos_after,
-                    "hard EOS forced (no sentence-end tokens)",
-                );
-            }
+            // Segment close, degenerate-decode abort and the EOS failsafes all
+            // resolve in `resolve_final_token`, shared with the CUDA path.
+            let token = self.resolve_final_token(i, sampled, state, config);
 
             // Record the token and advance RNG
             state.record_token(token, self.max_recent_len);
@@ -918,80 +1035,10 @@ impl BatchedSampler {
         // Apply post-sampler EOS failsafe overrides: if the sequence has exceeded
         // the configured length limits, replace the sampled token with EOS.
         for (i, state) in states.iter_mut().enumerate() {
-            let mut token = output_tokens[i];
+            // Segment close, degenerate-decode abort and the EOS failsafes all
+            // resolve in `resolve_final_token`, shared with the CPU path.
+            let token = self.resolve_final_token(i, output_tokens[i], state, config);
 
-            // One-shot: the dynamic EOS boost ramp begins as `current_len` reaches
-            // `eos_ramp_start` (it increments by one, so this fires exactly once per
-            // turn).  After this point EOS pressure builds toward the graceful/hard
-            // caps below.
-            if config.eos_boost != 0.0 && state.current_len == config.eos_ramp_start {
-                tracing::debug!(
-                    target: "candle_conversation::eos",
-                    row = i,
-                    current_len = state.current_len,
-                    eos_ramp_start = config.eos_ramp_start,
-                    eos_ramp_len = config.eos_ramp_len,
-                    graceful_eos_after = config.graceful_eos_after,
-                    forced_eos_after = config.forced_eos_after,
-                    "EOS boost ramp entered",
-                );
-            }
-
-            // Segment-close overrides: force the close token when the segment
-            // budget is exhausted.  A segment override is authoritative for the
-            // step — the EOS failsafes below must not clobber the close token or
-            // a closer-script token (they fire on a later step, once the segment
-            // is closed).
-            let segment_override = segment_close_override(config, state);
-            if let Some(t) = segment_override {
-                token = t;
-            }
-
-            // EOS failsafe overrides (post-sampler)
-            if segment_override.is_some() {
-                // Segment close in progress; EOS failsafes wait for the next step.
-            } else if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
-                // Hard stop: unconditionally force EOS regardless of sentence position.
-                token = eos_token_id;
-                tracing::debug!(
-                    target: "candle_conversation::eos",
-                    row = i,
-                    current_len = state.current_len,
-                    forced_eos_after = config.forced_eos_after,
-                    "hard EOS forced (length cap)",
-                );
-            } else if config.graceful_eos_after > 0
-                && state.current_len >= config.graceful_eos_after
-                && !config.sentence_end_token_ids.is_empty()
-            {
-                // Graceful stop: emit EOS only at the next sentence boundary so the
-                // current sentence completes before generation stops.  Prevents the
-                // mid-sentence truncation that occurred when EOS was unconditionally
-                // forced here.  `forced_eos_after` is the hard backstop.
-                if state.at_sentence_end(config) {
-                    token = eos_token_id;
-                    tracing::debug!(
-                        target: "candle_conversation::eos",
-                        row = i,
-                        current_len = state.current_len,
-                        graceful_eos_after = config.graceful_eos_after,
-                        "soft EOS forced (sentence boundary)",
-                    );
-                }
-            } else if config.graceful_eos_after > 0
-                && state.current_len >= config.graceful_eos_after
-                && config.sentence_end_token_ids.is_empty()
-            {
-                // No sentence-end tokens resolved: fall back to hard stop.
-                token = eos_token_id;
-                tracing::debug!(
-                    target: "candle_conversation::eos",
-                    row = i,
-                    current_len = state.current_len,
-                    graceful_eos_after = config.graceful_eos_after,
-                    "hard EOS forced (no sentence-end tokens)",
-                );
-            }
             output_tokens[i] = token;
 
             state.record_token(token, self.max_recent_len);
@@ -1618,6 +1665,47 @@ mod tests {
             DEGENERATE_TOKEN_RUN <= 16,
             "must fire long before the length cap: the observed failure ran 1219 tokens",
         );
+    }
+
+    /// The degenerate-decode abort must live on the resolver BOTH sampling
+    /// paths run through, not in one path's copy of the overrides.
+    ///
+    /// It was written into `sample_batch_cpu` alone, and `sample_full_vocab`
+    /// sends every unconstrained row to the CUDA kernel whenever the device is
+    /// CUDA — so on the only configuration production runs, the guard was dead:
+    /// a forward emitting token 0 forever ran to the length cap instead of
+    /// stopping at `DEGENERATE_TOKEN_RUN`, writing hundreds of `!` into the
+    /// conversation and into the substrate, where the turn's signatures then
+    /// polluted retrieval. Asserting on `resolve_final_token` is what keeps the
+    /// guard device-independent: there is no second copy to be missing from.
+    #[test]
+    fn degenerate_run_forces_eos_on_the_resolver_both_paths_share() {
+        let sampler = make_sampler();
+        let config = SamplingConfig::argmax();
+        let mut state = make_state();
+
+        // One short of the bar: an ordinary sampled token is committed as-is.
+        for _ in 0..DEGENERATE_TOKEN_RUN - 1 {
+            state.record_token(0, MAX_RECENT);
+        }
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            7,
+            "below the bar the sampler's own token stands"
+        );
+
+        // The next consecutive zero crosses it, and the turn is cut short.
+        state.record_token(0, MAX_RECENT);
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            EOS_TOKEN,
+            "a degenerate run must force EOS whichever path sampled the row"
+        );
+
+        // A real token clears the run, and decoding resumes normally — the
+        // guard fires on a consecutive run, never on token 0 being frequent.
+        state.record_token(42, MAX_RECENT);
+        assert_eq!(sampler.resolve_final_token(0, 7, &mut state, &config), 7);
     }
 
     fn make_sampler() -> BatchedSampler {
