@@ -1,8 +1,11 @@
-//! DeepSeek-V4-Flash as a `ManagedBatchedModel`: the conversation engine's
-//! wave-forward over the resident [`Engine`], with attention in the
-//! `paged-latent` kernels and the mHC hyper-connection loop private to this
-//! implementation (the scheduler sees only the trait surface — `WaveStep`
-//! residuals are opaque, so the multi-stream mHC state rides them directly).
+//! DeepSeek-V4-Flash on the shared wave loop: `forward_wave` is
+//! [`drive_wave`](crate::models::wave_driver::drive_wave) and this model's
+//! architecture lives in its [`WaveSweep`] — attention in the `paged-latent`
+//! kernels, the mHC hyper-connection loop, the per-layer corpus machinery.
+//! The scheduler sees only the trait surface: `WaveStep` residuals are
+//! opaque, so the multi-stream mHC state rides them directly (flattened to
+//! `[1, rows, hc·dim]` across a pause and permuted by the driver like any
+//! other model's).
 //!
 //! Per-sequence corpus state (galleries + streaming compressors, one per
 //! compression layer) lives behind interior mutability keyed by sequence
@@ -17,9 +20,13 @@ use candle::quantized::pinned_staging::Generation;
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::batched_inference::{
-    BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult, WaveStep,
+    BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, PendingGlue, WaveResult,
     MAX_PREFILL_TOKENS,
 };
+use crate::models::batched_model::{WaveGuard, WavePhase};
+use crate::models::kv_cache_utils::SequenceContext;
+use crate::models::tensor_cat::TensorCat;
+use crate::models::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 use candle_nn::kv_cache::ModelGeometry;
 use candle_nn::kv_cache::CHUNK_SIZE;
 
@@ -281,6 +288,28 @@ struct VerifySnapshot {
     layers: Vec<LayerVerifySnap>,
 }
 
+/// One wave member's pre-wave streaming-corpus state — the wave-failure twin
+/// of [`VerifySnapshot`]. Captured by `sweep` for every sequence before the
+/// layer loop can advance anything, consumed only when the sweep fails: the
+/// galleries and streaming compressors advance IN PLACE per layer, so an
+/// error mid-sweep otherwise leaves early layers holding entries later layers
+/// never produced. `state == None` records that the sequence had no entry at
+/// all (a fresh prefill member), so the restore removes what the failed wave
+/// created rather than zeroing it.
+struct WaveCorpusSnap {
+    seq: usize,
+    /// `(absorbed, per-layer (comp, icomp, gallery_len))`; `None` ⇒ no entry.
+    #[allow(clippy::type_complexity)]
+    state: Option<(
+        usize,
+        Vec<(
+            Option<super::compressor::CompressorState>,
+            Option<super::compressor::CompressorState>,
+            usize,
+        )>,
+    )>,
+}
+
 /// DeepSeek's batched wave model. See the module docs.
 pub struct BatchedEngine {
     engine: Engine,
@@ -385,7 +414,7 @@ impl BatchedEngine {
         // streams — no norm, no per-layer reduction beyond the model's dim-wide readout). Shift to
         // 0-based → [40,41,42], the last three layer outputs. `forward_wave` captures `head_reduce(h)`
         // (our hc_mult→dim readout) after each and stashes the concatenation.
-        let n = self.num_layers();
+        let n = self.engine.layer_count();
         self.target_layers = drafter
             .cfg
             .target_layers
@@ -455,11 +484,11 @@ impl BatchedEngine {
         corpus_base: usize,
         absorbed: usize,
     ) -> Result<()> {
-        if snaps.len() != self.num_layers() {
+        if snaps.len() != self.engine.layer_count() {
             candle::bail!(
                 "corpus_restore: {} snapshots for {} layers",
                 snaps.len(),
-                self.num_layers()
+                self.engine.layer_count()
             );
         }
         let cfg = self.engine.cfg();
@@ -529,7 +558,7 @@ impl BatchedEngine {
         seq: usize,
     ) -> Result<WindowRingSnapshot> {
         let dev = self.engine.engine_device();
-        let mut layers = Vec::with_capacity(self.num_layers());
+        let mut layers = Vec::with_capacity(self.engine.layer_count());
         for backing in session.backings() {
             let resident_len = backing.resident_len(seq)?;
             let kv = if resident_len == 0 {
@@ -560,11 +589,11 @@ impl BatchedEngine {
         snap: &WindowRingSnapshot,
         decode_pos: usize,
     ) -> Result<()> {
-        if snap.layers.len() != self.num_layers() {
+        if snap.layers.len() != self.engine.layer_count() {
             candle::bail!(
                 "window_ring_restore: {} layers for {} model layers",
                 snap.layers.len(),
-                self.num_layers()
+                self.engine.layer_count()
             );
         }
         for (l, backing) in session.backings().iter().enumerate() {
@@ -746,6 +775,74 @@ impl BatchedEngine {
         Ok(())
     }
 
+    /// Capture every wave member's streaming-corpus state ahead of a sweep —
+    /// per layer a pair of `Arc` clones and the gallery length, host-only, no
+    /// device work and no fences. See [`WaveCorpusSnap`].
+    fn capture_corpus_state(&self, seqs: &[usize]) -> Result<Vec<WaveCorpusSnap>> {
+        let map = self
+            .seq_state
+            .read()
+            .map_err(|_| candle::Error::Msg("seq_state lock poisoned".into()))?;
+        Ok(seqs
+            .iter()
+            .map(|&seq| WaveCorpusSnap {
+                seq,
+                state: map.get(&seq).map(|e| {
+                    (
+                        e.absorbed,
+                        e.layers
+                            .iter()
+                            .map(|ls| {
+                                (
+                                    ls.comp.as_ref().map(|c| c.state_snapshot()),
+                                    ls.icomp.as_ref().map(|c| c.state_snapshot()),
+                                    ls.gallery.as_ref().map_or(0, |g| g.len()),
+                                )
+                            })
+                            .collect(),
+                    )
+                }),
+            })
+            .collect())
+    }
+
+    /// Restore what [`Self::capture_corpus_state`] captured — the failed-wave
+    /// path. Galleries truncate to the recorded lengths (their appends are
+    /// append-only within a wave, and truncation is host metadata — the same
+    /// operation `rollback_verify_state` performs in production, so in-flight
+    /// kernels of the dead wave read rows that simply go unreferenced).
+    fn restore_corpus_state(&self, snaps: Vec<WaveCorpusSnap>) -> Result<()> {
+        let mut map = self
+            .seq_state
+            .write()
+            .map_err(|_| candle::Error::Msg("seq_state lock poisoned".into()))?;
+        for snap in snaps {
+            let Some((absorbed, layers)) = snap.state else {
+                // The sequence had no state entering the wave; whatever the
+                // failed wave created for it is discarded outright, so the
+                // retry's `ensure_seq_state` starts from nothing again.
+                map.remove(&snap.seq);
+                continue;
+            };
+            let Some(entry) = map.get_mut(&snap.seq) else {
+                continue;
+            };
+            entry.absorbed = absorbed;
+            for ((comp_s, icomp_s, glen), ls) in layers.into_iter().zip(entry.layers.iter_mut()) {
+                if let (Some(c), Some(s)) = (ls.comp.as_mut(), comp_s) {
+                    c.state_restore(s);
+                }
+                if let (Some(c), Some(s)) = (ls.icomp.as_mut(), icomp_s) {
+                    c.state_restore(s);
+                }
+                if let Some(g) = ls.gallery.as_mut() {
+                    g.truncate(glen);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Extract host token ids from an input tensor (`[1, s]` or `[s]`).
     /// Inputs are scheduler-built host tensors; when one arrives on the GPU
     /// this is a transfer — counted by the readback instrumentation.
@@ -877,9 +974,9 @@ impl ManagedBatchedModel for BatchedEngine {
             None,
         )?;
         first.set_single_latent(true);
-        let mut backings = Vec::with_capacity(self.num_layers());
+        let mut backings = Vec::with_capacity(self.engine.layer_count());
         backings.push(first.clone());
-        for layer_idx in 1..self.num_layers() {
+        for layer_idx in 1..self.engine.layer_count() {
             backings.push(first.new_layer(layer_idx, 1, cfg.initial_seq_len));
         }
         Ok(BatchedInferenceSession::new_with_backings(
@@ -949,12 +1046,306 @@ impl ManagedBatchedModel for BatchedEngine {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
-        if decode_inputs.len() != decode_seqs.len()
-            || prefill_inputs.len() != prefill_seqs.len()
-            || glue_inputs.len() != glue_seqs.len()
-        {
-            candle::bail!("forward_wave: input/seq length mismatch");
+        drive_wave(
+            self,
+            session,
+            decode_seqs,
+            decode_inputs,
+            prefill_seqs,
+            prefill_inputs,
+            glue_seqs,
+            glue_inputs,
+            layer_start,
+            layer_end,
+            residual_in,
+        )
+    }
+
+    /// Batched speculative verify: every sequence's `[committed, drafts…]`
+    /// block rides ONE wave — each block as one multi-token member of the
+    /// PREFILL slot (the encoding `verify_wave` documents for the qwen35
+    /// lineage), while the plain cohort's committed tokens lead as ordinary
+    /// decode rows. Inside the sweep the blocks are expanded back to one
+    /// virtual decode slot per position — decode numerics by construction —
+    /// so the two encodings meet at the same kernels; what the prefill-slot
+    /// form buys is the wave driver's contract (one context per sequence, no
+    /// duplicated ids) and with it the fair-wave co-batch. The wave is
+    /// launch-bound, so its fixed costs (per-layer MoE routing readbacks,
+    /// expert DMA) amortize across every session instead of being paid once
+    /// per session. Lossless is unchanged: the driver still accepts only the
+    /// model's own argmaxes. `verify_all_rows` marks the verifying sequences
+    /// for the sweep (row expansion + full-row head scoring); it is cleared by
+    /// `end_verify`/`abort_verify`. Advances each sequence by its block
+    /// length; the driver truncates back to the accepted lengths.
+    fn begin_verify(
+        &self,
+        session: &mut BatchedInferenceSession,
+        plain: &[(usize, u32)],
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        budget: usize,
+    ) -> Result<Option<VerifyPlan>> {
+        // Nothing here is armed speculatively: the corpus-state snapshots below
+        // are taken per verifying sequence, and a zero budget leaves that cohort
+        // empty, so this model already does no work it will not use.
+        let _ = budget;
+        if plain.is_empty() && seqs.is_empty() {
+            return Ok(Some(VerifyPlan {
+                decode_seqs: Vec::new(),
+                decode_inputs: Vec::new(),
+                verify_seqs: Vec::new(),
+                verify_inputs: Vec::new(),
+                rows: 0,
+            }));
         }
+        // Pre-verify corpus-state snapshots: the forward below absorbs the WHOLE
+        // blocks (including drafts the driver may reject) into the streaming
+        // compressors/galleries; the driver's `truncate_sequence` consumes each
+        // snapshot to roll that state back to the accepted prefix — the KV
+        // truncation alone cannot see it.
+        let s_snap = span("verify:snapshot");
+        let n_rows: usize = plain.len() + blocks.iter().map(|b| b.len()).sum::<usize>();
+        let mut decode_seqs: Vec<usize> = Vec::with_capacity(plain.len());
+        let mut decode_inputs: Vec<Tensor> = Vec::with_capacity(plain.len());
+        for &(seq, tok) in plain {
+            decode_seqs.push(seq);
+            decode_inputs.push(Tensor::from_vec(
+                vec![tok],
+                (1, 1),
+                self.engine.engine_device(),
+            )?);
+        }
+        let mut verify_seqs: Vec<usize> = Vec::with_capacity(seqs.len());
+        let mut verify_inputs: Vec<Tensor> = Vec::with_capacity(seqs.len());
+        for (i, &seq) in seqs.iter().enumerate() {
+            if blocks[i].is_empty() {
+                candle::bail!("verify_blocks: empty block for seq {seq}");
+            }
+            let q_start = session.sequence_offset(seq).unwrap_or(0);
+            self.snapshot_verify_state(seq, q_start, blocks[i].len())?;
+            verify_seqs.push(seq);
+            verify_inputs.push(Tensor::from_vec(
+                blocks[i].clone(),
+                (1, blocks[i].len()),
+                self.engine.engine_device(),
+            )?);
+        }
+        s_snap.end();
+        *self
+            .verify_all_rows
+            .write()
+            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))? =
+            seqs.to_vec();
+        Ok(Some(VerifyPlan {
+            decode_seqs,
+            decode_inputs,
+            verify_seqs,
+            verify_inputs,
+            rows: n_rows,
+        }))
+    }
+
+    fn end_verify(
+        &self,
+        session: &mut BatchedInferenceSession,
+        plain: &[(usize, u32)],
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        logits: Vec<Tensor>,
+    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        self.verify_all_rows
+            .write()
+            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))?
+            .clear();
+        let n_rows: usize = plain.len() + blocks.iter().map(|b| b.len()).sum::<usize>();
+        let s_post = span("verify:post");
+        for &(seq, _) in plain {
+            session.advance_sequence(seq, 1)?;
+        }
+        for (i, &seq) in seqs.iter().enumerate() {
+            session.advance_sequence(seq, blocks[i].len())?;
+        }
+        // Already copied off the wave's span by the caller: the accept walk
+        // reads these after the forward returns — position by position, and on
+        // partial accept a rollback + a NEXT forward — so span-lifetime views
+        // would dangle by then.
+        if logits.len() != n_rows {
+            candle::bail!(
+                "end_verify: expected {} scored rows, got {}",
+                n_rows,
+                logits.len()
+            );
+        }
+        // Split the scored rows back per cohort/sequence (row order: plain
+        // prefix, then each block's rows).
+        let plain_out = logits[..plain.len()].to_vec();
+        let mut out = Vec::with_capacity(seqs.len());
+        let mut off = plain.len();
+        for b in blocks {
+            out.push(logits[off..off + b.len()].to_vec());
+            off += b.len();
+        }
+        s_post.end();
+        Ok((plain_out, out))
+    }
+
+    fn abort_verify(&self, seqs: &[usize]) {
+        if let Ok(mut v) = self.verify_all_rows.write() {
+            v.clear();
+        }
+        // Failed verify: drop the snapshots so a later truncate cannot replay
+        // from a half-populated one.
+        if let Ok(mut m) = self.verify_snap.write() {
+            for &s in seqs {
+                m.remove(&s);
+            }
+        }
+    }
+
+    /// DSpark speculative draft: propose a block of up to `max_len` tokens after `committed`,
+    /// conditioned on `seq`'s stashed target feature (the concatenated `dflash.target_layers`
+    /// hidden states — paper Eq. 2). Lossless — the caller verifies every proposal against the
+    /// target — so the conditioning only affects acceptance, never output. Returns empty (⇒ plain
+    /// decode) when no drafter is attached or the sequence has no stashed feature yet.
+    fn speculative_draft(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seqs: &[usize],
+        committed: &[u32],
+        max_len: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        if committed.len() != seqs.len() {
+            candle::bail!(
+                "dspark draft: {} committed tokens for {} sequences",
+                committed.len(),
+                seqs.len()
+            );
+        }
+        // Per sequence, because DSpark conditions each proposal on that
+        // sequence's own stashed target feature and gates it on that sequence's
+        // own acceptance EMA. The qwen35 NextN head batches its cohort instead
+        // (`qwen35::mtp::MtpHead::draft_cohort`), which is what removes the
+        // per-session weight read the width-aware break-even below is priced
+        // against; doing the same here is a separate change to a drafter with
+        // its own measured schedule, not a rename.
+        let cohort = seqs.len();
+        seqs.iter()
+            .zip(committed)
+            .map(|(&seq, &tok)| self.draft_one(session, seq, tok, max_len, cohort))
+            .collect()
+    }
+}
+
+impl WaveSweep for BatchedEngine {
+    fn device(&self) -> &Device {
+        self.engine.engine_device()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.engine.layer_count()
+    }
+
+    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    }
+
+    /// No reconciliation: this model's session offsets are ABSOLUTE while
+    /// `sequence_backing_tokens` counts the RESIDENT chunks of the sliding
+    /// window ring — once the ring has slid, the default's `offset == backing`
+    /// clamp would silently re-base every slid sequence. The sweep re-derives
+    /// its arena lengths from the session at entry (`set_len` in resident
+    /// terms after `evict_window_front`), which is this model's form of the
+    /// same invariant.
+    fn reconcile_entry_offsets(
+        &self,
+        _session: &mut BatchedInferenceSession,
+        _seq_groups: [&[usize]; 3],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The decode write-length is committed ON-DEVICE by the paged decode
+    /// kernel (`commit_write_len`), and every wave entry re-commits the
+    /// arena's writer prefix from the session offsets in RESIDENT terms. The
+    /// default's `set_current_seq_len(offset + 1)` would stamp the ABSOLUTE
+    /// offset into a ring the arena addresses relatively — a deliberate no-op,
+    /// not an omission.
+    fn advance_decode_rows(
+        &self,
+        _contexts: &mut [SequenceContext],
+        _n_decode: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// KV lengths are re-committed from the session at every wave entry, so a
+    /// failed wave's partial per-layer advance is corrected by the retry's own
+    /// entry rather than by a truncate here — and the default's
+    /// absolute-offset truncate would mis-address a slid ring. Corpus state
+    /// (galleries/compressors) is rolled back through the verify snapshots
+    /// where one is armed.
+    fn rollback_wave(
+        &self,
+        _contexts: &mut [SequenceContext],
+        _kv_start: usize,
+        _kv_end: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The failure-atomicity bracket around the sweep body: **a failed wave
+    /// leaves no corpus trace.** The layer loop advances the galleries and
+    /// streaming compressors in place as each layer runs, so an error
+    /// mid-sweep — routine under the relief design — would leave the early
+    /// layers' corpus one token ahead of the rest, and the retry would absorb
+    /// the same positions AGAIN as duplicate, shifted groups (the re-attended
+    /// duplicated-context failure [`VerifySnapshot`] documents for verify
+    /// blocks, here for ANY failed wave). This also covers a FAILED verify
+    /// wave, whose `abort_verify` drops the per-seq snapshots without
+    /// rewinding the absorbed block. KV needs no twin: wave entry re-commits
+    /// every arena length from the session.
+    fn sweep(
+        &self,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
+    ) -> Result<(WavePhase, Option<WaveGuard>)> {
+        let snaps = self.capture_corpus_state(wave.seq_ids)?;
+        match self.sweep_wave_inner(session, wave) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if let Err(restore) = self.restore_corpus_state(snaps) {
+                    candle::bail!(
+                        "wave failed ({e}) and the corpus-state restore that keeps that \
+                         failure recoverable also failed ({restore})"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+impl BatchedEngine {
+    /// The sweep body proper — see [`WaveSweep::sweep`] above for the
+    /// failure-atomicity bracket around it.
+    fn sweep_wave_inner(
+        &self,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
+    ) -> Result<(WavePhase, Option<WaveGuard>)> {
+        let WaveGroups {
+            n_decode,
+            n_prefill,
+            seq_ids,
+            inputs,
+            pending_glue,
+            generation: wave_generation,
+            layer_start,
+            layer_end,
+            x_in,
+            act_dtype: _,
+        } = wave;
+        let residual_in: Option<Tensor> = x_in.map(|tc| tc.to_tensor());
         // The KV↔expert boundary's GROWING direction, in the one gap it is
         // legal in: between forwards, before this wave opens any state. Spare
         // KV regions above the KV side's recent high-water go back to the
@@ -966,33 +1357,87 @@ impl ManagedBatchedModel for BatchedEngine {
         self.engine.experts().reclaim_spare_ground();
         let e = &self.engine;
         let cfg = e.cfg();
-        let n_layers = self.num_layers();
+        let n_layers = self.engine.layer_count();
         let hc = e.hc();
 
-        // Token ids (host) + per-seq geometry.
-        let decode_ids: Vec<u32> = decode_inputs
+        // Group split, in the driver's internal `[decode | prefill | glue]`
+        // order (1-token prefills already folded into the decode group).
+        let n_glue_members = seq_ids
+            .len()
+            .checked_sub(n_decode + n_prefill)
+            .ok_or_else(|| candle::Error::Msg("deepseek wave: group bounds exceed batch".into()))?;
+        let (dec_member_seqs, rest) = seq_ids.split_at(n_decode);
+        let (pre_member_seqs, glue_member_seqs) = rest.split_at(n_prefill);
+        let (dec_member_inputs, rest_in) = inputs.split_at(n_decode);
+        let (pre_member_inputs, glue_member_inputs) = rest_in.split_at(n_prefill);
+        debug_assert_eq!(glue_member_seqs.len(), n_glue_members);
+
+        // The verifying sequences, read once for the whole wave. Their blocks
+        // arrive as multi-token PREFILL members (one context per sequence — the
+        // wave driver's contract), and are expanded here to one decode-class
+        // row per block position: the same seq on consecutive rows, exactly the
+        // per-token decode stream, batched. Verify members must LEAD the
+        // prefill group so the decode-class rows `[plain | verify]` stay one
+        // contiguous slice of the packed buffer — the batched decode front-end
+        // (projection, assemble, pool, select, gather) runs on a single narrow.
+        let verify_seqs: Vec<usize> = self
+            .verify_all_rows
+            .read()
+            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))?
+            .clone();
+        let mut n_verify_members = 0usize;
+        for (i, s) in pre_member_seqs.iter().enumerate() {
+            if verify_seqs.contains(s) {
+                if i != n_verify_members {
+                    candle::bail!(
+                        "verify wave: verify members must lead the prefill group \
+                         (prefill {pre_member_seqs:?}, verify set {verify_seqs:?})"
+                    );
+                }
+                n_verify_members += 1;
+            }
+        }
+
+        // Decode-class rows: the plain decode members, then each verify block
+        // position as one row of its sequence. From here down the sweep's row
+        // model is unchanged from the private-loop era — `decode_seqs` may name
+        // the same sequence on consecutive rows (a verify block), and every
+        // consumer below already handles that.
+        let mut dec_class_seqs: Vec<usize> = dec_member_seqs.to_vec();
+        let mut decode_ids: Vec<u32> = dec_member_inputs
             .iter()
             .map(|t| Ok(Self::token_ids(t)?[0]))
             .collect::<Result<Vec<_>>>()?;
-        let prefill_ids: Vec<Vec<u32>> = prefill_inputs
+        for m in 0..n_verify_members {
+            for tok in Self::token_ids(&pre_member_inputs[m])? {
+                dec_class_seqs.push(pre_member_seqs[m]);
+                decode_ids.push(tok);
+            }
+        }
+        let decode_seqs: &[usize] = &dec_class_seqs;
+
+        // The remaining prefill members are ordinary (creep) prompts.
+        let prefill_seqs: &[usize] = &pre_member_seqs[n_verify_members..];
+        let prefill_ids: Vec<Vec<u32>> = pre_member_inputs[n_verify_members..]
             .iter()
             .map(Self::token_ids)
             .collect::<Result<Vec<_>>>()?;
         let prefill_lens: Vec<usize> = prefill_ids.iter().map(|v| v.len()).collect();
-        let glue_ids: Vec<Vec<u32>> = glue_inputs
+        let glue_seqs: &[usize] = glue_member_seqs;
+        let glue_ids: Vec<Vec<u32>> = glue_member_inputs
             .iter()
             .map(Self::token_ids)
             .collect::<Result<Vec<_>>>()?;
         let glue_lens: Vec<usize> = glue_ids.iter().map(|v| v.len()).collect();
 
-        // Glue descriptors: staged on the session before this call, one per
-        // glue sequence in order. Positions derive from the reserved gap
-        // chunks: block logical start + (in-block offset − chunk offset).
-        // DeepSeek glue is causal-only (locked §E) — fwd_ahead must be 0.
-        let glue_desc = if glue_seqs.is_empty() {
+        // Glue descriptors: taken off the session by the driver, one per glue
+        // sequence in order. Positions derive from the reserved gap chunks:
+        // block logical start + (in-block offset − chunk offset). DeepSeek glue
+        // is causal-only (locked §E) — fwd_ahead must be 0.
+        let glue_desc: Vec<PendingGlue> = if glue_seqs.is_empty() {
             Vec::new()
         } else {
-            let desc = session.take_pending_glue().ok_or_else(|| {
+            let desc = pending_glue.ok_or_else(|| {
                 candle::Error::Msg("glue rows without staged PendingGlue descriptors".into())
             })?;
             if desc.len() != glue_seqs.len() {
@@ -1129,7 +1574,13 @@ impl ManagedBatchedModel for BatchedEngine {
             self.ensure_seq_state(s, base)?;
         }
         for &s in decode_seqs.iter().chain(glue_seqs) {
-            self.ensure_seq_state(s, 1)?; // decode/glue never reset
+            // A decode row is normally mid-sequence (never reset) — but the
+            // driver folds 1-token prefills into the decode group, and a FRESH
+            // sequence rerouted that way must still reset its corpus state,
+            // exactly as the prefill path it left would have. The session
+            // offset tells the two apart.
+            let start = session.sequence_offset(s).unwrap_or(0);
+            self.ensure_seq_state(s, if start == 0 { 0 } else { 1 })?;
         }
 
         // Residual: fresh waves embed all rows [decode… | prefill… | glue…]
@@ -1152,18 +1603,12 @@ impl ManagedBatchedModel for BatchedEngine {
             }
         };
 
-        // Read once for the whole wave: the sequences (if any) whose DECODE
-        // rows are speculative verify blocks (one row per block position, the
-        // same seq on consecutive rows). Their attention runs the DECODE
-        // kernel over per-position virtual slots with the rows pre-scattered,
-        // the per-row capture stashes their projected compressor rows
-        // (rollback replay source), and the head scores every decode row as
-        // it always does.
-        let verify_seqs: Vec<usize> = self
-            .verify_all_rows
-            .read()
-            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))?
-            .clone();
+        // `verify_seqs` was read in the prologue (it also shaped the row
+        // expansion). Verifying rows' attention runs the DECODE kernel over
+        // per-position virtual slots with the rows pre-scattered, the per-row
+        // capture stashes their projected compressor rows (rollback replay
+        // source), and the head scores every decode-class row as it always
+        // does.
         // A MIXED wave leads with plain decode rows (live slots, on-device
         // write-len commit, fused scatter) and ends with the verify blocks'
         // virtual rows (throwaway snapshot headers, pre-scattered) —
@@ -1268,7 +1713,7 @@ impl ManagedBatchedModel for BatchedEngine {
         // silently start allocating overflow arenas mid-wave.
         let desc_bytes = desc::wave_desc_bytes(
             decode_seqs.len() + prefill_seqs.len(),
-            self.num_layers(),
+            self.engine.layer_count(),
             self.engine
                 .cfg()
                 .compress_ratios
@@ -1292,7 +1737,11 @@ impl ManagedBatchedModel for BatchedEngine {
              metadata shares it, so re-check the arena size",
             desc::STAGER_ARENA_BYTES
         );
-        let generation = session.begin_stager_generation();
+        // The wave driver's stager generation — one arena guard for the whole
+        // wave (it opened before this sweep and drops after the logits are
+        // copied off, so everything staged below outlives every kernel that
+        // reads it).
+        let generation = wave_generation;
         // Glue-only sequences never decode-write (their latents scatter into
         // reserved gap chunks) — excluding them from the metadata build's
         // write-chunk ensure keeps their block tables untouched, so the
@@ -1423,7 +1872,7 @@ impl ManagedBatchedModel for BatchedEngine {
             let (pm, headers, stride) = session.build_decode_metadata_at(
                 0..session.num_layers(),
                 &all_seqs,
-                &generation,
+                generation,
                 &overrides,
                 &non_writer,
                 &snapshot_seqs,
@@ -1535,7 +1984,7 @@ impl ManagedBatchedModel for BatchedEngine {
                     glue_proj.push((xs, qr));
                     cursor += g_len;
                 }
-                super::paged::paged_latent_glue_scatter(&runs, &generation)?;
+                super::paged::paged_latent_glue_scatter(&runs, generation)?;
             }
             drop(s_glue_scatter);
 
@@ -1672,12 +2121,12 @@ impl ManagedBatchedModel for BatchedEngine {
                 let icomp_refs: Vec<Option<&GroupPool>> =
                     asms.iter().map(|m| m.icomp_gp.as_ref()).collect();
                 let comp_entries = match a.compressor() {
-                    Some(c) => pool_across_seqs(c, &comp_refs, None, &generation)?,
+                    Some(c) => pool_across_seqs(c, &comp_refs, None, generation)?,
                     None => None,
                 };
                 let icomp_keys = match a.indexer() {
                     Some(ix) => {
-                        pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope), &generation)?
+                        pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope), generation)?
                     }
                     None => None,
                 };
@@ -1696,7 +2145,7 @@ impl ManagedBatchedModel for BatchedEngine {
                         &comp_refs,
                         decode_seqs,
                         &mut by_seq,
-                        &generation,
+                        generation,
                     )?;
                 }
                 s_dpool.end();
@@ -1771,7 +2220,7 @@ impl ManagedBatchedModel for BatchedEngine {
                         &csa_w,
                         shortlist_m(ix.top_k()),
                         ix.top_k(),
-                        &generation,
+                        generation,
                     )?;
                     for (j, (gids, k)) in batched.into_iter().enumerate() {
                         let i = csa_idx[j];
@@ -1850,14 +2299,7 @@ impl ManagedBatchedModel for BatchedEngine {
                         }
                     }
                     gather_corpus_batched(
-                        &gg,
-                        &ggids,
-                        &goff,
-                        &out_nope,
-                        &out_scale,
-                        &out_rope,
-                        &out_pos,
-                        &generation,
+                        &gg, &ggids, &goff, &out_nope, &out_scale, &out_rope, &out_pos, generation,
                     )?;
                     super::paged::CorpusCache::from_gathered(
                         out_nope, out_scale, out_rope, out_pos, total_k,
@@ -1879,7 +2321,7 @@ impl ManagedBatchedModel for BatchedEngine {
                 // falls out of the same pass because the decode kernel wants the
                 // counts as a device array too.
                 let (comp_idx, comp_cnt) =
-                    super::comp_idx::build(&offsets, &cnts, max_sel, &dev, &generation)?;
+                    super::comp_idx::build(&offsets, &cnts, max_sel, &dev, generation)?;
                 // Explicit per-slot query position (the decode kernel no longer
                 // derives it from the writer slice, so the windowless slot works
                 // and the compressed causal guard has a reference). Hoisted
@@ -1938,7 +2380,7 @@ impl ManagedBatchedModel for BatchedEngine {
                             in_blk: wblk,
                         });
                     }
-                    super::paged::paged_latent_glue_scatter(&runs, &generation)?;
+                    super::paged::paged_latent_glue_scatter(&runs, generation)?;
                 }
                 // ONE launch over plain AND verify rows. The plain prefix
                 // (`n_plain_rows`) uses live persistent slot buffers — the
@@ -2136,13 +2578,11 @@ impl ManagedBatchedModel for BatchedEngine {
             let icomp_refs: Vec<Option<&super::compressor::GroupPool>> =
                 preps.iter().map(|p| p.icomp_gp.as_ref()).collect();
             let comp_entries = match a.compressor() {
-                Some(c) => pool_across_seqs(c, &comp_refs, None, &generation)?,
+                Some(c) => pool_across_seqs(c, &comp_refs, None, generation)?,
                 None => None,
             };
             let icomp_keys = match a.indexer() {
-                Some(ix) => {
-                    pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope), &generation)?
-                }
+                Some(ix) => pool_across_seqs(ix.compressor(), &icomp_refs, Some(rope), generation)?,
                 None => None,
             };
             s_ppool.end();
@@ -2164,7 +2604,7 @@ impl ManagedBatchedModel for BatchedEngine {
                     &comp_refs,
                     prefill_seqs,
                     &mut by_seq,
-                    &generation,
+                    generation,
                 )?;
             }
             s_pappend.end();
@@ -2333,14 +2773,7 @@ impl ManagedBatchedModel for BatchedEngine {
                         }
                     }
                     gather_corpus_batched(
-                        &gg,
-                        &ggids,
-                        &goff,
-                        &out_nope,
-                        &out_scale,
-                        &out_rope,
-                        &out_pos,
-                        &generation,
+                        &gg, &ggids, &goff, &out_nope, &out_scale, &out_rope, &out_pos, generation,
                     )?;
                     super::paged::CorpusCache::from_gathered(
                         out_nope, out_scale, out_rope, out_pos, total_g,
@@ -2370,8 +2803,8 @@ impl ManagedBatchedModel for BatchedEngine {
                 // once by the kernel and never by a tensor op, so they go
                 // straight into the wave's pinned arena instead of costing a
                 // device allocation plus a pageable upload each.
-                let seq_of = desc::stage_slice(&seq_of_host, &generation)?;
-                let new_meta = desc::stage_slice(&new_meta_host, &generation)?;
+                let seq_of = desc::stage_slice(&seq_of_host, generation)?;
+                let new_meta = desc::stage_slice(&new_meta_host, generation)?;
                 let q_pos_all = Tensor::cat(&prefill_q_pos.iter().collect::<Vec<_>>(), 0)?;
                 let out = super::paged::paged_latent_prefill_raw(
                     &projref.q_bf,
@@ -2422,7 +2855,7 @@ impl ManagedBatchedModel for BatchedEngine {
                         state.get_mut(&seq).expect("ensured above").absorbed = base + s_len;
                     }
                 }
-                super::paged::paged_latent_glue_scatter(&runs, &generation)?;
+                super::paged::paged_latent_glue_scatter(&runs, generation)?;
                 s_pwb.end();
             }
             drop(s_prefill);
@@ -2449,9 +2882,9 @@ impl ManagedBatchedModel for BatchedEngine {
                 let empty_cnt = Tensor::zeros(g_len, DType::U32, dev)?;
                 // Glue rows read only their arena window — one slot, no new-token
                 // diagonal (rows=0), no corpus.
-                let seq_of = desc::stage_slice(&vec![0u32; g_len], &generation)?;
+                let seq_of = desc::stage_slice(&vec![0u32; g_len], generation)?;
                 let kv_dummy = Tensor::zeros((1, HEAD_DIM), DType::BF16, dev)?;
-                let new_meta = desc::stage_slice(&[0u32, 0, 0, 0], &generation)?;
+                let new_meta = desc::stage_slice(&[0u32, 0, 0, 0], generation)?;
                 let out = super::paged::paged_latent_prefill_raw(
                     &q_bf,
                     hdr_of(l, decode_seqs.len() + prefill_seqs.len() + gi),
@@ -2503,16 +2936,15 @@ impl ManagedBatchedModel for BatchedEngine {
             }
         }
         drop(state);
-        drop(generation);
 
         if layer_end < n_layers {
             // Pause: persist the mHC stream flattened to a plain 3-D hidden
-            // shape (opaque to the scheduler).
+            // shape (opaque to the scheduler; the driver permutes and holds it).
             let flat = h.reshape((1, total_rows, cfg.hc_mult * cfg.dim))?;
-            return Ok(WaveResult::owned(WaveStep {
-                residual: Some(flat),
-                logits: None,
-            }));
+            return Ok((
+                WavePhase::Residual(TensorCat::from_cat_tensor(flat, 0)?),
+                None,
+            ));
         }
 
         // A batched prefill wrote its tokens via `write_contiguous` (not the
@@ -2571,15 +3003,11 @@ impl ManagedBatchedModel for BatchedEngine {
         let idx = Tensor::from_vec(sel_rows, r_total, &hdev)?;
         let scored_hidden = normed.index_select(&idx, 1)?; // [1, R, dim]
         let logits_all = e.lm_head().forward(&scored_hidden)?; // [1,R,vocab]
-        let mut logits_rows: Vec<Tensor> = Vec::with_capacity(r_total);
-        for r in 0..r_total {
-            logits_rows.push(logits_all.narrow(1, r, 1)?.reshape((1, cfg.vocab_size))?);
-        }
-        // Stash each scored row's target-layer feature — the drafter's conditioning source (`fc`
-        // input, paper `Hctx = RMSNorm(Wc·[H^{l₁};…;H^{lₘ}])`), read by `speculative_draft` next
-        // step. The per-layer captures (ordered by `target_layers`) are scored-row-selected and
-        // concatenated along the feature axis → one `[m·dim]` vector per row, keyed by its absolute
-        // position so the next draft picks the feature at `q_start-1`. Drafter only.
+                                                               // Stash each scored row's target-layer feature — the drafter's conditioning source (`fc`
+                                                               // input, paper `Hctx = RMSNorm(Wc·[H^{l₁};…;H^{lₘ}])`), read by `speculative_draft` next
+                                                               // step. The per-layer captures (ordered by `target_layers`) are scored-row-selected and
+                                                               // concatenated along the feature axis → one `[m·dim]` vector per row, keyed by its absolute
+                                                               // position so the next draft picks the feature at `q_start-1`. Drafter only.
         if capture_targets {
             let per_layer: Vec<Tensor> = self
                 .target_layers
@@ -2620,182 +3048,14 @@ impl ManagedBatchedModel for BatchedEngine {
             }
         }
         s_head.end();
-        Ok(WaveResult::owned(WaveStep {
-            residual: None,
-            logits: Some(logits_rows),
-        }))
-    }
-
-    /// Batched speculative verify: run EVERY sequence's `[committed, drafts…]` block in ONE
-    /// forward — each block's positions as virtual decode slots (decode numerics), all sequences
-    /// in a single wave — and return each sequence's per-position next-token logits rows. The wave
-    /// is launch-bound, so its fixed costs (per-layer MoE routing readbacks, expert DMA) amortize
-    /// across every session instead of being paid once per session. Lossless is unchanged: the
-    /// driver still accepts only the model's own argmaxes. `verify_all_rows` makes the head score
-    /// every row of these sequences (see `forward_wave`); it is cleared before returning, even on
-    /// error. Advances each sequence by its block length; the driver truncates back to the
-    /// accepted lengths.
-    fn begin_verify(
-        &self,
-        session: &mut BatchedInferenceSession,
-        plain: &[(usize, u32)],
-        seqs: &[usize],
-        blocks: &[Vec<u32>],
-        budget: usize,
-    ) -> Result<Option<VerifyPlan>> {
-        // Nothing here is armed speculatively: the corpus-state snapshots below
-        // are taken per verifying sequence, and a zero budget leaves that cohort
-        // empty, so this model already does no work it will not use.
-        let _ = budget;
-        if plain.is_empty() && seqs.is_empty() {
-            return Ok(Some(VerifyPlan {
-                decode_seqs: Vec::new(),
-                decode_inputs: Vec::new(),
-                verify_seqs: Vec::new(),
-                verify_inputs: Vec::new(),
-                rows: 0,
-            }));
-        }
-        // Pre-verify corpus-state snapshots: the forward below absorbs the WHOLE
-        // blocks (including drafts the driver may reject) into the streaming
-        // compressors/galleries; the driver's `truncate_sequence` consumes each
-        // snapshot to roll that state back to the accepted prefix — the KV
-        // truncation alone cannot see it.
-        let s_snap = span("verify:snapshot");
-        // ONE MIXED WAVE: the plain cohort's committed tokens lead as ordinary
-        // decode rows (live slots, on-device commit, fused scatter), the
-        // verify blocks trail as virtual rows — each block position one decode
-        // ROW of its sequence (the same seq repeated `block_len` times). The
-        // wave's decode front-end does everything a plain step does for EVERY
-        // row — batched projection, per-row streaming compressor capture
-        // (exact per-token semantics), batched selection, one gather — and the
-        // single kernel launch routes per row on the plain/verify boundary.
-        // Splitting the cohorts into two waves paid a second launch floor
-        // (WDDM's per-wave fixed cost) every step both were present.
-        let n_rows: usize = plain.len() + blocks.iter().map(|b| b.len()).sum::<usize>();
-        let mut row_seqs: Vec<usize> = Vec::with_capacity(n_rows);
-        let mut row_inputs: Vec<Tensor> = Vec::with_capacity(n_rows);
-        for &(seq, tok) in plain {
-            row_seqs.push(seq);
-            row_inputs.push(Tensor::from_vec(vec![tok], (1, 1), self.device())?);
-        }
-        for (i, &seq) in seqs.iter().enumerate() {
-            if blocks[i].is_empty() {
-                candle::bail!("verify_blocks: empty block for seq {seq}");
-            }
-            let q_start = session.sequence_offset(seq).unwrap_or(0);
-            self.snapshot_verify_state(seq, q_start, blocks[i].len())?;
-            for &tok in &blocks[i] {
-                row_seqs.push(seq);
-                row_inputs.push(Tensor::from_vec(vec![tok], (1, 1), self.device())?);
-            }
-        }
-        s_snap.end();
-        *self
-            .verify_all_rows
-            .write()
-            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))? =
-            seqs.to_vec();
-        // Every row of both cohorts goes in the DECODE slot — this model packs a
-        // block as one decode row per position rather than one multi-token
-        // member, so the whole step is full-sweep by construction.
-        Ok(Some(VerifyPlan {
-            decode_seqs: row_seqs,
-            decode_inputs: row_inputs,
-            verify_seqs: Vec::new(),
-            verify_inputs: Vec::new(),
-            rows: n_rows,
-        }))
-    }
-
-    fn end_verify(
-        &self,
-        session: &mut BatchedInferenceSession,
-        plain: &[(usize, u32)],
-        seqs: &[usize],
-        blocks: &[Vec<u32>],
-        logits: Vec<Tensor>,
-    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
-        self.verify_all_rows
-            .write()
-            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))?
-            .clear();
-        let n_rows: usize = plain.len() + blocks.iter().map(|b| b.len()).sum::<usize>();
-        let s_post = span("verify:post");
-        for &(seq, _) in plain {
-            session.advance_sequence(seq, 1)?;
-        }
-        for (i, &seq) in seqs.iter().enumerate() {
-            session.advance_sequence(seq, blocks[i].len())?;
-        }
-        // Already copied off the wave's span by the caller: the accept walk
-        // reads these after the forward returns — position by position, and on
-        // partial accept a rollback + a NEXT forward — so span-lifetime views
-        // would dangle by then.
-        if logits.len() != n_rows {
-            candle::bail!(
-                "end_verify: expected {} scored rows, got {}",
-                n_rows,
-                logits.len()
-            );
-        }
-        // Split the scored rows back per cohort/sequence (decode-row order:
-        // plain prefix, then each block's rows).
-        let plain_out = logits[..plain.len()].to_vec();
-        let mut out = Vec::with_capacity(seqs.len());
-        let mut off = plain.len();
-        for b in blocks {
-            out.push(logits[off..off + b.len()].to_vec());
-            off += b.len();
-        }
-        s_post.end();
-        Ok((plain_out, out))
-    }
-
-    fn abort_verify(&self, seqs: &[usize]) {
-        if let Ok(mut v) = self.verify_all_rows.write() {
-            v.clear();
-        }
-        // Failed verify: drop the snapshots so a later truncate cannot replay
-        // from a half-populated one.
-        if let Ok(mut m) = self.verify_snap.write() {
-            for &s in seqs {
-                m.remove(&s);
-            }
-        }
-    }
-
-    /// DSpark speculative draft: propose a block of up to `max_len` tokens after `committed`,
-    /// conditioned on `seq`'s stashed target feature (the concatenated `dflash.target_layers`
-    /// hidden states — paper Eq. 2). Lossless — the caller verifies every proposal against the
-    /// target — so the conditioning only affects acceptance, never output. Returns empty (⇒ plain
-    /// decode) when no drafter is attached or the sequence has no stashed feature yet.
-    fn speculative_draft(
-        &self,
-        session: &mut BatchedInferenceSession,
-        seqs: &[usize],
-        committed: &[u32],
-        max_len: usize,
-    ) -> Result<Vec<Vec<u32>>> {
-        if committed.len() != seqs.len() {
-            candle::bail!(
-                "dspark draft: {} committed tokens for {} sequences",
-                committed.len(),
-                seqs.len()
-            );
-        }
-        // Per sequence, because DSpark conditions each proposal on that
-        // sequence's own stashed target feature and gates it on that sequence's
-        // own acceptance EMA. The qwen35 NextN head batches its cohort instead
-        // (`qwen35::mtp::MtpHead::draft_cohort`), which is what removes the
-        // per-session weight read the width-aware break-even below is priced
-        // against; doing the same here is a separate change to a drafter with
-        // its own measured schedule, not a rename.
-        let cohort = seqs.len();
-        seqs.iter()
-            .zip(committed)
-            .map(|(&seq, &tok)| self.draft_one(session, seq, tok, max_len, cohort))
-            .collect()
+        // One `[R, vocab]` block; the driver splits it into per-row `[1, vocab]`
+        // logits (unit segments along dim 0) — row order `[decode-class | creep
+        // last rows]`, which is the `[decode | prefill]` order the caller reads.
+        let logits_flat = logits_all.reshape((r_total, cfg.vocab_size))?;
+        Ok((
+            WavePhase::Logits(TensorCat::from_cat_tensor(logits_flat, 0)?),
+            None,
+        ))
     }
 }
 
@@ -3025,7 +3285,7 @@ mod tests {
 
         let mut session = model.create_batched_session(BatchedConfig::default())?;
         let seq = session.create_sequence()?;
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
         super::super::readback::reset_readbacks();
 
         // Prefill the whole prompt in one wave.
@@ -3123,6 +3383,179 @@ mod tests {
             got, expected,
             "wave-path readbacks beyond the documented MoE-routing set: \
              {got} vs {expected}"
+        );
+        Ok(())
+    }
+
+    /// **Failed-wave corpus atomicity.** A wave that dies mid-sweep must leave
+    /// the streaming corpus (galleries + compressor states + `absorbed`)
+    /// exactly as it entered — the retry otherwise absorbs the same positions
+    /// twice, and the duplicated, shifted groups corrupt every later
+    /// selection (the repeat-itself failure [`VerifySnapshot`] documents).
+    ///
+    /// Simulated rather than fault-injected, because a failed wave IS
+    /// precisely "the forward ran, nothing was committed": run a decode wave,
+    /// discard its result without advancing the session, restore the capture,
+    /// and require the continuation to match a reference sequence that never
+    /// took the detour. The capture/restore pair under test is exactly what
+    /// `WaveSweep::sweep`'s failure bracket runs.
+    #[test]
+    #[ignore]
+    fn wave_failed_sweep_leaves_no_corpus_trace() -> Result<()> {
+        let _gpu = gpu_serial();
+        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
+        if !path.exists() {
+            eprintln!("[skip] merged file absent");
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        let model = BatchedEngine::new(engine)?;
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
+        // A prompt whose greedy continuation runs long enough to decode
+        // through several compressor groups on both sides of the detour.
+        let prompt = "<｜begin▁of▁sentence｜><｜User｜>Tell me a short story about a \
+             lighthouse keeper.<｜Assistant｜>";
+        let ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| candle::Error::msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+        let mut session = model.create_batched_session(BatchedConfig::default())?;
+        let n_layers = ManagedBatchedModel::num_layers(&model);
+
+        // Prefill + commit; returns the greedy next token.
+        let prefill = |model: &BatchedEngine,
+                       session: &mut BatchedInferenceSession,
+                       seq: usize|
+         -> Result<u32> {
+            let t = Tensor::from_vec(ids.clone(), (1, ids.len()), &Device::Cpu)?;
+            let step = model.forward_wave(
+                session,
+                &[],
+                &[],
+                &[seq],
+                std::slice::from_ref(&t),
+                &[],
+                &[],
+                0,
+                n_layers,
+                None,
+            )?;
+            session.advance_sequence(seq, ids.len())?;
+            step.logits_owned()?[0].i(0)?.argmax(0)?.to_scalar::<u32>()
+        };
+        // One COMMITTED greedy decode step; returns the next token.
+        let decode_step = |model: &BatchedEngine,
+                           session: &mut BatchedInferenceSession,
+                           seq: usize,
+                           tok: u32|
+         -> Result<u32> {
+            let t = Tensor::from_vec(vec![tok], (1, 1), &Device::Cpu)?;
+            let step = model.forward_wave(
+                session,
+                &[seq],
+                std::slice::from_ref(&t),
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                n_layers,
+                None,
+            )?;
+            session.advance_sequence(seq, 1)?;
+            step.logits_owned()?[0].i(0)?.argmax(0)?.to_scalar::<u32>()
+        };
+
+        // Reference: prefill + 9 committed tokens, no detour.
+        let seq_a = session.create_sequence()?;
+        let mut tok = prefill(&model, &mut session, seq_a)?;
+        let mut reference = vec![tok];
+        for _ in 0..9 {
+            tok = decode_step(&model, &mut session, seq_a, tok)?;
+            reference.push(tok);
+        }
+
+        // Perturbed: same prompt, 4 committed tokens, then a DISCARDED wave
+        // (the forward runs, the session is not advanced — a failed wave's
+        // exact residue), restore, and 5 more committed tokens.
+        let seq_b = session.create_sequence()?;
+        let mut tok = prefill(&model, &mut session, seq_b)?;
+        let mut stream = vec![tok];
+        for _ in 0..4 {
+            tok = decode_step(&model, &mut session, seq_b, tok)?;
+            stream.push(tok);
+        }
+        assert_eq!(
+            stream[..5],
+            reference[..5],
+            "streams diverged before the detour — the corpus lifecycle is not \
+             what this failure is about"
+        );
+
+        let snaps = model.capture_corpus_state(&[seq_b])?;
+        let absorbed_before = snaps[0].state.as_ref().map(|(a, _)| *a).unwrap();
+        let glens_before: Vec<usize> = snaps[0]
+            .state
+            .as_ref()
+            .map(|(_, ls)| ls.iter().map(|(_, _, g)| *g).collect())
+            .unwrap();
+
+        // The doomed wave: full forward, result discarded, nothing committed.
+        {
+            let t = Tensor::from_vec(vec![tok], (1, 1), &Device::Cpu)?;
+            let _ = model.forward_wave(
+                &mut session,
+                &[seq_b],
+                std::slice::from_ref(&t),
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                n_layers,
+                None,
+            )?;
+        }
+        // Self-check: the doomed wave really advanced the corpus — otherwise
+        // this test exercises nothing.
+        let mid = model.capture_corpus_state(&[seq_b])?;
+        let absorbed_mid = mid[0].state.as_ref().map(|(a, _)| *a).unwrap();
+        assert_eq!(
+            absorbed_mid,
+            absorbed_before + 1,
+            "the discarded wave absorbed nothing — the detour is not reaching \
+             the corpus state"
+        );
+
+        model.restore_corpus_state(snaps)?;
+        let after = model.capture_corpus_state(&[seq_b])?;
+        let absorbed_after = after[0].state.as_ref().map(|(a, _)| *a).unwrap();
+        let glens_after: Vec<usize> = after[0]
+            .state
+            .as_ref()
+            .map(|(_, ls)| ls.iter().map(|(_, _, g)| *g).collect())
+            .unwrap();
+        assert_eq!(absorbed_after, absorbed_before, "absorbed not restored");
+        assert_eq!(glens_after, glens_before, "gallery lengths not restored");
+
+        for _ in 0..5 {
+            tok = decode_step(&model, &mut session, seq_b, tok)?;
+            stream.push(tok);
+        }
+        assert_eq!(
+            stream, reference,
+            "continuation diverged after a discarded wave + restore — the \
+             corpus state was not returned to its entry value"
         );
         Ok(())
     }
@@ -3315,7 +3748,7 @@ mod tests {
 
         let mut session = model.create_batched_session(BatchedConfig::default())?;
         let seq = session.create_sequence()?;
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
 
         // Prefill the prompt; the first generated token is the argmax of the last
         // prefill row — held OUT of the KV as the driver's `committed` seed.
@@ -3451,7 +3884,7 @@ mod tests {
 
         let mut session = model.create_batched_session(BatchedConfig::default())?;
         let seq = session.create_sequence()?;
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
 
         let prompt_t = Tensor::from_vec(ids.clone(), (1, ids.len()), &Device::Cpu)?;
         let step = model.forward_wave(
@@ -3577,7 +4010,7 @@ mod tests {
         let eos = tokenizer
             .token_to_id("<｜end▁of▁sentence｜>")
             .expect("eos id");
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
         const MAX_NEW: usize = 64;
 
         // Prefill helper → returns (session, first committed token).
@@ -3760,7 +4193,7 @@ mod tests {
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
         let eos = tokenizer.token_to_id("<｜end▁of▁sentence｜>").expect("eos");
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
         let max_draft = 5usize;
         const MAX_NEW: usize = 128;
 
@@ -3898,7 +4331,7 @@ mod tests {
 
         let mut session = model.create_batched_session(BatchedConfig::default())?;
         let seq = session.create_sequence()?;
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
 
         let mut step_row = |tok: u32| -> Result<u32> {
             let t = Tensor::from_vec(vec![tok], (1, 1), &Device::Cpu)?;
@@ -3977,7 +4410,7 @@ mod tests {
             .get_ids()
             .to_vec();
         let n = ids.len();
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
 
         let mut session = model.create_batched_session(BatchedConfig::default())?;
         let seq_a = session.create_sequence()?; // per-token decode absorb
@@ -4108,7 +4541,7 @@ mod tests {
         let mut session = model.create_batched_session(BatchedConfig::default())?;
         let seq_a = session.create_sequence()?; // decode-step absorb (reference)
         let seq_b = session.create_sequence()?; // batched prefill (suspect)
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
 
         // A: per-token decode waves.
         for &t in &ids {
@@ -4278,7 +4711,7 @@ mod tests {
 
         let mut session = model.create_batched_session(BatchedConfig::default())?;
         let seq = session.create_sequence()?;
-        let n_layers = model.num_layers();
+        let n_layers = ManagedBatchedModel::num_layers(&model);
 
         let prompt_t = Tensor::from_vec(ids.clone(), (1, ids.len()), &Device::Cpu)?;
         let step = model.forward_wave(

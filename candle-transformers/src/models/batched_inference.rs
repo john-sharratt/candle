@@ -26,7 +26,7 @@
 
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
-use crate::models::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
+use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
@@ -4466,21 +4466,10 @@ impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
 
     fn sweep(
         &self,
-        contexts: &mut [SequenceContext],
-        groups: WaveGroups<'_>,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
-        self.forward_wave_contexts(
-            contexts,
-            groups.n_decode,
-            groups.n_prefill,
-            groups.decode_headers,
-            groups.prefill_headers,
-            groups.glue_headers,
-            groups.generation,
-            groups.layer_start,
-            groups.layer_end,
-            groups.x_in,
-        )
+        self.forward_wave_contexts(session, wave)
     }
 }
 

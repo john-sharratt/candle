@@ -2,12 +2,21 @@
 //!
 //! A wave forward splits cleanly in two. The **outer** half — bounding a
 //! forward's token count, routing 1-token prefills to the decode kernel,
-//! building the three groups' attention metadata, assembling the context list,
 //! permuting tokens between caller order and internal order, rolling the KV
 //! back when the sweep fails, and advancing the decode rows once the head has
 //! run — depends on nothing about the model except its depth and its device.
 //! The **inner** half, the layer sweep itself, is where a model's architecture
 //! actually lives.
+//!
+//! Attention metadata is deliberately the SWEEP'S to build, not the driver's.
+//! The slot headers serialize each sequence's live arena state, and a model may
+//! legitimately move that state before its layer loop reads it — a sliding
+//! window ring evicts front chunks and re-bases offsets, a prefill commits its
+//! whole write range up front, a speculative verify commits block lengths. A
+//! header built out here would describe the arena as it stood before any of
+//! that, which on a slid ring resolves ABSOLUTE offsets past the resident span.
+//! So the driver hands the sweep the session and the raw inputs, and the sweep
+//! builds its headers at the point in its own phase order where they are true.
 //!
 //! Only the inner half is per-model. This module is the outer half, written
 //! once: a model supplies [`WaveSweep`] and gets [`drive_wave`], which is the
@@ -22,12 +31,10 @@
 
 use candle::{DType, Device, Result, Tensor};
 
-#[cfg(feature = "cuda")]
-use super::batched_inference::build_glue_meta;
 use super::batched_inference::{
-    pack_prefill_slabs, prefill_slack_cap, BatchedInferenceSession, WaveResult, WaveStep,
+    pack_prefill_slabs, prefill_slack_cap, BatchedInferenceSession, PendingGlue, WaveResult,
+    WaveStep,
 };
-use super::batched_layer::{BatchedPrefillMeta, DecodeHeaders};
 use super::batched_model::{WaveGuard, WavePhase};
 use super::kv_cache_utils::SequenceContext;
 use super::tensor_cat::TensorCat;
@@ -49,9 +56,24 @@ pub struct WaveGroups<'a> {
     /// per-sequence state outside the paged cache — a recurrent mixer's `S` and
     /// conv tail — has to key that state by something, and this is it.
     pub seq_ids: &'a [usize],
-    pub decode_headers: DecodeHeaders,
-    pub prefill_headers: DecodeHeaders,
-    pub glue_headers: DecodeHeaders,
+    /// One input tensor per context, in the same internal
+    /// `[decode | prefill | glue]` order as `seq_ids` (the driver has already
+    /// folded 1-token prefills into the decode group).
+    ///
+    /// The sweep needs these twice: to assemble its [`SequenceContext`]s
+    /// (via [`assemble_wave_contexts`]) and to embed a fresh wave's rows. They
+    /// are here rather than inside pre-built contexts because the sweep also
+    /// needs the SESSION — for its attention-metadata build, which must run at
+    /// the sweep's own phase order (see the module docs) — and the contexts
+    /// borrow the session mutably, so the driver cannot hand over both.
+    pub inputs: &'a [Tensor],
+    /// Raw glue scatter descriptors staged on the session, one per glue
+    /// sequence in order — taken off the session by the driver (which also
+    /// drops stale staging, loudly) and handed through untranslated: what shape
+    /// the kernel metadata takes (flat device tensors, per-run host slices) is
+    /// the sweep's call. `None` when the wave carries no glue rows or nothing
+    /// was staged.
+    pub pending_glue: Option<Vec<PendingGlue>>,
     /// Pinned-stager generation guarding this wave's kernel metadata uploads.
     pub generation: &'a Generation,
     pub layer_start: usize,
@@ -101,13 +123,184 @@ pub trait WaveSweep {
         (layer_start, layer_end)
     }
 
-    /// Run `[layer_start, layer_end)` over `contexts`, returning the residual
-    /// (range stopped short of the head) or the logits (range reached it).
-    fn sweep(
+    /// Forward-entry invariant: every member's logical offset must equal the
+    /// token count its live block table covers. The varlen metadata is built
+    /// from the offsets while the slot headers are built from the block tables
+    /// — the attention kernels resolve every `[0, kv_len)` position through the
+    /// table, so any divergence walks them past the slot's span in the packed
+    /// staged uploads (garbage slice indices → wild record pointers →
+    /// CUDA_ERROR_ILLEGAL_ADDRESS, or silent cross-slot reads). Offsets run
+    /// AHEAD of the backing when a projection drops sections it could not lift
+    /// under VRAM pressure; they run BEHIND after glue reserves gap chunks the
+    /// wave didn't reflect. Positions are slot-relative (slice ropes), so the
+    /// backing length is also the correct RoPE base either way.
+    ///
+    /// **A model hook because the invariant itself is a model property.** The
+    /// default states the uniform/hybrid contract, `offset == backing`. A model
+    /// whose arena is a sliding window ring keeps ABSOLUTE offsets against a
+    /// RESIDENT backing (`offset == base_pos + backing`), and the default's
+    /// clamp would silently re-base every slid sequence — so such a model
+    /// overrides this with its own reconciliation (or a no-op, where its wave
+    /// entry re-derives lengths from the session itself).
+    fn reconcile_entry_offsets(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq_groups: [&[usize]; 3],
+    ) -> Result<()> {
+        for ids in seq_groups {
+            for &i in ids {
+                let off = session.sequence_offset(i).unwrap_or(0);
+                let backing = session.sequence_backing_tokens(i).unwrap_or(off);
+                if backing != off {
+                    if backing < off {
+                        tracing::warn!(
+                            seq = i,
+                            offset = off,
+                            backing,
+                            "sequence offset AHEAD of backing at forward entry — \
+                             clamped down (projection dropped un-liftable sections)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            seq = i,
+                            offset = off,
+                            backing,
+                            "sequence offset behind backing at forward entry — advanced"
+                        );
+                    }
+                    session.set_sequence_offset(i, backing)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance the decode rows' per-layer KV lengths after a completed step —
+    /// once per delivered token, every layer at once, called by the driver
+    /// only after the head ran and the logits were copied off.
+    ///
+    /// The default is the uniform/hybrid contract: every cache to
+    /// `offset + 1`, with a failure at row `i` unwound by truncating rows
+    /// `0..=i` back to their entry lengths (leaving layers `0..k` at
+    /// `offset+1` against the rest at `offset` is exactly the per-layer
+    /// divergence this consolidation exists to prevent, and the wave rollback
+    /// cannot reach it).
+    ///
+    /// A model whose decode write-length is committed **on-device** by its
+    /// decode kernel — and re-committed from the session at every wave entry —
+    /// overrides this as a no-op: the default's `set_current_seq_len` stamps
+    /// the session's ABSOLUTE offset into the backing, which a sliding window
+    /// ring addresses in RESIDENT terms.
+    fn advance_decode_rows(&self, contexts: &mut [SequenceContext], n_decode: usize) -> Result<()> {
+        for i in 0..n_decode {
+            let offset = contexts[i].offset;
+            let mut advance = || -> Result<()> {
+                for cache in contexts[i].kv_caches.caches.iter_mut() {
+                    cache.set_current_seq_len(offset + 1)?;
+                }
+                Ok(())
+            };
+            if let Err(e) = advance() {
+                for c in contexts[..=i].iter_mut() {
+                    let off = c.offset;
+                    let _ = c
+                        .kv_caches
+                        .caches
+                        .iter_mut()
+                        .try_for_each(|cache| cache.truncate_to_offset(off));
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Undo a failed wave's per-layer KV bookkeeping, so the scheduler's retry
+    /// is a retry rather than a decode against per-layer token windows.
+    ///
+    /// The default truncates every row on every KV layer of the range back to
+    /// its entry offset ([`super::wave_admit::rollback_wave_kv`]). A model
+    /// that re-derives every layer's writer length from the session at wave
+    /// entry overrides this to match — the default's absolute-offset truncate
+    /// would mis-address a sliding window ring's resident arena.
+    fn rollback_wave(
         &self,
         contexts: &mut [SequenceContext],
-        groups: WaveGroups<'_>,
+        kv_start: usize,
+        kv_end: usize,
+    ) -> Result<()> {
+        super::wave_admit::rollback_wave_kv(contexts, kv_start, kv_end)
+    }
+
+    /// Run `[layer_start, layer_end)` over the wave, returning the residual
+    /// (range stopped short of the head) or the logits (range reached it).
+    ///
+    /// The sweep owns the session for its duration. It builds its own attention
+    /// metadata (see the module docs for why the driver cannot), assembles its
+    /// [`SequenceContext`]s via [`assemble_wave_contexts`] when its layer body
+    /// works through per-sequence `KvCache`s, and is free to skip that entirely
+    /// when its KV lives behind the session's per-layer backings. Order matters
+    /// inside: metadata builds borrow the session shared, the contexts borrow
+    /// it mutably, so headers are built before contexts are taken.
+    fn sweep(
+        &self,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)>;
+}
+
+/// Assemble the per-sequence contexts for a wave, in `seq_ids` order.
+///
+/// `inputs` is one tensor per sequence in the same order. Fails loudly when a
+/// named sequence has no live slot — `caches_for_sequences_mut` silently skips
+/// those, which used to surface ~100 lines later as a `checked_sub` underflow
+/// naming neither the fault nor the sequence.
+///
+/// Used by the sweeps on the way in, and by [`drive_wave`] after the sweep
+/// returns — the KV rollback of a failed wave and the decode advance of a
+/// completed one need the same borrows, and re-assembling is legal because the
+/// sweep's mutable borrow of the session ends when it returns (nothing inside a
+/// wave moves the session's sequence offsets; the scheduler advances them after
+/// the forward).
+pub(crate) fn assemble_wave_contexts<'s>(
+    session: &'s mut BatchedInferenceSession,
+    seq_ids: &[usize],
+    inputs: &'s [Tensor],
+) -> Result<Vec<SequenceContext<'s>>> {
+    if inputs.len() != seq_ids.len() {
+        candle::bail!(
+            "assemble_wave_contexts: {} inputs against {} sequences",
+            inputs.len(),
+            seq_ids.len()
+        );
+    }
+    let caches_data = session.caches_for_sequences_mut(seq_ids);
+    if caches_data.len() != seq_ids.len() {
+        let live: std::collections::HashSet<usize> =
+            caches_data.iter().map(|(i, _, _)| *i).collect();
+        let missing: Vec<usize> = seq_ids
+            .iter()
+            .copied()
+            .filter(|s| !live.contains(s))
+            .collect();
+        candle::bail!(
+            "forward_wave: {} sequences requested but only {} have live slots \
+             (missing/duplicated: {missing:?}) — the wave group named a sequence \
+             the scheduler has since released",
+            seq_ids.len(),
+            caches_data.len(),
+        );
+    }
+    let mut contexts: Vec<SequenceContext<'s>> = Vec::with_capacity(seq_ids.len());
+    for ((_seq_idx, offset, caches), input) in caches_data.into_iter().zip(inputs.iter()) {
+        contexts.push(SequenceContext {
+            offset,
+            kv_caches: caches,
+            input_ids: input,
+            input_len: input.dims().get(1).copied().unwrap_or(1),
+        });
+    }
+    Ok(contexts)
 }
 
 /// Drive one co-batched wave: the whole of `forward_wave`, bar the sweep.
@@ -222,53 +415,16 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
 
     let stager_generation = session.begin_stager_generation();
 
-    // Forward-entry invariant: every member's logical offset must equal the
-    // token count its live block table covers. The varlen metadata
-    // (`cu_seqlens`/`kv_lens`) below is built from the offsets, while the
-    // per-layer slot headers are built from the block tables — the attention
-    // kernels resolve every `[0, kv_len)` position through the table, so any
-    // divergence walks them past the slot's span in the packed staged uploads
-    // (garbage slice indices → wild record pointers → CUDA_ERROR_ILLEGAL_ADDRESS,
-    // or silent cross-slot reads). Offsets run AHEAD of the backing when a
-    // projection drops sections it could not lift to hot under VRAM pressure;
-    // they run BEHIND after glue reserves gap chunks the wave didn't reflect.
-    // Positions are slot-relative (slice ropes), so the backing length is also
-    // the correct RoPE base either way. This is the choke point every forward
-    // passes through — wave steps, deferred projection gap-fills, and probes
-    // alike.
-    for ids in [decode_seqs, prefill_seqs, glue_seqs] {
-        for &i in ids {
-            let off = session.sequence_offset(i).unwrap_or(0);
-            let backing = session.sequence_backing_tokens(i).unwrap_or(off);
-            if backing != off {
-                if backing < off {
-                    tracing::warn!(
-                        seq = i,
-                        offset = off,
-                        backing,
-                        "sequence offset AHEAD of backing at forward entry — \
-                         clamped down (projection dropped un-liftable sections)"
-                    );
-                } else {
-                    tracing::debug!(
-                        seq = i,
-                        offset = off,
-                        backing,
-                        "sequence offset behind backing at forward entry — advanced"
-                    );
-                }
-                session.set_sequence_offset(i, backing)?;
-            }
-        }
-    }
+    // Forward-entry offset reconciliation — the choke point every forward
+    // passes through (wave steps, deferred projection gap-fills, probes). The
+    // invariant and its enforcement are the model's
+    // ([`WaveSweep::reconcile_entry_offsets`]): uniform/hybrid stacks clamp
+    // `offset` to the backing length, a sliding-window-ring model keeps its
+    // absolute offsets.
+    model.reconcile_entry_offsets(session, [decode_seqs, prefill_seqs, glue_seqs])?;
 
-    // Per-group offsets + query lengths.
+    // Per-group query lengths.
     let dev = model.device();
-    let seq_off = |session: &BatchedInferenceSession, ids: &[usize]| -> Vec<usize> {
-        ids.iter()
-            .map(|&i| session.sequence_offset(i).unwrap_or(0))
-            .collect()
-    };
     let input_len = |ins: &[Tensor]| -> Vec<usize> {
         ins.iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(1))
@@ -299,50 +455,18 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     let n_decode = proc_decode_seqs.len();
     let n_prefill = proc_prefill_seqs.len();
 
-    let pre_off = seq_off(session, &proc_prefill_seqs);
-    let glue_off = seq_off(session, glue_seqs);
-    let pre_lens = input_len(&proc_prefill_inputs);
     let glue_lens = input_len(glue_inputs);
 
-    // Build the three groups' attention headers. Decode gets its packed
-    // SlotHeader buffer; prefill/glue get ragged cu_seqlens; glue additionally
-    // carries the staged per-token scatter descriptors.
-    #[cfg(feature = "cuda")]
-    let (_pm_guard, decode_headers) = if n_decode > 0 {
-        let (pm_guard, buf, stride) =
-            session.build_decode_metadata(&proc_decode_seqs, &stager_generation)?;
-        (pm_guard, DecodeHeaders::Decode { buf, stride })
-    } else {
-        (
-            None,
-            DecodeHeaders::Decode {
-                buf: None,
-                stride: 0,
-            },
-        )
-    };
-    #[cfg(not(feature = "cuda"))]
-    let decode_headers = DecodeHeaders::Decode {
-        buf: None,
-        stride: 0,
-    };
-
-    let prefill_headers =
-        DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(&pre_off, &pre_lens, dev)?);
-
-    #[allow(unused_mut)]
-    let mut glue_meta = BatchedPrefillMeta::new_ragged(&glue_off, &glue_lens, dev)?;
-    // Staged glue is consumed only by a wave that carries glue rows. The
-    // descriptors are staged immediately before the gap-fill forward they
-    // describe — but that forward can die before reaching this point (its
-    // decode metadata refuses first), and the staging then sits on the session
-    // for whatever wave comes next. A glue-less wave that takes it fails
-    // `build_glue_meta` with "N glue descriptors vs 0 input_lens", which is how
-    // a dead wave's leftovers killed the titler twice. Stale staging is
-    // dropped, loudly: the reproject that staged it re-stages when its own
-    // retry runs.
-    #[cfg(feature = "cuda")]
-    if glue_lens.is_empty() {
+    // Glue staging: taken HERE — the one `&mut`-session step the sweep's shared
+    // borrows could not perform — and handed through raw; the sweep decides
+    // what kernel metadata to build from it. Staged glue is consumed only by a
+    // wave that carries glue rows. The descriptors are staged immediately
+    // before the gap-fill forward they describe — but that forward can die
+    // before reaching this point, and the staging then sits on the session for
+    // whatever wave comes next, which is how a dead wave's leftovers killed the
+    // titler twice. Stale staging is dropped, loudly: the reproject that staged
+    // it re-stages when its own retry runs.
+    let pending_glue: Option<Vec<PendingGlue>> = if glue_lens.is_empty() {
         if let Some(stale) = session.take_pending_glue() {
             tracing::warn!(
                 n = stale.len(),
@@ -350,12 +474,12 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
                  gap-fill forward — this wave carries no glue rows"
             );
         }
-    } else if let Some(pending) = session.take_pending_glue() {
-        glue_meta.glue = build_glue_meta(pending, &glue_lens, dev)?;
-    }
-    let glue_headers = DecodeHeaders::Prefill(glue_meta);
+        None
+    } else {
+        session.take_pending_glue()
+    };
 
-    // Assemble the combined context list in [decode | prefill | glue] order.
+    // Assemble the combined sequence list in [decode | prefill | glue] order.
     let mut all_seqs: Vec<usize> = Vec::with_capacity(n_decode + n_prefill + glue_seqs.len());
     all_seqs.extend_from_slice(&proc_decode_seqs);
     all_seqs.extend_from_slice(&proc_prefill_seqs);
@@ -379,53 +503,19 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             }
         }
     }
-    let mut all_inputs: Vec<&Tensor> = Vec::with_capacity(all_seqs.len());
-    all_inputs.extend(proc_decode_inputs.iter());
-    all_inputs.extend(proc_prefill_inputs.iter());
-    all_inputs.extend(glue_inputs.iter());
-    let all_lens: Vec<usize> = all_inputs
+    // One OWNED input per context, internal order. `WaveGroups` borrows these
+    // for the sweep, and the post-sweep rollback/advance re-borrows them to
+    // re-assemble contexts (`Tensor` clones are refcount bumps).
+    let all_inputs: Vec<Tensor> = proc_decode_inputs
         .iter()
-        .map(|t| t.dims().get(1).copied().unwrap_or(1))
+        .cloned()
+        .chain(proc_prefill_inputs.iter().cloned())
+        .chain(glue_inputs.iter().cloned())
         .collect();
 
-    // Read before the caches are borrowed mutably: this is the wave's declared
-    // activation width, and it belongs to the session, not to the caches.
+    // The wave's declared activation width; it belongs to the session, not to
+    // the caches.
     let act_dtype = session.activation_dtype();
-
-    let mut caches_data = session.caches_for_sequences_mut(&all_seqs);
-    // `caches_for_sequences_mut` SILENTLY skips slots that are `None`, so a
-    // sequence released between wave-group formation and this forward yields a
-    // short `contexts`. That used to surface ~100 lines later as
-    // `group bounds exceed batch` — a `checked_sub` underflow — which names
-    // neither the real fault nor the sequence responsible. Fail here instead,
-    // where the missing slots are still known. (A duplicate index in `all_seqs`
-    // collapses the same way, since the lookup is set-based; this catches that
-    // too.)
-    if caches_data.len() != all_seqs.len() {
-        let live: std::collections::HashSet<usize> =
-            caches_data.iter().map(|(i, _, _)| *i).collect();
-        let missing: Vec<usize> = all_seqs
-            .iter()
-            .copied()
-            .filter(|s| !live.contains(s))
-            .collect();
-        candle::bail!(
-            "forward_wave: {} sequences requested but only {} have live slots \
-             (missing/duplicated: {missing:?}) — the wave group named a sequence \
-             the scheduler has since released",
-            all_seqs.len(),
-            caches_data.len(),
-        );
-    }
-    let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(all_seqs.len());
-    for (i, (_seq_idx, offset, caches)) in caches_data.iter_mut().enumerate() {
-        contexts.push(SequenceContext {
-            offset: *offset,
-            kv_caches: caches,
-            input_ids: all_inputs[i],
-            input_len: all_lens[i],
-        });
-    }
 
     // Residual token order. The sweep packs per-token hidden states in INTERNAL
     // order `[orig-decode | single-prefills | multi-prefills | glue]` (the
@@ -491,14 +581,13 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
         (None, _) => None,
     };
     let wave = model.sweep(
-        &mut contexts,
+        session,
         WaveGroups {
             n_decode,
             n_prefill,
             seq_ids: &all_seqs,
-            decode_headers,
-            prefill_headers,
-            glue_headers,
+            inputs: &all_inputs,
+            pending_glue,
             generation: &stager_generation,
             layer_start,
             layer_end,
@@ -517,8 +606,13 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     let (phase, head_span) = match wave {
         Ok(v) => v,
         Err(e) => {
+            // The sweep's mutable session borrow ended with it, so the rollback
+            // re-assembles the contexts it needs. An assembly failure here is
+            // the same unrecoverable shape as a failed rollback: report both.
             let (kv_start, kv_end) = model.kv_layer_range(layer_start, layer_end);
-            if let Err(rb) = super::wave_admit::rollback_wave_kv(&mut contexts, kv_start, kv_end) {
+            let rolled = assemble_wave_contexts(session, &all_seqs, &all_inputs)
+                .and_then(|mut contexts| model.rollback_wave(&mut contexts, kv_start, kv_end));
+            if let Err(rb) = rolled {
                 candle::bail!(
                     "wave failed ({e}) and the KV rollback that keeps that failure \
                      recoverable also failed ({rb}) — the affected sequences may hold \
@@ -591,26 +685,8 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             // offset+1 against the rest at offset is exactly the per-layer
             // divergence this consolidation exists to prevent, and the wave
             // rollback cannot reach it.
-            for i in 0..n_decode {
-                let offset = contexts[i].offset;
-                let mut advance = || -> Result<()> {
-                    for cache in contexts[i].kv_caches.caches.iter_mut() {
-                        cache.set_current_seq_len(offset + 1)?;
-                    }
-                    Ok(())
-                };
-                if let Err(e) = advance() {
-                    for c in contexts[..=i].iter_mut() {
-                        let off = c.offset;
-                        let _ = c
-                            .kv_caches
-                            .caches
-                            .iter_mut()
-                            .try_for_each(|cache| cache.truncate_to_offset(off));
-                    }
-                    return Err(e);
-                }
-            }
+            let mut contexts = assemble_wave_contexts(session, &all_seqs, &all_inputs)?;
+            model.advance_decode_rows(&mut contexts, n_decode)?;
             let out = if single.is_empty() {
                 lg
             } else {

@@ -23,7 +23,8 @@ use super::expert_lre::GpuDispatchTables;
 #[cfg(feature = "cuda")]
 use super::expert_lre::{layer_geometries, minimum_resident_slots, slot_bytes_for};
 use super::expert_lre::{
-    ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
+    sort_assignments_by_expert, ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats,
+    ProfileSnapshot,
 };
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{gpu_span, profile_now, ProfileMark};
@@ -787,61 +788,11 @@ impl SparseMoeBlock {
         _routing_start: ProfileMark,
         wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
-        // ── 2. Group assignments by expert via a counting sort ──
-        // Each entry: (expert_id, token_idx, flat_weight_idx). Same-expert tokens
-        // must be contiguous for the grouped-GEMM dispatch. Expert id is a small
-        // bounded integer, so we bucket by it in **O(A + E)** (A = token→expert
-        // assignments, E = experts) — no comparison sort — keeping the cost
-        // linear even for large prefill batches (a sort here is O(A log A) and
-        // scaled badly with the batch size we want for expert-stream amortization).
+        // ── 2. Group assignments by expert — the shared grouped-GEMM dispatch
+        // sort (`expert_lre::sort_assignments_by_expert`: O(A+E) counting sort,
+        // stable in token order, router sentinels skipped). ──
         let t = profile_now();
-        let k_u = k as u32;
-        // Bucket count = the router's expert count. The router kernel writes
-        // `num_experts` itself as a sentinel into any top-k slot that found no
-        // valid expert (a token whose logits were all -inf/NaN), so ids `>=
-        // num_experts` are skipped in both passes — they aren't real experts and
-        // would index past `num_experts` here and the pipeline's expert arrays.
-        let n_experts = num_experts;
-
-        // Pass 1: count assignments per expert (skipping sentinels).
-        let mut counts = vec![0u32; n_experts];
-        for idxs in &idx_cpu {
-            for &eid in idxs {
-                if (eid as usize) < n_experts {
-                    counts[eid as usize] += 1;
-                }
-            }
-        }
-        // Prefix-sum into per-expert bucket starts; collect the ascending active
-        // expert ids in the same pass.
-        let mut cursor = vec![0u32; n_experts];
-        let mut expert_ids: Vec<usize> = Vec::new();
-        let mut running = 0u32;
-        for (e, &c) in counts.iter().enumerate() {
-            cursor[e] = running;
-            running += c;
-            if c > 0 {
-                expert_ids.push(e);
-            }
-        }
-        // Pass 2: scatter each assignment into its expert's bucket (stable in
-        // token order) → assignments grouped by ascending expert id, exactly as
-        // a sort-by-expert would produce. `slot_k` stays the original top-k
-        // position so the flat weight index remains aligned even when a
-        // sentinel slot is skipped.
-        let num_assignments = running as usize;
-        let mut assignments: Vec<(u32, u32, u32)> = vec![(0, 0, 0); num_assignments];
-        for (tok, idxs) in idx_cpu.iter().enumerate() {
-            let tok_u = tok as u32;
-            for (slot_k, &eid) in idxs.iter().enumerate() {
-                if (eid as usize) >= n_experts {
-                    continue;
-                }
-                let pos = cursor[eid as usize] as usize;
-                assignments[pos] = (eid, tok_u, tok_u * k_u + slot_k as u32);
-                cursor[eid as usize] += 1;
-            }
-        }
+        let (expert_ids, assignments) = sort_assignments_by_expert(&idx_cpu, k, num_experts);
         self.cache.record_profile("fwd_cpu_assign", t);
 
         // Store this layer's expert set for the next layer's speculative hint

@@ -56,16 +56,16 @@ use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, WaveResult,
 };
 use crate::models::batched_layer::{
-    forward_layer_batched_mixed, BatchedAttentionParams, WaveAttnGroup,
+    forward_layer_batched_mixed, BatchedAttentionParams, BatchedPrefillMeta, DecodeHeaders,
+    WaveAttnGroup,
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
-use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_buffers::wave_root;
-use crate::models::wave_driver::{drive_wave, WaveGroups, WaveSweep};
+use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
 
 /// The hybrid as the scheduler drives it.
 ///
@@ -720,10 +720,10 @@ impl WaveSweep for HybridBatched {
     /// failure than the one that caused it.
     fn sweep(
         &self,
-        contexts: &mut [SequenceContext],
-        groups: WaveGroups<'_>,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
-        let seqs = groups.seq_ids.to_vec();
+        let seqs = wave.seq_ids.to_vec();
 
         // Hand back the previous wave's transient tier, and let the elastic
         // boundary grow in the one gap it is legal in — every guard from that
@@ -748,10 +748,13 @@ impl WaveSweep for HybridBatched {
             self.reclaim_spare_ground();
         }
 
-        // Offsets in context order, which is the order `seq_ids` is in — a
-        // sequence standing at zero gets its recurrent state reset, not just
-        // created (see `ensure_recurrent`).
-        let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
+        // Offsets in `seq_ids` order, read from the session — a sequence
+        // standing at zero gets its recurrent state reset, not just created
+        // (see `ensure_recurrent`).
+        let offsets: Vec<usize> = seqs
+            .iter()
+            .map(|&s| session.sequence_offset(s).unwrap_or(0))
+            .collect();
         self.ensure_recurrent(&seqs, &offsets)?;
         self.begin_recurrent_wave(&seqs)?;
         let mut stores = match self.take_recurrent(&seqs) {
@@ -766,7 +769,7 @@ impl WaveSweep for HybridBatched {
 
         let swept = {
             let mut refs: Vec<&mut RecurrentStateStore> = stores.iter_mut().collect();
-            sweep_layers(self, contexts, groups, &mut refs)
+            sweep_layers(self, session, wave, &mut refs)
         };
 
         self.put_recurrent(&seqs, stores)?;
@@ -781,27 +784,23 @@ impl WaveSweep for HybridBatched {
 /// The layer sweep proper.
 fn sweep_layers(
     model: &HybridBatched,
-    contexts: &mut [SequenceContext],
-    groups: WaveGroups<'_>,
+    session: &mut BatchedInferenceSession,
+    wave: WaveGroups<'_>,
     stores: &mut [&mut RecurrentStateStore],
 ) -> Result<(WavePhase, Option<WaveGuard>)> {
     let WaveGroups {
         n_decode,
         n_prefill,
         seq_ids,
-        decode_headers,
-        prefill_headers,
-        glue_headers,
+        inputs,
+        pending_glue,
         generation,
         layer_start,
         layer_end,
         x_in,
         act_dtype,
-    } = groups;
-    // Refused below, before it can be read — named here so the destructuring
-    // stays exhaustive and a new group cannot be added without this seeing it.
-    drop(glue_headers);
-    if contexts.is_empty() {
+    } = wave;
+    if seq_ids.is_empty() {
         candle::bail!("qwen35 wave: empty batch");
     }
     let q = model.model();
@@ -811,14 +810,15 @@ fn sweep_layers(
             "qwen35 wave: bad layer range [{layer_start}, {layer_end}) over {num_layers} layers"
         );
     }
-    let n_glue = contexts
+    let n_glue = seq_ids
         .len()
         .checked_sub(n_decode + n_prefill)
         .ok_or_else(|| candle::Error::Msg("qwen35 wave: group bounds exceed batch".into()))?;
     // The gap-fill kernel is `head_dim 128` only and the float prefill fallback
     // carries no glue masking, so a glue row would be attended as an ordinary
-    // prefill token — a wrong answer, not a slow one.
-    if n_glue > 0 {
+    // prefill token — a wrong answer, not a slow one. `pending_glue` can only
+    // arrive with glue rows, so the one check covers both.
+    if n_glue > 0 || pending_glue.is_some() {
         candle::bail!(
             "qwen35 wave: {n_glue} glue rows — reprojection glue is not implemented at \
              head_dim {}; this stack must recompute rather than gap-fill",
@@ -826,12 +826,50 @@ fn sweep_layers(
         );
     }
 
-    let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
-    let q_lens: Vec<usize> = contexts.iter().map(|c| c.input_len).collect();
+    // Offsets + query lengths from the session, BEFORE the contexts borrow it.
+    let offsets: Vec<usize> = seq_ids
+        .iter()
+        .map(|&s| session.sequence_offset(s).unwrap_or(0))
+        .collect();
+    let q_lens: Vec<usize> = inputs
+        .iter()
+        .map(|t| t.dims().get(1).copied().unwrap_or(1))
+        .collect();
     let (dec_off, pre_off) = offsets.split_at(n_decode);
     let (dec_q, pre_q) = q_lens.split_at(n_decode);
     let pre_rows: usize = pre_q.iter().sum();
     let total_rows = n_decode + pre_rows;
+
+    // Attention metadata, from the session's shared borrow — the hybrid's arena
+    // state does not move before the layer loop reads it, so building here
+    // matches the order the wave driver used when it built these.
+    #[cfg(feature = "cuda")]
+    let (_pm_guard, decode_headers) = if n_decode > 0 {
+        let (pm_guard, buf, stride) =
+            session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
+        (pm_guard, DecodeHeaders::Decode { buf, stride })
+    } else {
+        (
+            None,
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            },
+        )
+    };
+    #[cfg(not(feature = "cuda"))]
+    let decode_headers = DecodeHeaders::Decode {
+        buf: None,
+        stride: 0,
+    };
+    let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
+        pre_off,
+        pre_q,
+        model.device(),
+    )?);
+
+    let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
+    let contexts = contexts.as_mut_slice();
 
     // The wave's declared width — carried, not re-derived. See
     // `WaveGroups::act_dtype`. The embedding emits this and every kernel after

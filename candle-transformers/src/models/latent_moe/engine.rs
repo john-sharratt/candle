@@ -22,8 +22,8 @@ use candle::{DType, Device, Result, Tensor, D};
 use memmap2::MmapOptions;
 
 use crate::models::expert_lre::{
-    layer_geometries, minimum_resident_slots, slot_bytes_for, ExpertCache, ExpertCacheSetup,
-    MmapExpertRef, MoeInput,
+    layer_geometries, minimum_resident_slots, slot_bytes_for, sort_assignments_by_expert,
+    ExpertCache, ExpertCacheSetup, MmapExpertRef, MoeInput,
 };
 use crate::models::profile::span;
 use candle_nn::kv_cache::WeightZone;
@@ -550,36 +550,7 @@ impl Engine {
         s_rb.end();
         let weights_flat = weights.flatten_all()?; // [nt*k]
         let (k, ne) = (self.cfg.n_activated_experts, self.cfg.n_routed_experts);
-        let mut counts = vec![0u32; ne];
-        for row in &idx_cpu {
-            for &eid in row {
-                if (eid as usize) < ne {
-                    counts[eid as usize] += 1;
-                }
-            }
-        }
-        let mut cursor = vec![0u32; ne];
-        let mut expert_ids: Vec<usize> = Vec::new();
-        let mut running = 0u32;
-        for (e, &c) in counts.iter().enumerate() {
-            cursor[e] = running;
-            running += c;
-            if c > 0 {
-                expert_ids.push(e);
-            }
-        }
-        let mut assignments: Vec<(u32, u32, u32)> = vec![(0, 0, 0); running as usize];
-        for (tok, row) in idx_cpu.iter().enumerate() {
-            for (slot_k, &eid) in row.iter().enumerate() {
-                if (eid as usize) >= ne {
-                    continue;
-                }
-                let pos = cursor[eid as usize] as usize;
-                assignments[pos] = (eid, tok as u32, tok as u32 * k as u32 + slot_k as u32);
-                cursor[eid as usize] += 1;
-            }
-        }
-
+        let (expert_ids, assignments) = sort_assignments_by_expert(&idx_cpu, k, ne);
         s_sort.end();
         let s_submit = span("moe:submit");
         let routed = self.experts.submit_moe_work(
