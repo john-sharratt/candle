@@ -1,4 +1,29 @@
 name: hash_state_init
+questions:
+- open a sha512 streaming context and give me the state id
+- begin an incremental blake3 over a large input
+- initialise a chunked sha3_256 computation
+- set up a rolling digest I'll feed in 1 MB pieces
+- can I hash something bigger than fits in one call
+- do I need a streaming hash for a 4 GB file
+- which algorithm should the incremental context use
+- what's the state id so I can add data to it
+- the file is too big to send in a single message
+- hashing a stream as it arrives rather than buffering it
+- I'll be appending chunks over several steps
+- computing a digest across many separate fragments
+- start a streaming hash
+- open a digest context
+- begin incremental sha256
+- init a rolling hash
+- start a streaming sha256 I can feed in chunks
+- begin an incremental hash, the input is too big for one go
+- open a streaming digest context using sha512
+- set up a chunked hash computation
+- I want to hash this file piece by piece — start it
+- initialise an incremental blake3 state
+- create a running hash I can add data to
+- start a multi-part digest session
 category: Hash streaming
 description: Begin an incremental, streaming hash computation — data is fed in chunks rather than all at once. Returns a state id for the subsequent hash_state_update and hash_state_finalize calls. Use when the input is too large to hold in memory at once.
 parameters:

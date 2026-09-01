@@ -1,4 +1,29 @@
 name: ssh_session_close
+questions:
+- close SSH session 3 on the build host
+- log out of the SSH shell on prod
+- terminate the secure shell connection to the jump box
+- end my SSH login and free its state
+- can I close the SSH session now
+- will closing the shell kill the background job on it
+- is it safe to disconnect from that host yet
+- do I still need this remote shell open
+- finished poking around on that server
+- done with the manual debugging, disconnect me
+- shouldn't leave a root shell open on prod
+- tidying up the remote logins I opened
+- log out of the ssh box
+- hang up the secure shell to that server
+- disconnect the SSH shell
+- exit the ssh session
+- close the SSH session
+- log out of the SSH shell on that server
+- disconnect my ssh shell from that host
+- end the secure shell session, I'm done
+- drop the SSH connection to prod
+- terminate the remote login session
+- exit the ssh session on the build box
+- shut down the SSH connection and free its state
 category: SSH sessions
 description: End a secure shell session on a remote server, terminating the encrypted login and freeing its working state.
 high_risk: true

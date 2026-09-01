@@ -1,4 +1,29 @@
 name: aead_decrypt
+questions:
+- aes256gcm with the key and nonce below — decrypt it
+- run chacha20poly1305 decryption over this base64 blob
+- decrypt with the associated data "v1|header" included
+- take this 48-byte ciphertext and recover the message
+- does this ciphertext still authenticate under the original key
+- what was the original plaintext here
+- is the tag on this blob still valid
+- can this be opened, or has someone modified it in transit
+- the API returned an encrypted envelope and I need to see inside it
+- I captured this off the wire and I have the session key
+- a bit may have flipped in transit, check before trusting the contents
+- our backup file is AEAD-sealed and I need the config out of it
+- open this sealed blob
+- unseal the payload, params below
+- I'm debugging a decryption failure, try it with these
+- got the key at last, let's see what's in there
+- decrypt this aes256gcm ciphertext and check the tag
+- I have an AEAD blob, a key and a nonce — can you recover the plaintext
+- verify and open this chacha20poly1305 message
+- can you decrypt this and tell me if it was tampered with
+- undo the aes128gcm encryption on this payload
+- open this authenticated ciphertext with the key below
+- check the integrity tag on this AEAD ciphertext and give me the contents
+- decrypt the attached gcm blob using this nonce
 category: Cryptography
 description: Decrypt and authenticate AEAD ciphertext — aes128gcm, aes256gcm, or chacha20poly1305 — verifying the integrity tag and rejecting any tampered input. Returns recovered plaintext as text when valid UTF-8, otherwise hex.
 parameters:

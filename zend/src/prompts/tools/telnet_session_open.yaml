@@ -1,4 +1,29 @@
 name: telnet_session_open
+questions:
+- telnet to 192.168.1.1 on port 23
+- open a Telnet session to the core switch
+- connect over telnet to the serial console server
+- start a Telnet terminal on the legacy firewall
+- does that device only speak telnet
+- what prompt does the telnet session land on
+- do I need credentials for the Telnet login
+- will telnet work on this appliance's management port
+- the switch has no SSH, only telnet
+- configuring network gear that predates modern access
+- reaching a console server that exposes a raw terminal
+- the appliance's menu interface is telnet-only
+- open a Telnet session
+- telnet to that device
+- connect over telnet
+- start a telnet terminal
+- telnet into that switch for me
+- open a Telnet session to the router on 23
+- connect over telnet to the legacy console
+- I need a Telnet terminal on this network device
+- start a telnet connection to the serial console server
+- open a plaintext terminal session to the firewall
+- get me telnet access to that appliance
+- connect to the switch's telnet interface
 category: Telnet sessions
 description: Open a Telnet session to a network device or host. Use for legacy network equipment, serial consoles, or any TCP text protocol. Returns session_id for subsequent sends.
 high_risk: true

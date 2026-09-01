@@ -24,6 +24,11 @@ use crate::types::{
 /// the tools dial so a no-tools turn omits the block entirely.
 const TOOLS_ENABLED_SELECTOR: &str = "tools_enabled";
 
+/// The `optional` node holding the tool-call FORMAT demonstration (its `id:` in
+/// `projection.yaml`). Tracks the tools dial: a no-tools turn must not be shown
+/// a worked tool call, which would contradict a prompt that lists no tools.
+const TOOL_EXAMPLE_SELECTOR: &str = "tool_call_example";
+
 /// `POST /v1/chat/completions`
 pub async fn completions(
     State(session): State<Arc<ZendSession>>,
@@ -71,14 +76,14 @@ pub async fn completions(
     // on the tools dial via the `tools_enabled` optional_group: `None` omits the
     // entire block (markers included), the other modes show it. Which *members*
     // appear under Restricted vs Comprehensive is still the mode_builders' job.
-    selection.set_optional(
-        TOOLS_ENABLED_SELECTOR,
-        if matches!(tools_mode, crate::types::ToolMode::None) {
-            OptionalState::Absent
-        } else {
-            OptionalState::Present
-        },
-    );
+    let tools_present = if matches!(tools_mode, crate::types::ToolMode::None) {
+        OptionalState::Absent
+    } else {
+        OptionalState::Present
+    };
+    selection.set_optional(TOOLS_ENABLED_SELECTOR, tools_present);
+    // The worked example follows the block it demonstrates.
+    selection.set_optional(TOOL_EXAMPLE_SELECTOR, tools_present);
     let messages = req.messages;
     if req.stream {
         stream_sse(

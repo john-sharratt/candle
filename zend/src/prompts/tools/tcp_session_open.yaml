@@ -1,4 +1,29 @@
 name: tcp_session_open
+questions:
+- open a raw TCP socket to 10.0.0.4:6379
+- connect a plain TCP stream to the SMTP server on port 25
+- start an unencrypted TCP connection to that custom daemon
+- open a TCP byte-stream to the game server on 7777
+- do I want raw TCP here or TLS
+- can I speak this protocol over a plain TCP socket
+- what session id does the TCP connection get
+- will a raw TCP stream work against that service
+- the service isn't HTTP so I need a plain socket
+- debugging a custom binary protocol at the byte level
+- want to grab the banner before deciding what it speaks
+- talking to a Redis-like daemon directly over TCP
+- open a raw TCP socket
+- connect over plain TCP
+- start a TCP stream
+- new TCP connection
+- open a raw TCP connection to that host on port 25
+- connect a plain TCP socket to 10.0.0.4:9000
+- I need a raw TCP stream to debug this custom protocol
+- open an unencrypted TCP connection to the service
+- start a TCP socket session to that endpoint
+- connect over plain TCP, no TLS
+- open a byte-stream socket to the server on port 6379
+- give me a raw TCP session for this non-HTTP service
 category: TCP sessions
 description: 'Open a raw TCP connection. Use for: custom protocols, debugging, non-HTTP services. Use tls_session_open for TLS. Returns session_id.'
 high_risk: true

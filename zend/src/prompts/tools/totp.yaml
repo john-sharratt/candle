@@ -1,4 +1,29 @@
 name: totp
+questions:
+- generate the TOTP for the aws-root credential
+- what's the six-digit code for the vpn secret right now
+- produce an authenticator code from the stored seed
+- give me the OTP for that account before it rolls
+- how long until this code expires
+- is that the current code or the previous window
+- which stored secret backs this authenticator
+- do I have a TOTP seed saved for this service
+- the login is prompting me for a second factor
+- automating a sign-in that needs MFA
+- my phone's flat and the seed is in the store
+- scripting the deploy and it stops at the 2FA prompt
+- 2FA code
+- otp please
+- authenticator code
+- need the MFA digits
+- give me the current 2FA code
+- what's my authenticator code right now
+- generate a TOTP for the github credential
+- I need the MFA code to log in
+- what six digits does the authenticator show at the moment
+- produce the one-time password for that account
+- get the current TOTP from my stored secret
+- what's the 2FA token for the VPN login
 category: Security utilities
 description: 'Generate a current TOTP (Time-based One-Time Password / authenticator app) code from a stored totp_secret credential. Use for: producing a 2FA or MFA code before logging in to a service, automating authentication flows that require a rotating OTP, getting the current 6-digit authenticator code for a named secret. Triggered by "generate a 2FA code", "get the TOTP code for", "what''s the authenticator code for my <name> secret", "generate OTP for". Pass the credential''s name in `credential_name` — this tool reads the stored totp_secret itself, so do NOT fetch or look up the credential first; call this directly. Returns the current code, seconds remaining until it expires, and the credential name.'
 parameters:

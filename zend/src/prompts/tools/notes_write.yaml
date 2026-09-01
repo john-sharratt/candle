@@ -1,4 +1,29 @@
 name: notes_write
+questions:
+- write a note keyed runbook-deploy with these steps
+- update the note "oncall-contacts" with the new roster
+- store this under key architecture-decisions, tagged adr
+- create a note recording why we chose the paged cache
+- should this go in a note so it survives the session
+- can you keep this where you'll find it next time
+- what key would you file this under
+- is there already a note for this, or shall I start one
+- I don't want to explain this context again next week
+- capturing the decision while the reasoning is fresh
+- this keeps coming up, write it down once
+- recording the workaround so the team can find it
+- note this down
+- save that as a note
+- remember this for later
+- write it to my notes
+- save a note about this decision so we don't lose it
+- remember that the staging DB password rotates monthly
+- write this down in my notes under "deploy-steps"
+- store these API details as a persistent note
+- make a note that the migration is scheduled for Friday
+- keep this reference for future conversations
+- update the note about the release checklist
+- jot this down so you'll have it next session
 category: Notes
 description: 'Write or update a persistent note by key. Notes survive across conversations. Use for: saving important information, tracking progress, storing references. Use notes_search to retrieve by content; notes_list to browse.'
 high_risk: true

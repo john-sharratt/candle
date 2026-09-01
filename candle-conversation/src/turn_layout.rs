@@ -24,7 +24,11 @@
 //! it), but kept so a *sub-range* of a turn can be projected directly — e.g.
 //! inject only the answer, or window to the user half.
 
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
+
+use crate::normalization::Phase;
 
 /// A segment's footprint in the turn's K/V grid: `len` token positions starting
 /// at absolute `offset`.  `offset` is recoverable from the running sum of prior
@@ -111,6 +115,38 @@ impl TurnSegment {
     pub fn is_real(&self) -> bool {
         self.kv().is_some()
     }
+}
+
+/// The K/V range `phase` occupies within a turn's segment list.
+///
+/// Taken as a slice so a caller holding persisted `TurnDecl.segments` can ask
+/// without cloning them into a [`TurnLayout`] first — the offline analysis path
+/// (`substrate_inspect --probe-phase` / `--gallery-phase`) reads exactly these,
+/// straight off the decls it walked out of the redo log.
+///
+/// A phase may be split across several segments (a turn can carry more than one
+/// user segment — a tool response arrives as a further user turn), so the range
+/// spans from the first to the last; a phase with no real K/V (an ethereal
+/// `<think>` whose K/V was dropped) yields `None`.
+pub fn phase_span_of(segments: &[TurnSegment], phase: Phase) -> Option<Range<usize>> {
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    for seg in segments {
+        let matches = matches!(
+            (phase, seg),
+            (Phase::User, TurnSegment::User { .. })
+                | (Phase::Thinking, TurnSegment::Thinking { .. })
+                | (Phase::Response, TurnSegment::Assistant { .. })
+        );
+        if !matches {
+            continue;
+        }
+        if let Some(kv) = seg.kv() {
+            lo = lo.min(kv.offset as usize);
+            hi = hi.max(kv.end() as usize);
+        }
+    }
+    (hi > lo && lo != usize::MAX).then_some(lo..hi)
 }
 
 /// A turn as an ordered list of segments.  Turn-level metadata (role, block span,
@@ -864,6 +900,70 @@ mod tests {
             .segments
             .iter()
             .any(|s| matches!(s, TurnSegment::Thinking { kv: None, .. })));
+    }
+
+    /// **A phase span covers the phase's real tokens and nothing else.**
+    ///
+    /// The span indexes a signature window directly, so an off-by-one here does
+    /// not fail — it silently scores the wrong tokens and shifts every phase
+    /// score by a token of glue.
+    #[test]
+    fn phase_spans_cover_exactly_their_own_segments() {
+        // [user(0..3)][im_end(3..5)][a_start(5..8)][answer(8..12)]
+        let layout =
+            TurnLayout::from_flat_grid(0, 3, 8, 12, 2, 3, "hi".into(), Some("ok".into()), false);
+        assert_eq!(phase_span_of(&layout.segments, Phase::User), Some(0..3));
+        assert_eq!(
+            phase_span_of(&layout.segments, Phase::Response),
+            Some(8..12)
+        );
+        // No think block was split out, so there is no thinking phase at all —
+        // distinct from "the thinking phase scored zero".
+        assert_eq!(phase_span_of(&layout.segments, Phase::Thinking), None);
+    }
+
+    /// An ETHEREAL thinking segment (text kept, K/V dropped by the clean-turn
+    /// re-prefill) has no tokens in the grid, so it must report no span rather
+    /// than a zero-width one at the split point.
+    #[test]
+    fn an_ethereal_thinking_phase_has_no_span() {
+        let layout =
+            TurnLayout::from_flat_grid(0, 3, 8, 20, 2, 3, "hi".into(), Some("ok".into()), false)
+                .with_thinking_split("<think>r</think>".into(), 5, true);
+        assert_eq!(phase_span_of(&layout.segments, Phase::Thinking), None);
+        // …while the phases that DO hold K/V are unaffected by the split.
+        assert_eq!(phase_span_of(&layout.segments, Phase::User), Some(0..3));
+    }
+
+    /// A tool round-trip arrives as a second user segment mid-turn (the tool
+    /// response), so the user phase is discontiguous. The span covers first to
+    /// last: scoring the question alone would drop the tool's own output, which
+    /// is the part naming the tool.
+    #[test]
+    fn a_split_phase_spans_first_to_last_segment() {
+        let layout = TurnLayout::new(vec![
+            TurnSegment::User {
+                text: "q".into(),
+                kv: KvSpan::new(0, 4),
+            },
+            TurnSegment::Assistant {
+                text: Some("call".into()),
+                kv: KvSpan::new(4, 3),
+            },
+            TurnSegment::User {
+                text: "tool result".into(),
+                kv: KvSpan::new(7, 5),
+            },
+            TurnSegment::Assistant {
+                text: Some("answer".into()),
+                kv: KvSpan::new(12, 2),
+            },
+        ]);
+        assert_eq!(phase_span_of(&layout.segments, Phase::User), Some(0..12));
+        assert_eq!(
+            phase_span_of(&layout.segments, Phase::Response),
+            Some(4..14)
+        );
     }
 
     /// Semantic accessors read the right segments back out of a flat-grid

@@ -1,4 +1,29 @@
 name: remote_fs_session_list_dir
+questions:
+- list /srv/releases on the SFTP host with sizes and mtimes
+- show the contents of the remote /etc/nginx directory
+- enumerate the remote uploads folder over SFTP
+- ls the remote home directory through the sftp session
+- what's in that directory on the remote machine
+- which files on the SFTP host are newest
+- are there any subdirectories under the remote path
+- how many files sit in the remote releases folder
+- checking what the last deploy left on the server
+- looking for the artefact before I download it
+- want to see the remote layout before uploading into it
+- verifying the cleanup job ran on the remote box
+- list the remote directory
+- ls over SFTP
+- show the remote folder contents
+- browse that path on the SFTP host
+- list /var/www on the remote server over SFTP
+- what files are in that directory on the remote host
+- show me the contents of the remote /srv/app folder
+- ls the remote directory via sftp
+- what's in the home directory on the SFTP host
+- list the remote logs folder with sizes and permissions
+- browse the remote filesystem at /opt over SFTP
+- show the entries under that path on the remote machine
 category: Remote filesystem
 description: List entries in a remote directory via SFTP. Returns name, size, is_dir, permissions, and modification time for each entry.
 high_risk: true

@@ -1,4 +1,29 @@
 name: datetime
+questions:
+- give me the time in America/Sao_Paulo
+- current timestamp in Europe/Warsaw please
+- what's the UTC offset where the London office is right now
+- today's date in Pacific/Auckland
+- is it still Tuesday in California
+- what week of the year are we in
+- has the date rolled over in Tokyo yet
+- what's the ISO 8601 timestamp for right now
+- I need to stamp this log entry accurately
+- the cert expiry is relative to now, so what is now
+- I'm scheduling a call and need to know the time on their end
+- work out whether the daily job should have fired by now
+- time
+- date today
+- clock check
+- what's the time, I don't want you guessing it
+- what time is it right now
+- what is today's date
+- what's the time in Berlin at the moment
+- give me the current ISO timestamp for a log entry
+- what day of the week does today fall on
+- how late is it in Sydney right now
+- what's the current unix epoch second
+- tell me the date and time in Asia/Kolkata
 category: Utilities & web
 description: 'Return the current date and time in a specified IANA timezone. Use for: getting today''s date, current time in a particular city or zone, what day of the week it is, the current ISO timestamp for logging, checking the time in another part of the world. Triggered by "what time is it", "what''s the date", "what day is today", "current time in [city]", "time in Tokyo right now", "what''s today''s date". Returns ISO 8601 timestamp, unix epoch, weekday name, and timezone. Stateless and instant — anchors the model when it would otherwise hallucinate dates.'
 parameters:

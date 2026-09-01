@@ -1,4 +1,29 @@
 name: tls_session_recv
+questions:
+- read the IMAPS greeting off the TLS channel
+- receive the LDAP result over the encrypted connection
+- pull the SMTPS response from the TLS session
+- read the broker's CONNACK off the encrypted channel
+- what did the server answer over TLS
+- is the TLS channel still delivering application data
+- how many decrypted bytes came back
+- did the peer close the TLS connection after replying
+- I sent the bind and want the encrypted channel's answer
+- checking the IMAP capability list the server advertises
+- reading the response before I send the next TLS command
+- confirming the broker accepted the connection
+- read from the TLS channel
+- receive on the encrypted connection
+- what came back over TLS
+- read the secure channel
+- read the decrypted reply from the TLS channel
+- what did the server send back over the encrypted connection
+- receive the IMAPS banner on the TLS session
+- pull the response off the TLS socket
+- read application data from the secure channel
+- grab the LDAPS answer over TLS
+- what's waiting on the encrypted connection
+- read the next TLS record's plaintext for me
 category: TLS sessions
 description: Read decrypted application data from an open TLS channel; decryption and certificate handling are transparent.
 high_risk: true

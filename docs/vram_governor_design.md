@@ -370,6 +370,94 @@ tiers (and after each `Critical` sync), stopping the moment headroom clears the
 tier's threshold. If the whole ladder is exhausted and headroom is still below
 floor → return `Exhausted` (circuit breaker: **no spin**), surfaced as a typed OOM.
 
+### 8.1 Idle demote — the counterpart to elevate
+
+**Sections are three-tier residences, exactly like turns.** `SequenceResidence`
+carries `hot` / `warm` / `cold` regardless of whether it holds a turn or a
+section, and `section_tier_state` reports all three. A section is prefilled hot,
+quantized to C4 and offloaded per branch during the catalog build
+(`OffloadCollectionMembers` → `quantize_section_batch(mark_evict = true)`, which
+bounds the native catalog to one branch), then lifted back on demand:
+`elevate_to_hot(sections, turns)` takes **both** lists.
+
+**The gap this closes: elevate had no counterpart.** Every rung of the ladder
+above that can reclaim — compress-to-free, `demote_turns_to_warm`,
+`evict_hot_to_free` — walks *turns*. Nothing demoted a section once it was
+elevated, and nothing demoted an idle conversation's turns either. So under
+sustained projection churn the hot set only grew, every shortfall was met by
+`request_kv_ground` conceding expert-weight ground, and that concession is
+one-way: giving it back needs a floor move, which `live_watermark` refuses while
+any region above the floor is live. Measured on a 16 GiB card: 234 concessions,
+expert zone 5,440 → 1,225 slots, decode 26 → **3 t/s**, KV side 8.6 GiB against
+2.8 GiB of weights. Every relief line read
+`turns_compressed=0 turns_evicted=0 arenas_released=0 conceded_mib=<all of it>`.
+
+**Mechanism — a last-touch epoch, not a live set.** Each `SequenceResidence`
+carries `last_used_epoch`. `set_working_set_pins` — which already computes the
+active set under the write lock — **stamps** it; the demote scan **advances** the
+clock. Residences where `epoch − last_used > IDLE_DEMOTE_GRACE_EPOCHS` **drop
+`hot`**, and only where `warm` already holds the bytes: the demote sheds a copy,
+so it is never the operation that loses the last one.
+
+**It sets no flag.** The obvious wiring — latch the existing `evict_when_cold`
+and let the persistence thread's `residence_evict_when_cold` → `install_cold`
+path do the freeing — is wrong twice over, and the shape of the flag is why.
+`evict_when_cold` is a statement about a residence's *kind*: this KV belongs to a
+transient timeline (a `code_read` fork, a calibration exemplar) whose cold copy
+is disposable, so drop it the moment cold lands. Idleness is not that; a dormant
+conversation's KV is as durable as any other. And the flag is **latched** —
+every write in the tree is `= true` and nothing ever clears it — so one quiet
+minute would permanently condemn ordinary KV to be dropped rather than persisted.
+Dropping `hot` directly says exactly what is meant, is undone by the next
+`elevate_to_hot`, and leaves the flag to mean the one thing it means.
+
+**The clock is one persistence pass**, ticked at the scan. Getting this unit
+right is the whole of the calibration: the pass wakes on every seal/flush trigger
+and otherwise on its own 5 s tick, so an epoch tracks real work with a wall-clock
+floor — a dormant conversation retires even with zero traffic, and the window
+shortens under load, which is when the VRAM is wanted back. The alternatives are
+both wrong: a projection *publish* is far too coarse (a whole session may do only
+a handful, which makes any usable grace unreachable and the demote silently
+inert — measured), and a per-*wave* tick would need a hook the scheduler does not
+expose to the substrate.
+
+The counter is **per-`Substrate`, not a global**: a process-wide clock lets one
+engine's activity age out another's residences, which showed up immediately as
+tier tests that passed alone and failed in parallel. Keeping it beside the
+residences it stamps also removes the static, the atomic, and the epoch argument
+every caller would otherwise thread through. Residences are stamped born-now at
+`alloc_residence`, so none is ever stale from birth and eligible for demotion
+before its first use.
+
+Three properties make this the shape to build rather than a live "active set":
+
+- **The active set is excluded arithmetically, not by a filter.** Anything the
+  current forward touched is stamped at the current epoch and cannot satisfy the
+  predicate. There is no check to forget and no set to get wrong.
+- **No snapshot window.** A set is built and then acted on, and reality can move
+  in between; a stamp is written by the consumer at the moment of use.
+- **No hot-path allocation.** One store per touch, one integer compare per
+  candidate — versus assembling every active conversation's KV per scan.
+
+**The grace window is load-bearing.** With a grace of zero, a conversation's KV
+becomes evictable the instant a *different* conversation forwards, which at 64
+concurrent sessions is continuous thrash. The grace keeps a conversation resident
+across its own turn while letting a genuinely idle one age out. It is sized
+against the tick above, never guessed — the failure directions are asymmetric, so
+too generous only reclaims later while too aggressive charges a warm→hot lift on
+every turn of a live conversation.
+
+**Why it cannot demote live KV.** Five barriers, the first structural: (1) the
+epoch predicate excludes the current forward by construction; (2) the working-set
+pins are checked as well, so a residence the current wave attends is skipped even
+if its stamp were somehow stale; (3) the stamp is written by the consumer, so
+"inactive" cannot go stale between decision and action; (4) the scan runs only on
+the persistence thread's between-forward seam — the same one
+`create_deferred_arenas` depends on, past `device.synchronize()`, with no wave in
+flight; (5) it only ever drops a **redundant** copy — `warm.is_some()` is part of
+the predicate, and a residence still owed a quantize (`pending_quantize`, whose
+`hot` is the interim native form the drain is about to replace) is excluded too.
+
 ---
 
 ## 9. Managed allocation, retry, and the forecast

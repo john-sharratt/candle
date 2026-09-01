@@ -1,4 +1,29 @@
 name: tcp_session_close
+questions:
+- close TCP session 2 and free its buffers
+- drop the raw TCP stream to port 6379
+- shut the plain TCP connection to that daemon
+- terminate the byte-stream socket we opened
+- can I close the raw TCP socket now
+- does closing the TCP stream send anything to the peer
+- is the custom protocol exchange finished on that socket
+- do I need to close the plain TCP connection before reopening
+- done with the byte-level protocol poking
+- the daemon stopped responding on that TCP stream
+- finished the banner grab, release the socket
+- tidying up the raw TCP connections I opened
+- close the TCP socket
+- drop the plain TCP stream
+- hang up the raw socket to that daemon
+- end the raw TCP connection
+- send FIN on the plain TCP stream
+- drop the plain TCP connection to that host
+- I'm done with the custom protocol exchange, close the TCP stream
+- shut the TCP session down and free its buffers
+- disconnect the byte-stream socket
+- terminate the unencrypted TCP connection
+- close out the TCP session on port 9000
+- release the raw TCP socket
 category: TCP sessions
 description: Close a raw TCP stream socket, dropping the connection and freeing its buffers. Use when a custom-protocol or non-HTTP byte-stream exchange is finished.
 high_risk: true

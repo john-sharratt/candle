@@ -2546,7 +2546,7 @@ impl TestParams {
         );
         println!("  Ceilings on the warm tier (lowest wins):");
         for (name, v) in [
-            (CEILING_HOST_BUDGET, s.kv_warm_budget),
+            (CEILING_HOST_BUDGET, s.expert_pinned_budget),
             (CEILING_AVAILABLE, s.available_less_headroom),
             (CEILING_PINNABLE, s.pinnable_cap),
         ] {

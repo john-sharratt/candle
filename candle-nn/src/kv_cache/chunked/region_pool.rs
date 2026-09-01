@@ -265,10 +265,31 @@ pub struct RegionStats {
     /// layout rounding.
     pub reserved_bytes: usize,
     pub granularity: usize,
+    /// Device bytes already in use the instant **before** this span was
+    /// reserved — the CUDA context, the driver's own working set, the module
+    /// images, and anything another process holds.
+    ///
+    /// Captured here because this is the only moment it is measurable in
+    /// isolation: the reservation runs before the weight load, so nothing of
+    /// ours is on the card yet. Without it the memory report can only say
+    /// `in_use − span − pool` and must lump this constant in with the thing a
+    /// reader actually wants — an allocation the report does not know about.
+    /// That residual read 1.4 GB on a 16 GB card while being almost entirely
+    /// this baseline, which makes a real leak of a few hundred MB invisible.
+    ///
+    /// `None` when no VRAM gauge was registered for the device, which the
+    /// reservation itself tolerates — so this is a state a live pool reaches,
+    /// not just a CPU-test artifact. It stays an `Option` all the way to the
+    /// memory report because a `0` here would read as "the card was empty
+    /// before us" and license a subtraction that silently did nothing.
+    pub pre_reservation_in_use_bytes: Option<u64>,
 }
 
 struct RegionPool {
     reservation: Reservation,
+    /// Device bytes in use just before this pool reserved its span — see
+    /// [`RegionStats::pre_reservation_in_use_bytes`].
+    pre_reservation_in_use: Option<u64>,
     /// First byte of the span.
     span_base: u64,
     /// Bytes of the span actually backed by physical memory. May be less than
@@ -756,6 +777,43 @@ impl RegionPool {
         // life of the process, and the weight zone and KV side (both carved from the span)
         // could never reach it again. Reserving the full target costs nothing and is what lets
         // [`reclaim_load_headroom`] hand the headroom back once the load is done.
+        // **Everything on the card that is not ours, measured while that is
+        // still true.** Taken before the reservation and therefore before the
+        // weight load: the CUDA context, the driver's working set, the module
+        // images, and any other process. After this line the card holds our span
+        // and the two can never be separated again by subtraction.
+        //
+        // The memory report otherwise has to publish `in_use − span − pool` and
+        // call it "unaccounted", which buries a real leak inside a large
+        // constant — it read 1.4 GB on a 16 GB card while being almost entirely
+        // this baseline.
+        // **`cuMemGetInfo`, because that is what the residual subtracts it
+        // from.** The memory report derives `device_in_use_bytes` as
+        // `driver_total − driver_free` from this same call, so the baseline has
+        // to come from the same scale or the subtraction is meaningless.
+        //
+        // The obvious alternative — `vram::get(ordinal).measure()` — is wrong
+        // here and was: on Windows that reads DXGI, whose `headroom` is relative
+        // to a driver *budget* rather than to installed VRAM, and which the
+        // governor's own docs forbid subtracting for exactly this reason.
+        // Mixing the two drove `unaccounted_bytes` persistently negative, the
+        // opposite of what the field exists to show.
+        // Bound to this thread first, exactly as `CudaDevice::mem_get_info` does.
+        // The driver call reads the CURRENT context, so without the bind it either
+        // answers for whichever context the thread last touched or fails — and
+        // either way it leaves the thread in a state the reservation below then
+        // has to work from.
+        // Bound to this thread first, exactly as `CudaDevice::mem_get_info` does.
+        // The driver call reads the CURRENT context, so without the bind it either
+        // answers for whichever context the thread last touched or fails — and
+        // either way it leaves the thread in a state the reservation below then
+        // has to work from.
+        let pre_reservation_in_use = stream
+            .context()
+            .bind_to_thread()
+            .ok()
+            .and_then(|()| candle::cuda_backend::cudarc::driver::result::mem_get_info().ok())
+            .map(|(free, total)| (total as u64).saturating_sub(free as u64));
         let va = (target / REGION_BYTES) * REGION_BYTES;
         let mut reservation = Reservation::reserve(stream, va.max(want))?;
 
@@ -845,6 +903,7 @@ impl RegionPool {
 
         Ok(Self {
             reservation,
+            pre_reservation_in_use,
             span_base,
             span_bytes,
             region_base: layout.region_base,
@@ -2521,6 +2580,7 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
         .slack,
         reserved_bytes: pool.reservation.reserved_bytes(),
         granularity: pool.reservation.granularity(),
+        pre_reservation_in_use_bytes: pool.pre_reservation_in_use,
     })
 }
 

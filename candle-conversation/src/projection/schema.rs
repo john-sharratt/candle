@@ -590,6 +590,22 @@ pub struct SectionSchema {
     /// the other `depends_on_absent` the same collection — so exactly one shows
     /// (e.g. a tools-aware vs a no-tools grounding paragraph).
     pub depends_on_absent: Option<CollectionId>,
+    /// Emission gate on whether the named collection is **configured** — has ≥ 1
+    /// MEMBER — rather than on what it selected this projection.
+    ///
+    /// [`Self::depends_on`] asks "did provenance pick something *this instant*",
+    /// which is the right question for the structural markers that wrap the
+    /// picks (an empty `<tools></tools>` is pointless) and the WRONG question for
+    /// the prose that introduces the facility. Gated on selection, a tool
+    /// overview vanishes on exactly the turn provenance happens to score
+    /// nothing — and the model, told nothing about tools, answers from memory
+    /// instead of calling one. A collection with zero members is genuinely
+    /// disabled (the tools dial set to `None` filters every member out), and
+    /// that is what this asks.
+    pub depends_on_configured: Option<CollectionId>,
+    /// Inverse of [`Self::depends_on_configured`]: emits only when the named
+    /// collection has **no** members, i.e. the facility is switched off.
+    pub depends_on_unconfigured: Option<CollectionId>,
     /// Marks this section as resolved from a dialect template (a
     /// `kind: template` YAML item that referenced a `DialectTemplate`
     /// catalog entry, e.g. `system_start`).  The scheduler's
@@ -637,6 +653,8 @@ impl CompressionPrompt {
                 priority: 50.0,
                 depends_on: None,
                 depends_on_absent: None,
+                depends_on_configured: None,
+                depends_on_unconfigured: None,
                 is_template: false,
                 template_tokens: None,
             },

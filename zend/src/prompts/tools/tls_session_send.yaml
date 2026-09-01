@@ -1,4 +1,29 @@
 name: tls_session_send
+questions:
+- send "a001 CAPABILITY" over the TLS channel to the IMAPS server
+- write the LDAP bind request through the encrypted connection
+- transmit the SMTPS EHLO line over TLS
+- push this MQTT CONNECT packet down the TLS channel
+- does the payload get encrypted automatically on the TLS session
+- will the server understand this command over TLS
+- how many bytes were written to the encrypted channel
+- do I need a line terminator on the TLS send
+- driving the IMAP conversation by hand over TLS
+- testing the LDAP bind before wiring it into the app
+- reproducing the client's exact bytes on the encrypted channel
+- probing what the broker accepts over TLS
+- send that over the TLS channel
+- write to the encrypted connection
+- transmit over TLS
+- send it on the secure channel
+- send this command over the encrypted TLS channel
+- write these bytes to the TLS connection
+- transmit the IMAP LOGIN line over TLS
+- push this payload through the TLS session, encrypted
+- send the LDAP bind request over the TLS channel
+- write this string to the secure connection
+- put this data on the wire over TLS
+- send the SMTP EHLO through the TLS session
 category: TLS sessions
 description: Transmit application data over an open TLS channel; the payload is encrypted on the wire automatically.
 high_risk: true

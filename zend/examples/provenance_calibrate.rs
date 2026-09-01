@@ -189,7 +189,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // WRITE: fold this turn into the hit levels (seal cadence, once per turn).
-        cache.observe(&scope, &raw_pairs);
+        cache.observe(&scope, turn_i as u64, &raw_pairs);
         for ci in 0..n {
             raw_mean[ci] += (raw[ci] - raw_mean[ci]) / (turn_i + 1) as f32;
         }

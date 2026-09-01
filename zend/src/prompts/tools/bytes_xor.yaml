@@ -1,4 +1,29 @@
 name: bytes_xor
+questions:
+- xor 0xdeadbeef against 0x11223344
+- apply this 4-byte repeating key across the whole buffer
+- xor the keystream into the ciphertext, pad the short one with zeros
+- combine these two captures byte by byte with XOR
+- where do these two blobs differ
+- are these two buffers identical, and if not by how many bits
+- what key turns the first string into the second
+- does xoring these give me back the plaintext
+- I think this is a one-time pad reused twice
+- two firmware images should be the same, find the differing bytes
+- I have the ciphertext and a crib, recover the keystream
+- the obfuscation here looks like a simple xor mask
+- xor them
+- mask this against the key below
+- bitwise difference of these two, please
+- I'm working through a CTF and this needs xoring
+- xor these two hex buffers together
+- what's the bitwise difference between these two blobs
+- apply this keystream to the ciphertext with XOR
+- combine these byte strings with xor, padding the shorter one
+- I want the XOR of these two one-time-pad fragments
+- mask this payload against that key
+- give me the xor delta between these two binary values
+- xor this data with the repeating key below
 category: Byte encoding
 description: Combine two byte sequences with a bitwise XOR, zero-padding the shorter one. Use for one-time-pad analysis, keystream masking, and computing bitwise differences between binary blobs. Always call this tool to perform the XOR; never compute the result yourself.
 parameters:

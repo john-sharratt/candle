@@ -1,4 +1,29 @@
 name: sql_session_query
+questions:
+- SELECT id, email FROM users WHERE created_at > '2026-01-01'
+- run an INSERT into events with these three values
+- UPDATE orders SET status='shipped' WHERE id = ?
+- CREATE INDEX on the sessions table by user_id
+- how many rows are in the orders table
+- what columns does the users table have
+- did that UPDATE affect any rows
+- what's the last insert rowid after that statement
+- I want to know what the data actually looks like
+- checking whether the migration populated the new column
+- counting the records before and after the backfill
+- the report numbers look wrong, query the source
+- run that SQL query
+- query the database
+- SELECT from that table
+- execute this statement on the db
+- select all rows from the users table
+- how many orders are in the database
+- run this SQL against the open session
+- insert a row into the events table
+- update the status column where id = 42
+- create a table for the audit log
+- query the top 10 customers by revenue
+- delete the stale rows from that table
 category: SQL sessions
 description: Execute a SQL statement in an open session. Returns rows and columns for SELECT; rows_affected and last_insert_rowid for INSERT/UPDATE/DELETE. Supports positional parameters via the params array (? placeholders).
 high_risk: true

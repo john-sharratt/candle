@@ -1,4 +1,29 @@
 name: sql_session_open
+questions:
+- open a SQL session on ./var/inventory.sqlite
+- connect to the database file in the data directory
+- start a database session against ':memory:' for a scratch table
+- open the sqlite db so I can run some queries
+- do I need a database session before querying
+- does SQLite need a credential to open
+- can I open the db read-only
+- which path is the database actually at
+- I want to poke at the data behind this service
+- the app's db is on disk and I'd like to inspect it
+- setting up to run a few reporting queries
+- need to check what the migration actually did to the schema
+- open the sqlite database file
+- connect to the sqlite database
+- start a SQL database session
+- open the db for querying
+- open the SQLite database at ./data/app.db
+- connect to that database file so I can query it
+- start a SQL session against an in-memory database
+- open a database connection to inventory.sqlite
+- I want to run some queries — open the DB
+- attach to the sqlite file in the project root
+- begin a SQL session on this database path
+- get me a database session for that .db file
 category: SQL sessions
 description: Open a SQL database session. SQLite is supported natively and needs no credential — pass the database path (or ':memory:' for in-memory). A credential_name is optional and only supplies a default database. Use sql_session_query to run statements. Close with sql_session_close.
 high_risk: true

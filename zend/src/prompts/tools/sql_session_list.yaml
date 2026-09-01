@@ -1,4 +1,29 @@
 name: sql_session_list
+questions:
+- enumerate the SQL sessions with their database paths
+- show every open database connection id
+- list the sqlite sessions in this conversation
+- which database session points at inventory.sqlite
+- do I already have a connection to that database
+- is the database session I opened still usable
+- how many db connections am I holding
+- which session id has the in-memory database
+- I lost the database session id I need for the query
+- checking before I open a second connection to the same file
+- want to know which db file the open session targets
+- reviewing the database handles left open
+- list database sessions
+- what SQL sessions are open
+- show db connection ids
+- any database sessions alive
+- which database sessions are open
+- list my SQL connections and their database paths
+- do I have a database session already
+- show the open sqlite sessions
+- what SQL session ids exist right now
+- which databases am I connected to
+- give me the database session for app.db
+- how many DB connections are live in this conversation
 category: SQL sessions
 description: Enumerate the database sessions currently open in this conversation, with each database path and connection state.
 high_risk: true

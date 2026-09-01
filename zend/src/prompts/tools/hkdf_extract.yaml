@@ -1,4 +1,29 @@
 name: hkdf_extract
+questions:
+- HKDF-Extract with sha384 over this ECDH shared secret
+- extract a PRK from this IKM using an empty salt
+- run the RFC 5869 first stage on these bytes
+- condense this Diffie-Hellman output into a pseudorandom key
+- what PRK does this salt and IKM produce
+- does an empty salt change the output here
+- is extract the right stage, or do I want expand
+- how long is the PRK for sha512
+- working through a TLS 1.3 key schedule by hand
+- the handshake secret has to be extracted before expanding
+- verifying our implementation against the RFC vectors
+- deriving from a raw ECDH secret that isn't uniform
+- hkdf extract this
+- extract the PRK
+- first stage of HKDF
+- condense this IKM
+- run HKDF-Extract over this input key material
+- condense this shared secret into a pseudorandom key
+- do the extract stage of HKDF with this salt
+- give me the PRK from this IKM using sha256
+- first stage of the HKDF chain on this secret please
+- extract a uniform key from this non-uniform material
+- what's the HKDF-Extract output for this salt and IKM
+- compute the RFC 5869 extract step with sha512
 category: Cryptography
 description: 'HKDF-Extract (RFC 5869): condense raw, possibly non-uniform input key material into one uniformly-random pseudorandom key — the first stage of the HKDF derivation chain. Supports sha256 and sha512.'
 parameters:

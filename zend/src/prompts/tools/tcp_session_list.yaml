@@ -1,4 +1,29 @@
 name: tcp_session_list
+questions:
+- enumerate the raw TCP sockets with their peer addresses
+- show every open plain TCP stream id
+- list the byte-stream sockets and whether they're idle
+- which TCP session is connected to port 6379
+- do I already have a raw TCP socket to that host
+- is the plain TCP connection I opened still up
+- how many unencrypted TCP streams am I holding
+- which TCP session id goes with the SMTP server
+- I lost the TCP session id for the next send
+- checking I'm not opening a duplicate TCP stream
+- want to see which raw sockets are lingering
+- reviewing the plain TCP connections before cleanup
+- list the TCP sockets
+- what raw TCP streams are open
+- show TCP session ids
+- any plain TCP connections alive
+- which raw TCP sockets are open
+- list my plain TCP connections and their peers
+- what TCP session ids do I have
+- am I still connected over raw TCP to that host
+- show the open TCP stream sockets
+- how many unencrypted TCP connections are live
+- give me the TCP session for port 6379
+- list the byte-stream sockets in this conversation
 category: TCP sessions
 description: Enumerate the raw TCP stream sockets currently open in this conversation, with each peer address and idle state.
 high_risk: true

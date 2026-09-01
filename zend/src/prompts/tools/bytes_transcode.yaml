@@ -1,4 +1,29 @@
 name: bytes_transcode
+questions:
+- base64url-encode these raw bytes for a JWT header
+- take this hex and give it to me base64 with padding
+- convert the base64 in this config value to plain hex
+- render this utf8 string as base64
+- is this base64 or base64url
+- what does this base64 decode to as text
+- why does this value have dashes and underscores in it
+- is this string valid hex, and what is it in base64
+- the API wants base64url but our config stores hex
+- I need to paste this into a JSON field that only takes base64
+- this identifier looks encoded, work out what form it's in
+- our logs print hex but the tool downstream expects base64
+- transcode this
+- hex to base64 please
+- re-encode, same bytes, different alphabet
+- I keep mixing these encodings up, convert it properly
+- convert this hex string to base64
+- re-encode this base64 payload as base64url
+- give me the hex form of this utf8 text
+- what's this base64url value in plain hex
+- change the encoding of this blob from base64 to hex
+- decode this base64 back to readable text
+- normalise this payload to hex without changing the bytes
+- turn this hex dump into base64 for me
 category: Byte encoding
 description: Re-encode data between byte representations — hex, base64, base64url, and raw utf8 — without changing the underlying bytes. Use to normalize how a payload is written, not what it contains. Always call this tool to re-encode; never convert the data yourself.
 parameters:

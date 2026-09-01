@@ -1,4 +1,29 @@
 name: hmac_compute
+questions:
+- hmac-sha256 this payload with the webhook secret
+- generate an HMAC-SHA512 tag for the canonical request string
+- sign this timestamp+body concatenation with the shared key
+- compute the sha1 HMAC for this legacy integration
+- does my computed tag match the X-Signature header they sent
+- which key did this signature use
+- should the timestamp be inside the signed string
+- is HMAC the right primitive here, and what's the tag
+- the webhook is being rejected as unsigned
+- I need to authenticate this API call before sending it
+- verifying that a message really came from the partner
+- reproducing their signing algorithm to debug a mismatch
+- hmac this
+- sign it with the secret
+- keyed digest please
+- generate the auth tag
+- compute an HMAC-SHA256 over this request body
+- sign this payload with the shared secret
+- generate the keyed authentication tag for this message
+- what's the HMAC of this string with that key
+- produce an hmac sha512 tag so I can verify the webhook
+- I need the signature header value for this API call
+- calculate the keyed MAC over this data
+- hmac this message using sha1 and the key below
 category: Cryptography
 description: Compute a keyed HMAC authentication tag over a message (sha256, sha512, or sha1). Use to sign API requests or to confirm a message arrived unaltered from a party holding the shared secret key.
 parameters:

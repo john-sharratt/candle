@@ -224,11 +224,18 @@ system_prompt:
         conversation.
 
     # Two grounding variants under the same `tools` collection gate — exactly
-    # one emits per projection: the tool-aware remedy when the catalog
-    # materialises, the say-so-only remedy when tools are off.
+    # one emits per projection: the tool-aware remedy when tools are configured,
+    # the say-so-only remedy when tools are off.
+    #
+    # Keyed on CONFIGURED, matching `tools_overview` below. On the selection gate
+    # these inverted on any turn provenance scored nothing: the model was handed
+    # `grounding_no_tools` — "say so plainly rather than guessing" — in the same
+    # prompt as a tool overview telling it to call a tool instead of guessing.
+    # Whether a remedy mentions tools depends on whether tools EXIST, not on
+    # whether one happened to score this instant.
     - kind: section
       id: grounding
-      depends_on: tools
+      depends_on_configured: tools
       content: |+
         Only speak from what is actually present in the conversation. If something you
         need has not appeared yet, fetch it with a tool when one fits — otherwise say so
@@ -236,7 +243,7 @@ system_prompt:
 
     - kind: section
       id: grounding_no_tools
-      depends_on_absent: tools
+      depends_on_unconfigured: tools
       content: |+
         Only speak from what is actually present in the conversation. If something you
         need has not appeared yet, say so plainly rather than guessing. Never fill the
@@ -244,13 +251,23 @@ system_prompt:
 
     - kind: section
       id: tools_overview
-      # Gated on the tools collection: the "how to call a tool" prose only
-      # makes sense when at least one tool is projected. With None tools mode
-      # the collection materialises nothing, so this section (like the
-      # `<tools>` markers) is suppressed — the conversation never sees a tools
-      # preamble with no tools behind it. Sealed unconditionally; emitted only
-      # when the collection has members.
-      depends_on: tools
+      # Gated on the tools collection being CONFIGURED, not on what it selected.
+      #
+      # This prose and the catalog summary beside it are the generic half of the
+      # tool block: they say the facility exists and how to invoke it. Only the
+      # per-tool JSON definitions inside `<tools>`…`</tools>` are the detailed
+      # half, and only those follow provenance.
+      #
+      # It was `depends_on: tools` — "the collection materialised ≥1 THIS
+      # projection" — which deleted the introduction on exactly the turns
+      # provenance scored nothing, and a turn's OPENING projection scores nothing
+      # by construction (it runs before the turn is prefilled, so there is no
+      # decode-Q, and `min`-budget force-fill deliberately declines to invent one
+      # from an all-zero belief). The model therefore opened every first turn
+      # having been told nothing about tools — and answered from memory rather
+      # than calling one. `tools` with zero MEMBERS is the real "tools are off"
+      # signal: the `None` tools dial filters every member out.
+      depends_on_configured: tools
       content: |+
         You have access to the tools listed below. Every listed tool is available and
         working right now.
@@ -307,6 +324,22 @@ system_prompt:
         # ADDITIVE (the preset default): the id-group "spike" IS the tool
         # signal — gating collapses Top-1 97.3% → 32.9% (results doc §25.8).
         layer_weights: [1.0, 1.0, 1.0]
+        # Concept F (§8): the turn's pinned question window scans as a second
+        # probe, max-fused with the decode tail after normalization.
+        #
+        # This is load-bearing for tools in a way it is not for the content
+        # layers. A turn's OPENING projection has no decode tail to scan, so
+        # without the question window nothing scores and NO tool is selected —
+        # and because `tools_open` / `tools_overview` / `tools_close` are
+        # `depends_on: tools`, the whole tool block then fails to emit and the
+        # section tree falls to the `grounding_no_tools` branch. The model
+        # therefore begins decoding on a prompt that shows it no tools at all,
+        # and answers from memory or says it cannot. The catalog does arrive at
+        # the first reprojection, but by then the reply is already committed.
+        # The question alone carries the tool signal cleanly (a bare "what is
+        # the time" ranks datetime #1 by ~30x over the runner-up), which is
+        # exactly the evidence this window preserves.
+        question_pin: true
         # Carry, made explicit — these are the committed_tool_scope values on
         # the normalized band (a tool stays relevant for several turns, so it
         # is deliberately STICKIER than repo_map). Pinned here so the repo_map
@@ -465,6 +498,54 @@ system_prompt:
                 </tool_response><|im_end|>
                 <|im_start|>assistant
                 This folder throttles requests per tenant, keeping the token buckets in Redis so every node shares one count. token_bucket.rs holds the bucket arithmetic and redis_store.rs the shared-state access.<|im_end|>
+
+    # Tool-call FORMAT demonstration for the live dialogue.
+    #
+    # `tools_overview` already states the format in prose and shows the tags
+    # inline, and Qwen3.6-35B-A3B does not follow it: asked "what is the time"
+    # with `datetime` projected and selected, it reasons — correctly, and often
+    # in its own words — that it must call the tool and must not invent a
+    # result, and then emits a fabricated timestamp instead of a call. Told
+    # outright to "emit the tool call", it produces bare `{"tool": "datetime",
+    # …}`: no tags, and the wrong key. Measured 0/6 tool calls across the
+    # battery, at every effort dial including `/no_think`.
+    #
+    # ONE demonstrated exchange fixes it, and the fix generalizes across tools:
+    # shown only a `dns_lookup` example, the same question produced
+    # `<tool_call>{"name": "datetime", …}</tool_call>`, the runner dispatched it,
+    # and the reply carried the real clock time. So what the model is missing is
+    # the SHAPE, not the instruction and not the tool — a demonstration teaches
+    # it where prose does not.
+    #
+    # `dns_lookup` is deliberately unlike the things tools are usually asked for
+    # here (times, arithmetic, files): an example teaches the SUBJECT as much as
+    # the format (see the summarizer note above), so the demonstrated tool is one
+    # no ordinary request should be drawn toward. The `absent` option exists for
+    # a tool-free projection, where demonstrating a call would contradict a
+    # prompt that lists no tools.
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: tool_call_example
+          default: present
+          # The demonstration STOPS at the call, and carries no `<tool_response>`
+          # and no prose answer. That is the whole difference between working and
+          # not: the model copies the last assistant turn it was shown. Given the
+          # full round-trip (call → response → "example.com resolves to …"), the
+          # last assistant behaviour on display is ANSWERING, and the model duly
+          # answered — from memory, with a fabricated clock time, in the same run
+          # where this section was verifiably in its prompt. Given the identical
+          # exchange truncated at the call, the same daemon and same question
+          # produced `<tool_call>{"name": "datetime", …}</tool_call>`, dispatched
+          # it, and reported the real time. Teaching the round-trip teaches the
+          # wrong half of it.
+          content: |+
+            <|im_start|>user
+            what is the IP address of example.com<|im_end|>
+            <|im_start|>assistant
+            <tool_call>
+            {"name": "dns_lookup", "arguments": {"host": "example.com"}}
+            </tool_call><|im_end|>
 
 
 layers:

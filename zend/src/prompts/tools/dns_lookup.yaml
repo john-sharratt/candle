@@ -1,4 +1,29 @@
 name: dns_lookup
+questions:
+- resolve api.stripe.com
+- look up the A record for grafana.internal
+- what addresses does this CNAME chain end at
+- get me the IPs behind cdn.example.org
+- did my nameserver change take effect yet
+- is this domain pointing at the old load balancer still
+- does the hostname resolve at all from here
+- how many A records does it return
+- the app can't find the database host
+- we moved the record an hour ago and I want to confirm it
+- someone says the site is down but it may just be DNS
+- verifying the cutover before we flip traffic
+- resolve it
+- dig this name
+- what's the IP for that domain
+- nslookup that host
+- what IP does example.com resolve to
+- resolve this hostname for me
+- has the DNS change propagated for my domain yet
+- look up the A records for that host
+- what address is this domain name pointing at
+- check DNS resolution for api.internal
+- give me the IP behind this hostname
+- is the DNS set up right for this domain
 category: Network diagnostics
 description: 'Perform a DNS lookup for a hostname and return its IP address records. Use for: resolving a hostname to its IP, verifying DNS is set up correctly for a domain, checking what address a name points to, confirming a DNS change has propagated. Triggered by "what is the IP of", "resolve this hostname", "DNS lookup for", "what does X resolve to", "dig", "nslookup". Returns record type and resolved addresses. A/AAAA records use the OS resolver. MX/TXT/NS records return not_supported. Use web_search for information about a domain; use ping_icmp to test connectivity to the resolved address.'
 parameters:
