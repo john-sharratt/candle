@@ -656,7 +656,10 @@ mod tests {
             // product name says nothing about what it is.
             let title = html
                 .lines()
-                .find_map(|l| l.split_once("<title>").and_then(|(_, r)| r.split_once("</title>")))
+                .find_map(|l| {
+                    l.split_once("<title>")
+                        .and_then(|(_, r)| r.split_once("</title>"))
+                })
                 .map(|(t, _)| t.trim().to_owned())
                 .unwrap_or_else(|| panic!("{shell} has no <title>"));
             assert!(
@@ -677,7 +680,10 @@ mod tests {
                 .find(|l| l.contains("property=\"og:url\""))
                 .and_then(|l| quoted_attr(l, "content"))
                 .unwrap_or_else(|| panic!("{shell} has no og:url"));
-            assert_eq!(og_url, origin, "{shell}'s og:url disagrees with its canonical");
+            assert_eq!(
+                og_url, origin,
+                "{shell}'s og:url disagrees with its canonical"
+            );
 
             let robots = std::fs::read_to_string(root.join(dir).join("robots.txt"))
                 .unwrap_or_else(|e| panic!("{dir}/robots.txt: {e}"));

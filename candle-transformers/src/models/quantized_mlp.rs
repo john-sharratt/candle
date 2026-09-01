@@ -23,6 +23,7 @@ use candle::quantized::{GgmlDType, Int8Mode, QTensor};
 use candle::{DType, LiveTensor, Module, Result, Tensor};
 use candle_nn::Activation;
 
+use crate::models::lora::{adapt, LayerLora};
 use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 
 /// The three (or two, when gate+up are fused) projections of a gated FFN.
@@ -285,6 +286,45 @@ impl QuantizedMlp {
         work_dtype: DType,
         out_dtype: DType,
     ) -> Result<LiveTensor<'w>> {
+        self.forward_dynamic_adapted(acts, work_dtype, out_dtype, LayerLora::default())
+    }
+
+    /// The MLP with its LoRA pairs, which is the same computation with three
+    /// optional rank-`r` corrections folded into the projections that carry
+    /// them.
+    ///
+    /// This is the *only* implementation — [`Self::forward_dynamic`] is it with
+    /// an empty [`LayerLora`] — so an unadapted MLP and an adapted one cannot
+    /// drift apart. An absent pair costs one null check.
+    ///
+    /// The adapter's input for gate and up is the post-norm activation, and for
+    /// down it is the SwiGLU result; both must be float, which is what an
+    /// adapted layer's `Int8Mode::Off` guarantees. A pair present against a
+    /// quantized activation is a wiring error and says so rather than adapting
+    /// the wrong tensor.
+    #[cfg(feature = "cuda")]
+    pub fn forward_dynamic_adapted<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        work_dtype: DType,
+        out_dtype: DType,
+        lora: LayerLora<'_>,
+    ) -> Result<LiveTensor<'w>> {
+        // Resolved once: the float the three adapters read, or `None` when this
+        // MLP is unadapted and the fused int8 activation is all that exists.
+        let lora_x = if lora.gate.is_some() || lora.up.is_some() || lora.down.is_some() {
+            match acts {
+                DynamicActs::Float(t) => Some(t.clone()),
+                DynamicActs::Int8(_) => candle::bail!(
+                    "quantized MLP is LoRA-adapted but its activations are q8a128 — \
+                     the layer's `int8mode()` must report `Off` so the float input \
+                     the adapter reads survives the norm"
+                ),
+            }
+        } else {
+            None
+        };
+
         let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
             let mut gu = w.forward_dynamic(acts.as_dynamic(), work_dtype)?;
             let (_, _, out_dim) = gu.dims3()?;
@@ -309,7 +349,21 @@ impl QuantizedMlp {
         // separate-weight Float path.
         gate.to_dtype_mut(work_dtype)?;
         up.to_dtype_mut(work_dtype)?;
+        // Both adapters add to the raw projections, before SwiGLU — the point
+        // PEFT trained them against. The fused-weight path above split one
+        // matmul into these two halves, so a fused base and a separate-weight
+        // base adapt identically.
+        if let Some(x) = &lora_x {
+            gate = adapt(lora.gate, gate, x)?;
+            up = adapt(lora.up, up, x)?;
+        }
         let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
-        self.down_proj.forward_live_as(&gated, out_dtype)
+        let out = self.down_proj.forward_live_as(&gated, out_dtype)?;
+        // `down`'s adapter reads the SwiGLU result, not the layer input — it is
+        // the operand of the projection it adapts, exactly as for the other two.
+        match lora.down {
+            Some(_) => adapt(lora.down, out, &gated),
+            None => Ok(out),
+        }
     }
 }

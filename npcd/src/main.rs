@@ -43,6 +43,7 @@ mod engine;
 mod guard;
 mod identity;
 mod images;
+mod lifegen;
 mod logs;
 mod mind;
 mod model;
@@ -298,7 +299,13 @@ async fn main() -> anyhow::Result<()> {
     // rather than from `--mind` directly, so the editor and the collections
     // read the same root — a second answer to "where is the mind" would be
     // free to disagree the day the layout changes.
-    let mind = mind::Mind::new(schema.dir.clone());
+    let mind_dir = schema.dir.clone();
+    let mind = mind::Mind::new(mind_dir.clone());
+    // A second handle for the engine. The editor and the ingest read the same
+    // schema through the same address, so they must be the same `Mind` — a
+    // second one built from the path would be a second reading of the document
+    // to drift from the first.
+    let mind_for_engine = mind.clone();
     match mind.root() {
         Some(root) => tracing::info!("mind: editable at {}", root.display()),
         None => tracing::info!("mind: none — the file editor will report it has nothing to edit"),
@@ -316,7 +323,70 @@ async fn main() -> anyhow::Result<()> {
         // writes, rather than things a person authored.
         images::Images::new(&data),
     );
-    let ops_state = ops::Ops::new(logs, &data, roles.clone());
+
+    // ── the engine ─────────────────────────────────────────────────────────
+    //
+    // Built here and *started* after the server is bound, so the console's
+    // loading screen is being served by the time the model starts loading. A
+    // daemon that loads first and binds afterwards has nothing to show the
+    // person waiting on it, which on a multi-gigabyte checkpoint is the whole
+    // of the first minute.
+    //
+    // The runtime is built first — it needs only the mind directory — then
+    // handed to the state, then given the two resolvers that read that state
+    // back. That order is what breaks the cycle between them: `Authored` needs
+    // the runtime to answer its routes, and the runtime needs `Authored` to know
+    // what time it is for a character and who that character is.
+    let runtime = engine::runtime::Runtime::new(mind_for_engine, &data);
+    let authored = authored.with_runtime(runtime.clone());
+
+    // The clock resolver closes over the state rather than reading a single
+    // daemon-wide clock: worlds run at their own pace and can be paused
+    // independently, and a character has to see its own world's time.
+    // `blocking_read`, because the tick driver is a plain OS thread with no
+    // async context. **This closure must never be called from inside the
+    // runtime** — `blocking_read` there panics rather than waiting, and the
+    // route that did it answered every request with a closed connection while
+    // the loop it was showing ran perfectly underneath. The async side uses
+    // `Authored::world_ms`, which reaches the same lookup by the other route.
+    let clock_state = authored.clone();
+    runtime.set_clock(Arc::new(move |npc_id: u64| {
+        clock::world_ms_for(
+            &clock_state.npcs.blocking_read(),
+            &clock_state.worlds.blocking_read(),
+            npc_id,
+            now_ms_i64(),
+        )
+    }));
+
+    // Who each character is, resolved at tick time rather than captured at
+    // startup. A belief edited through the authoring API has to reach the next
+    // tick — a persona snapshot taken here would keep every character as it was
+    // when the process began, and the mind editor would appear to do nothing.
+    let persona_state = authored.clone();
+    runtime.set_persona_source(Arc::new(move |npc_id: u64| {
+        let npcs = persona_state.npcs.blocking_read();
+        let payload = npcs.payload(npc_id)?;
+        // The world's own description, for the prompt's setting section. A
+        // character with no readable world still gets a persona — an empty
+        // setting is a thin prompt, a missing character is no prompt at all.
+        let world = persona_state
+            .worlds
+            .blocking_read()
+            .get(&payload.world_id)
+            .and_then(|r| {
+                r.body
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        Some(engine::persona::of(payload, &world))
+    }));
+
+    // The load progress is shared, not copied: `/v1/status` answers from it
+    // while the loader thread is still writing to it.
+    let ops_state = ops::Ops::new(logs, &data, roles.clone(), runtime.progress.clone());
 
     // The route table, at startup, with the role each route needs.
     //
@@ -356,7 +426,7 @@ async fn main() -> anyhow::Result<()> {
     let mut router = api_routes
         .into_router(authored.clone())
         .merge(ops_routes.into_router(ops_state))
-        .merge(engine_routes.into_router(authored));
+        .merge(engine_routes.into_router(authored.clone()));
 
     /* **There is no fallback.**
      *
@@ -401,6 +471,83 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
+    // ── start the engine ───────────────────────────────────────────────────
+    //
+    // After the router is assembled and before `serve()` blocks. The loader
+    // runs on its own OS thread and returns immediately, so the server binds
+    // while the model is still being fetched — which is the point: the loading
+    // screen has to be reachable during the load it is describing.
+    let cast: Vec<u64> = authored
+        .npcs
+        .read()
+        .await
+        .cast()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    tracing::info!("engine: loading, {} character(s) to wake", cast.len());
+    engine::runtime::start(
+        runtime.clone(),
+        engine::runtime::LoadPlan {
+            world_ms: 0,
+            cast,
+            // Personalities, not the cast. A layer directory is named after a
+            // personality — `layers/memory/zen/` — and a world's biographies
+            // exist whether or not anybody has cast them yet.
+            characters: authored
+                .personalities
+                .read()
+                .await
+                .iter()
+                .map(|r| r.id.clone())
+                .collect(),
+        },
+    );
+
+    // The mind watcher, so an edited world file takes effect without a restart.
+    // Held for the process's lifetime — dropping it stops the watch — which is
+    // why it is bound rather than discarded.
+    let _mind_watcher = match &mind_dir {
+        Some(dir) => match engine::watcher::spawn(
+            dir,
+            // The runtime's ledger, filled by the startup ingest — so the first
+            // edit after a boot is one changed file, not a whole-tree rewrite.
+            runtime.ledger.clone(),
+            Arc::new(|report: engine::watcher::ReloadReport| {
+                tracing::info!(
+                    "mind reloaded: +{} ~{} -{}",
+                    report.added,
+                    report.changed,
+                    report.removed
+                );
+            }),
+        ) {
+            Ok(w) => Some(w),
+            // Not fatal. A daemon that will not start because it cannot watch a
+            // directory is worse than one that runs without live reload and
+            // says so — the reload is a convenience, the engine is the product.
+            Err(e) => {
+                tracing::warn!("mind watcher not armed: {e} — edits need a restart");
+                None
+            }
+        },
+        None => None,
+    };
+
+    // Stop the tick driver on Ctrl-C, before the process goes.
+    //
+    // Not cosmetic. A character's decode writes turns to the substrate, and a
+    // driver killed mid-tick leaves the redo log with a turn whose sealing never
+    // happened. Setting the flag lets the current tick finish and the loop exit
+    // at its next quiet moment — the same reason the flag exists at all.
+    let stopping = runtime.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("interrupt received — stopping the tick driver");
+            stopping.stop();
+        }
+    });
+
     Builder::new(cfg)
         .content("npcd", roots)
         // Sign-in is the gateway's, and it names the caller on `X-Tokera-*`.
@@ -411,4 +558,16 @@ async fn main() -> anyhow::Result<()> {
         .local_api("npcd", router)
         .serve()
         .await
+}
+
+/// Wall-clock milliseconds as the narrative clock takes them.
+///
+/// Signed, because [`clock::Clock`] works in `i64` throughout — a world can be
+/// jumped backwards past its own epoch, and an unsigned instant would wrap
+/// rather than clamp.
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

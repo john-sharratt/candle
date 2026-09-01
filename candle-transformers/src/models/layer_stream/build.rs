@@ -207,7 +207,7 @@ fn slot_form(
     mode: candle::quantized::Int8Mode,
     narrow: Option<GgmlDType>,
 ) -> Result<(GgmlDType, usize, usize)> {
-    use candle::quantized::cuda::{gemx_repacking_supported, ko_repacked_bytes};
+    use candle::quantized::cuda::{ko_repacked_bytes, repackable_to_ko};
     use candle::quantized::ko_quant::ko_tileable;
     use candle::Shape;
 
@@ -216,14 +216,18 @@ fn slot_form(
         // The int8 kernel reads exactly the chunks it was given, so payload and
         // extent are the same number.
         //
-        // A source with no GEMX repack kernel does not repack: `QMatMul::build`
+        // A source `repack_ko_into` cannot read does not repack: `QMatMul::build`
         // dequantizes it and re-quantizes to Q8_0 first, so the twin follows Q8_0
-        // rather than the source. That is the path a *float* trunk projection
-        // takes (F32/F16/BF16 have no KO twin at all, so `to_ko` on them would
-        // fail the load outright), and the path MXFP4 takes (it names `MXFP4_KO`
-        // but has no `dtype_to_qtype` arm, so predicting `MXFP4_KO` here would
-        // size every slot at roughly half the width the loader then writes).
-        let repacked = if gemx_repacking_supported(src) {
+        // rather than the source. That is the path MXFP4 takes — it names
+        // `MXFP4_KO` but has no `dtype_to_qtype` arm, so predicting `MXFP4_KO`
+        // here would size every slot at roughly half the width the loader writes.
+        //
+        // A *float* trunk projection used to take it too, and no longer does:
+        // `dequantize_f32_into` widens a float band with a cast, so the banded
+        // route reads it directly and `to_ko` names its `Q8_KO` twin. The width
+        // predicted here is unchanged — `Q8_0.to_ko` and `F16.to_ko` are both
+        // `Q8_KO` — which is what made the routing change safe for this planner.
+        let repacked = if repackable_to_ko(src) {
             src
         } else {
             GgmlDType::Q8_0
@@ -284,14 +288,24 @@ pub fn images_from_gguf(
     layer_kinds: &[crate::models::delta_net::LayerKind],
     mode: candle::quantized::Int8Mode,
     narrow: Narrowing,
+    substitute: &dyn Fn(&str) -> Option<GgmlDType>,
 ) -> Result<Vec<LayerImage>> {
     use crate::models::delta_net::LayerKind;
 
+    // **The geometry must describe the tensor that will actually be loaded**, which is not
+    // always the one in this header: a load may substitute a weight from another checkpoint
+    // (see the qwen35 gate donor). Planning a slot from the header's dtype and then writing a
+    // differently-sized payload into it is caught by the pack writer, but only as an
+    // arithmetic mismatch far from its cause — `L2 WOut: projection is 17825792 bytes, the
+    // geometry says 13762560`, which is Q8_0 against Q6_K and says nothing about donors.
     let info = |name: &str| -> Result<(Vec<usize>, GgmlDType)> {
         let t = content.tensor_infos.get(name).ok_or_else(|| {
             candle::Error::Msg(format!("layer stream: the checkpoint has no {name}"))
         })?;
-        Ok((t.shape.dims().to_vec(), t.ggml_dtype))
+        Ok((
+            t.shape.dims().to_vec(),
+            substitute(name).unwrap_or(t.ggml_dtype),
+        ))
     };
     let entry = |role: LayerTensor,
                  dims: Vec<usize>,

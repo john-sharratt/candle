@@ -729,3 +729,362 @@ canvas { width: 100%; display: block; }
    so far that it stops being readable — reading is the reason it is paused. */
 .page.is-paused .grid, .page.is-paused .verdict { opacity: .62; transition: opacity .15s; }
 
+/* ── the loading screen ──────────────────────────────────────────────────────
+   A restart takes tens of seconds — weights onto the card, a redo log replayed,
+   the mind's layers diffed. The phase list is what turns "npcd is hanging" into
+   "npcd is on Replaying substrate, 40 000 of 250 000 turns". */
+.boot-card { display: grid; gap: 10px; justify-items: center; min-width: 260px; }
+.boot-title { font-weight: 700; letter-spacing: .01em; }
+.boot-bar {
+  width: 240px; height: 3px; border-radius: 2px;
+  background: var(--line); overflow: hidden;
+}
+.boot-bar-fill {
+  height: 100%; width: 0; background: var(--accent);
+  /* Eased, because the counter arrives in steps (a transformer block, a
+     thousand turns) and an un-eased bar jumps in a way that reads as stuttering
+     rather than as progress. */
+  transition: width .3s ease-out;
+}
+.boot-steps {
+  list-style: none; margin: 6px 0 0; padding: 0;
+  display: grid; gap: 3px; text-align: left; font-size: .78rem;
+}
+.boot-steps li { color: var(--dim); padding-left: 18px; position: relative; }
+/* The marker column: a dot for pending, a tick for done, a ring for current.
+   Same width in every state so the list does not shift as it advances. */
+.boot-steps li::before {
+  content: '·'; position: absolute; left: 4px; color: var(--dim);
+}
+.boot-steps li.done { color: var(--ink-soft); }
+.boot-steps li.done::before { content: '✓'; color: var(--ok); }
+.boot-steps li.now { color: var(--ink); font-weight: 600; }
+.boot-steps li.now::before { content: '◆'; color: var(--accent); }
+
+/* ── Pulse ───────────────────────────────────────────────────────────────────
+
+   The cast's loop, as an instrument, held to the same standard as the front
+   page — because it is the same claim. The landing page says a hundred minds run
+   at once; this is where somebody watches that be true, and a utilitarian table
+   under a confident pitch reads as the pitch being the more finished thing.
+
+   ── the hue mechanism ──
+   Every character gets a stable hue from its id, set as `--hue` on both its cast
+   card and every tick it owns. Everything character-coloured below reads that
+   one custom property, so a character is the same colour everywhere on the page
+   and adding a character never reshuffles the others. Saturation and lightness
+   are pinned here rather than per-element, so the palette stays coherent across
+   however many characters exist. */
+.pulse { padding: 26px var(--gutter) 60px; max-width: 1080px; margin: 0 auto; }
+
+.pulse-hd { margin-bottom: 26px; }
+.pulse-hd-main { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.pulse-hd h1 { font-size: 2.1rem; letter-spacing: -1px; margin: 0; }
+.pulse-lede {
+  font-size: .95rem; color: var(--ink-soft); line-height: 1.7;
+  max-width: 60ch; margin: 10px 0 0;
+}
+.pulse-lede em { font-style: normal; color: var(--ink-dim); font-weight: 600; }
+
+.pulse-status {
+  font-family: var(--mono); font-size: .7rem; text-transform: uppercase;
+  letter-spacing: 1px; font-weight: 700; color: var(--ink-faint);
+  display: inline-flex; align-items: center; gap: 7px;
+}
+/* The live dot. Only when the engine is actually up — a pulsing indicator over
+   a loading daemon is the page claiming something it cannot see. */
+.pulse-status.is-live::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ok); box-shadow: 0 0 0 0 var(--ok);
+  animation: pulse-beat 2.4s ease-out infinite;
+}
+@keyframes pulse-beat {
+  0%   { box-shadow: 0 0 0 0 rgba(108,179,154,.45); }
+  70%  { box-shadow: 0 0 0 7px rgba(108,179,154,0); }
+  100% { box-shadow: 0 0 0 0 rgba(108,179,154,0); }
+}
+
+.pulse-toggle {
+  display: inline-flex; align-items: center; gap: 8px; margin-top: 16px;
+  font-size: .82rem; color: var(--ink-soft); cursor: pointer; user-select: none;
+}
+.pulse-toggle input { accent-color: var(--accent); cursor: pointer; }
+
+/* ── the cast strip ─────────────────────────────────────────────────────── */
+.pulse-cast {
+  display: grid; gap: 10px; margin-bottom: 22px;
+  grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
+}
+.cast-card {
+  position: relative; display: grid; gap: 5px; text-align: left; cursor: pointer;
+  padding: 13px 15px 12px 18px; border: 1px solid var(--line-2);
+  border-radius: var(--radius-lg); background: var(--panel);
+  color: inherit; font: inherit; overflow: hidden;
+  transition: border-color .15s, transform .15s;
+}
+.cast-card:hover { border-color: var(--line-3); transform: translateY(-1px); }
+.cast-card.on { border-color: hsl(var(--hue) 55% 55% / .8); background: var(--panel-2); }
+/* The spine carries the character's identity. Colour is the identity here; the
+   name is confirmation, which is what makes an interlaced feed scannable. */
+.cast-spine {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: hsl(var(--hue) 52% 58%);
+}
+.cast-card.is-blocked .cast-spine { opacity: .45; }
+.cast-name {
+  font-weight: 650; font-size: .96rem; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.cast-state {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: .72rem; text-transform: uppercase; letter-spacing: .7px;
+  font-weight: 700; color: var(--ink-faint);
+}
+.cast-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.cast-card.is-pending   .cast-state { color: var(--info); }
+.cast-card.is-preempted .cast-state { color: var(--warn); }
+.cast-figs {
+  display: flex; gap: 11px; flex-wrap: wrap;
+  font-family: var(--mono); font-size: .7rem; color: var(--ink-ghost);
+  font-variant-numeric: tabular-nums;
+}
+.cast-inbox { color: var(--info); }
+.cast-win {
+  height: 2px; background: var(--line); border-radius: 2px;
+  overflow: hidden; margin-top: 3px;
+}
+.cast-win-fill { height: 100%; background: hsl(var(--hue) 45% 55%); }
+.cast-day {
+  display: flex; gap: 8px; font-size: .68rem; color: var(--ink-ghost);
+  font-variant-numeric: tabular-nums;
+}
+.cast-phase { color: var(--ink-faint); font-style: italic; }
+
+/* ── the composer ───────────────────────────────────────────────────────── */
+.pulse-composer { display: flex; gap: 9px; margin-bottom: 22px; }
+.pulse-composer .input { flex: 1; font-size: .86rem; }
+.pulse-composer .btn.ghost { min-width: 40px; }
+
+.pulse-help {
+  border: 1px solid var(--line-2); border-radius: var(--radius-lg);
+  background: var(--panel); padding: 16px 18px; display: grid; gap: 11px;
+  margin-bottom: 22px;
+}
+.help-row { display: grid; grid-template-columns: 104px 1fr; gap: 14px; align-items: baseline; }
+.help-cmd { font-family: var(--mono); font-size: .76rem; color: var(--accent); font-weight: 700; }
+.help-desc { font-size: .84rem; color: var(--ink-soft); line-height: 1.6; }
+.help-eg {
+  font-family: var(--mono); font-size: .72rem; color: var(--ink-ghost);
+  display: block; margin-top: 3px;
+}
+
+/* ── the interlaced stream ──────────────────────────────────────────────────
+   One column, every character woven together in the order things happened. The
+   ordering is the point: a cast is not a set of independent transcripts, it is
+   several minds running at once. */
+.pulse-stream { display: grid; gap: 10px; }
+.tick {
+  position: relative; padding: 13px 16px 13px 19px;
+  border: 1px solid var(--line); border-radius: var(--radius-lg);
+  background: var(--panel); overflow: hidden;
+}
+.tick-spine {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: hsl(var(--hue) 52% 58%);
+}
+/* A quiet tick is present but recessive — a wall of them is what an idle cast
+   looks like, and it should not compete with the one preempt among them. */
+.tick.is-blocked { background: var(--bg-deep); }
+.tick.is-blocked .tick-spine { opacity: .4; }
+.tick.is-preempted { border-color: var(--accent-line); }
+/* Only genuinely new rows animate, so a poll does not re-animate the page. */
+.tick.is-new { animation: tick-in .26s ease both; }
+@keyframes tick-in { from { opacity: 0; transform: translateY(-4px); } }
+
+.tick-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.tick-spacer { flex: 1; }
+.tick-who {
+  font-weight: 650; font-size: .88rem; color: hsl(var(--hue) 45% 62%);
+  background: none; border: 0; padding: 0; cursor: pointer; font-family: inherit;
+}
+.tick-who:hover { text-decoration: underline; }
+.tick-cause {
+  font-family: var(--mono); font-size: .64rem; text-transform: uppercase;
+  letter-spacing: .9px; font-weight: 800; color: var(--ink-ghost);
+  border: 1px solid var(--line-2); border-radius: 3px; padding: 1px 5px;
+}
+.tick.is-preempted .tick-cause { color: var(--warn); border-color: var(--warn); }
+.tick.is-pending   .tick-cause { color: var(--info); border-color: var(--line-3); }
+.tick-beat {
+  font-family: var(--mono); font-size: .68rem; color: var(--ink-ghost);
+  font-variant-numeric: tabular-nums;
+}
+
+/* What the character perceived, verbatim. This is the model's input, not a
+   rendering of it, so it is set apart from the acts rather than mixed in. */
+.tick-perceived { display: grid; gap: 5px; }
+.perceive {
+  margin: 0; font-size: .87rem; line-height: 1.62; color: var(--ink-dim);
+  padding-left: 12px; border-left: 2px solid var(--line-2);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+/* An act, given the same treatment the landing page's demo gives one — because
+   it is the same thing: a tool in mono, the intent in the body face, italic. */
+.tick-acts { display: grid; gap: 5px; margin-top: 10px; }
+.act { display: grid; grid-template-columns: 132px 1fr; gap: 10px; align-items: baseline; }
+.act-tool {
+  font-family: var(--mono); font-size: .74rem; font-weight: 700;
+  color: var(--accent); overflow: hidden; text-overflow: ellipsis;
+}
+.act-intent { font-size: .87rem; font-style: italic; color: var(--ink-mid); line-height: 1.55; }
+.tick-silent {
+  margin-top: 10px; font-size: .8rem; color: var(--ink-ghost); font-style: italic;
+}
+
+.pulse-empty {
+  border: 1px dashed var(--line-2); border-radius: var(--radius-lg);
+  padding: 30px 24px; text-align: center;
+}
+.pulse-empty p { margin: 0; color: var(--ink-faint); font-size: .88rem; max-width: 46ch;
+  margin-inline: auto; line-height: 1.65; }
+
+/* ── the window panel, on a character's own Pulse tab ───────────────────────
+   State, not events — so it sits below the feed and reads quieter. Putting it
+   above would suggest the character perceives it fresh each tick, which is the
+   opposite of what a window is. */
+.npc-window {
+  margin-top: 26px; border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+.npc-window-hd {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 12px; margin-bottom: 11px;
+  font-size: .7rem; text-transform: uppercase; letter-spacing: 1px;
+  font-weight: 700; color: var(--ink-ghost);
+}
+.npc-window-turns { display: grid; gap: 4px; }
+.win-turn {
+  font-size: .82rem; line-height: 1.55; padding: 4px 0 4px 11px;
+  border-left: 2px solid var(--line-2); color: var(--ink-soft);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+/* The character's own turns, marked apart from what it perceived — a transcript
+   where both sides look alike is one nobody can read. */
+.win-turn.is-npc { border-left-color: var(--accent-line); color: var(--ink-mid); font-style: italic; }
+
+/* ── The life editor ─────────────────────────────────────────────────────
+   A personality's authored life, written at four resolutions. The page is a
+   review tool: the model writes, a person reads and corrects, and the states
+   that matter are the ones that say what has happened to a document —
+   `edited` (a person wrote it, and a regeneration will not touch it) and
+   `stale` (a parent changed, so it no longer follows from what is above it).
+   Both are carried on the card's left edge, because the reader is scanning a
+   column of cards for the ones that need them, not reading each in turn. */
+.life { max-width: 1100px; margin: 0 auto; padding: 26px var(--gutter) 72px; }
+.life-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+.life-head h1 { margin: 0; }
+.life-counts { display: flex; gap: 12px; font: 600 .72rem/1 var(--mono); color: var(--ink-ghost); }
+.life-actions { margin-left: auto; display: flex; gap: 8px; }
+
+/* The generating overlay. Two stages, reported separately: a forked wave
+   finishes in clumps, so a single bar that jumps 0→100 says nothing during the
+   seconds somebody is wondering whether it has hung. */
+.life-progress {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 13px 15px; margin-bottom: 16px;
+}
+.life-phases { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-bottom: 10px; }
+.life-phase { font-size: .72rem; color: var(--ink-ghost); }
+.life-phase.done { color: var(--ok); }
+.life-phase.done::before { content: '✓ '; }
+.life-phase.now { color: var(--accent); font-weight: 700; }
+.life-progress .bar { height: 5px; background: var(--panel-3); border-radius: 3px; overflow: hidden; }
+.life-progress .fill { height: 100%; background: var(--accent); transition: width .4s ease; }
+.life-detail { margin: 8px 0 0; font: .75rem/1.4 var(--mono); color: var(--ink-faint); }
+
+.life-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
+.life-tab {
+  background: none; border: 0; border-bottom: 2px solid transparent; padding: 9px 14px;
+  font-size: .82rem; font-weight: 600; color: var(--ink-faint);
+}
+.life-tab:hover { color: var(--ink-mid); }
+.life-tab.on { color: var(--accent); border-bottom-color: var(--accent); }
+
+.life-seed .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.life-seed .field.wide { display: block; margin-top: 12px; }
+.life-seed .field.wide textarea { width: 100%; }
+.field.inline { display: inline-flex; align-items: center; gap: 6px; margin-right: 12px; }
+.field.inline > span { font-size: .72rem; color: var(--ink-ghost); white-space: nowrap; }
+
+.life-phasebar { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+.life-phasebar .note { margin: 0; }
+
+.life-card {
+  border: 1px solid var(--line); border-left: 3px solid var(--line-2);
+  border-radius: var(--radius); background: var(--panel); padding: 13px 15px; margin-bottom: 12px;
+}
+.life-card > header { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 9px; }
+.life-card > header h3 { margin: 0; font-size: .95rem; }
+.life-card > header h3.link { cursor: pointer; color: var(--accent); }
+/* An edit is sticky — nothing regenerates over it but an explicit request —
+   so the card says so rather than leaving the reader to find out by losing it. */
+.life-card.edited { border-left-color: var(--accent); }
+/* Stale is an INVITATION, not an action. The parent moved; these no longer
+   follow from it, and the console offers to fix that and never does it unasked. */
+.life-card.stale { border-left-color: var(--warn); }
+.chip.edited { background: var(--accent-soft); color: var(--accent); }
+.chip.stale { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+.life-body { display: grid; gap: 7px; }
+.life-body textarea { width: 100%; resize: vertical; line-height: 1.6; }
+.life-rowactions { display: flex; gap: 7px; margin-top: 9px; }
+.life-prose { white-space: pre-wrap; line-height: 1.65; color: var(--ink-soft); margin: 0 0 10px; }
+
+.life-cast, .life-outline { width: 100%; border-collapse: collapse; font-size: .82rem; margin-bottom: 18px; }
+.life-cast th { text-align: left; font-size: .68rem; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-ghost); }
+.life-cast td, .life-cast th, .life-outline td { padding: 5px 9px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+.life-outline td:first-child { font-family: var(--mono); color: var(--ink-faint); width: 4.5em; }
+
+/* The consequence editor. These are an INPUT to generation — the operator
+   authors them and the day is written to earn them — so they sit with the day
+   rather than being read back out of it. */
+.life-cons { border-top: 1px dashed var(--line); padding-top: 10px; }
+.life-consrow {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 7px 0; border-bottom: 1px solid var(--line);
+}
+.life-consrow strong { font-size: .78rem; }
+.life-consadd { display: flex; gap: 6px; flex-wrap: wrap; margin: 9px 0; }
+.life-consrow output { font: .72rem var(--mono); color: var(--ink-faint); min-width: 3em; }
+/* An UNSET dial is not a dial set to zero — `revise_relationship` moves only
+   the dials it names, so the two produce different characters. A slider has to
+   sit somewhere, so the whole field dims until somebody actually moves it. */
+.field.inline.unset { opacity: .45; }
+.field.inline.unset output { font-style: italic; }
+.life-addday { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-top: 14px; }
+
+@media (max-width: 680px) {
+  .life-head { gap: 8px; }
+  .life-actions { margin-left: 0; }
+  .life-seed .grid { grid-template-columns: 1fr; }
+  /* The tab strip scrolls rather than wrapping: five wrapped tabs push the
+     content below the fold on a phone, and the strip stops reading as one row. */
+  .life-tabs { overflow-x: auto; }
+  .life-consrow { gap: 5px; }
+}
+
+@media (max-width: 680px) {
+  .pulse { padding-top: 18px; }
+  .pulse-hd h1 { font-size: 1.7rem; }
+  /* The act's two columns become two lines: at this width a 132px tool column
+     leaves the intent too narrow to read as a sentence. */
+  .act { grid-template-columns: 1fr; gap: 2px; }
+  .help-row { grid-template-columns: 1fr; gap: 3px; }
+  .tick-head { flex-wrap: wrap; gap: 4px 9px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tick.is-new { animation: none; }
+  .pulse-status.is-live::before { animation: none; }
+  .cast-card:hover { transform: none; }
+}
+

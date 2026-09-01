@@ -80,11 +80,31 @@
 </script>
 </head>
 <body>
+  <!-- The loading screen.
+       A restart is not instant: gigabytes of weights onto the card, then a redo
+       log replayed, then the mind's layers diffed against what the substrate
+       already holds. Tens of seconds during which a bare spinner tells a person
+       nothing about whether it is working or wedged.
+       So the phases are listed, and the one in progress names what it is on.
+       The list is static here and lit up by `app.js` from `/v1/status`, rather
+       than being built in JS — a phase list that only exists once the first
+       status arrives would flash empty on every load. -->
   <div id="boot" class="overlay">
-    <div>
+    <div class="boot-card">
       <div class="spinner"></div>
-      <div style="font-weight:700">npcd</div>
-      <div class="tiny dim" id="boot-detail" style="margin-top:6px">starting…</div>
+      <div class="boot-title">npcd</div>
+      <div class="tiny dim" id="boot-detail">starting…</div>
+      <div class="boot-bar"><div class="boot-bar-fill" id="boot-bar"></div></div>
+      <div class="tiny dim" id="boot-count"></div>
+      <ol class="boot-steps" id="boot-steps">
+        <li data-step="model">Loading model</li>
+        <li data-step="substrate">Replaying substrate</li>
+        <!-- Calibration before the layers: every layer frames on the shared
+             system prompt, and the tool catalog is part of it. -->
+        <li data-step="calibrating">Calibrating tools</li>
+        <li data-step="layers">Ingesting mind layers</li>
+        <li data-step="waking">Waking the cast</li>
+      </ol>
     </div>
   </div>
 

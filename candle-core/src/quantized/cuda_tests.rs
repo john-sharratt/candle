@@ -3878,8 +3878,8 @@ fn q2_ko_int8_grouped_matches_f32_ref() -> Result<()> {
 /// constructor, so the slice could not be dropped. Banding the repack added two fallible steps
 /// inside that window, and nothing failed — because nothing exercised the window. This does.
 ///
-/// The provocation is an `F16` source: it has no `QType`, so `dequantize_f32_into` refuses on
-/// the first band, which is *after* `dest_slice` and before the destination is written. The
+/// The provocation is a source `dequantize_f32_into` refuses on the first band, which is
+/// *after* `dest_slice` and before the destination is written. The
 /// detector is recycling pressure — a freed block goes back to the CUDA pool, and a same-sized
 /// request immediately afterwards is very likely to be handed it, so a lease that was wrongly
 /// freed shows up as a clobbered sentinel rather than as a silent success.
@@ -3903,10 +3903,16 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
         p
     };
 
-    // An F16 source: tileable shape, so it reaches the band loop, and no `QType`, so the loop's
-    // first dequantize refuses.
+    // A source with a tileable shape, so it reaches the band loop, and no `QType`, so the
+    // loop's first dequantize refuses.
+    //
+    // **This was F16, and F16 stopped working as a provocation** when the float formats gained
+    // a widening arm in `dequantize_f32_into` — they now repack like any block format, which
+    // is the whole point of that change. `P2` is a pure arena-routing format with no matmul
+    // path at all, so it is refused for a reason that will not be engineered away: a weight is
+    // never a palette index.
     let w = crate::Tensor::zeros((nrows, ncols), crate::DType::F32, &device)?;
-    let src = crate::quantized::QTensor::quantize(&w, GgmlDType::F16)?;
+    let src = crate::quantized::QTensor::quantize(&w, GgmlDType::P2)?;
     let storage = match src.storage() {
         crate::quantized::QStorage::Cuda(s) => s,
         _ => panic!("expected CUDA storage"),
@@ -3918,7 +3924,7 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
             GgmlDType::Q4_KO,
             Some((lease_ptr, LeaseOrigin::Foreign)),
         )
-        .expect_err("an F16 source has no QType and must not repack");
+        .expect_err("a P2 source has no QType and must not repack");
     let msg = err.to_string();
     assert!(
         msg.contains("unsupported dtype"),
@@ -4036,6 +4042,456 @@ fn ko_repack_scratch_is_a_bounded_band() -> Result<()> {
         got, want,
         "the host-mapped intermediate changed the repack's output bytes"
     );
+    Ok(())
+}
+
+/// **The float source takes the banded route too, and this is what says so.**
+///
+/// A source that arrives already float — an F16 `output.weight`, which real checkpoints carve
+/// out (`…NEO-IMATRIX-MAX…` does) — had no `dtype_to_qtype` arm, so `repack_ko_into` could not
+/// read it and `QMatMul::build` fell back to converting it whole: dequantize the tensor to f32,
+/// copy it again inside `QTensor::quantize`'s `force_contiguous`, quantize *that* to an
+/// intermediate `Q8_0`, and only then repack. Four whole-tensor buffers live at once. On a
+/// `[248320, 4096]` head it was 10,730 MiB to produce a twin the banded route builds inside a
+/// 48 MiB band, and it OOMed a 24 GiB card with 14 GiB free — reported only as
+/// `CUDA_ERROR_OUT_OF_MEMORY`, naming no tensor and no size.
+///
+/// So this asserts the same two properties as the test above, against the path that did not
+/// have them: the VRAM dip stays near the twin, and the bytes match the CPU codec exactly.
+/// The second is not a formality — widening with a cast where the quantized path dequantizes is
+/// a different kernel writing the same buffer, which is exactly how a correctly-sized,
+/// plausibly-valued, wrong tensor gets made.
+#[test]
+fn a_float_source_repacks_through_the_same_bounded_band() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    // Same shape as the quantized sibling, so the two are directly comparable: 8192×8192 is
+    // 256 MiB of f32 — five times the band — against a 128 MiB F16 source and a 68 MiB twin.
+    let (nrows, ncols) = (8192usize, 8192usize);
+    let n = nrows * ncols;
+    let f32_bytes = n * 4;
+
+    let device = crate::Device::Cuda(dev.clone());
+    let w: Vec<f32> = (0..n).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
+    // An F16 tensor, quantized to F16 — i.e. stored as-is, which is what a checkpoint that
+    // carves a tensor out at higher precision hands the loader.
+    let w_t = crate::Tensor::from_vec(w, (nrows, ncols), &device)?.to_dtype(crate::DType::F16)?;
+    let src = crate::quantized::QTensor::quantize(&w_t, GgmlDType::F16)?;
+    assert_eq!(src.dtype(), GgmlDType::F16);
+    // The routing predicate must admit it, or the loader never reaches this path at all.
+    assert!(
+        crate::quantized::cuda::repackable_to_ko(GgmlDType::F16),
+        "a float source must route to the banded repack"
+    );
+    assert!(
+        !crate::quantized::cuda::gemx_repacking_supported(GgmlDType::F16),
+        "…and it must do so without claiming a GEMX kernel it does not have"
+    );
+
+    let shape = src.shape().clone();
+    let storage = match src.storage() {
+        crate::quantized::QStorage::Cuda(s) => s,
+        _ => panic!("expected CUDA storage"),
+    };
+
+    dev.cuda_stream()
+        .synchronize()
+        .map_err(crate::Error::wrap)?;
+    let (free_before, _) = crate::quantized::get_vram_info()?;
+    let twin = storage.repack_ko(&shape, GgmlDType::Q8_KO)?;
+    dev.cuda_stream()
+        .synchronize()
+        .map_err(crate::Error::wrap)?;
+    let (free_after, _) = crate::quantized::get_vram_info()?;
+
+    // The entitlement is computed, not guessed: the twin, plus exactly the two bands
+    // `repack_ko_into` sizes for this shape. A borrowed constant would be wrong here — the
+    // sibling test's twin is Q4_KO, and a Q8_KO twin's KO band is proportionally larger — and
+    // loosening a constant until a test passes is how a bound stops meaning anything.
+    let twin_bytes = crate::quantized::cuda::ko_repacked_bytes(&shape, GgmlDType::Q8_KO)?;
+    let band_rows = ((crate::quantized::cuda::REPACK_BAND_BYTES / (ncols * 4)) / 8)
+        .max(1)
+        .min(nrows / 8)
+        * 8;
+    let f32_band = band_rows * ncols * 4;
+    let ko_band = band_rows / 8
+        * (ncols / 128)
+        * crate::quantized::ko_quant::ko_chunk_bytes(GgmlDType::Q8_KO);
+    let used = free_before.saturating_sub(free_after);
+    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "float repack VRAM delta {:.1} MiB | twin {:.1} + f32 band {:.1} + ko band {:.1} | \
+         the old route: source {:.1} + f32 {:.1} + its copy {:.1} + Q8_0 intermediate",
+        mib(used),
+        mib(twin_bytes),
+        mib(f32_band),
+        mib(ko_band),
+        mib(n * 2),
+        mib(f32_bytes),
+        mib(f32_bytes),
+    );
+
+    // **The threshold is deliberately loose, and the looseness is the honest part.**
+    //
+    // A tight bound here measures the CUDA pool's rounding, not the code: the same repack
+    // reported 192 MiB and 224 MiB on consecutive runs against an arithmetic figure of 126.
+    // Chasing that with a constant tuned until it passed would produce a test that fails on
+    // somebody else's driver and tells them nothing.
+    //
+    // What the test is actually for is one question — did the whole-tensor conversion come
+    // back — and the two answers are far apart. Banded is band-scale: the twin plus two bands,
+    // ~200 MiB here. The old route materialised the tensor four times over (source 128 + f32
+    // 256 + `force_contiguous`'s copy 256 + a Q8_0 intermediate 68) before it repacked
+    // anything: ~700 MiB. A line drawn at the twin plus one whole-tensor f32 sits three
+    // hundred MiB clear of one and two hundred clear of the other.
+    let whole_tensor_scale = twin_bytes + f32_bytes;
+    assert!(
+        used < whole_tensor_scale,
+        "repacking a float source held {:.1} MiB — whole-tensor scale. The conversion is no \
+         longer banded, which is the route that OOMed a 24 GiB card with 14 GiB free.",
+        mib(used),
+    );
+
+    // Byte-identical to the CPU codec over the same values. The source is F16, so the
+    // reference dequantizes it the same way the band does.
+    assert_eq!(twin.dtype(), GgmlDType::Q8_KO);
+    let got: Vec<u8> = twin.data()?;
+    let deq = storage.dequantize(n)?;
+    let src_f32: Vec<f32> = dev
+        .memcpy_dtov(deq.as_cuda_slice::<f32>()?)
+        .map_err(crate::Error::wrap)?;
+    let want = crate::quantized::ko_quant::quantize_ko(&src_f32, nrows, ncols, GgmlDType::Q8_KO);
+    assert_eq!(got.len(), want.len(), "twin byte length changed");
+    assert_eq!(
+        got, want,
+        "the widening cast changed the repack's output bytes"
+    );
+    Ok(())
+}
+
+/// **The source never reaches the device whole, and the bytes are the same anyway.**
+///
+/// Banding the f32 intermediate left one whole-tensor allocation standing: getting the source
+/// onto the card so `repack_ko_into` could read it. For a `[248320, 4096]` BF16 `output.weight`
+/// that is 1,940 MiB which exists only to be read once, in order, and dropped — and it is what
+/// finally OOMed a 24 GiB card with 14 GiB free, because the load budget's margin over it was a
+/// few tens of MiB and allocator granularity ate them.
+///
+/// `repack_ko_from_host` reads the mapping a band at a time instead, so the device peak is
+/// `staging + f32 + ko` bands and does not scale with the tensor at all. Two assertions: the
+/// device delta stays band-scale, and the twin is byte-identical to what the device-sourced
+/// path produces. The second is the one that matters most — staging changes *when* each row
+/// reaches the kernel, which is exactly how a correctly-sized, plausibly-valued, wrong tensor
+/// gets made.
+#[test]
+fn a_host_banded_repack_matches_the_device_one_without_materialising_the_source() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    // Big enough that the source dwarfs the bands: 16384×4096 BF16 is 128 MiB of source
+    // against a 48 MiB f32 band, so a regression that materialised it could not hide inside
+    // the threshold.
+    let (nrows, ncols) = (16384usize, 4096usize);
+    let n = nrows * ncols;
+    let shape = crate::Shape::from((nrows, ncols));
+
+    let w: Vec<f32> = (0..n)
+        .map(|i| ((i % 397) as f32 - 198.0) * 0.00390625)
+        .collect();
+    let w_t = crate::Tensor::from_vec(w, (nrows, ncols), &device)?.to_dtype(crate::DType::BF16)?;
+    let src = crate::quantized::QTensor::quantize(&w_t, GgmlDType::BF16)?;
+    // The tensor's bytes exactly as GGUF lays them out — which is what the loader hands this
+    // function from the memory-mapped checkpoint.
+    let host: Vec<u8> = src.data()?.to_vec();
+    let src_bytes = n * 2;
+    assert_eq!(host.len(), src_bytes, "BF16 source is 2 bytes an element");
+
+    // The reference: the device-sourced path, whose bytes are already locked by
+    // `ko_repack_scratch_is_a_bounded_band`.
+    let want = {
+        let storage = match src.storage() {
+            crate::quantized::QStorage::Cuda(s) => s,
+            _ => panic!("expected CUDA storage"),
+        };
+        storage.repack_ko(&shape, GgmlDType::Q8_KO)?.data()?
+    };
+    // Drop the device-resident source before measuring, so the delta below is the host path's
+    // own and not this reference's.
+    drop(src);
+    dev.synchronize()?;
+
+    let (free_before, _) = crate::quantized::get_vram_info()?;
+    let twin = crate::quantized::cuda::repack_ko_from_host(
+        &dev,
+        &host,
+        &shape,
+        GgmlDType::BF16,
+        GgmlDType::Q8_KO,
+        None,
+    )?;
+    dev.synchronize()?;
+    let (free_after, _) = crate::quantized::get_vram_info()?;
+
+    let twin_bytes = crate::quantized::cuda::ko_repacked_bytes(&shape, GgmlDType::Q8_KO)?;
+    let used = free_before.saturating_sub(free_after);
+    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "host-banded repack VRAM delta {:.1} MiB | twin {:.1} | the source it did NOT upload \
+         {:.1}",
+        mib(used),
+        mib(twin_bytes),
+        mib(src_bytes),
+    );
+    // The twin, plus four bands' worth of slack for the three band buffers and pool
+    // granularity. Loose for the reason the sibling test records — the same repack measured
+    // 96, 192 and 224 MiB on consecutive runs — but decisive: uploading the source would add
+    // 128 MiB and put it over.
+    let entitled = twin_bytes + 4 * crate::quantized::cuda::REPACK_BAND_BYTES;
+    assert!(
+        used <= entitled,
+        "host-banded repack held {:.1} MiB against {:.1}; the source is being materialised on \
+         the device again, which is the allocation that OOMed a 24 GiB card",
+        mib(used),
+        mib(entitled),
+    );
+
+    // And byte-identical to the device-sourced repack. Staging rows through a small buffer
+    // must not move a single output bit.
+    let got: Vec<u8> = twin.data()?;
+    assert_eq!(got.len(), want.len(), "twin byte length differs");
+    assert_eq!(
+        got, want,
+        "the host-banded read changed the repack's output bytes"
+    );
+    Ok(())
+}
+
+/// **The host-banded read must match the device one for every source it accepts**, not just
+/// the float ones that motivated it.
+///
+/// The loader routes *every* repackable projection through `repack_ko_from_host` when it has
+/// the mapping, so a bug that only shows on block-quantized sources is a bug in most of the
+/// model — and the first version of this file tested BF16 alone, which is how a whole
+/// checkpoint's worth of weights went unchecked.
+#[test]
+fn a_host_banded_repack_matches_the_device_one_for_quantized_sources_too() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+
+    // Shapes and formats a real checkpoint actually carries, including a non-square
+    // projection and a source whose blocks are 256 wide.
+    for (nrows, ncols, dtype, ko) in [
+        (4096usize, 4096usize, GgmlDType::Q6_K, GgmlDType::Q6_KO),
+        (12288, 4096, GgmlDType::Q6_K, GgmlDType::Q6_KO),
+        (4096, 12288, GgmlDType::Q4_K, GgmlDType::Q5_KO),
+        (2048, 4096, GgmlDType::Q8_0, GgmlDType::Q8_KO),
+    ] {
+        let n = nrows * ncols;
+        let w: Vec<f32> = (0..n)
+            .map(|i| ((i % 313) as f32 - 156.0) * 0.00390625)
+            .collect();
+        let w_t = crate::Tensor::from_vec(w, (nrows, ncols), &device)?;
+        let src = crate::quantized::QTensor::quantize(&w_t, dtype)?;
+        let shape = src.shape().clone();
+        let host: Vec<u8> = src.data()?.to_vec();
+
+        let want = {
+            let storage = match src.storage() {
+                crate::quantized::QStorage::Cuda(s) => s,
+                _ => panic!("expected CUDA storage"),
+            };
+            storage.repack_ko(&shape, ko)?.data()?
+        };
+        let got: Vec<u8> =
+            crate::quantized::cuda::repack_ko_from_host(&dev, &host, &shape, dtype, ko, None)?
+                .data()?;
+
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{dtype:?} [{nrows}, {ncols}] → {ko:?}: twin length differs"
+        );
+        assert_eq!(
+            got, want,
+            "{dtype:?} [{nrows}, {ncols}] → {ko:?}: the host-banded read produced different \
+             bytes from the device one. Every projection in a mapped load takes this path."
+        );
+    }
+    Ok(())
+}
+
+/// **A float source's KO twin must hold the source's numbers, not merely agree with itself.**
+///
+/// Every other test around this path compares the host-banded read against the device one. That
+/// catches a *disagreement* and is blind to the case where both routes are wrong together —
+/// which is the case that matters here, because they share `dequantize_f32_into` and the float
+/// arms of it are the newest code in the file.
+///
+/// So this one is semantic: quantize to a KO twin, pull the bytes back, and reconstruct them
+/// with `ko_quant::dequant_ko` — a CPU reference implementation that shares nothing with the
+/// CUDA path. If the widen reads at the wrong stride, swaps the halves of a bf16 word, or
+/// widens the wrong element count, the reconstruction is wrong and no amount of host/device
+/// agreement hides it.
+///
+/// `Q8_0` is here as the control. It is what the reference checkpoint carries for `ssm_out`
+/// and is known-good in production, so a failure on the float rows *with* `Q8_0` passing is a
+/// float-widen bug, and a failure on all four is a bug in the repack proper.
+///
+/// # Why this path is worth its own test
+///
+/// A float weight had no KO twin at all until recently: `to_ko` bailed, and the loader left
+/// float projections on the FP path (see `quantized_qwen35.rs`, which records that being the
+/// prime suspect behind the 0.8B's KV factors sitting ~3× tighter than its siblings'). Giving
+/// floats a twin routed a whole class of weight through the int8 kernels for the first time,
+/// and the checkpoints that carry them — third-party conversions with BF16 `ssm_*` tensors
+/// where the reference has `F32`/`Q8_0` — are exactly the ones that generate word salad.
+#[test]
+fn a_float_sources_ko_twin_reconstructs_its_source_values() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+
+    // A DeltaNet output projection's proportions, small enough to reconstruct on the CPU.
+    let (nrows, ncols) = (512usize, 1024usize);
+    let n = nrows * ncols;
+    // Deliberately not symmetric about zero and not a round power of two: an affine twin with
+    // a sign error or a dropped `min` still reconstructs symmetric data passably.
+    let w: Vec<f32> = (0..n)
+        .map(|i| ((i % 397) as f32 - 120.0) * 0.011_718_75)
+        .collect();
+    let w_t = crate::Tensor::from_vec(w.clone(), (nrows, ncols), &device)?;
+
+    for dtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::F32,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+    ] {
+        let cast = match dtype {
+            GgmlDType::F16 => w_t.to_dtype(crate::DType::F16)?,
+            GgmlDType::BF16 => w_t.to_dtype(crate::DType::BF16)?,
+            _ => w_t.clone(),
+        };
+        let src = crate::quantized::QTensor::quantize(&cast, dtype)?;
+        assert_eq!(
+            src.dtype(),
+            dtype,
+            "{dtype:?}: source did not keep its format"
+        );
+        let shape = src.shape().clone();
+        let host: Vec<u8> = src.data()?.to_vec();
+
+        // **Both routes, because the loader picks between them on a condition unrelated to
+        // correctness.** `host_banded` takes the mapping when there is one; `QMatMul::build`
+        // repacks the device tensor when there is not. A weight is equally live either way, so
+        // a float bug in one of them is a float bug in half the loads — and testing only the
+        // host route is how this test first passed while the model still generated garbage.
+        let device_twin = {
+            let storage = match src.storage() {
+                crate::quantized::QStorage::Cuda(s) => s,
+                _ => panic!("expected CUDA storage"),
+            };
+            storage.repack_ko(&shape, GgmlDType::Q8_KO)?.data()?
+        };
+        let host_twin: Vec<u8> = crate::quantized::cuda::repack_ko_from_host(
+            &dev,
+            &host,
+            &shape,
+            dtype,
+            GgmlDType::Q8_KO,
+            None,
+        )?
+        .data()?;
+
+        // The source's own loss plus Q8's. BF16 keeps 8 mantissa bits, so it dominates its row;
+        // the others are bounded by the Q8 grid over this data's range.
+        let tol = match dtype {
+            GgmlDType::BF16 => 0.12,
+            GgmlDType::F16 => 0.05,
+            _ => 0.05,
+        };
+        for (route, bytes) in [("host-banded", &host_twin), ("device", &device_twin)] {
+            let back =
+                crate::quantized::ko_quant::dequant_ko(bytes, nrows, ncols, GgmlDType::Q8_KO);
+            assert_eq!(
+                back.len(),
+                n,
+                "{dtype:?} via {route}: reconstruction has the wrong length"
+            );
+
+            let mut worst = 0f32;
+            let mut worst_at = 0usize;
+            for (i, (g, s)) in back.iter().zip(w.iter()).enumerate() {
+                let d = (g - s).abs();
+                if d > worst {
+                    worst = d;
+                    worst_at = i;
+                }
+            }
+            assert!(
+                worst <= tol,
+                "{dtype:?} → Q8_KO via {route}: reconstruction is wrong. Worst element \
+                 {worst_at}: twin says {}, source says {} (off by {worst}, tolerance {tol}). \
+                 The twin does not hold this weight's numbers, so every matmul against it is \
+                 wrong.",
+                back[worst_at],
+                w[worst_at]
+            );
+        }
+
+        assert_eq!(
+            host_twin, device_twin,
+            "{dtype:?} → Q8_KO: the two routes produced different bytes, so which one a load \
+             happens to take changes the weights"
+        );
+    }
+    Ok(())
+}
+
+/// The widening arm itself, in isolation and against every float format.
+///
+/// `dequantize_f32_into` is what makes a float source readable by the banded repack, and it is
+/// a *cast* where the quantized arms are dequant kernels — F32 is not even that, it is a copy.
+/// Three different routines behind one signature is three chances to widen the wrong number of
+/// elements or read at the wrong stride, and the band loop hides an off-by-one inside the
+/// second band where a single-band test would never look. So the tensor is deliberately larger
+/// than one band.
+#[test]
+fn the_float_widen_matches_its_source_across_band_boundaries() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    // 24 MiB of f32 — several bands at 48 MiB per band's worth of f32? No: bands are sized in
+    // f32 bytes, so 32 M elements is 128 MiB of f32 and crosses the boundary twice.
+    let n = 32 * 1024 * 1024usize;
+    let (nrows, ncols) = (n / 4096, 4096);
+    let w: Vec<f32> = (0..n)
+        .map(|i| ((i % 509) as f32 - 254.0) * 0.0078125)
+        .collect();
+    let w_t = crate::Tensor::from_vec(w.clone(), (nrows, ncols), &device)?;
+
+    for dtype in [GgmlDType::F32, GgmlDType::F16, GgmlDType::BF16] {
+        let cast = match dtype {
+            GgmlDType::F16 => w_t.to_dtype(crate::DType::F16)?,
+            GgmlDType::BF16 => w_t.to_dtype(crate::DType::BF16)?,
+            _ => w_t.clone(),
+        };
+        let q = crate::quantized::QTensor::quantize(&cast, dtype)?;
+        assert_eq!(q.dtype(), dtype);
+        let back = q.dequantize(&device)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(back.len(), n, "{dtype:?} widened the wrong element count");
+
+        // The tolerance is the format's own, not the kernel's: F32 is exact, F16 and BF16 lose
+        // mantissa bits at conversion and nothing downstream can recover them. A single
+        // tolerance for all three would either fail F32's exactness or hide a BF16 bug.
+        let tol = match dtype {
+            GgmlDType::F32 => 0.0,
+            GgmlDType::F16 => 1e-3,
+            _ => 1e-2,
+        };
+        for (i, (g, s)) in back.iter().zip(w.iter()).enumerate() {
+            assert!(
+                (g - s).abs() <= tol,
+                "{dtype:?} element {i}: widened {g}, source {s}"
+            );
+        }
+    }
     Ok(())
 }
 

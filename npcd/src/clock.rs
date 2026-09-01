@@ -156,6 +156,35 @@ pub fn with_clock(body: &Value, clock: Clock) -> Map<String, Value> {
     map
 }
 
+/// What time it is for one character, given already-taken guards.
+///
+/// **Guards in, not locks.** The two callers reach the same registries by
+/// incompatible routes — the tick driver is a plain OS thread and takes
+/// `blocking_read`, an axum handler is inside the runtime and must `.await` —
+/// and `blocking_read` from a runtime thread does not contend, it *panics*.
+/// That is not a hypothetical: the census route did exactly this, and the whole
+/// Pulse page answered with a closed connection while the tick loop it was
+/// meant to be showing ran perfectly underneath.
+///
+/// So the locking is the caller's and the lookup is here, once. Zero for a
+/// character with no world, or a world with no clock — a character whose world
+/// cannot be read has no time of its own, and inventing one would put it in a
+/// day the world has never been in.
+pub fn world_ms_for(
+    npcs: &crate::npcs::Npcs,
+    worlds: &crate::registry::Registry,
+    npc_id: u64,
+    now_ms: i64,
+) -> u64 {
+    let Some(world_id) = npcs.world_of(npc_id) else {
+        return 0;
+    };
+    worlds
+        .get(world_id)
+        .map(|r| Clock::of_world(&r.body, now_ms).now(now_ms).max(0) as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

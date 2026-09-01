@@ -48,7 +48,7 @@ Routing patterns from the prior layer predict the current layer's expert needs. 
 | **Qwen3-30B-A3B** | Current development/benchmarking | 30B total, 3B active, MoE |
 | **DeepSeek-V4-Flash-0731** | Native-sparse 1M-context port (in progress) | 284B total, 13B active, MXFP4 experts, K≡V latent attention; see `docs/deepseek_batched_paged_attention_plan.md` |
 | **Qwen3-235B-A22B** | Production Zen Code target | Requires RTX 5090 workstation |
-| **Llama-3.2-3B** | batch_test integration testing | VibeStudio/Nidum uncensored fine-tune |
+| **Llama-3.2-3B** | batch_test integration testing | VibeStudio/Nidum fine-tune (the base model is gated) |
 | Qwen3-8B/14B | Ablation baselines | — |
 
 Qwen3 thresholds are model-specific and must be re-derived for each variant. When a new model is added, re-derive the `PRODUCTION_*` constants via measurement.

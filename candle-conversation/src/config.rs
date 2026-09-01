@@ -343,6 +343,48 @@ impl SamplingConfig {
     /// - Qwen3 family: <https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/generation_config.json>
     /// - Qwen2 family: <https://huggingface.co/Qwen/Qwen2-0.5B-Instruct/raw/main/generation_config.json>
     /// - Llama/Hermes: <https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B/raw/main/generation_config.json>
+    /// The `<think>`-block and turn-ending steering every Qwen reasoning
+    /// architecture shares, applied on top of that generation's own sampling numbers.
+    ///
+    /// Shared rather than repeated per arm because the sampling numbers are what
+    /// differ between Qwen3 and Qwen3.5+, and the steering is what does not. A second
+    /// copy would let one generation keep a backstop the other quietly lost — and a
+    /// missing backstop does not fail, it produces an empty answer after a full-length
+    /// decode.
+    fn with_qwen_thinking_steering(self) -> Self {
+        // DRY is span-scoped: the kernel gates and windows it on `dry_lens[seq]` —
+        // the current structural span (reset at
+        // `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, off inside tool calls).
+        // So it runs in both thinking AND the answer but only ever sees the current
+        // span's own tokens. That is what makes it safe on the answer: it breaks a
+        // repeating loop without penalizing verbatim reproduction of numbers,
+        // identifiers, or code lifted from the prompt or an earlier span — those live
+        // outside the span DRY can see. The thinking-only temperature boost lets
+        // reasoning sample a touch hotter while the answer stays at the reference temp.
+        self.with_segment_temp_boost(0.05)
+            .with_dry_penalty(0.8, 1.75, 2, 512)
+            .with_repeat_last_n(128)
+            // EOT ramp: nudge </think> after 200 thinking tokens, full boost by 400
+            // (segment_close_ramp_len is the ramp's absolute end, not a span).  zend overrides
+            // segment_close_ramp_start/len per turn from `ThinkMode::eot_budget()`; this is the
+            // fallback for non-steered callers.  These IDs are resolved from the
+            // tokenizer at engine startup.
+            .with_segment_close_boost(2.0, 200, 400, 5.0)
+            .with_graceful_segment_close_after(220)
+            .with_force_segment_close_after(300)
+            // EOS limits are in total generated tokens (thinking + response).
+            // Think block consumes ~200-300 tokens; leave ~500-700 for the response.
+            // EOS boost ramp starts nudging at 700 total tokens, full boost by 800
+            // (eos_ramp_len is the ramp's absolute end, not a span).
+            // graceful_eos fires at the next sentence boundary after 800 tokens;
+            // forced_eos fires unconditionally at 1000 tokens.
+            // non_thinking_for_gguf_architecture overrides these back to tighter limits.
+            // zend overrides all four per turn from `ThinkMode::eos_budget()`; this
+            // is the fallback for non-steered callers.
+            .with_dynamic_eos_boost(1.0, 700, 800, 3.0)
+            .with_eos_failsafe(800, 1000)
+    }
+
     pub fn for_gguf_architecture(arch: &str) -> Self {
         match arch {
             // All Qwen3 models — dense and MoE — share the same official config.
@@ -350,45 +392,45 @@ impl SamplingConfig {
             // EOT boost ramp params are set here; the actual <think>/<​/think>
             // token IDs are resolved automatically from the tokenizer in
             // `resolve_thinking_tokens()` during engine startup.
+            //
+            // Matched to the LM Studio reference run: temp=0.8, top_k=40,
+            // top_p=0.95, repeat_penalty=1.1.  A gentle multiplicative
+            // repeat_penalty applies batch-wide.
             "qwen3" | "qwen3moe" | "qwen2moe" => Self::top_k_top_p(40, 0.95, 0.8)
-                // Matched to the LM Studio reference run: temp=0.8, top_k=40,
-                // top_p=0.95, repeat_penalty=1.1.  A gentle multiplicative
-                // repeat_penalty applies batch-wide.
-                //
-                // DRY is span-scoped: the kernel gates and windows it on
-                // `dry_lens[seq]` — the current structural span (reset at
-                // `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, off inside
-                // tool calls).  So it runs in both thinking AND the answer but
-                // only ever sees the current span's own tokens.  That is what
-                // makes it safe on the answer: it breaks a repeating loop without
-                // penalizing verbatim reproduction of numbers, identifiers, or
-                // code lifted from the prompt or an earlier span — those live
-                // outside the span DRY can see.  The thinking-only temperature
-                // boost lets reasoning sample a touch hotter while the answer
-                // stays at the reference temp.
-                .with_segment_temp_boost(0.05)
-                .with_dry_penalty(0.8, 1.75, 2, 512)
                 .with_repeat_penalty(1.1)
-                .with_repeat_last_n(128)
-                // EOT ramp: nudge </think> after 200 thinking tokens, full boost by 400
-                // (segment_close_ramp_len is the ramp's absolute end, not a span).  zend overrides
-                // segment_close_ramp_start/len per turn from `ThinkMode::eot_budget()`; this is the
-                // fallback for non-steered callers.  These IDs are resolved from the
-                // tokenizer at engine startup.
-                .with_segment_close_boost(2.0, 200, 400, 5.0)
-                .with_graceful_segment_close_after(220)
-                .with_force_segment_close_after(300)
-                // EOS limits are in total generated tokens (thinking + response).
-                // Think block consumes ~200-300 tokens; leave ~500-700 for the response.
-                // EOS boost ramp starts nudging at 700 total tokens, full boost by 800
-                // (eos_ramp_len is the ramp's absolute end, not a span).
-                // graceful_eos fires at the next sentence boundary after 800 tokens;
-                // forced_eos fires unconditionally at 1000 tokens.
-                // non_thinking_for_gguf_architecture overrides these back to tighter limits.
-                // zend overrides all four per turn from `ThinkMode::eos_budget()`; this
-                // is the fallback for non-steered callers.
-                .with_dynamic_eos_boost(1.0, 700, 800, 3.0)
-                .with_eos_failsafe(800, 1000),
+                .with_qwen_thinking_steering(),
+
+            // **Qwen3.5 and later — their own published sampling, the same steering.**
+            //
+            // Qwen publish `temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5`
+            // for this generation and name the presence penalty as what "reduces endless
+            // repetitions". The difference from the Qwen3 row above is visible in the
+            // output, not just on paper: with the fallback's values the life generator
+            // produced an invented world, and with these it produced the character, on
+            // canon, at the right dates.
+            //
+            // **Being absent from this table is silent and catastrophic**, which is why
+            // the list is long. The `_` arm below leaves `top_k` unset, the `</think>`
+            // close ramp at `0` (disabled) and no EOS failsafe — so a checkpoint that
+            // does not close its own reasoning block runs to `max_response_tokens` and
+            // the caller discards the whole decode as all-reasoning. A stock checkpoint
+            // hides that by always self-closing; an abliterated or merged one does not,
+            // and the symptom is an empty document reported as a success. `qwen35` was
+            // missing here while the entire lineage loaded through it, and three
+            // separate third-party conversions were blamed for the result first.
+            //
+            // llama.cpp currently names this whole lineage by its first release —
+            // `qwen35` / `qwen35moe` cover Qwen3.5, Qwen3.6 and Qwen3.8 alike (see
+            // `candle-transformers/src/models/qwen35/mod.rs`). The `qwen36*` and
+            // `qwen38*` spellings are listed against the day it stops doing that: the
+            // cost of a string nobody emits is one alternation, and the cost of a
+            // missing one is the paragraph above.
+            "qwen35" | "qwen35moe" | "qwen36" | "qwen36moe" | "qwen38" | "qwen38moe" => {
+                Self::top_k_top_p(20, 0.8, 0.7)
+                    .with_presence_penalty(1.5)
+                    .with_repeat_penalty(1.0)
+                    .with_qwen_thinking_steering()
+            }
 
             // Qwen2 instruct models.
             "qwen2" => Self::top_k_top_p(20, 0.8, 0.7).with_repeat_penalty(1.1),
@@ -409,14 +451,21 @@ impl SamplingConfig {
     pub fn non_thinking_for_gguf_architecture(arch: &str) -> Option<Self> {
         match arch {
             // Qwen3 family non-thinking: matched exactly to LM Studio reference run
-            // (qwen3-30b-a3b-abliterated-untied-i1 @ Q4_K_M, 2026-02-20).
+            // (a Qwen3-30B-A3B Q4_K_M conversion, 2026-02-20).
             // LM Studio params: temp=0.8, top_k=40, top_p=0.95, repeat_penalty=1.1, min_p=0.05.
             // min_p is not yet implemented in this sampler; all other params match.
             // Qwen3 non-thinking: no think block overhead, so all tokens are
             // response content.  EOS boost ramp starts at 400 tokens, full by 500.
             // graceful_eos fires at next sentence boundary after 512 tokens;
             // forced_eos fires unconditionally at 700 tokens.
-            "qwen3" | "qwen3moe" | "qwen2moe" => Some(
+            //
+            // The 3.5-and-later strings are listed for the same reason they are in
+            // [`Self::for_gguf_architecture`]: returning `None` here says "this
+            // family has no thinking mode", which is false for every one of them —
+            // `builder.rs` reads `<think>` straight out of their chat templates and
+            // reports `thinking=true` in the same load.
+            "qwen3" | "qwen3moe" | "qwen2moe" | "qwen35" | "qwen35moe" | "qwen36" | "qwen36moe"
+            | "qwen38" | "qwen38moe" => Some(
                 Self::for_gguf_architecture(arch)
                     .with_no_segment_close()
                     .with_dynamic_eos_boost(1.0, 400, 100, 3.0)
@@ -1596,6 +1645,74 @@ mod scheduler_config_tests {
 #[cfg(test)]
 mod sampling_config_tests {
     use super::SamplingConfig;
+
+    /// Every architecture string the repository can load, and whether its family
+    /// reasons in a `<think>` block.
+    ///
+    /// One list, used by both directions of the test below, so an arch added to
+    /// the table without a steering arm — or given an arm it should not have —
+    /// fails here rather than in a decode months later.
+    const THINKING_ARCHES: &[&str] = &[
+        "qwen3",
+        "qwen3moe",
+        "qwen2moe",
+        "qwen35",
+        "qwen35moe",
+        "qwen36",
+        "qwen36moe",
+        "qwen38",
+        "qwen38moe",
+    ];
+
+    /// **A missing arch string is silent, so this test is the thing that speaks.**
+    ///
+    /// `for_gguf_architecture` falls through to a conservative `_` arm for anything
+    /// it does not recognise, and that arm leaves `force_segment_close_after` at `0`
+    /// — disabled. A model that then fails to close its own `<think>` block runs to
+    /// `max_response_tokens` and the caller throws the entire decode away as
+    /// all-reasoning: an empty document, reported as a success, with nothing in any
+    /// log to say what happened.
+    ///
+    /// That is not hypothetical. `qwen35` was absent from the table while the whole
+    /// Qwen3.5/3.6/3.8 lineage loaded through it, and three separate third-party
+    /// conversions were blamed for the result before the arm was found missing.
+    #[test]
+    fn every_thinking_arch_gets_a_close_backstop_and_an_eos_failsafe() {
+        for arch in THINKING_ARCHES {
+            let c = SamplingConfig::for_gguf_architecture(arch);
+            assert!(
+                c.force_segment_close_after > 0,
+                "{arch}: no </think> backstop — it fell through to the `_` arm"
+            );
+            assert!(
+                c.graceful_segment_close_after > 0,
+                "{arch}: no graceful </think> close"
+            );
+            assert!(c.forced_eos_after > 0, "{arch}: no EOS failsafe");
+            assert!(
+                c.top_k > 0,
+                "{arch}: top_k unset — the `_` arm's signature symptom"
+            );
+            assert!(
+                SamplingConfig::non_thinking_for_gguf_architecture(arch).is_some(),
+                "{arch}: reports no thinking mode, but its chat template has <think>"
+            );
+        }
+    }
+
+    /// The guard above only means something if the fallback really is bare — if the
+    /// `_` arm ever grew a backstop of its own, every assertion there would pass for
+    /// an arch that was never actually added.
+    #[test]
+    fn the_unknown_arch_fallback_is_genuinely_bare() {
+        let c = SamplingConfig::for_gguf_architecture("something-nobody-has-heard-of");
+        assert_eq!(c.force_segment_close_after, 0);
+        assert_eq!(c.top_k, 0);
+        assert!(SamplingConfig::non_thinking_for_gguf_architecture(
+            "something-nobody-has-heard-of"
+        )
+        .is_none());
+    }
 
     #[test]
     fn segment_temp_boost_defaults_to_zero() {

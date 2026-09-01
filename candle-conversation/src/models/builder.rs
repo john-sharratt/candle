@@ -122,6 +122,17 @@ pub struct ModelBuilder {
     /// `None` (the default) uses a temp file, unlinked as soon as it is open, so
     /// nothing is left on disk and the repack is paid on every start.
     expert_pack_dir: Option<PathBuf>,
+    /// Override for [`SchedulerConfig::large_prefill_max_tokens`].
+    ///
+    /// `None` keeps the default, which is sized for interactive serving where
+    /// only a turn or two is ever queued. A workload that reliably has more than
+    /// that waiting — a bulk ingest — wants it at the model ceiling instead; see
+    /// [`ModelBuilder::prefill_pass_tokens`].
+    prefill_pass_tokens: Option<usize>,
+    /// LoRA adapters to load alongside the base weights — `(name, directory)`.
+    ///
+    /// Empty by default. See [`ModelBuilder::lora`].
+    loras: Vec<(String, PathBuf)>,
 }
 
 impl ModelBuilder {
@@ -149,8 +160,57 @@ impl ModelBuilder {
             disable_summariser: false,
             layer_corrupt_turn: HashMap::new(),
             expert_pack_dir: None,
+            prefill_pass_tokens: None,
+            loras: Vec::new(),
             spec,
         }
+    }
+
+    /// Load a PEFT LoRA adapter from `dir` under `name`, available to any
+    /// conversation that asks for it.
+    ///
+    /// `dir` holds `adapter_config.json` and `adapter_model.safetensors` as PEFT
+    /// writes them. The adapter is loaded **up front**, with the model: it is a
+    /// few hundred megabytes shared by every conversation that opts in, and
+    /// loading it per conversation would pay that repeatedly for one copy.
+    ///
+    /// **Nothing is merged into the base weights.** The base projection is still
+    /// the quantized `Wx`; the adapter adds a rank-`r` term to its result. So
+    /// one resident checkpoint serves adapted and unadapted conversations at the
+    /// same time, which is what makes the opt-in per conversation possible at
+    /// all — see [`Conversation::set_lora`](crate::Conversation::set_lora).
+    ///
+    /// Called more than once to load several adapters; each is addressed by its
+    /// own name. Waves are grouped by adapter, so a conversation's choice never
+    /// affects another's output — only which wave it rides in.
+    pub fn lora(mut self, name: impl Into<String>, dir: impl Into<PathBuf>) -> Self {
+        self.loras.push((name.into(), dir.into()));
+        self
+    }
+
+    /// How many tokens one prefill forward carries.
+    ///
+    /// **A wave's fixed cost is paid per slab regardless of width** — the
+    /// per-layer routing readback and expert sweep, measured at ~2.37 s on the
+    /// 35B — while the compute-saturation cap is soft: tokens past it cost the
+    /// same per token as the ones before. So the budget decides how often that
+    /// fixed cost is paid, and a workload whose items are nearly as large as the
+    /// budget pays it *per item*.
+    ///
+    /// That is exactly what it cost `npcd`'s layer ingest. Its documents average
+    /// ~1,900 tokens against the 2,048 default, so every document was its own
+    /// slab and every slab paid the whole fixed sweep: measured 1.9 s a document
+    /// with the GPU at 100%, for work that should run at the batched-forward
+    /// gate's rate.
+    ///
+    /// The default is deliberately conservative because interactive serving
+    /// rarely has more than a turn queued, and a forward that runs starved
+    /// wastes the same fixed cost on fewer tokens. Raise it only where the
+    /// workload reliably keeps a wide forward fed. Bounded above by the model's
+    /// own per-forward ceiling, which the scheduler clamps to.
+    pub fn prefill_pass_tokens(mut self, tokens: usize) -> Self {
+        self.prefill_pass_tokens = Some(tokens);
+        self
     }
 
     /// Keep the repacked expert pack in `dir` instead of a temp file.
@@ -286,11 +346,21 @@ impl ModelBuilder {
 
         let spec = ModelSpec {
             arch,
+            // A model detected from a local GGUF brings no adapters of its own.
+            // The caller attaches any it wants with `ModelBuilder::lora`, which
+            // is the same path a preset's adapters take.
+            loras: Vec::new(),
             chat_format: dialect_type,
             dialect: dialect_type.dialect(),
             model_repo: String::new(),
             model_filename: gguf_filename,
             model_bytes,
+            // Built from a local file, which has no repository to pin a revision in.
+            model_rev: String::new(),
+            // A custom model replaced nothing, so there is no base to read gates from. Such a
+            // checkpoint is refused outright if its recurrent gates are quantized — which is
+            // the right answer when the caller chose the file themselves.
+            gate_donor: None,
             tokenizer_repo: String::new(),
             // A custom model is built from local files; there is no repo to
             // pin a revision of.
@@ -634,6 +704,9 @@ impl ModelBuilder {
         let mut ret = EngineConfig::new(eos_tokens.into());
         ret.disable_summariser = self.disable_summariser;
         ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
+        if let Some(n) = self.prefill_pass_tokens {
+            ret.scheduler.large_prefill_max_tokens = n;
+        }
         ret.batched_config.compression_level = Some(self.kv_compression_level);
         // Stress test: uniform-K pin REMOVED — both K and V now use fully
         // adaptive per-(head,palette) selection with non-identity pal_maps,
@@ -797,10 +870,52 @@ impl ModelBuilder {
                         // measured on the 3.6-35B) instead of reading the one
                         // beside the checkpoint.
                         expert_pack_dir: self.expert_pack_dir.clone(),
+                        gate_donor_path: self.gate_donor_path(model_path)?,
                         ..Default::default()
                     },
                 )
                 .map_err(ConversationError::Model)?;
+                Ok(Box::new(model))
+            }
+            ModelArch::Qwen35Dense => {
+                use candle_transformers::models::quantized_qwen35;
+                use candle_transformers::models::qwen35::Qwen35LoadOptions;
+                // Per-layer progress not yet wired for this arch.
+                let _ = progress;
+                // KV is allocated per ATTENTION layer, not per transformer
+                // layer, and the window budget is derived from the config.
+                let _ = max_seq;
+                // No `expert_pack_dir`: a dense checkpoint has no experts to
+                // pack, so there is nothing for a pack directory to hold and an
+                // empty one beside the model would only confuse.
+                let mut model = quantized_qwen35::from_gguf_path(
+                    model_path,
+                    device,
+                    Qwen35LoadOptions {
+                        gate_donor_path: self.gate_donor_path(model_path)?,
+                        ..Default::default()
+                    },
+                )
+                .map_err(ConversationError::Model)?;
+                // Adapters load after the base weights and before the model is
+                // handed to the scheduler, in the activation width the stack
+                // computes in — PEFT stores them F32, and converting per
+                // projection would be a full-tensor pass on the hot path.
+                // BF16 for this lineage — the width the residual stream flows
+                // in, which is what an adapter's `A` matmul consumes. Taken
+                // from the arch rather than named here so the adapter cannot
+                // disagree with the norms, which are materialised from the same
+                // answer.
+                let act = self
+                    .spec
+                    .arch
+                    .native_activation_dtype()
+                    .unwrap_or(candle::DType::F16);
+                for (name, dir) in self.resolve_loras()? {
+                    model
+                        .load_adapter(&name, &dir, act)
+                        .map_err(ConversationError::Model)?;
+                }
                 Ok(Box::new(model))
             }
         }
@@ -1275,26 +1390,179 @@ impl ModelBuilder {
     /// exact length the spec records. A cache hit is the answer, and asking
     /// anyway only makes startup depend on the network.
     #[cfg(feature = "hub")]
-    fn resolve_repo_file(&self, repo: &str, filename: &str) -> crate::Result<PathBuf> {
+    /// A file from a repository, at `rev` when one is pinned.
+    ///
+    /// An empty `rev` resolves `main`, which is right for a local custom model and a gap
+    /// anywhere else — see [`ModelSpec::model_rev`].
+    fn resolve_repo_file(&self, repo: &str, rev: &str, filename: &str) -> crate::Result<PathBuf> {
         use hf_hub::api::sync::Api;
-        use hf_hub::Cache;
+        use hf_hub::{Cache, Repo, RepoType};
 
-        if let Some(hit) = cached_repo_file(&Cache::default(), repo, filename) {
+        if let Some(hit) = cached_repo_file(&Cache::default(), repo, rev, filename) {
             return Ok(hit);
         }
-        Api::new()
-            .map_err(|e| ConversationError::Download(e.to_string()))?
-            .model(repo.to_string())
-            .get(filename)
-            .map_err(|e| ConversationError::Download(e.to_string()))
+        let api = Api::new().map_err(|e| ConversationError::Download(e.to_string()))?;
+        let got = match rev {
+            "" => api.model(repo.to_string()).get(filename),
+            r => api
+                .repo(Repo::with_revision(
+                    repo.to_owned(),
+                    RepoType::Model,
+                    r.to_owned(),
+                ))
+                .get(filename),
+        };
+        got.map_err(|e| ConversationError::Download(e.to_string()))
     }
 
+    /// The base checkpoint to read the DeltaNet recurrent gates from, if this one needs it.
+    ///
+    /// **Fetched only when the primary is actually defective**, which is what makes recording
+    /// a donor on every override free: the ordinary case reads one header and returns `None`,
+    /// and the second checkpoint — several gigabytes — is downloaded only for a fine-tune that
+    /// cannot run without it.
+    ///
+    /// `None` covers three different situations that all mean "load the primary as it is":
+    /// no override is in effect, the primary stores its gates at F32, or the file is not of a
+    /// lineage that has gates at all.
+    #[cfg(feature = "hub")]
+    fn gate_donor_path(&self, model_path: &Path) -> crate::Result<Option<PathBuf>> {
+        use candle_transformers::models::qwen35::quantized_weights::undersized_gates;
+
+        let Some((repo, rev, filename)) = self.spec.gate_donor.clone() else {
+            return Ok(None);
+        };
+        let mut f = std::fs::File::open(model_path)?;
+        let content = candle::quantized::gguf_file::Content::read(&mut f)
+            .map_err(ConversationError::Model)?;
+        let bad = undersized_gates(&content);
+        if bad.is_empty() {
+            return Ok(None);
+        }
+        tracing::warn!(
+            "this checkpoint stores {} DeltaNet recurrent gates below F32 (`{}` is {:?}); \
+             reading them from the base checkpoint {repo} instead, which is what this \
+             override replaced",
+            bad.len(),
+            bad[0].0,
+            bad[0].1,
+        );
+        Ok(Some(self.resolve_repo_file(&repo, &rev, &filename)?))
+    }
+
+    #[cfg(not(feature = "hub"))]
+    fn gate_donor_path(&self, _: &Path) -> crate::Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    /// The checkpoint and the tokenizer, each at its pinned revision.
+    ///
+    /// **Both revisions are passed, and until recently neither was.** `tokenizer_rev` was
+    /// added to stop the vocabulary moving under a substrate — the field was set by every
+    /// preset and then never read here, so resolution still fell through to `main` and the pin
+    /// existed only on paper. `model_rev` arrived with the same job and would have inherited
+    /// the same fate one line below. A pin that nothing consults is worse than no pin: it
+    /// reads as protection.
     #[cfg(feature = "hub")]
     fn download_or_fail(&self) -> crate::Result<(PathBuf, PathBuf)> {
-        let model_path =
-            self.resolve_repo_file(&self.spec.model_repo, &self.spec.model_filename)?;
-        let tokenizer_path = self.resolve_repo_file(&self.spec.tokenizer_repo, "tokenizer.json")?;
+        let model_path = self.resolve_repo_file(
+            &self.spec.model_repo,
+            &self.spec.model_rev,
+            &self.spec.model_filename,
+        )?;
+        let tokenizer_path = self.resolve_repo_file(
+            &self.spec.tokenizer_repo,
+            &self.spec.tokenizer_rev,
+            "tokenizer.json",
+        )?;
         Ok((model_path, tokenizer_path))
+    }
+
+    /// Every adapter this build should load, as `(name, directory)`.
+    ///
+    /// Two sources, and they mean different things. The spec's
+    /// [`loras`](ModelSpec::loras) are the ones the model *comes with* — the
+    /// preset's, or whatever `models.override.yaml` replaced them with — and are
+    /// fetched from HuggingFace here. [`Self::lora`]'s are the ones this
+    /// particular build was told about, already local. Both end up in the same
+    /// registry, addressed by name.
+    ///
+    /// A name collision is refused rather than resolved. The registry is a map,
+    /// so a duplicate would silently keep whichever was inserted last, and a
+    /// conversation asking for that name would get an adapter nobody chose.
+    fn resolve_loras(&self) -> crate::Result<Vec<(String, PathBuf)>> {
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+
+        for l in &self.spec.loras {
+            let dir = self.resolve_lora_repo(&l.repo, &l.revision)?;
+            out.push((l.name.clone(), dir));
+        }
+        for (name, dir) in &self.loras {
+            out.push((name.clone(), dir.clone()));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for (name, _) in &out {
+            if !seen.insert(name.clone()) {
+                return Err(ConversationError::Model(candle::Error::Msg(format!(
+                    "two LoRA adapters are both called {name:?} — the name is how a \
+                     conversation selects one, so a duplicate silently serves whichever \
+                     loaded last"
+                ))));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch a PEFT adapter's two files and return the directory holding them.
+    ///
+    /// PEFT writes `adapter_config.json` and `adapter_model.safetensors` side by
+    /// side and the loader reads the pair, so this fetches both and hands back
+    /// their common parent — which is the one way a LoRA's coordinates differ
+    /// from a GGUF's, where a single filename is the whole answer.
+    #[cfg(feature = "hub")]
+    fn resolve_lora_repo(&self, repo: &str, revision: &str) -> crate::Result<PathBuf> {
+        use hf_hub::api::sync::Api;
+        use hf_hub::{Cache, Repo, RepoType};
+
+        let r = Repo::with_revision(repo.to_owned(), RepoType::Model, revision.to_owned());
+        let mut dirs = Vec::new();
+        for f in ["adapter_config.json", "adapter_model.safetensors"] {
+            let path = match Cache::default().repo(r.clone()).get(f) {
+                Some(hit) => hit,
+                None => Api::new()
+                    .map_err(|e| ConversationError::Download(e.to_string()))?
+                    .repo(r.clone())
+                    .get(f)
+                    .map_err(|e| ConversationError::Download(e.to_string()))?,
+            };
+            let dir = path
+                .parent()
+                .ok_or_else(|| {
+                    ConversationError::Download(format!("{path:?} has no parent directory"))
+                })?
+                .to_path_buf();
+            dirs.push(dir);
+        }
+        // Both files share a revision directory in the cache. Asserted rather
+        // than assumed: a loader pointed at a directory holding only one of the
+        // two fails in a way that reads as a corrupt adapter.
+        if dirs[0] != dirs[1] {
+            return Err(ConversationError::Download(format!(
+                "LoRA {repo}@{revision}: its two files landed in different directories, \
+                 {:?} and {:?}",
+                dirs[0], dirs[1]
+            )));
+        }
+        Ok(dirs.remove(0))
+    }
+
+    #[cfg(not(feature = "hub"))]
+    fn resolve_lora_repo(&self, repo: &str, _revision: &str) -> crate::Result<PathBuf> {
+        Err(ConversationError::Download(format!(
+            "this model declares the LoRA adapter {repo:?}, which has to be downloaded — \
+             enable the 'hub' feature, or use ModelBuilder::lora with a local directory"
+        )))
     }
 
     #[cfg(not(feature = "hub"))]
@@ -1314,8 +1582,23 @@ impl ModelBuilder {
 /// the rule is what keeps a daemon startable when the hub is unreachable, and
 /// it is worth a test that does not depend on what happens to be downloaded.
 #[cfg(feature = "hub")]
-fn cached_repo_file(cache: &hf_hub::Cache, repo: &str, filename: &str) -> Option<PathBuf> {
-    cache.model(repo.to_string()).get(filename)
+fn cached_repo_file(
+    cache: &hf_hub::Cache,
+    repo: &str,
+    rev: &str,
+    filename: &str,
+) -> Option<PathBuf> {
+    use hf_hub::{Repo, RepoType};
+    match rev {
+        "" => cache.model(repo.to_string()).get(filename),
+        r => cache
+            .repo(Repo::with_revision(
+                repo.to_owned(),
+                RepoType::Model,
+                r.to_owned(),
+            ))
+            .get(filename),
+    }
 }
 
 #[cfg(all(test, feature = "hub"))]

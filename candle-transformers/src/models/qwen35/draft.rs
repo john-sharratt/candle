@@ -58,6 +58,7 @@ use crate::models::batched_layer::{
 };
 use crate::models::delta_net::SeqSpan;
 use crate::models::kv_cache_utils::SequenceContext;
+use crate::models::lora::LayerLora;
 use crate::models::operand_guard::expect_dtype;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
@@ -212,6 +213,10 @@ pub fn head_wave_pass(
         n_kv_head: q.cfg.num_kv_heads,
         head_dim: q.cfg.attn_head_dim,
         rotary: model.rotary(),
+        // The drafter proposes; the adapted trunk verifies. See the same field
+        // in `mtp.rs` for why leaving the head unadapted costs acceptance rate
+        // and never correctness.
+        lora: LayerLora::default(),
     };
     let mut cache_refs: Vec<&mut KvCache> = contexts
         .iter_mut()
@@ -572,6 +577,7 @@ mod tests {
                 int8mode: Some(Int8Mode::Off),
                 expert_pack_dir: None,
                 mtp_path: None,
+                gate_donor_path: None,
             },
         )?;
         assert!(model.has_drafter(), "the pinned 9B carries an MTP head");

@@ -27,6 +27,7 @@ extern crate intel_mkl_src;
 
 use candle::quantized::gguf_file;
 use candle::{Device, Result, Tensor};
+use candle_transformers::model_overrides::{self, Checkpoint};
 use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
@@ -59,13 +60,35 @@ enum ModelFamily {
 }
 
 impl ModelFamily {
-    fn gguf_repo(&self) -> &str {
+    /// This family's checkpoint, after any local override.
+    ///
+    /// Only the families a deployment is likely to substitute carry an override
+    /// key; the rest resolve straight to the repository's own coordinates. See
+    /// `candle_transformers::model_overrides` — the same file the serving
+    /// presets read.
+    fn checkpoint(&self) -> Checkpoint {
+        let default = Checkpoint::new(self.default_repo(), "main", self.gguf_filename());
+        match self {
+            Self::Llama3_2_3b => model_overrides::checkpoint("Llama3_2_3B", default),
+            _ => default,
+        }
+    }
+
+    fn gguf_repo(&self) -> String {
+        self.checkpoint().repo
+    }
+
+    /// The repository's own coordinates, before any override.
+    fn default_repo(&self) -> &str {
         match self {
             Self::Qwen3_30bA3b => "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
             Self::Qwen3_14b => "unsloth/Qwen3-14B-GGUF",
             Self::Qwen3_8b | Self::Qwen3_8bQ8 => "unsloth/Qwen3-8B-GGUF",
             Self::Qwen2_7b => "Qwen/Qwen2-7B-Instruct-GGUF",
-            Self::Llama3_2_3b => "VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF",
+            // The Instruct conversion, not the base model: Meta's own repo is
+            // gated behind HF authentication, so an eval nobody can run without
+            // credentials is an eval most people cannot reproduce.
+            Self::Llama3_2_3b => "bartowski/Llama-3.2-3B-Instruct-GGUF",
         }
     }
 
@@ -76,7 +99,7 @@ impl ModelFamily {
             Self::Qwen3_8b => "Qwen3-8B-Q4_K_M.gguf",
             Self::Qwen3_8bQ8 => "Qwen3-8B-Q8_0.gguf",
             Self::Qwen2_7b => "qwen2-7b-instruct-q4_0.gguf",
-            Self::Llama3_2_3b => "model-Q4_K_M.gguf",
+            Self::Llama3_2_3b => "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
         }
     }
 

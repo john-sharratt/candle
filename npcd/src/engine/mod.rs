@@ -1,37 +1,69 @@
-//! The surface an inference engine would answer, wired and honest about being
-//! empty.
+//! The engine: the cast's loop, the act vocabulary, and the routes above them.
 //!
-//! # Why these are routes at all
+//! # What is live
 //!
-//! Everything here needs something to have *run*: a substrate with turns in it,
-//! a projection composed for a tick, a monitor that scored an overlap, a model
-//! that generated a portrait. This daemon runs none of that yet.
+//! The whole perception half and the loop that drives it. Characters are woken
+//! at startup, tick on their own salience-driven heartbeats, drain their inboxes
+//! as prose, decode through [`mind`], and roll their conversation over at the day
+//! boundary. [`pulse`] is the instrument for watching all of it; [`slash`] is how
+//! an operator puts an event into a character's inbox by hand.
 //!
-//! They used to fall through to the console's fixture, which answered every one
-//! of them with invented data — for any character id, including ones that do
-//! not exist. That is the worst shape a fixture can take: not obviously fake,
-//! in the place the real thing belongs. A reader could not tell a substrate
-//! with nothing in it from one they were being shown a story about.
+//! Submodules, roughly in the order a character meets them:
 //!
-//! So the routes are here, they check the things that *can* be checked — the
-//! character exists, the caller owns it, the layer is one the schema declares —
-//! and then they say what is true:
+//! | Module | What it owns |
+//! |---|---|
+//! | [`loading`] | the startup phases the console's loading screen reads |
+//! | [`runtime`] | standing the engine up, and the thread that keeps it running |
+//! | [`event`] | what arrives in an inbox, and the prose it becomes |
+//! | [`tick`] | the scheduler: every character's loop, and what runs when |
+//! | [`window`] | the bounded verbatim tail carried into the next decode |
+//! | [`persona`] | an authored record rendered as the person the model reads |
+//! | [`prompt`] | the lens: identity, beliefs, vocabulary, the call format |
+//! | [`tools`] | the act vocabulary, with its calibration examples |
+//! | [`act`] | reading acts back out of what the character said |
+//! | [`mind`] | the per-character conversation and the decode itself |
+//! | [`sleep`] | the day boundary: tombstone yesterday, open today |
+//! | [`watcher`] | the mind directory, reloaded without a restart |
+//! | [`slash`] | `/` commands — an operator speaking to the loop |
+//! | [`pulse`] | the routes the Pulse view reads |
+//!
+//! # What is still absent, and says so
+//!
+//! Some routes here need machinery that does not exist yet: a projection
+//! composed for a tick, a monitor that scored an overlap, a model that generated
+//! a portrait. Those answer honestly rather than plausibly, which is the rule
+//! this module was written to enforce:
 //!
 //! - **Empty, where empty is the measurement.** A character that has never run
-//!   has no turns in any layer. `[]` is the honest answer and the console
-//!   renders it as "nothing in this layer yet".
-//! - **Absent, where nothing has measured.** A projection, a monitor band, a
-//!   resident percentage. `null`, never `0` — a zero is a measurement, and
-//!   reporting one nothing took is the fabrication this module exists to end.
-//! - **`503 no_engine`, where the request asks for work.** Probing retrieval,
-//!   opening an interaction, generating a portrait. A refusal that names what
-//!   is missing, rather than a job id that will never complete.
+//!   has no turns in a layer. `[]` is the honest answer.
+//! - **Absent, where nothing has measured.** `null`, never `0` — a zero is a
+//!   measurement, and reporting one nothing took is a fabrication.
+//! - **`503 no_engine`, where the request asks for work nothing can do yet.**
+//!   A refusal that names what is missing, rather than a job id that will never
+//!   complete.
 //!
-//! # What changes when there is an engine
-//!
-//! These handlers, and nothing else. The routes, their roles, their shapes and
-//! the console above them are already what they will be — which is the point of
-//! wiring them now rather than leaving them to the fixture.
+//! They used to fall through to the console's fixture, which answered every one
+//! of them with invented data for any character id, including ones that did not
+//! exist — not obviously fake, and in the place the real thing belongs.
+
+pub mod act;
+pub mod authoring;
+pub mod event;
+pub mod ingest;
+pub mod life;
+pub mod loading;
+pub mod mind;
+pub mod persona;
+pub mod prompt;
+pub mod pulse;
+pub mod runtime;
+pub mod schema;
+pub mod slash;
+pub mod sleep;
+pub mod tick;
+pub mod tools;
+pub mod watcher;
+pub mod window;
 
 use std::sync::Arc;
 
@@ -100,9 +132,21 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         .route("/v1/interaction/:ix/inject", Role::User, post(inject))
         .route("/v1/interaction/:ix/stream", Role::User, get(stream))
         // ── the act vocabulary ──────────────────────────────────────────────
-        .route("/v1/tools", Role::User, get(tools))
+        //
+        // Real: the catalog and the `/` command list are compiled in, and both
+        // are served rather than duplicated in the console so the two cannot
+        // drift. Calibration still needs the engine.
+        .route("/v1/tools", Role::User, get(pulse::tools))
         .route("/v1/tools/calibrate", Role::Admin, post(calibrate))
-        .route("/v1/commands", Role::User, get(commands))
+        .route("/v1/commands", Role::User, get(pulse::commands))
+        // ── Pulse: the cast's loop, as an instrument ────────────────────────
+        .route("/v1/pulse", Role::User, get(pulse::feed))
+        .route("/v1/pulse/census", Role::User, get(pulse::census))
+        .route("/v1/npc/:nid/pulse", Role::User, post(pulse::inject))
+        .route("/v1/npc/:nid/window", Role::User, get(pulse::window))
+        // Admin: it reaches characters the caller does not own, which every
+        // other route on this daemon refuses to do.
+        .route("/v1/pulse/broadcast", Role::Admin, post(pulse::broadcast))
         // ── generation ──────────────────────────────────────────────────────
         .route(
             "/v1/generate/description",
@@ -145,21 +189,24 @@ async fn events(ws: WebSocketUpgrade) -> Response {
 /// Every route here is about one character, so every one of them 404s for a
 /// character that does not exist — which is the difference the fixture could
 /// not make, since it answered for any id at all.
-async fn owned(s: &Arc<Authored>, headers: &HeaderMap, nid: &str) -> Result<u64, Response> {
-    let (_, owner) = owner_of(s, headers).await.map_err(|r| *r)?;
-    let Ok(npc_id) = nid.parse::<u64>() else {
-        return Err(err(
+///
+/// `Box`ed on the error side, matching [`owner_of`]. An axum `Response` is a
+/// large value and a `Result` is as big as its widest arm, so an unboxed one
+/// makes every success on this path carry the refusal's footprint.
+async fn owned(s: &Arc<Authored>, headers: &HeaderMap, nid: &str) -> Result<u64, Box<Response>> {
+    let (_, owner) = owner_of(s, headers).await?;
+    let not_found = || {
+        Box::new(err(
             StatusCode::NOT_FOUND,
             "npc_not_found",
             "no such character",
-        ));
+        ))
+    };
+    let Ok(npc_id) = nid.parse::<u64>() else {
+        return Err(not_found());
     };
     if s.npcs.read().await.visible_to(npc_id, &owner).is_none() {
-        return Err(err(
-            StatusCode::NOT_FOUND,
-            "npc_not_found",
-            "no such character",
-        ));
+        return Err(not_found());
     }
     Ok(npc_id)
 }
@@ -175,7 +222,7 @@ async fn substrate(
     Path(nid): Path<String>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     let layers = projection::layers(&s.mind).unwrap_or_default();
     Json(json!({
@@ -200,7 +247,7 @@ async fn layer(
     Path((nid, name)): Path<(String, String)>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     let layers = projection::layers(&s.mind).unwrap_or_default();
     let known = layers
@@ -225,7 +272,7 @@ async fn turn(
     Path((nid, _layer, _turn)): Path<(String, String, String)>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     err(
         StatusCode::NOT_FOUND,
@@ -241,7 +288,7 @@ async fn memory(
     Path(nid): Path<String>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     Json(json!({ "items": [], "next_cursor": Value::Null, "engine_connected": false }))
         .into_response()
@@ -270,7 +317,7 @@ async fn projection_at(
 /// than "nothing has run".
 async fn projection_absent(s: &Arc<Authored>, headers: &HeaderMap, nid: &str) -> Response {
     if let Err(r) = owned(s, headers, nid).await {
-        return r;
+        return *r;
     }
     err(
         StatusCode::NOT_FOUND,
@@ -286,7 +333,7 @@ async fn monitor(
     Path(nid): Path<String>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     // Absent, not `healthy`. A band is a verdict on a character's attention,
     // and this one has had none — the console renders `null` as "not measured".
@@ -304,7 +351,7 @@ async fn probe(
     Path(nid): Path<String>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     no_engine("probing retrieval")
 }
@@ -315,7 +362,7 @@ async fn perceive(
     Path(nid): Path<String>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     no_engine("delivering an event to a character")
 }
@@ -327,7 +374,7 @@ async fn list_interactions(
     Path(nid): Path<String>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     Json(json!({ "interactions": [], "engine_connected": false })).into_response()
 }
@@ -338,7 +385,7 @@ async fn open_interaction(
     Path(nid): Path<String>,
 ) -> Response {
     if let Err(r) = owned(&s, &headers, &nid).await {
-        return r;
+        return *r;
     }
     // Opening one forks the character's substrate and starts a decode loop.
     no_engine("opening an interaction")
@@ -367,24 +414,8 @@ async fn stream(Path(_ix): Path<String>) -> Response {
 /// it is empty. The tools are registered by the engine with the layers each may
 /// write, and calibration is a pass it runs; there is no authored catalog in the
 /// mind to read one from instead.
-async fn tools() -> Response {
-    Json(json!({
-        "tools": [],
-        // Absent, not zero. Zero uncalibrated tools out of zero tools is a
-        // green tick over an empty table, which is exactly what the console
-        // used to draw when this request failed.
-        "uncalibrated": Value::Null,
-        "engine_connected": false,
-    }))
-    .into_response()
-}
-
 async fn calibrate() -> Response {
     no_engine("calibrating tools")
-}
-
-async fn commands() -> Response {
-    Json(json!({ "commands": [], "engine_connected": false })).into_response()
 }
 
 async fn gen_description() -> Response {

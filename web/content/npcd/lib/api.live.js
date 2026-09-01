@@ -124,6 +124,30 @@ export const LiveAPI = {
    * the fields you changed. */
   setPersonality:    (a, c) => j(`/v1/personality/${a}`, { method: 'PUT', body: c }),
 
+  /* A personality's authored life — the ladder in `npcd/src/lifegen`.
+   *
+   * `getLife` answers `{plan: null}` for a character that has never been
+   * seeded, which is ordinary rather than an error: the page renders the seed
+   * form instead of a failure. Every other call here needs a plan to exist.
+   *
+   * `setLifeNode` marks the node edited — sticky, so a later regeneration of an
+   * ancestor leaves it alone — and everything below it stale. `generateLife`
+   * with `redo` is the only way to overwrite an edited node, which is what
+   * makes the stickiness real rather than advisory. */
+  getLifeCatalog: () => j('/v1/life/catalog'),
+  getLife:        (w) => j(`/v1/life/${w}`),
+  setLifeSeed:    (w, seed) => j(`/v1/life/${w}/seed`, { method: 'PUT', body: seed }),
+  setLifeNode:    (w, key, c) => j(`/v1/life/${w}/node/${key}`, { method: 'PUT', body: c }),
+  addLifeDay:     (w, d) => j(`/v1/life/${w}/day`, { method: 'POST', body: d }),
+  removeLifeDay:  (w, date) => j(`/v1/life/${w}/day/${date}`, { method: 'DELETE' }),
+  /* The operator authors these and generation injects them; the model never
+   * writes one. See `npcd/src/lifegen/consequence.rs`. */
+  setLifeConsequences: (w, date, cs) =>
+    j(`/v1/life/${w}/day/${date}/consequences`, { method: 'PUT', body: cs }),
+  generateLife:   (w, body) => j(`/v1/life/${w}/generate`, { method: 'POST', body }),
+  getLifeJob:     (w) => j(`/v1/life/${w}/job`),
+  cancelLife:     (w) => j(`/v1/life/${w}/cancel`, { method: 'POST' }),
+
   getLayerSchema:          () => j('/v1/schema/layers'),
   getTurn:     (id, layer, turn) => j('/v1/npc/' + id + '/substrate/turn/' + layer + '/' + turn),
   probe:       (id, text) => j('/v1/npc/' + id + '/project', { method: 'POST', body: { text } }),
@@ -137,6 +161,23 @@ export const LiveAPI = {
   listTools:      () => j('/v1/tools'),
   calibrateTools: () => j('/v1/tools/calibrate', { method: 'POST' }),
   listCommands:   () => j('/v1/commands'),
+
+  /* Pulse — the cast's tick loop, as an instrument.
+   *
+   * `pulse()` with no npc_id is the whole cast, which is the view's default and
+   * the reason it exists: the interesting bugs are about which character ticked
+   * when, and that is invisible one character at a time. */
+  pulse:       (o) => j('/v1/pulse' + qs(o || {})),
+  pulseCensus: () => j('/v1/pulse/census'),
+  /* Send an event into a character's inbox. `line` is the operator's raw input,
+   * `/`-prefixed or not — the daemon parses it, because the daemon is the only
+   * thing that can be authoritative about which commands exist. */
+  pulseInject: (id, line) => j('/v1/npc/' + id + '/pulse', { method: 'POST', body: { line } }),
+  /* The verbatim tail a character is carrying into its next decode. The
+   * counterpart of the feed: the feed is what happened, this is what is still
+   * held — and the difference between them is how you tell "it forgot" from "it
+   * never perceived that". */
+  npcWindow: (id) => j('/v1/npc/' + id + '/window'),
 
   /* The authored corpus.
    *

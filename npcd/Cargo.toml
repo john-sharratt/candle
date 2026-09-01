@@ -8,12 +8,6 @@ description = "NPC engine daemon — persistent NPCs on one card"
 name = "npcd"
 path = "src/main.rs"
 
-# NOTE: no candle / CUDA dependency, so the GUI is a fast `cargo build` and no
-# GPU. Authored content, accounts, telemetry and logs are answered by this
-# daemon; the routes that need an inference engine still fall through to the
-# console's mock fixture (`web::mock::npcd`). The engine lands behind those same
-# routes later — the wire contract in `docs/npc_api_gui_design.md` does not
-# change when it does.
 [dependencies]
 anyhow     = { workspace = true }
 clap       = { workspace = true }
@@ -51,6 +45,11 @@ axum       = { version = "0.7", features = ["macros", "ws"] }
 # the provider chose. Not a security boundary — the subject inside the file is
 # authoritative — but it has to be total over every possible input.
 sha2       = "0.10"
+# Watching the mind directory, so an edited world file takes effect without a
+# restart. Same version zend watches its workspace with — filesystem event
+# semantics differ enough between major versions that two of them in one
+# workspace would mean two sets of platform quirks to know about.
+notify     = "6"
 
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio      = { version = "1", features = ["full"] }
@@ -72,7 +71,12 @@ web = { path = "../web" }
 # Note it costs no CUDA *context*: the log machinery (`record`, `walker`,
 # `segmented_log`) touches no `Device`, so npcd reads and writes characters
 # without a GPU. Only the link needs the toolchain.
-candle-conversation = { path = "../candle-conversation" }
+candle-conversation = { path = "../candle-conversation", features = ["hub"] }
+# The `Device` the engine loads onto, and nothing else — npcd does not touch a
+# tensor directly. `cuda`, because a daemon that selected a CPU device would
+# stand up an engine that runs at a rate nobody would call inference, and would
+# do it silently.
+candle = { workspace = true, features = ["cuda"] }
 # Real card and host numbers for `/v1/telemetry`, which otherwise had to invent
 # them. NVML is what `nvidia-smi` itself reads: a runtime link against the
 # installed driver, so it costs no CUDA toolkit build — pulling in `candle` for

@@ -98,6 +98,7 @@ pub mod llama2_c;
 pub mod llama2_c_weights;
 pub mod llama_rope;
 pub mod llava;
+pub mod lora;
 pub mod mamba;
 pub mod marian;
 pub mod metavoice;

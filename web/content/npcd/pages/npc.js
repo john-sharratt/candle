@@ -16,6 +16,9 @@ import {
 export async function render(params) {
   const id = params.id;
   const tab = params.tab || 'overview';
+  /* Anything a tab starts that outlives its render — currently the Pulse tab's
+   * poll. Run on the way out; see the note beside the return. */
+  const teardowns = [];
 
   let npc;
   try { npc = await API.getNpc(id); }
@@ -52,6 +55,10 @@ export async function render(params) {
 
     h('div', { class: 'rail-sec' }, 'overview'),
     railItem('overview', 'Summary'),
+    // Directly under Summary, because "what is it doing right now" is the second
+    // question anybody has about a character and there was previously nowhere on
+    // this page to answer it — the loop was only visible from the global view.
+    railItem('pulse', 'Pulse', npc.tick?.ticks),
     railItem('interactions', 'Interactions', npc.live_interactions),
 
     h('div', { class: 'rail-sec' }, 'layers'),
@@ -99,9 +106,129 @@ export async function render(params) {
   const TABS = {
     overview, interactions, beliefs, relationships, agency, projection, monitor, manage,
     environment: environmentTab,
+    pulse: pulseTab,
   };
   const fn = TABS[tab] || (LAYERS.includes(tab) ? () => streamLayer(tab) : overview);
   await fn();
+
+  // ── pulse ─────────────────────────────────────────────────────────────────
+
+  /* This character's own loop: what it perceived, what it did, and what it is
+   * still holding.
+   *
+   * The same three panels the global Pulse view shows, scoped to one character
+   * and with the window added — which only makes sense for one character at a
+   * time, and is the panel that separates "it forgot" from "it never perceived
+   * that". A turn that has faded out of the window is the first; a turn that
+   * never reached the feed is the second, and they need different fixes.
+   *
+   * Reuses `.tick`, `.act` and `.perceive` from the global view rather than
+   * restyling them, so a tick reads identically wherever it is seen. */
+  async function pulseTab() {
+    const stream = h('div', { class: 'pulse-stream' });
+    const windowHost = h('div', { class: 'npc-window' });
+    let stop = false;
+    let seen = -1;
+
+    const input = h('input', {
+      class: 'input mono', style: 'flex:1',
+      placeholder: 'say something, or /hurt a bolt through the shoulder',
+      onKeydown: (e) => { if (e.key === 'Enter') send(); },
+    });
+
+    async function send() {
+      const line = input.value.trim();
+      if (!line) return;
+      try {
+        const r = await API.pulseInject(id, line);
+        input.value = '';
+        toast((r.preempts ? 'Preempt · ' : 'Delivered · ') + r.prose, 'ok');
+        tick();
+      } catch (e) { toast(e.detail || e.message || 'refused', 'err'); }
+    }
+
+    async function tick() {
+      if (stop) return;
+      try {
+        const [feed, win] = await Promise.all([
+          API.pulse({ limit: 40, npc_id: id }),
+          API.npcWindow(id).catch(() => null),
+        ]);
+        const ticks = (feed.ticks || []).slice().reverse();
+        if (!ticks.length) {
+          mount(stream, h('div', { class: 'pulse-empty' },
+            h('p', {}, feed.ready
+              ? 'This character has not thought yet. It wakes on its own heartbeat — ' +
+                'or send it something above.'
+              : 'The engine is still loading.')));
+        } else {
+          const newest = ticks[0].tick;
+          mount(stream, ...ticks.map((t) => {
+            const c = { blocked: 'quiet', pending: 'batch', preempted: 'preempt' }[t.cause] || t.cause;
+            return h('article', {
+              class: 'tick is-' + t.cause + (t.tick > seen ? ' is-new' : ''),
+              style: '--hue:' + (npc.hue != null ? npc.hue : 32),
+            },
+              h('div', { class: 'tick-spine' }),
+              h('header', { class: 'tick-head' },
+                h('span', { class: 'tick-cause' }, c),
+                h('span', { class: 'tick-spacer' }),
+                h('span', { class: 'tick-beat' }, '♥ ' + Math.round(t.heartbeat_ms / 1000) + 's')),
+              h('div', { class: 'tick-perceived' },
+                ...t.perceived.map((p) => h('p', { class: 'perceive' }, p))),
+              t.acts && t.acts.length
+                ? h('div', { class: 'tick-acts' }, ...t.acts.map((a) => {
+                    const i = a.indexOf(' — ');
+                    return h('div', { class: 'act' },
+                      h('span', { class: 'act-tool' }, i === -1 ? a : a.slice(0, i)),
+                      i === -1 ? null : h('span', { class: 'act-intent' }, a.slice(i + 3)));
+                  }))
+                : h('div', { class: 'tick-silent' }, 'nothing came of it'));
+          }));
+          seen = newest;
+        }
+
+        /* The verbatim tail. Deliberately below the feed and visually quieter:
+         * it is state, not events, and reading it top-down would suggest the
+         * character perceives it fresh each tick, which is the opposite of what
+         * a window is. */
+        if (win && win.turns) {
+          mount(windowHost,
+            h('div', { class: 'npc-window-hd' },
+              h('span', {}, 'Carried into the next decode'),
+              h('span', { class: 'tiny dim mono' },
+                `${win.turns.length}/${win.cap} turns · ${fmtK(win.faded)} faded`)),
+            win.turns.length
+              ? h('div', { class: 'npc-window-turns' },
+                  ...win.turns.map((t) => h('div', {
+                    class: 'win-turn is-' + t.speaker,
+                  }, t.text)))
+              : h('p', { class: 'tiny dim', style: 'margin:0' },
+                  'Nothing held — this character has not perceived anything yet today.'));
+        }
+      } catch (e) {
+        mount(stream, h('div', { class: 'pulse-empty' },
+          h('p', {}, e.error === 'no_engine' || e.status === 503
+            ? 'The engine is still loading.'
+            : 'Could not read this character’s pulse — ' + (e.detail || e.message))));
+      }
+    }
+
+    mount(bodyHost,
+      h('div', { class: 'page' },
+        h('div', { class: 'row', style: 'gap:9px;margin-bottom:18px' },
+          input,
+          h('button', { class: 'btn primary', onClick: send }, 'Send')),
+        stream,
+        windowHost));
+
+    await tick();
+    const t = setInterval(tick, 2000);
+    /* The rail persists across tabs, so leaving this one has to stop the poll —
+     * otherwise every visit leaves an interval running against a detached DOM
+     * for the life of the session. */
+    teardowns.push(() => { stop = true; clearInterval(t); });
+  }
 
   // ── overview ──────────────────────────────────────────────────────────────
 
@@ -707,9 +834,9 @@ export async function render(params) {
     });
   }
 
-  /* No `teardown` clearing the rail, deliberately.
+  /* The `teardown` does NOT clear the rail, deliberately.
    *
-   * Clearing it here emptied the rail the instant a tab was clicked, and the
+   * Clearing it emptied the rail the instant a tab was clicked, and the
    * replacement only arrived after `getNpc` and `getSubstrate` had both come
    * back — so the rail visibly vanished for the length of two round trips on
    * every click within a character. `paintRail` swaps the children in one go
@@ -717,6 +844,10 @@ export async function render(params) {
    *
    * Nothing is left stale: `/npc/:id` and `/npc/:id/:tab` are the only routes
    * marked `keepsRail`, so leaving the character for any other page clears the
-   * rail in `app.js` on the way out. */
-  return { el };
+   * rail in `app.js` on the way out.
+   *
+   * What it does clear is anything a tab left running. The Pulse tab polls, and
+   * a poll that survives the page runs against a detached DOM for the rest of
+   * the session — one more request every two seconds per visit, for ever. */
+  return { el, teardown: () => { for (const f of teardowns) f(); } };
 }

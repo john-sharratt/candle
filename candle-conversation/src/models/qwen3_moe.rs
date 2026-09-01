@@ -19,6 +19,7 @@ pub(super) fn qwen3_30b_a3b_q6() -> ModelSpec {
     let chat_format = DialectType::ChatML;
     ModelSpec {
         arch: ModelArch::Qwen3Moe,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         // Original (April 2025) Qwen3-30B-A3B — the HYBRID model: its chat
@@ -29,6 +30,10 @@ pub(super) fn qwen3_30b_a3b_q6() -> ModelSpec {
         model_repo: "unsloth/Qwen3-30B-A3B-GGUF".into(),
         model_filename: "Qwen3-30B-A3B-Q6_K.gguf".into(),
         model_bytes: 25_092_532_800,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "Qwen/Qwen3-30B-A3B".into(),
         // Unpinned: no revision verified against this checkpoint's own token
         // table. The load-time check against it guards the pairing meanwhile.

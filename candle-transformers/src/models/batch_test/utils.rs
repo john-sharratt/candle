@@ -117,6 +117,9 @@ pub struct TestParams {
     /// table records which numeric mode produced it. Defaults to `Off`; set via
     /// [`Self::with_int8mode`].
     pub int8mode: Int8Mode,
+    /// LoRA adapter every sequence decodes through, by name. `None` runs the
+    /// base model, which is every gate but the adapter's own.
+    pub lora: Option<String>,
     /// How the generate phase decides each step's draft budget.
     ///
     /// Defaults to [`DraftBudget::Adaptive`], so a gate measures what production
@@ -169,6 +172,7 @@ impl TestParams {
             begin_document_token,
             timeout_secs: 120,
             int8mode: Int8Mode::Off,
+            lora: None,
             speculative_max_draft: DraftBudget::Adaptive,
         })
     }
@@ -184,6 +188,23 @@ impl TestParams {
     /// Set the inference [`Int8Mode`] shown in the comparison table's `int8` column.
     pub fn with_int8mode(mut self, mode: Int8Mode) -> Self {
         self.int8mode = mode;
+        self
+    }
+
+    /// Run every sequence of every config through the named LoRA adapter.
+    ///
+    /// The adapter must already be loaded into the model by the `load` closure
+    /// the gate hands to [`Self::run`] — this only opts the sequences in, which
+    /// is the same two-step the engine uses: loaded once with the model, chosen
+    /// per conversation.
+    ///
+    /// Every sequence, not a mixture, and deliberately so. A wave carries one
+    /// adapter, so a gate that adapted half its contexts would be testing the
+    /// scheduler's grouping rather than the adapter — and in this harness, which
+    /// drives the session directly with no scheduler to group them, it would
+    /// simply fail the forward.
+    pub fn with_lora(mut self, name: impl Into<String>) -> Self {
+        self.lora = Some(name.into());
         self
     }
 
@@ -1128,6 +1149,13 @@ impl TestParams {
         let mut sequence_indices = Vec::with_capacity(config.num_contexts);
         for _ in 0..config.num_contexts {
             let seq_idx = session.create_sequence()?;
+            // Opted in while the slot is still empty, which is the only point
+            // it can be: the adapter changes the projections that write K/V, so
+            // a slot that has already prefilled cannot switch without attending
+            // its own keys with queries from a different model.
+            if let Some(name) = &self.lora {
+                session.set_sequence_adapter(seq_idx, Some(std::sync::Arc::from(name.as_str())))?;
+            }
             sequence_indices.push(seq_idx);
         }
 

@@ -1647,12 +1647,34 @@ impl Scheduler {
                 seq_id: self.active_prefills[i].work.sequence_id.0,
             })
             .collect();
+        // ── One adapter per wave ─────────────────────────────────────────────
+        //
+        // Same rule the decode cohort follows, applied where the prefill group
+        // is formed: the projections run once over every row, so a group carries
+        // one adapter or none. The first ready prefill sets it and the rest wait
+        // for a group of their own — they are still active, so nothing is lost,
+        // and successive groups drain each adapter's queue in turn.
+        //
+        // Sections are filtered by the same key below rather than after the
+        // fact: a section chunk is an ordinary row of this forward, and an
+        // unadapted ingest riding an adapted group would be prefilled through
+        // the wrong projections and its KV written that way permanently.
+        let group_adapter = members
+            .first()
+            .map(|m| self.session.sequence_adapter(m.seq_id()))
+            .unwrap_or(None)
+            .map(|s| s.to_owned());
+        members.retain(|m| self.session.sequence_adapter(m.seq_id()) == group_adapter.as_deref());
+
         if include_sections && !members.is_empty() {
             let cap = self.max_prefill_pass_tokens;
             let mut sec_tokens = 0usize;
             for i in 0..self.active_section_ingests.len() {
                 let s = &self.active_section_ingests[i];
                 if s.error.is_some() || s.offset >= s.tokens.len() {
+                    continue;
+                }
+                if self.session.sequence_adapter(s.sequence_id.0) != group_adapter.as_deref() {
                     continue;
                 }
                 let advance = (s.tokens.len() - s.offset).min(cap);

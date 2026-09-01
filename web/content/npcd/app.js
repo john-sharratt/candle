@@ -31,6 +31,7 @@ import { estateSwitcher } from './lib/estate.js';
  *   /npc/*       → GET  /v1/npc/:nid                user
  *   /worlds      → GET  /v1/world                   unauthenticated (writes are admin)
  *   /personalities → GET /v1/personality            unauthenticated (writes are admin)
+ *   /personality/:aid/life → GET /v1/life/:who      admin
  *   /performance → GET  /v1/telemetry, /v1/memory   user
  *   /substrate   → GET  /v1/substrate/storage       admin
  *   /logs        → WS   /ws/logs                    admin
@@ -53,6 +54,16 @@ definePage({ path: '/world/:wid', role: 'unauthenticated', under: '/worlds',
   load: () => import('./pages/worlds.js') });
 definePage({ path: '/personalities', role: 'unauthenticated', nav: { section: 'main', order: 30, label: 'Personalities' },
   load: () => import('./pages/personalities.js') });
+/* A personality's authored life — the four-rung ladder in `npcd/src/lifegen`.
+ *
+ * `admin` throughout, unlike the personality document above it, and the daemon
+ * agrees: the plan carries the SEED, which is the authoring intent behind a
+ * character rather than anything the character is, and every write here puts
+ * prose into the substrate that a character will believe it remembers. */
+definePage({ path: '/personality/:aid/life', role: 'admin', under: '/personalities',
+  load: () => import('./pages/life.js') });
+definePage({ path: '/personality/:aid/life/:tab', role: 'admin', under: '/personalities',
+  load: () => import('./pages/life.js') });
 /* The authored corpus as files. `user` rather than `unauthenticated` unlike the
  * two pages above, and the daemon agrees: those answer somebody who already
  * knows an id, while this one ENUMERATES — it hands out the mind a directory at
@@ -62,6 +73,10 @@ definePage({ path: '/mind', role: 'user', nav: { section: 'main', order: 35, lab
   load: () => import('./pages/mind.js') });
 definePage({ path: '/tools', role: 'user', nav: { section: 'main', order: 40, label: 'Tools' },
   load: () => import('./pages/tools.js') });
+// The cast's tick loop, live. Sits beside Tools because the two are the same
+// subject from opposite ends: what a character *can* do, and what it is doing.
+definePage({ path: '/pulse', role: 'user', nav: { section: 'main', order: 45, label: 'Pulse' },
+  load: () => import('./pages/pulse.js') });
 // Names the redo log's absolute path, so it matches `/v1/substrate/storage`.
 definePage({ path: '/substrate', role: 'admin', nav: { section: 'main', order: 50, label: 'Substrate' },
   load: () => import('./pages/substrate.js') });
@@ -366,6 +381,44 @@ async function gatewayHasSignIn() {
   }
 }
 
+/* Drive the loading overlay from one `/v1/status` snapshot.
+ *
+ * The phases are already in the HTML; this only lights them. Three states per
+ * row — done, current, still to come — because "which phase is this stuck on"
+ * is the question somebody watching a slow start is actually asking, and a
+ * single spinner cannot answer it.
+ *
+ * Tolerant of a snapshot it does not recognise: a daemon that adds a phase
+ * should not blank the overlay of a console that has not been redeployed. An
+ * unknown `current` simply lights nothing, and the label still reads. */
+function paintLoading(loading, detail) {
+  if (!loading) return;
+  if (detail) {
+    detail.textContent = loading.detail
+      ? loading.label + ' — ' + loading.detail
+      : (loading.label || 'loading…');
+  }
+  const bar = document.getElementById('boot-bar');
+  if (bar) bar.style.width = Math.round((loading.progress || 0) * 100) + '%';
+
+  const count = document.getElementById('boot-count');
+  if (count) {
+    /* Only when there is something real to count. `0 / 0` is not progress and
+     * an absolute readout beside an empty bar reads as a stall. */
+    count.textContent = loading.total
+      ? loading.progressed.toLocaleString() + ' / ' + loading.total.toLocaleString() +
+        (loading.unit ? ' ' + loading.unit : '')
+      : '';
+  }
+
+  const done = new Set(loading.completed || []);
+  for (const li of document.querySelectorAll('#boot-steps li')) {
+    const step = li.getAttribute('data-step');
+    li.classList.toggle('done', done.has(step));
+    li.classList.toggle('now', step === loading.current);
+  }
+}
+
 async function boot() {
   document.documentElement.setAttribute('data-theme', readTheme());
   const detail = document.getElementById('boot-detail');
@@ -379,11 +432,16 @@ async function boot() {
    *
    * Only a network failure or a not-yet-ready state is worth another go. */
   let status = null;
-  for (let i = 0; i < 40; i++) {
+  /* Long enough to cover a real cold start. The old bound was 40 × 400 ms —
+   * sixteen seconds — which was ample when nothing was loaded and is nowhere
+   * near a multi-gigabyte checkpoint coming off disk onto the card. Giving up
+   * mid-load would drop a person into an app whose every route 503s, which
+   * reads as a broken daemon rather than a slow one. */
+  for (let i = 0; i < 3000; i++) {
     try {
       status = await API.getStatus();
       if (status.state === 'ready') break;
-      if (detail) detail.textContent = status.detail || (status.loading && status.loading.current) || 'loading…';
+      paintLoading(status.loading, detail);
     } catch (e) {
       if (e && (e.status === 401 || e.status === 403)) {
         // Up, and not answering this to us. Carry on to sign-in rather than

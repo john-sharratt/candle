@@ -23,6 +23,7 @@
 pub mod attention;
 #[cfg(feature = "cuda")]
 pub mod batched;
+pub mod checkpoint_diff;
 pub mod config;
 #[cfg(feature = "cuda")]
 pub mod draft;

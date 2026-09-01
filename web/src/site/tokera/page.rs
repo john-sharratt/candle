@@ -207,7 +207,12 @@ fn doc_open(m: &Meta) -> String {
     // attribute a parser has to decide what to do with.
     let published = m
         .published
-        .map(|d| format!("\n<meta property=\"article:published_time\" content=\"{}\">", esc(d)))
+        .map(|d| {
+            format!(
+                "\n<meta property=\"article:published_time\" content=\"{}\">",
+                esc(d)
+            )
+        })
         .unwrap_or_default();
 
     format!(

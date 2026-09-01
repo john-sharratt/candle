@@ -245,6 +245,53 @@ impl Npcs {
             .ok_or(NpcError::NotFound)
     }
 
+    /// Every living character, with the world it belongs to.
+    ///
+    /// **Deliberately not filtered by owner.** The tick scheduler runs the whole
+    /// cast — the quartermaster counts sacks whether or not the person who
+    /// authored him is signed in — so this is the one read that crosses
+    /// ownership. Every route that reaches a character on a user's behalf still
+    /// goes through [`Self::visible_to`]; this is for the engine, which serves
+    /// the world rather than a caller.
+    pub fn cast(&self) -> Vec<(u64, String)> {
+        self.by_id
+            .values()
+            .filter(|n| !n.is_tombstoned())
+            .map(|n| (n.npc_id, n.world_id.clone()))
+            .collect()
+    }
+
+    /// The world a character belongs to, whoever owns it. Used by the tick
+    /// driver to resolve which clock a character lives on.
+    pub fn world_of(&self, npc_id: u64) -> Option<&str> {
+        self.by_id
+            .get(&npc_id)
+            .filter(|n| !n.is_tombstoned())
+            .map(|n| n.world_id.as_str())
+    }
+
+    /// The ids of every living character this account owns.
+    ///
+    /// A set, because the caller is testing membership per tick record and a
+    /// linear scan over a large cast per row is the kind of cost that only shows
+    /// up once somebody has two hundred characters.
+    pub fn owned_by(&self, owner: &str) -> std::collections::HashSet<u64> {
+        self.by_id
+            .values()
+            .filter(|n| !n.is_tombstoned() && n.owner_id == owner)
+            .map(|n| n.npc_id)
+            .collect()
+    }
+
+    /// A living character's record, whoever owns it.
+    ///
+    /// Ownership-blind for the same reason [`Self::cast`] is: the engine serves
+    /// the world rather than a caller. Every route that reaches a character on a
+    /// user's behalf still goes through [`Self::visible_to`].
+    pub fn payload(&self, npc_id: u64) -> Option<&NpcPayload> {
+        self.by_id.get(&npc_id).filter(|n| !n.is_tombstoned())
+    }
+
     /// Create a character owned by the caller.
     pub fn create(
         &mut self,

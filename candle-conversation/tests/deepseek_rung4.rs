@@ -61,6 +61,7 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
     let model_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
     ModelSpec {
         arch: ModelArch::DeepSeekV4,
+        loras: Vec::new(),
         chat_format: DialectType::DeepSeek,
         dialect: Dialect::deepseek(),
         model_repo: String::new(), // local file only — never downloaded

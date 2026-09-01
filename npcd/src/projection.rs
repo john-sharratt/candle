@@ -73,6 +73,26 @@ pub fn layers(mind: &crate::mind::Mind) -> Option<Vec<serde_json::Value>> {
     Some(items.into_iter().map(|(_, v)| v).collect())
 }
 
+/// Each layer's name and the noun it counts, in schema order.
+///
+/// The pair the ingest needs: a layer with an `ingest_unit:` is a turn sink, and
+/// the unit is what the loading screen counts. Read through [`layers`] rather
+/// than parsing the schema again, so there is one reading of the document.
+pub fn ingest_units(mind: &crate::mind::Mind) -> Vec<(String, Option<String>)> {
+    layers(mind)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|l| {
+            let name = l.get("name")?.as_str()?.to_string();
+            let unit = l
+                .get("ingest_unit")
+                .and_then(|u| u.as_str())
+                .map(str::to_string);
+            Some((name, unit))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub enum SchemaError {
     /// `--mind` named a directory that does not exist, or is a file.

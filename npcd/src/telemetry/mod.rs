@@ -86,24 +86,40 @@ pub struct Telemetry {
 impl Telemetry {
     pub fn new() -> Arc<Self> {
         let devices = Devices::open();
-        // Decided once, from the card that is actually here. A card does not
-        // grow memory while the process runs, so re-deciding per request would
-        // only be a chance for two requests to disagree.
+        // One model, not a ladder. It used to be chosen from the card's memory,
+        // back when nothing loaded it — but the C-ladder KV thresholds are
+        // derived against exactly one checkpoint, so a selection that varied by
+        // card would silently vary the calibration with it.
+        let model = model::spec();
+        // The card is still worth logging beside the model even though it no
+        // longer decides it: "7.5 GB of weights, 24 GiB of card" is the line an
+        // operator reads to know whether this will fit before it tries.
         let (_, vram) = devices.sample_gpu();
-        let total_bytes = vram.total_mib.map(|m| m * 1024 * 1024);
-        let model = model::choose(total_bytes);
         tracing::info!(
-            "model selected: {} {} ({} total / {} active, {:.1} GB) — {}",
+            "model: {} {} ({}, {:.1} GB) — {}",
             model.name,
             model.quant,
             model.params_total,
-            model.params_active,
             model.bytes as f64 / 1e9,
             match vram.total_mib {
                 Some(m) => format!("{:.1} GiB of card memory", m as f64 / 1024.0),
                 None => "no card detected".to_owned(),
             }
         );
+        // **Say so when this is not the repository's checkpoint.** An operator
+        // reading a console that names a model they did not expect should learn
+        // why from the log rather than by going looking for a build script. The
+        // line is absent on a machine with no `models.override.yaml`, which is
+        // the ordinary case.
+        let overridden = candle_conversation::models::overrides::active_keys();
+        if !overridden.is_empty() {
+            tracing::info!(
+                "models.override.yaml is in effect for {:?} — repo {} ({} adapter(s))",
+                overridden,
+                model.repo,
+                crate::model::model().spec().loras.len()
+            );
+        }
         Arc::new(Self {
             devices,
             started: Instant::now(),
@@ -255,26 +271,18 @@ mod tests {
         assert_eq!(t.read().series.t.len(), 1);
     }
 
-    /// The selection has to follow the card that is actually present, and it
-    /// has to reach the wire — a console showing the wrong quant would send
-    /// somebody looking for a bug in the engine.
+    /// The model the console shows must be the one the loader fetches — a page
+    /// naming a different checkpoint sends somebody looking for a bug in the
+    /// engine.
     #[test]
-    fn the_model_matches_the_card_this_machine_has() {
+    fn the_reported_model_is_the_one_this_daemon_runs() {
         let t = Telemetry::new();
         t.tick();
         let r = t.read();
-
-        let expected = crate::model::choose(
-            r.series
-                .vram_total_mib
-                .as_ref()
-                .and_then(|c| c.last().copied().flatten())
-                .map(|m| m as u64 * 1024 * 1024),
-        );
-        assert_eq!(r.model, expected);
+        assert_eq!(r.model.repo, crate::model::spec().repo);
 
         let json = serde_json::to_value(&r).unwrap();
-        assert_eq!(json["model"]["name"], "Qwen3-30B-A3B");
+        assert_eq!(json["model"]["name"], crate::model::spec().name);
         assert!(json["model"]["quant"].as_str().unwrap().starts_with('Q'));
         assert!(json["model"]["bytes"].as_u64().unwrap() > 0);
     }

@@ -289,6 +289,19 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
+    /// Choose the LoRA adapter this sequence decodes through, by name, or
+    /// `None` for the base model.
+    ///
+    /// Sent before the sequence's first turn. Changing it mid-conversation is
+    /// refused by the handler: the KV already written was produced by the
+    /// projections in force when it was written, and continuing with different
+    /// ones would attend those keys with queries from another model.
+    SetSequenceAdapter {
+        sequence_id: SequenceId,
+        adapter: Option<Arc<str>>,
+        response_tx: Sender<Result<(), ConversationError>>,
+    },
+
     /// Ingest a substrate section: fresh slot in, sealed section out.
     ///
     /// Synchronously prefills `tokens` into `sequence_id` (which must
@@ -1675,6 +1688,16 @@ pub(super) enum WaveMember {
     /// chunk is advanced + sealed). Rides the cohort's creep so its expert loads
     /// co-batch with decode + the dialogue prefills.
     Section { seq_id: usize, advance: usize },
+}
+
+impl WaveMember {
+    /// The session sequence this member occupies, whichever kind it is.
+    pub(super) fn seq_id(&self) -> usize {
+        match self {
+            WaveMember::Prefill { seq_id } => *seq_id,
+            WaveMember::Section { seq_id, .. } => *seq_id,
+        }
+    }
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -3619,6 +3642,35 @@ impl Scheduler {
                     self.deferred_glue_fires
                         .retain(|p| p.parent_id != sequence_id);
                 }
+                let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::SetSequenceAdapter {
+                sequence_id,
+                adapter,
+                response_tx,
+            } => {
+                // **Only on an empty slot.** The KV already in this sequence was
+                // written by whichever projections were in force at the time,
+                // and the adapter changes them — so switching mid-conversation
+                // would attend adapted keys with unadapted queries, or the
+                // reverse. Nothing about the shapes objects; the answers just
+                // quietly degrade, which is why this is refused rather than
+                // documented.
+                let offset = self.session.sequence_offset(sequence_id.0);
+                let result = if offset.unwrap_or(0) > 0 {
+                    Err(ConversationError::Model(candle::Error::Msg(format!(
+                        "sequence {} already holds {} tokens of KV — a LoRA must be \
+                         chosen before a conversation's first turn, not after",
+                        sequence_id.0,
+                        offset.unwrap_or(0)
+                    ))))
+                } else {
+                    self.session
+                        .set_sequence_adapter(sequence_id.0, adapter)
+                        .map_err(ConversationError::Model)
+                };
                 let _ = response_tx.send(result);
                 true
             }

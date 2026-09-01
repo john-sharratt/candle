@@ -71,7 +71,17 @@ export async function render(params, q) {
       h('div', { class: 'sub' },
         'What a character is before it has lived anything. Every character of this type shares it as a ' +
         'read-only prefix, so it costs one copy however many of them exist — which is also why it cannot drift.')),
-    list.length > 1 ? picker(list, aid) : null));
+    /* The way into the life editor.
+     *
+     * Admin-only, and absent rather than disabled below that: a personality is
+     * readable by anyone, but its authored life is not, and a dead button on a
+     * page somebody cannot act on is a question they have no way to answer. */
+    h('div', { class: 'row wrap' },
+      a && mayEdit() ? h('button', {
+        class: 'btn',
+        onClick: () => go('/personality/' + a.personality_id + '/life'),
+      }, 'Write its life') : null,
+      list.length > 1 ? picker(list, aid) : null)));
 
   if (!a) {
     /* Two different absences, said differently.

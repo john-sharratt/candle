@@ -21,6 +21,7 @@ use candle_nn::kv_cache::WaveGeneration;
 
 use super::quantized_weights::{QuantFfn, QuantLayer};
 use crate::models::batched_layer::{BatchedAttentionLayer, QkvProjection, WaveRef};
+use crate::models::lora::{adapt, LayerLora};
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::rotary_layout::RotaryLayout;
 use crate::models::wave_buffers::wave_root;
@@ -34,6 +35,10 @@ pub struct Qwen35AttentionLayer<'a> {
     pub n_kv_head: usize,
     pub head_dim: usize,
     pub rotary: &'a RotaryLayout,
+    /// This layer's LoRA pairs, resolved once by the wave loop. Default — all
+    /// `None` — is the unadapted layer, which is the overwhelmingly common case
+    /// and takes the same code path.
+    pub lora: LayerLora<'a>,
 }
 
 impl Qwen35AttentionLayer<'_> {
@@ -46,6 +51,27 @@ impl Qwen35AttentionLayer<'_> {
             ),
         }
     }
+
+    /// The float activation an adapter's `A` matmul reads.
+    ///
+    /// An adapted layer runs [`Int8Mode::Off`] (see [`BatchedAttentionLayer::int8mode`]
+    /// below), so its activations arrive as `Float` and this always finds one.
+    /// The `Int8` arm is therefore not a fallback but an assertion: reaching it
+    /// means the mode and the adapter disagreed, and computing the adapter term
+    /// against the wrong tensor would be silent.
+    #[cfg(feature = "cuda")]
+    fn lora_input<'w>(&self, acts: &DynamicActs<'w>, site: &str) -> Result<LiveTensor<'w>> {
+        match acts {
+            // A `LiveTensor` clone is an `Arc` bump, not a copy — this shares the
+            // activation the base projection reads rather than duplicating it.
+            DynamicActs::Float(t) => Ok(t.clone()),
+            DynamicActs::Int8(_) => candle::bail!(
+                "{site}: this layer is LoRA-adapted but its activations are q8a128 — \
+                 `int8mode()` must report `Off` for an adapted layer so the float \
+                 input the adapter reads survives the norm"
+            ),
+        }
+    }
 }
 
 impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
@@ -53,8 +79,33 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
         self.n_head
     }
 
+    /// The layer's numeric mode — **`Off` when the layer is adapted.**
+    ///
+    /// A LoRA's `A` matmul reads the same post-norm activation the base
+    /// projection does, and on the int8 path that tensor does not survive:
+    /// `attention_norm` fuses RMSNorm and quantize into one kernel and emits
+    /// q8a128, from which the float cannot be recovered (there is no dequant for
+    /// the operand, and adding one would be a host-side unpack or a new kernel
+    /// to undo work that had just been done).
+    ///
+    /// Reporting `Off` keeps the activation float, which is the whole of what
+    /// the adapter needs — and it makes the rest fall out for free: `want_q8` in
+    /// the batched decode path is gated on `int8mode().is_int8()`, so an adapted
+    /// layer also stops emitting its attention context as q8a1024 and
+    /// `output_projection` receives the float context its own adapter reads.
+    ///
+    /// **This does not drop the layer to FP matmuls.** `QMatMul::forward_dynamic`
+    /// against a KO weight quantizes a `Float` operand at the matmul, so the
+    /// arithmetic is still int8; what is given up is the *fusion* — one extra
+    /// quantize kernel per projection — on the eight attention layers of an
+    /// adapted conversation. Unadapted conversations are untouched, and share
+    /// the same resident weights.
     fn int8mode(&self) -> Int8Mode {
-        self.layer.ffn_int8mode()
+        if self.lora.is_empty() {
+            self.layer.ffn_int8mode()
+        } else {
+            Int8Mode::Off
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -78,7 +129,9 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.layer.ffn {
-            QuantFfn::Dense(m) => m.forward_dynamic(&acts, work_dtype, out_dtype),
+            QuantFfn::Dense(m) => {
+                m.forward_dynamic_adapted(&acts, work_dtype, out_dtype, self.lora)
+            }
             // See the qwen3-MoE arm: the shared+routed combine writes the width
             // its experts ran in, so this path narrows on return.
             QuantFfn::Moe(m) => {
@@ -118,10 +171,30 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
         let w = self.attn()?;
         let (n_head, n_kv, d) = (self.n_head, self.n_kv_head, self.head_dim);
 
+        // The adapter reads the same post-norm activation the base projections
+        // do, and adds to their raw output — before the q/k norms and before the
+        // rotary reordering. That ordering is the definition, not a choice: PEFT
+        // trained `B(Ax)` against `q_proj`'s output, which in this architecture
+        // is the pre-norm, pre-RoPE `[q | gate]`.
+        let lora_x = match self.lora.is_empty() {
+            true => None,
+            false => Some(self.lora_input(acts, "project_qkv")?),
+        };
+
         // `wq` is `[q | gate]` interleaved per head, so the projection is one
         // matmul and the split is a view: dim ordering per token is
         // `[h0_q(d) h0_gate(d) h1_q(d) …]`.
+        //
+        // The adapter's `q_proj` is the same fused shape — its `B` is
+        // `[n_head · 2 · head_dim, r]`, twice the hidden width — because the
+        // reference implementation this was trained against also projects the
+        // gate through `q_proj`. So it adds to `qg` whole, and the split below
+        // divides the adapted result exactly as it divides the base one.
         let qg = w.wq.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+        let qg = match &lora_x {
+            Some(x) => adapt(self.lora.q, qg, x)?,
+            None => qg,
+        };
         let lead: Vec<usize> = qg.dims()[..qg.rank() - 1].to_vec();
         let mut q_shape = lead.clone();
         q_shape.extend_from_slice(&[n_head, 2, d]);
@@ -132,6 +205,10 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
 
         let k = w.wk.forward_dynamic(acts.as_dynamic(), out_dtype)?;
         let v = w.wv.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+        let (k, v) = match &lora_x {
+            Some(x) => (adapt(self.lora.k, k, x)?, adapt(self.lora.v, v, x)?),
+            None => (k, v),
+        };
 
         // Per-head RMSNorm on Q and K, then the rotary reordering. Norm
         // first: it is elementwise over the head dim, so it commutes with a
@@ -171,5 +248,28 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
                 unreachable!("Qwen35AttentionLayer over a DeltaNet layer")
             }
         }
+    }
+
+    /// The output projection, with its adapter.
+    ///
+    /// The adapter's input here is the **attention context** — `o_proj`'s
+    /// operand, not the layer input — which is why an adapted layer must not
+    /// emit that context as q8a1024. `int8mode()` returning `Off` is what stops
+    /// it: `want_q8` is gated on the mode, so the context arrives as `Float` and
+    /// the gate has already been applied to it.
+    #[cfg(feature = "cuda")]
+    fn output_projection<'w>(
+        &self,
+        attn: DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<LiveTensor<'w>> {
+        let base = self
+            .o_proj()
+            .forward_dynamic(attn.as_dynamic(), out_dtype)?;
+        if self.lora.o.is_none() {
+            return Ok(base);
+        }
+        let x = self.lora_input(&attn, "output_projection")?;
+        adapt(self.lora.o, base, &x)
     }
 }

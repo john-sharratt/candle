@@ -322,6 +322,28 @@ impl Scheduler {
             }
         }
 
+        // ── One adapter per wave ─────────────────────────────────────────────
+        //
+        // A LoRA alters the projections every row of the forward flows through
+        // together — one set of matmuls runs over the whole batch — so a wave
+        // carries one adapter or none. Keep the leading sequence's adapter and
+        // defer the rest.
+        //
+        // This is the same kind of deferral as the ingest cap above: pure
+        // scheduling, nothing dropped. Successive waves drain each adapter's
+        // cohort in turn, which is why the engine loops waves by adapter rather
+        // than trying to batch across them. Taking the *leading* sequence's
+        // adapter matters — after the priority sort that is the interactive
+        // dialogue, so a bulk adapted ingest never displaces a waiting turn.
+        //
+        // `BatchedInferenceSession::wave_adapter` refuses a mixed wave outright,
+        // so without this filter an adapted conversation would fail the forward
+        // rather than merely share it.
+        if seq_ids.len() > 1 {
+            let wanted = self.session.sequence_adapter(seq_ids[0].0);
+            seq_ids.retain(|id| self.session.sequence_adapter(id.0) == wanted);
+        }
+
         if seq_ids.is_empty() {
             // Every active decode is deferred-glue-pending, so there is no decode
             // row to run this wave — but the glue that is BLOCKING them must still

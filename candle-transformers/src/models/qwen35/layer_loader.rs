@@ -25,13 +25,14 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use candle::quantized::{gguf_file, Int8Mode};
+use candle::quantized::{gguf_file, GgmlDType, Int8Mode};
 use candle::{Device, Result};
 
 use super::config::Qwen35Config;
 use super::layer_store::{sell_ground, LayerStore, StreamedLayers};
 use super::quantized_weights::{
     load_layer, narrow_resident_twin, streaming_twin, Loader, QuantLayer, ResidentResidue,
+    RECURRENT_PATH,
 };
 use crate::models::expert_lre::handle::warm_slots_for;
 use crate::models::layer_stream::assemble::assemble_layer;
@@ -117,6 +118,12 @@ pub fn build_layer_cache<R: std::io::Read + std::io::Seek>(
     gguf_identity: PackIdentity,
     pinned_layers: usize,
     residues: Arc<Vec<ResidentResidue>>,
+    // The base checkpoint to read the DeltaNet recurrent path from, when this one quantized
+    // it — see `LoadInputs::gate_src`. Threaded down here because the trunk's large
+    // projections are built by this path and not by the caller's loader: without it the
+    // repair covers the small resident gates and leaves `ssm_out` reading the checkpoint's
+    // own copy, which is a half-repaired recurrence and measurably not a fix.
+    gate_src: Option<(&gguf_file::Content, &[u8])>,
 ) -> Result<LayerStore> {
     let Device::Cuda(cuda) = device else {
         candle::bail!("qwen35: the layer cache is a CUDA-only path");
@@ -136,7 +143,19 @@ pub fn build_layer_cache<R: std::io::Read + std::io::Seek>(
     // weights use, so the two halves of one model are narrowed on one condition.
     let stream_narrow = narrow_resident_twin(device, cfg, content).map(|_| cfg.num_layers);
     let narrow = |name: &str| stream_narrow.and_then(|n| streaming_twin(name, n));
-    let images = images_from_gguf(content, &cfg.layer_kinds, mode, &narrow)?;
+    // The donor's dtype wherever the donor will supply the tensor, so the slot is sized for
+    // what gets written into it. Same rule as `Loader::donated`, stated once more here because
+    // the geometry is planned from the header before any loader exists.
+    let substitute = |name: &str| -> Option<GgmlDType> {
+        let (donor, _) = gate_src?;
+        if !RECURRENT_PATH.iter().any(|r| name.ends_with(r)) {
+            return None;
+        }
+        let theirs = donor.tensor_infos.get(name)?.ggml_dtype;
+        let mine = content.tensor_infos.get(name)?.ggml_dtype;
+        (theirs != mine).then_some(theirs)
+    };
+    let images = images_from_gguf(content, &cfg.layer_kinds, mode, &narrow, &substitute)?;
     let slot_bytes = slot_bytes_for_layers(&images);
     let pinned = pinned_layers.min(cfg.num_layers);
 
@@ -162,13 +181,15 @@ pub fn build_layer_cache<R: std::io::Read + std::io::Seek>(
                 pinned,
                 slot_bytes,
                 stream_narrow,
+                gate_src,
             )?;
             LayerPack::open(&path, gguf_identity, &images, pinned)?
         }
     };
 
     // ── The hot tier ──
-    let mut g = Loader::new(content, reader, device, mode, WeightResidency::Pool);
+    let mut g =
+        Loader::new(content, reader, device, mode, WeightResidency::Pool).with_gate_src(gate_src);
     g.set_stream_narrow(stream_narrow);
     let plan = carve_zone(cuda, &images, pinned)?;
     let assembler = LayerAssembler {
@@ -306,6 +327,7 @@ fn build_pack<R: std::io::Read + std::io::Seek>(
     pinned: usize,
     slot_bytes: usize,
     stream_narrow: Option<usize>,
+    gate_src: Option<(&gguf_file::Content, &[u8])>,
 ) -> Result<()> {
     let Device::Cuda(cuda) = device else {
         candle::bail!("qwen35: the layer pack build is a CUDA-only path");
@@ -314,7 +336,12 @@ fn build_pack<R: std::io::Read + std::io::Seek>(
     let mut w = PackWriter::create(path, header_for(images, identity, pinned, slot_bytes))?;
     // Pool, not span: each layer here is materialised only to be read back and
     // dropped, and the dense block never frees. See [`WeightResidency`].
-    let mut g = Loader::new(content, reader, device, mode, WeightResidency::Pool);
+    //
+    // The donor rides along, because what this writes is *persisted*: a pack built from the
+    // checkpoint's own quantized recurrent path would be reused on every later load, and the
+    // repair would be undone by a cache hit rather than by anything visible.
+    let mut g =
+        Loader::new(content, reader, device, mode, WeightResidency::Pool).with_gate_src(gate_src);
     g.set_stream_narrow(stream_narrow);
 
     for (li, image) in images.iter().enumerate().take(cfg.num_layers).skip(pinned) {

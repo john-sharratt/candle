@@ -975,16 +975,36 @@ pub struct NpcPayload {
      * The engine's own belief traffic is a different problem with a different
      * volume, and will want its own records. This is not that; this is what
      * somebody types when they build a world. */
+    /* The five authoring-plane layers below carry `#[serde(default)]`, and that
+     * is a statement about meaning rather than a compatibility shim.
+     *
+     * A character nobody has written beliefs for **holds none** — which is
+     * exactly what `Npcs::create` writes, an empty vector — so an absent field
+     * and an empty one denote the same character. Without the default, a record
+     * written before these layers existed fails to decode and the walker skips
+     * it, which is how a substrate holding thirteen characters reported a cast
+     * of zero: not a corrupt log, a record whose reader had learned five new
+     * required questions and refused anything that could not answer them.
+     *
+     * The distinction worth keeping is between "absent" and "measured zero",
+     * and it does not apply here: these are authored content, and unwritten
+     * authored content is empty. Where a *measurement* is missing the engine
+     * still reports `null` rather than defaulting it — see `crate::engine`. */
     /// Beliefs an operator wrote. Never written by the action plane — a tool
     /// declaring `beliefs` in `writes_layers` is refused at registration.
+    #[serde(default)]
     pub beliefs: Vec<AuthoredBelief>,
     /// Who this character knows, and how they hold them.
+    #[serde(default)]
     pub relationships: Vec<AuthoredRelationship>,
     /// What they are trying to do, as a tree.
+    #[serde(default)]
     pub agency: Vec<AuthoredStrategy>,
     /// The affect dials an operator set.
+    #[serde(default)]
     pub modulation: Modulation,
     /// The simulated environment's own instructions, when one is enabled.
+    #[serde(default)]
     pub environment_prompt: String,
 }
 
@@ -1837,6 +1857,41 @@ mod tests {
     /// record already on disk undecodable — asserting the encoding against
     /// itself cannot catch that, and this is the format's compatibility
     /// boundary.
+    /// **A record written before the authoring layers existed still decodes.**
+    ///
+    /// This is what a real substrate holds. Without the defaults, the walker
+    /// skips every one of them and a store of thirteen characters reports a cast
+    /// of zero — with a warning per record that reads as log corruption rather
+    /// than as a reader that has learned new required questions.
+    ///
+    /// A character nobody wrote beliefs for holds none, so an absent field and
+    /// an empty one denote the same character.
+    #[test]
+    fn a_record_without_the_authoring_layers_decodes_as_an_unwritten_one() {
+        let full = npc_fixture();
+        let mut v = serde_json::to_value(&full).expect("encodes");
+        let obj = v.as_object_mut().expect("an object");
+        for layer in [
+            "beliefs",
+            "relationships",
+            "agency",
+            "modulation",
+            "environment_prompt",
+        ] {
+            assert!(obj.remove(layer).is_some(), "{layer} was not in the record");
+        }
+
+        let back: NpcPayload = serde_json::from_value(v).expect("an older record still decodes");
+        assert!(back.beliefs.is_empty());
+        assert!(back.relationships.is_empty());
+        assert!(back.agency.is_empty());
+        assert!(back.environment_prompt.is_empty());
+        // And the fields that were always there are untouched.
+        assert_eq!(back.npc_id, full.npc_id);
+        assert_eq!(back.name, full.name);
+        assert_eq!(back.world_id, full.world_id);
+    }
+
     #[test]
     fn npc_payload_encodes_exact_bytes() {
         let bytes = npc_fixture().encode();

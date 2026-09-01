@@ -87,3 +87,13 @@ zend/examples/provenance_queries.json
 /walk/
 # Local nsys/ncu capture datasets (GB-scale, machine-specific).
 /profiles/
+
+# Local model overrides — which checkpoint and which LoRA adapters this machine
+# actually runs, replacing what the presets declare. Deliberately not in the
+# repository: a private fine-tune is a legitimate thing to run and a bad thing
+# to publish coordinates for.
+#
+# Optional. `candle-conversation/build.rs` writes an empty document when it is
+# absent, so a clone without one builds and behaves exactly as the presets say.
+# See `candle-conversation/src/models/overrides.rs`.
+/models.override.yaml

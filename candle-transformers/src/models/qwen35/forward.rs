@@ -797,6 +797,7 @@ fn sweep_layers(
         layer_end,
         x_in,
         act_dtype,
+        adapter,
     } = groups;
     // Refused below, before it can be read — named here so the destructuring
     // stays exhaustive and a new group cannot be added without this seeing it.
@@ -805,6 +806,9 @@ fn sweep_layers(
         candle::bail!("qwen35 wave: empty batch");
     }
     let q = model.model();
+    // Resolved once for the sweep, not per layer: an unknown name fails here,
+    // before any layer has run, rather than after the wave has half-decoded.
+    let adapter = model.adapter(adapter)?;
     let num_layers = q.cfg.num_layers;
     if layer_start > layer_end || layer_end > num_layers {
         candle::bail!(
@@ -1058,6 +1062,10 @@ fn sweep_layers(
         // hold the handle for as long as its compute is being issued. On a
         // resident store this is an `Arc` bump.
         let layer = q.layers.ensure(li)?;
+        // This layer's adapter pairs, or all-`None` when the wave is unadapted
+        // or the adapter does not reach this layer. Seven hash lookups per
+        // layer per wave against a wave that is thousands of matmuls long.
+        let layer_lora = adapter.map(|a| a.layer(li)).unwrap_or_default();
         // On `cfg.layer_kinds` rather than the layer's own `mix`: a streamed
         // store has no `q.layers[li]` to match against until `ensure` has
         // produced one, and the schedule is the same answer without a fetch.
@@ -1098,6 +1106,7 @@ fn sweep_layers(
                     n_kv_head: q.cfg.num_kv_heads,
                     head_dim: q.cfg.attn_head_dim,
                     rotary: model.rotary(),
+                    lora: layer_lora,
                 };
                 // `layer_idx` names the KV layer, not the trunk layer: it is
                 // what the per-layer arena bookkeeping inside the mixed
@@ -1209,7 +1218,7 @@ fn sweep_layers(
                     &[],
                     capture_dev,
                 )?;
-                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig)?;
+                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig, layer_lora)?;
             }
         }
         // The layer's result. Reaching this on a bad value means the mixer's
@@ -1537,6 +1546,7 @@ mod tests {
                 int8mode: Some(Int8Mode::Off),
                 expert_pack_dir: None,
                 mtp_path: None,
+                gate_donor_path: None,
             },
         )?;
         let mut session = model.create_batched_session(BatchedConfig::default())?;
@@ -1778,6 +1788,7 @@ mod tests {
                 int8mode: Some(Int8Mode::Off),
                 expert_pack_dir: None,
                 mtp_path: None,
+                gate_donor_path: None,
             },
         )?;
 

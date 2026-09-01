@@ -18,11 +18,16 @@ pub(super) fn qwen2_0_5b() -> ModelSpec {
     let chat_format = DialectType::ChatML;
     ModelSpec {
         arch: ModelArch::Qwen2,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         model_repo: "Qwen/Qwen2-0.5B-Instruct-GGUF".into(),
         model_filename: "qwen2-0_5b-instruct-q4_0.gguf".into(),
         model_bytes: 352_969_408,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "Qwen/Qwen2-0.5B-Instruct".into(),
         // Unpinned: no revision verified against this checkpoint's own token
         // table. The load-time check against it guards the pairing meanwhile.

@@ -12,7 +12,7 @@
 //! mirroring how `deepseek4` keeps its per-sequence streaming state.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
@@ -33,6 +33,7 @@ use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::RecurrentStateStore;
 use crate::models::draft_ladder::DraftLadder;
+use crate::models::lora::Adapter;
 use crate::models::rotary_layout::RotaryLayout;
 
 /// A loaded hybrid model of this lineage, ready to be driven by the scheduler.
@@ -44,6 +45,15 @@ use crate::models::rotary_layout::RotaryLayout;
 /// model's own derived KV threshold factors.
 pub struct HybridBatched {
     model: QuantModel,
+    /// LoRA adapters loaded alongside the base weights, by name.
+    ///
+    /// Loaded up front — with the model, not with a conversation — because an
+    /// adapter is a few hundred MB of weights that every adapted conversation
+    /// shares. Nothing is merged into the base: `Wx` is still the quantized
+    /// base projection, and the adapter adds a rank-`r` term to its result, so
+    /// one resident checkpoint serves adapted and unadapted conversations at
+    /// once. A wave names the one it wants; [`Self::adapter`] resolves it.
+    adapters: HashMap<String, Arc<Adapter>>,
     /// The concrete model's derived KV error-threshold factor row
     /// (`candle_nn::kv_cache::QWEN35_0_8B_KV_FACTORS` and siblings) —
     /// supplied at construction because thresholds are model-specific by
@@ -150,6 +160,7 @@ impl HybridBatched {
         })?;
         Ok(Self {
             model,
+            adapters: HashMap::new(),
             kv_factors,
             draft,
             kv_map,
@@ -165,6 +176,73 @@ impl HybridBatched {
             capture_rows: Mutex::new(HashMap::new()),
             seed: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Load a LoRA adapter alongside the base weights, under `name`.
+    ///
+    /// Called during construction, before the model is handed to the scheduler
+    /// — an adapter is shared by every conversation that opts into it, so it is
+    /// loaded once with the model rather than per conversation.
+    ///
+    /// The adapter is checked against the checkpoint here, where a mismatch is a
+    /// load error with both sets of numbers in it. Left unchecked, a wrong
+    /// adapter is not a crash: the shapes that do line up still multiply, and
+    /// the model simply answers slightly wrongly.
+    /// `dtype` is the width activations arrive in — the same one
+    /// `set_activation_dtype` materialises the norms in. PEFT stores adapters
+    /// F32; converting once here rather than per projection is the hot-path
+    /// rule against `to_dtype` in the loop.
+    pub fn load_adapter(&mut self, name: &str, dir: &std::path::Path, dtype: DType) -> Result<()> {
+        let adapter = Adapter::load(dir, name, dtype, &self.model.device)
+            .map_err(|e| candle::Error::Msg(format!("LoRA `{name}` from {dir:?}: {e}")))?;
+
+        // The adapter's attention pairs must land on layers that actually
+        // attend. On a 3:1 hybrid they should be exactly the attention layers;
+        // an adapter trained against a differently-mixed sibling would put them
+        // on DeltaNet layers, where there is no q/k/v/o to add to and the pairs
+        // would be silently ignored.
+        for li in adapter.attention_layers() {
+            match self.model.cfg.layer_kinds.get(li) {
+                Some(LayerKind::Attention) => {}
+                Some(LayerKind::DeltaNet) => candle::bail!(
+                    "LoRA `{name}` has attention pairs on layer {li}, which is a DeltaNet \
+                     layer in this checkpoint — the adapter was trained against a \
+                     differently-mixed model and its attention half would be ignored"
+                ),
+                None => candle::bail!(
+                    "LoRA `{name}` has pairs on layer {li} but this checkpoint has {} layers",
+                    self.model.cfg.layer_kinds.len()
+                ),
+            }
+        }
+        tracing::info!(
+            "LoRA `{name}`: {} pairs, rank {}, scale {:.4}, attention layers {:?}",
+            adapter.len(),
+            adapter.rank,
+            adapter.scale(),
+            adapter.attention_layers()
+        );
+        self.adapters.insert(name.to_owned(), Arc::new(adapter));
+        Ok(())
+    }
+
+    /// Resolve a wave's adapter name against what is loaded.
+    ///
+    /// An unknown name is an error, not a fallback to the base model: a
+    /// conversation that asked for an adapter and silently got the base one
+    /// reads as the fine-tune not working, and there is nothing in the output
+    /// to point at the name that failed to match.
+    pub fn adapter(&self, name: Option<&str>) -> Result<Option<&Adapter>> {
+        match name {
+            None => Ok(None),
+            Some(n) => match self.adapters.get(n) {
+                Some(a) => Ok(Some(a.as_ref())),
+                None => candle::bail!(
+                    "wave asked for LoRA `{n}`, which is not loaded (have: {:?})",
+                    self.adapters.keys().collect::<Vec<_>>()
+                ),
+            },
+        }
     }
 
     /// The sequences this wave must score every prefill row of. Empty on every
@@ -1092,6 +1170,38 @@ impl HybridBatched {
             head.input.enorm.maybe_change_dtype(dtype)?;
             head.input.hnorm.maybe_change_dtype(dtype)?;
             head.head_norm.maybe_change_dtype(dtype)?;
+        }
+        // LoRA adapters, for exactly the reason the norms are here: their
+        // weights are operands of matmuls whose other operand is an activation,
+        // and a matmul refuses mismatched dtypes outright.
+        //
+        // **Three widths, not one**, because a layer does not use a single one:
+        //
+        // * `dtype` — the residual stream, which is what `gate`/`up` read and
+        //   what `down` and the output projection write back into it.
+        // * `kv_dtype` — what Q/K/V are projected in, because they become the
+        //   arena's contents. Equal to `dtype` unless the model computes wider
+        //   than it stores.
+        // * the **SwiGLU promotion** — an F16 session runs its MLP intermediates
+        //   in BF16, since they can exceed F16's range. That makes `gate`'s
+        //   adapter write BF16 from an F16 input, and `down`'s read BF16 and
+        //   write F16, inside the same layer.
+        //
+        // Every one of them is materialised here, at session creation, from the
+        // host's F32 master — so nothing converts a weight inside a wave, and a
+        // width the forward asks for is always already there. Missing one is not
+        // a silent wrong answer: the matmul refuses it by name.
+        //
+        // Idempotent. A session whose widths match the last moves no bytes; in
+        // production, where the stream and the arena agree and nothing is
+        // promoted, this is a single resident copy.
+        let mut widths = vec![dtype, kv_dtype];
+        if dtype == DType::F16 {
+            widths.push(DType::BF16);
+        }
+        widths.dedup();
+        for adapter in self.adapters.values() {
+            adapter.maybe_change_dtype(&widths, &self.model.device)?;
         }
         self.model.final_norm.maybe_change_dtype(dtype)
     }

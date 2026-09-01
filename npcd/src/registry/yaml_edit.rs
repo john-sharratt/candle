@@ -178,8 +178,10 @@ fn plan<'a>(
     next: &Value,
     shape: &Shape,
 ) -> Result<(Vec<Patch<'a>>, Vec<String>), String> {
-    let mut patches = Vec::new();
-    let mut touched = Vec::new();
+    let mut sink = Sink {
+        patches: Vec::new(),
+        touched: Vec::new(),
+    };
     descend(
         doc,
         Route::from(vec![]),
@@ -187,10 +189,9 @@ fn plan<'a>(
         current,
         next,
         Some(shape),
-        &mut patches,
-        &mut touched,
+        &mut sink,
     )?;
-    Ok((patches, touched))
+    Ok((sink.patches, sink.touched))
 }
 
 /// The original document as YAML, used only for the order and spelling a
@@ -212,6 +213,17 @@ type Shape = serde_yaml::Value;
 /// sequence that gained or lost an entry, or a mapping whose key set moved, has
 /// no node-for-node correspondence to walk, so the collection is rewritten
 /// whole — as block YAML, so an authored list stays an authored list.
+/// What a descent accumulates: the ops to apply, and the human-readable paths
+/// they touched.
+///
+/// The two travel together everywhere and are pushed to in the same places, so
+/// they are one argument rather than two — which also keeps the recursion's
+/// signature short enough to read.
+struct Sink<'a> {
+    patches: Vec<Patch<'a>>,
+    touched: Vec<String>,
+}
+
 fn descend<'a>(
     doc: &'a Document,
     route: Route<'a>,
@@ -219,8 +231,7 @@ fn descend<'a>(
     have: &Value,
     want: &Value,
     shape: Option<&Shape>,
-    patches: &mut Vec<Patch<'a>>,
-    touched: &mut Vec<String>,
+    sink: &mut Sink<'a>,
 ) -> Result<(), String> {
     // Unchanged. The whole point: no op, so the bytes are untouched and the
     // author's block scalar, wrapping and inline comments survive exactly as
@@ -240,18 +251,9 @@ fn descend<'a>(
                 let child = route.with_key(Component::Key(key.clone().into()));
                 let child_path = join(&path, key);
                 match h.get(key) {
-                    Some(hv) => descend(
-                        doc,
-                        child,
-                        child_path,
-                        hv,
-                        wv,
-                        at_key(shape, key),
-                        patches,
-                        touched,
-                    )?,
+                    Some(hv) => descend(doc, child, child_path, hv, wv, at_key(shape, key), sink)?,
                     None => {
-                        patches.push(Patch {
+                        sink.patches.push(Patch {
                             // `Add` routes to the *mapping* that gains the key,
                             // not to the key itself.
                             route: route.clone(),
@@ -260,17 +262,17 @@ fn descend<'a>(
                                 value: to_yaml(wv)?,
                             },
                         });
-                        touched.push(child_path);
+                        sink.touched.push(child_path);
                     }
                 }
             }
             for key in h.keys() {
                 if !w.contains_key(key) {
-                    patches.push(Patch {
+                    sink.patches.push(Patch {
                         route: route.with_key(Component::Key(key.clone().into())),
                         operation: Op::Remove,
                     });
-                    touched.push(format!("-{}", join(&path, key)));
+                    sink.touched.push(format!("-{}", join(&path, key)));
                 }
             }
             Ok(())
@@ -287,14 +289,13 @@ fn descend<'a>(
                     hv,
                     wv,
                     at_index(shape, i),
-                    patches,
-                    touched,
+                    sink,
                 )?;
             }
             Ok(())
         }
         _ => {
-            patches.push(Patch {
+            sink.patches.push(Patch {
                 operation: if is_collection(want) {
                     rewrite_collection(doc, &route, &path, want, shape)?
                 } else {
@@ -302,7 +303,7 @@ fn descend<'a>(
                 },
                 route,
             });
-            touched.push(path);
+            sink.touched.push(path);
             Ok(())
         }
     }
@@ -959,14 +960,13 @@ groups:
 ";
         // Everything but two keys removed at once.
         let out = splice(original, &obj(json!({ "id": "world", "window": 9000 })));
-        match out {
-            // Whichever way the crate behaves, the contract here is the same:
-            // an answer, and a correct one.
-            Some(text) => {
-                let back: Value = serde_yaml::from_str(&text).expect("parses");
-                assert_eq!(back, json!({ "id": "world", "window": 9000 }), "{text}");
-            }
-            None => {}
+        // `None` is a legitimate answer: this is the shape that panics inside
+        // `yamlpath`, and the `catch_unwind` in `edit` turns that into a
+        // refusal. What must never happen is a `Some` holding a document that
+        // says something other than what was asked for.
+        if let Some(text) = out {
+            let back: Value = serde_yaml::from_str(&text).expect("parses");
+            assert_eq!(back, json!({ "id": "world", "window": 9000 }), "{text}");
         }
     }
 

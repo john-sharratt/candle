@@ -18,11 +18,16 @@ pub(super) fn qwen3_8b_q4() -> ModelSpec {
     let chat_format = DialectType::ChatML;
     ModelSpec {
         arch: ModelArch::Qwen3,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         model_repo: "unsloth/Qwen3-8B-GGUF".into(),
         model_filename: "Qwen3-8B-Q4_K_M.gguf".into(),
         model_bytes: 5_027_784_512,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "Qwen/Qwen3-8B".into(),
         // Unpinned: no revision has been verified against this checkpoint's
         // `tokenizer.ggml.tokens`. The load-time check against that table is
@@ -41,11 +46,16 @@ pub(super) fn qwen3_8b_q6() -> ModelSpec {
     let chat_format = DialectType::ChatML;
     ModelSpec {
         arch: ModelArch::Qwen3,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         model_repo: "unsloth/Qwen3-8B-GGUF".into(),
         model_filename: "Qwen3-8B-Q6_K.gguf".into(),
         model_bytes: 6_725_900_096,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "Qwen/Qwen3-8B".into(),
         // Unpinned: no revision has been verified against this checkpoint's
         // `tokenizer.ggml.tokens`. The load-time check against that table is
@@ -68,11 +78,16 @@ pub(super) fn qwen3_14b_q4() -> ModelSpec {
     let chat_format = DialectType::ChatML;
     ModelSpec {
         arch: ModelArch::Qwen3,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         model_repo: "unsloth/Qwen3-14B-GGUF".into(),
         model_filename: "Qwen3-14B-Q4_K_M.gguf".into(),
         model_bytes: 9_001_753_984,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
@@ -88,11 +103,16 @@ pub(super) fn qwen3_14b_q5() -> ModelSpec {
     let chat_format = DialectType::ChatML;
     ModelSpec {
         arch: ModelArch::Qwen3,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         model_repo: "unsloth/Qwen3-14B-GGUF".into(),
         model_filename: "Qwen3-14B-Q5_K_M.gguf".into(),
         model_bytes: 10_514_570_624,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
@@ -108,11 +128,16 @@ pub(super) fn qwen3_14b_q6() -> ModelSpec {
     let chat_format = DialectType::ChatML;
     ModelSpec {
         arch: ModelArch::Qwen3,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         model_repo: "unsloth/Qwen3-14B-GGUF".into(),
         model_filename: "Qwen3-14B-Q6_K.gguf".into(),
         model_bytes: 12_121_938_304,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),

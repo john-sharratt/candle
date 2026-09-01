@@ -20,7 +20,7 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json,
 };
 // Only the test-only `router` builds one directly; `main` goes through `api`.
@@ -35,9 +35,11 @@ use web::auth::{Role, Roles};
 use crate::accounts::{self, Accounts, NameError, PatchError};
 use crate::clock::{self, Clock};
 use crate::collections::{self, Libraries};
+use crate::engine::runtime::Runtime;
 use crate::guard::Api;
 use crate::identity::require;
 use crate::images::{ImageError, Images};
+use crate::lifegen::routes as lifegen;
 use crate::mind::catalog::CatalogError;
 use crate::mind::doc::{DocError, Wrote};
 use crate::mind::{
@@ -76,9 +78,36 @@ pub struct Authored {
     /// race in the OS whatever this does, and each is atomic (see
     /// [`crate::mind::doc`]).
     pub mind: Mind,
+    /// The engine.
+    ///
+    /// Always present, and always *there before the model is*. The daemon binds
+    /// its port and serves the console while the weights are still loading, so
+    /// what varies is not whether this exists but what it can answer — see
+    /// [`Runtime::is_ready`].
+    ///
+    /// `Option` only so the tests can stand this state up without an engine.
+    pub runtime: Option<Arc<Runtime>>,
+    /// Life generations, running and finished — see [`crate::lifegen`].
+    ///
+    /// Not behind a lock and not built at startup from anything: it is a
+    /// registry that starts empty and fills as an operator generates lives, and
+    /// it holds its own mutex over the one map it owns. Kept here rather than on
+    /// the runtime because a generation is an *authoring* action against the
+    /// mind directory — the engine is something it borrows, not something it
+    /// belongs to.
+    pub lifegen: crate::lifegen::job::Jobs,
 }
 
 impl Authored {
+    /// Eight arguments, and they stay eight.
+    ///
+    /// Every one is a distinct thing the daemon read at startup from a different
+    /// place — two registries, the account store, the cast, the role table, the
+    /// libraries, the mind and the portrait store. Bundling them into a struct
+    /// to satisfy an arity threshold would be the same eight fields written
+    /// twice, named once for the builder and once here, with a second place for
+    /// them to disagree. Called exactly once, from `main`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         worlds: Registry,
         personalities: Registry,
@@ -88,8 +117,8 @@ impl Authored {
         libraries: Libraries,
         mind: Mind,
         images: Images,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Self {
+        Self {
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
             accounts: RwLock::new(accounts),
@@ -98,7 +127,43 @@ impl Authored {
             libraries,
             images,
             mind,
-        })
+            runtime: None,
+            lifegen: crate::lifegen::job::Jobs::new(),
+        }
+    }
+
+    /// The same state with an engine behind it.
+    ///
+    /// The runtime is built first — it needs only the mind directory — and the
+    /// two things it needs *from* this state, the world clock and the persona
+    /// source, are installed afterwards through
+    /// [`Runtime::set_clock`]/[`Runtime::set_persona_source`]. That ordering is
+    /// what breaks the cycle: `Authored` needs the runtime to answer routes, and
+    /// the runtime needs `Authored` to know what time it is for a character.
+    ///
+    /// It was a rebuild-by-unwrap once, which panicked in exactly the case it
+    /// was written for: the clock closure captures a clone of this state, so by
+    /// the time the runtime existed the `Arc` already had two holders and
+    /// `try_unwrap` could never succeed.
+    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Arc<Self> {
+        self.runtime = Some(runtime);
+        Arc::new(self)
+    }
+
+    /// What time it is in a character's world — the async route in.
+    ///
+    /// `Runtime::world_ms` reaches the same answer through a closure that takes
+    /// `blocking_read`, which is correct on the tick thread and **panics**
+    /// inside the runtime. A handler must come this way instead. Both end at
+    /// `clock::world_ms_for`, so there is one lookup and two ways to hold the
+    /// locks for it.
+    pub async fn world_ms(&self, npc_id: u64) -> u64 {
+        crate::clock::world_ms_for(
+            &*self.npcs.read().await,
+            &*self.worlds.read().await,
+            npc_id,
+            now_ms() as i64,
+        )
     }
 }
 
@@ -154,6 +219,45 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             "/v1/personality/:aid/collections",
             Role::Unauthenticated,
             get(personality_collections),
+        )
+        // A character's life: the plan, the strata, and generating them.
+        //
+        // **Admin throughout, including the reads.** Every other authored
+        // document is readable by a signed-in user, but a life plan carries the
+        // seed — the arc, the shape, the world events a life is hung on — which
+        // is the authoring intent behind a character rather than anything the
+        // character is. And every write here puts prose into the substrate that
+        // a character will think it remembers, which is a larger act than
+        // editing a page of canon.
+        .route("/v1/life/catalog", Role::Admin, get(lifegen::get_catalog))
+        .route("/v1/life/:who", Role::Admin, get(lifegen::get_life))
+        .route("/v1/life/:who/seed", Role::Admin, put(lifegen::put_seed))
+        .route(
+            "/v1/life/:who/node/:key",
+            Role::Admin,
+            put(lifegen::put_node),
+        )
+        .route("/v1/life/:who/day", Role::Admin, post(lifegen::post_day))
+        .route(
+            "/v1/life/:who/day/:date",
+            Role::Admin,
+            delete(lifegen::delete_day),
+        )
+        .route(
+            "/v1/life/:who/day/:date/consequences",
+            Role::Admin,
+            put(lifegen::put_consequences),
+        )
+        .route(
+            "/v1/life/:who/generate",
+            Role::Admin,
+            post(lifegen::post_generate),
+        )
+        .route("/v1/life/:who/job", Role::Admin, get(lifegen::get_job))
+        .route(
+            "/v1/life/:who/cancel",
+            Role::Admin,
+            post(lifegen::post_cancel),
         )
         // The authored corpus — canon, craft, characters, settings. Addressed
         // by what things ARE (`canon/ammo/bolt`), never by where they are
@@ -435,11 +539,35 @@ async fn create_npc(
     }
     match s.npcs.write().await.create(&id, &owner, &body, now_ms()) {
         Ok(mut v) => {
+            // Put the new character into the loop straight away.
+            //
+            // The cast is woken at startup, so without this a character created
+            // while the daemon runs never ticks — it exists, it is listed, and
+            // it is not alive. The failure reads as the engine ignoring it, and
+            // the only fix a person would find is a restart. `wake` is
+            // idempotent, so doing it here costs nothing on the startup path.
+            if let Some(rt) = s.runtime.as_ref() {
+                if let Some(id) = v.get("npc_id").and_then(npc_id_of) {
+                    rt.scheduler.wake(id, 0, s.world_ms(id).await);
+                    tracing::info!("npc {id}: created and woken");
+                }
+            }
             name_personality(&mut v, &*s.personalities.read().await);
             (StatusCode::CREATED, Json(v)).into_response()
         }
         Err(e) => npc_err(e),
     }
+}
+
+/// A character id off the wire.
+///
+/// The id is serialised as a **string**, because a `u64` past 2^53 does not
+/// survive a JavaScript client — so reading it back out of a response body is a
+/// string parse, not `as_u64`, and using the latter here silently found nothing.
+fn npc_id_of(v: &Value) -> Option<u64> {
+    v.as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| v.as_u64())
 }
 
 /// The 400 for a create that names a world or personality this daemon does not
@@ -877,7 +1005,19 @@ async fn delete_npc(
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.write().await.delete(npc_id, &owner, now_ms()) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // Take the character out of the engine too. Without this its loop
+            // keeps ticking against an authored record that no longer resolves —
+            // the persona source returns `None`, so it thinks about nothing for
+            // ever, and its conversation is never retired.
+            if let Some(rt) = s.runtime.as_ref() {
+                rt.scheduler.retire(npc_id);
+                if let Some(minds) = rt.minds.read().unwrap().as_ref() {
+                    minds.retire_npc(npc_id);
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => npc_err(e),
     }
 }
@@ -1113,13 +1253,13 @@ pub fn err(status: StatusCode, code: &str, detail: &str) -> Response {
 async fn mind_request(
     s: &Arc<Authored>,
     q: &std::collections::HashMap<String, String>,
-) -> Result<(std::path::PathBuf, Option<Address>, Scope), Response> {
+) -> Result<(std::path::PathBuf, Option<Address>, Scope), Box<Response>> {
     let Some(root) = s.mind.root() else {
-        return Err(err(
+        return Err(Box::new(err(
             StatusCode::NOT_FOUND,
             "no_mind",
             "this daemon was started without --mind, so it has no authored content to edit",
-        ));
+        )));
     };
     // `?id=` is an address in the corpus — `canon/ammo/bolt` — not a path. The
     // absent case is the corpus itself.
@@ -1134,7 +1274,7 @@ async fn mind_request(
         Some(wid) => match s.worlds.read().await.get(wid) {
             Some(r) => Scope::of_world(&r.body),
             None => {
-                return Err(err(StatusCode::BAD_REQUEST, "unknown_world", wid));
+                return Err(Box::new(err(StatusCode::BAD_REQUEST, "unknown_world", wid)));
             }
         },
     };
@@ -1181,7 +1321,7 @@ async fn mind_list(
 ) -> Response {
     let (root, addr, scope) = match mind_request(&s, &q).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let cat = category_lookup(&s);
     let (id, title, parent, has_text, children) = match &addr {
@@ -1227,14 +1367,14 @@ async fn mind_list(
 async fn mind_entry_of(
     s: &Arc<Authored>,
     q: &std::collections::HashMap<String, String>,
-) -> Result<(std::path::PathBuf, Address), Response> {
+) -> Result<(std::path::PathBuf, Address), Box<Response>> {
     let (root, addr, scope) = mind_request(s, q).await?;
     let Some(addr) = addr else {
-        return Err(err(
+        return Err(Box::new(err(
             StatusCode::BAD_REQUEST,
             "unknown_address",
             "name something in the mind",
-        ));
+        )));
     };
     let cat = category_lookup(s);
     // Asked of whichever path the address has, so a topic is checked by its
@@ -1242,11 +1382,11 @@ async fn mind_entry_of(
     let path = addr.collection_path().or_else(|| addr.entry_path());
     if let Some(p) = path {
         if !scope.admits(&p, &cat) {
-            return Err(err(
+            return Err(Box::new(err(
                 StatusCode::FORBIDDEN,
                 "out_of_scope",
                 "this world does not include that",
-            ));
+            )));
         }
     }
     Ok((root, addr))
@@ -1259,7 +1399,7 @@ async fn mind_entry(
 ) -> Response {
     let (root, addr) = match mind_entry_of(&s, &q).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match mind_catalog::read(&root, &addr) {
         Ok(d) => Json(json!({
@@ -1284,7 +1424,7 @@ async fn put_mind_entry(
 ) -> Response {
     let (root, addr) = match mind_entry_of(&s, &q).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Some(text) = body.get("text").and_then(Value::as_str) else {
         return err(
@@ -1380,7 +1520,7 @@ async fn mind_fields(
 ) -> Response {
     let (root, addr) = match mind_entry_of(&s, &q).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let doc = match mind_catalog::read(&root, &addr) {
         Ok(d) => d,
@@ -1417,7 +1557,7 @@ async fn put_mind_fields(
 ) -> Response {
     let (root, addr) = match mind_entry_of(&s, &q).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Some(values) = body.get("values").and_then(Value::as_object) else {
         return err(
@@ -1480,7 +1620,7 @@ async fn delete_mind_entry(
 ) -> Response {
     let (root, addr) = match mind_entry_of(&s, &q).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match mind_catalog::remove(&root, &addr) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1879,7 +2019,7 @@ mod tests {
     /// Shared state, for a test that makes several requests against one store.
     /// `router` consumes its state, so the `Arc` is what gets reused.
     fn state(base: std::path::PathBuf) -> Arc<Authored> {
-        Authored::new(
+        Arc::new(Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
             Registry::load("personality", base.join("personalities")).unwrap(),
             Accounts::load(base.join("accounts")).unwrap(),
@@ -1899,7 +2039,7 @@ mod tests {
             // one. `mind_state` below is the same thing with content seeded.
             Mind::new(Some(base.clone())),
             Images::new(&base),
-        )
+        ))
     }
 
     /// State whose mind directory holds a small tree to browse and edit.
@@ -2477,6 +2617,24 @@ mod tests {
                 // Read-only, from the personality's own document — open for the
                 // same reason reading the document is.
                 ("/v1/personality/:aid/collections", "unauthenticated"),
+                // A character's authored life. **`admin` for the reads too**,
+                // which is the one place this table departs from the pattern
+                // above it, and deliberately: the plan carries the SEED — the
+                // arc, the shape, the world events a life hangs on — which is
+                // the authoring intent behind a character rather than anything
+                // the character is. Every write puts prose into the substrate
+                // that a character will believe it remembers, which is a larger
+                // act than editing a page of canon.
+                ("/v1/life/catalog", "admin"),
+                ("/v1/life/:who", "admin"),
+                ("/v1/life/:who/seed", "admin"),
+                ("/v1/life/:who/node/:key", "admin"),
+                ("/v1/life/:who/day", "admin"),
+                ("/v1/life/:who/day/:date", "admin"),
+                ("/v1/life/:who/day/:date/consequences", "admin"),
+                ("/v1/life/:who/generate", "admin"),
+                ("/v1/life/:who/job", "admin"),
+                ("/v1/life/:who/cancel", "admin"),
                 // The authored corpus. `user` to read rather than open, because
                 // this one *enumerates* — see the route's own comment.
                 ("/v1/mind/list", "user"),
@@ -3356,7 +3514,7 @@ mod tests {
     #[tokio::test]
     async fn without_a_mind_the_editor_says_it_has_nothing_to_edit() {
         let base = tmp("mind-none");
-        let st = Authored::new(
+        let st = Arc::new(Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
             Registry::load("personality", base.join("personalities")).unwrap(),
             Accounts::load(base.join("accounts")).unwrap(),
@@ -3365,7 +3523,7 @@ mod tests {
             crate::collections::Libraries::load(&crate::projection::Source::resolve(None).unwrap()),
             Mind::new(None),
             Images::new(&base),
-        );
+        ));
         let (s, v) = call(router(st), get("/v1/mind/list", Some("google-1"))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(v["error"], "no_mind");

@@ -23,6 +23,9 @@
 //! call into `models::` for weight loading (`VarBuilder`) and forward passes,
 //! and into `generation`/`pipelines` for turning logits into tokens.
 pub mod generation;
+/// The gitignored `models.override.yaml` that lets a machine run checkpoints
+/// the repository does not name.
+pub mod model_overrides;
 pub mod models;
 pub mod object_detection;
 pub mod pipelines;

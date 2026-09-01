@@ -17,6 +17,16 @@ const clock = (s) => `${pad2(Math.floor(s / 3600) % 24)}:${pad2(Math.floor(s / 6
 const WORLD_EPOCH = 412 * 86400000 + 6 * 3600000 + 14 * 60000;
 const worldMs = () => WORLD_EPOCH + (Date.now() % 3600000) * 60;
 
+/* The refusal a fixture owes for work that genuinely needs a card.
+ *
+ * Shaped exactly like the daemon's `503 no_engine`, so a page handles one case
+ * rather than two. The alternative — answering `{ok: true}` — is the failure
+ * this whole fixture was rewritten to stop: somebody believing they had saved
+ * something that nothing anywhere holds. */
+const noEngine = (what) => Object.assign(new Error(`this is the fixture — it cannot ${what}`), {
+  error: 'no_engine', detail: `this is the fixture — it cannot ${what}`, status: 503,
+});
+
 /* Narrow a listing by the console's filter box.
  *
  * A substring match, which is looser than the daemon's whole-word rule — and
@@ -639,6 +649,68 @@ export const MockAPI = {
   async getPersonality(a) { return (await this.listPersonalities()).personalities.find((x) => x.personality_id === a); },
   async setPersonality() { return { ok: true }; },
 
+  /* The life ladder.
+   *
+   * The catalog is a real copy of the daemon's authoring table rather than an
+   * invention, because the console builds its consequence form from it — a
+   * fixture with different tool names would exercise a form that could never
+   * be saved against the real thing.
+   *
+   * Every life here is UNSEEDED. That is the honest fixture: the interesting
+   * half of this page is generation, which needs a card, and a mock plan full
+   * of invented prose would put a life on screen that no daemon wrote and that
+   * nothing could regenerate. The seed form is what the mock can truthfully
+   * show. */
+  async getLifeCatalog() {
+    const T = (name, writes, description, params, required, example) =>
+      ({ name, writes, description, params, required, example });
+    return {
+      tools: [
+        T('form_belief', 'beliefs',
+          'A conviction this episode produced, in the character\'s own voice.',
+          ['statement', 'confidence', 'threshold'], ['statement'],
+          '{"name":"form_belief","arguments":{"statement":"Hess burned the east granary","confidence":0.9}}'),
+        T('form_relationship', 'relationships',
+          'Someone this episode put into the character\'s life, and how they stand afterwards.',
+          ['entity_id', 'display', 'trust', 'affect', 'familiarity', 'notes'], ['entity_id'],
+          '{"name":"form_relationship","arguments":{"entity_id":"prof-lim","display":"Professor Lim"}}'),
+        T('revise_relationship', 'relationships',
+          'A relationship this episode moved. Only the named dials change.',
+          ['entity_id', 'trust', 'affect', 'familiarity', 'notes'], ['entity_id'],
+          '{"name":"revise_relationship","arguments":{"entity_id":"hess","trust":-0.7}}'),
+        T('leave_intent', 'agency',
+          'A standing intention this episode left the character with.',
+          ['intent', 'until'], ['intent'],
+          '{"name":"leave_intent","arguments":{"intent":"finish the doctorate on her own terms"}}'),
+      ],
+      cadences: [
+        { value: 'quiet', label: 'quiet', instruction: 'Mark defining days sparingly.' },
+        { value: 'even', label: 'even', instruction: 'Spread the defining days across the whole life.' },
+        { value: 'early', label: 'formed early', instruction: 'Concentrate them in the first third.' },
+        { value: 'late', label: 'formed late', instruction: 'Let the last third carry them.' },
+        { value: 'punctuated', label: 'punctuated', instruction: 'Long flat runs broken by tight clusters.' },
+      ],
+      phases: [
+        { value: 'story', label: 'Writing the life story', unit: 'story' },
+        { value: 'years', label: 'Laying out the years', unit: 'years' },
+        { value: 'months', label: 'Writing the months', unit: 'months' },
+        { value: 'days', label: 'Writing the defining days', unit: 'days' },
+      ],
+    };
+  },
+  async getLife(who) { return { who, plan: null }; },
+  /* The writes report the absence rather than pretending. A fixture that
+   * answered `{ok:true}` would leave somebody believing they had seeded a life
+   * that no daemon has. */
+  async setLifeSeed() { throw noEngine('write a life'); },
+  async setLifeNode() { throw noEngine('edit a life'); },
+  async addLifeDay() { throw noEngine('add a day'); },
+  async removeLifeDay() { throw noEngine('remove a day'); },
+  async setLifeConsequences() { throw noEngine('set consequences'); },
+  async generateLife() { throw noEngine('generate a life'); },
+  async getLifeJob() { return null; },
+  async cancelLife() { throw noEngine('cancel a generation'); },
+
   async getLayerSchema() {
     const L = (layer, window, priority, min_percent, selection, masking, score_threshold,
       decode_priority, summarize, description) =>
@@ -984,6 +1056,58 @@ export const MockAPI = {
     ] };
   },
   async calibrateTools() { return { job_id: 'job_cal_1', tools: ['open_gate'] }; },
+
+  /* Pulse. The fixture's job here is to exercise the view's shapes — a
+   * preempted tick beside a quiet one, a character mid-batch, a fade counter
+   * that is not zero — because those are the states that are hard to reach on a
+   * live daemon exactly when you are trying to lay the page out. */
+  async pulse(o) {
+    const ticks = [
+      { npc_id: 1, tick: 41, at_ms: 610000, world_ms: 51_840_000, cause: 'blocked',
+        perceived: ['Time passes quietly. Nothing demands you.'], acts: [],
+        heartbeat_ms: 120000, inbox_after: 0 },
+      { npc_id: 2, tick: 42, at_ms: 612400, world_ms: 51_842_000, cause: 'pending',
+        perceived: ['Hess says to you: "Where is the ledger?"'], acts: [],
+        heartbeat_ms: 32000, inbox_after: 0 },
+      { npc_id: 1, tick: 43, at_ms: 615100, world_ms: 51_845_000, cause: 'preempted',
+        perceived: ['You are hurt: a crossbow bolt through the left shoulder, badly',
+                    'You overhear someone nearby say: "That is the one."'],
+        acts: [], heartbeat_ms: 4000, inbox_after: 0 },
+    ];
+    const id = o && o.npc_id;
+    return { ticks: id ? ticks.filter((t) => t.npc_id === Number(id)) : ticks,
+             ready: true, population: 2 };
+  },
+  async pulseCensus() {
+    return { ready: true, characters: [
+      { npc_id: 1, readiness: 'preempted', inbox_depth: 2, heartbeat_ms: 4000,
+        ticks: 43, events_seen: 51, window_turns: 24, window_cap: 24, faded: 118, day: 3 },
+      { npc_id: 2, readiness: 'blocked', inbox_depth: 0, heartbeat_ms: 120000,
+        ticks: 12, events_seen: 12, window_turns: 6, window_cap: 24, faded: 0, day: 3 },
+    ] };
+  },
+  async npcWindow(_id) {
+    return {
+      cap: 24, faded: 118, empty: false,
+      turns: [
+        { speaker: 'world', at_ms: 51_840_000, replaces: null,
+          text: 'Hess says to you: "Where is the ledger?"' },
+        { speaker: 'npc', at_ms: 51_840_400, replaces: null,
+          text: '→ refuse — handing over the ledger' },
+        { speaker: 'world', at_ms: 51_845_000, replaces: null,
+          text: 'You are hurt: a crossbow bolt through the left shoulder, badly' },
+      ],
+    };
+  },
+  async pulseInject(id, line) {
+    if (line.startsWith('/') && !/^\/(say|overhear|see|notice|map|hurt|urgent|wake|sleep)\b/.test(line)) {
+      throw Object.assign(new Error('no command `' + line.split(/\s/)[0].slice(1) + '`'),
+        { error: 'bad_command', status: 400 });
+    }
+    return { delivered: true, command: line.startsWith('/') ? line.slice(1).split(/\s/)[0] : 'say',
+             salience: 0.6, preempts: /^\/(hurt|urgent|wake)\b/.test(line),
+             prose: line.replace(/^\/\w+\s*/, '') };
+  },
   async listCommands() {
     return { commands: [
       C('say', 'narration', 'Speak as yourself', 'interaction_event', { text: { type: 'string', description: 'What you say' } }, ['text']),

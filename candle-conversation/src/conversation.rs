@@ -3720,6 +3720,51 @@ impl Sequence {
         Ok(())
     }
 
+    /// Decode this conversation through a LoRA adapter loaded with the model,
+    /// or `None` for the base model.
+    ///
+    /// The name is one given to [`ModelBuilder::lora`](crate::models::ModelBuilder::lora)
+    /// when the engine was built. An unknown name is an error — at the first
+    /// wave rather than here, because the model owns the registry — and never a
+    /// silent fall back to the base weights, which would read as the fine-tune
+    /// not working with nothing to point at.
+    ///
+    /// # Before the first turn
+    ///
+    /// The adapter changes the projections that write K/V, so it must be chosen
+    /// while the slot is still empty. Calling this on a conversation that has
+    /// already decoded is refused: the existing keys were produced by the
+    /// projections in force when they were written, and attending them with
+    /// queries from a different model is not an error anything can detect — the
+    /// answers simply get worse.
+    ///
+    /// # What it costs
+    ///
+    /// Nothing is merged, so an adapted conversation shares the resident
+    /// checkpoint with every unadapted one. What it does change is which wave it
+    /// rides in: waves are grouped by adapter, so an adapted conversation
+    /// co-batches with other conversations on the same adapter rather than with
+    /// all of them.
+    pub fn set_lora(&mut self, adapter: Option<&str>) -> crate::Result<()> {
+        if self.turn_in_flight {
+            return Err(ConversationError::TurnInFlight {
+                sequence_id: self.id,
+            });
+        }
+        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::SetSequenceAdapter {
+                sequence_id: self.id,
+                adapter: adapter.map(Arc::from),
+                response_tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        response_rx
+            .recv()
+            .map_err(|_| ConversationError::SchedulerGone)??;
+        Ok(())
+    }
+
     /// Abandon an in-flight turn whose stream ended without a `Done` (e.g. the
     /// scheduler shut down mid-decode, or a scheduler error). Clears the local
     /// in-flight state so the next [`Self::submit_turn`]/[`Self::reset`] is not

@@ -29,6 +29,9 @@ rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_plain = { workspace = true }
+# `model_overrides` — the gitignored `models.override.yaml` that lets a machine
+# run checkpoints the repository does not name.
+serde_yaml = { workspace = true }
 # Binary fixture (de)serialization: the offline MoE-predictor routing-trace eval
 # and the paged-prefill kernel-replay capture (models::prefill_capture).
 bincode = "1.3"
