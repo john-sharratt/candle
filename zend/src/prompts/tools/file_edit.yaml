@@ -1,4 +1,29 @@
 name: file_edit
+questions:
+- bump the version in Cargo.toml from 0.9.1 to 0.10.0
+- change the log level from info to debug in that file
+- replace the hardcoded localhost with an env lookup
+- set retries to 5 where it currently says 3
+- can you fix just that one line without touching the rest
+- what's the smallest change that corrects this constant
+- could you swap the deprecated call for the new one in place
+- is it enough to change the default, or does the caller need it too
+- the timeout is too aggressive and it's flaking in CI
+- this typo is in the generated docs and I want it gone
+- we renamed the field upstream and this file still uses the old name
+- the endpoint moved, point it at the new host
+- patch that line
+- one-line fix in the config
+- tweak that value
+- s/old/new/ in the file
+- change the port from 8080 to 9090 in the config
+- replace that function name throughout the file
+- fix the typo in the header comment of main.rs
+- update the version string in Cargo.toml
+- swap out that one line in the script
+- edit the README to correct the install command
+- patch this file so the timeout is 30 seconds
+- rename the variable in that source file
 category: Files
 description: 'Make a targeted edit to an existing file by replacing a unique substring. The file may be one this session created or one from the project on disk — editing a project file copies it into the session first, so the version on disk is never modified. Use for: changing a value in a config, updating a function body, fixing a typo, modifying one line without rewriting the whole file, applying small surgical changes. The old_str must appear exactly once — if it appears multiple times the call returns ambiguous and asks for more surrounding context. Triggered by "change X to Y in the file", "update this line", "modify the part where it says", "fix the value of". Returns path and new byte count. For full rewrites use write.'
 high_risk: true

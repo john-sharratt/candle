@@ -13,17 +13,18 @@ use crate::persistence::content_hash::{hash_tokens, ContentChain, ContentHash};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    from_projection_with_origins, Builder, Conversation, ProjectionEvent, ProjectionMode,
+    from_projection_with_origins, Builder, Conversation, Observe, ProjectionEvent, ProjectionMode,
     ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId,
     TurnIndex,
 };
 use crate::provenance::WideQSig;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
-    note_branch_checkpoint_computed, note_branch_checkpoint_installed, ProjectionInputs,
-    ReprojectionPolicy, SchedulerRequest,
+    note_branch_checkpoint_computed, note_branch_checkpoint_installed, CarvedTurn,
+    ProjectionInputs, ReprojectionPolicy, SchedulerRequest, TurnContent,
 };
 use crate::sequence_handle::{BlockCount, SequenceId};
+use crate::stuffed_grid::{plan_stuffed_grid_with_indices, CaseGrid};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
@@ -1993,6 +1994,171 @@ impl Sequence {
         Ok(handle)
     }
 
+    /// Prefill MANY calibration turns in ONE forward and seal each to its own
+    /// block range.
+    ///
+    /// The batched form of [`Self::submit_prefilled_turn`]. Each case is a
+    /// question exemplar — a user turn followed by an empty assistant turn — and
+    /// they are laid end to end by [`crate::stuffed_grid`], every case starting
+    /// on a block boundary so no two share a block and no exemplar's `sign(Q)`
+    /// window carries its neighbour's tokens.
+    ///
+    /// **Why.** One case per forward runs the model deep in the launch-overhead
+    /// regime: 353 tokens across 2.4 sequences in a 1,095 ms forward, 263 t/s,
+    /// with a thousand-token backlog queued behind it. The forward costs about
+    /// the same for 3,500 tokens as for 350.
+    ///
+    /// **A group shares one projection and one `SelectionState`, so it must be
+    /// a group of ONE tool's cases.** The projection event records a single
+    /// selected catalog member for the whole submission; grouping a tool's own
+    /// question exemplars makes that record correct for every case in it.
+    /// Mixing tools in one group would leave the event naming one tool for all
+    /// of them. Retrieval would mostly survive that — `belief_gallery` resolves
+    /// an exemplar's slot from its turn's tags first and only falls back to
+    /// projection events when the tags name none — but the persisted event
+    /// trail would be a lie, so the constraint is stated rather than leaned on.
+    ///
+    /// `tags` is required per case rather than defaulted for the same reason: a
+    /// case with empty tags falls through to the group's selection.
+    ///
+    /// `cases` pair the user question with that case's tags. Returns the
+    /// streaming handle plus, for each sealed region, the index of the case it
+    /// came from — empty cases claim no region, so the two are not 1:1.
+    pub fn submit_prefilled_turn_group(
+        &mut self,
+        cases: &[(String, Vec<String>)],
+        selection: SelectionState,
+        pad_token: u32,
+    ) -> crate::Result<(TurnHandle, Vec<usize>)> {
+        if self.turn_in_flight {
+            return Err(ConversationError::TurnInFlight {
+                sequence_id: self.id,
+            });
+        }
+        self.selection = selection;
+
+        // Each case's grid is the whole turn a lone prefill would lay down —
+        // opener, user body, the user/assistant join, and the closing marker —
+        // because a stuffed case is sealed as a complete turn and must carry its
+        // own brackets. `submit_prefill_unit` bakes those ends for a single
+        // turn; here every case needs its own pair, so they are built directly.
+        let head = self.turn_head_text(false);
+        let user_end = self.config.dialect.user_end;
+        let assistant_start = self.config.dialect.assistant_start;
+        let assistant_end = self.config.dialect.assistant_end;
+
+        let mut grids: Vec<CaseGrid> = Vec::with_capacity(cases.len());
+        for (question, _) in cases {
+            let user_prefix = format!("{head}{question}");
+            let assistant_head = format!("{user_prefix}{user_end}{assistant_start}");
+            let whole = format!("{assistant_head}{assistant_end}");
+            // Tokenised as cumulative prefixes of ONE string, so a tokenizer
+            // that merges across a join reports bounds on the same ids the model
+            // will see. Measuring the pieces separately and summing would drift
+            // wherever a merge crosses a boundary.
+            let tokens = self.tokenize(&whole)?;
+            let user_content_end = self.tokenize(&user_prefix)?.len().min(tokens.len()) as u32;
+            let assistant_content_start =
+                self.tokenize(&assistant_head)?.len().min(tokens.len()) as u32;
+            grids.push(CaseGrid {
+                tokens: tokens[..].to_vec(),
+                user_content_end,
+                assistant_content_start,
+            });
+        }
+
+        let (grid, sources) = plan_stuffed_grid_with_indices(&grids, pad_token);
+        if grid.regions.is_empty() {
+            return Err(ConversationError::Channel(
+                "submit_prefilled_turn_group: no case produced any tokens".into(),
+            ));
+        }
+
+        // One `CarvedTurn` per region: its block range, and the content the
+        // substrate pins on the turn it becomes. The layout is built from the
+        // region's CASE-relative bounds — a turn records its spans against its
+        // own token run, and `turn_layout::phase_span_of` reads them back against
+        // the turn's own signature window, so rebasing them into the grid would
+        // put every span past the end of its window and make the offline
+        // phase analysis read nothing.
+        let im_end_len = self.tokenize(user_end)?.len() as u32;
+        let assistant_start_len = self.tokenize(assistant_start)?.len() as u32;
+        let trailing_len = self.tokenize(assistant_end)?.len() as u32;
+        // The opener is the same text for every case, so it is measured once
+        // rather than per case. It is clamped against each region's user end
+        // below: a tokenizer that merges across the head↔question join makes the
+        // standalone count an approximation of where the question really starts,
+        // and an unclamped one could exceed the end and invert the span — which
+        // `phase_span_of` would then read backwards.
+        let head_len = self.tokenize(&head)?.len() as u32;
+        let mut turns: Vec<CarvedTurn> = Vec::with_capacity(grid.regions.len());
+        for (region, &src) in grid.regions.iter().zip(&sources) {
+            let (question, tags) = &cases[src];
+            let layout = TurnLayout::from_flat_grid_with_tail(
+                // The opener is baked into every case's grid, so the user body
+                // starts past it — the non-zero start is what tells the layout
+                // the grid reserves room for a real opener.
+                head_len.min(region.user_content_end),
+                region.user_content_end,
+                region.assistant_content_start,
+                region.token_len as u32,
+                im_end_len,
+                assistant_start_len,
+                trailing_len,
+                question.clone(),
+                // A question exemplar has no assistant body; the empty turn is
+                // the point — routing happens on the question.
+                Some(String::new()),
+                false,
+            );
+            turns.push(CarvedTurn {
+                region: *region,
+                content: TurnContent {
+                    role: Role::User,
+                    tags: tags.clone(),
+                    layout,
+                    // The region's own tokens, padding excluded: `token_ids`
+                    // must align 1:1 with the turn's K/V grid, and the padding
+                    // belongs to the block range, not to the turn's content.
+                    token_ids: TokenBuffer::from(grid.tokens[region.token_range()].to_vec()),
+                },
+            });
+        }
+
+        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        self.scheduler_tx
+            .send(SchedulerRequest::SubmitTurn {
+                sequence_id: self.id,
+                projection_inputs: Some(self.projection_inputs()),
+                prefill_text: String::new(),
+                prefill_tokens: TokenBuffer::from(grid.tokens.clone()),
+                user_text: String::new(),
+                // The grid's own openers and closers are already baked per case,
+                // so the single-turn boundary baking must not run again: a zero
+                // `user_content_start` is what tells `submit_prefill_unit`'s
+                // successor there is no head to add.
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
+                no_think: false,
+                tags: Vec::new(),
+                projection_offsets: Vec::new(),
+                prefill_assistant_text: String::new(),
+                // Every case closed its own bracket inside the grid.
+                post_decode_tokens: TokenBuffer::new(),
+                max_decode_tokens: 0,
+                sampling: self.config.sampling.clone(),
+                event_tx,
+                reprojection: None,
+                disable_reprojection: self.config.disable_reprojection,
+                triggers: Arc::new(TriggerRegistry::new()),
+                seal_group: Some(Arc::new(turns)),
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        self.turn_in_flight = true;
+        Ok((TurnHandle::new(event_rx), sources))
+    }
+
     /// Send a `SubmitTurn` request to the scheduler, returning the
     /// streaming handle.
     ///
@@ -2107,6 +2273,8 @@ impl Sequence {
         let (event_tx, event_rx) = crossbeam::channel::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
+                // One turn, and it is the slot's tail — the ordinary shape.
+                seal_group: None,
                 sequence_id,
                 projection_inputs,
                 prefill_tokens,
@@ -2956,7 +3124,7 @@ impl Sequence {
         use crate::provenance::decode_wide_sigs;
         let empty = crate::substrate::ProjectionScores::new();
         let timeline = self.target.timeline;
-        let (probe, q_span) = {
+        let (probe, q_span, tags, source) = {
             let read = self.substrate.read();
             let count = read.turn_count(timeline);
             if count == 0 {
@@ -2981,21 +3149,32 @@ impl Sequence {
             // Concept F: the sealed turn's question window is its persisted
             // user span — the sig grid is 1:1 with the real-KV layout.
             let q_span = read.user_sig_span(timeline, idx);
-            (probe, q_span)
+            // The turn's own gather-scope tags, which route the observation below
+            // to the scopes this turn belongs to.
+            let tags = read.turn_tags(timeline, idx);
+            // The turn's own stream id keys the observation, so a later replay of
+            // this turn folds nothing a second time.
+            let source = crate::persistence::content_hash::turn_stream_id(timeline.raw(), idx.0).0;
+            (probe, q_span, tags, source)
         };
         let probe_q = q_span.and_then(|r| probe.get(r)).filter(|q| !q.is_empty());
         let (scores, _) = self
             .substrate
-            // observe = true: the seal scan is the once-per-turn learning
-            // point for the score-normalization hit levels. No arena here (the
-            // scheduler owns it) → the CPU per-file scan; the hot reproject path
-            // runs the paged GPU scan over the resident arena.
+            // The seal scan is the once-per-turn learning point for the
+            // score-normalization hit levels — and it teaches only the scopes this
+            // turn is inside, so a dialogue turn cannot rewrite a tag-scoped
+            // collection's lens. No arena here (the scheduler owns it) → the CPU
+            // per-file scan; the hot reproject path runs the paged GPU scan over
+            // the resident arena.
             .score_beliefs(
                 self.projection.schema(),
                 self.target,
                 &probe,
                 probe_q,
-                true,
+                Observe::Yes {
+                    tags: &tags,
+                    source,
+                },
                 None,
             );
         scores
@@ -4145,7 +4324,9 @@ impl ProbeCtx {
             self.target,
             &probe,
             None,
-            false,
+            // A probe writes nothing to the substrate and must teach nothing
+            // either: it is a question being asked, not evidence about a scope.
+            Observe::No,
             None,
         );
         let resolver = self.substrate.read_for_scored(self.target, &scores);
@@ -4208,6 +4389,9 @@ impl ProbeCtx {
         if self
             .scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
+                // An ephemeral probe seals nothing at all — see the
+                // `ephemeral_slots` branch that forces `SealAction::None`.
+                seal_group: None,
                 sequence_id: slot,
                 projection_inputs: Some(ProjectionInputs {
                     projection: Arc::clone(&self.projection),

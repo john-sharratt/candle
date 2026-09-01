@@ -1,4 +1,29 @@
 name: file_read
+questions:
+- cat zend/src/session.rs
+- print docs/kv_tier_migration.md
+- open the Dockerfile so I can check the base image
+- show me what's in .gitignore
+- what does the build script actually do
+- does that module still import the old helper
+- what version is pinned in the lockfile
+- how long is that source file
+- I want to review the code before we change it
+- need to see the current config to know what to override
+- checking whether my earlier edit actually landed
+- the error mentions line 240, let me see the file
+- read it
+- print that file's contents
+- open the file and show me the text
+- let's look at the source
+- show me the contents of src/main.rs
+- read that config file for me
+- what's in README.md
+- open the file I wrote earlier and print it
+- let me see what's inside Cargo.toml
+- print the contents of the log file
+- pull up that source file so I can look at it
+- read back the notes file from this session
 category: Files
 description: 'Read a file''s content. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what''s in", "open the file", "cat", "display the contents of". Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. At most 200 lines come back per call: when the header reads `(lines 1-200 of 900)` there is more, and the next call asks for start_line 201. For remote filesystems use remote_fs_session_get to download first, then file_read.'
 parameters:

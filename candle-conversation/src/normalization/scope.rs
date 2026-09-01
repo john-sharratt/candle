@@ -1,7 +1,7 @@
 //! One scope's normalization state: a hit level per child, plus the read
 //! (`normalize_with_floors`) and write (`observe`) operations over them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::hit_level::HitLevel;
 use super::{ChildKey, NormConfig};
@@ -10,9 +10,20 @@ use super::{ChildKey, NormConfig};
 #[derive(Default)]
 pub(super) struct ScopeState {
     children: HashMap<ChildKey, HitLevel>,
+    /// Evidence already folded into this scope, so folding it again is a no-op
+    /// (see [`super::cache::NormalizationCache::observe`]). One `u64` per
+    /// distinct observation — a turn stream id — which for the corpora here is
+    /// hundreds to low thousands per scope.
+    observed: HashSet<u64>,
 }
 
 impl ScopeState {
+    /// Record `source` as folded into this scope. Returns `false` when it was
+    /// already present, i.e. the caller should skip the fold.
+    pub(super) fn mark_observed(&mut self, source: u64) -> bool {
+        self.observed.insert(source)
+    }
+
     /// Normalize each child's raw score to the 0–1000 band:
     /// `scale × raw / max(hit_level, floor)`. A child never observed in this
     /// scope normalizes against the cold-start prior. Pure — does not mutate.
@@ -85,7 +96,9 @@ impl ScopeState {
         self.children.get(k).map(|h| h.level())
     }
 
-    #[cfg(test)]
+    /// How many distinct observations have shaped this child's level here — the
+    /// measure of whether this scope knows enough about it to be its
+    /// denominator. `None` when the scope has never seen it at all.
     pub(super) fn count_of(&self, k: &ChildKey) -> Option<u32> {
         self.children.get(k).map(|h| h.count())
     }

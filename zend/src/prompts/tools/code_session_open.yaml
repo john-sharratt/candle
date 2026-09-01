@@ -1,4 +1,29 @@
 name: code_session_open
+questions:
+- start a JS session and keep it around for the next few steps
+- open a scripting sandbox where definitions persist
+- give me a code session so I can build this up incrementally
+- create a javascript interpreter session for this task
+- can I get a session where my variables survive between calls
+- is there a way to keep state across several JS runs
+- would a persistent sandbox be better than one-off snippets here
+- can we work in a REPL instead of re-pasting everything
+- I'm going to build a helper library up piece by piece
+- this analysis needs several steps sharing the same data
+- re-declaring the fixtures every time is wasteful
+- want somewhere to keep the parsed dataset while I explore it
+- open a javascript sandbox session
+- new code sandbox
+- start a REPL
+- give me a scratch interpreter
+- open a javascript session I can keep using
+- start a persistent JS sandbox for this work
+- I want a code session where my variables stick around
+- spin up a REPL for javascript
+- begin a stateful JS session please
+- create a code sandbox I can run several snippets in
+- open an interpreter session for javascript
+- set up a persistent scripting session
 category: Code execution
 description: Open a persistent JavaScript session. Runs in-process on an embedded, sandboxed pure-Rust engine — no Node or external interpreter required. Variable, function, and const definitions persist across code_session_exec calls. Close with code_session_close when done.
 high_risk: true

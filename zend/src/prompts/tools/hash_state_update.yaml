@@ -1,4 +1,29 @@
 name: hash_state_update
+questions:
+- absorb this second block into state id 3
+- push these bytes into the open digest context
+- add chunk 4 of 9 to the streaming hash
+- feed this hex fragment into the rolling computation
+- how many chunks have gone in so far
+- can I keep adding to the same state
+- does the order of these chunks matter
+- is the context still open for more data
+- continuing to stream the file through
+- more of the payload has arrived, take it
+- part two of the upload, same digest
+- appending the next segment to the running hash
+- next chunk
+- add this to the hash
+- absorb this block
+- keep hashing, more data
+- feed this next chunk into the running hash
+- absorb this block into the streaming digest
+- add these bytes to the hash state I opened
+- push the second part of the file into the hash
+- continue the incremental digest with this data
+- keep hashing — here's the next segment
+- append this chunk to the in-progress hash
+- update the streaming hash with this piece
 category: Hash streaming
 description: Absorb another chunk of data into an in-progress streaming hash computation. Call repeatedly to feed a large input piece by piece before hash_state_finalize emits the digest.
 parameters:

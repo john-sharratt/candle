@@ -48,6 +48,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
 
 use crate::conversation::window_sealed_tokens;
+use crate::normalization::Phase;
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
@@ -69,7 +70,7 @@ use crate::summary_tree::{
     TurnKind, MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
-use crate::turn_layout::{TurnLayout, TurnSegment};
+use crate::turn_layout::{phase_span_of, TurnLayout};
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -186,6 +187,24 @@ pub struct Substrate {
     /// shared stream). See `active_timelines_for_group` in `score_belief_groups`.
     working_set_pins: HashSet<ResidenceIndex>,
 
+    /// Monotonic wave counter behind the idle demote's last-touch stamp
+    /// (`docs/vram_governor_design.md` §8.1), bumped by
+    /// [`Self::set_working_set_pins`].
+    ///
+    /// **Per-substrate, deliberately not a global.** A process-wide counter
+    /// couples independent substrates: one engine's waves age out another's
+    /// residences, so what the demote does to a conversation depends on
+    /// unrelated activity elsewhere in the process. Benign with a single engine
+    /// and wrong in principle — and it showed up immediately as two tier tests
+    /// that passed alone and failed in parallel. Keeping the clock beside the
+    /// residences it stamps also removes the static, the atomic, and the epoch
+    /// argument every caller would otherwise have to thread through.
+    ///
+    /// Starts at `Default`'s zero, which is safe because `alloc_residence`
+    /// stamps every residence as born-now: no residence is ever stale from
+    /// birth, so the counter's origin carries no meaning of its own.
+    wave_epoch: u64,
+
     /// Per-stream in-RAM index of where each chunk / tokens record /
     /// committed-through watermark sits on disk.
     /// Built by replaying the redo log on startup (and updated on
@@ -255,13 +274,12 @@ pub struct Substrate {
     /// and no timeline tombstone names it, so without a bound they accumulate
     /// one orphan per prompt edit at ~63 MiB each.
     branch_checkpoints: HashMap<StreamId, RecordLoc>,
-    /// Timelines whose KV is transient scratch — code_read scope forks whose
-    /// sealed turns are spliced by REFERENCE onto a file timeline and then
-    /// tombstoned. Their residences are flagged [`SequenceResidence::no_cold_persist`]
-    /// so the persistence thread never writes their KV to cold: the file timeline
-    /// holds the durable copy, and a cold copy of the fork would only be stranded as
-    /// an unreconstructable orphan when the fork's decl drops at tombstone. In-memory
-    /// only — a transient timeline is never reloaded, so it carries no redo-log marker.
+    /// Timelines whose KV **no reader will ever need from disk**, so the
+    /// persistence thread never writes it to cold. Residences are flagged
+    /// [`SequenceResidence::no_cold_persist`]; see
+    /// [`Self::mark_timeline_transient`] for the two users and why each
+    /// qualifies. In-memory only — the flag is re-derived on load, never a
+    /// redo-log marker.
     transient_timelines: HashSet<TimelineId>,
     /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
@@ -296,6 +314,37 @@ pub struct Substrate {
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
+
+/// How many persistence passes a hot residence may go unattended before the
+/// idle demote sheds it.
+///
+/// **An epoch is one persistence pass**, not one wave and not one projection
+/// publish. The pass wakes on every seal/flush trigger and otherwise on its own
+/// 5 s tick, so the unit tracks real work with a wall-clock floor: at minimum
+/// this is ~80 s of dormancy, and it shortens under load — which is the correct
+/// direction, since load is exactly when the VRAM is wanted back.
+///
+/// This is **hygiene, not relief** — the ladder in
+/// `docs/vram_governor_design.md` §8 still handles pressure — so the two failure
+/// directions are not symmetric: too generous merely reclaims later, while too
+/// aggressive sheds a conversation's KV between its own turns and charges a
+/// warm→hot lift on every one of them.
+///
+/// Sized against the tick, not guessed: an earlier value of 256 was chosen
+/// reasoning about waves while the clock actually ran on publishes, which made
+/// the window unreachable and the demote silently inert.
+pub const IDLE_DEMOTE_GRACE_EPOCHS: u64 = 16;
+
+/// Epochs elapsed since `last_used`, saturating.
+///
+/// Pure and separate so the staleness rule is testable without a substrate, and
+/// so the wrap case is stated once: the counter is `u64` at roughly one tick per
+/// wave, so it does not wrap in any real run — but a `last_used` *ahead* of
+/// `epoch` (a stamp published concurrently with a scan reading an older load)
+/// must read as "just used", never as a huge age that would evict live KV.
+pub fn idle_for(last_used: u64, epoch: u64) -> u64 {
+    epoch.saturating_sub(last_used)
+}
 
 /// Index into [`Substrate::residence`]. Strongly typed so it can't be
 /// confused with [`TurnIndex`] or any other `usize`.
@@ -398,6 +447,23 @@ pub struct SequenceResidence {
     /// across tier transitions since the payload itself doesn't change.
     /// `0` for a freshly-allocated residence with no bytes anywhere.
     pub byte_size: u64,
+    /// Wave epoch at which a forward last resolved this residence's hot KV —
+    /// the last-touch stamp the idle demote reads
+    /// (`docs/vram_governor_design.md` §8.1).
+    ///
+    /// Written by the consumer at the moment of use, which is what makes the
+    /// demote safe: anything the current forward touched carries the current
+    /// epoch and so cannot satisfy the staleness predicate. The active set is
+    /// excluded arithmetically rather than by a filter someone can forget, and
+    /// there is no window between deciding a residence is idle and acting on it
+    /// — the alternative, assembling a live set of active KV per scan, has both
+    /// problems and allocates on the hot path besides.
+    ///
+    /// Initialised to the epoch current at `alloc_residence` — a residence is
+    /// born "now", never at zero. It is installed *before* the wave that will
+    /// attend it publishes its pins, so a zero stamp would make it stale from
+    /// birth and let the demote take it before its first use.
+    pub last_used_epoch: u64,
     /// When `true`, the persistence thread fully offloads this residence as its
     /// KV becomes durable — freeing `hot` (VRAM) the moment a warm/cold copy
     /// exists and `warm` (RAM) the moment the cold copy lands (`install_cold`),
@@ -1292,6 +1358,13 @@ impl Substrate {
             warm: None,
             cold: None,
             byte_size: 0,
+            // **Born now, not at zero.** A residence is installed before the
+            // wave that will attend it publishes its pins, so a zero stamp would
+            // make it stale from birth and let the demote take it *before its
+            // first use* — the whole grace window exists to prevent exactly
+            // that. Stamping at creation gives every residence a full window to
+            // be attended in.
+            last_used_epoch: self.wave_epoch,
             evict_when_cold: false,
             cold_pending: false,
             no_cold_persist: false,
@@ -1361,9 +1434,17 @@ impl Substrate {
         self.hot_lru.push_front(residence);
     }
 
-    /// Section variant of [`Self::install_hot`]. Sections are pinned —
-    /// once installed they stay hot and do **not** appear in
-    /// [`Self::hot_lru`], so eviction never touches them.
+    /// Section variant of [`Self::install_hot`]. A section does **not** join
+    /// [`Self::hot_lru`], so the LRU eviction paths never reach it: a section is
+    /// shared prompt content that a projection re-reads constantly, and ranking
+    /// it against dialogue turns by recency would evict the catalog under load.
+    ///
+    /// It is not, however, permanently resident. [`Self::demote_idle_hot`]
+    /// scans sections explicitly — by age and working-set pin rather than by
+    /// LRU position — because `elevate_to_hot` lifts sections and had no
+    /// counterpart (`docs/vram_governor_design.md` §8.1). Absence from the list
+    /// is a statement about *which* policy may take it, not about whether any
+    /// policy may.
     fn install_section_hot(&mut self, residence: ResidenceIndex, sealed: Vec<SealedSequence>) {
         debug_assert!(
             !sealed.is_empty(),
@@ -1562,7 +1643,21 @@ impl Substrate {
     /// current scheduler state each call, so a residence that has left every
     /// working set drops out of the pin set and becomes evictable again. Mirrors
     /// the protected-set resolution in [`Self::demote_cold_ingest`].
+    /// **Also the last-touch stamp point** (`docs/vram_governor_design.md` §8.1).
+    /// The pin set *is* the active set, so `epoch` is written onto exactly the
+    /// residences this wave will attend, under the same write lock that
+    /// publishes the pins. Stamping here rather than at some later consumer is
+    /// what makes the idle demote safe by construction: a residence the current
+    /// wave touched carries the current epoch, so
+    /// [`Self::demote_idle_hot`] cannot select it — the active set is
+    /// excluded arithmetically, not by a filter that could drift out of sync
+    /// with this one.
     pub fn set_working_set_pins(&mut self, keep_turns: &[TurnKey], keep_sections: &[SectionId]) {
+        // Stamps, never advances: the clock belongs to the persistence pass that
+        // reads it (see [`Self::demote_idle_hot`]). Publishes are far too
+        // coarse to be a clock — a whole session may do only a handful — so
+        // ticking here made the grace window unreachable and the demote inert.
+        let epoch = self.wave_epoch;
         let mut pins: HashSet<ResidenceIndex> =
             HashSet::with_capacity(keep_turns.len() + keep_sections.len());
         for &key in keep_turns {
@@ -1575,7 +1670,86 @@ impl Substrate {
                 pins.insert(e.residence);
             }
         }
+        for &idx in &pins {
+            self.residence[idx.0].last_used_epoch = epoch;
+        }
         self.working_set_pins = pins;
+    }
+
+    /// Drop the hot copy of residences that no wave has attended for `grace`
+    /// epochs and that already have a warm one
+    /// (`docs/vram_governor_design.md` §8.1). Returns how many were shed.
+    ///
+    /// **Sets no flag.** An earlier version latched `evict_when_cold`, which was
+    /// wrong twice over: that flag is a statement about a residence's *kind*
+    /// (collection members and completed-ingest turns are offload-only by
+    /// nature) and nothing in the tree ever clears it — all nine writes are
+    /// `= true`. Latching it on a live dialogue turn that merely went quiet made
+    /// the residence permanently offload-only, so every later warm purge cost it
+    /// its hot copy where an unflagged residence would have kept it. Dropping
+    /// hot directly says exactly what is meant, is undone by the next elevate,
+    /// and leaves no state to reset.
+    ///
+    /// This is the counterpart `elevate_to_hot` never had. Everything above it
+    /// in the relief ladder reclaims *turns*; nothing demoted a section once it
+    /// was lifted, nor an idle conversation's turns, so the hot set only grew
+    /// and every shortfall was met by conceding expert-weight ground — which is
+    /// one-way, because the give-back needs a floor move that is refused while
+    /// any region above it is live.
+    ///
+    /// **Why it cannot take live KV.** Three independent barriers, the first
+    /// structural: a residence the current wave attends was stamped `epoch` by
+    /// [`Self::set_working_set_pins`] and so fails the staleness test outright;
+    /// `working_set_pins` excludes it again; and the drop itself runs only on
+    /// the persistence thread's between-wave pass, past a device sync, with no
+    /// wave in flight — and only ever onto a residence whose warm copy already
+    /// holds the same bytes.
+    ///
+    /// `pending_quantize` residences are skipped: their `hot` is the interim
+    /// native form the scheduler still owes a quantize, and persisting that
+    /// would diverge from the final Q form.
+    pub fn demote_idle_hot(&mut self, grace: u64) -> usize {
+        // **The pass is the clock.** One tick per call, from the persistence
+        // thread's between-forward pass, which wakes on every seal/flush trigger
+        // and otherwise on its own 5 s tick. That makes an epoch track real work
+        // — pressure ages residences sooner, which is the direction we want —
+        // while the idle floor still retires a dormant conversation that
+        // generates no traffic at all.
+        self.wave_epoch = self.wave_epoch.wrapping_add(1);
+        let epoch = self.wave_epoch;
+        // **Sections as well as turns, and sections are NOT on `hot_lru`.**
+        // `install_section_hot` sets `hot` without touching the list, so a scan
+        // over `hot_lru` alone reaches only turn residences — which would make
+        // this miss precisely the case it was built for: nothing demoted a
+        // section once `elevate_to_hot` lifted it, and `elevate_to_hot` takes
+        // both lists. Dropping a section from `hot_lru` afterwards is a harmless
+        // no-op for the same reason it is absent here.
+        let candidates: Vec<ResidenceIndex> = self
+            .hot_lru
+            .iter()
+            .copied()
+            .chain(self.sections.values().map(|e| e.residence))
+            .collect();
+        let stale: Vec<ResidenceIndex> = candidates
+            .into_iter()
+            .filter(|idx| !self.working_set_pins.contains(idx))
+            .filter(|idx| {
+                let slot = &self.residence[idx.0];
+                // `warm.is_some()` is the safety condition AND the whole
+                // mechanism: the copy the drop falls back on must already exist.
+                // A residence without one is simply left for a later pass, by
+                // which time the migrate will have made it.
+                slot.hot.is_some()
+                    && slot.warm.is_some()
+                    && !slot.pending_quantize
+                    && idle_for(slot.last_used_epoch, epoch) > grace
+            })
+            .collect();
+        for idx in &stale {
+            self.residence[idx.0].hot = None;
+            Self::remove_from_lru(&mut self.hot_lru, *idx);
+        }
+        stale.len()
     }
 
     /// Flag every turn residence of `timeline` for full eviction the moment its
@@ -2109,10 +2283,28 @@ impl Substrate {
             // cold on disk. A warm-only residence (its cold write hasn't landed,
             // or failed) is its turn's ONLY copy; dropping it would lose the K/V.
             // Set it aside (restored below) rather than free it.
+            //
+            // **Except when its cold copy is never coming.** `no_cold_persist`
+            // says this K/V is disposable and will not be written to disk — a
+            // code_read fork, a calibration exemplar whose signature is already
+            // captured. For those, "wait for cold to land" waits forever, so the
+            // guard turns a temporary skip into permanently unreclaimable host
+            // RAM. Measured on a full calibration: warm climbed to 8.8 GiB and
+            // could not be shed, past the level that had already taken the
+            // machine down once.
+            //
+            // The pin check replaces the safety the copy rule was providing.
+            // Warm-only means the residence is not on the GPU and so is not
+            // being attended, but `elevate_to_hot` stamps pins under the write
+            // lock before it reads warm to build hot — and this purge is the one
+            // warm-dropping path that does not otherwise consult them.
             let slot = &self.residence[idx.0];
             if slot.warm.is_some() && slot.cold.is_none() && slot.hot.is_none() {
-                skipped.push(idx);
-                continue;
+                let disposable = slot.no_cold_persist && !self.working_set_pins.contains(&idx);
+                if !disposable {
+                    skipped.push(idx);
+                    continue;
+                }
             }
             let slot = &mut self.residence[idx.0];
             if slot.warm.take().is_some() {
@@ -3405,12 +3597,39 @@ impl Substrate {
         }
     }
 
-    /// Mark `timeline` as transient scratch — a code_read scope fork whose sealed
-    /// turns are spliced by REFERENCE onto a file timeline and then tombstoned. Its
-    /// residences are flagged [`SequenceResidence::no_cold_persist`] so the
-    /// persistence thread never cold-persists their KV (which would strand an
-    /// orphan). Flags residences already allocated for the timeline; `append_complete`
-    /// flags future ones via the `transient_timelines` set. In-memory only.
+    /// Mark `timeline`'s durable state as **ephemeral**: nothing will ever read
+    /// it back from disk, so neither its KV nor its recurrent snapshot is
+    /// written. Flags residences already allocated; `append_complete` flags
+    /// future ones via the `transient_timelines` set, and
+    /// `Conversation::enqueue_recurrent_snapshot` skips the timeline outright.
+    /// In-memory only.
+    ///
+    /// The invariant is "no durable consumer", which two very different callers
+    /// satisfy for different reasons:
+    ///
+    /// - **code_read scope forks.** Their sealed turns are spliced by REFERENCE
+    ///   onto a file timeline and the fork is then tombstoned. The file timeline
+    ///   holds the durable copy; a cold copy of the fork would only strand an
+    ///   unreconstructable orphan once the fork's decl drops.
+    /// - **Calibration exemplars.** The seal captures the turn's wide-Q
+    ///   signature, which persists on its own record, and the exemplar's designed
+    ///   end state is `DistillMode::ProvenanceOnly` — KV dropped, signature kept.
+    ///   Cold-persisting the KV therefore writes bytes that the next load's
+    ///   distillation deletes. Measured on the 2,998-case corpus: ~4 GB of redo
+    ///   log per minute, ~108 GB in total, every byte of it discarded.
+    ///
+    /// Safe for a kept (non-tombstoned) timeline because a chunkless turn is
+    /// legal on reload: `classify_turn` only reports `MissingKv` when the tokens
+    /// record is *also* gone, so a turn that kept its tokens classifies `Ok`.
+    ///
+    /// **The warm copy needs this flag to be reclaimable, and reads it.**
+    /// `purge_warm_to_budget` normally refuses to drop a warm-only residence,
+    /// because without a hot or cold copy behind it the warm bytes are the
+    /// turn's last. For a timeline marked here the cold copy is never coming, so
+    /// that refusal would hold forever — which it did: warm reached 8.8 GiB on a
+    /// full calibration and could not be shed. The purge therefore treats
+    /// `no_cold_persist` warm-only residences as disposable, which is exactly
+    /// what this mark declares them to be.
     pub fn mark_timeline_transient(&mut self, timeline: TimelineId) {
         self.transient_timelines.insert(timeline);
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
@@ -3420,6 +3639,13 @@ impl Substrate {
         for r in residences {
             self.residence[r.0].no_cold_persist = true;
         }
+    }
+
+    /// Whether `timeline`'s durable state is ephemeral — see
+    /// [`Self::mark_timeline_transient`]. Read by the recurrent-snapshot enqueue,
+    /// which skips such a timeline entirely.
+    pub fn is_timeline_transient(&self, timeline: TimelineId) -> bool {
+        self.transient_timelines.contains(&timeline)
     }
 
     /// Whether `timeline` has been tombstoned.
@@ -3448,6 +3674,56 @@ impl Substrate {
     /// matching `Distilled` record so the marker survives reload).
     pub fn distill_timeline(&mut self, timeline: TimelineId, mode: DistillMode) {
         self.distilled_timelines.insert(timeline, mode);
+        self.release_distilled_kv(timeline);
+    }
+
+    /// Drop the hot and warm KV of every turn in a timeline just marked for
+    /// distillation. Returns how many residences were released.
+    ///
+    /// **Both [`DistillMode`]s drop KV chunks**, so the mark is a declaration
+    /// that this timeline's K/V is disposable — the signature and whatever text
+    /// the mode keeps live on their own records. Waiting for the compactor to
+    /// act on that declaration is what made it expensive: the mark went into a
+    /// map and the bytes stayed in RAM until a compaction that may not run for
+    /// the rest of the phase.
+    ///
+    /// Measured on a full tool calibration: 2,222 archived exemplars, every one
+    /// marked `ProvenanceOnly` the moment its signature was captured, holding
+    /// **7.2 GiB** of warm host RAM between them. Nothing could ever read it —
+    /// `belief_gallery` scores against the persisted signature blob, never the
+    /// K/V — and the retire path had explicitly demoted it hot→warm to keep VRAM
+    /// flat, so the garbage was moved into host RAM rather than released. That
+    /// 7.2 GiB is what pushed the box to 0.9 GiB free and 1,302 pages/sec.
+    ///
+    /// The cold copy is left alone: the compactor sheds it with the record, and
+    /// a transient timeline never had one.
+    fn release_distilled_kv(&mut self, timeline: TimelineId) -> usize {
+        let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
+            Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
+            None => return 0,
+        };
+        let mut released = 0usize;
+        for r in residences {
+            let slot = &self.residence[r.0];
+            // The same two exclusions every hot-drop path honours: a residence
+            // the current wave is attending, and one whose `hot` is the interim
+            // native form a quantize drain still owes. The second is rare here —
+            // a case is marked only once archived — and the compactor reclaims
+            // anything this pass skips, exactly as it did before.
+            if self.working_set_pins.contains(&r) || slot.pending_quantize {
+                continue;
+            }
+            if slot.hot.is_some() || slot.warm.is_some() {
+                released += 1;
+            }
+            if self.residence[r.0].hot.take().is_some() {
+                Self::remove_from_lru(&mut self.hot_lru, r);
+            }
+            if self.residence[r.0].warm.take().is_some() {
+                Self::remove_from_lru(&mut self.warm_lru, r);
+            }
+        }
+        released
     }
 
     /// Whether `timeline` is marked for distillation (any mode).
@@ -4526,6 +4802,22 @@ impl Substrate {
             .and_then(|s| s.wide_q_sigs.as_deref())
     }
 
+    /// A sealed turn's gather-scope tags, as persisted on its `TurnDecl`.
+    ///
+    /// These are what route a seal-time normalization observation to the scopes
+    /// the turn actually belongs to: a `tool`-tagged turn teaches the tool lens,
+    /// an untagged dialogue turn does not. Empty for an untagged turn and for a
+    /// turn that is not present.
+    pub fn turn_tags(&self, timeline: TimelineId, index: TurnIndex) -> Vec<String> {
+        let Some(stream) = self.streams.get(&turn_stream_id(timeline.raw(), index.0)) else {
+            return Vec::new();
+        };
+        match &stream.decl {
+            Some(StreamDecl::Turn(decl)) => decl.tags.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The turn's user-half span in its real-KV grid — the Concept F question
     /// window (`docs/provenance_adaptive_projection.md` §8). Read from the
     /// persisted turn layout's `User` segments; `gather_wide_sigs` emits one
@@ -4536,19 +4828,23 @@ impl Substrate {
         timeline: TimelineId,
         index: TurnIndex,
     ) -> Option<std::ops::Range<usize>> {
-        let stream = self.streams.get(&turn_stream_id(timeline.raw(), index.0))?;
+        self.turn_phase_span(turn_stream_id(timeline.raw(), index.0), Phase::User)
+    }
+
+    /// The signature sub-range one `phase` of a stored turn occupies, or `None`
+    /// when the turn is unknown, is not a turn, or has no real K/V for that
+    /// phase. Signatures are 1:1 with the turn's real tokens, so the range
+    /// indexes its signature window directly.
+    pub fn turn_phase_span(
+        &self,
+        stream_id: StreamId,
+        phase: Phase,
+    ) -> Option<std::ops::Range<usize>> {
+        let stream = self.streams.get(&stream_id)?;
         let Some(StreamDecl::Turn(decl)) = &stream.decl else {
             return None;
         };
-        let mut lo = usize::MAX;
-        let mut hi = 0usize;
-        for seg in &decl.segments {
-            if let TurnSegment::User { kv, .. } = seg {
-                lo = lo.min(kv.offset as usize);
-                hi = hi.max(kv.end() as usize);
-            }
-        }
-        (hi > lo && lo != usize::MAX).then_some(lo..hi)
+        phase_span_of(&decl.segments, phase)
     }
 
     // ── Section accessors ────────────────────────────────────────────────────
@@ -5434,6 +5730,39 @@ mod tests {
         // confirming we didn't double-push on re-registration.
         let listed: Vec<_> = sub.timelines_for_group(group).collect();
         assert_eq!(listed, vec![timeline]);
+    }
+
+    /// **An ephemeral timeline is also skipped by the recurrent snapshot.**
+    ///
+    /// The two halves of a turn's durable state cost very differently, and only
+    /// one of them scales with tokens. Recurrent state is fixed-size *per
+    /// sequence*, so a 19-token calibration question writes the same ~65 MB as a
+    /// full trajectory — measured, that is ~195 GB across a 2,998-exemplar
+    /// corpus, dwarfing its KV and enough on its own to fill the disk. Flagging
+    /// the KV without the snapshot removed a quarter of the writes and left the
+    /// failure in place, so this pins the query the snapshot guard reads.
+    #[test]
+    fn an_ephemeral_timeline_is_marked_for_both_kv_and_snapshot() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let normal = alloc.next();
+        let ephemeral = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(normal, layer, group);
+        sub.register_timeline(ephemeral, layer, group);
+        sub.mark_timeline_transient(ephemeral);
+
+        assert!(
+            sub.is_timeline_transient(ephemeral),
+            "the snapshot guard must see the mark — without this the recurrent \
+             state is still written and the KV flag alone fixes almost nothing"
+        );
+        assert!(
+            !sub.is_timeline_transient(normal),
+            "a durable conversation must keep its snapshot: it is what restart \
+             and fork-resume read"
+        );
     }
 
     /// A transient (scratch-fork) timeline's turns are flagged `no_cold_persist`
@@ -6444,6 +6773,341 @@ mod tests {
             "unpinned hot dropped now"
         );
         assert!(!sub.hot_lru.contains(&unpinned));
+    }
+
+    /// **The idle demote cannot take KV the current wave is using.**
+    ///
+    /// This is the whole safety property. A residence in the working set is
+    /// stamped with the current epoch as the pins are published, so it fails the
+    /// staleness test arithmetically — the active set is excluded by
+    /// construction rather than by a filter that could drift. The idle sibling
+    /// beside it is shed on the same call, which is what proves the test is
+    /// exercising the predicate and not simply flagging nothing.
+    #[test]
+    fn idle_demote_never_takes_the_current_working_set() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (active_idx, active) = install_hot_and_warm(&mut sub, timeline, 10);
+        let (_idle_idx, idle) = install_hot_and_warm(&mut sub, timeline, 10);
+
+        // Run many passes with `active` re-published each time — exactly a live
+        // conversation. Each pass ticks the clock, so `idle` ages past the grace
+        // window while `active` keeps being re-stamped at the current epoch.
+        let mut shed = 0;
+        for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
+            sub.set_working_set_pins(&[TurnKey::new(timeline, active_idx)], &[]);
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+        }
+        assert_eq!(shed, 1, "only the idle residence is shed");
+        assert!(
+            sub.residence[active.0].hot.is_some(),
+            "a residence the current wave is attending must keep its hot copy"
+        );
+        assert!(
+            sub.residence[idle.0].hot.is_none(),
+            "the idle one's hot is dropped, since warm already exists"
+        );
+        assert!(!sub.hot_lru.contains(&idle));
+        // **Shedding hot is not a verdict on the residence's kind.** The demote
+        // must leave `evict_when_cold` exactly as it found it: the flag says a
+        // residence's cold copy is disposable (a transient timeline), it is
+        // latched — nothing in the tree ever clears it — and a dormant
+        // conversation is not transient. Setting it here condemned ordinary KV
+        // to be dropped rather than persisted, permanently, on the strength of
+        // one quiet minute.
+        for idx in [active, idle] {
+            assert!(
+                !sub.residence[idx.0].evict_when_cold,
+                "the idle demote must not latch evict_when_cold on a durable residence"
+            );
+        }
+    }
+
+    /// Within the grace window nothing is shed: an idle-for-a-moment residence
+    /// is not the same as a dormant one, and shedding it would charge a
+    /// warm→hot lift on a conversation's very next turn.
+    #[test]
+    fn idle_demote_respects_the_grace_window() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, _r) = install_hot_and_warm(&mut sub, timeline, 10);
+
+        // Each pass ticks the clock. Inside the window nothing is shed.
+        for pass in 1..=IDLE_DEMOTE_GRACE_EPOCHS {
+            assert_eq!(
+                sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS),
+                0,
+                "pass {pass} is still inside the grace window"
+            );
+        }
+        assert_eq!(
+            sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS),
+            1,
+            "the first pass beyond grace sheds it"
+        );
+    }
+
+    /// A residence still owed a quantize keeps its hot copy. Its `hot` is the
+    /// interim native form; letting the demote push that to disk would leave the
+    /// cold copy diverging from the Q form the drain is about to install.
+    #[test]
+    fn idle_demote_skips_residences_pending_quantize() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residence[r.0].pending_quantize = true;
+        let mut shed = 0;
+        for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+        }
+
+        assert_eq!(
+            shed, 0,
+            "a pending-quantize residence is not the demote's to take"
+        );
+        assert!(sub.residence[r.0].hot.is_some());
+    }
+
+    /// **The idle demote reaches SECTIONS, which are not on `hot_lru`.**
+    ///
+    /// `elevate_to_hot` lifts sections and turns alike, and §8.1 of
+    /// `docs/vram_governor_design.md` names "nothing demoted a section once it
+    /// was elevated" as the gap this closes. A scan over `hot_lru` alone reaches
+    /// only turns — `install_section_hot` deliberately keeps sections off that
+    /// list — so it would miss the very case it was written for.
+    #[test]
+    fn idle_demote_reaches_sections_not_only_turns() {
+        let mut sub = Substrate::new();
+        let section = SectionId::new(42);
+        sub.set_section_full(
+            section,
+            StreamId::default(),
+            10,
+            Arc::new(vec![minimal_sealed_layer()]),
+            identity_migrate,
+            Arc::new(vec![1u32, 2, 3]),
+        )
+        .unwrap();
+        let r = sub.section_residence(section).expect("section installed");
+        // A warm copy must exist for the demote to have something to fall back
+        // on — the same condition it applies to turns.
+        sub.install_warm(r, vec![minimal_sealed_layer()]);
+        assert!(sub.residence[r.0].hot.is_some());
+        assert!(
+            !sub.hot_lru.contains(&r),
+            "sections are deliberately off the LRU — that is what makes this test \
+             about the scan rather than about the list",
+        );
+
+        let mut shed = 0;
+        for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+        }
+
+        assert_eq!(shed, 1, "the idle section is shed");
+        assert!(
+            sub.residence[r.0].hot.is_none(),
+            "an idle section must give its VRAM back like any other residence",
+        );
+        assert!(
+            sub.residence[r.0].warm.is_some(),
+            "warm survives the demote"
+        );
+    }
+
+    /// …but a section the current wave is attending is untouchable, exactly as
+    /// for a turn.
+    #[test]
+    fn idle_demote_never_takes_a_pinned_section() {
+        let mut sub = Substrate::new();
+        let section = SectionId::new(7);
+        sub.set_section_full(
+            section,
+            StreamId::default(),
+            10,
+            Arc::new(vec![minimal_sealed_layer()]),
+            identity_migrate,
+            Arc::new(vec![1u32, 2, 3]),
+        )
+        .unwrap();
+        let r = sub.section_residence(section).expect("section installed");
+        sub.install_warm(r, vec![minimal_sealed_layer()]);
+
+        let mut shed = 0;
+        for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
+            sub.set_working_set_pins(&[], &[section]);
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+        }
+
+        assert_eq!(shed, 0);
+        assert!(
+            sub.residence[r.0].hot.is_some(),
+            "a pinned section is part of the live projection and must stay hot",
+        );
+    }
+
+    /// **A transient warm-only residence is reclaimable; an ordinary one is
+    /// not.** The purge normally refuses to drop warm bytes that are a turn's
+    /// last copy. `no_cold_persist` says the cold copy is never coming, so that
+    /// refusal is permanent — measured as 8.8 GiB of warm host RAM that could
+    /// not be shed during a full calibration.
+    #[test]
+    fn the_warm_purge_sheds_transient_warm_only_and_keeps_durable_warm_only() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, durable) = install_hot_and_warm(&mut sub, timeline, 4096);
+        let (_j, transient) = install_hot_and_warm(&mut sub, timeline, 4096);
+        // Both warm-only: no hot, no cold.
+        for idx in [durable, transient] {
+            sub.residence[idx.0].hot = None;
+            Substrate::remove_from_lru(&mut sub.hot_lru, idx);
+        }
+        sub.residence[transient.0].no_cold_persist = true;
+
+        // A budget of zero asks the purge to shed everything it safely can.
+        let report = sub.purge_warm_to_budget(0, 0);
+
+        assert!(
+            sub.residence[durable.0].warm.is_some(),
+            "a durable warm-only residence is its turn's last copy and must survive",
+        );
+        assert!(
+            sub.residence[transient.0].warm.is_none(),
+            "a transient warm-only residence has no cold copy coming, so holding \
+             it is holding it forever",
+        );
+        assert_eq!(report.count, 1);
+    }
+
+    /// …but not one the current wave is attending. The copy rule was standing in
+    /// for a pin check on this path; removing it for transients means the pin
+    /// check has to be real.
+    #[test]
+    fn the_warm_purge_never_sheds_a_pinned_transient() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (idx, r) = install_hot_and_warm(&mut sub, timeline, 4096);
+        sub.residence[r.0].hot = None;
+        Substrate::remove_from_lru(&mut sub.hot_lru, r);
+        sub.residence[r.0].no_cold_persist = true;
+        sub.set_working_set_pins(&[TurnKey::new(timeline, idx)], &[]);
+
+        sub.purge_warm_to_budget(0, 0);
+
+        assert!(
+            sub.residence[r.0].warm.is_some(),
+            "elevate stamps pins before it reads warm to build hot; the purge \
+             must not pull those bytes out from under it",
+        );
+    }
+
+    /// **Marking a timeline for distillation frees its K/V immediately.**
+    ///
+    /// The mark says the K/V is disposable — both [`DistillMode`]s drop KV
+    /// chunks — so holding it until a compactor runs is holding garbage. On a
+    /// full tool calibration that garbage reached 7.2 GiB of warm host RAM
+    /// across 2,222 archived exemplars, and took the machine to 0.9 GiB free.
+    #[test]
+    fn distilling_a_timeline_releases_its_hot_and_warm_kv() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, a) = install_hot_and_warm(&mut sub, timeline, 10);
+        let (_j, b) = install_hot_and_warm(&mut sub, timeline, 10);
+        assert!(sub.residence[a.0].hot.is_some() && sub.residence[a.0].warm.is_some());
+
+        sub.distill_timeline(timeline, DistillMode::ProvenanceOnly);
+
+        for idx in [a, b] {
+            assert!(
+                sub.residence[idx.0].hot.is_none(),
+                "a distilled turn must not keep hot K/V",
+            );
+            assert!(
+                sub.residence[idx.0].warm.is_none(),
+                "a distilled turn must not keep warm K/V — this is the 7.2 GiB",
+            );
+            assert!(!sub.hot_lru.contains(&idx));
+            assert!(!sub.warm_lru.contains(&idx));
+        }
+        // The mark itself still stands: the compactor sheds the record and the
+        // cold copy, and the signature keeps answering the belief scan.
+        assert_eq!(
+            sub.distill_mode(timeline),
+            Some(DistillMode::ProvenanceOnly)
+        );
+    }
+
+    /// `TextOnly` drops KV chunks too, so it releases as well — the two modes
+    /// differ in what they KEEP beside the K/V, not in whether the K/V goes.
+    #[test]
+    fn text_only_distillation_also_releases_kv() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.distill_timeline(timeline, DistillMode::TextOnly);
+        assert!(sub.residence[r.0].hot.is_none());
+        assert!(sub.residence[r.0].warm.is_none());
+    }
+
+    /// The release honours the working set, like every other drop path: a
+    /// residence the current wave is attending is left alone even when its
+    /// timeline is marked. Distillation is a statement about the corpus, not a
+    /// licence to pull K/V out from under a live forward.
+    #[test]
+    fn distillation_never_takes_the_current_working_set() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (active_idx, active) = install_hot_and_warm(&mut sub, timeline, 10);
+        let (_j, idle) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.set_working_set_pins(&[TurnKey::new(timeline, active_idx)], &[]);
+
+        sub.distill_timeline(timeline, DistillMode::ProvenanceOnly);
+
+        assert!(
+            sub.residence[active.0].hot.is_some(),
+            "a pinned residence keeps its K/V through a distill mark",
+        );
+        assert!(sub.residence[idle.0].hot.is_none());
+        assert!(sub.residence[idle.0].warm.is_none());
+    }
+
+    /// A residence still owed a quantize keeps its K/V: its `hot` is the interim
+    /// native form the drain is about to replace, and the compactor reclaims
+    /// whatever this pass skips exactly as it did before.
+    #[test]
+    fn distillation_skips_residences_pending_quantize() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residence[r.0].pending_quantize = true;
+        sub.distill_timeline(timeline, DistillMode::ProvenanceOnly);
+        assert!(sub.residence[r.0].hot.is_some());
+        assert!(sub.residence[r.0].warm.is_some());
+    }
+
+    /// **Hot is only dropped where warm already holds the bytes.** The demote
+    /// sheds a copy; it must never be the thing that loses the only one. With no
+    /// warm tier the drop would leave the section reachable solely through the
+    /// cold log — and, for a residence whose cold copy has not landed yet, not
+    /// reachable at all.
+    #[test]
+    fn idle_demote_never_takes_the_last_copy() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residence[r.0].warm = None;
+
+        let mut shed = 0;
+        for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+        }
+
+        assert_eq!(shed, 0, "a hot-only residence is not the demote's to take");
+        assert!(sub.residence[r.0].hot.is_some());
+    }
+
+    /// A stamp that runs ahead of the scan's epoch reads as "just used", never
+    /// as a huge age. The scan and the publish are on different threads, so an
+    /// underflow here would evict the live working set.
+    #[test]
+    fn idle_for_never_underflows_into_a_huge_age() {
+        assert_eq!(
+            idle_for(10, 4),
+            0,
+            "a stamp ahead of the epoch is not stale"
+        );
+        assert_eq!(idle_for(4, 10), 6);
+        assert_eq!(idle_for(0, 1), 1, "never attended is stale from birth");
     }
 
     /// `set_working_set_pins` replaces the keep-set wholesale — a residence that

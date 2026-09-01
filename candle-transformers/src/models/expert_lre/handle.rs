@@ -125,33 +125,7 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// performance argument is a wash, the safety argument decides.
 pub const WARM_TIER_HEADROOM: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Host RAM that must stay pageable, whatever else happens.
-///
-/// The page cache, the mapped checkpoint, every other process's working set,
-/// and the engine's own non-pinned allocations all live here. Pinning into it
-/// does not fail — measured directly: a probe took the entire pinnable half of
-/// a 31.5 GiB box without the driver once refusing, and free RAM ended at
-/// 0.02 GiB. **There is no natural stopping point**, which is why this bound is
-/// stated rather than discovered, and why an allocate-until-refusal probe cannot
-/// find it: refusal never comes, the machine just starts thrashing.
-/// `candle-core/tests/pinned_ceiling_probe.rs` re-measures it on any machine
-/// this needs revisiting on.
-///
-/// # An absolute floor, not a fraction
-///
-/// This was `total / 2`, from a measured failure at 76 % on a 194 GB machine
-/// (148 GB locked, 66 GB of other commit pushed to pagefile). A fraction reads
-/// the right way on that machine and the wrong way on a small one: on a 31.5 GiB
-/// box half is 15.76 GiB reserved against an OS and application set measured at
-/// 9.5 GiB, so the rule bound the warm tier for no reason anyone could point
-/// at — the tier stopped growing while 6 GiB sat unused and unusable.
-///
-/// What the OS and the surrounding applications need does not scale with how
-/// much RAM is installed, so the reserve is an absolute quantity. 10 GiB covers
-/// the 9.5 GiB measured here with room, and on a large machine it lets pinning
-/// go far past half — which is correct, and is what the 194 GB case was really
-/// telling us: 46 GB pageable was too little there too.
-const PAGEABLE_RESERVE: u64 = 10 * 1024 * 1024 * 1024;
+use candle::vram::PAGEABLE_RESERVE;
 
 /// How many warm slots to ask for: **every expert the machine will actually
 /// give room for.**
@@ -192,9 +166,10 @@ pub struct WarmTierSizing {
     pub launch_ram: u64,
     /// Host RAM this process had already page-locked when the tier was sized.
     pub already_pinned: u64,
-    /// Ceiling 1: what the machine is big enough for once the mmap'd weights
-    /// and the OS floor are reserved.
-    pub kv_warm_budget: u64,
+    /// Ceiling 1: this tier's slice of the host partition — the tier pool left
+    /// once the mmap'd weights, the pageable reserve and the OS floor are taken
+    /// out, less the warm KV tier's share of it.
+    pub expert_pinned_budget: u64,
     /// Ceiling 2: what is free this second, less the headroom the rest of the
     /// process needs after the tier.
     pub available_less_headroom: u64,
@@ -214,7 +189,7 @@ pub struct WarmTierSizing {
 
 /// The three ceilings, named once so [`WarmTierSizing::bound_by`] and any
 /// report of it agree by construction rather than by matching prose.
-pub const CEILING_HOST_BUDGET: &str = "host RAM budget (weights + OS floor)";
+pub const CEILING_HOST_BUDGET: &str = "expert share of the host tier pool";
 pub const CEILING_AVAILABLE: &str = "available RAM less headroom";
 pub const CEILING_PINNABLE: &str = "pinnable region (total less pageable reserve)";
 pub const CEILING_NONE: &str = "nothing — the tier holds every evictable expert";
@@ -255,7 +230,7 @@ fn warm_sizing_from(
     available: u64,
     launch_available: u64,
     already_pinned: u64,
-    kv_warm_budget: u64,
+    expert_pinned_budget: u64,
 ) -> WarmTierSizing {
     // **The headroom bounds this ceiling too, and that is not cosmetic.**
     //
@@ -296,7 +271,7 @@ fn warm_sizing_from(
     // stays a constant because it is a guess (see `WARM_TIER_HEADROOM`) rather
     // than a measurement like the term above.
     let available_less_headroom = baseline.saturating_sub(WARM_TIER_HEADROOM);
-    let affordable = kv_warm_budget
+    let affordable = expert_pinned_budget
         .min(available_less_headroom)
         .min(pinnable_cap);
     let slots = if stride == 0 {
@@ -309,12 +284,12 @@ fn warm_sizing_from(
         available_ram: available,
         launch_ram: baseline,
         already_pinned,
-        kv_warm_budget,
+        expert_pinned_budget,
         available_less_headroom,
         pinnable_cap,
         bound_by: if slots == total_experts {
             CEILING_NONE
-        } else if affordable == kv_warm_budget {
+        } else if affordable == expert_pinned_budget {
             CEILING_HOST_BUDGET
         } else if affordable == available_less_headroom {
             CEILING_AVAILABLE
@@ -364,9 +339,14 @@ pub(crate) fn warm_slots_for(stride: usize, total_slots: usize) -> usize {
         available,
         candle::vram::launch_available_ram().unwrap_or(available),
         candle::vram::host_pinned_bytes(),
-        budget.kv_warm_budget_bytes,
+        // This tier's OWN slice of the host partition. It used to be handed the
+        // KV tier's budget as a ceiling, which never bound: this runs before the
+        // pool is pinned, so that figure was computed against a machine with
+        // nothing pinned in it and came out near the size of the whole box.
+        budget.expert_pinned_budget_bytes,
     );
     let slots = sizing.slots;
+    let bound_by = sizing.bound_by;
     if let Ok(mut g) = WARM_SIZING.lock() {
         *g = Some(sizing);
     }
@@ -374,12 +354,19 @@ pub(crate) fn warm_slots_for(stride: usize, total_slots: usize) -> usize {
         target: "candle_transformers::expert_lre",
         total_gib = total_ram as f64 / 1e9,
         available_gib = available as f64 / 1e9,
-        budgeted_gib = budget.kv_warm_budget_bytes as f64 / 1e9,
+        // The whole partition, so a run's log says where every byte went and
+        // which of the three ceilings actually bound the tier — reading a `take`
+        // without them leaves the reader guessing at the arithmetic.
+        tier_pool_gib = budget.tier_pool_bytes as f64 / 1e9,
+        expert_budget_gib = budget.expert_pinned_budget_bytes as f64 / 1e9,
+        kv_warm_budget_gib = budget.kv_warm_budget_bytes as f64 / 1e9,
+        pageable_reserve_gib = budget.pageable_reserve_bytes as f64 / 1e9,
         weights_gib = budget.weights_reserved_bytes as f64 / 1e9,
         take_gib = (slots * stride) as f64 / 1e9,
+        bound_by,
         slots,
         of = total_experts,
-        "warm tier: sized against available RAM"
+        "warm tier: sized from the host partition"
     );
     slots
 }
@@ -1800,6 +1787,12 @@ mod warm_sizing_tests {
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Bytes as GiB, so a failure message reads in the units the budget is
+    /// reasoned about in rather than eleven digits.
+    fn gib(b: u64) -> f64 {
+        b as f64 / GIB as f64
+    }
     /// The 3.6-35B's slot: three projections at their aligned offsets.
     const SLOT: usize = 1_933_312;
     /// Its evictable set — 39 unpinned layers of 256.
@@ -2025,6 +2018,62 @@ mod warm_sizing_tests {
         );
         // The pinnable cap always subtracts: `total_ram` is a constant.
         assert_eq!(none.pinnable_cap - some.pinnable_cap, 4 * GIB);
+    }
+
+    /// **The two warm tiers must fit the machine TOGETHER.**
+    ///
+    /// The failure this pins, measured on the 16 GB box during a tool
+    /// calibration: this tier page-locked 13.5 GiB at launch, the warm KV tier
+    /// then grew to 7.1 GiB against a budget that believed it had 14.5, and the
+    /// host reached 0.9 GiB free while paging at 1,302 pages/sec. Neither tier
+    /// was individually wrong; they were sized against snapshots that did not
+    /// contain each other.
+    ///
+    /// Sizing this tier from the shared partition is what makes the sum safe, so
+    /// the assertion is on the sum — the two budgets plus everything the machine
+    /// owes, against the machine.
+    #[test]
+    fn the_expert_tier_and_the_kv_tier_fit_the_machine_together() {
+        let total = 31 * GIB + GIB / 2;
+        let weights = 2 * GIB + GIB / 2;
+        let budget = candle::vram::host_ram_budget_from(total, 0, weights, 30, 1024 * 1024 * 1024);
+        let already = 640 * 1024 * 1024;
+        let s = warm_sizing_from(
+            SLOT,
+            EVICTABLE,
+            total,
+            // A machine with plenty free at launch — the case that let the old
+            // sizing take everything above a fixed 4 GiB guess.
+            20 * GIB,
+            20 * GIB,
+            already,
+            budget.expert_pinned_budget_bytes,
+        );
+        let committed = s.taken_bytes
+            + budget.kv_warm_budget_bytes
+            + budget.weights_reserved_bytes
+            + already
+            + candle::vram::PAGEABLE_RESERVE;
+        assert!(
+            committed <= total,
+            "expert tier {:.2} + warm KV {:.2} + weights {:.2} + pinned {:.2} + \
+             pageable reserve {:.2} = {:.2} GiB on a {:.2} GiB machine",
+            gib(s.taken_bytes),
+            gib(budget.kv_warm_budget_bytes),
+            gib(budget.weights_reserved_bytes),
+            gib(already),
+            gib(candle::vram::PAGEABLE_RESERVE),
+            gib(committed),
+            gib(total),
+        );
+        // And the tier must still be worth having — a partition that fixes the
+        // over-commit by starving the cache would pass the line above.
+        assert!(
+            s.taken_bytes > 8 * GIB,
+            "the expert tier got only {:.2} GiB; the split is too tight to be \
+             worth the pack-file misses it avoids",
+            gib(s.taken_bytes),
+        );
     }
 
     /// Each ceiling binds when it is the lowest, and says so by name — the whole

@@ -1,4 +1,29 @@
 name: ssh_session_list
+questions:
+- enumerate the SSH sessions with their hosts and status
+- show every open secure shell session id
+- list the remote shells I'm logged in to
+- which SSH session is on the build box
+- am I still logged in over SSH anywhere
+- did my ssh connection to prod drop
+- how many remote shells am I holding open
+- which host does session 2 correspond to
+- I forgot which server I already connected to
+- checking before I open a second shell to the same host
+- want to know what SSH sessions are lingering
+- reviewing my open remote logins
+- list SSH sessions
+- what am I ssh'd into
+- show remote shells
+- ssh session ids
+- which SSH sessions do I have open
+- what servers am I currently ssh'd into
+- list my remote shell sessions and their hosts
+- am I still logged in to the build box over ssh
+- show the ssh session ids
+- how many SSH connections are live
+- which hosts have an open secure shell session
+- give me the SSH session for the staging server
 category: SSH sessions
 description: Enumerate the secure shell sessions currently logged in to remote servers, with each host and connection status.
 high_risk: true

@@ -4,7 +4,7 @@
   "title": "Tool definition",
   "description": "One callable tool: the definition surfaced into the `tools` collection plus the user-prompt seeds that train its selection. One file per tool under tools/. Execution is bound separately (a Rust handler for built-ins, or a game/stub handler for pluggable tools) keyed by `name`.",
   "type": "object",
-  "required": ["name", "description", "parameters", "examples"],
+  "required": ["name", "description", "parameters", "examples", "questions"],
   "additionalProperties": false,
   "properties": {
     "name": {
@@ -34,6 +34,15 @@
       "type": "array",
       "minItems": 1,
       "description": "Selection-calibration examples in ChatML: each is the user prompt, then `<|im_end|><|im_start|>assistant`, then the recorded think→call trajectory (the `<think>…</think>` reasoning and the `<tool_call>{json}</tool_call>`), annotated with `<|projection|>` markers at each wide-Q capture point. Prefilled verbatim during calibration — the loader splits on the assistant header for the user turn vs the prefill body, and the markers are stripped with their token offsets recorded so a projection fires at each. A freshly-authored tool may give just the bare prompt (no assistant part) and let calibration generate the trajectory. Target 8 per tool, authored to be genuinely varied so a held-out example still tests generalization.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "questions": {
+      "type": "array",
+      "minItems": 16,
+      "description": "Extra ways a user might ASK for this tool — one plain question per entry, no `<|im_end|>`, no assistant part, no reasoning, no call. Calibration renders each into a short prefilled turn with an EMPTY assistant body, so the exemplar is only the question. Routing happens on the question, and a full `examples` trajectory is ~95% think block and call, so its question is a few percent of the exemplar; these are entries that are only the part a live probe resembles, at a fraction of the prefill cost. Target 24 per tool, spent on COVERAGE rather than paraphrase — the shipped set spreads each tool's across four shapes: imperative with concrete arguments, interrogative, goal-or-symptom-first (describing the problem rather than the action), and terse. Two rules are enforced by tests. (1) No two seeds for one tool may exceed 80% content-token overlap: a paraphrase costs a prefill and adds no coverage. (2) Every seed must contain at least one word used by no more than a quarter of the catalog — \"close it\" is valid English and a useless exemplar, because fifteen tools close something and the seed then drags all of them toward every closing probe. Where sibling tools differ only by protocol or verb — the session families, `_open`/`_list`/`_close` — every question MUST name the discriminator explicitly (\"the raw TCP socket\", \"over SFTP\", \"the Telnet session\"), because that word is the only signal separating them.",
       "items": {
         "type": "string",
         "minLength": 1

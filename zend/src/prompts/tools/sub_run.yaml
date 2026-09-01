@@ -1,4 +1,29 @@
 name: sub_run
+questions:
+- spawn one agent per crate to audit them in parallel
+- delegate the schema analysis to a nested agent with its own context
+- run a child agent restricted to the read-only tools
+- fan this out across three sub-agents and collect the results
+- would this go faster split across agents
+- can a sub-agent handle the search while you keep working
+- should this be one agent or several
+- what tool subset would the child need
+- this is too big for one context window
+- the research half is independent of the implementation half
+- I want the exploration done without polluting this conversation
+- parallelising the boring part of the sweep
+- spawn a sub-agent
+- delegate this
+- fan it out
+- run a child agent on it
+- spawn a sub-agent to handle the research half of this
+- delegate this subtask to a nested agent
+- split this into parallel agents, one per component
+- run a separate agent loop on that part of the problem
+- hand this off to a specialised sub-agent
+- decompose this task and farm the pieces out
+- start a child agent with its own context for this
+- delegate the migration analysis to another agent
 category: Subagent
 description: 'Spawn a nested agent loop with its own context, message history, and tool subset. Use for: decomposing complex multi-step tasks, parallelising subtasks with different expertise, delegating to a specialised model. Requires the host process to inject a SubagentRunner into ToolContext. Returns the agent''s final result text, turn count, and tool calls made. Triggered by: ''have a subagent'', ''run this as a sub-task'', ''delegate to another agent'', ''use a nested agent''. Not for simple tool calls — use the direct tools for those.'
 high_risk: true

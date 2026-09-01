@@ -1,4 +1,29 @@
 name: telnet_session_close
+questions:
+- close Telnet session 1 to the core switch
+- log out of the telnet console on the router
+- end the Telnet terminal connection to that appliance
+- drop the plaintext terminal to the firewall
+- can I close the Telnet session now
+- should I exit the enable mode before closing telnet
+- is the device config saved before I drop the terminal
+- will closing telnet lose the unsaved switch config
+- finished configuring the switch over telnet
+- done reading the router tables from the terminal
+- shouldn't leave a telnet session open on network gear
+- tidying up the terminal connections to the devices
+- hang up the terminal line to that switch
+- log out of the telnet console on the appliance
+- disconnect the telnet terminal
+- end the telnet connection to the device
+- close the Telnet session
+- log out of the switch's telnet console
+- disconnect the telnet terminal from that device
+- end the Telnet connection to the router
+- drop the plaintext terminal session
+- terminate telnet on the network appliance
+- close out the telnet session, I'm done configuring
+- shut the Telnet connection down
 category: Telnet sessions
 description: End a Telnet terminal session to a network device, releasing the plaintext terminal connection.
 high_risk: true

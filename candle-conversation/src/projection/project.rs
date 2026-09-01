@@ -1790,14 +1790,22 @@ fn emit_system_prompt_items<R: ContentResolver>(
     let mut collection_results: std::collections::HashMap<CollectionId, Vec<ProjectionSegment>> =
         std::collections::HashMap::new();
     // Catalog summaries to emit just before each collection's opening structural
-    // marker (OUTSIDE it). A summary emits only when the selection is a proper
-    // non-empty subset — top-k/threshold dropped at least one member, so the
-    // summary names the full set — and the summary section is actually sealed.
+    // marker (OUTSIDE it). A summary emits when the selection is a proper subset
+    // — top-k/threshold dropped at least one member, so the summary names the
+    // full set — and the summary section is actually sealed.
+    //
+    // **Including when the selection is EMPTY**, which is the case that matters
+    // most: the summary is the only thing naming the collection's members, and
+    // the turn where provenance selected none is precisely the turn the model
+    // most needs to be told they exist. Requiring a non-empty selection deleted
+    // the catalog listing on exactly that turn — the model was shown no tools and
+    // answered from memory. It sits outside the structural markers by design, so
+    // it stands alone perfectly well with no `<tools>` block after it.
     let mut pending_summaries: std::collections::HashMap<CollectionId, SectionId> =
         std::collections::HashMap::new();
     let mut record = |coll: &SectionCollection, selected: Vec<ProjectionSegment>| {
         if let Some(sum_id) = coll.summary_section {
-            let partial = !selected.is_empty() && selected.len() < coll.sections.len();
+            let partial = selected.len() < coll.sections.len();
             if partial && resolver.section_token_count(sum_id) > 0 {
                 pending_summaries.insert(coll.id, sum_id);
             }
@@ -1848,19 +1856,43 @@ fn emit_system_prompt_items<R: ContentResolver>(
         .filter(|(_, segs)| !segs.is_empty())
         .map(|(cid, _)| *cid)
         .collect();
+    // Collections that are CONFIGURED — declare ≥1 member — which is a different
+    // question from whether provenance picked one of them this projection, and
+    // the one the `*_configured` gates ask. A tools dial set to `None` filters
+    // every member out, so an empty membership really is "the facility is off";
+    // a full membership with nothing selected is "the facility is on and nothing
+    // scored", which must still tell the model the facility exists.
+    let configured_collections: std::collections::HashSet<CollectionId> = sp
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            SystemPromptItem::Collection(c) if !c.sections.is_empty() => Some(c.id),
+            _ => None,
+        })
+        .collect();
     // Second pass: walk items in declaration order, applying the
     // `depends_on` predicate to Sections and using the cached
     // collection results for Collections.
     for item in &sp.items {
         match item {
             SystemPromptItem::Section(s) => {
-                let should_emit = match (s.depends_on, s.depends_on_absent) {
+                let should_emit = match (
+                    s.depends_on,
+                    s.depends_on_absent,
+                    s.depends_on_configured,
+                    s.depends_on_unconfigured,
+                ) {
                     // `depends_on`: emit only when the collection materialised ≥1.
-                    (Some(cid), _) => non_empty_collections.contains(&cid),
+                    (Some(cid), _, _, _) => non_empty_collections.contains(&cid),
                     // `depends_on_absent`: the inverse — emit only when it
                     // materialised zero (the no-tools variant).
-                    (None, Some(cid)) => !non_empty_collections.contains(&cid),
-                    (None, None) => true,
+                    (None, Some(cid), _, _) => !non_empty_collections.contains(&cid),
+                    // `depends_on_configured` / `_unconfigured`: keyed on whether
+                    // the collection HAS members, independent of this
+                    // projection's selection.
+                    (None, None, Some(cid), _) => configured_collections.contains(&cid),
+                    (None, None, None, Some(cid)) => !configured_collections.contains(&cid),
+                    (None, None, None, None) => true,
                 };
                 if should_emit {
                     // Emit the collection's catalog summary just before its opening

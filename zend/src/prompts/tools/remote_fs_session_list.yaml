@@ -1,4 +1,29 @@
 name: remote_fs_session_list
+questions:
+- enumerate the SFTP sessions with their hosts and base paths
+- show every open remote-filesystem session id
+- list the SFTP transports connected in this conversation
+- which remote-fs session points at the build host
+- do I already have an SFTP connection to that server
+- is the remote filesystem session still connected
+- how many SFTP transports am I holding open
+- which session id serves the releases directory
+- I lost the SFTP session id for the upload
+- checking I'm not opening a second transport to the same host
+- want to see which remote-fs sessions are lingering
+- reviewing the SFTP connections before cleanup
+- list the SFTP sessions
+- what remote filesystems are connected
+- show remote-fs session ids
+- any SFTP transports alive
+- which SFTP sessions are open
+- what remote filesystems am I connected to
+- list my remote-fs session ids and hosts
+- am I still connected over SFTP to the build server
+- show the open remote filesystem connections
+- how many SFTP sessions are live in this conversation
+- give me the remote-fs session for that host
+- list the SFTP transports currently connected
 category: Remote filesystem
 description: Enumerate the remote-filesystem sessions currently connected to hosts over SFTP in this conversation.
 high_risk: true

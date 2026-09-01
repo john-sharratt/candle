@@ -1,4 +1,29 @@
 name: web_fetch
+questions:
+- fetch https://docs.rs/tokio/latest/tokio/ and pull out the runtime section
+- get the text of that RFC page
+- retrieve the changelog at this URL
+- open the vendor's status page and tell me what it says
+- what does the page at this link actually claim
+- does that documentation mention the flag I need
+- is the example on that page using the old API
+- what version does the release page list
+- I linked the article above, read it properly
+- the answer is on this page and I'd rather you read it than guess
+- need the exact wording from their docs
+- checking the upstream README before we upgrade
+- fetch this URL
+- read that link
+- pull that page
+- open the link
+- read this URL and summarise it for me
+- fetch the content of that documentation page
+- pull down the article I linked above
+- what does this page say
+- grab the text of this blog post
+- open that link and tell me what's on it
+- retrieve the README from this GitHub URL
+- fetch and clean up the content at this address
 category: Utilities & web
 description: 'Fetch a single public web page or document by URL and return its main content as cleaned text. Use for: reading a specific article the user linked, retrieving documentation pages, pulling content from a known URL, getting context about a page the user mentioned. Triggered by "read this page", "fetch the article at", "what does this URL say", "open this link", "get me the content of", "summarise this page", or the user pasting a URL. Returns title, cleaned body text, final URL after redirects, and a truncated flag. Use web_search when the URL is not yet known. Use http_session_* for authenticated API calls or operations needing cookies/auth state.'
 parameters:

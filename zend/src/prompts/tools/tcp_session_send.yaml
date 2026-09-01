@@ -1,4 +1,29 @@
 name: tcp_session_send
+questions:
+- write "PING\r\n" to the raw TCP stream
+- send the hex bytes 16 03 01 00 ff on the TCP socket
+- transmit the EHLO line over the plain TCP connection
+- push this length-prefixed frame down the TCP stream
+- does the TCP send need a trailing newline
+- will the server respond if I write this to the socket
+- should I send this as text or hex on the TCP stream
+- how many bytes went out on the TCP connection
+- probing what the daemon does with a malformed frame
+- driving the protocol handshake by hand over TCP
+- replaying a captured request onto the raw socket
+- testing the parser by writing odd bytes to the TCP stream
+- send that on the TCP socket
+- write to the TCP stream
+- transmit over plain TCP
+- send those bytes down the socket
+- send this text down the raw TCP socket
+- write these hex bytes to the TCP stream
+- transmit the protocol handshake over the TCP connection
+- push this command string through the plain TCP session
+- send a HELO line on the raw TCP socket
+- write the client hello bytes to the TCP stream
+- put this payload on the wire over TCP
+- send this frame through the open TCP connection
 category: TCP sessions
 description: 'Write bytes to an open TCP stream. Accepts text via data or arbitrary bytes via data_hex (hex-encoded, whitespace allowed — ''16 03 01 00 ff'' and ''160301 00ff'' both parse). Use for: sending a protocol message, writing a command to a custom service, transmitting a binary payload. Triggered by "send bytes to the connection", "write to the socket", "transmit", "send this packet", "send these hex bytes". Returns bytes_written. Every send requires user confirmation. For the response use tcp_session_recv. For TLS-protected streams use tls_session_send instead.'
 high_risk: true

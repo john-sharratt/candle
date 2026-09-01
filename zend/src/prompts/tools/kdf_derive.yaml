@@ -1,4 +1,29 @@
 name: kdf_derive
+questions:
+- argon2id this passphrase with 64 MB memory and 3 iterations
+- run scrypt over this password with N=16384
+- pbkdf2_sha256, 200000 rounds, salt below
+- derive 32 bytes of key material from this passphrase
+- which KDF should I use for storing user passwords
+- are these parameters strong enough for today
+- how slow is this configuration in practice
+- what salt length do you recommend here
+- I'm hashing passwords for a signup flow
+- turning a human passphrase into a disk encryption key
+- the old system used plain sha256 and we're upgrading
+- need something an attacker can't brute-force cheaply
+- derive a key from this
+- stretch this password
+- kdf this passphrase
+- run a slow password-stretching KDF over this
+- derive a key from this password with argon2id
+- stretch this passphrase into a 32-byte key
+- hash this password for storage using a slow KDF
+- run pbkdf2 over this password with 100k iterations
+- turn this weak password into something brute-force resistant
+- use scrypt to derive an encryption key from this passphrase
+- generate a memory-hard key from this secret and salt
+- what's the argon2 hash of this password
 category: Cryptography
 description: Stretch a low-entropy password into a cryptographic key with a slow, memory-hard KDF — argon2id, pbkdf2_sha256, or scrypt. Use for password hashing and brute-force-resistant key derivation.
 parameters:

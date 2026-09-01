@@ -72,6 +72,7 @@ mod sequence_handle;
 mod stats;
 pub mod stencil;
 pub mod store;
+pub mod stuffed_grid;
 pub mod substrate;
 pub mod summary_tree;
 pub mod think_strip;

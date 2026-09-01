@@ -1,4 +1,29 @@
 name: http_session_open
+questions:
+- open an HTTP session to https://api.stripe.com with my bearer token
+- start an API session with base URL https://gitlab.internal/api/v4
+- create an HTTP client session that sends X-Tenant on every request
+- open a web session with cookies against the admin portal
+- do I need an HTTP session before I can call that endpoint
+- can the auth header be set once for all the API calls
+- which credential should the HTTP session use
+- will cookies persist across requests in this session
+- I'm about to make a dozen calls to the same API
+- the endpoint needs auth on every request and I'd rather not repeat it
+- logging in first so the later REST calls are authenticated
+- setting up against their sandbox environment before we go live
+- open an HTTP session
+- start an API session
+- connect to that REST API
+- new HTTP client session
+- open an HTTP session against https://api.example.com
+- set up an API client with my bearer token
+- start an HTTP session with these default headers
+- connect to that REST API so we can make several calls
+- open a web session with cookies against this base URL
+- I need an authenticated HTTP client for this service
+- begin an HTTP session using the credential named github
+- establish an API session with this base url
 category: HTTP sessions
 description: Open a persistent HTTP client session with optional base URL, default headers, and authentication credentials applied to every request. Use before making API calls that need cookies or auth across multiple requests, when the user mentions a specific API or service to interact with, or when setting up a workflow hitting the same endpoint multiple times. Triggered by "connect to the API", "set up a session for", "use this base URL", "open an HTTP client for", "I want to call the X API". Returns session_id and base_url. Subsequent requests use http_request. For one-shot retrieval of a public page use web_fetch — no session needed.
 high_risk: true

@@ -1,4 +1,29 @@
 name: write
+questions:
+- save this as scripts/deploy.sh
+- write a .env.example with these keys and blank values
+- put this SQL into migrations/002_add_index.sql
+- create a README stub for the new crate
+- can you drop that output into a file rather than printing it
+- which path should this new file be created at
+- would you write the whole file rather than patching the old one
+- can you write this out as a downloadable file
+- I want to keep this snippet around for later
+- the config doesn't exist yet, we need to author it from scratch
+- replacing the whole file is cleaner than editing it here
+- generating a fixture for the test suite
+- save that
+- write it to a file
+- dump this to disk
+- create a new file containing that text
+- create a file called notes.md with these contents
+- save this snippet to a new file
+- write out a Dockerfile for this project
+- put that JSON into config.json
+- draft a shell script and save it
+- write these results to results.csv
+- create an empty module file for me
+- overwrite the existing file with this version
 category: Files
 description: 'Create a new file or overwrite an existing one. The result is held in this session only — a project file of the same path is shadowed, never modified on disk. Use for: drafting code, writing notes, saving intermediate output the model wants to reference later, creating files the user will download or transfer, replacing a file''s full content. Triggered by "create a file", "save this as", "write to", "put this in a file called", "make a file with". Returns path, byte count, and whether the file was newly created vs overwritten. For partial edits use file_edit; for pushing files to a real remote system use remote_fs_session_put.'
 high_risk: true

@@ -1,4 +1,29 @@
 name: signature_sign
+questions:
+- sign the release manifest with the credential named release-key
+- produce a p256_sha256 signature over this digest
+- ed25519-sign these bytes and give me the signature hex
+- sign this nonce to prove I hold the private key
+- which of my stored keys can sign this
+- is ed25519 or p256 more appropriate for this format
+- what does the signature look like over that exact payload
+- do I sign the raw message or its hash
+- the update channel requires signed artefacts
+- proving authorship of this document to the recipient
+- the server sent a challenge and wants it signed
+- attesting this build came from us
+- sign it
+- sign this payload
+- generate a signature
+- authorise this with my key
+- sign this message with my ed25519 key
+- produce a digital signature over this payload
+- sign the release manifest using the stored private key
+- I need a p256 signature for this data
+- authorise this document by signing it
+- create a signature so the recipient can prove I sent it
+- sign this challenge with the credential named release-key
+- generate an ed25519 signature over the bytes below
 category: Cryptography
 description: Produce a digital signature over a message using a private signing key from the credential store (ed25519 or p256_sha256). Proves authorship; the counterpart signature_verify checks it.
 parameters:

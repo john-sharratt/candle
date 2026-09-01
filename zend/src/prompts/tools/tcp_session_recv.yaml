@@ -1,4 +1,29 @@
 name: tcp_session_recv
+questions:
+- read exactly 128 bytes from the TCP socket
+- drain the raw TCP stream for 5 seconds and show what arrives
+- grab the SMTP banner off the plain TCP connection
+- wait for the 4-byte length header on the TCP stream
+- did the server reply on the TCP socket
+- how many bytes came back over the plain TCP connection
+- is the TCP stream idle or still delivering
+- should I read a fixed count or drain the TCP socket
+- I sent the request and want the raw response bytes
+- fingerprinting the service from what it greets me with
+- the protocol reply is variable length so just drain the socket
+- reading the daemon's answer before I send the next frame
+- read from the TCP socket
+- drain the TCP stream
+- what came back over plain TCP
+- receive on the TCP connection
+- read 256 bytes from the raw TCP stream
+- grab the banner off that TCP connection
+- drain the TCP socket for 3 seconds and show me what came back
+- read the server's reply on the plain TCP session
+- wait for the next 12 bytes on the TCP stream
+- what did the service send back over TCP
+- read the response frame from the TCP socket
+- collect whatever the peer wrote to the TCP connection
 category: TCP sessions
 description: 'Read bytes from an open TCP stream. Two modes: recv_amt (wait for N bytes, use when the protocol has a known message size) or recv_wait (drain for N seconds, use for banner grabs or unknown-size responses). Triggered by "read N bytes", "wait for X bytes", "grab the banner", "drain the connection for N seconds", "wait and see what comes back". Returns data (printable UTF-8) or data_hex (binary) per the format parameter, bytes_received, eof, and timed_out. No confirmation — receiving has no remote side effects. Provide exactly one of recv_amt or recv_wait.'
 high_risk: true

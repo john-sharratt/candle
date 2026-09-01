@@ -1,4 +1,29 @@
 name: weather
+questions:
+- conditions in Reykjavik right now
+- forecast for Cape Town over the next couple of days
+- how windy is it in Wellington
+- humidity and temperature in Singapore please
+- should I bring an umbrella to the meeting
+- is it warm enough to eat outside this evening
+- will the flight be delayed by the weather there
+- how cold does it get overnight in Helsinki this time of year
+- I'm packing for a trip and don't know what to expect
+- deciding whether to cycle in today
+- the picnic is Saturday and I need to know if it's off
+- checking whether the site crew can work outside tomorrow
+- weather
+- forecast, Lisbon
+- is it raining
+- what's it doing outside
+- what's the weather like in Melbourne today
+- is it going to rain this afternoon
+- do I need a jacket where I am
+- how hot is it in Madrid right now
+- give me the forecast for tomorrow in Oslo
+- is it raining in London
+- what are the conditions in Denver at the moment
+- will it be cold in Toronto tonight
 category: Utilities & web
 description: 'Get current weather conditions and a short-term forecast for a city or location. Use for: "is it raining", "what''s the weather like", "do I need a jacket", "will it rain tomorrow", "temperature in [city]", "weather forecast for the weekend", "how hot is it", "is there snow expected". Returns current temperature, feels_like, humidity, wind_kph, conditions text, and optional daily forecast (high/low/conditions/precipitation) for up to 7 days. Resolves city names automatically. Use web_search for weather articles, not live data. Backed by Open-Meteo (no API key needed).'
 parameters:

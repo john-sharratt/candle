@@ -1,4 +1,29 @@
 name: aead_encrypt
+questions:
+- aes128gcm this string with the 16-byte key below
+- encrypt the JSON body and bind "tenant=42" as associated data
+- seal these 2 KB of config with chacha20poly1305
+- wrap this token so only the holder of the key can read it
+- which cipher should I use here, and can you encrypt it that way
+- what nonce did you use for this encryption
+- is 16 bytes enough key material for the cipher you picked
+- can you give me both the ciphertext and the tag separately
+- I need to store this secret at rest and detect tampering later
+- we're sending this over an untrusted channel, protect it
+- the spec wants an AEAD envelope for this field
+- I want this unreadable to anyone without the key, and verifiable
+- seal this
+- encrypt, key below
+- I'm building a test vector, encrypt this known plaintext
+- lock this down before I put it in the queue
+- encrypt this message with aes256gcm
+- I need authenticated encryption over this payload, use chacha20poly1305
+- seal this text so it can't be read or tampered with
+- encrypt these bytes with aes128gcm and give me the nonce
+- turn this plaintext into AEAD ciphertext using the key below
+- can you produce a gcm-encrypted version of this string
+- protect this data with an authenticated cipher
+- encrypt and authenticate this in one step
 category: Cryptography
 description: Encrypt plaintext into authenticated ciphertext with an AEAD cipher — aes128gcm, aes256gcm, or chacha20poly1305 — giving confidentiality and tamper-detection in one step. Returns ciphertext plus a fresh nonce; key as hex (16 bytes for aes128gcm, else 32 bytes).
 parameters:

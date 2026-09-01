@@ -1,4 +1,29 @@
 name: udp_session_list
+questions:
+- enumerate the UDP sockets with their default peers
+- show every bound datagram socket id
+- list the connectionless sockets and their ports
+- which UDP session points at the syslog collector
+- do I already have a datagram socket for that peer
+- is the UDP socket I bound earlier still open
+- how many datagram sockets am I holding
+- which UDP session id goes with the DNS server
+- I lost the UDP session id for the next send
+- checking I haven't bound the same port twice
+- want to see which datagram sockets are lingering
+- reviewing the UDP endpoints before cleanup
+- list the UDP sockets
+- what datagram sockets are bound
+- show UDP session ids
+- any connectionless sockets open
+- which UDP sockets are bound right now
+- list my datagram sessions and their default peers
+- what UDP session ids exist
+- do I have a UDP socket open for syslog
+- show the bound UDP ports in this conversation
+- how many datagram sockets are live
+- give me the UDP session pointed at the DNS server
+- list the connectionless sockets I have open
 category: UDP sessions
 description: Enumerate the UDP datagram sockets currently bound in this conversation, with each default peer.
 high_risk: true

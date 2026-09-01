@@ -1,4 +1,29 @@
 name: random
+questions:
+- give me a random integer from 1000 to 9999
+- pick 5 distinct numbers between 1 and 49
+- shuffle these 12 names into a running order
+- choose one of red, green or blue at random
+- who goes first, decide it fairly
+- which of these three options should we take, flip for it
+- can you actually randomise this rather than picking a favourite
+- what's a random float between -1 and 1
+- I need an unbiased draw for the prize
+- assign the reviewers to the PRs without me influencing it
+- I want a nonce-ish value for a throwaway test
+- randomise the order so nobody's always last
+- roll a twenty-sided die
+- random coin flip
+- pick one of these at random
+- surprise me, properly randomly
+- pick a random number between 1 and 100
+- shuffle this list for me
+- choose one of these options at random
+- give me a genuinely random integer, not a guess
+- roll a d20
+- randomly order these names
+- pick three items from this list without bias
+- generate a random float between 0 and 1
 category: Utilities & web
 description: 'Generate genuinely random values when actual randomness is needed rather than the model''s biased pseudo-random picks (which favour 7, 37, "blue"). Modes: integer (whole number in a range), float (real in a range), choice (pick from a list), shuffle (randomise list order), dice (roll N dice with S sides). Use for: rolling dice in a game, picking randomly between options, shuffling a list, flipping a coin, drawing names, generating test data. Triggered by "roll a die", "pick one randomly", "shuffle these", "random number between", "flip a coin", "choose at random", "give me N random". Returns values appropriate to the chosen mode.'
 parameters:

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -322,6 +323,76 @@ fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
         }
     }
     ids
+}
+
+/// One unit of calibration work — one conversation, one submission, one resume
+/// marker.
+///
+/// The two kinds differ in how many exemplars a submission produces, which is
+/// the whole point of the split: a trajectory is one turn, a question group is
+/// one prefill carved into as many turns as it has questions.
+enum CalibCase<'a> {
+    /// One authored trajectory from the tool's definition file: prompt +
+    /// `<think>…</think>` + the call. Prefilled and sealed on its own.
+    Trajectory {
+        tool: &'a str,
+        /// Borrowed from the definition, which outlives this list — the authored
+        /// trajectories are the bulk of the corpus by bytes and copying them all
+        /// would be pure waste.
+        text: Cow<'a, str>,
+        marker: String,
+    },
+    /// EVERY question exemplar of one tool, prefilled in a single forward and
+    /// carved into one turn each.
+    Questions {
+        tool: &'a str,
+        questions: Vec<String>,
+        marker: String,
+    },
+}
+
+impl CalibCase<'_> {
+    fn tool(&self) -> &str {
+        match self {
+            CalibCase::Trajectory { tool, .. } | CalibCase::Questions { tool, .. } => tool,
+        }
+    }
+
+    fn marker(&self) -> &str {
+        match self {
+            CalibCase::Trajectory { marker, .. } | CalibCase::Questions { marker, .. } => marker,
+        }
+    }
+
+    /// How many provenance exemplars this submission produces — one per turn it
+    /// seals. Progress is reported in exemplars rather than submissions so the
+    /// figure keeps meaning the same thing it did before grouping.
+    fn exemplars(&self) -> usize {
+        match self {
+            CalibCase::Trajectory { .. } => 1,
+            CalibCase::Questions { questions, .. } => questions.len(),
+        }
+    }
+}
+
+/// A calibration submission in flight, awaiting its `Done`.
+struct InFlightCase<'a> {
+    conv: Sequence,
+    handle: TurnHandle,
+    tool: &'a str,
+    /// Mid-decode reprojection events, accumulated across sweeps — they arrive
+    /// interleaved with tokens, so a sweep that finds no terminal event still
+    /// has to keep what it drained.
+    events: Vec<ProjectionEvent>,
+    /// A prefilled trajectory is complete by construction (it is the validated
+    /// exported `.md`) and its `Done` carries no decoded text, so it must NOT be
+    /// gated on `resp.text` the way a live decode is.
+    is_prefill: bool,
+    /// How many exemplars this submission produces — one for a trajectory, one
+    /// per question for a stuffed group. Progress is reported in exemplars, so
+    /// crediting a 24-question group with a single step would stall the bar for
+    /// a twenty-fourth of the corpus and then jump.
+    exemplars: usize,
 }
 
 /// Wall-time attribution for the calibration phase.
@@ -955,9 +1026,23 @@ impl InferenceState {
             let calib_start = Instant::now();
             let mut timing = CalibTiming::default();
             let defs = crate::tool_def::all();
-            let total: usize = defs.iter().map(|d| d.examples.len()).sum();
+            let total: usize = defs
+                .iter()
+                .map(|d| d.examples.len() + d.questions.len())
+                .sum();
+            let asks: usize = defs.iter().map(|d| d.questions.len()).sum();
+            // Submissions, not exemplars: every tool's question set is ONE
+            // stuffed prefill carved into one turn per question, so the number
+            // of forwards the phase costs is trajectories + tools, not the
+            // corpus size.
+            let submissions: usize = defs
+                .iter()
+                .map(|d| d.examples.len() + usize::from(!d.questions.is_empty()))
+                .sum();
             tracing::info!(
-                cases = total,
+                exemplars = total,
+                question_only = asks,
+                submissions,
                 "calibrating sections: per-tool example prefills (named tool selection)"
             );
             let (calib_builder, calib_layer, calib_group) =
@@ -972,18 +1057,64 @@ impl InferenceState {
                 c.kv_lossless = true;
                 c
             };
-            // Flatten to (tool, example) cases. Each `example` is the full ChatML
-            // calibration trajectory from the tool's definition file — prompt +
-            // `<|im_end|><|im_start|>assistant` + think→call with projection markers.
-            // The prefill path splits it on the assistant header (below).
+            // Two kinds of calibration case:
+            //
+            //  • `examples` — the full trajectory from the definition file:
+            //    prompt + `<|im_end|><|im_start|>assistant` + think→call with
+            //    projection markers. One submission each.
+            //  • `questions` — plain user questions with an EMPTY assistant
+            //    turn. Routing happens on the question, and a full trajectory is
+            //    ~95% think block and call, so these are exemplars that are only
+            //    the part a live probe resembles — the region the phase lens
+            //    reads (`docs/provenance_score_normalization.md` §3.4). ALL of a
+            //    tool's questions go in as ONE submission.
+            //
             // Each case carries its content marker, computed once here from the
-            // tool's whole projected definition plus the example.
-            let cases: Vec<(&str, &str, String)> = defs
+            // tool's whole projected definition plus the trajectory, so editing
+            // either regenerates exactly that case.
+            // The authored trajectories are BORROWED from the definitions, which
+            // outlive this vector; only the question trajectories are built here
+            // and so have to be owned. `Cow` lets both kinds share one list
+            // without copying every authored example — thousands of them across
+            // the catalog, each a full think block and call.
+            // **A tool's questions are ONE submission, not one each.** They are
+            // short, uniform, and all carry the same tool tag and the same
+            // pinned selection, so they stuff into a single prefill grid and are
+            // carved back into one turn apiece
+            // (`Conversation::submit_prefilled_turn_group`). That takes the
+            // corpus from 2,998 submissions to 859 without changing a single
+            // exemplar's content.
+            //
+            // Per TOOL rather than per catalog: a group shares one projection
+            // and one selection, so it must contain one tool's cases only. Size
+            // is the other reason — a tool's 24 questions are ~1.5k tokens of
+            // lossless KV (~55 MiB), while the whole question corpus in one
+            // sequence would be ~143k tokens (~5 GB), which would consume the
+            // entire KV budget and force exactly the expert-zone concessions
+            // this engine works to avoid.
+            //
+            // Trajectories stay one per submission: they are ~95% think block
+            // and call, long and irregular, so stuffing buys little and the
+            // per-case padding to a block boundary buys less.
+            let cases: Vec<CalibCase<'_>> = defs
                 .iter()
                 .flat_map(|d| {
-                    d.examples
-                        .iter()
-                        .map(move |ex| (d.name.as_str(), ex.as_str(), d.calibration_marker(ex)))
+                    let full = d.examples.iter().map(move |e| CalibCase::Trajectory {
+                        tool: d.name.as_str(),
+                        text: Cow::Borrowed(e.as_str()),
+                        marker: d.calibration_marker(e),
+                    });
+                    let asked = (!d.questions.is_empty()).then(|| CalibCase::Questions {
+                        tool: d.name.as_str(),
+                        questions: d.questions.clone(),
+                        // One marker for the whole group: the group is
+                        // regenerated as a unit, so its resume key must change
+                        // when ANY of its questions does. Joined with a
+                        // separator that cannot occur inside a question, so two
+                        // different splits cannot hash alike.
+                        marker: d.calibration_marker(&d.questions.join("\u{0}")),
+                    });
+                    full.chain(asked)
                 })
                 .collect();
 
@@ -996,7 +1127,7 @@ impl InferenceState {
             // alongside the freshly calibrated ones. Tombstoning drops it from the
             // gather (`resolver.rs` skips tombstoned timelines), leaving exactly
             // the current corpus.
-            let current: HashSet<&str> = cases.iter().map(|(_, _, m)| m.as_str()).collect();
+            let current: HashSet<&str> = cases.iter().map(|c| c.marker()).collect();
             let mut retired = 0usize;
             for (timeline, marker) in engine.conversations_with_metadata_key(CALIB_MARKER_KEY) {
                 if current.contains(marker.as_str()) {
@@ -1038,8 +1169,9 @@ impl InferenceState {
             // rewording a description or a parameter, or editing the example,
             // changes the marker and the case regenerates against the current text.
             let mut done = 0usize;
-            let mut to_run: Vec<(&str, &str, &str)> = Vec::new();
-            for (name, example, marker) in cases.iter() {
+            let mut to_run: Vec<&CalibCase<'_>> = Vec::new();
+            for case in cases.iter() {
+                let (name, marker) = (case.tool(), case.marker());
                 // Distill-inclusive: a finished exemplar's designed end state is
                 // archived + distilled(`ProvenanceOnly`) + tombstoned, and the
                 // live-only lookup cannot see it — every such case read as
@@ -1059,7 +1191,11 @@ impl InferenceState {
                     {
                         mark_calibration_distill(&engine, *t, name, &mut timing);
                     }
-                    done += 1;
+                    // Progress counts EXEMPLARS, not submissions: a resumed
+                    // question group already produced all of its turns, so
+                    // crediting it with one would make the bar crawl for a
+                    // resumed run and then jump.
+                    done += case.exemplars();
                     progress.set_step_progress(done as u64, total as u64);
                     continue;
                 }
@@ -1071,7 +1207,7 @@ impl InferenceState {
                         tracing::warn!(tool = name, "tombstone partial calibration failed: {e}");
                     }
                 }
-                to_run.push((*name, *example, marker.as_str()));
+                to_run.push(case);
             }
             // Say up front how much of the corpus is being regenerated and why the
             // step will take as long as it does. A case resumes only when a prior
@@ -1079,10 +1215,14 @@ impl InferenceState {
             // reworded tool description, an edited example, or an archive record
             // that did not survive — regenerates. Without this split a partial
             // recalibration is indistinguishable from a full one at a glance.
+            // `exemplars` and `submissions` are deliberately both reported: a
+            // question group is one submission carrying many exemplars, so a
+            // single figure would misrepresent either the work or the corpus.
             tracing::info!(
-                cases = total,
+                exemplars = total,
                 resumed = done,
-                to_run = to_run.len(),
+                submissions = to_run.len(),
+                exemplars_to_run = to_run.iter().map(|c| c.exemplars()).sum::<usize>(),
                 "calibration resume filter"
             );
 
@@ -1090,89 +1230,83 @@ impl InferenceState {
             // last sweep. Archives only complete trajectories (`</tool_call>`); an
             // incomplete/failed one stays un-archived to retry next load. Returns
             // whether anything was retired.
-            // Each in-flight case carries the mid-decode reprojection events streamed
-            // so far, accumulated across sweeps (they arrive interleaved with tokens).
-            // The trailing `bool` is `is_prefill`: a prefilled trajectory is
-            // complete by construction (it's the validated exported `.md`), and
-            // its `Done` response carries no decoded text — so it must NOT be
-            // gated on `resp.text` the way a live decode is.
-            let mut inflight: Vec<(Sequence, TurnHandle, &str, Vec<ProjectionEvent>, bool)> =
-                Vec::new();
-            let retire_completed =
-                |inflight: &mut Vec<(Sequence, TurnHandle, &str, Vec<ProjectionEvent>, bool)>,
-                 done: &mut usize,
-                 reclaim: &mut Vec<TimelineId>,
-                 timing: &mut CalibTiming|
-                 -> bool {
-                    let mut retired = false;
-                    let mut i = 0;
-                    while i < inflight.len() {
-                        let mut collected: Vec<ProjectionEvent> = Vec::new();
-                        let terminal = loop {
-                            match inflight[i].1.try_recv() {
-                                Some(TurnEvent::Done(resp)) => break Some(Some(resp)),
-                                Some(TurnEvent::Error(_)) => break Some(None),
-                                Some(TurnEvent::Projection(ev)) => collected.push(ev),
-                                Some(_) => {}
-                                None => break None,
-                            }
-                        };
-                        inflight[i].3.append(&mut collected);
-                        match terminal {
-                            Some(result) => {
-                                let (mut conv, handle, name, events, is_prefill) =
-                                    inflight.remove(i);
-                                match result {
-                                    Some(resp)
-                                        if is_prefill || resp.text.contains("</tool_call>") =>
-                                    {
-                                        seal_calibration_turn(
-                                            &mut conv, handle, &resp, name, events, timing,
+            let mut inflight: Vec<InFlightCase<'_>> = Vec::new();
+            let retire_completed = |inflight: &mut Vec<InFlightCase<'_>>,
+                                    done: &mut usize,
+                                    reclaim: &mut Vec<TimelineId>,
+                                    timing: &mut CalibTiming|
+             -> bool {
+                let mut retired = false;
+                let mut i = 0;
+                while i < inflight.len() {
+                    let mut collected: Vec<ProjectionEvent> = Vec::new();
+                    let terminal = loop {
+                        match inflight[i].handle.try_recv() {
+                            Some(TurnEvent::Done(resp)) => break Some(Some(resp)),
+                            Some(TurnEvent::Error(_)) => break Some(None),
+                            Some(TurnEvent::Projection(ev)) => collected.push(ev),
+                            Some(_) => {}
+                            None => break None,
+                        }
+                    };
+                    inflight[i].events.append(&mut collected);
+                    match terminal {
+                        Some(result) => {
+                            let InFlightCase {
+                                mut conv,
+                                handle,
+                                tool: name,
+                                events,
+                                is_prefill,
+                                exemplars,
+                            } = inflight.remove(i);
+                            match result {
+                                Some(resp) if is_prefill || resp.text.contains("</tool_call>") => {
+                                    seal_calibration_turn(
+                                        &mut conv, handle, &resp, name, events, timing,
+                                    );
+                                    if let Err(e) = timing.time(
+                                        |t| &mut t.archive,
+                                        || {
+                                            engine
+                                                .set_conversation_archived(conv.timeline_id(), true)
+                                        },
+                                    ) {
+                                        tracing::warn!(
+                                            tool = name,
+                                            "calibration archive failed: {e}"
                                         );
-                                        if let Err(e) = timing.time(
-                                            |t| &mut t.archive,
-                                            || {
-                                                engine.set_conversation_archived(
-                                                    conv.timeline_id(),
-                                                    true,
-                                                )
-                                            },
-                                        ) {
-                                            tracing::warn!(
-                                                tool = name,
-                                                "calibration archive failed: {e}"
-                                            );
-                                        }
-                                        // Only the wide-Q sig is needed henceforth —
-                                        // mark for distillation so compaction sheds
-                                        // the trajectory content.
-                                        mark_calibration_distill(
-                                            &engine,
-                                            conv.timeline_id(),
-                                            name,
-                                            timing,
-                                        );
-                                        // Retired: its sealed K/V is never attended
-                                        // again (only the persisted wide-Q sig is),
-                                        // so queue its timeline for hot→warm demotion
-                                        // to keep calibration's VRAM footprint flat.
-                                        reclaim.push(conv.timeline_id());
                                     }
-                                    Some(_) => tracing::warn!(
+                                    // Only the wide-Q sig is needed henceforth —
+                                    // mark for distillation so compaction sheds
+                                    // the trajectory content.
+                                    mark_calibration_distill(
+                                        &engine,
+                                        conv.timeline_id(),
+                                        name,
+                                        timing,
+                                    );
+                                    // Retired: its sealed K/V is never attended
+                                    // again (only the persisted wide-Q sig is),
+                                    // so queue its timeline for hot→warm demotion
+                                    // to keep calibration's VRAM footprint flat.
+                                    reclaim.push(conv.timeline_id());
+                                }
+                                Some(_) => tracing::warn!(
                                     tool = name,
                                     "calibration trajectory incomplete — left un-archived for retry"
                                 ),
-                                    None => tracing::warn!(tool = name, "calibration case failed"),
-                                }
-                                *done += 1;
-                                progress.set_step_progress(*done as u64, total as u64);
-                                retired = true;
+                                None => tracing::warn!(tool = name, "calibration case failed"),
                             }
-                            None => i += 1,
+                            *done += exemplars;
+                            progress.set_step_progress(*done as u64, total as u64);
+                            retired = true;
                         }
+                        None => i += 1,
                     }
-                    retired
-                };
+                }
+                retired
+            };
 
             // The ChatML markers a calibration example is split on: everything
             // after `assistant_start` is the verbatim body we prefill; the user
@@ -1180,6 +1314,18 @@ impl InferenceState {
             let assistant_start = conv_config.dialect.assistant_start;
             let user_end = conv_config.dialect.user_end;
             let mut to_run_iter = to_run.into_iter();
+            // Fills each stuffed case out to its block boundary. The dialect's
+            // turn terminator rather than an arbitrary id: it is a token the
+            // model has seen in exactly this position ten thousand times, so a
+            // run of them is the most inert tail available. It lands in the
+            // assistant half, outside every phase span — see
+            // `candle_conversation::stuffed_grid`.
+            let calib_pad_token = engine
+                .tokenizer()
+                .encode(conv_config.dialect.assistant_end, false)
+                .ok()
+                .and_then(|e| e.get_ids().last().copied())
+                .unwrap_or(0);
             let mut warmed = false;
             // Timelines of archived (retired) calibration cases, awaiting hot→warm
             // demotion. Their sealed K/V is never attended again — only the
@@ -1219,7 +1365,7 @@ impl InferenceState {
                 } else {
                     0
                 };
-                let batch: Vec<(&str, &str, &str)> =
+                let batch: Vec<&CalibCase<'_>> =
                     (0..want).map_while(|_| to_run_iter.next()).collect();
                 let created_any = !batch.is_empty();
                 let convs = if created_any {
@@ -1239,7 +1385,8 @@ impl InferenceState {
                 } else {
                     Vec::new()
                 };
-                for ((name, example, marker), conv_res) in batch.into_iter().zip(convs) {
+                for (case, conv_res) in batch.into_iter().zip(convs) {
+                    let (name, marker) = (case.tool(), case.marker());
                     let mut conv = match conv_res {
                         Ok(conv) => conv,
                         Err(e) => {
@@ -1249,6 +1396,22 @@ impl InferenceState {
                             continue;
                         }
                     };
+                    // **This exemplar's KV never goes to disk.** The seal captures
+                    // its wide-Q signature — which persists on its own record —
+                    // and the case's designed end state is
+                    // `DistillMode::ProvenanceOnly`: KV dropped, signature kept.
+                    // Cold-persisting it therefore writes bytes the next load's
+                    // distillation immediately deletes. Measured on this 2,998-case
+                    // corpus before the flag: ~4 GB of redo log per minute, ~108 GB
+                    // in total, all of it discarded — enough to fill the disk and
+                    // wedge the daemon on failing fsyncs.
+                    //
+                    // Marked before the turn is submitted so the residence is
+                    // flagged at `append_complete` rather than after it has already
+                    // been queued for a cold write.
+                    engine
+                        .conversation()
+                        .mark_timeline_transient(conv.timeline_id());
                     // Tag at creation so a half-finished case is findable next load.
                     if let Err(e) = timing.time(
                         |t| &mut t.tag,
@@ -1286,30 +1449,59 @@ impl InferenceState {
                     // strips the markers for the prefilled text and records each
                     // one's token offset so the staged prefill wave fires a
                     // projection there, reproducing the decode's projection sequence.
-                    let (user_prompt, body): (&str, Option<String>) =
-                        if example.matches(assistant_start).count() == 1 {
-                            let (before, b) =
-                                example.split_once(assistant_start).expect("count == 1");
-                            let p = before.trim_end();
-                            let p = p.strip_suffix(user_end.trim()).unwrap_or(p).trim_end();
-                            (p, Some(b.to_string()))
-                        } else {
-                            (example.trim(), None)
-                        };
                     let (submit_result, is_prefill) = timing.time(
                         |t| &mut t.submit,
-                        || match body {
-                            Some(body) => (
-                                conv.submit_prefilled_turn(
-                                    user_prompt,
-                                    &body,
-                                    crate::tool_def::PROJECTION_MARKER,
-                                    opts.selection.clone(),
-                                    opts.tags.clone(),
-                                ),
-                                true,
-                            ),
-                            None => (conv.submit_turn_with_options(user_prompt, opts), false),
+                        || match case {
+                            // ALL of this tool's question exemplars in ONE
+                            // prefill, carved back into one turn each. They
+                            // share this submission's pinned selection, which is
+                            // correct precisely because a group is one tool's.
+                            CalibCase::Questions { questions, .. } => {
+                                let group: Vec<(String, Vec<String>)> = questions
+                                    .iter()
+                                    .map(|q| (q.clone(), opts.tags.clone()))
+                                    .collect();
+                                (
+                                    conv.submit_prefilled_turn_group(
+                                        &group,
+                                        opts.selection.clone(),
+                                        calib_pad_token,
+                                    )
+                                    .map(|(handle, _)| handle),
+                                    true,
+                                )
+                            }
+                            CalibCase::Trajectory { text, .. } => {
+                                // Prefill the tool file's ChatML trajectory
+                                // verbatim in one batched forward instead of
+                                // decoding it token by token — the wide-Q is
+                                // captured identically at seal. Only a
+                                // single-turn example (exactly one assistant
+                                // header) qualifies: split into the body (after
+                                // the header — the think→call we prefill,
+                                // projection markers kept) and the user prompt
+                                // (before it, minus the trailing `user_end`). A
+                                // bare prompt or a multi-turn lead-in is decoded
+                                // live rather than prefilling a wrong-grid body.
+                                if text.matches(assistant_start).count() == 1 {
+                                    let (before, b) =
+                                        text.split_once(assistant_start).expect("count == 1");
+                                    let p = before.trim_end();
+                                    let p = p.strip_suffix(user_end.trim()).unwrap_or(p).trim_end();
+                                    (
+                                        conv.submit_prefilled_turn(
+                                            p,
+                                            b,
+                                            crate::tool_def::PROJECTION_MARKER,
+                                            opts.selection.clone(),
+                                            opts.tags.clone(),
+                                        ),
+                                        true,
+                                    )
+                                } else {
+                                    (conv.submit_turn_with_options(text.trim(), opts), false)
+                                }
+                            }
                         },
                     );
                     match submit_result {
@@ -1362,15 +1554,24 @@ impl InferenceState {
                                     ),
                                     None => {}
                                 }
-                                done += 1;
+                                done += case.exemplars();
                                 progress.set_step_progress(done as u64, total as u64);
                             } else {
-                                inflight.push((conv, handle, name, Vec::new(), is_prefill));
+                                inflight.push(InFlightCase {
+                                    conv,
+                                    handle,
+                                    tool: name,
+                                    events: Vec::new(),
+                                    is_prefill,
+                                    exemplars: case.exemplars(),
+                                });
                             }
                         }
                         Err(e) => {
                             tracing::warn!(tool = name, "calibration submit failed: {e}");
-                            done += 1;
+                            // A failed group forfeits all of its exemplars, not
+                            // one — otherwise the bar never reaches its total.
+                            done += case.exemplars();
                             progress.set_step_progress(done as u64, total as u64);
                         }
                     }
@@ -4284,6 +4485,14 @@ impl ZendSession {
                             let conv =
                                 { state_for_reconcile.engine.lock().unwrap().conversation() };
                             let schema = state_for_reconcile.refresh_builder.schema().clone();
+                            // The tool catalog's levels first: they are what every
+                            // conversation's tool selection is scored on, they are
+                            // rebuilt empty on each process load, and the dialogue
+                            // replay cannot teach them (its probes are the untagged
+                            // turns; the tool corpus is tagged). Cold, the scores are
+                            // not merely smaller but differently ORDERED, so a tool
+                            // query resolves to the wrong tool.
+                            conv.warm_collection_normalization(&schema);
                             conv.warm_ingest_normalization(&schema);
                         });
                         // The engine is up — only NOW mark ready and unblock

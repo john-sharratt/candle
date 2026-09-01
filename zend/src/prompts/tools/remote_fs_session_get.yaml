@@ -1,4 +1,29 @@
 name: remote_fs_session_get
+questions:
+- download /etc/nginx/nginx.conf from the SFTP host
+- fetch the crash dump off the remote server
+- pull /srv/releases/latest.tar.gz down over SFTP
+- copy the remote log file into the session so I can read it
+- can I read that remote file without opening a shell
+- how big is the file I'm about to download over SFTP
+- where does the downloaded file land locally
+- did the transfer from the remote host complete
+- the logs aren't shipping so I'll fetch them directly
+- need the server's config to compare against ours
+- retrieving the artefact the build left on the box
+- grabbing the core dump before the box is recycled
+- download that from the SFTP host
+- fetch the remote file
+- pull it down over SFTP
+- copy that file across from the server
+- download /var/log/app.log from the remote host
+- pull that config file off the SFTP server
+- fetch the remote file into the session so I can read it
+- copy the build artefact down from the server
+- retrieve /etc/nginx/nginx.conf over SFTP
+- bring that remote file across to me
+- download the backup archive from the remote filesystem
+- get the log file off the SFTP host
 category: Remote filesystem
 description: Download a file from the remote SFTP filesystem into the session VFS. Returns the VFS path where content was written.
 high_risk: true

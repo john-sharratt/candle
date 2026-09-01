@@ -1,4 +1,29 @@
 name: remote_fs_session_rename
+questions:
+- move /incoming/tmp.bin into /srv/data on the SFTP host
+- move the uploaded tarball into the releases directory remotely
+- swap current and previous symlink targets on the remote server
+- rename the remote log before the rotation runs
+- can I move a file across directories on the SFTP host
+- will the rename overwrite an existing remote path
+- is rename atomic on the remote filesystem
+- does the destination directory exist on the server
+- doing an atomic release swap on the remote box
+- archiving the old deploy before putting the new one in place
+- the upload landed under a temp name and needs moving
+- rotating the remote log by hand
+- rename it on the SFTP host
+- move that remote file
+- rename over SFTP
+- shift that path on the server
+- rename that file on the remote server
+- move the old release directory aside over SFTP
+- rename /srv/app to /srv/app.bak on the remote host
+- shift that remote file into the archive folder
+- move the uploaded file into place on the SFTP host
+- rename the remote log before rotating it
+- change the name of that file on the remote filesystem
+- move a directory to a new path on the remote machine
 category: Remote filesystem
 description: Rename or move a file or directory on a remote host's filesystem over SFTP.
 high_risk: true

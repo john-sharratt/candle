@@ -620,6 +620,16 @@ impl ConversationEngine {
         self.conversation.warm_ingest_normalization(schema);
     }
 
+    /// Warm the belief-driven section collections' per-member hit levels from
+    /// their own tag-scoped corpus. Call after load, once the corpus is stable —
+    /// without it a collection's levels are cold on every process start but the
+    /// one that built the corpus, which changes both the scale and the RANKING of
+    /// its scores. See
+    /// [`crate::projection::Conversation::warm_collection_normalization`].
+    pub fn warm_collection_normalization(&self, schema: &crate::projection::Schema) {
+        self.conversation.warm_collection_normalization(schema);
+    }
+
     /// Merge a `(key, value)` into `timeline`'s free-form `custom`
     /// metadata bag and persist it. Used by utility ingests to tag each
     /// conversation with a content hash + descriptive fields for the
@@ -1312,6 +1322,8 @@ impl ConversationEngine {
         let (event_tx, event_rx) = channel::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
+                // One turn, and it is the slot's tail.
+                seal_group: None,
                 sequence_id,
                 projection_inputs: None,
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),

@@ -1,4 +1,29 @@
 name: file_delete
+questions:
+- delete scratch/notes-old.md
+- remove the two temp files I made earlier
+- drop the failed export from the session
+- delete the half-written migration
+- do I still need that file, and if not can you remove it
+- can you clear out the leftovers before we package this
+- is anything I created still taking up session space
+- would you get rid of the duplicate I made by mistake
+- I'm near the session size limit and need to free space
+- that draft went in the wrong direction, bin it
+- the uploaded document has sensitive data, remove it
+- cleaning up before I hand this over
+- delete it
+- bin that file
+- rm the temp one
+- get rid of it
+- delete that draft file
+- remove the temp file I created
+- get rid of the uploaded document
+- clean up scratch.txt before we export
+- drop that file, I don't need it any more
+- delete the old version from the session
+- remove the file to free up session space
+- discard the file I wrote by mistake
 category: Files
 description: 'Remove a file from this session''s view. Use for: removing a draft that''s no longer needed, cleaning up before exporting, getting rid of an uploaded file the user wants gone, freeing space within the 10 MiB session budget. Triggered by "delete the file", "remove", "rm", "get rid of the file called". Returns the path and a deleted flag. A project file on disk is NOT erased — it is only hidden from this session, and reappears in a new one. For removing files on remote systems use remote_fs_session_delete.'
 high_risk: true

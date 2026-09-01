@@ -1,4 +1,29 @@
 name: tls_session_close
+questions:
+- close TLS session 2 with a proper close-notify
+- shut the encrypted channel to the IMAPS server
+- tear down the certificate-verified connection on 636
+- end the TLS session to the MQTT broker
+- can I close the TLS channel now
+- does closing send close-notify to the peer
+- is the encrypted exchange finished on that channel
+- do I need to close TLS before opening another to the same host
+- done driving the IMAP conversation
+- finished testing the LDAP bind over TLS
+- the broker exchange is complete, release the channel
+- tidying up the encrypted connections I opened
+- close the TLS channel
+- shut the encrypted connection
+- disconnect the TLS session
+- end the secure channel
+- close the TLS connection
+- send close-notify and shut the encrypted channel
+- disconnect from the IMAPS server over TLS
+- end the secure TLS session, I'm finished
+- tear down the certificate-verified connection
+- terminate the encrypted socket to that host
+- close out the TLS session on port 993
+- shut down the TLS channel cleanly
 category: TLS sessions
 description: Shut a TLS-encrypted connection, sending close-notify and freeing the certificate-verified channel.
 high_risk: true
