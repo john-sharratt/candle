@@ -283,6 +283,54 @@ pub const QWEN36_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
 const QWEN38_27B_BRACKETS: &[(usize, usize)] = &[(16, 4)];
 pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS);
 
+/// Qwen3.8-Flash-Next (`qwen4exp`). Its NextN head is a full routed block of
+/// the same architecture, folded into the artifact as `blk.48`.
+///
+/// **Measured** by `quantized_qwen38_moe::tests::test_speculative_decode`, on
+/// the RTX PRO 5000 (72 GB), 255 generated tokens, StoryRewrite, every budget
+/// character-identical to the baseline:
+///
+/// | budget | accepted/step | t/s ×1 | t/s ×4 |
+/// |---|---|---|---|
+/// | 0 | 1.00 | 29.6 | 82.2 |
+/// | 1 | 1.99 | 43.6 | 118.2 |
+/// | 2 | 3.00 | 57.1 | 160.4 |
+/// | 3 | 3.98 | 72.8 | 188.1 |
+/// | 4 | 4.90 | 82.2 | 216.0 |
+///
+/// It had not turned over by 4 — acceptance is still ~98% of the block at the
+/// head's own ceiling, because a rewrite task is largely predictable from the
+/// context both the trunk and the head are reading. So the bracket sits at the
+/// deepest measured point rather than at an inferred optimum.
+///
+/// **The width limit is the rewind stash, and it was measured by hitting it.**
+///
+/// What a width has to survive is not throughput but the stash:
+/// `width × (budget + 1)` rows across all 36 DeltaNet layers, allocated
+/// *between* forwards, where nothing is left to concede to — so the failure is
+/// a device OOM rather than a refusal.
+///
+/// Measured on the 72 GB card by `test_speculative_ladder`, in stash rows:
+///
+/// | width | budget | rows | outcome |
+/// |---|---|---|---|
+/// | 1 | 4 | 5 | ✓ 4.90 accepted/step |
+/// | 4 | 4 | 20 | ✓ 4.90 |
+/// | 8 | 4 | 40 | ✓ 4.72 per sequence |
+/// | 16 | 4 | 80 | **CUDA_ERROR_OUT_OF_MEMORY** |
+///
+/// So budget 4 is carried to width 8 and no further. The second bracket is the
+/// lineage's own, which the sibling rows back.
+///
+/// **`affordable_draft_budget` did not save the width-16 row**, and this is the
+/// same disagreement the 27B row below records: the budget it reads reports
+/// claimable bytes the device then refuses, so the clamp permits a depth that
+/// does not fit. It is kept because it binds correctly when the reservation is
+/// genuinely small, but it must not be treated as a licence to widen a bracket
+/// past what has been run — which is exactly the mistake this table replaced.
+const QWEN38_FLASH_NEXT_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
+pub const QWEN38_FLASH_NEXT_DRAFT: DraftLadder = DraftLadder::new(QWEN38_FLASH_NEXT_BRACKETS);
+
 #[cfg(test)]
 mod tests {
     use super::*;
