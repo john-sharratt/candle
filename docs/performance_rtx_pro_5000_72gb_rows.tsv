@@ -1,0 +1,147 @@
+test	label	depth	prompt_tokens	mode	int8	contexts	valid	prefill_tps	decode_tps	quantized_pct	compress	peak_tokens
+long_context_0_5b	Qwen2-0.5B-Instruct (dense, Q4_0)	8192	7953	BF16	prec	1	✓	26516.7	142.1	-	-	8060
+long_context_0_5b	Qwen2-0.5B-Instruct (dense, Q4_0)	8192	7953	C5	prec	1	✓	26312.6	137.5	0.0%	-	8060
+long_context_0_5b	Qwen2-0.5B-Instruct (dense, Q4_0)	8192	7953	C10	prec	1	✓	25674.0	138.3	0.0%	-	8060
+long_context_0_8b	Qwen3.5-0.8B (hybrid dense)	32768	32128	BF16	prec	1	✓	7309.1	157.3	-	-	32235
+long_context_0_8b	Qwen3.5-0.8B (hybrid dense)	32768	32128	C5	prec	1	✓	6578.9	155.0	100.0%	2.85x	32235
+long_context_0_8b	Qwen3.5-0.8B (hybrid dense)	32768	32128	C10	prec	1	✓	7149.6	158.5	100.0%	4.60x	32235
+long_context_0_8b	Qwen3.5-0.8B (hybrid dense)	131072	128433	BF16	prec	1	✓	1859.0	135.6	-	-	128540
+long_context_0_8b	Qwen3.5-0.8B (hybrid dense)	131072	128433	C10	prec	1	✓	1913.1	132.1	100.0%	4.63x	128540
+long_context_27b	Qwen3.8-27B (hybrid dense)	32768	32128	BF16	perf	1	✓	691.7	30.6	-	-	32235
+long_context_27b	Qwen3.8-27B (hybrid dense)	32768	32128	C5	perf	1	✓	655.0	27.4	100.0%	3.64x	32235
+long_context_27b	Qwen3.8-27B (hybrid dense)	32768	32128	C10	perf	1	✓	656.7	26.0	100.0%	5.39x	32235
+long_context_27b	Qwen3.8-27B (hybrid dense)	131072	128433	BF16	perf	1	✓	192.0	17.7	-	-	128540
+long_context_27b	Qwen3.8-27B (hybrid dense)	131072	128433	C10	perf	1	✓	196.7	11.5	100.0%	5.44x	128540
+long_context_30b_a3b	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	8192	7953	BF16	prec	1	✓	3444.7	51.2	-	-	8060
+long_context_30b_a3b	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	8192	7953	C5	prec	1	✓	3388.6	47.5	100.0%	3.70x	8060
+long_context_30b_a3b	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	8192	7953	C10	prec	1	✓	3367.6	47.2	100.0%	5.94x	8060
+long_context_35b	Qwen3.5-35B-A3B (hybrid MoE)	32768	32128	BF16	perf	1	✓	1692.7	61.5	-	-	32235
+long_context_35b	Qwen3.5-35B-A3B (hybrid MoE)	32768	32128	C5	perf	1	✓	1641.4	57.6	100.0%	3.82x	32235
+long_context_35b	Qwen3.5-35B-A3B (hybrid MoE)	32768	32128	C10	perf	1	✓	1641.4	42.8	100.0%	7.48x	32235
+long_context_35b	Qwen3.5-35B-A3B (hybrid MoE)	131072	128433	BF16	perf	1	✓	441.4	28.7	-	-	128540
+long_context_35b	Qwen3.5-35B-A3B (hybrid MoE)	131072	128433	C10	perf	1	✓	449.8	14.1	100.0%	7.63x	128540
+long_context_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	32768	32128	BF16	perf	1	✓	1692.8	56.8	-	-	32235
+long_context_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	32768	32128	C5	perf	1	✓	1647.1	53.2	100.0%	3.81x	32235
+long_context_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	32768	32128	C10	perf	1	✓	1637.4	41.4	100.0%	7.01x	32235
+long_context_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	131072	128433	BF16	perf	1	✓	443.4	27.9	-	-	128540
+long_context_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	131072	128433	C10	perf	1	✓	456.4	14.5	100.0%	7.17x	128540
+long_context_8b	Qwen3-8B (dense, Q6_K)	8192	7953	BF16	prec	1	✓	3235.1	42.8	-	-	8060
+long_context_8b	Qwen3-8B (dense, Q6_K)	8192	7953	C5	prec	1	✓	3213.9	40.1	100.0%	3.71x	8060
+long_context_8b	Qwen3-8B (dense, Q6_K)	8192	7953	C10	prec	1	✓	3212.7	41.8	100.0%	6.31x	8060
+long_context_9b	Qwen3.5-9B (hybrid dense)	32768	32128	BF16	prec	1	✓	1987.2	75.0	-	-	32235
+long_context_9b	Qwen3.5-9B (hybrid dense)	32768	32128	C5	prec	1	✓	2002.5	58.5	100.0%	3.76x	32235
+long_context_9b	Qwen3.5-9B (hybrid dense)	32768	32128	C10	prec	1	✓	2000.8	52.1	100.0%	6.29x	32235
+long_context_9b	Qwen3.5-9B (hybrid dense)	131072	128433	BF16	prec	1	✓	592.3	35.7	-	-	128540
+long_context_9b	Qwen3.5-9B (hybrid dense)	131072	128433	C10	prec	1	✓	603.2	18.5	100.0%	6.37x	128540
+long_context_llama2	Llama-2-7B-Chat (dense, Q4_0)	3968	3879	BF16	prec	1	✓	3684.7	47.1	-	-	3993
+long_context_llama2	Llama-2-7B-Chat (dense, Q4_0)	3968	3879	C5	prec	1	✓	3852.0	47.2	100.0%	3.33x	3993
+long_context_llama2	Llama-2-7B-Chat (dense, Q4_0)	3968	3879	C10	prec	1	✓	3851.1	44.1	100.0%	4.81x	3993
+long_context_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	8192	7959	BF16	prec	1	✓	6195.9	69.9	-	-	8064
+long_context_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	8192	7959	C5	prec	1	✓	5963.8	69.5	100.0%	3.29x	8064
+long_context_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	8192	7959	C10	prec	1	✓	5936.8	66.1	100.0%	4.62x	8064
+test_long_context_scaling	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	32768	32128	BF16	prec	1	✓	1282.4	26.5	-	-	32235
+test_long_context_scaling	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	32768	32128	C5	prec	1	✓	1347.6	28.1	100.0%	4.20x	32235
+test_long_context_scaling	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	32768	32128	C10	prec	1	✓	1341.2	25.6	100.0%	7.03x	32235
+test_long_context_scaling	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	131072	128433	BF16	prec	1	✓	1269.5	29.5	-	-	128540
+test_long_context_scaling	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	131072	128433	C10	prec	1	✓	1277.1	23.8	100.0%	6.97x	128540
+profile_decode_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	8192	7990	BF16	prec	1	✓	1098.8	24.7	-	-	8065
+profile_decode_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	16384	16020	BF16	prec	1	✓	1368.9	28.3	-	-	16095
+profile_decode_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	32768	32128	BF16	prec	1	✓	1342.8	24.6	-	-	32203
+profile_decode_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	65536	64249	BF16	prec	1	✓	1291.8	26.3	-	-	64324
+profile_decode_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	131072	128433	BF16	prec	1	✓	1257.5	26.4	-	-	128508
+profile_story_rewrite_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	8192	8454	BF16	prec	1	✓	1108.1	62.3	-	-	8664
+profile_story_rewrite_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	16384	16484	BF16	prec	1	✓	1347.9	66.6	-	-	16694
+profile_story_rewrite_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	32768	32592	BF16	prec	1	✓	1307.7	57.8	-	-	32802
+profile_story_rewrite_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	65536	64713	BF16	prec	1	✓	1284.3	63.5	-	-	64923
+profile_story_rewrite_vs_depth	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	131072	128897	BF16	prec	1	✓	1258.7	53.9	-	-	129107
+deepseek4__test_parallel_batched_forwarding	DeepSeek-V4-Flash-0731 (native-sparse MoE, MXFP4_KO)	-	-	BF16	perf	1	✓	276.2	11.7	-	-	670
+deepseek4__test_parallel_batched_forwarding	DeepSeek-V4-Flash-0731 (native-sparse MoE, MXFP4_KO)	-	-	BF16	perf	4	✓	730.6	32.0	-	-	2722
+deepseek4__test_parallel_batched_forwarding	DeepSeek-V4-Flash-0731 (native-sparse MoE, MXFP4_KO)	-	-	BF16	perf	8	✓	941.9	51.0	-	-	5404
+deepseek4__test_parallel_batched_forwarding	DeepSeek-V4-Flash-0731 (native-sparse MoE, MXFP4_KO)	-	-	BF16	perf	16	✓	1095.9	73.5	-	-	10792
+deepseek4__test_parallel_batched_forwarding	DeepSeek-V4-Flash-0731 (native-sparse MoE, MXFP4_KO)	-	-	BF16	perf	1	✓	333.3	15.0	-	-	670
+quantized_llama__test_parallel_batched_forwarding_llama2	Llama-2-7B-Chat (dense, Q4_0)	-	-	BF16	perf	1	-	5518.9	91.5	-	-	283
+quantized_llama__test_parallel_batched_forwarding_llama2	Llama-2-7B-Chat (dense, Q4_0)	-	-	BF16	perf	8	-	5513.2	460.4	-	-	2316
+quantized_llama__test_parallel_batched_forwarding_llama2	Llama-2-7B-Chat (dense, Q4_0)	-	-	BF16	perf	16	-	5151.0	594.1	-	-	4624
+quantized_llama__test_parallel_batched_forwarding_llama2	Llama-2-7B-Chat (dense, Q4_0)	-	-	BF16	perf	48	-	3486.3	834.3	-	-	13796
+quantized_llama__test_parallel_batched_forwarding_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	-	-	BF16	prec	4	✓	13642.9	469.6	-	-	2658
+quantized_llama__test_parallel_batched_forwarding_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	-	-	C0	prec	1	✓	11987.9	122.9	100.0%	1.87x	654
+quantized_llama__test_parallel_batched_forwarding_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	-	-	C1	prec	1	✓	12140.4	124.3	100.0%	2.19x	654
+quantized_llama__test_parallel_batched_forwarding_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	-	-	C3	prec	1	✓	12013.6	126.7	100.0%	2.75x	654
+quantized_llama__test_parallel_batched_forwarding_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	-	-	C5	prec	1	✓	12470.4	132.0	100.0%	3.28x	654
+quantized_llama__test_parallel_batched_forwarding_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	-	-	C8	prec	10	✓	12797.2	729.2	100.0%	3.90x	6590
+quantized_llama__test_parallel_batched_forwarding_llama3	Llama-3.2-3B (Nidum uncensored, Q4_K_M)	-	-	C10	prec	5	✓	11828.1	504.6	100.0%	4.63x	3312
+quantized_qwen2__test_parallel_batched_forwarding	Qwen2-0.5B-Instruct (dense, Q4_0)	-	-	BF16	off	1	-	30359.9	244.0	-	-	308
+quantized_qwen2__test_parallel_batched_forwarding	Qwen2-0.5B-Instruct (dense, Q4_0)	-	-	BF16	off	60	-	75846.1	4562.4	-	-	18612
+quantized_qwen35__test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B (hybrid dense)	-	-	BF16	prec	1	✓	21078.9	168.8	-	-	659
+quantized_qwen35__test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B (hybrid dense)	-	-	BF16	prec	16	✓	30789.3	1851.2	-	-	10618
+quantized_qwen35__test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B (hybrid dense)	-	-	C0	prec	2	✓	27733.0	366.1	100.0%	1.86x	1358
+quantized_qwen35__test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B (hybrid dense)	-	-	C1	prec	2	✓	27995.8	383.9	100.0%	2.05x	1358
+quantized_qwen35__test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B (hybrid dense)	-	-	C3	prec	2	✓	28299.4	380.2	100.0%	2.48x	1358
+quantized_qwen35__test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B (hybrid dense)	-	-	C5	prec	2	✓	27793.9	380.2	100.0%	2.88x	1358
+quantized_qwen35__test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B (hybrid dense)	-	-	C8	prec	32	✓	30948.3	2399.5	100.0%	3.88x	21202
+quantized_qwen35__test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B (hybrid dense)	-	-	C10	prec	10	✓	31669.4	1400.6	100.0%	4.68x	6640
+quantized_qwen35__test_parallel_batched_forwarding_9b	Qwen3.5-9B (hybrid dense)	-	-	BF16	prec	1	✓	5231.9	121.0	-	-	659
+quantized_qwen35__test_parallel_batched_forwarding_9b	Qwen3.5-9B (hybrid dense)	-	-	BF16	prec	4	✓	5661.3	414.5	-	-	2678
+quantized_qwen35__test_parallel_batched_forwarding_9b	Qwen3.5-9B (hybrid dense)	-	-	C0	prec	1	✓	5225.5	131.4	100.0%	2.19x	659
+quantized_qwen35__test_parallel_batched_forwarding_9b	Qwen3.5-9B (hybrid dense)	-	-	C1	prec	1	✓	5250.4	130.6	100.0%	2.66x	659
+quantized_qwen35__test_parallel_batched_forwarding_9b	Qwen3.5-9B (hybrid dense)	-	-	C3	prec	1	✓	5239.8	129.0	100.0%	3.35x	659
+quantized_qwen35__test_parallel_batched_forwarding_9b	Qwen3.5-9B (hybrid dense)	-	-	C5	prec	1	✓	5173.8	127.1	100.0%	3.78x	659
+quantized_qwen35__test_parallel_batched_forwarding_9b	Qwen3.5-9B (hybrid dense)	-	-	C8	prec	20	✓	5537.6	869.9	100.0%	4.96x	13278
+quantized_qwen35__test_parallel_batched_forwarding_9b	Qwen3.5-9B (hybrid dense)	-	-	C10	prec	10	✓	5580.1	670.3	100.0%	6.29x	6640
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	BF16	perf	1	✓	6731.3	109.4	-	-	659
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	BF16	perf	4	✓	6782.7	374.4	-	-	2678
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C0	perf	1	✓	6477.4	93.5	100.0%	2.21x	659
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C1	perf	1	✓	6477.8	113.8	100.0%	2.93x	659
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C3	perf	1	✓	6553.9	114.8	100.0%	3.44x	659
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C5	perf	1	✓	6544.4	112.9	100.0%	3.87x	659
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C8	perf	5	✓	6707.4	426.9	100.0%	5.40x	3337
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C10	perf	8	✓	6705.6	549.0	100.0%	7.14x	5316
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C10	perf	16	✓	6628.8	700.5	100.0%	7.09x	10618
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C10	perf	32	✓	6656.3	985.4	100.0%	7.10x	21202
+quantized_qwen35_moe__test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B (hybrid MoE)	-	-	C10	perf	64	✓	6549.8	1170.7	100.0%	7.10x	42338
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	BF16	perf	1	✓	6747.2	107.8	-	-	659
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	BF16	perf	4	✓	5406.4	368.8	-	-	2678
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C0	perf	1	✓	6608.0	112.9	100.0%	2.21x	659
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C1	perf	1	✓	6470.3	108.6	100.0%	2.90x	659
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C3	perf	1	✓	6516.4	110.9	100.0%	3.41x	659
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C5	perf	1	✓	6555.7	113.1	100.0%	3.85x	659
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C8	perf	5	✓	6644.5	423.4	100.0%	5.18x	3337
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C10	perf	8	✓	6667.3	554.5	100.0%	6.68x	5316
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C10	perf	16	✓	6606.4	728.5	100.0%	6.65x	10618
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C10	perf	32	✗	6519.6	973.9	100.0%	6.65x	21202
+quantized_qwen36_moe__test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B (hybrid MoE)	-	-	C10	perf	64	✗	6645.6	1144.9	100.0%	6.66x	42338
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	BF16	perf	1	✓	1527.1	57.1	-	-	659
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	BF16	perf	4	✓	1572.5	186.8	-	-	2678
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	C0	perf	1	✓	1523.8	61.6	100.0%	2.19x	659
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	C1	perf	1	✓	1467.6	60.7	100.0%	2.37x	659
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	C3	perf	1	✓	1523.1	61.6	100.0%	3.24x	659
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	C5	perf	1	✓	1526.4	61.3	100.0%	3.63x	659
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	C8	perf	20	✓	1624.8	330.7	100.0%	4.53x	13278
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	C10	perf	10	✓	1628.5	281.4	100.0%	5.44x	6640
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	C10	perf	20	✓	1623.0	326.8	100.0%	5.44x	13278
+quantized_qwen38__test_parallel_batched_forwarding_27b	Qwen3.8-27B (hybrid dense)	-	-	C10	perf	40	✓	1607.2	458.1	100.0%	5.45x	26488
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	BF16	prec	1	✓	579.4	68.1	-	-	713
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	BF16	prec	4	✓	1798.7	233.5	-	-	2894
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	BF16	prec	8	✓	1751.2	310.6	-	-	5748
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	BF16	prec	16	✓	1841.5	333.3	-	-	11482
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	BF16	prec	1	✓	1628.1	86.9	-	-	713
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	C0	prec	2	✓	1808.6	146.4	100.0%	2.29x	1466
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	C5	prec	2	✓	1771.2	145.4	100.0%	4.21x	1466
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	C8	prec	2	✓	1838.2	139.5	100.0%	5.43x	1466
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	C10	prec	2	✓	1824.6	126.9	100.0%	6.93x	1466
+quantized_qwen38_moe__test_parallel_batched_forwarding	Qwen3.8-Flash-Next (qwen4exp, 250B-A13B)	-	-	C10	prec	8	✓	1857.7	295.9	100.0%	6.89x	5748
+quantized_qwen3__test_parallel_batched_forwarding	Qwen3-8B (dense, Q6_K)	-	-	BF16	perf	1	✓	5599.3	62.5	-	-	636
+quantized_qwen3__test_parallel_batched_forwarding	Qwen3-8B (dense, Q6_K)	-	-	BF16	perf	4	✓	6143.2	253.3	-	-	2586
+quantized_qwen3__test_parallel_batched_forwarding	Qwen3-8B (dense, Q6_K)	-	-	C0	perf	1	✓	5858.9	64.8	100.0%	1.90x	636
+quantized_qwen3__test_parallel_batched_forwarding	Qwen3-8B (dense, Q6_K)	-	-	C1	perf	1	✓	5649.1	65.9	100.0%	2.54x	636
+quantized_qwen3__test_parallel_batched_forwarding	Qwen3-8B (dense, Q6_K)	-	-	C3	perf	1	✓	5818.4	66.8	100.0%	2.92x	636
+quantized_qwen3__test_parallel_batched_forwarding	Qwen3-8B (dense, Q6_K)	-	-	C5	perf	1	✓	5858.9	64.8	100.0%	3.67x	636
+quantized_qwen3__test_parallel_batched_forwarding	Qwen3-8B (dense, Q6_K)	-	-	C8	perf	10	✓	6006.0	460.1	100.0%	4.85x	6410
+quantized_qwen3__test_parallel_batched_forwarding	Qwen3-8B (dense, Q6_K)	-	-	C10	perf	5	✓	6062.9	306.9	100.0%	6.21x	3222
+quantized_qwen3_moe__test_parallel_batched_forwarding	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	-	-	BF16	perf	1	✓	8165.7	80.0	-	-	626
+quantized_qwen3_moe__test_parallel_batched_forwarding	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	-	-	BF16	perf	10	✓	9709.2	505.8	-	-	6310
+quantized_qwen3_moe__test_parallel_batched_forwarding	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	-	-	C0	perf	2	✓	8821.9	111.4	100.0%	1.98x	1292
+quantized_qwen3_moe__test_parallel_batched_forwarding	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	-	-	C1	perf	2	✓	8930.5	113.6	100.0%	2.54x	1292
+quantized_qwen3_moe__test_parallel_batched_forwarding	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	-	-	C3	perf	2	✓	9120.4	120.4	100.0%	2.99x	1292
+quantized_qwen3_moe__test_parallel_batched_forwarding	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	-	-	C5	perf	2	✓	9281.9	117.6	100.0%	3.67x	1292
+quantized_qwen3_moe__test_parallel_batched_forwarding	Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)	-	-	BF16	perf	1	✓	7779.8	86.4	-	-	626
