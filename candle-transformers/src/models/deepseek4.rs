@@ -723,6 +723,88 @@ mod tests {
         params.run(configs, load_model)
     }
 
+    /// **Depth on DeepSeek-V4-Flash**: the batched forward at 32K and 128K of
+    /// KV.
+    ///
+    /// The native-sparse member of the fleet, and the one whose attention is
+    /// meant to stop scaling with depth at all — so this is the curve that
+    /// distinguishes the architecture from the dense lineage rather than just
+    /// measuring it.
+    #[test]
+    #[ignore = "reads the merged MXFP4_KO GGUF and runs a 128K-token prompt. Run with: \
+                cargo test --release --features cuda -p candle-transformers --lib \
+                deepseek4::tests::long_context_v4_flash \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_v4_flash() -> candle::Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+        use crate::models::batched_inference::InferenceMode;
+        use crate::models::dialect::Dialect;
+        use crate::models::gpu_test_lock::gpu_serial;
+        use crate::models::latent_moe::{BatchedEngine, Engine};
+        use candle::quantized::Int8Mode;
+        use candle::Device;
+
+        let _gpu = gpu_serial();
+        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
+        if !path.exists() {
+            candle::bail!("merged DeepSeek-V4-Flash GGUF absent");
+        }
+        let device = Device::new_cuda(0)?;
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer_json = std::fs::read_to_string(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("read tokenizer.json: {e}")))?;
+        long_context_gate(
+            "DeepSeek-V4-Flash-0731 (native-sparse MoE, MXFP4_KO)",
+            Int8Mode::Performance,
+            &tokenizer_json,
+            Dialect::deepseek(),
+            // `deepseek4.context_length` in the GGUF — 1M native, the widest
+            // window in the fleet by a factor of four.
+            1_048_576,
+            &[
+                (
+                    32_768,
+                    &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+                ),
+                (131_072, &[InferenceMode::BF16, InferenceMode::C10][..]),
+            ],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                // **No DSpark drafter here**, unlike the ladder gate above.
+                //
+                // The drafter is a dense-tier resident loaded before the span
+                // reservation, so its ~6 GB comes straight off what the KV side
+                // can ever hold — and on this card that is the difference
+                // between a 32K cache and `CUDA_ERROR_OUT_OF_MEMORY`. Measured:
+                // with the drafter, every rung of this gate OOMs at 32K while
+                // the ladder's ~700-token rungs are unaffected.
+                //
+                // Dropping it costs this gate nothing it is measuring.
+                // Speculation changes how many tokens a decode *step* commits,
+                // which the ladder gate covers; what a depth row reports is the
+                // per-token cost of prefill and decode against cache size, and
+                // the drafter only subtracts room from that.
+                let (engine, _) = Engine::load_with_drafter(
+                    &path,
+                    None,
+                    &DEEPSEEK_V4,
+                    &device,
+                    Int8Mode::Performance,
+                )?;
+                BatchedEngine::new(engine)
+            },
+        )
+    }
+
     /// The drafter is a separate architecture reachable from the target, and it
     /// must differ where it matters (metadata namespace) while agreeing where the
     /// engine depends on it (tensor names, latent geometry).

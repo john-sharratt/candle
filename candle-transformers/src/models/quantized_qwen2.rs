@@ -1449,4 +1449,68 @@ mod tests {
 
         params.run(full_configs, load_model)
     }
+
+    /// **Depth on the 0.5B**: the batched forward at 8K and 32K of KV.
+    ///
+    /// The smallest model in the fleet, which makes it the clearest case of the
+    /// regime this engine is built for: even at 32K the cache is many times the
+    /// weights, so the depth curve here is almost entirely the KV subsystem's.
+    /// 32K is the checkpoint's whole trained window, so the ladder takes its
+    /// spread from the shallow end.
+    #[test]
+    #[ignore = "downloads the Qwen2-0.5B-Instruct Q4_0 GGUF and prefills its full 32K window. \
+                Run with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen2::tests::long_context_0_5b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_0_5b() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+        use crate::models::batched_model::BatchedInference;
+
+        let api = crate::models::batch_test::test_helpers::api()
+            .map_err(|e| candle::Error::Msg(format!("HF API: {e}")))?;
+        let tok_repo = api.model("Qwen/Qwen2-0.5B-Instruct".to_string());
+        let tokenizer_path = tok_repo
+            .get("tokenizer.json")
+            .map_err(|e| candle::Error::Msg(format!("tokenizer.json: {e}")))?;
+        let tokenizer_json = std::fs::read_to_string(&tokenizer_path)
+            .map_err(|e| candle::Error::Msg(format!("read tokenizer.json: {e}")))?;
+        let repo = api.repo(hf_hub::Repo::with_revision(
+            "Qwen/Qwen2-0.5B-Instruct-GGUF".to_string(),
+            hf_hub::RepoType::Model,
+            "main".to_string(),
+        ));
+        let model_path = repo
+            .get("qwen2-0_5b-instruct-q4_0.gguf")
+            .map_err(|e| candle::Error::Msg(format!("model: {e}")))?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        long_context_gate(
+            "Qwen2-0.5B-Instruct (dense, Q4_0)",
+            int8mode,
+            &tokenizer_json,
+            Dialect::chat_ml(),
+            // `qwen2.context_length` in the GGUF.
+            32_768,
+            // One shallow rung: the depth-scaling question is asked of the
+            // Qwen3.5+ checkpoints, whose 262K windows can actually answer it.
+            // What this row contributes is the small-model end of the fleet at
+            // a depth every model can reach.
+            &[(
+                8_192,
+                &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+            )],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                let model =
+                    ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;
+                let inv_freq = model
+                    .rope_inv_freq()
+                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            },
+        )
+    }
 }

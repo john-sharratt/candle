@@ -13,6 +13,7 @@
 use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
+use candle_nn::kv_cache::QuantFormat;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
@@ -52,6 +53,19 @@ impl DraftBudget {
 use crate::models::profile::{
     gpu_drain_blocking, pipeline_record, pipeline_snapshot_and_reset, profile_now, ProfileSnapshot,
 };
+
+/// The story a [`TestMode::StoryRewrite`] prompt asks the model to reproduce
+/// with its character renamed.
+///
+/// Line endings are normalised here, once. The file is checked in with CRLF on
+/// Windows, and a prompt carrying `\r\n` tokenises differently from the same
+/// text with `\n` — so a second `include_str!` of it elsewhere would be a
+/// different prompt that merely looked identical in the source.
+pub fn story_prompt() -> String {
+    include_str!("story.md")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+}
 
 /// Determines the validation strategy for the test harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +141,14 @@ pub struct TestParams {
     /// and therefore every gate's expected-output check — is identical at any
     /// budget. See [`Self::with_speculative`].
     pub speculative_max_draft: DraftBudget,
+    /// Pin every sealed K block to one quantization format instead of letting
+    /// the policy choose per block.
+    ///
+    /// For asking which *format* a rung's behaviour belongs to. A level's
+    /// candidate list is a set, and the adaptive selection means a run tells
+    /// you what the level did on average, never which member did it. Pinning
+    /// one at a time turns that into an answerable question.
+    pub override_k_quant: Option<QuantFormat>,
 }
 
 impl TestParams {
@@ -153,9 +175,7 @@ impl TestParams {
             prompt_system: include_str!("system.md")
                 .replace("\r\n", "\n")
                 .replace("\r", "\n"),
-            prompt_user: include_str!("story.md")
-                .replace("\r\n", "\n")
-                .replace("\r", "\n"),
+            prompt_user: story_prompt(),
             per_config_prompts: Vec::new(),
             stop_on_eos: Vec::new(),
             names: include_str!("names.md")
@@ -170,7 +190,14 @@ impl TestParams {
             timeout_secs: 120,
             int8mode: Int8Mode::Off,
             speculative_max_draft: DraftBudget::Adaptive,
+            override_k_quant: None,
         })
+    }
+
+    /// Pin every sealed K block to `fmt` — see [`Self::override_k_quant`].
+    pub fn with_override_k_quant(mut self, fmt: Option<QuantFormat>) -> Self {
+        self.override_k_quant = fmt;
+        self
     }
 
     /// Pin the draft budget instead of asking the model — `0` for a plain-decode
@@ -380,6 +407,11 @@ pub struct TestResults {
     pub compression_ratio: Option<f64>, // Float-equivalent bytes / actual quantized bytes
     pub peak_tokens: usize,         // Total tokens across all sessions at peak (after generation)
     pub expert_stats: Option<PipelineStats>, // Expert cache telemetry (if model has MoE)
+    /// `(hits, misses, evictions)` of a disk-resident embedding tier's row
+    /// cache, if the model serves one. Cumulative across the run: the cache is
+    /// process-wide and deliberately not reset per config, because its hit
+    /// rate is a property of the traffic seen so far.
+    pub row_cache_stats: Option<(u64, u64, u64)>,
     pub bulk_profile: ProfileSnapshot, // Profile data from prompt (bulk) phase
     pub single_profile: ProfileSnapshot, // Profile data from generate (single) phase
     pub pipeline_bulk_profile: ProfileSnapshot, // Pipeline spans, prefill (bulk) phase only
@@ -869,21 +901,57 @@ fn format_diff(expected: &str, actual: &str) -> String {
     output
 }
 
+/// Take the VRAM baseline, run `load`, and register what the weights cost.
+///
+/// The weights' footprint is a free-VRAM delta **across** the load, so the
+/// baseline has to be taken before they come in. That is why this wraps the
+/// load rather than sitting inside [`TestParams::run_loaded`], which by
+/// construction runs with the model already resident: a baseline taken there
+/// measures the weights as zero and folds the whole checkpoint into the
+/// `cuda context` row, which is the number the VRAM table's sizing decisions
+/// are read off.
+///
+/// One definition, two consumers: [`TestParams::run`] wraps its `load_model`,
+/// and a caller that loads once for several [`TestParams::run_loaded`] sweeps
+/// wraps its own load so its table is populated the same way.
+pub fn account_model_load<M>(device: &Device, load: impl FnOnce() -> Result<M>) -> Result<M> {
+    candle::gpu_memory::clear();
+    let (free_before, total) = device.mem_get_info().unwrap_or((0, 0));
+    let cuda_ctx_bytes = total.saturating_sub(free_before);
+    if cuda_ctx_bytes > 0 {
+        candle::gpu_memory::register("cuda context", cuda_ctx_bytes);
+    }
+    let _ = candle::gpu_memory::snapshot("before_model_load", device);
+    let model = load()?;
+    let _ = candle::gpu_memory::snapshot("after_model_load", device);
+    let free_after = device.mem_get_info().map(|(f, _)| f).unwrap_or(0);
+    candle::gpu_memory::register("model weights", free_before.saturating_sub(free_after));
+    Ok(model)
+}
+
 impl TestParams {
-    /// Generic test harness for forward pass performance testing.
+    /// Load a model and run `configs` against it.
     ///
-    /// This version uses the new BatchedInferenceSession API for batched mode.
-    /// The model must implement `ManagedBatchedModel` which includes `forward_batched`.
+    /// A caller that runs several *sweeps* over one checkpoint — the draft
+    /// budgets of `speculative_gate`, say — should load once and call
+    /// [`Self::run_loaded`] per sweep instead. Loading is not incidental cost
+    /// on these models: a 124 GB artifact takes minutes to open, so a
+    /// five-budget sweep spends most of its wall clock re-reading weights that
+    /// never changed.
+    pub fn run<M>(self, configs: Vec<TestConfig>, load_model: impl Fn() -> Result<M>) -> Result<()>
+    where
+        M: ManagedBatchedModel,
+    {
+        let model = account_model_load(&self.device, load_model)?;
+        self.run_loaded(configs, &model)
+    }
+
+    /// Run `configs` against a model the caller already holds.
     ///
-    /// # Arguments
-    /// * `configs` - List of test configurations to run
-    /// * `sequential` - Callbacks for non-batched mode (individual caches per sequence)
-    /// * `model` - The model implementing ManagedBatchedModel for batched mode
-    pub fn run<M>(
-        mut self,
-        configs: Vec<TestConfig>,
-        load_model: impl Fn() -> Result<M>,
-    ) -> Result<()>
+    /// The memory bookkeeping around the load belongs to whoever performed it,
+    /// so this reports the run's own figures and nothing about weights it did
+    /// not bring in.
+    pub fn run_loaded<M>(mut self, configs: Vec<TestConfig>, model: &M) -> Result<()>
     where
         M: ManagedBatchedModel,
     {
@@ -933,22 +1001,11 @@ impl TestParams {
 
         let mut results = Vec::new();
 
-        // GPU memory tracking: snapshot before model load
-        candle::gpu_memory::clear();
-        let (free_before, total) = self.device.mem_get_info().unwrap_or((0, 0));
-        let cuda_ctx_bytes = total.saturating_sub(free_before);
-        if cuda_ctx_bytes > 0 {
-            candle::gpu_memory::register("cuda context", cuda_ctx_bytes);
-        }
-        let _ = candle::gpu_memory::snapshot("before_model_load", &self.device);
-
-        let model = load_model()?;
-
-        // GPU memory tracking: snapshot after model load and register weight memory
-        let _ = candle::gpu_memory::snapshot("after_model_load", &self.device);
-        let free_after = self.device.mem_get_info().map(|(f, _)| f).unwrap_or(0);
-        let model_bytes = free_before.saturating_sub(free_after);
-        candle::gpu_memory::register("model weights", model_bytes);
+        // The load's VRAM accounting is NOT done here: the weights are already
+        // resident by the time this runs, so a baseline taken now measures
+        // nothing. [`account_model_load`] wraps the load itself — `run` calls it
+        // around `load_model`, and a caller that loads once for several sweeps
+        // wraps its own load in it.
 
         for (n, config) in configs.into_iter().enumerate() {
             println!("\n=== Running tests for config: {:?} ===", config);
@@ -1032,7 +1089,7 @@ impl TestParams {
             );
 
             // The harness is batched-only — the sequential/`forward_with_context` path is retired.
-            let result = match self.run_batched_config(&config, &model) {
+            let result = match self.run_batched_config(&config, model) {
                 Ok(r) => r,
                 Err(e) => {
                     // Arena bytes and table were already captured by the ArenaErrGuard
@@ -1050,6 +1107,7 @@ impl TestParams {
             // Collect expert pipeline stats for this config
             let mut result = result;
             result.expert_stats = model.expert_stats();
+            result.row_cache_stats = model.row_cache_stats();
 
             results.push(result);
 
@@ -1088,6 +1146,7 @@ impl TestParams {
             k_format: config.mode.k_format(),
             v_format: config.mode.v_format(),
             compression_level: config.mode.compression_level(),
+            override_k_quant: self.override_k_quant,
             ..Default::default()
         };
         // One loaded model serves every config in the sweep and the configs
@@ -1323,20 +1382,72 @@ impl TestParams {
                 }
             }
             let nl = model.num_layers();
-            let logits_vec = model
-                .forward_wave(
-                    &mut session,
-                    &[],
-                    &[],
-                    &sequence_indices,
-                    &user_tensors,
-                    &[],
-                    &[],
-                    0,
-                    nl,
-                    None,
-                )?
-                .logits_owned()?;
+            // **Prefill honours the model's own width cap.**
+            //
+            // A wave's transient tier is sized by its row count, so a prompt
+            // submitted whole asks for a tier proportional to the whole prompt:
+            // at 127K tokens that was a measured 9.4 GB against a 3.2 GB span,
+            // and the partition refused it — correctly, since the ground is not
+            // there. `prefill_width_cap` is the model's answer to exactly this
+            // question and every engine already implements it; the harness was
+            // simply not asking. Submitting the prompt in cap-sized slices
+            // keeps each wave inside the span whatever the prompt's length.
+            //
+            // Short prompts are unaffected: every existing gate's prompt is a
+            // few hundred tokens, far below any model's cap, so it still takes
+            // exactly one slice and runs the identical single call it always
+            // did. Only the last slice's logits are kept — they are the ones
+            // that predict the first generated token.
+            let cap = model.prefill_width_cap(session.activation_dtype()).max(1);
+            let longest = user_tensors
+                .iter()
+                .map(|t| t.dims().last().copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            let logits_vec = if longest <= cap {
+                model
+                    .forward_wave(
+                        &mut session,
+                        &[],
+                        &[],
+                        &sequence_indices,
+                        &user_tensors,
+                        &[],
+                        &[],
+                        0,
+                        nl,
+                        None,
+                    )?
+                    .logits_owned()?
+            } else {
+                let mut last: Vec<Tensor> = Vec::new();
+                let mut start = 0usize;
+                while start < longest {
+                    // Sequences whose prompt has already been fully submitted
+                    // drop out of the slice rather than being padded: the wave
+                    // takes a ragged batch, and padding would put tokens in
+                    // their KV that the prompt never contained.
+                    let mut idx: Vec<usize> = Vec::new();
+                    let mut parts: Vec<Tensor> = Vec::new();
+                    for (&seq, t) in sequence_indices.iter().zip(user_tensors.iter()) {
+                        let len = t.dims().last().copied().unwrap_or(0);
+                        if start >= len {
+                            continue;
+                        }
+                        let take = cap.min(len - start);
+                        idx.push(seq);
+                        parts.push(t.narrow(t.rank() - 1, start, take)?);
+                    }
+                    if idx.is_empty() {
+                        break;
+                    }
+                    last = model
+                        .forward_wave(&mut session, &[], &[], &idx, &parts, &[], &[], 0, nl, None)?
+                        .logits_owned()?;
+                    start += cap;
+                }
+                last
+            };
 
             // Idempotence gate: with the truncate above, every repeat runs the
             // same tokens from the same state through the same kernels, so the
@@ -1373,9 +1484,42 @@ impl TestParams {
             session.free_sequence(shadow)?;
             model.release_sequence(shadow)?;
         }
-        // Advance each sequence by its own (ragged) prompt length.
-        for (&seq_idx, &ulen) in sequence_indices.iter().zip(user_lens.iter()) {
-            session.advance_sequence(seq_idx, ulen)?;
+        // Advance each sequence to the offset its own (ragged) prompt puts it
+        // at — **to a target, not by a length.**
+        //
+        // A single prefill wave leaves the logical offset untouched, so adding
+        // `ulen` was right. A *chunked* prefill is not: at each wave after the
+        // first, the wave-entry reconciler finds the logical offset behind the
+        // physical backing the previous slices wrote and advances it to match.
+        // Adding `ulen` on top of that counts the prompt twice, and the second
+        // count is silent — it surfaces later, in the decode step, as a
+        // sequence standing at roughly twice its real depth: measured as
+        // "cannot truncate sequence 0 to 62934 tokens — it stands at 32172" on
+        // the recurrent lineage, and as "computed write len 30720 is invalid
+        // for chunk_size 32" on the qwen4exp engine.
+        //
+        // Advancing to `base + ulen` is correct for both shapes and needs to
+        // know nothing about which of them ran, or about how much of the walk
+        // the reconciler already did.
+        for ((&seq_idx, &ulen), &base) in sequence_indices
+            .iter()
+            .zip(user_lens.iter())
+            .zip(repeat_base_offsets.iter())
+        {
+            let target = base + ulen;
+            let now = session.sequence_offset(seq_idx).unwrap_or(0);
+            match target.checked_sub(now) {
+                Some(0) | None => {}
+                Some(gap) => session.advance_sequence(seq_idx, gap)?,
+            }
+            let after = session.sequence_offset(seq_idx).unwrap_or(0);
+            if after != target {
+                candle::bail!(
+                    "prefill left sequence {seq_idx} at {after} tokens, not the {target} its \
+                     {ulen}-token prompt puts it at (from {base}) — the prompt has been counted \
+                     more than once, and every depth measured from here would be wrong"
+                );
+            }
         }
         self.device.synchronize()?;
         pipeline_record("bench:bulk_total", t_prompt_total);
@@ -1650,7 +1794,8 @@ impl TestParams {
             quantized_token_percent,
             compression_ratio,
             peak_tokens,
-            expert_stats: None, // Filled by run() after collection
+            expert_stats: None,    // Filled by run() after collection
+            row_cache_stats: None, // Likewise
             bulk_profile,
             single_profile,
             pipeline_bulk_profile,
@@ -2415,6 +2560,21 @@ impl TestParams {
                     }
                 }),
             ),
+            // Which path the MoE dispatched on. `device` means the grid is
+            // fully resident and routing never leaves the card; `host (readback)`
+            // means each layer syncs to schedule its uploads — a multiple on
+            // decode latency, and previously visible only as a `tracing::warn`
+            // no harness subscribes to.
+            (
+                "MoE dispatch",
+                Box::new(|s: &PipelineStats| {
+                    if s.device_dispatch {
+                        "device".to_string()
+                    } else {
+                        "host (readback)".to_string()
+                    }
+                }),
+            ),
             (
                 "Warm loads (RAM)",
                 Box::new(|s: &PipelineStats| format!("{}", s.warm_loads)),
@@ -2510,6 +2670,34 @@ impl TestParams {
             print!("┴{:─<cw$}", "", cw = col_w + 2);
         }
         println!("┘");
+
+        self.print_row_cache_report(results);
+    }
+
+    /// Print the disk-resident embedding tier's row-cache hit rate, if the
+    /// model serves one.
+    ///
+    /// The counters are cumulative over the whole run, so the last config's
+    /// snapshot is the total. This is the number §0.1's cost model turns on —
+    /// the tier is IOPS-shaped, and the miss count IS the IOPS — and it went
+    /// unread for the whole bring-up because nothing printed it.
+    fn print_row_cache_report(&self, results: &[TestResults]) {
+        let Some((hits, misses, evictions)) = results.iter().rev().find_map(|r| r.row_cache_stats)
+        else {
+            return;
+        };
+        let total = hits + misses;
+        if total == 0 {
+            return;
+        }
+        println!("\n=== Embedding Row Cache (disk-resident tier) ===");
+        println!(
+            "  lookups {total} | hits {hits} ({:.1}%) | misses {misses} | evictions {evictions}",
+            100.0 * hits as f64 / total as f64
+        );
+        // A miss is one row read from the tier; §0.1 sizes the tier by that
+        // rate, so it is reported as reads rather than left to be inferred.
+        println!("  tier reads (row granularity): {misses}");
     }
 
     /// Print what host RAM the engine page-locked, and what bounded it.

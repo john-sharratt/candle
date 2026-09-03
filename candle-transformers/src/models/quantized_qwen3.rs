@@ -1567,6 +1567,68 @@ mod tests {
         Ok(())
     }
 
+    /// **Depth on the 8B**: the batched forward at 8K and 32K of KV. The
+    /// classic-attention dense baseline the hybrid lineage is measured against.
+    ///
+    /// Shallower than the hybrid models' ladders because the checkpoint is:
+    /// Qwen3's trained window is 40,960, and reaching 128K on it would mean
+    /// scaling the positions, which changes what the row measures.
+    #[test]
+    #[ignore = "downloads the Qwen3-8B Q6_K GGUF and prefills 32K of its 40,960 window. \
+                Run with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen3::tests::long_context_8b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_8b() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+        use crate::models::batched_model::BatchedInference;
+
+        let api = crate::models::batch_test::test_helpers::api()
+            .map_err(|e| candle::Error::Msg(format!("HF API: {e}")))?;
+        let tok_repo = api.model("Qwen/Qwen3-8B".to_string());
+        let tokenizer_path = tok_repo
+            .get("tokenizer.json")
+            .map_err(|e| candle::Error::Msg(format!("tokenizer.json: {e}")))?;
+        let tokenizer_json = std::fs::read_to_string(&tokenizer_path)
+            .map_err(|e| candle::Error::Msg(format!("read tokenizer.json: {e}")))?;
+        let repo = api.repo(hf_hub::Repo::with_revision(
+            "unsloth/Qwen3-8B-GGUF".to_string(),
+            hf_hub::RepoType::Model,
+            "main".to_string(),
+        ));
+        let model_path = repo
+            .get("Qwen3-8B-Q6_K.gguf")
+            .map_err(|e| candle::Error::Msg(format!("model: {e}")))?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        long_context_gate(
+            "Qwen3-8B (dense, Q6_K)",
+            int8mode,
+            &tokenizer_json,
+            Dialect::chat_ml(),
+            // `qwen3.context_length` in the GGUF. Qwen3 reaches 131K only under
+            // YaRN, which this fleet does not use.
+            40_960,
+            // One shallow rung; the depth ladder belongs to the Qwen3.5+
+            // checkpoints, which hold 262K without scaling anything.
+            &[(
+                8_192,
+                &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+            )],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                let model =
+                    ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;
+                let inv_freq = model
+                    .rope_inv_freq()
+                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            },
+        )
+    }
+
     #[test]
     #[ignore] // cargo test --release --features cuda --lib -p candle-transformers quantized_qwen3::tests::test_ruler_eval -- --ignored --nocapture
     fn test_ruler_eval() -> Result<()> {

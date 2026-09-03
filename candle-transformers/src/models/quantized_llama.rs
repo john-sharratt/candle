@@ -2116,6 +2116,67 @@ mod tests {
         Ok(())
     }
 
+    /// **Depth on Llama-3.2-3B**: the batched forward at 8K of KV.
+    ///
+    /// The non-Qwen control in the fleet — a different tokenizer, a different
+    /// rope configuration and classic GQA attention. Shallow because this
+    /// conversion ships no rope scaling, so 8,192 is the whole of what it can
+    /// address; see the note on the window argument below.
+    #[test]
+    #[ignore = "downloads the Nidum-Llama-3.2-3B Q4_K_M GGUF and prefills its 8K window. \
+                Run with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_llama::tests::long_context_llama3 \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_llama3() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+        use crate::models::batched_model::BatchedInference;
+
+        let tokenizer_json = include_str!("quantized_llama_tokenizer.json");
+        let api = crate::models::batch_test::test_helpers::api()
+            .map_err(|e| candle::Error::Msg(format!("HF API: {e}")))?;
+        let repo = api.model("VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF".to_string());
+        let model_path = repo
+            .get("model-Q4_K_M.gguf")
+            .map_err(|e| candle::Error::Msg(format!("model: {e}")))?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        long_context_gate(
+            "Llama-3.2-3B (Nidum uncensored, Q4_K_M)",
+            int8mode,
+            tokenizer_json,
+            Dialect::llama3(),
+            // **Not** the 131,072 this GGUF's `llama.context_length` advertises.
+            // Llama 3.2 reaches 128K only through llama3 rope scaling — factor
+            // 32 over a base window of 8,192 — and this conversion ships none
+            // of it: no `rope.scaling.type`, no `factor`, no
+            // `original_context_length`. `from_gguf_by_path_with_int8_v3` reads
+            // exactly those keys, finds nothing, and builds plain RoPE at
+            // theta=500,000, whose trained extent is the base window. So the
+            // file declares 131,072 and supplies the machinery for 8,192; the
+            // smaller number is the one that describes what actually runs.
+            //
+            // Measured, not inferred: at 32K this checkpoint emits ". \n\n"
+            // repeated to the token limit, identically under BF16, C5 and C10.
+            8_192,
+            &[(
+                8_192,
+                &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+            )],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                let model =
+                    ModelWeights::from_gguf_by_path_with_int8_v3(&model_path, &device, int8mode)?;
+                let inv_freq = model
+                    .rope_inv_freq()
+                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            },
+        )
+    }
+
     /// Llama 2 7B Q4_0 parallel batched forwarding test.
     ///
     /// This test benchmarks Llama 2 7B (TheBloke/Llama-2-7B-GGUF) using quantized
@@ -2306,6 +2367,70 @@ mod tests {
         params.with_int8mode(int8mode).run(configs, load_model)?;
 
         Ok(())
+    }
+
+    /// **Depth on Llama-2-7B**: the batched forward across its 4K window.
+    ///
+    /// The shallow end of the fleet, and the control for the rope schemes: Llama
+    /// 2 has no long-context rope scaling at all, so its whole trained window is
+    /// 4K where the Qwen3.5+ checkpoints reach 262K. The row is shallow by the
+    /// checkpoint's nature, not by any limit of the engine — what it establishes
+    /// is that the cost curve and the compression behave the same on a model
+    /// whose positions were never scaled as on the ones whose were.
+    #[test]
+    #[ignore = "downloads the Llama-2-7B-Chat Q4_0 GGUF and prefills its full 4K window. \
+                Run with: cargo test --release --features cuda \
+                -p candle-transformers --lib quantized_llama::tests::long_context_llama2 \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_llama2() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+        use crate::models::batched_model::BatchedInference;
+
+        let api = crate::models::batch_test::test_helpers::api()
+            .map_err(|e| candle::Error::Msg(format!("HF API: {e}")))?;
+        let tok_repo = api.model("NousResearch/Llama-2-7b-hf".to_string());
+        let tokenizer_path = tok_repo
+            .get("tokenizer.json")
+            .map_err(|e| candle::Error::Msg(format!("tokenizer.json: {e}")))?;
+        let tokenizer_json = std::fs::read_to_string(&tokenizer_path)
+            .map_err(|e| candle::Error::Msg(format!("read tokenizer.json: {e}")))?;
+        let repo = api.model("TheBloke/Llama-2-7B-Chat-GGUF".to_string());
+        let model_path = repo
+            .get("llama-2-7b-chat.Q4_0.gguf")
+            .map_err(|e| candle::Error::Msg(format!("model: {e}")))?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        long_context_gate(
+            "Llama-2-7B-Chat (dense, Q4_0)",
+            int8mode,
+            &tokenizer_json,
+            Dialect::llama2(),
+            // `llama.context_length` in the GGUF — the original 4K, with no
+            // rope scaling of any kind, and here the declaration is honest:
+            // 4,096 is what Llama 2 was trained on.
+            4_096,
+            // The shallowest rung in the fleet, because the window is. 3,968
+            // rather than 4,096 to leave the 64 decoded tokens somewhere to go:
+            // `padding_prose` reserves a proportional 2%, which is 2,621 tokens
+            // at 128K but only 81 here — less than the generation it has to
+            // make room for.
+            &[(
+                3_968,
+                &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+            )],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                let model =
+                    ModelWeights::from_gguf_by_path_with_int8_v3(&model_path, &device, int8mode)?;
+                let inv_freq = model
+                    .rope_inv_freq()
+                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            },
+        )
     }
 
     /// KV-cache dump infrastructure for offline selection analysis.

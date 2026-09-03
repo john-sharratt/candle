@@ -133,7 +133,7 @@ pub(crate) fn tokenizer_json() -> Result<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::models::batch_test::test_helpers::hf_get;
-    use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
+    use crate::models::batch_test::utils::{account_model_load, TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::{InferenceMode, ManagedBatchedModel};
     use crate::models::dialect::Dialect;
     use crate::models::qwen35::mtp::MTP_MAX_DRAFT;
@@ -656,6 +656,55 @@ pub(crate) mod tests {
         params.run(configs, load)
     }
 
+    /// **Depth on the 0.8B**: the batched forward at 32K and 128K of KV.
+    ///
+    /// The smallest member of the lineage, and the one where the KV cache
+    /// dominates soonest relative to the weights — at 128K it is the larger
+    /// resident object by a wide margin, which is exactly the regime the
+    /// compression ladder exists for.
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.5-0.8B GGUF and runs a 128K-token prompt. Run with: \
+                cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen35::tests::long_context_0_8b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_0_8b() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+
+        let model_path = pinned(QWEN35_0_8B)?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        long_context_gate(
+            "Qwen3.5-0.8B (hybrid dense)",
+            int8mode,
+            &tokenizer_json()?,
+            Dialect::qwen35(),
+            // `qwen35.context_length` in the GGUF.
+            262_144,
+            &[
+                (
+                    32_768,
+                    &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+                ),
+                (131_072, &[InferenceMode::BF16, InferenceMode::C10][..]),
+            ],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                from_gguf_path(
+                    &model_path,
+                    &device,
+                    Qwen35LoadOptions {
+                        int8mode: Some(int8mode),
+                        expert_pack_dir: None,
+                        mtp_path: None,
+                    },
+                )
+            },
+        )
+    }
+
     /// **Speculative decode on the dense 9B, measured against itself.**
     ///
     /// The lineage's smallest checkpoint that can speculate at all, and the
@@ -692,10 +741,14 @@ pub(crate) mod tests {
                 quantized_qwen35::tests::speculative_decode_9b \
                 -- --ignored --nocapture --test-threads=1"]
     fn speculative_decode_9b() -> Result<()> {
+        let device = Device::new_cuda(0)?;
         speculative_gate(
             "Qwen3.5-9B",
             Int8Mode::Off,
             &[1, 4],
+            &tokenizer_json()?,
+            MTP_MAX_DRAFT,
+            &device,
             dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
         )
     }
@@ -904,10 +957,17 @@ pub(crate) mod tests {
     /// enough that the prefill and the first block dominate it. The draft
     /// budget is swept so the table shows where the yield stops paying for the
     /// rows it adds.
+    ///
+    /// `tokenizer` and `max_draft` are the caller's, because they are the two
+    /// things that are genuinely per-checkpoint: a lineage sibling has its own
+    /// vocabulary, and its head's ceiling is its own.
     pub(crate) fn speculative_gate<M>(
         label: &str,
         int8mode: Int8Mode,
         widths: &[usize],
+        tokenizer: &str,
+        max_draft: usize,
+        device: &Device,
         load: impl Fn() -> Result<M>,
     ) -> Result<()>
     where
@@ -923,11 +983,17 @@ pub(crate) mod tests {
                 test_mode: Some(TestMode::StoryRewrite),
             })
             .collect();
-        // Up to the head's own ceiling, [`MTP_MAX_DRAFT`], and no further: past
-        // it the drafter clamps, so the extra rows would report the same
-        // configuration twice. The turnover the sweep used to look for is what
-        // set that constant — the measurements are recorded there.
-        for draft in 0..=MTP_MAX_DRAFT {
+        // **Loaded once for the whole sweep.** Every budget runs the same
+        // weights, and on these checkpoints opening the artifact costs minutes
+        // — reloading per budget spent most of the wall clock re-reading bytes
+        // that never changed. It also makes the comparison sounder: the expert
+        // cache's warmth and the arena's shape carry across the budgets instead
+        // of being rebuilt differently for each.
+        let model = account_model_load(device, load)?;
+
+        // Up to the head's own ceiling, and no further: past it the drafter
+        // clamps, so the extra rows would report the same configuration twice.
+        for draft in 0..=max_draft {
             println!(
                 "\n=== {label}: {} ===\n",
                 if draft == 0 {
@@ -936,7 +1002,7 @@ pub(crate) mod tests {
                     format!("speculative decode, draft budget {draft}")
                 }
             );
-            let mut params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
+            let mut params = TestParams::new(256, tokenizer, Dialect::qwen35())
                 .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
                 .with_suppress_thinking(true)
                 .with_timeout_secs(3600);
@@ -946,12 +1012,8 @@ pub(crate) mod tests {
             // from, so a checkpoint that has quietly lost its NextN head would
             // report every budget as 1.00× here and read as "speculation stopped
             // paying" rather than "the drafter is missing".
-            let checked = || {
-                let m = load()?;
-                assert_drafter(&m, draft)?;
-                Ok(m)
-            };
-            params.run(configs.clone(), checked)?;
+            assert_drafter(&model, draft)?;
+            params.run_loaded(configs.clone(), &model)?;
         }
         Ok(())
     }
@@ -1180,6 +1242,50 @@ pub(crate) mod tests {
             Ok(m)
         };
         params.run(configs, load)
+    }
+
+    /// **Depth on the 9B**: the batched forward at 32K and 128K of KV.
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.5-9B GGUF (7.5 GB) and runs a 128K-token prompt. \
+                Run with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen35::tests::long_context_9b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_9b() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+
+        let model_path = pinned(QWEN35_9B)?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        long_context_gate(
+            "Qwen3.5-9B (hybrid dense)",
+            int8mode,
+            &tokenizer_json()?,
+            Dialect::qwen35(),
+            // `qwen35.context_length` in the GGUF.
+            262_144,
+            &[
+                (
+                    32_768,
+                    &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+                ),
+                (131_072, &[InferenceMode::BF16, InferenceMode::C10][..]),
+            ],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                from_gguf_path(
+                    &model_path,
+                    &device,
+                    Qwen35LoadOptions {
+                        int8mode: Some(int8mode),
+                        expert_pack_dir: None,
+                        mtp_path: None,
+                    },
+                )
+            },
+        )
     }
 
     /// Greedily decode the story rewrite on the 9B, driving `forward_wave`
