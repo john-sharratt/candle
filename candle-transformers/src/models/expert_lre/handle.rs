@@ -894,6 +894,11 @@ impl ExpertCache {
                 s.resident_vram_bytes = seeded;
                 s.warm_slots = warm.num_slots();
                 s.total_experts = num_moe_layers * experts_per_layer;
+                // Which MoE path this cache will take, as a reported gauge.
+                // `all_resident` is the whole of it: a streaming cache's slot
+                // addresses move, so the device tables cannot be captured and
+                // every layer reads its routing back to schedule uploads.
+                s.device_dispatch = all_resident;
             }
         }
 
@@ -1244,6 +1249,15 @@ impl ExpertCache {
         // bound it — but this mode exists only when there is no pipeline thread,
         // which production never configures, so it stays an ordinary allocation
         // rather than a second wave consumer for a path nothing takes.
+        //
+        // Uninitialised on CUDA (hot-path invariant 6): the deterministic
+        // scatter stores every `(token, column)` of the target, and the one path
+        // that does not reach it — no expert routed at all — zeros explicitly
+        // below. The non-CUDA arm accumulates through `index_add`, so its zero
+        // is read.
+        #[cfg(feature = "cuda")]
+        let mut ys = Tensor::empty((num_tokens, hidden), out_dtype, device)?;
+        #[cfg(not(feature = "cuda"))]
         let mut ys = Tensor::zeros((num_tokens, hidden), out_dtype, device)?;
         let mut _inline_prof = ProfileAccumulator::new();
         #[cfg(feature = "cuda")]
@@ -1267,7 +1281,12 @@ impl ExpertCache {
                 };
                 experts_vec.push((slot, toks.as_slice(), wids.as_slice()));
             }
-            if !experts_vec.is_empty() {
+            if experts_vec.is_empty() {
+                // Nothing routed, so the scatter never runs and the target it
+                // would have defined is still uninitialised. Zero by definition,
+                // not by omission.
+                ys = Tensor::zeros((num_tokens, hidden), out_dtype, device)?;
+            } else {
                 compute_experts_grouped(
                     &input,
                     &mut ys,

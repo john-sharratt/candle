@@ -929,9 +929,9 @@ mod tests {
             _ => unreachable!(),
         };
         // Compile-time, because it is a fact about a constant: the bucketize
-        // kernel is documented for 256 routed experts, and that bound is what
-        // the table builder trusts.
-        const _: () = assert!(MAX_EXPERTS >= 256);
+        // kernel is documented for 512 routed experts (Qwen3.8-Flash-Next's
+        // width), and that bound is what the table builder trusts.
+        const _: () = assert!(MAX_EXPERTS >= 512);
         let inner = make_inner(&device, &cuda, 0, 1, MAX_EXPERTS, None);
         let gd = GpuDispatchTables::build(&inner, &cuda)
             .expect("a complete grid at the kernel's own maximum must build");

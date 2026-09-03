@@ -15,8 +15,15 @@
 
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::quantized::pinned_staging::Generation;
-use candle::{DType, Device, Result, Storage, Tensor};
-use candle_kernels::simple::rows_scatter::{run_rows_scatter, ROWS_SCATTER_WORDS};
+// `Tensor` is `LiveTensor<'static>`; the production path is generic over the
+// lifetime (a run may address wave-leased memory) and only the tests below name
+// the owned alias.
+#[cfg(test)]
+use candle::Tensor;
+use candle::{DType, Device, LiveTensor, Result, Storage};
+use candle_kernels::simple::rows_scatter::{
+    run_rows_scatter, ROWS_SCATTER_INLINE_MAX, ROWS_SCATTER_WORDS,
+};
 
 use super::desc;
 
@@ -27,17 +34,26 @@ use super::desc;
 /// type and row width. Both must have unit stride along the channel axis; the
 /// row strides may differ, so a source that is a slice of a wider block is read
 /// where it lies.
-pub struct RowRun {
-    pub src: Tensor,
-    pub dst: Tensor,
+/// The lifetime is the whole point: a run may address **wave-leased** memory —
+/// a stacked projection's output and the arena block its parts are scattered
+/// into are both transients of the forward, not owned tensors. `Tensor` is
+/// `LiveTensor<'static>`, so a caller holding persistent buffers (the gallery
+/// append) still writes `RowRun::new(src, &dst, row)` and infers `'static`.
+///
+/// Without it a leased operand would have to reach this through
+/// `to_owned_tensor`, which is a **deep copy** — "It really does allocate, that
+/// is the point" — and would defeat the copy this kernel exists to avoid.
+pub struct RowRun<'w> {
+    pub src: LiveTensor<'w>,
+    pub dst: LiveTensor<'w>,
     pub dst_row: usize,
 }
 
-impl RowRun {
+impl<'w> RowRun<'w> {
     /// `src`'s rows into `dst` starting at `dst_row`. Both tensors are `Arc`
     /// handles, so holding them costs a pointer bump and keeps the storage the
     /// descriptor addresses alive until the launch is enqueued.
-    pub fn new(src: Tensor, dst: &Tensor, dst_row: usize) -> Self {
+    pub fn new(src: LiveTensor<'w>, dst: &LiveTensor<'w>, dst_row: usize) -> Self {
         Self {
             src,
             dst: dst.clone(),
@@ -57,7 +73,10 @@ fn elem_size(dt: DType) -> Result<usize> {
 }
 
 /// Base address of a tensor's logical element 0, in bytes.
-fn base_ptr(t: &Tensor, stream: &candle::cuda_backend::cudarc::driver::CudaStream) -> Result<u64> {
+fn base_ptr(
+    t: &LiveTensor<'_>,
+    stream: &candle::cuda_backend::cudarc::driver::CudaStream,
+) -> Result<u64> {
     let (storage, layout) = t.storage_and_layout();
     let off = layout.start_offset();
     let p = match &*storage {
@@ -89,7 +108,7 @@ fn base_ptr(t: &Tensor, stream: &candle::cuda_backend::cudarc::driver::CudaStrea
 
 /// A tensor's `(rows, row width in bytes, row stride in bytes)`, accepting both
 /// `[rows]` (an implicit width of one element) and `[rows, w]`.
-fn row_geometry(t: &Tensor) -> Result<(usize, usize, usize)> {
+fn row_geometry(t: &LiveTensor<'_>) -> Result<(usize, usize, usize)> {
     let es = elem_size(t.dtype())?;
     match t.dims() {
         [n] => Ok((*n, es, t.stride()[0] * es)),
@@ -103,12 +122,34 @@ fn row_geometry(t: &Tensor) -> Result<(usize, usize, usize)> {
     }
 }
 
+/// Run every copy in `runs` in ONE launch, **without staging anything**.
+///
+/// For a run count the kernel can carry in its parameters
+/// ([`ROWS_SCATTER_INLINE_MAX`]), which is every projection split. The
+/// descriptor then lives in constant memory, so the device table the
+/// [`Generation`] exists to hold is never read — and skipping it skips the whole
+/// pinned-staging path: `desc::scope` takes a **global mutex and a map lookup**
+/// on every call, and a wave issues one of these per DeltaNet and attention
+/// layer. Measured as `dn:proj` at 124.6 ms against 107.5 ms for the same split
+/// done with per-part copies: the staging, not the copy, was the cost.
+///
+/// Errors rather than falling back for too many runs — a caller with a gallery's
+/// worth of runs wants [`rows_scatter`], and quietly staging for it here would
+/// hide exactly the cost this exists to remove.
+pub fn rows_scatter_inline(runs: &[RowRun<'_>]) -> Result<()> {
+    scatter_impl(runs, None)
+}
+
 /// Run every copy in `runs` in ONE launch. A run with no rows is skipped; an
 /// empty (or all-empty) `runs` is a no-op.
 /// `generation` is the pinned-arena guard the descriptor table is bump-allocated
 /// from and read in place — the wave's, or one the caller opened with
 /// `desc::scope`. See `desc.rs`.
-pub fn rows_scatter(runs: &[RowRun], generation: &Generation) -> Result<()> {
+pub fn rows_scatter(runs: &[RowRun<'_>], generation: &Generation) -> Result<()> {
+    scatter_impl(runs, Some(generation))
+}
+
+fn scatter_impl(runs: &[RowRun<'_>], generation: Option<&Generation>) -> Result<()> {
     let live: Vec<&RowRun> = runs
         .iter()
         .filter(|r| r.src.dims().first().copied().unwrap_or(0) > 0)
@@ -124,6 +165,7 @@ pub fn rows_scatter(runs: &[RowRun], generation: &Generation) -> Result<()> {
 
     let mut desc = vec![0i64; ROWS_SCATTER_WORDS * live.len()];
     let mut max_elems = 0usize;
+    let mut max_rows = 0usize;
     for (i, run) in live.iter().enumerate() {
         // Element types need NOT match: the kernel copies 32-bit words, so a
         // run is valid whenever the two rows are the same width in BYTES. That
@@ -158,19 +200,38 @@ pub fn rows_scatter(runs: &[RowRun], generation: &Generation) -> Result<()> {
         w[3] = dst_stride_w as i64;
         w[4] = rows as i64;
         w[5] = words as i64;
-        max_elems = max_elems.max(rows * words);
+        // The grid's two axes are sized independently — see `run_rows_scatter`.
+        max_elems = max_elems.max(words);
+        max_rows = max_rows.max(rows);
     }
 
     // Staged into the wave's pinned arena and read in place — for the
     // 64-session shape the upload was 24 us against a 2.9 us kernel (`desc.rs`).
     // Held until the launch below is enqueued.
-    let staged = desc::stage(&desc, generation)?;
-    let p_desc = staged.ptr();
+    //
+    // Skipped entirely without a generation: the kernel then carries the table
+    // in its parameters, so there is nothing for the device to read here and
+    // nothing to stage. A run count past what parameters hold is refused rather
+    // than silently staged — see `rows_scatter_inline`.
+    let staged = match generation {
+        Some(g) => Some(desc::stage(&desc, g)?),
+        None if live.len() <= ROWS_SCATTER_INLINE_MAX => None,
+        None => candle::bail!(
+            "rows_scatter_inline: {} runs exceeds the {ROWS_SCATTER_INLINE_MAX} a kernel \
+             parameter holds — this set needs `rows_scatter` and a staging generation",
+            live.len()
+        ),
+    };
+    let p_desc = staged
+        .as_ref()
+        .map_or(std::ptr::null(), |s| s.ptr() as *const u8);
     unsafe {
         run_rows_scatter(
             p_desc as *const i64,
+            desc.as_ptr(),
             live.len() as i32,
             max_elems as i32,
+            max_rows as i32,
             stream.cu_stream() as *mut core::ffi::c_void,
         );
     }
@@ -366,6 +427,114 @@ mod tests {
                  slice_set {eager:8.2} us  {:.1}x",
                 runs.len(),
                 eager / best
+            );
+        }
+        Ok(())
+    }
+
+    /// The **other** geometry this kernel now serves: splitting a stacked
+    /// projection's output into its parts.
+    ///
+    /// It is the mirror image of the gallery append above and that is the point
+    /// of measuring it separately (§0.4 rule 4 — a kernel that is fast at the
+    /// geometry it was tuned for is an unknown at a new one). The append is
+    /// *many tiny ragged runs*: six arrays × up to 64 sessions, one to four rows
+    /// each, tens of kilobytes in total. A projection split is **four enormous
+    /// runs**: widths 10240 / 6144 / 48 / 48 elements over every row of the
+    /// block, ~40M elements at prefill width. The kernel's own header records
+    /// the assumption the first shape licensed — *"the runs are small"* — and
+    /// caps the grid at 64 tiles on the strength of it.
+    ///
+    /// Gated before timing: the scatter must reproduce each part exactly, which
+    /// is a byte-for-byte question (it is a copy, not arithmetic) and asserted
+    /// as one.
+    ///
+    ///   cargo test -p candle-transformers --features cuda --release --lib \
+    ///     bench_rows_scatter_projection_split -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_rows_scatter_projection_split() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        // qwen4exp's DeltaNet group: [Q|K|V] · z · β · α over `hidden` 2560.
+        const WIDTHS: [usize; 4] = [10240, 6144, 48, 48];
+        let total: usize = WIDTHS.iter().sum();
+
+        // Prefill width and a decode wave, which are three orders of magnitude
+        // apart and stress opposite ends of the kernel's grid arithmetic.
+        for rows in [2434usize, 16] {
+            let stacked = Tensor::from_vec(
+                (0..rows * total).map(|i| i as f32).collect::<Vec<_>>(),
+                (rows, total),
+                &dev,
+            )?;
+            let block = Tensor::zeros(rows * total, DType::F32, &dev)?;
+
+            let mut runs = Vec::with_capacity(WIDTHS.len());
+            let mut parts = Vec::with_capacity(WIDTHS.len());
+            let (mut off, mut dst_off) = (0usize, 0usize);
+            for &w in &WIDTHS {
+                let src = stacked.narrow(1, off, w)?;
+                let dst = block.narrow(0, dst_off, rows * w)?.reshape((rows, w))?;
+                runs.push(RowRun::new(src, &dst, 0));
+                parts.push(dst);
+                off += w;
+                dst_off += rows * w;
+            }
+
+            let gen = desc::scope(&dev)?;
+            rows_scatter(&runs, &gen)?;
+            // The gate: every part is exactly its slice of the source.
+            let mut off = 0usize;
+            for (pi, (&w, part)) in WIDTHS.iter().zip(parts.iter()).enumerate() {
+                let want = stacked.narrow(1, off, w)?.contiguous()?;
+                let got = part.flatten_all()?.to_vec1::<f32>()?;
+                let want = want.flatten_all()?.to_vec1::<f32>()?;
+                assert_eq!(
+                    got, want,
+                    "part {pi} ({w} wide, {rows} rows) is not its slice of the stacked output"
+                );
+                off += w;
+            }
+
+            // Iterations scale inversely with the work: a decode-width split is
+            // tens of microseconds, and timing it over 20 calls measured 19% and
+            // 96% run-to-run spread on the two sides — a number that cannot
+            // distinguish a kernel change from nothing.
+            let iters = if rows > 256 { 50 } else { 2000 };
+            let timed = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
+                for _ in 0..8 {
+                    f()?;
+                }
+                let mut best = f64::INFINITY;
+                for _ in 0..5 {
+                    dev.synchronize()?;
+                    let t = std::time::Instant::now();
+                    for _ in 0..iters {
+                        f()?;
+                    }
+                    dev.synchronize()?;
+                    best = best.min(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+                }
+                Ok(best)
+            };
+            let scatter = timed(&|| rows_scatter(&runs, &gen))?;
+            // What it replaces: one `contiguous` per part — N allocations and N
+            // copy launches for the same bytes.
+            let per_part = timed(&|| {
+                let mut off = 0usize;
+                for &w in &WIDTHS {
+                    stacked.narrow(1, off, w)?.contiguous()?;
+                    off += w;
+                }
+                Ok(())
+            })?;
+            let bytes = (rows * total * 2 * std::mem::size_of::<f32>()) as f64;
+            println!(
+                "[split rows={rows:<5}] scatter {scatter:8.1} us ({:6.1} GB/s)  \
+                 contiguous x{} {per_part:8.1} us  {:.2}x",
+                bytes / (scatter * 1e-6) / 1e9,
+                WIDTHS.len(),
+                per_part / scatter,
             );
         }
         Ok(())
