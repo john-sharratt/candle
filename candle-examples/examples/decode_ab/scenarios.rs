@@ -38,28 +38,18 @@ impl Scenario {
     }
 }
 
-/// The default scenario matrix: every scenario except those currently known to
-/// crash a kernel and poison the CUDA context (see [`all_scenarios`]). This is
-/// what runs when no `--scenarios` filter is given, so the default sweep
-/// completes cleanly end to end.
+/// The default scenario matrix — [`all_scenarios`] plus the wide-head
+/// Flash-Next shapes at their shallow depths. This is what runs when no
+/// `--scenarios` filter is given.
 pub fn default_scenarios() -> Vec<Scenario> {
-    all_scenarios()
-        .into_iter()
-        .filter(|s| !CONTEXT_FATAL_KNOWN.contains(&s.name))
-        .collect()
+    let mut s = all_scenarios();
+    s.extend(flash_next_scenarios());
+    s
 }
 
-/// Scenarios currently known to illegal-address a kernel (poisoning the CUDA
-/// context for the rest of the process) and therefore excluded from the
-/// default sweep. `mha_hd256_ctx128`: V2 paged-decode illegal-addresses at
-/// head_dim=256 even with a plain F16 arena — the kernel compiles an hd256
-/// launcher but it faults (suspected shared-memory overrun). Still runnable via
-/// `--scenarios mha_hd256_ctx128` for investigation.
-pub const CONTEXT_FATAL_KNOWN: &[&str] = &["mha_hd256_ctx128"];
-
-/// The full scenario universe, including ones flagged `context_fatal_known`.
-/// `--scenarios <name>` resolves against this list so a known-bad scenario can
-/// still be run in isolation for investigation.
+/// The core scenario universe: the hd64/96/128 shapes across MHA / GQA / MQA,
+/// partial tails, both RoPE layouts and both compute dtypes, plus one hd256
+/// MHA row (hpg = 1 on the wide-head tile kernel).
 pub fn all_scenarios() -> Vec<Scenario> {
     let f16 = DType::F16;
     vec![
@@ -162,6 +152,53 @@ pub fn all_scenarios() -> Vec<Scenario> {
             rope_interleaved: true,
             compute: f16,
         },
+    ]
+}
+
+/// Qwen3.8-Flash-Next's full-attention shape (24 query heads over 2 KV heads,
+/// head_dim 256, half-split RoPE, BF16 compute — `docs/qwen38_flash_next.md`
+/// §head geometry) — the wide-head INT8 tile kernel's production shape. The
+/// group's 12 heads are the MMA's M rows, so batch 1 already fills 12 of the
+/// 16-row tile; depth is the axis that matters.
+fn flash_next(name: &'static str, ctx: usize, slots: usize) -> Scenario {
+    Scenario {
+        name,
+        n_q_head: 24,
+        n_kv_head: 2,
+        head_dim: 256,
+        ctx_len: ctx,
+        num_slots: slots,
+        rope_interleaved: false,
+        compute: DType::BF16,
+    }
+}
+
+/// Flash-Next at shallow depth: the partial-tail layouts (ctx % 32 ≠ 0), a
+/// single slice, and the split fan-out over a handful of slices — the regime
+/// where a null-partial storm or a per-block prologue dominates. Part of the
+/// default `compare` sweep.
+pub fn flash_next_scenarios() -> Vec<Scenario> {
+    vec![
+        flash_next("fn_b1_ctx31", 31, 1),
+        flash_next("fn_b1_ctx128", 128, 1),
+        flash_next("fn_b1_ctx200", 200, 1),
+        flash_next("fn_b1_ctx512", 512, 1),
+        flash_next("fn_b1_ctx2048", 2048, 1),
+        flash_next("fn_b8_ctx512", 512, 8),
+        flash_next("fn_b8_ctx2048", 2048, 8),
+    ]
+}
+
+/// Flash-Next at depth: single-session 8K → 128K, the regime the tile kernel
+/// must hold FLAT in (per-token cost is one slice stage; the kernel is
+/// bandwidth-bound on the arena bytes it reads). The 128K fixture stages a
+/// ~2 GB host Q for its prefill, so this group is `bench`/`--scenarios` only.
+pub fn flash_next_deep_scenarios() -> Vec<Scenario> {
+    vec![
+        flash_next("fn_b1_ctx8k", 8192, 1),
+        flash_next("fn_b1_ctx32k", 32768, 1),
+        flash_next("fn_b1_ctx128k", 131072, 1),
+        flash_next("fn_b8_ctx8k", 8192, 8),
     ]
 }
 
@@ -279,6 +316,8 @@ pub fn suite_deep_scenarios() -> Vec<Scenario> {
 /// Filter scenarios by a comma-separated list of names (`--scenarios a,b`).
 pub fn select_scenarios(filter: &str) -> Result<Vec<Scenario>, String> {
     let mut universe = all_scenarios();
+    universe.extend(flash_next_scenarios());
+    universe.extend(flash_next_deep_scenarios());
     universe.extend(perf_scenarios());
     universe.extend(single_decode_scenarios());
     universe.extend(suite_scenarios());

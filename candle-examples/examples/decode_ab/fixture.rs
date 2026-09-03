@@ -2,19 +2,19 @@
 //!
 //! A [`Fixture`] is a fully-built paged-decode problem: a KV arena populated
 //! by prefilling deterministic synthetic tokens at a chosen storage format,
-//! plus the freshly-projected decode-step Q/K/V. [`Fixture::decode`] rebuilds
-//! the per-slot `SlotHeader` array and launches one decode kernel backend.
+//! plus the freshly-projected decode-step Q/K/V. [`Fixture::decode`] builds
+//! the per-slot `SlotHeader` array, launches one decode step, and advances
+//! every slot past the token it scattered.
 //!
-//! The construction mirrors `decode_one_slot` in
-//! `candle-transformers/tests/kernel_layout_tests.rs` — the same host-side
-//! metadata code the production scheduler uses — so any A/B divergence points
-//! at the kernel, not the harness.
+//! The slot-state the kernel walks is built by the production decode metadata
+//! path (`ChunkedKvBacking::sync_decode_gpu_chunks_snapshot` on the live
+//! device-resident slot, the same call `build_decode_metadata_at` makes), so
+//! any A/B divergence points at the kernel, not the harness — and the timings
+//! see the memory placement production sees.
 
 use std::time::Duration;
 
-use candle::backend::BackendStorage;
-use candle::cuda_backend::cudarc::driver::DevicePtr;
-use candle::quantized::pinned_staging::PinnedBuf;
+use candle::quantized::pinned_staging::{PinnedBuf, PinnedStager};
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     quantize_sealed_in_place, ChunkedKvBacking, CompressionPolicy, KvCache, KvFormat, CHUNK_SIZE,
@@ -22,11 +22,6 @@ use candle_nn::kv_cache::{
 use candle_transformers::models::prefill_utils::{
     compute_rope_cs, paged_decode_attn, paged_prefill_batched,
 };
-use candle_transformers::models::slot_state::{
-    tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
-};
-
-use candle::quantized::pinned_staging::PinnedStager;
 
 use crate::formats::ArenaFmt;
 use crate::scenarios::Scenario;
@@ -47,6 +42,19 @@ fn resolve_dtypes(sc: &Scenario, fmt: ArenaFmt) -> (DType, DType, DType) {
         // RealQuant: source/active arena is F16, decode computes in F16.
         ArenaFmt::RealQuant { .. } => (DType::F16, DType::F16, DType::F16),
     }
+}
+
+/// Which rotary table the fixture is built with.
+///
+/// The golden gate compares the kernel against a plain FP32 attention that
+/// does not replicate RoPE, so it builds with `Identity` (all-zero inverse
+/// frequencies: cos = 1, sin = 0 — the kernel still runs its rotary path,
+/// the rotation is just the identity). The bench builds with `Real` so the
+/// rotary arithmetic is timed as production runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rope {
+    Identity,
+    Real,
 }
 
 /// A built, ready-to-run synthetic decode problem.
@@ -70,6 +78,7 @@ impl Fixture {
     pub fn build(
         sc: &Scenario,
         fmt: ArenaFmt,
+        rope: Rope,
         device: &Device,
         stager: &PinnedStager,
     ) -> Result<Fixture> {
@@ -79,15 +88,12 @@ impl Fixture {
 
         // RealQuant builds an adaptive F16-source backing whose compression
         // candidate arenas are pre-warmed, then quantizes the sealed sequence
-        // after prefill (see below). Palette4 quant requires head_dim==128.
+        // after prefill (see below).
         let policy: Option<CompressionPolicy> = match fmt {
             ArenaFmt::RealQuant {
                 level,
                 override_fmt,
             } => {
-                if sc.head_dim != 128 {
-                    candle::bail!("real-quant requires head_dim=128, got {}", sc.head_dim);
-                }
                 let mut p = CompressionPolicy::new(level);
                 if let Some(qf) = override_fmt {
                     p = p
@@ -132,8 +138,7 @@ impl Fixture {
             }
         };
 
-        // Non-zero RoPE so the kernel's rotary path is actually exercised.
-        let inv_freq = make_inv_freq(sc.head_dim, device)?;
+        let inv_freq = make_inv_freq(sc.head_dim, rope, device)?;
         let rope_cs = compute_rope_cs(&inv_freq, max_blocks, sc.head_dim, device)?;
         let rope_offsets = Tensor::zeros(1, DType::U32, device)?;
 
@@ -144,6 +149,9 @@ impl Fixture {
             cache.set_chunked_backing(&backing, slot, None)?;
             let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
             let (q, k, v) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?;
+            // The prefill writes into the slot's write region, which the
+            // scheduler allocates before the pass; the harness does the same.
+            backing.ensure_for_batch_entries(&[(slot, 0)], sc.ctx_len)?;
             run_prefill(&mut cache, &q, &k, &v, sc, &rope_cs, &rope_offsets, stager)?;
 
             // RealQuant: convert the freshly-sealed R16 sequence into genuine
@@ -191,10 +199,13 @@ impl Fixture {
         })
     }
 
-    /// Run a single INT8 decode step. Rebuilds the per-slot `SlotHeader` array
-    /// fresh each call, so the call is idempotent and sees pristine arena state.
-    /// Returns the output and the device-synchronized kernel wall time.
-    pub fn decode(&self, device: &Device, stager: &PinnedStager) -> Result<(Tensor, Duration)> {
+    /// Run one INT8 decode step at every slot's current position, then advance
+    /// each slot by the token the kernel just scattered — the same two moves
+    /// the production scheduler makes per token, so repeated calls walk the
+    /// context forward one token at a time (through write-chunk boundaries
+    /// included) instead of replaying a frozen state. Returns the output and
+    /// the device-synchronized kernel wall time.
+    pub fn decode(&mut self, device: &Device, stager: &PinnedStager) -> Result<(Tensor, Duration)> {
         let sc = &self.scenario;
 
         // Ensure every slot's writer chunk exists BEFORE resolving arena
@@ -212,66 +223,39 @@ impl Fixture {
         self.backing.ensure_for_batch_entries(&entries, 1)?;
         let arena_info = self.backing.resolve_arena_info()?;
 
-        // The KV-pointer validity check, fetched once for the whole pass —
-        // `span_layout` takes the region pool's global lock, so every
-        // serialized head would otherwise take it again. This fixture exists
-        // to catch exactly the failure that check names (a resolved address
-        // into the transient tier or outside the span), so it runs the check
-        // rather than passing `None`.
-        let span = SlotStateHost::span_layout_for_checks();
+        // The slot-state (slice headers + KvHead records) comes from the same
+        // path production decode uses: `sync_decode_gpu_chunks_snapshot` with
+        // an all-false snapshot mask is the LIVE path — each sequence's
+        // serialised chunk state lives in its device-resident slot-state slot,
+        // and the kernel's own `commit_decode_write_len_kernel` advances the
+        // write chunk's length on device after every token. Memory placement is
+        // part of what is being measured: the kernel opens on a dependent chain
+        // of descriptor loads, so a zero-copy host mapping here would add a
+        // PCIe round trip per link that production never pays.
+        let generation = stager.begin_generation();
+        let snapshot_mask = vec![false; entries.len()];
+        let (seq_ptrs, _stats) = self.backing.sync_decode_gpu_chunks_snapshot(
+            &entries,
+            &arena_info,
+            &generation,
+            &snapshot_mask,
+        )?;
 
-        let mut keepalive: Vec<Tensor> = Vec::new();
+        // Decode headers carry no position map (the field is zero — the
+        // kernel derives positions from the slice walk).
         let mut hdr_all: Vec<u8> = Vec::with_capacity(24 * sc.num_slots);
-
-        for cache in self.caches.iter() {
-            let chunks = cache
-                .k_cache()
-                .chunked_live_chunks_as_sealed()
-                .unwrap_or_default();
-            let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-
-            let mut st = SlotStateHost::from_sealed_chunks(
-                &chunks,
-                sc.n_kv_head,
-                sc.head_dim,
-                &arena_info,
-                writer_start,
-                true, // build the position map — extended for the write region below
-            );
-            st.extend_for_write_region(1, CHUNK_SIZE);
-
-            let slice_size = TokenSliceHost::record_size(sc.n_kv_head, sc.head_dim);
-            let mut sbuf = Vec::with_capacity(st.slices.len() * slice_size);
-            for s in &st.slices {
-                s.serialize_record(&mut sbuf, span.as_ref());
-            }
-            let stensor = if sbuf.is_empty() {
-                Tensor::zeros(1, DType::U8, device)?
-            } else {
-                Tensor::from_slice(&sbuf, sbuf.len(), device)?
-            };
-            let slices_ptr = tensor_u8_device_ptr(&stensor)?;
-
-            let mut pm = st.position_map.clone();
-            if pm.is_empty() {
-                pm.push(0);
-            }
-            let pm_tensor = Tensor::from_slice(&pm, pm.len(), device)?;
-            let pm_ptr = u32_tensor_device_ptr(&pm_tensor)?;
-
-            hdr_all.extend_from_slice(&(st.slices.len() as u32).to_le_bytes());
-            hdr_all.extend_from_slice(&st.write_slice.to_le_bytes());
-            hdr_all.extend_from_slice(&slices_ptr.to_le_bytes());
-            hdr_all.extend_from_slice(&pm_ptr.to_le_bytes());
-
-            keepalive.push(stensor);
-            keepalive.push(pm_tensor);
+        for &(ptr, n_slices, write_slice) in &seq_ptrs {
+            hdr_all.extend_from_slice(&n_slices.to_le_bytes());
+            hdr_all.extend_from_slice(&write_slice.to_le_bytes());
+            hdr_all.extend_from_slice(&ptr.to_le_bytes());
+            hdr_all.extend_from_slice(&0u64.to_le_bytes());
         }
 
-        let generation = stager.begin_generation();
+        // Device-resident, as `build_decode_metadata_at` submits them: every
+        // block opens on its slot header.
         let mut pinned = generation.alloc(hdr_all.len())?;
         pinned.copy_from_slice(&hdr_all);
-        let headers_gpu = generation.submit(pinned)?;
+        let headers_gpu = generation.submit_resident(pinned)?;
         let headers_ptr = headers_gpu.dev_ptr();
 
         // Time the kernel with CUDA events on the device's (persistent) stream
@@ -305,26 +289,33 @@ impl Fixture {
             &self.v_new,
             &self.rope_cs,
             sc.rope_interleaved,
+            None,
         )?;
         let stop = cstream
             .record_event(Some(CU_EVENT_DEFAULT))
             .map_err(ev_err)?;
         let ms = start.elapsed_ms(&stop).map_err(ev_err)?;
         let elapsed = Duration::from_secs_f64(ms as f64 / 1000.0);
-
         drop(headers_gpu);
-        drop(keepalive);
+
+        // The kernel scattered this token's K/V into each slot's write chunk
+        // and committed the new write length on device; the host-side offset
+        // follows, so the next call decodes the token after it.
+        for cache in &mut self.caches {
+            let len = cache.current_seq_len();
+            cache.set_current_seq_len(len + 1)?;
+        }
         Ok((out, elapsed))
     }
 }
 
 /// RoPE inverse-frequency table for `head_dim` (theta = 10000), F32, shape
-/// `(head_dim/2,)`. With `DECODE_AB_IDENTITY_ROPE` set, returns all-zeros so
-/// RoPE is the identity — this lets the FP32 golden be plain attention (no RoPE
-/// to replicate). The kernels still run their rotary path (cos=1, sin=0).
-fn make_inv_freq(head_dim: usize, device: &Device) -> Result<Tensor> {
+/// `(head_dim/2,)`. [`Rope::Identity`] is all-zeros, so the rotation is the
+/// identity and the FP32 golden can be plain attention with no RoPE to
+/// replicate; the kernels still run their rotary path (cos=1, sin=0).
+fn make_inv_freq(head_dim: usize, rope: Rope, device: &Device) -> Result<Tensor> {
     let half = head_dim / 2;
-    if std::env::var("DECODE_AB_IDENTITY_ROPE").is_ok() {
+    if rope == Rope::Identity {
         return Tensor::zeros(half, DType::F32, device);
     }
     let mut v = Vec::with_capacity(half);
@@ -336,7 +327,7 @@ fn make_inv_freq(head_dim: usize, device: &Device) -> Result<Tensor> {
 }
 
 /// FP32 ground-truth decode attention over the *same* synthetic K/V the fixture
-/// prefilled, assuming identity RoPE (so only valid under `DECODE_AB_IDENTITY_ROPE`).
+/// prefilled, assuming identity RoPE (so only valid against a [`Rope::Identity`] fixture).
 /// K/V are F16-rounded to match the arena storage precision; for real-quant
 /// arenas a kernel that reads K correctly lands within quant precision of this,
 /// while a structural (e.g. palette) K-read bug diverges far more.
@@ -528,20 +519,8 @@ fn run_prefill(
         &generation,
         // No shared position-map cache in this one-shot fixture prefill.
         &std::cell::RefCell::new(None),
+        None,
     )?;
     caches_arr[0].set_current_seq_len(offset + sc.ctx_len)?;
     Ok(())
-}
-
-/// Extract the raw device pointer of a U32 tensor's storage.
-fn u32_tensor_device_ptr(t: &Tensor) -> Result<u64> {
-    let (storage, layout) = t.storage_and_layout();
-    let cs = match &*storage {
-        candle::Storage::Cuda(c) => c,
-        _ => candle::bail!("expected CUDA storage for position_map"),
-    };
-    let stream = cs.device().cuda_stream();
-    let s = cs.as_cuda_slice::<u32>()?.slice(layout.start_offset()..);
-    let (p, _g) = s.device_ptr(&stream);
-    Ok(p)
 }

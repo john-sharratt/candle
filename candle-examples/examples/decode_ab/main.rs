@@ -27,15 +27,15 @@ use candle::quantized::pinned_staging::PinnedStager;
 use candle::Device;
 use clap::{Parser, Subcommand};
 
-use fixture::Fixture;
+use fixture::{Fixture, Rope};
 use formats::{
     all_formats, deep_formats, default_formats, quant_formats, select_formats, ArenaFmt,
 };
 use metrics::Metrics;
 use report::{render_bench, render_golden, BenchRow, GoldenOutcome, GoldenRow};
 use scenarios::{
-    default_scenarios, perf_scenarios, select_scenarios, single_decode_scenarios,
-    suite_deep_scenarios, suite_scenarios, Scenario,
+    default_scenarios, flash_next_deep_scenarios, flash_next_scenarios, perf_scenarios,
+    select_scenarios, single_decode_scenarios, suite_deep_scenarios, suite_scenarios, Scenario,
 };
 
 #[derive(Parser)]
@@ -133,16 +133,18 @@ fn main() -> Result<()> {
 
     let markdown = match &cli.cmd {
         Cmd::Compare { golden_cosine_tol } => {
-            std::env::set_var("DECODE_AB_IDENTITY_ROPE", "1");
             run_golden(&scenarios, &fmts, *golden_cosine_tol, &device, &stager)?
         }
         Cmd::Bench { iters, warmup } => {
-            // Default the bench to the batch-8 perf set (fills the MMA M dim)
-            // plus the batch-1 deep-context single-decode set (the grid-starved
-            // regime split-KV targets); an explicit --scenarios still overrides.
+            // Default the bench to the batch-8 perf set (fills the MMA M dim),
+            // the batch-1 deep-context single-decode set (the grid-starved
+            // regime split-KV targets), and the wide-head Flash-Next shape at
+            // shallow and deep context; an explicit --scenarios still overrides.
             let bench_scen = if cli.scenarios.is_none() {
                 let mut s = perf_scenarios();
                 s.extend(single_decode_scenarios());
+                s.extend(flash_next_scenarios());
+                s.extend(flash_next_deep_scenarios());
                 s
             } else {
                 scenarios.clone()
@@ -176,7 +178,6 @@ fn main() -> Result<()> {
                     ),
                 ]
             };
-            std::env::set_var("DECODE_AB_IDENTITY_ROPE", "1");
             let mut golden = String::from("# Decode suite — ground truth (vs FP32)\n");
             for (scn, fmt, label) in &groups {
                 golden.push_str(&format!("\n## {label}\n\n"));
@@ -282,7 +283,7 @@ fn run_bench(
             }
             eprint!("bench   {:<24} {:<8} ... ", sc.name, fmt.label());
             let run = || -> candle::Result<std::time::Duration> {
-                let fix = Fixture::build(sc, fmt, device, stager)?;
+                let mut fix = Fixture::build(sc, fmt, Rope::Real, device, stager)?;
                 for _ in 0..warmup {
                     let _ = fix.decode(device, stager)?;
                 }
@@ -324,16 +325,17 @@ fn run_bench(
     Ok(render_bench(&rows))
 }
 
-/// Build a fresh fixture and run a single int8 decode. The fresh build
-/// guarantees pristine, deterministic input (a decode commits the write token,
-/// so fixtures must not be reused across calls).
+/// Build a fresh identity-RoPE fixture (the golden is plain attention) and run
+/// a single int8 decode. The fresh build guarantees pristine, deterministic
+/// input (a decode commits the write token, so fixtures must not be reused
+/// across calls).
 fn build_and_decode(
     sc: &Scenario,
     fmt: ArenaFmt,
     device: &Device,
     stager: &PinnedStager,
 ) -> candle::Result<candle::Tensor> {
-    let fix = Fixture::build(sc, fmt, device, stager)?;
+    let mut fix = Fixture::build(sc, fmt, Rope::Identity, device, stager)?;
     Ok(fix.decode(device, stager)?.0)
 }
 
