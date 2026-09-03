@@ -1495,7 +1495,9 @@ impl PagedSelectionGpuInputs {
         let v_head_amax: Vec<f32> = self.dev.memcpy_dtov(&v_head_amax_gpu)?;
 
         let to_palette = |flat: &[i32]| -> Result<Vec<[SampleFormat; 4]>> {
-            flat.chunks_exact(4)
+            flat.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| {
                     Ok([
                         SampleFormat::try_from_cuda_tag(c[0])?,
@@ -1506,11 +1508,7 @@ impl PagedSelectionGpuInputs {
                 })
                 .collect()
         };
-        let to_scale_palette = |flat: &[f32]| -> Vec<[f32; 4]> {
-            flat.chunks_exact(4)
-                .map(|c| [c[0], c[1], c[2], c[3]])
-                .collect()
-        };
+        let to_scale_palette = |flat: &[f32]| -> Vec<[f32; 4]> { flat.as_chunks::<4>().0.to_vec() };
 
         let k_palette4_rows = to_palette(&k_pal_tags_cpu)?;
         let v_palette4_rows = to_palette(&v_pal_tags_cpu)?;

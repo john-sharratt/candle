@@ -53,7 +53,7 @@
 //! The inter-layer hidden state is the deliberate exception: it is the result of
 //! a residual add and outlives every layer generation, so it stays owned.
 //!
-//! The MoE combine target is here too, via [`wave_zeros`]. It is *returned*
+//! The MoE combine target is here too, via [`wave_empty`]. It is *returned*
 //! from the expert forward, so nothing inside the MoE code bounds it — the
 //! bound comes from one level up, where the layer opens a generation around
 //! `ffn_forward` and the residual add that consumes the result. That is the
@@ -195,46 +195,21 @@ pub(crate) fn wave_root(wave: Option<&WaveGeneration>) -> candle::cuda_backend::
     }
 }
 
-/// A zeroed tensor on the wave's half, or an ordinary one when there is no wave.
-///
-/// For accumulators, where the caller needs the buffer to *start* at zero — the
-/// MoE combine target is scattered into, not overwritten, so it cannot take a
-/// wave range as-is. The fill is `memset` on the device's stream, which is the
-/// same work `Tensor::zeros` does; what it replaces is the allocate/free pair
-/// around it, one per MoE layer per forward.
-pub(crate) fn wave_zeros<'w, S: Into<Shape>>(
-    shape: S,
-    dtype: DType,
-    device: &Device,
-    wave: Option<&'w WaveGeneration>,
-) -> Result<LiveTensor<'w>> {
-    let shape = shape.into();
-    let (Device::Cuda(cuda), Some(wave)) = (device, wave) else {
-        return Tensor::zeros(shape, dtype, device);
-    };
-    let stream = cuda.cuda_stream();
-    let bytes = shape.elem_count() * dtype.size_in_bytes();
-    let ticket = wave.ticket();
-    let range = wave.alloc(bytes, WAVE_ALIGN)?;
-    // SAFETY: `range` is `bytes` of the half pinned by `wave`, and nothing else
-    // addresses it within this generation.
-    unsafe { memset_d8_async(range.ptr, 0, bytes, stream.cu_stream()) }
-        .map_err(|e| candle::Error::Msg(format!("zeroing a wave buffer: {e}")))?;
-    // SAFETY: as above, and the returned tensor borrows `wave`, so it cannot be
-    // named after the guard that reclaims the range has dropped.
-    unsafe {
-        LiveTensor::from_leased_cuda_ptr(range.ptr, dtype, shape, device, LeaseOrigin::Wave(ticket))
-    }
-}
-
 /// An **uninitialised** buffer on the wave's half, or an ordinary one when there
 /// is no wave.
 ///
-/// [`wave_zeros`] without the `memset`, for a buffer the caller fully overwrites
-/// — hot-path invariant 6. The distinction matters here rather than being a
-/// micro-optimisation: this exists to give a *root* operand wave provenance, and
-/// a root is by definition something whose every byte is about to be written
-/// from somewhere else.
+/// A wave range handed over with no `memset`, for a buffer the caller fully
+/// overwrites — hot-path invariant 6. The distinction matters here rather than
+/// being a micro-optimisation: this exists to give a *root* operand wave
+/// provenance, and a root is by definition something whose every byte is about
+/// to be written from somewhere else.
+///
+/// There is deliberately **no zeroing counterpart taking the guard**. The one
+/// caller that had one was the MoE combine target, on the belief that the
+/// deterministic scatter accumulated into it; the scatter defines every element
+/// it touches, so the memset was writing the exact bytes the kernel was about to
+/// stamp. [`wave_zeros_ticketed`] remains only for the degenerate
+/// nothing-was-routed path, where no kernel writes the target at all.
 ///
 /// **This is the constructor for a provenance root that has no device operand to
 /// inherit from.** `Tensor::empty` can only produce an `Owned` tensor, and
@@ -269,7 +244,7 @@ pub(crate) fn wave_empty<'w, S: Into<Shape>>(
 
 /// A host-built table uploaded onto the wave's half.
 ///
-/// The upload counterpart of [`wave_zeros`], and the one the per-forward
+/// The upload counterpart of [`wave_empty`], and the one the per-forward
 /// descriptor tables need: a pointer array, a row map, a rotary layout. They are
 /// built on the host, so there is no device operand whose provenance they could
 /// inherit — `Tensor::from_vec` can only ever produce an `Owned` tensor, i.e. a
@@ -343,7 +318,49 @@ pub(crate) fn wave_from_vec<'w, D: CudaDType + candle::WithDType, S: Into<Shape>
     }
 }
 
-/// [`wave_zeros`] for a holder of a [`WaveTicket`] rather than of the guard.
+/// [`wave_empty`] for a holder of a [`WaveTicket`] rather than of the guard.
+///
+/// The uninitialised twin of [`wave_zeros_ticketed`], and sound for exactly the
+/// reasons given there — the expert-pipeline thread cannot borrow the
+/// generation, but the ticket is a `Copy` coordinate that crosses the channel
+/// and the submitting thread blocks on the response throughout.
+///
+/// It issues **no driver call at all**, which is the whole point: no memset, and
+/// therefore none of `wave_zeros_ticketed`'s context binding either (that exists
+/// only because `memset_d8_async` takes its context from the calling thread).
+///
+/// SAFETY / CONTRACT: as [`candle::Tensor::empty`] — every element must be
+/// written before it is read. The MoE combine target qualifies because the
+/// deterministic scatter stores every `(token, column)` of it; a caller that
+/// might skip that launch must zero the target itself.
+pub(crate) fn wave_empty_ticketed<S: Into<Shape>>(
+    shape: S,
+    dtype: DType,
+    device: &Device,
+    ticket: Option<WaveTicket>,
+) -> Result<Tensor> {
+    let shape = shape.into();
+    let bytes = shape.elem_count() * dtype.size_in_bytes();
+    let (Device::Cuda(_), Some(ticket)) = (device, ticket) else {
+        return Tensor::empty(shape, dtype, device);
+    };
+    let Some(ptr) = wave_alloc(ticket, bytes, WAVE_ALIGN) else {
+        return Tensor::empty(shape, dtype, device);
+    };
+    // SAFETY: `ptr` addresses `bytes` the resolver just carved from the ticket's
+    // arena, and no other claimant holds that range within this generation. The
+    // lease frees nothing on drop, so the range's only reclaim is the
+    // generation's reset.
+    unsafe { Tensor::from_leased_cuda_ptr(ptr, dtype, shape, device, LeaseOrigin::Wave(ticket)) }
+}
+
+/// A **zeroed** wave range for a holder of a [`WaveTicket`] rather than of the
+/// guard.
+///
+/// One caller, and it is a narrow one: the expert pipeline's
+/// nothing-was-routed path, where the deterministic scatter never launches and
+/// so nothing defines the combine target. Every other MoE target takes
+/// [`wave_empty_ticketed`], because the scatter writes all of it.
 ///
 /// The expert-pipeline thread is the caller that needs this. It cannot borrow
 /// the generation — a `&WaveGeneration` does not cross a channel — but the
@@ -372,8 +389,8 @@ pub(crate) fn wave_zeros_ticketed<S: Into<Shape>>(
     };
     let stream = cuda.cuda_stream();
     // `memset_d8_async` is a raw driver call, and the driver takes its context
-    // from the calling thread. [`wave_zeros`] gets away without this because it
-    // runs on the forward thread, where candle has already bound one; this runs
+    // from the calling thread. A caller on the forward thread would get away
+    // without this, since candle has already bound a context there; this runs
     // on the expert-pipeline thread, which has not, and the call fails with
     // `CUDA_ERROR_INVALID_CONTEXT`. Binding is idempotent.
     stream

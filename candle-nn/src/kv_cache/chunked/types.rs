@@ -1013,20 +1013,12 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
-    /// Rebuild the GPU slot-state buffer for decode using the true sequence length.
-    ///
-    /// Serialises all chunks into the pinned host buffer with per-chunk
-    /// `rope_base` values derived from cumulative usage, then uploads to the
-    /// device buffer asynchronously.
-    ///
-    /// Returns `(raw_device_ptr, n_chunks, write_chunk_idx)` where:
-    /// - `raw_device_ptr` is the GPU base pointer for the decode kernel,
-    /// - `n_chunks` is the number of serialised chunk entries,
-    /// - `write_chunk_idx` is the index of the last (writable) chunk.
-    ///
-    /// `seq_offset` is the current sequence length used to derive the true
-    /// token count for the write chunk (overrides the potentially-stale
-    /// `chunk.usage` field).
+    /// The chunks the serialised slot-state references, for a consumer to hold
+    /// across its launch (see `GpuChunks::pins`).
+    pub(crate) fn gpu_chunk_pins(&self) -> Arc<Vec<HeadGids>> {
+        self.gpu_chunks.pins()
+    }
+
     /// Index of the chunk the decode kernel writes into: the first non-full
     /// chunk at or after `writer_start_idx`. Chunks after it are trailing
     /// empties — e.g. a freshly-appended empty writer sitting past a partial
@@ -1107,6 +1099,20 @@ impl SequenceState {
         out
     }
 
+    /// Rebuild the GPU slot-state buffer for decode using the true sequence length.
+    ///
+    /// Serialises all chunks into the pinned host buffer with per-chunk
+    /// `rope_base` values derived from cumulative usage, then uploads to the
+    /// device buffer asynchronously.
+    ///
+    /// Returns `(raw_device_ptr, n_chunks, write_chunk_idx)` where:
+    /// - `raw_device_ptr` is the GPU base pointer for the decode kernel,
+    /// - `n_chunks` is the number of serialised chunk entries,
+    /// - `write_chunk_idx` is the index of the last (writable) chunk.
+    ///
+    /// `seq_offset` is the current sequence length used to derive the true
+    /// token count for the write chunk (overrides the potentially-stale
+    /// `chunk.usage` field).
     pub(crate) fn rebuild_decode_gpu_chunks(
         &mut self,
         n_kv_head: usize,
