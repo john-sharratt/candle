@@ -436,7 +436,15 @@ impl BatchedConfig {
     /// Build a [`CompressionPolicy`] from this config's level (if set).
     /// Returns `None` for uniform/non-compression modes.
     pub fn compression_policy(&self) -> Option<CompressionPolicy> {
-        self.compression_level.map(|level| {
+        self.compression_level
+            .and_then(|level| self.compression_policy_at(level))
+    }
+
+    /// The same policy at an explicit level, for a caller that seals one layer
+    /// differently from the rest. `None` when the session is uncompressed —
+    /// a level cannot conjure compression the mode does not have.
+    pub fn compression_policy_at(&self, level: u8) -> Option<CompressionPolicy> {
+        self.compression_level.map(|_| level).map(|level| {
             CompressionPolicy::new_with_error_threshold_factors(
                 level,
                 self.k_hi_error_threshold_factor,
@@ -521,6 +529,56 @@ pub(crate) fn build_glue_meta(
     }))
 }
 
+/// How a model's KV layers divide into the ones a wave steps together and the
+/// ones stepped by a pass of their own.
+///
+/// A **stream** layer advances on every wave: the trunk sweep writes it, so all
+/// stream layers hold the same token prefix at a wave boundary, and every
+/// stream-wide aggregate — the token prefix `sequence_backing_tokens` reports,
+/// the block structure `build_decode_metadata` reconciles a group to — is taken
+/// over exactly this set.
+///
+/// A **draft** layer is one a NextN/MTP head owns but the wave does not step:
+/// it is allocated, so the head has somewhere to write, and excluded from every
+/// stream-wide aggregate, so a layer holding nothing cannot speak for the ones
+/// that do.
+///
+/// A head is only meant to sit here while it is being brought up. The finished
+/// arrangement is the one `qwen35::draft` documents and `qwen35::engine::kv_layers`
+/// declares: the head's pass runs over the same rows at the same positions in
+/// the same wave, so its layer stands at the same length as its siblings and is
+/// a **stream** layer like any other — covered by the wave's own metadata, and
+/// invisible to fork, view, prefix injection, turn sealing and truncation
+/// precisely because it is not a special case. A model moves from `draft` to
+/// `stream_only` when its head starts stepping in lockstep, and `draft` should
+/// be 0 everywhere once it does.
+///
+/// Folding a draft layer into a stream aggregate is silent and destructive. A
+/// minimum over token prefixes reads 0 for a layer nothing has written, and the
+/// wave-entry reconciler treats that as "offset ran ahead of the backing" and
+/// clamps the sequence to 0 — every wave, with only a `tracing::warn!` to show
+/// for it. The trunk then re-attends from position 0 and the model answers
+/// fluently and wrongly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvLayers {
+    /// Layers the wave steps together.
+    pub stream: usize,
+    /// Layers past the stream, each stepped by a draft head's own pass.
+    pub draft: usize,
+}
+
+impl KvLayers {
+    /// A model whose every KV layer advances on every wave.
+    pub fn stream_only(stream: usize) -> Self {
+        Self { stream, draft: 0 }
+    }
+
+    /// Backings the session allocates.
+    pub fn total(&self) -> usize {
+        self.stream + self.draft
+    }
+}
+
 /// Batched inference session that manages KV cache state for multiple sequences.
 ///
 /// This is the main interface for batched inference. It:
@@ -538,6 +596,13 @@ pub struct BatchedInferenceSession {
     config: BatchedConfig,
     /// Number of layers in the model.
     num_layers: usize,
+    /// Leading layers a wave steps together — see [`KvLayers`]. Every
+    /// stream-wide aggregate is taken over `0..stream_layers`, never over all
+    /// `num_layers`, so a draft head's layer cannot poison one.
+    stream_layers: usize,
+    /// Per layer, a ceiling on the compression level its seals use. `None`
+    /// takes the session's. See [`Self::cap_layer_seal_level`].
+    layer_seal_cap: Vec<Option<u8>>,
     /// Device the session is on.
     device: Device,
     /// Pending reprojection-glue descriptors, set by the wave immediately before
@@ -585,12 +650,13 @@ pub struct ProvSignPacked {
 impl BatchedInferenceSession {
     /// Create a new batched inference session.
     pub fn new(
-        num_layers: usize,
+        layers: KvLayers,
         n_kv_head: usize,
         head_dim: usize,
         device: &Device,
         config: BatchedConfig,
     ) -> Result<Self> {
+        let num_layers = layers.total();
         // Create one backing and share it across all layers.
         // All layers have the same (n_kv_head, head_dim, format) so they
         // share arenas, the GID pool, and the arena table. Each layer gets
@@ -617,9 +683,47 @@ impl BatchedInferenceSession {
             sequences: Vec::new(),
             config,
             num_layers,
+            stream_layers: layers.stream,
+            layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
         })
+    }
+
+    /// Hold one layer's seals at or below `max_level`, whatever the rest of the
+    /// ladder runs at.
+    ///
+    /// **For a layer whose error budget is not the stack's.** A trunk spreads
+    /// every read over many KV layers, so a level's quantisation error is
+    /// partly averaged over the depth; a one-block draft head has a single
+    /// layer and absorbs none of it.
+    ///
+    /// A **ceiling**, not a setting: the cap only ever lowers, so a session
+    /// already running below it is untouched and the caller does not have to
+    /// know what the session was configured with. Capping to a level *deeper*
+    /// than the session's would be compressing one layer harder than the stack,
+    /// which is never what this is for.
+    ///
+    /// A *level*, not a format, so the layer takes the same code path and the
+    /// same candidate machinery as every other — only less aggressively. The
+    /// alternative of excluding the layer from the seal entirely walks into a
+    /// known corruption: the round-trip truncates every layer to zero blocks
+    /// and re-injects, and "re-injecting Arc-shared chunks under a lone
+    /// sequence corrupted the decode read".
+    ///
+    /// **Note this is the seal path, which is where compression actually
+    /// happens.** A per-`KvCache` policy does not reach it — the seal reads the
+    /// session's — so setting one of those is a silent no-op that looks exactly
+    /// like a null result, and cost this codebase a wrongly-refuted hypothesis.
+    pub fn cap_layer_seal_level(&mut self, layer: usize, max_level: u8) -> Result<()> {
+        let slot = self.layer_seal_cap.get_mut(layer).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "cap_layer_seal_level: layer {layer} is past the session's {} KV layers",
+                self.num_layers
+            ))
+        })?;
+        *slot = Some(max_level);
+        Ok(())
     }
 
     /// Create a session that shares the KV arena pool with an existing session.
@@ -644,6 +748,11 @@ impl BatchedInferenceSession {
             sequences: Vec::new(),
             config,
             num_layers,
+            // Every backing handed in is a stream layer: a sibling session
+            // exists to borrow chunks through the shared arena pool, and no
+            // draft head runs against it.
+            stream_layers: num_layers,
+            layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
         }
@@ -803,15 +912,28 @@ impl BatchedInferenceSession {
     ///
     /// Rebuilds slice and header data directly from backing arenas on every call.
     /// Pass `seq_indices` in the same order used for the forward pass batch.
-    /// Returns per-layer slice tensors (must stay alive until after the kernel) and
-    /// per-layer header GpuBufs. Both vecs are empty when `seq_indices` is empty.
+    /// Returns the device-resident `SlotHeader` buffer holding every layer's
+    /// headers (must stay alive until after the kernels) and the per-layer byte
+    /// stride; the buffer is `None` when `seq_indices` is empty.
     #[cfg(feature = "cuda")]
     pub fn build_decode_metadata(
         &self,
         seq_indices: &[usize],
         generation: &Generation,
-    ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
-        self.build_decode_metadata_at(0..self.num_layers, seq_indices, generation, &[], &[], &[])
+    ) -> Result<(Option<GpuBuf>, u64)> {
+        // The STREAM's layers, not every backing: the group a wave steps is
+        // reconciled to a common block structure, and a draft head's layer —
+        // which this sweep never writes — would drag that repair across the
+        // whole group on every decode step, moving the trunk's own write slices
+        // under it. The head's pass builds metadata for its layer alone.
+        self.build_decode_metadata_at(
+            0..self.stream_layers,
+            seq_indices,
+            generation,
+            &[],
+            &[],
+            &[],
+        )
     }
 
     /// [`Self::build_decode_metadata`] with explicit per-sequence offset
@@ -839,11 +961,12 @@ impl BatchedInferenceSession {
     /// `&[]` makes every row live.
     ///
     /// `layers` names the contiguous group of KV layers to describe. The whole
-    /// stack (`0..num_layers`) is the ordinary answer, and the shared position
-    /// map is what makes it one build rather than N — every layer of the group
-    /// must therefore agree on block structure, which
-    /// [`ChunkedKvBacking::ensure_for_batch_entries_all`] establishes over the
-    /// group before the map is read from its first backing.
+    /// stack (`0..num_layers`) is the ordinary answer, and the group's one
+    /// write-capacity reconciliation is what makes it one build rather than
+    /// N — every layer of the group must therefore agree on block structure,
+    /// which [`ChunkedKvBacking::ensure_for_batch_entries_all`] establishes
+    /// over the group before each layer's headers are checked against the
+    /// first's.
     ///
     /// A NARROWER group exists for exactly one reason: a layer that legitimately
     /// stands at a different length from the rest. The MTP draft head is one —
@@ -863,10 +986,10 @@ impl BatchedInferenceSession {
         offset_overrides: &[(usize, usize)],
         non_writer: &[usize],
         snapshot_seqs: &[usize],
-    ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
+    ) -> Result<(Option<GpuBuf>, u64)> {
         let n_active = seq_indices.len();
         if n_active == 0 {
-            return Ok((None, None, 0));
+            return Ok((None, 0));
         }
         if layers.start >= layers.end || layers.end > self.num_layers {
             candle::bail!(
@@ -905,23 +1028,19 @@ impl BatchedInferenceSession {
             })
             .collect();
 
-        // Build per-sequence position_map covering [0, state.offset + 1).
-        // Each entry is u32: (slice_idx << 16) | in_blk.  The map is
-        // invariant across the GROUP (slice metadata is uniform within it),
-        // built once, and every layer's SlotHeader points into the
-        // per-sequence region.
-        // Entry at index state.offset is the write slot for the new token.
-        let mut pm_flat: Vec<u32> = Vec::new();
-        let mut pm_seq_byte_offsets: Vec<usize> = Vec::with_capacity(n_active);
-        // `(slice count, write slice)` the map was built against, per sequence.
-        // Both are read from the group's FIRST layer while the map is one buffer
-        // every layer's slot header points at, so every layer's own answer is
-        // checked against them below rather than assumed equal.
-        let mut pm_slot_shape: Vec<(u32, u32)> = Vec::with_capacity(n_active);
+        // `(slice count, write slice)` per sequence, read from the group's
+        // FIRST layer. The decode kernels address the write chunk through
+        // each layer's own header, so every layer's answer is checked
+        // against the first's below rather than assumed equal: a layer whose
+        // block table disagrees would scatter the token into one chunk and
+        // attend to another. (The decode headers carry no position map —
+        // no decode kernel reads one; the prefill and glue uploads in
+        // `prefill_utils` build theirs per forward.)
+        let mut slot_shape: Vec<(u32, u32)> = Vec::with_capacity(n_active);
         // Ensure backings are sized for the upcoming decode write so the slot's
         // chunks reflect the post-write layout when we read them, and reconcile
-        // any block-structure skew between layers — the map built below is one
-        // buffer describing all of them.
+        // any block-structure skew between layers — the shape read below from
+        // the first layer must describe all of them.
         //
         // Every layer of the GROUP at once, and once per decode step rather than
         // once per layer: only the layers that need an allocation take the write
@@ -938,28 +1057,17 @@ impl BatchedInferenceSession {
             .collect();
         ChunkedKvBacking::ensure_for_batch_entries_all(group, &writer_offsets, 1)?;
         for &(seq_idx, seq_offset) in &seq_offsets {
-            let entry_start = pm_flat.len();
-            pm_seq_byte_offsets.push(entry_start * 4);
             let chunks = group[0].live_chunks_as_sealed(seq_idx).unwrap_or_default();
-            for (sidx, c) in chunks.iter().enumerate() {
-                let base = (sidx as u32) << 16;
-                pm_flat.extend(
-                    (c.offset as u32..c.offset as u32 + c.token_count as u32)
-                        .map(|in_blk| base | in_blk),
-                );
-            }
+            let cum_tokens: usize = chunks.iter().map(|c| c.token_count as usize).sum();
             debug_assert_eq!(
-                pm_flat.len() - entry_start,
-                seq_offset,
-                "decode position_map: cum_tokens {} != state.offset {seq_offset} for seq {seq_idx}",
-                pm_flat.len() - entry_start,
+                cum_tokens, seq_offset,
+                "decode metadata: cum_tokens {cum_tokens} != state.offset {seq_offset} for seq {seq_idx}",
             );
-            // Write-slot entry: the new token lands in the WRITE chunk — the
-            // first non-full chunk from `writer_start_idx`, NOT `chunks.last()`
-            // (which may be a trailing empty sitting past the writer). This MUST
-            // match the `write_slice` rule in `sync_decode_gpu_chunks`, or the
-            // kernel scatters the token into one chunk while attention is told
-            // (via the position_map) to read it from another.
+            // The new token lands in the WRITE chunk — the first non-full
+            // chunk from `writer_start_idx`, NOT `chunks.last()` (which may be
+            // a trailing empty sitting past the writer). This MUST match the
+            // `write_slice` rule in `sync_decode_gpu_chunks`, which is what
+            // every layer is checked against below.
             let wstart = group[0].writer_start_idx_for_seq(seq_idx).unwrap_or(0);
             let n_ch = chunks.len();
             let wi = if n_ch == 0 {
@@ -970,27 +1078,8 @@ impl BatchedInferenceSession {
                     .find(|&i| (chunks[i].offset as usize + chunks[i].token_count as usize) < 32)
                     .unwrap_or(n_ch - 1)
             };
-            let wi_within = chunks
-                .get(wi)
-                .map_or(0, |c| c.offset as u32 + c.token_count as u32);
-            pm_flat.push(((wi as u32) << 16) | wi_within);
-            pm_slot_shape.push((n_ch as u32, wi as u32));
+            slot_shape.push((n_ch as u32, wi as u32));
         }
-
-        // Upload position_map via the pinned stager — zero-copy PCIe read,
-        // same path as all_headers below.  Pad to at least one entry so the
-        // device pointer is always valid.
-        if pm_flat.is_empty() {
-            pm_flat.push(0);
-        }
-        let pm_byte_len = pm_flat.len() * std::mem::size_of::<u32>();
-        let mut pm_pinned = generation.alloc(pm_byte_len)?;
-        // SAFETY: u32 has no padding and is trivially copyable; the lengths match.
-        let pm_bytes =
-            unsafe { std::slice::from_raw_parts(pm_flat.as_ptr() as *const u8, pm_byte_len) };
-        pm_pinned.copy_from_slice(pm_bytes);
-        let pm_gpu_buf = generation.submit(pm_pinned)?;
-        let pm_base_ptr = pm_gpu_buf.dev_ptr();
 
         let mut slot_rebuild_time = std::time::Duration::ZERO;
         let mut slot_reuse_time = std::time::Duration::ZERO;
@@ -1027,32 +1116,32 @@ impl BatchedInferenceSession {
             saw_slot_reuse |= sync_stats.reuses > 0;
             saw_slot_rebuild |= sync_stats.rebuilds > 0;
 
-            // Append this layer's headers (24 bytes × n_active).
+            // Append this layer's headers (24 bytes × n_active; the position
+            // map field is 0 — see `slot_shape` above).
             for (i, &(ptr, n_slices, write_slice)) in seq_ptrs.iter().enumerate() {
                 // The kernel SCATTERS the new token through this layer's own
-                // `write_slice` and READS it back through the shared map's write
-                // slot. A layer whose block table disagrees with the one the map
-                // was built from writes the token into one chunk and attends to
-                // another — silently, with no fault and no wrong-looking number
-                // anywhere. `ensure_for_batch_entries_all` reconciles the layers
-                // before this point; this is where that is worth confirming,
-                // because both values are already in hand.
-                let (exp_slices, exp_write) = pm_slot_shape[i];
+                // `write_slice`. A layer whose block table disagrees with the
+                // group's writes the token into one chunk while the group's
+                // shared selection attends to another — silently, with no
+                // fault and no wrong-looking number anywhere.
+                // `ensure_for_batch_entries_all` reconciles the layers before
+                // this point; this is where that is worth confirming, because
+                // both values are already in hand.
+                let (exp_slices, exp_write) = slot_shape[i];
                 if (n_slices, write_slice) != (exp_slices, exp_write) {
                     candle::bail!(
                         "decode metadata: layer {layer_idx} describes sequence {} as \
-                         {n_slices} slices writing slice {write_slice}, but the position map \
-                         every layer of {layers:?} shares was built from layer {} as \
-                         {exp_slices} slices writing slice {exp_write}",
+                         {n_slices} slices writing slice {write_slice}, but layer {} of \
+                         the group {layers:?} describes it as {exp_slices} slices writing \
+                         slice {exp_write}",
                         seq_offsets[i].0,
                         layers.start
                     )
                 }
-                let pm_ptr = pm_base_ptr + pm_seq_byte_offsets[i] as u64;
                 all_headers.extend_from_slice(&n_slices.to_le_bytes());
                 all_headers.extend_from_slice(&write_slice.to_le_bytes());
                 all_headers.extend_from_slice(&ptr.to_le_bytes());
-                all_headers.extend_from_slice(&pm_ptr.to_le_bytes());
+                all_headers.extend_from_slice(&0u64.to_le_bytes());
             }
         }
 
@@ -1067,12 +1156,17 @@ impl BatchedInferenceSession {
             u64::from(saw_slot_rebuild),
         );
 
-        // Upload the group's headers in a single pinned → GPU copy.
+        // The group's headers go to DEVICE memory in one pinned → GPU copy.
+        // Every block of every attention launch opens on its slot header and
+        // hangs its whole slice chain off it, so the header is the one
+        // latency-critical read of the kernel: over the zero-copy mapping
+        // that is a PCIe round trip per warp (measured ~11% of the sparse
+        // decode kernel), resident it is an L2 hit.
         let total = group.len() * header_stride;
         let mut pinned = generation.alloc(total)?;
         pinned.copy_from_slice(&all_headers);
-        let gpu_buf = generation.submit(pinned)?;
-        Ok((Some(pm_gpu_buf), Some(gpu_buf), header_stride as u64))
+        let gpu_buf = generation.submit_resident(pinned)?;
+        Ok((Some(gpu_buf), header_stride as u64))
     }
 
     /// Free a sequence, returning its resources to the pool.
@@ -1435,16 +1529,22 @@ impl BatchedInferenceSession {
             // truncate below keeps their (refcounted) arena slots alive.
             let mut quantized_per_layer: Vec<SealedSequence> =
                 Vec::with_capacity(self.backings.len());
-            for backing in &self.backings {
+            for (layer_idx, backing) in self.backings.iter().enumerate() {
                 let live = backing.record_turn(seq_idx)?;
                 if live.chunks.is_empty() || policy.is_none() {
                     quantized_per_layer.push(live);
                     continue;
                 }
+                // A capped layer seals at min(session, cap); every other layer
+                // takes the session's unchanged.
+                let pinned = self.layer_seal_cap[layer_idx]
+                    .filter(|&cap| self.config.compression_level.is_some_and(|l| cap < l))
+                    .and_then(|cap| self.config.compression_policy_at(cap));
+                let layer_policy = pinned.as_ref().unwrap_or_else(|| policy.as_ref().unwrap());
                 let out = quantize_sealed_in_place(
                     backing,
                     &[&live],
-                    policy.as_ref().unwrap(),
+                    layer_policy,
                     &self.device,
                     &copy_stream,
                     &mut scratch,
@@ -2523,8 +2623,14 @@ impl BatchedInferenceSession {
         // it is valid on every layer, and as the wave completes and the layers
         // converge the minimum rises to the true length. For a uniform (settled)
         // slot every layer is equal, so this is identical to reading layer 0.
+        // The STREAM's layers only. A draft head's layer is stepped by the
+        // head's own pass, so it holds nothing at all until the head runs and
+        // trails by a token mid-wave once it does — either way its prefix is not
+        // evidence about the stream's, and a minimum that included it would
+        // report 0 and drive the wave-entry reconciler to clamp the sequence
+        // back to the start of its history. See [`KvLayers`].
         let mut min_cum: Option<usize> = None;
-        for cache in &caches.caches {
+        for cache in caches.caches.iter().take(self.stream_layers) {
             let mut cum: usize = 0;
             cache.k_cache().chunked_visit_live_chunks(|it| {
                 for c in it {
@@ -3987,7 +4093,19 @@ pub trait ManagedBatchedModel {
         // `docs/deltanet_state_persistence.md` §5.4). Which offsets are
         // rewindable is a property of the stashed block, so `truncate_sequences`
         // is what refuses one it has no rewind point for.
-        if !self.can_rewind_speculative_block() {
+        //
+        // And only a step that would actually DRAFT needs the rewind: at a zero
+        // draft budget every sequence takes a plain decode wave below and
+        // nothing is ever put back, so a recurrent model with no drafter (a
+        // bring-up, a checkpoint whose conversion carries no MTP head) runs
+        // through this driver legally.
+        //
+        // The test is `max_draft`, the width this step will actually hand
+        // `speculative_draft` below — NOT `draft_budget`, which is the model's
+        // own advice and defaults to 0. Testing the advice lets a caller pass a
+        // real width to a model that never overrode it and draft without a
+        // rewind point, which is precisely the case the bail exists to refuse.
+        if !self.can_rewind_speculative_block() && max_draft > 0 {
             candle::bail!(
                 "speculative decode is unavailable on this model: accepting k of n \
                  drafted tokens requires rewinding the sequence, and this model \
@@ -4128,6 +4246,11 @@ pub trait ManagedBatchedModel {
             walk.commit(&tokens, |i, token| (emits[i])(token))?;
         }
         let (next, kept) = walk.finish();
+        // The walk is bounded by the draft budget and the rollback is not, so
+        // they are timed apart: one is `max_draft + 1` chooser dispatches over a
+        // narrowing cohort, the other visits every layer's chunk list. A single
+        // span over both reads as "accept got slower with depth" and hides which.
+        pipeline_record_duration("spec:walk", t_accept.elapsed(), 1);
         let targets: Vec<(usize, usize)> = seqs
             .iter()
             .enumerate()
@@ -4136,7 +4259,9 @@ pub trait ManagedBatchedModel {
         // ONE rollback call for the step: every sequence's target at once, so a
         // model whose rollback does real work (the recurrent replay) batches it
         // across the cohort instead of paying it per sequence.
+        let t_rollback = std::time::Instant::now();
         self.truncate_sequences(session, &targets)?;
+        pipeline_record_duration("spec:rollback", t_rollback.elapsed(), 1);
         pipeline_record_duration("spec:accept", t_accept.elapsed(), 1);
         Ok(next)
     }
@@ -4150,7 +4275,9 @@ pub trait ManagedBatchedModel {
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         let session = BatchedInferenceSession::new(
-            props.num_layers,
+            // The default stack has no draft head; a model that carries one
+            // overrides this and declares its head's layer.
+            KvLayers::stream_only(props.num_layers),
             props.n_kv_heads,
             props.head_dim,
             self.device(),
@@ -4202,6 +4329,19 @@ pub trait ManagedBatchedModel {
 
     /// Snapshot expert pipeline telemetry counters (if the model has an expert cache).
     fn expert_stats(&self) -> Option<PipelineStats> {
+        None
+    }
+
+    /// Snapshot the row-cache counters of a disk-resident embedding tier, if
+    /// this model has one.
+    ///
+    /// `(hits, misses, evictions)`. Only Qwen3.8-Flash-Next's PLE table is
+    /// served this way today: 51 B parameters that never enter VRAM, fronted by
+    /// a bounded RAM cache whose hit rate is an empirical property of the
+    /// traffic rather than of the table. The counters existed from the start
+    /// and nothing read them — which is why the tier's sizing has been a design
+    /// estimate rather than a measurement.
+    fn row_cache_stats(&self) -> Option<(u64, u64, u64)> {
         None
     }
 
@@ -4420,6 +4560,11 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.model().expert_stats()
     }
+
+    // `row_cache_stats` keeps the trait's `None`: no model reached through
+    // `BatchedInference<M>` serves an embedding tier from disk. The one that
+    // does (Qwen3.8-Flash-Next's PLE table) implements `ManagedBatchedModel`
+    // directly.
 
     fn layer_stream_stats(&self) -> Option<[usize; 7]> {
         self.model().layer_stream_stats()

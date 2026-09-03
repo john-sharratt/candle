@@ -241,6 +241,7 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
             cap.rope_interleaved,
             &generation,
             &RefCell::new(None),
+            None,
         )
     };
 

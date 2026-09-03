@@ -634,18 +634,14 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // reads it, so building here — before phase 0 — matches the order the
         // wave driver used when it built these.
         #[cfg(feature = "cuda")]
-        let (_pm_guard, decode_headers) = if n_decode > 0 {
-            let (pm_guard, buf, stride) =
-                session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
-            (pm_guard, DecodeHeaders::Decode { buf, stride })
+        let decode_headers = if n_decode > 0 {
+            let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
+            DecodeHeaders::Decode { buf, stride }
         } else {
-            (
-                None,
-                DecodeHeaders::Decode {
-                    buf: None,
-                    stride: 0,
-                },
-            )
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            }
         };
         #[cfg(not(feature = "cuda"))]
         let decode_headers = DecodeHeaders::Decode {
@@ -967,6 +963,9 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     params: &dec_params,
                     rows: n_decode,
                     decode_layout: true,
+                    // No QSA: this lineage's attention reads the whole causal
+                    // prefix (the selection is Qwen3.8-Flash-Next's own).
+                    qsa: None,
                 });
             }
             if n_prefill > 0 {
@@ -976,6 +975,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     params: &pre_params,
                     rows: pre_rows,
                     decode_layout: false,
+                    qsa: None,
                 });
             }
             if n_glue > 0 {
@@ -985,6 +985,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     params: &glue_params,
                     rows: glue_rows,
                     decode_layout: false,
+                    qsa: None,
                 });
             }
             forward_layer_batched_mixed(

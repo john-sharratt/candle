@@ -424,7 +424,7 @@ mod cuda_tests {
         backing.ensure_for_offset(0, seq_offset, 1)?;
 
         let arena_info = backing.resolve_arena_info()?;
-        let (ptrs, _) = backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info)?;
+        let (ptrs, _pins, _) = backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info)?;
         let (ptr, n_slices, write_slice) = ptrs[0];
 
         // Stage the 16-byte SlotHeader to GPU.
@@ -470,6 +470,7 @@ mod cuda_tests {
             &v_c,
             rope_cs,
             false, // rope_interleaved
+            None,  // no QSA selection: the full causal read
         )?;
 
         // `gen` drops here — Generation::drop syncs the stream then frees the
@@ -531,7 +532,7 @@ mod cuda_tests {
         backing.test_set_writer_start(0, 1)?;
 
         let arena_info = backing.resolve_arena_info()?;
-        let (ptrs, _) = backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info)?;
+        let (ptrs, _pins, _) = backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info)?;
         let (ptr, n_slices, write_slice) = ptrs[0];
 
         let stager = PinnedStager::new(device.as_cuda_device()?);
@@ -569,6 +570,7 @@ mod cuda_tests {
             &v_c,
             &rope_cs,
             false,
+            None,
         )?;
         drop(gen);
         Ok(result)
