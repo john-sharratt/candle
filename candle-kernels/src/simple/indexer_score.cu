@@ -51,17 +51,28 @@ extern "C" __global__ void indexer_score_reduce_kernel(
     const float* __restrict__ scores, // [B, H, M] strided
     const float* __restrict__ w,      // [B, H]    strided
     const unsigned int* __restrict__ counts, // [B] strided, or null for "no padding"
-    float* __restrict__ out,          // [B, M] packed
+    float* __restrict__ out,          // [B, M], rows `out_s` apart
     int H,
     int M,
     long long sc_sb, long long sc_sh, long long sc_sm,
     long long w_sb, long long w_sh,
-    long long cnt_s)
+    long long cnt_s,
+    long long out_s)
 {
     const int b = blockIdx.y;
     const float* scb = scores + (long long)b * sc_sb;
-    const float* wb = w + (long long)b * w_sb;
-    float* outb = out + (size_t)b * (size_t)M;
+    // `w == nullptr` is a UNIFORM weight of one, the same convention `counts`
+    // uses for "no padding". The QSA indexer's own fold has no per-head weight
+    // — it is a plain `Σ_h relu(·)` — and a caller with nothing to weight by
+    // would otherwise have to allocate and upload a tensor of ones per call to
+    // say so, which on a per-layer path is the launch this kernel exists to
+    // remove.
+    const float* wb = w ? w + (long long)b * w_sb : nullptr;
+    // Rows are `out_s` apart, not `M`: a caller reducing several groups whose
+    // candidate counts differ writes them all into one buffer as wide as the
+    // widest, so that a single downstream pass covers every row. Packed output
+    // is `out_s == M`.
+    float* outb = out + (size_t)b * (size_t)out_s;
     // `counts` is read through its own stride like every other input. It is the
     // one input a caller is most likely to hand over as a view of something
     // wider, and assuming stride 1 here would read a neighbour as a visibility
@@ -121,7 +132,7 @@ extern "C" __global__ void indexer_score_reduce_kernel(
         for (int h = 0; h < H; ++h) {
             const float s = scj[(long long)h * sc_sh];
             const float r = (s > 0.0f ? s : 0.0f);
-            const float wv = wb[(long long)h * w_sh];
+            const float wv = wb ? wb[(long long)h * w_sh] : 1.0f;
             // Exact product: r*wv == p + e, with e recovered by the FMA.
             const float p = __fmul_rn(r, wv);
             c = __fadd_rn(c, __fmaf_rn(r, wv, -p));
@@ -199,6 +210,7 @@ extern "C" void run_indexer_score_reduce(
     long long sc_sb, long long sc_sh, long long sc_sm,
     long long w_sb, long long w_sh,
     long long cnt_s,
+    long long out_s,
     void* stream)
 {
     // `h == 0` is NOT excluded here. The reduction over zero heads is 0, and the
@@ -247,5 +259,5 @@ extern "C" void run_indexer_score_reduce(
     const int tiles = (m + threads - 1) / threads;
     dim3 grid(tiles, b, 1);
     indexer_score_reduce_kernel<<<grid, threads, 0, (cudaStream_t)stream>>>(
-        scores, w, counts, out, h, m, sc_sb, sc_sh, sc_sm, w_sb, w_sh, cnt_s);
+        scores, w, counts, out, h, m, sc_sb, sc_sh, sc_sm, w_sb, w_sh, cnt_s, out_s);
 }

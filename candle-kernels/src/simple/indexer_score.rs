@@ -12,10 +12,14 @@ extern "C" {
     /// `out[b, j] = Σ_h relu(scores[b, h, j]) · w[b, h]
     ///              + (j < counts[b] ? 0 : -1e30)`.
     ///   scores: device f32 `[b, h, m]`, read through `sc_s{b,h,m}` (ELEMENTS)
-    ///   w:      device f32 `[b, h]`, read through `w_s{b,h}`
+    ///   w:      device f32 `[b, h]`, read through `w_s{b,h}`, or NULL for a
+    ///           uniform weight of one — the QSA indexer's fold is a plain
+    ///           `Σ_h relu(·)` and would otherwise upload a tensor of ones
     ///   counts: device u32 `[b]`, read through `cnt_s`, or NULL to leave every
     ///           column unmasked
-    ///   out:    device f32[b * m], packed
+    ///   out:    device f32[b * out_s], rows `out_s` apart (`out_s == m` packs
+    ///           them; a wider stride lets several groups with different `m`
+    ///           share one buffer that a single downstream pass covers)
     ///
     /// `h == 0` is a valid call and writes the reduction over zero heads (0,
     /// plus the mask) rather than leaving `out` untouched — the caller allocates
@@ -35,6 +39,7 @@ extern "C" {
         w_sb: i64,
         w_sh: i64,
         cnt_s: i64,
+        out_s: i64,
         stream: *mut c_void,
     );
 }

@@ -29,6 +29,12 @@ extern "C" {
         rope_cs: *const f32,
         rope_interleaved: i32,
         stream: *mut c_void,
+        // QSA selection, one row per PACKED QUERY (`cu_seqlens_q[b] + token`);
+        // null for a full causal read. See `candle-kernels/src/qsa_select.cuh`.
+        sel_entries: *const u32,
+        sel_cnt: *const u32,
+        sel_stride: i32,
+        sel_ratio: i32,
     );
 
 }

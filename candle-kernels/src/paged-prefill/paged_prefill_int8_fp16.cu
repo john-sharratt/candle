@@ -22,27 +22,32 @@ extern "C" void run_paged_prefill_int8_fp16(
     const uint32_t* rope_offsets,
     const float* rope_cs,
     int32_t rope_interleaved,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const uint32_t* sel_entries,
+    const uint32_t* sel_cnt,
+    int32_t sel_stride,
+    int32_t sel_ratio
 ) {
+    const QsaSel sel{sel_entries, sel_cnt, sel_stride, sel_ratio};
     using prefill_int8::launch_paged_prefill_int8;
     switch (head_dim) {
         case 64:
             launch_paged_prefill_int8<__half, 64>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
-                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream);
+                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream, sel);
             break;
         case 128:
             launch_paged_prefill_int8<__half, 128>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
-                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream);
+                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream, sel);
             break;
         case 256:
             launch_paged_prefill_int8<__half, 256>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
-                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream);
+                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream, sel);
             break;
         default:
             fprintf(stderr, "run_paged_prefill_int8_fp16: unsupported head_dim %d\n", head_dim);
