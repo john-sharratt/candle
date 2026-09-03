@@ -15,8 +15,13 @@
 //                                        position_map: u32[total_tokens]
 //                                        where each entry packs
 //                                        (slice_idx << 16) | in_blk.
-//                                        Replaces chunk_div/chunk_mod
-//                                        positional math.)
+//                                        Only the prefill and glue kernels
+//                                        walk positions through it, via
+//                                        `resolve_pos`, so only the prefill
+//                                        upload (`upload_slot_headers`)
+//                                        builds one; decode headers carry 0
+//                                        here and the decode kernels walk
+//                                        the slice table directly.)
 //
 // TokenSlice (16 bytes, fixed stride):
 //   [0..2)   uint16_t offset
@@ -117,6 +122,30 @@ __device__ __forceinline__ uint8_t* get_slice_mut(uint64_t slices_ptr, int slice
         + (int64_t)slice_idx * token_slice_byte_size<HD>(n_kv_head);
 }
 
+// A TokenSlice read whole: one 16-byte load carries offset, len, rope and
+// the KvHead record pointer, so a walk that needs several of them pays one
+// global round instead of one per field.
+struct TokenSliceHdr {
+    uint64_t meta;      // offset | len << 16 | rope << 32
+    uint64_t kvheads;   // KvHead[n_kv_head] record pointer
+
+    __device__ __forceinline__ int offset() const { return (int)((uint32_t)meta & 0xffffu); }
+    __device__ __forceinline__ int len() const { return (int)(((uint32_t)meta) >> 16); }
+    __device__ __forceinline__ int rope_base() const { return (int)(uint32_t)(meta >> 32); }
+    __device__ __forceinline__ uint64_t kvheads_ptr() const { return kvheads; }
+};
+static_assert(sizeof(TokenSliceHdr) == 16, "TokenSliceHdr mirrors the 16-byte TokenSlice");
+
+template <int HD>
+__device__ __forceinline__ TokenSliceHdr load_token_slice(uint64_t slices_ptr, int slice_idx, int n_kv_head) {
+    const ulonglong2 w =
+        *reinterpret_cast<const ulonglong2*>(get_slice<HD>(slices_ptr, slice_idx, n_kv_head));
+    TokenSliceHdr h;
+    h.meta = w.x;
+    h.kvheads = w.y;
+    return h;
+}
+
 __device__ __forceinline__ uint16_t slice_offset(const uint8_t* slice) {
     return *reinterpret_cast<const uint16_t*>(slice + 0);
 }
@@ -142,14 +171,21 @@ __device__ __forceinline__ void slice_increment_len(uint8_t* slice) {
 // KvHead field accessors
 // ============================================================================
 
+// KvHead[head_idx] of the record at `kvheads_ptr` (a slice's record pointer,
+// already in hand from a `TokenSliceHdr`).
+template <int HD, int NP = 4>
+__device__ __forceinline__ const uint8_t* get_head_at(uint64_t kvheads_ptr, int head_idx) {
+    return reinterpret_cast<const uint8_t*>(kvheads_ptr)
+        + (int64_t)head_idx * kv_head_byte_size<HD, NP>();
+}
+
 // Get a pointer to KvHead[head_idx] for a slice. The slice stores a device
 // pointer to its KvHead[n_kv_head] record at byte offset 8; dereference and
 // index by head.
 template <int HD, int NP = 4>
 __device__ __forceinline__ const uint8_t* get_head(const uint8_t* slice, int head_idx) {
     uint64_t kvheads_ptr = *reinterpret_cast<const uint64_t*>(slice + 8);
-    return reinterpret_cast<const uint8_t*>(kvheads_ptr)
-        + (int64_t)head_idx * kv_head_byte_size<HD, NP>();
+    return get_head_at<HD, NP>(kvheads_ptr, head_idx);
 }
 
 // Mutable version.

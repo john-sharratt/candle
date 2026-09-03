@@ -699,6 +699,7 @@ fn run_prefill(
         false,
         &generation,
         &std::cell::RefCell::new(None),
+        None,
     )?;
     caches_arr[0].set_current_seq_len(offset + seq_len)?;
     // `paged_prefill_batched` returns the flat attention output
@@ -833,6 +834,7 @@ fn decode_one_slot(
         v_new,
         rope_cs,
         false,
+        None,
     )?;
     drop(headers_gpu);
     drop(slices_tensor);

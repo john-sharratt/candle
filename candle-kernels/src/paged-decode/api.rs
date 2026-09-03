@@ -1,4 +1,13 @@
 //! FFI bindings for paged decode attention kernels
+//!
+//! # The QSA selection arguments
+//!
+//! Every entry point ends with `sel_entries` / `sel_cnt` / `sel_stride` /
+//! `sel_ratio`: the block-sparse selection Qwen3.8-Flash-Next's full-attention
+//! layers read through (`candle-kernels/src/qsa_select.cuh`, defined by
+//! `models::qwen4exp::qsa_select`). One row per SLOT — decode is one query per
+//! slot. A null `sel_entries` is a full causal read, which is what every other
+//! model passes.
 
 use core::ffi::c_void;
 
@@ -25,6 +34,10 @@ extern "C" {
         rope_cs: *const f32,
         rope_interleaved: i32,
         stream: *mut c_void,
+        sel_entries: *const u32,
+        sel_cnt: *const u32,
+        sel_stride: i32,
+        sel_ratio: i32,
     ) -> i32;
 
     /// See [`run_paged_decode_fp16`] for the return-code contract.
@@ -42,6 +55,10 @@ extern "C" {
         rope_cs: *const f32,
         rope_interleaved: i32,
         stream: *mut c_void,
+        sel_entries: *const u32,
+        sel_cnt: *const u32,
+        sel_stride: i32,
+        sel_ratio: i32,
     ) -> i32;
 
     /// B2: decode with fused q8a128 context output (head_dim 128 or 256). Writes the per-head
@@ -69,6 +86,10 @@ extern "C" {
         rope_cs: *const f32,
         rope_interleaved: i32,
         stream: *mut c_void,
+        sel_entries: *const u32,
+        sel_cnt: *const u32,
+        sel_stride: i32,
+        sel_ratio: i32,
     ) -> i32;
 
     /// B2 bf16 sibling of [`run_paged_decode_fp16_q8`] (`gate` is bf16).
@@ -88,6 +109,10 @@ extern "C" {
         rope_cs: *const f32,
         rope_interleaved: i32,
         stream: *mut c_void,
+        sel_entries: *const u32,
+        sel_cnt: *const u32,
+        sel_stride: i32,
+        sel_ratio: i32,
     ) -> i32;
 
     /// Regression-test entry for the int8 m16n8k32 MMA fragment loaders.

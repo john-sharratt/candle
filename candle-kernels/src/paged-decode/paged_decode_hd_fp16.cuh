@@ -40,11 +40,15 @@ extern "C" int32_t DECODE_CAT(run_paged_decode_fp16_hd, DECODE_HD)(
     void* stream_ptr,
     void* q8_out,
     const void* gate,
-    int64_t gate_slot_stride
+    int64_t gate_slot_stride,
+    const uint32_t* sel_entries,
+    const uint32_t* sel_cnt,
+    int32_t sel_stride,
+    int32_t sel_ratio
 ) {
     return fused_attn::launch_int8_decode_attn<__half, __half, __half, DECODE_HD>(
         (const __half*)q_ptr, headers_ptr, (__half*)o_ptr, num_active_slots, n_q_head,
         n_kv_head, softmax_scale, (const __half*)k_new, (const __half*)v_new, rope_cs,
         rope_interleaved, (cudaStream_t)stream_ptr, (uint8_t*)q8_out, (const __half*)gate,
-        gate_slot_stride);
+        gate_slot_stride, QsaSel{sel_entries, sel_cnt, sel_stride, sel_ratio});
 }
