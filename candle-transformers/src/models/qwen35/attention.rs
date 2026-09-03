@@ -100,9 +100,47 @@ impl RopeTables {
         self.cos.dim(0).unwrap_or(0)
     }
 
+    /// The `cos` and `sin` tables as raw device addresses, for a kernel that
+    /// rotates in place rather than gathering rows into a tensor first. Both
+    /// are `[max_pos, rope_dim / 2]` row-major and contiguous.
+    pub fn table_ptrs(&self) -> Result<(u64, u64)> {
+        Ok((table_ptr(&self.cos)?, table_ptr(&self.sin)?))
+    }
+
     /// Apply to `x [T, n_heads, head_dim]` for absolute positions
     /// `offset..offset + T`. Dims `[rope_dim, head_dim)` pass through.
     pub fn apply(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
+        let t = x.dim(0)?;
+        let cos = self.cos.narrow(0, offset, t)?;
+        let sin = self.sin.narrow(0, offset, t)?;
+        self.rotate(x, &cos, &sin)
+    }
+
+    /// Apply with an explicit position per row — the QSA indexer ropes each
+    /// pooled block key at its block's **first** position, which is a
+    /// stride-`ratio` walk rather than a contiguous range.
+    pub fn apply_at_positions(&self, x: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        let t = x.dim(0)?;
+        if positions.len() != t {
+            candle::bail!("rope: {} positions for {t} rows", positions.len());
+        }
+        let max = self.max_pos();
+        if let Some(&p) = positions.iter().find(|&&p| p >= max) {
+            candle::bail!("rope: position {p} past the {max}-entry tables");
+        }
+        let ids = Tensor::from_vec(
+            positions.iter().map(|&p| p as u32).collect::<Vec<u32>>(),
+            (t,),
+            self.cos.device(),
+        )?;
+        let cos = self.cos.index_select(&ids, 0)?;
+        let sin = self.sin.index_select(&ids, 0)?;
+        self.rotate(x, &cos, &sin)
+    }
+
+    /// The NeoX half-split rotation shared by both position forms; `cos`/`sin`
+    /// are `[T, rope_dim/2]`, one row per row of `x`.
+    fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let (t, _h, d) = x.dims3()?;
         if d < self.rope_dim {
             candle::bail!(
@@ -111,8 +149,8 @@ impl RopeTables {
             );
         }
         let half = self.rope_dim / 2;
-        let cos = self.cos.narrow(0, offset, t)?.reshape((t, 1, half))?;
-        let sin = self.sin.narrow(0, offset, t)?.reshape((t, 1, half))?;
+        let cos = cos.reshape((t, 1, half))?;
+        let sin = sin.reshape((t, 1, half))?;
         let x1 = x.narrow(2, 0, half)?;
         let x2 = x.narrow(2, half, half)?;
         let r1 = x1.broadcast_mul(&cos)?.sub(&x2.broadcast_mul(&sin)?)?;
@@ -123,6 +161,23 @@ impl RopeTables {
         let tail = x.narrow(2, self.rope_dim, d - self.rope_dim)?;
         Tensor::cat(&[r1, r2, tail], 2)
     }
+}
+
+/// A rope table's device address.
+fn table_ptr(t: &Tensor) -> Result<u64> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    let candle::Device::Cuda(dev) = t.device() else {
+        candle::bail!("rope tables must be CUDA for a device-side rotation");
+    };
+    let stream = dev.cuda_stream();
+    let (s, l) = t.storage_and_layout();
+    let slice = match &*s {
+        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+        _ => candle::bail!("rope tables must be CUDA f32"),
+    }
+    .slice(l.start_offset()..);
+    let (ptr, _guard) = slice.device_ptr(&stream);
+    Ok(ptr)
 }
 
 /// Per-head weighted RMSNorm over the last dim.
@@ -159,6 +214,7 @@ pub fn attention_layer_forward(
         n_kv_head,
         head_dim,
         rms_eps,
+        None,
     )?;
     let out = gated.reshape((t, n_head * d))?.matmul(&w.wo.t()?)?;
     Ok((out, state))
@@ -177,6 +233,11 @@ pub fn attention_layer_forward(
 /// `qg` is `[T, 2·n_head·head_dim]` (interleaved `[q|gate]` per head), `k` and
 /// `v` are `[T, n_kv_head·head_dim]`. Returns the gated context
 /// `[T, n_head, head_dim]` — the caller applies its own `wo`.
+///
+/// `extra_mask` is an additive `[T, past + T]` score mask applied on top of
+/// causality — `0` keeps a key, `−inf` drops it. The `qwen4exp` sparse
+/// attention (QSA) passes its per-token selection here; every dense caller
+/// passes `None` and pays nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_attention_core(
     qg: &Tensor,
@@ -190,6 +251,7 @@ pub fn gated_attention_core(
     n_kv_head: usize,
     head_dim: usize,
     rms_eps: f64,
+    extra_mask: Option<&Tensor>,
 ) -> Result<(Tensor, AttentionState)> {
     let d = head_dim;
     let t = qg.dim(0)?;
@@ -245,22 +307,34 @@ pub fn gated_attention_core(
     // sequence per step against a history that grows with the conversation,
     // that was the single largest host cost in the decode loop. Skipping it is
     // exact, not approximate: the add it replaces is `+ 0.0`.
-    let probs = if t == 1 {
-        candle_nn::ops::softmax_last_dim(&scores)?
-    } else {
-        let mask_vals: Vec<f32> = (0..t)
-            .flat_map(|i| {
-                (0..total).map(move |j| {
-                    if j <= past + i {
-                        0f32
-                    } else {
-                        f32::NEG_INFINITY
-                    }
+    let probs = match (t, extra_mask) {
+        (1, None) => candle_nn::ops::softmax_last_dim(&scores)?,
+        (1, Some(sel)) => {
+            // A single query row still masks nothing causally, so the
+            // selection mask is the whole mask.
+            let sel = sel.reshape((1, t, total))?;
+            candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&sel)?)?
+        }
+        (_, extra) => {
+            let mask_vals: Vec<f32> = (0..t)
+                .flat_map(|i| {
+                    (0..total).map(move |j| {
+                        if j <= past + i {
+                            0f32
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
                 })
-            })
-            .collect();
-        let mask = Tensor::from_vec(mask_vals, (1, t, total), qg.device())?;
-        candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask)?)?
+                .collect();
+            let mut mask = Tensor::from_vec(mask_vals, (1, t, total), qg.device())?;
+            if let Some(sel) = extra {
+                // `−inf + −inf` stays `−inf`; the selection never unmasks a
+                // future key because the causal term is added regardless.
+                mask = mask.broadcast_add(&sel.reshape((1, t, total))?)?;
+            }
+            candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask)?)?
+        }
     };
     // Same grouping on the way back out: `[H, T, total]` → `[n_kv, group·T,
     // total]` reads `v_all` in place, no broadcast copy.

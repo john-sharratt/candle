@@ -175,9 +175,10 @@ extern "C" {
     );
 
     /// Row-wise epilogue over the whole wave: per `(token, V head)` row,
-    /// `out = (o / sqrt(mean(o²) + eps)) ⊙ gain ⊙ SiLU(z)` — the per-head
+    /// `out = (o / sqrt(mean(o²) + eps)) ⊙ gain ⊙ zgate(z)` — the per-head
     /// RMS norm and the z-gate in one launch. `rows = T · n_v_heads`,
-    /// `gain [d]`, `d ≤ 256`.
+    /// `gain [d]`, `d ≤ 256`. `sigmoid_gate` selects the gate instantiation:
+    /// 0 = SiLU(z) (the Qwen3.5 lineage), nonzero = sigmoid(z) (qwen4exp).
     pub fn run_delta_net_norm_gate_f32(
         o: *const f32,
         z: *const f32,
@@ -186,6 +187,7 @@ extern "C" {
         rows: i32,
         d: i32,
         eps: f32,
+        sigmoid_gate: i32,
         stream: *mut c_void,
     );
 }

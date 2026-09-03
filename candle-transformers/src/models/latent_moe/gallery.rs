@@ -482,6 +482,8 @@ fn indexer_score_reduce(scores: &Tensor, w: &Tensor, counts: Option<&Tensor>) ->
                     ws[0] as i64,
                     ws[1] as i64,
                     cnt_s,
+                    // Packed: this caller's rows all have the same width.
+                    m as i64,
                     stream.cu_stream() as *mut core::ffi::c_void,
                 );
             }
@@ -1292,16 +1294,22 @@ impl CorpusSnapshot {
         };
         let nope_i8 = take(&mut off, len * NOPE_DIM)?.to_vec();
         let nope_scale: Vec<f32> = take(&mut off, len * NOPE_BANDS * 4)?
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let rope_bf: Vec<u16> = take(&mut off, len * ROPE_DIM * 2)?
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let keys: Vec<f32> = take(&mut off, len * ih * 4)?
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         Some(Self {
             index_head_dim: ih,

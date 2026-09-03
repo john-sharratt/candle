@@ -1869,7 +1869,7 @@ impl BatchedEngine {
             .copied()
             .collect();
         let std_meta = {
-            let (pm, headers, stride) = session.build_decode_metadata_at(
+            let (headers, stride) = session.build_decode_metadata_at(
                 0..session.num_layers(),
                 &all_seqs,
                 generation,
@@ -1878,10 +1878,10 @@ impl BatchedEngine {
                 &snapshot_seqs,
             )?;
             let headers = headers.ok_or_else(|| candle::Error::Msg("no decode metadata".into()))?;
-            (pm, headers, stride)
+            (headers, stride)
         };
         let hdr_of = |layer: usize, seq_slot: usize| -> u64 {
-            let (_, headers, stride) = &std_meta;
+            let (headers, stride) = &std_meta;
             headers.dev_ptr() + (layer as u64) * stride + (seq_slot as u64) * 24
         };
         // Per-group scatter header: a group's positions share IDENTICAL

@@ -58,11 +58,17 @@ namespace delta_net {
 // ============================================================================
 // Row-wise epilogue over the whole wave, shared by the prefill scan and the
 // decode step: per (token, V head),
-//   gated = (o / sqrt(mean(o²) + eps)) ⊙ gain ⊙ SiLU(z)
+//   gated = (o / sqrt(mean(o²) + eps)) ⊙ gain ⊙ zgate(z)
 // — `rms_norm_per_head` and the z-gate in one pass instead of ~6 launches and
 // three full-width intermediates. One block per row; d is a runtime width
 // (≤ 256), threads stripe it and reduce the mean in shared memory.
+//
+// The z-gate is a TEMPLATE parameter, not a runtime branch: the Qwen3.5
+// lineage gates with SiLU(z), qwen4exp with sigmoid(z) — the one numerical
+// difference between the two generations' GDN — and baking the choice per
+// instantiation keeps the epilogue branch-free for both.
 // ============================================================================
+template <bool SIGMOID_GATE>
 static __global__ void delta_net_norm_gate_f32_kernel(
         const float* __restrict__ o,     // [T, h_v·d]
         const float* __restrict__ z,     // [T, h_v·d] raw (pre-SiLU)
@@ -96,7 +102,8 @@ static __global__ void delta_net_norm_gate_f32_kernel(
 
     for (int x = tid; x < d; x += (int)blockDim.x) {
         const float zv = z[row + x];
-        out[row + x] = o[row + x] * inv * gain[x] * (zv * dn_sigmoid(zv));
+        const float gate = SIGMOID_GATE ? dn_sigmoid(zv) : zv * dn_sigmoid(zv);
+        out[row + x] = o[row + x] * inv * gain[x] * gate;
     }
 }
 
@@ -108,10 +115,16 @@ static inline void launch_norm_gate_f32(
         int rows,
         int d,
         float eps,
+        int sigmoid_gate,
         cudaStream_t stream) {
     if (rows <= 0 || d <= 0 || d > 256) return;
-    delta_net_norm_gate_f32_kernel<<<rows, 128, 0, stream>>>(
-        o, z, gain, out, d, eps);
+    if (sigmoid_gate != 0) {
+        delta_net_norm_gate_f32_kernel<true><<<rows, 128, 0, stream>>>(
+            o, z, gain, out, d, eps);
+    } else {
+        delta_net_norm_gate_f32_kernel<false><<<rows, 128, 0, stream>>>(
+            o, z, gain, out, d, eps);
+    }
 }
 
 } // namespace delta_net

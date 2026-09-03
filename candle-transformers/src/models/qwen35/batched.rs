@@ -24,10 +24,11 @@ use super::engine::{
     wave_kv_range,
 };
 use super::quantized_weights::QuantModel;
-use super::spec::{replay_accepted_prefixes, StashSpan, VerifyStash};
+use super::spec::{replay_accepted_prefixes, ReplayLayer, StashSpan, VerifyStash};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ModelCoreProperties, ProvenanceLayerIndices,
 };
+use crate::models::delta_net::DeltaNetConstants;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::LayerKind;
@@ -988,7 +989,47 @@ impl HybridBatched {
             })?;
             full.push((span, kept, store));
         }
-        replay_accepted_prefixes(&self.model, stash, &mut full)
+        // The **residues**, not the layers. The replay runs at accept time,
+        // well after the sweep that captured the stash, so on a streamed
+        // checkpoint the layer's image may long since have been evicted — and
+        // `ensure`ing it would pull ~240 MB over PCIe to read four small
+        // constants that never left VRAM. The residue holds exactly those four.
+        let recurrent: Vec<usize> = match full.first() {
+            Some((_, _, store)) => store.recurrent_layer_indices().collect(),
+            None => return Ok(()),
+        };
+        let mut residues = Vec::with_capacity(recurrent.len());
+        for &li in &recurrent {
+            residues.push((li, self.model.layers.residue(li)?));
+        }
+        let layers: Vec<ReplayLayer<'_>> = residues
+            .iter()
+            .map(|(li, r)| {
+                let w = r.delta_net().map_err(|_| {
+                    candle::Error::Msg(format!(
+                        "qwen35 verify replay: layer {li} carries recurrent state but is \
+                         not DeltaNet"
+                    ))
+                })?;
+                Ok(ReplayLayer {
+                    layer_index: *li,
+                    consts: DeltaNetConstants {
+                        dt_bias: &w.dt_bias,
+                        a: &w.a,
+                        conv: &w.conv,
+                        norm: &w.norm,
+                    },
+                })
+            })
+            .collect::<Result<_>>()?;
+        replay_accepted_prefixes(
+            &layers,
+            &self.model.cfg.delta_net,
+            self.model.cfg.rms_norm_eps,
+            &self.model.device,
+            stash,
+            &mut full,
+        )
     }
 
     fn for_each_store(

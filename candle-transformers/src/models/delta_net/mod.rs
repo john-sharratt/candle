@@ -10,10 +10,17 @@
 //! Mirrors the kernel family `candle-kernels/src/delta-net/`, whose parity
 //! oracle is [`mix`]'s sequential reference.
 
+/// Microbench + `ncu` target for the fused prefill scan, with its own
+/// correctness gate (§0.4 rule 4).
+#[cfg(feature = "cuda")]
+pub mod bench;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod kv_layout;
 pub mod mix;
+/// The quantized driver projects through `models::stacked_proj`, whose ragged
+/// scatter is a kernel wrapper, so it shares that module's gate.
+#[cfg(feature = "cuda")]
 pub mod quantized;
 pub mod state_store;
 pub mod types;
@@ -25,9 +32,10 @@ pub use mix::{
     DeltaNetLayerTable, DeltaNetOut, DeltaNetProjections, DeltaNetSeq, DeltaNetSpanTable,
     DeltaNetState, DeltaNetWeights, SeqSpan, SpanOperands, StashSlot,
 };
+#[cfg(feature = "cuda")]
 pub use quantized::{
     quantized_delta_net_layer_forward, quantized_delta_net_layer_forward_spans,
     QuantDeltaNetWeights,
 };
 pub use state_store::{ExportedLayerState, RecurrentStateStore};
-pub use types::{DeltaNetDims, LayerKind};
+pub use types::{DeltaNetDims, LayerKind, ZGate};

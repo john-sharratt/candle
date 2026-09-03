@@ -313,7 +313,9 @@ impl Qwen35Config {
     }
 }
 
-fn value_to_usize(v: &Value, key: &str) -> Result<usize> {
+// `pub(crate)`: the `qwen4exp` sibling parses its own metadata namespace with
+// the same GGUF value coercions — one copy of the integer-widening rules.
+pub(crate) fn value_to_usize(v: &Value, key: &str) -> Result<usize> {
     let n: i64 = match v {
         Value::U8(n) => *n as i64,
         Value::I8(n) => *n as i64,
@@ -332,7 +334,7 @@ fn value_to_usize(v: &Value, key: &str) -> Result<usize> {
     Ok(n as usize)
 }
 
-fn value_to_f32(v: &Value) -> Result<f32> {
+pub(crate) fn value_to_f32(v: &Value) -> Result<f32> {
     match v {
         Value::F32(f) => Ok(*f),
         Value::F64(f) => Ok(*f as f32),

@@ -49,6 +49,7 @@ use super::wave::delta_net_mix_wave;
 use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::{RecurrentStateStore, StashSlot};
+use crate::models::profile::pipeline_record_duration;
 use crate::models::verify_wave::VerifyPlan;
 use candle_nn::kv_cache::ModelGeometry;
 
@@ -497,10 +498,17 @@ impl ManagedBatchedModel for HybridBatched {
                     }
                 }
             }
-            match stash.as_ref() {
+            // The KV truncate above walks every layer's chunk list; the replay
+            // below advances the recurrence over the kept tokens alone. They
+            // scale with different things — the cache's depth against the draft
+            // budget — so they are timed apart.
+            let t_replay = std::time::Instant::now();
+            let r = match stash.as_ref() {
                 Some(st) => self.replay_recurrent(st, &jobs),
                 None => Ok(()),
-            }
+            };
+            pipeline_record_duration("rewind:replay", t_replay.elapsed(), 1);
+            r
         })();
         if let Some(st) = stash {
             self.put_verify_stash(st)?;
@@ -844,18 +852,14 @@ fn sweep_layers(
     // state does not move before the layer loop reads it, so building here
     // matches the order the wave driver used when it built these.
     #[cfg(feature = "cuda")]
-    let (_pm_guard, decode_headers) = if n_decode > 0 {
-        let (pm_guard, buf, stride) =
-            session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
-        (pm_guard, DecodeHeaders::Decode { buf, stride })
+    let decode_headers = if n_decode > 0 {
+        let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
+        DecodeHeaders::Decode { buf, stride }
     } else {
-        (
-            None,
-            DecodeHeaders::Decode {
-                buf: None,
-                stride: 0,
-            },
-        )
+        DecodeHeaders::Decode {
+            buf: None,
+            stride: 0,
+        }
     };
     #[cfg(not(feature = "cuda"))]
     let decode_headers = DecodeHeaders::Decode {
@@ -1119,6 +1123,9 @@ fn sweep_layers(
                         params: &dec_params,
                         rows: n_decode,
                         decode_layout: true,
+                        // Dense attention: the block-sparse selection belongs
+                        // to Qwen3.8-Flash-Next's indexer, not this lineage.
+                        qsa: None,
                     });
                 }
                 if n_prefill > 0 {
@@ -1128,6 +1135,7 @@ fn sweep_layers(
                         params: &pre_params,
                         rows: pre_rows,
                         decode_layout: false,
+                        qsa: None,
                     });
                 }
                 let layer = Qwen35AttentionLayer {

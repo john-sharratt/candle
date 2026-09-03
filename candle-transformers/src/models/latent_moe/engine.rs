@@ -769,7 +769,7 @@ impl KernelSession<'_> {
             b.set_len(self.seq, resident);
         }
         let generation = self.kv.begin_stager_generation();
-        let (_pm, headers, stride) = self.kv.build_decode_metadata(&[self.seq], &generation)?;
+        let (headers, stride) = self.kv.build_decode_metadata(&[self.seq], &generation)?;
         let headers = headers.ok_or_else(|| candle::Error::msg("no decode metadata"))?;
         let base = headers.dev_ptr();
 

@@ -292,7 +292,10 @@ impl DsparkStreamingMoe {
                 &self.cuda_dev,
             )?
             .to_dtype(candle::DType::F32)?;
-            let ys = Tensor::zeros((t_tok, dim), candle::DType::F32, &self.device)?;
+            // The scatter defines every element of the target — one block per
+            // token, the column loop striding the whole row — so it is allocated
+            // uninitialised (hot-path invariant 6).
+            let ys = Tensor::empty((t_tok, dim), candle::DType::F32, &self.device)?;
             fused_deterministic_scatter(
                 &ys,
                 &down_out,

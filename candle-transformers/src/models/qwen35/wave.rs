@@ -25,7 +25,7 @@ use candle_nn::kv_cache::{begin_wave, LayerPhase};
 use super::quantized_weights::{QuantLayer, QuantLayerMix, QuantModel};
 use crate::models::delta_net::{
     quantized_delta_net_layer_forward_spans, DeltaNetLayerTable, DeltaNetSeq, KvLayerMap,
-    RecurrentStateStore, SeqSpan, StashSlot,
+    RecurrentStateStore, SeqSpan, StashSlot, ZGate,
 };
 use crate::models::rotary_layout::RotaryLayout;
 use crate::models::tensor_cat::TensorCat;
@@ -138,8 +138,15 @@ pub fn delta_net_mix_wave(
             stash: *slot,
         });
     }
-    let mixed =
-        quantized_delta_net_layer_forward_spans(&normed, w, dims, &mut seqs, rms_eps, table)?;
+    let mixed = quantized_delta_net_layer_forward_spans(
+        &normed,
+        w,
+        dims,
+        &mut seqs,
+        rms_eps,
+        table,
+        ZGate::Silu,
+    )?;
     drop(seqs);
     let mixed = mixed.reshape(xt.shape())?;
     x.add_mut(&mixed)?;
@@ -307,6 +314,7 @@ mod tests {
                 &model.cfg.delta_net,
                 solo.layer_state_mut(li)?,
                 eps,
+                ZGate::Silu,
             )?;
             wants.push(rows.add(&y)?);
         }

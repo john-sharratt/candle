@@ -45,10 +45,22 @@ pub fn expert_host_refs(content: &Content, cfg: &Qwen35Config) -> Result<Vec<Vec
     let moe = cfg
         .moe
         .ok_or_else(|| candle::Error::Msg("expert_host_refs: model declares no experts".into()))?;
-    let n_expert = moe.n_experts;
+    expert_host_refs_for(content, moe.n_experts, cfg.num_layers + cfg.num_mtp_layers)
+}
+
+/// [`expert_host_refs`] with the geometry passed directly — the frozen
+/// `ffn_{gate,up,down}_exps` schema is shared by every model in the qwen3/3.5
+/// lineage AND qwen4exp (`docs/qwen38_flash_next.md` §12.2 pins it as
+/// "exactly as qwen35moe"), so the scan is written once and each model hands
+/// over its own expert count and layer range.
+pub fn expert_host_refs_for(
+    content: &Content,
+    n_expert: usize,
+    n_layers_total: usize,
+) -> Result<Vec<Vec<MmapExpertRef>>> {
     let mut all = Vec::new();
 
-    for li in 0..cfg.num_layers + cfg.num_mtp_layers {
+    for li in 0..n_layers_total {
         let p = format!("blk.{li}");
         let names = [
             format!("{p}.ffn_gate_exps.weight"),
@@ -134,19 +146,46 @@ pub fn build_expert_cache(
     int8mode: candle::quantized::Int8Mode,
     expert_pack_dir: Option<&std::path::Path>,
 ) -> Result<Option<Arc<ExpertCache>>> {
+    let Some(moe) = cfg.moe else {
+        return Ok(None);
+    };
+    build_expert_cache_for(
+        content,
+        moe.n_experts,
+        cfg.num_layers + cfg.num_mtp_layers,
+        device,
+        gguf_path,
+        mmap,
+        int8mode,
+        expert_pack_dir,
+    )
+}
+
+/// [`build_expert_cache`] with the geometry passed directly — see
+/// [`expert_host_refs_for`] for why the scan is model-agnostic. Everything
+/// below the tensor names (the span measurement, the elastic boundary, the
+/// zone floor, the ground broker) was already the engine's.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_expert_cache_for(
+    content: &Content,
+    n_expert: usize,
+    n_layers_total: usize,
+    device: &Device,
+    gguf_path: &std::path::Path,
+    mmap: Arc<memmap2::Mmap>,
+    int8mode: candle::quantized::Int8Mode,
+    expert_pack_dir: Option<&std::path::Path>,
+) -> Result<Option<Arc<ExpertCache>>> {
     use crate::models::expert_lre::{layer_geometries, slot_bytes_for};
     use candle_nn::kv_cache::{
         initial_weight_bytes, set_weight_floor, span_end, weight_capacity_bytes, WeightZone,
     };
 
-    let Some(moe) = cfg.moe else {
-        return Ok(None);
-    };
-    let host_refs = expert_host_refs(content, cfg)?;
+    let host_refs = expert_host_refs_for(content, n_expert, n_layers_total)?;
     if host_refs.is_empty() {
         return Ok(None);
     }
-    let n_expert = moe.n_experts;
     let total_experts = host_refs.len() * n_expert;
 
     let Device::Cuda(cuda_dev) = device else {

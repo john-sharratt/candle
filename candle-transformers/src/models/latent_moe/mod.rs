@@ -33,8 +33,11 @@ pub mod bench;
 mod comp_idx;
 mod compressor;
 mod config;
+/// Staging a descriptor table where the device can read it. Public because
+/// `models::stacked_proj` scatters with it too — the machinery is generic, and
+/// only its first caller happened to live here.
 #[cfg(feature = "cuda")]
-mod desc;
+pub mod desc;
 mod dspark;
 mod dspark_experts;
 #[cfg(feature = "cuda")]
@@ -52,8 +55,11 @@ mod moe;
 mod paged;
 pub mod readback;
 mod rope;
+/// The batched ragged row scatter. Public for the same reason as [`desc`]: it
+/// is a generic descriptor-table copy, and the projection split in
+/// `models::stacked_proj` is its second caller.
 #[cfg(feature = "cuda")]
-mod scatter;
+pub mod scatter;
 #[cfg(feature = "cuda")]
 pub mod select_bench;
 mod streaming;

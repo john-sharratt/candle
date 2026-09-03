@@ -3886,7 +3886,7 @@ mod tests {
         session.set_sequence_offset(seq, case.n_win)?;
 
         let generation = session.begin_stager_generation();
-        let (_pm, headers, _stride) = session.build_decode_metadata(&[seq], &generation)?;
+        let (headers, _stride) = session.build_decode_metadata(&[seq], &generation)?;
         let headers = headers.expect("decode metadata headers");
 
         let qf: Vec<f32> = inp.q.iter().flat_map(|h| h.iter().copied()).collect();
@@ -4058,7 +4058,7 @@ mod tests {
             } else {
                 &[]
             };
-            let (_pm, headers, _stride) = session.build_decode_metadata_at(
+            let (headers, _stride) = session.build_decode_metadata_at(
                 0..session.num_layers(),
                 &[seq],
                 &generation,

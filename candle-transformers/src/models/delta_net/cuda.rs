@@ -845,15 +845,17 @@ pub fn delta_net_prefill_scan(
 }
 
 /// The mixer epilogue over the whole wave in one launch: per `(token, V head)`
-/// row, `out = (o / sqrt(mean(o²) + eps)) ⊙ gain ⊙ SiLU(z)` — the per-head
+/// row, `out = (o / sqrt(mean(o²) + eps)) ⊙ gain ⊙ zgate(z)` — the per-head
 /// RMS norm and the z-gate that were ~6 ops and three full-width
-/// intermediates.
+/// intermediates. The gate is a kernel template instantiation selected by
+/// `zgate` (SiLU for the Qwen3.5 lineage, sigmoid for qwen4exp).
 pub fn delta_net_norm_gate<'w>(
     o: &LiveTensor<'w>,
     z: &LiveTensor<'w>,
     gain: &Tensor,
     d: usize,
     eps: f32,
+    zgate: super::ZGate,
 ) -> Result<LiveTensor<'w>> {
     let (t, cols) = o.dims2()?;
     if z.dims2()? != (t, cols) {
@@ -889,6 +891,7 @@ pub fn delta_net_norm_gate<'w>(
                 rows as i32,
                 d as i32,
                 eps,
+                matches!(zgate, super::ZGate::Sigmoid) as i32,
                 stream.cu_stream() as *mut core::ffi::c_void,
             );
         }
@@ -1833,7 +1836,7 @@ mod tests {
             delta_net_prefill_scan(&fused, &whole).unwrap();
         });
         let g_us = time("norm_gate", &mut || {
-            let _ = delta_net_norm_gate(&o, &z, &gain, d, 1e-6).unwrap();
+            let _ = delta_net_norm_gate(&o, &z, &gain, d, 1e-6, super::super::ZGate::Silu).unwrap();
         });
         eprintln!(
             "  {:<26} {:9.1} µs/layer (T={t} prefill)",
@@ -1876,7 +1879,9 @@ mod tests {
     }
 
     /// The fused epilogue against the op forms it replaced: per-head RMS norm
-    /// with the gain, gated by SiLU(z).
+    /// with the gain, gated by the z-gate — BOTH instantiations (SiLU for the
+    /// Qwen3.5 lineage, sigmoid for qwen4exp), because a kernel reused at a
+    /// new configuration extends its harness to cover it (§0.4 rule 4).
     #[test]
     fn norm_gate_matches_the_op_epilogue() {
         let Ok(gpu) = Device::new_cuda(0) else {
@@ -1900,18 +1905,24 @@ mod tests {
             .unwrap()
             .broadcast_mul(&gain)
             .unwrap();
-        let silu_z = z3
-            .broadcast_mul(&candle_nn::ops::sigmoid(&z3).unwrap())
-            .unwrap();
-        let want = normed.mul(&silu_z).unwrap().reshape((t, h_v * d)).unwrap();
-
         let to = |x: &Tensor| x.to_device(&gpu).unwrap().contiguous().unwrap();
-        let got = delta_net_norm_gate(&to(&o), &to(&z), &to(&gain), d, eps as f32)
-            .unwrap()
-            .to_device(&cpu)
-            .unwrap();
 
-        let diff = max_diff(&got, &want);
-        assert!(diff <= 2e-5, "epilogue diverged from the op forms: {diff}");
+        for zgate in [super::super::ZGate::Silu, super::super::ZGate::Sigmoid] {
+            let sig_z = candle_nn::ops::sigmoid(&z3).unwrap();
+            let gate = match zgate {
+                super::super::ZGate::Silu => z3.broadcast_mul(&sig_z).unwrap(),
+                super::super::ZGate::Sigmoid => sig_z,
+            };
+            let want = normed.mul(&gate).unwrap().reshape((t, h_v * d)).unwrap();
+            let got = delta_net_norm_gate(&to(&o), &to(&z), &to(&gain), d, eps as f32, zgate)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap();
+            let diff = max_diff(&got, &want);
+            assert!(
+                diff <= 2e-5,
+                "epilogue diverged from the op forms under {zgate:?}: {diff}"
+            );
+        }
     }
 }

@@ -105,11 +105,26 @@ impl GgufModel {
         self.contents[i].tensor(&mut self.files[i], name, device)
     }
 
+    /// Byte location of a tensor's data: `(split index, absolute file offset,
+    /// info)`. The `qwen4exp` oracle reads expert slabs and PLE rows straight
+    /// from these locations instead of materialising whole tensors.
+    pub fn raw_location(&self, name: &str) -> Option<(usize, u64, &TensorInfo)> {
+        let &i = self.tensor_split.get(name)?;
+        let info = self.contents[i].tensor_infos.get(name)?;
+        Some((i, self.contents[i].tensor_data_offset + info.offset, info))
+    }
+
+    /// Positioned exact read from a split's file. Takes `&self` — positioned
+    /// reads carry their own offset, so runtime readers (per-forward expert
+    /// and PLE-row gathers) need no mutable handle and no seek state.
+    pub fn read_at(&self, split: usize, offset: u64, buf: &mut [u8]) -> Result<()> {
+        read_exact_at(&self.files[split], buf, offset)
+    }
+
     /// Read an integer tensor (e.g. the I32 hash-routing `tid2eid`) directly from its
     /// source split as a `U32` [`Tensor`]. The generic GGUF tensor loader has no path for
     /// raw integer dtypes, so we read the bytes and reinterpret.
     pub fn read_int_tensor_u32(&mut self, name: &str, device: &Device) -> Result<Tensor> {
-        use std::io::{Read, Seek, SeekFrom};
         let &i = self
             .tensor_split
             .get(name)
@@ -123,18 +138,24 @@ impl GgufModel {
         let type_size = info.ggml_dtype.type_size(); // 4 for I32
         let off = self.contents[i].tensor_data_offset + info.offset;
         let mut buf = vec![0u8; elems * type_size];
-        self.files[i].seek(SeekFrom::Start(off))?;
-        self.files[i].read_exact(&mut buf)?;
+        // Positioned, like every other read here. A seek-then-read would be the
+        // one place in this loader that depends on the file's cursor, and the
+        // positioned reads move that cursor as a side effect on Windows — so the
+        // two styles cannot share a handle safely, and the cursor is simply not
+        // relied upon anywhere.
+        read_exact_at(&self.files[i], &mut buf, off)?;
         let vals: Vec<u32> = match type_size {
             4 => buf
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c) as u32)
                 .collect(),
             8 => buf
-                .chunks_exact(8)
-                .map(|c| {
-                    i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as u32
-                })
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c) as u32)
                 .collect(),
             other => candle::bail!("read_int_tensor_u32: unexpected type size {other}"),
         };
@@ -151,6 +172,51 @@ impl GgufModel {
     pub fn paths(&self) -> &[PathBuf] {
         &self.paths
     }
+}
+
+/// `read_exact` at an absolute offset, taking `&File` so readers need no
+/// exclusive access.
+///
+/// **The read is positioned; the cursor is not promised untouched.** On Unix
+/// `read_at` leaves the cursor alone, but Windows `seek_read` documents that it
+/// *does* update the file pointer — and Windows is a primary platform here, so
+/// the stronger claim would be false exactly where it is most relied upon. What
+/// holds on both is that each call reads from the offset it was given regardless
+/// of where the cursor happens to be, which is the property callers actually
+/// need.
+///
+/// The consequence is a rule rather than a caveat: **nothing in this loader may
+/// read through the cursor.** A `seek` + `read_exact` pair sharing a handle with
+/// these calls would be racing a pointer they move behind its back, and the
+/// failure would be a short or misplaced read under concurrency — silent, and
+/// dependent on timing. `read_int_tensor_u32` was that pair and is now
+/// positioned like the rest.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut at = offset;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], at)?;
+            if n == 0 {
+                candle::bail!("read_exact_at: eof at offset {at}");
+            }
+            done += n;
+            at += n as u64;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)?;
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (file, buf, offset);
+        candle::bail!("read_exact_at: unsupported platform");
+    }
+    Ok(())
 }
 
 /// Dequantize a tensor to an F32 `Tensor` (used for norms, sinks, ape, and the

@@ -48,10 +48,19 @@ use crate::quantized_nn::RmsNorm;
 
 /// A full-attention layer's production weights.
 pub struct QuantAttentionWeights {
-    /// `[2·head_dim·n_head, hidden]` — interleaved `[q|gate]` per head.
-    pub wq: QMatMul,
-    pub wk: QMatMul,
-    pub wv: QMatMul,
+    /// The `q`, `k` and `v` projections in that order — `q` itself interleaves
+    /// `[q|gate]` per head, so its rows are `2·head_dim·n_head` against
+    /// `head_dim·n_kv` for each of the others.
+    ///
+    /// One weight when the loader could row-concatenate them, three when it
+    /// could not — see `QuantDeltaNetWeights::proj` for why that is the
+    /// loader's decision and not a fallback.
+    pub wqkv: Vec<QMatMul>,
+    /// Rows of `q`, and of each of `k`/`v` — the widths
+    /// [`crate::models::stacked_proj::split_group`] splits on, since a stacked
+    /// weight's shape no longer distinguishes the three.
+    pub q_rows: usize,
+    pub kv_rows: usize,
     pub wo: QMatMul,
     /// Per-head Q/K norms, folded into the projection by `project_qkv`.
     pub q_norm: RmsNorm,
@@ -138,11 +147,21 @@ pub(crate) fn load_layer<R: Read + Seek>(
     let p = format!("blk.{li}");
     let mix = match cfg.layer_kinds[li] {
         LayerKind::Attention => QuantLayerMix::Attention(g.attention(&p, cfg.rms_norm_eps)?),
+        // **Four weights, not one stacked one, and that is this lineage's
+        // constraint rather than an oversight.** `streaming_twin` narrows
+        // `attn_qkv` to `Q4_KO` in the interior and leaves the other three
+        // alone; a stacked weight takes exactly one target, and a narrowed
+        // weight is a KO twin whose lane-major rows cannot be row-appended
+        // afterwards. The schedule and the stacking are mutually exclusive
+        // here, and the schedule wins — it is what fits this model on a card
+        // that cannot hold it.
         LayerKind::DeltaNet => QuantLayerMix::DeltaNet(QuantDeltaNetWeights {
-            wqkv: g.proj(&format!("{p}.attn_qkv.weight"))?,
-            wz: g.proj(&format!("{p}.attn_gate.weight"))?,
-            w_beta: g.proj(&format!("{p}.ssm_beta.weight"))?,
-            w_alpha: g.proj(&format!("{p}.ssm_alpha.weight"))?,
+            proj: vec![
+                g.proj(&format!("{p}.attn_qkv.weight"))?,
+                g.proj(&format!("{p}.attn_gate.weight"))?,
+                g.proj(&format!("{p}.ssm_beta.weight"))?,
+                g.proj(&format!("{p}.ssm_alpha.weight"))?,
+            ],
             w_out: g.proj(&format!("{p}.ssm_out.weight"))?,
             dt_bias: g.f32(&format!("{p}.ssm_dt.bias"))?,
             a: g.f32(&format!("{p}.ssm_a"))?,
@@ -607,8 +626,13 @@ impl QuantLayer {
             post_attn_norm: self.post_attn_norm.clone(),
             mix: match &self.mix {
                 QuantLayerMix::DeltaNet(d) => ResidueMix::DeltaNet(DeltaNetResidue {
-                    w_beta: d.w_beta.clone(),
-                    w_alpha: d.w_alpha.clone(),
+                    // Entries 2 and 3 of the group — this loader never stacks,
+                    // so they are the `β`/`α` projections themselves. They stay
+                    // resident because they are sub-tile (48 rows does not
+                    // clear `nrows % 32`), which is also why they could not join
+                    // a stacked weight even if the schedule allowed it.
+                    w_beta: d.proj[2].clone(),
+                    w_alpha: d.proj[3].clone(),
                     dt_bias: d.dt_bias.clone(),
                     a: d.a.clone(),
                     conv: d.conv.clone(),
@@ -637,12 +661,16 @@ impl QuantLayer {
             ),
         };
         match (role, &self.mix) {
-            (LayerTensor::Wqkv, QuantLayerMix::DeltaNet(d)) => Ok(&d.wqkv),
-            (LayerTensor::Wz, QuantLayerMix::DeltaNet(d)) => Ok(&d.wz),
+            // `proj` and `wqkv` are groups, and this lineage's loader never
+            // stacks them (its narrowing schedule forbids it), so each entry is
+            // one streamable role — in the canonical order the loader pushes,
+            // `[qkv, z, β, α]` and `[q, k, v]`.
+            (LayerTensor::Wqkv, QuantLayerMix::DeltaNet(d)) => Ok(&d.proj[0]),
+            (LayerTensor::Wz, QuantLayerMix::DeltaNet(d)) => Ok(&d.proj[1]),
             (LayerTensor::WOut, QuantLayerMix::DeltaNet(d)) => Ok(&d.w_out),
-            (LayerTensor::Wq, QuantLayerMix::Attention(a)) => Ok(&a.wq),
-            (LayerTensor::Wk, QuantLayerMix::Attention(a)) => Ok(&a.wk),
-            (LayerTensor::Wv, QuantLayerMix::Attention(a)) => Ok(&a.wv),
+            (LayerTensor::Wq, QuantLayerMix::Attention(a)) => Ok(&a.wqkv[0]),
+            (LayerTensor::Wk, QuantLayerMix::Attention(a)) => Ok(&a.wqkv[1]),
+            (LayerTensor::Wv, QuantLayerMix::Attention(a)) => Ok(&a.wqkv[2]),
             (LayerTensor::Wo, QuantLayerMix::Attention(a)) => Ok(&a.wo),
             (LayerTensor::FfnGateUp, _) => ffn.fused_gate_up().ok_or_else(|| {
                 candle::Error::Msg(
@@ -886,10 +914,22 @@ impl<R: Read + Seek> Loader<'_, R> {
     /// `p`. Shared by the trunk's attention layers and the MTP draft head,
     /// which carries exactly the same tensor set.
     fn attention(&mut self, p: &str, eps: f64) -> Result<QuantAttentionWeights> {
+        // Three weights, for the same reason the DeltaNet loader keeps four:
+        // `streaming_twin` narrows `attn_q` alone.
+        let wq = self.proj(&format!("{p}.attn_q.weight"))?;
+        let wk = self.proj(&format!("{p}.attn_k.weight"))?;
+        let rows = |w: &QMatMul, what: &str| -> Result<usize> {
+            match w.weight_dims().as_slice() {
+                [rows, _] => Ok(*rows),
+                other => candle::bail!("{what} is rank {}, expected 2", other.len()),
+            }
+        };
+        let q_rows = rows(&wq, "attn_q")?;
+        let kv_rows = rows(&wk, "attn_k")?;
         Ok(QuantAttentionWeights {
-            wq: self.proj(&format!("{p}.attn_q.weight"))?,
-            wk: self.proj(&format!("{p}.attn_k.weight"))?,
-            wv: self.proj(&format!("{p}.attn_v.weight"))?,
+            wqkv: vec![wq, wk, self.proj(&format!("{p}.attn_v.weight"))?],
+            q_rows,
+            kv_rows,
             wo: self.proj(&format!("{p}.attn_output.weight"))?,
             q_norm: self.norm(&format!("{p}.attn_q_norm.weight"), eps)?,
             k_norm: self.norm(&format!("{p}.attn_k_norm.weight"), eps)?,
