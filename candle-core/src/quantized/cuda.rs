@@ -6641,8 +6641,11 @@ pub fn moe_route<'w>(
     if k > n_experts {
         crate::bail!("moe_route: k={k} exceeds n_experts={n_experts}");
     }
-    if n_experts > 256 {
-        crate::bail!("moe_route: n_experts={n_experts} exceeds 256 (warp slot bound)");
+    if n_experts > 512 {
+        crate::bail!(
+            "moe_route: n_experts={n_experts} exceeds 512 (the widest slot \
+             instantiation — 16 experts per lane)"
+        );
     }
     let device = match logits.device() {
         crate::Device::Cuda(d) => d.clone(),
@@ -6778,7 +6781,11 @@ pub fn fused_moe_gather_q8a128<'w>(
 /// where `token_starts[t]` is the start index in the token-major arrays for token t.
 /// Variable k per token is supported via these offsets.
 ///
-/// `ys` is ACCUMULATED into (+=); initialize to zero before the first call.
+/// `ys` is **DEFINED**, not accumulated into: one block per token with the
+/// column loop striding the whole row, so every element is stored exactly once.
+/// Allocate it uninitialised (hot-path invariant 6) — a memset would write the
+/// exact bytes this kernel is about to stamp. A caller that may skip this launch
+/// (nothing routed) owes its target a zero of its own.
 pub fn fused_deterministic_scatter(
     ys: &LiveTensor<'_>,
     down_out: &LiveTensor<'_>,

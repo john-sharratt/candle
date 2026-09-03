@@ -1041,8 +1041,9 @@ impl GgmlDType {
     ///
     /// ⚠ MUST be the exact inverse of `from_gguf_file_code` above — the output
     /// is the integer written to disk in GGUF tensor metadata, NOT the
-    /// `#[repr(u32)]` discriminant of this enum.
-    pub(crate) fn to_gguf_file_code(self) -> u32 {
+    /// `#[repr(u32)]` discriminant of this enum. `pub` for the same streaming
+    /// GGUF composers as [`gguf_file::Value::write`].
+    pub fn to_gguf_file_code(self) -> u32 {
         match self {
             Self::F32 => 0,
             Self::F16 => 1,
@@ -2357,6 +2358,29 @@ impl<'w> LiveQTensor<'w> {
         let dtype = qtensors[0].dtype();
         let device = qtensors[0].device();
         let (mut total_n, k) = qtensors[0].shape.dims2()?;
+
+        // **The one failure this function cannot survive quietly.** Everything
+        // below is a byte append, which is the stacked weight exactly when a
+        // row is a contiguous run of blocks — true of every GGUF block format,
+        // where `k` is a multiple of the block size so no block spans two rows.
+        //
+        // It is false of the KO twins. Those are lane-major GPU chunks whose
+        // bytes are already permuted into the layout the int8 tensor-core
+        // matmul reads (`QCudaStorage::repack_ko`), so rows are interleaved
+        // across lanes and appending two of them yields a weight of exactly the
+        // right byte count holding nonsense — which surfaces as bad numbers many
+        // layers downstream, never as a fault here. Refused by name rather than
+        // guessed at, because the caller's fix is to move the stack earlier
+        // (onto the GGUF layout, before `QMatMul::from_qtensor_with_mode`
+        // repacks) rather than to give up on it.
+        if dtype.is_ko() {
+            crate::bail!(
+                "concat_rows_cuda: {dtype:?} is a KO twin — its bytes are lane-major, already \
+                 repacked for the int8 matmul, so its rows are interleaved and a byte append \
+                 would build a correctly-sized weight holding nonsense. Stack on the GGUF block \
+                 layout instead, BEFORE the repack"
+            )
+        }
 
         for (i, t) in qtensors.iter().enumerate() {
             if t.rank() != 2 {

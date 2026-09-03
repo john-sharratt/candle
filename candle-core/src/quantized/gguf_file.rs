@@ -356,7 +356,11 @@ impl Value {
         Ok(v)
     }
 
-    pub(crate) fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
+    /// Serialize this value in the GGUF on-disk encoding. `pub` because
+    /// streaming GGUF composers outside this crate (the qwen4exp W4A16
+    /// importer) re-emit a source file's metadata block verbatim without
+    /// materialising every tensor the [`write`] entry point would demand.
+    pub fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
         match self {
             &Self::U8(v) => w.write_u8(v)?,
             &Self::I8(v) => w.write_i8(v)?,
@@ -416,7 +420,9 @@ impl ValueType {
         Ok(v)
     }
 
-    pub(crate) fn to_u32(self) -> u32 {
+    /// The GGUF on-disk type code. `pub` for the same streaming composers as
+    /// [`Value::write`].
+    pub fn to_u32(self) -> u32 {
         match self {
             Self::U8 => 0,
             Self::I8 => 1,

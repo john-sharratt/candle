@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 // (`src/simple/quantized_dispatcher.cu` — the seal-time quantize/select
 // kernels — compiles in its own group under the bit-exact mirror contract
 // flags; see the `quantize_dispatch` group below.)
-const SIMPLE_KERNELS: [&str; 52] = [
+const SIMPLE_KERNELS: [&str; 57] = [
     "src/api.cu", // FFI wrapper functions for all simple kernels
     "src/simple/nvtx.cu",
     "src/simple/tensor_assert.cu",
@@ -38,6 +38,11 @@ const SIMPLE_KERNELS: [&str; 52] = [
     "src/simple/fletcher32.cu",
     "src/simple/moe_bucketize.cu",
     "src/simple/sinkhorn.cu",
+    "src/simple/w4a16_repack.cu",
+    "src/simple/ple_gather_dequant.cu",
+    "src/simple/qsa_topk.cu",
+    "src/simple/qsa_index_append.cu",
+    "src/simple/gr_hyper.cu",
     "src/simple/hyper_mhc.cu",
     "src/simple/compressor_pool.cu",
     "src/simple/indexer_score.cu",
@@ -363,15 +368,31 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
     //     .5 rounding boundaries (measured: one-code quant flips). These
     //     kernels run at seal time, not on the decode hot path, so the
     //     precise-math cost is irrelevant.
+    //
+    //     **`--use_fast_math` is REMOVED, not overridden.** It is an umbrella
+    //     that sets `-prec-div=false -prec-sqrt=false -fmad=true --ftz=true`,
+    //     and appending the opposites after it leaves the result up to how
+    //     nvcc resolves a flag against an umbrella that already implied it —
+    //     which is not a guarantee to build a bit-exactness contract on. It was
+    //     not holding: `ko_repack_scratch_is_a_bounded_band` measured 16,709 of
+    //     35,651,584 twin bytes diverging from the CPU codec over the same
+    //     dequantized source — 11,488 in the `dm` plane (a 1-ULP `scale`, so
+    //     the f16 rounds the other way) and 5,221 in `ql` (that scale moving a
+    //     `roundf` across a .5 boundary, one nibble each). Dropping the
+    //     umbrella and stating the four settings outright leaves nothing to
+    //     resolve. `--ftz=false` is named for the same reason: the CPU codec
+    //     does not flush denormals, so neither may this.
     {
         let quantize_dispatch_args: Vec<String> = simple_args
             .iter()
+            .filter(|a| a.as_str() != "--use_fast_math")
             .cloned()
             .chain(
                 [
                     "-fmad=false".to_string(),
                     "-prec-div=true".to_string(),
                     "-prec-sqrt=true".to_string(),
+                    "--ftz=false".to_string(),
                 ]
                 .into_iter(),
             )

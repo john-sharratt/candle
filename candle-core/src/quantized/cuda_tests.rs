@@ -4032,10 +4032,54 @@ fn ko_repack_scratch_is_a_bounded_band() -> Result<()> {
         got.len(),
         want.len()
     );
-    assert_eq!(
-        got, want,
-        "the host-mapped intermediate changed the repack's output bytes"
-    );
+    // Locate the first differing byte rather than `assert_eq!`-ing the vectors.
+    // A 34 MiB byte-vector comparison that fails prints both operands in full,
+    // which is tens of millions of numbers and answers nothing; what identifies
+    // the fault is *which chunk* diverged — the band it fell in, and whether the
+    // divergence starts at a band boundary.
+    let chunk_bytes = crate::quantized::ko_quant::ko_chunk_bytes(GgmlDType::Q4_KO);
+    let row_groups = nrows / 8;
+    let k_blocks = ncols / 128;
+    if let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) {
+        let chunk = i / chunk_bytes;
+        let (k_blk, g) = (chunk / row_groups, chunk % row_groups);
+        let diffs = (0..got.len()).filter(|&i| got[i] != want[i]).count();
+        let bad_chunks: std::collections::BTreeSet<usize> = (0..got.len())
+            .filter(|&i| got[i] != want[i])
+            .map(|i| i / chunk_bytes)
+            .collect();
+        let bad_groups: std::collections::BTreeSet<usize> =
+            bad_chunks.iter().map(|c| c % row_groups).collect();
+        // Which plane: a divergence confined to `dm` is the (scale, min) pair,
+        // i.e. float rounding in the observer; one in `ql` is the codes, i.e. a
+        // layout or permutation fault. They have nothing to do with each other,
+        // and the byte offset is the only thing that separates them.
+        let in_dm = (0..got.len())
+            .filter(|&i| got[i] != want[i])
+            .filter(|&i| i % chunk_bytes >= 512)
+            .count();
+        let max_delta = (0..got.len())
+            .filter(|&i| got[i] != want[i])
+            .map(|i| got[i].abs_diff(want[i]))
+            .max()
+            .unwrap_or(0);
+        panic!(
+            "the banded repack changed the twin's bytes: {diffs} of {} differ, in {} of {} \
+             chunks; {in_dm} of them in the dm (scale,min) plane and {} in ql (codes). \
+             Largest byte delta {max_delta}.\nfirst at byte {i} (chunk {chunk} = k_blk \
+             {k_blk}, row-group {g}, offset {} in chunk): got {} want {}\nrow-groups \
+             touched: {:?}{}",
+            got.len(),
+            bad_chunks.len(),
+            k_blocks * row_groups,
+            diffs - in_dm,
+            i % chunk_bytes,
+            got[i],
+            want[i],
+            bad_groups.iter().take(16).collect::<Vec<_>>(),
+            if bad_groups.len() > 16 { " …" } else { "" },
+        );
+    }
     Ok(())
 }
 
@@ -5211,7 +5255,12 @@ fn q4_ko_matches_q4_k_int8() -> Result<()> {
         "compact Q4_K weight must be a whole number of 80-byte blocks"
     );
     let mut ko_bytes = k_bytes.clone();
-    for (kb, ob) in k_bytes.chunks_exact(80).zip(ko_bytes.chunks_exact_mut(80)) {
+    for (kb, ob) in k_bytes
+        .as_chunks::<80>()
+        .0
+        .iter()
+        .zip(ko_bytes.as_chunks_mut::<80>().0.iter_mut())
+    {
         // Each sub's 4 qs ints interleaved [I0,I2,I1,I3] (swap I1/I2). K qs bases per
         // sub are {0,24,40,64}; scales group at the tail (64-79).
         for (s, &kb0) in [0usize, 24, 40, 64].iter().enumerate() {
@@ -8235,9 +8284,12 @@ fn cuda_moe_route_matches_reference() -> Result<()> {
         dt: crate::DType,
         norm: bool,
     ) -> Result<()> {
-        // (e*131 + t*17) mod 251 is injective over e<251, so every row has distinct experts.
-        // Scale by 0.5 (a power of two) to keep the values exactly representable in bf16/f16.
-        let logit = |t: usize, e: usize| -> f32 { (((e * 131 + t * 17) % 251) as f32) * 0.5 };
+        // A tie-free injective hash per row: mod 251 covers e<251, mod 521 (prime
+        // > 512) covers the wide-slot instantiation. Scale by 0.5 (a power of
+        // two); the 521-modulus values reach 260 and are exact only in f32, so
+        // the 512-expert rung runs F32-only below.
+        let m = if n_experts > 251 { 521 } else { 251 };
+        let logit = move |t: usize, e: usize| -> f32 { (((e * 131 + t * 17) % m) as f32) * 0.5 };
         let data: Vec<f32> = (0..num_tokens * n_experts)
             .map(|i| logit(i / n_experts, i % n_experts))
             .collect();
@@ -8284,6 +8336,14 @@ fn cuda_moe_route_matches_reference() -> Result<()> {
             check(&device, 5, 128, 2, dt, norm)?; // small k
             check(&device, 3, 64, 4, dt, norm)?; // non-128 expert count
         }
+    }
+    // The 16-slot instantiation (n_experts > 256): qwen4exp's 512 × top-10,
+    // plus the boundary just past the narrow kernel. F32-only — see the logit
+    // representability note above.
+    for &norm in &[true, false] {
+        check(&device, 1, 512, 10, crate::DType::F32, norm)?;
+        check(&device, 7, 512, 10, crate::DType::F32, norm)?;
+        check(&device, 3, 257, 4, crate::DType::F32, norm)?;
     }
     Ok(())
 }
@@ -9124,6 +9184,14 @@ fn bench_moe_bucketize() -> Result<()> {
         (4096, 8, 128, "prefill-4096"),
         (8192, 8, 128, "prefill-8192"),
         (4096, 8, 256, "prefill-4096-e256"),
+        // Qwen3.8-Flash-Next: 512 experts, top-10. §0.4 rule 2 — the width the
+        // bound was raised for AND the width it was raised from, so a
+        // regression for the existing callers cannot hide.
+        (16, 10, 512, "decode-16-e512"),
+        (713, 10, 512, "prefill-713-e512"),
+        (2048, 10, 512, "prefill-2048-e512"),
+        (4096, 10, 512, "prefill-4096-e512"),
+        (4096, 10, 256, "prefill-4096-e256-k10"),
     ];
 
     println!("\n=== moe_bucketize micro-bench (tile_w={tile_w}, iters={iters}) ===");
@@ -9347,6 +9415,39 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
     // k = 1 and tile_w = 16 shape edges.
     assert_bucketize_case(&device, vec![2, 0, 2, 1, 2], 5, 1, 4, 16, "k1-tile16")?;
 
+    // 512 experts — MORE experts than the kernel has threads, so every
+    // per-expert phase must stride rather than assume one thread per expert.
+    // The upper half is what a one-thread-per-expert form would have silently
+    // dropped, so these cases put weight there: an expert at the very top, and
+    // the sentinel at exactly `n_experts`.
+    assert_bucketize_case(
+        &device,
+        vec![511, 256, 0, 511, 300, 511, 1, 480, 511, 257],
+        1,
+        10,
+        512,
+        32,
+        "e512-top-half",
+    )?;
+    assert_bucketize_case(
+        &device,
+        vec![511u32; 64 * 10],
+        64,
+        10,
+        512,
+        32,
+        "e512-one-expert",
+    )?;
+    assert_bucketize_case(
+        &device,
+        vec![512, 300, 512, 511, 0, 999, 512, 256, 7, 512],
+        1,
+        10,
+        512,
+        32,
+        "e512-sentinels",
+    )?;
+
     // Seeded fuzz across prefill-like shapes, with a sprinkle of sentinels.
     let mut rng = StdRng::seed_from_u64(0xb0cc_e71e);
     for &(n_tokens, k, n_experts, tile_w) in &[
@@ -9358,6 +9459,13 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
         (7, 3, 16, 32),
         (129, 8, 128, 16),
         (17, 8, 128, 1),
+        // Qwen3.8-Flash-Next's own width and top-k, across decode and prefill
+        // shapes; 257 sits one past the old bound.
+        (16, 10, 512, 32),
+        (713, 10, 512, 32),
+        (2048, 10, 512, 32),
+        (64, 10, 257, 32),
+        (33, 10, 512, 16),
     ] {
         let ids: Vec<u32> = (0..n_tokens * k)
             .map(|_| {
@@ -9595,5 +9703,105 @@ fn mxfp4_int8_matmul_matches_float_baseline() -> Result<()> {
         rel_per32 < 0.03,
         "exact per-32 int8 rel_l2 {rel_per32:.5} unexpectedly high"
     );
+    Ok(())
+}
+
+/// The deterministic MoE scatter **defines** its target; it does not accumulate
+/// into it.
+///
+/// This is the contract that lets every caller allocate the combine target with
+/// `Tensor::empty` (hot-path invariant 6) instead of paying a memset over the
+/// layer's largest transient — and, on the kernel side, lets it skip a full read
+/// of that target to add a value that is always zero.
+///
+/// **The target is filled with poison, not zeros.** That is the whole test. A
+/// kernel that seeds its reduction from `ys` — which this one did, back when the
+/// callers ran it twice per layer for hits and then misses — passes any test
+/// that pre-zeroes the target, and silently adds garbage to every expert output
+/// the day a caller stops zeroing. Poison makes the two behaviours differ by the
+/// poison value, and the assertion below is exact: the scatter's arithmetic is
+/// one `w · v` product per contribution, and the expected value is computed the
+/// same way in the same order, so there is nothing here to tolerance.
+#[test]
+fn cuda_deterministic_scatter_defines_its_target_rather_than_accumulating() -> Result<()> {
+    use crate::cuda_backend::Backing;
+    use crate::quantized::cuda::fused_deterministic_scatter;
+    use crate::{DType, Device, Tensor};
+
+    let dev = CudaDevice::new(0)?;
+    let device = Device::Cuda(dev.clone());
+
+    // Three tokens with deliberately UNEQUAL contribution counts (2, 3, 0), so
+    // the test covers the variable-k prefix-sum path and, in token 2, the row
+    // that no contribution writes — the case where "defines its target" and
+    // "accumulates into a zeroed target" agree only if the kernel stores an
+    // explicit zero rather than leaving the row alone.
+    const HIDDEN: usize = 5;
+    const NUM_TOKENS: usize = 3;
+    let token_starts: Vec<i32> = vec![0, 2, 5, 5];
+    // token-major row order; each entry names a row of `down_out` and a weight.
+    let perm: Vec<u32> = vec![0, 1, 2, 3, 4];
+    let rw_ids: Vec<u32> = vec![0, 1, 2, 3, 4];
+    let weights: Vec<f32> = vec![0.5, 0.25, 2.0, -1.0, 0.125];
+
+    let down_rows = perm.len();
+    let down: Vec<f32> = (0..down_rows * HIDDEN).map(|i| (i as f32) + 1.0).collect();
+
+    // What the kernel must produce, from the same products in the same order.
+    let mut want = [0f32; NUM_TOKENS * HIDDEN];
+    for t in 0..NUM_TOKENS {
+        for col in 0..HIDDEN {
+            let mut sum = 0f32;
+            for idx in token_starts[t] as usize..token_starts[t + 1] as usize {
+                sum += weights[rw_ids[idx] as usize] * down[perm[idx] as usize * HIDDEN + col];
+            }
+            want[t * HIDDEN + col] = sum;
+        }
+    }
+
+    let down_out = Tensor::from_vec(down, (down_rows, HIDDEN), &device)?;
+    let weights_flat = Tensor::from_vec(weights.clone(), (weights.len(),), &device)?;
+    let perm_dev = dev.memcpy_stod_from(&perm, Backing::Owned)?;
+    let rw_dev = dev.memcpy_stod_from(&rw_ids, Backing::Owned)?;
+    let ts_dev = dev.memcpy_stod_from(&token_starts, Backing::Owned)?;
+
+    // Poison. Any nonzero pattern works; this one is large enough that a stale
+    // read could not be mistaken for rounding and negative on alternating
+    // elements so a sign error shows too.
+    let poison: Vec<f32> = (0..NUM_TOKENS * HIDDEN)
+        .map(|i| if i % 2 == 0 { 1.0e6 } else { -7.5e5 })
+        .collect();
+
+    for dtype in [DType::F32, DType::BF16] {
+        let ys =
+            Tensor::from_vec(poison.clone(), (NUM_TOKENS, HIDDEN), &device)?.to_dtype(dtype)?;
+        fused_deterministic_scatter(
+            &ys,
+            &down_out,
+            &perm_dev,
+            &weights_flat,
+            &rw_dev,
+            &ts_dev,
+            NUM_TOKENS,
+            &dev,
+        )?;
+        let got = ys.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            // BF16 storage rounds the store; F32 must be exact.
+            let ok = if dtype == DType::F32 {
+                g == w
+            } else {
+                (g - w).abs() <= 1e-2 * w.abs().max(1.0)
+            };
+            assert!(
+                ok,
+                "{dtype:?} element {i} (token {}, col {}): got {g}, want {w} — a nonzero gap of \
+                 roughly the poison value means the kernel seeded its reduction from `ys`, and \
+                 every caller allocating the target with `Tensor::empty` is now returning garbage",
+                i / HIDDEN,
+                i % HIDDEN,
+            );
+        }
+    }
     Ok(())
 }
