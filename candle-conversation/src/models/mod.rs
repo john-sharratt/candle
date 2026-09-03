@@ -86,6 +86,22 @@ pub enum ModelArch {
     /// K/V, which is why it declares
     /// `ManagedBatchedModel::carries_recurrent_state`.
     Qwen35Hybrid,
+    /// `qwen4exp::Qwen4ExpBatched` — Qwen3.8-Flash-Next: a 3:1 gated-DeltaNet ⁄
+    /// sparse-attention hybrid over a 4-stream gated residual, 512 experts on
+    /// every layer, an n-gram hash embedding injected at layer 1, and QSA block
+    /// selection on the 12 full-attention layers.
+    ///
+    /// Carries **four** per-sequence states, the most of any arch here: the
+    /// DeltaNet recurrence, the PLE convolution tail, the QSA index cache, and
+    /// the paged K/V. The first three all live outside the K/V, so this
+    /// declares `carries_recurrent_state` for the same reason
+    /// [`Self::Qwen35Hybrid`] does.
+    ///
+    /// Loaded from a **locally prepared** merged GGUF whose experts are
+    /// `Q4_KO` (a bit-exact import of the vendor's W4A16 release, not a
+    /// requant — `qwen4exp/convert.rs`), the same posture as
+    /// [`Self::DeepSeekV4`]'s offline KO artifact.
+    Qwen4Exp,
 }
 
 impl ModelArch {
@@ -116,7 +132,9 @@ impl ModelArch {
     /// invalidate that calibration without re-deriving it.
     pub fn native_activation_dtype(self) -> Option<DType> {
         match self {
-            Self::Qwen35Hybrid => Some(DType::BF16),
+            // Qwen3.8-Flash-Next declares `"dtype": "bfloat16"` like the rest
+            // of the hybrid lineage, and its gate ladder runs BF16.
+            Self::Qwen35Hybrid | Self::Qwen4Exp => Some(DType::BF16),
             Self::Qwen3 | Self::Qwen3Moe | Self::Qwen2 | Self::Llama | Self::DeepSeekV4 => None,
         }
     }
@@ -377,6 +395,7 @@ impl std::fmt::Display for ModelArch {
             ModelArch::Qwen2 => write!(f, "Qwen2"),
             ModelArch::Llama => write!(f, "Llama"),
             ModelArch::DeepSeekV4 => write!(f, "DeepSeekV4"),
+            ModelArch::Qwen4Exp => write!(f, "Qwen4Exp"),
             ModelArch::Qwen35Hybrid => write!(f, "Qwen35Hybrid"),
         }
     }

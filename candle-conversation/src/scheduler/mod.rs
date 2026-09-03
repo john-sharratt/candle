@@ -6893,7 +6893,7 @@ impl Scheduler {
             return Ok(());
         }
         let drained: Vec<PendingSectionQuantize> =
-            self.pending_section_quantize.drain(..).collect();
+            std::mem::take(&mut self.pending_section_quantize);
         self.quantize_section_batch(conversation, drained, boundary_policy, member_policy, false)
     }
 
@@ -9130,7 +9130,7 @@ mod tests {
     }
 
     use candle_transformers::models::batched_inference::{
-        BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
+        BatchedConfig, BatchedInferenceSession, KvLayers, ManagedBatchedModel,
     };
     use std::str::FromStr;
 
@@ -9493,8 +9493,8 @@ mod tests {
                         l.state.len()
                     );
                 }
-                for (slot, chunk) in row.iter_mut().zip(l.state.chunks_exact(4)) {
-                    *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                for (slot, chunk) in row.iter_mut().zip(l.state.as_chunks::<4>().0) {
+                    *slot = f32::from_le_bytes(*chunk);
                 }
             }
             self.probe.set(seq, state);
@@ -9519,7 +9519,7 @@ mod tests {
     /// Minimal CPU-backed session: 1 layer, 1 KV head, head_dim=16.
     fn make_test_session() -> BatchedInferenceSession {
         BatchedInferenceSession::new(
-            1,  // num_layers
+            KvLayers::stream_only(1),
             1,  // n_kv_head
             16, // head_dim
             &candle::Device::Cpu,

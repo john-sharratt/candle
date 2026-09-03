@@ -1679,8 +1679,10 @@ fn describe_recurrent_state(model: &(dyn ManagedBatchedModel + Send), seq: Seque
 
     let non_finite = |bytes: &[u8]| -> usize {
         bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .filter(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+            .as_chunks::<{ std::mem::size_of::<f32>() }>()
+            .0
+            .iter()
+            .filter(|c| !f32::from_le_bytes(**c).is_finite())
             .count()
     };
     let mut bad_layers = 0usize;

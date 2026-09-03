@@ -497,8 +497,10 @@ fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, &'stati
             return true;
         }
         bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .any(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+            .as_chunks::<{ std::mem::size_of::<f32>() }>()
+            .0
+            .iter()
+            .any(|c| !f32::from_le_bytes(*c).is_finite())
     }
     layers.iter().find_map(|l| {
         if bad(&l.state) {

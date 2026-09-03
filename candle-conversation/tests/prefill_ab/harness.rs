@@ -510,6 +510,7 @@ pub fn run_prefill(case: &mut BuiltCase) -> Result<Tensor> {
         false,
         &generation,
         &std::cell::RefCell::new(None),
+        None,
     )?;
     for (si, seq) in case.spec.seqs.iter().enumerate() {
         let off = offsets[si];

@@ -778,6 +778,23 @@ impl ModelBuilder {
                     BatchedEngine::new(engine).map_err(ConversationError::Model)?,
                 ))
             }
+            ModelArch::Qwen4Exp => {
+                use candle::quantized::Int8Mode;
+                use candle_transformers::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+                // Per-layer progress not yet wired for this arch.
+                let _ = progress;
+                // KV is allocated per ATTENTION layer (12 of 48) and the window
+                // budget is config-derived, exactly as the hybrid's is.
+                let _ = max_seq;
+                // `model_path` is the merged KO artifact, not the vendor's
+                // split: the engine takes one mmap and one `Content`, and the
+                // expert pack is sized from a live span measurement at load.
+                let gpu = Qwen4ExpGpu::load(model_path, device, Int8Mode::auto(device))
+                    .map_err(ConversationError::Model)?;
+                Ok(Box::new(
+                    Qwen4ExpBatched::new(gpu).map_err(ConversationError::Model)?,
+                ))
+            }
             ModelArch::Qwen35Hybrid => {
                 use candle_transformers::models::quantized_qwen36_moe;
                 use candle_transformers::models::qwen35::Qwen35LoadOptions;
