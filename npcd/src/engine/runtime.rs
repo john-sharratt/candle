@@ -298,8 +298,23 @@ fn load(
     // fewer tokens. This daemon is the other case: the ingest queues a windowful
     // of documents at a time, and a cast of characters ticking queues many
     // small prefills at once. Both reliably keep a wide forward fed.
+    // The co-resident models, if this deployment configured any. Read before the
+    // engine is built and **before the long checkpoint load**, so a wrong path
+    // is a refusal at second zero rather than a five-minute load followed by
+    // one. A daemon with no `guests.yaml` gets an empty registry, which costs
+    // one atomic load per scheduler pass and nothing else.
+    let guests = crate::guests::load(&rt.data).map_err(|e| anyhow::anyhow!("guests.yaml: {e}"))?;
+    if !guests.is_empty() {
+        tracing::info!(
+            "co-resident guests configured: {:?} — normal inference stops between waves to \
+             serve them",
+            guests.configured()
+        );
+    }
+
     let mut builder = model::model()
         .builder()
+        .guests(guests)
         .prefill_pass_tokens(PREFILL_PASS_TOKENS)
         // **The engine's redo log goes under `--data`, with everything else this
         // daemon writes.**
@@ -368,6 +383,26 @@ fn load(
     p.set_progress(done as u64, total as u64);
     tracing::info!("substrate: {done} of {total} turns restored");
 
+    // **The engine goes on the runtime here, not at the end of startup.**
+    //
+    // It used to be published only after every layer had been ingested and
+    // every character woken, so on a real mind — twenty minutes of ingest —
+    // every engine-backed route answered 503 for the whole of it. That is
+    // exactly the window in which somebody watching a slow start wants to ask
+    // the daemon something: what the guests are, how the ingest is going,
+    // whether the model is the one they expected.
+    //
+    // Safe because nothing downstream holds the lock for longer than one call
+    // (see [`SharedEngine`]) — the ingest takes it to create a window's
+    // conversations and gives it straight back, so a guest submission never
+    // waits behind a layer. The routes that need the *cast* still report an
+    // empty one until the wake phase, which is true rather than a refusal.
+    let engine: SharedEngine = Arc::new(Mutex::new(engine));
+    *rt.minds.write().unwrap() = Some(Arc::new(Minds::new(
+        Arc::clone(&engine),
+        conv_config.clone(),
+    )));
+
     // ── tool calibration ───────────────────────────────────────────────────
     //
     // Before the layers, deliberately. Every layer frames on the shared system
@@ -435,14 +470,15 @@ fn load(
                         projection.as_ref(),
                         source,
                         &turns,
+                        &rt.ledger,
                         p,
                     )?;
                     report.written -= failed;
                     report.failed += failed;
                 }
-                // After each layer, not each document: a crash mid-layer
-                // re-ingests that layer, which costs one layer rather than the
-                // whole mind, and saves four hundred writes for nothing.
+                // A final flush at the layer boundary. The windows inside
+                // `ingest_layer` have been flushing as they seal — see the note
+                // there — so this only catches a layer that ingested nothing.
                 rt.ledger.flush();
                 tracing::info!(
                     "layer {}: {} written, {} unchanged, {} failed ({})",
@@ -518,10 +554,8 @@ fn load(
     }
     tracing::info!("cast: {} character(s) awake", rt.scheduler.population());
 
-    *rt.minds.write().unwrap() = Some(Arc::new(Minds::new(
-        Arc::new(Mutex::new(engine)),
-        conv_config,
-    )));
+    // The engine was published at the substrate step — see there. What changes
+    // here is only that the load is over.
     p.mark_ready();
     tracing::info!("engine ready in {:?}", rt.uptime());
 
@@ -604,12 +638,28 @@ fn persist_signatures(
 /// this replaced. The sequences are dropped after sealing: the turns are in the
 /// substrate by then and the gather reaches them across conversations, so
 /// holding the sequence would only hold its K/V.
+/// **The engine, shared rather than borrowed, and locked per call.**
+///
+/// The ingest used to hold a `&ConversationEngine` for the whole of startup,
+/// and the shared handle was only published once every layer had been ingested
+/// and every character woken. So for the twenty minutes a real mind takes to
+/// load, every engine-backed route answered 503 — including the guest routes,
+/// which is exactly when somebody wants to look at the daemon.
+///
+/// Taking the lock *per engine call* rather than for the phase is the whole of
+/// what makes that safe: a submission needs the lock only long enough to push a
+/// job onto a queue, so it is never waiting behind a layer.
+type SharedEngine = Arc<Mutex<ConversationEngine>>;
+
 fn ingest_layer(
-    engine: &ConversationEngine,
+    engine: &SharedEngine,
     base_config: &SequenceConfig,
     proj: Option<&schema::Projection>,
     source: &ingest::LayerSource,
-    turns: &[(String, String)],
+    turns: &[ingest::Pending],
+    // Each document's hash is recorded **as its turn seals**, so a document that never
+    // reached the substrate is not claimed to be in it. See `ingest::Pending`.
+    ledger: &Ledger,
     p: &LoadProgress,
 ) -> anyhow::Result<usize> {
     let mut cfg = base_config.clone();
@@ -649,18 +699,26 @@ fn ingest_layer(
 
         // One round trip for the whole window. Creating them one at a time is
         // what starved zend's own batch to 2–4 wide before it was pipelined.
-        let convs = engine.new_conversations_with_projection_batch(
-            slice.len(),
-            &prompt,
-            builder,
-            layer_id,
-            group_id,
-            &cfg,
-        );
+        //
+        // The lock is taken for this call and released before the window is
+        // submitted — see [`SharedEngine`]. Holding it across the window would
+        // put every other caller, guest submissions included, behind a layer.
+        let convs = engine
+            .lock()
+            .unwrap()
+            .new_conversations_with_projection_batch(
+                slice.len(),
+                &prompt,
+                builder,
+                layer_id,
+                group_id,
+                &cfg,
+            );
 
         // Submit every turn first, await none. This is the step that batches.
         let mut inflight = Vec::with_capacity(slice.len());
-        for ((addr, body), conv) in slice.iter().zip(convs) {
+        for (doc, conv) in slice.iter().zip(convs) {
+            let (addr, body) = (&doc.addr, &doc.body);
             let mut conv = match conv {
                 Ok(c) => c,
                 Err(e) => {
@@ -679,7 +737,7 @@ fn ingest_layer(
                 SelectionState::new(),
                 tags.clone(),
             ) {
-                Ok(handle) => inflight.push((conv.timeline_id(), conv, handle, addr)),
+                Ok(handle) => inflight.push((conv.timeline_id(), conv, handle, doc)),
                 Err(e) => {
                     tracing::warn!("{addr}: not submitted — {e:?}");
                     failed += 1;
@@ -691,7 +749,8 @@ fn ingest_layer(
         // Now drain. Each seal is what puts the turn in the substrate; the
         // sequence is dropped immediately after, freeing its K/V.
         let mut sealed: Vec<_> = Vec::with_capacity(inflight.len());
-        for (timeline, mut conv, handle, addr) in inflight {
+        for (timeline, mut conv, handle, doc) in inflight {
+            let addr = &doc.addr;
             // Where the prefill forward is actually awaited. For a co-batched
             // window the first drain absorbs the slab and the rest return
             // quickly — measured as roughly four documents per slab, which is
@@ -706,7 +765,25 @@ fn ingest_layer(
             match response {
                 Some(r) => match conv.finish_turn(handle, &r) {
                     Ok(_) => {
+                        // **The tokens this document actually cost the GPU.**
+                        //
+                        // Documents are the wrong unit for watching an ingest:
+                        // they differ by an order of magnitude in length, so a
+                        // count of them says nothing about the rate. Tokens per
+                        // second is the number that compares directly against
+                        // the forward-batched gate's prefill rate on the same
+                        // card — which is how "this is taking a while" becomes
+                        // "this is running at a tenth of what the card can do".
+                        //
+                        // Counted at the seal, so it only ever includes work
+                        // that reached the substrate.
+                        p.add_prefill_tokens(r.stats.prefill_token_count as u64);
                         persist_signatures(&mut conv, &r, &mut events, addr);
+                        // **The seal is what earns the ledger entry.** Recorded here, at the
+                        // one point the document is provably a turn in the substrate, so a
+                        // failure on any path above leaves it un-recorded and therefore
+                        // retried on the next boot.
+                        ledger.reconcile(&doc.path, Some(&doc.body));
                         sealed.push(timeline);
                     }
                     Err(e) => {
@@ -719,6 +796,27 @@ fn ingest_layer(
             done += 1;
             ingest::announce(p, source, done, turns.len());
         }
+
+        // **The ledger is written at the window boundary, not the layer's.**
+        //
+        // It used to flush once per layer, on the reasoning that a crash
+        // mid-layer "costs one layer rather than the whole mind". That holds for
+        // a mind of many small layers and fails completely for a real one: this
+        // estate's `world/` layer is 1,267 of its 1,823 documents, so one layer
+        // *is* the whole mind, and a daemon stopped anywhere inside it wrote no
+        // ledger at all.
+        //
+        // The cost of that is not a repeated ingest — it is a **duplicated**
+        // one. A document with no ledger entry reads as `Added` rather than
+        // `Changed`, so nothing tombstones the turn the interrupted run already
+        // sealed, and the next boot writes a second copy that the gather can
+        // surface alongside the first. Two runs of 641 documents left 84 GB of
+        // world history with no way to tell the copies apart.
+        //
+        // A window is ~4 documents, so this is a few hundred small writes across
+        // a half-hour load, and the most an interruption can cost is the window
+        // in flight.
+        ledger.flush();
 
         // Give the arena back before the next window.
         //
@@ -734,7 +832,7 @@ fn ingest_layer(
         // This drains completely between windows, so there is no later sweep and
         // a not-yet-warm timeline would simply not be reclaimed.
         if !sealed.is_empty() {
-            if let Err(e) = engine.demote_timelines_hot(&sealed, true) {
+            if let Err(e) = engine.lock().unwrap().demote_timelines_hot(&sealed, true) {
                 tracing::warn!("hot→warm demote failed: {e} — the arena will fill");
             }
         }
@@ -792,7 +890,7 @@ pub struct Lived {
 /// orphaned-belief shape this whole design exists to end.
 #[allow(clippy::too_many_arguments)]
 fn run_life(
-    engine: &ConversationEngine,
+    engine: &SharedEngine,
     base_config: &SequenceConfig,
     proj: Option<&schema::Projection>,
     who: &str,
@@ -809,9 +907,12 @@ fn run_life(
             tracing::warn!("life {who}: {} unreadable", ep.path.display());
             continue;
         };
-        // The ledger covers episodes too, so a restart re-lives nothing.
+        // The ledger covers episodes too, so a restart re-lives nothing. `inspect` asks the
+        // question; the answer is recorded at the seal below, so an episode that errors on the
+        // way there is re-lived next boot instead of being silently lost with every belief,
+        // relationship and intention it would have formed.
         if !matches!(
-            ledger.reconcile(&ep.path, Some(&raw)),
+            ledger.inspect(&ep.path, Some(&raw)),
             crate::engine::watcher::Reconcile::Added | crate::engine::watcher::Reconcile::Changed
         ) {
             lived.episodes += 1;
@@ -832,7 +933,7 @@ fn run_life(
         // signature, which is the whole point of running the life against the
         // world rather than beside it.
         let mut conv = match proj {
-            Some(pr) => engine.new_conversation_with_projection(
+            Some(pr) => engine.lock().unwrap().new_conversation_with_projection(
                 &pr.prelude,
                 pr.builder.clone(),
                 pr.layer,
@@ -840,6 +941,8 @@ fn run_life(
                 cfg.clone(),
             )?,
             None => engine
+                .lock()
+                .unwrap()
                 .new_conversation(&format!("An episode from the life of {who}."), cfg.clone())?,
         };
         let address = life::address(ep);
@@ -856,7 +959,18 @@ fn run_life(
         // persisting it writes the link from this moment to the world content it
         // happened against.
         let (response, mut events) = drain(&handle, &address);
-        let Some(r) = response else { continue };
+        // A silent `continue` here left the episode un-lived *and* un-retryable: the hash was
+        // already banked above, so the next boot skipped it. Now the hash is written at the
+        // seal, so this path simply leaves it unrecorded — but it still has to say so and
+        // still has to advance the bar, which stalled for that character otherwise.
+        let Some(r) = response else {
+            tracing::warn!(
+                "life {who}: {address} produced no response — not lived, and left unrecorded \
+                 so the next boot retries it"
+            );
+            p.set_progress(i as u64 + 1, episodes.len() as u64);
+            continue;
+        };
         conv.finish_turn(handle, &r)?;
         persist_signatures(&mut conv, &r, &mut events, &address);
         // Date and title as conversation metadata, so the substrate knows when
@@ -867,10 +981,18 @@ fn run_life(
             ("life.date", ep.date.as_str()),
             ("life.title", ep.title.as_str()),
         ] {
-            if let Err(e) = engine.set_conversation_metadata(timeline, key, value) {
+            if let Err(e) = engine
+                .lock()
+                .unwrap()
+                .set_conversation_metadata(timeline, key, value)
+            {
                 tracing::debug!("life {who}: metadata {key} not set — {e:?}");
             }
         }
+        // **The episode is in the substrate; record it.** Everything above this line can fail
+        // and leave the hash unwritten, which is what makes the next boot retry rather than
+        // skip. See `ingest::Pending`.
+        ledger.reconcile(&ep.path, Some(&raw));
         lived.episodes += 1;
 
         // Now the consequences, on their own records, after the episode they
@@ -895,7 +1017,11 @@ fn run_life(
         }
 
         // Give the arena back — the same reason the layer ingest does.
-        if let Err(e) = engine.demote_timelines_hot(&[timeline], true) {
+        if let Err(e) = engine
+            .lock()
+            .unwrap()
+            .demote_timelines_hot(&[timeline], true)
+        {
             tracing::debug!("life {who}: demote failed — {e}");
         }
         p.set_progress(i as u64 + 1, episodes.len() as u64);
@@ -911,7 +1037,7 @@ fn run_life(
 /// it names the episode that produced it — arguable. A belief you can trace to a
 /// day is one you can disagree with; a belief simply asserted is not.
 fn write_consequence(
-    engine: &ConversationEngine,
+    engine: &SharedEngine,
     cfg: &SequenceConfig,
     proj: Option<&schema::Projection>,
     who: &str,
@@ -938,14 +1064,14 @@ fn write_consequence(
     );
 
     let mut conv = match proj {
-        Some(pr) => engine.new_conversation_with_projection(
+        Some(pr) => engine.lock().unwrap().new_conversation_with_projection(
             &pr.prelude,
             pr.builder.clone(),
             pr.layer,
             pr.group,
             cfg.clone(),
         )?,
-        None => engine.new_conversation(
+        None => engine.lock().unwrap().new_conversation(
             &format!("What {who}'s life left them holding."),
             cfg.clone(),
         )?,
@@ -971,9 +1097,12 @@ fn write_consequence(
     // formed. That is what makes a later contradiction reachable from the belief
     // it contradicts.
     persist_signatures(&mut conv, &r, &mut events, &address);
-    let _ = engine.set_conversation_metadata(timeline, "from.date", &ep.date);
-    let _ = engine.set_conversation_metadata(timeline, "from.title", &ep.title);
-    let _ = engine.demote_timelines_hot(&[timeline], true);
+    {
+        let e = engine.lock().unwrap();
+        let _ = e.set_conversation_metadata(timeline, "from.date", &ep.date);
+        let _ = e.set_conversation_metadata(timeline, "from.title", &ep.title);
+        let _ = e.demote_timelines_hot(&[timeline], true);
+    }
     Ok(())
 }
 

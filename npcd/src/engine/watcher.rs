@@ -16,7 +16,13 @@
 //!   as a fresh turn. Not overwritten: the substrate is an append-only redo log,
 //!   and the previous version stays reachable. A tombstone retires a turn from
 //!   selection; it does not delete it.
-//! - **Deleted** — the turn is tombstoned with nothing to replace it.
+//! - **Deleted** — reported by the reload, and **not yet retired from the
+//!   substrate**. The watcher sees the file go and the report counts it; the
+//!   ingest side has no path that tombstones the turn it wrote, so a deleted
+//!   document's content stays selectable by the gather. Stated here rather than
+//!   implied by an unused affordance: the method that listed a ledger's
+//!   no-longer-present files had no caller, which made the gap read as an
+//!   oversight in the wiring instead of as work that has not been done.
 //!
 //! # Why hashing, and why per file
 //!
@@ -62,6 +68,22 @@ pub const MAX_DEBOUNCE_HOLD: Duration = Duration::from_secs(5);
 #[derive(Debug, Default)]
 pub struct Ledger {
     hashes: Mutex<HashMap<PathBuf, String>>,
+    /// What the filesystem watcher has already reported, which is a different
+    /// fact from what has been ingested and therefore a different map.
+    ///
+    /// `hashes` means *this document is a turn in the substrate* and is written
+    /// only by the ingest seal. `seen` means *the watcher has already announced
+    /// this content* and is written only by [`reload`]. Sharing one map made
+    /// each corrupt the other: a watcher event during the multi-minute startup
+    /// load hashed the whole mind tree before `ingest::pending` reached it, so
+    /// every document then read `Unchanged`, nothing was written, and `flush`
+    /// persisted that across restarts — the mind never ingesting again on any
+    /// boot until the files were edited.
+    ///
+    /// Not persisted: a run's first reload should describe the tree as it finds
+    /// it, and a `seen` carried across restarts would suppress the report of a
+    /// file edited while the daemon was down.
+    seen: Mutex<HashMap<PathBuf, String>>,
     /// Where to persist. `None` keeps the ledger in memory — the shape the
     /// tests use, and the honest state for a daemon with no data directory.
     path: Option<PathBuf>,
@@ -117,6 +139,7 @@ impl Ledger {
         }
         Self {
             hashes: Mutex::new(hashes),
+            seen: Mutex::new(HashMap::new()),
             path: Some(path),
         }
     }
@@ -149,7 +172,72 @@ impl Ledger {
         }
     }
 
-    /// Decide what a file needs, and record the decision.
+    /// The verdict [`Self::reconcile`] would give, **without recording it**.
+    ///
+    /// The ledger's entry is a claim that a document is a turn in the substrate, so writing one
+    /// is only ever correct next to the write that puts it there. Anything that merely wants to
+    /// *know* what a document still owes — planning a layer's turns, a console listing, a dry
+    /// run — asks this instead, and the seal calls [`Self::reconcile`] afterwards.
+    ///
+    /// Splitting the two is not tidiness. `ingest::pending` used `reconcile`, so merely asking
+    /// what a layer owed recorded every document as already ingested: a document whose turn
+    /// then failed was skipped on every later boot, unrecoverable without editing the file.
+    pub fn inspect(&self, path: &Path, content: Option<&str>) -> Reconcile {
+        let h = self.hashes.lock().unwrap();
+        match content {
+            None => {
+                if h.contains_key(path) {
+                    Reconcile::Removed
+                } else {
+                    Reconcile::Unchanged
+                }
+            }
+            Some(text) => {
+                let digest = hash(text);
+                match h.get(path) {
+                    None => Reconcile::Added,
+                    Some(prev) if *prev == digest => Reconcile::Unchanged,
+                    Some(_) => Reconcile::Changed,
+                }
+            }
+        }
+    }
+
+    /// What moved since the watcher last looked, recorded against [`Self::seen`].
+    ///
+    /// The reload report's counterpart to `reconcile`: same arithmetic, different map, and it
+    /// never touches the ingest claim. That is what lets an editor event land during the
+    /// startup load without convincing the ledger that the tree is already in the substrate.
+    ///
+    /// The two maps also answer over different sets. `reload` walks the whole mind directory —
+    /// `world.yaml`, the registries, everything — while only layer documents ever become turns,
+    /// so a shared map would leave every non-document file reading `Added` forever and report
+    /// the entire tree as new on every save.
+    fn observe(&self, path: &Path, content: Option<&str>) -> Reconcile {
+        let mut s = self.seen.lock().unwrap();
+        match content {
+            None => {
+                if s.remove(path).is_some() {
+                    Reconcile::Removed
+                } else {
+                    Reconcile::Unchanged
+                }
+            }
+            Some(text) => {
+                let digest = hash(text);
+                match s.insert(path.to_path_buf(), digest.clone()) {
+                    None => Reconcile::Added,
+                    Some(prev) if prev == digest => Reconcile::Unchanged,
+                    Some(_) => Reconcile::Changed,
+                }
+            }
+        }
+    }
+
+    /// Record that a document is now a turn in the substrate.
+    ///
+    /// Only correct next to the write that puts it there — see [`Self::inspect`] for the
+    /// question that merely wants the verdict.
     pub fn reconcile(&self, path: &Path, content: Option<&str>) -> Reconcile {
         let mut h = self.hashes.lock().unwrap();
         match content {
@@ -174,10 +262,15 @@ impl Ledger {
         }
     }
 
-    /// Files the ledger knows about that are no longer on disk.
-    pub fn missing(&self, present: &[PathBuf]) -> Vec<PathBuf> {
-        let h = self.hashes.lock().unwrap();
-        h.keys().filter(|p| !present.contains(p)).cloned().collect()
+    /// Files the *watcher* has reported that are no longer on disk.
+    ///
+    /// `observe`'s counterpart, over [`Self::seen`] and for the same reason: a deletion the
+    /// reload report has already announced is not a deletion the substrate has retired, and
+    /// asking the ingest map here would report every non-document file's removal on the first
+    /// save after it went.
+    fn unseen(&self, present: &[PathBuf]) -> Vec<PathBuf> {
+        let s = self.seen.lock().unwrap();
+        s.keys().filter(|p| !present.contains(p)).cloned().collect()
     }
 }
 
@@ -283,7 +376,10 @@ pub fn reload(root: &Path, ledger: &Ledger) -> std::io::Result<ReloadReport> {
 
     for path in &files {
         let content = std::fs::read_to_string(path).ok();
-        match ledger.reconcile(path, content.as_deref()) {
+        // `observe`, not `reconcile`: this records what the watcher has *reported*, which is a
+        // different claim from what has been ingested and lives in a different map. See
+        // `Ledger::seen` for what conflating the two cost.
+        match ledger.observe(path, content.as_deref()) {
             Reconcile::Added => report.added += 1,
             Reconcile::Changed => report.changed += 1,
             Reconcile::Removed => report.removed += 1,
@@ -293,8 +389,8 @@ pub fn reload(root: &Path, ledger: &Ledger) -> std::io::Result<ReloadReport> {
 
     // Files the ledger holds that are no longer present. Walked separately
     // because the loop above only visits what exists.
-    for gone in ledger.missing(&files) {
-        if ledger.reconcile(&gone, None) == Reconcile::Removed {
+    for gone in ledger.unseen(&files) {
+        if ledger.observe(&gone, None) == Reconcile::Removed {
             report.removed += 1;
         }
     }
@@ -545,6 +641,61 @@ mod tests {
                 unchanged: 0
             }
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A reload does not claim anything was ingested.**
+    ///
+    /// The two maps answer different questions, and this is the failure that proved it. An
+    /// editor event during the multi-minute startup load ran a reload over the whole mind
+    /// tree; when `reload` recorded into the ingest map, `ingest::pending` then arrived to
+    /// find every document `Unchanged`, wrote nothing, and `flush` persisted that. The mind
+    /// never ingested again, on any boot, until the files were edited — and the loading
+    /// screen went green over a cast that knew nothing.
+    #[test]
+    fn a_reload_leaves_the_ingest_claim_alone() {
+        let root = tmp();
+        let doc = root.join("a.yaml");
+        std::fs::write(&doc, "one").unwrap();
+        let l = Ledger::new();
+
+        // The watcher gets there first, as it does during a slow startup.
+        assert_eq!(reload(&root, &l).unwrap().added, 1);
+
+        // Ingest still owes the document.
+        assert_eq!(
+            l.inspect(&doc, Some("one")),
+            Reconcile::Added,
+            "the reload marked the document ingested — nothing had ingested it"
+        );
+
+        // And once it has genuinely been sealed, it stops owing it.
+        l.reconcile(&doc, Some("one"));
+        assert_eq!(l.inspect(&doc, Some("one")), Reconcile::Unchanged);
+
+        // The reload's own record is likewise untouched by the seal: it already reported this
+        // content, so the next walk is a no-op rather than a second announcement.
+        assert!(reload(&root, &l).unwrap().is_noop());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only layer documents ever become turns, but a reload walks the whole mind — `world.yaml`,
+    /// the registries, everything. Reading those against the ingest map would leave every one of
+    /// them `Added` forever, so each save would report the entire tree as new.
+    #[test]
+    fn files_that_never_become_turns_still_settle() {
+        let root = tmp();
+        std::fs::write(root.join("world.yaml"), "name: Ardh").unwrap();
+        std::fs::write(root.join("registry.yaml"), "cast: []").unwrap();
+        let l = Ledger::new();
+
+        assert_eq!(reload(&root, &l).unwrap().added, 2);
+        let second = reload(&root, &l).unwrap();
+        assert!(
+            second.is_noop(),
+            "a file nothing ingests reported as new twice: {second:?}"
+        );
+        assert_eq!(second.unchanged, 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

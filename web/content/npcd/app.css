@@ -159,7 +159,7 @@
 .palette .opt .nm { font-family: var(--mono); font-size: .8rem; color: var(--accent); font-weight: 700; min-width: 100px; }
 .palette .opt .ds { font-size: .785rem; color: var(--ink-soft); }
 .palette .params { padding: 12px 14px; border-top: 1px solid var(--line); }
-.param { display: grid; grid-template-columns: 110px 90px 1fr auto; gap: 10px; align-items: baseline; padding: 3px 0; font-size: .775rem; }
+.param { display: grid; grid-template-columns: 110px 90px minmax(0, 1fr) auto; gap: 10px; align-items: baseline; padding: 3px 0; font-size: .775rem; }
 .param .pn { font-family: var(--mono); color: var(--ink-dim); }
 .param .pt { font-family: var(--mono); font-size: .7rem; color: var(--ink-ghost); }
 .param .pd { color: var(--ink-faint); font-size: .745rem; }
@@ -170,7 +170,7 @@
 
 /* ── data displays ───────────────────────────────────────────────────────── */
 
-.proj-row { display: grid; grid-template-columns: 118px 1fr 148px; gap: 14px; align-items: center; padding: 6px 0; font-size: .8rem; }
+.proj-row { display: grid; grid-template-columns: 118px minmax(0, 1fr) 148px; gap: 14px; align-items: center; padding: 6px 0; font-size: .8rem; }
 .proj-row .nm { font-family: var(--mono); font-size: .77rem; color: var(--ink-dim); }
 .proj-row .track { height: 16px; background: var(--bg-deep); border-radius: 4px; overflow: hidden; }
 .proj-row .track > i { display: block; height: 100%; border-radius: 4px 0 0 4px; }
@@ -458,6 +458,25 @@ table.t tr.click:hover td { background: var(--panel-2); }
 .log-row .lvl { font-weight: 700; font-size: .69rem; letter-spacing: .04em; }
 .log-row .tgt { color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .log-row .msg { color: var(--ink-dim); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* **A log line on a phone.** The four columns are 268 px of fixed track before
+ * the message starts, which is most of a 360 px screen — so the message was
+ * crushed to nothing and the row scrolled sideways. Logs are read on a phone
+ * more than anything else here (something is wrong, and you are not at a desk),
+ * so this is the one grid that has to give.
+ *
+ * The stamp and level stay on one line as a header; the target and the message
+ * go underneath at full width. Nothing is dropped — a log row that hid its
+ * target would be unreadable in a different way. */
+@media (max-width: 559px) {
+  .log-row {
+    grid-template-columns: auto auto 1fr;
+    gap: 2px 8px;
+    padding-left: 12px; padding-right: 12px;
+  }
+  .log-row .tgt { grid-column: 1 / -1; white-space: normal; overflow-wrap: anywhere; }
+  .log-row .msg { grid-column: 1 / -1; }
+}
 
 /* ── telemetry ───────────────────────────────────────────────────────────── */
 
@@ -1040,6 +1059,12 @@ canvas { width: 100%; display: block; }
 .life-rowactions { display: flex; gap: 7px; margin-top: 9px; }
 .life-prose { white-space: pre-wrap; line-height: 1.65; color: var(--ink-soft); margin: 0 0 10px; }
 
+/* A table is the one element that cannot reflow: its columns are as wide as
+ * their content demands, so on a phone it either scrolls or it pushes the page.
+ * Scrolling the table alone is the correct one — the body must never scroll
+ * sideways. `-webkit-overflow-scrolling` is for older iOS, where a nested
+ * scroller without it does not take momentum and reads as stuck. */
+.life-tables { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .life-cast, .life-outline { width: 100%; border-collapse: collapse; font-size: .82rem; margin-bottom: 18px; }
 .life-cast th { text-align: left; font-size: .68rem; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-ghost); }
 .life-cast td, .life-cast th, .life-outline td { padding: 5px 9px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -1086,5 +1111,194 @@ canvas { width: 100%; display: block; }
   .tick.is-new { animation: none; }
   .pulse-status.is-live::before { animation: none; }
   .cast-card:hover { transform: none; }
+}
+
+/* ── Images ─────────────────────────────────────────────────────────────────
+ *
+ * Controls on the left, one stage on the right. The stage is a fixed square
+ * that does not resize with the result: a frame that collapses to the empty
+ * state's height and then jumps to 512 px on every draw moves the Generate
+ * button under the pointer, and the page is used by pressing that button
+ * repeatedly. */
+/* `min-width: 0` on both tracks, and it is load-bearing rather than defensive:
+ * a grid item's default `min-width: auto` refuses to shrink below its content's
+ * minimum, so a wide result or a long unbroken caption pushes the whole page
+ * sideways instead of fitting. This is the difference between a page that
+ * reflows on a phone and one that scrolls horizontally. */
+.img-page {
+  display: grid; grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+  gap: 14px; align-items: start;
+}
+/* The control column spaces itself, so nothing depends on a margin utility
+ * being remembered at each call site. */
+.img-controls { display: grid; gap: 12px; align-content: start; min-width: 0; }
+.img-controls .lbl { display: block; font-size: .715rem; color: var(--ink-faint);
+  text-transform: uppercase; letter-spacing: .5px; margin-bottom: 5px; }
+.img-controls .textarea { width: 100%; resize: vertical; min-height: 92px; }
+/* A label belongs to the control under it, so the gap above it is the group's
+ * and the gap below it is the label's own 5px. */
+.img-controls > .lbl { margin-bottom: -7px; }
+
+/* Steps beside Seed, and stacked as soon as two will not fit. `auto-fit` rather
+ * than a flex row: flex would keep them side by side and squeeze the seed box
+ * to nothing rather than dropping it to its own line. */
+.img-pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+
+/* Generate, the hint, and the status line. Wraps, because on a narrow phone the
+ * status ("Drawn in 7.9s · seed 42") is longer than the row. */
+.img-go { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.img-go .btn { flex: 0 0 auto; }
+.img-go > :last-child { margin-left: auto; }
+
+/* The admin's checkbox at the panel's foot. Quiet on purpose: it is an
+ * operator's control, not part of the ordinary flow, and it is simply absent
+ * for everyone the daemon would refuse it to anyway. */
+.img-restricted { display: flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; }
+.img-restricted input { accent-color: var(--accent); }
+
+/* ── the reference picture ──────────────────────────────────────────────────
+ *
+ * A dashed well that is also a `<label>`, so the whole area is the file
+ * picker's hit target and the keyboard reaches it through the input inside.
+ * The input is taken out of the layout rather than `display:none`, which would
+ * take it out of the tab order with it. */
+.ref-zone {
+  display: block; position: relative; cursor: pointer;
+  border: 1px dashed var(--line-2); border-radius: var(--radius);
+  background: var(--panel-2); padding: 12px;
+  transition: border-color .12s, background .12s;
+}
+.ref-zone:hover { border-color: var(--accent); }
+/* Highlighted while a file is over it — the only feedback that says "let go
+ * here" rather than "this page will navigate away". */
+.ref-zone.over { border-color: var(--accent); background: var(--accent-soft); }
+.ref-file { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.ref-zone:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.ref-empty { display: flex; flex-direction: column; align-items: center; gap: 3px; text-align: center; padding: 10px 4px; }
+.ref-icon { font-size: 1.4rem; color: var(--accent); line-height: 1; }
+
+.ref-body { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.ref-thumb {
+  width: 72px; height: 72px; flex: 0 0 auto;
+  /* `cover`, because the daemon crops to the draw's aspect too — a thumbnail
+   * that letterboxed would promise a fit the pipeline does not make. */
+  object-fit: cover; border-radius: var(--radius); border: 1px solid var(--line);
+}
+.ref-meta { display: flex; flex-direction: column; gap: 4px; min-width: 0; align-items: flex-start; }
+.ref-name { font-weight: 600; overflow-wrap: anywhere; }
+
+/* ── the dials ──────────────────────────────────────────────────────────────
+ *
+ * A slider with its value beside its name, because a bare range input says
+ * where the handle is and not what that means. */
+.dial-row { display: flex; flex-direction: column; gap: 5px; }
+.dial-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.dial-head .lbl { margin: 0; }
+.dial-val { color: var(--accent); font-weight: 700; }
+.dial { width: 100%; accent-color: var(--accent); margin: 0; }
+.dial-hint { font-size: .78rem; }
+/* Disabled until there is a reference to hold. Dimmed rather than removed, so
+ * the control does not appear and displace the layout on a drop. */
+.dial-row.off { opacity: .45; }
+.dial-row.off .dial { cursor: not-allowed; }
+
+/* A picture with its background lifted, over a checkerboard so the
+ * transparency is visible rather than merely present. Painted with two
+ * gradients rather than an image because the CSP admits no external assets. */
+.img-frame.alpha {
+  --sq: 12px;
+  background-color: #fff;
+  background-image:
+    linear-gradient(45deg, rgba(0, 0, 0, .11) 25%, transparent 25%, transparent 75%, rgba(0, 0, 0, .11) 75%),
+    linear-gradient(45deg, rgba(0, 0, 0, .11) 25%, transparent 25%, transparent 75%, rgba(0, 0, 0, .11) 75%);
+  background-size: calc(var(--sq) * 2) calc(var(--sq) * 2);
+  background-position: 0 0, var(--sq) var(--sq);
+}
+
+.img-stage { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.img-frame {
+  display: grid; place-items: center;
+  min-height: 512px;
+  background: var(--panel-2, var(--panel));
+  border: 1px solid var(--line); border-radius: var(--radius);
+  overflow: hidden;
+}
+/* The draw's progress. A real fraction, reported by the guest per denoise step
+ * and once for the decode — not a timer pretending to know. */
+.bar-wrap { display: grid; gap: 8px; width: min(320px, 70%); }
+.bar {
+  height: 6px; border-radius: 3px; overflow: hidden;
+  background: var(--line);
+}
+.bar-fill {
+  height: 100%; width: 0; border-radius: 3px; background: var(--accent);
+  /* Eased, because eight steps at a second each would otherwise be eight jumps.
+   * Short enough that the bar still reads as arriving rather than gliding. */
+  transition: width .35s ease;
+}
+/* Loading the model has no fraction anybody could compute — what it costs
+ * depends on what has to be evicted first — so the track sweeps instead of
+ * claiming a number. */
+.bar.idle .bar-fill {
+  transition: none;
+  background: linear-gradient(90deg, var(--line) 0%, var(--accent) 50%, var(--line) 100%);
+  background-size: 200% 100%;
+  animation: bar-sweep 1.1s linear infinite;
+}
+@keyframes bar-sweep { to { background-position: -200% 0; } }
+.bar-label { text-align: center; font-size: .78rem; }
+
+/* A bar that animates is motion like any other, and a reader who asked for less
+ * of it gets the state without the sweep. */
+@media (prefers-reduced-motion: reduce) {
+  .bar-fill { transition: none; }
+  .bar.idle .bar-fill { animation: none; background: var(--line-2); }
+}
+/* The result is never upscaled past its own pixels — a 256 draw shown at 512 is
+ * a blurry claim about detail the model did not produce. */
+.img-result { max-width: 100%; max-height: 72vh; image-rendering: auto; }
+
+/* The caption under a result: three facts, then three actions. Two groups
+ * rather than seven children in one row, so a wrap breaks *between* them and
+ * never mid-caption — and both groups wrap internally, because three buttons do
+ * not fit beside three facts on a 360px phone. */
+.img-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 0 2px; }
+.img-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
+.img-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
+/* Long seeds are 19 digits and do not break — allowed to, so they cannot push
+ * the caption wider than the frame above it. */
+.img-facts .mono { overflow-wrap: anywhere; }
+
+/* No Ctrl key on a touch device, and the words are clutter in a row that has to
+ * fit a phone. `hover: none` rather than a width query: it is the input that
+ * makes the hint useless, not the size of the screen. */
+@media (hover: none) {
+  .img-hint { display: none; }
+}
+
+/* One column at the console's own narrow breakpoint, not a number invented
+ * here. `viewport.js` mirrors the same 820 onto the root, so the rail becomes a
+ * drawer and this page becomes one column at the same instant — a page that
+ * collapsed at its own width would leave a band where the shell had gone
+ * narrow and the page had not. */
+@media (max-width: 819px) {
+  .img-page { grid-template-columns: minmax(0, 1fr); }
+  /* The stage leads on a phone: after a draw the picture is what you came for,
+   * and the controls are one thumb-scroll below it. */
+  .img-stage { order: -1; }
+  .img-frame { min-height: 300px; }
+  .img-result { max-height: 60vh; }
+}
+
+/* Narrower still: the frame stops reserving height it cannot fill, and the
+ * actions go full width so three ghost buttons are three clear targets rather
+ * than a crowded line. */
+@media (max-width: 559px) {
+  .img-frame { min-height: 220px; }
+  .img-acts { margin-left: 0; width: 100%; }
+  .img-acts .btn { flex: 1 1 auto; justify-content: center; }
+  .img-go .btn.primary { flex: 1 1 100%; justify-content: center; }
+  .img-go > :last-child { margin-left: 0; }
 }
 

@@ -8,6 +8,7 @@
 
 import { API } from '../lib/api.js';
 import { h, mount } from '../lib/dom.js';
+import { pngBlob } from '../lib/img.js';
 import { can, go } from '../lib/router.js';
 import { onReveal, revealing } from '../lib/reveal.js';
 import { toast, empty } from '../lib/ui.js';
@@ -27,6 +28,10 @@ export async function render() {
     name: '', world_id: '', personality_id: '',
     description: '', description_origin: 'generated',
     portrait: null, portrait_origin: null,
+    // The file to upload, or the intent to draw. Never both — choosing either
+    // in the face step clears the other, because an upload outranks the
+    // generator permanently and a draft holding both would have to pick.
+    portrait_file: null, portrait_generate: false,
     environment_enabled: true,
   };
   let step = 1;
@@ -127,17 +132,92 @@ export async function render() {
     const markOrigin = () => { originChip.textContent = draft.description_origin; };
 
     const regen = h('button', { class: 'btn sm', onClick: gen }, '⟳ Regenerate');
+    /* The button is disabled while this runs, because a second click would queue
+     * a second job that stops the cast again for no extra answer.
+     *
+     * An ordinary wait, deliberately. The daemon does swap a second model onto
+     * the card to answer this, but the swap is ~0.3s and the whole request is a
+     * second or two, so naming the machinery would be explaining an interval
+     * nobody is left waiting through. The text arriving is what says it works.
+     *
+     * The failure is reported in the field rather than as a toast, because the
+     * field is where the author is looking and what they have to do about it
+     * (write one themselves) happens there. */
+    /* Name the character, then describe *that* person.
+     *
+     * Two calls rather than one because they are two things an author judges
+     * separately: liking the name and not the prose used to mean regenerating
+     * both and losing the name. The name is also twenty tokens, so it lands
+     * almost immediately and the form stops looking empty while the description
+     * is still being written.
+     *
+     * Both drains reuse the same resident model — the guest is loaded once and
+     * serves its whole backlog — so the second call pays no load. */
+    async function nameThenDescribe() {
+      if (!draft.world_id) return;
+      nameIn.setAttribute('disabled', '');
+      nameIn.placeholder = 'naming…';
+      try {
+        const r = await API.generateName({
+          world_id: draft.world_id,
+          personality_id: draft.personality_id,
+        });
+        draft.name = r.name;
+        nameIn.value = r.name;
+      } catch (_) {
+        // A name that could not be written is not a reason to skip the
+        // description: the field is editable and an author can type one.
+        nameIn.placeholder = 'Varek';
+      } finally {
+        nameIn.removeAttribute('disabled');
+      }
+      await gen();
+    }
+
     async function gen() {
+      // Disabled while it runs; the label stays put. The text appearing in the
+      // field is the progress indicator, and it is where the reader is looking.
       regen.setAttribute('disabled', '');
       desc.value = '';
-      desc.placeholder = 'generating…';
+      desc.placeholder = 'writing…';
       try {
-        const r = await API.generateDescription({ personality_id: draft.personality_id, world_id: draft.world_id });
+        /* Streamed into the field as it is written, at about reading speed.
+         *
+         * The textarea is scrolled to the bottom on each fragment so a
+         * description longer than the box keeps its newest words in view —
+         * without it the text grows out of sight after three lines. */
+        const r = await API.generateDescriptionStream(
+          {
+            personality_id: draft.personality_id,
+            world_id: draft.world_id,
+            // The subject, so the prose is about the person in the name field
+            // rather than a second one it invents. Empty means "invent one",
+            // which is what a cleared name field should do.
+            name: draft.name || '',
+          },
+          (ev) => {
+            if (ev.event === 'token') {
+              desc.placeholder = '';
+              desc.value += ev.text;
+              desc.scrollTop = desc.scrollHeight;
+            }
+          });
+        /* The final text replaces the preview rather than being appended to it.
+         * The daemon's fragments can end a character or two off where tokenizer
+         * cleanup revised something already sent, and `done` is authoritative. */
         draft.description = r.description;
         draft.description_origin = 'generated';
         desc.value = r.description;
         markOrigin();
-      } catch (_) { desc.placeholder = 'generation unavailable — write one yourself'; }
+      } catch (e) {
+        desc.value = '';
+        /* `no_prose_model` is a deployment fact, not a fault — this daemon has
+         * no prose guest configured. Saying which it is stops somebody
+         * debugging a model that was never there. */
+        desc.placeholder = e && e.error === 'no_prose_model'
+          ? 'no prose model is configured on this daemon — write a description yourself'
+          : 'generation unavailable — write one yourself';
+      }
       regen.removeAttribute('disabled');
     }
 
@@ -190,8 +270,13 @@ export async function render() {
           regen))
     );
 
-    if (!draft.description) gen();
-    else { desc.value = draft.description; markOrigin(); }
+    /* On opening: name first, then a description of that person. An author who
+     * has already typed either keeps both — this fills an empty form, it does
+     * not overwrite work. */
+    if (!draft.description) {
+      if (!draft.name) nameThenDescribe();
+      else gen();
+    } else { desc.value = draft.description; markOrigin(); }
 
     mount(foot,
       h('button', { class: 'btn ghost', onClick: () => go('/') }, 'Cancel'),
@@ -206,11 +291,25 @@ export async function render() {
     const progWrap = h('div', { class: 'bar', style: 'margin:10px 0 6px' }, prog);
     const label = h('div', { class: 'tiny dim' }, 'queued');
 
+    const initial = (draft.name || '?')[0] || '?';
     const art = h('div', {
       style: 'width:170px;height:170px;border-radius:12px;display:grid;place-items:center;' +
         'background:linear-gradient(145deg,var(--panel-3),var(--bg-deep));border:1px solid var(--line-2);' +
         'font-size:2.6rem;color:var(--accent)',
-    }, (draft.name || '?')[0] || '?');
+    }, initial);
+
+    /* The frame says what the frame is doing.
+     *
+     * A portrait takes ten seconds or so, and the state used to live in a line
+     * of small text above the button — far from the empty square everybody is
+     * actually watching. Put it where the result appears and there is nothing
+     * to hunt for. The child overrides the frame's 2.6rem initial-letter size. */
+    const artSays = (text) => mount(art, h('div', {
+      // `pre-line` so a newline in the message is a line break: a text node's
+      // whitespace collapses otherwise, and the two halves run together.
+      style: 'font-size:.78rem;line-height:1.45;color:var(--ink-faint);text-align:center;'
+        + 'padding:0 14px;white-space:pre-line',
+    }, text));
 
     /* There was a `fakeProgress()` here: a bar that crept to 100% on a timer
      * and then set `portrait_origin = 'generated'`, having generated nothing.
@@ -243,6 +342,9 @@ export async function render() {
     function useFile(f) {
       if (!f) return;
       draft.portrait_file = f;
+      // An upload outranks the generator permanently, so choosing a file
+      // cancels a pending draw rather than queueing both.
+      draft.portrait_generate = false;
       draft.portrait_origin = 'uploaded';
       const url = URL.createObjectURL(f);
       mount(art, h('img', {
@@ -277,16 +379,92 @@ export async function render() {
           h('div', { class: 'row', style: 'margin-top:12px;gap:8px' },
             canGenerate
               ? h('select', { class: 'select', style: 'width:auto' },
-                models.map((m) => h('option', { value: m.id, selected: m.default }, `${m.display} · ${m.vram_gib} GiB`)))
+                /* `vram_gib` is null for a co-resident guest: it stands in
+                 * ground claimed from the KV side for the length of a drain,
+                 * so it has no standing footprint to quote. Rendered
+                 * unconditionally it read "· null GiB". */
+                models.map((m) => h('option', { value: m.id, selected: m.default },
+                  m.vram_gib ? `${m.display} · ${m.vram_gib} GiB` : m.display)))
               : null,
+            /* **It draws, now, and shows you the portrait.**
+             *
+             * It used to only mark the draft — the actual draw was deferred to
+             * `create()`, because `POST /v1/npc/:id/portrait/generate` is
+             * addressed to a character and there is not one yet. That is true of
+             * the *route*, but it was never true of the model: `/v1/image/generate`
+             * takes a prompt and gives back bytes, and the description on this
+             * page is the prompt. So the deferral bought nothing and cost the
+             * button its meaning — you pressed Generate and no portrait appeared.
+             *
+             * The bytes are kept and attached once the character exists, marked
+             * `generated` so a later draw may still replace them. */
             h('button', {
               class: 'btn sm',
-              onClick: () => toast('generating a portrait — image model required', 'err'),
+              disabled: !canGenerate,
+              onClick: async (e) => {
+                if (!canGenerate) return;
+                const desc = (draft.description || '').trim();
+                if (!desc) {
+                  label.textContent = 'write a description first — the portrait is drawn from it';
+                  toast('write a description first — the portrait is drawn from it', 'err');
+                  return;
+                }
+                /* The button is disabled while it runs and its label never
+                 * changes. A control that renames itself mid-action is its own
+                 * puzzle: the state goes in the frame, which is the thing being
+                 * watched and where the portrait lands. */
+                const b = e.currentTarget;
+                b.disabled = true;
+                artSays('◍ drawing…\nthe cast is paused');
+                label.textContent = '';
+                try {
+                  const img = await API.generateImage({ prompt: desc });
+                  if (!img || !img.png_base64) {
+                    throw new Error('the daemon returned no image');
+                  }
+                  const blob = pngBlob(img.png_base64);
+                  draft.portrait_file = new File([blob], 'portrait.png', { type: 'image/png' });
+                  // Real bytes now, so there is nothing left to defer to create.
+                  draft.portrait_generate = false;
+                  draft.portrait_origin = 'generated';
+                  const url = URL.createObjectURL(blob);
+                  mount(art, h('img', {
+                    src: url,
+                    style: 'width:100%;height:100%;object-fit:cover;border-radius:12px',
+                    onLoad: () => URL.revokeObjectURL(url),
+                  }));
+                  label.textContent = 'drawn — press Generate again for a different one';
+                } catch (err) {
+                  const why = err.error === 'no_image_model'
+                    ? 'no image model is configured on this daemon'
+                    : (err.detail || err.message || 'could not draw a portrait');
+                  // The frame goes back to resting rather than being left
+                  // saying "drawing…" over a draw that has stopped. The reason
+                  // goes to the label and to a toast — a failure that only
+                  // appeared in small grey text read as nothing having
+                  // happened, which is how this was reported.
+                  mount(art, initial);
+                  label.textContent = why;
+                  toast(why, 'err');
+                } finally {
+                  b.disabled = false;
+                }
+              },
             }, '⟳ Generate')),
+          /* **The copy has to follow the deployment.** This paragraph used to
+           * say "Generation needs an image model on this daemon, and there is
+           * none" unconditionally, which stayed on the page after the image
+           * guest arrived — so pressing Generate toggled the state above while
+           * the text below still said it could not work, and the button read as
+           * broken. Whether a model is loaded is already known here; say it. */
           h('div', { class: 'tiny dim', style: 'margin-top:10px;max-width:70ch' },
-            'Generation needs an image model on this daemon, and there is none. Uploading works now and '
-            + 'outranks the generator permanently, so a portrait you choose is never replaced by one it '
-            + 'invents. A character with no portrait shows its initial.'),
+            canGenerate
+              ? 'Generating takes a few seconds and pauses the cast while it runs. Press it again for a '
+                + 'different portrait. A file you upload outranks the generator permanently, so a '
+                + 'portrait you choose is never replaced by one it invents.'
+              : 'Generation needs an image model on this daemon, and there is none. Uploading works now '
+                + 'and outranks the generator permanently, so a portrait you choose is never replaced '
+                + 'by one it invents. A character with no portrait shows its initial.'),
           h('div', { style: 'margin-top:14px' }, drop, file))),
       /* The environment simulator lives here because it is a field on the
        * record, and this is now the last step that has any. It sat on a third
@@ -346,11 +524,34 @@ export async function render() {
        */
       if (draft.portrait_file) {
         try {
-          await API.putPortrait(npc.npc_id, draft.portrait_file);
+          /* The origin travels with the bytes. A portrait drawn on this page is
+           * `generated` even though it arrives through the upload route — filed
+           * as `uploaded` it could never be redrawn, because the generator
+           * refuses to replace an uploaded portrait. */
+          await API.putPortrait(npc.npc_id, draft.portrait_file, draft.portrait_origin);
           toast(`${draft.name} created`, 'ok');
         } catch (e) {
           toast(`${draft.name} created, but the portrait did not upload: `
             + (e.detail || e.message || 'unknown error'), 'err');
+        }
+      } else if (draft.portrait_generate) {
+        /* The draw, now that there is a character to address it to. Same trade
+         * as the upload above: its failure does not fail the create, and the
+         * toast says which happened rather than reporting plain success over a
+         * portrait that never landed.
+         *
+         * It blocks for the length of a drain — every character stops thinking
+         * while it runs — so the toast before it exists to explain a pause that
+         * would otherwise look like a hang. */
+        toast(`${draft.name} created — drawing the portrait, the cast is paused`, 'ok');
+        try {
+          await API.generatePortrait(npc.npc_id);
+          toast('portrait drawn', 'ok');
+        } catch (e) {
+          toast(`${draft.name} created, but the portrait was not drawn: `
+            + (e.error === 'no_image_model'
+              ? 'no image model is configured on this daemon'
+              : (e.detail || e.message || 'unknown error')), 'err');
         }
       } else {
         toast(`${draft.name} created`, 'ok');

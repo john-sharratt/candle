@@ -65,6 +65,17 @@ impl Ops {
         loading: Arc<LoadProgress>,
     ) -> Arc<Self> {
         let telemetry = Telemetry::new();
+        // **The sampler reads the load progress, so the ingest shows up on the
+        // performance page while it runs.**
+        //
+        // `Telemetry`'s engine fields were a stub — "nothing fills this in yet"
+        // — so `/v1/telemetry` reported `prefill_tps: null` throughout a
+        // half-hour world load, and the only way to see whether the ingest was
+        // fast or slow was to poll `/v1/status` and do the arithmetic by hand.
+        // The rate is already computed where it is measured; this is the
+        // sampler being told where to find it, rather than a second place that
+        // computes it.
+        telemetry.watch_loading(Arc::clone(&loading));
         telemetry.spawn_sampler();
         Arc::new(Self {
             telemetry,

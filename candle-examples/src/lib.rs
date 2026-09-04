@@ -146,6 +146,17 @@ pub fn hub_load_safetensors(
     repo: &hf_hub::api::sync::ApiRepo,
     json_file: &str,
 ) -> Result<Vec<std::path::PathBuf>> {
+    // **The shards live beside their index, not at the repo root.**
+    //
+    // A weight map names bare filenames — `model-00001-of-00003.safetensors` —
+    // which resolve against the repo root. That is right when the index is at
+    // the root and wrong for every diffusers-layout repo, where each component
+    // has its own directory (`text_encoder/`, `transformer/`) and fetching the
+    // bare name is a 404. The index's own path is what says which.
+    let prefix = match json_file.rfind('/') {
+        Some(i) => &json_file[..=i],
+        None => "",
+    };
     let json_file = repo.get(json_file).map_err(candle::Error::wrap)?;
     let json_file = std::fs::File::open(json_file)?;
     let json: serde_json::Value =
@@ -163,7 +174,10 @@ pub fn hub_load_safetensors(
     }
     let safetensors_files = safetensors_files
         .iter()
-        .map(|v| repo.get(v).map_err(candle::Error::wrap))
+        .map(|v| {
+            repo.get(&format!("{prefix}{v}"))
+                .map_err(candle::Error::wrap)
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(safetensors_files)
 }

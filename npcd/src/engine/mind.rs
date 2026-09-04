@@ -5,16 +5,27 @@
 //!
 //! Each character holds a [`Sequence`] — a conversation on the substrate — for
 //! the day it is living in. Its id is *derived* from `(npc_id, day)` rather than
-//! allocated, so a daemon restarted at noon rejoins the conversation the
-//! character was already on instead of opening a second one for the same day.
-//! That bug is invisible until somebody asks why a character has two of
-//! everything.
+//! allocated, and recorded against the timeline in the redo log, so the day's
+//! turns are identifiable as that character's day from the log alone. A daemon
+//! restarted at noon opens a fresh timeline for the rest of the day: the
+//! sequence is GPU state and does not survive the process. What the derived id
+//! buys is that both halves of the day carry the same name, so the morning's
+//! turns are still the character's own history rather than an anonymous
+//! timeline nothing can attribute.
 //!
 //! At the day boundary the conversation is retired and a new one opened. Retired
 //! means **tombstoned**, not deleted: the turns stay in the redo log and stay
 //! reachable by the gather. What changes is that they are no longer selected by
 //! default. This is the mind design's soft fade made explicit at a boundary —
 //! yesterday stops being transcript and becomes memory.
+//!
+//! # Locking
+//!
+//! The map of live conversations and a live conversation are two locks, taken in
+//! that order and never together for long. A decode is seconds; the map is what
+//! [`Minds::resident`] and every Pulse header read. Holding the map across the
+//! decode — which it used to — stalled the whole daemon behind whichever
+//! character happened to be thinking, on tokio worker threads.
 //!
 //! # Why the sequence is windowed as well
 //!
@@ -69,7 +80,9 @@ pub struct Minds {
     /// checkpoint, and a second opinion about either is a silent way to run a
     /// model outside the settings it was tuned under.
     base_config: SequenceConfig,
-    live: Mutex<HashMap<u64, Live>>,
+    /// Each conversation behind its own lock, so a decode holds only the
+    /// character that is thinking — see the module's *Locking* note.
+    live: Mutex<HashMap<u64, Arc<Mutex<Live>>>>,
 }
 
 /// What one character's tick produced.
@@ -136,35 +149,58 @@ impl Minds {
         window: &Window,
     ) -> anyhow::Result<Thought> {
         let mut thought = Thought::default();
-        let mut live = self.live.lock().unwrap();
 
-        // The day boundary. Checked here rather than on a timer because a
-        // timer fires on host-elapsed time and would be wrong the moment the
-        // narrative clock is paused, jumped or re-paced — all of which the
-        // console can do at any moment.
-        if let Some(existing) = live.get(&npc_id) {
-            if existing.day != day {
-                let from = existing.day;
-                // Tombstone, not delete. The turns stay in the redo log; what
-                // changes is that they stop being selected by default.
-                if let Some(l) = live.remove(&npc_id) {
-                    retire(&self.engine, l);
+        // The map is held only long enough to find or open this character's
+        // conversation; the decode below runs under the conversation's own lock.
+        let conversation = {
+            let mut live = self.live.lock().unwrap();
+
+            // The day boundary. Checked here rather than on a timer because a
+            // timer fires on host-elapsed time and would be wrong the moment the
+            // narrative clock is paused, jumped or re-paced — all of which the
+            // console can do at any moment.
+            if let Some(existing) = live.get(&npc_id) {
+                let from = existing.lock().unwrap().day;
+                if from != day {
+                    // Tombstone, not delete. The turns stay in the redo log; what
+                    // changes is that they stop being selected by default.
+                    if let Some(l) = live.remove(&npc_id) {
+                        retire(&self.engine, &l.lock().unwrap());
+                    }
+                    thought.rolled_over = Some((from, day));
                 }
-                thought.rolled_over = Some((from, day));
             }
-        }
 
-        // Opened through the vacant entry rather than `contains_key` + `insert`,
-        // so the map is probed once and the borrow below cannot miss.
-        let l = match live.entry(npc_id) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(slot) => {
-                let id = conversation_id(npc_id, day);
-                let system = prompt::build(persona, mode, &for_mode(mode));
-                let mut cfg = self.base_config.clone();
-                cfg.context_window_turns = CONTEXT_WINDOW_TURNS;
-                let sequence = self.engine.lock().unwrap().new_conversation(&system, cfg)?;
-                slot.insert(Live { sequence, day, id })
+            // Opened through the vacant entry rather than `contains_key` + `insert`,
+            // so the map is probed once and the borrow below cannot miss.
+            match live.entry(npc_id) {
+                Entry::Occupied(e) => Arc::clone(e.get()),
+                Entry::Vacant(slot) => {
+                    let id = conversation_id(npc_id, day);
+                    let system = prompt::build(persona, mode, &for_mode(mode));
+                    let mut cfg = self.base_config.clone();
+                    cfg.context_window_turns = CONTEXT_WINDOW_TURNS;
+                    let sequence = self.engine.lock().unwrap().new_conversation(&system, cfg)?;
+                    // **The derived id, given to the substrate.** Minting it and keeping it
+                    // in this struct made it a log label and nothing else: the timeline went
+                    // into the redo log anonymous, so nothing downstream could attribute a
+                    // day's turns to the character that lived them, and the two doc comments
+                    // promising a stable per-day identity described a string that never left
+                    // the process. Failure is logged rather than propagated — an unnamed
+                    // timeline is worse reporting, not a character that cannot think.
+                    if let Err(e) = self
+                        .engine
+                        .lock()
+                        .unwrap()
+                        .set_conversation_conv_id(sequence.timeline_id(), &id)
+                    {
+                        tracing::warn!(
+                            "conversation {id} could not be named in the log: {e:?} — its turns \
+                             will not be attributable to this character"
+                        );
+                    }
+                    Arc::clone(slot.insert(Arc::new(Mutex::new(Live { sequence, day, id }))))
+                }
             }
         };
 
@@ -173,15 +209,23 @@ impl Minds {
         // the mind design is explicit that this is what a busy character should
         // get.
         let perception = compose(events, window);
-        let response = l.sequence.send_turn(&perception)?;
+        let response = conversation
+            .lock()
+            .unwrap()
+            .sequence
+            .send_turn(&perception)?;
         thought.parsed = act::parse(&response.text);
         Ok(thought)
     }
 
     /// Retire a character's conversation — on delete, or on shutdown.
     pub fn retire_npc(&self, npc_id: u64) {
-        if let Some(l) = self.live.lock().unwrap().remove(&npc_id) {
-            retire(&self.engine, l);
+        // Taken out of the map first, then locked: a character mid-decode is
+        // waited on rather than tombstoned underneath, and the map is free for
+        // everyone else while we wait.
+        let gone = self.live.lock().unwrap().remove(&npc_id);
+        if let Some(l) = gone {
+            retire(&self.engine, &l.lock().unwrap());
         }
     }
 }
@@ -191,7 +235,7 @@ impl Minds {
 /// Failure is logged, never propagated. A tombstone that did not land leaves
 /// yesterday's turns selectable — untidy, and strictly better than refusing to
 /// open today's conversation over it.
-fn retire(engine: &Arc<Mutex<ConversationEngine>>, l: Live) {
+fn retire(engine: &Arc<Mutex<ConversationEngine>>, l: &Live) {
     let timeline = l.sequence.timeline_id();
     match engine.lock().unwrap().tombstone_timeline(timeline) {
         Ok(()) => tracing::info!("conversation {} retired (tombstoned)", l.id),
@@ -270,8 +314,8 @@ mod tests {
         assert_eq!(compose(&[], &Window::with_default_cap()), "");
     }
 
-    /// A restart mid-day must rejoin the day's conversation rather than open a
-    /// second one for the same day.
+    /// A restart mid-day opens a second timeline, and it must carry the same
+    /// day's name so both halves stay attributable to the character.
     #[test]
     fn a_days_conversation_id_is_stable_across_a_restart() {
         assert_eq!(conversation_id(4, 9), conversation_id(4, 9));

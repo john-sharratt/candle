@@ -136,7 +136,7 @@ const QUANTIZED_KERNELS: [&str; 46] = [
 ];
 
 // Flash-attention kernels: 12 total
-const FLASH_KERNELS: [&str; 22] = [
+const FLASH_KERNELS: [&str; 23] = [
     // Batched sampling (1 api + 4 variants)
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
@@ -171,6 +171,9 @@ const FLASH_KERNELS: [&str; 22] = [
     // Gated DeltaNet (Qwen3.5/3.8 hybrid layers): one F32 entry TU over the
     // decode-step/conv-step and fused-prefill-scan kernel headers
     "src/delta-net/delta_net_api_f32.cu",
+    // Dense int8 attention for diffusion transformers: unmasked, unpaged,
+    // per-row scales — see the file header for why none of the paged kernels fit
+    "src/dit-attn/dit_attn_int8.cu",
 ];
 
 /// Provenance BDP scan — the scalar backend, the b1 tensor-core (BMMA) backend
@@ -480,6 +483,24 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         groups.push(ArchiveGroup {
             name: "paged_glue".to_string(),
             kernels: glue_kernels,
+            compile_args: decode_args.clone(),
+            include_dirs: flash_includes.clone(),
+        });
+    }
+
+    // Dense int8 attention for diffusion transformers — unmasked, unpaged, and
+    // therefore nothing the paged kernels above can serve. Its own group so a
+    // change to it does not invalidate their archives, which are the expensive
+    // ones.
+    {
+        let dit_kernels: Vec<String> = FLASH_KERNELS
+            .iter()
+            .filter(|k| k.contains("dit-attn"))
+            .map(|s| s.to_string())
+            .collect();
+        groups.push(ArchiveGroup {
+            name: "dit_attn".to_string(),
+            kernels: dit_kernels,
             compile_args: decode_args.clone(),
             include_dirs: flash_includes.clone(),
         });

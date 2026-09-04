@@ -6,7 +6,7 @@
 
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_var_builder::VarBuilder;
-use candle::quantized::{GgmlDType, QTensor};
+use candle::quantized::{GgmlDType, Int8Mode, QTensor};
 #[cfg(feature = "cuda")]
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, LiveTensor, Module, Result, Tensor};
@@ -82,6 +82,38 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
         weight,
         bias: Some(bias),
     })
+}
+
+/// [`linear_b`], with the weight repacked for `mode` and the bias held at the
+/// width the model's activations run at.
+///
+/// At an int8 mode the projection becomes its KO twin and runs the q8a128
+/// tensor-core matmul; at `Int8Mode::Off` this is `linear_b` exactly. The bias is
+/// dequantised either way — it is one vector added after the matmul, not
+/// something the kernel reads — but it is *also* narrowed to `dtype` here,
+/// because the matmul emits the activation's width and `broadcast_add` does not
+/// convert: a bias left at f32 over a bf16 model is a dtype error at the first
+/// forward, and converting it per call would be a full-width pass per layer per
+/// step to fix something that is decided once at load.
+pub fn linear_b_mode(
+    in_dim: usize,
+    out_dim: usize,
+    bias: bool,
+    mode: Int8Mode,
+    dtype: DType,
+    vb: VarBuilder,
+) -> Result<Linear> {
+    let bias = if bias {
+        Some(
+            vb.get(out_dim, "bias")?
+                .dequantize(vb.device())?
+                .to_dtype(dtype)?,
+        )
+    } else {
+        None
+    };
+    let weight = QMatMul::new_with_mode(in_dim, out_dim, mode, vb)?;
+    Ok(Linear { weight, bias })
 }
 
 pub fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<candle_nn::LayerNorm> {

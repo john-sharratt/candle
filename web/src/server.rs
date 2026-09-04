@@ -255,85 +255,6 @@ fn redirect(to: &str, req: &Request) -> Response {
     res
 }
 
-#[cfg(test)]
-mod redirect_tests {
-    use super::*;
-
-    fn to(uri: &str) -> String {
-        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
-        redirect("https://tokera.com", &req)
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// **A redirect keeps the address somebody typed.**
-    ///
-    /// Dropping the path sends every deep link to the front page, which for a
-    /// consolidated domain means every inbound link to a paper or a post
-    /// arrives nowhere in particular — and a search engine following one learns
-    /// only that the old address is gone.
-    #[test]
-    fn the_path_and_query_come_across() {
-        assert_eq!(to("/"), "https://tokera.com/");
-        assert_eq!(to("/papers/o1"), "https://tokera.com/papers/o1");
-        assert_eq!(
-            to("/blog/x?utm=1&b=2"),
-            "https://tokera.com/blog/x?utm=1&b=2"
-        );
-        assert_eq!(to("/a/b/c/"), "https://tokera.com/a/b/c/");
-    }
-
-    /// A target written with a trailing slash must not produce `//`.
-    #[test]
-    fn the_target_is_joined_without_doubling_the_slash() {
-        let req = Request::builder().uri("/x").body(Body::empty()).unwrap();
-        let res = redirect("https://tokera.com/", &req);
-        assert_eq!(res.headers()[header::LOCATION], "https://tokera.com/x");
-    }
-
-    #[test]
-    fn it_is_permanent() {
-        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
-        assert_eq!(
-            redirect("https://tokera.com", &req).status(),
-            StatusCode::MOVED_PERMANENTLY
-        );
-    }
-
-    /// **The tail is the client's to choose, so it must not be able to write a
-    /// second header.**
-    ///
-    /// A `Location` carrying a carriage return is header injection. The URI
-    /// parser rejects most of it before this is reached, and `from_str` is the
-    /// backstop — anything it will not take falls back to the target's root,
-    /// which is the safe direction to be wrong in.
-    #[test]
-    fn a_crafted_path_cannot_inject_a_header() {
-        for raw in [
-            "/x%0d%0aSet-Cookie:%20a=b",
-            "/x%0aLocation:%20https://evil.example",
-            "/x%00y",
-        ] {
-            let Ok(req) = Request::builder().uri(raw).body(Body::empty()) else {
-                continue; // refused before it got here, which is also correct
-            };
-            let res = redirect("https://tokera.com", &req);
-            let loc = res.headers()[header::LOCATION].to_str().unwrap();
-            assert!(
-                !loc.contains('\r') && !loc.contains('\n') && !loc.contains('\0'),
-                "`{raw}` produced `{loc}`"
-            );
-            assert!(
-                loc.starts_with("https://tokera.com"),
-                "`{raw}` escaped the target"
-            );
-        }
-    }
-}
-
 fn announce(cfg: &Config, roots: &HashMap<String, Roots>, local: &HashMap<String, Router>) {
     for site in &cfg.sites {
         let hosts = if site.hosts.is_empty() {
@@ -553,4 +474,83 @@ async fn serve_files(app: &App, site: &Site, path: &str, headers: &header::Heade
         Problem::not_found(format!("no such file in site `{}`", site.name)),
         want_html,
     )
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+
+    fn to(uri: &str) -> String {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        redirect("https://tokera.com", &req)
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// **A redirect keeps the address somebody typed.**
+    ///
+    /// Dropping the path sends every deep link to the front page, which for a
+    /// consolidated domain means every inbound link to a paper or a post
+    /// arrives nowhere in particular — and a search engine following one learns
+    /// only that the old address is gone.
+    #[test]
+    fn the_path_and_query_come_across() {
+        assert_eq!(to("/"), "https://tokera.com/");
+        assert_eq!(to("/papers/o1"), "https://tokera.com/papers/o1");
+        assert_eq!(
+            to("/blog/x?utm=1&b=2"),
+            "https://tokera.com/blog/x?utm=1&b=2"
+        );
+        assert_eq!(to("/a/b/c/"), "https://tokera.com/a/b/c/");
+    }
+
+    /// A target written with a trailing slash must not produce `//`.
+    #[test]
+    fn the_target_is_joined_without_doubling_the_slash() {
+        let req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        let res = redirect("https://tokera.com/", &req);
+        assert_eq!(res.headers()[header::LOCATION], "https://tokera.com/x");
+    }
+
+    #[test]
+    fn it_is_permanent() {
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert_eq!(
+            redirect("https://tokera.com", &req).status(),
+            StatusCode::MOVED_PERMANENTLY
+        );
+    }
+
+    /// **The tail is the client's to choose, so it must not be able to write a
+    /// second header.**
+    ///
+    /// A `Location` carrying a carriage return is header injection. The URI
+    /// parser rejects most of it before this is reached, and `from_str` is the
+    /// backstop — anything it will not take falls back to the target's root,
+    /// which is the safe direction to be wrong in.
+    #[test]
+    fn a_crafted_path_cannot_inject_a_header() {
+        for raw in [
+            "/x%0d%0aSet-Cookie:%20a=b",
+            "/x%0aLocation:%20https://evil.example",
+            "/x%00y",
+        ] {
+            let Ok(req) = Request::builder().uri(raw).body(Body::empty()) else {
+                continue; // refused before it got here, which is also correct
+            };
+            let res = redirect("https://tokera.com", &req);
+            let loc = res.headers()[header::LOCATION].to_str().unwrap();
+            assert!(
+                !loc.contains('\r') && !loc.contains('\n') && !loc.contains('\0'),
+                "`{raw}` produced `{loc}`"
+            );
+            assert!(
+                loc.starts_with("https://tokera.com"),
+                "`{raw}` escaped the target"
+            );
+        }
+    }
 }

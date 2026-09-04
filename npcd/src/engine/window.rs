@@ -72,7 +72,12 @@ pub struct Turn {
 }
 
 /// A character's rolling transcript.
-#[derive(Debug)]
+///
+/// `Clone` so a tick can take a snapshot to decode against and release the inbox lock first —
+/// see `Scheduler::tick`. The cost is one `VecDeque<Turn>` of at most `cap` entries, against a
+/// model decode measured in seconds; holding the lock instead stalls every `deliver`,
+/// `census` and `window` call in the daemon, on tokio worker threads.
+#[derive(Clone, Debug)]
 pub struct Window {
     turns: VecDeque<Turn>,
     cap: usize,

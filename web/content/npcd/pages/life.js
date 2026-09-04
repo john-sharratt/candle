@@ -63,7 +63,15 @@ export async function render(params, q) {
     return host;
   }
 
-  S.catalog = S.catalog || await API.getLifeCatalog().catch(() => ({ tools: [], cadences: [], phases: [] }));
+  /* **A failed catalog fetch is not cached.** Assigning the fallback made
+   * `S.catalog` truthy, so a single failed read — a daemon still loading, one
+   * dropped request — left the console with no phases, no cadences and no tools
+   * for the life of the tab, and every later visit skipped the retry. Only a
+   * successful read is kept; a failure falls back for this render and is asked
+   * again on the next. */
+  if (!S.catalog) {
+    S.catalog = await API.getLifeCatalog().catch(() => null);
+  }
   await reload();
   draw(host);
   /* The poll is the page's only timer and it belongs to the page. Left running,
@@ -73,7 +81,18 @@ export async function render(params, q) {
 }
 
 async function reload() {
-  const r = await API.getLife(S.who).catch((e) => ({ plan: null, error: e }));
+  /* A read that FAILED is not a character without a life, and the difference is
+   * destructive. Both render `plan: null`, but the empty state offers "Create
+   * the life", and that PUTs a seed — whose carry-over is
+   * `if let Ok(Some(old)) = plan::load(...)`, so the `Err` arm falls through and
+   * a fresh empty plan is written over the authored story, years and months. A
+   * 500 from an unparseable plan file is exactly when the existing life is most
+   * worth keeping, and exactly when this offered to replace it.
+   *
+   * So the error is kept and rendered as an error. `plan: undefined` — not
+   * `null` — is what distinguishes "we do not know" from "there is none". */
+  const r = await API.getLife(S.who).catch((e) => ({ error: e }));
+  S.error = r.error || null;
   S.plan = r.plan || null;
   S.job = r.job || null;
   S.counts = r.counts || {};
@@ -84,6 +103,14 @@ async function reload() {
   if (!monthOf(S.year, S.month)) S.month = firstMonth();
 }
 
+/* The catalog, or an empty one when the read failed.
+ *
+ * An accessor rather than a cached fallback: a failure must not be *kept*, or a
+ * single dropped request leaves the console with no phases for the life of the
+ * tab. The empty shape is supplied here, per read, so the next render asks
+ * again. */
+const cat = () => S.catalog || { tools: [], cadences: [], phases: [] };
+
 const yearOf = (y) => (S.plan ? S.plan.years.find((x) => x.year === y) : null);
 const firstMonth = () => { const y = yearOf(S.year); return y && y.months[0] ? y.months[0].month : null; };
 const monthOf = (y, m) => { const yy = yearOf(y); return yy ? yy.months.find((x) => x.month === m) : null; };
@@ -93,9 +120,22 @@ const monthOf = (y, m) => { const yy = yearOf(y); return yy ? yy.months.find((x)
 function draw(host) {
   mount(host,
     header(host),
-    S.job && !S.job.outcome ? overlay(host) : null,
+    /* A stable slot rather than the overlay itself. The progress poll ticks
+     * every 1.2 s while a generation runs, and `mount` is `replaceChildren` —
+     * so redrawing the whole page on each tick tore out whatever the operator
+     * was typing, once per second and a bit, in the editor right beside the
+     * bar they were watching. `tick` below refills only this. */
+    h('div', { class: 'life-overlay' }, S.job && !S.job.outcome ? overlay(host) : null),
     !S.plan ? seedTab(host) : tabs(host),
     !S.plan ? null : body(host));
+}
+
+/* Refresh the progress overlay in place, leaving the rest of the page — and
+ * every input in it — untouched. */
+function tick(host) {
+  const slot = host.querySelector(':scope > .life-overlay');
+  if (!slot) return;
+  mount(slot, S.job && !S.job.outcome ? overlay(host) : null);
 }
 
 const redraw = (host) => reload().then(() => draw(host));
@@ -135,12 +175,15 @@ function overlay(host) {
   const pct = Math.round((j.progress || 0) * 100);
   if (!S.poll) S.poll = setInterval(async () => {
     S.job = await API.getLifeJob(S.who).catch(() => null);
+    /* Finished: the plan has changed underneath, so the whole page is redrawn.
+     * Still running: only the overlay, because the rest of the page may hold an
+     * editor with unsaved text in it. */
     if (!S.job || S.job.outcome) { clearInterval(S.poll); S.poll = 0; redraw(host); }
-    else draw(host);
+    else tick(host);
   }, 1200);
   return h('div', { class: 'life-progress' },
     h('div', { class: 'life-phases' },
-      ...(S.catalog.phases || []).map((p) => h('span', {
+      ...(cat().phases || []).map((p) => h('span', {
         class: 'life-phase' + (p.value === j.phase ? ' now' : (j.completed || []).includes(p.value) ? ' done' : ''),
       }, p.label))),
     h('div', { class: 'bar' }, h('div', { class: 'fill', style: `width:${pct}%` })),
@@ -188,13 +231,19 @@ function seedTab(host) {
       (f[k] = h('textarea', { class: 'textarea', rows: 4, disabled: !mayEdit() }, value ?? '')));
 
   const cadence = h('select', { class: 'select', disabled: !mayEdit() },
-    ...(S.catalog.cadences || []).map((c) => h('option', {
+    ...(cat().cadences || []).map((c) => h('option', {
       value: c.value, selected: c.value === (s.cadence || 'even'),
     }, c.label)));
   f.cadence = cadence;
 
   return h('section', { class: 'life-seed' },
-    !S.plan ? h('p', { class: 'note' },
+    /* Three states, not two: a life, no life, or no answer. The last one must
+     * not read as the middle one — see `reload`. */
+    S.error ? h('p', { class: 'note error' },
+      'Could not read this life: ' + (S.error.message || S.error)
+      + '. Saving a seed now would replace whatever is on disk, so it is disabled '
+      + 'until the read succeeds.') : null,
+    !S.plan && !S.error ? h('p', { class: 'note' },
       'This character has no life yet. Give it a seed and the ladder can start.') : null,
     h('div', { class: 'grid' },
       field('display', 'Name', s.display || S.who),
@@ -211,8 +260,11 @@ function seedTab(host) {
       (s.world || []).map((w) => `${w.date} | ${w.what}`).join('\n')),
     area('cast', 'People who already exist — `entity-id | Name | who they are` (one per line)',
       (s.cast || []).map((c) => `${c.entity_id} | ${c.display} | ${c.what || ''}`).join('\n')),
+    /* Disabled while the read is unresolved: a seed save is a full rewrite, and
+     * the daemon's carry-over silently skips a plan it could not load. */
     mayEdit() ? h('button', {
       class: 'btn primary',
+      disabled: !!S.error,
       onClick: async () => {
         const rows = (k) => f[k].value.split('\n').map((l) => l.trim()).filter(Boolean);
         const seed = {
@@ -258,22 +310,25 @@ function storyTab(host) {
     h('h3', {}, 'The cast'),
     h('p', { class: 'note' },
       'Fixed here and inherited by every stratum below. Nothing lower invents a person, which is what stops one professor becoming four different ids.'),
-    (st.cast || []).length ? h('table', { class: 'life-cast' },
+    // Wrapped so the table scrolls rather than the page: four columns of names
+    // and prose cannot reflow, and a body that scrolls sideways on a phone is
+    // the one layout failure that makes everything else feel broken too.
+    (st.cast || []).length ? h('div', { class: 'life-tables' }, h('table', { class: 'life-cast' },
       h('thead', {}, h('tr', {}, h('th', {}, 'id'), h('th', {}, 'Name'), h('th', {}, 'Who they are'), h('th', {}, ''))),
       h('tbody', {}, ...(st.cast || []).map((c) => h('tr', {},
         h('td', {}, h('code', {}, c.entity_id)),
         h('td', {}, c.display),
         h('td', {}, c.what || ''),
         h('td', {}, c.from_seed ? h('span', { class: 'chip' }, 'seeded') : null,
-          c.npc_id != null ? h('span', { class: 'chip' }, 'NPC ' + c.npc_id) : null))))) : h('p', { class: 'note' }, 'Nobody named yet.'),
+          c.npc_id != null ? h('span', { class: 'chip' }, 'NPC ' + c.npc_id) : null)))))) : h('p', { class: 'note' }, 'Nobody named yet.'),
     h('h3', {}, 'The years'),
     h('p', { class: 'note' },
       'What each year is FOR. The years tab expands these; it does not choose them.'),
-    (st.outline || []).length ? h('table', { class: 'life-outline' },
+    (st.outline || []).length ? h('div', { class: 'life-tables' }, h('table', { class: 'life-outline' },
       h('tbody', {}, ...(st.outline || []).map((b) => h('tr', {},
         h('td', {}, h('strong', {}, b.year)),
         h('td', {}, b.title),
-        h('td', {}, b.premise))))) : h('p', { class: 'note' }, 'No outline yet.'));
+        h('td', {}, b.premise)))))) : h('p', { class: 'note' }, 'No outline yet.'));
 }
 
 /* ---- years / months / days ------------------------------------------- */
@@ -388,7 +443,54 @@ function stratum(host, key, node, heading, hint, open, aside) {
             onConfirm: go,
           });
         },
-      }, 'Regenerate')) : null);
+      }, 'Regenerate'),
+      /* **Narrate — this one stratum, in the narrator's voice.**
+       *
+       * Beside Regenerate rather than replacing it, because they are different
+       * things. Regenerate queues the ladder on the main engine: it may run
+       * several rungs, it fans out, and it comes back as a job you watch. This
+       * asks the prose guest for exactly this node and returns the prose — one
+       * prompt, one answer, no job to poll.
+       *
+       * It blocks the whole cast for its duration, so the button says so, and
+       * disables itself rather than letting a second press queue a second
+       * stop-the-world job over the same node. */
+      h('button', {
+        class: 'btn sm',
+        title: 'Rewrite just this stratum with the co-resident narrator. Pauses the cast.',
+        onClick: async (e) => {
+          const b = e.target;
+          const run = async () => {
+            const was = b.textContent;
+            b.disabled = true;
+            b.textContent = '◍ narrating — the cast is paused';
+            try {
+              const r = await API.narrateLifeNode(S.who, key, { force: node.edited });
+              toast(`Narrated — ${r.tokens} tokens`
+                + (r.stale_below ? `, ${r.stale_below} below are now out of date` : ''), 'ok');
+              await redraw(host);
+            } catch (err) {
+              /* A daemon with no prose guest is a deployment fact, not a
+               * fault — naming it stops somebody debugging a model that was
+               * never configured. */
+              problems(err.error === 'no_prose_model'
+                ? { detail: 'no prose model is configured on this daemon' }
+                : err);
+            } finally {
+              b.disabled = false;
+              b.textContent = was;
+            }
+          };
+          if (!node.edited) return run();
+          confirmDialog({
+            title: 'Narrate over your edit?',
+            message: 'You wrote this by hand. Narrating replaces it with the narrator\'s version.',
+            confirmText: 'Narrate',
+            danger: true,
+            onConfirm: run,
+          });
+        },
+      }, 'Narrate')) : null);
 }
 
 /* ---- a day, and the consequences it must earn ------------------------ */
@@ -430,7 +532,7 @@ function dayCard(host, d) {
  * appears again. */
 function consequences(host, key, list) {
   const cast = S.plan.story.cast || [];
-  const tools = S.catalog.tools || [];
+  const tools = cat().tools || [];
   const rows = h('div', { class: 'life-cons' });
   let draft = list.map((c) => ({ tool: c.tool, args: { ...c.args } }));
 

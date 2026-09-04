@@ -39,6 +39,14 @@ use super::progress::{GenProgress, GenSnapshot, Outcome};
 #[derive(Debug)]
 pub struct Job {
     pub id: String,
+    /// The reservation counter this run took, which is the *only* thing that
+    /// orders two runs.
+    ///
+    /// The id embeds it — `zen-11` — and comparing ids is comparing strings, so
+    /// `zen-11` sorted before `zen-2` and "the most recent run" became the wrong
+    /// run from a character's tenth regeneration onward. A console attaching to
+    /// it then watched a finished job and reported a live generation as done.
+    seq: u64,
     pub who: String,
     /// The phases this run was asked for, in ladder order.
     pub phases: Vec<Phase>,
@@ -128,7 +136,18 @@ impl Jobs {
             });
         }
 
-        let id = format!("{}-{}", who, self.next.fetch_add(1, Ordering::Relaxed));
+        // **Finished runs for this character are dropped as the new one supersedes
+        // them.** They are kept between runs on purpose — a job that vanished on
+        // completion is indistinguishable from one that never existed, and the
+        // difference matters when it failed — but keeping every run this daemon
+        // has ever done is a map that only grows, and an operator regenerating a
+        // life a hundred times over a long-lived daemon holds a hundred plans.
+        // One finished run per character is what the console reads; the older
+        // ones are what nothing reads.
+        map.retain(|_, j| j.who != who || !j.progress.is_finished());
+
+        let seq = self.next.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{who}-{seq}");
         let mut phases = phases;
         // Ladder order regardless of how they were asked for: a months phase
         // that ran before its years would prime a prefix from an outline
@@ -138,6 +157,7 @@ impl Jobs {
 
         let job = Arc::new(Job {
             id: id.clone(),
+            seq,
             who,
             phases,
             progress: Arc::new(GenProgress::new()),
@@ -190,7 +210,10 @@ impl Jobs {
     pub fn for_who(&self, who: &str) -> Option<Arc<Job>> {
         let map = self.map.lock().unwrap();
         let mut mine: Vec<&Arc<Job>> = map.values().filter(|j| j.who == who).collect();
-        mine.sort_by(|a, b| a.id.cmp(&b.id));
+        // By reservation order, not by id: the id embeds the counter as text, so
+        // `zen-11` sorts before `zen-2` and the tenth regeneration onward picked
+        // the wrong run as the most recent.
+        mine.sort_by_key(|j| j.seq);
         mine.iter()
             .rev()
             .find(|j| !j.progress.is_finished())
@@ -210,15 +233,13 @@ impl Jobs {
     }
 
     pub fn list(&self) -> Vec<JobView> {
-        let mut out: Vec<JobView> = self
-            .map
-            .lock()
-            .unwrap()
-            .values()
-            .map(|j| j.view())
-            .collect();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-        out
+        let map = self.map.lock().unwrap();
+        // Sorted by reservation order before the views are built: sorting the
+        // views means sorting ids, and an id compares as text — `zen-11` before
+        // `zen-2`, which is the order this listing was rendered in.
+        let mut jobs: Vec<&Arc<Job>> = map.values().collect();
+        jobs.sort_by_key(|j| j.seq);
+        jobs.into_iter().map(|j| j.view()).collect()
     }
 }
 
@@ -311,6 +332,51 @@ mod tests {
         first.progress.finish(Outcome::Done);
         let second = jobs.reserve(plan("a"), vec![Phase::Story]).unwrap();
         assert_ne!(first.id, second.id);
+        // The finished one is superseded rather than kept forever: `for_who` and
+        // the console read the newest, and a daemon that keeps every run a
+        // character ever had holds every plan with it.
+        assert_eq!(jobs.list().len(), 1);
+        assert_eq!(jobs.list()[0].id, second.id);
+    }
+
+    /// **"The most recent run" is the newest reservation, not the largest id.**
+    ///
+    /// Runs were ordered by comparing their ids, and an id embeds its counter as
+    /// text — so from a character's tenth regeneration onward `zen-11` sorted
+    /// before `zen-2` and the newest run stopped being the one picked. A console
+    /// attaching to a character then watched an old finished job and reported the
+    /// live generation as done.
+    #[test]
+    fn the_newest_run_wins_past_the_tenth() {
+        let jobs = Jobs::new();
+        // Ten finished runs, so the eleventh's id sorts below several of them.
+        for _ in 0..10 {
+            jobs.reserve(plan("zen"), vec![Phase::Story])
+                .unwrap()
+                .progress
+                .finish(Outcome::Done);
+        }
+        let newest = jobs.reserve(plan("zen"), vec![Phase::Story]).unwrap();
+        assert_eq!(newest.id, "zen-10");
+        assert!(
+            newest.id.as_str() < "zen-9",
+            "the ids no longer sort the wrong way — this test is not testing anything"
+        );
+        assert_eq!(jobs.for_who("zen").unwrap().id, newest.id);
+    }
+
+    /// Two characters' runs never supersede each other, however they interleave.
+    #[test]
+    fn superseding_a_run_leaves_other_characters_alone() {
+        let jobs = Jobs::new();
+        let a = jobs.reserve(plan("a"), vec![Phase::Story]).unwrap();
+        a.progress.finish(Outcome::Done);
+        let b = jobs.reserve(plan("b"), vec![Phase::Story]).unwrap();
+        b.progress.finish(Outcome::Done);
+        let a2 = jobs.reserve(plan("a"), vec![Phase::Story]).unwrap();
+
+        assert_eq!(jobs.for_who("a").unwrap().id, a2.id);
+        assert_eq!(jobs.for_who("b").unwrap().id, b.id, "b's run was dropped");
         assert_eq!(jobs.list().len(), 2);
     }
 
@@ -322,6 +388,7 @@ mod tests {
         let jobs = Jobs::new();
         let job = Arc::new(Job {
             id: "cindy-0".into(),
+            seq: 0,
             who: "cindy".into(),
             phases: vec![Phase::Story],
             progress: Arc::new(GenProgress::new()),
@@ -356,6 +423,7 @@ mod tests {
         let jobs = Jobs::new();
         let live = Arc::new(Job {
             id: "cindy-0".into(),
+            seq: 0,
             who: "cindy".into(),
             phases: vec![Phase::Story],
             progress: Arc::new(GenProgress::new()),
@@ -388,9 +456,10 @@ mod tests {
     #[test]
     fn a_live_job_outranks_a_finished_one_for_the_same_character() {
         let jobs = Jobs::new();
-        for (id, finished) in [("cindy-0", false), ("cindy-1", true)] {
+        for (seq, id, finished) in [(0, "cindy-0", false), (1, "cindy-1", true)] {
             let j = Arc::new(Job {
                 id: id.into(),
+                seq,
                 who: "cindy".into(),
                 phases: vec![Phase::Story],
                 progress: Arc::new(GenProgress::new()),
@@ -415,6 +484,7 @@ mod tests {
         let jobs = Jobs::new();
         let j = Arc::new(Job {
             id: "cindy-0".into(),
+            seq: 0,
             who: "cindy".into(),
             phases: vec![Phase::Story],
             progress: Arc::new(GenProgress::new()),
@@ -438,6 +508,7 @@ mod tests {
     fn a_job_view_carries_its_identity_and_its_progress() {
         let j = Job {
             id: "cindy-0".into(),
+            seq: 0,
             who: "cindy".into(),
             phases: vec![Phase::Story, Phase::Years],
             progress: Arc::new(GenProgress::new()),

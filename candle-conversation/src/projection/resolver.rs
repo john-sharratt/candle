@@ -262,6 +262,73 @@ pub struct Conversation {
     /// change misses and refills exactly once, and the phases that open many
     /// conversations all open them on a single shared prompt branch.
     branch_checkpoint: Arc<Mutex<Option<(ContentHash, Arc<BranchCheckpointPayload>)>>>,
+    /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
+    /// in, removed when the last clone of that conversation drops.
+    ///
+    /// `None` for every conversation opened on a real workspace — those own a
+    /// directory somebody chose and must never delete it.
+    ///
+    /// **Without this the temp directory outlived the process.** An ephemeral
+    /// conversation is a throwaway log, and `LogFile` grows in 64 MiB extents,
+    /// so the first record written costs 64 MiB on disk — reclaimed only when a
+    /// segment *seals*, which a throwaway never does. Every ephemeral
+    /// conversation therefore left 64 MiB behind permanently: summarisation
+    /// makes them, tests make them, and 727 of them had accumulated in `%TEMP%`
+    /// on this machine, ~46 GB, alongside the same leak from the test helpers.
+    /// Held behind the same `Arc` as everything else here so a clone does not
+    /// delete the directory the original is still writing to.
+    ///
+    /// **Declared last on purpose.** Rust drops fields in declaration order, so
+    /// `writer` above goes first — draining, fsyncing and joining the writer
+    /// thread — and only then does this remove the directory. Windows refuses to
+    /// delete a directory holding an open file, so a guard that ran before the
+    /// writer released its handles would silently fail and leave the 64 MiB
+    /// behind, which is the bug it exists to fix.
+    ///
+    /// Never read, and that is the point: the whole of its behaviour is in
+    /// `Drop`. Holding it is the feature.
+    #[allow(dead_code)]
+    ephemeral_dir: Option<Arc<TempDirGuard>>,
+}
+
+/// Removes a directory when the last holder drops it.
+///
+/// Deliberately best-effort: a failure to remove a *temp* directory is not
+/// worth failing a drop over, and on Windows a file another process still has
+/// open will refuse. The alternative to best-effort is a panic in `Drop`, which
+/// aborts.
+#[derive(Debug)]
+pub struct TempDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempDirGuard {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// The directory this guard will remove.
+    ///
+    /// Only the tests that assert the removal actually happens have any reason
+    /// to ask — production code holds the guard and never looks inside it.
+    #[cfg(test)]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            // `NotFound` is the ordinary outcome when a test removed it itself.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    "temp directory {:?} not removed: {e} — it will be left on disk",
+                    self.path
+                );
+            }
+        }
+    }
 }
 
 /// Per-turn residency fingerprint for a decoded sig window: the memo's stable
@@ -326,6 +393,9 @@ impl Conversation {
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
             branch_checkpoint: Arc::new(Mutex::new(None)),
+            // The directory goes when the last clone of this conversation does.
+            // See the field's own note for what it cost not to have this.
+            ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
         }
     }
 
@@ -340,6 +410,10 @@ impl Conversation {
         let persistence = Arc::new(Mutex::new(persistence));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
+            // **No guard.** This conversation's log lives in a directory the
+            // caller chose — a workspace, someone's `--data`. Removing it on
+            // drop would delete the substrate rather than a temp file.
+            ephemeral_dir: None,
             inner,
             allocator: Arc::new(TimelineAllocator::new()),
             maintenance,
@@ -3666,10 +3740,77 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collection_warm_plan, selected_in_collection, subwindow_bounds, Observe};
+    use super::{
+        collection_warm_plan, selected_in_collection, subwindow_bounds, Conversation, Observe,
+    };
 
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **An ephemeral conversation takes its directory with it.**
+    ///
+    /// Its log is a throwaway, and `LogFile` grows in 64 MiB extents — the
+    /// slack is only reclaimed when a segment *seals*, which a throwaway never
+    /// does. So every ephemeral conversation used to leave 64 MiB in `%TEMP%`
+    /// permanently. Summarisation makes them, tests make them, and 727 of them
+    /// had accumulated on this machine (~46 GB) beside the same leak from the
+    /// test helpers — together half a 1 TB disk.
+    ///
+    /// The clone is not decoration: the guard sits behind the same `Arc` as
+    /// everything else on the handle, so a clone must *not* remove the
+    /// directory the original is still writing to.
+    #[test]
+    fn an_ephemeral_conversation_removes_its_temp_directory_on_the_last_drop() {
+        let conv = Conversation::ephemeral();
+        let dir = conv
+            .ephemeral_dir
+            .as_ref()
+            .expect("an ephemeral conversation owns its directory")
+            .path()
+            .to_path_buf();
+        assert!(dir.is_dir(), "the ephemeral log directory was never made");
+
+        let clone = conv.clone();
+        drop(conv);
+        assert!(
+            dir.is_dir(),
+            "dropping one clone removed the directory the other is still writing to"
+        );
+
+        drop(clone);
+        assert!(
+            !dir.exists(),
+            "the last drop left {dir:?} behind — 64 MiB per ephemeral conversation, forever"
+        );
+    }
+
+    /// A conversation opened on a real workspace holds no guard, because
+    /// removing *that* directory on drop would delete somebody's substrate
+    /// rather than a temp file.
+    #[test]
+    fn a_workspace_conversation_owns_no_directory_to_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "candle-conv-workspace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut substrate = crate::substrate::Substrate::new();
+        let persistence =
+            crate::persistence::SubstratePersistence::open_in_with_substrate(&dir, &mut substrate)
+                .expect("workspace persistence");
+        let conv = Conversation::from_parts(substrate, persistence);
+        assert!(conv.ephemeral_dir.is_none());
+        drop(conv);
+        assert!(
+            dir.is_dir(),
+            "a workspace conversation deleted the directory it was opened on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The segmentation rule: a scope learns from a probe only when the probe is

@@ -115,9 +115,30 @@ impl QMatMul {
         Ok(Self { inner })
     }
 
+    /// [`Self::new`] repacked for `mode`: at an int8 mode the weight becomes its
+    /// KO twin and forward runs the q8a128 tensor-core matmul. A weight whose
+    /// shape the matmul cannot tile keeps its source form and reports `Off`;
+    /// that decision belongs to
+    /// [`super::quantized_matmul::QMatMul`], which makes it per tensor.
+    pub fn new_with_mode(
+        out_dim: usize,
+        in_dim: usize,
+        mode: candle::quantized::Int8Mode,
+        vb: crate::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        let ws = vb.get((in_dim, out_dim), "weight")?;
+        let inner = super::quantized_matmul::QMatMul::from_weights_with_mode(ws, mode)?;
+        Ok(Self { inner })
+    }
+
     pub fn from_weights(ws: std::sync::Arc<candle::quantized::QTensor>) -> Result<Self> {
         let inner = super::quantized_matmul::QMatMul::from_weights(ws)?;
         Ok(Self { inner })
+    }
+
+    /// The numeric mode this weight actually resolved to.
+    pub fn int8mode(&self) -> candle::quantized::Int8Mode {
+        self.inner.int8mode()
     }
 }
 

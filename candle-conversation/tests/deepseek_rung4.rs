@@ -70,6 +70,11 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         model_bytes,
+        // Local file only, so there is no revision to pin and no repo an
+        // override could displace — the two fields a downloaded checkpoint uses
+        // to stay the bytes the gate measured.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "deepseek-ai/DeepSeek-V4-Flash-0731".to_string(),
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a concise, factual assistant.".to_string(),

@@ -74,6 +74,7 @@ pub mod consequence;
 pub mod document;
 pub mod generate;
 pub mod job;
+pub mod narrate;
 pub mod plan;
 pub mod progress;
 pub mod prompt;

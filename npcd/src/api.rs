@@ -26,6 +26,7 @@ use axum::{
 // Only the test-only `router` builds one directly; `main` goes through `api`.
 #[cfg(test)]
 use axum::Router;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use web::auth::session::Identity;
@@ -37,8 +38,10 @@ use crate::clock::{self, Clock};
 use crate::collections::{self, Libraries};
 use crate::engine::runtime::Runtime;
 use crate::guard::Api;
+use crate::guest_routes;
 use crate::identity::require;
 use crate::images::{ImageError, Images};
+use crate::lifegen::narrate as lifegen_narrate;
 use crate::lifegen::routes as lifegen;
 use crate::mind::catalog::CatalogError;
 use crate::mind::doc::{DocError, Wrote};
@@ -47,6 +50,7 @@ use crate::mind::{
     Scope,
 };
 use crate::npcs::{self, Filter, NpcError, Npcs};
+use crate::portrait;
 use crate::registry::{self, PutError, Registry};
 use crate::visibility;
 
@@ -229,6 +233,52 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // character is. And every write here puts prose into the substrate that
         // a character will think it remembers, which is a larger act than
         // editing a page of canon.
+        // **Co-resident models, and why they are `Admin`.**
+        //
+        // A guest job stops the world: the scheduler evicts the engine's KV
+        // working set to make room, and every character in every world stops
+        // thinking until it finishes. That is a legitimate thing for an operator
+        // to ask for and not a thing to expose to a player — the ask is cheap to
+        // make and expensive to serve, which is the shape of request that needs
+        // a hand on it rather than a rate limit.
+        // Separating a picture from its background.
+        //
+        // **`user`, because the split is by audience and not by cost.** Every
+        // console image route is `user` — `/v1/image/generate` included, and
+        // that one stops the world for ten to twenty-five seconds — while the
+        // raw `/v1/guest/*` operator routes are `admin`. This serves the Images
+        // page, which is itself a `user` page, so `admin` here would be the one
+        // console image route that refused the people the page is for.
+        //
+        // What bounds the exposure is not the role: a matte is one forward at a
+        // fixed size, `GuestRequest::check` caps the picture, and the queue
+        // serialises drains. It is the cheapest world-stopping thing this
+        // daemon offers, by an order of magnitude.
+        .route(
+            "/v1/image/cutout",
+            Role::User,
+            post(guest_routes::post_cutout),
+        )
+        .route("/v1/guest", Role::Admin, get(guest_routes::get_guests))
+        .route(
+            "/v1/guest/image",
+            Role::Admin,
+            post(guest_routes::post_image),
+        )
+        .route(
+            "/v1/guest/prose",
+            Role::Admin,
+            post(guest_routes::post_prose),
+        )
+        // One stratum of a life, rewritten in the narrator's voice through the
+        // prose guest. The ladder (`/generate`) stays on the main engine, which
+        // is the right shape for a five-hundred-node fan-out; this is the other
+        // case — one node, on demand, in a voice the acting model does not have.
+        .route(
+            "/v1/life/:who/node/:key/narrate",
+            Role::Admin,
+            post(lifegen_narrate::post_narrate),
+        )
         .route("/v1/life/catalog", Role::Admin, get(lifegen::get_catalog))
         .route("/v1/life/:who", Role::Admin, get(lifegen::get_life))
         .route("/v1/life/:who/seed", Role::Admin, put(lifegen::put_seed))
@@ -334,6 +384,21 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         )
         // A portrait is a file, and needs no engine — see [`crate::images`].
         .route("/v1/npc/:nid/portrait", Role::User, put(put_portrait))
+        // Drawing one does need an engine, and stops every character thinking
+        // while it runs. `User` rather than `Admin` all the same: it is a
+        // portrait of *your own* character, the route refuses anything you do
+        // not own, and making it admin-only would mean nobody could ever use
+        // the button on the character they just created.
+        .route(
+            "/v1/npc/:nid/portrait/generate",
+            Role::User,
+            post(portrait::post_generate),
+        )
+        // `/v1/image/models` and `/v1/generate/description` are **not** here.
+        // They already exist in `engine::routes` as the placeholders the console
+        // was written against, and that is where their real implementations now
+        // live — a second registration is not an override, it is an
+        // "overlapping method route" panic at startup.
         .route("/v1/image/:iid", Role::User, get(get_image))
         // An account and its profile are the caller's own, so `User` and then
         // the record is keyed by their subject — there is no id in these paths
@@ -426,7 +491,7 @@ pub async fn owner_of(
 /// `NotFound` covers both "no such id" and "not yours" on purpose: a 403 would
 /// confirm that an id exists, which is enough to enumerate somebody else's cast
 /// one guess at a time — the §8.3 leak by another route.
-fn npc_err(e: NpcError) -> Response {
+pub(crate) fn npc_err(e: NpcError) -> Response {
     match e {
         NpcError::NotFound => err(StatusCode::NOT_FOUND, "npc_not_found", "no such character"),
         NpcError::Invalid(field) => err(
@@ -483,7 +548,7 @@ async fn list_npcs(
 /// listing, against a map that is already in memory. A slug whose file is gone
 /// keeps no name and the page falls back to showing the slug, which is the
 /// honest thing to show for a reference that no longer resolves.
-fn name_personality(npc: &mut Value, reg: &Registry) {
+pub(crate) fn name_personality(npc: &mut Value, reg: &Registry) {
     let Some(id) = npc.get("personality_id").and_then(Value::as_str) else {
         return;
     };
@@ -537,7 +602,18 @@ async fn create_npc(
     if let Some(r) = missing_ref(&s, &body).await {
         return r;
     }
-    match s.npcs.write().await.create(&id, &owner, &body, now_ms()) {
+    // **Bound to a local so the write guard drops before the arm runs.** As a match scrutinee
+    // the guard is a temporary that lives to the end of the whole `match`, and the `Ok` arm
+    // calls `world_ms`, which takes `npcs.read()`. `tokio::sync::RwLock` is not reentrant, so
+    // that read never resolves: the request hangs *holding the write lock*, every later reader
+    // and writer queues behind it, and the tick thread — which reaches the same lock through
+    // the clock and persona closures — stops with it. The daemon wedges on the first character
+    // created while it is running.
+    //
+    // Invisible to the suite because `Authored::new` leaves `runtime: None`, so the block that
+    // calls `world_ms` only ever executes in production.
+    let created = s.npcs.write().await.create(&id, &owner, &body, now_ms());
+    match created {
         Ok(mut v) => {
             // Put the new character into the loop straight away.
             //
@@ -923,12 +999,45 @@ where
 /// posted a name, a world, a personality and a description, and the image
 /// existed only as an object URL that went away with the tab. The record has
 /// carried `portrait_image_id` the whole time with nothing to put in it.
+/// Where the bytes came from, for [`crate::npcs::Npcs::set_portrait`].
+///
+/// Defaults to `uploaded`, which is what a file chosen from disk is. The create
+/// step needs the other value: it draws a portrait through the image guest and
+/// shows it *before* there is a character to attach it to, then sends the bytes
+/// it already has once the character exists. Those bytes are a generated
+/// portrait and have to be recorded as one — filed as `uploaded`, the character
+/// could never be redrawn afterwards, because [`crate::portrait::post_generate`]
+/// refuses to replace an uploaded portrait without `force`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortraitOrigin {
+    #[serde(default)]
+    origin: Option<String>,
+}
+
 async fn put_portrait(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(nid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<PortraitOrigin>,
     body: axum::body::Bytes,
 ) -> Response {
+    // Two values, and anything else is refused rather than stored: the string
+    // is written onto the record and read back as a rule about what may
+    // overwrite it, so a third value would be a portrait nothing can classify.
+    let origin =
+        match q.origin.as_deref() {
+            None | Some("uploaded") => "uploaded",
+            Some("generated") => "generated",
+            Some(other) => return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "bad_origin",
+                    "detail": format!("origin must be `uploaded` or `generated`, not `{other}`"),
+                })),
+            )
+                .into_response(),
+        };
     let id = match s.images.put(&body) {
         Ok(id) => id,
         Err(e) => return image_err(e),
@@ -941,7 +1050,7 @@ async fn put_portrait(
     // not be able to name one — every id in the store is valid, so there would
     // be nothing to reject.
     write_npc(s, headers, nid, move |n, npc_id, owner, now| {
-        n.set_portrait(npc_id, owner, id, "uploaded", now)
+        n.set_portrait(npc_id, owner, id, origin, now)
     })
     .await
 }
@@ -1680,7 +1789,7 @@ fn doc_err(e: DocError) -> Response {
 
 /// Wall-clock milliseconds, for stamping a record. A clock before the epoch is
 /// not a reason to refuse a write, so it reads as zero.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -2582,6 +2691,103 @@ mod tests {
         assert_eq!(list["items"].as_array().unwrap().len(), 1);
     }
 
+    /// **A restricted draw is an admin's ask, twice over.** The route table
+    /// puts `/v1/guest/image` at `admin`; the handler *also* requires `admin`
+    /// for `lora: restricted` specifically, because that flag waives the
+    /// prompt's compliance gate and must not ride along if the route's level
+    /// is ever relaxed. This pins the contract from the outside: a caller
+    /// below admin never draws restricted, and an admin's ask gets past
+    /// authorisation — to the engine check, since a test daemon has none.
+    #[tokio::test]
+    async fn a_restricted_draw_needs_the_admin_role() {
+        let st = state(tmp("restricted-draw"));
+        let body = json!({ "prompt": "a lantern", "lora": "restricted" });
+        let (s, _) = call(
+            router(st.clone()),
+            send("/v1/guest/image", "POST", "g1", body.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, b) = call(
+            router(st.clone()),
+            send("/v1/guest/image", "POST", ADMIN, body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+    }
+
+    /// **A cutout is a guest job, so it needs an engine.** It used to be a
+    /// flood fill on the host and answered without one; it is a network now,
+    /// and on a daemon with no engine the honest answer is the same 503 every
+    /// other guest route gives rather than a colour algorithm's guess.
+    #[tokio::test]
+    async fn a_cutout_needs_an_engine_like_every_other_guest() {
+        use base64::Engine as _;
+        let st = state(tmp("cutout-route"));
+
+        let mut img = image::RgbImage::from_pixel(32, 32, image::Rgb([250, 250, 250]));
+        for y in 8..24 {
+            for x in 8..24 {
+                img.put_pixel(x, y, image::Rgb([20, 30, 60]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+
+        let (s, out) = call(
+            router(st.clone()),
+            send(
+                "/v1/image/cutout",
+                "POST",
+                "g1",
+                json!({ "png_base64": b64 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{out}");
+    }
+
+    /// A malformed upload is still the caller's mistake, and is still answered
+    /// **before** anything is queued — a drain evicts the engine's working set,
+    /// and finding out inside one that a file was not a picture is the failure
+    /// the boundary decode exists to prevent.
+    #[tokio::test]
+    async fn a_cutout_of_something_that_is_not_a_picture_is_refused_at_the_boundary() {
+        let st = state(tmp("cutout-junk"));
+        let (s, out) = call(
+            router(st),
+            send(
+                "/v1/image/cutout",
+                "POST",
+                "g1",
+                json!({ "png_base64": "bm90IGEgcGljdHVyZQ==" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{out}");
+        assert_eq!(out["error"], "bad_reference");
+    }
+
+    /// The console's own draw route (`/v1/image/generate`) sits at `user`, so
+    /// the handler's re-check is the ONLY thing between an ordinary user and
+    /// the restricted checkpoint with its waived prompt gate. Called directly
+    /// here, exactly as that route calls it.
+    #[tokio::test]
+    async fn a_users_restricted_ask_is_refused_by_the_handler_itself() {
+        let st = state(tmp("restricted-handler"));
+        let mut headers = axum::http::HeaderMap::new();
+        for (k, v) in signed_in("g1") {
+            headers.insert(k, v.parse().unwrap());
+        }
+        let body: crate::guest_routes::ImageBody =
+            serde_json::from_value(json!({ "prompt": "a lantern", "lora": "restricted" })).unwrap();
+        let res = crate::guest_routes::post_image(State(st), headers, Json(body)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
     /// **The whole route table, written down.**
     ///
     /// `guard::Api` makes it impossible to *forget* a role — the compiler
@@ -2617,6 +2823,23 @@ mod tests {
                 // Read-only, from the personality's own document — open for the
                 // same reason reading the document is.
                 ("/v1/personality/:aid/collections", "unauthenticated"),
+                // A flood fill on the host — no model, no drain, no engine — so
+                // it sits in this table rather than the engine's and answers on
+                // a daemon that has none.
+                ("/v1/image/cutout", "user"),
+                // The co-resident models. `admin` including the read, because a
+                // guest job **stops the world**: the scheduler evicts the
+                // engine's KV working set to make room, and every character in
+                // every world stops thinking until it finishes. A request that
+                // costs one line to make and a minute of the whole estate to
+                // serve wants a hand on it rather than a rate limit.
+                ("/v1/guest", "admin"),
+                ("/v1/guest/image", "admin"),
+                ("/v1/guest/prose", "admin"),
+                // One stratum of a life, in the narrator's voice. `admin` with
+                // the rest of `/v1/life` — it writes prose into the substrate
+                // that a character will believe it remembers.
+                ("/v1/life/:who/node/:key/narrate", "admin"),
                 // A character's authored life. **`admin` for the reads too**,
                 // which is the one place this table departs from the pattern
                 // above it, and deliberately: the plan carries the SEED — the
@@ -2667,6 +2890,11 @@ mod tests {
                 // id is a content hash and unguessable, and unguessable is not
                 // a permission.
                 ("/v1/npc/:nid/portrait", "user"),
+                // Drawing one, and what it can be drawn with. `user` like the
+                // upload: it is a portrait of the caller's own character, and
+                // admin-only would mean nobody could use the button on the
+                // character they just made.
+                ("/v1/npc/:nid/portrait/generate", "user"),
                 ("/v1/image/:iid", "user"),
                 // The caller's own account.
                 ("/v1/me", "user"),
@@ -4027,6 +4255,164 @@ layers:
         assert_eq!(s, StatusCode::NO_CONTENT);
         let (_, v) = call(router(st), get(&format!("/v1/npc/{id}/beliefs"), Some(a))).await;
         assert_eq!(v["beliefs"].as_array().unwrap().len(), 0);
+    }
+
+    /// **The portrait button reaches the image guest, and says so when there is
+    /// none.**
+    ///
+    /// This state has no engine at all, which is the honest shape for a router
+    /// test — what it pins is that the route exists, is reachable by the
+    /// character's owner, refuses a stranger, and comes back with a machine-
+    /// readable reason rather than a 404. Before this route the console called
+    /// `/v1/image/models`, got a 404, and *inferred* "no image model is
+    /// loaded"; a guess that happened to be right is still a guess.
+    #[tokio::test]
+    async fn a_portrait_can_be_asked_for_and_the_refusal_is_legible() {
+        let st = state(tmp("portrait-generate"));
+        let a = "google-1";
+        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        author(&st).await;
+
+        let (s, npc) = call(
+            router(st.clone()),
+            send(
+                "/v1/npc",
+                "POST",
+                a,
+                json!({
+                    "name": "Hess", "world_id": "battle-cities",
+                    "personality_id": "commander",
+                    "persona_description": "a quartermaster in his fifties, scarred left hand",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{npc}");
+        let id = npc["npc_id"].as_str().expect("created").to_string();
+
+        // The models catalogue is **not** asserted here: it lives in
+        // `engine::routes` — where the placeholder it replaced already was —
+        // and this `router()` builds `api::routes` alone. Reaching for it from
+        // here is what a duplicate registration looks like just before axum
+        // panics at startup with "overlapping method route", which is exactly
+        // how it was found.
+
+        // The draw is refused, with a reason a console can branch on.
+        let (s, v) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}/portrait/generate"),
+                "POST",
+                a,
+                json!({}),
+            ),
+        )
+        .await;
+        assert!(
+            s == StatusCode::NOT_IMPLEMENTED || s == StatusCode::SERVICE_UNAVAILABLE,
+            "a daemon with no image guest answered {s} to a portrait request: {v}"
+        );
+        assert!(
+            v["error"].is_string(),
+            "the refusal carries no machine-readable code: {v}"
+        );
+
+        // And it is somebody's own character: a stranger cannot draw over it.
+        let (s, _) = call(
+            router(st),
+            send(
+                &format!("/v1/npc/{id}/portrait/generate"),
+                "POST",
+                "google-2",
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "a stranger could ask for a portrait of somebody else's character"
+        );
+    }
+
+    /// **The narrate route is reachable and refuses legibly.**
+    ///
+    /// Its companion to the portrait test above, and the same shape: this state
+    /// has no engine, so what is pinned is that the route exists, that it is
+    /// admin-gated with the rest of `/v1/life`, that a bad node key is refused
+    /// before anything else happens, and that a missing prose guest comes back
+    /// as a code a console can branch on rather than as a 404 it has to guess
+    /// from.
+    #[tokio::test]
+    async fn a_life_stratum_can_be_narrated_and_the_refusal_is_legible() {
+        let base = tmp("narrate");
+        let st = mind_state(base);
+        // Admin, with the rest of `/v1/life`: this route writes prose into the
+        // substrate that a character will believe it remembers.
+        let a = ADMIN;
+        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        author(&st).await;
+
+        // An ordinary user cannot reach it at all.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                "/v1/life/commander/node/story/narrate",
+                "POST",
+                "google-1",
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "narrate is not admin-gated");
+
+        // A character the registry does not know is refused as *that*, rather
+        // than as a life with no plan — the two have different fixes.
+        let (_, v) = call(
+            router(st.clone()),
+            send("/v1/life/nobody/node/story/narrate", "POST", a, json!({})),
+        )
+        .await;
+        assert_eq!(v["error"], "personality_not_found", "{v}");
+
+        // A real character with no plan yet says so, and says it before
+        // reaching the guest: there is nothing to narrate, so nothing should be
+        // evicted to find that out.
+        let (_, v) = call(
+            router(st.clone()),
+            send(
+                "/v1/life/commander/node/story/narrate",
+                "POST",
+                a,
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            v["error"], "no_life_plan",
+            "a character with no plan was reported as something else: {v}"
+        );
+
+        // An unknown field is refused rather than ignored — a caller sending a
+        // `prompt` is asking for something this route deliberately does not
+        // offer, and narrating from the plan instead would look like it was
+        // honoured. This is what `Option<Json<_>>` silently defeated: axum turns
+        // a parse failure into `None`, so the defaults answered 200.
+        let (s, _) = call(
+            router(st),
+            send(
+                "/v1/life/commander/node/story/narrate",
+                "POST",
+                a,
+                json!({ "prompt": "make it up" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an unknown field was accepted"
+        );
     }
 
     /// **The narrative clock writes, and the world remembers it.**

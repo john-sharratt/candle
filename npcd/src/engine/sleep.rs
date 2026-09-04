@@ -119,9 +119,18 @@ impl DayTracker {
 
 /// The conversation id a character uses for a given day.
 ///
-/// Derived rather than allocated, so a restart mid-day rejoins the conversation
-/// it was already on instead of opening a second one for the same day. That bug
-/// is invisible until somebody asks why a character has two of everything.
+/// Derived rather than allocated, and recorded against the timeline by
+/// [`crate::engine::mind::Minds::think`], so every timeline a character opens
+/// during one day carries that day's name in the redo log. A restart mid-day
+/// opens a fresh timeline — the sequence is GPU state — but it is named the same
+/// day, so the morning's turns stay attributable to the character that lived
+/// them rather than sitting in the log anonymous.
+///
+/// Determinism alone is not the property: this function was correct and its
+/// result was never handed to the substrate, which made every timeline
+/// unattributable while two doc comments said otherwise. A test that only
+/// exercises the string cannot see that, which is why the caller is what the
+/// doc points at.
 pub fn conversation_id(npc_id: u64, day: u64) -> String {
     format!("npc-{npc_id}-day-{day}")
 }
@@ -230,8 +239,10 @@ mod tests {
         assert_eq!(t.evaluate(DAY_MS * 2), DayAction::Continue);
     }
 
-    /// A restart mid-day must rejoin the day's conversation rather than open a
-    /// second one for the same day.
+    /// Every timeline a character opens during one day must carry that day's
+    /// name, so a restart's second timeline is still attributable to the
+    /// character and the day. This pins the derivation; that the id actually
+    /// reaches the substrate is `mind::think`'s to do and its own doc's to say.
     #[test]
     fn a_days_conversation_id_is_derived_not_allocated() {
         assert_eq!(conversation_id(7, 3), "npc-7-day-3");

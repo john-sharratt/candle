@@ -20,6 +20,75 @@ async function j(path, opts) {
   return r.status === 204 ? null : r.json();
 }
 
+/* Read one of the daemon's NDJSON streams: one JSON object per line, every
+ * stream ending in exactly one terminal `done` or `error` line.
+ *
+ * NDJSON over `fetch` rather than `EventSource`, because `EventSource` can only
+ * issue a GET and every generation route here takes a body. The parsing
+ * difference is one `split`.
+ *
+ * Shared by every streaming call rather than written per route. The two hard
+ * parts — a chunk boundary landing mid-line or mid-character, and a stream that
+ * closes cleanly without its terminal line — are subtle enough that a second
+ * copy would be a second chance to get them wrong, and the failures are quiet
+ * ones: a mangled character, or a truncated answer treated as the whole thing.
+ *
+ * `what` names the stream in the "ended early" message, since by then there is
+ * no status and no error line to say what was being waited on.
+ */
+async function ndjson(path, body, onEvent, what) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  /* A refusal that happened before the stream opened is an ordinary status with
+   * a JSON body — thrown like any other call's, so a caller branches on
+   * `status` rather than on where in the response the failure appeared. */
+  if (!r.ok) {
+    let e = { error: 'http_' + r.status, detail: r.statusText };
+    try { e = await r.json(); } catch (_) {}
+    throw Object.assign(new Error(e.detail || e.error), e, { status: r.status });
+  }
+
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  /* A chunk boundary lands wherever the network puts it, which is regularly
+   * mid-line and occasionally mid-character. `stream: true` holds a partial
+   * UTF-8 sequence back rather than emitting a replacement character, and `buf`
+   * holds the partial line. */
+  let buf = '';
+  let done = null;
+  const take = (line) => {
+    if (!line.trim()) return;
+    let ev;
+    try { ev = JSON.parse(line); } catch (_) { return; }
+    if (ev.event === 'error') throw Object.assign(new Error(ev.detail || ev.error), ev);
+    if (ev.event === 'done') done = ev;
+    else if (onEvent) onEvent(ev);
+  };
+  for (;;) {
+    const { value, done: eof } = await reader.read();
+    if (eof) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) take(line);
+  }
+  /* Flush both buffers at EOF. The daemon terminates every line, so the
+   * remainder is normally empty — but a body that ended without its final
+   * newline would otherwise lose the one line that carries the whole result,
+   * and the failure would look like a dropped connection rather than a parsing
+   * rule. */
+  buf += dec.decode();
+  take(buf);
+  /* No terminal line means the connection dropped mid-job. Silence is not
+   * success here: without this a caller would keep whatever arrived and treat a
+   * truncated answer — or no answer at all — as the result. */
+  if (!done) throw new Error(`${what} ended before it finished`);
+  return done;
+}
+
 const qs = (o) => {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(o || {})) if (v != null && v !== '') p.set(k, v);
@@ -138,6 +207,11 @@ export const LiveAPI = {
   getLife:        (w) => j(`/v1/life/${w}`),
   setLifeSeed:    (w, seed) => j(`/v1/life/${w}/seed`, { method: 'PUT', body: seed }),
   setLifeNode:    (w, key, c) => j(`/v1/life/${w}/node/${key}`, { method: 'PUT', body: c }),
+  /* One stratum, rewritten by the co-resident narrator rather than by the
+   * ladder. Returns the prose itself, not a job — a guest drain is one
+   * indivisible stop-the-world event, so there is nothing useful to poll. */
+  narrateLifeNode: (w, key, o) =>
+    j(`/v1/life/${w}/node/${key}/narrate`, { method: 'POST', body: o || {} }),
   addLifeDay:     (w, d) => j(`/v1/life/${w}/day`, { method: 'POST', body: d }),
   removeLifeDay:  (w, date) => j(`/v1/life/${w}/day/${date}`, { method: 'DELETE' }),
   /* The operator authors these and generation injects them; the model never
@@ -168,7 +242,12 @@ export const LiveAPI = {
    * the reason it exists: the interesting bugs are about which character ticked
    * when, and that is invisible one character at a time. */
   pulse:       (o) => j('/v1/pulse' + qs(o || {})),
-  pulseCensus: () => j('/v1/pulse/census'),
+  /* The census takes the same query the feed does, and dropping it was not
+   * harmless: the route reads `all` to decide an admin's scope, so the toggle
+   * filtered the stream and left the cast list showing every character in the
+   * estate. The two panels then disagreed on screen with nothing saying which
+   * was right. */
+  pulseCensus: (o) => j('/v1/pulse/census' + qs(o || {})),
   /* Send an event into a character's inbox. `line` is the operator's raw input,
    * `/`-prefixed or not — the daemon parses it, because the daemon is the only
    * thing that can be authoritative about which commands exist. */
@@ -227,8 +306,12 @@ export const LiveAPI = {
    * file and no other fields, so an envelope would be ceremony around a byte
    * string — and the daemon decides the format from the bytes anyway, so the
    * `Content-Type` here is a courtesy rather than a claim it trusts. */
-  async putPortrait(id, file) {
-    const r = await fetch(`/v1/npc/${id}/portrait`, {
+  /* `origin` is `uploaded` (a file chosen from disk) or `generated` (bytes the
+   * create step drew through the image guest before there was a character to
+   * attach them to). It decides whether a later draw may replace this portrait,
+   * so generated bytes filed as uploaded would be permanent. */
+  async putPortrait(id, file, origin) {
+    const r = await fetch(`/v1/npc/${id}/portrait${origin ? `?origin=${origin}` : ''}`, {
       method: 'PUT',
       headers: { 'content-type': file.type || 'application/octet-stream' },
       body: file,
@@ -241,9 +324,63 @@ export const LiveAPI = {
     return r.json();
   },
 
+  /* A name, written against the world's own `setting` summary. Short enough
+   * that it lands while the author is still reading the world they picked, and
+   * it is what `generateDescription` is then handed — so the name field and the
+   * prose agree about who this is. */
+  generateName: (b) => j('/v1/generate/name', { method: 'POST', body: b || {} }),
+
   generateDescription: (b) => j('/v1/generate/description', { method: 'POST', body: b || {} }),
-  generateImage:       (b) => j('/v1/image/generate', { method: 'POST', body: b || {} }),
+
+  /* The same generation, arriving as it is written.
+   *
+   * A description is a second or two: the cast stops, Hermes-3's weights cross
+   * the PCIe link (~0.3s), and it decodes at about reading speed. `onEvent` is
+   * called with each line as it lands: `{event:'loading'}` while the model
+   * loads, `{event:'token', text}` per fragment, and the promise resolves with
+   * the terminal `done`.
+   *
+   * `loading` is reported because it is a real phase and a caller may want it —
+   * the console does not render it separately, since the interval is too short
+   * to be worth a state of its own.
+   *
+   * NDJSON over `fetch`, not `EventSource`: `EventSource` can only issue a GET,
+   * and this request has a body. The parsing difference is one `split`.
+   *
+   * The `done` line carries the whole description, so a caller shows fragments
+   * while waiting and then takes the final text — the streamed preview can end a
+   * character or two off where tokenizer cleanup revised something already
+   * shown. */
+  generateDescriptionStream(b, onEvent) {
+    return ndjson('/v1/generate/description/stream', b, onEvent, 'the description');
+  },
+
+  /* Draw an image. NDJSON for the same reason the description is, with one
+   * difference worth naming: prose streams its *result*, an image streams only
+   * its progress. A picture is mush until the final denoise step and is not
+   * pixels at all until the decoder runs, so `onEvent` gets `step` lines with
+   * `{done, total, what}` and the picture arrives whole in the terminal line.
+   *
+   * `onEvent` is optional — a caller that only wants the image passes nothing
+   * and reads this exactly like the blocking call it replaced. */
+  generateImage(b, onEvent) {
+    return ndjson('/v1/image/generate', b, onEvent, 'the draw');
+  },
+
+  /* Separate a picture from its background, giving back a PNG with alpha.
+   *
+   * A plain POST rather than a stream: it is one forward through a
+   * salient-object network — a fraction of a second — so there is no interior
+   * progress worth reporting, unlike a draw's denoise steps. It is a guest job
+   * like any other, so it waits for a drain. */
+  cutout: (b) => j('/v1/image/cutout', { method: 'POST', body: b }),
   listImageModels:     () => j('/v1/image/models'),
+  /* Draw a portrait from the character's own description. There is no prompt
+   * argument on purpose — the description is the prompt, so the two cannot
+   * drift apart. Blocks for the length of the drain; the daemon answers with
+   * the character's record, exactly as the upload route does. */
+  generatePortrait: (id, o) =>
+    j(`/v1/npc/${id}/portrait/generate`, { method: 'POST', body: o || {} }),
   getImageQueue:       () => j('/v1/image/queue'),
   imageUrl:            (id) => `/v1/image/${id}`,
 };

@@ -103,3 +103,67 @@ fn group_norm() -> Result<()> {
 
     Ok(())
 }
+
+/// **The CUDA path must agree with the CPU one, at the shapes a real model
+/// uses.**
+///
+/// The test above pins the numbers against PyTorch, but only on `Device::Cpu`,
+/// and only for a 2×6×3 toy. Nothing exercised group norm on a card, and nothing
+/// exercised it at a width where a kernel's reduction strategy changes — which
+/// is exactly where a per-group reduction goes wrong.
+///
+/// The shapes here are Stable Diffusion's VAE decoder: 32 groups over 512, 256
+/// and 128 channels at the resolutions the decoder upsamples through. A
+/// diffusion pipeline whose decode collapses to flat grey looks like bad weights
+/// and is indistinguishable from bad normalisation, so this is the check that
+/// tells the two apart.
+#[cfg(feature = "cuda")]
+#[test]
+fn group_norm_cuda_matches_cpu() -> Result<()> {
+    let cuda = Device::new_cuda(0)?;
+
+    // (channels, height, width) — the VAE decoder's three up-block stages, plus
+    // a deliberately awkward one: 30 channels over 3 groups is 10 per group,
+    // which no power-of-two tiling divides evenly.
+    for &(c, h, w, groups) in &[
+        (512usize, 64usize, 64usize, 32usize),
+        (256, 128, 128, 32),
+        (128, 256, 256, 32),
+        (30, 7, 5, 3),
+    ] {
+        // Deterministic and non-trivial: a constant input normalises to zero
+        // whatever the reduction does, so it would pass a broken kernel.
+        let n = c * h * w;
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i % 97) as f32 - 48.0) / 17.0 + (i % 7) as f32 * 0.13)
+            .collect();
+        let weight: Vec<f32> = (0..c).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
+        let bias: Vec<f32> = (0..c).map(|i| (i % 3) as f32 * 0.1 - 0.1).collect();
+
+        let on = |dev: &Device| -> Result<Vec<f32>> {
+            let x = Tensor::from_vec(data.clone(), (1, c, h, w), dev)?;
+            let g = GroupNorm::new(
+                Tensor::from_vec(weight.clone(), c, dev)?,
+                Tensor::from_vec(bias.clone(), c, dev)?,
+                c,
+                groups,
+                1e-6,
+            )?;
+            Ok(g.forward(&x)?.flatten_all()?.to_vec1::<f32>()?)
+        };
+
+        let (a, b) = (on(&Device::Cpu)?, on(&cuda)?);
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 2e-4,
+            "group_norm({groups} groups over {c}ch, {h}x{w}) differs between CPU and CUDA by \
+             {worst} — a decoder built on this normalises to the wrong statistics, which reads \
+             as a washed-out image rather than as an error"
+        );
+    }
+    Ok(())
+}

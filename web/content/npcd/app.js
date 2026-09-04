@@ -73,6 +73,11 @@ definePage({ path: '/mind', role: 'user', nav: { section: 'main', order: 35, lab
   load: () => import('./pages/mind.js') });
 definePage({ path: '/tools', role: 'user', nav: { section: 'main', order: 40, label: 'Tools' },
   load: () => import('./pages/tools.js') });
+/* The image guest with no character attached — a prompt box for artwork. `user`
+ * like the route it calls (`/v1/image/generate`), which is the same guest the
+ * portrait button borrows and blocks the estate's thinking for either way. */
+definePage({ path: '/images', role: 'user', nav: { section: 'main', order: 42, label: 'Images' },
+  load: () => import('./pages/images.js') });
 // The cast's tick loop, live. Sits beside Tools because the two are the same
 // subject from opposite ends: what a character *can* do, and what it is doing.
 definePage({ path: '/pulse', role: 'user', nav: { section: 'main', order: 45, label: 'Pulse' },

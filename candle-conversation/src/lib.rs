@@ -48,6 +48,7 @@ pub mod conversation_log;
 mod decode_health;
 mod engine;
 mod error;
+pub mod guest;
 mod handle;
 pub mod models;
 pub mod narrator;

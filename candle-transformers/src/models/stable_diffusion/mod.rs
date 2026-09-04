@@ -513,6 +513,24 @@ impl StableDiffusionConfig {
     pub fn build_scheduler(&self, n_steps: usize) -> Result<Box<dyn Scheduler>> {
         self.scheduler.build(n_steps)
     }
+
+    /// The UNet's architecture, for a caller building it through its own
+    /// [`nn::VarBuilder`].
+    ///
+    /// [`Self::build_unet`] takes a path and makes a mmapped builder, which is
+    /// the right thing when the weights may land wherever the CUDA pool puts
+    /// them. A caller that must place them somewhere specific — the guest
+    /// models in `candle-conversation`, which put a whole checkpoint inside the
+    /// device reservation — supplies its own builder and needs the config that
+    /// goes with it.
+    pub fn unet_config(&self) -> &unet_2d::UNet2DConditionModelConfig {
+        &self.unet
+    }
+
+    /// The decoder's architecture, for the same reason as [`Self::unet_config`].
+    pub fn autoencoder_config(&self) -> &vae::AutoEncoderKLConfig {
+        &self.autoencoder
+    }
 }
 
 pub fn build_clip_transformer<P: AsRef<std::path::Path>>(

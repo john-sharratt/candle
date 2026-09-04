@@ -694,11 +694,13 @@ extern "C" void run_max_pool2d(
 /// @param h_out Output height
 /// @param w_scale Width scale factor
 /// @param h_scale Height scale factor
+/// @param dst_numel Total destination elements: b_size * c * w_out * h_out
 /// @param info Pointer to dims and strides info
 /// @param src Source tensor
 /// @param dst Destination tensor
 extern "C" void run_upsample_nearest2d(
     int32_t dtype,
+    size_t dst_numel,
     size_t w_out,
     size_t h_out,
     double w_scale,
@@ -707,9 +709,21 @@ extern "C" void run_upsample_nearest2d(
     const void* src,
     void* dst
 ) {
-    // Use output size to calculate grid
-    size_t numel = w_out * h_out;
-    int grid = grid_size(numel);
+    // **The whole destination, not one plane of it.**
+    //
+    // This was `w_out * h_out`, which launches threads for a single channel of
+    // a single batch item. The kernel's own guard admits the full
+    // `b * c * w_out * h_out`, so it was willing to write everything and simply
+    // never got the threads: every element past the first plane kept whatever
+    // the allocation held. The output is uninitialised rather than wrong, so it
+    // fails as plausible-looking structure — a Stable Diffusion VAE decoding a
+    // *uniform* latent into a regular tiled grid — instead of as an error.
+    //
+    // `dst_numel` is passed in because `info` is a device pointer: the host
+    // cannot read the dims out of it, which is why the count has to come from
+    // the caller that already computed it. Every other dispatcher here takes it
+    // the same way; this one was the outlier.
+    int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
             upsample_nearest2d_f32<<<grid, BLOCK_SIZE>>>(w_out, h_out, w_scale, h_scale, info,

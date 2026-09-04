@@ -80,6 +80,8 @@ pub struct Telemetry {
     started: Instant,
     ring: Mutex<Ring>,
     engine: Mutex<Option<Engine>>,
+    /// The startup load, when there is one — see [`Self::watch_loading`].
+    loading: Mutex<Option<Arc<crate::engine::loading::LoadProgress>>>,
     model: ModelSpec,
 }
 
@@ -125,24 +127,51 @@ impl Telemetry {
             started: Instant::now(),
             ring: Mutex::new(Ring::new()),
             engine: Mutex::new(None),
+            loading: Mutex::new(None),
             model,
         })
     }
 
-    /// The engine's hook. Nothing calls this yet; when something does, the page
-    /// stops saying *not measured* on its own.
+    /// The engine's hook: set the value the *next* sample will carry.
     ///
-    /// This sets the value the *next* sample will carry rather than pushing a
-    /// sample of its own. One timer owns the cadence, so an engine reporting at
-    /// its own rhythm cannot bend the time axis every other panel shares.
-    ///
-    /// Allowed dead because it is the one entry point an engine calls and the
-    /// tests below drive the whole "absent until reported, then present"
-    /// behaviour through it. Deleting it to silence a warning would delete that
-    /// behaviour's only description.
-    #[allow(dead_code)]
+    /// A set rather than a push of its own sample — one timer owns the cadence,
+    /// so an engine reporting at its own rhythm cannot bend the time axis every
+    /// other panel shares.
     pub fn record(&self, e: Engine) {
         *self.engine.lock().unwrap() = Some(e);
+    }
+
+    /// Read the load progress on every sample, so a long ingest is visible on
+    /// the performance page as it happens.
+    ///
+    /// **Startup is the one phase with heavy engine work and no engine to ask.**
+    /// The `Engine` fields here were a stub, so a half-hour world load reported
+    /// `prefill_tps: null` from beginning to end and the only way to know
+    /// whether it was fast or slow was to poll `/v1/status` twice and do the
+    /// arithmetic. `LoadProgress` already counts the tokens where they are
+    /// sealed and derives the rate; this points the sampler at it rather than
+    /// computing the same number a second way.
+    ///
+    /// Pulled per sample rather than pushed per document: an ingest seals
+    /// several documents a second and the ring wants one reading every two.
+    pub fn watch_loading(&self, loading: Arc<crate::engine::loading::LoadProgress>) {
+        *self.loading.lock().unwrap() = Some(loading);
+    }
+
+    /// The engine reading for this instant: whatever an engine last reported,
+    /// or — during startup — what the load progress can say.
+    fn engine_now(&self) -> Option<Engine> {
+        if let Some(e) = self.engine.lock().unwrap().clone() {
+            return Some(e);
+        }
+        let l = self.loading.lock().unwrap().clone()?.snapshot()?;
+        // Only once tokens have been counted. A phase that prefills nothing —
+        // the model load, the calibration — has no rate to report, and a zero
+        // there reads as a stalled engine rather than as an absent one.
+        l.prefill_tps.map(|tps| Engine {
+            prefill_tps: Some(tps),
+            ..Engine::default()
+        })
     }
 
     /// Take one sample and file it. Called by the sampler task, and directly by
@@ -153,7 +182,7 @@ impl Telemetry {
             at: Instant::now(),
             vram,
             host: device::sample_host(),
-            engine: self.engine.lock().unwrap().clone(),
+            engine: self.engine_now(),
         };
         self.ring.lock().unwrap().push(s);
     }
@@ -258,6 +287,81 @@ mod tests {
         assert_eq!(r.series.decode_tps.unwrap(), vec![None, Some(41.5)]);
         // A field the engine did not fill is still absent entirely.
         assert!(r.series.prefill_tps.is_none());
+    }
+
+    /// **A long ingest is visible while it runs.**
+    ///
+    /// The engine fields were a stub, so a half-hour world load reported
+    /// `prefill_tps: null` from beginning to end — and startup is precisely the
+    /// phase with heavy engine work and no engine to ask. The only way to know
+    /// whether an ingest was fast or slow was to poll `/v1/status` twice and do
+    /// the arithmetic by hand.
+    #[test]
+    fn an_ingest_reports_its_rate_before_the_engine_exists() {
+        use crate::engine::loading::{LoadProgress, LoadStep};
+
+        let loading = Arc::new(LoadProgress::new());
+        let t = Telemetry::new();
+        t.watch_loading(Arc::clone(&loading));
+
+        // Nothing prefilled yet: absent, not zero. A zero here reads as a
+        // stalled engine rather than as one that has not started.
+        t.tick();
+        assert!(t.read().series.prefill_tps.is_none());
+
+        loading.set_step(LoadStep::Layers);
+        loading.add_prefill_tokens(4_000);
+        t.tick();
+
+        let r = t.read();
+        let series = r
+            .series
+            .prefill_tps
+            .expect("the ingest rate never appeared");
+        let latest = series.last().copied().flatten().expect("no reading");
+        assert!(
+            latest > 0.0,
+            "the ingest reported a rate of {latest} tokens/s"
+        );
+        // **And the flag stays false.** `engine_connected` means *an engine has
+        // reported*, and during startup none has — the loading counter has.
+        // Flipping it here would tell the console the engine is up while every
+        // route it would then call still answers 503. The rate belongs in the
+        // series (and in `/v1/status`'s loading block); the flag keeps meaning
+        // what it says.
+        assert!(
+            !r.engine_connected,
+            "a loading daemon claimed a live engine because its ingest was measurable"
+        );
+    }
+
+    /// A real engine's own reading wins over the load progress — once it is
+    /// answering, it knows more than the startup counter does.
+    #[test]
+    fn a_live_engine_outranks_the_loading_counter() {
+        use crate::engine::loading::{LoadProgress, LoadStep};
+
+        let loading = Arc::new(LoadProgress::new());
+        loading.set_step(LoadStep::Layers);
+        loading.add_prefill_tokens(4_000);
+        let t = Telemetry::new();
+        t.watch_loading(loading);
+
+        t.record(Engine {
+            prefill_tps: Some(1234.0),
+            ..Default::default()
+        });
+        t.tick();
+        assert_eq!(
+            t.read()
+                .series
+                .prefill_tps
+                .unwrap()
+                .last()
+                .copied()
+                .flatten(),
+            Some(1234.0)
+        );
     }
 
     /// `record` must not itself add a sample — one timer owns the cadence, or

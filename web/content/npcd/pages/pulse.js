@@ -137,7 +137,7 @@ export async function render() {
         style: `--hue:${hue}`,
         title: r.hint,
         'aria-pressed': on ? 'true' : 'false',
-        onClick: () => { focus = on ? null : id; lastTick = -1; refresh(); },
+        onClick: () => { focus = on ? null : id; lastTick = -1; refetch(); },
       },
         h('span', { class: 'cast-spine' }),
         h('span', { class: 'cast-name' }, nameOf(id)),
@@ -192,7 +192,7 @@ export async function render() {
           h('button', {
             class: 'tick-who',
             title: 'show only this character',
-            onClick: () => { focus = id; lastTick = -1; refresh(); },
+            onClick: () => { focus = id; lastTick = -1; refetch(); },
           }, nameOf(id)),
           h('span', { class: 'tick-cause', title: c.hint }, c.label),
           h('span', { class: 'tick-spacer' }),
@@ -219,11 +219,53 @@ export async function render() {
     lastTick = newest;
   }
 
+  /* **One refresh at a time, and the newest wins.**
+   *
+   * The poll and the toggles both call this, so a slow read overlaps the next
+   * tick's and the two land in whatever order the network returns them — which
+   * on a page whose whole job is *when things happened* renders an older feed
+   * over a newer one and leaves it there until the tick after. The guard drops
+   * the overlapping call rather than queueing it: the next tick is 1–2 s away
+   * and carries fresher data than the one being dropped.
+   *
+   * `focus`/`showAll` change the query, so those calls must not be dropped —
+   * they bump `generation`, and an in-flight read whose generation is stale
+   * discards its own result instead of rendering it. */
+  let generation = 0;
+  /* Generation of the read currently running, or -1 for none. Keyed by
+   * generation rather than a bare boolean so a control's forced read starts
+   * immediately — its generation differs — while a poll tick landing on top of
+   * the same generation is dropped. A boolean could not tell the two apart, and
+   * clearing it to let the control through meant the older read's own cleanup
+   * then cleared the newer one's claim. */
+  let inFlightGen = -1;
   async function refresh() {
     if (stopped) return;
+    if (inFlightGen === generation) return;
+    const mine = generation;
+    inFlightGen = mine;
+    try {
+      await read(mine);
+    } finally {
+      if (inFlightGen === mine) inFlightGen = -1;
+    }
+  }
+
+  /* Force a refresh that a stale in-flight read cannot overwrite. For the
+   * controls, whose whole point is that the query changed. */
+  function refetch() {
+    generation += 1;
+    refresh();
+  }
+
+  async function read(mine) {
     const q = { limit: FEED_LIMIT, npc_id: focus || undefined, all: showAll ? 1 : undefined };
     try {
       const [feed, census] = await Promise.all([API.pulse(q), API.pulseCensus(q)]);
+      /* The query moved while this was in flight — a focus change, a toggle.
+       * Rendering now would put the previous filter's data on screen under the
+       * new filter's controls. */
+      if (stopped || mine !== generation) return;
       maySeeAll = !!feed.may_see_all;
       names = Object.assign({}, census.names, feed.names);
       renderCast(census);
@@ -239,6 +281,7 @@ export async function render() {
       /* A 503 during startup is the ordinary state, not a fault. Saying so is
        * the truth; a red banner would send somebody looking for a problem that
        * is about to resolve itself. */
+      if (stopped || mine !== generation) return;
       const loading = e.error === 'no_engine' || e.status === 503;
       mount(feedHost, h('div', { class: 'pulse-empty' },
         h('p', {}, loading
@@ -254,7 +297,7 @@ export async function render() {
     mount(toggleHost, h('label', { class: 'pulse-toggle' },
       h('input', {
         type: 'checkbox', checked: showAll,
-        onChange: (e) => { showAll = e.target.checked; focus = null; lastTick = -1; refresh(); },
+        onChange: (e) => { showAll = e.target.checked; focus = null; lastTick = -1; refetch(); },
       }),
       h('span', {}, 'Show all NPCs'),
     ));
@@ -283,12 +326,28 @@ export async function render() {
   }
 
   let helpEl = null;
+  /* **Claimed before the await, not after.** The list is fetched from the
+   * daemon, so two clicks inside that round trip both saw `helpEl === null`,
+   * both fetched, and both appended — leaving two panels with only the second
+   * tracked, so the first could never be closed again. The flag is set on the
+   * synchronous path, where a second click cannot get between the test and the
+   * set. */
+  let helpOpening = false;
   async function toggleHelp() {
     if (helpEl) { helpEl.remove(); helpEl = null; return; }
+    if (helpOpening) return;
+    helpOpening = true;
     /* The daemon's own list, never a copy. A console holding its own would offer
      * a command that gets rejected, and an operator reads a rejection as the
      * character ignoring them. */
-    const r = await API.listCommands();
+    let r;
+    try {
+      r = await API.listCommands();
+    } finally {
+      helpOpening = false;
+    }
+    /* Closed, or opened by something else, while the list was in flight. */
+    if (helpEl) return;
     helpEl = h('div', { class: 'pulse-help' },
       ...(r.commands || []).map((c) => h('div', { class: 'help-row' },
         h('code', { class: 'help-cmd' }, '/' + c.name),

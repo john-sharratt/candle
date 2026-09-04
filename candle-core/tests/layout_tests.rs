@@ -51,6 +51,66 @@ fn contiguous(device: &Device) -> Result<()> {
 
 test_device!(contiguous, contiguous_cpu, contiguous_gpu, contiguous_metal);
 
+/// **Reshaping a transposed tensor must produce the same bytes on every
+/// backend.**
+///
+/// `t()` leaves a non-contiguous layout, and `reshape` on one has to
+/// materialise it before it can reinterpret the dims. That materialisation is
+/// exactly what this repo's hot-path work removes wherever it can, so the
+/// pattern is worth pinning: a `reshape` that reinterprets a *transposed*
+/// layout without copying reads the right bytes in the wrong order, and the
+/// result is a plausible tensor of the right shape with its contents
+/// spatially scrambled.
+///
+/// The shape here is Stable Diffusion's VAE attention block, which ends on
+/// `proj_attn.forward(xs).t().reshape((batch, channel, height, width))` — the
+/// one place in that model where a transpose feeds a reshape directly.
+fn reshape_of_a_transpose(device: &Device) -> Result<()> {
+    // Distinct values, so any misordering is visible rather than averaged away.
+    let (b, hw, c) = (2usize, 12usize, 6usize);
+    let t = Tensor::arange(0u32, (b * hw * c) as u32, device)?.reshape((b, hw, c))?;
+
+    // What the VAE does.
+    let got = t
+        .t()?
+        .reshape((b, c, 3, 4))?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
+
+    // What it must equal: the transpose materialised first, which is the same
+    // operation stated so that no backend can take a shortcut through it.
+    let want = t
+        .t()?
+        .contiguous()?
+        .reshape((b, c, 3, 4))?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
+
+    assert_eq!(
+        got, want,
+        "reshaping a transposed tensor took the un-transposed bytes — a model doing this gets \
+         the right shape with its spatial layout scrambled, which reads as a periodic grid \
+         rather than as an error"
+    );
+
+    // And against the value the indices define, so the test does not merely
+    // assert two implementations agree with each other.
+    let expect: Vec<u32> = (0..b)
+        .flat_map(|bi| {
+            (0..c).flat_map(move |ci| (0..hw).map(move |hi| (bi * hw * c + hi * c + ci) as u32))
+        })
+        .collect();
+    assert_eq!(got, expect, "the transpose itself is wrong");
+    Ok(())
+}
+
+test_device!(
+    reshape_of_a_transpose,
+    reshape_of_a_transpose_cpu,
+    reshape_of_a_transpose_gpu,
+    reshape_of_a_transpose_metal
+);
+
 #[test]
 fn strided_blocks() -> Result<()> {
     use candle::Device::Cpu;

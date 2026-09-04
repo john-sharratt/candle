@@ -16,6 +16,9 @@ prost = "0.12.1"
 
 [build-dependencies]
 prost-build = "0.12.1"
+# Ships `protoc` itself, so building this crate needs nothing installed on the
+# machine. See `build.rs` for why that is worth a dependency.
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 anyhow = { version = "1", features = ["backtrace"] }

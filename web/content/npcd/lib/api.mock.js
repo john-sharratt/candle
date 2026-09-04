@@ -704,6 +704,7 @@ export const MockAPI = {
    * that no daemon has. */
   async setLifeSeed() { throw noEngine('write a life'); },
   async setLifeNode() { throw noEngine('edit a life'); },
+  async narrateLifeNode() { throw noEngine('narrate a life'); },
   async addLifeDay() { throw noEngine('add a day'); },
   async removeLifeDay() { throw noEngine('remove a day'); },
   async setLifeConsequences() { throw noEngine('set consequences'); },
@@ -895,12 +896,18 @@ export const MockAPI = {
   /* A portrait upload, accepted and forgotten. The fixture has no store, so it
    * gives back an id shaped like a real one — enough for the create flow to
    * finish without a daemon, which is what `?mock=1` is for. */
-  async putPortrait(id, file) {
+  /* `origin` rides with the bytes, as it does live: the create step draws a
+   * portrait through the image guest and sends it here, and it has to be
+   * recorded as generated or the character could never be redrawn. */
+  async putPortrait(id, file, origin) {
     await sleep(120);
     if (!file || !/^image\//.test(file.type || '')) {
       throw Object.assign(new Error('that is not an image'), { error: 'not_an_image' });
     }
-    return { npc_id: id, portrait: { image_id: 'img_0011223344556677.png', origin: 'uploaded' } };
+    return {
+      npc_id: id,
+      portrait: { image_id: 'img_0011223344556677.png', origin: origin || 'uploaded' },
+    };
   },
 
   async getWorldKnowledge() {
@@ -1078,13 +1085,19 @@ export const MockAPI = {
     return { ticks: id ? ticks.filter((t) => t.npc_id === Number(id)) : ticks,
              ready: true, population: 2 };
   },
-  async pulseCensus() {
-    return { ready: true, characters: [
+  /* Takes the feed's query, as the live one does: the route reads `npc_id` and
+   * `all`, so a mock that ignored them would show the console behaving in a way
+   * the daemon does not. */
+  async pulseCensus(o) {
+    const characters = [
       { npc_id: 1, readiness: 'preempted', inbox_depth: 2, heartbeat_ms: 4000,
         ticks: 43, events_seen: 51, window_turns: 24, window_cap: 24, faded: 118, day: 3 },
       { npc_id: 2, readiness: 'blocked', inbox_depth: 0, heartbeat_ms: 120000,
         ticks: 12, events_seen: 12, window_turns: 6, window_cap: 24, faded: 0, day: 3 },
-    ] };
+    ];
+    const id = o && o.npc_id;
+    return { ready: true,
+             characters: id ? characters.filter((c) => c.npc_id === Number(id)) : characters };
   },
   async npcWindow(_id) {
     return {
@@ -1131,13 +1144,112 @@ export const MockAPI = {
     ] };
   },
 
+  /* Named before described, as the daemon does. The list cycles rather than
+   * repeating one fixture, because the create step's whole point is that a
+   * second press gives a different character. */
+  async generateName(b) {
+    await sleep(400);
+    const names = ['Ursula Ved', 'Aelis Maelstrom', 'Hess Corran', 'Tam Sorrel', 'Ivo Renn'];
+    return {
+      name: names[personaIdx % names.length],
+      seed: 5150 + personaIdx,
+      world_id: (b && b.world_id) || '',
+      personality_id: (b && b.personality_id) || '',
+    };
+  },
+
   async generateDescription() { await sleep(650); return { description: PERSONAS[personaIdx++ % PERSONAS.length], seed: 88213 + personaIdx }; },
-  async generateImage() { return { job_id: 'job_img_1', kind: 'image', state: 'queued', progress: 0, queue_position: 2, eta_secs: null }; },
+
+  /* Streamed like the daemon streams it, at roughly the rate it decodes.
+   *
+   * Word by word rather than all at once: the mock is what the create page's
+   * appearance is developed against, and a mock that resolved instantly would
+   * make a layout that jumps as text arrives look fine right up until it met a
+   * real card. The load pause is short because the real one is — the model swap
+   * measures ~0.3s. */
+  async generateDescriptionStream(b, onEvent) {
+    const description = PERSONAS[personaIdx++ % PERSONAS.length];
+    if (onEvent) onEvent({ event: 'loading' });
+    await sleep(300);
+    const parts = description.match(/\S+\s*/g) || [];
+    for (const part of parts) {
+      await sleep(28);
+      if (onEvent) onEvent({ event: 'token', text: part });
+    }
+    return { event: 'done', description, tokens: parts.length, seed: 88213 + personaIdx,
+             world_id: (b && b.world_id) || '', personality_id: (b && b.personality_id) || '' };
+  },
+
+  /* The daemon's shape: progress while it draws, then the bytes. Not a job to
+   * poll — it used to answer a queued job id, which nothing ever polled. A 2x2
+   * PNG stands in for the draw so the create step's preview has something real
+   * to paint.
+   *
+   * The steps are emitted on the same schedule the real guest reports them —
+   * `steps` denoise units against a total of `steps + 1`, then the decode — so a
+   * bar built against this mock is a bar that behaves live. Getting that wrong
+   * is how a progress UI ends up looking right in development and jumping from
+   * 0 to 100 against the daemon. */
+  async generateImage(b, onEvent) {
+    // A reference draw runs a fraction of the budget, so the mock reports a
+    // fraction of the steps — a bar built against a mock that always ran the
+    // full count would look right here and jump against the daemon.
+    const hold = b && b.reference ? Math.min(0.95, b.reference_hold ?? 0.45) : 0;
+    const asked = (b && b.steps) || 8;
+    const steps = hold > 0 ? Math.max(Math.min(8, asked), Math.round(asked * (1 - hold))) : asked;
+    const total = steps + 1;
+    if (onEvent) onEvent({ event: 'loading' });
+    await sleep(400);
+    if (hold > 0) {
+      if (onEvent) onEvent({ event: 'step', done: 0, total, what: 'reading the reference' });
+      await sleep(200);
+    }
+    for (let done = 1; done <= steps; done++) {
+      await sleep(90);
+      if (onEvent) onEvent({ event: 'step', done, total, what: 'denoising' });
+    }
+    if (onEvent) onEvent({ event: 'step', done: steps, total, what: 'decoding' });
+    await sleep(500);
+    // The size and seed come back as asked, because the Images page reads them
+    // off the response rather than off its own request — a mock that answered a
+    // fixed 2×2 made the caption disagree with the controls and the "reuse
+    // seed" button repeat a number nothing had drawn.
+    return {
+      event: 'done',
+      width: (b && b.width) || 512,
+      height: (b && b.height) || 512,
+      seed: b && b.seed != null ? b.seed : 4242,
+      png_base64:
+        'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAF0lEQVR4nGP8z8Dwn4GBgYGJAQ0'
+        + 'AACPPAQhKfeMLAAAAAElFTkSuQmCC',
+    };
+  },
+  /* Lifting a background. The mock hands the picture straight back, because
+   * there is nothing to flood-fill in a 2×2 placeholder — what it exercises is
+   * the page's own path: the button, the checkerboard, and the toggle back. */
+  async cutout(b) {
+    await sleep(400);
+    return { png_base64: b.png_base64, width: 512, height: 512, lifted: 0.71 };
+  },
+
+  /* The shape the daemon answers with: one co-resident image guest, or none.
+   * It used to offer three checkpoints with `loaded: false` on all of them,
+   * which is a picker over things that could not be picked — the daemon has
+   * never had a model *catalogue*, it has a guest that is configured or is not.
+   * `vram_gib` is null for the same reason it is on the live route: the guest
+   * claims span ground per drain, sized from the jobs in it. */
   async listImageModels() {
-    return { models: [
-      { id: 'sdxl-turbo', display: 'SDXL Turbo', vram_gib: 8, loaded: false, default: true },
-      { id: 'sd15', display: 'Stable Diffusion 1.5', vram_gib: 2.8, loaded: false },
-      { id: 'wuerstchen', display: 'Würstchen', vram_gib: 3.6, loaded: false }] };
+    return { models: [{
+      id: 'guest-image',
+      display: 'Z-Image-Turbo (co-resident)',
+      vram_gib: null,
+      loaded: true,
+      default: true,
+    }], resident_between_drains: false };
+  },
+  async generatePortrait(id) {
+    await sleep(1400);
+    return { ...(await this.getNpc(id)), portrait: { image_id: 'img_mock_generated.png', origin: 'generated', seed: 42 } };
   },
   async getImageQueue() { return { depth: 2, position: 1, state: 'waiting_for_vram', next_run_eta: null }; },
   imageUrl: () => null,

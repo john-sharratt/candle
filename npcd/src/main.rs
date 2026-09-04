@@ -38,18 +38,26 @@ mod accounts;
 mod api;
 mod clock;
 mod collections;
+mod compliance;
 mod console;
+mod describe;
 mod engine;
 mod guard;
+mod guest_routes;
+mod guests;
 mod identity;
 mod images;
 mod lifegen;
 mod logs;
 mod mind;
 mod model;
+mod namegen;
+mod ndjson;
 mod npcs;
 mod ops;
+mod portrait;
 mod projection;
+mod refimage;
 mod registry;
 mod substrate;
 mod telemetry;
@@ -135,10 +143,20 @@ fn count<A, B>(a: &guard::Api<A>, b: &guard::Api<B>, min: web::auth::Role) -> us
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // `candle_conversation::guest` is on at every level, and it is the only
+    // engine target that is.
+    //
+    // A guest drain stops the world: every character in every estate stops
+    // thinking while a co-resident model has the card. That is an operator-
+    // visible event — it is the answer to "why did the cast go quiet for forty
+    // seconds" — and it was invisible, because the filter admits `npcd` and
+    // `web` and the drain logs from the engine. Turning the whole engine up to
+    // `info` to see it would bury it in wave telemetry; naming the one target
+    // costs a handful of lines per drain and nothing between them.
     let level = match cli.verbose {
-        0 => "npcd=info,web=info",
-        1 => "npcd=debug,web=debug",
-        _ => "npcd=trace,web=trace",
+        0 => "npcd=info,web=info,candle_conversation::guest=info",
+        1 => "npcd=debug,web=debug,candle_conversation::guest=debug",
+        _ => "npcd=trace,web=trace,candle_conversation::guest=trace",
     };
     // Every line goes two places: the terminal, and the bus the console reads
     // from `/ws/logs`. One formatter feeds both, so what an operator sees on

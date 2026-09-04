@@ -15,9 +15,11 @@
 //     full-width `shfl_xor` (5 butterfly steps) reduces amax/Σx across the tile.
 //   - 16-byte vector loads (float4 / 2×half2) — naturally aligned.
 //   - one char4 (int32) store of the 4 quants instead of 4 byte writes.
-// Σx (ds[0].y) is the raw activation sum used by the INT8 matmul's Q4_K min
-// correction; it is unused for plain dequant. Its f16 value is invariant to the
-// reduction order (order differences are ~100× below the f16 ULP at these sums).
+// ds[0].y is the activation sum used by the INT8 matmul's affine min correction
+// (unused for plain dequant). It is stored **normalised by amax** — Σx/amax, not
+// Σx — and the matmul rebuilds Σx as `ds.y * ds.x * 127`. See "the sum is
+// normalised" in blocks.cuh for why. Its f16 value is invariant to the reduction
+// order (order differences are ~100× below the f16 ULP).
 
 #include "../blocks.cuh"
 #include <cuda_fp16.h>
@@ -82,7 +84,11 @@ __global__ void quantize_q8a128_kernel(
         if (lane == 0) {
             // One (scale, sum) per 128-element tile (per-128). Stored at the tile slot's first half2.
             half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(tile));
-            ds[0] = make_half2(__float2half_rn(amax / 127.f), __float2half_rn(s));
+            // Σx normalised by amax: |Σx/amax| ≤ 128 whatever the activation's
+            // magnitude, where the raw Σx overflows f16 above 65504. `id` already
+            // carries the amax==0 guard, so a dead tile stores {0, 0}.
+            ds[0] = make_half2(__float2half_rn(amax / 127.f),
+                               __float2half_rn(s * id * (1.f / 127.f)));
         }
     }
 }

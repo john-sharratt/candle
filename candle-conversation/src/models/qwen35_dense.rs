@@ -30,7 +30,7 @@
 //! [`crate::models::overrides`] for why that indirection exists — a private
 //! fine-tune belongs on the machine that runs it, not in a public repository.
 
-use super::{LoraSpec, ModelArch, ModelSpec};
+use super::{ModelArch, ModelSpec};
 use crate::{config::SamplingConfig, models::DialectType};
 use candle_transformers::models::quantized_qwen35;
 
@@ -38,6 +38,15 @@ use candle_transformers::models::quantized_qwen35;
 /// its own layers (`npcd/src/engine/prompt.rs`). This is what a bare engine gets
 /// with no character attached, which is only ever an operator probing the model.
 const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
+
+/// The GGUF `general.architecture` string this lineage's checkpoints carry.
+///
+/// Named once because it is the key into [`SamplingConfig::for_gguf_architecture`], and a
+/// preset's sampling is whatever that lookup returns — `ModelBuilder::from_spec` copies
+/// `default_sampling` verbatim and only `Model::custom` ever re-reads the checkpoint. So a
+/// wrong string here is not a wrong label, it is the model decoding on another generation's
+/// published numbers, with nothing at load to say so.
+const ARCH: &str = "qwen35";
 
 /// Qwen3.5-9B Q6_K — the stock instruct model, 9 B dense.
 pub(super) fn qwen35_9b_q6() -> ModelSpec {
@@ -71,9 +80,13 @@ pub(super) fn qwen35_9b_q6() -> ModelSpec {
         tokenizer_rev: quantized_qwen35::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
-        default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
+        // **The lineage's own arch string, not Qwen3's.** A preset's sampling is taken as-is by
+        // `ModelBuilder::from_spec` — only `Model::custom` re-detects from the GGUF — so asking
+        // for `"qwen3"` here is the whole decision, and it silently ran this model on the
+        // previous generation's published numbers while the `qwen35` arm sat unreachable.
+        default_sampling: SamplingConfig::for_gguf_architecture(ARCH),
         supports_thinking: true,
-        non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
+        non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture(ARCH),
     }
 }
 
@@ -143,6 +156,40 @@ mod tests {
     /// `checkpoints.Qwen35_9B_LoRA` in `models.override.yaml`, by the batched
     /// LoRA gate, and by `resolve_loras`' own tests. A preset is what a
     /// deployment runs, not where an example belongs.
+    /// **The preset decodes on its own generation's numbers, not the previous one's.**
+    ///
+    /// `from_spec` copies `default_sampling` verbatim and only `Model::custom` re-detects from
+    /// the GGUF, so the arch string passed here *is* the sampling decision. It read `"qwen3"`
+    /// while the table's `qwen35` arm sat unreachable, and nothing failed: the steering fields
+    /// are shared between the two arms, so the model still terminated correctly and only the
+    /// four sampled numbers were the older generation's. Comparing against the table directly
+    /// is what makes that visible.
+    #[test]
+    fn the_preset_samples_as_its_own_architecture() {
+        let got = qwen35_9b_q6().default_sampling;
+        let want = SamplingConfig::for_gguf_architecture("qwen35");
+        let previous = SamplingConfig::for_gguf_architecture("qwen3");
+
+        // The four numbers the two generations publish differently. `SamplingConfig` has no
+        // `PartialEq`, and naming them is clearer regardless: these are the values Qwen
+        // documents for this lineage, and the ones an earlier version of this preset was not
+        // using.
+        assert_eq!((got.temperature, got.top_k), (want.temperature, want.top_k));
+        assert_eq!(
+            (got.top_p, got.presence_penalty),
+            (want.top_p, want.presence_penalty)
+        );
+        assert_ne!(
+            (got.top_k, got.presence_penalty),
+            (previous.top_k, previous.presence_penalty),
+            "qwen3 and qwen35 publish different sampling; if these match, the table has \
+             collapsed the two rows and this preset can no longer tell which it got"
+        );
+        // The steering is shared between the arms, which is exactly why the wrong arch string
+        // produced no visible failure — assert it survived the change.
+        assert!(got.force_segment_close_after > 0 && got.forced_eos_after > 0);
+    }
+
     #[test]
     fn the_preset_carries_no_adapter() {
         assert!(

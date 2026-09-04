@@ -17,7 +17,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use futures::stream::{self, Stream};
+use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -420,21 +420,54 @@ async fn gen_attributes() -> impl IntoResponse {
     }))
 }
 
-async fn gen_image() -> impl IntoResponse {
+/// A draw, as NDJSON — `loading`, a `step` per denoise unit, then `done`.
+///
+/// **Paced, not answered all at once.** The console's Images page draws its
+/// progress bar straight from these counts, and a mock that delivered every
+/// line in one chunk would show a bar that sits at zero and then jumps to full
+/// — the one appearance a progress bar must not have. So the lines are spaced,
+/// on the same shape the guest reports: `steps` denoise units against a total
+/// of `steps + 1`, then the decode.
+///
+/// The picture is a 2×2 PNG. The mock has no model; what it stands in for is
+/// the response's *shape*, and a preview with something real to paint.
+async fn gen_image(body: Option<Json<Value>>) -> impl IntoResponse {
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAF0lEQVR4nGP8z8Dwn4GBgYGJAQ0\
+                       AACPPAQhKfeMLAAAAAElFTkSuQmCC";
+    let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let num = |k: &str, d: u64| b.get(k).and_then(Value::as_u64).unwrap_or(d);
+    let (steps, width, height) = (num("steps", 8), num("width", 512), num("height", 512));
+    let seed = b.get("seed").and_then(Value::as_u64).unwrap_or(4242);
+    let total = steps + 1;
+
+    let mut lines = vec![json!({ "event": "loading" })];
+    for done in 1..=steps {
+        lines.push(json!({ "event": "step", "done": done, "total": total, "what": "denoising" }));
+    }
+    lines.push(json!({ "event": "step", "done": steps, "total": total, "what": "decoding" }));
+    lines.push(json!({
+        "event": "done", "width": width, "height": height, "seed": seed, "png_base64": PNG,
+    }));
+
+    let body = stream::iter(lines).then(|v| async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        Ok::<_, Infallible>(format!("{v}\n"))
+    });
     (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "job_id": "job_img_1", "kind": "image", "state": "queued",
-            "progress": 0.0, "queue_position": 2, "eta_secs": null, "result": null, "error": null
-        })),
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
+            (axum::http::header::CACHE_CONTROL, "no-cache, no-transform"),
+        ],
+        Body::from_stream(body),
     )
 }
 
 async fn image_models() -> impl IntoResponse {
+    // The live route answers with one entry or none — a deployment configures
+    // one image guest and the queue routes by kind, so there is nothing to pick
+    // between. See `npcd::portrait::image_models`.
     Json(json!({ "models": [
-        { "id": "sdxl-turbo", "display": "SDXL Turbo", "vram_gib": 8.0, "loaded": false, "default": true },
-        { "id": "sd15",       "display": "Stable Diffusion 1.5", "vram_gib": 2.8, "loaded": false },
-        { "id": "wuerstchen", "display": "Würstchen", "vram_gib": 3.6, "loaded": false }
+        { "id": "guest-image", "display": "Z-Image-Turbo (co-resident)", "vram_gib": null, "loaded": true, "default": true }
     ]}))
 }
 

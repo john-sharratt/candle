@@ -268,6 +268,17 @@ impl Scheduler {
         self.inboxes.lock().unwrap().len()
     }
 
+    /// Entries standing in the due heap.
+    ///
+    /// Not the population: a retired character's entry is left to expire, and a
+    /// character is entered once per wake it is owed. The number the duplicate
+    /// -wake test reads, since the scheduler behaves identically either way and
+    /// only the heap shows the difference.
+    #[cfg(test)]
+    fn due_len(&self) -> usize {
+        self.due.lock().unwrap().len()
+    }
+
     /// Deliver an event to a character. `false` if there is no such character.
     pub fn deliver(&self, npc_id: u64, world_ms: u64, salience: Salience, kind: EventKind) -> bool {
         let seq = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
@@ -278,12 +289,24 @@ impl Scheduler {
         };
         let preempts = inbox.push(event);
         if preempts {
-            // Due immediately. The heap gets a second entry for this character;
-            // the older one is harmless because a tick that finds nothing to do
-            // simply reschedules.
+            // Due immediately — but only *entered* as due once. `due_at == 0`
+            // already means an at-zero entry is standing in the heap and has not
+            // been served, so a second one would be a duplicate wake for a
+            // character that is already at the front of the queue. A burst of
+            // twenty preempting arrivals between two passes pushed twenty
+            // entries, all naming the same character, all popped by the same
+            // pass — work proportional to the burst to schedule one tick that
+            // drains the whole burst anyway.
+            //
+            // An arrival *during* a decode still gets its entry: the tick set
+            // `due_at` to its next heartbeat before decoding, so this reads
+            // non-zero and the character is re-woken the moment it finishes.
+            let already_queued = inbox.due_at == 0;
             inbox.due_at = 0;
             drop(inboxes);
-            self.due.lock().unwrap().push(Due { at: 0, npc_id });
+            if !already_queued {
+                self.due.lock().unwrap().push(Due { at: 0, npc_id });
+            }
         }
         true
     }
@@ -381,19 +404,36 @@ impl Scheduler {
             events
         };
 
-        let mut inboxes = self.inboxes.lock().unwrap();
-        let inbox = inboxes.get_mut(&npc_id)?;
-
-        // Perception lands in the window before the decode sees it, because the
-        // decode reasons over the window.
+        // **Three phases, because the middle one is a model decode.**
+        //
+        // Perception lands in the window before the decode sees it, the decode reasons over
+        // the window, and the acts land after — but only the first and third need the lock.
+        // Holding it across `act` is what the note above says must not happen, and it did:
+        // every `deliver`, `broadcast`, `window_of`, `census`, `wake` and `retire` blocked on
+        // this `Mutex` for the length of a generation, and the HTTP ones do it from `async fn`s
+        // that park a tokio worker while they wait.
+        //
+        // The decode reads a *snapshot*. Anything delivered while it runs lands in the real
+        // window and is seen by the next tick, which is the same guarantee as an event that
+        // arrived a moment after the lock was released.
         let perceived: Vec<String> = events.iter().map(|e| e.prose()).collect();
-        for e in &events {
-            inbox
-                .window
-                .push_world(e.prose(), e.at_ms, e.kind.replaces());
-        }
+        let snapshot = {
+            let mut inboxes = self.inboxes.lock().unwrap();
+            let inbox = inboxes.get_mut(&npc_id)?;
+            for e in &events {
+                inbox
+                    .window
+                    .push_world(e.prose(), e.at_ms, e.kind.replaces());
+            }
+            inbox.window.clone()
+        };
 
-        let acts = act(&events, &inbox.window);
+        let acts = act(&events, &snapshot);
+
+        let mut inboxes = self.inboxes.lock().unwrap();
+        // Retired while the decode ran. Its acts have nowhere to land and nothing downstream
+        // wants a record for a character that is gone.
+        let inbox = inboxes.get_mut(&npc_id)?;
         for a in &acts {
             inbox.window.push_npc(a.clone(), world_ms);
         }
@@ -578,6 +618,37 @@ mod tests {
         assert!(s.due_now(10_000).is_empty(), "not due yet");
         s.deliver(1, 0, Salience::URGENT, say("the beam gives"));
         assert_eq!(s.census()[0].readiness, Readiness::Preempted);
+        assert_eq!(s.due_now(10_000), vec![1]);
+    }
+
+    /// **A burst of urgent arrivals is one wake, not one wake each.**
+    ///
+    /// A character already at the front of the queue cannot be moved further
+    /// forward, so every preempting arrival after the first used to push a heap
+    /// entry that named a character already standing there — work proportional
+    /// to the burst, to schedule the single tick that drains the whole burst.
+    /// The tick itself is unaffected either way, which is what kept this
+    /// invisible: the character behaves correctly and the heap does the work.
+    #[test]
+    fn a_burst_of_preempting_arrivals_queues_one_wake() {
+        let s = sched();
+        s.wake(1, 10_000, 0);
+        for _ in 0..20 {
+            s.deliver(1, 0, Salience::URGENT, say("the beam gives"));
+        }
+        // Two: the heartbeat entry `wake` stood up, and one at-zero wake for the
+        // whole burst. Twenty-one is the bug — an entry per arrival.
+        assert_eq!(s.due_len(), 2, "the burst queued one wake per arrival");
+
+        // And the one wake still drains all twenty.
+        assert_eq!(s.due_now(10_000), vec![1]);
+        let rec = s.tick(1, 10_000, 0, |_, _| vec![]).expect("ticked");
+        assert_eq!(rec.perceived.len(), 20);
+
+        // An arrival during the decode is a different case and must still wake
+        // the character: the tick had already set its next heartbeat, so this is
+        // the first at-zero entry rather than a duplicate of a standing one.
+        s.deliver(1, 0, Salience::URGENT, say("and again"));
         assert_eq!(s.due_now(10_000), vec![1]);
     }
 

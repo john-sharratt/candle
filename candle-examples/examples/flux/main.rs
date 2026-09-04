@@ -15,7 +15,7 @@ extern crate intel_mkl_src;
 use candle_transformers::models::{clip, flux, t5};
 
 use anyhow::{Error as E, Result};
-use candle::{IndexOp, Module, Tensor};
+use candle::{Device, IndexOp, Module, Tensor};
 use candle_nn::VarBuilder;
 use clap::Parser;
 use tokenizers::Tokenizer;
@@ -198,7 +198,30 @@ fn run(args: Args) -> Result<()> {
                         Model::Schnell => api
                             .repo(hf_hub::Repo::model("lmz/candle-flux".to_string()))
                             .get("flux1-schnell.gguf")?,
-                        Model::Dev => todo!(),
+                        // **Chosen by the card, not by a flag.** FLUX is dense —
+                        // every parameter is read on every step — so the file
+                        // size is the requirement and the card's capacity is a
+                        // hard gate. `quant_choice` is the one place that
+                        // decides, so the file fetched and the file opened
+                        // cannot disagree.
+                        Model::Dev => {
+                            let total = match &device {
+                                Device::Cuda(_) => device.mem_get_info()?.1 as u64,
+                                // Without a card there is nothing to size
+                                // against; take the smaller rung, which runs
+                                // anywhere the larger one would.
+                                _ => 0,
+                            };
+                            let q = flux::quant_choice::FluxQuant::for_vram(total);
+                            println!(
+                                "flux dev: {} ({:.1} GiB) for {:.1} GiB of VRAM",
+                                q.filename(),
+                                q.bytes() as f64 / (1u64 << 30) as f64,
+                                total as f64 / (1u64 << 30) as f64,
+                            );
+                            api.repo(hf_hub::Repo::model(q.repo().to_string()))
+                                .get(q.filename())?
+                        }
                     };
                     let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
                         model_file, &device,

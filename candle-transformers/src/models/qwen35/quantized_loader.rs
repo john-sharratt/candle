@@ -27,7 +27,7 @@ use super::embedding::EmbeddingTable;
 use super::expert_loader::build_expert_cache;
 use super::layer_loader::build_layer_cache;
 use super::layer_store::LayerStore;
-use super::quantized_weights::{load_quantized_model, LoadInputs, QuantModel};
+use super::quantized_weights::{load_quantized_model, undersized_gates, LoadInputs, QuantModel};
 use crate::models::batched_model::ensure_vram_governor;
 use crate::models::expert_lre::pack::repack_fingerprint;
 use crate::models::expert_lre::{ExpertCache, PINNED_LAYERS};
@@ -183,7 +183,18 @@ pub fn load_hybrid_gguf(
             Some((content, m))
         }
     };
-    let gate_src = gate_mmap.as_ref().map(|(c, m)| (c, &m[..]));
+    // **Filtered here, once, because more than one consumer reads it.** `load_quantized_model`
+    // applies the same "repair only what is broken" rule to its own copy, but the
+    // `build_layers` closure below captures *this* binding — so an unfiltered donor would
+    // reach the streamed layers while the pinned ones and the resident residues took the
+    // checkpoint's own recurrent path. That is a half-repaired recurrence, which is precisely
+    // what `donor_gates` refuses to produce, arrived at by a route that never consults it. The
+    // pack fingerprint below is computed from this too, so an unfiltered donor would also key
+    // the pack to a repair that never happened.
+    let gate_src = gate_mmap
+        .as_ref()
+        .map(|(c, m)| (c, &m[..]))
+        .filter(|_| !undersized_gates(&content).is_empty());
 
     // The embedding is the one dense tensor read per token rather than per forward, so it is
     // bound to host-mapped memory here — where the mappings are — and the GPU gathers its rows

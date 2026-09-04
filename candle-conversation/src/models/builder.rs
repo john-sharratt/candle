@@ -68,6 +68,12 @@ struct GgufInfo {
 #[derive(Debug, Clone)]
 pub struct ModelBuilder {
     pub(super) spec: ModelSpec,
+    /// Co-resident models this deployment wants available between waves.
+    ///
+    /// Empty by default and empty for every caller that does not ask, which
+    /// costs one atomic load per scheduler pass and nothing else. See
+    /// [`Self::with_guest`] and [`crate::guest`].
+    guests: crate::guest::GuestRegistry,
     /// Override: local GGUF model path (skips HF download).
     model_path: Option<PathBuf>,
     /// Override: system prompt text
@@ -142,6 +148,7 @@ impl ModelBuilder {
     /// [`Model::custom`], but can also be used directly.
     pub fn from_spec(spec: ModelSpec) -> Self {
         Self {
+            guests: crate::guest::GuestRegistry::new(),
             sampling: spec.default_sampling.clone(),
             sampling_user_set: false,
             max_seq_len: spec.max_seq_len,
@@ -185,6 +192,29 @@ impl ModelBuilder {
     /// affects another's output — only which wave it rides in.
     pub fn lora(mut self, name: impl Into<String>, dir: impl Into<PathBuf>) -> Self {
         self.loras.push((name.into(), dir.into()));
+        self
+    }
+
+    /// Make co-resident models available between the engine's waves.
+    ///
+    /// The registry holds *constructors*: nothing is loaded until a job for a
+    /// guest is queued, and each drain builds a fresh instance so a guest that
+    /// failed half-way through a load is not inherited by the next one. A
+    /// deployment that configures none pays one atomic load per scheduler pass
+    /// and nothing else.
+    ///
+    /// ```ignore
+    /// let mut guests = GuestRegistry::new();
+    /// guests.register(Guest::Prose, move || {
+    ///     Box::new(ProseGuest::new(ProseSpec::hermes3_3b(&gguf, &tok)))
+    /// });
+    /// let engine = ModelBuilder::from_spec(spec).guests(guests).engine(&device)?;
+    /// ```
+    ///
+    /// See [`crate::guest`] for what a drain does and why normal inference is
+    /// blocked while one runs.
+    pub fn guests(mut self, guests: crate::guest::GuestRegistry) -> Self {
+        self.guests = guests;
         self
     }
 
@@ -1140,7 +1170,7 @@ impl ModelBuilder {
             );
         }
 
-        let engine = crate::ConversationEngine::new(model, tokenizer, config)?;
+        let engine = crate::ConversationEngine::new(model, tokenizer, config, self.guests.clone())?;
         Ok(engine)
     }
 
@@ -1620,7 +1650,7 @@ mod cache_first_tests {
         let repo = "acme/widget-GGUF";
 
         assert!(
-            cached_repo_file(&cache, repo, "widget.gguf").is_none(),
+            cached_repo_file(&cache, repo, "", "widget.gguf").is_none(),
             "an empty cache must report a miss, not a phantom hit"
         );
 
@@ -1639,9 +1669,24 @@ mod cache_first_tests {
         std::fs::write(snapshot.join("widget.gguf"), b"weights").expect("write");
 
         assert_eq!(
-            cached_repo_file(&cache, repo, "widget.gguf"),
+            cached_repo_file(&cache, repo, "", "widget.gguf"),
             Some(snapshot.join("widget.gguf")),
             "a file already in the cache must resolve from it"
+        );
+
+        // **A pinned revision resolves to that revision's snapshot, not to
+        // whatever the ref happens to point at.** The pin exists because an
+        // upstream re-upload silently invalidated a threshold tuning; a
+        // cache-first lookup that ignored it would hand back the moving
+        // checkpoint from disk and never consult the pin at all.
+        assert_eq!(
+            cached_repo_file(&cache, repo, commit, "widget.gguf"),
+            Some(snapshot.join("widget.gguf")),
+            "the pinned commit's own snapshot did not resolve"
+        );
+        assert!(
+            cached_repo_file(&cache, repo, "cafebabe", "widget.gguf").is_none(),
+            "a revision the cache does not hold reported a hit — the pin is being ignored"
         );
     }
 }

@@ -167,6 +167,15 @@ pub struct ConversationEngine {
     /// drained, and `Drop` falls through to the same path.
     summariser_thread: SummariserThread,
 
+    /// The co-resident models that borrow the card between waves.
+    ///
+    /// Shared with the scheduler, which polls the queue once per pass and
+    /// drains it between forwards. Held here because the *registry* is a
+    /// deployment decision made before the engine starts, and the *queue* is
+    /// what callers submit to from any thread — see [`Self::submit_guest`] and
+    /// [`crate::guest`].
+    guests: Arc<crate::guest::Guests>,
+
     /// Static model properties captured before the model moves to the scheduler thread.
     model_core: ModelCoreProperties,
 
@@ -187,10 +196,16 @@ impl ConversationEngine {
     ///   `BatchedInference<M>` for some `M: BatchedModelCore`.
     /// * `tokenizer` — HuggingFace tokenizer for encoding/decoding text.
     /// * `config` — Engine-wide configuration (VRAM budgets, EOS token, etc.).
+    /// * `guests` — The co-resident models this deployment has configured, if
+    ///   any. [`GuestRegistry::new`] is the ordinary answer and costs one atomic
+    ///   load per scheduler pass; see [`crate::guest`] for what a populated one
+    ///   buys. A parameter rather than a field on `EngineConfig` because the
+    ///   registry holds constructors — it is not `Clone`, and the config is.
     pub fn new(
         model: Box<dyn ManagedBatchedModel + Send>,
         tokenizer: tokenizers::Tokenizer,
         mut config: EngineConfig,
+        guests: crate::guest::GuestRegistry,
     ) -> crate::Result<Self> {
         // Capture model metadata before the model moves to the scheduler thread.
         let model_core = model.model_core_properties();
@@ -221,6 +236,12 @@ impl ConversationEngine {
             session_init_ms = session_start.elapsed().as_millis() as u64,
             "batched session created (KV arenas allocated)"
         );
+
+        let guests = Arc::new(crate::guest::Guests {
+            queue: Arc::new(crate::guest::GuestQueue::new()),
+            registry: guests,
+        });
+        let guests_for_scheduler = Arc::clone(&guests);
 
         let eos_tokens = config.eos_tokens.clone();
         let vocab_size = config.vocab_size;
@@ -396,6 +417,7 @@ impl ConversationEngine {
                     persist_trigger,
                     summariser_trigger,
                     boundary_markers,
+                    guests_for_scheduler,
                 );
                 // Localizes the startup gap between "model loaded" and the
                 // substrate progress bar moving: this is the scheduler thread
@@ -428,8 +450,60 @@ impl ConversationEngine {
             conversation,
             persist_thread,
             summariser_thread,
+            guests,
             substrate_reload_status,
         })
+    }
+
+    /// Queue work for a co-resident model and get a handle on its answer.
+    ///
+    /// The scheduler picks it up between two of its waves, evicts what it needs
+    /// to make room, serves the whole backlog for that guest, and hands the
+    /// ground back. Normal inference is blocked for the length of that drain —
+    /// see [`crate::guest`] for why that is the design rather than a cost.
+    ///
+    /// Refuses synchronously — before anything is queued and before anything is
+    /// evicted — when the request itself is not servable. A caller can block on
+    /// [`GuestReceipt::wait`] or poll `try_take`.
+    pub fn submit_guest(
+        &self,
+        request: crate::guest::GuestRequest,
+    ) -> Result<crate::guest::GuestReceipt, crate::guest::GuestError> {
+        self.submit_guest_watched(request, crate::guest::GuestSink::none())
+    }
+
+    /// The same, reporting progress to `sink` while the job runs.
+    ///
+    /// The sink is called on the scheduler thread with normal inference blocked,
+    /// so it must not block — see [`crate::guest::progress`].
+    pub fn submit_guest_watched(
+        &self,
+        request: crate::guest::GuestRequest,
+        sink: crate::guest::GuestSink,
+    ) -> Result<crate::guest::GuestReceipt, crate::guest::GuestError> {
+        let receipt = self.guests.queue.submit_watched(request, sink)?;
+        // **Wake the scheduler.** It parks in `rx.recv()` when there is nothing
+        // to do, and the guest queue is the one producer that does not arrive
+        // through that channel — so on an idle daemon a submitted job sat in
+        // the queue indefinitely, below a loop that was never going to come
+        // back round to look at it.
+        //
+        // Sent *after* the job is queued, so the loop either sees the work on
+        // its own next pass or is woken to find it. There is no ordering in
+        // which both miss: the channel buffers, so a wake that arrives while
+        // the loop is still running is waiting for it when it parks.
+        let _ = self.scheduler_tx.send(SchedulerRequest::Wake);
+        Ok(receipt)
+    }
+
+    /// The guests this deployment configured, for a status view.
+    pub fn configured_guests(&self) -> Vec<crate::guest::Guest> {
+        self.guests.registry.configured()
+    }
+
+    /// How many guest jobs are waiting.
+    pub fn guest_backlog(&self) -> usize {
+        self.guests.queue.depth()
     }
 
     /// Shared handle to the startup substrate-reload progress. The daemon's
@@ -1426,6 +1500,13 @@ impl ConversationEngine {
     /// dropped and we must ensure the CUDA scheduler thread exits before the
     /// CUDA driver's atexit handler fires.
     pub fn shutdown(&self) -> crate::Result<()> {
+        // **Before the scheduler is asked to stop.** A caller blocked in
+        // `GuestReceipt::wait` is blocked on the scheduler thread; once that
+        // thread joins there is nobody left to answer, and the caller waits for
+        // the life of the process with its HTTP request still open. Closing
+        // first also refuses anything submitted during the teardown, so no job
+        // lands in a queue nothing will drain.
+        self.guests.queue.close();
         let _ = self.scheduler_tx.send(SchedulerRequest::Shutdown);
         let handle = self
             .scheduler_handle

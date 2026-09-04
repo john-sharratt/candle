@@ -285,10 +285,7 @@ impl Plan {
         let mut years: Vec<Year> = Vec::new();
         for era in checked.eras.iter().filter(|e| e.kind.is_written()) {
             for year in era.years() {
-                if years.iter().any(|y| y.year == year) {
-                    continue;
-                }
-                let months = match era.grain {
+                let months: Vec<Month> = match era.grain {
                     Grain::Years => Vec::new(),
                     Grain::Months => months_in_year(year, era.from, era.to)
                         .into_iter()
@@ -299,11 +296,28 @@ impl Plan {
                         })
                         .collect(),
                 };
-                years.push(Year {
-                    year,
-                    content: Content::default(),
-                    months,
-                });
+                // **A year can belong to two spans, and gets the months of both.**
+                // Spans meet mid-year routinely — a dormancy that ends in June, a
+                // course that starts in September — and the first span to claim
+                // the year used to keep it whole. So a 2461 of coarse vigil
+                // followed by a fine-grained awakening produced a 2461 with no
+                // months at all, and the half of the year the character was
+                // actually living through simply had nowhere to be written.
+                match years.iter_mut().find(|y| y.year == year) {
+                    Some(existing) => {
+                        for m in months {
+                            if !existing.months.iter().any(|e| e.month == m.month) {
+                                existing.months.push(m);
+                            }
+                        }
+                        existing.months.sort_by_key(|m| m.month);
+                    }
+                    None => years.push(Year {
+                        year,
+                        content: Content::default(),
+                        months,
+                    }),
+                }
             }
         }
         years.sort_by_key(|y| y.year);
@@ -357,6 +371,10 @@ impl Plan {
         self.year(year)?.months.iter().find(|m| m.month == month)
     }
 
+    pub fn day(&self, year: i32, month: u32, day: u32) -> Option<&Day> {
+        self.month(year, month)?.days.iter().find(|d| d.day == day)
+    }
+
     pub fn month_mut(&mut self, year: i32, month: u32) -> Option<&mut Month> {
         self.year_mut(year)?
             .months
@@ -369,6 +387,23 @@ impl Plan {
             .days
             .iter_mut()
             .find(|d| d.day == day)
+    }
+
+    /// A node's content, read-only.
+    ///
+    /// [`Self::content_mut`]'s counterpart, for the callers that are *reading* a
+    /// stratum — assembling the ancestors a narration is written against, or
+    /// checking whether a node was edited before offering to rewrite it. Taking
+    /// `&mut` for a read would mean those callers could not hold two strata at
+    /// once, which is exactly what building a day's prompt from its month and
+    /// its year needs.
+    pub fn content(&self, id: NodeId) -> Option<&Content> {
+        match id {
+            NodeId::Story => Some(&self.story.content),
+            NodeId::Year { year } => self.year(year).map(|y| &y.content),
+            NodeId::Month { year, month } => self.month(year, month).map(|m| &m.content),
+            NodeId::Day { year, month, day } => self.day(year, month, day).map(|d| &d.content),
+        }
     }
 
     pub fn content_mut(&mut self, id: NodeId) -> Option<&mut Content> {
@@ -579,13 +614,20 @@ impl Plan {
     /// Only what actually reaches the *shared prefix* is hashed, and the shared
     /// prefix is the same for every phase: the seed, the arc, the cast and the
     /// year outline. A node's own parent text — the year a month expands, the
-    /// month a day expands — travels in that fork's **turn**, which is built
-    /// from the plan at fan-out time and is therefore never stale.
+    /// month a day expands — travels in that fork's **turn**, and is left out of
+    /// this hash on purpose.
     ///
     /// That is what keeps an edit local. Correcting one year invalidates its own
     /// months through [`Self::mark_stale_below`] and leaves every other month in
     /// the life alone, where a coarser hash would force the whole phase to
     /// regenerate over an edit to one line.
+    ///
+    /// **The turn is guarded separately, and has to be.** A fork's turn is built
+    /// from a snapshot taken before the phase primes, so it *can* go stale — this
+    /// doc used to claim otherwise, and the gap was exactly the edited year's own
+    /// months: their correction was marked, then overwritten by prose generated
+    /// against the year as it stood before it. [`super::generate::run_phase`]
+    /// re-derives each node's turn under the write lock and skips any that moved.
     pub fn prefix_hash(&self) -> String {
         let mut h = Sha256::new();
         h.update(serde_json::to_vec(&self.seed).unwrap_or_default());
@@ -779,6 +821,55 @@ mod tests {
         assert_eq!(p.seed.eras.len(), 3);
         assert_eq!(p.era_for(3000).unwrap().kind, EraKind::Dormant);
         assert_eq!(p.era_for(2500).unwrap().grain, Grain::Years);
+    }
+
+    /// **A year two spans share gets the months of both.**
+    ///
+    /// Spans meet mid-year routinely — a dormancy that ends in June, a course
+    /// that starts in September — and the first span to claim the year used to
+    /// keep it whole. A coarse watch handing over to a fine-grained awakening in
+    /// the same year therefore produced that year with no months at all, and the
+    /// half of it the character was actually living through had nowhere to be
+    /// written. Nothing reported it: the year existed, so the plan looked laid
+    /// out, and the missing months read as months nobody had generated yet.
+    #[test]
+    fn a_year_split_between_two_spans_keeps_the_finer_grains_months() {
+        use crate::lifegen::seed::{Era, EraKind, Grain};
+        let mut s = seed("2461-01-01", "2465-12-31");
+        s.eras = vec![
+            // Coarse to the end of June, fine from July — inside one year.
+            Era {
+                from: "2461-01-01".into(),
+                to: "2463-06-30".into(),
+                kind: EraKind::Lived,
+                grain: Grain::Years,
+                what: "The long watch.".into(),
+            },
+            Era {
+                from: "2463-07-01".into(),
+                to: "2465-12-31".into(),
+                kind: EraKind::Lived,
+                grain: Grain::Months,
+                what: "Awake, and busy.".into(),
+            },
+        ];
+        let p = Plan::new(&check(&s).unwrap());
+
+        // 2463 belongs to both. The coarse span reached it first and contributes
+        // no months; the fine one contributes July to December.
+        let shared = p.year(2463).expect("the shared year");
+        let months: Vec<u32> = shared.months.iter().map(|m| m.month).collect();
+        assert_eq!(
+            months,
+            vec![7, 8, 9, 10, 11, 12],
+            "the half-year the character was awake for has nowhere to be written"
+        );
+
+        // And the year is laid out once, not twice.
+        assert_eq!(p.years.iter().filter(|y| y.year == 2463).count(), 1);
+        // The spans either side are unaffected.
+        assert!(p.year(2462).unwrap().months.is_empty());
+        assert_eq!(p.year(2464).unwrap().months.len(), 12);
     }
 
     /// **No days are laid out.** Which days mattered is the one thing only the

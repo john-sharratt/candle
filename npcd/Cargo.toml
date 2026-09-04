@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow     = { workspace = true }
+# The image guest hands back PNG bytes, and they ride in the JSON response
+# beside the seed that produced them — an operator who liked a draw needs the
+# seed to ask for it again, and a header is a worse place for it than the body.
+base64     = { workspace = true }
 clap       = { workspace = true }
 tracing    = { workspace = true }
 # Authored worlds and personalities are YAML on disk and JSON on the wire. They are
@@ -50,9 +54,23 @@ sha2       = "0.10"
 # semantics differ enough between major versions that two of them in one
 # workspace would mean two sets of platform quirks to know about.
 notify     = "6"
+# Decoding an uploaded reference and encoding a cutout's matte. The workspace
+# build carries PNG and JPEG only, which is what a browser sends from a file
+# picker and what this daemon hands back — a format list is an attack surface,
+# so it stays the short one the rest of the workspace already compiles.
+image      = { workspace = true }
+# The alpha-matte network behind "remove background". ONNX rather than a
+# hand-written architecture because the model is somebody else's published
+# graph and this fork already carries a runtime for those — see `src/matte.rs`
+# for what it is and why it is not a colour algorithm.
+candle-onnx = { path = "../candle-onnx", version = "0.9.1" }
 
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio      = { version = "1", features = ["full"] }
+# Turning the guest's progress channel into the body of a streaming response, so
+# a generated description reaches the page a token at a time instead of after
+# the whole drain. Already in the lockfile via axum's own dependencies.
+tokio-stream = { version = "0.1" }
 include_dir = { version = "0.7" }
 
 # The HTTP front. `npcd` supplies the console files and an API router; `web`
@@ -93,9 +111,6 @@ sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 # every 2s, so proving it runs unattended would otherwise mean a test that
 # genuinely sleeps for eight seconds.
 tokio = { version = "1", features = ["full", "test-util"] }
-# For forging a token in the identity tests — proving a tampered payload is
-# rejected requires assembling one by hand.
-base64 = { workspace = true }
 # Driving the router directly in the integration tests: the auth wiring is the
 # part worth proving over HTTP rather than over function calls, and `oneshot`
 # does it without binding a port.

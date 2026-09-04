@@ -707,10 +707,81 @@ export async function render(params) {
           'generated from. Written as a present-day person: the personality supplies the anchor, this ' +
           'supplies the human texture.'),
         h('div', { class: 'row', style: 'margin-top:10px;gap:8px' },
+          /* **Real, and streamed into the field.** This was a stub that toasted
+           * "engine required" and called nothing — a button that could only
+           * fail, left behind when the prose guest arrived. It writes the same
+           * generation the create step does, against the character's own world
+           * and personality, and lands in the textarea so the existing Save
+           * decides whether it is kept. */
           h('button', {
             class: 'btn sm',
-            onClick: () => toast('regenerating a description — engine required', 'err'),
+            onClick: async (e) => {
+              // Disabled while it runs; the label stays put. The text arriving
+              // in the field below is the progress indicator.
+              const b = e.currentTarget;
+              b.disabled = true;
+              const before = descIn.value;
+              descIn.value = '';
+              descIn.placeholder = 'writing…';
+              try {
+                const r = await API.generateDescriptionStream(
+                  { world_id: npc.world_id, personality_id: npc.personality_id },
+                  (ev) => {
+                    if (ev.event === 'token') {
+                      descIn.value += ev.text;
+                      descIn.scrollTop = descIn.scrollHeight;
+                    }
+                  });
+                descIn.value = r.description;
+                /* Not saved here. The field is now dirty and Save is what
+                 * commits it, so a draft you dislike is discarded by leaving. */
+                toast('description written — Save to keep it', 'ok');
+              } catch (err) {
+                descIn.value = before;
+                toast(err.error === 'no_prose_model'
+                  ? 'no prose model is configured on this daemon'
+                  : (err.detail || err.message || 'could not write a description'), 'err');
+              } finally {
+                b.disabled = false;
+                descIn.placeholder = '';
+              }
+            },
           }, '⟳ Regenerate description'),
+          /* **The portrait, drawn from the description above it.**
+           *
+           * Here rather than only on the create step because this is where the
+           * description is edited: a portrait is generated *from* it, so the
+           * button belongs beside the thing it reads. The daemon answers with
+           * the whole record, so the header's avatar updates from the same
+           * response rather than from a second fetch.
+           *
+           * It blocks — the drain stops every character thinking while it runs
+           * — so the button says so and disables itself rather than letting an
+           * impatient second press queue a second stop-the-world job. */
+          h('button', {
+            class: 'btn sm',
+            onClick: async (e) => {
+              // Disabled while it runs; the label stays put. A toast opens the
+              // wait and the portrait itself closes it.
+              const b = e.currentTarget;
+              b.disabled = true;
+              toast('drawing the portrait — the cast is paused', 'ok');
+              try {
+                npc = await API.generatePortrait(id);
+                repaint();
+                toast('portrait drawn', 'ok');
+              } catch (err) {
+                /* `no_image_model` is a deployment fact, not a fault: this
+                 * daemon has no image guest configured. Saying which it is
+                 * stops somebody debugging a model that was never there. */
+                toast(err.error === 'no_image_model'
+                  ? 'no image model is configured on this daemon'
+                  : (err.detail || err.message || 'could not draw a portrait'), 'err');
+              } finally {
+                b.disabled = false;
+              }
+            },
+          }, '⟳ Draw portrait'),
           saveBtn)),
 
       h('div', { class: 'panel' },

@@ -16,7 +16,19 @@
 # ============================================================================
 
 server:
-  bind: "127.0.0.1:8081"
+  # Every interface, so the console can be reached from another machine on the
+  # estate rather than only from the box the daemon happens to run on.
+  #
+  # **What that changes about trust.** Identity arrives in `x-tokera-*` headers
+  # and `identity::identify` believes them — it has to, because the gateway in
+  # front of the DMZ deployment is what mints them after it has done the OAuth.
+  # On loopback that was safe by construction: only a process on this machine
+  # could set them. On every interface it is not, and `roles.admins` below is
+  # matched on an address anyone can type. So this binding assumes the daemon
+  # sits on a network where reaching port 8081 is itself the credential — behind
+  # the estate's gateway, or on a LAN you own. Do not put it on a public address
+  # without a gateway in front stripping and re-minting those headers.
+  bind: "0.0.0.0:8081"
   # A minute for code, fifteen for pictures — see the note in `web/web.yaml`.
   # Both keep their ETag, so once the age is up an unchanged file still costs a
   # conditional request and no body, and `--content` editing shows up on the

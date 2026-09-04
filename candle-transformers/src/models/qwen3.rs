@@ -396,6 +396,33 @@ impl Model {
     }
 
     pub fn forward(&self, caches: &mut [KvCache], input: &Tensor, offset: usize) -> Result<Tensor> {
+        let h = self.hidden_states(caches, input, offset, 0)?;
+        self.norm.forward(&h)
+    }
+
+    /// The hidden state with the last `skip_last` layers left un-run, and the
+    /// final norm not applied.
+    ///
+    /// This is HuggingFace's `output_hidden_states=True` indexed from the end.
+    /// That tuple is `(embeddings, after_layer_0, …, after_layer_{L−2},
+    /// normed_final)` — the entry *before* each layer, then the normed output —
+    /// so `hidden_states[-1]` is [`Self::forward`] and `hidden_states[-2]` is
+    /// this with `skip_last = 1`: every layer but the last, un-normed.
+    ///
+    /// Diffusion text encoders routinely want a penultimate layer rather than
+    /// the last — Stable Diffusion's CLIP does, and Z-Image's Qwen3 does — on
+    /// the reasoning that the final layer is specialised toward predicting the
+    /// next token, which is not what a conditioning signal wants.
+    ///
+    /// `caches` must still have one entry per layer; the skipped ones are left
+    /// untouched.
+    pub fn hidden_states(
+        &self,
+        caches: &mut [KvCache],
+        input: &Tensor,
+        offset: usize,
+        skip_last: usize,
+    ) -> Result<Tensor> {
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
 
@@ -405,10 +432,11 @@ impl Model {
             Some(self.causal_mask(b, l, offset, None)?)
         };
 
-        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+        let run = self.layers.len().saturating_sub(skip_last);
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()).take(run) {
             h = layer.forward(cache, &h, causal.as_ref(), offset)?;
         }
-        self.norm.forward(&h)
+        Ok(h)
     }
 }
 

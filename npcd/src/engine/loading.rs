@@ -109,6 +109,25 @@ pub struct LoadingSnapshot {
     /// arbitrary number of items without needing a phase each.
     pub detail: String,
     pub elapsed_ms: u64,
+    /// Tokens prefilled so far in this phase, and the rate they arrived at.
+    ///
+    /// **Documents are the wrong unit for the question anyone actually asks.**
+    /// A layer's documents differ by an order of magnitude in length, so "208 of
+    /// 1267" says nothing about how fast the engine is going or how long the
+    /// rest will take. Tokens are what the GPU actually processes, and tokens
+    /// per second is the number that compares directly against the
+    /// forward-batched gate's prefill rate — the same measurement, on the same
+    /// card, so a slow ingest can be recognised as slow rather than merely
+    /// long.
+    ///
+    /// `zend` has had exactly this since its upload pipeline was built
+    /// (`zend::loading::IngestStats`); npcd copied the structure around it and
+    /// left the counter out.
+    pub prefill_tokens: u64,
+    /// Cumulative tokens over the phase's elapsed wall time. `None` before any
+    /// tokens have been counted, so the console shows nothing rather than a
+    /// zero that reads as a stalled engine.
+    pub prefill_tps: Option<f64>,
 }
 
 /// Shared, mutable load progress. A `None` snapshot means ready — the console
@@ -125,6 +144,9 @@ enum Inner {
         unit: String,
         detail: String,
         started: Instant,
+        /// Cumulative tokens prefilled in this phase — see
+        /// [`LoadingSnapshot::prefill_tokens`].
+        prefill_tokens: u64,
     },
     Ready,
 }
@@ -145,6 +167,7 @@ impl LoadProgress {
                 unit: LoadStep::Model.unit().to_string(),
                 detail: String::new(),
                 started: Instant::now(),
+                prefill_tokens: 0,
             }),
         }
     }
@@ -165,7 +188,22 @@ impl LoadProgress {
             unit: step.unit().to_string(),
             detail: String::new(),
             started,
+            // Reset with the counter, for the reason the counter is: a token
+            // total carried over from the previous phase reads as throughput in
+            // this one.
+            prefill_tokens: 0,
         };
+    }
+
+    /// Add tokens the engine has just prefilled.
+    ///
+    /// Called per document by the ingest, so the rate is live rather than
+    /// arriving at the end — which is the whole point of watching a load that
+    /// takes half an hour.
+    pub fn add_prefill_tokens(&self, n: u64) {
+        if let Inner::Loading { prefill_tokens, .. } = &mut *self.inner.lock().unwrap() {
+            *prefill_tokens += n;
+        }
     }
 
     /// Report position within the current phase.
@@ -215,10 +253,12 @@ impl LoadProgress {
             unit,
             detail,
             started,
+            prefill_tokens,
         } = &*g
         else {
             return None;
         };
+        let elapsed = started.elapsed().as_secs_f64();
         // Everything strictly before the current step, by the canonical order.
         // Derived rather than accumulated so a phase that is skipped entirely
         // still counts as done — which is the normal case for `Layers` on a
@@ -242,6 +282,12 @@ impl LoadProgress {
             unit: unit.clone(),
             detail: detail.clone(),
             elapsed_ms: started.elapsed().as_millis() as u64,
+            prefill_tokens: *prefill_tokens,
+            // `None` until tokens have actually been counted: a zero rate and
+            // an unmeasured one look identical on a chart, and the difference
+            // is "the engine has stalled" against "nothing has reported yet".
+            prefill_tps: (*prefill_tokens > 0 && elapsed > 0.0)
+                .then(|| *prefill_tokens as f64 / elapsed),
         })
     }
 }

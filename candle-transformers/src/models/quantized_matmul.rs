@@ -187,6 +187,28 @@ impl QMatMul {
         // take `forward_live_as`; a new fused consumer must check `int8mode()` rather than assume.
         #[cfg(feature = "cuda")]
         if mode.is_int8() {
+            // **A weight that already IS its KO twin is used as it stands.**
+            //
+            // Repacking one is not a no-op: `repackable_to_ko` does not admit a
+            // KO dtype, so the twin falls to the expensive arm below and is
+            // dequantized to a whole-tensor f32 buffer and requantized — 177 MB
+            // of pool for a `[11520, 3840]` projection, to reproduce the bytes it
+            // was handed. A caller that placed its own twins (a co-resident
+            // guest, whose weights live in span ground because the pool has
+            // nothing to give) hits that on every projection and dies on the
+            // first one the pool cannot serve.
+            //
+            // So this makes `build` idempotent, which is what a caller reasonably
+            // expects of it. `is_ko` already implies the mode: the KO twin and
+            // the int8 path imply each other, which is the invariant
+            // `from_qtensor_view` states.
+            if ws.dtype().is_ko() {
+                return Ok(Self {
+                    inner: candle::quantized::QMatMul::from_arc(ws)?,
+                    span,
+                    int8mode: mode,
+                });
+            }
             // **A shape that will not tile is a per-tensor fact, knowable up front — not a load
             // failure.** The q8a128 matmul tiles N in blocks of 32, and a narrow projection can
             // sit below it (Qwen3.5-0.8B's DeltaNet `w_alpha`/`w_beta` are `[16, hidden]` at 16

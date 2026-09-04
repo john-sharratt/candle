@@ -267,7 +267,11 @@ __device__ void silu_mul_q8a128_impl(
             (int8_t)__float2int_rn(n3 * id));
         if (lane == 0) {
             half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(tile));
-            ds[0] = make_half2(__float2half_rn(amax / 127.f), __float2half_rn(s));
+            // Σx normalised by amax — see blocks.cuh. This producer especially:
+            // a SwiGLU intermediate is the widest activation in a model, and it
+            // is where the raw f16 sum overflows first.
+            ds[0] = make_half2(__float2half_rn(amax / 127.f),
+                               __float2half_rn(s * id * (1.f / 127.f)));
         }
     }
 }

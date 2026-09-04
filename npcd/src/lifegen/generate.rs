@@ -34,6 +34,7 @@
 //! engine's wave width; beyond it the extra forks would queue inside the
 //! scheduler anyway, while holding KV for a turn that has not started.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -115,6 +116,13 @@ pub fn run_phase(
         .iter()
         .map(|id| (*id, turn_for(&snapshot, *id)))
         .collect();
+    // What each fork was actually asked, kept for the write-back check below. The
+    // prefix hash cannot stand in for this: a month's parent year travels in the
+    // fork's *turn*, not in the shared prefix, and is deliberately left out of the
+    // hash so that correcting one year does not invalidate every other year's
+    // months. That keeps an edit local — and left the edited year's own months
+    // unguarded.
+    let planned: BTreeMap<NodeId, String> = turns.iter().cloned().collect();
 
     // **What was actually asked, in characters.** A phase that produces nothing looks
     // identical whether the prompt was wrong, the turn was empty, or the model declined — and
@@ -181,6 +189,25 @@ pub fn run_phase(
             head = %text.chars().take(400).collect::<String>(),
             "decode"
         );
+        // **The parent this node expanded must still be the parent.** The shared
+        // prefix is checked once above; a node's own parent — the year a month
+        // expands, the month a day expands — reaches it through the turn, which
+        // was built from the snapshot taken before the decode. An operator
+        // correcting year 1999 mid-phase marks its months stale, and writing
+        // prose generated against the *old* 1999 over that mark would discard the
+        // correction and clear the flag that recorded it. Checked per node rather
+        // than per phase, so the other eleven years' months still land.
+        let asked_now = turn_for(&p, a.id);
+        if planned.get(&a.id) != Some(&asked_now) {
+            tracing::warn!(
+                "life {}: {:?} not written — what it expands was edited while the {} phase \
+                 ran; it stays pending and regenerates against the correction",
+                p.seed.who,
+                a.id,
+                phase.unit()
+            );
+            continue;
+        }
         if apply(&mut p, a.id, &text) {
             written += 1;
         } else {

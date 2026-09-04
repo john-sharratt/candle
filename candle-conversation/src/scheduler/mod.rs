@@ -17,6 +17,7 @@
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
 mod decode;
+mod guest_room;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
@@ -605,6 +606,20 @@ pub(crate) enum SchedulerRequest {
         timelines: Vec<TimelineId>,
         response_tx: Sender<Result<usize, ConversationError>>,
     },
+
+    /// Nothing to do — wake the loop so it looks around.
+    ///
+    /// **Guest work needs this and nothing else does.** An idle scheduler parks
+    /// in `rx.recv()`, and everything else that produces work arrives *through*
+    /// that channel, so the block is also the wake. The guest queue is the one
+    /// producer that is not a `SchedulerRequest`: a job submitted to an idle
+    /// daemon sat in the queue forever, because the loop was parked below the
+    /// point that polls it and nothing was ever going to arrive to unpark it.
+    ///
+    /// Handled as a no-op that returns to the top of the loop, where the guest
+    /// poll is. Sent after the job is queued, so the loop either sees the work
+    /// on its own or is woken to it — there is no ordering in which both miss.
+    Wake,
 
     /// Shut down the scheduler.
     Shutdown,
@@ -2501,6 +2516,16 @@ pub(crate) struct Scheduler {
     /// fallback). In-memory only: a daemon restart begins from an empty belief
     /// and the first turn's reprojections rebuild it.
     carried_beliefs: HashMap<SequenceId, PriorBelief>,
+    /// The co-resident models that borrow the card between waves, and the
+    /// backlog they are waiting on.
+    ///
+    /// Polled once per pass of the loop — one atomic load, answering "no" on
+    /// almost every pass — and drained between forwards when it is not empty.
+    /// Shared with the engine, which is what the API submits through. A
+    /// deployment with no guests configured carries an empty registry and a
+    /// queue nothing ever pushes to; see [`crate::guest`].
+    guests: Arc<crate::guest::Guests>,
+
     /// Pending mid-decode view swaps, queued during `batch_decode_step`
     /// (which holds shared/exclusive borrows on `active_decodes`) and
     /// drained immediately after the batch completes.  Values are
@@ -2814,6 +2839,7 @@ impl Scheduler {
         persist_trigger: PersistenceTrigger,
         summariser_trigger: SummariserTrigger,
         boundary_markers: projection_assembler::BoundaryMarkers,
+        guests: Arc<crate::guest::Guests>,
     ) -> Self {
         let device = model.device().clone();
 
@@ -2891,6 +2917,7 @@ impl Scheduler {
             ephemeral_sigs: HashMap::new(),
             turn_views: HashMap::new(),
             carried_beliefs: HashMap::new(),
+            guests,
             pending_reprojections: Vec::new(),
             slot_tokens: HashMap::new(),
             slot_projection_state: HashMap::new(),
@@ -4078,6 +4105,10 @@ impl Scheduler {
                 let _ = response_tx.send(Ok(demoted));
                 true
             }
+
+            // Nothing to do. Returning to the top of the loop *is* the work —
+            // that is where the guest queue is polled.
+            SchedulerRequest::Wake => true,
 
             SchedulerRequest::Shutdown => false,
         }
@@ -9973,7 +10004,8 @@ mod tests {
     /// A scheduler over the CPU test session and a `DummyModel`, plus its
     /// request sender — for tests that drive handler-level state (belief
     /// lifecycle) rather than forwards.
-    fn make_test_scheduler() -> (Scheduler, crossbeam::channel::Sender<SchedulerRequest>) {
+    pub(super) fn make_test_scheduler() -> (Scheduler, crossbeam::channel::Sender<SchedulerRequest>)
+    {
         let (tx, rx) = crossbeam::channel::bounded(16);
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
@@ -9992,6 +10024,9 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
+            // No guests: these exercise the wave loop, and an empty registry is
+            // what every deployment that has not configured one carries.
+            Arc::new(crate::guest::Guests::new()),
         );
         (scheduler, tx)
     }
@@ -10024,6 +10059,9 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
+            // No guests: these exercise the wave loop, and an empty registry is
+            // what every deployment that has not configured one carries.
+            Arc::new(crate::guest::Guests::new()),
         );
         (scheduler, tx, probe)
     }
@@ -10821,6 +10859,9 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
+            // No guests: these exercise the wave loop, and an empty registry is
+            // what every deployment that has not configured one carries.
+            Arc::new(crate::guest::Guests::new()),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
@@ -10884,6 +10925,9 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
+            // No guests: these exercise the wave loop, and an empty registry is
+            // what every deployment that has not configured one carries.
+            Arc::new(crate::guest::Guests::new()),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();

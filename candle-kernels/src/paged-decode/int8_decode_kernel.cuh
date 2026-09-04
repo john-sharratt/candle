@@ -1649,8 +1649,11 @@ __global__ void int8_decode_combine_kernel(
             obytes[q8a1024_qs_off(flat) + (d & 127)] = (int8_t)__float2int_rn(vr * id);
             if ((d & 127) == 0) {
                 half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(flat));
+                // Σx normalised by amax — see blocks.cuh. `id` carries the
+                // amax==0 guard, and the same IEEE-division reasoning applies:
+                // the normalisation reuses `id` rather than dividing again.
                 ds[0] = make_half2(__float2half_rn(__fdiv_rn(tile_amax, 127.f)),
-                                   __float2half_rn(tile_sum));
+                                   __float2half_rn(tile_sum * id * (1.f / 127.f)));
             }
             return;
         }

@@ -47,6 +47,25 @@ impl VarBuilder {
         })
     }
 
+    /// Build over tensors somebody else placed.
+    ///
+    /// [`Self::from_gguf`] both reads the file *and* decides where the tensors
+    /// live — it calls `Content::tensor`, which allocates each one from the CUDA
+    /// pool. A caller that owns its own memory (a co-resident guest placing
+    /// weights in the span reservation it was handed, an int8 load that repacked
+    /// each projection into a chosen address) has already done the placing and
+    /// needs only the naming. This is that half.
+    pub fn from_tensors(
+        data: std::collections::HashMap<String, Arc<QTensor>>,
+        device: Device,
+    ) -> Self {
+        Self {
+            data: Arc::new(data),
+            path: Vec::new(),
+            device,
+        }
+    }
+
     pub fn pp<S: ToString>(&self, s: S) -> Self {
         let mut path = self.path.clone();
         path.push(s.to_string());

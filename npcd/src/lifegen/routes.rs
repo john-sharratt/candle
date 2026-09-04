@@ -55,7 +55,7 @@ fn refuse(code: StatusCode, kind: &str, detail: &str) -> Refusal {
 
 /// Resolve a character id to a mind root, refusing anything the registry does
 /// not know.
-async fn resolve(s: &Arc<Authored>, who: &str) -> Result<std::path::PathBuf, Refusal> {
+pub(super) async fn resolve(s: &Arc<Authored>, who: &str) -> Result<std::path::PathBuf, Refusal> {
     let Some(mind) = s.mind.root() else {
         return Err(refuse(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -77,7 +77,7 @@ async fn resolve(s: &Arc<Authored>, who: &str) -> Result<std::path::PathBuf, Ref
 }
 
 /// Load the plan for a character, or report that there is not one.
-fn open(mind: &std::path::Path, who: &str) -> Result<Plan, Refusal> {
+pub(super) fn open(mind: &std::path::Path, who: &str) -> Result<Plan, Refusal> {
     match plan::load(mind, who) {
         Ok(Some(p)) => Ok(p),
         Ok(None) => Err(refuse(
@@ -94,7 +94,7 @@ fn open(mind: &std::path::Path, who: &str) -> Result<Plan, Refusal> {
 }
 
 /// Persist a plan and bring its documents into line with it.
-fn commit(mind: &std::path::Path, p: &Plan) -> Result<Value, Refusal> {
+pub(super) fn commit(mind: &std::path::Path, p: &Plan) -> Result<Value, Refusal> {
     let fail = |e: anyhow::Error| {
         refuse(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -177,6 +177,18 @@ pub async fn put_seed(
     };
 
     let mut fresh = Plan::new(&checked);
+    // **An unreadable plan is refused, not overwritten.** The carry-over below reads the
+    // existing life so a re-seed keeps everything already written; matching `Ok(Some(old))`
+    // let the `Err` arm fall through to a fresh empty plan, so a plan file that failed to
+    // parse — the one moment the authored life is least recoverable — was replaced by a blank
+    // one instead of reported.
+    if let Err(e) = plan::load(&mind, &who) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "life_plan_unreadable",
+            &format!("the existing plan could not be read, so re-seeding would discard it: {e:#}"),
+        );
+    }
     if let Ok(Some(old)) = plan::load(&mind, &who) {
         fresh.story = old.story.clone();
         for y in &mut fresh.years {
@@ -444,9 +456,21 @@ pub async fn post_generate(
         let Some(c) = p.content_mut(id) else {
             return err(StatusCode::NOT_FOUND, "no_such_node", key);
         };
-        c.text.clear();
+        // **Marked stale, not emptied.** `wants_generation()` is
+        // `!edited && (!is_generated() || stale)`, so staleness selects the node just as an
+        // empty one does — and leaves the text where it is until something better replaces it.
+        //
+        // Clearing here meant a redo destroyed the node before the run that was meant to
+        // improve it. A decode that yields no prose then leaves `apply` with nothing to
+        // write, `document::sync` drops the file (the node no longer reads as generated), and
+        // `plan::save` persists the emptied node — the operator's good month gone from both
+        // disk and plan, with the job still reporting `done`. Cancelling a multi-node redo did
+        // the same to every node it had not reached yet, which is not "a shorter run".
+        //
+        // `edited` is still cleared: naming a node in `redo` is the explicit override that the
+        // sticky rule exists to require.
         c.edited = false;
-        c.stale = false;
+        c.stale = true;
         if !implied.contains(&id.phase()) {
             implied.push(id.phase());
         }
@@ -546,7 +570,7 @@ pub async fn get_catalog() -> Response {
 /// Strict about the shapes, because a key that parsed loosely would address a
 /// different node than the console meant and the edit would land somewhere
 /// plausible.
-fn node_id(key: &str) -> Option<NodeId> {
+pub(super) fn node_id(key: &str) -> Option<NodeId> {
     if key.eq_ignore_ascii_case("story") {
         return Some(NodeId::Story);
     }

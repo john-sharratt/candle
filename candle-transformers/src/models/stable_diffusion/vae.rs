@@ -310,6 +310,18 @@ impl DiagonalGaussianDistribution {
         let sample = self.mean.randn_like(0., 1.);
         &self.mean + &self.std * sample
     }
+
+    /// The distribution's mode — its mean, with no noise drawn.
+    ///
+    /// **What image-to-image wants.** Encoding a picture to start a denoise from
+    /// it is not sampling a latent, it is *reading* one: the noise the schedule
+    /// is about to add is chosen deliberately by the strength, and a second,
+    /// undeclared helping from the encoder would sit on top of it. Diffusers
+    /// calls this `mode()` and its img2img pipelines take it for the same
+    /// reason.
+    pub fn mode(&self) -> Tensor {
+        self.mean.clone()
+    }
 }
 
 // https://github.com/huggingface/diffusers/blob/970e30606c2944e3286f56e8eb6d3dc6d1eb85f7/src/diffusers/models/vae.py#L485

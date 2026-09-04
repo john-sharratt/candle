@@ -167,6 +167,10 @@ fn main() -> anyhow::Result<()> {
         model,
         tokenizer.clone(),
         engine_config,
+        // No guests: this measures the engine's own long-context behaviour, and
+        // a co-resident model stopping the wave loop mid-run is exactly what a
+        // RULER measurement must not have in it.
+        candle_conversation::guest::GuestRegistry::new(),
     )?);
 
     // Open the log file in append mode so repeated runs accumulate data.

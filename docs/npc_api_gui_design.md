@@ -551,9 +551,8 @@ defend against anyone with server access. The UI therefore says "hidden" and nev
   /v1/generate/npc                            whole NPC, one call
   /v1/generate/{job_id}                       poll a generation job
 
-  /v1/image/generate                          text-to-image job
-  /v1/image/{image_id}                        fetch bytes
-  /v1/image/models                            available image models, load state
+  /v1/image/generate                          text-to-image; NDJSON, image in the last line
+  /v1/image/models                            the configured image guest, load state
   /v1/image/queue                             drain queue: depth, position, next run
 
   /v1/commands                                slash-command catalog (schema-described)
@@ -1027,27 +1026,353 @@ Portraits are either uploaded or generated. Generation needs a diffusion model, 
 new subsystem with a real constraint attached.
 
 ```
-POST /v1/image/generate
-{ "prompt": "…", "negative": "…", "size": "768x768", "seed": null,
-  "model": "flux-schnell-q8" }
-→ 202 { GenerationJob }        // kind: "image"
+POST /v1/image/generate                     → NDJSON stream
+{ "prompt": "…", "width": 512, "height": 512, "steps": 8, "seed": null }
 
-GET  /v1/image/{image_id}                   → image bytes (immutable, cacheable)
-GET  /v1/image/models                       → available models + load state
+  { "event": "loading" }                              the model crossing the link
+  { "event": "step", "done": 3, "total": 9,
+    "what": "denoising" }                             one line per unit of work
+  { "event": "done", "width": …, "height": …,
+    "seed": …, "png_base64": "…" }                    terminal; the whole image
+  { "event": "error", "error": "no_room",
+    "detail": "…", "retry": true }                    terminal; the alternative
+
+GET  /v1/image/models                       → the configured guest + load state
 POST /v1/npc/{id}/portrait                  multipart upload
 PUT  /v1/npc/{id}/portrait                  { "image_id": "…" }
 ```
 
+**A stream, not a job to poll.** A drain is one indivisible stop-the-world event: a caller that
+reconnected mid-drain would learn only that it was still running, which is why there is no job
+id and no polling route. But it is also *seconds long*, and the console draws a progress bar
+from the counts above — so the connection stays open and the units come across as they finish.
+The image arrives whole in the terminal line, base64 rather than as `image/png` bytes, so the
+seed travels with it.
+
+**There is no `negative`, and the size is two numbers.** The model is guidance-distilled
+(below), so there is no unconditioned branch for a negative prompt to push away from and the
+field would accept text and change nothing. Sides are integers because both must be multiples
+of 16 — the latent is the image over 8 and the transformer patches that by 2 — and a `"768x768"`
+string is a parsing step that can only ever produce the same two numbers.
+
 ### The models are already in the tree
 
-No external service is required. `candle-transformers` ships `flux` (**including
-`quantized_model.rs`**), `stable_diffusion`, `stable_diffusion_3`, and `wuerstchen`, with
-working examples for each. The module is a loader, a scheduler, and an API over models that
-already exist here.
+No external service is required. `candle-transformers` ships the model families and the loader,
+scheduler and API are built over what is already here.
 
-**Quantized Flux Schnell is the default.** Schnell is a few-step model, so a portrait is
-seconds rather than a minute, and the quantized weights are what make it viable at all next to
-a 30B MoE.
+**Z-Image-Turbo is the model.** A 6B NextDiT with a Qwen3-4B text encoder and the FLUX
+autoencoder, quantized per card (`z_image::quant_choice`) and placed in guest ground as
+repacked int8 twins. It is guidance-distilled, its schedule is trained at **eight steps**, and
+the daemon asks for **twelve**. That is what makes a portrait a couple of seconds of drain
+rather than a minute of it, and it is the whole reason a generator that stops every character's
+thinking is an acceptable thing to run at all.
+
+### What distillation costs: the seed does not choose the face
+
+A guidance-distilled model is trained to reach the modal answer in as few evaluations as it can,
+and **faces are the densest mode there is**. The symptom is specific and was hit here: draws with
+different seeds return the same face wearing different clothes against different backgrounds. It
+is a property of the released checkpoint rather than a fault in this port — the upstream
+discussion closes on *"that's the problem with distilled models"*, and a third-party diversity
+adapter exists for exactly this.
+
+**Measured on the 3090, one prompt ("a portrait photograph of a person, head and shoulders,
+plain background"), seeds 11 / 22 / 33:**
+
+| | Result |
+|---|---|
+| 8 steps, three seeds | The same young man, same shirt, same pose, three times. |
+| 12 steps, the same three seeds | The same young man again. A given seed's face is unchanged from its 8-step draw; only fine detail moves. |
+| 12 steps, **one seed**, two described subjects | Two entirely different people. |
+
+So the intuitive fix is the wrong one. Spending steps against the collapse does nothing: the
+first Euler step is not what is deciding the identity — **the conditioning is**, and the noise
+barely touches it. The step count is a detail-versus-drain trade and nothing more, which is why
+the daemon's twelve is justified on refinement rather than on variety.
+
+Two knobs commonly blamed are inert here for the same reason as the negative prompt:
+
+- `cfg_truncation` **1.0 → 0.7** applies CFG for the first 70% of timesteps and drops to
+  unconditional after. It is a knob on the *guidance branch*. Turbo runs at
+  `guidance_scale = 0.0` and has no such branch, so there is nothing to truncate.
+- A negative prompt: nothing to push away from. See the API block above.
+
+What works is outside the sampler: varying the prompt (an age, a build, a feature), or a
+diversity adapter on the transformer. The Images page takes the first route with its style
+presets — and it is why a cast whose descriptions all read "a guard at the north gate" will come
+back as one man however the seeds differ. On this model the writing is the casting.
+
+### The decode is tiled, so its peak does not scale with the image
+
+The autoencoder — not the denoise — is the peak of a drain. It upsamples to 128 channels at the
+image's **full resolution** and a residual block holds several of those at once, so its working
+set grows with the image's *area*, and it comes from the CUDA pool, which a co-resident guest
+gets little of.
+
+That produced a deterministic failure: **the first draw of a session above roughly one megapixel
+died with `CUDA_ERROR_OUT_OF_MEMORY`, and the retry succeeded** — because the failed attempt's
+allocations went back to the pool already carved to decoder shapes. Measured on the 3090: all
+twelve denoise steps passed, `trim_pool_after_load` recovered **544 MiB** against the ~3 GiB the
+decode wanted, and it died 0.8 s later.
+
+`guest::tiled_decode` decodes in overlapping tiles and cross-fades the joins, so **the peak is
+one 512×512 tile whatever the output is** — a bigger image costs proportionally more time
+instead of failing. A latent that fits one tile is decoded in a single call with no blending, so
+the 512×512 path costs exactly what it did before.
+
+> **The bump allocator cannot back a decode, and this is why.** The obvious fix is to serve the
+> decode from the guest's own ground, which is span the drain already reserved. `GuestGround` is
+> a **bump** allocator with no free — right for weights, which are written once and read until
+> the drain ends. A decoder's intermediates are allocated and dropped continuously, so a bump
+> cursor holds the *sum* of every intermediate rather than the peak: tens of gigabytes. Backing a
+> decode from ground means building a freeing allocator over the span, which is what the pool
+> already is. Separately, `conv2d` and `upsample_nearest2d` carry no arena provenance at all, so
+> every one of them would need converting first.
+
+Measured after tiling, all as the **first** draw of a fresh daemon — the case that used to fail:
+
+| Size | Before | After |
+|---|---|---|
+| 512 × 512 | 6.7 s | 6.7 s |
+| 1024 × 1024 | 38.6 s | **19.7 s** |
+| 1248 × 832 | **out of memory** | 21.0 s |
+| 832 × 1248 | out of memory (first draw) | 18.5 s |
+
+The 1024 speedup is not tiling being faster arithmetic — it is the decode no longer thrashing
+the pool for allocations it could not get.
+
+### The diversity adapter, fused
+
+The second route is `F16/z-image-turbo-sda` — a LoKr trained to recover what the distillation
+removed. It is **fused into the weights offline**, not applied at run time, by the `z-image-fuse`
+example:
+
+```bash
+cargo run --release --example z-image-fuse -- \
+    --checkpoint …/z_image_turbo-Q8_0.gguf \
+    --out        …/z_image_turbo-Q8_0-sda.gguf
+```
+
+The output is an ordinary GGUF, so a deployment chooses by pointing `guests.yaml`'s
+`transformer:` at one file or the other. **There is no code path to select and nothing in the
+denoise loop that knows the adapter exists** — which is the whole reason to fuse rather than
+apply. A LoKr delta is `kron(w1, w2)`, full-size and built from small factors; it *could* be
+applied live via `(A ⊗ B)·vec(X) = vec(B·X·Aᵀ)` at about an eighth of the base arithmetic, but
+the base runs int8 on the tensor cores while an adapter path would run bf16, so every step of
+every draw would pay for it while the estate waits.
+
+The cost of fusing is one extra rounding: an adapted tensor is dequantised, added to, and
+quantised again, and is written back in the rung it arrived in. Tensors the adapter does not
+touch are passed through still quantised. See `z_image::adapter`, which fuses both of the
+factorisations the ai-toolkit ecosystem stores: LoKr (`ΔW = kron(w1, w2)`, the SDA file) and
+plain LoRA (`ΔW = B·A`). A LoRA file with no `alpha` tensors is ai-toolkit's convention for
+`alpha = rank`, so its scale is 1.0 — the same number as the LoKr's, for the opposite reason.
+
+**Measured on the Q8_0 checkpoint:** 240 adapter modules land on 180 tensors — 30 layers ×
+(qkv, out, w1, w2, w3, adaLN), the three `to_q`/`to_k`/`to_v` deltas stacking row-wise into the
+GGUF's fused `qkv`. Mean `‖Δ‖/‖W‖` is **0.0124** and the largest is **0.0521**, which is what a
+trained adapter should look like and is the check that the scale was read correctly: LoKr stores
+`alpha = 1e10` as a full-rank sentinel, and taking it for a multiplier would scale every delta by
+10¹⁰. The converter refuses to write a checkpoint whose worst delta exceeds the weight it
+modifies, because that failure produces a file that loads and is ruined.
+
+Same prompt, seeds 11/22/33, at 12 steps: the stock checkpoint returns one man three times; the
+fused one returns three different people. The aesthetic shifts with it — away from the modal
+glamour shot and toward something plainer — which is the trade being made, not a defect.
+
+**A request picks its checkpoint.** `ImageRequest` carries a `lora` enum — `diversity` (the
+default, the standing SDA-fused file) or `restricted` — and the image guest, which reloads its
+weights every drain anyway, simply loads the variant the drain's oldest image job names
+(`transformer` / `transformer_restricted` in `guests.yaml`). An enum rather than a path, so a
+request can never name an arbitrary file; a variant the deployment did not configure is refused
+by name before any weights move, and a job queued behind a drain standing on the other
+checkpoint is refused with a retry message rather than drawn on the wrong weights. `restricted`
+is additionally an admin's ask: the handler re-checks the role itself (not just the route
+table's minimum) because the flag also waives the prompt-compliance gate — the admin's own
+judgement stands in for it. The Images page shows the checkbox only to admins; the daemon
+refuses the flag from anyone else regardless.
+
+### Starting from a picture
+
+A draw may carry a **reference**: `ImageRequest.reference` is RGB8 at exactly the draw's own size,
+plus a `hold` in `0 ..= 0.95`. The guest encodes it through the VAE, mixes noise at
+`σ = 1 − hold`, and joins the flow schedule there instead of starting from noise. This is
+**SDEdit**, and the distinction from instruction editing is not pedantry: the model is never told
+what changed, it is handed a partly dissolved picture and asked to complete it under the prompt.
+Composition, pose, palette and framing carry across; "give him a hat" does not, and an
+implementation that appears to do it is doing it by luck. That wants reference conditioning
+(Z-Image-Edit's shared spatial RoPE), which is not released.
+
+Four things make the result good, none of which needs a second model:
+
+- **The walk is cut out of the same curve.** `sampling::sigmas_from(n, shift, start)` converts the
+  start back to its raw position and takes the linspace over `r₀ … r₀/n`, so a partial walk has the
+  shape a full draw would have had over that stretch. `sigmas_from(n, shift, 1.0)` reproduces
+  `sigmas(n, shift)` entry for entry, and a test asserts it rather than trusting it.
+- **The step count follows the distance.** `steps_from` gives the walk the fraction of the budget it
+  covers, so a light touch is *quicker* rather than paying a full draw's time for a fraction of its
+  distance. Floored at `DISTILLED_STEPS` (8), because below the count the model is distilled at,
+  Euler error stops being a matter of finish.
+- **`hold` moves the schedule position, not sigma** (`sampling::sigma_at`). This one was measured
+  the hard way. The shift is steeply non-linear — at `shift = 3`, σ = 0.85 is already a third of the
+  way through the walk — so a dial mapped straight onto sigma crushes its entire useful range into
+  its bottom eighth: holds of 0.15, 0.30 and 0.45 all returned the reference essentially untouched,
+  and everything interesting happened between σ = 0.92 and σ = 0.80. Raw position is the honest
+  axis because it *is* the step budget, which makes the dial mean one thing in both places:
+  `steps ≈ asked × (1 − hold)`, verified live at 17/24 for hold 0.3 and 10/24 for hold 0.6.
+
+  Calibrated on that axis: **0.25** carries framing, scale and ground while the prompt still decides
+  the subject; 0.30 has the reference's own subject contesting it; past ~0.45 the words cannot
+  change the face. The knee is sharp, so the default sits on the side where the prompt still wins.
+- **The encoder's mode, not a sample.** The noise this latent carries is chosen by the hold; a
+  second helping from the encoder's Gaussian would sit on top of it. `DiagonalGaussianDistribution::mode()`.
+- **The encode is tiled**, like the decode — `guest::tiled::encode_tiled`. The encoder starts at
+  128 channels at full resolution, so a 1248×832 reference wants what a 1248×832 decode wants and
+  would have failed in the same place.
+
+The upload is decoded, size-checked and **cover-cropped to the draw's size at the HTTP boundary**
+(`npcd::refimage`), never in the guest: a drain evicts the engine's whole working set before the
+guest loads, so a truncated JPEG discovered inside one costs every character its resident KV to
+find out. `GuestRequest::check` then enforces `pixels.len() == width·height·3` at submission.
+
+### The dials
+
+Two, and there are no others to offer honestly. `shift` is the schedule's own re-weighting
+(`MIN_SHIFT`..`MAX_SHIFT`, default the deployment's 3.0) — raising it spends more budget deciding
+what the picture is, lowering it spends more resolving how it looks. `hold` is the reference
+strength. There is deliberately **no guidance / prompt-strength dial**: Turbo runs at
+`guidance_scale = 0.0` with no unconditioned branch, so a slider weighing the prompt against one
+would be weighing against something never computed — the same bug as the negative-prompt field that
+is also absent. The console sends `shift` only once the dial has been moved, so a deployment that
+set its own in `guests.yaml` keeps it.
+
+### Removing a background
+
+`POST /v1/image/cutout` takes a PNG and gives back one with alpha. **No model, no drain, no
+engine** — it is a flood fill on the host, so it lives in the always-on route table and answers on
+a daemon whose engine has not finished loading.
+
+`POST /v1/image/cutout` runs a **salient-object network** over the picture and returns the alpha it
+emits. That is the whole of it: no colour threshold, no flood fill, no trimap, no green screen. The
+network was trained to know what a subject *is*, which is the one thing a colour algorithm cannot
+be told.
+
+**Three attempts preceded it, and the two that were abandoned are worth recording.** The first was
+a colour keyer — flood-fill the backdrop from the frame, fit a plane through it, refine the edge.
+It failed on its own domain: measured on this daemon's own portraits, a light-grey knit came within
+**24** of the wall behind it while the wall's own gradient spread **22.7**, two overlapping
+distributions that no threshold separates, so the shoulder speckled. Worse, it refused every
+picture with a real background in it, because all it could ask was "is the frame one colour".
+
+The second was to arrange the problem away with a chroma key — put `on a solid chroma key green
+screen background` in the prompt and key that. It worked, and it is still the trick film uses, but
+it only helps pictures you are about to draw and it changes the picture to get there.
+
+The third, considered and rejected as over-built, was extracting cross-attention from the image
+transformer — it is a bidirectional DiT, so the image-patch rows of the score matrix localise each
+caption word. That needed capture hooks through `Block::forward`, a bf16-only path because the int8
+attention is fused, and measurement to find which blocks carry clean signal, all to *recover*
+information a 44 MB published network simply has.
+
+### How it runs
+
+**A guest, like prose and image** (`candle_conversation::guest::matte`) — not a special case beside
+them. Its weights are placed in span ground through the same `place_bytes` primitive
+`GroundVars` uses for the image guest's autoencoder, and it is served in a drain between two of the
+engine's waves. That mattered: on the CPU the same graph takes **11.9 s** and on the card
+**0.23 s**, with the two agreeing to within 1 of 255 on every alpha — so the CPU path is the oracle
+and the card is what ships. End to end through the route, including evict-load-run-unload, is
+**0.7–0.9 s**.
+
+The graph is evaluated as it shipped, through `candle-onnx`, rather than rebuilt as candle modules:
+the export folds batch-norm into the convolutions and renames every tensor to `onnx::Conv_1896`, so
+a hand-written architecture would mean mapping 238 anonymous tensors by position. **That changes
+nothing about where the weights live** — `GroundVars` only adds a `VarBuilder` backend on top of the
+placement, and an ONNX graph has no `VarBuilder` to be a backend for.
+
+Four fixes to `candle-onnx` were needed and each is a real bug: `protoc` is vendored so the
+workspace builds without a system tool; `Resize` gained **linear** mode (it had only nearest, and
+every segmentation decoder upsamples bilinearly — nearest there is a staircase where the alpha edge
+should be); `sizes` now takes precedence over `scales` per the spec, which traced PyTorch exports
+need; and initializers and `Constant` nodes are placed on the evaluation's device.
+
+**One measured trap.** IS-Net does *not* use ImageNet normalisation — its reference is mean 0.5,
+std 1.0. Fed ImageNet's statistics it returned a portrait with holes punched through the hair and a
+green-screen shot that was 100% transparent: it reads as a broken model and is a wrong constant.
+Both families' statistics live in a `Family` enum carried in `guests.yaml`, never sniffed from the
+file name.
+
+### What was deleted
+
+All of it: the flood fill, the plane-fitted backdrop, the morphological opening, the frontier alpha
+ramp, the despill, the green-screen toggle, and the tolerance dial. The dial existed only because a
+threshold had to be guessed. Everything below is kept for the record of what was tried and why it
+could not work.
+
+The general problem is segmentation; the old approach assumed the problem in front of us was not.
+These pictures were drawn by this daemon from prompts that overwhelmingly say "plain background",
+so the algorithm was a four-connected fill from the frame. Each correction below was forced by a
+real picture:
+
+- **Connectivity, not colour matching**, so a backdrop-coloured pocket inside the subject survives
+  rather than being punched out.
+- **The backdrop is a fitted plane, not a colour.** This is the load-bearing one. Measured on a
+  real portrait: the frame's own deviation from its median reaches 22.7 (the wall's light falls
+  off across the shot) while the jumper's brightest threads come within 24. Those overlap, so *no*
+  single-colour threshold separates them — the fill walks up the bright yarn and speckles the
+  shoulder. Taking the gradient out leaves a residual of a few units, and each pixel is then
+  compared to the backdrop where it actually is. A plane and no more: it is fitted from a
+  one-pixel frame, so anything with more freedom would be fitting the subject.
+- **Judge the frame by share, not spread.** A head-and-shoulders portrait has shoulders across the
+  bottom edge — a quarter of the frame — so a uniformity test calls the plainest backdrop the
+  model draws "busy". It did, on a real draw: 129 of 255, refused. What matters is that *most* of
+  the frame agrees, because that is what the fill needs seeds from.
+- **An opening severs thin leaks.** Where colour cannot separate, shape can: the leaks into the
+  knit are one or two pixels wide, so eroding and dilating by one removes them and leaves every
+  wider region exactly where it was.
+- **The ramp only applies on the frontier.** Partial alpha means "part subject, part backdrop",
+  which is a claim about an edge pixel. Interior background goes fully transparent whatever its
+  colour distance says — otherwise the wall comes back as a half-transparent ghost wherever the
+  plane is a shade off, which a plane will be behind a head.
+- **Decontamination** against the local backdrop: an edge pixel is `α·F + (1−α)·B`, so solving for
+  `F` removes the pale halo that otherwise appears the moment the cutout is placed on another
+  ground.
+
+It refuses rather than guesses, and the two refusals are different: a frame that is mostly not one
+colour (`422 no_background`) and a fill that took more than 92% of the picture, which is the
+full-bleed case where the frame *is* the subject.
+
+**The known limit, pinned by a fixture rather than left to be rediscovered.** A desert canyon at
+sunset is *not* refused: 64% of its frame is within tolerance of its own median, because the dark
+sky above and the dark sand below happen to be the same brown. It keys 73% of the picture and the
+result is meaningless. The guard asks "is there a plain backdrop at the frame", a question about
+the edge, and answers it correctly — knowing there is no subject behind it is the segmentation
+problem this deliberately does not solve. Nor can the threshold be raised to catch it: the
+canyon's 64% sits *below* a real green screen's 66%, so any bar that refuses the one refuses the
+other. What follows is a product decision — the button is for pictures with a backdrop, and the
+console says so.
+
+### Testing it on real pictures
+
+`npcd/tests/images/` holds five 512×512 draws from this daemon, each documented with the prompt and
+seed that made it, so any of them can be regenerated exactly. They pinned every constant the colour
+keyer had, and they are what the network was chosen against — squares of flat colour prove
+arithmetic, only a real draw proves a model.
+
+| fixture | what it is for |
+|---|---|
+| `grey_portrait` | **The one that settled it.** A light-grey knit against a light wall — the case the colour keyer could not do at any threshold, and the network cuts cleanly, hair wisps and all |
+| `green_curls` | The hardest matte there is — thousands of strands with background showing between the curls |
+| `green_hood` | A dark subject; a duller green than the curls, which is what proved the old keyer inferred its key rather than assuming one |
+| `green_lantern` | Not a person, and warm-coloured; its glass is genuinely see-through, which is where any matte has to make a choice |
+| `busy_canyon` | A landscape with no subject at all. The colour keyer deleted 73% of it and called that success; a network is at least honest about finding nothing |
+
+`guest_routes` asserts every fixture decodes to exactly the `width · height · 3` the guest requires
+— the boundary invariant that keeps a malformed upload from being discovered inside a drain, after
+the engine's working set has already been evicted for it.
+
+Measured live through the route, including evict-load-run-unload: **0.7–0.9 s** at 512×512, and the
+`lifted` fractions match the CPU oracle's to four decimal places.
 
 ### It runs as misc work between waves
 

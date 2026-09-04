@@ -544,23 +544,30 @@ fn section<'a>(raw: &'a str, heading: &str) -> (String, Vec<&'a str>) {
     let mut before = String::new();
     let mut lines = Vec::new();
     let mut inside = false;
+    // **The prose ends at the first heading, whichever heading that is.** The
+    // test used to be "have we collected any of our own lines yet", which is only
+    // the same question when the wanted heading comes first. A decode that writes
+    // `## Outline` before `## Cast` — which the story phase asks for in that order
+    // — had the whole outline block read as prose, so the arc a year expands
+    // arrived with a table of year titles pasted onto the end of it.
+    let mut heading_seen = false;
     for line in raw.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("##") {
             let name = rest.trim();
             inside = name.eq_ignore_ascii_case(heading);
+            heading_seen = true;
             continue;
         }
         if inside {
             if !t.is_empty() {
                 lines.push(t);
             }
-        } else if !lines.is_empty() {
-            // Text after a different heading is neither prose nor ours.
-        } else {
+        } else if !heading_seen {
             before.push_str(line);
             before.push('\n');
         }
+        // Otherwise: under some other heading. Neither prose nor ours.
     }
     (before.trim().to_string(), lines)
 }
@@ -1096,6 +1103,45 @@ It did not stop for a week.
         let out = parse_story("p\n  ##cast\n- a | A | x\n  ## YEARS \n- 1998 | T | P\n");
         assert_eq!(out.cast.len(), 1);
         assert_eq!(out.outline.len(), 1);
+    }
+
+    /// **The prose ends at the first heading, whichever heading that is.**
+    ///
+    /// The prose was collected until the wanted section started producing lines,
+    /// which is only the same rule when the wanted heading comes first. A decode
+    /// that puts `## Years` before `## Cast` had its whole year table read as
+    /// prose — and the arc is what every year of the life is then expanded from,
+    /// so twelve forks each opened with a list of year titles pasted onto the end
+    /// of the story they were meant to be continuing.
+    #[test]
+    fn a_section_written_out_of_order_does_not_become_prose() {
+        let out = parse_story(
+            "She grew up in the delta.\n\n\
+             ## Years\n- 1998 | Arrival | She arrives.\n\n\
+             ## Cast\n- lim | Professor Lim | her tutor\n",
+        );
+        assert_eq!(out.prose, "She grew up in the delta.");
+        assert_eq!(out.cast.len(), 1);
+        assert_eq!(out.outline.len(), 1);
+    }
+
+    /// The same rule for a month: the day list is a section, not part of the
+    /// month's prose, whichever order the model writes them in.
+    #[test]
+    fn a_months_prose_stops_at_the_first_heading() {
+        let out = parse_month(
+            "# A Quiet January\n\nNothing much happened.\n\n\
+             ## Notes\nignore me\n\n\
+             ## Days\n- 3 | the letter\n",
+            1999,
+            1,
+        );
+        assert!(
+            !out.prose.contains("ignore me"),
+            "another section's body became the month's prose: {:?}",
+            out.prose
+        );
+        assert_eq!(out.days.len(), 1);
     }
 
     #[test]

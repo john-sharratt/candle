@@ -2775,10 +2775,13 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
             let amax = vals.iter().fold(0f32, |m, &x| m.max(x.abs()));
             let sum: f32 = vals.iter().sum();
             let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-            // The single {scale, sum} lives at ds[0] of the tile's meta slot.
+            // The single {scale, sum} lives at ds[0] of the tile's meta slot. The
+            // sum field is Σx **normalised by amax** — the matmul rebuilds Σx as
+            // `ds.y · ds.x · 127`, and storing it raw overflows f16 on any
+            // activation whose block sums pass 65504 (blocks.cuh).
             let ds_b = ds_off(flat);
             let exp_scale = f16::from_f32(amax / 127.0);
-            let exp_sum = f16::from_f32(sum);
+            let exp_sum = f16::from_f32(sum * id / 127.0);
             let got_scale = f16::from_le_bytes([raw[ds_b], raw[ds_b + 1]]);
             let got_sum = f16::from_le_bytes([raw[ds_b + 2], raw[ds_b + 3]]);
             assert_eq!(
@@ -2900,7 +2903,8 @@ fn q8a128_edge_cases() -> Result<()> {
         assert_eq!(q, 0, "zero tile qs[{i}]");
     }
 
-    // Tile 1 — amax is the spike, so scale = 100/127 and Σx = 100 + 32×2 + Σ(i−16).
+    // Tile 1 — amax is the spike, so scale = 100/127 and Σx = 100 + 32×2 + Σ(i−16)
+    // = 148, stored normalised as 148/100.
     assert_eq!(
         scale_at(1040).to_bits(),
         f16::from_f32(100.0 / 127.0).to_bits(),
@@ -2908,8 +2912,8 @@ fn q8a128_edge_cases() -> Result<()> {
     );
     assert_eq!(
         sum_at(1040).to_bits(),
-        f16::from_f32(148.0).to_bits(),
-        "mixed tile sum",
+        f16::from_f32(148.0 / 100.0).to_bits(),
+        "mixed tile sum, normalised by amax",
     );
 
     // The spike saturates to 127; everything else is scaled by the SAME id, so
@@ -2933,6 +2937,91 @@ fn q8a128_edge_cases() -> Result<()> {
         assert_eq!(qs[96 + i] as i8, RAMP[i], "ramp qs[{i}]");
     }
     println!("q8a128 edge cases (zero tile / spike / constant / ramp) verified");
+    Ok(())
+}
+
+/// **An activation whose per-128 block sums exceed f16's range must still
+/// matmul.** The block's `ds[0].y` carries the sum feeding the affine weight's
+/// min term, and both `ds` fields are f16 — so storing Σx raw put `+inf` in
+/// every block whose 128 values sum past 65504, and each dot product touching
+/// one became NaN.
+///
+/// That is not a synthetic bound. An LLM's activations keep block sums under
+/// ~10³ and never came near it, which is why the format survived this long; but
+/// Z-Image's transformer is sandwich-normed, so its SwiGLU intermediate runs at
+/// 10⁴–10⁵ and its block sums reach 2×10⁵. The first symptom was a black image
+/// eight steps later, with every weight, shape and dtype checking out.
+///
+/// The fix normalises the field (Σx/amax, bounded by 128 whatever the magnitude
+/// — see `blocks.cuh`); this pins the property rather than the encoding, so it
+/// holds however the sum is later stored. The activation here is deliberately
+/// biased far from zero: a zero-mean one cancels to a small sum however large
+/// its elements are, and would pass even with the bug.
+#[test]
+fn int8_matmul_survives_block_sums_past_f16_range() -> Result<()> {
+    use crate::quantized::{QMatMul, QTensor};
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let (n, k, m) = (128usize, 256usize, 16usize);
+    let mut rng = StdRng::seed_from_u64(0x2f0e_b10c);
+
+    // Q8_0 → Q8_KO: an *affine* twin, so the min term — and therefore the block
+    // sum — actually takes part in the dot product. A centred format would not
+    // read the field at all.
+    let w: Vec<f32> = (0..n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let mut q = QCudaStorage::zeros(&dev, n * k, GgmlDType::Q8_0)?;
+    q.quantize(&CudaStorage::wrap_cuda_slice(
+        dev.memcpy_stod(&w)?,
+        dev.clone(),
+    ))?;
+    let shape = crate::Shape::from((n, k));
+    let w_ref = QTensor::new(
+        QStorage::Cuda(q.repack_ko(&shape, GgmlDType::Q8_KO)?),
+        shape.clone(),
+    )?;
+    let src = QTensor::new(QStorage::Cuda(q), shape)?;
+    let mm = QMatMul::from_qtensor(w_ref)?;
+
+    // Each 128-element block sums to ~128 × 1000 = 1.3×10⁵, twice f16's 65504,
+    // while amax/127 (~8.7) stays comfortably inside it — so the scale field is
+    // fine and only the sum overflows, which is exactly the production shape of
+    // the bug.
+    let act: Vec<f32> = (0..m * k)
+        .map(|_| 1000.0 + rng.random_range(-100.0..100.0))
+        .collect();
+    let xs = crate::Tensor::from_vec(act, (m, k), &device)?;
+    let block_sum = xs.narrow(1, 0, 128)?.sum(1)?.min(0)?.to_scalar::<f32>()?;
+    assert!(
+        block_sum > 65504.0,
+        "fixture does not reach the f16 ceiling it exists to cross: {block_sum}"
+    );
+
+    let got = mm
+        .forward_via_int8(&xs, Int8Mode::Precision, crate::DType::F32)?
+        .to_vec2::<f32>()?;
+    // The FP reference: the same weights dequantised, same activations, f32.
+    let want = xs
+        .matmul(&src.dequantize(&device)?.t()?.contiguous()?)?
+        .to_vec2::<f32>()?;
+
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for (g_row, w_row) in got.iter().zip(want.iter()) {
+        for (&g, &w) in g_row.iter().zip(w_row.iter()) {
+            assert!(g.is_finite(), "int8 output is {g}, not a number");
+            num += ((g - w) as f64).powi(2);
+            den += (w as f64).powi(2);
+        }
+    }
+    let rel = (num / den).sqrt();
+    assert!(
+        rel < 0.01,
+        "int8 vs f32 rel_l2 = {rel} beyond the 8-bit budget"
+    );
+    println!("int8 with block sums {block_sum:.0} (f16 max 65504): rel_l2 = {rel:.5}");
     Ok(())
 }
 

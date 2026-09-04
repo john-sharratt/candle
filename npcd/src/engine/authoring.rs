@@ -251,6 +251,13 @@ fn admit(block: &str, out: &mut Parsed) {
 
 /// Three or more consecutive newlines become two.
 fn squeeze(s: &str) -> String {
+    // **CRLF is folded first.** `\r` is whitespace, so it neither counted as a
+    // newline nor reset the run: on a document written in a Windows editor —
+    // which is the common case, not the exotic one — the `\r`s were pushed
+    // through while the `\n`s they belonged to were being dropped, so three
+    // blank lines came out as `\n\r\n\r\r` and the prose reached the character
+    // with stray carriage returns in it.
+    let s = s.replace("\r\n", "\n");
     let mut out = String::with_capacity(s.len());
     let mut run = 0;
     for c in s.chars() {
@@ -270,6 +277,27 @@ fn squeeze(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A document written in a Windows editor reaches the character clean.**
+    ///
+    /// `\r` is whitespace, so it neither counted as a newline nor reset the blank
+    /// -line run: the `\n`s were dropped as duplicates while the `\r`s they
+    /// belonged to were pushed through, and the prose arrived with bare carriage
+    /// returns embedded in it. Nothing reported it — the text is still text.
+    #[test]
+    fn crlf_prose_squeezes_without_leaving_carriage_returns() {
+        let doc = "You came back to the yard.\r\n\r\n\r\n\r\nThe granary was gone.\r\n";
+        let p = parse(doc);
+        assert!(
+            !p.prose.contains('\r'),
+            "carriage returns survived: {:?}",
+            p.prose
+        );
+        assert_eq!(
+            p.prose,
+            "You came back to the yard.\n\nThe granary was gone."
+        );
+    }
 
     #[test]
     fn a_call_is_lifted_and_the_prose_is_left() {

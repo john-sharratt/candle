@@ -362,6 +362,43 @@ impl Scheduler {
                 self.relieve_vram_pressure("starvation", VramPhase::Load);
             }
 
+            // 1c. **Serve any co-resident model waiting for the card.**
+            //
+            // Here, and only here. This is the one point in the loop where no
+            // forward is in flight and none has been issued for this pass,
+            // which is the window a span claim and a boundary move are legal
+            // in — `claim_span_region` refuses anywhere inside the quanta,
+            // correctly, because the transient tier stands flush against the KV
+            // frontier while a wave is open and the ground above it belongs to
+            // that wave.
+            //
+            // Normal inference is blocked for the whole drain. That is the
+            // design rather than a cost: the guest stands in ground the KV side
+            // was using, and a wave running against regions that now hold a
+            // diffusion model's weights would read them as attention state —
+            // which does not fault, because every address in the span is
+            // mapped, and so surfaces as numbers rather than as an error.
+            //
+            // Costs one atomic load on the overwhelming majority of passes,
+            // where nothing is queued.
+            {
+                let guests = Arc::clone(&self.guests);
+                if let Some(report) = self.drain_guests(&guests) {
+                    // The drain evicted, ran and handed its ground back. Skip
+                    // straight to the top: the widths this pass measured are
+                    // from before the eviction, and forming a wave against them
+                    // would admit against a working set that is no longer there.
+                    tracing::info!(
+                        target: "candle_conversation::guest",
+                        served = report.served,
+                        failed = report.failed,
+                        total_ms = report.total_ms,
+                        "normal inference resuming"
+                    );
+                    continue;
+                }
+            }
+
             // 2. Promote queued PrefillWork → ActivePrefill (up to cap).
             {
                 let _g = profile::span("loop:promote_new_prefills");

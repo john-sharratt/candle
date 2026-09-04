@@ -294,10 +294,25 @@ pub fn address(layer: &str, owner: Option<&str>, dir: &Path, file: &Path) -> Str
 ///
 /// Separated from the substrate write so the decision — which documents moved —
 /// is testable without an engine, which is most of what can go wrong here.
+/// What a layer still owes the substrate: one entry per document to write.
+///
+/// The `path` rides along because the ledger is keyed by it and **the ledger entry is written
+/// after the turn seals, not here**. Recording at planning time — which is what calling
+/// `reconcile` in this function did — banks the claim that a document is in the substrate
+/// before anything has tried to put it there. A document whose conversation could not be
+/// created, whose prefill errored, or whose turn never sealed was then marked ingested anyway,
+/// `flush` persisted that, and every later boot skipped it as `Unchanged`. It could only be
+/// rescued by editing the file. The log said "N failed" exactly once and never again.
+pub struct Pending {
+    pub addr: String,
+    pub body: String,
+    pub path: std::path::PathBuf,
+}
+
 pub fn pending(
     source: &LayerSource,
     ledger: &Ledger,
-) -> std::io::Result<(Vec<(String, String)>, LayerReport)> {
+) -> std::io::Result<(Vec<Pending>, LayerReport)> {
     let files = walk(&source.dir)?;
     let mut out = Vec::new();
     let mut report = LayerReport {
@@ -311,12 +326,15 @@ pub fn pending(
             report.failed += 1;
             continue;
         };
-        match ledger.reconcile(&file, Some(&content)) {
+        // `inspect`, not `reconcile`: deciding what to write must not also claim it was
+        // written. The caller records each document's hash as its turn seals.
+        match ledger.inspect(&file, Some(&content)) {
             Reconcile::Added | Reconcile::Changed => {
-                out.push((
-                    address(&source.name, source.owner.as_deref(), &source.dir, &file),
-                    content,
-                ));
+                out.push(Pending {
+                    addr: address(&source.name, source.owner.as_deref(), &source.dir, &file),
+                    body: content,
+                    path: file,
+                });
                 report.written += 1;
             }
             Reconcile::Unchanged | Reconcile::Removed => report.unchanged += 1,
@@ -693,9 +711,30 @@ mod tests {
         let src = source("world", dir.clone());
         let ledger = Ledger::new();
 
+        // What the runtime does when a turn seals. `pending` only plans; the ledger entry is
+        // the claim that the document reached the substrate, and only the write may make it.
+        let seal = |docs: &[Pending]| {
+            for d in docs {
+                ledger.reconcile(&d.path, Some(&d.body));
+            }
+        };
+
         let (first, r1) = pending(&src, &ledger).unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(r1.written, 2);
+
+        // **Planning twice owes the same work.** `pending` used to `reconcile`, so merely
+        // asking what a layer owed recorded every document as already ingested — and a
+        // document whose turn then failed was skipped on every later boot, unrecoverable
+        // without editing the file.
+        let (replan, _) = pending(&src, &ledger).unwrap();
+        assert_eq!(
+            replan.len(),
+            2,
+            "planning recorded a write that had not happened"
+        );
+
+        seal(&first);
 
         let (second, r2) = pending(&src, &ledger).unwrap();
         assert!(
@@ -707,8 +746,14 @@ mod tests {
         std::fs::write(dir.join("a.md"), "# Alpha, revised").unwrap();
         let (third, r3) = pending(&src, &ledger).unwrap();
         assert_eq!(third.len(), 1);
-        assert_eq!(third[0].0, "world/a");
+        assert_eq!(third[0].addr, "world/a");
         assert_eq!(r3.written, 1);
+
+        seal(&third);
+        assert!(
+            pending(&src, &ledger).unwrap().0.is_empty(),
+            "the revised document was still owed after its turn sealed"
+        );
         let _ = std::fs::remove_dir_all(&mind);
     }
 
@@ -723,7 +768,7 @@ mod tests {
         std::fs::write(dir.join("hess.md"), body).unwrap();
 
         let (out, _) = pending(&source("world", dir), &Ledger::new()).unwrap();
-        assert_eq!(out[0].1, body);
+        assert_eq!(out[0].body, body);
         let _ = std::fs::remove_dir_all(&mind);
     }
 

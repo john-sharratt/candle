@@ -2034,6 +2034,13 @@ __device__ void grouped_matmul_impl_int8(
         for (int t = 0; t < N_SUB; ++t) {
             const float2 a0 = __half22float2(smem_A_ds[ab][t * 16 + groupID]);      // token-half A
             const float2 a1 = __half22float2(smem_A_ds[ab][t * 16 + groupID + 8]);  // token-half B
+            // Rebuild Σx from the stored Σx/amax: the block holds the sum
+            // normalised (blocks.cuh), because a raw f16 Σx overflows on any
+            // activation whose 128-block sums pass 65504 — Z-Image's SwiGLU
+            // intermediate reaches 2×10⁵ and turned the whole matmul into NaN.
+            // `a.x` is amax/127, so `a.y · a.x · 127` is Σx exactly.
+            const float a0_sum = a0.y * a0.x * 127.f;
+            const float a1_sum = a1.y * a1.x * 127.f;
             if constexpr (is_mxfp4_persub<block_c_t>::value) {
                 // PER-SUB fold: each 32-K sub's exact int32 sum scaled by its own
                 // E8M0 `2^(e_sub-128)` (the activation scale is per-128, so it is
@@ -2068,10 +2075,10 @@ __device__ void grouped_matmul_impl_int8(
                 }
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) C0[i] += C1[i];
-                frag_c[t * 4 + 0] += d0.x * a0.x * (float)C0[0] + d0.y * a0.y;
-                frag_c[t * 4 + 1] += d1.x * a0.x * (float)C0[1] + d1.y * a0.y;
-                frag_c[t * 4 + 2] += d0.x * a1.x * (float)C0[2] + d0.y * a1.y;
-                frag_c[t * 4 + 3] += d1.x * a1.x * (float)C0[3] + d1.y * a1.y;
+                frag_c[t * 4 + 0] += d0.x * a0.x * (float)C0[0] + d0.y * a0_sum;
+                frag_c[t * 4 + 1] += d1.x * a0.x * (float)C0[1] + d1.y * a0_sum;
+                frag_c[t * 4 + 2] += d0.x * a1.x * (float)C0[2] + d0.y * a1_sum;
+                frag_c[t * 4 + 3] += d1.x * a1.x * (float)C0[3] + d1.y * a1_sum;
             }
         }
 

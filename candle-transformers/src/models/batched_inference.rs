@@ -4295,6 +4295,18 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// The other direction: let the weight side take back KV regions standing
+    /// free. See `BatchedModel::reclaim_spare_ground`.
+    ///
+    /// **Only legal between forwards** — a boundary move evicts and relocates
+    /// expert slots. The scheduler's guest drain is the caller: after a
+    /// co-resident model has been unloaded and its span ground returned, the
+    /// weight side should take back whatever the drain's eviction made it
+    /// concede, rather than waiting for the pressure signal to swing the other
+    /// way. On a quiet world that may be a long time, and until it does the
+    /// model runs with a smaller expert working set for no reason.
+    fn reclaim_spare_ground(&self) {}
+
     /// Live VRAM held by the model's weights (fixed base + time-varying resident
     /// experts), for the whole-card VRAM decomposition. `None` if unavailable.
     fn resident_weight_bytes(&self) -> Option<usize> {
@@ -4503,6 +4515,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn request_kv_ground(&self, regions: usize) -> u64 {
         self.model().request_kv_ground(regions)
+    }
+
+    fn reclaim_spare_ground(&self) {
+        self.model().reclaim_spare_ground()
     }
 
     fn resident_weight_bytes(&self) -> Option<usize> {

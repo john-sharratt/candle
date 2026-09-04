@@ -2012,6 +2012,11 @@ impl Map1 for UpsampleNearest2D {
             unsafe {
                 kernels::simple::conv::run_upsample_nearest2d(
                     dtype,
+                    // The whole destination. The dispatcher used to size its own
+                    // launch from `out_w * out_h`, which is one channel of one
+                    // batch item — everything past that came back as whatever
+                    // the allocation held.
+                    dst_el,
                     out_w,
                     out_h,
                     scale_w,
@@ -4485,14 +4490,19 @@ impl BackendStorage for CudaStorage {
             col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
         } else {
             // Make the kernel contiguous if not already the case.
+            //
+            // **And then use it.** This branch built `kernel_c` and handed the
+            // original `kernel` to the matmul, so the copy was computed and
+            // thrown away while a non-contiguous tensor was read under a layout
+            // that claims to be contiguous. The offset comes from the copy's own
+            // layout, which starts at zero, rather than from the source's.
             let mut kernel_c = unsafe {
                 self.device()
                     .alloc_uninit(kernel_l.shape(), kernel.dtype())?
             };
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l =
-                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
-            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
+            let kernel_l = Layout::contiguous((n, k)).transpose(0, 1)?;
+            col.matmul(&kernel_c, (1, b * m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, h_out, w_out, n))
             .transpose(1, 2)?

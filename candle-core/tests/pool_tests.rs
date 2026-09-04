@@ -115,3 +115,65 @@ test_device!(
     upsample_nearest2d_gpu,
     upsample_nearest2d_metal
 );
+
+/// **Nearest-neighbour upsampling at the sizes a decoder actually uses.**
+///
+/// The test above upsamples a 1×1×2×3 tensor. That is six elements — one
+/// thread's worth — so it says nothing about a kernel's grid bounds, and a
+/// launch that covers only part of a large output leaves the remainder holding
+/// whatever was in the buffer. Stable Diffusion's VAE decoder upsamples
+/// 512×64×64 to 128×128 and twice more after that, which is millions of
+/// elements per call.
+///
+/// Two properties, because they fail differently. Every output element must
+/// equal the input element it copies — checked against the CPU implementation —
+/// and a spatially constant input must stay constant, which catches unwritten
+/// output even when both backends are launched the same wrong way.
+#[cfg(feature = "cuda")]
+#[test]
+fn upsample_nearest2d_large_cuda_matches_cpu() -> Result<()> {
+    let cuda = Device::new_cuda(0)?;
+    for &(c, h, w) in &[
+        (512usize, 64usize, 64usize),
+        (256, 128, 128),
+        (128, 256, 256),
+    ] {
+        let n = c * h * w;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 251) as f32 - 125.0) / 37.0).collect();
+
+        let up = |dev: &Device| -> Result<Vec<f32>> {
+            let t = Tensor::from_vec(data.clone(), (1, c, h, w), dev)?;
+            Ok(t.upsample_nearest2d(2 * h, 2 * w)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        let (a, b) = (up(&Device::Cpu)?, up(&cuda)?);
+        assert_eq!(a.len(), b.len(), "output element count differs");
+        let bad = a.iter().zip(&b).position(|(x, y)| x != y);
+        assert!(
+            bad.is_none(),
+            "upsample_nearest2d({c}x{h}x{w} -> {}x{}) differs between CPU and CUDA at element {} \
+             of {} — part of the output was never written, or was written from the wrong source",
+            2 * h,
+            2 * w,
+            bad.unwrap(),
+            a.len()
+        );
+
+        // Constancy: nearest-neighbour copies, so a constant input is a constant
+        // output everywhere, with no border exception.
+        let k = Tensor::from_vec(vec![0.375f32; n], (1, c, h, w), &cuda)?;
+        let out = k
+            .upsample_nearest2d(2 * h, 2 * w)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let off = out.iter().position(|v| *v != 0.375);
+        assert!(
+            off.is_none(),
+            "a constant {c}x{h}x{w} input upsampled to a non-constant output at element {} — that \
+             element holds memory the kernel never wrote",
+            off.unwrap()
+        );
+    }
+    Ok(())
+}
