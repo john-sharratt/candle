@@ -202,6 +202,7 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
         RecordType::StreamDecl
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
+            | RecordType::TurnIndexPage
             | RecordType::Commit
     )
 }
@@ -833,6 +834,16 @@ impl SubstratePersistence {
     /// Append a turn's `WideQSig` record (opaque wide-Q window payload), keyed by stream id.
     pub fn append_wide_q_sigs(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
         self.append_record(RecordType::WideQSig, 0, stream_id.0, 0, 0, 0, payload)?;
+        Ok(())
+    }
+
+    /// Append a turn's QSA index page (opaque payload), keyed by stream id.
+    ///
+    /// The counterpart of [`Self::append_wide_q_sigs`]: both carry a blob that
+    /// belongs to a turn and that no amount of re-reading the turn's K/V can
+    /// reconstruct, because it was computed from hidden states.
+    pub fn append_turn_index_page(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
+        self.append_record(RecordType::TurnIndexPage, 0, stream_id.0, 0, 0, 0, payload)?;
         Ok(())
     }
 

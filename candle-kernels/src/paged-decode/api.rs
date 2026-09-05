@@ -36,6 +36,8 @@ extern "C" {
         stream: *mut c_void,
         sel_entries: *const u32,
         sel_cnt: *const u32,
+        sel_pages: *const u32,
+        sel_page_win: *const u32,
         sel_stride: i32,
         sel_ratio: i32,
     ) -> i32;
@@ -57,6 +59,8 @@ extern "C" {
         stream: *mut c_void,
         sel_entries: *const u32,
         sel_cnt: *const u32,
+        sel_pages: *const u32,
+        sel_page_win: *const u32,
         sel_stride: i32,
         sel_ratio: i32,
     ) -> i32;
@@ -88,6 +92,8 @@ extern "C" {
         stream: *mut c_void,
         sel_entries: *const u32,
         sel_cnt: *const u32,
+        sel_pages: *const u32,
+        sel_page_win: *const u32,
         sel_stride: i32,
         sel_ratio: i32,
     ) -> i32;
@@ -111,6 +117,8 @@ extern "C" {
         stream: *mut c_void,
         sel_entries: *const u32,
         sel_cnt: *const u32,
+        sel_pages: *const u32,
+        sel_page_win: *const u32,
         sel_stride: i32,
         sel_ratio: i32,
     ) -> i32;

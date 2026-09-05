@@ -2539,6 +2539,19 @@ fn run_inference_stream(
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(sampling.clone()),
+                // Seal this turn WITH its reasoning when a tool call could
+                // follow, so the tool result decodes against the thinking that
+                // produced the call. The chat template asks for exactly this: a
+                // `<tool_response>` message is deliberately not counted as a new
+                // query, so reasoning survives the round trip.
+                //
+                // Decided here because it cannot be decided later — the seal
+                // fires before `Done`, so by the time the response is parsed for
+                // tool calls the reasoning is already stripped. Availability of
+                // tools is the closest thing to the answer that is knowable in
+                // time; a turn that calls nothing keeps its reasoning for the
+                // one turn, which the next turn's projection then drops anyway.
+                keep_reasoning: tools_mode != ToolMode::None,
                 // Apply the caller's assistant prefill only on the first tool
                 // iteration — re-prefilling it on every chained iteration would
                 // prevent the model ever reaching a final answer.

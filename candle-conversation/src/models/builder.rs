@@ -290,6 +290,9 @@ impl ModelBuilder {
             dialect: dialect_type.dialect(),
             model_repo: String::new(),
             model_filename: gguf_filename,
+            // A custom model already IS a local file — the caller handed one
+            // over. There is no prepare step to report and no repo to skip.
+            prepared_from_source: false,
             model_bytes,
             tokenizer_repo: String::new(),
             // A custom model is built from local files; there is no repo to

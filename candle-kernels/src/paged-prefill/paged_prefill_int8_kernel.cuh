@@ -920,7 +920,7 @@ inline void launch_paged_prefill_int8(
     const float* rope_cs,
     int32_t rope_interleaved,
     cudaStream_t stream,
-    QsaSel sel = {nullptr, nullptr, 0, 1}
+    QsaSel sel = {nullptr, nullptr, nullptr, nullptr, 0, 1}
 ) {
     // The tile packs 32 / ratio selection blocks, so the ratio must divide
     // the tile. A selection built at any other ratio is a host bug, not a

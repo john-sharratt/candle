@@ -85,6 +85,8 @@
 
 #define QSA_APPEND_JOB_WORDS 5
 #define QSA_APPEND_CARRY_WORDS 3
+/// i64 words per flush job: `{dst, src, count, pos}`.
+#define QSA_FLUSH_JOB_WORDS 4
 
 namespace qsa_index_append {
 
@@ -184,6 +186,79 @@ __global__ __launch_bounds__(MAX_D) void append_kernel(
     dst[c] = out;
 }
 
+// ============================================================================
+// Flush: close a turn on a block boundary by pooling a SHORT block
+// ============================================================================
+// `append_kernel` only ever emits a block once `ratio` rows are available, and
+// divides by `ratio` unconditionally. That is right while a sequence decodes —
+// the leftover rows stay in the open buffer and the next wave completes them —
+// and it is exactly wrong at a turn boundary.
+//
+// A turn's index is only a self-contained PAGE if it ends on a block boundary.
+// It does not: a turn of `T` tokens leaves `T mod ratio` rows carried, belonging
+// to a block the NEXT turn will finish. Reconstruct a window from turns {A, C}
+// and C's leading block was pooled with B's trailing rows — a key for tokens
+// that are not in the window.
+//
+// So the seal flushes: the carried rows become one short block, pooled over the
+// count actually present. The result differs from what a continuous run would
+// have produced for that span, and deliberately so — a block covering 2 tokens
+// is a summary of those 2 tokens. The scorer is built for it (the window's page
+// table carries each page's `last_cells`, and the candidate prefix is derived
+// from the widths rather than assumed uniform).
+//
+// One job per flushed layer: `{dst, src, count, pos}`.
+__global__ __launch_bounds__(MAX_D) void flush_kernel(
+    const long long* __restrict__ jobs,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ cos_tab,
+    const float* __restrict__ sin_tab,
+    int d,
+    int rope_dim,
+    float eps,
+    int n_jobs
+) {
+    const int j = blockIdx.x;
+    if (j >= n_jobs) return;
+    const int c = threadIdx.x;
+
+    const long long* job = jobs + (long long)j * QSA_FLUSH_JOB_WORDS;
+    float* dst = (float*)(uintptr_t)job[0];
+    const float* src = (const float*)(uintptr_t)job[1];
+    const int count = (int)job[2];
+    const int pos = (int)job[3];
+    if (count <= 0) return;
+
+    // The mean over the rows that are ACTUALLY there — the one line that
+    // differs from `append_kernel`, and the whole reason this kernel exists.
+    float acc = 0.0f;
+    for (int r = 0; r < count; ++r) acc += src[(long long)r * d + c];
+    float x = acc / (float)count;
+
+    extern __shared__ float sv[];
+    const float ss = block_sum(x * x, sv);
+    x = x / sqrtf(ss / (float)d + (float)eps);
+    x = x * k_norm[c];
+
+    sv[c] = x;
+    __syncthreads();
+    const int half = rope_dim >> 1;
+    float out;
+    if (c < half) {
+        const float co = cos_tab[(long long)pos * half + c];
+        const float si = sin_tab[(long long)pos * half + c];
+        out = sv[c] * co - sv[c + half] * si;
+    } else if (c < rope_dim) {
+        const int k = c - half;
+        const float co = cos_tab[(long long)pos * half + k];
+        const float si = sin_tab[(long long)pos * half + k];
+        out = sv[c] * co + sv[k] * si;
+    } else {
+        out = sv[c];
+    }
+    dst[c] = out;
+}
+
 // Carry the wave's trailing rows — the ones that do not complete a block — into
 // each sequence's own open-block buffer, so the next wave can read them in
 // place. One block per span; `rows · d` is at most `(ratio − 1) · d`.
@@ -237,4 +312,22 @@ extern "C" void run_qsa_index_carry(
     if (n_carry <= 0) return;
     qsa_index_append::carry_kernel<<<(unsigned)n_carry, 256, 0,
                                     (cudaStream_t)stream>>>(carries, d, n_carry);
+}
+
+extern "C" void run_qsa_index_flush(
+    const long long* jobs,
+    const float* k_norm,
+    const float* cos_tab,
+    const float* sin_tab,
+    int32_t d,
+    int32_t rope_dim,
+    float eps,
+    int32_t n_jobs,
+    void* stream
+) {
+    if (n_jobs <= 0 || d <= 0) return;
+    const size_t shmem = (size_t)d * sizeof(float);
+    qsa_index_append::flush_kernel<<<(unsigned)n_jobs, (unsigned)d, shmem,
+                                     (cudaStream_t)stream>>>(
+        jobs, k_norm, cos_tab, sin_tab, d, rope_dim, eps, n_jobs);
 }

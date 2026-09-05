@@ -46,11 +46,32 @@ struct QsaWalk {
     uint32_t c[QSA_WALK_ROWS_PER_LANE];        // cursor: first entry not yet passed
     uint32_t dense;                            // bit h: this lane's row h attends everything
     int ratio;                                 // positions per block
+    // Page layout for this run, bound once — see `QsaSel::pages`. A prefill
+    // block serves a run of consecutive query rows of ONE sequence, so every
+    // row here shares a window and the block→position map is a property of the
+    // run rather than of the row. Null when the sequence forwarded its whole
+    // prefix, and then a block starts at `block * ratio`.
+    const uint2* pages;
+    uint2 win;
+
+    // The first key position of `block`, through this run's page layout.
+    __device__ __forceinline__ int start_of(uint32_t block) const {
+        if (pages == nullptr) return (int)block * ratio;
+        uint32_t lo = win.x, hi = win.x + win.y;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) >> 1;
+            if (pages[mid].y <= block) lo = mid; else hi = mid;
+        }
+        const uint2 p = pages[lo];
+        return (int)(p.x + (block - p.y) * (uint32_t)ratio);
+    }
 
     // Bind rows [row_base, row_base + n_rows) of `sel`. Called by every lane.
     __device__ __forceinline__ void init(const QsaSel& sel, int row_base, int n_rows, int lane) {
         base = sel.entries;
         ratio = sel.ratio;
+        pages = sel.pages;
+        win = (sel.pages != nullptr) ? sel.page_win[row_base] : make_uint2(0u, 0u);
         dense = 0u;
         #pragma unroll
         for (int h = 0; h < QSA_WALK_ROWS_PER_LANE; ++h) {
@@ -76,6 +97,8 @@ struct QsaWalk {
     __device__ __forceinline__ void init_dense(int n_rows, int block, int lane) {
         base = nullptr;
         ratio = block;
+        pages = nullptr;
+        win = make_uint2(0u, 0u);
         dense = 0u;
         #pragma unroll
         for (int h = 0; h < QSA_WALK_ROWS_PER_LANE; ++h) {
@@ -112,7 +135,7 @@ struct QsaWalk {
             }
             while (c[h] < n[h]) {
                 const uint32_t ent = base[e[h] + c[h]];
-                const int first = (int)(ent >> QSA_CELL_BITS) * ratio;
+                const int first = start_of(ent >> QSA_CELL_BITS);
                 const int cells = (int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1;
                 if (first + cells - 1 < bound) {
                     c[h] += 1u;

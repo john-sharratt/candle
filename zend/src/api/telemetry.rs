@@ -30,6 +30,11 @@ pub struct Telemetry {
 #[derive(Serialize, Clone)]
 struct Wave {
     t: f64,
+    /// Wave wall-clock and forward time, **both milliseconds** — as are every
+    /// other duration on this record (`pdrain`, `delev`, `dglue`, `reproj`,
+    /// `scan`, `rglue`, `layout`). The page divides `tok` by `ws` for
+    /// throughput and plots the two on one axis, so a unit that disagrees with
+    /// the name is a silently wrong reading rather than an error.
     ws: f64,
     fwd: f64,
     tok: f64,
@@ -196,7 +201,7 @@ fn build_body() -> Telemetry {
             let s = &w.sample;
             Wave {
                 t: t_of(w.age_s),
-                ws: (s.ws_ms as f64) / 1000.0,
+                ws: s.ws_ms as f64,
                 fwd: s.fwd_ms as f64,
                 tok: s.tok as f64,
                 budget: s.budget_mib as f64,

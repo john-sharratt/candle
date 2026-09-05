@@ -2748,6 +2748,21 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))
     }
 
+    /// Persist a turn's QSA index page to the redo log (`TurnIndexPage`,
+    /// last-writer-wins per stream) and mirror it into the in-RAM substrate.
+    ///
+    /// The page has to outlive the process for the same reason the turn's K/V
+    /// does: a later projection borrows both. Kept in RAM alone it is gone at
+    /// restart, and every cold-loaded turn then hands a slot keys it cannot
+    /// index.
+    pub fn persist_index_page(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
+        self.write()
+            .set_index_page_blob(stream_id, payload.to_vec());
+        let mut p = self.persistence.lock().unwrap();
+        p.append_turn_index_page(stream_id, payload)
+            .map_err(|e| candle::Error::Msg(format!("persist index page: {e}")))
+    }
+
     /// Enqueue a turn/section `Tokens` record onto the off-thread writer — the
     /// durable copy for reload. The in-memory token buffer is already set at
     /// record time, so this NEVER blocks the seal on the persistence lock (which a
@@ -2775,6 +2790,14 @@ impl Conversation {
             .set_wide_q_sigs_blob(stream_id, payload.clone());
         self.writer
             .enqueue(WriteJob::WideQSigs { stream_id, payload });
+    }
+
+    /// Enqueue a turn's QSA index page, mirroring it in RAM first so this
+    /// session's own projections can borrow the turn immediately.
+    pub fn enqueue_index_page(&self, stream_id: StreamId, payload: Vec<u8>) {
+        self.write().set_index_page_blob(stream_id, payload.clone());
+        self.writer
+            .enqueue(WriteJob::TurnIndexPage { stream_id, payload });
     }
 
     /// Enqueue a conversation's recurrent-state snapshot (the encoded

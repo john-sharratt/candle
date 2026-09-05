@@ -97,6 +97,9 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     int score_stride,
     const uint32_t* __restrict__ n_cand,
     const uint32_t* __restrict__ qpos,
+    // [n_rows] — cells of its OWN block the query has, `1..=ratio`. Not derived
+    // here: a block's width is a property of the page it belongs to.
+    const uint32_t* __restrict__ tail_len,
     uint32_t* __restrict__ entries,
     int entry_stride,
     uint32_t* __restrict__ cnt,
@@ -117,8 +120,17 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
         return;
     }
 
-    const int tail_start = visible / ratio * ratio;
-    const int n_tail = visible - tail_start;
+    // **The tail comes from the host, and the block index it lands in is
+    // `n_cand[row]` — not `visible / ratio`.**
+    //
+    // Those agree only while every block covers `ratio` consecutive positions.
+    // A sequence whose prefix arrived as separately sealed pieces has a short
+    // block at each boundary, so a position no longer divides into its block;
+    // what does not change is that if `C` blocks sit wholly below the query, the
+    // query is in block `C`. So the identity is used and the arithmetic is not,
+    // and the one quantity that cannot be recovered here — how many cells of its
+    // own block the query has — is passed in.
+    const int n_tail = (int)tail_len[row];
     const int budget = width - n_tail;
     const int cand = (int)n_cand[row];
     const int full = budget / ratio;
@@ -188,7 +200,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     }
     if (n_tail > 0) {
         if (tid == 0) {
-            ent[n_ent] = (((uint32_t)(tail_start / ratio)) << 2) | (uint32_t)(n_tail - 1);
+            ent[n_ent] = ((uint32_t)cand << 2) | (uint32_t)(n_tail - 1);
         }
         n_ent += 1;
     }
@@ -206,6 +218,7 @@ extern "C" void run_qsa_topk_entries(
     int32_t score_stride,
     const uint32_t* n_cand,
     const uint32_t* qpos,
+    const uint32_t* tail_len,
     uint32_t* entries,
     int32_t entry_stride,
     uint32_t* cnt,
@@ -217,5 +230,6 @@ extern "C" void run_qsa_topk_entries(
     if (n_rows <= 0) return;
     qsa_topk::qsa_topk_entries_kernel<<<(unsigned)n_rows, qsa_topk::THREADS, 0,
                                        (cudaStream_t)stream>>>(
-        scores, score_stride, n_cand, qpos, entries, entry_stride, cnt, ratio, top_k, n_rows);
+        scores, score_stride, n_cand, qpos, tail_len, entries, entry_stride, cnt, ratio, top_k,
+        n_rows);
 }

@@ -33,6 +33,8 @@ extern "C" {
         // null for a full causal read. See `candle-kernels/src/qsa_select.cuh`.
         sel_entries: *const u32,
         sel_cnt: *const u32,
+        sel_pages: *const u32,
+        sel_page_win: *const u32,
         sel_stride: i32,
         sel_ratio: i32,
     );

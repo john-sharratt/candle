@@ -68,6 +68,8 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        // The path is handed over directly, so nothing resolves it.
+        prepared_from_source: false,
         model_bytes,
         tokenizer_repo: "deepseek-ai/DeepSeek-V4-Flash-0731".to_string(),
         tokenizer_rev: String::new(),

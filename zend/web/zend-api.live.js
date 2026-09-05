@@ -111,23 +111,51 @@
         body: JSON.stringify(payload),
         signal: controller.signal,
       }).then((resp) => {
-        if (!resp.ok || !resp.body) { handlers.onDone(); return; }
+        // **A stream that failed is not a stream that finished.** Every one of
+        // these used to call `onDone`, so an HTTP 500, a body-less response and
+        // a mid-stream socket drop all rendered as a completed answer — an
+        // empty bubble and no way to tell whether the model had nothing to say
+        // or the daemon had died. The caller gets `onError` and decides;
+        // `onDone` still runs after it, so the composer always unlocks.
+        if (!resp.ok || !resp.body) {
+          fail(handlers, 'The daemon rejected the request (HTTP ' + resp.status + ').');
+          return;
+        }
         const reader = resp.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
+        let sawFrame = false;
         const pump = () => reader.read().then(({ done, value }) => {
-          if (done) { handlers.onDone(); return; }
+          if (done) {
+            // A stream that closed without ever sending a frame produced no
+            // answer at all. The daemon logs why; the user needs to know it
+            // happened.
+            if (!sawFrame) {
+              fail(handlers, 'The response ended before it started. The daemon logged the reason.');
+              return;
+            }
+            handlers.onDone();
+            return;
+          }
           buf += dec.decode(value, { stream: true });
           let nl;
           while ((nl = buf.indexOf('\n\n')) !== -1) {
             const frame = buf.slice(0, nl);
             buf = buf.slice(nl + 2);
+            sawFrame = true;
             handleFrame(frame, handlers);
           }
           return pump();
-        }).catch(() => handlers.onDone());
+        }).catch((e) => {
+          // An abort is the user pressing stop, not a failure.
+          if (e && e.name === 'AbortError') { handlers.onDone(); return; }
+          fail(handlers, 'The response stream broke: ' + errText(e));
+        });
         pump();
-      }).catch(() => handlers.onDone());
+      }).catch((e) => {
+        if (e && e.name === 'AbortError') { handlers.onDone(); return; }
+        fail(handlers, 'Could not reach the daemon: ' + errText(e));
+      });
       return { cancel: () => controller.abort() };
     },
 
@@ -222,6 +250,18 @@
     else if (event === 'file_rejected' && handlers.onFileRejected) handlers.onFileRejected(obj.name, obj.reason);
     else if (event === 'phase' && handlers.onPhase) handlers.onPhase(obj.phase, obj.state, obj);
     else if (event === 'stats' && handlers.onStats) handlers.onStats(obj);
+  }
+
+  // A stream ended badly. Tell the caller what happened, then end the stream
+  // normally so the composer unlocks whether or not it handles `onError`.
+  function fail(handlers, message) {
+    if (handlers.onError) handlers.onError(message);
+    handlers.onDone();
+  }
+
+  function errText(e) {
+    if (!e) return 'unknown error';
+    return (e && e.message) ? e.message : String(e);
   }
 
   // Parse one SSE frame: a named `status` event, or an OpenAI chunk / [DONE].

@@ -1313,6 +1313,8 @@ impl ConversationEngine {
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id,
+                // A bare eval turn has no continuation to seal it.
+                keep_reasoning: false,
                 projection_inputs: None,
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
                 prefill_text: String::new(),

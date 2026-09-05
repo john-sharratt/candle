@@ -72,6 +72,29 @@ pub struct TurnOptions {
     /// model decodes the continuation. `None` = ordinary free decode.
     pub assistant_prefill: Option<String>,
 
+    /// Seal this turn with its `<think>` reasoning intact.
+    ///
+    /// **For a turn that may end in a tool call.** An ordinary dialogue turn is
+    /// re-prefilled with its reasoning stripped before it seals, so no later
+    /// projection can attend its own thoughts. A turn that calls a tool needs
+    /// the opposite: its result arrives as a *new turn*, and the chat template
+    /// deliberately does not count a `<tool_response>` message as a new query,
+    /// precisely so the reasoning that motivated the call is still attendable
+    /// when the result comes back.
+    ///
+    /// Set at submit time because it cannot be decided later: the seal fires
+    /// before `Done`, so a caller that discovers a tool call in the response has
+    /// already lost the reasoning. Whether tools are *available* is the closest
+    /// thing to the answer that is knowable in time.
+    ///
+    /// **The seal itself is not deferred.** Everything else about it is
+    /// unchanged — the substrate write, `Done`, and `SealResult::turn_index` all
+    /// fire at their usual moment, and the turn is persisted and compressible
+    /// exactly like any other. The only difference is which grid gets sealed.
+    /// A turn that ends the conversation is therefore safe to set this on; it
+    /// costs one turn's reasoning kept in the record, not a turn at risk.
+    pub keep_reasoning: bool,
+
     /// Section-tree selector choices for this turn (e.g. the composer
     /// thinking-effort / response-length dials).  Becomes the conversation's
     /// current selection, used by every projection until the next turn changes

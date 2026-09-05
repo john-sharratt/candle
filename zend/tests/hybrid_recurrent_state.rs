@@ -70,10 +70,17 @@ fn snapshot_for(
 /// The load-bearing assertion of this file. A zeroed state is exactly what a
 /// conversation that has forgotten everything looks like, and it is invisible
 /// from the outside.
+///
+/// **Both classes count.** The hybrid's whole durable recurrence is its
+/// delta-rule layers, so for this file the `aux` arm never fires — but a model
+/// that keeps its recurrence in the model-opaque blob instead would have every
+/// assertion here read "forgotten" while resuming perfectly. The helper answers
+/// "does this record carry memory", and that is the honest form of the question.
 fn state_is_non_zero(p: &SnapshotPayload) -> bool {
     p.layers
         .iter()
         .any(|l| l.state.iter().any(|&b| b != 0) || l.conv_tail.iter().any(|&b| b != 0))
+        || p.aux.iter().any(|&b| b != 0)
 }
 
 fn build_engine(workspace: PathBuf, device: &Device) -> (ConversationEngine, Sequence) {

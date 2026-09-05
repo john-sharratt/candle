@@ -56,6 +56,7 @@ impl RecordAccounting {
             | RecordType::Commit
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
+            | RecordType::TurnIndexPage
             // `Npc` carries its `npc_id` in the header's `stream_id`, so the
             // newest record for a character supersedes every earlier one here
             // mechanically — the same trick `Snapshot` uses for its per-timeline

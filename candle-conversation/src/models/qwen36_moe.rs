@@ -38,6 +38,7 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
         // for exactly this reason.
         model_repo: "unsloth/Qwen3.6-35B-A3B-MTP-GGUF".into(),
         model_filename: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf".into(),
+        prepared_from_source: false,
         // The published file's exact length, read off the local snapshot at the
         // pinned revision. Downloaders use it for progress totals when the
         // server omits Content-Length, so a guess shows a wrong bar. The MTP

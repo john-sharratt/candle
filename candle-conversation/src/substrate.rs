@@ -1231,6 +1231,14 @@ pub struct StreamRuntime {
     /// recent (re)projection — the decode→decode (`Q·Q`) consensus substrate. Last-writer-wins;
     /// rebuilt from the redo log on replay. `None` until the first projection writes it.
     pub wide_q_sigs: Option<Vec<u8>>,
+    /// The turn's QSA index page — the compressed index rows covering exactly
+    /// this turn's tokens, as sealed. Last-writer-wins, rebuilt from the redo
+    /// log on replay, `None` for a turn sealed by a model that indexes nothing.
+    ///
+    /// A projection that borrows this turn's K/V needs these rows handed over
+    /// with it: the index is computed from hidden states, so unlike the K/V it
+    /// cannot be reconstructed by the slot that borrows it.
+    pub index_page: Option<Vec<u8>>,
     /// Highest chunk index the stream is durably committed through.
     pub committed_through: Option<u64>,
 }
@@ -3667,6 +3675,12 @@ impl Substrate {
                     Some(entry.record.payload.clone());
                 self.evict_decoded_wide_sig(stream_id);
             }
+            RecordType::TurnIndexPage => {
+                // Opaque QSA index-page bytes, last-writer-wins per turn stream
+                // id — a re-seal of the same turn replaces the page.
+                self.streams.entry(stream_id).or_default().index_page =
+                    Some(entry.record.payload.clone());
+            }
             // Singletons go to the manifest, not the substrate; the
             // header-index chain is consumed by recovery, never here.
             RecordType::ModelSpec
@@ -4524,6 +4538,22 @@ impl Substrate {
         self.streams
             .get(&turn_stream_id(timeline.raw(), index.0))
             .and_then(|s| s.wide_q_sigs.as_deref())
+    }
+
+    /// Cache a turn's QSA index page, last-writer-wins.
+    pub fn set_index_page_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
+        self.streams.entry(stream_id).or_default().index_page = Some(payload);
+    }
+
+    /// The stored QSA index page for a turn, if any.
+    ///
+    /// What a projection hands the model alongside a borrowed turn's K/V.
+    /// `None` means the turn's keys can be borrowed but not indexed — the slot
+    /// will hold tokens no cache accounts for.
+    pub fn index_page_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
+        self.streams
+            .get(&turn_stream_id(timeline.raw(), index.0))
+            .and_then(|s| s.index_page.as_deref())
     }
 
     /// The turn's user-half span in its real-KV grid — the Concept F question

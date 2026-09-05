@@ -18,6 +18,7 @@ use crate::projection::{
     TurnIndex,
 };
 use crate::provenance::WideQSig;
+use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, ProjectionInputs,
@@ -446,8 +447,11 @@ pub(crate) fn install_branch_states(
         scheduler_tx
             .send(SchedulerRequest::InstallRecurrentState {
                 sequence_ids,
-                schedule_hash: payload.schedule_hash,
-                layers,
+                state: SharedState {
+                    schedule_hash: payload.schedule_hash,
+                    layers,
+                    aux: payload.aux.clone().into(),
+                },
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -1124,11 +1128,12 @@ impl Sequence {
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
-            Ok(Some((schedule_hash, layers))) => {
+            Ok(Some(state)) => {
                 let payload = BranchCheckpointPayload {
                     prefix_hash: prefix,
-                    schedule_hash,
-                    layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+                    schedule_hash: state.schedule_hash,
+                    layers: state.layers.into_iter().map(SnapshotLayer::from).collect(),
+                    aux: state.aux,
                 };
                 self.substrate
                     .enqueue_branch_checkpoint(prefix, payload.encode());
@@ -1868,6 +1873,7 @@ impl Sequence {
             sampling,
             reprojection,
             options.triggers,
+            options.keep_reasoning,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -1990,6 +1996,8 @@ impl Sequence {
             None,
             // No tool stencils on a calibration prefill.
             Arc::new(TriggerRegistry::new()),
+            // A prefilled turn is not a tool loop; it seals when it finishes.
+            false,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2035,6 +2043,7 @@ impl Sequence {
         sampling: SamplingConfig,
         reprojection: Option<ReprojectionPolicy>,
         triggers: Arc<TriggerRegistry>,
+        keep_reasoning: bool,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2110,6 +2119,7 @@ impl Sequence {
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id,
+                keep_reasoning,
                 projection_inputs,
                 prefill_tokens,
                 prefill_text,
@@ -2347,6 +2357,8 @@ impl Sequence {
             None,
             // A no-decode insert never samples, so no stencil can fire.
             Arc::new(TriggerRegistry::new()),
+            // An inserted turn has no decode and nothing to continue into.
+            false,
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -4211,6 +4223,8 @@ impl ProbeCtx {
             .scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id: slot,
+                // A probe turn ends where it ends; nothing follows to seal it.
+                keep_reasoning: false,
                 projection_inputs: Some(ProjectionInputs {
                     projection: Arc::clone(&self.projection),
                     selection: self.selection.clone(),

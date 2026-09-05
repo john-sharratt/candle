@@ -36,6 +36,7 @@ use candle_transformers::models::batched_inference::{
 
 use crate::conversation::slice_per_layer_sealed;
 use crate::error::ConversationError;
+use crate::persistence::content_hash::turn_stream_id;
 use crate::projection::event::{group_name_of, layer_name_of_group, role_str};
 use crate::projection::{
     ContentResolver, Conversation, GroupId, MaterializedPiece, ProjectionSegment, ProjectionTarget,
@@ -48,13 +49,13 @@ use crate::summary_tree::TurnKind;
 
 /// Per-slot state owned by the projection assembler.
 ///
-/// `pending_user_part` holds the captured K/V for the in-flight turn's user
-/// message — populated when a `NewUserMessage` segment is prefilled, cleared at
-/// seal time; survives mid-decode reprojection (which truncates the slot)
-/// because it lives here on `SlotState`, not on the slot.
-#[derive(Debug, Default)]
+/// `pending_user_part` holds the captured K/V **and index page** for the
+/// in-flight turn's user message — populated when a `NewUserMessage` segment is
+/// prefilled, cleared at seal time; survives mid-decode reprojection (which
+/// truncates the slot) because it lives here on `SlotState`, not on the slot.
+#[derive(Default)]
 pub(super) struct SlotState {
-    pub(super) pending_user_part: Option<Arc<Vec<SealedSequence>>>,
+    pub(super) pending_user_part: Option<CapturedSpan>,
     /// The sealed sections + turns this slot's current projection attends over.
     /// Refreshed on every `apply_projection`; consumed by the relief-eviction
     /// path as an explicit protect-list so it never drops the hot copy of a turn
@@ -76,7 +77,7 @@ pub(super) struct SlotState {
     /// projection generation that used them (hit or capture) and survive
     /// [`GLUE_ISLAND_RETAIN_GENERATIONS`] projections. Same lifecycle/capture
     /// pattern as `pending_user_part`.
-    pub(super) glue_islands: HashMap<u64, (u64, Arc<Vec<SealedSequence>>)>,
+    pub(super) glue_islands: HashMap<u64, (u64, CapturedSpan)>,
     /// Monotone projection counter for the island cache's generation stamps.
     pub(super) glue_generation: u64,
 }
@@ -491,6 +492,13 @@ pub(super) struct ApplyContext<'a> {
     /// carried because the compression probe frames its synthetic exchange with
     /// them and the debug view decodes them.
     pub(super) boundary_markers: &'a BoundaryMarkers,
+    /// Each sealed section's per-position model state, so a borrowed section
+    /// brings its index rows along with its chunks. Empty for a model that
+    /// carries none — see `Scheduler::section_positional`.
+    pub(super) section_positional: &'a HashMap<SectionId, Arc<Vec<u8>>>,
+    /// Each sealed turn's per-position model state — the dialogue counterpart
+    /// of [`Self::section_positional`], and the one this path uses most.
+    pub(super) turn_positional: &'a HashMap<TurnKey, Arc<Vec<u8>>>,
 }
 
 /// A built-but-not-yet-fired gap-fill descriptor for one slot. Owned (no
@@ -517,6 +525,11 @@ pub(super) struct GapFillPlan {
     pub deferred_user: Option<Arc<Vec<u32>>>,
     /// The writer tail snapshotted before truncation, re-attached on finish.
     pub tail_per_layer: Vec<WriterTail>,
+    /// The slot's token length BEFORE the rebuild took it apart, so
+    /// [`apply_segments_finish`] can check that the rebuild put back everything
+    /// it removed. `None` where the plan was cloned for a fire-only pass and
+    /// there is nothing to compare against.
+    pub held_before: Option<usize>,
     /// Glue token count actually COMPUTED by the wave (cache-reused islands are
     /// excluded — they were Arc-injected during the walk).
     pub n_glue_tokens: usize,
@@ -588,6 +601,8 @@ fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
         fwd_ahead: plan.fwd_ahead.clone(),
         deferred_user: None,
         tail_per_layer: Vec::new(),
+        // Fire-only: it restores no tail, so it has no rebuild to check.
+        held_before: None,
         n_glue_tokens: plan.n_glue_tokens,
         islands: Vec::new(),
     }
@@ -667,14 +682,31 @@ pub(super) fn apply_segments_build(
     let parent_id = ctx.parent_id;
 
     // 1. Snapshot the writer tail (in-flight decode chunks).
+    // What the slot held before the rebuild takes it apart. The rebuild is
+    // responsible for putting all of it back — from the substrate for sealed
+    // pieces, from the writer-tail snapshot for anything this slot forwarded
+    // itself — and [`apply_segments_finish`] checks that it did.
+    //
+    // The check exists because the invariant it guards is about to widen.
+    // "Unsealed content is at most the current turn" was true only by accident
+    // of the seal firing before every continuation, and nothing anywhere
+    // asserted it. A slot that comes back short does not fault: it decodes
+    // fluently against a prefix missing its own last turn.
+    let held_before = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
     let tail_per_layer = {
         let _g = profile::span("apply:snapshot_tail");
         snapshot_tail(ctx.session, parent_id)?
     };
 
-    // 2. Truncate the slot.
+    // 2. Truncate the slot. Its per-position state goes with the K/V: the
+    //    rebuild below re-injects every segment from position 0, and pages left
+    //    from the previous assembly would sit at positions this one does not
+    //    have.
     ctx.session
         .truncate_sequence_to_blocks(parent_id.0, 0)
+        .map_err(ConversationError::Model)?;
+    ctx.model
+        .reset_positional_state(parent_id.0)
         .map_err(ConversationError::Model)?;
 
     // 3. Full rebuild — rewrite the slot_tokens record from scratch.
@@ -803,8 +835,11 @@ pub(super) fn apply_segments_build(
                     .flatten()
                 {
                     // Cache hit: Arc-inject the captured K/V — the wave never
-                    // sees this island. Mirrors the sealed-inject bookkeeping.
-                    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &cached)?;
+                    // sees this island. Mirrors the sealed-inject bookkeeping,
+                    // the index page included: the wave not seeing the island is
+                    // exactly why nothing would otherwise index it.
+                    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &cached.kv)?;
+                    push_captured_page(ctx, &cached, "cached glue island");
                     walker.logical_pos += tokens.len() as u32;
                     walker.last_was_sealed = true;
                     walker.reused_glue_tokens += tokens.len();
@@ -933,8 +968,23 @@ pub(super) fn apply_segments_build(
         glue_tokens = walker.n_glue_tokens,
         reused_glue_tokens = walker.reused_glue_tokens,
         deferred_user = walker.deferred_user.is_some(),
+        pages_pushed = walker.pages_pushed,
         "apply_segments: assembled slot prefix"
     );
+    // Sealed K/V went in and no index page came with it. Every borrow site
+    // pushes one or says why, so reaching here means the walk took a route that
+    // does neither — the slot ends up holding a prefix nothing indexed, which is
+    // silent until the select passes the identity threshold and refuses.
+    if ctx.model.carries_positional_state() && walker.sealed_tokens > 0 && walker.pages_pushed == 0
+    {
+        tracing::warn!(
+            slot = parent_id.0,
+            sealed_tokens = walker.sealed_tokens,
+            sealed_turns = walker.sealed_turns,
+            sealed_sections = walker.sealed_sections,
+            "apply_segments: injected sealed K/V but pushed no index page at all"
+        );
+    }
 
     Ok(GapFillPlan {
         parent_id,
@@ -944,6 +994,7 @@ pub(super) fn apply_segments_build(
         fwd_ahead: std::mem::take(&mut walker.fwd_ahead),
         deferred_user: walker.deferred_user.take(),
         tail_per_layer,
+        held_before: Some(held_before),
         n_glue_tokens: walker.n_glue_tokens,
         islands,
     })
@@ -985,6 +1036,10 @@ struct SegmentWalker {
     sealed_tokens: usize,
     skipped_turns: usize,
     skipped_sections: usize,
+    /// Index pages handed to the model during this walk. Counted so the
+    /// assembled prefix can be checked against it: a walk that injects sealed
+    /// tokens and pushes no pages has built a slot whose K/V nothing indexes.
+    pages_pushed: usize,
 }
 
 impl SegmentWalker {
@@ -1004,6 +1059,7 @@ impl SegmentWalker {
             sealed_tokens: 0,
             skipped_turns: 0,
             skipped_sections: 0,
+            pages_pushed: 0,
         }
     }
 
@@ -1142,6 +1198,24 @@ fn inject_sealed_section(
         }
     };
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    // The rows that go with those chunks. Borrowing the K/V is what makes this
+    // path cheap; the index cannot be borrowed the same way, because its keys
+    // come from hidden states this slot never computed.
+    if let Some(blob) = ctx.section_positional.get(&sid) {
+        match ctx.model.push_positional_state(parent_id.0, blob) {
+            Ok(_) => walker.pages_pushed += 1,
+            Err(e) => tracing::warn!(
+                "apply_projection: section {} index page refused: {e}",
+                sid.raw()
+            ),
+        }
+    } else if ctx.model.carries_positional_state() {
+        tracing::warn!(
+            "apply_projection: section {} has no index page — this slot will select \
+             against a prefix it never indexed",
+            sid.raw()
+        );
+    }
 
     let toks = ctx.conversation.read().section_tokens_of(sid);
     let start_block = ctx
@@ -1263,6 +1337,41 @@ fn inject_sealed_turn(
         return Ok(());
     }
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    // The rows that go with those chunks. Borrowing the K/V is what makes a
+    // reprojection cheap; the index cannot be borrowed the same way, because
+    // its keys come from hidden states this slot never computed.
+    // Resident first, then the turn's persisted `TurnIndexPage`. The map holds
+    // only what THIS process sealed, so after a restart every turn that predates
+    // it misses here and the stored record is the only copy — which is the whole
+    // reason the page is written to the log rather than kept in RAM.
+    let key = TurnKey { timeline, index };
+    let resident = ctx.turn_positional.get(&key).map(|b| b.to_vec());
+    let page = match resident {
+        Some(b) => Some(b),
+        None => ctx
+            .conversation
+            .read()
+            .index_page_blob(timeline, index)
+            .map(|b| b.to_vec()),
+    };
+    if let Some(blob) = page {
+        match ctx.model.push_positional_state(parent_id.0, &blob) {
+            Ok(_) => walker.pages_pushed += 1,
+            Err(e) => tracing::warn!(
+                "apply_projection: turn {}/{} index page refused: {e}",
+                timeline,
+                index.0
+            ),
+        }
+    } else if ctx.model.carries_positional_state() {
+        tracing::warn!(
+            stream_id = format!("{:#018x}", turn_stream_id(timeline.raw(), index.0).0),
+            "apply_projection: turn {}/{} has no index page, resident or stored — this \
+             slot will select against a prefix it never indexed",
+            timeline,
+            index.0
+        );
+    }
 
     let toks: Vec<u32> = ctx
         .conversation
@@ -1331,6 +1440,19 @@ fn inject_sealed_turn_half(
         }
     };
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    // **No page for a HALF, deliberately.** The stored page covers a whole
+    // turn, and this borrows only its user half — handing the whole turn's rows
+    // over would claim blocks for positions this slot does not hold, which is a
+    // worse error than having none. Reported so the gap is visible rather than
+    // silent; the compression path this serves selects over what it did index.
+    if ctx.model.carries_positional_state() {
+        tracing::warn!(
+            "apply_projection: turn-half {}/{} carries no index page — a half is not a \
+             sealed piece of its own, so the turn's rows do not describe it",
+            timeline,
+            index.0
+        );
+    }
 
     walker.sealed_turns += 1;
     walker.sealed_tokens += sealed[0].token_count;
@@ -1369,6 +1491,40 @@ fn inject_arc_sealed(
     Ok(())
 }
 
+/// A span this slot forwarded once and can re-inject instead of recomputing.
+///
+/// **The page travels with the K/V, always.** Re-injecting the bytes is what
+/// makes a reproject cheap, but the index cannot be recovered from them — its
+/// keys come from hidden states, so the only copy is the one taken when the
+/// forward ran. A cached span whose page is dropped comes back as tokens no
+/// cache accounts for, which is silent under the QSA identity threshold and
+/// refuses the select above it.
+#[derive(Clone)]
+pub(super) struct CapturedSpan {
+    pub kv: Arc<Vec<SealedSequence>>,
+    /// `None` only for a model that indexes nothing.
+    pub page: Option<Arc<Vec<u8>>>,
+}
+
+/// Hand a re-injected span's index rows back to the model.
+fn push_captured_page(ctx: &mut ApplyContext<'_>, span: &CapturedSpan, what: &str) {
+    match &span.page {
+        Some(page) => {
+            if let Err(e) = ctx.model.push_positional_state(ctx.parent_id.0, page) {
+                tracing::warn!("apply_projection: {what} index page refused: {e}");
+            }
+        }
+        None => {
+            if ctx.model.carries_positional_state() {
+                tracing::warn!(
+                    "apply_projection: {what} has no index page — this slot will select \
+                     against a prefix it never indexed"
+                );
+            }
+        }
+    }
+}
+
 // ── NewUserMessage handling (live-prefill into pending_user_part) ────────────
 
 fn handle_new_user_message(
@@ -1381,7 +1537,10 @@ fn handle_new_user_message(
         // Mid-decode reproject path: the user's K/V was already
         // captured on an earlier apply.  Re-inject the cached bytes;
         // do not re-run the forward pass.
-        inject_arc_sealed(ctx.session, ctx.parent_id, ctx.chunk_size, &cached)?;
+        inject_arc_sealed(ctx.session, ctx.parent_id, ctx.chunk_size, &cached.kv)?;
+        // And the rows that go with them — `apply_segments_build` reset the
+        // index before this walk, so nothing else puts them back.
+        push_captured_page(ctx, &cached, "cached user message");
         log_injected_tokens(ctx, tokens);
     } else {
         let captured = drive_prefill_and_capture(ctx, tokens, walker.last_was_sealed)?;
@@ -1466,9 +1625,13 @@ fn drive_prefill_and_capture(
     ctx: &mut ApplyContext<'_>,
     tokens: &[u32],
     last_was_sealed: bool,
-) -> Result<Arc<Vec<SealedSequence>>, ConversationError> {
+) -> Result<CapturedSpan, ConversationError> {
     let parent_id = ctx.parent_id;
     push_empty_if_sealed(ctx, last_was_sealed)?;
+    // Where this span's tokens start, so the index rows it is about to build can
+    // be sealed back out of the cache as the span's own page. Taken before the
+    // forward: afterwards the tail has grown and the span's start is gone.
+    let start_pos = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
     let start_block = ctx
         .session
         .sequence_block_count(parent_id.0)
@@ -1497,8 +1660,26 @@ fn drive_prefill_and_capture(
             .map_err(ConversationError::Model)?;
         slice_per_layer_sealed(&full, start_block, end_block)
     };
+    // The index rows this forward just built, taken as a page so a later
+    // re-inject of the same K/V can hand them over with it. Without this the
+    // cached bytes come back and the rows do not: a reproject resets the index,
+    // re-injects the K/V from cache, and leaves the slot holding this span's
+    // tokens with nothing indexing them.
+    let page = match ctx.model.seal_positional_range(parent_id.0, start_pos) {
+        Ok(page) => page.map(Arc::new),
+        Err(e) => {
+            tracing::warn!(
+                "apply_projection: captured span at {start_pos} has no index page ({e}); \
+                 a reproject re-injecting it will select against a prefix it never indexed"
+            );
+            None
+        }
+    };
     log_injected_tokens(ctx, tokens);
-    Ok(Arc::new(captured))
+    Ok(CapturedSpan {
+        kv: Arc::new(captured),
+        page,
+    })
 }
 
 /// Fire ONE batched gap-fill forward over `plans` (the cross-conversation wave),
@@ -1620,6 +1801,7 @@ pub(super) fn apply_segments_finish(
         fwd_ahead: _,
         deferred_user,
         tail_per_layer,
+        held_before,
         n_glue_tokens,
         islands,
     } = plan;
@@ -1644,7 +1826,24 @@ pub(super) fn apply_segments_finish(
                     .session
                     .snapshot_sequence_blocks(parent_id.0, isl.start_block, isl.end_block)
                     .map_err(ConversationError::Model)?;
-                state.glue_islands.insert(isl.key, (gen, Arc::new(sealed)));
+                // **No page, and today that is provable rather than assumed.**
+                // An island exists only for a model that gap-fills, and
+                // `can_gap_fill` is `!carries_recurrent_state()` — while the
+                // only stack that carries an index (`carries_positional_state`)
+                // is recurrent and refuses islands outright. So a cached island
+                // never has rows to carry. If that ever stops holding,
+                // `push_captured_page` says so on the re-inject instead of
+                // leaving the island's tokens silently unindexed.
+                state.glue_islands.insert(
+                    isl.key,
+                    (
+                        gen,
+                        CapturedSpan {
+                            kv: Arc::new(sealed),
+                            page: None,
+                        },
+                    ),
+                );
             }
         }
     }
@@ -1662,6 +1861,56 @@ pub(super) fn apply_segments_finish(
     {
         let _g = profile::span("apply:restore_tail");
         restore_tail(ctx.session, parent_id, tail_per_layer)?;
+    }
+
+    // **The rebuild put back everything it took apart.**
+    //
+    // A slot that comes back SHORT has lost content that existed a moment ago
+    // and exists nowhere else: the substrate holds only what was sealed, and
+    // the writer-tail snapshot holds only what this slot forwarded. Anything
+    // that was neither is simply gone, and nothing downstream faults — the turn
+    // decodes fluently against a prefix missing part of itself, which is the
+    // most expensive kind of wrong.
+    //
+    // LONG is reported too. The rebuild is supposed to reproduce the slot, and
+    // a slot that grew has injected something twice — a piece restored both
+    // from the substrate and from the tail.
+    if let Some(before) = held_before {
+        let after = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
+        if after != before {
+            tracing::warn!(
+                slot = parent_id.0,
+                before,
+                after,
+                "apply_segments_finish: the rebuild did not reproduce the slot — {} \
+                 token(s) {}",
+                after.abs_diff(before),
+                if after < before { "lost" } else { "duplicated" }
+            );
+        }
+    }
+
+    // The rebuild is responsible for leaving the slot's per-position state
+    // covering the K/V it assembled, exactly. Both directions are faults, and
+    // for different reasons: SHORT means a source put K/V back without its rows,
+    // and the select refuses once the conversation passes the identity
+    // threshold; LONG means rows were installed twice, and the surplus claims
+    // positions this slot does not hold — which selects against them without
+    // erroring at all. This is the same invariant `handle_memory_catch_up`
+    // asserts after its own rebuild, on the same pair of quantities.
+    if let Some(cov) = ctx.model.positional_coverage(parent_id.0) {
+        let held = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
+        if cov != held {
+            tracing::warn!(
+                slot = parent_id.0,
+                held,
+                coverage = cov,
+                "apply_segments_finish: the assembled slot's index is {} token(s) {} its \
+                 K/V",
+                cov.abs_diff(held),
+                if cov < held { "short of" } else { "past" }
+            );
+        }
     }
 
     tracing::trace!(
@@ -1721,7 +1970,12 @@ mod tests {
     #[test]
     fn island_cache_retention_and_refresh() {
         let mut state = SlotState::default();
-        let sealed = || Arc::new(Vec::<SealedSequence>::new());
+        // A cached island carries its K/V and (for a gap-filling model) no index
+        // page — see the capture site.
+        let sealed = || CapturedSpan {
+            kv: Arc::new(Vec::<SealedSequence>::new()),
+            page: None,
+        };
 
         // Captured at generation 1.
         let gen = state.begin_island_capture();

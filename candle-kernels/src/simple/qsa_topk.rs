@@ -25,6 +25,7 @@ extern "C" {
         score_stride: i32,
         n_cand: *const u32,
         qpos: *const u32,
+        tail_len: *const u32,
         entries: *mut u32,
         entry_stride: i32,
         cnt: *mut u32,

@@ -25,7 +25,7 @@
 //! default hooks — this model keeps every [`WaveSweep`] default: its offsets
 //! equal its backing lengths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
@@ -38,11 +38,14 @@ use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hyper::{hc_combine, hc_mix};
 use super::indexer::{select_layer, IndexCache, IndexSnapshot};
+use super::paged_index;
+use super::paged_index::{IndexPage, SealedIndex};
 use super::ple::{ple_apply, ple_row_ids, PleState};
 use super::qsa::IndexerWeights;
 use super::spec::SpecCapture;
 use crate::models::batched_inference::{
-    BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult, MAX_PREFILL_TOKENS,
+    BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, WaveResult,
+    MAX_PREFILL_TOKENS,
 };
 use crate::models::batched_layer::{
     forward_attn_batched, BatchedAttentionParams, BatchedPrefillMeta, DecodeHeaders,
@@ -50,7 +53,7 @@ use crate::models::batched_layer::{
 use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::delta_net::StashSlot;
 use crate::models::delta_net::{
-    quantized_delta_net_layer_forward_spans, seq_spans, DeltaNetSeq, LayerKind,
+    quantized_delta_net_layer_forward_spans, seq_spans, DeltaNetSeq, ExportedLayerState, LayerKind,
     RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
@@ -98,6 +101,26 @@ pub struct Qwen4ExpBatched {
     /// checkpoint with no head, and reset with the other carried state when a
     /// sequence starts over. See [`super::draft`].
     pub(super) seeds: RwLock<SeedStore>,
+    /// Sequences whose carried state was put there **deliberately** — by a view
+    /// carve or by a resume — and which must therefore survive exactly one
+    /// `offset == 0` reset in [`Self::ensure_seq_state`].
+    ///
+    /// Without it the reset rule and the restore contradict each other: a slot
+    /// holding state it did not compute legitimately stands at offset 0 (a fork
+    /// borrows the parent's K/V; a resume installs its state before the first
+    /// wave), so "offset 0 means start over" throws away precisely the state
+    /// that was just installed. Every shape still matches and nothing is raised
+    /// — the sequence simply answers as though it remembers nothing.
+    ///
+    /// One flag for all four carried classes, because they are always seeded
+    /// together: a fork copies all of them, and a resume installs the GDN rows
+    /// and the auxiliary blob from one record. Consumed on the first wave either
+    /// way — a flag that outlived that wave would suppress a later, genuine
+    /// reset, which is the recycled-slot defect wearing the fix's clothes. The
+    /// rule is `HybridBatched::ensure_recurrent`'s, which reaches it through
+    /// [`RecurrentStateStore::take_seeded`]; this model needs it to cover the
+    /// PLE and index caches as well, so the flag lives beside them.
+    pub(super) seeded: RwLock<HashSet<usize>>,
     /// Armed only while a speculative block is in flight: what the verify wave
     /// must capture so a partial accept can be rewound ([`super::spec`]).
     /// `None` on every plain decode, which is what keeps the capture sites a
@@ -121,7 +144,664 @@ pub struct Qwen4ExpBatched {
     pub(super) inv_freq: Tensor,
 }
 
+/// The carried per-sequence state, and what persisting it costs.
+///
+/// This model carries four classes outside the paged K/V, and they divide on
+/// one question — **is it cheaper to store or to rebuild?**
+///
+/// * **GDN recurrence** — an accumulated sum with no per-token decomposition.
+///   Not derivable from anything; must be stored. [`RecurrentStateStore`]
+///   already exports and imports it, geometry-checked against a schedule hash,
+///   and is shared with the hybrid lineage.
+/// * **PLE** — a `(conv_kernel − 1) × ngram_size` row convolution history plus
+///   the last `ngram_size − 1` token ids. Kilobytes: stored, in the snapshot's
+///   opaque auxiliary blob.
+/// * **QSA index** — `n_blocks × head_dim` keys per attention layer, which at
+///   128K tokens and ratio 4 is ~16 MiB a layer and ~192 MiB a sequence. That
+///   is not a per-turn snapshot; it is **rebuilt** from the restored K by
+///   [`Self::reindex_from_kv`].
+/// * **Draft seeds** — one residual row per sequence, and only meaningful
+///   inside the wave that produced it. Neither stored nor rebuilt: a resumed
+///   sequence simply drafts nothing until its first wave seeds it, which costs
+///   one step of speculation and no correctness.
 impl Qwen4ExpBatched {
+    /// Whether `seq` carries any of the recurrent classes yet.
+    ///
+    /// The fork and move sites consult this rather than erroring, because a
+    /// view can legitimately be carved before its parent has ever run a wave —
+    /// a brand-new conversation's first turn does exactly that, and there the
+    /// child correctly starts from the sequence-start value.
+    pub fn has_recurrent(&self, seq: usize) -> Result<bool> {
+        Ok(self
+            .recurrent
+            .read()
+            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
+            .contains_key(&seq))
+    }
+
+    /// How many sequences currently carry recurrent state.
+    pub fn recurrent_len(&self) -> Result<usize> {
+        Ok(self
+            .recurrent
+            .read()
+            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
+            .len())
+    }
+
+    /// A view carve: `child` begins as an independent copy of `parent`'s
+    /// carried state.
+    ///
+    /// **All three copied classes move together or none does.** The K/V the
+    /// child borrows is one history; a child holding the parent's GDN state but
+    /// an empty index would attend over blocks its selector never scored, and
+    /// one holding the index but a zero PLE would inject an n-gram embedding
+    /// computed from a window it never saw. Both read as a plausible answer.
+    pub fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
+        let forked = {
+            let map = self
+                .recurrent
+                .read()
+                .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
+            match map.get(&parent) {
+                Some(store) => store.fork_from()?,
+                // Nothing to copy — the parent has not run a wave, so the
+                // child's own lazy init gives it the same sequence-start value.
+                None => return Ok(()),
+            }
+        };
+        let ple = {
+            let map = self
+                .ple
+                .read()
+                .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?;
+            map.get(&parent).map(PleState::snapshot)
+        };
+        let index = {
+            let map = self
+                .index
+                .read()
+                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+            match map.get(&parent) {
+                Some(caches) => Some(
+                    caches
+                        .iter()
+                        .map(IndexCache::fork)
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                None => None,
+            }
+        };
+        self.recurrent
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
+            .insert(child, forked);
+        if let Some(p) = ple {
+            self.ple
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?
+                .insert(child, p);
+        }
+        if let Some(i) = index {
+            self.index
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?
+                .insert(child, i);
+        }
+        self.mark_seeded(child)?;
+        Ok(())
+    }
+
+    /// Materialise the norm weights this model meets activations with.
+    ///
+    /// **Two widths, because this model computes wider than it stores.** The
+    /// residual stream is BF16 (the lineage publishes `"dtype": "bfloat16"`),
+    /// while a live sequence's K/V sits in the arena at F16 — `R16` is raw F16
+    /// with Q-capture space. `kv` is the second, and passing the first in its
+    /// place is not a rounding difference: the per-head Q/K norms run INSIDE
+    /// the projection, on operands that *become* the arena's bytes, so a
+    /// BF16 weight there meets an F16 activation and `weight_for` refuses it —
+    /// every wave, from the first ingest, with the model fully loaded and
+    /// nothing else wrong.
+    ///
+    /// The Gated Residual runs F32 end to end and the projections quantize
+    /// their own activations, so the Q/K norms are the only weights that need
+    /// materialising; both are done here, at session creation, never inside the
+    /// wave.
+    ///
+    /// The draft head's block is included deliberately. It is a full-attention
+    /// layer with Q/K norms of its own and it was POPPED out of `layers` at
+    /// load, so a loop over `layers` alone leaves exactly one attention layer
+    /// holding unconverted norms, and the head's first pass fails inside the
+    /// wave rather than here.
+    pub fn maybe_change_dtype(&self, _act: DType, kv: DType) -> Result<()> {
+        let head_block = self.model.mtp.as_ref().map(|h| &h.block);
+        for layer in self.model.layers.iter().chain(head_block) {
+            if let GpuLayerMix::Attention { w, .. } = &layer.mix {
+                w.q_norm.maybe_change_dtype(kv)?;
+                w.k_norm.maybe_change_dtype(kv)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop `seq`'s index — the slot's K/V was truncated to nothing.
+    pub fn reset_positional_state(&self, seq: usize) -> Result<()> {
+        if let Ok(mut map) = self.index.write() {
+            if let Some(caches) = map.get_mut(&seq) {
+                for c in caches.iter_mut() {
+                    c.reset();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Close `seq`'s index on a block boundary and hand back the page.
+    ///
+    /// The flush is what makes the piece self-contained: a section's tokens do
+    /// not end on a block boundary, so `T mod ratio` rows sit carried, and a
+    /// page without them would leave those tokens indexed by a block the *next*
+    /// section completes. The flushed block summarises fewer than `ratio`
+    /// tokens and is deliberately not what a continuous run would have produced
+    /// for that span — the scorer carries each page's width and so can express
+    /// a short block, where a block pooled across two sections is not
+    /// correctable at all.
+    #[cfg(feature = "cuda")]
+    pub fn seal_positional_state(&self, seq: usize) -> Result<Option<Vec<u8>>> {
+        let cfg = &self.model.cfg;
+        let ratios = self.attention_ratios();
+        let indexers = self.attention_indexers();
+        let mut map = self
+            .index
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        let Some(caches) = map.get_mut(&seq) else {
+            return Ok(None);
+        };
+        // The flush ropes its block at position `n_blocks`, so the table has to
+        // span one past the deepest cache here.
+        let depth = caches
+            .iter()
+            .map(|c| c.live_blocks() + 1)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let rope = self.index_rope_for(depth)?;
+        let mut pages = Vec::with_capacity(caches.len());
+        for ((c, &ratio), w) in caches.iter_mut().zip(ratios.iter()).zip(indexers.iter()) {
+            if ratio == 0 {
+                pages.push(SealedIndex {
+                    page: IndexPage::new(c.live_rows()?, 0, 1),
+                    open: c.open_rows()?,
+                });
+                continue;
+            }
+            let cells = c.flush_open_block(w, &rope, ratio, cfg.rms_norm_eps)?;
+            pages.push(SealedIndex {
+                page: IndexPage::new(c.live_rows()?, 0, cells.unwrap_or(ratio)),
+                // The flush consumed the carried rows, so the page IS the whole
+                // piece and there is no open block to carry with it.
+                open: c.open_rows()?,
+            });
+        }
+        Ok(Some(paged_index::encode_aux(&[], &pages)?))
+    }
+
+    /// The page covering `seq`'s tokens from `start_pos` onward.
+    ///
+    /// **Taken on a fork, because this slot keeps decoding.** A section is
+    /// ingested on a throwaway slot, so closing its cache in place costs
+    /// nothing; a conversation turn is sealed on the slot that produced it and
+    /// the flush would leave the live cache with a short block mid-sequence,
+    /// which every later position would then be addressed through. The fork is
+    /// `n_blocks × head_dim` floats per attention layer — the same shape of cost
+    /// a view carve already pays.
+    ///
+    /// `start_pos` is where the turn's own K/V begins. Rows below it belong to
+    /// what the projection injected ahead of this turn and are already pages of
+    /// their own; carrying them again would place the same block at two
+    /// positions.
+    #[cfg(feature = "cuda")]
+    pub fn seal_positional_range(&self, seq: usize, start_pos: usize) -> Result<Option<Vec<u8>>> {
+        let cfg = &self.model.cfg;
+        let ratios = self.attention_ratios();
+        let indexers = self.attention_indexers();
+        let map = self
+            .index
+            .read()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        let Some(caches) = map.get(&seq) else {
+            return Ok(None);
+        };
+        let depth = caches
+            .iter()
+            .map(|c| c.live_blocks() + 1)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let rope = self.index_rope_for(depth)?;
+        let mut pages = Vec::with_capacity(caches.len());
+        for ((c, &ratio), w) in caches.iter().zip(ratios.iter()).zip(indexers.iter()) {
+            if ratio == 0 {
+                pages.push(SealedIndex {
+                    page: IndexPage::new(c.live_rows()?, 0, 1),
+                    open: c.open_rows()?,
+                });
+                continue;
+            }
+            // **Two row spaces, and they are not the same one.**
+            // `candidates_at` counts blocks over the WHOLE sequence — the
+            // injected pages ahead of this turn and the live tail together —
+            // while `live_rows` is the tail alone. Subtracting the page span
+            // converts the global block index into an offset into the tail,
+            // which is where a turn's own rows live. Without it the offset
+            // overshoots by exactly the number of rows the projection injected,
+            // and the narrow is refused.
+            //
+            // Saturating below the pages; refused above the tail. A `start_pos`
+            // that lands inside the injected pages has no offset in tail row
+            // space, and silently clamping it would hand back a page describing
+            // a different span than the caller asked for — rows for the wrong
+            // positions, which selects fluently against the wrong context. Said
+            // plainly here instead: `narrow` reports this as
+            // `start > dim_len` naming neither the sequence nor the span, from
+            // a call site several layers removed.
+            let first = if start_pos == 0 {
+                0
+            } else {
+                c.candidates_at(start_pos - 1, ratio)
+                    .saturating_sub(c.page_row_span())
+            };
+            let mut fork = c.fork()?;
+            let cells = fork.flush_open_block(w, &rope, ratio, cfg.rms_norm_eps)?;
+            let rows = fork.live_rows()?;
+            let n = rows.dim(0)?;
+            if first > n {
+                candle::bail!(
+                    "qsa seal: seq {seq} asked for the rows from position {start_pos}, which \
+                     is row {first} of a {n}-row live tail — the span starts inside the \
+                     injected pages, whose rows this cannot return. Seal the span from the \
+                     sequence that forwarded it, where it is the tail."
+                );
+            }
+            let take = n - first;
+            pages.push(SealedIndex {
+                page: IndexPage::new(rows.narrow(0, first, take)?, 0, cells.unwrap_or(ratio)),
+                open: fork.open_rows()?,
+            });
+        }
+        Ok(Some(paged_index::encode_aux(&[], &pages)?))
+    }
+
+    /// Seal the rows for the last `tokens` tokens of `seq`, wherever they live.
+    ///
+    /// **Why this is not [`Self::seal_positional_range`].** That one returns
+    /// live-tail rows only, which is right for a span the sequence forwarded
+    /// and still holds. A turn's rows do not stay there: a reprojection
+    /// re-injects the turn's user half from cache and pushes it as a *page*, so
+    /// after one reprojection the turn is split — its opening tokens sit in a
+    /// page and only its decoded tail sits in the live rows. Sealing the tail
+    /// alone then drops exactly the user's message, and the model decodes a
+    /// turn whose question it cannot attend to; measured, it invents a
+    /// different question and answers that instead.
+    ///
+    /// Returns one blob per source page in ascending order, with the live tail
+    /// last. They are pushed in that order, which preserves each piece's own
+    /// ragged width — merging them into one page would re-pool rows across
+    /// boundaries the pieces ended at.
+    pub fn seal_positional_tail_span(&self, seq: usize, tokens: usize) -> Result<Vec<Vec<u8>>> {
+        if tokens == 0 {
+            return Ok(Vec::new());
+        }
+        let cfg = &self.model.cfg;
+        let ratios = self.attention_ratios();
+        let indexers = self.attention_indexers();
+        let map = self
+            .index
+            .read()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        let Some(caches) = map.get(&seq) else {
+            return Ok(Vec::new());
+        };
+        // The page structure is the same on every layer — they index one stream
+        // — so the walk is decided once, on the first live cache.
+        let Some((probe, &probe_ratio)) = caches.iter().zip(ratios.iter()).find(|(_, r)| **r > 0)
+        else {
+            return Ok(Vec::new());
+        };
+        let (blocks, open) = probe.seal_shape();
+        let tail_tokens = blocks * probe_ratio + open;
+        // Whole trailing pages, until the span is covered.
+        let mut need = tokens.saturating_sub(tail_tokens);
+        let mut first_page = probe.page_count();
+        while need > 0 && first_page > 0 {
+            let Some((_, width)) = probe.page_at(first_page - 1) else {
+                break;
+            };
+            first_page -= 1;
+            need = need.saturating_sub(width);
+        }
+
+        let mut blobs = Vec::new();
+        for pi in first_page..probe.page_count() {
+            let mut layer_pages = Vec::with_capacity(caches.len());
+            for c in caches.iter() {
+                let (p, _) = c
+                    .page_at(pi)
+                    .ok_or_else(|| candle::Error::Msg(format!("qsa seal: page {pi} vanished")))?;
+                layer_pages.push(SealedIndex {
+                    page: IndexPage::new(p.keys.clone(), 0, p.last_cells),
+                    // A page is already closed; only the live tail carries an
+                    // open block.
+                    open: p.keys.narrow(0, 0, 0)?,
+                });
+            }
+            blobs.push(paged_index::encode_aux(&[], &layer_pages)?);
+        }
+
+        if tail_tokens > 0 {
+            let depth = caches
+                .iter()
+                .map(|c| c.live_blocks() + 1)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let rope = self.index_rope_for(depth)?;
+            let mut layer_pages = Vec::with_capacity(caches.len());
+            for ((c, &ratio), w) in caches.iter().zip(ratios.iter()).zip(indexers.iter()) {
+                if ratio == 0 {
+                    layer_pages.push(SealedIndex {
+                        page: IndexPage::new(c.live_rows()?, 0, 1),
+                        open: c.open_rows()?,
+                    });
+                    continue;
+                }
+                let mut fork = c.fork()?;
+                let cells = fork.flush_open_block(w, &rope, ratio, cfg.rms_norm_eps)?;
+                layer_pages.push(SealedIndex {
+                    page: IndexPage::new(fork.live_rows()?, 0, cells.unwrap_or(ratio)),
+                    open: fork.open_rows()?,
+                });
+            }
+            blobs.push(paged_index::encode_aux(&[], &layer_pages)?);
+        }
+        Ok(blobs)
+    }
+
+    /// Install a sealed page per attention layer ahead of `seq`'s live tail.
+    #[cfg(feature = "cuda")]
+    pub fn push_positional_state(&self, seq: usize, blob: &[u8]) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let (_, sealed) = paged_index::decode_aux(blob, &self.model.device)?;
+        let want = cfg.kv_layers().total();
+        if sealed.len() != want {
+            candle::bail!(
+                "qwen4exp: an injected piece carries {} index pages but this checkpoint has \
+                 {want} KV layers — the layers it does not cover would select against an \
+                 empty candidate set",
+                sealed.len()
+            );
+        }
+        let ratios = self.attention_ratios();
+        let mut map = self
+            .index
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        let caches = map.entry(seq).or_default();
+        if caches.is_empty() {
+            for _ in 0..want {
+                caches.push(IndexCache::new(cfg.indexer.head_dim, &self.model.device)?);
+            }
+        }
+        for ((c, s), &ratio) in caches.iter_mut().zip(sealed.iter()).zip(ratios.iter()) {
+            if ratio == 0 {
+                continue;
+            }
+            c.push_page(s.page.clone(), ratio)?;
+        }
+        Ok(())
+    }
+
+    /// Declare `seq`'s carried state deliberately installed, so the next wave
+    /// does not reset it out from under the caller. See the `seeded` field.
+    pub(super) fn mark_seeded(&self, seq: usize) -> Result<()> {
+        self.seeded
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: seeded lock poisoned".into()))?
+            .insert(seq);
+        Ok(())
+    }
+
+    /// A view finalizes: `child`'s state becomes `parent`'s.
+    ///
+    /// A move, not a merge — a view is a linear continuation of its parent, so
+    /// what it holds now is what the parent's state becomes. The child's
+    /// entries are gone afterwards and the parent's previous ones are dropped.
+    pub fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
+        let store = {
+            let mut map = self
+                .recurrent
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
+            match map.remove(&child) {
+                Some(s) => s,
+                // The view never ran a wave; the parent keeps what it had.
+                None => return Ok(()),
+            }
+        };
+        self.recurrent
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
+            .insert(parent, store);
+        {
+            let mut map = self
+                .ple
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?;
+            if let Some(p) = map.remove(&child) {
+                map.insert(parent, p);
+            }
+        }
+        {
+            let mut map = self
+                .index
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+            if let Some(i) = map.remove(&child) {
+                map.insert(parent, i);
+            }
+        }
+        {
+            let mut map = self
+                .seeds
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: seeds lock poisoned".into()))?;
+            if let Some(s) = map.remove(&child) {
+                map.insert(parent, s);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read `seq`'s GDN state back as the snapshot record's layer rows.
+    ///
+    /// `None` when the sequence carries none — a slot that has never run a wave
+    /// has nothing worth persisting, and writing a zero snapshot would be worse
+    /// than writing none: resume would install it and report success.
+    ///
+    /// **This is the GDN state only.** The PLE window rides in the record's
+    /// auxiliary blob ([`Self::export_aux_state`]) and the QSA index is rebuilt
+    /// rather than stored — see this impl block's header for why the three
+    /// classes are treated differently.
+    pub fn export_recurrent(&self, seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
+        let map = self
+            .recurrent
+            .read()
+            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
+        let Some(store) = map.get(&seq) else {
+            return Ok(None);
+        };
+        // `export` refuses mid-wave itself; the seal runs outside the wave, so
+        // reaching that error means the ordering broke.
+        let layers = store.export()?;
+        Ok(Some((store.schedule_hash(), layers)))
+    }
+
+    /// Scatter a snapshot into `seq`'s GDN state — the resume path.
+    ///
+    /// Creates the store if the slot has none yet, which is the normal case:
+    /// resume runs at `create_sequence`, before any wave. `import` validates
+    /// the schedule hash and every layer's geometry before touching a tensor.
+    pub fn restore_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: &[ExportedLayerState],
+    ) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let mut map = self
+            .recurrent
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
+        let store = match map.entry(seq) {
+            std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(
+                RecurrentStateStore::new(&cfg.layer_kinds, &cfg.delta_net, &self.model.device)?,
+            ),
+        };
+        store.import(schedule_hash, layers)?;
+        drop(map);
+        self.mark_seeded(seq)
+    }
+
+    /// The carried state that is not a DeltaNet layer stack — the PLE window
+    /// and one QSA index page per attention layer — for the turn record's
+    /// auxiliary slot.
+    ///
+    /// Each layer's record carries the cache's completed rows AND its carried
+    /// open block, so a resumed sequence's index covers exactly the tokens its
+    /// restored K/V does — including the `T mod ratio` that had not completed a
+    /// row when the turn ended, which is the usual case rather than an edge one.
+    /// Rows above `n_blocks` (and `n_open`) are dead until an append writes them
+    /// and are not persisted.
+    ///
+    /// `last_cells` is `ratio`: every row this cache completed is a full one.
+    /// A page whose last row is SHORT is what a per-turn seal emits after
+    /// [`IndexCache::flush_open_block`], for a window reconstructed from several
+    /// turns' pieces — the container's format is the same either way, which is
+    /// what lets both forms share one record.
+    pub fn export_aux_state(&self, seq: usize) -> Result<Option<Vec<u8>>> {
+        let ple_blob = {
+            let map = self
+                .ple
+                .read()
+                .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?;
+            match map.get(&seq) {
+                Some(state) => state.encode()?,
+                None => return Ok(None),
+            }
+        };
+        let layers = {
+            let map = self
+                .index
+                .read()
+                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+            match map.get(&seq) {
+                Some(caches) => {
+                    let mut v = Vec::with_capacity(caches.len());
+                    for (c, ratio) in caches.iter().zip(self.attention_ratios()) {
+                        v.push(SealedIndex {
+                            page: IndexPage::new(c.live_rows()?, 0, ratio.max(1)),
+                            open: c.open_rows()?,
+                        });
+                    }
+                    v
+                }
+                None => Vec::new(),
+            }
+        };
+        Ok(Some(paged_index::encode_aux(&ple_blob, &layers)?))
+    }
+
+    /// Install a PLE window and the QSA index pages from a snapshot's
+    /// auxiliary blob.
+    ///
+    /// Refuses a page count that does not match this checkpoint's KV layers
+    /// rather than installing a partial index: a sequence whose deepest
+    /// attention layers had no index would select against an empty candidate
+    /// set there and attend to nothing, which reads as a retrieval that simply
+    /// found nothing relevant.
+    pub fn restore_aux_state(&self, seq: usize, blob: &[u8]) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let (ple_blob, layers) = paged_index::decode_aux(blob, &self.model.device)?;
+        let state = PleState::decode(
+            &ple_blob,
+            cfg.ple.conv_history(),
+            cfg.hc.dim(cfg.hidden_size),
+            &self.model.device,
+        )?;
+        let want = cfg.kv_layers().total();
+        if !layers.is_empty() && layers.len() != want {
+            candle::bail!(
+                "qwen4exp: the snapshot carries {} index pages but this checkpoint has {want} \
+                 KV layers — a partial index would select against an empty candidate set on \
+                 the layers it does not cover",
+                layers.len()
+            );
+        }
+        self.ple
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?
+            .insert(seq, state);
+        if !layers.is_empty() {
+            let mut caches = Vec::with_capacity(layers.len());
+            for s in &layers {
+                caches.push(IndexCache::from_rows(
+                    &s.page.keys,
+                    &s.open,
+                    cfg.indexer.head_dim,
+                )?);
+            }
+            self.index
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?
+                .insert(seq, caches);
+        }
+        self.mark_seeded(seq)
+    }
+
+    /// Bytes the carried state holds for every live sequence.
+    ///
+    /// Reported because it is large and it moves: this is a span-reservation
+    /// tenant, and a total that omits it makes the partition look emptier than
+    /// it is — the same blindness that let the dense weights hide.
+    pub fn recurrent_reserved_bytes(&self) -> usize {
+        let gdn: usize = self
+            .recurrent
+            .read()
+            .map(|m| m.values().map(|s| s.reserved_bytes()).sum())
+            .unwrap_or(0);
+        let idx: usize = self
+            .index
+            .read()
+            .map(|m| {
+                m.values()
+                    .map(|caches| {
+                        caches
+                            .iter()
+                            .map(|c| {
+                                c.capacity_blocks()
+                                    * self.model.cfg.indexer.head_dim
+                                    * std::mem::size_of::<f32>()
+                            })
+                            .sum::<usize>()
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        gdn + idx
+    }
+
     pub fn new(model: Qwen4ExpGpu) -> Result<Self> {
         // `[rope_dim/2]` inverse frequencies for the paged kernels — the
         // rotated pairs only, exactly as the hybrid builds them; the layout's
@@ -136,6 +816,7 @@ impl Qwen4ExpBatched {
             model,
             recurrent: RwLock::new(HashMap::new()),
             seeds: RwLock::new(SeedStore::new()),
+            seeded: RwLock::new(HashSet::new()),
             verify: RwLock::new(None),
             ple: RwLock::new(HashMap::new()),
             index: RwLock::new(HashMap::new()),
@@ -186,7 +867,17 @@ impl Qwen4ExpBatched {
     ) -> Result<()> {
         let cfg = &self.model.cfg;
         let hc_dim = cfg.hc.count * cfg.hidden_size;
-        let starting_over = offset == 0 && layer_start == 0;
+        // Consumed here, once, whether or not it fires — see `seeded`. Taken
+        // before the four class blocks so all of them see the same answer: a
+        // flag read per class would be true for the first and false for the
+        // rest, resetting three quarters of a restored sequence.
+        let seeded = layer_start == 0
+            && self
+                .seeded
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: seeded lock poisoned".into()))?
+                .remove(&seq);
+        let starting_over = offset == 0 && layer_start == 0 && !seeded;
         {
             let mut idx = self
                 .index
@@ -204,6 +895,20 @@ impl Qwen4ExpBatched {
                         .collect::<Result<Vec<_>>>()?,
                 ),
             };
+            // **A sequence-start reset must not throw away installed pages.**
+            //
+            // `starting_over` means "this slot is at position 0 and nobody
+            // declared its state deliberate", which for the index is only true
+            // before anything was injected. A projection installs its pages and
+            // THEN fills the K/V, so a wave that lands between those two steps
+            // sees offset 0, resets, and silently discards the rows for a prefix
+            // the slot is about to hold — leaving pages 0 against a K/V of
+            // hundreds of tokens, invisible until the select refuses at depth.
+            let injected_before_reset = starting_over
+                && caches
+                    .iter()
+                    .zip(self.attention_ratios())
+                    .any(|(c, ratio)| ratio > 0 && c.page_row_span() > 0);
             for (cache, ratio) in caches.iter_mut().zip(self.attention_ratios()) {
                 if starting_over {
                     cache.reset();
@@ -211,6 +916,74 @@ impl Qwen4ExpBatched {
                 if ratio > 0 {
                     cache.ensure_capacity(tokens, ratio)?;
                 }
+            }
+            if injected_before_reset {
+                tracing::warn!(
+                    seq,
+                    offset,
+                    tokens,
+                    "qwen4exp sequence-start reset discarded injected index pages — the \
+                     slot keeps the K/V they described and loses every row, so the select \
+                     refuses once it passes the identity threshold"
+                );
+            }
+            // **The index covers exactly the K/V that is already there.**
+            //
+            // At wave entry the sequence holds `offset` tokens and every live
+            // cache must already account for all of them — as injected pages,
+            // as appended rows, or as a mix. Anything less and this slot carries
+            // K/V nothing indexed, which is invisible while the sequence is
+            // under the identity threshold and refuses the select the moment it
+            // crosses. Checked here, on host counters already in hand (no
+            // launch, no readback), because `score_rows` finds it at depth —
+            // long after whichever step dropped the tokens, and only for the
+            // sequences that get deep enough to look.
+            //
+            // Comparing the caches only against EACH OTHER is not this check:
+            // a fork that rebuilds a child's caches from pages leaves all
+            // thirteen short by the parent's un-sealed tail, in perfect
+            // agreement.
+            // **Both directions.** Short is the loud failure — the select
+            // refuses. Long is the silent one: the rows are there, so nothing
+            // errors, and the extra ones claim positions this slot does not
+            // hold, which reads as a plausible answer about the wrong context.
+            // A tail restored twice lands exactly here.
+            // **Only on the window that enters the wave.** A sweep is split
+            // into layer windows and `ensure_seq_state` runs per window, so by
+            // the second one the earlier layers have already appended this
+            // wave's rows — their coverage legitimately reads `tokens`, not
+            // `offset`, and comparing there reports every wide wave as
+            // over-covered. The first window is the only moment at which the
+            // whole stack is still standing at `offset`.
+            let off: Vec<(usize, usize)> = if layer_start != 0 {
+                Vec::new()
+            } else {
+                caches
+                    .iter()
+                    .zip(self.attention_ratios())
+                    .enumerate()
+                    .filter(|(_, (_, ratio))| *ratio > 0)
+                    .filter_map(|(layer, (c, ratio))| {
+                        let have = c.indexed_tokens(ratio);
+                        // The open block carries up to `ratio - 1` tokens the
+                        // wave is about to complete, so equality is not
+                        // expected — only a whole block of disagreement is.
+                        (have + ratio <= offset || have > offset + ratio).then_some((layer, have))
+                    })
+                    .collect()
+            };
+            if !off.is_empty() {
+                tracing::warn!(
+                    seq,
+                    offset,
+                    tokens,
+                    starting_over,
+                    layers = ?off,
+                    "qwen4exp index disagrees with this sequence's K/V at wave entry — \
+                     (kv layer, tokens indexed) against {offset} held: short refuses the \
+                     select past the identity threshold, long selects over positions the \
+                     slot does not hold"
+                );
             }
         }
         {
@@ -269,6 +1042,27 @@ impl Qwen4ExpBatched {
             }
         }
         ratios
+    }
+
+    /// Each KV layer's indexer weights, in the same KV-layer order as
+    /// [`Self::attention_ratios`] — the two are zipped against the caches, so
+    /// they must walk the layers identically.
+    pub(super) fn attention_indexers(&self) -> Vec<&IndexerWeights> {
+        let mut out: Vec<&IndexerWeights> = self
+            .model
+            .layers
+            .iter()
+            .filter_map(|l| match &l.mix {
+                GpuLayerMix::Attention { indexer, .. } => Some(indexer),
+                GpuLayerMix::DeltaNet(_) => None,
+            })
+            .collect();
+        if let Some(head) = &self.model.mtp {
+            if let GpuLayerMix::Attention { indexer, .. } = &head.block.mix {
+                out.push(indexer);
+            }
+        }
+        out
     }
 
     /// The indexer's rotation tables, covering every position the arena can
@@ -365,23 +1159,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     }
 
     fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
-        // The Gated Residual runs F32 end to end and the projections quantize
-        // their own activations — but the per-head Q/K norms run INSIDE the
-        // projection at the KV arena's width, so their weights are
-        // materialised here, at session creation, never inside the wave.
-        // The draft head's block too. It is a full-attention layer with Q/K
-        // norms of its own, and it was POPPED out of `layers` at load — so a
-        // loop over `layers` alone leaves exactly one attention layer holding
-        // F32 norms against BF16 activations, and the head's first pass fails
-        // inside the wave rather than here.
-        let head_block = self.model.mtp.as_ref().map(|h| &h.block);
-        for layer in self.model.layers.iter().chain(head_block) {
-            if let GpuLayerMix::Attention { w, .. } = &layer.mix {
-                w.q_norm.maybe_change_dtype(dtype)?;
-                w.k_norm.maybe_change_dtype(dtype)?;
-            }
-        }
-        Ok(())
+        Qwen4ExpBatched::maybe_change_dtype(self, dtype, dtype)
     }
 
     fn num_layers(&self) -> usize {
@@ -404,6 +1182,117 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         // The GDN state is an accumulated sum with no per-token decomposition,
         // and the PLE conv history is likewise irrecoverable from the KV.
         true
+    }
+
+    fn recurrent_memory_count(&self) -> usize {
+        Qwen4ExpBatched::recurrent_len(self).unwrap_or(0)
+    }
+
+    fn recurrent_reserved_bytes(&self) -> usize {
+        Qwen4ExpBatched::recurrent_reserved_bytes(self)
+    }
+
+    /// A view carve. The child borrows the parent's K/V; its carried state has
+    /// to be copied, because it is about to advance it.
+    fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
+        Qwen4ExpBatched::fork_recurrent(self, parent, child)
+    }
+
+    /// A view finalizes: its decoded blocks transfer to the parent, and its
+    /// carried state goes with them.
+    fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
+        Qwen4ExpBatched::move_recurrent(self, child, parent)
+    }
+
+    fn export_recurrent(&self, seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
+        Qwen4ExpBatched::export_recurrent(self, seq)
+    }
+
+    fn export_aux_state(&self, seq: usize) -> Result<Option<Vec<u8>>> {
+        Qwen4ExpBatched::export_aux_state(self, seq)
+    }
+
+    /// **Attention layers only, and not the draft head's.**
+    ///
+    /// The default assumes a uniform transformer where every layer attends and
+    /// so every layer has a Q in the KV cache to capture. Three quarters of
+    /// this stack is gated DeltaNet and has no Q at all, and the layer past the
+    /// trunk is the speculative head's — its Q is about a continuation the head
+    /// proposed, not about the conversation.
+    ///
+    /// Reporting the trunk's 48 here is not a slow path, it is silence: the
+    /// fold is derived from this number, so it grouped `[46, 1, 1]` over a
+    /// stack that offers 12 KV layers, could not fill its three layer-groups,
+    /// and refused every capture — turns sealed, K/V was written, and only the
+    /// signature was quietly missing, leaving retrieval on recency.
+    fn model_core_properties(&self) -> ModelCoreProperties {
+        let mut props = ManagedBatchedModel::default_core_properties(self);
+        props.provenance_capture_layers = self.model.cfg.n_attention_layers();
+        props
+    }
+
+    fn carries_positional_state(&self) -> bool {
+        // The QSA index: one pooled key per `ratio` tokens per attention layer,
+        // derived from hidden states rather than from stored K, so borrowing a
+        // prefix's K/V does not bring it along.
+        true
+    }
+
+    fn reset_positional_state(&self, seq: usize) -> Result<()> {
+        Qwen4ExpBatched::reset_positional_state(self, seq)
+    }
+
+    fn seal_positional_state(&self, seq: usize) -> Result<Option<Vec<u8>>> {
+        Qwen4ExpBatched::seal_positional_state(self, seq)
+    }
+
+    fn seal_positional_range(&self, seq: usize, start_pos: usize) -> Result<Option<Vec<u8>>> {
+        Qwen4ExpBatched::seal_positional_range(self, seq, start_pos)
+    }
+
+    fn seal_positional_tail_span(&self, seq: usize, tokens: usize) -> Result<Vec<Vec<u8>>> {
+        Qwen4ExpBatched::seal_positional_tail_span(self, seq, tokens)
+    }
+
+    fn positional_coverage(&self, seq: usize) -> Option<usize> {
+        let map = self.index.read().ok()?;
+        // **A sequence with no entry covers nothing, and says so.** Returning
+        // `None` here reads as "this model keeps no per-position state" to every
+        // caller, which is how a slot holding borrowed K/V and no index at all
+        // slipped past guards written as `if let Some(cov)` — the one case they
+        // most needed to catch.
+        let Some(caches) = map.get(&seq) else {
+            return Some(0);
+        };
+        // The narrowest live layer: they index one stream, so the smallest is
+        // what the sequence can actually select against.
+        caches
+            .iter()
+            .zip(self.attention_ratios())
+            .filter(|(_, ratio)| *ratio > 0)
+            .map(|(c, ratio)| c.indexed_tokens(ratio))
+            .min()
+            .or(Some(0))
+    }
+
+    fn push_positional_state(&self, seq: usize, blob: &[u8]) -> Result<bool> {
+        Qwen4ExpBatched::push_positional_state(self, seq, blob)?;
+        Ok(true)
+    }
+
+    fn restore_aux_state(&self, seq: usize, blob: &[u8]) -> Result<bool> {
+        Qwen4ExpBatched::restore_aux_state(self, seq, blob)?;
+        Ok(true)
+    }
+
+    fn restore_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: &[ExportedLayerState],
+    ) -> Result<bool> {
+        Qwen4ExpBatched::restore_recurrent(self, seq, schedule_hash, layers)?;
+        Ok(true)
     }
 
     /// This checkpoint's ladder, gated on the head actually being loaded — a
@@ -637,8 +1526,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if let Some(head_kv) = cfg.mtp_kv_layer() {
             session.cap_layer_seal_level(head_kv, DRAFT_HEAD_MAX_COMPRESSION)?;
         }
-        // The Q/K norm weights meet activations at the KV arena's width.
-        self.maybe_change_dtype(session.activation_dtype())?;
+        // The Q/K norm weights meet activations at the KV arena's width, which
+        // is NOT the residual stream's — see `maybe_change_dtype`. Both are
+        // passed so the call site says which is which.
+        Qwen4ExpBatched::maybe_change_dtype(
+            self,
+            session.activation_dtype(),
+            session.kv_live_dtype(),
+        )?;
         Ok(session)
     }
 
@@ -674,6 +1569,12 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             m.remove(&seq);
         }
         if let Ok(mut m) = self.seeds.write() {
+            m.remove(&seq);
+        }
+        // Or the next sequence to be handed this slot id inherits a suppression
+        // it never asked for, and its first wave keeps whatever the released
+        // one left behind.
+        if let Ok(mut m) = self.seeded.write() {
             m.remove(&seq);
         }
         Ok(())

@@ -196,6 +196,7 @@ impl Manifest {
             | RecordType::Distilled
             | RecordType::TurnCoupling
             | RecordType::ProjectionEvents
+            | RecordType::TurnIndexPage
             // NPCs belong to whoever holds the registry — `npcd` — not to the
             // manifest's singleton hints. They reach it through the same walker
             // sink every other per-entity record uses.

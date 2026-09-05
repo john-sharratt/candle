@@ -16,19 +16,23 @@ extern "C" {
 int32_t run_paged_decode_fp16_hd64(const void*, const uint8_t*, void*, int32_t, int32_t,
                                    int32_t, float, const void*, const void*, const float*,
                                    int32_t, void*, void*, const void*, int64_t,
-                                   const uint32_t*, const uint32_t*, int32_t, int32_t);
+                                   const uint32_t*, const uint32_t*, const uint2*,
+                                   const uint2*, int32_t, int32_t);
 int32_t run_paged_decode_fp16_hd96(const void*, const uint8_t*, void*, int32_t, int32_t,
                                    int32_t, float, const void*, const void*, const float*,
                                    int32_t, void*, void*, const void*, int64_t,
-                                   const uint32_t*, const uint32_t*, int32_t, int32_t);
+                                   const uint32_t*, const uint32_t*, const uint2*,
+                                   const uint2*, int32_t, int32_t);
 int32_t run_paged_decode_fp16_hd128(const void*, const uint8_t*, void*, int32_t, int32_t,
                                     int32_t, float, const void*, const void*, const float*,
                                     int32_t, void*, void*, const void*, int64_t,
-                                    const uint32_t*, const uint32_t*, int32_t, int32_t);
+                                    const uint32_t*, const uint32_t*, const uint2*,
+                                   const uint2*, int32_t, int32_t);
 int32_t run_paged_decode_fp16_hd256(const void*, const uint8_t*, void*, int32_t, int32_t,
                                     int32_t, float, const void*, const void*, const float*,
                                     int32_t, void*, void*, const void*, int64_t,
-                                    const uint32_t*, const uint32_t*, int32_t, int32_t);
+                                    const uint32_t*, const uint32_t*, const uint2*,
+                                   const uint2*, int32_t, int32_t);
 }
 
 // Returns 0 on success, nonzero when the launch needed the split-KV partial
@@ -49,6 +53,8 @@ extern "C" int32_t run_paged_decode_fp16(
     void* stream_ptr,
     const uint32_t* sel_entries,
     const uint32_t* sel_cnt,
+    const uint2* sel_pages,
+    const uint2* sel_page_win,
     int32_t sel_stride,
     int32_t sel_ratio
 ) {
@@ -57,7 +63,7 @@ extern "C" int32_t run_paged_decode_fp16(
         return run_paged_decode_fp16_hd##HD( \
             q_ptr, headers_ptr, o_ptr, num_active_slots, n_q_head, n_kv_head, \
             softmax_scale, k_new, v_new, rope_cs, rope_interleaved, stream_ptr, \
-            nullptr, nullptr, 0, sel_entries, sel_cnt, sel_stride, sel_ratio)
+            nullptr, nullptr, 0, sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio)
     switch (head_dim) {
         case 64:  LAUNCH_INT8(64);
         case 96:  LAUNCH_INT8(96);
@@ -95,6 +101,8 @@ extern "C" int32_t run_paged_decode_fp16_q8(
     void* stream_ptr,
     const uint32_t* sel_entries,
     const uint32_t* sel_cnt,
+    const uint2* sel_pages,
+    const uint2* sel_page_win,
     int32_t sel_stride,
     int32_t sel_ratio
 ) {
@@ -103,7 +111,7 @@ extern "C" int32_t run_paged_decode_fp16_q8(
         return run_paged_decode_fp16_hd##HD(                                               \
             q_ptr, headers_ptr, nullptr, num_active_slots, n_q_head, n_kv_head,            \
             softmax_scale, k_new, v_new, rope_cs, rope_interleaved, stream_ptr,            \
-            q8_out, gate, gate_slot_stride, sel_entries, sel_cnt, sel_stride, sel_ratio)
+            q8_out, gate, gate_slot_stride, sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio)
     switch (head_dim) {
         case 128: LAUNCH_Q8(128);
         case 256: LAUNCH_Q8(256);

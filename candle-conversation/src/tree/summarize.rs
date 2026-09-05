@@ -251,6 +251,8 @@ impl SummarizationTask {
         if scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id: seq_id,
+                // A summary probe is a single turn on a scratch slot.
+                keep_reasoning: false,
                 projection_inputs: None,
                 prefill_tokens,
                 prefill_text: window_text,

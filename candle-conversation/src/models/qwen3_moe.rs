@@ -28,6 +28,7 @@ pub(super) fn qwen3_30b_a3b_q6() -> ModelSpec {
         // neither of which can toggle — see the spec history.)
         model_repo: "unsloth/Qwen3-30B-A3B-GGUF".into(),
         model_filename: "Qwen3-30B-A3B-Q6_K.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 25_092_532_800,
         tokenizer_repo: "Qwen/Qwen3-30B-A3B".into(),
         // Unpinned: no revision verified against this checkpoint's own token
@@ -49,6 +50,7 @@ pub(super) fn qwen3_30b_a3b_q6() -> ModelSpec {
 pub(super) fn qwen3_30b_a3b_q4() -> ModelSpec {
     ModelSpec {
         model_filename: "Qwen3-30B-A3B-Q4_K_M.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 18_556_686_912,
         ..qwen3_30b_a3b_q6()
     }

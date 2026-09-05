@@ -595,10 +595,15 @@ pub fn sealed_memory(engine: &ConversationEngine, timeline: TimelineId) -> Snaps
 }
 
 /// Whether a sealed record carries memory that is not all zeros.
+///
+/// Both classes count: the delta-rule layers and the model-opaque blob beside
+/// them. A model whose recurrence lives entirely in the blob would otherwise
+/// read as "forgotten" here while resuming perfectly.
 pub fn sealed_is_non_zero(p: &SnapshotPayload) -> bool {
     p.layers
         .iter()
         .any(|l| l.state.iter().any(|&b| b != 0) || l.conv_tail.iter().any(|&b| b != 0))
+        || p.aux.iter().any(|&b| b != 0)
 }
 
 /// Layer indices whose memory differs between two sealed records.

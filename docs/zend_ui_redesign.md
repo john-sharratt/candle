@@ -180,7 +180,19 @@ seedLogs() -> LogLine[]                              // backlog
 subscribeLogs(onLine) -> unsubscribe()              // live stream
 ```
 `opts = { think: boolean, effort: 0..4, verbosity: 0..4 }`.
-`handlers (chat) = { onStatus(text), onToken(delta), onProjection(span), onLog?(), onDone() }`.
+`handlers (chat) = { onStatus(text), onToken(delta), onProjection(span), onLog?(), onError?(message), onDone() }`.
+
+`onError` fires when the stream **failed** rather than finished — a non-2xx
+response, a body-less response, a socket that broke mid-stream, or a stream that
+closed without ever sending a frame. `onDone` always runs after it, so a caller
+that ignores `onError` still unlocks its composer; a caller that handles it must
+not then hydrate from the server, because a failed turn persisted nothing and
+the fetch would replace the error with an empty conversation. A user abort is
+**not** an error: it resolves through `onDone` alone.
+
+The distinction is load-bearing. While every failure path called `onDone`, a
+wedged turn was indistinguishable from the model answering with nothing — the
+conversation opened, flashed, and went blank with no message anywhere in the UI.
 `handlers (upload) = { onFileStart(fileId, name, totalParts), onPart(fileId, partIndex, totalParts), onFileDone(fileId, FileMeta), onAllDone(FileMeta[]), onError(fileId, message) }`.
 
 ### 4.2 Objects

@@ -17,6 +17,7 @@
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
 mod decode;
+pub mod exported_state;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
@@ -78,6 +79,8 @@ use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked,
 };
 use candle_transformers::models::delta_net::ExportedLayerState;
+
+use self::exported_state::{ExportedState, SharedState};
 use crossbeam::channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -219,6 +222,12 @@ pub(crate) enum SchedulerRequest {
         /// the turn's [`TurnLayout`] at seal so prior turns re-render their
         /// switch.
         no_think: bool,
+        /// Seal this turn with its `<think>` reasoning intact rather than
+        /// re-prefilling it away — see [`crate::TurnOptions::keep_reasoning`].
+        /// The seal fires at its usual moment; only the grid it captures
+        /// differs, so the reasoning is still attendable when a tool result
+        /// decodes against it on the following turn.
+        keep_reasoning: bool,
         /// Marker-delimited projection points — token offsets into `prefill_tokens`
         /// where a staged calibration prefill fires a projection. The prefill wave
         /// stops its per-pass advance on each offset and emits a `ProjectionEvent`,
@@ -349,8 +358,7 @@ pub(crate) enum SchedulerRequest {
     /// Replies `Ok(false)` when the model carries no recurrent state.
     InstallRecurrentState {
         sequence_ids: Vec<SequenceId>,
-        schedule_hash: u64,
-        layers: Arc<[ExportedLayerState]>,
+        state: SharedState,
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 
@@ -386,7 +394,7 @@ pub(crate) enum SchedulerRequest {
         /// The branch's complete ordered token stream — every sealed section of
         /// the system prompt under one selector assignment, concatenated.
         tokens: TokenBuffer,
-        response_tx: Sender<Result<Option<(u64, Vec<ExportedLayerState>)>, ConversationError>>,
+        response_tx: Sender<Result<Option<ExportedState>, ConversationError>>,
     },
 
     /// Recover a previously-persisted section directly from the redo
@@ -1081,6 +1089,12 @@ struct ReprojectInFlight {
     view_id: SequenceId,
     parent_id: SequenceId,
     tail_per_layer: Vec<candle_nn::kv_cache::SealedSequence>,
+    /// The index rows describing `tail_per_layer`, taken in `prepare` before the
+    /// re-projection resets the parent's per-position state, and re-attached in
+    /// `complete` where that K/V is injected back. Travels with the K/V it
+    /// describes for the same reason a sealed section's page does: the rows come
+    /// from hidden states, so nothing downstream can recompute them.
+    tail_index_page: Vec<Vec<u8>>,
     decode_state: DecodeState,
     sampling_state: Option<SequenceSamplingState>,
     sections_len: usize,
@@ -1123,6 +1137,11 @@ struct DecodeState {
     /// The `(layer, group, timeline)` to write to is looked up from
     /// [`Scheduler::slot_targets`] at seal time, not carried here.
     seal_action: SealAction,
+    /// Seal with the `<think>` reasoning intact — see
+    /// [`crate::TurnOptions::keep_reasoning`]. Carried from submit because the
+    /// decision has to be made before `Done`, and the caller only learns there
+    /// was a tool call after it.
+    keep_reasoning: bool,
     /// Whether this sequence has finished (EOS or max_tokens).
     finished: bool,
     /// Decode start time (for stats).
@@ -1340,6 +1359,16 @@ struct PendingTurnSeal {
     /// First block of the turn's own region on `parent_id` — the clean re-prefill
     /// appends here, and the seal captures `[seal_block_from, block_count)`.
     seal_block_from: usize,
+    /// Token position the turn's own region starts at, read after the truncate
+    /// that anchors it.
+    ///
+    /// The K/V boundary is a BLOCK index and the index cache is addressed by
+    /// POSITION, so the two need this to name the same span. A turn's page has
+    /// to cover exactly the tokens its chunks do — a page starting one row
+    /// early carries a block belonging to the previous turn, and a projection
+    /// that borrows both would then hold that block twice at two different
+    /// positions.
+    seal_pos_from: usize,
     /// The turn's segment layout: the `<think>…</think>` block is an ETHEREAL
     /// `Thinking` segment (its text is kept for display, its K/V dropped).
     layout: TurnLayout,
@@ -1511,6 +1540,11 @@ pub(super) struct PrefillWork {
     /// on the right key.  The substrate target is looked up from
     /// [`Scheduler::slot_targets`] at seal time, not carried here.
     pub(super) seal_action: SealAction,
+    /// Carried through prefill for the same reason as `seal_action`: the seal
+    /// fires in `cleanup_finished`, before `Done`, so the decision to hold it
+    /// has to arrive with the turn rather than after it. See
+    /// [`crate::TurnOptions::keep_reasoning`].
+    pub(super) keep_reasoning: bool,
     /// Trailing structural tokens written into the slot after decode
     /// finishes, before the seal.  Carried through prefill so the
     /// post-decode forward pass in `cleanup_finished` can run.  Empty
@@ -2362,6 +2396,30 @@ pub(crate) struct Scheduler {
     /// each entry's offset reaches its token count, then finalised by
     /// [`Self::finalize_done_section_ingests`].
     pub(super) active_section_ingests: Vec<ActiveSectionIngest>,
+    /// Each sealed section's per-position model state, keyed as its K/V is.
+    ///
+    /// The index page a section's own prefill produced, kept so the next
+    /// section that borrows this one's chunks can be handed the rows that go
+    /// with them — see `ManagedBatchedModel::push_positional_state`. Empty for
+    /// every model that carries no such state.
+    ///
+    /// Process-local, and that is a real limit rather than a choice: a section
+    /// recovered cold from the substrate on a later run has its K/V and not its
+    /// page, so the first ingest to borrow it warns and selects against a
+    /// prefix it never indexed. Persisting it belongs beside the section's own
+    /// records, keyed by the same stream id.
+    pub(super) section_positional: HashMap<SectionId, Arc<Vec<u8>>>,
+    /// Each sealed turn's per-position model state, keyed as its K/V is.
+    ///
+    /// The conversation counterpart of [`Self::section_positional`], and the
+    /// one that carries the actual dialogue: a projection rebuilds a slot by
+    /// Arc-injecting the turns it selected, and those turns' index rows cannot
+    /// be borrowed with their chunks.
+    ///
+    /// Process-local, with the same limit stated there — a turn cold-loaded on
+    /// a later run has its K/V and not its page, and the injection says so
+    /// rather than selecting silently against a prefix it never indexed.
+    pub(super) turn_positional: HashMap<TurnKey, Arc<Vec<u8>>>,
     /// Batched sampler for token generation.
     sampler: BatchedSampler,
     /// When `true`, special tokens are included in streamed text.
@@ -2526,6 +2584,15 @@ pub(crate) struct Scheduler {
     /// silently wrong on anything else. Holding the value here is what makes
     /// them one thing.
     prov_fold: crate::provenance::FoldParams,
+    /// KV layers whose Q carries provenance — the model's
+    /// `provenance_capture_layers`, cached beside the fold that was derived
+    /// from it.
+    ///
+    /// Cached together on purpose: the fold's geometry is `layers × kv_heads`,
+    /// so a gather taken over a different count than the fold was built for
+    /// yields different bits, not merely slower ones. One field each, read from
+    /// one place, is what keeps them from drifting.
+    prov_capture_layers: usize,
 
     /// Periodic forward-pass batch-size telemetry (diagnostic; one line / 2 s).
     wave_stats: WaveStats,
@@ -2716,7 +2783,7 @@ impl Scheduler {
         // records, and the substrate read paths check a record's stamp against
         // it and refuse a mismatch rather than scoring incomparable bits into a
         // confident number.
-        let prov_fold = {
+        let (prov_fold, prov_capture_layers) = {
             let props = model.model_core_properties();
             let f = crate::provenance::FoldParams::derive(
                 props.n_kv_heads,
@@ -2724,7 +2791,7 @@ impl Scheduler {
                 props.head_dim,
             );
             crate::provenance::set_active_fold(f);
-            f
+            (f, props.provenance_capture_layers)
         };
 
         // Force this thread to bind to the device's CUDA context
@@ -2773,6 +2840,8 @@ impl Scheduler {
             prefill_queue: VecDeque::new(),
             active_prefills: Vec::new(),
             active_section_ingests: Vec::new(),
+            section_positional: HashMap::new(),
+            turn_positional: HashMap::new(),
             sampler,
             show_special_tokens,
             health_config,
@@ -2797,6 +2866,7 @@ impl Scheduler {
             ),
             boundary_markers,
             prov_fold,
+            prov_capture_layers,
             wave_stats: WaveStats::new(),
             compression_jobs: HashMap::new(),
             pending_compression_seals: HashMap::new(),
@@ -2976,6 +3046,7 @@ impl Scheduler {
 
             SchedulerRequest::SubmitTurn {
                 sequence_id,
+                keep_reasoning,
                 projection_inputs,
                 prefill_tokens,
                 prefill_text,
@@ -3448,6 +3519,7 @@ impl Scheduler {
                     reprojection,
                     belief: turn_belief,
                     seal_action,
+                    keep_reasoning,
                     post_decode_tokens,
                     projection_offsets,
                     staged_composition,
@@ -3783,8 +3855,7 @@ impl Scheduler {
 
             SchedulerRequest::InstallRecurrentState {
                 sequence_ids,
-                schedule_hash,
-                layers,
+                state,
                 response_tx,
             } => {
                 // Every slot gets the same state, so the scatter is per-slot but
@@ -3800,15 +3871,35 @@ impl Scheduler {
                 let mut installed = false;
                 let mut first_err = None;
                 for sequence_id in sequence_ids {
-                    match self
-                        .model
-                        .restore_recurrent(sequence_id.0, schedule_hash, &layers)
-                        .map_err(ConversationError::Model)
-                    {
-                        Ok(did) => installed |= did,
-                        Err(e) => {
-                            if first_err.is_none() {
-                                first_err = Some(e);
+                    if !state.layers.is_empty() {
+                        match self
+                            .model
+                            .restore_recurrent(sequence_id.0, state.schedule_hash, &state.layers)
+                            .map_err(ConversationError::Model)
+                        {
+                            Ok(did) => installed |= did,
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    // The aux blob is installed even when the layers were
+                    // refused: the two classes validate independently, and a
+                    // schedule-hash mismatch on the delta-rule rows says nothing
+                    // about whether this model can read these bytes.
+                    if !state.aux.is_empty() {
+                        match self
+                            .model
+                            .restore_aux_state(sequence_id.0, &state.aux)
+                            .map_err(ConversationError::Model)
+                        {
+                            Ok(did) => installed |= did,
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
                             }
                         }
                     }
@@ -4536,6 +4627,8 @@ impl Scheduler {
                 max_tokens,
                 sampling_config: config,
                 seal_action: SealAction::CompressionPass { job_id },
+                // A summariser decode is one turn on a scratch slot.
+                keep_reasoning: false,
                 prefill_assistant_text: String::new(),
                 finished: false,
                 decode_start: Instant::now(),
@@ -4852,6 +4945,8 @@ impl Scheduler {
             reprojection: None,
             belief: PriorBelief::default(),
             seal_action: SealAction::CompressionTurn { job_id },
+            // The summary turn seals on completion.
+            keep_reasoning: false,
             post_decode_tokens: TokenBuffer::default(),
             projection_offsets: Vec::new(),
             staged_composition: None,
@@ -5116,6 +5211,10 @@ impl Scheduler {
             PendingTurnSeal {
                 parent_id,
                 seal_block_from,
+                // Read here, after the truncate that anchored the slot to the
+                // turn boundary — so it is where the clean re-prefill begins
+                // appending, which is where the turn's own tokens start.
+                seal_pos_from: self.session.sequence_offset(parent_id.0).unwrap_or(0),
                 layout,
                 token_ids: clean_tokens.clone(),
                 tags: state.tags,
@@ -5149,6 +5248,8 @@ impl Scheduler {
             reprojection: None,
             belief: PriorBelief::default(),
             seal_action: SealAction::TurnReprefill { pending_id },
+            // This IS the seal; it cannot itself be held.
+            keep_reasoning: false,
             post_decode_tokens: TokenBuffer::default(),
             projection_offsets: Vec::new(),
             staged_composition: None,
@@ -5167,6 +5268,7 @@ impl Scheduler {
         let PendingTurnSeal {
             parent_id,
             seal_block_from,
+            seal_pos_from,
             layout,
             token_ids,
             tags,
@@ -5203,6 +5305,48 @@ impl Scheduler {
                 tracing::warn!("clean turn seal failed for slot {}: {}", parent_id, e);
                 None
             });
+
+        // The page that goes with the chunks just sealed — taken BEFORE the
+        // truncate below drops them, and covering only this turn's own tokens.
+        // A projection that later borrows this turn's K/V is handed these rows
+        // with it; without them the slot holds the turn's keys and no index of
+        // them, and the select scores against a prefix it never indexed.
+        if let (Some(seal), Some(timeline)) = (
+            seal_result.as_ref(),
+            self.slot_targets.get(&parent_id).map(|t| t.timeline),
+        ) {
+            if let Some(index) = seal.turn_index {
+                match self.model.seal_positional_range(parent_id.0, seal_pos_from) {
+                    Ok(Some(blob)) => {
+                        // Durable as well as resident. The in-RAM map answers
+                        // this process's projections; the record is what makes
+                        // the turn borrowable by the next one, and without it a
+                        // restart turns every stored turn into K/V that no index
+                        // covers.
+                        if let Some(conv) = self.slot_conversations.get(&parent_id) {
+                            conv.enqueue_index_page(
+                                turn_stream_id(timeline.raw(), index),
+                                blob.clone(),
+                            );
+                        }
+                        self.turn_positional.insert(
+                            TurnKey {
+                                timeline,
+                                index: TurnIndex(index),
+                            },
+                            Arc::new(blob),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "turn {index}: index page not sealed ({e}); a projection \
+                             borrowing it will select against a prefix it never indexed",
+                        );
+                    }
+                }
+            }
+        }
 
         let write_us = t_write.elapsed().as_micros() as u64;
 
@@ -5877,6 +6021,55 @@ impl Scheduler {
                 );
             }
         }
+
+        // The model's own state, restored from the same record. Independent of
+        // the layer restore above: a model may carry one, the other, or both,
+        // and the delta-rule import failing on geometry says nothing about
+        // whether this blob is installable.
+        self.restore_aux_from_payload(slot_id, timeline, payload.turn_index, &payload.aux);
+    }
+
+    /// Install a snapshot's model-opaque blob, reporting what happened.
+    ///
+    /// Shared by the two paths that install a persisted state — a timeline
+    /// resume and a branch checkpoint — because the interesting part is the
+    /// reporting, and a path that quietly skipped the blob would produce
+    /// exactly the fluent-and-forgotten resume the recurrent path is loud
+    /// about.
+    fn restore_aux_from_payload(
+        &self,
+        slot_id: SequenceId,
+        timeline: TimelineId,
+        turn_index: u32,
+        aux: &[u8],
+    ) {
+        if aux.is_empty() {
+            return;
+        }
+        match self.model.restore_aux_state(slot_id.0, aux) {
+            Ok(true) => {
+                tracing::debug!(
+                    "restored {} bytes of auxiliary state for timeline {timeline} at \
+                     turn {turn_index}",
+                    aux.len(),
+                );
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    "AUXILIARY RESUME SKIPPED (model reads no auxiliary state) for \
+                     timeline {timeline}: {} bytes were persisted, so this conversation \
+                     was sealed by a different model",
+                    aux.len(),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "AUXILIARY RESUME REFUSED for timeline {timeline} at turn \
+                     {turn_index}: {e} — the conversation continues without that \
+                     state.",
+                );
+            }
+        }
     }
 
     /// Handle the case where generation finishes on the first token (EOS or max=0).
@@ -5998,6 +6191,8 @@ impl Scheduler {
                 tokenizer: &self.tokenizer,
                 slot_tokens: &mut self.slot_tokens,
                 boundary_markers: &self.boundary_markers,
+                section_positional: &self.section_positional,
+                turn_positional: &self.turn_positional,
             },
             segments,
             defer,
@@ -6042,6 +6237,8 @@ impl Scheduler {
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
+            section_positional: &self.section_positional,
+            turn_positional: &self.turn_positional,
         };
         projection_assembler::apply_segments_build(state, &mut ctx, segments)
     }
@@ -6077,6 +6274,8 @@ impl Scheduler {
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
+            section_positional: &self.section_positional,
+            turn_positional: &self.turn_positional,
         };
         // The wave path fires the batched gap-fill BEFORE this finish, so the
         // fresh islands' K/V is in the gaps and capturable.
@@ -6332,7 +6531,24 @@ impl Scheduler {
                 // wave (batched with the next wave's normal prefills); on the rare
                 // truncate failure we fall through to the immediate,
                 // reasoning-bearing seal so the turn is never lost.
+                //
+                // **A turn that may call tools seals WITH its reasoning.**
+                //
+                // `keep_reasoning` marks a turn whose result may arrive as a
+                // follow-up turn that has to decode against this turn's
+                // thinking. The clean re-prefill below exists to strip exactly
+                // that, so it is skipped and the turn falls through to the
+                // immediate, reasoning-bearing seal — the same path a truncate
+                // failure takes, and already correct.
+                //
+                // Everything else about the seal is unchanged, which is the
+                // point: `Done`, the substrate write and `SealResult::turn_index`
+                // all still fire at their usual moment. The tool loop couples
+                // the call turn to its follow-up by that index and there is no
+                // other window in which it is knowable, so a turn that defers
+                // its seal cannot be coupled at all.
                 if matches!(state.seal_action, SealAction::Turn)
+                    && !state.keep_reasoning
                     && self
                         .session
                         .truncate_sequence_to_blocks(seal_slot.0, seal_block_from)
@@ -6634,6 +6850,12 @@ impl Scheduler {
         self.session
             .truncate_sequence_to_blocks(sequence_id.0, 0)
             .map_err(ConversationError::Model)?;
+        // The slot's per-position state goes with its K/V. A reused slot starts
+        // at position 0, and pages describing the previous occupant's positions
+        // would put this section's first token at that prefix's end.
+        self.model
+            .reset_positional_state(sequence_id.0)
+            .map_err(ConversationError::Model)?;
 
         // 2. Inject substrate-pinned prefix sections (zero-copy Arc clone).
         let has_prefix = !prefix_section_ids.is_empty();
@@ -6698,6 +6920,27 @@ impl Scheduler {
                             let layer_seq = &sealed[layer_idx];
                             per_layer_chunks[layer_idx].extend(layer_seq.chunks.iter().cloned());
                             per_layer_token_count[layer_idx] += layer_seq.token_count;
+                        }
+                        // The one thing borrowing the chunks does not bring
+                        // along. Pushed in prefix order, so the pages sit at
+                        // the positions their K/V does; a section without one
+                        // leaves this ingest's queries asking for blocks the
+                        // model does not hold, and the select refuses.
+                        if let Some(blob) = self.section_positional.get(&prefix_id) {
+                            if let Err(e) = self.model.push_positional_state(sequence_id.0, blob) {
+                                tracing::warn!(
+                                    "prepare_section_ingest: prefix section {:?} index page \
+                                     refused: {e}",
+                                    prefix_id
+                                );
+                            }
+                        } else if self.model.carries_positional_state() {
+                            tracing::warn!(
+                                "prepare_section_ingest: prefix section {:?} has no index \
+                                 page — this ingest will select against a prefix it never \
+                                 indexed",
+                                prefix_id
+                            );
                         }
                     }
                 }
@@ -6806,6 +7049,26 @@ impl Scheduler {
                 "ingest_section: seal returned None (slot had no content?)".into(),
             )
         })?;
+
+        // The page that goes with the chunks just sealed. Taken here, at the
+        // seal, because this is where the section's own forward has finished
+        // and before the slot is reused — and closed on a block boundary, so
+        // the piece covers its own tokens and no others.
+        match self.model.seal_positional_state(sequence_id.0) {
+            Ok(Some(blob)) => {
+                self.section_positional.insert(section_id, Arc::new(blob));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Not fatal to the seal — the K/V is committed — but the next
+                // ingest to borrow this section will have to say so.
+                tracing::warn!(
+                    "section {:?}: index page not sealed ({e}); an ingest borrowing it will \
+                     select against a prefix it never indexed",
+                    section_id
+                );
+            }
+        }
 
         Ok(seal)
     }
@@ -7323,6 +7586,22 @@ impl Scheduler {
                 // state, so this site is model-agnostic and Qwen3-30B pays a
                 // branch.
                 let t_export = Instant::now();
+                // The model's other recurrence, in its own encoding. Exported at
+                // the same instant as `layers` — one seal, one state — so the
+                // two can never describe different token counts. A model with
+                // none returns `None` and the blob is empty.
+                let aux = match self.model.export_aux_state(seal_slot.0) {
+                    Ok(blob) => blob.unwrap_or_default(),
+                    Err(e) => {
+                        tracing::warn!(
+                            "auxiliary state export failed for turn {} (the turn is \
+                             sealed; resuming it will rebuild that state by prefill): {}",
+                            idx.0,
+                            e,
+                        );
+                        Vec::new()
+                    }
+                };
                 match self.model.export_recurrent(seal_slot.0) {
                     Ok(Some((schedule_hash, layers))) => {
                         let payload = SnapshotPayload {
@@ -7330,6 +7609,7 @@ impl Scheduler {
                             turn_index: idx.0,
                             schedule_hash,
                             layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+                            aux,
                         };
                         let bytes = payload.encode();
                         // Timed around export + encode, which is the whole of
@@ -7341,6 +7621,37 @@ impl Scheduler {
                         SNAPSHOT_BYTES.fetch_add(bytes.len() as u64, Relaxed);
                         SNAPSHOT_COUNT.fetch_add(1, Relaxed);
                         conversation.enqueue_recurrent_snapshot(target.timeline, bytes);
+                    }
+                    // **`None` from a model that declares recurrent state is a
+                    // contradiction, not a fast path.**
+                    //
+                    // The two readings of `None` are "this architecture has no
+                    // such state" and "this architecture has state it cannot
+                    // export", and they are indistinguishable here while having
+                    // opposite consequences: the first costs nothing, the second
+                    // silently produces a conversation that resumes with no
+                    // memory of its history and reads perfectly fluently. That
+                    // is the exact defect this whole path exists to remove, so
+                    // the model's own `carries_recurrent_state` is used to tell
+                    // them apart.
+                    //
+                    // A model reaching this arm has declared state and returned
+                    // none for a sequence that has just decoded a turn — the
+                    // only innocent case, a slot that never ran a wave, cannot
+                    // be sealing. It is a wiring gap in that architecture, and
+                    // it is worth a warning on every seal rather than a silence
+                    // that is only discovered by noticing the model has
+                    // forgotten.
+                    Ok(None) if self.model.carries_recurrent_state() => {
+                        tracing::warn!(
+                            "turn {} sealed with NO recurrent snapshot, but this model \
+                             declares it carries recurrent state — `export_recurrent` \
+                             returned None. The turn's K/V and text are committed, but \
+                             resuming this conversation will start from the \
+                             sequence-start state: it will read fluently and have \
+                             forgotten. This is a missing model hook, not a data loss.",
+                            idx.0,
+                        );
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -7533,7 +7844,7 @@ impl Scheduler {
     fn handle_branch_checkpoint_pass(
         &mut self,
         tokens: &[u32],
-    ) -> Result<Option<(u64, Vec<ExportedLayerState>)>, ConversationError> {
+    ) -> Result<Option<ExportedState>, ConversationError> {
         if !self.model.carries_recurrent_state() {
             return Ok(None);
         }
@@ -7544,14 +7855,35 @@ impl Scheduler {
             .session
             .create_sequence()
             .map_err(ConversationError::Model)?;
-        let result = self.prefill_tokens_on(seq, tokens).and_then(|()| {
-            self.model
-                .export_recurrent(seq)
-                .map_err(ConversationError::Model)
-        });
+        let result = self
+            .prefill_tokens_on(seq, tokens)
+            .and_then(|()| self.export_state_of(seq));
         let _ = self.model.release_sequence(seq);
         let _ = self.session.free_sequence(seq);
         result
+    }
+
+    /// Both classes of a sequence's recurrent state, from one export.
+    ///
+    /// `None` only when the model produced neither — a model may carry either
+    /// alone, so the layers being absent is not on its own an answer.
+    fn export_state_of(&self, seq: usize) -> Result<Option<ExportedState>, ConversationError> {
+        let recurrent = self
+            .model
+            .export_recurrent(seq)
+            .map_err(ConversationError::Model)?;
+        let aux = self
+            .model
+            .export_aux_state(seq)
+            .map_err(ConversationError::Model)?
+            .unwrap_or_default();
+        let (schedule_hash, layers) = recurrent.unwrap_or_default();
+        let state = ExportedState {
+            schedule_hash,
+            layers,
+            aux,
+        };
+        Ok(if state.is_empty() { None } else { Some(state) })
     }
 
     /// Run `tokens` through the model on `seq`, in `max_prefill_pass_tokens`
@@ -7649,6 +7981,22 @@ impl Scheduler {
             .session
             .create_sequence()
             .map_err(ConversationError::Model)?;
+        // **Seed before injecting, then clear the per-position state the seed
+        // brought.**
+        //
+        // The fork is here for the recurrent memory — the GDN/PLE state this
+        // replay exists to rebuild — but it copies the whole carried state,
+        // per-position index included, and that part describes the LIVE
+        // sequence's layout rather than the one assembled below. Running it
+        // after the injections also overwrote them. Scratch's index has to
+        // describe scratch: cleared here, then rebuilt piece by piece as each
+        // turn is injected, exactly as a projection assembles a slot.
+        self.model
+            .fork_recurrent(sequence_id.0, scratch)
+            .map_err(ConversationError::Model)?;
+        self.model
+            .reset_positional_state(scratch)
+            .map_err(ConversationError::Model)?;
         let mut injected = 0usize;
         if let (Some(conversation), Some(target)) = (
             self.slot_conversations.get(&sequence_id).cloned(),
@@ -7672,7 +8020,42 @@ impl Scheduler {
                 let sealed = conversation.read().turn_sealed_of(target.timeline, idx);
                 if let Some(sealed) = sealed {
                     match self.session.inject_sealed_at_tail(scratch, &sealed) {
-                        Ok(_) => injected += 1,
+                        Ok(_) => {
+                            injected += 1;
+                            // The rows for the K/V just injected. Borrowing the
+                            // turn's keys does not bring its index across —
+                            // resident copy first, then the turn's stored page,
+                            // the same order a projection uses.
+                            let key = TurnKey::new(target.timeline, idx);
+                            let page =
+                                self.turn_positional
+                                    .get(&key)
+                                    .map(|b| b.to_vec())
+                                    .or_else(|| {
+                                        conversation
+                                            .read()
+                                            .index_page_blob(target.timeline, idx)
+                                            .map(|b| b.to_vec())
+                                    });
+                            match page {
+                                Some(blob) => {
+                                    if let Err(e) = self.model.push_positional_state(scratch, &blob)
+                                    {
+                                        tracing::warn!(
+                                            "memory catch-up: turn {idx} index page refused \
+                                             ({e})"
+                                        );
+                                    }
+                                }
+                                None if self.model.carries_positional_state() => {
+                                    tracing::warn!(
+                                        "memory catch-up: turn {idx} has no index page — the \
+                                         replay selects against a prefix it never indexed"
+                                    );
+                                }
+                                None => {}
+                            }
+                        }
                         Err(e) => tracing::warn!(
                             "memory catch-up: could not inject turn {idx} as context ({e}) — \
                              the adopted span replays with less context than a real append"
@@ -7685,16 +8068,11 @@ impl Scheduler {
             "memory catch-up: replaying {} adopted tokens over {injected} injected turns",
             tokens.len(),
         );
-        let result = self
-            .model
-            .fork_recurrent(sequence_id.0, scratch)
-            .map_err(ConversationError::Model)
-            .and_then(|()| self.prefill_tokens_on(scratch, tokens))
-            .and_then(|()| {
-                self.model
-                    .move_recurrent(scratch, sequence_id.0)
-                    .map_err(ConversationError::Model)
-            });
+        let result = self.prefill_tokens_on(scratch, tokens).and_then(|()| {
+            self.model
+                .move_recurrent(scratch, sequence_id.0)
+                .map_err(ConversationError::Model)
+        });
         let _ = self.model.release_sequence(scratch);
         let _ = self.session.free_sequence(scratch);
         result.map(|()| true)
@@ -7733,7 +8111,20 @@ impl Scheduler {
     /// backing is gone (compressed) contribute nothing — capture a turn while its KV is
     /// still R16 (e.g. `kv_lossless`, or at seal before the bg-quantizer runs).
     fn gather_wide_sigs(&self, seq_id: SequenceId, range: (usize, usize)) -> Vec<WideQSig> {
-        let n_layers = self.session.num_layers();
+        // **The STREAM layers, not every KV layer.** A signature is a statement
+        // about the conversation's own history, and a draft head's K/V is not
+        // that — it is the speculative continuation the head proposed. Folding
+        // it in would describe two histories as one, and on the GPU path it did
+        // worse than that: the capture is all-or-nothing across layers, so the
+        // head's disagreeing block set made every turn's signature come back
+        // empty.
+        //
+        // Both paths take the same bound, because they must produce the same
+        // bits — the fold's geometry is `layers × kv_heads`, so a CPU fallback
+        // counting one more layer than the kernel would not be a slower answer
+        // but a different one. And both take the number the FOLD was derived
+        // from, which is the only way that guarantee holds.
+        let n_layers = self.prov_capture_layers.min(self.session.num_layers());
         let n_kv_head = self.session.n_kv_head();
         let head_dim = self.session.head_dim();
         if n_layers == 0 || n_kv_head == 0 || head_dim == 0 || range.1 <= range.0 {
@@ -7754,7 +8145,7 @@ impl Scheduler {
             let t_res = Instant::now();
             let resolved = self
                 .session
-                .resolve_provenance_q_ptrs(seq_id.0, Some(range))
+                .resolve_provenance_q_ptrs(seq_id.0, Some(range), n_layers)
                 .ok()
                 .flatten();
             PROV_RESOLVE_US.fetch_add(t_res.elapsed().as_micros() as u64, Relaxed);
@@ -7897,6 +8288,25 @@ impl Scheduler {
             .fork_recurrent(parent_id.0, view_id.0)
             .map_err(ConversationError::Model)?;
         FORK_RECURRENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The view borrows the parent's K/V blocks but copies its per-position
+        // state, so the two have to agree at the moment of the carve. A view
+        // that starts short stays short for its whole life and says nothing
+        // until a selection past the identity threshold refuses — so the
+        // mismatch is named here, where the parent that caused it is still in
+        // hand.
+        if let Some(cov) = self.model.positional_coverage(view_id.0) {
+            let parent_tokens = self.session.sequence_offset(parent_id.0).unwrap_or(0);
+            if cov < parent_tokens {
+                tracing::warn!(
+                    parent = parent_id.0,
+                    view = view_id.0,
+                    parent_tokens,
+                    view_coverage = cov,
+                    "create_view: carved a view over {} token(s) its index does not cover",
+                    parent_tokens - cov
+                );
+            }
+        }
 
         // Seed sampling state for the view (clone parent's state so
         // the DRY window survives the carve).
@@ -8723,6 +9133,32 @@ impl Scheduler {
         // reprojected turn would read fluently and have forgotten its own
         // first half.
         //
+        // **The index rows for `tail_per_layer`, taken from the VIEW, before
+        // anything moves.**
+        //
+        // The K/V for the turn so far survives this swap as `tail_per_layer` and
+        // is injected back onto the rebuilt parent. Its index rows do not travel
+        // with it: the move below puts them on the parent, and the re-projection
+        // immediately resets the parent's per-position state and replays the
+        // prefix from pages. So the turn's K/V comes back and the rows
+        // describing it do not, leaving the slot short by exactly this turn's
+        // width — silent while the conversation sits under the QSA identity
+        // threshold, and a refused select the moment it passes it.
+        //
+        // **Sealed by WIDTH, not from a position, and read from the view.** The
+        // turn's rows are not all in its live tail: a previous reprojection
+        // re-injects the turn's user half from cache and pushes it as a page, so
+        // the turn spans a page boundary. `seal_positional_tail_span` walks back
+        // over whole pages until the width is covered and flushes the partial
+        // block, which is the only formulation that takes the whole turn.
+        // Sealing the live tail alone drops the user's own message — measured at
+        // 14 tokens, after which the model decoded a question it could not
+        // attend to and answered a different one it invented.
+        let turn_tokens = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
+        let tail_index_page = self
+            .model
+            .seal_positional_tail_span(view_id.0, turn_tokens)
+            .map_err(ConversationError::Model)?;
         // Ordering: move before the free, or there is nothing left to read.
         // The move already removes the view's entry, so the release below is
         // just the general per-sequence cleanup.
@@ -8784,6 +9220,7 @@ impl Scheduler {
             view_id,
             parent_id,
             tail_per_layer,
+            tail_index_page,
             decode_state,
             sampling_state,
             sections_len: projected_sections.len(),
@@ -8816,6 +9253,7 @@ impl Scheduler {
             view_id,
             parent_id,
             tail_per_layer,
+            tail_index_page,
             mut decode_state,
             sampling_state,
             sections_len,
@@ -8885,6 +9323,55 @@ impl Scheduler {
             self.session
                 .inject_sealed_at_tail(parent_id.0, &tail_per_layer)
                 .map_err(ConversationError::Model)?;
+            // The rows that describe those tokens, back at the position the
+            // tokens landed. The rebuilt prefix ended flush with its last
+            // injected piece and forwarded nothing, so these rows sit on an
+            // empty live tail and go in as a page — the same shape every other
+            // borrowed piece uses.
+            if !tail_index_page.is_empty() {
+                // In order: each piece the turn spanned keeps its own width.
+                for page in tail_index_page.iter() {
+                    if let Err(e) = self.model.push_positional_state(parent_id.0, page) {
+                        tracing::warn!(
+                            slot = parent_id.0,
+                            tail_token_count,
+                            "reproject: the turn's index page was refused ({e}); this slot \
+                             holds the turn's K/V with nothing indexing it"
+                        );
+                        break;
+                    }
+                }
+            } else if self.model.carries_positional_state() {
+                tracing::warn!(
+                    slot = parent_id.0,
+                    tail_token_count,
+                    "reproject: the turn's K/V came back with no index page"
+                );
+            }
+            // The turn's K/V is back; its rows have to be too. A gap here is the
+            // width of whatever part of the turn the pages did not cover, and it
+            // is the last point at which that is attributable to this rebuild —
+            // downstream it surfaces only as a refused select on some later turn.
+            if let Some(cov) = self.model.positional_coverage(parent_id.0) {
+                let held = self.session.sequence_offset(parent_id.0).unwrap_or(0);
+                // Both directions. Short drops rows the turn needs; long means
+                // a piece was restored twice — the rebuild re-supplies the
+                // turn's user half from cache and the span seal carries it too
+                // — and the surplus rows claim positions this slot does not
+                // hold, which selects against them without erroring.
+                if cov != held {
+                    tracing::warn!(
+                        slot = parent_id.0,
+                        held,
+                        coverage = cov,
+                        tail_token_count,
+                        pages_pushed = tail_index_page.len(),
+                        "reproject: the rebuilt slot's index is {} token(s) {} its K/V",
+                        cov.abs_diff(held),
+                        if cov < held { "short of" } else { "past" }
+                    );
+                }
+            }
             // Mirror the tail's tokens back into the slot_tokens log
             // (we recorded them at original prefill / decode time
             // under the now-freed view id, but the parent's log was
@@ -9241,6 +9728,50 @@ mod tests {
     /// slightly different, perfectly fluent prose.
     type ToyState = [[f32; 4]; 2];
 
+    /// Ratio of the toy index: tokens per whole row, so a turn boundary that is
+    /// not a multiple of it leaves a ragged open block — the case that makes the
+    /// index worth persisting separately rather than deriving on restore.
+    const TOY_INDEX_RATIO: u32 = 4;
+
+    /// The toy model's auxiliary recurrence — a running token count.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct ToyIndex {
+        tokens: u32,
+    }
+
+    impl ToyIndex {
+        /// Magic + version, so a blob from another model is refused rather than
+        /// read as a plausible count. Mirrors the real aux container.
+        const MAGIC: &'static [u8; 4] = b"TIDX";
+
+        fn rows(&self) -> u32 {
+            self.tokens / TOY_INDEX_RATIO
+        }
+
+        /// Tokens in the trailing partial row — 0 when the count lands on a
+        /// boundary.
+        fn open(&self) -> u32 {
+            self.tokens % TOY_INDEX_RATIO
+        }
+
+        fn encode(&self) -> Vec<u8> {
+            let mut out = Self::MAGIC.to_vec();
+            out.extend_from_slice(&self.tokens.to_le_bytes());
+            out
+        }
+
+        fn decode(blob: &[u8]) -> candle::Result<Self> {
+            if blob.len() != 8 || &blob[..4] != Self::MAGIC {
+                candle::bail!("not a toy index blob ({} bytes)", blob.len());
+            }
+            let mut w = [0u8; 4];
+            w.copy_from_slice(&blob[4..8]);
+            Ok(Self {
+                tokens: u32::from_le_bytes(w),
+            })
+        }
+    }
+
     const ZERO_STATE: ToyState = [[0.0; 4]; 2];
 
     /// The toy recurrence: `s ← 2s + t·k`, per element, with `k` the element's
@@ -9273,6 +9804,11 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecurrentProbe {
         states: Arc<Mutex<HashMap<usize, ToyState>>>,
+        /// The model's *other* recurrence, standing in for Flash-Next's QSA
+        /// index: a token count, from which whole rows and a ragged open block
+        /// are derived. It travels as opaque bytes and is shaped like nothing in
+        /// `ToyState`, which is the entire reason the aux blob exists.
+        index: Arc<Mutex<HashMap<usize, ToyIndex>>>,
         /// Sequences whose state arrived by fork or restore, and must therefore
         /// survive exactly one `offset == 0` reset. The store-level `seeded`
         /// flag of §10 decision 2, modelled per sequence.
@@ -9282,6 +9818,15 @@ mod tests {
     impl RecurrentProbe {
         fn get(&self, seq: usize) -> Option<ToyState> {
             self.states.lock().unwrap().get(&seq).copied()
+        }
+
+        fn get_index(&self, seq: usize) -> Option<ToyIndex> {
+            self.index.lock().unwrap().get(&seq).copied()
+        }
+
+        fn advance_index(&self, seq: usize, tokens: usize) {
+            let mut idx = self.index.lock().unwrap();
+            idx.entry(seq).or_default().tokens += tokens as u32;
         }
 
         fn len(&self) -> usize {
@@ -9387,6 +9932,11 @@ mod tests {
                     if let Some(state) = self.probe.states.lock().unwrap().get_mut(&seq) {
                         toy_advance(state, tokens);
                     }
+                    // The second recurrence advances on the same forward as the
+                    // first. That is not decoration: it is what makes a seal
+                    // that exports one and not the other observable, because
+                    // the two then describe different token counts.
+                    self.probe.advance_index(seq, tokens);
                 }
             }
             self.inner.forward_wave(
@@ -9409,6 +9959,7 @@ mod tests {
 
         fn release_sequence(&self, seq: usize) -> candle::Result<()> {
             self.probe.states.lock().unwrap().remove(&seq);
+            self.probe.index.lock().unwrap().remove(&seq);
             self.probe.seeded.lock().unwrap().remove(&seq);
             Ok(())
         }
@@ -9432,6 +9983,11 @@ mod tests {
             if let Some(state) = parent_state {
                 self.probe.set(child, state);
                 self.probe.seeded.lock().unwrap().insert(child);
+            }
+            // Both classes fork, or the child decodes with one half of its
+            // memory at the parent's depth and the other at zero.
+            if let Some(idx) = self.probe.get_index(parent) {
+                self.probe.index.lock().unwrap().insert(child, idx);
             }
             Ok(())
         }
@@ -9510,7 +10066,27 @@ mod tests {
             if let Some(state) = taken {
                 self.probe.set(parent, state);
             }
+            let taken_idx = self.probe.index.lock().unwrap().remove(&child);
+            if let Some(idx) = taken_idx {
+                self.probe.index.lock().unwrap().insert(parent, idx);
+            }
             Ok(())
+        }
+
+        /// The toy index in its own encoding — bytes only this model reads.
+        fn export_aux_state(&self, seq: usize) -> candle::Result<Option<Vec<u8>>> {
+            Ok(self.probe.get_index(seq).map(|i| i.encode()))
+        }
+
+        /// Installs the index and seeds the slot for the same reason
+        /// `restore_recurrent` does: a restored sequence's first wave stands at
+        /// offset 0, and an unseeded slot would have the state it was just given
+        /// reset out from under it.
+        fn restore_aux_state(&self, seq: usize, blob: &[u8]) -> candle::Result<bool> {
+            let idx = ToyIndex::decode(blob)?;
+            self.probe.index.lock().unwrap().insert(seq, idx);
+            self.probe.seeded.lock().unwrap().insert(seq);
+            Ok(true)
         }
     }
 
@@ -9618,13 +10194,13 @@ mod tests {
     #[test]
     fn the_branch_checkpoint_pass_returns_state_the_tokens_produced() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
-        let (hash, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[1, 2, 3, 4])
             .expect("pass ran")
             .expect("a model that carries state returns some");
-        assert_eq!(hash, DummyRecurrentModel::SCHEDULE_HASH);
-        assert_eq!(layers.len(), 2, "one row per toy layer");
-        let advanced = layers.iter().any(|l| l.state.iter().any(|&b| b != 0));
+        assert_eq!(state.schedule_hash, DummyRecurrentModel::SCHEDULE_HASH);
+        assert_eq!(state.layers.len(), 2, "one row per toy layer");
+        let advanced = state.layers.iter().any(|l| l.state.iter().any(|&b| b != 0));
         assert!(
             advanced,
             "the exported state is all zeros — the tokens never reached the model, \
@@ -9680,19 +10256,21 @@ mod tests {
     /// not tolerance — these are copies, so any difference is a layout bug.
     #[test]
     fn a_branch_checkpoint_round_trips_through_its_record_and_installs() {
+        use crate::persistence::content_hash::ContentHash;
         use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
-        let (hash, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[5, 6, 7, 8])
             .expect("pass ran")
             .expect("state");
-        let computed = layers.clone();
+        let computed = state.layers.clone();
 
         let payload = BranchCheckpointPayload {
-            prefix_hash: crate::persistence::content_hash::ContentHash { lo: 9, hi: 11 },
-            schedule_hash: hash,
-            layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+            prefix_hash: ContentHash { lo: 9, hi: 11 },
+            schedule_hash: state.schedule_hash,
+            layers: state.layers.into_iter().map(SnapshotLayer::from).collect(),
+            aux: state.aux,
         };
         let back = BranchCheckpointPayload::decode(&payload.encode()).expect("decode");
         assert_eq!(back, payload, "the record did not survive its own encoding");
@@ -9739,14 +10317,14 @@ mod tests {
     #[test]
     fn a_branch_checkpoint_under_a_foreign_schedule_is_refused() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
-        let (_, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[3, 1, 4])
             .expect("pass ran")
             .expect("state");
         let slot = sched.session.create_sequence().expect("slot");
         let err = sched
             .model
-            .restore_recurrent(slot, 0xBAD, &layers)
+            .restore_recurrent(slot, 0xBAD, &state.layers)
             .expect_err("a foreign schedule hash must not install");
         assert!(err.to_string().contains("schedule hash"), "{err}");
     }
@@ -9758,7 +10336,7 @@ mod tests {
     #[test]
     fn install_recurrent_state_request_installs_onto_the_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
-        let (hash, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[2, 4, 6])
             .expect("pass ran")
             .expect("state");
@@ -9767,8 +10345,7 @@ mod tests {
         let (tx, rx) = crossbeam::channel::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: vec![slot],
-            schedule_hash: hash,
-            layers: layers.into(),
+            state: SharedState::from(&state),
             response_tx: tx,
         });
         assert!(
@@ -9776,6 +10353,208 @@ mod tests {
             "the install reported that no state was carried"
         );
         assert!(probe.get(slot.0).is_some(), "the slot has no state");
+    }
+
+    // —— Store and resume: both classes of state ————————————————————————————
+    //
+    // Everything below is about the SECOND class — the model's own encoding,
+    // carried as opaque bytes beside the delta-rule layers. The layers have
+    // their own coverage above; these exist because the two classes travel the
+    // same paths and only one of them was ever asserted, which is exactly the
+    // shape of a state that goes missing without a failing test.
+
+    /// **The pass exports BOTH classes, and they agree about the tokens.**
+    ///
+    /// The failure this rules out is a pass that returns the layers a prefill
+    /// produced beside an aux blob it did not — which reads as a complete
+    /// checkpoint and installs a sequence whose two halves of memory stand at
+    /// different depths.
+    #[test]
+    fn the_branch_checkpoint_pass_exports_both_classes_of_state() {
+        let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7];
+        let state = sched
+            .handle_branch_checkpoint_pass(&tokens)
+            .expect("pass ran")
+            .expect("state");
+        assert!(!state.layers.is_empty(), "no delta-rule layers");
+        let idx = ToyIndex::decode(&state.aux).expect("the aux blob is this model's");
+        assert_eq!(
+            idx.tokens,
+            tokens.len() as u32,
+            "the index stands at a different depth than the prefill that made it"
+        );
+        assert_eq!(idx.rows(), 1, "7 tokens at ratio 4 is one whole row");
+        assert_eq!(
+            idx.open(),
+            3,
+            "…and a ragged open block of 3 — the case a boundary-aligned \
+             fixture would never exercise"
+        );
+    }
+
+    /// **A ragged boundary survives the record verbatim.**
+    ///
+    /// A turn ends where the text ends, not on a block boundary, so the open
+    /// block is the normal case rather than an edge one. Every remainder is
+    /// checked because a reconstruction that rounded to whole rows would still
+    /// pass at remainder 0.
+    #[test]
+    fn every_ragged_boundary_round_trips_through_the_snapshot_record() {
+        use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
+
+        for extra in 0..TOY_INDEX_RATIO {
+            let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
+            let n = (2 * TOY_INDEX_RATIO + extra) as usize;
+            let tokens: Vec<u32> = (0..n as u32).collect();
+            let state = sched
+                .handle_branch_checkpoint_pass(&tokens)
+                .expect("pass ran")
+                .expect("state");
+
+            let payload = SnapshotPayload {
+                timeline_id: 3,
+                turn_index: 0,
+                schedule_hash: state.schedule_hash,
+                layers: state.layers.into_iter().map(SnapshotLayer::from).collect(),
+                aux: state.aux.clone(),
+            };
+            let back = SnapshotPayload::decode(&payload.encode()).expect("decode");
+            assert_eq!(back.aux, state.aux, "the record altered the blob");
+
+            let idx = ToyIndex::decode(&back.aux).expect("decode index");
+            assert_eq!(idx.tokens, n as u32);
+            assert_eq!(idx.rows(), 2 + extra / TOY_INDEX_RATIO);
+            assert_eq!(idx.open(), extra, "the partial row's width was lost");
+        }
+    }
+
+    /// **Install puts the aux blob on the slot, and the value is the one that
+    /// was exported.**
+    ///
+    /// Through `handle_request`, so the wiring is covered rather than the
+    /// handler body alone.
+    #[test]
+    fn install_recurrent_state_request_installs_the_aux_blob_too() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let state = sched
+            .handle_branch_checkpoint_pass(&[2, 4, 6, 8, 10])
+            .expect("pass ran")
+            .expect("state");
+        let slot = SequenceId(sched.session.create_sequence().expect("slot"));
+
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        sched.handle_request(SchedulerRequest::InstallRecurrentState {
+            sequence_ids: vec![slot],
+            state: SharedState::from(&state),
+            response_tx: tx,
+        });
+        assert!(rx.recv().expect("reply").expect("install"));
+        assert_eq!(
+            probe.get_index(slot.0).expect("the slot has no index"),
+            ToyIndex { tokens: 5 },
+            "the slot's index is not the one the checkpoint carried"
+        );
+    }
+
+    /// **A restored slot is seeded, so its first wave does not reset the index
+    /// it was just given.**
+    ///
+    /// The same trap the delta-rule restore has: a restored sequence stands at
+    /// offset 0, and `ensure` resets an occupied slot at offset 0 unless it was
+    /// seeded. An aux restore that installed the bytes without seeding would put
+    /// the index back to zero on the next forward — and nothing downstream would
+    /// report it.
+    #[test]
+    fn an_aux_restore_survives_the_first_waves_offset_zero_reset() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = sched.session.create_sequence().expect("slot");
+        sched
+            .model
+            .restore_aux_state(slot, &ToyIndex { tokens: 9 }.encode())
+            .expect("restore");
+
+        // The reset rule is `ensure`'s, and `ensure` is what a wave runs first.
+        probe.ensure(slot, 0);
+        assert_eq!(
+            probe.get_index(slot).expect("index gone entirely"),
+            ToyIndex { tokens: 9 },
+            "the restored index did not survive the offset-0 wave — the slot \
+             was not seeded, and the conversation resumes having forgotten"
+        );
+    }
+
+    /// **A blob from another model is refused, not read as a plausible state.**
+    ///
+    /// The aux blob is opaque to everything between the model and the record,
+    /// so the model is the only place this can be caught. Reading a foreign
+    /// blob as a state is worse than failing to read it: the conversation then
+    /// resumes at a depth nothing computed.
+    #[test]
+    fn a_foreign_aux_blob_is_refused() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = sched.session.create_sequence().expect("slot");
+        for bad in [
+            b"XIDX\x01\x00\x00\x00".to_vec(), // right shape, wrong magic
+            b"TIDX\x01\x00\x00".to_vec(),     // right magic, truncated
+            Vec::new(),
+        ] {
+            assert!(
+                sched.model.restore_aux_state(slot, &bad).is_err(),
+                "a {}-byte foreign blob installed as a state",
+                bad.len()
+            );
+        }
+        assert!(
+            probe.get_index(slot).is_none(),
+            "a refused restore still left something on the slot"
+        );
+    }
+
+    /// **A fork copies both classes.**
+    ///
+    /// A view carve that copied the layers alone would give the child a
+    /// delta-rule state at the parent's depth and an index at zero.
+    #[test]
+    fn a_fork_carries_both_classes_of_state() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = sched.session.create_sequence().expect("parent");
+        let child = sched.session.create_sequence().expect("child");
+        sched
+            .model
+            .restore_aux_state(parent, &ToyIndex { tokens: 13 }.encode())
+            .expect("seed the parent");
+        probe.set(parent, [[1.0; 4]; 2]);
+
+        sched.model.fork_recurrent(parent, child).expect("fork");
+        assert_eq!(probe.get(child), Some([[1.0; 4]; 2]), "layers not forked");
+        assert_eq!(
+            probe.get_index(child),
+            Some(ToyIndex { tokens: 13 }),
+            "the child's index is at a different depth than its layers"
+        );
+    }
+
+    /// **Releasing a slot releases both classes.**
+    ///
+    /// The branch checkpoint pass allocates a throwaway slot per call. A class
+    /// of state the release does not drop leaks once per new branch, for the
+    /// life of the daemon — and the existing leak test only counts the layers.
+    #[test]
+    fn releasing_a_slot_drops_both_classes_of_state() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let before = probe.index.lock().unwrap().len();
+        for _ in 0..4 {
+            sched
+                .handle_branch_checkpoint_pass(&[7, 7, 7])
+                .expect("pass ran");
+        }
+        assert_eq!(
+            probe.index.lock().unwrap().len(),
+            before,
+            "four passes leaked {} index entries",
+            probe.index.lock().unwrap().len() - before
+        );
     }
 
     /// **One request installs the same branch state onto EVERY named slot.**
@@ -9786,7 +10565,7 @@ mod tests {
     #[test]
     fn install_recurrent_state_request_installs_onto_every_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
-        let (hash, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[2, 4, 6])
             .expect("pass ran")
             .expect("state");
@@ -9797,8 +10576,7 @@ mod tests {
         let (tx, rx) = crossbeam::channel::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: slots.clone(),
-            schedule_hash: hash,
-            layers: layers.into(),
+            state: SharedState::from(&state),
             response_tx: tx,
         });
         assert!(

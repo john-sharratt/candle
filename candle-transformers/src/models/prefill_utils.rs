@@ -1096,7 +1096,7 @@ impl<'k> PagedPrefillInt8<'k> {
             QsaSelection::with_kernel_args(
                 self.qsa.as_ref(),
                 &stream,
-                |sel_e, sel_c, sel_stride, sel_ratio| {
+                |sel_e, sel_c, sel_pages, sel_win, sel_stride, sel_ratio| {
                     run_paged_prefill_int8(
                         q_ptr as *const core::ffi::c_void,
                         k_ptr as *const core::ffi::c_void,
@@ -1120,6 +1120,8 @@ impl<'k> PagedPrefillInt8<'k> {
                         raw_stream,
                         sel_e,
                         sel_c,
+                        sel_pages,
+                        sel_win,
                         sel_stride,
                         sel_ratio,
                     )
@@ -1949,6 +1951,8 @@ impl<'k> PagedDecode<'k> {
             *mut core::ffi::c_void,
             *const u32,
             *const u32,
+            *const u32,
+            *const u32,
             i32,
             i32,
         ) -> i32,
@@ -2002,7 +2006,7 @@ impl<'k> PagedDecode<'k> {
             let status = QsaSelection::with_kernel_args(
                 self.qsa.as_ref(),
                 &stream,
-                |sel_e, sel_c, sel_stride, sel_ratio| unsafe {
+                |sel_e, sel_c, sel_pages, sel_win, sel_stride, sel_ratio| unsafe {
                     ffi_fn(
                         q_ptr as *const core::ffi::c_void,
                         headers_ptr,
@@ -2019,6 +2023,8 @@ impl<'k> PagedDecode<'k> {
                         raw_stream,
                         sel_e,
                         sel_c,
+                        sel_pages,
+                        sel_win,
                         sel_stride,
                         sel_ratio,
                     )
@@ -2065,6 +2071,8 @@ impl<'k> PagedDecode<'k> {
             *const f32,
             i32,
             *mut core::ffi::c_void,
+            *const u32,
+            *const u32,
             *const u32,
             *const u32,
             i32,
@@ -2136,7 +2144,7 @@ impl<'k> PagedDecode<'k> {
             let status = QsaSelection::with_kernel_args(
                 self.qsa.as_ref(),
                 &stream,
-                |sel_e, sel_c, sel_stride, sel_ratio| unsafe {
+                |sel_e, sel_c, sel_pages, sel_win, sel_stride, sel_ratio| unsafe {
                     ffi_fn(
                         q_ptr as *const core::ffi::c_void,
                         headers_ptr,
@@ -2155,6 +2163,8 @@ impl<'k> PagedDecode<'k> {
                         raw_stream,
                         sel_e,
                         sel_c,
+                        sel_pages,
+                        sel_win,
                         sel_stride,
                         sel_ratio,
                     )

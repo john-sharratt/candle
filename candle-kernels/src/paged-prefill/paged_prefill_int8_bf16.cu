@@ -25,10 +25,12 @@ extern "C" void run_paged_prefill_int8_bf16(
     cudaStream_t stream,
     const uint32_t* sel_entries,
     const uint32_t* sel_cnt,
+    const uint2* sel_pages,
+    const uint2* sel_page_win,
     int32_t sel_stride,
     int32_t sel_ratio
 ) {
-    const QsaSel sel{sel_entries, sel_cnt, sel_stride, sel_ratio};
+    const QsaSel sel{sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio};
     using prefill_int8::launch_paged_prefill_int8;
     switch (head_dim) {
         case 64:

@@ -51,6 +51,7 @@ mod hermes3;
 mod qwen2;
 mod qwen3;
 mod qwen36_moe;
+mod qwen38_flash_next;
 mod qwen3_moe;
 
 pub use builder::ModelBuilder;
@@ -196,6 +197,17 @@ pub enum Model {
     /// `docs/deltanet_state_persistence.md`.
     Qwen36_35B_A3B_Q4,
 
+    /// Qwen3.8-Flash-Next Q4_KO — 250 B total, ~13 B active, 48 layers at 3:1
+    /// (36 gated-DeltaNet, 12 attention). Native 262,144-token context.
+    ///
+    /// Carries two classes of state no other preset does — a PLE window and a
+    /// QSA index — neither of which is a delta-rule matrix, so both ride the
+    /// turn record's model-opaque blob (`docs/qwen38_index_persistence.md`).
+    ///
+    /// **Its engine GGUF is prepared locally, not downloaded** — see
+    /// [`qwen38_flash_next`] and [`ModelSpec::prepared_from_source`].
+    Qwen38_FlashNext_Q4KO,
+
     // ── Qwen2 ──────────────────────────────────────────────────────────
     /// Qwen2-0.5B-Instruct Q4_0 — tiny, great for CI and testing (~0.4 GB).
     Qwen2_0_5B,
@@ -249,9 +261,26 @@ pub struct ModelSpec {
     /// Dialect used to construct chat messages
     pub dialect: Dialect,
     /// HuggingFace repository containing the GGUF file.
+    ///
+    /// When [`Self::prepared_from_source`] is set this names the repo the
+    /// artifact is *built from*, not one that publishes it.
     pub model_repo: String,
     /// GGUF filename within the repository.
     pub model_filename: String,
+    /// Set when [`Self::model_filename`] names an artifact this codebase
+    /// **prepares** from [`Self::model_repo`]'s published files, rather than one
+    /// published under that name.
+    ///
+    /// Flash-Next is the case that needs it: its engine GGUF is a local build —
+    /// the pinned Q8_0 split, plus the W4A16 release's expert tensors imported
+    /// to Q4_KO, plus the MTP head folded in as the block past the trunk, merged
+    /// into one file. Nothing on the hub is that file.
+    ///
+    /// Resolution therefore skips the network for these: a 404 on a name that
+    /// was never published is a confusing way to say "you have not run the
+    /// prepare step", and retrying it on every start is worse. The resolver
+    /// looks in the local cache and, failing that, says what to run.
+    pub prepared_from_source: bool,
     /// Exact on-disk size of the GGUF file in bytes. Presets pin the
     /// published file's length; custom models read it from the local file.
     /// Downloaders use it for progress totals when the server omits
@@ -314,6 +343,7 @@ impl Model {
             Model::Qwen3_14B_Q6 => qwen3::qwen3_14b_q6(),
             // Qwen3 MoE
             Model::Qwen36_35B_A3B_Q4 => qwen36_moe::qwen36_35b_a3b_q4(),
+            Model::Qwen38_FlashNext_Q4KO => qwen38_flash_next::qwen38_flash_next_q4ko(),
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),
             Model::Qwen3_30B_A3B_Q6 => qwen3_moe::qwen3_30b_a3b_q6(),
             // Qwen2

@@ -51,7 +51,80 @@ impl PleState {
             prev: self.prev.clone(),
         }
     }
+
+    /// Encode for the turn snapshot's auxiliary blob.
+    ///
+    /// Self-describing in its dimensions, and versioned, because this is the
+    /// only carried class with no schedule hash standing behind it: the GDN
+    /// store validates its geometry against a hash the model computes, and
+    /// there is no equivalent for a `[history, hc_dim]` tail. The dimensions
+    /// are written so [`Self::decode`] can refuse a blob from a differently
+    /// shaped checkpoint instead of reshaping bytes into a plausible lie.
+    ///
+    /// Kilobytes: `conv_history()` is `(conv_kernel − 1) × ngram_size` = 9 rows
+    /// on this checkpoint, so the whole thing is three orders of magnitude
+    /// under the GDN snapshot it rides beside.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let (rows, cols) = self.conv_hist.dims2()?;
+        let vals = self.conv_hist.flatten_all()?.to_vec1::<f32>()?;
+        let mut out = Vec::with_capacity(20 + vals.len() * 4 + self.prev.len() * 4);
+        out.extend_from_slice(&PLE_AUX_VERSION.to_le_bytes());
+        out.extend_from_slice(&(rows as u32).to_le_bytes());
+        out.extend_from_slice(&(cols as u32).to_le_bytes());
+        for v in &vals {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.prev.len() as u32).to_le_bytes());
+        for t in &self.prev {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    /// Read back what [`Self::encode`] wrote, refusing anything that does not
+    /// match `(rows, cols)` — a foreign or stale layout recomputes rather than
+    /// scattering bytes of the wrong shape.
+    pub fn decode(blob: &[u8], rows: usize, cols: usize, dev: &candle::Device) -> Result<Self> {
+        let u32_at = |o: usize| -> Result<u32> {
+            let b = blob
+                .get(o..o + 4)
+                .ok_or_else(|| candle::Error::Msg("ple aux: blob truncated".into()))?;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let version = u32_at(0)?;
+        if version != PLE_AUX_VERSION {
+            candle::bail!(
+                "ple aux: blob version {version} unknown (this build reads {PLE_AUX_VERSION})"
+            );
+        }
+        let (r, c) = (u32_at(4)? as usize, u32_at(8)? as usize);
+        if r != rows || c != cols {
+            candle::bail!(
+                "ple aux: blob is [{r}, {c}] but this checkpoint's PLE state is \
+                 [{rows}, {cols}] — recompute instead of reshaping"
+            );
+        }
+        let n = r * c;
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            vals.push(f32::from_bits(u32_at(12 + i * 4)?));
+        }
+        let after = 12 + n * 4;
+        let n_prev = u32_at(after)? as usize;
+        let mut prev = Vec::with_capacity(n_prev);
+        for i in 0..n_prev {
+            prev.push(u32_at(after + 4 + i * 4)?);
+        }
+        Ok(Self {
+            conv_hist: Tensor::from_vec(vals, (r, c), dev)?,
+            prev,
+        })
+    }
 }
+
+/// Wire version of the PLE auxiliary blob; bump on layout change and keep
+/// decode for every version ever written.
+const PLE_AUX_VERSION: u32 = 1;
 
 /// The PLE layer's weights.
 #[derive(Debug, Clone)]

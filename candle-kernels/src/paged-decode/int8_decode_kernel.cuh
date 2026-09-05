@@ -2197,7 +2197,7 @@ int launch_int8_decode_attn(
                                   // (n_q_head·HEAD_DIM when the gate is contiguous;
                                   // the fused [q|gate] projection's row width when
                                   // the gate is a strided view of it)
-    QsaSel sel = {nullptr, nullptr, 0, 1} // QSA: one selection row per slot
+    QsaSel sel = {nullptr, nullptr, nullptr, nullptr, 0, 1} // QSA: one selection row per slot
 ) {
     int heads_per_group = (n_kv_head > 0) ? (n_q_head / n_kv_head) : 1;
     if (heads_per_group < 1) heads_per_group = 1;

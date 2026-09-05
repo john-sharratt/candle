@@ -36,6 +36,8 @@ use candle::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::paged_index::IndexPage;
+
 use super::config::IndexerConfig;
 use super::qsa::{rms_norm_last, IndexerWeights};
 use super::qsa_select::{max_entries, max_keep, selected_width, MAX_RATIO};
@@ -72,6 +74,35 @@ pub struct IndexCache {
     raw: Tensor,
     /// Rows of [`Self::raw`] that are live.
     n_open: usize,
+    /// Index rows for positions this sequence holds but never forwarded —
+    /// prefixes whose K/V arrived by injection.
+    ///
+    /// **The case that makes this necessary is section ingest.** A section is
+    /// prefilled against an Arc-injected prefix: the prefix's K/V already
+    /// exists, so copying it is free and the forward attends to real preceding
+    /// context. The index cannot be copied that way — its keys come from hidden
+    /// states, which injection never computes — so without these pages a query
+    /// at position 22,020 asks for 5,505 blocks against a cache holding one.
+    ///
+    /// **They are pages and not more rows of `keys` because they are ragged.**
+    /// A section advances the sequence by its real token count, not by a whole
+    /// number of blocks, so the next section's pooling starts mid-block and its
+    /// rows do not line up with `(pos + 1) / ratio`. Concatenating them into the
+    /// uniform buffer would silently address the wrong block for every position
+    /// after the first boundary. Each page therefore keeps its own width and
+    /// [`Self::candidates_at`] walks them, exactly as
+    /// [`PagedIndex`](super::paged_index::PagedIndex) does for a window
+    /// reconstructed from turn records.
+    ///
+    /// Empty for a sequence that forwarded everything it holds, which is every
+    /// sequence the gates run — there the walk reduces to the uniform formula
+    /// and the scorer sees a single page.
+    pages: Vec<IndexPage>,
+    /// Exclusive prefix sum of [`Self::pages`] token spans; `page_tokens.last()`
+    /// is the position the live tail begins at.
+    page_tokens: Vec<usize>,
+    /// Exclusive prefix sum of [`Self::pages`] row counts.
+    page_rows: Vec<usize>,
 }
 
 /// What a wave must put back if it fails.
@@ -94,6 +125,9 @@ impl IndexCache {
             // fewer than `ratio` rows and `ratio` is bounded by `MAX_RATIO`.
             raw: Tensor::zeros((MAX_RATIO, head_dim), DType::F32, device)?,
             n_open: 0,
+            pages: Vec::new(),
+            page_tokens: vec![0],
+            page_rows: vec![0],
         })
     }
 
@@ -105,8 +139,12 @@ impl IndexCache {
     }
 
     /// Tokens this cache has consumed — `n_blocks · ratio + open`.
+    /// Tokens this cache accounts for — injected pages plus the live tail.
+    ///
+    /// The pages count because the caller compares this against the sequence's
+    /// own length, and the sequence holds their positions.
     pub fn len(&self, ratio: usize) -> usize {
-        self.n_blocks * ratio + self.n_open
+        self.page_token_span() + self.n_blocks * ratio + self.n_open
     }
 
     pub fn is_empty(&self, ratio: usize) -> bool {
@@ -119,6 +157,56 @@ impl IndexCache {
             raw: self.raw.to_owned_tensor()?,
             n_open: self.n_open,
         })
+    }
+
+    /// The first position of `block`, through this cache's page layout — the
+    /// inverse of [`Self::candidates_at`].
+    pub fn block_start(&self, block: usize, ratio: usize) -> usize {
+        let rows = self.page_row_span();
+        if block >= rows {
+            return self.page_token_span() + (block - rows) * ratio;
+        }
+        let p = match self.page_rows.binary_search(&block) {
+            Ok(i) => return self.page_tokens[i],
+            Err(i) => i - 1,
+        };
+        self.page_tokens[p] + (block - self.page_rows[p]) * ratio
+    }
+
+    /// Cells of its own block the query at `pos` has, `1..=ratio`.
+    ///
+    /// What the selection kernel is handed instead of deriving `pos % ratio`:
+    /// a block's width belongs to the page it is in, and at a page boundary the
+    /// last block is short.
+    pub fn tail_len(&self, pos: usize, ratio: usize) -> u32 {
+        let block = self.candidates_at(pos, ratio);
+        (pos + 1 - self.block_start(block, ratio)) as u32
+    }
+
+    /// This cache's page layout as `{tokens_before, blocks_before}` pairs,
+    /// ascending, with a final entry for the live tail.
+    ///
+    /// The trailing entry is what makes the walk uniform: a position past every
+    /// page resolves against `{page_token_span, page_row_span}` and lands in the
+    /// live tail's own arithmetic, so the kernels need no special case for it.
+    pub fn page_prefixes(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity((self.pages.len() + 1) * 2);
+        for i in 0..=self.pages.len() {
+            out.push(self.page_tokens[i] as u32);
+            out.push(self.page_rows[i] as u32);
+        }
+        out
+    }
+
+    /// Whether this cache holds any injected prefix at all.
+    pub fn has_pages(&self) -> bool {
+        !self.pages.is_empty()
+    }
+
+    /// Blocks the live tail has completed — the position the next pooled block
+    /// key ropes at, and therefore the depth a RoPE table for it must span.
+    pub fn live_blocks(&self) -> usize {
+        self.n_blocks
     }
 
     /// Undo everything a failed wave appended. The keys above `n_blocks` are
@@ -134,6 +222,260 @@ impl IndexCache {
         self.raw = snap.raw.to_owned_tensor()?;
         self.n_open = snap.n_open;
         Ok(())
+    }
+
+    /// Close this cache on a block boundary, pooling the carried rows into one
+    /// SHORT block. Returns that block's width in tokens, or `None` when the
+    /// cache already ended on a boundary.
+    ///
+    /// **This is what makes a turn's index a self-contained page.** Without it a
+    /// turn leaves `T mod ratio` rows carried, belonging to a block the next
+    /// turn completes — so a window reconstructed from a subset of turns has a
+    /// leading block pooled over tokens that are not in the window.
+    ///
+    /// The flushed block is a summary of fewer than `ratio` tokens and is
+    /// therefore NOT what a continuous run would have produced for that span.
+    /// That is the deliberate trade: the scorer carries each page's width and
+    /// derives the candidate prefix from it, so a short block is expressible;
+    /// a block pooled from another turn's tokens is not correctable at all.
+    #[cfg(feature = "cuda")]
+    pub fn flush_open_block(
+        &mut self,
+        w: &IndexerWeights,
+        rope: &RopeTables,
+        ratio: usize,
+        rms_eps: f64,
+    ) -> Result<Option<usize>> {
+        use candle_kernels::simple::qsa_index_append::{run_qsa_index_flush, FLUSH_WORDS};
+
+        if self.n_open == 0 {
+            return Ok(None);
+        }
+        let cells = self.n_open;
+        let d = self.keys.dim(1)?;
+        self.ensure_capacity((self.n_blocks + 1) * ratio, ratio)?;
+        let dst = self.keys_ptr()? + (self.n_blocks as u64) * (d * 4) as u64;
+        let src = self.raw_ptr()?;
+        let jobs: Vec<i64> = vec![dst as i64, src as i64, cells as i64, self.n_blocks as i64];
+
+        let device = self.keys.device().clone();
+        let candle::Device::Cuda(cuda) = &device else {
+            candle::bail!("qsa index flush runs on CUDA");
+        };
+        let stream = cuda.cuda_stream();
+        let jobs_t = Tensor::from_vec(jobs, (FLUSH_WORDS,), &device)?;
+        candle::set_kernel_breadcrumb("run_qsa_index_flush", file!(), line!());
+        let (cos, sin) = rope.table_ptrs()?;
+        unsafe {
+            run_qsa_index_flush(
+                i64_ptr(&jobs_t)? as *const i64,
+                tensor_ptr(&w.k_norm)? as *const f32,
+                cos as *const f32,
+                sin as *const f32,
+                d as i32,
+                rope.rope_dim() as i32,
+                rms_eps as f32,
+                1,
+                stream.cu_stream() as *mut std::ffi::c_void,
+            );
+        }
+        self.n_blocks += 1;
+        self.n_open = 0;
+        Ok(Some(cells))
+    }
+
+    /// A cache holding `rows` as its live prefix and `open` as its carried,
+    /// un-pooled tail — the resume path, and the exact inverse of
+    /// [`Self::live_rows`] + [`Self::open_rows`].
+    ///
+    /// **`open` is not optional and not decoration.** The cache's arithmetic is
+    /// `n_blocks · ratio + n_open == tokens`, and every consumer depends on it:
+    /// [`Self::plan`] derives the next append from `n_open`, and the scorer
+    /// addresses block `k` as tokens `[k · ratio, (k+1) · ratio)`. A restore
+    /// that dropped the open rows would put the cache `tokens % ratio` behind
+    /// its own K/V and keep it there — internally consistent, wrong against the
+    /// sequence, and silent.
+    pub fn from_rows(rows: &Tensor, open: &Tensor, head_dim: usize) -> Result<Self> {
+        let (n, d) = rows.dims2()?;
+        if d != head_dim {
+            candle::bail!("index cache: rows are [{n}, {d}] against head_dim {head_dim}");
+        }
+        let (n_open, open_d) = open.dims2()?;
+        if n_open > MAX_RATIO {
+            candle::bail!(
+                "index cache: {n_open} open rows exceeds the {MAX_RATIO}-row block — a full \
+                 block would have been pooled into a row instead of carried"
+            );
+        }
+        if n_open > 0 && open_d != head_dim {
+            candle::bail!("index cache: open rows are [{n_open}, {open_d}] against {head_dim}");
+        }
+        let raw = Tensor::zeros((MAX_RATIO, head_dim), DType::F32, rows.device())?;
+        if n_open > 0 {
+            raw.slice_set(open, 0, 0)?;
+        }
+        Ok(Self {
+            keys: rows.to_owned_tensor()?,
+            n_blocks: n,
+            raw,
+            n_open,
+            pages: Vec::new(),
+            page_tokens: vec![0],
+            page_rows: vec![0],
+        })
+    }
+
+    /// Append an injected prefix's index rows ahead of the live tail.
+    ///
+    /// Called when a sequence receives K/V it did not forward — today, a sealed
+    /// section borrowed into a projection. The page keeps its own width because
+    /// the piece it describes ended wherever its tokens ended; see
+    /// [`Self::pages`].
+    ///
+    /// Refused once the sequence has forwarded anything, because a page landing
+    /// after live rows would sit at the wrong positions: pages describe a
+    /// prefix, and the live tail is what follows them.
+    pub fn push_page(&mut self, page: IndexPage, ratio: usize) -> Result<()> {
+        if self.n_blocks != 0 || self.n_open != 0 {
+            candle::bail!(
+                "qsa index: a page arrived after {} live block(s) and {} carried row(s) — \
+                 injected prefixes must precede anything this sequence forwarded",
+                self.n_blocks,
+                self.n_open,
+            );
+        }
+        let rows = page.rows()?;
+        let tokens = page.tokens(ratio)?;
+        self.page_rows.push(self.page_rows.last().unwrap() + rows);
+        self.page_tokens
+            .push(self.page_tokens.last().unwrap() + tokens);
+        self.pages.push(page);
+        Ok(())
+    }
+
+    /// Tokens covered by injected pages — the position the live tail starts at.
+    pub fn page_token_span(&self) -> usize {
+        *self.page_tokens.last().unwrap_or(&0)
+    }
+
+    /// Injected pages held, oldest first.
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Page `i` and the tokens it covers.
+    ///
+    /// **Pages are atomic to a caller that wants to hand a span on.** A page's
+    /// last row is ragged — it covers `last_cells` tokens, not `ratio` — so a
+    /// span cannot start partway through one without re-pooling rows across a
+    /// boundary the original piece ended at. A caller taking a trailing span
+    /// therefore takes whole pages and stops when it has covered enough.
+    pub fn page_at(&self, i: usize) -> Option<(&IndexPage, usize)> {
+        let p = self.pages.get(i)?;
+        let tokens = self
+            .page_tokens
+            .get(i + 1)?
+            .saturating_sub(self.page_tokens[i]);
+        Some((p, tokens))
+    }
+
+    /// Rows held in injected pages.
+    pub fn page_row_span(&self) -> usize {
+        *self.page_rows.last().unwrap_or(&0)
+    }
+
+    /// Tokens this cache actually covers — injected pages plus the live tail.
+    ///
+    /// The quantity a query position is checked against, and the one that has
+    /// to agree across every one of a sequence's caches: they index the same
+    /// stream, so a cache holding fewer tokens than its siblings has missed
+    /// appends the others took. Below the identity threshold nothing reads it,
+    /// so a divergence here is silent until a select refuses at depth.
+    pub fn indexed_tokens(&self, ratio: usize) -> usize {
+        self.page_token_span() + self.n_blocks * ratio + self.n_open
+    }
+
+    /// Blocks wholly at or below `pos` — the ragged replacement for
+    /// `(pos + 1) / ratio`.
+    ///
+    /// Walks the injected pages by their own widths, then counts uniformly
+    /// inside the live tail. Identical to the uniform formula for a sequence
+    /// with no pages, which is every sequence that forwarded its whole prefix.
+    pub fn candidates_at(&self, pos: usize, ratio: usize) -> usize {
+        let limit = pos + 1;
+        let span = self.page_token_span();
+        if limit > span {
+            // Inside the live tail: the pages are wholly below, and the tail
+            // pools uniformly from its own first position.
+            return self.page_row_span() + (limit - span) / ratio;
+        }
+        // Inside the pages. Take whole pages while they fit, then the whole
+        // rows of the page the position lands in — its last row is short, so it
+        // only counts once the position reaches the page's full span.
+        let p = match self.page_tokens.binary_search(&limit) {
+            Ok(i) => return self.page_rows[i],
+            Err(i) => i - 1,
+        };
+        let inside = limit - self.page_tokens[p];
+        let page_rows = self.pages[p].rows().unwrap_or(0);
+        let whole = (inside / ratio).min(page_rows.saturating_sub(1));
+        self.page_rows[p] + whole
+    }
+
+    /// The live prefix as a view — `[n_blocks, head_dim]`, no copy.
+    ///
+    /// What a seal writes and what a single-page window reads. The rows above
+    /// `n_blocks` are dead until an append writes them, so handing out the whole
+    /// buffer would persist uninitialised memory.
+    pub fn live_rows(&self) -> Result<Tensor> {
+        self.keys.narrow(0, 0, self.n_blocks)
+    }
+
+    /// The carried open block as a view — `[n_open, head_dim]`, no copy.
+    ///
+    /// The same rule as [`Self::live_rows`]: the rows above `n_open` are dead
+    /// until the next append writes them.
+    pub fn open_rows(&self) -> Result<Tensor> {
+        self.raw.narrow(0, 0, self.n_open)
+    }
+
+    /// Rows the cache has completed, and the tokens still carried in the open
+    /// block — the two numbers a turn seal needs to describe its page.
+    pub fn seal_shape(&self) -> (usize, usize) {
+        (self.n_blocks, self.n_open)
+    }
+
+    /// An independent copy of the whole cache — the view-carve fork.
+    ///
+    /// **Distinct from [`Self::snapshot`], which is a rewind point.** A snapshot
+    /// keeps only what a failed wave must put back: the open block's rows and
+    /// the two counters, because the keys above `n_blocks` are dead rows the
+    /// re-append will overwrite. A fork is a different question — the child is
+    /// about to append to keys the parent still owns, so the live prefix
+    /// `[0, n_blocks)` has to come with it.
+    ///
+    /// Why the child needs it at all: a view borrows the parent's KV blocks
+    /// zero-copy, so its sequence already contains the parent's tokens. An
+    /// index that started empty there would leave selection scoring a handful
+    /// of blocks against a KV holding the whole history — the mismatch is
+    /// silent, and it reads as a retrieval that simply chose badly.
+    ///
+    /// The copy is `n_blocks × head_dim` floats per attention layer, so it is
+    /// proportional to depth rather than to the turn. That is the same shape of
+    /// cost the recurrent store's `fork_from` already pays at every view carve.
+    pub fn fork(&self) -> Result<Self> {
+        Ok(Self {
+            keys: self.keys.to_owned_tensor()?,
+            n_blocks: self.n_blocks,
+            raw: self.raw.to_owned_tensor()?,
+            n_open: self.n_open,
+            // The pages are shared, not copied: a page is a sealed prefix that
+            // nothing appends to, so parent and child read the same rows. Only
+            // the live tail above them is written, and that is copied.
+            pages: self.pages.clone(),
+            page_tokens: self.page_tokens.clone(),
+            page_rows: self.page_rows.clone(),
+        })
     }
 
     /// Room for the blocks a sequence at `tokens` tokens will have completed.
@@ -163,9 +505,17 @@ impl IndexCache {
     }
 
     /// Reset to empty — a sequence starting over at offset 0.
+    /// Start the sequence over — including its injected prefix.
+    ///
+    /// The pages go too. They describe positions this slot held; a slot
+    /// starting over holds none of them, and leaving them would put the next
+    /// sequence's first token at the old prefix's end.
     pub fn reset(&mut self) {
         self.n_blocks = 0;
         self.n_open = 0;
+        self.pages.clear();
+        self.page_tokens.truncate(1);
+        self.page_rows.truncate(1);
     }
 
     /// Blocks this span would complete, and the rows it would leave open.
@@ -224,16 +574,54 @@ impl IndexCache {
         }
         let q = q.reshape((t * h, d))?;
 
-        // Per row, the candidate blocks are those wholly below its tail.
-        let cand: Vec<u32> = qpos.iter().map(|&p| ((p + 1) / ratio) as u32).collect();
+        // Per row, the candidate blocks are those wholly below its tail. With
+        // injected pages ahead of the live tail this is a walk over their
+        // widths rather than a division — see `candidates_at`.
+        let cand: Vec<u32> = qpos
+            .iter()
+            .map(|&p| self.candidates_at(p, ratio) as u32)
+            .collect();
         let cand_max = cand.iter().copied().max().unwrap_or(0) as usize;
-        if cand_max > self.n_blocks {
+        let held = self.page_row_span() + self.n_blocks;
+        if cand_max > held {
+            // Report the TOKEN accounting, not just the row counts. The rows say
+            // the select cannot proceed; the tokens say why, and they are what
+            // identifies the piece at fault: `unindexed` is exactly how many
+            // tokens of this sequence's K/V no page and no append ever covered,
+            // so it can be matched against the width of whatever the assembler
+            // last put in the slot. Rows alone leave that invisible, because a
+            // ragged page holds fewer tokens than `rows × ratio`.
+            let pos = qpos.iter().max().copied().unwrap_or(0);
+            let page_tok = self.page_token_span();
+            let tail_tok = self.n_blocks * ratio + self.n_open;
             candle::bail!(
-                "qsa select: a query at position {} needs {cand_max} blocks but the \
-                 index cache holds {} — the segment's keys were not appended first",
-                qpos.iter().max().copied().unwrap_or(0),
-                self.n_blocks
+                "qsa select: a query at position {pos} needs {cand_max} blocks but the \
+                 index cache holds {held} ({} in injected pages, {} forwarded) — the \
+                 segment's keys were not appended first. Tokens: {} indexed \
+                 ({page_tok} in pages + {tail_tok} in the live tail) against a query at \
+                 {pos}, so {} token(s) of this sequence carry K/V that no page and no \
+                 append ever covered",
+                self.page_row_span(),
+                self.n_blocks,
+                page_tok + tail_tok,
+                (pos + 1).saturating_sub(page_tok + tail_tok),
             );
+        }
+
+        // **Two layouts, two kernels, disjoint column ranges.**
+        //
+        // The injected pages are stored channel-blocked so a warp's key read is
+        // contiguous (`paged_index`), while the live tail is the row-major
+        // buffer the append kernel writes and cuBLAS reads transposed as a view.
+        // Neither can read the other's layout, and converting either one would
+        // cost a full copy of it per score — so each is scored by the kernel
+        // built for it, into its own columns of the same output row.
+        //
+        // Column order is page rows then live rows, which is block order, so
+        // the selection that follows indexes them exactly as it always has.
+        let page_cols = self.page_row_span();
+        if page_cols > 0 {
+            self.score_pages(&q, &cand, t, h, d, out, out_stride, row_base)?;
         }
 
         // The scan's right operand is the cache **transposed**, and that is a
@@ -244,8 +632,24 @@ impl IndexCache {
         // per sequence per layer per wave — 128 bytes a token, which at
         // conversational depth is the largest single copy in the selection
         // path and buys the GEMM nothing it could not already read.
-        let keys_t = self.keys.narrow(0, 0, cand_max.max(1))?.t()?;
-        let rows_per_tile = (SCORE_TILE_BYTES / (h * cand_max.max(1) * 4)).clamp(1, t);
+        // Live-tail columns only: the pages above already covered theirs.
+        let live_cols = cand_max.saturating_sub(page_cols);
+        if live_cols == 0 {
+            return Ok(cand);
+        }
+        // Only narrowed when pages actually sit ahead of the tail. With none,
+        // `page_cols` is 0 and the narrow is the whole buffer — a view that
+        // costs a `Tensor` per span per layer per wave to describe what `out`
+        // already is.
+        let narrowed;
+        let live_out = if page_cols == 0 {
+            out
+        } else {
+            narrowed = out.narrow(1, page_cols, live_cols)?;
+            &narrowed
+        };
+        let keys_t = self.keys.narrow(0, 0, live_cols)?.t()?;
+        let rows_per_tile = (SCORE_TILE_BYTES / (h * live_cols * 4)).clamp(1, t);
         let mut row = 0usize;
         while row < t {
             let rows = rows_per_tile.min(t - row);
@@ -268,14 +672,75 @@ impl IndexCache {
                 &raw,
                 rows,
                 h,
-                cand_max.max(1),
-                out,
+                live_cols,
+                live_out,
                 out_stride,
                 row_base + row,
             )?;
             row += rows;
         }
         Ok(cand)
+    }
+
+    /// Score the injected pages into columns `[0, page_row_span())`.
+    ///
+    /// The pages are separately allocated and ragged, which is exactly the
+    /// descriptor-table shape `qsa_score_paged` takes: one pointer and one row
+    /// count per page, and the widths folded into `cnt` on the host so the
+    /// kernel never sees one (hot-path invariant 2b — nothing is concatenated).
+    ///
+    /// `cnt` is the FULL candidate count per row, page rows and live rows
+    /// together, and the kernel masks anything past its own column range on its
+    /// own — a row whose candidates run into the live tail simply has every page
+    /// column visible, which is what "wholly below" means for a prefix.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn score_pages(
+        &self,
+        q: &Tensor,
+        cand: &[u32],
+        t: usize,
+        h: usize,
+        d: usize,
+        out: &Tensor,
+        out_stride: usize,
+        row_base: usize,
+    ) -> Result<()> {
+        use candle_kernels::simple::qsa_score_paged::run_qsa_score_paged;
+
+        let device = self.keys.device().clone();
+        let mut ptrs: Vec<i64> = Vec::with_capacity(self.pages.len());
+        for p in &self.pages {
+            ptrs.push(tensor_ptr(p.blocked()?)? as i64);
+        }
+        let first: Vec<u32> = self.page_rows.iter().map(|&r| r as u32).collect();
+        let keys_tbl = Tensor::from_vec(ptrs, (self.pages.len(),), &device)?;
+        let first_tbl = Tensor::from_vec(first, (self.page_rows.len(),), &device)?;
+        let cnt_t = Tensor::from_vec(cand.to_vec(), (t,), &device)?;
+
+        let candle::Device::Cuda(cuda) = &device else {
+            candle::bail!("qsa paged score runs on CUDA");
+        };
+        let stream = cuda.cuda_stream();
+        candle::set_kernel_breadcrumb("run_qsa_score_paged", file!(), line!());
+        unsafe {
+            run_qsa_score_paged(
+                tensor_ptr(q)? as *const f32,
+                i64_ptr(&keys_tbl)? as *const u64,
+                u32_ptr(&first_tbl)? as *const u32,
+                u32_ptr(&cnt_t)? as *const u32,
+                tensor_ptr(out)? as *mut f32,
+                t as i32,
+                h as i32,
+                d as i32,
+                self.page_row_span() as i32,
+                self.pages.len() as i32,
+                out_stride as i64,
+                row_base as i64,
+                stream.cu_stream() as *mut std::ffi::c_void,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -334,11 +799,16 @@ impl SelectionTable {
     /// against [`super::qsa_select::selection_entries`] without a model in the
     /// way.
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_rows(
         &mut self,
         scores: &Tensor,
         cand: &[u32],
         qpos: &[usize],
+        // Cells of its own block each query has, `1..=ratio` — the one thing
+        // the selection kernel cannot derive from a position once blocks stop
+        // being uniformly `ratio` wide. See `IndexCache::tail_len`.
+        tail: &[u32],
         ratio: usize,
         top_k: usize,
         row_base: usize,
@@ -354,12 +824,23 @@ impl SelectionTable {
             candle::bail!("qsa selection runs on CUDA");
         };
         let stream = dev.cuda_stream();
-        let cand_t = Tensor::from_slice(cand, (rows,), scores.device())?;
-        let qpos_t = Tensor::from_slice(
-            &qpos.iter().map(|&p| p as u32).collect::<Vec<u32>>(),
-            (rows,),
-            scores.device(),
-        )?;
+        if tail.len() != rows {
+            candle::bail!(
+                "qsa selection: {} tail lengths against {rows} rows",
+                tail.len()
+            );
+        }
+        // **One upload, not three.** Every one of these is a host→device copy
+        // per layer per wave, and on WDDM a small transfer costs far more in
+        // submission than in bytes — three of them measured ~5% of the whole
+        // forward-batched ladder. They are the same length and the same dtype,
+        // so they travel as one `[3, rows]` block and the kernel takes three
+        // offsets into it.
+        let mut packed: Vec<u32> = Vec::with_capacity(rows * 3);
+        packed.extend_from_slice(cand);
+        packed.extend(qpos.iter().map(|&p| p as u32));
+        packed.extend_from_slice(tail);
+        let packed_t = Tensor::from_slice(&packed, (3, rows), scores.device())?;
 
         let (s_s, s_l) = scores.storage_and_layout();
         let s_slice = match &*s_s {
@@ -367,18 +848,12 @@ impl SelectionTable {
             _ => candle::bail!("qsa selection: scores must be CUDA"),
         }
         .slice(s_l.start_offset()..);
-        let (c_s, c_l) = cand_t.storage_and_layout();
+        let (c_s, c_l) = packed_t.storage_and_layout();
         let c_slice = match &*c_s {
             candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-            _ => candle::bail!("qsa selection: cand must be CUDA"),
+            _ => candle::bail!("qsa selection: row metadata must be CUDA"),
         }
         .slice(c_l.start_offset()..);
-        let (p_s, p_l) = qpos_t.storage_and_layout();
-        let p_slice = match &*p_s {
-            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-            _ => candle::bail!("qsa selection: qpos must be CUDA"),
-        }
-        .slice(p_l.start_offset()..);
         let (e_s, e_l) = self.entries.storage_and_layout();
         let e_slice = match &*e_s {
             candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
@@ -394,7 +869,9 @@ impl SelectionTable {
 
         let (s_ptr, _sg) = s_slice.device_ptr(&stream);
         let (c_ptr, _cg) = c_slice.device_ptr(&stream);
-        let (p_ptr, _pg) = p_slice.device_ptr(&stream);
+        // The three rows of the packed block, in the order they were written.
+        let p_ptr = (c_ptr as *const u32).wrapping_add(rows);
+        let t_ptr = (c_ptr as *const u32).wrapping_add(rows * 2);
         let (e_ptr, _eg) = e_slice.device_ptr(&stream);
         let (n_ptr, _ng) = n_slice.device_ptr(&stream);
         // The table is one allocation; a tile writes its own row window, so
@@ -407,7 +884,8 @@ impl SelectionTable {
                 s_ptr as *const f32,
                 score_stride as i32,
                 c_ptr as *const u32,
-                p_ptr as *const u32,
+                p_ptr,
+                t_ptr,
                 e_ptr,
                 self.stride as i32,
                 n_ptr,
@@ -540,7 +1018,7 @@ fn fold_heads_into(
 }
 
 /// A tensor's device address.
-fn tensor_ptr(t: &Tensor) -> Result<u64> {
+pub(super) fn tensor_ptr(t: &Tensor) -> Result<u64> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     let candle::Device::Cuda(dev) = t.device() else {
         candle::bail!("qsa index cache lives on CUDA");
@@ -716,7 +1194,24 @@ pub fn append_wave(
 }
 
 /// Device address of an i64 descriptor table.
-fn i64_ptr(t: &Tensor) -> Result<u64> {
+/// A U32 descriptor table's device address — prefix sums and per-row counts.
+pub(super) fn u32_ptr(t: &Tensor) -> Result<u64> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    let candle::Device::Cuda(dev) = t.device() else {
+        candle::bail!("qsa descriptor table must be CUDA");
+    };
+    let stream = dev.cuda_stream();
+    let (s, l) = t.storage_and_layout();
+    let slice = match &*s {
+        candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+        _ => candle::bail!("qsa descriptor table must be CUDA u32"),
+    }
+    .slice(l.start_offset()..);
+    let (ptr, _guard) = slice.device_ptr(&stream);
+    Ok(ptr)
+}
+
+pub(super) fn i64_ptr(t: &Tensor) -> Result<u64> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     let candle::Device::Cuda(dev) = t.device() else {
         candle::bail!("qsa append table must be CUDA");
@@ -862,15 +1357,28 @@ pub fn select_layer(
         // single launch. A row's own candidate count still bounds its scan, so
         // the columns a narrower span leaves untouched are never read — which
         // is why the buffer is allocated uninitialised (hot-path invariant 6).
+        // Asked of the caches, not derived from the offsets. A sequence holding
+        // injected pages has MORE rows than `tokens / ratio`: a page ends
+        // wherever its piece did, so its last row is short, and a prefix of
+        // several pieces carries one short row per boundary. Sizing this from
+        // the uniform formula under-allocates by exactly that many columns, and
+        // the first span to write past the end fails inside the wave.
         let widest = spans
             .iter()
             .zip(offsets)
-            .map(|(span, &off)| (off + span.len).div_ceil(compress_ratio))
+            .map(|(span, &off)| {
+                let last = off + span.len;
+                match idx_map.get(&span.seq).and_then(|c| c.get(kv)) {
+                    Some(cache) => cache.candidates_at(last.saturating_sub(1), compress_ratio),
+                    None => last.div_ceil(compress_ratio),
+                }
+            })
             .max()
             .unwrap_or(0)
             .max(1);
         let scores = Tensor::empty((total_rows, widest), DType::F32, device)?;
         let mut cand: Vec<u32> = vec![0; total_rows];
+        let mut tail: Vec<u32> = vec![1; total_rows];
         for span in spans {
             let cache = idx_map
                 .get(&span.seq)
@@ -878,21 +1386,77 @@ pub fn select_layer(
                 .ok_or_else(|| {
                     candle::Error::Msg(format!("seq {} has no index cache", span.seq))
                 })?;
-            let span_cand = cache.score_rows(
-                &q_all.narrow(0, span.start, span.len)?,
-                &positions[span.start..span.start + span.len],
-                idx_cfg,
-                compress_ratio,
-                &scores,
-                widest,
-                span.start,
-            )?;
+            // Name the cache, not just the shortfall. A sequence holds one cache
+            // per KV layer and they are not interchangeable: the trunk's are
+            // appended by every wave, while the MTP draft head's — the slot at
+            // `n_attention_layers()` — is appended only by the draft walks it
+            // runs. A shortfall reported without its layer reads as one bug in
+            // the index when it is two different populations of the same array.
+            let span_cand = cache
+                .score_rows(
+                    &q_all.narrow(0, span.start, span.len)?,
+                    &positions[span.start..span.start + span.len],
+                    idx_cfg,
+                    compress_ratio,
+                    &scores,
+                    widest,
+                    span.start,
+                )
+                .map_err(|e| candle::Error::Msg(format!("kv layer {kv}, seq {}: {e}", span.seq)))?;
             cand[span.start..span.start + span.len].copy_from_slice(&span_cand);
+            for (r, &p) in positions[span.start..span.start + span.len]
+                .iter()
+                .enumerate()
+            {
+                tail[span.start + r] = cache.tail_len(p, compress_ratio);
+            }
         }
         expect_dense(&scores, "qsa selection scores")?;
-        table.fill_rows(&scores, &cand, &positions, compress_ratio, idx_cfg.top_k, 0)?;
+        table.fill_rows(
+            &scores,
+            &cand,
+            &positions,
+            &tail,
+            compress_ratio,
+            idx_cfg.top_k,
+            0,
+        )?;
     }
-    table.map(SelectionTable::into_selection).transpose()
+    // The page layout the attention kernels walk, built only when some sequence
+    // in this wave holds an injected prefix. Every other wave passes null and
+    // the kernels keep their inline `pos / ratio`.
+    let sel = table.map(SelectionTable::into_selection).transpose()?;
+    let Some(sel) = sel else { return Ok(None) };
+    let needs_pages = spans.iter().any(|s| {
+        idx_map
+            .get(&s.seq)
+            .and_then(|c| c.get(kv))
+            .is_some_and(|c| c.has_pages())
+    });
+    if !needs_pages {
+        return Ok(Some(sel));
+    }
+    let mut pages: Vec<u32> = Vec::new();
+    let mut win: Vec<u32> = vec![0; total_rows * 2];
+    for span in spans {
+        let off = pages.len() / 2;
+        let prefixes = match idx_map.get(&span.seq).and_then(|c| c.get(kv)) {
+            Some(cache) => cache.page_prefixes(),
+            // A sequence with no cache contributes the degenerate layout, which
+            // is the uniform arithmetic.
+            None => vec![0, 0],
+        };
+        let count = prefixes.len() / 2;
+        pages.extend(prefixes);
+        for r in span.start..span.start + span.len {
+            win[r * 2] = off as u32;
+            win[r * 2 + 1] = count as u32;
+        }
+    }
+    let n_pages = pages.len() / 2;
+    let pages_t = Tensor::from_vec(pages, (n_pages, 2), device)?;
+    let win_t = Tensor::from_vec(win, (total_rows, 2), device)?;
+    Ok(Some(sel.with_pages(pages_t, win_t)?))
 }
 
 #[cfg(test)]
@@ -952,7 +1516,13 @@ mod tests {
         }
         let scores = Tensor::from_vec(host.clone(), (rows, blocks), &device)?;
         let mut table = SelectionTable::new(rows, ratio, top_k, &device)?;
-        table.fill_rows(&scores, &cand, &qpos, ratio, top_k, 0)?;
+        // Uniform blocks here, so the tail is what the kernel used to derive.
+        let tail: Vec<u32> = qpos
+            .iter()
+            .zip(&cand)
+            .map(|(&p, &c)| (p + 1 - c as usize * ratio) as u32)
+            .collect();
+        table.fill_rows(&scores, &cand, &qpos, &tail, ratio, top_k, 0)?;
 
         let mut want = Vec::new();
         for (r, &p) in qpos.iter().enumerate() {
@@ -994,7 +1564,13 @@ mod tests {
         let host = lcg(rows * blocks, 0x53, 4.0);
         let scores = Tensor::from_vec(host.clone(), (rows, blocks), &device)?;
         let mut table = SelectionTable::new(rows, ratio, top_k, &device)?;
-        table.fill_rows(&scores, &cand, &qpos, ratio, top_k, 0)?;
+        // Uniform blocks here, so the tail is what the kernel used to derive.
+        let tail: Vec<u32> = qpos
+            .iter()
+            .zip(&cand)
+            .map(|(&p, &c)| (p + 1 - c as usize * ratio) as u32)
+            .collect();
+        table.fill_rows(&scores, &cand, &qpos, &tail, ratio, top_k, 0)?;
         let mut want = Vec::new();
         for (r, &p) in qpos.iter().enumerate() {
             let row_scores = &host[r * blocks..r * blocks + blocks];
@@ -1005,6 +1581,381 @@ mod tests {
                 "row {r} differs past the buffer's first trim"
             );
         }
+        Ok(())
+    }
+
+    // —— Store and resume ————————————————————————————————————————————————
+    //
+    // A resumed sequence's index has to be the index it would have had if the
+    // process had never stopped. These build a cache by ragged appends, put it
+    // through the seal's export shape, rebuild it, and then require the rebuilt
+    // one to behave identically — not merely to hold the same bytes.
+
+    /// The test rig the store/resume tests share: weights, rope tables, and a
+    /// hidden-state stream long enough to append in ragged waves.
+    struct Rig {
+        device: Device,
+        cfg: IndexerConfig,
+        w: IndexerWeights,
+        rope: RopeTables,
+        keys: Tensor,
+        ratio: usize,
+        eps: f64,
+    }
+
+    impl Rig {
+        fn new(device: Device, tokens: usize) -> Result<Self> {
+            let cfg = IndexerConfig {
+                n_heads: 2,
+                head_dim: 16,
+                top_k: 8,
+            };
+            let (ratio, hidden, eps) = (4usize, 12usize, 1e-6);
+            let w = IndexerWeights {
+                q_proj: Tensor::from_vec(
+                    lcg(cfg.n_heads * cfg.head_dim * hidden, 0x71, 0.6),
+                    (cfg.n_heads * cfg.head_dim, hidden),
+                    &device,
+                )?,
+                k_proj: Tensor::from_vec(
+                    lcg(cfg.head_dim * hidden, 0x72, 0.6),
+                    (cfg.head_dim, hidden),
+                    &device,
+                )?,
+                q_norm: Tensor::from_vec(
+                    lcg(cfg.head_dim, 0x73, 0.2)
+                        .into_iter()
+                        .map(|v| v + 1.0)
+                        .collect::<Vec<f32>>(),
+                    (cfg.head_dim,),
+                    &device,
+                )?,
+                k_norm: Tensor::from_vec(
+                    lcg(cfg.head_dim, 0x74, 0.2)
+                        .into_iter()
+                        .map(|v| v + 1.0)
+                        .collect::<Vec<f32>>(),
+                    (cfg.head_dim,),
+                    &device,
+                )?,
+            };
+            let x = Tensor::from_vec(lcg(tokens * hidden, 0x75, 1.0), (tokens, hidden), &device)?;
+            let rope = RopeTables::new(8, 1e6, 4096, &device)?;
+            let keys = project_keys(&x, &w)?;
+            Ok(Self {
+                device,
+                cfg,
+                w,
+                rope,
+                keys,
+                ratio,
+                eps,
+            })
+        }
+
+        /// Append `rows` tokens starting at `start`.
+        fn append(&self, cache: &mut IndexCache, start: usize, rows: usize) -> Result<()> {
+            cache.ensure_capacity(start + rows, self.ratio)?;
+            let mut work = [AppendSpan { cache, start, rows }];
+            append_wave(
+                &mut work, &self.keys, &self.w, &self.rope, self.ratio, self.eps,
+            )
+        }
+
+        /// A cache holding the first `tokens` tokens, appended in waves whose
+        /// lengths are deliberately not multiples of `ratio`.
+        fn build(&self, tokens: usize) -> Result<IndexCache> {
+            let mut cache = IndexCache::new(self.cfg.head_dim, &self.device)?;
+            let mut at = 0usize;
+            for step in [7usize, 5, 11, 3].iter().cycle() {
+                if at >= tokens {
+                    break;
+                }
+                let rows = (*step).min(tokens - at);
+                self.append(&mut cache, at, rows)?;
+                at += rows;
+            }
+            assert_eq!(cache.len(self.ratio), tokens);
+            Ok(cache)
+        }
+
+        /// The seal's export shape, through the record bytes and back — the
+        /// whole persistence path, not a direct field copy.
+        fn round_trip(&self, cache: &IndexCache) -> Result<IndexCache> {
+            use crate::models::qwen4exp::paged_index::{decode_page, encode_page};
+            let blob = encode_page(&cache.live_rows()?, self.ratio, &cache.open_rows()?)?;
+            let back = decode_page(&blob, &self.device)?;
+            IndexCache::from_rows(&back.page.keys, &back.open, self.cfg.head_dim)
+        }
+
+        /// Every row's selection, as the model would compute it.
+        fn select(&self, cache: &IndexCache, qpos: &[usize]) -> Result<Vec<Option<Vec<u32>>>> {
+            let t = qpos.len();
+            let widest = cache.n_blocks.max(1);
+            let x = Tensor::from_vec(
+                lcg(t * self.w.q_proj.dim(1)?, 0x76, 1.0),
+                (t, self.w.q_proj.dim(1)?),
+                &self.device,
+            )?;
+            let q = project_queries(&x, &self.w, &self.cfg, &self.rope, qpos, self.eps)?;
+            let scores = Tensor::empty((t, widest), DType::F32, &self.device)?;
+            let cand = cache.score_rows(&q, qpos, &self.cfg, self.ratio, &scores, widest, 0)?;
+            let mut table = SelectionTable::new(t, self.ratio, self.cfg.top_k, &self.device)?;
+            let tail: Vec<u32> = qpos
+                .iter()
+                .map(|&p| cache.tail_len(p, self.ratio))
+                .collect();
+            table.fill_rows(&scores, &cand, qpos, &tail, self.ratio, self.cfg.top_k, 0)?;
+            (0..t).map(|r| table.row_to_host(r)).collect()
+        }
+    }
+
+    /// **The cache survives the record byte-for-byte, at every ragged width.**
+    ///
+    /// `T mod ratio` is uniformly distributed over `0..ratio` because a turn
+    /// ends where its text ends, so all four remainders are exercised. Byte
+    /// equality, not a tolerance: these are copies.
+    #[test]
+    fn a_cache_round_trips_through_the_record_at_every_ragged_width() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device, 128)?;
+        for extra in 0..rig.ratio {
+            let tokens = 10 * rig.ratio + extra;
+            let cache = rig.build(tokens)?;
+            assert_eq!(
+                cache.seal_shape(),
+                (tokens / rig.ratio, extra),
+                "the built cache is not at the width the test intends"
+            );
+
+            let back = rig.round_trip(&cache)?;
+            assert_eq!(
+                back.seal_shape(),
+                cache.seal_shape(),
+                "the restored cache stands at a different shape ({extra} carried)"
+            );
+            assert_eq!(
+                back.len(rig.ratio),
+                tokens,
+                "the restored cache reports {} tokens against {tokens} — it would \
+                 index every later token against the wrong block",
+                back.len(rig.ratio)
+            );
+            assert_eq!(
+                back.live_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                cache.live_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                "the completed rows changed"
+            );
+            assert_eq!(
+                back.open_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                cache.open_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                "the open block changed"
+            );
+        }
+        Ok(())
+    }
+
+    /// **A resumed cache keeps decoding as though it never stopped.**
+    ///
+    /// The property the round trip alone cannot establish. Two caches reach the
+    /// same 43 tokens — one continuously, one by resuming from a record sealed
+    /// at a ragged boundary — and are then appended the same further tokens.
+    /// Their rows must be identical.
+    ///
+    /// This is what fails if the open block is dropped: the restored cache pools
+    /// its next row over the wrong tokens, every row after it is shifted, and
+    /// both caches remain internally consistent while disagreeing about the
+    /// sequence. Nothing downstream reports it.
+    #[test]
+    fn a_resumed_cache_appends_the_same_rows_as_one_that_never_stopped() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device, 128)?;
+        // 43 is not a multiple of 4, so the seal lands mid-block — the case a
+        // boundary-aligned fixture would miss entirely.
+        let sealed_at = 43usize;
+        let mut live = rig.build(sealed_at)?;
+        let mut resumed = rig.round_trip(&live)?;
+
+        for (start, rows) in [
+            (sealed_at, 9usize),
+            (sealed_at + 9, 17),
+            (sealed_at + 26, 4),
+        ] {
+            rig.append(&mut live, start, rows)?;
+            rig.append(&mut resumed, start, rows)?;
+            assert_eq!(
+                resumed.seal_shape(),
+                live.seal_shape(),
+                "after appending {rows} at {start} the two caches are at different shapes"
+            );
+            assert_eq!(
+                resumed.live_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                live.live_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                "the resumed cache's rows diverged after appending {rows} at {start}"
+            );
+        }
+        Ok(())
+    }
+
+    /// **And it SELECTS the same rows.**
+    ///
+    /// The end of the chain: identical keys are worth nothing if the selection
+    /// built from them differs, and the selection is what the attention kernel
+    /// actually consumes. Exact equality per row, for the same reason
+    /// `device_selection_matches_the_cpu_oracle` requires it.
+    #[test]
+    fn a_resumed_cache_selects_exactly_what_the_live_one_selects() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device, 128)?;
+        let sealed_at = 43usize;
+        let mut live = rig.build(sealed_at)?;
+        let mut resumed = rig.round_trip(&live)?;
+        rig.append(&mut live, sealed_at, 21)?;
+        rig.append(&mut resumed, sealed_at, 21)?;
+
+        // Query positions spanning the seal boundary, so rows that see only
+        // pre-seal blocks, only post-seal ones, and both are all represented.
+        let qpos: Vec<usize> = (40..64).collect();
+        assert_eq!(
+            rig.select(&resumed, &qpos)?,
+            rig.select(&live, &qpos)?,
+            "the resumed cache selects different blocks than the live one — the \
+             conversation would attend to different history after a restart"
+        );
+        Ok(())
+    }
+
+    /// **A page's rows are visible to exactly the queries they sit below.**
+    ///
+    /// The arithmetic that replaces `(pos + 1) / ratio` once a sequence holds a
+    /// prefix it did not forward. Swept over three ragged pages and every
+    /// position across them, because the widths only disagree with the uniform
+    /// formula *after* the first boundary — a fixture with one page, or with
+    /// block-aligned ones, agrees with it everywhere and proves nothing.
+    #[test]
+    fn candidates_walk_the_pages_widths() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let head_dim = 16usize;
+        let ratio = 4usize;
+        // Section lengths that are deliberately NOT multiples of the ratio, so
+        // every boundary lands mid-block — which is what a section does, since
+        // injection advances the sequence by its real token count.
+        let sections = [13usize, 7, 26];
+        let mut cache = IndexCache::new(head_dim, &device)?;
+        let mut pos = 0usize;
+        for &t in &sections {
+            let rows = t.div_ceil(ratio);
+            let keys = Tensor::zeros((rows, head_dim), DType::F32, &device)?;
+            cache.push_page(IndexPage::new(keys, pos, t - (rows - 1) * ratio), ratio)?;
+            pos += t;
+        }
+        let total: usize = sections.iter().sum();
+        assert_eq!(cache.len(ratio), total, "pages do not span their tokens");
+        assert_eq!(
+            cache.page_row_span(),
+            sections.iter().map(|t| t.div_ceil(ratio)).sum::<usize>()
+        );
+
+        // Monotone, never past what exists, and exactly complete at the end.
+        let mut last = 0usize;
+        for p in 0..total {
+            let c = cache.candidates_at(p, ratio);
+            assert!(c >= last, "candidates went backwards at {p}: {last} -> {c}");
+            assert!(
+                c <= cache.page_row_span(),
+                "position {p} sees {c} rows but only {} exist",
+                cache.page_row_span()
+            );
+            last = c;
+        }
+        assert_eq!(
+            cache.candidates_at(total - 1, ratio),
+            cache.page_row_span(),
+            "the last token must see every page row — a page's short final row \
+             is still wholly below it"
+        );
+        Ok(())
+    }
+
+    /// **The live tail counts from where the pages end, not from zero.**
+    ///
+    /// The join is the part that cannot be got right by accident: rows appended
+    /// after an injected prefix pool from the tail's own first position, so
+    /// their visibility is `page_rows + (pos − span) / ratio`. Off by one page
+    /// and every forwarded token addresses a block belonging to the prefix.
+    #[test]
+    fn the_live_tail_counts_from_the_pages_end() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device.clone(), 128)?;
+        let mut cache = IndexCache::new(rig.cfg.head_dim, &device)?;
+        // One ragged page of 13 tokens => 4 rows, last covering 1.
+        let page_tokens = 13usize;
+        let page_rows = page_tokens.div_ceil(rig.ratio);
+        cache.push_page(
+            IndexPage::new(
+                Tensor::zeros((page_rows, rig.cfg.head_dim), DType::F32, &device)?,
+                0,
+                page_tokens - (page_rows - 1) * rig.ratio,
+            ),
+            rig.ratio,
+        )?;
+
+        // Forward 9 more tokens on top: 2 whole rows and 1 carried.
+        rig.append(&mut cache, 0, 9)?;
+        assert_eq!(cache.len(rig.ratio), page_tokens + 9);
+        assert_eq!(
+            cache.candidates_at(page_tokens - 1, rig.ratio),
+            page_rows,
+            "the last page token must see the whole page and none of the tail"
+        );
+        assert_eq!(
+            cache.candidates_at(page_tokens + 3, rig.ratio),
+            page_rows + 1,
+            "four tail tokens complete exactly one tail row"
+        );
+        assert_eq!(
+            cache.candidates_at(page_tokens + 8, rig.ratio),
+            page_rows + 2,
+            "nine tail tokens complete two, with one carried"
+        );
+        Ok(())
+    }
+
+    /// **A page arriving after live rows is refused.**
+    ///
+    /// Pages describe a prefix. One pushed after a forward would claim
+    /// positions the live tail already holds, and every later query would
+    /// address the wrong block — silently, because the counts would still add
+    /// up.
+    #[test]
+    fn a_page_after_live_rows_is_refused() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device.clone(), 32)?;
+        let mut cache = IndexCache::new(rig.cfg.head_dim, &device)?;
+        rig.append(&mut cache, 0, 8)?;
+        let page = IndexPage::new(
+            Tensor::zeros((2, rig.cfg.head_dim), DType::F32, &device)?,
+            0,
+            rig.ratio,
+        );
+        let err = cache.push_page(page, rig.ratio).unwrap_err();
+        assert!(err.to_string().contains("must precede"), "{err}");
+        Ok(())
+    }
+
+    /// **An open block wider than one can be is refused, not truncated.**
+    ///
+    /// `n_open` is always `< ratio ≤ MAX_RATIO` by construction, so a record
+    /// declaring more is corrupt. Installing it would leave rows in the raw
+    /// buffer that the next append neither pools nor overwrites.
+    #[test]
+    fn an_oversized_open_block_is_refused() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let head_dim = 16usize;
+        let rows = Tensor::zeros((4, head_dim), DType::F32, &device)?;
+        let open = Tensor::zeros((MAX_RATIO + 1, head_dim), DType::F32, &device)?;
+        let err = IndexCache::from_rows(&rows, &open, head_dim).unwrap_err();
+        assert!(err.to_string().contains("open rows"), "{err}");
         Ok(())
     }
 
@@ -1093,7 +2044,8 @@ mod tests {
         let widest = t.div_ceil(ratio).max(1);
         let scores = Tensor::empty((t, widest), DType::F32, &device)?;
         let cand = cache.score_rows(&q_all, &qpos, &cfg, ratio, &scores, widest, 0)?;
-        table.fill_rows(&scores, &cand, &qpos, ratio, cfg.top_k, 0)?;
+        let tail: Vec<u32> = qpos.iter().map(|&p| cache.tail_len(p, ratio)).collect();
+        table.fill_rows(&scores, &cand, &qpos, &tail, ratio, cfg.top_k, 0)?;
 
         // Oracle: the additive mask, from the same weights on the CPU.
         let w_cpu = w(&Device::Cpu)?;

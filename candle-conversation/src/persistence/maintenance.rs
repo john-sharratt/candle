@@ -350,6 +350,17 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                     payload: p.clone(),
                 });
             }
+            // The index page rides with the turn's K/V: a turn that survives
+            // relocation with its chunks but loses its page comes back
+            // borrowable and unindexable.
+            if let Some(p) = &entry.index_page {
+                out.push(Resident {
+                    rt: RecordType::TurnIndexPage,
+                    stream_id: stream_id.0,
+                    chunk_index: 0,
+                    payload: p.clone(),
+                });
+            }
         }
         if let Some(through) = entry.committed_through {
             out.push(Resident {
@@ -1092,6 +1103,7 @@ mod tests {
                     conv_tail_cols: 2,
                     conv_tail: vec![fill; 16],
                 }],
+                aux: vec![fill; 24],
             }
             .encode()
         };
@@ -1125,6 +1137,11 @@ mod tests {
         let decoded = SnapshotPayload::decode(&bytes).unwrap();
         assert_eq!(decoded.turn_index, 2, "the newer snapshot is the tail");
         assert_eq!(decoded.layers[0].state[0], 0x22);
+        assert_eq!(
+            decoded.aux,
+            vec![0x22u8; 24],
+            "the model's own state rides the record, not just the layers"
+        );
 
         // Relocation worklist contains exactly the tail (the dead copy is
         // invisible to the index).
@@ -1168,6 +1185,10 @@ mod tests {
                 conv_tail_cols: 2,
                 conv_tail: vec![fill; 16],
             }],
+            // Filled, not empty: a relocation that carried the layers and
+            // dropped the model's own state would still pass every assertion
+            // that only inspects the layers.
+            aux: vec![fill; 24],
         }
         .encode()
     }
@@ -1244,6 +1265,11 @@ mod tests {
         let decoded = SnapshotPayload::decode(&sp.read_record_payload(&tail).unwrap()).unwrap();
         assert_eq!(decoded.turn_index, 2);
         assert_eq!(decoded.layers[0].state[0], 0x22);
+        assert_eq!(
+            decoded.aux,
+            vec![0x22u8; 24],
+            "relocation carries the model's own state too"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

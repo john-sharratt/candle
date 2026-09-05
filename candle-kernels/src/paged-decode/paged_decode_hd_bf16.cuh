@@ -74,6 +74,8 @@ extern "C" int32_t DECODE_CAT(run_paged_decode_bf16_hd, DECODE_HD)(
     int64_t gate_slot_stride,
     const uint32_t* sel_entries,
     const uint32_t* sel_cnt,
+    const uint2* sel_pages,
+    const uint2* sel_page_win,
     int32_t sel_stride,
     int32_t sel_ratio
 ) {
@@ -83,5 +85,5 @@ extern "C" int32_t DECODE_CAT(run_paged_decode_bf16_hd, DECODE_HD)(
         n_q_head, n_kv_head, softmax_scale, (const __nv_bfloat16*)k_new,
         (const __nv_bfloat16*)v_new, rope_cs, rope_interleaved, (cudaStream_t)stream_ptr,
         (uint8_t*)q8_out, (const __nv_bfloat16*)gate, gate_slot_stride,
-        QsaSel{sel_entries, sel_cnt, sel_stride, sel_ratio});
+        QsaSel{sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio});
 }

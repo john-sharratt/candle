@@ -26,6 +26,7 @@
 
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
+use crate::models::delta_net::ExportedLayerState;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
@@ -2027,6 +2028,17 @@ impl BatchedInferenceSession {
         self.num_layers
     }
 
+    /// Leading KV layers a wave steps together — every layer except a draft
+    /// head's.
+    ///
+    /// The bound for any aggregate taken *across* layers. A speculative head's
+    /// K/V is its own history rather than the conversation's, so including it
+    /// makes such an aggregate describe two different things at once — see the
+    /// `stream_layers` field.
+    pub fn stream_layers(&self) -> usize {
+        self.stream_layers
+    }
+
     /// Get the KV backing for a specific layer.
     pub fn backing(&self, layer: usize) -> Option<&ChunkedKvBacking> {
         self.backings.get(layer)
@@ -2131,9 +2143,10 @@ impl BatchedInferenceSession {
         &self,
         seq_idx: usize,
         block_range: Option<(usize, usize)>,
+        n_layers: usize,
     ) -> candle::Result<Option<ProvSignPacked>> {
         let Some((all_ptrs, block_indices)) =
-            self.resolve_provenance_q_ptrs(seq_idx, block_range)?
+            self.resolve_provenance_q_ptrs(seq_idx, block_range, n_layers)?
         else {
             return Ok(None);
         };
@@ -2221,13 +2234,30 @@ impl BatchedInferenceSession {
         &self,
         seq_idx: usize,
         block_range: Option<(usize, usize)>,
+        n_layers: usize,
     ) -> candle::Result<Option<(Vec<i64>, Vec<usize>)>> {
         if self.backings.is_empty() || self.n_kv_head() == 0 || self.prov_sub_head_dim() == 0 {
             return Ok(None);
         }
+        // **The provenance-bearing layers, which are not always all of them.**
+        //
+        // `n_layers` comes from the model's `provenance_capture_layers`, and it
+        // has to be the same number the fold was derived from: the fold's
+        // geometry is `layers × kv_heads`, so a gather over one more layer than
+        // the fold expects does not produce a slower answer, it produces a
+        // different one.
+        //
+        // It also has to exclude a speculative head's layer. The gather is
+        // all-or-nothing — every layer must agree on the same block set, and
+        // any disagreement returns `None` — and a draft head's K/V is its own
+        // history, at its own seal level, so its blocks never match the trunk's.
+        // Including it returned `None` on every turn: the turn sealed, the K/V
+        // was written, and only the signature was silently absent, leaving
+        // retrieval on recency with nothing saying so.
         let mut all_ptrs: Vec<i64> = Vec::new();
         let mut block_indices: Option<Vec<usize>> = None;
-        for backing in &self.backings {
+        let take = n_layers.min(self.backings.len());
+        for backing in &self.backings[..take] {
             let (ptrs, blocks) = backing.provenance_q_ptrs(seq_idx, block_range)?;
             if ptrs.is_empty() {
                 return Ok(None);
@@ -3418,6 +3448,17 @@ pub trait ManagedBatchedModel {
     /// and sets threshold factors to `1.0`.  The blanket impl for `BatchedInference<M>`
     /// overrides this to read per-model threshold factors from the inner `BatchedModelCore`.
     fn model_core_properties(&self) -> ModelCoreProperties {
+        self.default_core_properties()
+    }
+
+    /// The uniform-transformer answer, so an override can adjust ONE field
+    /// instead of restating all eleven.
+    ///
+    /// A model that differs in one respect — a hybrid whose provenance lives in
+    /// its attention layers only, say — should not have to copy the threshold
+    /// factors and layer indices to say so, because a copy is a second place
+    /// for them to drift.
+    fn default_core_properties(&self) -> ModelCoreProperties {
         let n = self.num_layers();
         let provenance_layer_indices = if n == 0 {
             ProvenanceLayerIndices {
@@ -3758,10 +3799,7 @@ pub trait ManagedBatchedModel {
     /// Refuses mid-wave — a snapshot must capture a sealed boundary, never a
     /// wave in flight. The seal runs outside the wave, so this is an assertion
     /// on that ordering rather than a case to handle.
-    fn export_recurrent(
-        &self,
-        _seq: usize,
-    ) -> Result<Option<(u64, Vec<crate::models::delta_net::ExportedLayerState>)>> {
+    fn export_recurrent(&self, _seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
         Ok(None)
     }
 
@@ -3776,9 +3814,141 @@ pub trait ManagedBatchedModel {
         &self,
         _seq: usize,
         _schedule_hash: u64,
-        _layers: &[crate::models::delta_net::ExportedLayerState],
+        _layers: &[ExportedLayerState],
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Carried per-sequence state that is **not** a DeltaNet layer stack, as an
+    /// opaque byte string the persistence layer stores verbatim.
+    ///
+    /// [`Self::export_recurrent`]'s rows are shaped for one thing — a per-layer
+    /// `(S, conv_tail)` pair — because that is what the hybrid lineage carries.
+    /// An architecture with a differently-shaped state has two bad options and
+    /// one good one: widen `ExportedLayerState` with fields most models leave
+    /// empty, invent a second record type the scheduler has to learn, or hand
+    /// the scheduler bytes it never interprets. This is the third.
+    ///
+    /// The model owns the encoding **and its versioning**. Nothing above this
+    /// line may parse the blob, so a model may change its layout freely as long
+    /// as [`Self::restore_aux_state`] still reads what it once wrote — the same
+    /// contract the record format keeps for its own wire versions.
+    ///
+    /// `None` for a model with no such state, which is every model but
+    /// Qwen3.8-Flash-Next today (its PLE convolution window and hash history).
+    /// Called at the same seal point as `export_recurrent`, so a model that
+    /// returns rows there and `None` here is saying its state is entirely
+    /// DeltaNet-shaped.
+    fn export_aux_state(&self, _seq: usize) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Install what [`Self::export_aux_state`] wrote. Returns `true` when the
+    /// blob was consumed.
+    ///
+    /// **Errors on a blob it cannot parse** rather than starting from zeros.
+    /// The whole point of persisting this is that it cannot be recomputed from
+    /// the K/V; silently discarding it produces a sequence that reads fluently
+    /// against a history it never processed, which is the failure this path
+    /// exists to make impossible.
+    fn restore_aux_state(&self, _seq: usize, _blob: &[u8]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether this model keeps state indexed by token position that borrowing
+    /// K/V does not bring along.
+    ///
+    /// Distinct from [`Self::carries_recurrent_state`]: a recurrence is one
+    /// value carried forward and is rebuilt by replaying tokens in order, while
+    /// this is per-position and has to travel with the positions it describes.
+    /// Answering `true` is what makes a missing page worth a warning rather
+    /// than silence.
+    fn carries_positional_state(&self) -> bool {
+        false
+    }
+
+    /// Discard per-position derived state for `seq` — paired with truncating
+    /// the sequence's K/V to nothing.
+    ///
+    /// A slot being reused starts at position 0, and state describing the
+    /// previous occupant's positions would put the next sequence's first token
+    /// at the old prefix's end. No-op for a model with no such state.
+    fn reset_positional_state(&self, _seq: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// The per-position state produced for whatever `seq` has forwarded since
+    /// its last reset — a sealed section's page.
+    ///
+    /// **Sealed on a block boundary**, so the piece is self-contained: a
+    /// section's tokens do not end on one, and rows left carried would belong
+    /// to a block the *next* section completes. Returns `None` for a model with
+    /// nothing of the kind.
+    fn seal_positional_state(&self, _seq: usize) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// [`Self::seal_positional_state`] for a piece that is not the whole of
+    /// what `seq` has forwarded — a conversation turn, whose slot carries the
+    /// projection's injected prefix ahead of it and keeps decoding after.
+    ///
+    /// `start_pos` is the first token of the piece. Taken without disturbing the
+    /// live state, because the sequence this is read from is still in use.
+    fn seal_positional_range(&self, _seq: usize, _start_pos: usize) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// How many of `seq`'s tokens the model's per-position state actually
+    /// covers, if it keeps any.
+    ///
+    /// The number that has to track the slot's K/V length. Exposed so the paths
+    /// that move K/V around — carve a view, fork, rebuild a prefix — can say
+    /// what they left behind, instead of the mismatch surfacing many layers
+    /// later as a refused selection.
+    fn positional_coverage(&self, _seq: usize) -> Option<usize> {
+        None
+    }
+
+    /// Seal the per-position state for the last `tokens` tokens of `seq`,
+    /// wherever it is held, as blobs to be re-installed in the order returned.
+    ///
+    /// Unlike [`Self::seal_positional_range`] this spans state that has already
+    /// been folded into an injected piece, which is where part of a turn ends
+    /// up once a reprojection has re-injected its opening half.
+    fn seal_positional_tail_span(&self, _seq: usize, _tokens: usize) -> Result<Vec<Vec<u8>>> {
+        Ok(Vec::new())
+    }
+
+    /// Install a sealed piece ahead of whatever `seq` forwards next — the
+    /// counterpart of Arc-injecting that piece's K/V.
+    ///
+    /// **This is the one thing injection cannot copy.** K/V can be borrowed
+    /// because it already exists; a recurrence cannot, which is what the branch
+    /// checkpoint pass is for. Per-position state is a third case: it is not a
+    /// recurrence, so no whole-prefix pass rebuilds it, and it is not K/V, so
+    /// borrowing the chunks does not bring it along. Without it a query lands
+    /// at a position whose blocks the model does not hold, and the select
+    /// refuses rather than scoring against a prefix it never indexed.
+    ///
+    /// Returns `false` when the model carries none, so the caller can offer it
+    /// unconditionally.
+    fn push_positional_state(&self, _seq: usize, _blob: &[u8]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Rebuild any per-sequence index derived from the K/V, after the K/V has
+    /// been restored but before the sequence decodes.
+    ///
+    /// The counterpart to the aux blob: state that IS derivable from the K/V,
+    /// and large enough that deriving it beats storing it. Qwen3.8-Flash-Next's
+    /// QSA index is ~16 MiB per attention layer at 128K tokens — two orders of
+    /// magnitude past its recurrent snapshot — so it is rebuilt here from the
+    /// keys the restore just brought back.
+    ///
+    /// A no-op for every model whose sequence state is fully described by its
+    /// K/V plus its recurrent snapshot.
+    fn reindex_restored_sequence(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
     }
 
     /// `child`'s state becomes `parent`'s — the linear join.

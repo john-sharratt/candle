@@ -34,9 +34,54 @@
 struct QsaSel {
     const uint32_t* entries;  // [n_rows, stride], ascending by block
     const uint32_t* cnt;      // [n_rows]
+    // Page layout, for a sequence whose prefix arrived as independently sealed
+    // pieces. `{tokens_before, blocks_before}` per page, ascending, concatenated
+    // over the launch's sequences; `page_win[row]` is `{offset, count}` into it
+    // for that row's sequence.
+    //
+    // **Null for a sequence that forwarded everything it holds**, which is every
+    // sequence outside the projection path — and then block `b` covers
+    // `[b*ratio, (b+1)*ratio)` exactly as it always did. The walk below reduces
+    // to that arithmetic with one page `{0, 0}`, so the null case is a
+    // dereference saved, not a different rule.
+    const uint2* pages;
+    const uint2* page_win;    // [n_rows]
     int stride;
     int ratio;
 };
+
+// The page holding `pos` (or the block `b`), by binary search over the ascending
+// prefix sums. `key_is_block` picks which member of the pair to compare.
+__device__ __forceinline__ uint2 qsa_page_for(
+    const QsaSel& sel, int row, uint32_t key, bool key_is_block)
+{
+    const uint2 w = sel.page_win[row];
+    uint32_t lo = w.x, hi = w.x + w.y;
+    // Last page whose prefix is at or below `key`. The list is non-empty by
+    // construction and its first entry is {0, 0}, so `lo` always lands.
+    while (lo + 1 < hi) {
+        const uint32_t mid = (lo + hi) >> 1;
+        const uint2 p = sel.pages[mid];
+        const uint32_t at = key_is_block ? p.y : p.x;
+        if (at <= key) lo = mid; else hi = mid;
+    }
+    return sel.pages[lo];
+}
+
+// The block covering key position `pos` for `row`.
+__device__ __forceinline__ uint32_t qsa_block_of(const QsaSel& sel, int row, int pos) {
+    if (sel.pages == nullptr) return (uint32_t)(pos / sel.ratio);
+    const uint2 p = qsa_page_for(sel, row, (uint32_t)pos, false);
+    return p.y + ((uint32_t)pos - p.x) / (uint32_t)sel.ratio;
+}
+
+// The first key position of `block` for `row` — the inverse of
+// [`qsa_block_of`], which the prefill walk steps the prefix by.
+__device__ __forceinline__ int qsa_block_start(const QsaSel& sel, int row, uint32_t block) {
+    if (sel.pages == nullptr) return (int)block * sel.ratio;
+    const uint2 p = qsa_page_for(sel, row, block, true);
+    return (int)(p.x + (block - p.y) * (uint32_t)sel.ratio);
+}
 
 __device__ __forceinline__ bool qsa_active(const QsaSel& sel) {
     return sel.entries != nullptr;
@@ -58,8 +103,8 @@ __device__ __forceinline__ bool qsa_selects(const QsaSel& sel, int row, int pos)
     const uint32_t n = sel.cnt[row];
     if (n == QSA_DENSE_ROW) return true;
     const uint32_t* e = sel.entries + (int64_t)row * sel.stride;
-    const uint32_t want = (uint32_t)(pos / sel.ratio);
-    const uint32_t cell = (uint32_t)(pos - (int)want * sel.ratio);
+    const uint32_t want = qsa_block_of(sel, row, pos);
+    const uint32_t cell = (uint32_t)(pos - qsa_block_start(sel, row, want));
     uint32_t lo = 0, hi = n;
     while (lo < hi) {
         uint32_t mid = (lo + hi) >> 1;

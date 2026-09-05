@@ -213,6 +213,22 @@ pub enum RecordType {
     /// payload is owned by the daemon's registry and is not in this process's
     /// RAM at all. See [`super::compaction`].
     Npc = 22,
+    /// A turn's **QSA index page** — the compressed index rows covering exactly
+    /// that turn's own tokens. Opaque payload, keyed by the turn's stream id,
+    /// last-writer-wins, structurally a sibling of [`Self::WideQSig`].
+    ///
+    /// **Why this has to be on disk.** A projection borrows a sealed turn's K/V
+    /// rather than recomputing it, and the index cannot be borrowed the same
+    /// way: its keys come from hidden states the borrowing slot never computed.
+    /// The page is what carries them across. Held only in the daemon's RAM, it
+    /// survives exactly as long as the process — so after a restart every
+    /// cold-loaded turn hands a slot its keys and no index of them, the slot's
+    /// caches sit permanently short by that turn's width, and the QSA select
+    /// refuses the moment the conversation grows past the identity threshold.
+    /// Under the threshold nothing reads the index, so the loss is silent until
+    /// it is fatal, and it is fatal only for conversations long enough to
+    /// matter.
+    TurnIndexPage = 23,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -253,6 +269,7 @@ impl RecordType {
             20 => RecordType::Snapshot,
             21 => RecordType::BranchCheckpoint,
             22 => RecordType::Npc,
+            23 => RecordType::TurnIndexPage,
             _ => RecordType::Unknown,
         }
     }
@@ -1207,11 +1224,30 @@ pub struct SnapshotPayload {
     pub turn_index: u32,
     pub schedule_hash: u64,
     pub layers: Vec<SnapshotLayer>,
+    /// Model-opaque state this record carries alongside `layers`.
+    ///
+    /// `layers` is one shape — a per-layer delta-rule matrix plus a conv tail —
+    /// and it is the right shape for the state that owns this record. It is not
+    /// the only recurrence a model can carry: Flash-Next also holds a PLE cache
+    /// and a QSA index, neither of which is a delta-rule matrix and neither of
+    /// which fits a field of `SnapshotLayer` without inventing one per model.
+    ///
+    /// So this is bytes, and only the model that wrote them reads them
+    /// ([`export_aux_state`](candle_transformers::models::batched_inference::ManagedBatchedModel::export_aux_state)).
+    /// Persistence carries the blob, checksums it with the rest of the record,
+    /// and never decodes it — which is what keeps one seal path serving every
+    /// architecture instead of growing a branch per model. Empty for a model
+    /// with no such state, which costs a length word.
+    pub aux: Vec<u8>,
 }
 
-/// Wire version of [`SnapshotPayload`]; bump on layout change, keep decode
-/// for every version ever written.
-const SNAPSHOT_PAYLOAD_VERSION: u32 = 1;
+/// Wire version of [`SnapshotPayload`]; bump on layout change.
+///
+/// Version 2 appends the model-opaque `aux` blob. A version-1 record decodes to
+/// a *plausible* state under this layout — the trailing length word would be
+/// read from whatever followed the layers — so the mismatch is refused rather
+/// than tolerated, and a substrate written by an older build recomputes.
+const SNAPSHOT_PAYLOAD_VERSION: u32 = 2;
 
 impl SnapshotPayload {
     pub fn encode(&self) -> Vec<u8> {
@@ -1224,6 +1260,7 @@ impl SnapshotPayload {
         for l in &self.layers {
             encode_snapshot_layer(&mut w, l);
         }
+        w.put_blob(&self.aux);
         w.into_bytes()
     }
 
@@ -1244,11 +1281,13 @@ impl SnapshotPayload {
         for _ in 0..n_layers {
             layers.push(decode_snapshot_layer(&mut r)?);
         }
+        let aux = r.get_blob()?.to_vec();
         Ok(Self {
             timeline_id,
             turn_index,
             schedule_hash,
             layers,
+            aux,
         })
     }
 }
@@ -1284,6 +1323,15 @@ pub struct BranchCheckpointPayload {
     pub prefix_hash: ContentHash,
     pub schedule_hash: u64,
     pub layers: Vec<SnapshotLayer>,
+    /// Model-opaque state, exactly as [`SnapshotPayload::aux`].
+    ///
+    /// A checkpoint exists so a conversation enters its first user turn holding
+    /// the state the system prompt would have produced. That argument does not
+    /// single out the delta-rule matrices: a model whose *whole* recurrence is
+    /// in the aux blob and whose checkpoint carried only `layers` would restore
+    /// an empty index over a prompt's worth of attention K/V — the same
+    /// asymmetry this record exists to remove, one class of state further in.
+    pub aux: Vec<u8>,
 }
 
 /// Leading magic, so the two payloads sharing [`RecordType::Snapshot`] can
@@ -1299,8 +1347,8 @@ pub struct BranchCheckpointPayload {
 /// this magic cannot collide with, so the refusal runs in both directions.
 const BRANCH_CHECKPOINT_MAGIC: &[u8; 4] = b"BRCK";
 
-/// Wire version of [`BranchCheckpointPayload`].
-const BRANCH_CHECKPOINT_VERSION: u32 = 1;
+/// Wire version of [`BranchCheckpointPayload`]. Version 2 appends `aux`.
+const BRANCH_CHECKPOINT_VERSION: u32 = 2;
 
 impl BranchCheckpointPayload {
     pub fn encode(&self) -> Vec<u8> {
@@ -1316,6 +1364,7 @@ impl BranchCheckpointPayload {
         for l in &self.layers {
             encode_snapshot_layer(&mut w, l);
         }
+        w.put_blob(&self.aux);
         w.into_bytes()
     }
 
@@ -1347,10 +1396,12 @@ impl BranchCheckpointPayload {
         for _ in 0..n_layers {
             layers.push(decode_snapshot_layer(&mut r)?);
         }
+        let aux = r.get_blob()?.to_vec();
         Ok(Self {
             prefix_hash: ContentHash { lo, hi },
             schedule_hash,
             layers,
+            aux,
         })
     }
 }
@@ -1428,6 +1479,7 @@ mod snapshot_payload_tests {
                 conv_tail_cols: 1,
                 conv_tail: vec![1u8; 12],
             }],
+            aux: vec![9u8; 5],
         }
     }
 
@@ -1436,7 +1488,7 @@ mod snapshot_payload_tests {
     fn encode_is_byte_stable() {
         let bytes = tiny().encode();
         let mut expect: Vec<u8> = Vec::new();
-        expect.extend_from_slice(&1u32.to_le_bytes()); // version
+        expect.extend_from_slice(&2u32.to_le_bytes()); // version
         expect.extend_from_slice(&7u64.to_le_bytes()); // timeline
         expect.extend_from_slice(&3u32.to_le_bytes()); // turn
         expect.extend_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
@@ -1452,6 +1504,8 @@ mod snapshot_payload_tests {
         expect.extend_from_slice(&1u32.to_le_bytes()); // conv_tail_cols
         expect.extend_from_slice(&12u32.to_le_bytes()); // tail blob len
         expect.extend_from_slice(&[1u8; 12]);
+        expect.extend_from_slice(&5u32.to_le_bytes()); // aux blob len
+        expect.extend_from_slice(&[9u8; 5]);
         assert_eq!(bytes, expect);
     }
 
@@ -1466,6 +1520,61 @@ mod snapshot_payload_tests {
         bad.layers[0].state.pop();
         let err = SnapshotPayload::decode(&bad.encode()).unwrap_err();
         assert!(err.to_string().contains("state blob"));
+    }
+
+    /// A model with no auxiliary state writes an empty blob, and it round-trips
+    /// as empty rather than as a missing field.
+    #[test]
+    fn an_absent_aux_blob_round_trips_as_empty() {
+        let mut p = tiny();
+        p.aux.clear();
+        let back = SnapshotPayload::decode(&p.encode()).unwrap();
+        assert!(back.aux.is_empty());
+        assert_eq!(p, back);
+    }
+
+    /// The aux blob is the record's LAST field, so a truncation that loses it
+    /// is the one corruption a length-prefixed reader can meet at the end of
+    /// the buffer. Refused, not read as empty: an empty blob and a lost blob
+    /// mean opposite things — no state to install, versus state that was
+    /// installed and is now silently gone.
+    #[test]
+    fn a_truncated_aux_blob_is_refused() {
+        let bytes = tiny().encode();
+        for cut in 1..=6 {
+            let err = SnapshotPayload::decode(&bytes[..bytes.len() - cut]).unwrap_err();
+            assert!(err.to_string().contains("truncated input"), "{err}");
+        }
+    }
+
+    /// **A record written before `aux` existed is REFUSED, not misread.**
+    ///
+    /// This is the one case a live substrate actually meets: version 1 had no
+    /// trailing blob, so under this layout its bytes end exactly where the
+    /// length word would begin. Read leniently it would either take four bytes
+    /// of whatever followed as a length, or — for a record that happened to sit
+    /// at the end of a segment — decode to a plausible state with an empty aux,
+    /// which is the same shape as "this model carries no auxiliary state" and
+    /// is indistinguishable from it.
+    ///
+    /// The refusal is what makes an old substrate degrade honestly:
+    /// `read_recurrent_snapshot` returns the error,
+    /// `Scheduler::restore_recurrent_state` logs RECURRENT RESUME FAILED and
+    /// continues, and the conversation opens with no memory of its history
+    /// instead of a wrong one.
+    #[test]
+    fn a_version_one_record_is_refused() {
+        // Version 1 is this payload's bytes with the version word set to 1 and
+        // the trailing aux blob absent.
+        let mut v1 = tiny().encode();
+        v1.truncate(v1.len() - (4 + 5)); // aux length word + aux bytes
+        v1[..4].copy_from_slice(&1u32.to_le_bytes());
+
+        let err = SnapshotPayload::decode(&v1).unwrap_err();
+        assert!(
+            err.to_string().contains("version 1"),
+            "a version-1 record must be named as such, got: {err}"
+        );
     }
 
     #[test]
@@ -1513,6 +1622,7 @@ mod branch_checkpoint_tests {
             },
             schedule_hash: 0xDEAD_BEEF_CAFE_F00D,
             layers: (0..30).map(real_layer).collect(),
+            aux: vec![0xABu8; 4096],
         }
     }
 
@@ -1527,7 +1637,7 @@ mod branch_checkpoint_tests {
         let bytes = p.encode();
         let mut expect: Vec<u8> = Vec::new();
         expect.extend_from_slice(b"BRCK"); // magic
-        expect.extend_from_slice(&1u32.to_le_bytes()); // version
+        expect.extend_from_slice(&2u32.to_le_bytes()); // version
         expect.extend_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes()); // prefix lo
         expect.extend_from_slice(&0xFEDC_BA98_7654_3210u64.to_le_bytes()); // prefix hi
         expect.extend_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes()); // schedule
@@ -1543,6 +1653,12 @@ mod branch_checkpoint_tests {
         let back = BranchCheckpointPayload::decode(&p.encode()).unwrap();
         assert_eq!(p, back);
         assert_eq!(back.layers.len(), 30, "every recurrent layer survives");
+        assert_eq!(
+            back.aux.len(),
+            4096,
+            "and so does the model's own state, which for an architecture that \
+             keeps its whole recurrence there is the entire checkpoint"
+        );
     }
 
     /// A truncated state blob is corrupt, not clamped — restoring a partial
@@ -1575,6 +1691,7 @@ mod branch_checkpoint_tests {
             turn_index: 3,
             schedule_hash: 11,
             layers: vec![real_layer(0)],
+            aux: Vec::new(),
         };
         let err = BranchCheckpointPayload::decode(&conv.encode()).unwrap_err();
         assert!(err.to_string().contains("not a branch checkpoint"), "{err}");

@@ -266,6 +266,16 @@ p { margin: 0 0 10px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; }
 .card + .card { margin-top: 10px; }
 
+/* The stacking margins above are for FLOW: one panel under another. A grid
+   already spaces its children with `gap`, and there the adjacent-sibling rule
+   still matches — so the second panel of every two-column row took a 10px top
+   margin its neighbour did not, and the two columns sat at different heights
+   down the whole page. Grid and flex containers own their own spacing. */
+.grid > .panel + .panel,
+.grid > .card + .card,
+.col > .panel + .panel,
+.col > .card + .card { margin-top: 0; }
+
 /* A list is ONE surface with hairline dividers — not a stack of boxes. */
 .list { background: var(--panel); border-radius: var(--radius); overflow: hidden; }
 .list > * { border-bottom: 1px solid var(--line); }

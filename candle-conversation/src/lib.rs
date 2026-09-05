@@ -76,6 +76,7 @@ pub mod substrate;
 pub mod summary_tree;
 pub mod think_strip;
 mod time_source;
+pub mod token_bias;
 pub mod token_buffer;
 pub mod tree;
 pub mod turn;

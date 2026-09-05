@@ -454,6 +454,25 @@ pub fn collect_live_records(
                 ));
             }
         }
+        // The turn's QSA index page, re-emitted with its K/V for the same
+        // reason: a compaction that carries a turn's chunks forward but drops
+        // its page leaves a turn that can be borrowed and cannot be indexed.
+        // Unlike the signature this is not sig-gated — it belongs to the K/V,
+        // and a `TextOnly` turn that keeps its chunks keeps its page.
+        if let Some(payload) = &entry.index_page {
+            out.push(CompactItem::synth(
+                RecordHeader {
+                    record_type: RecordType::TurnIndexPage,
+                    format: 0,
+                    payload_len: payload.len() as u64,
+                    crc: 0,
+                    stream_id: stream_id.0,
+                    chunk_index: 0,
+                    token_count: 0,
+                },
+                payload.clone(),
+            ));
+        }
         if let Some(through) = entry.committed_through {
             out.push(CompactItem::synth(
                 RecordHeader {
@@ -1493,6 +1512,10 @@ mod tests {
                 conv_tail_cols: 2,
                 conv_tail: vec![fill; 16],
             }],
+            // Filled, not empty: a relocation that carried the layers and
+            // dropped the model's own state would still pass every assertion
+            // that only inspects the layers.
+            aux: vec![fill; 24],
         }
         .encode()
     }

@@ -1060,6 +1060,73 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A turn's QSA index page has to outlive the process that sealed it.
+    ///
+    /// Held only in the scheduler's `turn_positional` map it dies with the
+    /// daemon, and every turn cold-loaded afterwards hands a projection its K/V
+    /// with no index of it — the slot's caches then sit permanently short by
+    /// that turn's width and the select refuses once the conversation passes the
+    /// identity threshold. This asserts the byte-for-byte round trip through a
+    /// simulated restart, which is the only thing that closes that gap.
+    #[test]
+    fn index_page_persists_and_recovers() {
+        use crate::projection::{TimelineId, TurnIndex};
+
+        let dir = tmp_dir("index_page");
+        let decl = turn_decl(9, 0, 3);
+        let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+        // Opaque to this layer by design — the model owns the encoding, and the
+        // log carries the bytes without inspecting them.
+        let payload: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
+            sp.append_turn_index_page(stream_id, &payload).unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
+            let blob = substrate
+                .index_page_blob(tl, TurnIndex(decl.turn_index))
+                .expect("index page recovered after restart");
+            assert_eq!(blob, payload.as_slice());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Last-writer-wins: re-sealing a turn replaces its page rather than
+    /// leaving the stale one to be handed to the next projection.
+    #[test]
+    fn index_page_last_writer_wins() {
+        use crate::projection::{TimelineId, TurnIndex};
+
+        let dir = tmp_dir("index_page_lww");
+        let decl = turn_decl(9, 0, 3);
+        let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
+            sp.append_turn_index_page(stream_id, b"first-page").unwrap();
+            sp.append_turn_index_page(stream_id, b"second-page")
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
+            assert_eq!(
+                substrate.index_page_blob(tl, TurnIndex(decl.turn_index)),
+                Some(b"second-page".as_slice())
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn recover_turn_demux_fails_on_wrong_layer_count() {
         let dir = tmp_dir("wrong_layers");

@@ -37,6 +37,7 @@ pub mod model;
 /// The NextN / MTP draft head — the block past the trunk, and the input
 /// assembly that feeds it.
 pub mod mtp;
+pub mod paged_index;
 pub mod ple;
 pub mod ple_cache;
 pub mod qsa;
