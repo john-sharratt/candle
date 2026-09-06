@@ -63,11 +63,6 @@ pub fn router() -> Router {
         .route("/v1/npc/:id/projection", get(projection_latest))
         .route("/v1/npc/:id/projection/:tick", get(projection_at))
         .route("/v1/npc/:id/monitor", get(monitor))
-        .route("/v1/npc/:id/environment", get(|Path(id): Path<String>| async move {
-            Json(data::environment(&id))
-        }))
-        .route("/v1/npc/:id/environment", put(ok))
-        .route("/v1/npc/:id/environment/inject", post(ok))
         .route("/v1/npc/:id/interaction", get(list_ix).post(open_ix))
         // interactions
         .route("/v1/interaction/:ix", get(get_ix).delete(|| async { StatusCode::NO_CONTENT }))

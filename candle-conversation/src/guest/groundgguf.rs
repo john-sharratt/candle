@@ -36,7 +36,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use candle::cuda_backend::wave_provenance::LeaseOrigin;
 use candle::quantized::cuda::{ko_repacked_bytes, QCudaStorage, MATRIX_ROW_PADDING};
 use candle::quantized::ko_quant::ko_tileable;
 use candle::quantized::{GgmlDType, Int8Mode, QStorage, QTensor};
@@ -164,7 +163,18 @@ fn place_ko_twin(
         .map_err(candle::Error::wrap)?;
     std::mem::forget(dst);
 
-    let twin = scratch.repack_ko_into(shape, ko, Some((at.ptr, LeaseOrigin::Foreign)))?;
+    // The routing seed, as `place_verbatim` — and this is the path that matters
+    // most, because the int8 twin is what the image transformer's thirty-four
+    // blocks are made of. Stamping only the verbatim path would leave the
+    // largest model in the guest allocating from the pool.
+    let twin = scratch.repack_ko_into(
+        shape,
+        ko,
+        Some((
+            at.ptr,
+            super::varground::guest_origin_on(cuda.cuda_stream().context().ordinal()),
+        )),
+    )?;
     QTensor::new(QStorage::Cuda(twin), shape.clone())
 }
 
@@ -212,7 +222,11 @@ fn place_verbatim(
             shape.elem_count(),
             dtype,
             cuda,
-            LeaseOrigin::Foreign,
+            // The routing seed, not `Foreign` — see `varground::guest_origin`.
+            // A quantized weight is read by exactly the ops whose outputs this
+            // is meant to carve, so leaving it foreign would route the dense
+            // half of a model and not the quantized half.
+            super::varground::guest_origin_on(cuda.cuda_stream().context().ordinal()),
         )?
     };
     QTensor::new(QStorage::Cuda(storage), shape.clone())

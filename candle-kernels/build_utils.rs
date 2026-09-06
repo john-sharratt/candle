@@ -259,22 +259,22 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
             .map(|sm| format!("-gencode=arch=compute_{sm},code=sm_{sm}")),
     );
 
-    // **`kernel-lineinfo` — off unless a kernel is faulting and the address does
-    // not say where.**
+    // **`kernel-lineinfo` — off, and not how a fault is found here.**
+    //
+    // A device-side fault in this repository is hunted with the `tensor-assert`
+    // harness: `readonly_regions` declares the ground that must never be written
+    // again and names the *writer* at the moment of the write, on the thread
+    // that did it, before the corruption — rather than leaving an address to
+    // decode afterwards. See CLAUDE.md.
     //
     // `--generate-line-info` costs nothing at runtime and is two thirds of the
     // build's output on disk. Measured across a cubin: 175 KB of `.text` SASS
     // against 592 KB of debug sections, `.nv_debug_ptx_txt` — the embedded PTX
     // source text — being 490 KB of that on its own. Those archives are
     // statically linked into every CUDA test binary, and cargo keeps every
-    // generation of every binary, so the multiplier is large.
-    //
-    // What it buys, when it is on, is `compute-sanitizer` and `cuda-gdb` naming
-    // the kernel file and line behind an illegal address instead of leaving a
-    // bare pointer. That is worth a rebuild for one session and not worth
-    // carrying the rest of the time. Since the compile args are hashed, turning
-    // it on rebuilds the affected archive groups and turning it off restores the
-    // cached small ones.
+    // generation of every binary, so the multiplier is large. Since the compile
+    // args are hashed, turning it on rebuilds the affected archive groups and
+    // turning it off restores the cached small ones.
     if std::env::var_os("CARGO_FEATURE_KERNEL_LINEINFO").is_some() {
         base_args.push("--generate-line-info".to_string());
     }

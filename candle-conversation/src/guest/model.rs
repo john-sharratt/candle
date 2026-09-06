@@ -41,6 +41,23 @@ pub trait GuestModel: Send {
     /// eviction has already happened.
     fn footprint_bytes(&self, jobs: &[GuestRequest]) -> usize;
 
+    /// Of that footprint, how much the guest wants **placed in its own ground**.
+    ///
+    /// Defaults to all of it, which is right for a guest whose every allocation
+    /// is a placement it makes itself.
+    ///
+    /// # Why the two can differ
+    ///
+    /// A guest may have a second tenancy. The prose guest's K/V is the engine's
+    /// chunked cache, which claims its own regions from the same reservation the
+    /// ground is carved from — so the drain has to *shed* for the cache as well
+    /// as the weights, and must not *claim* the cache's share as ground, or the
+    /// arenas find the reservation full and the wave dies on "no region is
+    /// claimable". Shed to [`Self::footprint_bytes`]; claim this.
+    fn ground_bytes(&self, jobs: &[GuestRequest]) -> usize {
+        self.footprint_bytes(jobs)
+    }
+
     /// Stand the model up in `ground`, for this backlog.
     ///
     /// `jobs` is the same backlog [`Self::footprint_bytes`] sized, and it is
@@ -75,6 +92,43 @@ pub trait GuestModel: Send {
     /// called on the scheduler thread with normal inference blocked, so a guest
     /// must emit and carry on rather than wait for anything.
     fn run(&mut self, request: &GuestRequest, sink: &GuestSink) -> Result<GuestOutcome, String>;
+
+    /// Serve the whole backlog, with the model already loaded.
+    ///
+    /// `answer` is called exactly once per job, with that job's index — **as
+    /// soon as its result exists, not when the backlog finishes.** That is the
+    /// whole reason it is a callback and not a returned `Vec`: a guest that
+    /// decodes one job at a time has an answer for job 0 long before job 7 has
+    /// started, and its caller is blocked waiting for it. Collecting the results
+    /// and dispatching them at the end costs that caller the whole backlog's
+    /// latency for nothing, which is a regression this signature exists to make
+    /// unexpressible.
+    ///
+    /// # Why this exists next to `run`
+    ///
+    /// Decode is bandwidth-bound on the weights: every token streams the whole
+    /// checkpoint, so B sequences stepping together stream those same bytes once
+    /// instead of B times. That is the difference between this engine's 509 t/s
+    /// on one session and 2,446 t/s across sixty-four, and a guest that answers
+    /// its backlog one job at a time is paying the single-session rate for work
+    /// that has no ordering constraint in it at all.
+    ///
+    /// The default is that sequential loop, because it is right for most guests:
+    /// an image already saturates the card on its own, so a second one beside it
+    /// wins nothing and costs a second latent. Only a guest whose per-step cost
+    /// is dominated by reading its own weights has anything to gain, and only
+    /// that guest should override this — a wave genuinely does finish together,
+    /// so it answers together.
+    fn run_batch(
+        &mut self,
+        jobs: &[(&GuestRequest, &GuestSink)],
+        answer: &mut dyn FnMut(usize, Result<GuestOutcome, String>),
+    ) {
+        for (i, (r, s)) in jobs.iter().enumerate() {
+            let out = self.run(r, s);
+            answer(i, out);
+        }
+    }
 
     /// Tear the model down, before the ground is returned.
     ///

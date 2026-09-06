@@ -30,12 +30,56 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use candle_conversation::guest::{GuestOutcome, GuestRequest, ProseRequest};
+
 use super::consequence::{self, Consequence};
 use super::document;
+use super::generate::Narrator;
 use super::job::NotStarted;
 use super::plan::{self, NodeId, Phase, Plan};
 use super::seed::{check, Seed};
 use crate::api::Authored;
+
+/// What one rung of the ladder may write.
+///
+/// Larger than [`super::narrate`]'s budget for a single node, because the story
+/// rung writes a whole life's shape plus its cast and its year outline in one
+/// answer and a truncated outline loses years that never come back — every rung
+/// below expands what the story names, so a year dropped here is a year the life
+/// simply does not have.
+///
+/// # A cap costs context even when nothing uses it
+///
+/// This was briefly 2,400, to give the story rung room to write its outline in
+/// the same answer as its prose. The outline is [`super::prompt::outline_turn`]'s
+/// now — a run of twenty years at a time, which is a few hundred tokens — so
+/// nothing needs the headroom, and the headroom was not free. The guest refuses a
+/// job whose prompt plus budget passes its context, so a budget nobody spends
+/// still narrows what every prompt may be: at 2,400 the years phase refused all
+/// forty-one of a character's nodes on a prompt that would otherwise have fitted
+/// comfortably.
+///
+/// So it is sized to the largest answer any rung actually writes — the story's
+/// four to eight paragraphs, plus its cast — and the rungs below stop at their
+/// own end token well short of it.
+const LADDER_MAX_TOKENS: u32 = 1200;
+
+/// Sampling temperature for every rung of the ladder.
+///
+/// # Why the ladder names one at all
+///
+/// Passing nothing means greedy, which is right for a caller that wants a
+/// reproducible decision and wrong for one asking for a life story. Greedy has
+/// no way out of a sentence that is locally the most likely thing to say next,
+/// so a long answer walks into one and stays: a 1,400-token story rung came back
+/// as its own opening paragraph, word for word, thirteen times.
+///
+/// Everything else that fixes — the repeat penalty, DRY, the truncation they
+/// need to be safe — is the architecture's own configuration, which the guest
+/// now takes wholesale. This is the one value the ladder has an opinion about,
+/// set a little above the chat default because a narrator wants more range than
+/// an assistant and the plan it is expanding is what keeps it honest.
+const LADDER_TEMPERATURE: f32 = 0.85;
 
 /// An error shaped like every other one this daemon returns.
 fn err(code: StatusCode, kind: &str, detail: &str) -> Response {
@@ -55,6 +99,20 @@ fn refuse(code: StatusCode, kind: &str, detail: &str) -> Refusal {
 
 /// Resolve a character id to a mind root, refusing anything the registry does
 /// not know.
+/// The character's own idiom, from the personality this life belongs to.
+///
+/// Empty when there is no personality or it carries no anchor — a life still
+/// generates, in the plain diary register, rather than failing over a field an
+/// author has not written yet.
+pub(super) async fn voice_for(s: &Arc<Authored>, who: &str) -> String {
+    s.personalities
+        .read()
+        .await
+        .get(who)
+        .map(|r| super::prompt::voice_of(&r.body))
+        .unwrap_or_default()
+}
+
 pub(super) async fn resolve(s: &Arc<Authored>, who: &str) -> Result<std::path::PathBuf, Refusal> {
     let Some(mind) = s.mind.root() else {
         return Err(refuse(
@@ -483,14 +541,17 @@ pub async fn post_generate(
             "this daemon has no inference engine, so it cannot write a life",
         );
     };
-    let minds = rt.minds.read().unwrap().clone();
-    let Some(minds) = minds else {
+    // The ladder decodes on the prose guest, not on the resident model — but a
+    // guest is served *between the engine's waves*, so there still has to be an
+    // engine for it to be served between. Checked here, before a job is
+    // reserved, rather than discovered by every node of a phase in turn.
+    if rt.minds.read().unwrap().is_none() {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_engine",
             "the model is still loading",
         );
-    };
+    }
 
     // No phases and no redo means "everything still missing", which is what the
     // console's one big button asks for. A redo on its own runs exactly the
@@ -501,10 +562,41 @@ pub async fn post_generate(
         body.phases
     };
     phases.extend(implied);
-    match s
-        .lifegen
-        .start(minds.engine(), minds.base_config(), &mind, p, phases)
-    {
+
+    // **The ladder runs on the prose guest.** Hermes-4 is the narrator for every
+    // rung, the same model `/narrate` uses for a single node — one voice for the
+    // whole life rather than the acting model for the ladder and a narrator for
+    // corrections afterwards.
+    //
+    // Built here because this is where both halves are in scope: the state the
+    // guest queue hangs off, and a runtime handle to submit from. A job owns a
+    // plain OS thread with no runtime under it, so the handle is captured now
+    // and the thread blocks on it — `Handle::block_on` off-runtime is exactly
+    // this case.
+    let state = Arc::clone(&s);
+    let handle = tokio::runtime::Handle::current();
+    let narrate: Narrator = Arc::new(move |system: &str, user: &str| {
+        let request = GuestRequest::Prose(ProseRequest {
+            system: system.to_string(),
+            prompt: user.to_string(),
+            max_tokens: LADDER_MAX_TOKENS,
+            temperature: Some(LADDER_TEMPERATURE),
+            seed: None,
+            // Prose, not a decision — nothing to constrain it to.
+            choices: None,
+        });
+        match handle.block_on(crate::guest_routes::run_guest(&state, request)) {
+            Ok(GuestOutcome::Prose { text, .. }) => Ok(text),
+            Ok(other) => Err(format!("the prose request came back as {}", other.guest())),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+
+    // Read once, here, where the registry is: the ladder runs on its own thread
+    // and a personality is an authored document an operator can edit mid-run,
+    // so the voice a phase writes against is the one it started with.
+    let voice = voice_for(&s, &who).await;
+    match s.lifegen.start(narrate, &mind, p, phases, voice) {
         Ok(job) => Json(job.view()).into_response(),
         Err(e @ NotStarted::AlreadyRunning { .. }) => (
             StatusCode::CONFLICT,

@@ -77,6 +77,15 @@ pub struct Authored {
     /// are content-addressed and atomic — two uploads of the same image are the
     /// same file, and of different ones are different names.
     pub images: Images,
+    /// `personality_id -> image_id` for the portraits personalities were
+    /// authored with — see [`crate::personality_portrait`].
+    ///
+    /// Read once at startup and never written, so no lock. It is *derived* from
+    /// the personality registry rather than stored in it: the registry holds the
+    /// document as authored, and an id minted by this daemon's image store is
+    /// not something the author wrote. Keeping it out here is what stops a save
+    /// round-tripping a local id back into the mind.
+    pub personality_portraits: BTreeMap<String, String>,
     /// The mind directory, for the file editor. No lock: it holds a path, and
     /// the filesystem is the thing being shared — two saves to one document
     /// race in the OS whatever this does, and each is atomic (see
@@ -103,14 +112,15 @@ pub struct Authored {
 }
 
 impl Authored {
-    /// Eight arguments, and they stay eight.
+    /// Nine arguments, and they stay nine.
     ///
     /// Every one is a distinct thing the daemon read at startup from a different
     /// place — two registries, the account store, the cast, the role table, the
-    /// libraries, the mind and the portrait store. Bundling them into a struct
-    /// to satisfy an arity threshold would be the same eight fields written
-    /// twice, named once for the builder and once here, with a second place for
-    /// them to disagree. Called exactly once, from `main`.
+    /// libraries, the mind, the portrait store and the portraits personalities
+    /// were authored with. Bundling them into a struct to satisfy an arity
+    /// threshold would be the same nine fields written twice, named once for the
+    /// builder and once here, with a second place for them to disagree. Called
+    /// exactly once, from `main`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         worlds: Registry,
@@ -121,6 +131,7 @@ impl Authored {
         libraries: Libraries,
         mind: Mind,
         images: Images,
+        personality_portraits: BTreeMap<String, String>,
     ) -> Self {
         Self {
             worlds: RwLock::new(worlds),
@@ -130,6 +141,7 @@ impl Authored {
             roles,
             libraries,
             images,
+            personality_portraits,
             mind,
             runtime: None,
             lifegen: crate::lifegen::job::Jobs::new(),
@@ -376,11 +388,6 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             "/v1/npc/:nid/modulation",
             Role::User,
             get(get_modulation).put(put_modulation),
-        )
-        .route(
-            "/v1/npc/:nid/environment",
-            Role::User,
-            get(get_environment).put(put_environment),
         )
         // A portrait is a file, and needs no engine — see [`crate::images`].
         .route("/v1/npc/:nid/portrait", Role::User, put(put_portrait))
@@ -924,26 +931,6 @@ async fn put_modulation(
     .await
 }
 
-async fn get_environment(
-    State(s): State<Arc<Authored>>,
-    headers: HeaderMap,
-    Path(nid): Path<String>,
-) -> Response {
-    read_npc(s, headers, nid, npcs::environment_wire).await
-}
-
-async fn put_environment(
-    State(s): State<Arc<Authored>>,
-    headers: HeaderMap,
-    Path(nid): Path<String>,
-    Json(body): Json<Value>,
-) -> Response {
-    write_npc(s, headers, nid, move |n, id, owner, now| {
-        n.put_environment(id, owner, &body, now)
-    })
-    .await
-}
-
 /// One read of a character, rendered by whichever view asked.
 async fn read_npc(
     s: Arc<Authored>,
@@ -1340,7 +1327,7 @@ async fn put_unique_name(
 /// The console reads `world_id` and `personality_id`; the file knows only its own
 /// name. Joining the two here keeps the id out of the authored document, where
 /// it would be a second place for the same fact to live and disagree.
-fn with_id(key: &str, id: &str, body: &Value) -> Value {
+pub(crate) fn with_id(key: &str, id: &str, body: &Value) -> Value {
     let mut out = body.clone();
     if let Some(map) = out.as_object_mut() {
         map.insert(key.to_string(), json!(id));
@@ -2002,7 +1989,13 @@ async fn list_personalities(
     let personalities: Vec<Value> = reg
         .iter()
         .filter(|r| reveal || visibility::listable(&r.id, &r.body, query))
-        .map(|r| with_count(with_id("personality_id", &r.id, &r.body), &counts, &r.id))
+        .map(|r| {
+            with_portrait_image(
+                with_count(with_id("personality_id", &r.id, &r.body), &counts, &r.id),
+                &s,
+                &r.id,
+            )
+        })
         .collect();
     Json(json!({ "personalities": personalities })).into_response()
 }
@@ -2011,14 +2004,39 @@ async fn get_personality(State(s): State<Arc<Authored>>, Path(aid): Path<String>
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.personality_id.as_str());
     match s.personalities.read().await.get(&aid) {
-        Some(r) => Json(with_count(
-            with_id("personality_id", &r.id, &r.body),
-            &counts,
+        Some(r) => Json(with_portrait_image(
+            with_count(with_id("personality_id", &r.id, &r.body), &counts, &r.id),
+            &s,
             &r.id,
         ))
         .into_response(),
         None => err(StatusCode::NOT_FOUND, "personality_not_found", &aid),
     }
+}
+
+/// Add the servable id for the portrait this personality was authored with.
+///
+/// Written into the `portrait` block beside the author's own `image:` and
+/// `prompt:` rather than at the top level, so the console reads one object for
+/// everything about the picture. The author's path stays exactly as written —
+/// this only adds the id the image route answers to, which is a fact about this
+/// daemon's store and not about the document.
+fn with_portrait_image(mut v: Value, s: &Authored, id: &str) -> Value {
+    let Some(image_id) = s.personality_portraits.get(id) else {
+        return v;
+    };
+    let Some(map) = v.as_object_mut() else {
+        return v;
+    };
+    map.entry(crate::personality_portrait::FIELD)
+        .or_insert_with(|| json!({}));
+    if let Some(p) = map
+        .get_mut(crate::personality_portrait::FIELD)
+        .and_then(Value::as_object_mut)
+    {
+        p.insert("image_id".to_string(), json!(image_id));
+    }
+    v
 }
 
 async fn put_personality(
@@ -2128,9 +2146,19 @@ mod tests {
     /// Shared state, for a test that makes several requests against one store.
     /// `router` consumes its state, so the `Arc` is what gets reused.
     fn state(base: std::path::PathBuf) -> Arc<Authored> {
+        // The real ingest, against the test's own personalities directory, so a
+        // test that seeds a personality with a portrait exercises the path the
+        // daemon takes rather than a hand-built map that cannot disagree with it.
+        let personalities = Registry::load("personality", base.join("personalities")).unwrap();
+        let images = Images::new(&base);
+        let personality_portraits = crate::personality_portrait::ingest(
+            &personalities,
+            &base.join("personalities"),
+            &images,
+        );
         Arc::new(Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
-            Registry::load("personality", base.join("personalities")).unwrap(),
+            personalities,
             Accounts::load(base.join("accounts")).unwrap(),
             // A real substrate, in the test's own directory — the registry has
             // no in-memory mode, and one that only existed for tests would be a
@@ -2147,7 +2175,8 @@ mod tests {
             // that writes a document writes it here and nowhere near a real
             // one. `mind_state` below is the same thing with content seeded.
             Mind::new(Some(base.clone())),
-            Images::new(&base),
+            images,
+            personality_portraits,
         ))
     }
 
@@ -2885,7 +2914,6 @@ mod tests {
                 ("/v1/npc/:nid/agency", "user"),
                 ("/v1/npc/:nid/agency/:sid", "user"),
                 ("/v1/npc/:nid/modulation", "user"),
-                ("/v1/npc/:nid/environment", "user"),
                 // A portrait, and the bytes back. `user` rather than open: an
                 // id is a content hash and unguessable, and unguessable is not
                 // a permission.
@@ -3014,8 +3042,7 @@ mod tests {
                     "persona_description": "Sixty-one now, and slower.",
                     "heartbeat_ms": 300_000,
                     "salience_gate": 0.7,
-                    "state": "suspended",
-                    "environment_enabled": false
+                    "state": "suspended"
                 }),
             ),
         )
@@ -3064,7 +3091,6 @@ mod tests {
         assert_eq!(back["tick"]["heartbeat_ms"], 300_000);
         assert_eq!(back["tick"]["salience_gate"], 0.7);
         assert_eq!(back["state"], "suspended");
-        assert_eq!(back["environment_enabled"], false);
         assert_eq!(back["tags"], json!(["north", "command"]));
         assert_eq!(back["hidden"], true);
         assert_eq!(
@@ -3751,6 +3777,7 @@ mod tests {
             crate::collections::Libraries::load(&crate::projection::Source::resolve(None).unwrap()),
             Mind::new(None),
             Images::new(&base),
+            BTreeMap::new(),
         ));
         let (s, v) = call(router(st), get("/v1/mind/list", Some("google-1"))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
@@ -4137,25 +4164,6 @@ layers:
         .await;
         assert_eq!(v["modulation"]["threat"], 0.66);
         assert_eq!(v["modulation"]["curiosity"], 0.5, "an untouched dial moved");
-
-        // The environment is config, and it saves.
-        let (_, _) = call(
-            router(st.clone()),
-            send(
-                &format!("/v1/npc/{id}/environment"),
-                "PUT",
-                a,
-                json!({ "enabled": false, "system_prompt": "A ridge at dusk." }),
-            ),
-        )
-        .await;
-        let (_, v) = call(
-            router(st.clone()),
-            get(&format!("/v1/npc/{id}/environment"), Some(a)),
-        )
-        .await;
-        assert_eq!(v["enabled"], false);
-        assert_eq!(v["system_prompt"], "A ridge at dusk.");
 
         // A strategy under a parent that does not exist is refused, rather than
         // silently becoming a root and losing the nesting.

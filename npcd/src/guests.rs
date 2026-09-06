@@ -42,6 +42,7 @@
 
 use std::path::{Path, PathBuf};
 
+use candle_conversation::guest::prose_choice::HermesQuant;
 use candle_conversation::guest::{
     Guest, GuestModel, GuestRegistry, ImageGuest, ImageSpec, MatteFamily, MatteGuest, MatteSpec,
     ProseGuest, ProseSpec,
@@ -81,7 +82,20 @@ pub struct MatteSection {
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProseSection {
-    pub gguf: PathBuf,
+    /// The directory holding the Hermes-4-14B rungs a deployment downloaded.
+    ///
+    /// **A directory, not a file, because the rung is the card's decision.**
+    /// The image guest names its checkpoint outright — a deployment picks a
+    /// Z-Image rung once and lives with it — but the prose guest is claimed and
+    /// dropped every drain against ground that a resident model is already
+    /// standing in, so the file that fits is a property of the machine rather
+    /// than of the deployment. `HermesQuant::for_vram` picks it, and this says
+    /// where to look; see [`candle_conversation::guest::prose_choice`] for the
+    /// ladder and the measurements under it.
+    ///
+    /// One machine's directory may hold one rung and another's three. Only the
+    /// rung this card wants has to be present.
+    pub dir: PathBuf,
     pub tokenizer: PathBuf,
     #[serde(default)]
     pub max_context: Option<usize>,
@@ -151,9 +165,38 @@ pub fn build(file: GuestsFile) -> Result<GuestRegistry, String> {
     let mut registry = GuestRegistry::new();
 
     if let Some(p) = file.prose {
-        require_file(&p.gguf, "prose.gguf")?;
+        // **The card chooses the rung, here, once.** Total VRAM rather than
+        // free: this is which checkpoint the deployment runs, and a free-memory
+        // reading would have the daemon pick a different file depending on what
+        // happened to be resident at startup.
+        let total_vram = candle::quantized::get_total_vram_device0().unwrap_or(0) as u64;
+        let quant = HermesQuant::for_vram(total_vram);
+        let gguf = p.dir.join(quant.filename());
+        require_dir(&p.dir, "prose.dir")?;
+        // Named in the error, because "no such file" against a path the operator
+        // never wrote is a puzzle: they configured a directory and the daemon
+        // chose the filename inside it.
+        if !gguf.is_file() {
+            return Err(format!(
+                "prose.dir has no {}: this card reports {} MiB of VRAM, so the prose guest wants \
+                 the {:?} rung of Hermes-4-14B. Download it from {} into {:?}",
+                quant.filename(),
+                total_vram >> 20,
+                quant,
+                quant.repo(),
+                p.dir,
+            ));
+        }
         require_file(&p.tokenizer, "prose.tokenizer")?;
-        let mut spec = ProseSpec::hermes3_3b(p.gguf, p.tokenizer);
+        tracing::info!(
+            target: "npcd::guests",
+            vram_mib = total_vram >> 20,
+            rung = ?quant,
+            file = ?gguf,
+            ground_mib = candle_conversation::guest::prose_choice::ground_bytes_at(quant, 4096) >> 20,
+            "prose guest: Hermes-4-14B rung chosen for this card"
+        );
+        let mut spec = ProseSpec::hermes4_14b(gguf, p.tokenizer);
         if let Some(c) = p.max_context {
             spec.max_context = c;
         }
@@ -261,11 +304,38 @@ mod tests {
         let d = tmp("missing-ckpt");
         std::fs::write(
             path(&d),
-            "prose:\n  gguf: ./nope.gguf\n  tokenizer: ./nope.json\n",
+            "prose:\n  dir: ./nope\n  tokenizer: ./nope.json\n",
         )
         .unwrap();
         let e = load(&d).unwrap_err();
-        assert!(e.contains("prose.gguf"), "{e}");
+        assert!(e.contains("prose.dir"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **A directory that exists without the rung this card wants is refused,
+    /// and the message names the file.** The operator configured a directory
+    /// and the daemon chose the filename inside it, so "no such file" against a
+    /// path they never wrote is a puzzle unless the error says where the name
+    /// came from.
+    #[test]
+    fn a_directory_without_this_cards_rung_says_which_file_it_wanted() {
+        let d = tmp("wrong-rung");
+        let dir = d.join("hermes4");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok = d.join("t.json");
+        std::fs::write(&tok, b"{}").unwrap();
+        std::fs::write(
+            path(&d),
+            format!(
+                "prose:\n  dir: {}\n  tokenizer: {}\n",
+                dir.display().to_string().replace('\\', "/"),
+                tok.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let e = load(&d).unwrap_err();
+        assert!(e.contains("Hermes-4-14B-Q"), "should name the rung: {e}");
+        assert!(e.contains("bartowski"), "should name where to get it: {e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -274,7 +344,7 @@ mod tests {
     #[test]
     fn a_malformed_file_is_an_error_not_an_empty_registry() {
         let d = tmp("malformed");
-        std::fs::write(path(&d), "prose:\n  gguf: [not, a, path]\n").unwrap();
+        std::fs::write(path(&d), "prose:\n  dir: [not, a, path]\n").unwrap();
         assert!(load(&d).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -286,7 +356,7 @@ mod tests {
         let d = tmp("unknown-key");
         std::fs::write(
             path(&d),
-            "prose:\n  gguf: a.gguf\n  tokeniser: b.json\n  tokenizer: b.json\n",
+            "prose:\n  dir: a\n  tokeniser: b.json\n  tokenizer: b.json\n",
         )
         .unwrap();
         assert!(load(&d).is_err());
@@ -297,15 +367,20 @@ mod tests {
     #[test]
     fn each_guest_can_be_configured_without_the_other() {
         let d = tmp("prose-only");
-        let gguf = d.join("m.gguf");
+        let dir = d.join("hermes4");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Whatever rung this machine's card asks for, so the test passes on all
+        // three of them rather than on whichever one wrote it.
+        let quant =
+            HermesQuant::for_vram(candle::quantized::get_total_vram_device0().unwrap_or(0) as u64);
+        std::fs::write(dir.join(quant.filename()), b"x").unwrap();
         let tok = d.join("t.json");
-        std::fs::write(&gguf, b"x").unwrap();
         std::fs::write(&tok, b"{}").unwrap();
         std::fs::write(
             path(&d),
             format!(
-                "prose:\n  gguf: {}\n  tokenizer: {}\n",
-                gguf.display().to_string().replace('\\', "/"),
+                "prose:\n  dir: {}\n  tokenizer: {}\n",
+                dir.display().to_string().replace('\\', "/"),
                 tok.display().to_string().replace('\\', "/")
             ),
         )
@@ -323,7 +398,7 @@ mod tests {
         let file = GuestsFile {
             matte: None,
             prose: Some(ProseSection {
-                gguf: PathBuf::from("a"),
+                dir: PathBuf::from("a"),
                 tokenizer: PathBuf::from("b"),
                 max_context: Some(8192),
                 system: Some("You are terse.".into()),

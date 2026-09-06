@@ -154,7 +154,6 @@ mod tests {
             world_id: "w".into(),
             personality_id: "p".into(),
             hidden: false,
-            environment_enabled: true,
             heartbeat_ms: 120_000,
             salience_gate: 0.5,
             tags: Vec::new(),
@@ -166,7 +165,6 @@ mod tests {
             relationships: Vec::new(),
             agency: Vec::new(),
             modulation: Default::default(),
-            environment_prompt: String::new(),
         }
     }
 

@@ -144,11 +144,30 @@ mod tests {
     /// **The invariant the guest depends on**, from every input shape: exactly
     /// `w · h · 3` bytes at the draw's own size. The guest reshapes these
     /// without re-deriving the size, so anything else reaches the card.
+    ///
+    /// **The sizes are small on purpose, and the shapes are the point.** This
+    /// ran on 1920×1080 sources against 1248×832 draws and took **17 seconds** —
+    /// on its own, more than the rest of the crate's suite put together — because
+    /// [`FILTER`] is Lanczos3 and a debug build resamples every output pixel
+    /// through a six-tap kernel per channel. What is under test is the size
+    /// arithmetic in [`cover`], which is scale-free: what has to vary is the
+    /// *relationships* — an aspect wider than the target and narrower than it,
+    /// an exact match, an upscale, a degenerate 1×1 and an extreme 17×3 — and
+    /// every one of those survives at a tenth of the dimensions. The aspect
+    /// ratios are the originals: 192×108 is 16:9 and 60×90 is 2:3.
+    ///
+    /// The limits that genuinely need large numbers — the byte cap and the
+    /// pixel-bomb — are asserted in the test below from a *header*, which costs
+    /// nothing precisely because no pixels are ever produced.
     #[test]
     fn every_upload_conforms_to_the_draws_own_size() {
-        for (sw, sh) in [(64, 64), (1920, 1080), (600, 900), (17, 3), (1, 1)] {
-            for (dw, dh) in [(512u32, 512u32), (1248, 832), (384, 640)] {
-                let r = conform(&png(sw, sh), dw, dh, 0.45).unwrap();
+        for (sw, sh) in [(64, 64), (192, 108), (60, 90), (17, 3), (1, 1)] {
+            // Encoded once per source rather than once per pair: the inner loop
+            // does not vary it, and PNG-encoding the same picture three times
+            // was a third of this test's remaining cost.
+            let src = png(sw, sh);
+            for (dw, dh) in [(128u32, 128u32), (156, 104), (96, 160)] {
+                let r = conform(&src, dw, dh, 0.45).unwrap();
                 assert_eq!(
                     r.pixels.len(),
                     dw as usize * dh as usize * 3,
@@ -182,12 +201,26 @@ mod tests {
     /// The scale is taken from the axis that needs it most, so the result
     /// covers the target on both — a scale from the wrong axis leaves a strip
     /// of nothing, which would be a band of black in the reference.
+    ///
+    /// **Both the sources and the target are small, and they had to shrink
+    /// together.** This test cost eleven seconds on 4000×100 and 100×4000
+    /// sources against a 512×320 target, and the reason is worth stating because
+    /// it is not the source size: [`cover`] scales the whole picture to fill the
+    /// target and crops afterwards, so a 40:1 source covering a 1.6:1 target is
+    /// upscaled to 12800×320 — and the taller one to 512×20480 — before 96% of
+    /// it is thrown away. Fifteen million pixels through a Lanczos3 kernel in a
+    /// debug build.
+    ///
+    /// The *aspect* is what drives that, not the pixel count, so shrinking the
+    /// sources alone would have changed nothing. Target and sources both come
+    /// down by roughly ten, the 40:1 extremes are kept in both directions, and
+    /// the assertions are untouched.
     #[test]
     fn a_cover_fills_both_axes_whichever_way_the_aspect_runs() {
-        for (sw, sh) in [(4000u32, 100u32), (100, 4000), (300, 300)] {
+        for (sw, sh) in [(400u32, 10u32), (10, 400), (150, 150)] {
             let src = RgbImage::from_pixel(sw, sh, Rgb([9, 9, 9]));
-            let out = cover(&src, 512, 320);
-            assert_eq!(out.dimensions(), (512, 320), "{sw}×{sh}");
+            let out = cover(&src, 64, 40);
+            assert_eq!(out.dimensions(), (64, 40), "{sw}×{sh}");
             // Every pixel came from the source, so none is the zero a
             // short scale would have left behind.
             assert!(out.pixels().all(|p| *p == Rgb([9, 9, 9])), "{sw}×{sh}");

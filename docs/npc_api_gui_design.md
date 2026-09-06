@@ -576,7 +576,6 @@ defend against anyone with server access. The UI therefore says "hidden" and nev
   /v1/npc/{id}/memory                         consolidated memory
   /v1/npc/{id}/modulation                     affect, threat, curiosity
   /v1/npc/{id}/tick                           force a tick; read tick config
-  /v1/npc/{id}/environment                    simulator state, toggle, system prompt
   /v1/npc/{id}/substrate[/layer/{name}]       introspection
   /v1/npc/{id}/projection[/{tick}]            what the gather actually selected
   /v1/npc/{id}/monitor                        metacognition health
@@ -617,7 +616,6 @@ Npc {
     "pending_events": 3,
     "salience_gate": 0.42
   },
-  "environment_enabled": true,
   "monitor": { "overlap": 0.19, "band": "healthy" | "fixated" | "runaway" },
   "owner_id":   "u_8812",
   "access":     "owner" | "editor" | "viewer",   // the caller's access
@@ -798,7 +796,6 @@ POST /v1/npc
   // character with an empty persona and no error, because an absent persona is
   // legal — so the two names have to be the same one.
   "persona_description": "Fifty-three, a former staff sergeant.",
-  "environment_enabled": null,      // null → default by origin (see below)
   "seed": {
     "relationships": [ … ],
     "beliefs":       [ … ],
@@ -809,15 +806,10 @@ POST /v1/npc
 → 201 { Npc }
 ```
 
-`environment_enabled: null` resolves by **origin**: the GUI sends `true`, an API client that
-omits it gets `false`. A character created in the GUI has no world attached and would
-otherwise perceive nothing; an API caller presumably has its own world simulation and does
-not want a second one inventing events underneath it. Clients that care set it explicitly.
-
 ```
 GET    /v1/npc?world_id=&personality_id=&state=&tag=&q=&limit=&cursor=
 GET    /v1/npc/{id}
-PATCH  /v1/npc/{id}          { name?, persona_description?, state?, environment_enabled?,
+PATCH  /v1/npc/{id}          { name?, persona_description?, state?,
                                heartbeat_ms?, salience_gate?, tags?, hidden? }
 PUT    /v1/npc/{id}/tags     { "tags": ["campaign-2", "moonlight"] }
 PUT    /v1/npc/{id}/hidden   { "hidden": true }
@@ -1778,20 +1770,24 @@ Heartbeat comment frames every 15s keep intermediaries from closing an idle stre
 
 ## 20. Environment, tools, introspection, worlds
 
-### Environment simulator
+### Environment simulator — removed
 
-```
-GET  /v1/npc/{id}/environment
-→ { "enabled": true, "system_prompt": "…", "window_turns": 24,
-    "recent": [ { "world_ms": …, "text": "…" } ] }
-PUT  /v1/npc/{id}/environment      { "enabled"?, "system_prompt"?, "window_turns"? }
-POST /v1/npc/{id}/environment/inject   { "text": "…", "world_ms"? }
-```
+A character with no game attached perceives nothing, and the plan was to generate events for it:
+a simulator with its own system prompt and a sliding window, writing into the `world` layer.
 
-Its own system prompt and a sliding window — `Sequence { recent: N }`, no historical top-k,
-because the environment's job is continuity of the immediate scene rather than recall of
-everything that ever happened. Long-run world memory belongs to the `world` layer, which the
-simulator writes into.
+**It was never built.** What existed was the storage and the controls — `environment_enabled` and
+`environment_prompt` on the record, `GET`/`PUT /v1/npc/{id}/environment`, a checkbox in the create
+wizard and another on the character page — and nothing that read any of it. The routes saved a
+setting, the console displayed it, and no engine ever consulted it. A control that looks like a
+decision and changes nothing is worse than an absent feature, because it invites somebody to plan
+around behaviour that does not exist.
+
+So the record fields, the routes, and both controls are gone. Nothing was lost: there was no
+behaviour to lose. `NpcPayload` carries no `deny_unknown_fields`, so records already written with
+the two fields still decode — the values are simply ignored.
+
+When this is actually built, it comes back as a whole thing: the fields, the routes, the controls
+**and** the engine that reads them, landing together. The design above is the starting point.
 
 ### Tools
 
@@ -2863,11 +2859,20 @@ which is both noise and, for the one user who cares, a prompt at exactly the wro
 │  New character                            ① Identity  ② Face  ③ Inner life │
 ├────────────────────────────────────────────────────────────────────────────┤
 │    ┌─────────────────┐                                                     │
-│    │                 │     Generating from the description                 │
-│    │   [ portrait ]  │     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░  62%              │
-│    │    generating   │                                                     │
-│    │                 │     Model [ sdxl-turbo ▾ ]   seed 441028  [ ⟳ ]     │
-│    └─────────────────┘                                                     │
+│    │                 │     A portrait, from the personality                │
+│    │   [ portrait ]  │     Keeper was authored with a portrait and the      │
+│    │   from Keeper   │     prompt that drew it.                            │
+│    │                 │     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ready            │
+│    └─────────────────┘     Model [ guest-image ▾ ]           [ ⟳ ]         │
+│                                                                            │
+│    The prompt this portrait is drawn from                                  │
+│    ┌──────────────────────────────────────────────────────────────────┐   │
+│    │ a portrait of an ancient guardian filling the frame, the          │   │
+│    │ weathered face of an elderly man with deeply lined skin, close    │   │
+│    │ cropped grey hair, a short grey beard, clear pale blue eyes …     │   │
+│    └──────────────────────────────────────────────────────────────────┘   │
+│    Authored on this personality. Editing it here changes this character’s  │
+│    portrait only — the personality keeps its own.                          │
 │                                                                            │
 │    ┌──────────────────────────────────────────────────────────────────┐   │
 │    │  or drop an image here / [ Upload a portrait ]                    │   │
@@ -2877,18 +2882,95 @@ which is both noise and, for the one user who cares, a prompt at exactly the wro
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-There is no prompt field. The portrait derives from the description, so a prompt box would be a
-second place to say who the character is and a guaranteed source of drift.
+**The prompt is shown, and it comes from the personality.** A personality may be authored with a
+`portrait:` block — the picture it was given and the words that drew it (see *A personality's own
+portrait* below). Choosing that personality opens this step already showing that face, with that
+prompt in an editable box; **Generate** draws another one from those words.
+
+This reverses an earlier rule that there be no prompt field at all, on the grounds that the
+portrait derived from the description and a second field would be a source of drift. The drift risk
+is real, but it was paying for a worse problem: a description is written to be *read* — it becomes
+the character's identity in the system prompt — and a prompt is written to be *drawn*. Framing,
+lens, light and wardrobe belong in one and not the other, and forcing a single sentence to serve
+both produced a worse version of each with no way to keep a portrait somebody had spent an
+afternoon getting right.
+
+What replaces the old guarantee is *where the prompt lives*: authored beside the character in the
+mind, under the same review as everything else in that file — not typed into a box that vanishes
+when the page closes. A character with no authored prompt still falls back to the description, so
+nothing about the old behaviour is lost for a personality nobody has art-directed.
+
+The box is prefilled with exactly what the daemon would have used anyway, so sending it back
+unchanged is the same request as sending nothing. Clearing it falls back rather than drawing from
+an empty string.
+
+### A personality's own portrait
+
+```yaml
+# personalities/keeper.yaml
+portrait:
+  image: portraits/keeper.png
+  prompt: |
+    a portrait of an ancient guardian filling the frame, …
+```
+
+`prompt` is the art direction, inherited by every character struck from this personality.
+
+`image` is a file **beside the personality in the mind**, not an id in a daemon's image store. The
+store is content-addressed and local, so an id in an authored document would name bytes that exist
+on the machine that drew them and nowhere else — a fresh clone of the mind would show a broken
+portrait. A file travels with the personality because it is part of it.
+
+At startup the daemon reads each such file once and puts it into the image store, and the listing
+carries the resulting `portrait.image_id` alongside the author's own fields. Content addressing
+makes that idempotent: a restart re-ingests the same bytes to the same id and writes nothing. The
+minted id is **derived, never written back** — the registry holds the document as authored, so a
+save cannot round-trip a local id into the mind.
+
+`image` is a path out of a file that is editable through the console, so it is treated as hostile:
+a plain relative path under the personalities directory and nothing else. No `..`, no absolute
+root, no drive letter, no backslash, and only an extension the image store can serve back. The
+check is on the path's *shape*, before any join, so there is no canonicalisation race to lose. A
+personality whose portrait cannot be read is logged and skipped — the character still serves, and
+falls back to its initial exactly as one with no portrait at all does.
+
+### Which words a draw uses
+
+Three sources, in this order:
+
+| Rung | Source | Where it comes from |
+|---|---|---|
+| 1 | the request | the console's prompt box, edited for this one character |
+| 2 | the personality | `portrait.prompt` in its YAML |
+| 3 | the description | `persona.description`, through the portrait framing |
+
+Blank is absent at every rung: a cleared box, or a `prompt:` somebody started and left empty, falls
+through to the next rung rather than being sent to the model as an empty string. The prompt chosen
+is compliance-checked whichever rung supplied it — gating only `/v1/image/generate` would leave the
+character editor as the way around it.
+
+A prompt sent in a request is **not stored on the character**. A prompt worth keeping belongs in
+the personality document, where it is authored and reviewed; the record keeps the picture rather
+than the words.
 
 **A progress bar, not a warning.** Generation waits for the wave boundary and the reclaim, which
 is a real delay, but that is the system working normally and the UI treats it as such. The bar
 reflects queue position and generation progress; **Skip** stays available so nobody is blocked,
 and the job continues in the background either way.
 
-### Regeneration follows the description
+### Regeneration follows the words the portrait was drawn from
 
 > **Editing the description regenerates the portrait** — queued as misc work, running at the
-> next wave boundary — **unless the user has uploaded one.**
+> next wave boundary — **unless the user has uploaded one, or the personality supplies its own
+> prompt.**
+
+A personality's authored prompt outranks the description (see *Which words a draw uses*), so for a
+character struck from an art-directed personality, editing the description changes what the
+character *is* without changing what it *looks like*. That is the intended behaviour: the prompt is
+the thing the picture tracks, and it is a different sentence.
+
+Where the description is still the source — every personality without a `portrait:` block — the
+rule below is unchanged.
 
 An uploaded portrait is a deliberate choice and outranks the generator permanently. It is never
 replaced by regeneration; `origin: "uploaded"` is sticky until the user explicitly asks for a
@@ -2919,10 +3001,6 @@ Drag-and-drop anywhere on the panel switches to upload.
 │   │ [✓] Hess — commander        trust +0.6  affect +0.2          ✎ ✕ │    │
 │   │ [✓] Ilse — merchant         trust +0.1  affect +0.4          ✎ ✕ │    │
 │   └──────────────────────────────────────────────────────────────────┘    │
-│                                                                            │
-│   Environment simulator  [✓] on                                            │
-│   ⓘ No world simulation is attached, so this generates what happens        │
-│     around the character. Turn it off if your own game drives events.      │
 │                                                                            │
 │                                  [ ← Back ]            [ Create ]          │
 └────────────────────────────────────────────────────────────────────────────┘
@@ -3336,10 +3414,10 @@ brooding character lives, and the point of the instrument is to let you push an 
 characterful near-edge *deliberately* while seeing when it is about to tip past character into
 incoherence.
 
-## 38. Environment, worlds, personalities, tools
+## 38. Worlds, personalities, tools
 
-**Environment panel** (`/npc/{id}/environment`) — a toggle with its consequence stated, a
-system-prompt editor, the sliding window's recent turns, and a world-event injector.
+The environment panel that stood at the head of this section is gone with the feature — see
+*Environment simulator — removed* in §20.
 
 ### Worlds — `/world` and `/world/{wid}`
 

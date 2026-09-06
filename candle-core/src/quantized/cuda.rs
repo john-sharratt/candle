@@ -5740,17 +5740,17 @@ pub fn to_dynamic<'w>(
         CudaStorageSlice::F16(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
         }
         CudaStorageSlice::BF16(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
         }
         CudaStorageSlice::F32(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
         }
         _ => crate::bail!("to_dynamic(int8): activation slice dtype must be F16/BF16/F32"),
     };
@@ -5776,29 +5776,45 @@ pub(crate) fn q8a1024_byte_len(rows: usize, cols: usize) -> usize {
 /// q8a1024 flat-grouped blocks (8 × 128-tiles per 1152-byte super-block; qs
 /// de-interleaved from the per-32 ds — see blocks.cuh). The matmul mode is not chosen here; it is
 /// derived later by the occupancy formula `q8a128_dense_use_mode2` at dispatch.
-pub fn quantize_acts_q8a128(
+pub fn quantize_acts_q8a128<'w>(
     act_ptr: u64,
     dtype: i32,
     rows: usize,
     cols: usize,
     device: &CudaDevice,
-) -> Result<Q8a128Operand<'static>> {
+    // The activation's own backing, so the operand is carved where the
+    // activation lives. Unplumbed, this allocated from the pool unconditionally
+    // — and it is on the int8 matmul's hot path, so *every* projection in a
+    // quantized model did. The forbidden-allocation detector named it directly:
+    // `quantize_acts_q8a128 <- to_dynamic <- forward_via_int8`, at the top of
+    // the report by both call count and bytes.
+    origin: Backing,
+) -> Result<Q8a128Operand<'w>> {
     let bytes = q8a1024_byte_len(rows, cols);
-    let mut out = unsafe { device.alloc::<u8>(bytes)? };
-    {
-        let stream = device.cuda_stream();
-        let (op, _g) = out.device_ptr_mut(&stream);
-        unsafe {
-            run_quantize_q8a128(
-                act_ptr as *const std::ffi::c_void,
-                op as *mut std::ffi::c_void,
-                rows as i32,
-                cols as i32,
-                dtype,
-            );
-        }
+    // The same three-value resolve `rms_norm_q8a128` below uses, which is the
+    // fused form of this and was plumbed while this was not.
+    let (out_ptr_planned, owned, out_backing) = resolve_u8_out(origin, device, bytes)?;
+    // SAFETY: `out_ptr_planned` names `bytes` of either the carved arena range or
+    // the owned fallback, and the kernel writes exactly that; `act_ptr` is the
+    // caller's activation, read as `dtype` for `rows * cols`.
+    unsafe {
+        run_quantize_q8a128(
+            act_ptr as *const std::ffi::c_void,
+            out_ptr_planned as *mut std::ffi::c_void,
+            rows as i32,
+            cols as i32,
+            dtype,
+        );
     }
-    Ok(Q8a128Operand::new(out, rows, cols))
+    q8a128_from_out(
+        owned,
+        out_ptr_planned,
+        out_backing,
+        bytes,
+        rows,
+        cols,
+        device,
+    )
 }
 
 /// Fused RMSNorm → q8a128: normalize each row of `xs` `[.. × K]` by `alpha` `[K]` and emit the

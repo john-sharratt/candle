@@ -264,7 +264,16 @@ impl Module for UpDecoderBlock2D {
             xs = resnet.forward(&xs, None)?
         }
         match &self.upsampler {
-            Some(upsampler) => upsampler.forward(&xs, None),
+            // Staged, because each resnet returns a tensor that has been copied
+            // off the arena — so the upsampler's input carries no ticket, and a
+            // convolution at the block's output resolution is the largest single
+            // allocation in the block. Seeding it here rather than wrapping the
+            // whole block costs one copy pair instead of two: the resnets bound
+            // their own sums already, so a block-wide generation would hold
+            // almost nothing for the price of a full-resolution round trip.
+            Some(upsampler) => {
+                candle_nn::kv_cache::guest_stage(&xs, |xs| upsampler.forward(xs, None))
+            }
             None => Ok(xs),
         }
     }

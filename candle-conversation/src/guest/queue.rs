@@ -43,7 +43,20 @@ impl Pending {
     /// A send that fails is an ordinary outcome, not an error: the caller's HTTP
     /// request may have been cancelled while the job was queued, and the work
     /// was still worth doing for whatever else the drain was already loaded for.
-    pub fn answer(self, outcome: Result<GuestOutcome, GuestError>) {
+    ///
+    /// # Why this borrows rather than consuming
+    ///
+    /// Consuming was the better signature while a drain answered its jobs by
+    /// walking them: taking `self` made "answered exactly once" a property of
+    /// the type. A drain that hands its whole backlog to the guest and is called
+    /// back per job cannot move out of the list it is still lending, so the
+    /// once-ness moved to [`super::drain`], which tracks what it has answered
+    /// and reports a job the guest never answered for.
+    ///
+    /// A second send is harmless in itself — the receiver reads the first and
+    /// the channel drops the rest — so this is a weaker guarantee, not an unsafe
+    /// one.
+    pub fn answer(&self, outcome: Result<GuestOutcome, GuestError>) {
         let _ = self.reply.send(outcome);
     }
 

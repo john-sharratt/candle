@@ -56,6 +56,93 @@ const VOICE: &str = "You write character profiles for a fiction engine. Given a 
      scar that makes them specific. Two or three sentences, plain prose, no headings, no lists, \
      no preamble. Write only the description.";
 
+/// What to call a personality in a prompt.
+///
+/// **A personality document has no `name` field.** It has `id` and `category`
+/// and the authored prose; the console derives its label from the slug. So
+/// `p["name"]` was absent for every real personality in the mind and this read
+/// "THE PERSONALITY THEY ARE CAST AS / this personality" every time — while the
+/// task's "who could be cast as …" clause, built from the same missing field,
+/// collapsed to an empty string and never mentioned the personality at all.
+///
+/// It survived because the test fixture carries a `name`, which no document in
+/// the corpus does. Preferring the field and falling back to the id means an
+/// authored `name:` still wins if anybody adds one.
+pub fn personality_label(p: &serde_json::Value) -> String {
+    if let Some(n) = p["name"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return n.to_string();
+    }
+    let id = p["personality_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match id {
+        // `the-dapper-lich` → `The Dapper Lich`, the same reading the console
+        // shows in its selector, so the prompt and the picker agree.
+        Some(id) => id
+            .split('-')
+            .filter(|w| !w.is_empty())
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => "this personality".to_string(),
+    }
+}
+
+/// How much of a personality's anchor reaches a naming or describing prompt.
+///
+/// **A character budget, not a line count.** This was `lines().take(6)`, which
+/// measures the author's wrapping rather than the text: six lines of Keeper is
+/// most of an anchor, six lines of a personality written in long paragraphs is
+/// the whole thing, and six lines of one written in short ones is a fragment
+/// that stops mid-thought. Characters are at least proportional to what the
+/// model actually reads.
+///
+/// Twelve hundred takes every anchor in the corpus whole except the longest —
+/// Keeper's is 848, the ordinary ones are under 350 — while still bounding the
+/// outlier at roughly 300 tokens, against the 2,048 the prose guest allows a
+/// whole prompt.
+///
+/// The cap survives because an anchor is *unbounded authored text*: it is a
+/// whole system prompt with sections and examples, and pasting an arbitrarily
+/// long one makes the description a summary of the anchor rather than a person
+/// who fits it — and, past the guest's headroom, refuses the job outright.
+const ANCHOR_BUDGET_CHARS: usize = 1_200;
+
+/// As much of an anchor as the budget allows, cut on a line boundary.
+///
+/// Never mid-line: a prompt that stops in the middle of a sentence reads as a
+/// transmission error, and a model completing the thought is a model writing
+/// from something the author did not say.
+pub fn anchor_extract(anchor: &str) -> String {
+    let anchor = anchor.trim();
+    if anchor.len() <= ANCHOR_BUDGET_CHARS {
+        return anchor.to_string();
+    }
+    let mut out = String::new();
+    for line in anchor.lines() {
+        if out.len() + line.len() + 1 > ANCHOR_BUDGET_CHARS {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    // A single line longer than the whole budget would leave nothing at all,
+    // and no anchor is better than a short one.
+    if out.is_empty() {
+        out = anchor.chars().take(ANCHOR_BUDGET_CHARS).collect();
+    }
+    out
+}
+
 /// Tokens one description gets.
 ///
 /// Two or three sentences is well under this; the ceiling is here so a model
@@ -169,30 +256,20 @@ pub fn brief_for(
         context.push_str(&format!("\n{}\n", setting.trim()));
     }
 
-    // **The world's own content rules, stated as rules.** A setting that
-    // excludes a register is not a stylistic preference — it is what the author
-    // decided this world admits, and a generated description that ignores it
-    // lands in the character's permanent identity section.
-    let excludes: Vec<&str> = world["excludes"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-    if !excludes.is_empty() {
-        context.push_str(&format!(
-            "\nTHIS WORLD EXCLUDES\nDo not write anything {}.\n",
-            excludes.join(", ")
-        ));
-    }
+    // The world's `excludes` used to be restated here as "do not write anything
+    // sexual, intimate". It is gone, and it was doing less than it looked like.
+    // `excludes` gates which *section categories* of the mind a world admits
+    // (see [`crate::collections`]) — it is a retrieval filter, not a style
+    // guide, and borrowing it as one put a list of registers in front of a model
+    // that had not been going to write them. Naming a thing you do not want is
+    // how it ends up in the frame. The register a description should be in is
+    // already carried by the setting prose and by `VOICE`.
 
     if let Some(p) = personality {
-        let pname = p["name"].as_str().unwrap_or("this personality");
+        let pname = personality_label(p);
         context.push_str(&format!("\nTHE PERSONALITY THEY ARE CAST AS\n{pname}\n"));
         if let Some(anchor) = p["anchor"].as_str().filter(|s| !s.trim().is_empty()) {
-            // Trimmed to the opening: a personality's anchor is a whole system
-            // prompt with sections and examples, and pasting all of it makes
-            // the description a summary of the anchor rather than a person.
-            let opening: String = anchor.trim().lines().take(6).collect::<Vec<_>>().join("\n");
-            context.push_str(&format!("{opening}\n"));
+            context.push_str(&format!("{}\n", anchor_extract(anchor)));
         }
     }
 
@@ -205,9 +282,32 @@ pub fn brief_for(
     let initial = spice.pick(&INITIALS).copied().unwrap_or('A');
     let station = spice.pick(&STATIONS).copied().unwrap_or(STATIONS[0]);
 
-    let cast = match personality.and_then(|p| p["name"].as_str()) {
-        Some(pname) => format!(" who could be cast as {pname}"),
+    let cast = match personality {
+        Some(p) => format!(" who could be cast as {}", personality_label(p)),
         None => String::new(),
+    };
+
+    /* **The station is what to do when there is no personality, not a second
+     * opinion alongside one.**
+     *
+     * `STATIONS` exists to decorrelate draws: without it the model returns the
+     * same handful of people whatever the seed. But it was stated in the *task*
+     * — "Make them someone who feeds people" — while the personality sat in the
+     * system turn as background, and a concrete imperative in the turn being
+     * answered beats background every time. An anxious dragon drew "someone who
+     * builds or maintains the physical fabric" and came back a broad-shouldered
+     * carpenter; a dapper lich drew "someone who feeds people" and came back an
+     * elderly cook. The station is picked from the seed alone and has no idea a
+     * personality was chosen, so it was overwriting one at random.
+     *
+     * A chosen personality *is* the decorrelation, and a much better one. So the
+     * station is used only when there is none, and where a personality exists
+     * the task names it and lets the anchor decide the walk of life. The seeded
+     * initial still separates the names either way.
+     */
+    let walk = match personality {
+        Some(_) => String::new(),
+        None => format!(" Make them {station}."),
     };
 
     // **Named or not are different jobs.** With a name the description is
@@ -220,13 +320,13 @@ pub fn brief_for(
     let named = named.trim();
     let task = if named.is_empty() {
         format!(
-            "Invent one person who lives in {name}{cast}. Make them {station}. Their name begins \
-             with the letter {initial}. Write their description."
+            "Invent one person who lives in {name}{cast}.{walk} Their name begins with the letter \
+             {initial}. Write their description."
         )
     } else {
         format!(
-            "Write the description of {named}, who lives in {name}{cast}. Make them {station}. \
-             Use the name {named} and do not rename them."
+            "Write the description of {named}, who lives in {name}{cast}.{walk} Use the name \
+             {named} and do not rename them."
         )
     };
 
@@ -265,7 +365,10 @@ pub async fn post_describe(
         None
     } else {
         match s.personalities.read().await.get(&body.personality_id) {
-            Some(p) => Some(p.body.clone()),
+            // With its id, because a personality document carries no `name` and
+            // the id is what [`personality_label`] falls back to. Same shape the
+            // listings hand the console.
+            Some(p) => Some(crate::api::with_id("personality_id", &p.id, &p.body)),
             None => {
                 return fail(
                     StatusCode::NOT_FOUND,
@@ -363,7 +466,10 @@ pub async fn post_describe_stream(
         None
     } else {
         match s.personalities.read().await.get(&body.personality_id) {
-            Some(p) => Some(p.body.clone()),
+            // With its id, because a personality document carries no `name` and
+            // the id is what [`personality_label`] falls back to. Same shape the
+            // listings hand the console.
+            Some(p) => Some(crate::api::with_id("personality_id", &p.id, &p.body)),
             None => {
                 return ndjson::refuse(
                     StatusCode::NOT_FOUND,
@@ -499,10 +605,14 @@ mod tests {
         })
     }
 
+    /// **Shaped like a document in the mind, which has no `name`.**
+    ///
+    /// The fixture used to carry one, and that is the only reason the missing
+    /// field went unnoticed: every prompt in production read "this personality"
+    /// while every test read "Commander".
     fn personality() -> serde_json::Value {
         json!({
             "personality_id": "commander",
-            "name": "Commander",
             "anchor": "You are the Commander.\nPosition is read before people are.\nline3\nline4\n\
                        line5\nline6\nline7 SHOULD NOT APPEAR\nline8",
         })
@@ -526,15 +636,19 @@ mod tests {
         assert!(b.task.contains("Battle Cities"));
     }
 
-    /// **A world's exclusions are rules, not preferences.** They are what the
-    /// author decided the setting admits, and a generated description that
-    /// ignores them lands in the record permanently.
+    /// **A world's exclusions do not reach the model, deliberately.**
+    ///
+    /// `excludes` is a retrieval filter over the mind's section categories, not
+    /// a style guide; restating it in the prompt put a list of registers in
+    /// front of a model that was not going to write them, which is how a thing
+    /// gets into the frame rather than out of it. The register a description
+    /// belongs in comes from the setting prose and from `VOICE`.
     #[test]
-    fn the_worlds_exclusions_reach_the_model() {
+    fn the_worlds_exclusions_are_not_restated_as_instructions() {
         let b = brief_for(&world(), None, S, "");
-        assert!(b.context.contains("EXCLUDES"));
-        assert!(b.context.contains("sexual"));
-        assert!(b.context.contains("intimate"));
+        assert!(!b.context.contains("EXCLUDES"), "{}", b.context);
+        assert!(!b.context.contains("sexual"), "{}", b.context);
+        assert!(!b.context.contains("intimate"), "{}", b.context);
     }
 
     /// The personality is context when there is one, and its absence is not an
@@ -551,17 +665,104 @@ mod tests {
         assert!(without.task.contains("Invent one person"));
     }
 
-    /// **Only the anchor's opening.** A personality's anchor is a whole system
-    /// prompt with sections and worked examples; pasting all of it makes the
-    /// description a summary of the anchor rather than a person who fits it.
+    /// **A personality is named from its id, because it has no name.**
+    ///
+    /// The bug this pins made every prompt in the daemon say "this personality"
+    /// while the tests said "Commander" — the fixture carried a field no
+    /// document in the mind has.
     #[test]
-    fn only_the_anchors_opening_is_used() {
+    fn a_personality_is_named_from_its_id_when_it_has_no_name_field() {
+        assert_eq!(
+            personality_label(&json!({ "personality_id": "the-dapper-lich" })),
+            "The Dapper Lich"
+        );
+        // An authored `name` still wins, for a document that grows one.
+        assert_eq!(
+            personality_label(&json!({ "personality_id": "keeper", "name": "The Keeper" })),
+            "The Keeper"
+        );
+        // Neither is not a crash, and not an empty heading.
+        assert_eq!(personality_label(&json!({})), "this personality");
+
+        let b = brief_for(&world(), Some(&personality()), S, "");
+        assert!(b.context.contains("Commander"), "{}", b.context);
+        assert!(
+            !b.context.contains("this personality"),
+            "the heading fell back to the placeholder: {}",
+            b.context
+        );
+    }
+
+    /// **A station is for when there is no personality, not a rival to one.**
+    ///
+    /// Stated in the task — the turn the model answers — "Make them someone who
+    /// feeds people" beat an anchor sitting in the system turn, and the station
+    /// is drawn from the seed with no knowledge of which personality was picked.
+    /// That is how an anxious dragon came back a carpenter.
+    #[test]
+    fn a_station_is_only_dictated_when_no_personality_was_chosen() {
+        // With a personality: no station, and the personality is named instead.
+        for seed in 0..40u64 {
+            let b = brief_for(&world(), Some(&personality()), seed, "");
+            assert!(
+                !b.task.contains("Make them"),
+                "a station overrode the personality: {}",
+                b.task
+            );
+            assert!(b.task.contains("cast as Commander"), "{}", b.task);
+        }
+
+        // Without one, the station is the only thing decorrelating the person,
+        // so it must still be there.
+        let plain = brief_for(&world(), None, S, "");
+        assert!(plain.task.contains("Make them"), "{}", plain.task);
+    }
+
+    /// **An ordinary anchor reaches the model whole.**
+    ///
+    /// The budget replaced a six-line trim that cut most real anchors short —
+    /// every anchor in the corpus but one is under 350 characters, so the
+    /// interesting case is that they now arrive complete.
+    #[test]
+    fn an_ordinary_anchor_is_not_truncated() {
         let b = brief_for(&world(), Some(&personality()), S, "");
         assert!(b.context.contains("Position is read before people are."));
         assert!(
-            !b.context.contains("SHOULD NOT APPEAR"),
-            "the whole anchor was pasted in"
+            b.context.contains("SHOULD NOT APPEAR"),
+            "a short anchor was cut: {}",
+            b.context
         );
+    }
+
+    /// **A long one is still bounded, and cut on a line.**
+    ///
+    /// An anchor is unbounded authored text. Past the prose guest's prompt
+    /// headroom it does not degrade the description, it refuses the job — and a
+    /// cut mid-sentence reads as a transmission error the model then completes
+    /// from something the author never wrote.
+    #[test]
+    fn a_long_anchor_is_bounded_and_never_cut_mid_line() {
+        let long: String = (0..400)
+            .map(|i| format!("line {i} of a very long anchor indeed"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = anchor_extract(&long);
+        assert!(out.len() <= ANCHOR_BUDGET_CHARS, "{} chars", out.len());
+        assert!(out.starts_with("line 0 of"));
+        // Every line kept is a whole line of the original.
+        for line in out.lines() {
+            assert!(long.lines().any(|l| l == line), "cut mid-line: {line:?}");
+        }
+    }
+
+    /// A single line past the whole budget still yields something rather than
+    /// nothing — an anchor written as one long paragraph is not an error.
+    #[test]
+    fn one_enormous_line_still_briefs() {
+        let one = "x".repeat(ANCHOR_BUDGET_CHARS * 3);
+        let out = anchor_extract(&one);
+        assert!(!out.is_empty());
+        assert!(out.chars().count() <= ANCHOR_BUDGET_CHARS);
     }
 
     /// Context and task are separate turns, for the reason `lifegen::narrate`
@@ -645,12 +846,12 @@ mod tests {
         );
     }
 
-    /// A name is the subject; the world and its rules are still the context.
+    /// A name is the subject; the world is still the context.
     #[test]
     fn a_given_name_does_not_displace_the_world() {
         let b = brief_for(&world(), None, S, "Ursula Ved");
         assert!(b.context.contains("Battle Cities"));
-        assert!(b.context.contains("EXCLUDES"));
+        assert!(b.context.contains("THE WORLD"));
         assert!(
             !b.context.contains("Ursula Ved"),
             "the name leaked into the context"

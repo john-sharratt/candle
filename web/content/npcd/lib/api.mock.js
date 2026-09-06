@@ -43,7 +43,7 @@ const narrow = (rows, q, fields) => {
 const mk = (id, name, arch, archName, state, pending, band, overlap, hb, hidden, tags, desc) => ({
   npc_id: id, name, world_id: 'ardh', personality_id: arch, personality_name: archName, state,
   tick: { heartbeat_ms: hb, last_tick_ms: Date.now() - pending * 900 - 400, pending_events: pending, salience_gate: 0.42 },
-  environment_enabled: true, monitor: { overlap, band }, owner_id: 'u_8812', access: 'owner',
+  monitor: { overlap, band }, owner_id: 'u_8812', access: 'owner',
   hidden, tags, portrait: null, persona: { description: desc, origin: 'generated' },
   live_interactions: state === 'active' ? 2 : 0,
   created_ms: Date.now() - 86400000 * 12, updated_ms: Date.now() - 4000,
@@ -553,17 +553,6 @@ export const MockAPI = {
         return { tick: 312 + i, value: +(0.12 + 0.1 * Math.abs(Math.sin(t * 6)) + 0.06 * t).toFixed(3) };
       }) };
   },
-
-  async getEnvironment() {
-    return { enabled: true, window_turns: 24,
-      system_prompt: 'You describe what happens around a character in Ardh: a northern frontier three years after an inconclusive war. Keep to what could be perceived from where they stand. Never narrate their thoughts or decide their actions.',
-      recent: [
-        { world_ms: worldMs() - 600000, text: 'Wind off the ridge; the light going amber.' },
-        { world_ms: worldMs() - 300000, text: 'A horn, twice, from below the eastern slope.' },
-        { world_ms: worldMs() - 60000, text: 'The line east of the mill gives ground.' }] };
-  },
-  async setEnvironment() { return { ok: true }; },
-  async injectEnvironment() { return { ok: true }; },
 
   async listInteractions(id) {
     const base = { npc_id: id, interlocutor: { kind: 'operator', id: 'u_8812', display: 'Wren' }, state: 'live' };

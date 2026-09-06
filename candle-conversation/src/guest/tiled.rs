@@ -33,19 +33,20 @@
 //!
 //! # Why tiles rather than a bigger reservation
 //!
-//! The obvious fix is to give the decode its memory from the guest's own ground,
-//! which is span the drain already reserved. It cannot work, and the reason is
-//! worth writing down so it is not attempted twice: [`super::ground::Bump`] is a
-//! **bump** allocator with no free — correct for weights, which are written once
-//! and read until the drain ends. A decoder's intermediates are allocated and
-//! dropped continuously, so a bump cursor would hold the *sum* of every
-//! intermediate rather than the peak, which for a full decoder is tens of
-//! gigabytes. Backing a decode from ground means building a freeing allocator
-//! over the span, which is what the pool already is.
+//! The decode *is* also given memory from the guest's own ground, and the two
+//! measures answer different halves of the problem. Ground is a **bump** with no
+//! free, so a cursor holds the *sum* of everything carved inside one generation
+//! rather than the peak — and a decoder allocates and drops its intermediates
+//! continuously, which for a whole decoder is tens of gigabytes. What makes it
+//! usable is scope rather than a freeing allocator: generations nest, and the
+//! decoder opens one per block and per resnet
+//! ([`candle_nn::kv_cache::guest_stage`]), so the sum that has to fit is one
+//! resnet's.
 //!
-//! Tiling attacks the quantity that is actually wrong. A tile is decoded at a
-//! fixed size whatever the image is, so **the peak stops depending on the
-//! output** — a 2048×2048 decode has the same working set as a 512×512 one, and
+//! Tiling attacks the other quantity. Scoping bounds what a *generation* holds;
+//! tiling bounds what the whole decode holds, because a tile is decoded at a
+//! fixed size whatever the image is — so **the peak stops depending on the
+//! output**. A 2048×2048 decode has the same working set as a 512×512 one, and
 //! takes proportionally longer instead of failing.
 //!
 //! # Seams, and why the overlap is in latent space

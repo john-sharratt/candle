@@ -37,9 +37,9 @@ use candle::Device;
 
 use super::ground::{GroundError, GuestGround};
 use super::model::GuestModel;
-use super::progress::GuestEvent;
+use super::progress::{GuestEvent, GuestSink};
 use super::queue::Pending;
-use super::work::{Guest, GuestError, GuestRequest};
+use super::work::{Guest, GuestError, GuestOutcome, GuestRequest};
 
 /// What one drain did, for the log and for the memory report.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -153,9 +153,12 @@ pub fn drain_one<R: EngineRoom>(
     }
     report.freed_mib = freed >> 20;
 
-    // Step 3.
+    // Step 3. Claim only what the guest places itself — a second tenancy, like
+    // the prose guest's chunked K/V, was shed for above and claims its own
+    // regions from what that freed.
     let device = room.device();
-    let ground = match room.claim_ground(want) {
+    let ground_want = model.ground_bytes(&requests);
+    let ground = match room.claim_ground(ground_want) {
         Ok(g) => Arc::new(Mutex::new(g)),
         Err(e) => {
             let err = ground_refusal(&e, want, freed);
@@ -212,30 +215,97 @@ pub fn drain_one<R: EngineRoom>(
         return report;
     }
 
+    // **What the arena did not serve, and why.** A reading now and a
+    // subtraction after, rather than a reset, because the counters are
+    // process-wide and the persistence thread can add to them mid-drain — see
+    // [`candle::cuda_backend::wave_provenance::DeclineSnapshot`]. The two
+    // reasons have opposite fixes: `NoTicket` is a provenance break somewhere
+    // upstream, `ArenaFull` is a sizing problem and nothing else.
+    let before_declines = candle::cuda_backend::wave_provenance::DeclineSnapshot::now();
     let t_run = Instant::now();
-    for job in jobs {
-        match model.run(&job.request, &job.sink) {
-            Ok(outcome) => {
-                report.served += 1;
-                job.answer(Ok(outcome));
-            }
-            Err(e) => {
-                // One job's failure is not the backlog's. The guest is loaded
-                // and the ground is claimed; abandoning the rest would pay the
-                // whole cost of a drain to serve nothing, and the next drain
-                // would pay it again for the same jobs.
-                tracing::warn!(
+    // **The whole backlog in one call, so a guest that can batch does.**
+    //
+    // This was `for job in jobs { model.run(..) }`, which paid the load once and
+    // then decoded strictly one sequence at a time — the drain's own log said
+    // `jobs=1` on every line of a nineteen-turn outline, and `run_ms` was 48,000
+    // against a `load_ms` of 1,150. Amortising the load, which is what the queue
+    // was already doing, was saving 2% of the wrong thing.
+    let pairs: Vec<(&GuestRequest, &GuestSink)> =
+        jobs.iter().map(|p| (&p.request, &p.sink)).collect();
+    // Answered through a callback rather than a returned list, so a guest that
+    // decodes sequentially still unblocks each caller as its own job lands
+    // instead of at the end of the backlog. Taken out of `jobs` by index so each
+    // is answered exactly once, and whatever the guest never answered for is
+    // caught below.
+    let mut answered = vec![false; jobs.len()];
+    let (mut served, mut failed) = (0usize, 0usize);
+    {
+        let jobs = &jobs;
+        let answered = &mut answered;
+        let mut answer = |i: usize, outcome: Result<GuestOutcome, String>| {
+            let Some(job) = jobs.get(i).filter(|_| !answered[i]) else {
+                // An index outside the backlog, or one answered twice. Neither
+                // is recoverable into an outcome for anybody, so it is reported
+                // rather than silently pairing one job's answer with another's
+                // caller.
+                tracing::error!(
                     target: "candle_conversation::guest",
                     %guest,
-                    seq = job.seq,
-                    "guest job failed: {e}"
+                    "the guest answered job {i} of {} — out of range, or twice",
+                    jobs.len()
                 );
-                report.failed += 1;
-                job.answer(Err(GuestError::Failed(e)));
+                return;
+            };
+            answered[i] = true;
+            match outcome {
+                Ok(outcome) => {
+                    served += 1;
+                    job.answer(Ok(outcome));
+                }
+                Err(e) => {
+                    // One job's failure is not the backlog's. The guest is
+                    // loaded and the ground is claimed; abandoning the rest
+                    // would pay the whole cost of a drain to serve nothing, and
+                    // the next drain would pay it again for the same jobs.
+                    tracing::warn!(
+                        target: "candle_conversation::guest",
+                        %guest,
+                        seq = job.seq,
+                        "guest job failed: {e}"
+                    );
+                    failed += 1;
+                    job.answer(Err(GuestError::Failed(e)));
+                }
             }
-        }
+        };
+        model.run_batch(&pairs, &mut answer);
     }
+    drop(pairs);
+
+    // **A queued job whose caller is left waiting is the failure this whole
+    // function is arranged to make impossible**, and a guest that returns
+    // without answering one is the way it would happen.
+    for (job, done) in jobs.iter().zip(&answered) {
+        if *done {
+            continue;
+        }
+        tracing::error!(
+            target: "candle_conversation::guest",
+            %guest,
+            seq = job.seq,
+            "the guest returned without answering this job"
+        );
+        failed += 1;
+        job.answer(Err(GuestError::Failed(format!(
+            "the {guest} guest returned without answering this job"
+        ))));
+    }
+    report.served = served;
+    report.failed = failed;
     report.run_ms = t_run.elapsed().as_millis() as u64;
+    // Read before `unload`, which closes the arena and would leave the last
+    // stage's figures describing a guest that is already gone.
+    let declines = before_declines.bytes_since();
 
     model.unload();
     // Step 5. Explicit rather than left to the end of scope, so the order —
@@ -256,6 +326,13 @@ pub fn drain_one<R: EngineRoom>(
         load_ms = report.load_ms,
         run_ms = report.run_ms,
         total_ms = report.total_ms,
+        // Bytes that reached the pool through the inheriting path. Not the whole
+        // story — a site calling `dev.alloc` directly never asks, so it never
+        // appears here — but it is the difference between "the arena is too
+        // small" and "the provenance broke", which is the question a guest
+        // out-of-memory always turns out to be.
+        no_ticket_mib = declines.0 >> 20,
+        arena_full_mib = declines.1 >> 20,
         "guest drained"
     );
     report
@@ -690,6 +767,78 @@ mod tests {
             receipts.into_iter().next().unwrap().wait(),
             Err(GuestError::Failed(_))
         ));
+    }
+
+    /// **A sequential guest answers each caller as its own job lands.**
+    ///
+    /// The drain hands its whole backlog to the guest in one call now, so that a
+    /// guest able to decode a wave can. The hazard that introduces is latency for
+    /// one that cannot: an image guest decodes its jobs one at a time, and if the
+    /// drain collected the results and dispatched them at the end, the caller
+    /// waiting on the first image would wait for the last one instead. The
+    /// callback is what makes that unexpressible, and this is the test that says
+    /// so — a guest that answers job 0 before it starts job 1 has job 0's caller
+    /// unblocked at that moment.
+    #[test]
+    fn a_job_is_answered_when_it_lands_and_not_when_the_backlog_ends() {
+        // Records the order of (job answered, next job started), so a drain that
+        // batched the dispatch would show every answer after every run.
+        struct Narrator {
+            log: Arc<StdMutex<Vec<String>>>,
+        }
+        impl GuestModel for Narrator {
+            fn guest(&self) -> Guest {
+                Guest::Image
+            }
+            fn footprint_bytes(&self, _: &[GuestRequest]) -> usize {
+                1 << 20
+            }
+            fn load(
+                &mut self,
+                _: &Device,
+                _: &Arc<Mutex<GuestGround>>,
+                _: &[GuestRequest],
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn run(
+                &mut self,
+                request: &GuestRequest,
+                _: &GuestSink,
+            ) -> Result<GuestOutcome, String> {
+                self.log.lock().unwrap().push("run".into());
+                let GuestRequest::Image(r) = request else {
+                    return Err("not an image".into());
+                };
+                Ok(GuestOutcome::Image(super::super::work::GuestImage {
+                    width: r.width,
+                    height: r.height,
+                    png: vec![],
+                    seed: 0,
+                }))
+            }
+            fn unload(&mut self) {}
+        }
+
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let mut room = FakeRoom {
+            free: 64 << 20,
+            ..Default::default()
+        };
+        let mut model = Narrator {
+            log: Arc::clone(&log),
+        };
+        let (_q, jobs, receipts) = queued(vec![image_job(), image_job(), image_job()]);
+
+        // The default `run_batch` answers through the callback, so each answer
+        // lands between two `run`s rather than after all of them.
+        let report = drain_one(&mut room, &mut model, jobs);
+        assert_eq!(report.served, 3);
+
+        for r in receipts {
+            assert!(matches!(r.wait(), Ok(GuestOutcome::Image(_))));
+        }
+        assert_eq!(log.lock().unwrap().len(), 3, "one run per job");
     }
 
     /// **A guest that does not let go of its ground is named.**

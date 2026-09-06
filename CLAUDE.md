@@ -398,27 +398,28 @@ All weight loading uses `VarBuilder`:
 3. Add FFI binding in `candle-kernels/src/lib.rs`
 4. Call from `candle-core/src/cuda_backend/` via `unsafe`
 
-### Debugging a faulting kernel — `kernel-lineinfo`
+### Debugging a faulting kernel
 
-The kernels build **without** `--generate-line-info`, so a device-side fault
-gives you an address and no source location. When you need the file and line —
-an illegal access whose origin is not obvious, a `compute-sanitizer` run — build
-with the feature for that session and drop it again afterwards:
+**Use the `tensor-assert` harness, below.** A device-side fault is a write that
+went somewhere it should not have, and `readonly_regions` is built to catch
+exactly that: declare the ground that must never be written again, and the guard
+names the writer *at the moment of the write* — before the corruption, with the
+tenant's name, on the thread that did it. That is a better answer than an address
+to decode after the fact, and it is what this repository has instead of a
+debugger workflow.
 
-```bash
-cargo test -p candle-transformers --features cuda,kernel-lineinfo <test> -- --nocapture
-```
+Narrow the same way everything else here is narrowed: `Tensor::assert` to bound
+the window, `on_bad` to compose the next question inside it, `check_now` at the
+one site an armed capture has named. The method is in the harness section — test,
+narrow, test, narrow — and the two dangers it records (an instrument that fences
+suppresses the race it hunts; a stale declared region blames an innocent
+allocation) apply to fault hunting most of all.
 
-**Do not leave it on.** It costs nothing at runtime and two thirds of the build
-on disk: a measured cubin holds 175 KB of `.text` SASS against 592 KB of debug
-sections, `.nv_debug_ptx_txt` (the embedded PTX source text) being 490 KB of
-that. Those archives are statically linked into *every* CUDA test binary, and
-cargo keeps every generation of every binary it has ever produced.
-
-Which is the other half of the same story: `target/` grows tens of GB per build
-generation and cargo has no garbage collector. `cargo prune` (`target-prune`)
-sweeps superseded generations — it keeps the two newest of each artifact, so
-alternating feature sets do not thrash. `cargo prune -- --dry-run` reports first.
+A note on disk, which is the other half of any debugging session: `target/` grows
+tens of GB per build generation and cargo has no garbage collector. `cargo prune`
+(`target-prune`) sweeps superseded generations — it keeps the two newest of each
+artifact, so alternating feature sets do not thrash. `cargo prune -- --dry-run`
+reports first.
 
 ---
 

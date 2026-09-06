@@ -1,17 +1,31 @@
-//! Generating a character's portrait from its own description.
+//! Generating a character's portrait.
 //!
-//! # Why there is no prompt field
+//! # Where the prompt comes from
 //!
-//! The console's create step says it, and it is a real decision rather than a
-//! simplification: the portrait derives from `persona.description`, so there is
-//! nowhere for the two to drift apart. A character whose description says
-//! "a quartermaster in his fifties, scarred left hand" and whose portrait shows
-//! a young woman is a character nobody can use, and the way that happens is a
-//! prompt field somebody edited once and forgot.
+//! Three sources, in this order, and the order is the whole design:
 //!
-//! What this module does is turn the description into an image prompt — adding
-//! the framing a *portrait* needs and the description does not carry — and hand
-//! it to the image guest.
+//! 1. **The request**, if it carries one. This is the console's prompt box —
+//!    somebody looking at a portrait and adjusting the words that drew it.
+//! 2. **The personality's authored prompt**, if it has one. See
+//!    [`crate::personality_portrait`]: a personality is art-directed once, in
+//!    the mind, and every character struck from it inherits that direction.
+//! 3. **The description**, turned into a portrait prompt by [`prompt_for`].
+//!
+//! There used to be only the third, and a header here explaining that a prompt
+//! field would let a character's picture drift from its description. That risk
+//! is real and it has not gone away — but it was being paid for by a worse one.
+//! A description is written to be *read*: it is the character's identity in the
+//! system prompt, prose about who somebody is. A prompt is written to be
+//! *drawn*: framing, lens, light, what fills the frame. Forcing one sentence to
+//! do both jobs got a worse version of each, and left no way to keep a portrait
+//! somebody had spent an afternoon getting right.
+//!
+//! What keeps the two from drifting now is that the prompt is **authored beside
+//! the character**, in the same file, under the same review — not typed into a
+//! box that vanishes when the page closes.
+//!
+//! Whichever source wins, the prompt reaches the image guest the same way and
+//! is checked the same way — see [`crate::compliance`].
 //!
 //! # Why an upload outranks this permanently
 //!
@@ -94,6 +108,45 @@ pub struct GenerateBody {
     /// Pin the draw, so a portrait an operator liked can be reproduced.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Draw from these words instead of the character's own.
+    ///
+    /// The console's prompt box, which opens holding whatever this route would
+    /// have used anyway — so sending it back unchanged is the same request as
+    /// omitting it. Blank or whitespace is treated as absent rather than as an
+    /// instruction to draw nothing.
+    ///
+    /// It is **not** stored on the character. A prompt worth keeping belongs in
+    /// the personality document, where it is authored and reviewed; this is the
+    /// one-off, and the record keeps the picture rather than the words.
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// Which words this draw uses, of the three that could supply them.
+///
+/// The order is the module header's: the request, then the personality's
+/// authored prompt, then the description. Separate from the route and tested
+/// directly — the route can only report a refusal, so a test driving it end to
+/// end cannot see *which* prompt was chosen, and a test that re-implemented
+/// this decision would be free to disagree with the one that ships.
+///
+/// **Blank is absent.** A cleared prompt box falls through to the character's
+/// own words rather than sending the model an empty string, which draws
+/// something — just nothing anybody asked for.
+pub fn choose_prompt(
+    requested: Option<&str>,
+    authored: Option<&str>,
+    description: &str,
+    name: &str,
+) -> String {
+    for candidate in [requested, authored] {
+        if let Some(words) = candidate.map(str::trim) {
+            if !words.is_empty() {
+                return words.to_string();
+            }
+        }
+    }
+    prompt_for(description, name)
 }
 
 /// The prompt a description becomes.
@@ -147,7 +200,7 @@ pub async fn post_generate(
     // lock and released before the drain. Holding the cast's write lock across
     // a stop-the-world image generation would block every character's tick, the
     // console's listing and every other write in the daemon for the duration.
-    let (description, name, existing_origin) = {
+    let (description, name, personality_id, existing_origin) = {
         let npcs = s.npcs.read().await;
         let Ok(record) = npcs.get(npc_id, &owner) else {
             return refused(
@@ -166,6 +219,10 @@ pub async fn post_generate(
                 .as_str()
                 .unwrap_or("this character")
                 .to_string(),
+            record["personality_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             record["portrait"]["origin"].as_str().map(str::to_string),
         )
     };
@@ -180,12 +237,27 @@ pub async fn post_generate(
         );
     }
 
-    // The description is the prompt, and a description is written by whoever
-    // owns the character — so this route reaches the generator with caller text
-    // exactly as `/v1/image/generate` does, and is checked the same way. Gating
-    // only the direct route would leave the character editor as the way around
-    // it. See [`crate::compliance`].
-    let prompt = prompt_for(&description, &name);
+    // The three sources, in the order the module header sets out: the request's
+    // own words, then the personality's authored direction, then the
+    // description. The personality is read under its own read lock and released
+    // immediately — the drain below must not hold it.
+    let authored = {
+        let reg = s.personalities.read().await;
+        reg.get(&personality_id)
+            .and_then(|r| crate::personality_portrait::prompt(&r.body).map(str::to_string))
+    };
+    let prompt = choose_prompt(
+        body.prompt.as_deref(),
+        authored.as_deref(),
+        &description,
+        &name,
+    );
+
+    // Whichever source won, the prompt is caller-reachable text — a request
+    // body, or a document edited through the console — so this route reaches
+    // the generator exactly as `/v1/image/generate` does and is checked the same
+    // way. Gating only the direct route would leave the character editor as the
+    // way around it. See [`crate::compliance`].
     if let Err(denial) = crate::compliance::check(&s, &prompt).await {
         let (status, code, retry) = match denial {
             crate::compliance::Denial::Refused => (StatusCode::FORBIDDEN, "prompt_declined", false),
@@ -402,12 +474,73 @@ mod tests {
         assert!(GenerateBody::default().seed.is_none());
     }
 
-    /// An unknown key is refused rather than ignored: a caller sending
-    /// `{"prompt": "..."}` is asking for something this route deliberately does
-    /// not offer, and silently drawing from the description instead would look
-    /// like the prompt was honoured.
+    /// An unknown key is still refused rather than ignored — a caller sending a
+    /// field this route does not have is asking for something it will not do,
+    /// and drawing from the description anyway would look like it was honoured.
     #[test]
     fn an_unknown_field_is_refused_rather_than_ignored() {
-        assert!(serde_json::from_str::<GenerateBody>(r#"{"prompt":"a wizard"}"#).is_err());
+        assert!(serde_json::from_str::<GenerateBody>(r#"{"stlye":"a wizard"}"#).is_err());
+        assert!(serde_json::from_str::<GenerateBody>(r#"{"lora":"restricted"}"#).is_err());
+    }
+
+    /// A prompt in the body is read, because it is now a field this route has.
+    #[test]
+    fn a_prompt_in_the_body_is_accepted() {
+        let b: GenerateBody = serde_json::from_str(r#"{"prompt":"a wizard"}"#).unwrap();
+        assert_eq!(b.prompt.as_deref(), Some("a wizard"));
+    }
+
+    /// The request outranks the personality, which outranks the description.
+    #[test]
+    fn the_request_outranks_the_personality_which_outranks_the_description() {
+        assert_eq!(
+            choose_prompt(Some("a wizard"), Some("authored"), "a guard", "Keeper"),
+            "a wizard"
+        );
+        assert_eq!(
+            choose_prompt(None, Some("authored"), "a guard", "Keeper"),
+            "authored"
+        );
+        let fallen = choose_prompt(None, None, "a guard", "Keeper");
+        assert!(fallen.contains("a guard"), "{fallen}");
+        assert!(fallen.starts_with("character portrait"), "{fallen}");
+    }
+
+    /// **Blank is absent, not an instruction to draw nothing.**
+    ///
+    /// The console's prompt box can be cleared, and a cleared box must fall
+    /// back to the character's own words rather than sending the model an empty
+    /// string — which draws something, just nothing anybody asked for. The same
+    /// holds one rung down: a personality whose `prompt:` was started and left
+    /// blank falls through to the description.
+    #[test]
+    fn a_blank_prompt_falls_back_rather_than_drawing_nothing() {
+        for blank in ["", "   ", "\n\t "] {
+            assert_eq!(
+                choose_prompt(Some(blank), Some("authored"), "a guard", "Keeper"),
+                "authored",
+                "a blank request did not fall through"
+            );
+            let fallen = choose_prompt(Some(blank), Some(blank), "a guard", "Keeper");
+            assert!(
+                fallen.contains("a guard"),
+                "a blank personality prompt did not fall through: {fallen}"
+            );
+        }
+    }
+
+    /// The chosen prompt is trimmed whichever rung it came from — a trailing
+    /// newline out of a YAML block scalar or a textarea would otherwise end the
+    /// prompt on whitespace the tokenizer spends a token on.
+    #[test]
+    fn the_chosen_prompt_is_trimmed_whichever_source_won() {
+        assert_eq!(
+            choose_prompt(Some("  a wizard\n"), None, "a guard", "Keeper"),
+            "a wizard"
+        );
+        assert_eq!(
+            choose_prompt(None, Some("\na guardian  "), "a guard", "Keeper"),
+            "a guardian"
+        );
     }
 }

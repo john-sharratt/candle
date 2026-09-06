@@ -299,6 +299,87 @@ impl GroundVars {
 ///
 /// **Asynchronous, deliberately.** The caller guarantees `raw` outlives the
 /// copy — it is either the process-lifetime checkpoint mapping, or a host buffer
+/// The lease a guest stamps on the ground it places weights into.
+///
+/// # It used to be `Foreign`, and that is why a guest never used an arena
+///
+/// `Foreign` means "memory with no allocator to inherit", and an op reading one
+/// allocates its output from the pool. That is right for a KV slot or a pinned
+/// staging buffer. It is wrong for a guest's weights, because arena routing is
+/// **inheritance-only** — `wave_alloc_attributed` takes its ticket from an input
+/// tensor and there is no ambient generation a fresh allocation can pick up. So
+/// weights stamped `Foreign` meant every activation derived from them fell to
+/// the pool, at every resolution, for the whole life of the guest. Measured on
+/// one image drain: `no_ticket_mib=221283`, `arena_full_mib=0` — not one
+/// allocation was ever declined for a *full* arena, because not one ever reached
+/// an arena to be declined by.
+///
+/// The seed does not put the weights in the arena; they stay where they were
+/// placed. It says where the things *read from* them should be carved, and
+/// resolves to the pool whenever no guest generation is open — which is every
+/// guest that has not opened one, unchanged.
+pub fn guest_origin(device: &Device) -> candle::cuda_backend::wave_provenance::LeaseOrigin {
+    use candle::cuda_backend::wave_provenance::LeaseOrigin;
+
+    match device.as_cuda_device() {
+        Ok(cuda) => guest_origin_on(cuda.cuda_stream().context().ordinal()),
+        // No CUDA device is no arena either, and `Foreign` is what every
+        // non-CUDA path already means by it.
+        Err(_) => LeaseOrigin::Foreign,
+    }
+}
+
+/// Copy `src` into the open guest generation, so what reads it carves there too.
+///
+/// # Seeding the chain, not the weights
+///
+/// Stamping a routing seed on the *weights* does nothing, and finding out why
+/// took a measurement: `no_ticket_mib` did not move at all. Inheritance runs
+/// along the activation chain — a matmul takes its ticket from the **lhs**, and
+/// for `x.matmul(w)` the lhs is `x`. The weight is the right-hand operand and is
+/// never asked. So a forward inherits from whatever started `x`, which is a
+/// `randn` or an embedding lookup: owned, ticketless, pool.
+///
+/// Seeding the root fixes the whole chain, because every tensor after it is
+/// derived. One copy at the head of a stage buys the arena for everything that
+/// stage allocates.
+///
+/// Returns `src` unchanged when no generation is open or the arena is full —
+/// both mean "the pool", which is where all of this came from before.
+pub fn into_arena(src: &Tensor, device: &Device) -> candle::Result<Tensor> {
+    use candle::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin, WaveTicket};
+
+    let Ok(cuda) = device.as_cuda_device() else {
+        return Ok(src.clone());
+    };
+    let ticket = WaveTicket::guest(cuda.cuda_stream().context().ordinal() as u32);
+    let bytes = src.elem_count() * src.dtype().size_in_bytes();
+    let Some(ptr) = wave_alloc(ticket, bytes, 256) else {
+        return Ok(src.clone());
+    };
+    // SAFETY: the range was just carved from the open generation, which outlives
+    // this tensor — the caller drops it before the generation rewinds — and
+    // nothing else holds that range while the generation is live.
+    let dst = unsafe {
+        Tensor::from_leased_cuda_ptr(
+            ptr,
+            src.dtype(),
+            src.dims().to_vec(),
+            device,
+            LeaseOrigin::Wave(ticket),
+        )
+    }?;
+    dst.slice_set(src, 0, 0)?;
+    Ok(dst)
+}
+
+/// [`guest_origin`] for a caller that already holds the stream's ordinal.
+pub fn guest_origin_on(ordinal: usize) -> candle::cuda_backend::wave_provenance::LeaseOrigin {
+    use candle::cuda_backend::wave_provenance::{LeaseOrigin, WaveTicket};
+
+    LeaseOrigin::Wave(WaveTicket::guest(ordinal as u32))
+}
+
 /// the caller waits on itself. `GroundVars::with` issues one barrier for the
 /// whole load, so the transfers pipeline instead of stopping at every tensor;
 /// a caller placing tensors by hand owes the same barrier before it reads them.
@@ -309,8 +390,6 @@ pub fn place_bytes(
     dtype: DType,
     shape: Shape,
 ) -> candle::Result<(Tensor, u64)> {
-    use candle::cuda_backend::wave_provenance::LeaseOrigin;
-
     let bytes = shape.elem_count() * dtype.size_in_bytes();
     if raw.len() != bytes {
         candle::bail!(
@@ -341,7 +420,7 @@ pub fn place_bytes(
     // ground), and nothing else writes the range. The caller's barrier orders
     // the copy before any read.
     let t = unsafe {
-        Tensor::from_leased_cuda_ptr(at.ptr, dtype, shape, device, LeaseOrigin::Foreign)
+        Tensor::from_leased_cuda_ptr(at.ptr, dtype, shape, device, guest_origin(device))
     }?;
     Ok((t, at.ptr))
 }

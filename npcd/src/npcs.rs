@@ -317,10 +317,6 @@ impl Npcs {
             world_id,
             personality_id,
             hidden: body.get("hidden").and_then(Value::as_bool).unwrap_or(false),
-            environment_enabled: body
-                .get("environment_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
             heartbeat_ms: DEFAULT_HEARTBEAT_MS,
             salience_gate: DEFAULT_SALIENCE_GATE,
             tags: clean_tags(body.get("tags"))?,
@@ -335,7 +331,6 @@ impl Npcs {
             relationships: Vec::new(),
             agency: Vec::new(),
             modulation: Modulation::default(),
-            environment_prompt: String::new(),
         };
         self.commit(npc, owner)
     }
@@ -366,11 +361,6 @@ impl Npcs {
         }
         if let Some(v) = body.get("hidden") {
             npc.hidden = v.as_bool().ok_or(NpcError::Invalid("hidden"))?;
-        }
-        if let Some(v) = body.get("environment_enabled") {
-            npc.environment_enabled = v
-                .as_bool()
-                .ok_or(NpcError::Invalid("environment_enabled"))?;
         }
         if let Some(v) = body.get("state") {
             let s = v.as_str().ok_or(NpcError::Invalid("state"))?;
@@ -599,28 +589,6 @@ impl Npcs {
         self.bump(npc, owner, now_ms)
     }
 
-    /// Set the simulated environment: whether it runs, and what it says.
-    pub fn put_environment(
-        &mut self,
-        npc_id: u64,
-        owner: &str,
-        body: &Value,
-        now_ms: u64,
-    ) -> Result<Value, NpcError> {
-        let mut npc = self.owned(npc_id, owner)?;
-        if let Some(v) = body.get("enabled") {
-            npc.environment_enabled = v.as_bool().ok_or(NpcError::Invalid("enabled"))?;
-        }
-        if let Some(v) = body.get("system_prompt") {
-            let s = v.as_str().ok_or(NpcError::Invalid("system_prompt"))?;
-            if s.chars().count() > MAX_PROMPT_CHARS {
-                return Err(NpcError::Invalid("system_prompt"));
-            }
-            npc.environment_prompt = s.to_string();
-        }
-        self.bump(npc, owner, now_ms)
-    }
-
     /// The character, if the caller owns it. Every authoring write starts here:
     /// ownership is authorization (§8.2), and a role cannot express "yours".
     fn owned(&self, npc_id: u64, owner: &str) -> Result<NpcPayload, NpcError> {
@@ -727,7 +695,6 @@ fn wire(n: &NpcPayload, caller: &str) -> Value {
             "last_tick_ms": Value::Null,
             "pending_events": Value::Null,
         },
-        "environment_enabled": n.environment_enabled,
         // Same reason: the monitor is an engine measurement.
         "monitor": Value::Null,
         "modulation": {
@@ -811,20 +778,6 @@ pub fn modulation_wire(n: &NpcPayload) -> Value {
     })
 }
 
-pub fn environment_wire(n: &NpcPayload) -> Value {
-    json!({
-        "enabled": n.environment_enabled,
-        "system_prompt": n.environment_prompt,
-        // What the simulated environment has actually done. It has not run.
-        "last_event_ms": Value::Null,
-        "events": Value::Null,
-    })
-}
-
-/// The longest a simulated environment's instructions may be. Generous for
-/// prose, short of a way to fill a disk one save at a time.
-const MAX_PROMPT_CHARS: usize = 8_000;
-
 /// A field that must be 0..1, or the value it already had.
 ///
 /// Absent means unchanged, never zero: a `PUT` that sets one dial must not
@@ -850,10 +803,18 @@ fn bounded(body: &Value, key: &str, current: f32, lo: f64, hi: f64) -> Result<f3
     Ok(n as f32)
 }
 
+/// The longest one line of authored text may be. Generous for a statement or a
+/// note, short of a way to fill a disk one save at a time.
+///
+/// This was `MAX_PROMPT_CHARS`, belonging to the simulated environment's system
+/// prompt and borrowed by the helper below. That feature is gone; the bound is
+/// still needed here, so it is named for what it actually guards.
+const MAX_LINE_CHARS: usize = 8_000;
+
 /// One line of authored text, trimmed and bounded.
 fn clean_line(v: &Value, key: &'static str) -> Result<String, NpcError> {
     let s = v.as_str().ok_or(NpcError::Invalid(key))?.trim();
-    if s.chars().count() > MAX_PROMPT_CHARS {
+    if s.chars().count() > MAX_LINE_CHARS {
         return Err(NpcError::Invalid(key));
     }
     Ok(s.to_string())

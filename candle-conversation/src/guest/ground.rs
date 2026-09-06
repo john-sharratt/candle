@@ -137,6 +137,30 @@ impl Bump {
         &self.runs
     }
 
+    /// The largest contiguous stretch still placeable.
+    ///
+    /// [`Self::largest_run`] answers what the ground could serve when it was
+    /// empty; this answers what it can serve *now*, with the cursor where the
+    /// weights left it. The difference is what a caller sizing one big
+    /// allocation out of the remainder needs — a guest's activation arena, which
+    /// must be a single run because a bump cursor walking off the end of one
+    /// would hand out an address in another tenant's ground.
+    pub fn largest_free_run(&self) -> usize {
+        let here = self
+            .runs
+            .get(self.run)
+            .map(|r| r.bytes.saturating_sub(self.offset))
+            .unwrap_or(0);
+        let later = self
+            .runs
+            .iter()
+            .skip(self.run + 1)
+            .map(|r| r.bytes)
+            .max()
+            .unwrap_or(0);
+        here.max(later)
+    }
+
     /// Bytes still placeable.
     ///
     /// The tail of the run in progress plus every run after it. This is what is
@@ -262,6 +286,21 @@ impl GuestGround {
 
     pub fn place(&mut self, len: usize, align: usize) -> Result<Placement, GroundError> {
         self.bump.place(len, align)
+    }
+
+    /// The coalesced stretches this ground occupies.
+    ///
+    /// For a tenant that wants to say something about its own extent — declaring
+    /// it read-only once its weights are written, most usefully, so that a write
+    /// landing here from anywhere else names itself at the FFI boundary instead
+    /// of surfacing later as attention reading a weight.
+    pub fn runs(&self) -> &[Run] {
+        self.bump.runs()
+    }
+
+    /// The largest contiguous stretch still placeable — see [`Bump::largest_free_run`].
+    pub fn largest_free_run(&self) -> usize {
+        self.bump.largest_free_run()
     }
 
     /// Ground over addresses nobody owns, for testing the drain without a card.
@@ -501,6 +540,39 @@ mod tests {
                 wanted: 8
             })
         );
+    }
+
+    /// `free` sums what is left; this reports the widest single stretch of it.
+    /// The two differ exactly when a claim is fragmented, which is the case an
+    /// activation arena has to be sized against — it is one allocation, so the
+    /// sum is not what it can have.
+    #[test]
+    fn the_largest_free_run_is_a_stretch_not_a_sum() {
+        let mut b = scattered();
+        let whole = b.largest_free_run();
+        assert_eq!(whole, b.largest_run(), "nothing placed yet");
+        assert!(
+            b.free() > whole,
+            "a scattered claim holds more in total ({}) than in any one run ({whole})",
+            b.free()
+        );
+        // Cutting into the widest run shortens what remains of it by exactly
+        // the placement, so long as that is still the widest.
+        b.place(0x100, 1).unwrap();
+        assert_eq!(b.largest_free_run(), whole - 0x100);
+    }
+
+    /// An exhausted ground offers no stretch at all, rather than the width of a
+    /// run whose bytes are all handed out — which is what an arena carved from
+    /// the remainder would otherwise be told it could have.
+    #[test]
+    fn an_exhausted_ground_has_no_free_run() {
+        let mut b = scattered();
+        let all = b.free();
+        // Drain it a run at a time: a single `place` of `all` would be refused,
+        // since no one run holds the whole capacity.
+        while b.place(0x1000, 1).is_ok() {}
+        assert_eq!(b.largest_free_run(), 0, "started with {all}");
     }
 
     #[test]

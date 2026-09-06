@@ -27,6 +27,7 @@
 import { API } from '../lib/api.js';
 import { h, mount } from '../lib/dom.js';
 import { go } from '../lib/router.js';
+import { onReveal, revealing } from '../lib/reveal.js';
 import { empty, confirmDialog, toast, mayEdit, ro, roChip, only, roNote } from '../lib/ui.js';
 
 /* A trait key is `under_pressure` in the file and "Under pressure" on the page.
@@ -41,7 +42,13 @@ const title = (id) => String(id || '').split('-').map(label).join(' ');
 const named = (a) => a.name || title(a.personality_id);
 
 export async function render(params, q) {
-  const listed = (await API.listPersonalities().catch(() => ({ personalities: [] }))).personalities || [];
+  /* `revealing()` is held-key AND admin, and the daemon checks the role again
+   * on its own — so this is a request, never a grant. Worlds have asked since
+   * the create page was written; personalities never did, which is why holding
+   * the key on this page revealed nothing however many hidden ones there were.
+   */
+  const listed = (await API.listPersonalities('', revealing())
+    .catch(() => ({ personalities: [] }))).personalities || [];
   const aid = params.aid || q.a || (listed[0] && listed[0].personality_id);
 
   /* A personality named directly is fetched directly.
@@ -65,11 +72,21 @@ export async function render(params, q) {
 
   const el = h('div', { class: 'page wide' });
 
+  /* Built here rather than inline, because it owns a reveal subscription this
+   * page has to be able to stop. A picker is only offered when there is more
+   * than one to pick from. */
+  const chooser = list.length > 1 ? picker(list, aid) : null;
+  // Always a function, so every exit from this page can hand back the same one
+  // without asking whether a picker was offered.
+  const teardown = () => {
+    if (chooser) chooser.stop();
+  };
+
   el.appendChild(h('div', { class: 'hd' },
     h('div', {},
       h('h1', {}, a ? named(a) : 'Personalities'),
       h('div', { class: 'sub' },
-        'What a character is before it has lived anything. Every character of this type shares it as a ' +
+        'What a character is before they have lived anything. Every character of this type shares it as a ' +
         'read-only prefix, so it costs one copy however many of them exist — which is also why it cannot drift.')),
     /* The way into the life editor.
      *
@@ -80,8 +97,8 @@ export async function render(params, q) {
       a && mayEdit() ? h('button', {
         class: 'btn',
         onClick: () => go('/personality/' + a.personality_id + '/life'),
-      }, 'Write its life') : null,
-      list.length > 1 ? picker(list, aid) : null)));
+      }, 'Write their life') : null,
+      chooser && chooser.node)));
 
   if (!a) {
     /* Two different absences, said differently.
@@ -96,7 +113,7 @@ export async function render(params, q) {
       : empty('◈', 'No personalities',
         'Personalities are YAML files in the mind. Point the daemon at one with --mind, or add a file to '
         + 'its personalities/ directory.'));
-    return { el };
+    return { el, teardown };
   }
 
   const count = a.npc_count || 0;
@@ -144,7 +161,7 @@ export async function render(params, q) {
         'None declared. The anchor carries this character on its own.')));
 
   el.appendChild(doctrinePanel(a, count));
-  return { el };
+  return { el, teardown };
 }
 
 /* A search box and a select, not a select alone.
@@ -201,7 +218,10 @@ function picker(list, aid) {
   const search = async (v) => {
     // A slower request must not overwrite a newer one's answer.
     const mine = ++seq;
-    const r = await API.listPersonalities(v).catch(() => null);
+    // Asks with the reveal, so an admin holding the key sees hidden documents
+    // while narrowing rather than only on a whole word. Without the key this is
+    // exactly the request it always was.
+    const r = await API.listPersonalities(v, revealing()).catch(() => null);
     if (r && mine === seq) fill(r.personalities || []);
   };
 
@@ -213,7 +233,19 @@ function picker(list, aid) {
     },
   });
 
-  return h('div', { class: 'row' }, box, sel);
+  /* Re-ask when the key goes down or up.
+   *
+   * A refetch rather than a client-side unfilter, for the reason the search
+   * above is a server call at all: a hidden personality is never sent, so there
+   * is nothing in hand to reveal. `search` reads `revealing()` itself, so the
+   * current filter text is simply asked again under the new answer.
+   *
+   * The unsubscribe goes back to the caller and out through the page's
+   * teardown — a listener left behind would keep refetching for a page that
+   * has been replaced. */
+  const stopReveal = onReveal(() => search(box.value.trim()));
+
+  return { node: h('div', { class: 'row' }, box, sel), stop: stopReveal };
 }
 
 /* The one editable part. A publish is a real write: PUT replaces the document,

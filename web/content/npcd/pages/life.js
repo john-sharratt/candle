@@ -46,7 +46,62 @@ const dayKey = (y, m, d) => `${pad(y, 4)}-${pad(m)}-${pad(d)}`;
 /* Page state. Held in a module-level object rather than threaded through every
  * renderer: the page is one editor over one plan, and passing it down six
  * levels would be ceremony around a single subject. */
-const S = { who: null, plan: null, catalog: null, job: null, tab: 'story', year: null, month: null, poll: 0 };
+const S = { who: null, plan: null, catalog: null, job: null, tab: 'story', year: null, month: null, poll: 0, writtenOnly: false };
+
+/* Whether a stratum has anything in it yet.
+ *
+ * Title OR text: a day the months phase named has a title and no prose, and it
+ * is emphatically not empty — it is the one kind of unwritten node that already
+ * says something. */
+const written = (node) => Boolean(node && ((node.text || '').trim() || (node.title || '').trim()));
+
+/* An index down the left, one editor on the right.
+ *
+ * # Why a pane rather than a list of cards
+ *
+ * These tabs used to render a full editor — title, textarea, Save, Regenerate —
+ * for every slot, and a life has as many slots as it has time. Yen is 362
+ * years, two of them written, so the tab meant to show a life showed two
+ * paragraphs and three hundred and sixty empty textareas and the written ones
+ * could not be found by scrolling.
+ *
+ * The slots are all real: they are what "Generate what is missing" fills, and
+ * any of them can be written by hand. So none is hidden. What changes is that
+ * the *list* is a list — a scannable column where a year is one row and its
+ * state is a colour — and the editor is the one thing you are actually editing.
+ *
+ * The index carries the same three states the cards did, because they are how
+ * you decide what to look at next: written, edited by hand (sticky, nothing
+ * regenerates over it), and out of date (a parent moved under it).
+ */
+function pane(host, items, opts) {
+  const list = S.writtenOnly ? items.filter(written) : items;
+  const gaps = items.length - items.filter(written).length;
+  const sel = list.find(opts.selected) || list[0];
+  return h('div', { class: 'life-split' },
+    h('nav', { class: 'life-index' },
+      h('div', { class: 'life-index-head' },
+        h('span', {}, `${items.length - gaps}/${items.length} written`),
+        !gaps ? null : h('button', {
+          class: 'life-index-filter' + (S.writtenOnly ? ' on' : ''),
+          title: 'Show only the ones with something in them',
+          onClick: () => { S.writtenOnly = !S.writtenOnly; draw(host); },
+        }, S.writtenOnly ? 'showing written' : 'show written only')),
+      !list.length
+        ? h('p', { class: 'note' }, 'Nothing written at this level yet.')
+        : h('div', { class: 'life-index-rows' }, ...list.map((it) => h('button', {
+          class: 'life-index-row'
+            + (sel && opts.key(it) === opts.key(sel) ? ' on' : '')
+            + (written(it) ? '' : ' blank')
+            + (it.edited ? ' edited' : '') + (it.stale ? ' stale' : ''),
+          onClick: () => { opts.pick(it); draw(host); },
+        },
+        h('span', { class: 'k' }, opts.label(it)),
+        h('span', { class: 'v' }, opts.meta ? opts.meta(it) : (it.title || ''))))) ),
+    h('div', { class: 'life-pane' },
+      sel ? opts.render(sel)
+        : h('p', { class: 'note' }, 'Nothing to edit at this level yet.')));
+}
 
 export async function render(params, q) {
   const who = params.aid || q.a;
@@ -59,7 +114,7 @@ export async function render(params, q) {
   S.tab = params.tab || q.tab || 'story';
   const host = h('div', { class: 'life' });
   if (!S.who) {
-    mount(host, empty('○', 'No personality', 'Open a personality to write its life.'));
+    mount(host, empty('○', 'No personality', 'Open a personality to write their life.'));
     return host;
   }
 
@@ -99,8 +154,40 @@ async function reload() {
   /* Re-seeding can move a life's dates, so a selection that was valid a moment
    * ago may name a year the plan no longer has. Checked against the plan rather
    * than merely defaulted when unset. */
-  if (S.plan && !yearOf(S.year)) S.year = (S.plan.years[0] || {}).year ?? null;
+  if (S.plan && !yearOf(S.year)) S.year = defaultYear();
   if (!monthOf(S.year, S.month)) S.month = firstMonth();
+  /* Also on load, not only on a tab click: arriving straight at
+   * `/personality/:id/life/days` from a link is exactly the case where the
+   * selection has never been focused for the tab being shown. */
+  if (S.plan) focus(S.tab);
+}
+
+/* Which year to open on.
+ *
+ * **Not `years[0]`.** A life is laid out across its whole span before a word of
+ * it is written, so the first year is the year of somebody's birth and is
+ * almost always blank — landing there showed an empty Months tab for a life
+ * with written years in it, which reads as a broken page rather than an
+ * unwritten decade.
+ *
+ * The selection only drives the Months and Days tabs, so it is ordered by what
+ * those tabs can actually show. A year's grain decides whether it has months at
+ * all: a century of coarse vigil has none, so the written year is not always a
+ * year the months tab can render, and preferring prose alone lands on a year
+ * with nothing below it. */
+function defaultYear() {
+  const ys = (S.plan && S.plan.years) || [];
+  const months = (y) => (y.months || []).length;
+  const pick =
+    // A month with something in it — the tab opens on real content.
+    ys.find((y) => (y.months || []).some(written))
+    // Failing that, somewhere with months to write into.
+    || ys.find(months)
+    // Failing that, a written year, so the picker at least names the part of
+    // the life that exists.
+    || ys.find(written)
+    || ys[0];
+  return (pick || {}).year ?? null;
 }
 
 /* The catalog, or an empty one when the read failed.
@@ -112,7 +199,13 @@ async function reload() {
 const cat = () => S.catalog || { tools: [], cadences: [], phases: [] };
 
 const yearOf = (y) => (S.plan ? S.plan.years.find((x) => x.year === y) : null);
-const firstMonth = () => { const y = yearOf(S.year); return y && y.months[0] ? y.months[0].month : null; };
+/* The month to open on, written by preference — same reason as [`defaultYear`].
+ * A year whose months are all blank still opens on its first. */
+const firstMonth = () => {
+  const y = yearOf(S.year);
+  if (!y || !y.months.length) return null;
+  return (y.months.find(written) || y.months[0]).month;
+};
 const monthOf = (y, m) => { const yy = yearOf(y); return yy ? yy.months.find((x) => x.month === m) : null; };
 
 /* ---- rendering ------------------------------------------------------- */
@@ -194,10 +287,41 @@ function overlay(host) {
       j.detail ? ` · ${j.detail}` : ''));
 }
 
+/* Move the year/month selection to where the tab being opened has something.
+ *
+ * The two tabs share one selection and want different things from it: Months
+ * wants a year with months, Days wants a month with days, and a life can easily
+ * have those in different years — Yen's months are a two-year window in the
+ * 2770s and her notable days are in 2775 and 3086. Opening Days on the month
+ * Months happened to leave selected showed "no days marked" for a life with
+ * days in it.
+ *
+ * Only ever moves off a selection that has nothing to show, so it cannot pull
+ * somebody away from the year they were reading. */
+function focus(tab) {
+  const ys = (S.plan && S.plan.years) || [];
+  if (tab === 'years') {
+    /* The selection is shared, and the other two tabs want a year with months
+     * under it — which for a coarse-grained span is not a year anybody has
+     * written. Opening the editor on a blank year while the written ones sit in
+     * the index is the same complaint this pane was built to answer. */
+    if (written(yearOf(S.year))) return;
+    const w = ys.find(written);
+    if (w) S.year = w.year;
+    return;
+  }
+  if (tab !== 'days') return;
+  if ((monthOf(S.year, S.month) || {}).days?.length) return;
+  for (const y of ys) {
+    const m = (y.months || []).find((x) => x.days.length);
+    if (m) { S.year = y.year; S.month = m.month; return; }
+  }
+}
+
 function tabs(host) {
   const t = (id, label) => h('button', {
     class: 'life-tab' + (S.tab === id ? ' on' : ''),
-    onClick: () => { S.tab = id; draw(host); },
+    onClick: () => { S.tab = id; focus(id); draw(host); },
   }, label);
   return h('nav', { class: 'life-tabs' },
     t('story', 'Life story'), t('years', 'Years'),
@@ -244,7 +368,8 @@ function seedTab(host) {
       + '. Saving a seed now would replace whatever is on disk, so it is disabled '
       + 'until the read succeeds.') : null,
     !S.plan && !S.error ? h('p', { class: 'note' },
-      'This character has no life yet. Give it a seed and the ladder can start.') : null,
+      'This character has no life yet. Give them a seed and the ladder can start — the '
+      + 'story, years, months and days tabs appear once there is one to hang them on.') : null,
     h('div', { class: 'grid' },
       field('display', 'Name', s.display || S.who),
       field('born', 'Born', s.born, 'date'),
@@ -336,8 +461,19 @@ function storyTab(host) {
 function yearsTab(host) {
   return h('section', {},
     phaseBar(host, 'years', 'Write every year the story outlined.'),
-    ...S.plan.years.map((y) => stratum(host, String(y.year), y,
-      `${y.year}${beat(y.year) ? ' — ' + beat(y.year).title : ''}`, beat(y.year) ? beat(y.year).premise : '')));
+    pane(host, S.plan.years, {
+      key: (y) => y.year,
+      label: (y) => String(y.year),
+      /* The outline's own one-liner where the year has no title yet: it is what
+       * the story phase decided this year is *for*, so it is the most useful
+       * thing to scan when choosing what to write next. */
+      meta: (y) => y.title || (beat(y.year) ? beat(y.year).title : ''),
+      selected: (y) => y.year === S.year,
+      pick: (y) => { S.year = y.year; S.month = firstMonth(); },
+      render: (y) => stratum(host, String(y.year), y,
+        `${y.year}${beat(y.year) ? ' — ' + beat(y.year).title : ''}`,
+        beat(y.year) ? beat(y.year).premise : ''),
+    }));
 }
 
 const beat = (year) => ((S.plan.story.outline || []).find((b) => b.year === year));
@@ -348,9 +484,27 @@ function monthsTab(host) {
     phaseBar(host, 'months', 'Every month is written — a quiet month is written as a quiet month, never skipped.'),
     yearPicker(host),
     !y ? empty('○', 'No year', 'This life has no years yet.') :
-      h('div', {}, ...y.months.map((m) => stratum(host, monthKey(y.year, m.month), m,
-        `${MONTHS[m.month - 1]} ${y.year}`, '', () => { S.tab = 'days'; S.month = m.month; draw(host); },
-        m.days.length ? `${m.days.length} notable day${m.days.length > 1 ? 's' : ''}` : 'no notable days'))));
+      /* A year with no months is not a gap — it is a year the seed gave a
+       * coarse grain, and no amount of generating will put months in it. Said
+       * plainly, because an empty list here otherwise reads as a failure. */
+      !y.months.length ? h('p', { class: 'note' },
+        `${y.year} is written at year grain, so it has no months. `
+        + 'Set that span\'s grain to months on the Seed tab if you want them.') :
+      pane(host, y.months, {
+        key: (m) => m.month,
+        label: (m) => MONTHS[m.month - 1],
+        /* The day count, because that is what the months phase decides and what
+         * the Days tab has to work with — a month with none is a month that
+         * named nothing worth remembering. */
+        meta: (m) => m.title
+          || (m.days.length ? `${m.days.length} day${m.days.length > 1 ? 's' : ''}` : ''),
+        selected: (m) => m.month === S.month,
+        pick: (m) => { S.month = m.month; },
+        render: (m) => stratum(host, monthKey(y.year, m.month), m,
+          `${MONTHS[m.month - 1]} ${y.year}`, '',
+          () => { S.tab = 'days'; S.month = m.month; draw(host); },
+          m.days.length ? `${m.days.length} notable day${m.days.length > 1 ? 's' : ''}` : 'no notable days'),
+      }));
 }
 
 function daysTab(host) {
@@ -371,7 +525,9 @@ function yearPicker(host) {
       class: 'select',
       onChange: (e) => { S.year = Number(e.target.value); S.month = firstMonth(); draw(host); },
     }, ...S.plan.years.map((y) => h('option', { value: y.year, selected: y.year === S.year },
-      `${y.year}${y.text ? '' : ' (unwritten)'}`))));
+      /* A year with blank prose but written months is not unwritten — labelling
+       * it so sent somebody past the only year that had anything in it. */
+      `${y.year}${written(y) || (y.months || []).some(written) ? '' : ' (unwritten)'}`))));
 }
 
 function monthPicker(host) {
@@ -380,7 +536,8 @@ function monthPicker(host) {
   return h('label', { class: 'field inline' }, h('span', {}, 'Month'),
     h('select', { class: 'select', onChange: (e) => { S.month = Number(e.target.value); draw(host); } },
       ...y.months.map((m) => h('option', { value: m.month, selected: m.month === S.month },
-        `${MONTHS[m.month - 1]}${m.days.length ? ` · ${m.days.length}` : ''}`))));
+        `${MONTHS[m.month - 1]}${m.days.length ? ` · ${m.days.length}` : ''}`
+        + (written(m) ? '' : ' (unwritten)')))));
 }
 
 function phaseBar(host, phase, note) {

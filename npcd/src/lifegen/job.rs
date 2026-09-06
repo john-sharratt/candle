@@ -28,10 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::{ConversationEngine, SequenceConfig};
 use serde::Serialize;
 
-use super::generate::run_phase;
+use super::generate::{run_phase, Narrator};
 use super::plan::{Phase, Plan};
 use super::progress::{GenProgress, GenSnapshot, Outcome};
 
@@ -174,11 +173,13 @@ impl Jobs {
     /// running it, not choosing it.
     pub fn start(
         &self,
-        engine: Arc<Mutex<ConversationEngine>>,
-        cfg: SequenceConfig,
+        narrate: Narrator,
         mind: &Path,
         plan: Plan,
         phases: Vec<Phase>,
+        // The character's own idiom, read from their personality by the caller
+        // — the registry is on the app state and a job does not have one.
+        voice: String,
     ) -> Result<Arc<Job>, NotStarted> {
         let job = self.reserve(plan, phases)?;
         let run = Arc::clone(&job);
@@ -187,7 +188,7 @@ impl Jobs {
         let spawned = std::thread::Builder::new()
             .name(format!("npcd-lifegen-{}", job.id))
             .spawn(move || {
-                let outcome = drive(&engine, &cfg, &mind, &run, &phases);
+                let outcome = drive(&narrate, &mind, &run, &phases, &voice);
                 run.progress.finish(outcome);
             });
         if let Err(e) = spawned {
@@ -244,18 +245,12 @@ impl Jobs {
 }
 
 /// Run the ladder, rung by rung.
-fn drive(
-    engine: &Arc<Mutex<ConversationEngine>>,
-    cfg: &SequenceConfig,
-    mind: &Path,
-    job: &Job,
-    phases: &[Phase],
-) -> Outcome {
+fn drive(narrate: &Narrator, mind: &Path, job: &Job, phases: &[Phase], voice: &str) -> Outcome {
     for phase in phases {
         if job.progress.is_cancelled() {
             return Outcome::Cancelled;
         }
-        match run_phase(engine, cfg, mind, &job.plan, *phase, &job.progress) {
+        match run_phase(narrate, mind, &job.plan, *phase, voice, &job.progress) {
             Ok(n) => tracing::info!("life {}: {} — {n} node(s) written", job.who, phase.unit()),
             Err(e) => {
                 tracing::warn!("life {}: {} failed — {e:#}", job.who, phase.unit());

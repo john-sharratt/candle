@@ -142,16 +142,33 @@ impl EraKind {
     }
 
     /// How the prompts describe this span to the writer.
+    ///
+    /// # Directives, not sentences about the character
+    ///
+    /// These read as instructions — a fragment and an imperative — and they used
+    /// to read as finished prose: *"They were being developed inside a
+    /// simulation for this — conscious, but in a world with rules somebody else
+    /// set, which they may not know were rules."*
+    ///
+    /// A model handed that transposed it to the second person and pasted it into
+    /// the diary as narration, three times in one story, alongside the era's
+    /// `what` text. It is the same failure `prompt::VOICE`'s example had: a
+    /// sentence *about the character*, sitting in a prompt whose output is
+    /// sentences about the character, is indistinguishable from the thing being
+    /// asked for. Position cannot separate them and neither can a model.
+    ///
+    /// So the information survives — a writer genuinely needs to know a span was
+    /// a simulation — and the grammar no longer offers itself as a draft.
     pub fn instruction(self) -> &'static str {
         match self {
-            EraKind::Lived => "They were awake and in the world for this.",
+            EraKind::Lived => "Awake and in the world. Write as lived experience.",
             EraKind::Developed => {
-                "They were being developed inside a simulation for this — conscious, but in a \
-                 world with rules somebody else set, which they may not know were rules."
+                "A simulation, with rules somebody else set. Write as lived experience — it was \
+                 lived, from the inside — and do not have them realise it was not the world."
             }
             EraKind::Dormant => {
-                "They were archived for this. Nothing happened to them and they remember none \
-                 of it."
+                "Archived. No experience to write and no memory of it afterwards; do not narrate \
+                 this span, and do not let the life flow smoothly across it."
             }
         }
     }

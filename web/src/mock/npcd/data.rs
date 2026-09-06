@@ -99,7 +99,6 @@ fn npc(r: Row<'_>) -> Value {
             "pending_events": pending,
             "salience_gate": 0.42
         },
-        "environment_enabled": true,
         "monitor": { "overlap": overlap, "band": band },
         "owner_id": "u_8812",
         "access": "owner",
@@ -571,22 +570,6 @@ pub fn script() -> Vec<Value> {
                          eastern line buckles. Somewhere below, a horn.",
                 "covers_acts": ["a_88212","a_88213","a_88214"], "world_ms": world_ms(), "at_ms": now_ms() }),
     ]
-}
-
-pub fn environment(_npc: &str) -> Value {
-    json!({
-        "enabled": true,
-        "window_turns": 24,
-        "system_prompt": "You describe what happens around a character in Ardh: a northern \
-                          frontier three years after an inconclusive war. Keep to what could be \
-                          perceived from where they stand. Never narrate their thoughts or \
-                          decide their actions. Change the world slowly and only for a reason.",
-        "recent": [
-            { "world_ms": world_ms() - 600_000, "text": "Wind off the ridge; the light going amber." },
-            { "world_ms": world_ms() - 300_000, "text": "A horn, twice, from below the eastern slope." },
-            { "world_ms": world_ms() - 60_000,  "text": "The line east of the mill gives ground." }
-        ]
-    })
 }
 
 pub fn status() -> Value {

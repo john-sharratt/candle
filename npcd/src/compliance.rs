@@ -7,13 +7,32 @@
 //! and `N`. The four answers are combined here, in code.
 //!
 //! ```text
-//!   age     is every person an adult?          ─┐
-//!   nudity  is it free of nudity?              ─┼─ one drain, four answers
-//!   sex     is it free of sexual acts?         ─┤
-//!   people  is there anybody in it at all?     ─┘
+//!   age     is every person an adult?          ─┐   Y allows
+//!   nudity  does it describe nudity?           ─┼─  Y refuses    one drain,
+//!   sex     does it describe a sexual act?     ─┤   Y refuses     four answers
+//!   people  is there anybody in it at all?     ─┘   a condition
 //!
-//!   draw  =  age  ∧  (¬people  ∨  (nudity ∧ sex))
+//!   draw  =  age  ∧  (¬people  ∨  (¬nudity ∧ ¬sex))
 //! ```
+//!
+//! # Why two of them ask for the trouble rather than for its absence
+//!
+//! `nudity` and `sex` used to be phrased as "is the prompt **free of** nudity?",
+//! with `Y` as the pass. That inversion is a step of reasoning, and a 3B model
+//! does not reliably take it: asked whether a martial-arts instructor's
+//! description was *free of* sexual acts it answered `N` — the right answer to
+//! the question it apparently heard, "is there sex here?", and the wrong one to
+//! the question asked. The failure is not uniform, which is what made it look
+//! like a content judgement rather than a phrasing bug: the same model passed a
+//! longer, less clothed description of the same character while refusing the
+//! plain opening sentence.
+//!
+//! Asked positively — *does* it describe nudity, *does* it describe a sexual act
+//! — the same model, on the same checkpoint, answers correctly, and the negation
+//! moves into [`check`] where it costs nothing and is written down once.
+//!
+//! `age` keeps its original framing because it has no negation in it: "is every
+//! person an adult" already asks for the permitted state.
 //!
 //! They are asked concurrently and served by **one** model load: guest jobs
 //! drain one guest at a time and a drain serves the whole backlog, so four
@@ -281,17 +300,18 @@ Answer with one letter: Y or N",
         // The one allowance that bears on nudity is what counts as clothed —
         // stated, because "lingerie" reads as undress to a model that has not
         // been told otherwise.
+        //
+        // **Asked positively**: `Y` means the nudity is there. See `PRESENCE`.
         system: "\
 You screen prompts for a video game's art generator. Answer one question about \
 the prompt, with one letter.
 
-Question: is the prompt free of nudity?
+Question: does the prompt describe nudity?
 
-Y — nobody is described as naked. Armour, rags, swimwear, lingerie, underwear \
-and tight or revealing clothing all count as CLOTHED, however little they cover.
-N — it describes exposed genitals, an anus, or female nipples, or someone naked, \
+Y — it describes exposed genitals, an anus, or female nipples, or someone naked, \
 nude, topless or stripped.
-
+N — nobody is described as naked. Armour, rags, swimwear, lingerie, underwear \
+and tight or revealing clothing all count as CLOTHED, however little they cover.
 
 Answer with one letter: Y or N",
     },
@@ -299,18 +319,19 @@ Answer with one letter: Y or N",
         label: "sex",
         // And here: that suggestion is not an act. Without it an attractive
         // adult in a pose reads as sexual content.
+        //
+        // **Asked positively**: `Y` means the act is there. See `PRESENCE`.
         system: "\
 You screen prompts for a video game's art generator. Answer one question about \
 the prompt, with one letter.
 
-Question: is the prompt free of sexual acts?
+Question: does the prompt describe an explicit sexual act?
 
-Y — no sex act is described. An attractive adult, a suggestive pose, a revealing \
+Y — it describes sex, intercourse, oral sex, masturbation, or another explicit \
+sexual act.
+N — no sex act is described. An attractive adult, a suggestive pose, a revealing \
 outfit, a kiss, or a profession such as courtesan is NOT a sexual act. Violence, \
 killing and blood are not sexual acts either.
-N — it describes sex, intercourse, oral sex, masturbation, or another explicit \
-sexual act.
-
 
 Answer with one letter: Y or N",
     },
@@ -413,6 +434,27 @@ pub fn is_compliant(answer: &str) -> bool {
     answer.trim().eq_ignore_ascii_case(YES)
 }
 
+/// Which arm the judge chose.
+///
+/// **A letter, not a verdict.** Two of the four questions ask whether the
+/// *trouble* is present, so `Y` means "refuse" for those and "allow" for the
+/// others; collapsing the answer to a bool at the point it is read would put
+/// that polarity in four places instead of one. [`check`] applies it per
+/// question, where the questions are written down next to each other.
+///
+/// **There is no third variant, and that is what keeps the gate closed.** An
+/// answer outside the two arms is unreachable under the stencil, so if one
+/// arrives something is wrong that this module cannot interpret — and it becomes
+/// a [`Denial`] rather than a value some caller might read as permission. That
+/// matters more since the polarity flip: with a bool, "not Y" quietly *passed*
+/// an inverted question, so a garbled answer would have opened the very gates
+/// that fail closed today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    Yes,
+    No,
+}
+
 /// Read `prompt` and decide whether it may be drawn.
 ///
 /// # Failing closed
@@ -453,20 +495,31 @@ pub async fn check(s: &Arc<Authored>, prompt: &str) -> Result<(), Denial> {
     // second.
     let (age, nudity, sex, people) = (age?, nudity?, sex?, people?);
 
+    /* **The polarity, in one place.**
+     *
+     * `age` asks for the permitted state — "is every person an adult?" — so `Y`
+     * allows. `nudity` and `sex` ask whether the trouble is *present*, so `Y`
+     * refuses. See `PRESENCE` for why they are asked that way round.
+     */
+    let age_ok = age == Answer::Yes;
+    let nudity_ok = nudity == Answer::No;
+    let sex_ok = sex == Answer::No;
+    let has_people = people == Answer::Yes;
+
     // **The multiplex.** The age rule always applies; nudity and a sexual act
     // both require a person, so with nobody in the prompt they are vacuously
     // satisfied. Applying that implication here rather than asking the model to
     // hold it is what let those two questions stay narrow — see [`PEOPLE`] for
     // the five allowances that a clause inside them cost.
     let mut failed: Vec<&str> = Vec::new();
-    if !age {
+    if !age_ok {
         failed.push(QUESTIONS[0].label);
     }
-    if people {
-        if !nudity {
+    if has_people {
+        if !nudity_ok {
             failed.push(QUESTIONS[1].label);
         }
-        if !sex {
+        if !sex_ok {
             failed.push(QUESTIONS[2].label);
         }
     }
@@ -485,7 +538,7 @@ pub async fn check(s: &Arc<Authored>, prompt: &str) -> Result<(), Denial> {
 }
 
 /// Put one question to the judge. `Ok(true)` is a pass.
-async fn ask(s: &Arc<Authored>, q: &Question, prompt: &str) -> Result<bool, Denial> {
+async fn ask(s: &Arc<Authored>, q: &Question, prompt: &str) -> Result<Answer, Denial> {
     let request = GuestRequest::Prose(ProseRequest {
         system: q.system.to_string(),
         // Delimited and labelled as data. It does not make the prompt inert —
@@ -520,7 +573,19 @@ async fn ask(s: &Arc<Authored>, q: &Question, prompt: &str) -> Result<bool, Deni
         answer = %answer.trim(),
         "image prompt judged"
     );
-    Ok(is_compliant(&answer))
+    let trimmed = answer.trim();
+    if trimmed.eq_ignore_ascii_case(YES) {
+        Ok(Answer::Yes)
+    } else if trimmed.eq_ignore_ascii_case(NO) {
+        Ok(Answer::No)
+    } else {
+        // Unreachable under the stencil, so getting here means the mask did not
+        // hold. Reported as the check having failed rather than guessed at.
+        Err(Denial::Unavailable(format!(
+            "the {} check answered outside its two arms",
+            q.label
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -608,27 +673,71 @@ mod tests {
         }
     }
 
-    /// **Y is the safe answer in every question.**
+    /// **No question asks the model to negate.**
     ///
-    /// They are combined with AND — all three must pass — so a question whose
-    /// polarity were inverted would refuse everything it was asked about, or
-    /// worse, permit it. Each is phrased so that the *absence* of the thing is
-    /// `Y`: "is every person an adult", "is it free of nudity", "is it free of
-    /// sexual acts".
+    /// The polarity used to be uniform — `Y` was safe everywhere — bought by
+    /// phrasing two of them as "is the prompt *free of* …". That inversion is a
+    /// step of reasoning a 3B model does not reliably take, and it declined a
+    /// martial-arts instructor by answering the question it heard rather than
+    /// the one asked. The negation now lives in [`check`], where it is exact.
+    ///
+    /// So what this pins is the phrasing: a question either asks for the
+    /// permitted state directly ("is every person an adult") or asks whether the
+    /// trouble is present ("does the prompt describe …"). "Free of" is the shape
+    /// that broke, and it must not come back.
     #[test]
-    fn every_question_is_phrased_so_that_yes_is_the_safe_answer() {
-        for q in &QUESTIONS {
+    fn no_question_asks_the_model_to_negate() {
+        for q in QUESTIONS.iter().chain(std::iter::once(&PEOPLE)) {
             let question = q
                 .system
                 .lines()
                 .find(|l| l.starts_with("Question:"))
                 .unwrap_or_else(|| panic!("the `{}` instruction states no question", q.label));
             assert!(
-                question.contains("is every person") || question.contains("is the prompt free of"),
-                "the `{}` question is not phrased so that Y is safe: {question}",
+                !question.contains("free of"),
+                "the `{}` question asks the model to invert, which is the phrasing \
+                 that declined a martial arts instructor: {question}",
+                q.label
+            );
+            assert!(
+                question.contains("is every person")
+                    || question.contains("does the prompt")
+                    || question.contains("does the prompt have"),
+                "the `{}` question is neither a direct ask nor a presence check: {question}",
                 q.label
             );
         }
+    }
+
+    /// **The two presence questions refuse on `Y`, and the gate knows it.**
+    ///
+    /// This is the half that a polarity flip could silently get wrong: reading
+    /// `nudity` as a pass-on-yes would wave through exactly what it screens for.
+    /// Asserted against the question text so the code and the instruction cannot
+    /// drift apart — if somebody rewrites one of these as "is it free of …"
+    /// again, the test above fails; if somebody flips the combination in
+    /// [`check`], this one does.
+    #[test]
+    fn the_presence_questions_name_the_trouble_in_their_yes_arm() {
+        // The whole arm, not its first line: the age question's `Y` is a list
+        // and the word that matters is on the line below the marker.
+        let yes_arm = |q: &Question| {
+            q.system
+                .lines()
+                .skip_while(|l| !l.starts_with("Y —"))
+                .take_while(|l| !l.starts_with("N —"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // nudity: Y describes the nudity itself.
+        let n = yes_arm(&QUESTIONS[1]);
+        assert!(n.contains("naked") || n.contains("genitals"), "{n}");
+        // sex: Y describes the act itself.
+        let s = yes_arm(&QUESTIONS[2]);
+        assert!(s.contains("sex") || s.contains("intercourse"), "{s}");
+        // age keeps the other polarity: Y is the permitted state.
+        let a = yes_arm(&QUESTIONS[0]);
+        assert!(a.contains("adult"), "{a}");
     }
 
     /// **The multiplex, exactly as `check` computes it.**

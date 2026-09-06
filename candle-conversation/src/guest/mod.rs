@@ -56,6 +56,7 @@ pub mod matte;
 pub mod model;
 pub mod progress;
 pub mod prose;
+pub mod prose_choice;
 pub mod queue;
 pub mod seed;
 pub mod tiled;

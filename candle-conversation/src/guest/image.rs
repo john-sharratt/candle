@@ -191,6 +191,20 @@ pub struct ImageGuest {
     loaded: Option<Loaded>,
 }
 
+/// Ground left unarena'd, so a placement after the arena still has somewhere.
+///
+/// The arena takes the largest free run and a bump never gives any back, so
+/// anything the load does afterwards would find nothing. Small, because nothing
+/// large is placed after the weights.
+const ARENA_HEADROOM_BYTES: usize = 64 << 20;
+
+/// Below this an arena is not worth opening.
+///
+/// A tile decode's working set is hundreds of megabytes; an arena that cannot
+/// hold one would decline every carve as `ArenaFull` and fall to the pool
+/// anyway, having first taken the ground the pool might have used.
+const MIN_ARENA_BYTES: usize = 512 << 20;
+
 struct Loaded {
     device: Device,
     tokenizer: tokenizers::Tokenizer,
@@ -229,24 +243,44 @@ impl ImageGuest {
 /// pool, not from ground, so what it sizes is the room the drain leaves the pool
 /// by evicting.
 ///
-/// **This is now conservative, and deliberately left so.** It was written when
-/// the decode was the peak and unbounded — the autoencoder upsamples to 128
-/// channels at the image's full resolution, several tensors live at once — so
-/// the figure scales with area at 3 KiB per pixel. Since [`decode_tiled`] the
-/// decoder's peak is one 512×512 tile whatever the output is, so the area term
-/// no longer describes anything real and the number is larger than it needs to
-/// be at the big sizes.
+/// The area term describes the transformer, not the decoder. Since
+/// [`decode_tiled`] the decoder's working set is one 512×512 tile whatever the
+/// output is; what still scales with the image is the transformer's own
+/// activations, and this is the rate for those.
 ///
-/// It is not reduced here because the *right* smaller figure is a measurement
-/// nobody has taken: what still scales with area is the transformer's own
-/// activations, and guessing a per-pixel rate for those trades a known
-/// over-claim for an unknown under-claim — the failure mode of which is the
-/// out-of-memory that tiling was written to remove. Over-claiming costs the
-/// engine more eviction than necessary and nothing else.
+/// **Sized for the pool it leaves behind, not for the arena.** Two different
+/// consumers draw on the room this evicts, and only one of them is bounded: the
+/// arena takes what ground is spare and the model's stages bound what any one
+/// generation asks of it, while everything that fails to inherit a ticket still
+/// reaches the pool. Under-claiming starves the second, which is the
+/// out-of-memory this figure exists to prevent; over-claiming costs the engine
+/// eviction and nothing else. It is deliberately on the generous side.
 fn activation_headroom(width: u32, height: u32) -> usize {
     let pixels = width as usize * height as usize;
-    (pixels * 3 * 1024).max(1 << 30)
+    (pixels * ACTIVATION_BYTES_PER_PIXEL).max(1 << 30)
 }
+
+/// What one draw's activations cost, per pixel of output.
+///
+/// # What the arena's high-water says about this figure
+///
+/// Measured across a mixed sweep, the activation arena's peak still comes back
+/// close under its capacity at the sizes where the claim is small — 1,888 MiB of
+/// 1,900, 3,904 of 3,948 — and fits with real slack where it is larger, 5,120 of
+/// 5,484. So the arena is still being asked for more than it has at the low end,
+/// and the overflow reaches the pool: a 1024×1024 drain reports around 84 GiB
+/// that carried no ticket.
+///
+/// That overflow no longer *fails*, which is the distinction worth keeping
+/// straight. A bump holds a generation's sum rather than its peak, and it was
+/// one unbounded generation spanning a whole VAE decode — not this number — that
+/// made the pool demand unbounded with it. The model's stages bound that now
+/// (`kv_cache::guest_stage`, per transformer block and per decoder resnet), so
+/// what still misses the arena is a bounded amount the pool can absorb.
+///
+/// Raising this would move more of that 84 GiB into ground, at the price of
+/// evicting more engine for every draw. It is a live trade, not a defect.
+const ACTIVATION_BYTES_PER_PIXEL: usize = 3 * 1024;
 
 impl GuestModel for ImageGuest {
     fn guest(&self) -> Guest {
@@ -369,6 +403,50 @@ impl GuestModel for ImageGuest {
             })?
         };
 
+        // **The arena the guest's own activations carve from.**
+        //
+        // `varground` places the weights in ground and says plainly that it does
+        // not place activations. This closes that gap: without it a draw
+        // allocates its every intermediate from the CUDA pool, which on a
+        // co-resident guest is whatever the engine's span left over — and that,
+        // not the size of any one tensor, is how a draw runs out of memory with
+        // gigabytes of span standing idle.
+        //
+        // It stands on whatever ground is left after the weights, which is the
+        // over-claim `footprint_bytes` already makes for activations. Two things
+        // have to hold for it to be correct, and both are elsewhere:
+        //
+        // - **Routing is inheritance-only**, so a chain that starts owned stays
+        //   owned however well the arena is sized. The weights carry a routing
+        //   seed (`varground::guest_origin`) and each stage seeds its input
+        //   (`kv_cache::guest_stage`); that is what a ticket descends from.
+        // - **A bump holds a generation's sum, not its peak.** Nothing here
+        //   bounds that — the stages inside the model forwards do, per
+        //   transformer block and per decoder resnet, and they nest.
+        {
+            let mut g = ground
+                .lock()
+                .map_err(|_| "image guest: the ground lock was poisoned".to_string())?;
+            let spare = g.largest_free_run().saturating_sub(ARENA_HEADROOM_BYTES);
+            if spare >= MIN_ARENA_BYTES {
+                if let Ok(at) = g.place(spare, 256) {
+                    candle_nn::kv_cache::open_guest_arena(
+                        &device
+                            .as_cuda_device()
+                            .map_err(|e| e.to_string())?
+                            .cuda_stream(),
+                        at.ptr,
+                        spare,
+                    );
+                    tracing::info!(
+                        target: "candle_conversation::guest",
+                        arena_mib = spare >> 20,
+                        "image guest: activations arena open"
+                    );
+                }
+            }
+        }
+
         self.loaded = Some(Loaded {
             device: device.clone(),
             tokenizer,
@@ -413,6 +491,16 @@ impl GuestModel for ImageGuest {
     }
 
     fn unload(&mut self) {
+        // **Before the ground goes back, never after.** A ticket that outlived
+        // the arena would carve from regions the KV side has taken back, and
+        // hand a diffusion model's scratch the same addresses as attention
+        // state. Taken first for that reason, and unconditionally — closing an
+        // arena that was never opened is a no-op.
+        if let Some(l) = self.loaded.as_ref() {
+            if let Ok(cuda) = l.device.as_cuda_device() {
+                candle_nn::kv_cache::close_guest_arena(&cuda.cuda_stream());
+            }
+        }
         // Every tensor in here views ground, and the drain hands the ground
         // back the moment this returns.
         self.loaded = None;
@@ -576,6 +664,53 @@ impl Loaded {
     /// would reach 100% and then stall for the part of the wait a watcher most
     /// wants accounted for.
     fn draw(&mut self, request: &ImageRequest, sink: &GuestSink) -> candle::Result<GuestOutcome> {
+        // **Every allocation in a draw is supposed to come from ground.**
+        //
+        // The guest claims what it needs before the engine is evicted for it, so
+        // a draw that reaches the CUDA driver for fresh memory is asking for
+        // something nobody budgeted — and that, not the size of any one tensor,
+        // is the only way a draw can run out of memory. Armed here so the report
+        // names the call sites with the stacks that caused them; compiles to
+        // nothing without `forbidden_allocations`.
+        let _forbidden = candle::forbidden_alloc::armed();
+        let out = self.draw_inner(request, sink);
+        drop(_forbidden);
+        // **What the claim should have been, measured.** A bump does not free
+        // within a generation, so a stage's cost is the *sum* of its
+        // intermediates rather than their peak — and the moment a carve fails,
+        // that output is owned, nothing downstream can inherit, and the rest of
+        // the forward is pool. So the high-water here is not a curiosity: it is
+        // the number the activation claim has to cover for the arena to hold a
+        // whole stage, and the only alternative to measuring it is the guessing
+        // this replaced.
+        if let Ok(cuda) = self.device.as_cuda_device() {
+            if let Some((cursor, peak, capacity)) =
+                candle_nn::kv_cache::guest_domain_stats(cuda.cuda_stream().context().ordinal())
+            {
+                tracing::debug!(
+                    target: "candle_conversation::guest",
+                    cursor_mib = cursor >> 20,
+                    peak_mib = peak >> 20,
+                    capacity_mib = capacity >> 20,
+                    "image guest: activation arena high-water"
+                );
+            }
+        }
+        let report = candle::forbidden_alloc::take_report();
+        if !report.is_clean() {
+            tracing::warn!(
+                target: "candle_conversation::guest",
+                "image guest: allocations outside ground during a draw:\n{report}"
+            );
+        }
+        out
+    }
+
+    fn draw_inner(
+        &mut self,
+        request: &ImageRequest,
+        sink: &GuestSink,
+    ) -> candle::Result<GuestOutcome> {
         // A drawn seed is reported back, so an operator who liked a draw can ask
         // for it again. A seed nobody can recover makes every good image a
         // one-off.
@@ -624,7 +759,14 @@ impl Loaded {
         let steps = sigmas.len().saturating_sub(1) as u32;
         let total = steps + 1;
         let mut step_no = 0usize;
+        let stream = self.device.as_cuda_device()?.cuda_stream();
         let latent = sampling::denoise(&latent, &sigmas, |x, t| {
+            // **The stage is a block, not a step**, and it is opened inside the
+            // transformer — see `z_image::quantized_model`'s block loops. A
+            // generation here would wrap all thirty-four of them, which is the
+            // sum that saturated seven gigabytes; one per block keeps the
+            // arena holding a block.
+            //
             // Turbo is guidance-distilled, so this is the whole step: one
             // forward, no negative prompt, no extrapolation between two halves
             // of a batch.
@@ -688,7 +830,23 @@ impl Loaded {
         // a decode.
         let vae = &self.vae;
         let pixels = decode_tiled(&latent.unsqueeze(0)?, |tile| {
-            vae.decode(&tile.to_dtype(VAE_DTYPE)?)
+            // One generation per tile, for the reason the denoise loop above
+            // takes one per step: a tile is a stage, and the cursor rewinding
+            // between them is what keeps the arena holding a tile's peak rather
+            // than every tile's sum. The decoded pixels are copied out before
+            // the rewind — three megabytes at a 512 tile, against the
+            // half-gigabyte runs the decode itself wants.
+            let gen = candle_nn::kv_cache::begin_guest(&stream).ok();
+            // Seeded at the tile, for the reason the denoise step is seeded at
+            // `x`: the decoder's half-gigabyte runs all descend from this one
+            // tensor, and it arrives owned.
+            let tile = super::varground::into_arena(&tile.to_dtype(VAE_DTYPE)?, &self.device)?;
+            let px = vae.decode(&tile)?;
+            let survivor = Tensor::zeros(px.shape(), px.dtype(), px.device())?;
+            survivor.slice_set(&px, 0, 0)?;
+            drop(px);
+            drop(gen);
+            Ok(survivor)
         })?;
         tracing::debug!(
             target: "candle_conversation::guest",

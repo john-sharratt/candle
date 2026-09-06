@@ -1039,6 +1039,52 @@ canvas { width: 100%; display: block; }
 .life-phasebar { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
 .life-phasebar .note { margin: 0; }
 
+/* An index beside the editor, for the two tabs whose entries are as numerous as
+   the life is long — 362 years for a companion, and only a handful of them
+   written. The index scrolls on its own so the editor stays put while you look
+   for the next thing to write.
+
+   Collapses to one column under 900px: two panes side by side on a phone gives
+   an index too narrow to read and an editor too narrow to write in. */
+.life-split { display: grid; grid-template-columns: minmax(150px, 210px) 1fr; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .life-split { grid-template-columns: 1fr; } }
+
+.life-index { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); overflow: hidden; }
+.life-index-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--line);
+  font: 600 .68rem/1 var(--mono); color: var(--ink-ghost);
+}
+.life-index-filter {
+  border: 0; background: none; cursor: pointer; padding: 0;
+  font: inherit; color: var(--ink-ghost); text-decoration: underline dotted;
+}
+.life-index-filter:hover, .life-index-filter.on { color: var(--accent); }
+/* Bounded so the index cannot outgrow the viewport: the whole point is that the
+   editor beside it stays where you left it. */
+.life-index-rows { max-height: 62vh; overflow-y: auto; }
+.life-index-row {
+  display: flex; align-items: baseline; gap: 8px; width: 100%;
+  border: 0; border-left: 3px solid transparent; background: none; cursor: pointer;
+  padding: 6px 10px; text-align: left; color: var(--ink-mid);
+}
+.life-index-row:hover { background: var(--panel-2); }
+.life-index-row.on { background: var(--panel-3); color: var(--ink); }
+.life-index-row .k { font: 600 .76rem/1.3 var(--mono); }
+.life-index-row .v {
+  font-size: .72rem; color: var(--ink-ghost);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The same three states the cards carry, because they are how you choose what
+   to look at next. Blank is dimmed rather than hidden — an unwritten year is
+   what "Generate what is missing" fills. */
+.life-index-row.blank .k { color: var(--ink-ghost); font-weight: 400; }
+.life-index-row.edited { border-left-color: var(--accent); }
+.life-index-row.stale { border-left-color: var(--warn); }
+
+.life-pane { min-width: 0; }
+.life-pane .life-card { margin-bottom: 0; }
+
 .life-card {
   border: 1px solid var(--line); border-left: 3px solid var(--line-2);
   border-radius: var(--radius); background: var(--panel); padding: 13px 15px; margin-bottom: 12px;

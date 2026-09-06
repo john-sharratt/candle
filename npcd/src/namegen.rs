@@ -93,8 +93,24 @@ pub fn name_brief(
     if let Some(setting) = world["setting"].as_str().filter(|s| !s.trim().is_empty()) {
         context.push_str(&format!("\n{}\n", setting.trim()));
     }
-    if let Some(p) = personality.and_then(|p| p["name"].as_str()) {
-        context.push_str(&format!("\nTHEY WILL BE CAST AS\n{p}\n"));
+    /* **The anchor, not just the label.**
+     *
+     * This named the personality and stopped — "THEY WILL BE CAST AS Keeper" —
+     * which tells a naming model almost nothing. A personality's *name* is a
+     * slug an author chose; its anchor is who the character is, and that is what
+     * a name has to suit. An ancient tower intelligence and a frontier
+     * quartermaster want different names, and only one of those facts was
+     * reaching the model.
+     *
+     * Same extract the description uses, so the two prompts agree about what a
+     * personality is rather than each taking their own slice of it.
+     */
+    if let Some(p) = personality {
+        let pname = crate::describe::personality_label(p);
+        context.push_str(&format!("\nTHEY WILL BE CAST AS\n{pname}\n"));
+        if let Some(anchor) = p["anchor"].as_str().filter(|s| !s.trim().is_empty()) {
+            context.push_str(&format!("{}\n", crate::describe::anchor_extract(anchor)));
+        }
     }
 
     // **The same first-token problem the description had, and worse.** A name
@@ -205,7 +221,8 @@ pub async fn post_name(State(s): State<Arc<Authored>>, Json(body): Json<NameBody
         None
     } else {
         match s.personalities.read().await.get(&body.personality_id) {
-            Some(p) => Some(p.body.clone()),
+            // With its id — see [`crate::describe::personality_label`].
+            Some(p) => Some(crate::api::with_id("personality_id", &p.id, &p.body)),
             None => {
                 return fail(
                     StatusCode::NOT_FOUND,

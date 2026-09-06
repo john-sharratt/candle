@@ -149,10 +149,6 @@ export const LiveAPI = {
   getProjection:(id, tick) => j(`/v1/npc/${id}/projection` + (tick ? '/' + tick : '')),
   getMonitor:   (id, w) => j(`/v1/npc/${id}/monitor` + qs({ window: w })),
 
-  getEnvironment:    (id) => j(`/v1/npc/${id}/environment`),
-  setEnvironment:    (id, c) => j(`/v1/npc/${id}/environment`, { method: 'PUT', body: c }),
-  injectEnvironment: (id, e) => j(`/v1/npc/${id}/environment/inject`, { method: 'POST', body: e }),
-
   listInteractions: (id) => j(`/v1/npc/${id}/interaction`),
   openInteraction:  (id, spec) => j(`/v1/npc/${id}/interaction`, { method: 'POST', body: spec }),
   getInteraction:   (ix) => j(`/v1/interaction/${ix}`),

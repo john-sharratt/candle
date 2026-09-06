@@ -55,6 +55,7 @@ mod namegen;
 mod ndjson;
 mod npcs;
 mod ops;
+mod personality_portrait;
 mod portrait;
 mod projection;
 mod refimage;
@@ -329,6 +330,22 @@ async fn main() -> anyhow::Result<()> {
         None => tracing::info!("mind: none — the file editor will report it has nothing to edit"),
     }
 
+    // Portraits, beside the accounts and the substrate — things this daemon
+    // writes, rather than things a person authored.
+    let images = images::Images::new(&data);
+
+    // A personality may name a portrait it was authored with. Read those into
+    // the image store now, once, so the console can fetch them through the
+    // ordinary image route — see [`personality_portrait`] for why the picture
+    // is a file in the mind rather than an id in this daemon's store.
+    let personality_portraits =
+        personality_portrait::ingest(&personalities, &authored_dir.join("personalities"), &images);
+    tracing::info!(
+        "authored portraits: {} of {} personalities carry one",
+        personality_portraits.len(),
+        personalities.len(),
+    );
+
     let authored = api::Authored::new(
         worlds,
         personalities,
@@ -337,9 +354,8 @@ async fn main() -> anyhow::Result<()> {
         roles.clone(),
         libraries,
         mind,
-        // Portraits, beside the accounts and the substrate — things this daemon
-        // writes, rather than things a person authored.
-        images::Images::new(&data),
+        images,
+        personality_portraits,
     );
 
     // ── the engine ─────────────────────────────────────────────────────────

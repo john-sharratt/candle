@@ -96,7 +96,33 @@ pub fn safe_title(raw: &str) -> String {
 /// `None` for the story, which is undated and therefore not a life document —
 /// it belongs in semantic memory, not in the dated history.
 pub fn file_name(id: NodeId, title: &str) -> Option<String> {
-    Some(format!("{} {}.md", id.date_key()?, safe_title(title)))
+    let key = id.date_key()?;
+    let title = safe_title(title);
+    Some(format!("{key} {}.md", strip_leading_key(&title, &key)))
+}
+
+/// Drop a leading repetition of the date the filename already begins with.
+///
+/// Asked for a year, a model titles it *"2751 Year of the First Battle"* — which
+/// is a good title and becomes `2751 2751 Year of the First Battle.md` once the
+/// key is prepended. Nine of one character's forty-three documents came out that
+/// way; the rest had titled themselves without the year, which is the same model
+/// making a free choice either way.
+///
+/// Only the node's **own** key is stripped, and only from the front. A year that
+/// is genuinely part of the title — a document about 2751 filed under 2760 — is
+/// not this, and survives.
+fn strip_leading_key(title: &str, key: &str) -> String {
+    let rest = match title.strip_prefix(key) {
+        Some(r) => r.trim_start_matches([' ', '-', '_', '.', ':']),
+        None => return title.to_string(),
+    };
+    // A title that was *only* the date has nothing left to say, and a filename
+    // of just the key repeated is worse than the title it came from.
+    if rest.is_empty() {
+        return title.to_string();
+    }
+    rest.to_string()
 }
 
 /// The body of a life document: the prose, then the calls it produces.
@@ -279,6 +305,47 @@ mod tests {
     use crate::lifegen::consequence::Consequence;
     use crate::lifegen::plan::Plan;
     use crate::lifegen::seed::{check, Cadence, Seed};
+
+    /// A model that titles its year with the year gets one date in the filename,
+    /// not two. Nine of one character's forty-three came out as
+    /// `2751 2751 Year of the First Battle.md`.
+    #[test]
+    fn a_title_that_repeats_its_own_date_does_not_get_it_twice() {
+        let y = NodeId::Year { year: 2751 };
+        assert_eq!(
+            file_name(y, "2751 Year of the First Battle").unwrap(),
+            "2751 Year of the First Battle.md"
+        );
+        // Separators between the date and the title go with it.
+        assert_eq!(
+            file_name(y, "2751 - The Year of Hardened Resolve").unwrap(),
+            "2751 The Year of Hardened Resolve.md"
+        );
+        // A title that never mentioned the year is untouched.
+        assert_eq!(
+            file_name(y, "Year of Injured Pride").unwrap(),
+            "2751 Year of Injured Pride.md"
+        );
+    }
+
+    /// A date that is genuinely part of the title, rather than a repetition of
+    /// this node's own, is the author's and stays.
+    #[test]
+    fn a_different_year_in_a_title_is_not_stripped() {
+        let y = NodeId::Year { year: 2760 };
+        assert_eq!(
+            file_name(y, "2751 Remembered").unwrap(),
+            "2760 2751 Remembered.md"
+        );
+    }
+
+    /// A title that was only the date leaves nothing to name the document by, so
+    /// it keeps what it had rather than becoming a bare key.
+    #[test]
+    fn a_title_that_is_only_its_date_keeps_it() {
+        let y = NodeId::Year { year: 2751 };
+        assert_eq!(file_name(y, "2751").unwrap(), "2751 2751.md");
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("npcd-doc-{}-{tag}", std::process::id()));

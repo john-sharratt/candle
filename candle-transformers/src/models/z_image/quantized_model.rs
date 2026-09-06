@@ -490,23 +490,34 @@ impl ZImageTransformer {
         let x_ids = g.img_ids(cap_padded, ht, wt);
         let x_run = g.pad_run(&x_feats, x_ids, &self.x_pad_token)?;
 
+        // **A block at a time, when there is an arena to run them on.**
+        //
+        // [`candle_nn::kv_cache::guest_stage`] is the identity for every caller
+        // that is not a co-resident guest, and it costs one copy of the hidden
+        // state either side of a block for one that is. What that buys is the
+        // arena holding a *block's* intermediates instead of the whole forward's
+        // — measured, the sum of a 1024×1024 forward saturated seven gigabytes,
+        // and once one carve fails nothing after it can inherit and the rest of
+        // the draw falls back to the pool it was evicted from.
         let (x_cos, x_sin) = g.rope.gather(&x_run.ids, dev)?;
         let mut x = x_run.feats.unsqueeze(0)?;
         for blk in self.noise_refiner.iter() {
-            x = blk.forward(&x, &x_cos, &x_sin, Some(&adaln))?;
+            x = candle_nn::kv_cache::guest_stage(&x, |x| {
+                blk.forward(x, &x_cos, &x_sin, Some(&adaln))
+            })?;
         }
 
         let (c_cos, c_sin) = g.rope.gather(&cap_run.ids, dev)?;
         let mut c = cap_run.feats.unsqueeze(0)?;
         for blk in self.context_refiner.iter() {
-            c = blk.forward(&c, &c_cos, &c_sin, None)?;
+            c = candle_nn::kv_cache::guest_stage(&c, |c| blk.forward(c, &c_cos, &c_sin, None))?;
         }
 
         let mut h = Tensor::cat(&[&x, &c], 1)?;
         let cos = Tensor::cat(&[&x_cos, &c_cos], 0)?.contiguous()?;
         let sin = Tensor::cat(&[&x_sin, &c_sin], 0)?.contiguous()?;
         for blk in self.layers.iter() {
-            h = blk.forward(&h, &cos, &sin, Some(&adaln))?;
+            h = candle_nn::kv_cache::guest_stage(&h, |h| blk.forward(h, &cos, &sin, Some(&adaln)))?;
         }
 
         let h = self.final_layer.forward(&h, &adaln)?;

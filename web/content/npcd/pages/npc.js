@@ -261,7 +261,6 @@ export async function render(params) {
             ['pending', String(npc.tick?.pending_events ?? 0)],
             ['salience gate', String(npc.tick?.salience_gate ?? '—')],
             ['state', npc.state],
-            ['environment sim', npc.environment_enabled ? 'on' : 'off'],
           ]))),
 
       h('div', { class: 'grid g2', style: 'margin-top:11px' },
@@ -686,11 +685,6 @@ export async function render(params) {
     gate.oninput = () => { gateOut.textContent = gate.value; };
     gate.onchange = () => patch({ salience_gate: Number(gate.value) }, 'gate saved');
 
-    const envOn = h('input', {
-      type: 'checkbox', checked: !!npc.environment_enabled,
-      onChange: (e) => patch({ environment_enabled: e.target.checked }),
-    });
-
     mount(bodyHost,
       h('div', { class: 'panel' },
         h('div', { class: 'grid g2' },
@@ -812,10 +806,7 @@ export async function render(params) {
         h('div', { class: 'row wrap', style: 'gap:26px;align-items:flex-end' },
           h('label', { class: 'field', style: 'margin:0' }, h('span', {}, 'Heartbeat'), beat),
           h('label', { class: 'field', style: 'margin:0' },
-            h('span', {}, 'Salience gate ', gateOut), gate),
-          h('label', { class: 'row', style: 'gap:9px;cursor:pointer' }, envOn,
-            h('div', {}, h('div', { style: 'font-size:.86rem;font-weight:600' }, 'Environment'),
-              h('div', { class: 'tiny dim' }, 'a simulator feeds it events')))),
+            h('span', {}, 'Salience gate ', gateOut), gate)),
         h('div', { class: 'tiny dim', style: 'margin-top:11px;max-width:88ch' },
           'The resting rate an idle character thinks at, and the level below which an event does not wake ' +
           'it. Both are authored settings rather than measurements — what the character is actually doing ' +
@@ -857,7 +848,6 @@ export async function render(params) {
         world_id: npc.world_id,
         personality_id: npc.personality_id,
         persona_description: npc.persona?.description || '',
-        environment_enabled: !!npc.environment_enabled,
         tags: npc.tags || [],
       });
       toast('created ' + made.name, 'ok');

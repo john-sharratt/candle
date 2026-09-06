@@ -943,7 +943,6 @@ pub struct NpcPayload {
     /// Omitted from default listings (§8.3). Never counted in a total — the
     /// count is what gives a hidden character away.
     pub hidden: bool,
-    pub environment_enabled: bool,
     /// Idle metabolism in milliseconds, and the salience level below which an
     /// event does not wake the character. Authored configuration, not a
     /// measurement — the *live* tick figures are excluded, see above.
@@ -1003,9 +1002,6 @@ pub struct NpcPayload {
     /// The affect dials an operator set.
     #[serde(default)]
     pub modulation: Modulation,
-    /// The simulated environment's own instructions, when one is enabled.
-    #[serde(default)]
-    pub environment_prompt: String,
 }
 
 /// One authored belief.
@@ -1815,7 +1811,6 @@ mod tests {
             world_id: "battle-cities".to_string(),
             personality_id: "commander".to_string(),
             hidden: false,
-            environment_enabled: true,
             heartbeat_ms: 30_000,
             salience_gate: 0.5,
             tags: vec!["campaign-2".to_string(), "north".to_string()],
@@ -1848,7 +1843,6 @@ mod tests {
                 threat: 0.66,
                 curiosity: 0.3,
             },
-            environment_prompt: "A ridge at dusk.".to_string(),
         }
     }
 
@@ -1871,13 +1865,7 @@ mod tests {
         let full = npc_fixture();
         let mut v = serde_json::to_value(&full).expect("encodes");
         let obj = v.as_object_mut().expect("an object");
-        for layer in [
-            "beliefs",
-            "relationships",
-            "agency",
-            "modulation",
-            "environment_prompt",
-        ] {
+        for layer in ["beliefs", "relationships", "agency", "modulation"] {
             assert!(obj.remove(layer).is_some(), "{layer} was not in the record");
         }
 
@@ -1885,7 +1873,6 @@ mod tests {
         assert!(back.beliefs.is_empty());
         assert!(back.relationships.is_empty());
         assert!(back.agency.is_empty());
-        assert!(back.environment_prompt.is_empty());
         // And the fields that were always there are untouched.
         assert_eq!(back.npc_id, full.npc_id);
         assert_eq!(back.name, full.name);
@@ -1900,7 +1887,7 @@ mod tests {
             r#""created_ms":1740200000000,"updated_ms":1740300112340,"#,
             r#""state":"active","name":"Varek","world_id":"battle-cities","#,
             r#""personality_id":"commander","#,
-            r#""hidden":false,"environment_enabled":true,"heartbeat_ms":30000,"#,
+            r#""hidden":false,"heartbeat_ms":30000,"#,
             r#""salience_gate":0.5,"tags":["campaign-2","north"],"#,
             r#""persona_description":"Fifty-three, a former staff sergeant.","#,
             r#""persona_origin":"generated","portrait_image_id":"img_4471","#,
@@ -1911,8 +1898,7 @@ mod tests {
             r#""affect":0.1,"familiarity":0.8,"notes":"Met at the crossing."}],"#,
             r#""agency":[{"strategy_id":"hold_ridge","statement":"Hold the eastern ridge.","#,
             r#""parent_id":null,"state":"active"}],"#,
-            r#""modulation":{"affect":-0.2,"threat":0.66,"curiosity":0.3},"#,
-            r#""environment_prompt":"A ridge at dusk."}"#,
+            r#""modulation":{"affect":-0.2,"threat":0.66,"curiosity":0.3}}"#,
         );
         assert_eq!(
             std::str::from_utf8(&bytes).unwrap(),

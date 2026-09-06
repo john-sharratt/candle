@@ -97,13 +97,20 @@ pub struct Narration {
     pub task: String,
 }
 
-pub fn prompt_for(plan: &Plan, id: NodeId, note: &str) -> Narration {
+pub fn prompt_for(plan: &Plan, id: NodeId, note: &str, voice: &str) -> Narration {
     let mut s = String::new();
     let seed = &plan.seed;
     s.push_str(&format!(
         "THE CHARACTER\n{} — {}, of {}. Born {}, through {}.\n",
         seed.display, seed.role, seed.place, seed.born, seed.through
     ));
+    // **How they sound, not only what happened to them.** These documents are
+    // injected into the character's own prefix, so a memory in a neutral
+    // literary register is a few thousand tokens teaching the model to answer
+    // in somebody else's words. See `prompt::voice_of`.
+    if !voice.trim().is_empty() {
+        s.push_str(&format!("\nHOW THIS PERSON WRITES\n{}\n", voice.trim()));
+    }
     if !plan.story.content.text.trim().is_empty() {
         s.push_str(&format!("\nTHE ARC\n{}\n", plan.story.content.text.trim()));
     }
@@ -151,15 +158,55 @@ pub fn prompt_for(plan: &Plan, id: NodeId, note: &str) -> Narration {
         }
     }
 
+    // **Each rung says how much time it covers, and says it against the rung
+    // below.** "In full" was the whole instruction a year got, and a model reads
+    // that as "write it richly" rather than "write all of it" — so a year of
+    // Yen's life came back as one morning: woke before dawn, practised in the
+    // courtyard, paused as the sun rose. Excellent prose, and a day.
+    //
+    // The day's task already said "One day, closely" and produced days
+    // correctly, which is the tell: the rung that stated its span got its span.
+    // The contrast is explicit now because a year and a day are the same
+    // *instruction* otherwise, and the only thing separating them is a number
+    // the model has no reason to read as a duration.
     let mut task = match id {
-        NodeId::Story => "Write the shape of this whole life as continuous prose.".to_string(),
-        NodeId::Year { year } => format!("Write the year {year} of this life, in full."),
-        NodeId::Month { year, month } => {
-            format!(
-                "Write the month {year}-{month:02} of this life, in full. Expand only the \
-                 part of the year that falls inside this month."
-            )
-        }
+        NodeId::Story => "Write the shape of this whole life as continuous prose — the arc of \
+                          the whole span, not any one part of it."
+            .to_string(),
+        NodeId::Year { year } => format!(
+            "Write the year {year} of this life — the WHOLE of it, not a scene from it.{}\n\n\
+             A year is a span. Move through it: what was underway when it began, what changed \
+             across it, what recurred, where it had got to by the end. Some of it in summary, \
+             the way a year is remembered rather than relived.\n\n\
+             Do NOT write a single day, a single morning, or one continuous episode. A day is \
+             what the days below this are for, and one written here takes the place of the year.",
+            // **The beat, in the task and not only in the context.** It is
+            // already stated above as "WHAT THIS YEAR IS FOR", and the draft
+            // ignored it: asked for 2792 — "you fight alongside Commander
+            // Kaelor, who falls" — the model wrote a year of sparring in the
+            // courtyard from the character sheet, with a man who had been dead
+            // seven years by then.
+            //
+            // Third time this file has learned the same thing. "Prose only" and
+            // the second person both had to move into the task for the same
+            // reason: the context is long and vivid, the task is the last thing
+            // read, and what the task does not name does not survive it.
+            match plan.story.beat(year) {
+                None => String::new(),
+                Some(b) => format!(
+                    "\n\nThis year is the one the outline calls \"{}\": {}. That is what the \
+                     year is about — write it, rather than around it.",
+                    b.title,
+                    b.premise.trim_end_matches('.')
+                ),
+            }
+        ),
+        NodeId::Month { year, month } => format!(
+            "Write the month {year}-{month:02} of this life — the whole month, not a day in \
+             it.\n\n\
+             Expand only the part of the year that falls inside this month, and move across the \
+             weeks of it. A single episode belongs to a day, not here."
+        ),
         NodeId::Day { year, month, day } => format!(
             "Write the day {year}-{month:02}-{day:02} — a day that became a memory. One day, \
              closely."
@@ -169,9 +216,15 @@ pub fn prompt_for(plan: &Plan, id: NodeId, note: &str) -> Narration {
     // the system turn was not enough: given the context and the task together,
     // the model continued the context — headings and all — and the year came
     // back with `THE CHARACTER / Hess — a quartermaster…` pasted on the front.
+    // The person is restated here for the same reason "prose only" is: `VOICE`
+    // says it in the system turn and the drafts came back in third person
+    // anyway — "Yen woke before dawn… she stretched" — because the context
+    // immediately above the task is full of the character's name. The last
+    // instruction read wins, so the last instruction says it.
     task.push_str(
-        "\n\nWrite only the document's prose. Do not repeat the headings above, do not restate \
-         the character, and do not write a preamble.",
+        "\n\nWrite only the document's prose, in the SECOND person — \"You waited\", never the \
+         character's name and never \"she\" or \"he\" as the subject. Do not repeat the headings \
+         above, do not restate the character, and do not write a preamble.",
     );
     if !note.trim().is_empty() {
         // Last, so it is the most recent instruction the model read — and
@@ -242,7 +295,12 @@ pub async fn post_narrate(
 
     // Built before the drain and from a plan this route owns, so nothing else
     // can move the context underneath the prompt while the guest runs.
-    let narration = prompt_for(&plan, id, &body.note);
+    let narration = prompt_for(
+        &plan,
+        id,
+        &body.note,
+        &crate::lifegen::routes::voice_for(&s, &who).await,
+    );
     let request = GuestRequest::Prose(ProseRequest {
         // The voice and everything already true go in the system turn; the one
         // thing to write goes in the user turn. See [`Narration`] for what
@@ -393,7 +451,7 @@ mod tests {
                 month: 10,
             },
         ] {
-            let p = prompt_for(&plan(), id, "");
+            let p = prompt_for(&plan(), id, "", "");
             assert!(p.context.contains("Cindy Tan"), "{id:?} lost the character");
             assert!(
                 p.context.contains("She grew up beside the river."),
@@ -409,7 +467,7 @@ mod tests {
     /// prose. The split is what a system turn is for.
     #[test]
     fn the_context_and_the_task_are_separate_turns() {
-        let p = prompt_for(&plan(), NodeId::Year { year: 1998 }, "");
+        let p = prompt_for(&plan(), NodeId::Year { year: 1998 }, "", "");
         assert!(
             p.context.contains("THE CHARACTER") && !p.task.contains("THE CHARACTER"),
             "the headings leaked into the turn the model answers"
@@ -428,7 +486,7 @@ mod tests {
     /// system turn — the system turn alone did not stop the echo.
     #[test]
     fn the_task_forbids_a_preamble_where_the_model_will_read_it() {
-        let p = prompt_for(&plan(), NodeId::Story, "");
+        let p = prompt_for(&plan(), NodeId::Story, "", "");
         assert!(p.task.contains("Do not repeat the headings"));
         assert!(p.task.contains("do not write a preamble"));
     }
@@ -453,6 +511,7 @@ mod tests {
                 year: 1998,
                 month: 10,
             },
+            "",
             "",
         );
         assert!(
@@ -486,6 +545,7 @@ mod tests {
                 day: 4,
             },
             "",
+            "",
         );
         assert!(prompt.context.contains("OCTOBER PROSE"));
         assert!(prompt.context.contains("The year the granary burned."));
@@ -507,6 +567,7 @@ mod tests {
                 month: 10,
             },
             "",
+            "",
         );
         assert!(
             !prompt.context.contains("THE YEAR 1998"),
@@ -519,7 +580,7 @@ mod tests {
     /// model writes it into the record as established fact.
     #[test]
     fn a_direction_is_labelled_as_this_draft_only_and_comes_last() {
-        let p = prompt_for(&plan(), NodeId::Year { year: 1998 }, "make it colder");
+        let p = prompt_for(&plan(), NodeId::Year { year: 1998 }, "make it colder", "");
         let at = p.task.find("make it colder").expect("the note is missing");
         assert!(p.task[..at].contains("DIRECTION FOR THIS DRAFT ONLY"));
         assert!(
@@ -536,7 +597,7 @@ mod tests {
     /// to interpret.
     #[test]
     fn no_direction_leaves_no_heading() {
-        let p = prompt_for(&plan(), NodeId::Story, "   ");
+        let p = prompt_for(&plan(), NodeId::Story, "   ", "");
         assert!(!p.task.contains("DIRECTION"));
         assert!(!p.context.contains("DIRECTION"));
     }
@@ -545,7 +606,7 @@ mod tests {
     /// exactly as the route assembles it, or the check is of something else.
     #[test]
     fn the_request_it_builds_is_servable() {
-        let n = prompt_for(&plan(), NodeId::Year { year: 1998 }, "");
+        let n = prompt_for(&plan(), NodeId::Year { year: 1998 }, "", "");
         let r = GuestRequest::Prose(ProseRequest {
             system: format!("{VOICE}\n\n{}", n.context),
             prompt: n.task,

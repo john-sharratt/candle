@@ -136,9 +136,10 @@ pub use super::arena_table::ArenaLocation;
 pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use bump_arena::{
-    begin_forward, begin_wave, end_wave_transient, persistence_domain_stats, plan_wave_transient,
-    wave_domain_stats, wave_is_live, BumpRange, ForwardOpen, Generation as WaveGeneration,
-    KV_ARENA_MID_WAVE,
+    begin_forward, begin_guest, begin_wave, close_guest_arena, end_wave_transient,
+    guest_domain_stats, guest_stage, open_guest_arena, persistence_domain_stats,
+    plan_wave_transient, wave_domain_stats, wave_is_live, BumpRange, ForwardOpen,
+    Generation as WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
 pub use guard::{expect_kv_range, expect_kv_range_in};
