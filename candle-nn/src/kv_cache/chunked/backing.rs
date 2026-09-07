@@ -39,6 +39,18 @@ use crate::{CHUNK_SIZE, GID_STRIDE};
 /// WDDM silently collapses throughput rather than failing).
 pub const KV_DEVICE_OOM_MARKER: &str = "kv-cache GPU VRAM budget exceeded";
 
+/// Marker the region pool puts in the error a wave's transient tier raises
+/// when it cannot be placed below the weight floor. The scheduler matches on
+/// it via [`is_tier_refusal`]: the wave has not run — the placement fails
+/// before any compute — so the refusal is a wave that was composed too wide,
+/// to be retried narrower, not a failure of the sequences in it.
+pub const TIER_REFUSAL_MARKER: &str = "wave transient tier needs";
+
+/// Recognize a transient-tier placement refusal ([`TIER_REFUSAL_MARKER`]).
+pub fn is_tier_refusal(err: &candle::Error) -> bool {
+    err.to_string().contains(TIER_REFUSAL_MARKER)
+}
+
 /// Recognize a device-out-of-memory error — either our own budget rejection
 /// ([`KV_DEVICE_OOM_MARKER`]) or a driver-reported CUDA OOM (when sysmem
 /// fallback is disabled, `cuMemAlloc` returns `CUDA_ERROR_OUT_OF_MEMORY`).
@@ -769,6 +781,151 @@ impl ChunkedKvBacking {
     /// defrag stays on the reactive allocation-time OOM retry.
     pub fn release_empty_arenas(&self) -> Result<usize> {
         self.inner.release_empty_arenas()
+    }
+
+    /// Pack KV arenas toward the low end of the reservation so the region
+    /// watermark can fall, and report how many moved.
+    ///
+    /// **Why this and not chunk migration.** `weight_floor − live_end()` is what
+    /// the weight zone grows into *and* the whole budget of the wave transient
+    /// tier, and `live_end` is the *highest* live region — so one arena left high
+    /// by an earlier busy moment strands every free region beneath it from both.
+    /// Moving chunks between arenas would fix that too, but it changes their
+    /// gids and this cache has no index from a gid back to the block tables
+    /// holding it. Moving the arena's *bytes* changes no identity at all.
+    ///
+    /// **Both halves, or neither.** Relocating the slab leaves every resident
+    /// `KvHead` record pointing at the old address — mapped, owned by someone
+    /// else by then, and silent. So each move is immediately followed by
+    /// rebuilding the records of every chunk in that arena against the new base.
+    /// The two are one operation and this is the only entry point that performs
+    /// it; `relocate_arena` alone is not safe.
+    ///
+    /// Runs between forwards — `relocate_arena` takes the same arena window as
+    /// arena creation, which refuses while a forward owns the partition.
+    #[cfg(feature = "cuda")]
+    pub fn compact_arenas_down(&self) -> candle::Result<usize> {
+        // Highest first: an arena is moved into the lowest ground standing free
+        // and refuses a move that is not leftward, so taking them in descending
+        // order gives that ground to the one stranding the most behind it.
+        let mut order: Vec<(u64, usize)> = self.inner.storage.read(|s| {
+            s.arenas
+                .iter()
+                .filter_map(|(idx, a)| a.base_ptr().map(|b| (b, *idx)))
+                .collect()
+        })?;
+        order.sort_unstable_by_key(|(base, _)| std::cmp::Reverse(*base));
+
+        // **Read once for the pass, not once per arena.** `region_stats`
+        // iterates the free heap twice and is documented as a per-wave path;
+        // asking it per arena made one scan into one per arena, several hundred
+        // entries each. A relocation hands back the region it left, so the count
+        // is stable across the pass — nothing else claims between forwards.
+        let free_regions = crate::kv_cache::region_stats(0).map_or(0, |s| s.free);
+
+        let mut moved = 0usize;
+        for (_, idx) in order {
+            let Some(new_base) = self.inner.relocate_arena(idx, free_regions)? else {
+                continue;
+            };
+            // The bytes moved; the records that name them must follow before
+            // anything reads through them.
+            self.rewrite_arena_records(idx, new_base)?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
+    /// Rebuild the resident `KvHead` record of every chunk whose bands live in
+    /// `arena_idx`, against that arena's current base.
+    ///
+    /// Rewritten **in place** under each chunk's existing handle, so the record's
+    /// own device address never changes and nothing holding a `MetaGid` needs
+    /// telling. Only the eight per-band pointers inside it move.
+    ///
+    /// A chunk shared by several sequences is reached more than once and
+    /// serialises identically each time, so the handle is written once — the
+    /// dedupe is for the transfer, not for correctness.
+    #[cfg(feature = "cuda")]
+    fn rewrite_arena_records(&self, arena_idx: usize, new_base: u64) -> candle::Result<()> {
+        if !self.inner.meta_pool.is_device_resident() {
+            return Ok(());
+        }
+        let arena_info = self.resolve_arena_info()?;
+        // **The one way this goes silently wrong.** Every pointer written below
+        // is `arena_info[idx].base_ptr + chunk_idx * stride`. If that view has
+        // not picked up the move, the records are rewritten with the address the
+        // arena just left — which is still mapped and by now belongs to someone
+        // else, so the kernel reads a stranger's bytes and nothing faults.
+        // Cheap to check, and the check is the difference between a wrong number
+        // months later and a refusal here.
+        match arena_info.get(arena_idx) {
+            Some(ai) if ai.base_ptr == new_base => {}
+            Some(ai) => candle::bail!(
+                "arena relocate: arena {arena_idx} moved to {new_base:#x} but the resolved \
+                 arena info still reads {:#x} — refusing to write records against a stale base",
+                ai.base_ptr
+            ),
+            None => candle::bail!(
+                "arena relocate: arena {arena_idx} moved to {new_base:#x} but resolves to no \
+                 arena info — refusing to write records"
+            ),
+        }
+        let n_kv_head = self.inner.n_kv_head;
+        let head_dim = self.inner.head_dim;
+        let n_palette = self.inner.n_palette();
+        let rb = super::meta_pool::chunk_record_bytes(n_kv_head, head_dim, n_palette);
+
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut items: Vec<(super::meta_pool::MetaGid, Vec<u8>)> = Vec::new();
+        for seq in state.sequences.iter().flatten() {
+            for w in seq.chunks_slice() {
+                let Some(handle) = w.meta.as_ref() else {
+                    // A float writer chunk builds a scratch record per forward,
+                    // so it reads the new base for free.
+                    continue;
+                };
+                if !w
+                    .gids
+                    .as_slice()
+                    .iter()
+                    .any(|g| g.raw() >= 0 && g.arena_idx() == arena_idx)
+                {
+                    continue;
+                }
+                if !seen.insert(handle.raw()) {
+                    continue;
+                }
+                let mut bytes = vec![0u8; rb];
+                let src = super::meta_pool::ChunkRecordSrc {
+                    gids: &w.gids,
+                    k_pal: w.k_pal.as_slice(),
+                    v_pal: w.v_pal.as_slice(),
+                    k_scale: w.k_scale.as_slice(),
+                    v_scale: w.v_scale.as_slice(),
+                    k_fmt: w.k_fmt.as_slice(),
+                    v_fmt: w.v_fmt.as_slice(),
+                };
+                super::meta_pool::serialize_kv_heads(
+                    &mut bytes,
+                    &src,
+                    n_kv_head,
+                    head_dim,
+                    n_palette,
+                    &arena_info,
+                );
+                items.push((handle.clone(), bytes));
+            }
+        }
+        drop(state);
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.inner.meta_pool.write_records_batched(&items)
     }
 
     /// Get the current batch capacity (number of sequence slots).

@@ -79,7 +79,7 @@ pub use chunked::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
-    weight_capacity_bytes, weight_floor_after,
+    transient_headroom_bytes, weight_capacity_bytes, weight_floor_after,
 };
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.
@@ -88,7 +88,7 @@ pub use chunked::{
 };
 /// The wave arena's phase spans. Measurements, so they are available whether or
 /// not the crate was built with a GPU backend.
-pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
+pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;
@@ -109,7 +109,7 @@ pub use chunked::{
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
-pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
+pub use chunked::{is_device_oom, is_tier_refusal, KV_DEVICE_OOM_MARKER, TIER_REFUSAL_MARKER};
 pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,

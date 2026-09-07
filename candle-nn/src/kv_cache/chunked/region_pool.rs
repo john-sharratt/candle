@@ -82,6 +82,7 @@ use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::vram::AllocClass;
 use candle::Result;
 
+use super::backing::TIER_REFUSAL_MARKER;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::growth_policy::{kv_grow_step, GrowthPolicy, Occupancy, Refusal};
 use super::reservation::Reservation;
@@ -91,6 +92,13 @@ use super::weight_zone::{INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE};
 
 /// One region of the KV side. Every size class carves its arenas at this size.
 pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
+
+/// Tier placements the weight side's growth term looks back over — the widest
+/// of these is the ground it leaves for the next wave's tier. About a minute
+/// of waves on the 35B: long enough to span the decode-only waves between one
+/// prefill chunk and the next, short enough that a wide calibration tier
+/// stops shaping the grant once the pool phase has run for a minute.
+pub const TIER_RECENT_WAVES: usize = 16;
 
 /// The widest the wave transient tier can ever be — the old fixed reservation,
 /// kept only as the worst case the elastic middle must be able to *reach*.
@@ -398,6 +406,20 @@ struct RegionPool {
     /// no spare at all. Removing the seed exposed it, and a geometric grow step
     /// made it reachable within a few waves rather than dozens.
     transient_high_water: usize,
+    /// Bytes of the last tier placed — see [`Occupancy::tier_planned`].
+    transient_last: usize,
+    /// Bytes of the last [`TIER_RECENT_WAVES`] tiers placed, a ring; the
+    /// growth term is their maximum ([`Self::recent_tier_bytes`]).
+    ///
+    /// The last tier alone is the wrong term on a co-batched wave loop: a
+    /// decode-only wave places a tier of a few regions, the weight side then
+    /// takes everything above it, and the next wave's prefill chunk — up to two
+    /// gigabytes on the 35B — buys it back. Measured, 90 grows against 83
+    /// concessions in 102 steady-state waves with the last-tier term. The
+    /// widest tier of the recent past is what the next few waves may need.
+    transient_recent: [usize; TIER_RECENT_WAVES],
+    /// Next slot of `transient_recent` to overwrite.
+    transient_recent_at: usize,
     /// Persistence-staging bytes carved from the fixed left block.
     persist_carved: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
@@ -927,6 +949,9 @@ impl RegionPool {
             transient_base: None,
             transient_bytes: 0,
             transient_high_water: 0,
+            transient_last: 0,
+            transient_recent: [0; TIER_RECENT_WAVES],
+            transient_recent_at: 0,
             persist_carved: 0,
             fresh_claims_during_wave: 0,
             refusals_during_wave: 0,
@@ -1066,6 +1091,12 @@ impl RegionPool {
         {
             *slot = self.quiesce_epoch;
         }
+    }
+
+    /// The widest tier placed in the last [`TIER_RECENT_WAVES`] placements —
+    /// the ground the weight side leaves for the next wave's tier.
+    fn recent_tier_bytes(&self) -> usize {
+        self.transient_recent.iter().copied().max().unwrap_or(0)
     }
 
     /// One past the highest region currently held by an arena.
@@ -1243,15 +1274,39 @@ impl RegionPool {
         // engine actually runs rather than a model of it — the partition's
         // defects have all been trajectory defects, and a trajectory is only
         // testable if it can be run without a device.
+        let recent = self.recent_tier_bytes();
         let occ = Occupancy {
             live: self.live,
             free_below_ceiling: self.free_count(),
             ceiling_blocked: self.ceiling_blocked(),
             tier_bytes: self.transient_bytes,
             tier_high_water: self.transient_high_water,
+            tier_planned: recent,
         };
         match self.growth.spare(occ, slack, REGION_BYTES) {
             Ok(spare) => {
+                // **Bounded by the frontier gap, not by the free count.** The
+                // policy's `free_below_ceiling` counts every free region,
+                // wherever it lies; the weight side takes ground at the
+                // frontier only, and the wave transient tier is placed against
+                // that same frontier. Free regions scattered below live ones
+                // are spare to the policy and useless to the tier, so a grant
+                // priced on them took the tier's gap: the next fill bought it
+                // back, the weight side took it again — measured at one
+                // concession per wave for the length of a run (764 in 45
+                // minutes, 90,017 expert slots evicted and reloaded). What may
+                // be taken is the gap above the live watermark less the slack
+                // and the last tier's ground, whatever the free list says.
+                let gap_regions =
+                    (self.weight_floor.saturating_sub(self.live_end()) as usize) / REGION_BYTES;
+                let usable = gap_regions
+                    .saturating_sub(slack)
+                    .saturating_sub(recent.div_ceil(REGION_BYTES));
+                let spare = spare.min(usable);
+                if spare == 0 {
+                    SPARE_TALLY[2].fetch_add(1, Ordering::Relaxed);
+                    return 0;
+                }
                 SPARE_TALLY[3].fetch_add(spare as u64, Ordering::Relaxed);
                 spare
             }
@@ -1708,7 +1763,7 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
                 ))
             })?;
             candle::bail!(
-                "wave transient tier needs {len} B below the weight floor and is \
+                "{TIER_REFUSAL_MARKER} {len} B below the weight floor and is \
                  {still_short} regions into ground live KV arenas hold, which cannot \
                  move. The weight side could not concede them — it is at its own \
                  floor — so this wave is too wide for a partition that has nothing \
@@ -1775,6 +1830,14 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         // Survives the release, so the between-forwards demand reading still
         // knows a tier of this size is about to want its ground back.
         pool.transient_high_water = pool.transient_high_water.max(len);
+        // **The last tier actually placed**, which the spare calculation deducts
+        // so it stops offering the next one's ground away. The high-water above
+        // is the wrong term for that — it is the widest tier the process ever
+        // stood, and deducting it cut applied grants from 17 to 4. The recent
+        // ring sits between the two: the widest of the last few waves.
+        pool.transient_last = len;
+        pool.transient_recent[pool.transient_recent_at] = len;
+        pool.transient_recent_at = (pool.transient_recent_at + 1) % TIER_RECENT_WAVES;
         Ok(Placed::At(base))
     })
 }
@@ -2172,6 +2235,30 @@ pub fn span_end(stream: &std::sync::Arc<CudaStream>) -> Result<u64> {
 /// `VramGovernor::expert_budget`. It is a *position*, not a budget: there is no
 /// arithmetic here about what anything else might want, because everything else
 /// is on the other side of the floor by construction.
+/// Bytes a wave's transient tier could stand in right now: the gap between the
+/// live arena frontier and the weight floor.
+///
+/// **The admission bound's budget.** `WavePlan::max_rows_within` answers "how
+/// many rows fit in `budget`" and this is that budget — the ground the tier can
+/// actually have, measured rather than assumed. Admission that prices a wave
+/// against anything else is guessing: the tier is placed against the frontier as
+/// it stands, and refused if it would cross the floor.
+///
+/// A lower bound, deliberately. The placement may still buy ground from the
+/// weight side (`buy_ground`) or sweep empty arenas, so a wave priced against
+/// this figure and admitted will fit; one priced against the *post*-concession
+/// figure might not, because the concession can be refused.
+///
+/// Zero between the frontier and the floor crossing, which admission must read
+/// as "take nothing more this wave" rather than as an error.
+/// Keyed by device ordinal like [`region_stats`], so a caller that only wants to
+/// price a wave does not have to hold a stream to ask.
+pub fn transient_headroom_bytes(ordinal: usize) -> Option<usize> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ordinal)
+        .map(|pool| pool.weight_floor.saturating_sub(pool.live_end()) as usize)
+}
+
 pub fn weight_capacity_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
     with_pool(stream, |pool| {
         Ok(pool.tradeable_bytes().saturating_sub(MIN_ELASTIC_RESERVE))

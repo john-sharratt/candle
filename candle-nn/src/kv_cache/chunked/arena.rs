@@ -274,6 +274,34 @@ impl Arena {
         self
     }
 
+    /// Move this arena onto different backing bytes, handing back the region it
+    /// left so the caller can release it.
+    ///
+    /// **The arena's identity does not change.** Its `index` is untouched, so
+    /// every `ChunkGid` naming `(arena_idx, chunk_idx)` stays valid and no block
+    /// table is rewritten — the chunks are where they always were, the bytes
+    /// under them are somewhere else. That is the whole point: the alternative,
+    /// moving chunks between arenas, changes gids and needs a holder index this
+    /// cache does not have.
+    ///
+    /// What the caller still owes is the one thing that caches an address rather
+    /// than an index: a resident `KvHead` record holds
+    /// `base_ptr + chunk_idx * stride` from when it was written, and nothing
+    /// re-derives it per forward. Those must be rewritten against the new base
+    /// before any forward reads them, or the kernel follows a pointer into
+    /// ground that now belongs to someone else — mapped, silent, and wrong.
+    #[cfg(feature = "cuda")]
+    pub(super) fn swap_slab(&mut self, data: Tensor, region: RegionHandle) -> Option<RegionHandle> {
+        debug_assert_eq!(data.dtype(), DType::U8, "an arena slab is raw bytes");
+        debug_assert_eq!(
+            data.elem_count(),
+            self.data.elem_count(),
+            "a relocated arena keeps its size class",
+        );
+        self.data = data;
+        self.region.replace(region)
+    }
+
     /// This arena's size class.
     pub fn class(&self) -> SizeClass {
         self.class
@@ -314,6 +342,12 @@ impl Arena {
     /// distinction.
     pub(super) fn is_allocatable(&self) -> bool {
         true
+    }
+
+    /// Bytes in this arena's slab — what a relocation has to copy.
+    #[cfg(feature = "cuda")]
+    pub(super) fn slab_bytes(&self) -> usize {
+        self.data.elem_count()
     }
 
     /// Device pointer to slot 0, or `None` for a CPU arena.

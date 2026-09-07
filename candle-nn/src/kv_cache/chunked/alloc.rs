@@ -15,6 +15,8 @@ use std::time::Instant;
 // the `cuda_backend` re-export of it is. Reaching it through that re-export
 // made this file unbuildable without the `cuda` feature.
 #[cfg(feature = "cuda")]
+#[cfg(feature = "cuda")]
+use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_sync;
 use candle::wave_provenance::LeaseOrigin;
 use candle::{DType, Device, Result, Tensor};
 
@@ -26,6 +28,17 @@ use super::backing::KV_DEVICE_OOM_MARKER;
 use super::bump_arena::{enter_arena_window, ArenaWindow, KV_ARENA_MID_WAVE};
 use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
+
+/// Free regions [`BackingInner::relocate_arena`] leaves standing beyond the one
+/// it takes.
+///
+/// A guard band, not a tuning knob: the free count is read a moment before the
+/// claim, and anything claiming in that gap would push the move onto the
+/// purchase path — which sells weight ground to buy KV ground, the one outcome
+/// a compaction pass must never cause. In regions, so it means the same on
+/// every machine; a pass that declines simply retries at the next boundary.
+#[cfg(feature = "cuda")]
+const ARENA_RELOCATE_FREE_MARGIN_REGIONS: usize = 2;
 #[cfg(feature = "cuda")]
 use super::region_pool;
 use super::size_class::{elems_per_chunk, SizeClass};
@@ -284,6 +297,98 @@ impl BackingInner {
         enter_arena_window(&cd.cuda_stream()).map(Some)
     }
 
+    /// Move one arena's bytes into lower ground so the region watermark can
+    /// fall, reporting whether it moved.
+    ///
+    /// **The caller owes the record rewrite.** This changes where an arena's
+    /// bytes live and nothing else — the arena keeps its index, its chunks keep
+    /// theirs, and every gid stays valid. But a resident `KvHead` record holds
+    /// `base_ptr + chunk_idx * stride` frozen from when it was written, so every
+    /// chunk in this arena must have its record rebuilt against the new base
+    /// before the next forward. `ChunkedKvBacking::compact_arenas_down` is the
+    /// entry point that does both halves; this one is not safe alone.
+    ///
+    /// Three refusals, none of them faults:
+    /// * a live forward owns the partition (`enter_arena_window`), which is what
+    ///   keeps a relocation out of a wave;
+    /// * `free_regions` — the caller's count of what stands free — leaves no
+    ///   margin. A claim that runs the free list out *buys* from the weight
+    ///   side, and compaction must never purchase the ground it is compacting.
+    ///   **Passed in rather than read here**: `region_stats` iterates the free
+    ///   heap twice and is documented as a per-wave path, so reading it once per
+    ///   arena turned one scan into one per arena. A relocation returns the
+    ///   region it left, so the count a pass starts with holds for the whole
+    ///   pass — nothing else claims between forwards;
+    /// * the ground on offer is not to the left, which would raise the watermark
+    ///   rather than lower it.
+    #[cfg(feature = "cuda")]
+    pub(super) fn relocate_arena(&self, idx: usize, free_regions: usize) -> Result<Option<u64>> {
+        let Device::Cuda(cuda) = &self.device else {
+            return Ok(None);
+        };
+        let stream = cuda.cuda_stream();
+        // Same gate as arena creation, for the same reason.
+        let _window = enter_arena_window(&stream)?;
+
+        let Some((old_base, bytes)) = self.storage.read(|s| {
+            s.arena(idx)
+                .and_then(|a| a.base_ptr().map(|b| (b, a.slab_bytes())))
+        })?
+        else {
+            return Ok(None);
+        };
+
+        if free_regions < 1 + ARENA_RELOCATE_FREE_MARGIN_REGIONS {
+            return Ok(None);
+        }
+        let Some(region) = region_pool::claim_region(&stream)? else {
+            return Ok(None);
+        };
+        let new_base = region.base();
+        if new_base >= old_base {
+            // Dropping the handle hands the region straight back.
+            return Ok(None);
+        }
+
+        // SAFETY: both name whole slabs of the reservation, `bytes` long, and
+        // the destination is a region only this claim holds. No forward is open
+        // — the window above refuses while one is.
+        unsafe {
+            memcpy_dtod_sync(new_base, old_base, bytes)
+                .map_err(|e| candle::Error::Msg(format!("arena relocate copy: {e}")))?;
+        }
+        // SAFETY: `new_base` is `REGION_BYTES` of mapped read/write device
+        // memory this arena now holds alone, and `bytes` never exceeds a region.
+        let data = unsafe {
+            Tensor::from_leased_cuda_ptr(
+                new_base,
+                DType::U8,
+                bytes,
+                &self.device,
+                LeaseOrigin::Foreign,
+            )?
+        };
+        let new_region_idx = region.index();
+        let moved = self.storage.try_write(|s| {
+            let Some(arena) = s.arena_mut(idx) else {
+                // Vanished between the two locks; the claim drops with this
+                // scope and goes back to the free list.
+                return Ok(false);
+            };
+            // The old region drops at the end of this statement, returning it.
+            let _old = arena.swap_slab(data, region);
+            Ok(true)
+        })?;
+        if moved {
+            // The arena is lower in the span than it was, so it should now be
+            // reached *earlier* by the claim path. Leaving the rank stale would
+            // undo the point of moving it: compaction would pack the bytes down
+            // and allocation would keep filling whatever sits above them.
+            self.pool.set_arena_rank(idx, new_region_idx);
+        }
+        Ok(moved.then_some(new_base))
+    }
+
     /// The same gate for an operation that **cannot be refused part-way**.
     ///
     /// A fork is per *layer* — `KvCache::fork` runs once per layer and the caller
@@ -525,6 +630,12 @@ impl BackingInner {
                 LeaseOrigin::Foreign,
             )?
         };
+        // The slab now has an address, so the pool can stop treating this arena
+        // as a last resort and place it where it actually sits in the span. Done
+        // here rather than at `register_arena` because that runs before a region
+        // is claimed, and here rather than at the call sites because every path
+        // that carves a GPU arena passes through this one.
+        self.pool.set_arena_rank(index, region.index());
         Ok(Arena::new(data, key.class, key.location, index).in_region(region))
     }
 
@@ -1371,8 +1482,8 @@ impl ChunkedKvBacking {
     /// CHUNK_SIZE - n_tokens`, `usage = n_tokens`, so its valid window is the
     /// tail `[offset, CHUNK_SIZE)` and `offset + usage == CHUNK_SIZE`. This is
     /// the load-bearing invariant: a *partial* writer-owned chunk is, by the
-    /// cache's own rules, an extendable writable tail — `extend_for_write_region`
-    /// walks into it, `set_len` advances its usage, the writable-tail pass
+    /// cache's own rules, an extendable writable tail — the kernel's pending-write
+    /// walk enters it, `set_len` advances its usage, the writable-tail pass
     /// CoW-extends it. A *full* chunk is immutable to all of them: `write_slice`
     /// and `decode_write_chunk_idx` skip it, `set_len`'s cap is 0, `ensure`'s
     /// available-space sum counts it as 0, and the writable-tail pass pushes a

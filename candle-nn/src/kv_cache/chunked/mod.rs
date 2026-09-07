@@ -91,7 +91,7 @@ mod tests;
 // Re-export public types
 pub use backing::ChunkedKvBacking;
 pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
-pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
+pub use backing::{is_device_oom, is_tier_refusal, KV_DEVICE_OOM_MARKER, TIER_REFUSAL_MARKER};
 pub use chunk_ops::BlockAllocSpec;
 pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 #[cfg(feature = "cuda")]
@@ -147,12 +147,12 @@ pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
     freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas,
     reclaim_load_headroom, region_stats, set_ground_broker, set_weight_floor, span_end,
-    span_layout, span_region_refusal, spare_tally, weight_capacity_bytes, weight_floor_after,
-    RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,
+    span_layout, span_region_refusal, spare_tally, transient_headroom_bytes, weight_capacity_bytes,
+    weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;
-pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
+pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 // Defined in both configurations — `None` when there is no CUDA device to
 // budget — so the export is unconditional too.

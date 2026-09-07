@@ -1031,8 +1031,10 @@ impl SequenceState {
     /// chunk at or after `writer_start_idx`. Chunks after it are trailing
     /// empties — e.g. a freshly-appended empty writer sitting past a partial
     /// sealed chunk — and must be skipped. This is the same selection rule
-    /// `set_len` and the position_map use, so the K/V write, the rope base,
-    /// and attention all agree on which chunk is the writer.
+    /// `set_len` and the slot's `write_slice` use — and the kernel resolves a
+    /// pending write's position by walking from that same `write_slice` — so the
+    /// K/V write, the rope base, and attention all agree on which chunk is the
+    /// writer.
     pub(super) fn decode_write_chunk_idx(&self) -> usize {
         let n = self.chunks.len();
         if n == 0 {

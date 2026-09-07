@@ -308,6 +308,9 @@ mod tests {
         fn test_chunked_state_free_lifecycle_across_arenas() {
             use crate::kv_cache::chunked::arena::ArenaKey;
 
+            // See `arena_indices_recycle_lowest_first` below for the ordering
+            // this registry must preserve.
+            //
             // The new per-arena refcount-table design replaces the
             // old global min-heap free list. Free counts are computed
             // from `arena_chunks - live` per arena and summed across
@@ -404,6 +407,49 @@ mod tests {
         fn test_chunk_meta_zero_constructor() {
             let meta = ChunkMeta::new(8, 0, 0u16);
             assert_eq!(meta.rope_base(), 0);
+        }
+
+        /// **Arena indices must recycle lowest-first, so the index space stays
+        /// dense.**
+        ///
+        /// An arena index is not an address — it comes from this free list,
+        /// while the arena's region comes from a heap shared with the recurrent
+        /// stores and the wave tier — so chunk packing keys on the region
+        /// instead (`ArenaRefcounts::rank`). What the index still has to be is
+        /// *compact*: it sizes `arena_registry`, and it is the rank an arena
+        /// carries during the window between registration and its region being
+        /// carved, which has to stay inside the bitmap's reserved range.
+        ///
+        /// A FIFO queue let indices drift upward without bound under churn —
+        /// an index freed long ago sat at the back while fresh ones climbed
+        /// past it. Lowest-first keeps the live set packed against zero.
+        #[test]
+        fn arena_indices_recycle_lowest_first() {
+            use crate::kv_cache::ArenaKey;
+            let _state = create_test_state(4, 4);
+            let pool = ChunkGidPool::new();
+            let key = ArenaKey::new(
+                crate::kv_cache::chunked::SizeClass::at(5),
+                crate::kv_cache::ArenaLocation::Gpu,
+            );
+
+            let a = pool.register_arena(key.clone());
+            let b = pool.register_arena(key.clone());
+            let c = pool.register_arena(key.clone());
+            assert!(a < b && b < c, "fresh indices climb: {a} {b} {c}");
+
+            // Release the HIGHEST first, then a lower one. A FIFO queue would
+            // hand `c` back next because it was freed first; lowest-first must
+            // hand back `b`.
+            pool.next_tombstone(key.clone());
+            pool.next_tombstone(key.clone());
+
+            let first = pool.register_arena(key.clone());
+            let second = pool.register_arena(key.clone());
+            assert!(
+                first < second,
+                "recycled indices must come back in ascending order, got {first} then {second}",
+            );
         }
     }
 }
