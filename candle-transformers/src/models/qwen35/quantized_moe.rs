@@ -56,16 +56,31 @@ pub fn shared_expert_contribution<'w>(
     // One width for both: the shared expert's result is summed into the MoE
     // combine, which runs at the experts' working dtype, so there is no
     // narrower store to ask for here.
+    // **Every step of the shared half, probed asynchronously.**
+    //
+    // `moe.shared_gated` checks the product `y * sigmoid(gate)`, which cannot
+    // say which operand went bad — and `sigmoid` never manufactures a NaN from
+    // a finite input, so the answer is one of the two. These are `assert`, not
+    // `checkpoint`: one kernel each, no fence, no readback, so the drain can
+    // rank them by when they actually went bad without draining the pipeline
+    // the fault needs to reproduce.
     let y = shared.forward_dynamic(acts, out_dtype, out_dtype)?;
+    y.assert("moe.shared.mlp_out");
     // The gate weight is padded to a full KO tile (see `SHARED_GATE_TILE`), so
     // the projection yields a tile's worth of outputs and only the first is the
     // gate — the rest are the zero rows. Narrowing unconditionally is also
     // correct for an unpadded weight, which keeps this free of any dependence
     // on the numeric path the weights were built for.
     let gate = shared_gate.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+    // Before AND after the narrow: if the raw tile is clean and row 0 is not,
+    // the pad is contaminating the row the gate is read from — which is the one
+    // way this differs from an ordinary projection.
+    gate.assert("moe.shared.gate_tile");
     let last = gate.rank() - 1;
     let gate = gate.narrow(last, 0, 1)?;
+    gate.assert("moe.shared.gate_row0");
     let gate = candle_nn::ops::sigmoid(&gate)?;
+    gate.assert("moe.shared.gate_sigmoid");
     // The gate is one scalar per token and `y` is `[.., hidden]`; both carry
     // the same leading dims, so the broadcast is over the last one.
     y.broadcast_mul(&gate)

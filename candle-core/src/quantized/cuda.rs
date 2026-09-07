@@ -5819,6 +5819,27 @@ pub fn to_dynamic<'w>(
     sum_scale: SumScale,
 ) -> Result<DynamicActs<'w>> {
     use crate::cuda_backend::CudaStorageSlice;
+    // **The float activations, immediately before they are quantized.**
+    //
+    // This is the last point at which the input to every projection in the layer
+    // is still an ordinary float tensor. `mlp.gate_up_raw` — the fused GEMM's
+    // output — goes non-finite while the FFN's own input (`ffn.in`) is still
+    // clean at that layer, so the fault lies between a good float input and the
+    // GEMM's result: either this quantization or the kernel. Probing here splits
+    // those two, and it is one kernel with no fence.
+    // Named by dtype, because the width is the hypothesis. This site is the only
+    // one in the model carrying infinities (90,162 of them) and the only one
+    // whose finite values reach 4.6e4 — every other site sits under ~22. F16's
+    // maximum is 65,504, so an F16 residual here is running at 70% of its range
+    // with the overflowed tail already saturated to inf; BF16 carries F32's
+    // exponent and could not overflow at these magnitudes. Splitting the slot by
+    // dtype says which of those two we are looking at.
+    match xs.dtype() {
+        crate::DType::F16 => xs.assert("acts.float_in.f16"),
+        crate::DType::BF16 => xs.assert("acts.float_in.bf16"),
+        crate::DType::F32 => xs.assert("acts.float_in.f32"),
+        _ => xs.assert("acts.float_in.other"),
+    };
     if !mode.is_int8() {
         return Ok(DynamicActs::Float(xs.clone()));
     }

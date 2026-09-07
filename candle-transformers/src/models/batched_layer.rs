@@ -707,6 +707,16 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
         layer.project_qkv(&acts, kv_dtype)?
     };
+    // Separate slots from the prefill path's: decode and prefill append to the
+    // SAME arena, so a value that saturates on the decode store is read back by
+    // every later prefill and would otherwise be blamed on the prefill
+    // projection that merely read it.
+    q.assert("attn.q.dec");
+    k.assert("attn.k.dec");
+    v.assert("attn.v.dec");
+    if let Some(g) = gate.as_ref() {
+        g.assert("attn.gate.dec");
+    }
 
     // Reshape for attention: (B, seq_len, H*D) -> (B, H, seq_len, D)
     // For seq_len=1, we can reshape directly without transpose
@@ -885,6 +895,19 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
         layer.project_qkv(&acts, kv_dtype)?
     };
+    // The three projections at the KV ARENA's width, which is F16 while the
+    // residual stream is BF16. `acts.float_in.f16` — the o_proj operand at the
+    // bottom of this function — is the only site in the whole model that carries
+    // `inf`, and everything else bad is NaN downstream of it. These four answer
+    // which side of the attention kernel the overflow happens on: bad here and
+    // the F16 projection store is what saturates, clean here and the kernel
+    // makes it.
+    q.assert("attn.q");
+    k.assert("attn.k");
+    v.assert("attn.v");
+    if let Some(g) = gate.as_ref() {
+        g.assert("attn.gate");
+    }
 
     let n_head = layer.n_head();
     let n_kv_head = layer.n_kv_head();
@@ -1064,6 +1087,10 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
         )?,
     };
 
+    // The kernel's own output, before the gate and before o_proj quantizes it.
+    // A softmax-weighted combination cannot exceed `max|V|`, so `inf` here with
+    // clean operands above names the kernel's F16 epilogue rather than the data.
+    out_packed.assert("attn.ctx_raw");
     // Project per-token: [total_q, n_head*head_dim] -> [total_q, hidden_out].
     // (n_head*head_dim may differ from n_embd, e.g. Qwen3-MoE.)
     let reshaped_ctx = out_packed
@@ -1074,6 +1101,10 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     let g_out_proj = gpu_span("prefill:out_proj", reshaped_ctx.device());
     let output = {
         let gated = apply_attention_gate(reshaped_ctx, gate)?;
+        // The o_proj operand itself: this IS the tensor `acts.float_in.f16`
+        // reports on, named at its own call site so the drain can place it in the
+        // layer rather than in the shared quantizer.
+        gated.assert("attn.ctx_gated");
         // Store the RESIDUAL STREAM's width, as the decode path does — not the
         // context's own. `x + attn(x)` needs one dtype, and naming it here means
         // the projection's store performs the conversion instead of a
