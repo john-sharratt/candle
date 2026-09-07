@@ -34,7 +34,7 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
-    ModelGeometry, QuantFormat, WavePlan, WAVE_FFN_BYTES,
+    ModelGeometry, QuantFormat, WavePlan, WAVE_SPAN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -545,6 +545,15 @@ pub struct BatchedInferenceSession {
     /// `seq_indices` order). Taken + cleared inside `forward_batched`, which
     /// routes HD128 glue to the paged-glue kernel.
     pending_glue: Option<Vec<PendingGlue>>,
+    /// Ground the next wave's transient tier may be priced against, in bytes.
+    ///
+    /// Set by the scheduler's fill, which knows both halves of it — the gap
+    /// between the arena frontier and the weight floor, and how far the weight
+    /// zone stands above the residency it defends — and read by every path
+    /// that sizes a prefill (`prefill_width_cap`), so the fill's bound and the
+    /// slab packer's bound are one number. Never priced below
+    /// `WAVE_SPAN_BYTES`, the ground the floor guarantees a wave.
+    tier_budget_bytes: usize,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -619,6 +628,7 @@ impl BatchedInferenceSession {
             num_layers,
             device: device.clone(),
             pending_glue: None,
+            tier_budget_bytes: WAVE_SPAN_BYTES,
         })
     }
 
@@ -646,6 +656,7 @@ impl BatchedInferenceSession {
             num_layers,
             device: device.clone(),
             pending_glue: None,
+            tier_budget_bytes: WAVE_SPAN_BYTES,
         }
     }
 
@@ -803,14 +814,15 @@ impl BatchedInferenceSession {
     ///
     /// Rebuilds slice and header data directly from backing arenas on every call.
     /// Pass `seq_indices` in the same order used for the forward pass batch.
-    /// Returns per-layer slice tensors (must stay alive until after the kernel) and
-    /// per-layer header GpuBufs. Both vecs are empty when `seq_indices` is empty.
+    /// Returns the packed per-layer header buffer (which must stay alive until
+    /// after the kernel) and its per-layer byte stride. `None` when
+    /// `seq_indices` is empty.
     #[cfg(feature = "cuda")]
     pub fn build_decode_metadata(
         &self,
         seq_indices: &[usize],
         generation: &Generation,
-    ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
+    ) -> Result<(Option<GpuBuf>, u64)> {
         self.build_decode_metadata_at(0..self.num_layers, seq_indices, generation, &[], &[], &[])
     }
 
@@ -863,10 +875,10 @@ impl BatchedInferenceSession {
         offset_overrides: &[(usize, usize)],
         non_writer: &[usize],
         snapshot_seqs: &[usize],
-    ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
+    ) -> Result<(Option<GpuBuf>, u64)> {
         let n_active = seq_indices.len();
         if n_active == 0 {
-            return Ok((None, None, 0));
+            return Ok((None, 0));
         }
         if layers.start >= layers.end || layers.end > self.num_layers {
             candle::bail!(
@@ -883,8 +895,8 @@ impl BatchedInferenceSession {
             .map(|s| snapshot_seqs.contains(s))
             .collect();
 
-        // 24-byte SlotHeader: n_slices, write_slice, slices_ptr, position_map_ptr.
-        let header_stride = n_active * 24;
+        // 16-byte SlotHeader: n_slices, write_slice, slices_ptr.
+        let header_stride = n_active * 16;
         let mut all_headers: Vec<u8> = Vec::with_capacity(group.len() * header_stride);
 
         // Pre-compute per-sequence offsets once (same for all layers).
@@ -905,23 +917,17 @@ impl BatchedInferenceSession {
             })
             .collect();
 
-        // Build per-sequence position_map covering [0, state.offset + 1).
-        // Each entry is u32: (slice_idx << 16) | in_blk.  The map is
-        // invariant across the GROUP (slice metadata is uniform within it),
-        // built once, and every layer's SlotHeader points into the
-        // per-sequence region.
-        // Entry at index state.offset is the write slot for the new token.
-        let mut pm_flat: Vec<u32> = Vec::new();
-        let mut pm_seq_byte_offsets: Vec<usize> = Vec::with_capacity(n_active);
-        // `(slice count, write slice)` the map was built against, per sequence.
-        // Both are read from the group's FIRST layer while the map is one buffer
-        // every layer's slot header points at, so every layer's own answer is
-        // checked against them below rather than assumed equal.
-        let mut pm_slot_shape: Vec<(u32, u32)> = Vec::with_capacity(n_active);
-        // Ensure backings are sized for the upcoming decode write so the slot's
-        // chunks reflect the post-write layout when we read them, and reconcile
-        // any block-structure skew between layers — the map built below is one
-        // buffer describing all of them.
+        // Ensure backings are sized for the upcoming decode write, so each
+        // layer's chunk state reflects the post-write layout when the slot
+        // metadata is read below.
+        //
+        // The kernel resolves the new token's `(slice, in_blk)` by walking from
+        // the layer's own `write_slice`, which lands on the first chunk from
+        // `writer_start_idx` with room — the same chunk the scatter writes. That
+        // is why there is no per-group position map here and no cross-layer
+        // shape check: each layer answers from its own slice array, so a layer
+        // whose block structure differs from its neighbours' simply resolves
+        // against its own rather than reading through a description of another's.
         //
         // Every layer of the GROUP at once, and once per decode step rather than
         // once per layer: only the layers that need an allocation take the write
@@ -937,71 +943,15 @@ impl BatchedInferenceSession {
             .filter(|(s, _)| !non_writer.contains(s))
             .collect();
         ChunkedKvBacking::ensure_for_batch_entries_all(group, &writer_offsets, 1)?;
-        for &(seq_idx, seq_offset) in &seq_offsets {
-            let entry_start = pm_flat.len();
-            pm_seq_byte_offsets.push(entry_start * 4);
-            let chunks = group[0].live_chunks_as_sealed(seq_idx).unwrap_or_default();
-            for (sidx, c) in chunks.iter().enumerate() {
-                let base = (sidx as u32) << 16;
-                pm_flat.extend(
-                    (c.offset as u32..c.offset as u32 + c.token_count as u32)
-                        .map(|in_blk| base | in_blk),
-                );
-            }
-            debug_assert_eq!(
-                pm_flat.len() - entry_start,
-                seq_offset,
-                "decode position_map: cum_tokens {} != state.offset {seq_offset} for seq {seq_idx}",
-                pm_flat.len() - entry_start,
-            );
-            // Write-slot entry: the new token lands in the WRITE chunk — the
-            // first non-full chunk from `writer_start_idx`, NOT `chunks.last()`
-            // (which may be a trailing empty sitting past the writer). This MUST
-            // match the `write_slice` rule in `sync_decode_gpu_chunks`, or the
-            // kernel scatters the token into one chunk while attention is told
-            // (via the position_map) to read it from another.
-            let wstart = group[0].writer_start_idx_for_seq(seq_idx).unwrap_or(0);
-            let n_ch = chunks.len();
-            let wi = if n_ch == 0 {
-                0
-            } else {
-                let start = wstart.min(n_ch - 1);
-                (start..n_ch)
-                    .find(|&i| (chunks[i].offset as usize + chunks[i].token_count as usize) < 32)
-                    .unwrap_or(n_ch - 1)
-            };
-            let wi_within = chunks
-                .get(wi)
-                .map_or(0, |c| c.offset as u32 + c.token_count as u32);
-            pm_flat.push(((wi as u32) << 16) | wi_within);
-            pm_slot_shape.push((n_ch as u32, wi as u32));
-        }
-
-        // Upload position_map via the pinned stager — zero-copy PCIe read,
-        // same path as all_headers below.  Pad to at least one entry so the
-        // device pointer is always valid.
-        if pm_flat.is_empty() {
-            pm_flat.push(0);
-        }
-        let pm_byte_len = pm_flat.len() * std::mem::size_of::<u32>();
-        let mut pm_pinned = generation.alloc(pm_byte_len)?;
-        // SAFETY: u32 has no padding and is trivially copyable; the lengths match.
-        let pm_bytes =
-            unsafe { std::slice::from_raw_parts(pm_flat.as_ptr() as *const u8, pm_byte_len) };
-        pm_pinned.copy_from_slice(pm_bytes);
-        let pm_gpu_buf = generation.submit(pm_pinned)?;
-        let pm_base_ptr = pm_gpu_buf.dev_ptr();
 
         let mut slot_rebuild_time = std::time::Duration::ZERO;
         let mut slot_reuse_time = std::time::Duration::ZERO;
         let mut saw_slot_rebuild = false;
         let mut saw_slot_reuse = false;
 
-        for (slot, backing) in group.iter().enumerate() {
+        for backing in group.iter() {
             // Capacity for the upcoming write is ensured for EVERY layer of the
             // group above, before this loop — see `ensure_for_batch_entries_all`.
-            let layer_idx = layers.start + slot;
-
             let arena_info = backing.resolve_arena_info()?;
 
             // Incrementally sync each sequence's GPU slot-state buffer.
@@ -1027,32 +977,14 @@ impl BatchedInferenceSession {
             saw_slot_reuse |= sync_stats.reuses > 0;
             saw_slot_rebuild |= sync_stats.rebuilds > 0;
 
-            // Append this layer's headers (24 bytes × n_active).
-            for (i, &(ptr, n_slices, write_slice)) in seq_ptrs.iter().enumerate() {
-                // The kernel SCATTERS the new token through this layer's own
-                // `write_slice` and READS it back through the shared map's write
-                // slot. A layer whose block table disagrees with the one the map
-                // was built from writes the token into one chunk and attends to
-                // another — silently, with no fault and no wrong-looking number
-                // anywhere. `ensure_for_batch_entries_all` reconciles the layers
-                // before this point; this is where that is worth confirming,
-                // because both values are already in hand.
-                let (exp_slices, exp_write) = pm_slot_shape[i];
-                if (n_slices, write_slice) != (exp_slices, exp_write) {
-                    candle::bail!(
-                        "decode metadata: layer {layer_idx} describes sequence {} as \
-                         {n_slices} slices writing slice {write_slice}, but the position map \
-                         every layer of {layers:?} shares was built from layer {} as \
-                         {exp_slices} slices writing slice {exp_write}",
-                        seq_offsets[i].0,
-                        layers.start
-                    )
-                }
-                let pm_ptr = pm_base_ptr + pm_seq_byte_offsets[i] as u64;
+            // Append this layer's headers (16 bytes × n_active). The kernel both
+            // scatters the new token through `write_slice` and resolves its read
+            // position by walking from that same `write_slice` over these same
+            // slices, so the write target and the read target cannot disagree.
+            for &(ptr, n_slices, write_slice) in seq_ptrs.iter() {
                 all_headers.extend_from_slice(&n_slices.to_le_bytes());
                 all_headers.extend_from_slice(&write_slice.to_le_bytes());
                 all_headers.extend_from_slice(&ptr.to_le_bytes());
-                all_headers.extend_from_slice(&pm_ptr.to_le_bytes());
             }
         }
 
@@ -1072,7 +1004,7 @@ impl BatchedInferenceSession {
         let mut pinned = generation.alloc(total)?;
         pinned.copy_from_slice(&all_headers);
         let gpu_buf = generation.submit(pinned)?;
-        Ok((Some(pm_gpu_buf), Some(gpu_buf), header_stride as u64))
+        Ok((Some(gpu_buf), header_stride as u64))
     }
 
     /// Free a sequence, returning its resources to the pool.
@@ -1898,6 +1830,17 @@ impl BatchedInferenceSession {
     /// A model whose blocks legitimately produce 1e5–1e6 outputs has them
     /// silently become `inf` at the narrowing, and the next layer turns the
     /// `inf` into a NaN.
+    /// Ground the next wave's transient tier may be priced against — see the
+    /// field.
+    pub fn tier_budget_bytes(&self) -> usize {
+        self.tier_budget_bytes
+    }
+
+    /// Record the ground the next wave's tier may be priced against.
+    pub fn set_tier_budget_bytes(&mut self, bytes: usize) {
+        self.tier_budget_bytes = bytes;
+    }
+
     pub fn activation_dtype(&self) -> DType {
         crate::models::batched_model::activation_dtype(
             self.config
@@ -1925,6 +1868,25 @@ impl BatchedInferenceSession {
     /// Get the number of layers.
     pub fn num_layers(&self) -> usize {
         self.num_layers
+    }
+
+    /// Pack every layer's KV arenas toward the low end of the reservation so the
+    /// region watermark can fall, and report how many arenas moved.
+    ///
+    /// The watermark is the *highest* live region, and both the weight zone's
+    /// room to grow and the wave transient tier's entire budget are
+    /// `weight_floor − live_end()`. An arena left high by an earlier busy moment
+    /// therefore strands every free region beneath it from both at once.
+    ///
+    /// Between forwards only: each arena's relocation takes the same window as
+    /// arena creation, which refuses while a forward owns the partition.
+    #[cfg(feature = "cuda")]
+    pub fn compact_kv_arenas(&self) -> Result<usize> {
+        let mut moved = 0usize;
+        for backing in &self.backings {
+            moved += backing.compact_arenas_down()?;
+        }
+        Ok(moved)
     }
 
     /// Get the KV backing for a specific layer.
@@ -3219,14 +3181,52 @@ pub trait ManagedBatchedModel {
     /// answer — no reservation yet, or a plan that cannot price a single row —
     /// because a zero-width wave makes no progress, and refusing here would abort
     /// a forward that can still run.
-    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
         let mut cap = MAX_PREFILL_TOKENS;
-        let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_within(WAVE_FFN_BYTES);
-        if fits > 0 {
-            cap = cap.min(fits);
-        }
+        // **Price the whole tier against the ground it may actually have.**
+        //
+        // Two corrections in one term, and each was worth a run:
+        //
+        // * The cost is `tier_bytes` — the *sum* of the phase spans, which is
+        //   what `plan_wave_transient` buys — not `wave_bytes`, the max over
+        //   them. The max under-prices the tier ~3x on this geometry, which is
+        //   how waves reached a 6.5 GiB tier request against a 912 MiB
+        //   guarantee.
+        // * The budget is `tier_budget`, which the scheduler's fill sets on the
+        //   session from the two things it can see and this cannot: the gap
+        //   between the arena frontier and the weight floor, and how far the
+        //   weight zone stands above the residency the fill defends — ground
+        //   the placement buys from the weight side. Never less than
+        //   `WAVE_SPAN_BYTES`, the ground `MIN_ELASTIC_RESERVE` keeps for a
+        //   wave and the weight floor may never take.
+        //
+        // The guarantee alone was tried and is far too narrow: on this geometry
+        // 912 MiB prices to ~1,000 tokens, which sliced a two-sequence
+        // calibration wave into two forwards and would cap ingest prefill at a
+        // few hundred tokens a second against the ~3,000 the same card does with
+        // a 6 GiB tier. The bare frontier gap was tried next and was no better:
+        // live arenas are scattered up to the floor, so the gap is small while
+        // most of the tier's room is what the weight side concedes at placement.
+        //
+        // **The tier is sized to every row of the wave, so the rows ahead of
+        // the prefill come off the top.** A co-batched wave's decode rows and
+        // verify blocks ride the same tier, and a cap that ignored them let a
+        // wave priced exactly to the guarantee overflow it by the head. The
+        // caller passes `head_rows` — what it has already put in the wave — and
+        // the prefill gets what remains, never less than one row.
+        //
+        // **The budget is priced as given, never floored at the guarantee.**
+        // The guarantee is what `MIN_ELASTIC_RESERVE` keeps the weight floor
+        // from taking; it is not ground the placement can use while live
+        // arenas stand inside it. A caller that measured the frontier gap at
+        // 150 MiB was handed ~1,000 rows by a 912 MiB floor here — 1,641
+        // refusals of one wave, re-formed to the same width every time. A
+        // budget that holds nothing prices to one row, and the placement is
+        // the judge of that row.
+        let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_for_tier(tier_budget);
+        cap = cap.min(fits.saturating_sub(head_rows).max(1));
         if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
-            cap = cap.min(kv_fits);
+            cap = cap.min(kv_fits.saturating_sub(head_rows).max(1));
         }
         cap
     }
@@ -3286,6 +3286,24 @@ pub trait ManagedBatchedModel {
     /// with a static layout (nothing to cede).
     fn reclaimable_kv_bytes(&self) -> usize {
         0
+    }
+
+    /// Pack this model's long-lived span tenants toward the low end so the
+    /// region watermark falls, and report how many moved.
+    ///
+    /// Regions are handed out lowest-first, which left-packs correctly only
+    /// while lifetimes are uniform. On a hybrid they are not: KV arenas churn
+    /// while a sequence's recurrent state persists for as long as the sequence
+    /// is live, so a store claimed under load lands high and strands every
+    /// region freed beneath it. `live_end()` is the *highest* live index, so one
+    /// stranded store caps both consumers of the tail —
+    /// `weight_floor − live_end()` is the weight zone's room to grow AND the
+    /// wave transient tier's whole budget.
+    ///
+    /// Called between forwards, where a region may legally be claimed. `0` for
+    /// models whose span tenants are all short-lived (nothing to pack).
+    fn compact_span(&self) -> Result<usize> {
+        Ok(0)
     }
 
     /// Re-materialise every norm weight in the activation dtype — see
@@ -3407,6 +3425,59 @@ pub trait ManagedBatchedModel {
     fn draft_budget(&self, width: usize) -> usize {
         let _ = width;
         0
+    }
+
+    /// Sequences a wave should carry at most on this card — the width at
+    /// which this model's aggregate decode rate peaks, measured.
+    ///
+    /// The scheduler fills a wave to this and no further, whatever the
+    /// partition would afford. On a streaming-expert model every row widens
+    /// the routed-expert union a step must load, so the aggregate rate rises
+    /// with width only until the union covers the working set and falls from
+    /// there; on a dense resident model it keeps rising far past any width a
+    /// conversation feeder reaches. The number belongs to the model *on the
+    /// card it is loaded on*: the same checkpoint peaks at a handful of
+    /// sessions where its experts stream and at dozens where they are all
+    /// resident. It is measured by the `test_parallel_batched_forwarding_*`
+    /// gates' width rows, and the value here is that measurement for the card
+    /// and checkpoint the model was calibrated on — not a guess about another.
+    ///
+    /// Eight is the default because the gates so far were run on a 16 GB card
+    /// where the streaming lineages peak at four to eight; a model that has
+    /// been measured elsewhere gives its own answer.
+    fn decode_width_target(&self) -> usize {
+        8
+    }
+
+    /// The expert-cache hit rate below which this model is streaming rather
+    /// than decoding, and no further sequence should be made resident until
+    /// the ones it carries finish.
+    ///
+    /// Dimensionless, so it reads the same on every card: a card holding every
+    /// expert reports every routing a hit and is never gated; a card streaming
+    /// half of them at the width the curve peaks at sits just above this. The
+    /// batched-forwarding gate on the 16 GB card measured 55–65% at its best
+    /// rows, and the ingest's collapse points — 3 s a step at width 20 with a
+    /// 4.4 GiB zone, 1 s at width 8–10 with 5.6 GiB — sat well below one half.
+    /// The ingest's steady state on long contexts sits at 0.45–0.55 at any
+    /// width between five and eleven: the rate there is set by the routing
+    /// diversity of the contexts more than by the width, so a knee at one
+    /// half had the width hunting between 5 and 11 on noise. The knee sits
+    /// under that band and catches only a genuine collapse. A model with no
+    /// expert cache never reports a rate and is never gated.
+    fn expert_hit_rate_knee(&self) -> f64 {
+        0.45
+    }
+
+    /// The expert-cache hit rate at and above which the cache is effectively
+    /// resident — nearly every routing served from VRAM — so the wave may
+    /// widen past this model's measured row (`decode_width_target`) toward the
+    /// engine's hard cap. Nine tenths: a streaming card at its best rows
+    /// measured 55–72%, a card holding every expert reports one, and the gap
+    /// between them is where a model's row stops being the right bound. A
+    /// model with no expert cache reports no rate and keeps its row.
+    fn resident_hit_rate(&self) -> f64 {
+        0.9
     }
 
     /// Draft up to `max_len` speculative next-tokens for **every** sequence in the step's
@@ -3621,6 +3692,57 @@ pub trait ManagedBatchedModel {
     /// that carries none.
     fn recurrent_memory_count(&self) -> usize {
         0
+    }
+
+    /// Whether `seq`'s recurrent memory stands on the device right now.
+    ///
+    /// Two callers, one question. The wave fill asks it to price admission: a
+    /// resident sequence rides the wave for free, while one that must be
+    /// materialised costs a store out of the weight zone, and only the latter
+    /// is held at the zone's hold point. The fork/move/restore wiring asks it to
+    /// decide whether a slot carries state at all — state sealed to the
+    /// substrate is evicted ([`Self::evict_recurrent`]), so "this sequence has
+    /// none" is an ordinary state meaning *restore it first*, not an error.
+    ///
+    /// These were once two predicates, because an idle sequence's state could
+    /// be parked in host memory and so exist without being resident. Recurrent
+    /// state no longer leaves the device, so there is one answer.
+    ///
+    /// `false` for a model that carries none, which makes every caller's
+    /// restore path a no-op there rather than a special case.
+    fn recurrent_resident(&self, _seq: usize) -> bool {
+        false
+    }
+
+    /// Make `seq`'s per-sequence model state resident for a wave standing at
+    /// `offset`, or say that it cannot be: `Ok(false)` means the device has
+    /// no room for one more sequence's state right now.
+    ///
+    /// **The admission question, asked of the real allocator.** The scheduler
+    /// fills a wave one sequence at a time and calls this for each candidate
+    /// before it counts the sequence in; a `false` ends the wave at the width
+    /// this model can actually carry, which is how width is bounded without
+    /// anyone estimating a per-sequence cost. Runs between forwards, the only
+    /// window in which the reservation may be claimed from.
+    ///
+    /// `true` for a model whose sequences carry no state outside the KV cache,
+    /// which is what makes the scheduler's fill model-agnostic: it asks every
+    /// model the same question and a model with nothing to allocate answers
+    /// yes for free.
+    fn admit_recurrent(&self, _seq: usize, _offset: usize) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Drop `seq`'s recurrent memory, which the caller has already persisted.
+    ///
+    /// **The caller owns the safety of this.** The state is only recoverable
+    /// from the snapshot it just wrote, so this may only be called once that
+    /// snapshot is durable — a sequence evicted without one comes back from
+    /// zeros, reads fluently, and has forgotten. `release_sequence` is the
+    /// other direction: that ends the sequence, this keeps it and frees the
+    /// memory its idle state was holding.
+    fn evict_recurrent(&self, _seq: usize) -> Result<()> {
+        Ok(())
     }
 
     /// `child` begins as a copy of `parent`'s per-sequence model state.
@@ -4240,6 +4362,18 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// What **one** sequence's recurrent state costs, resident or not.
+    ///
+    /// Distinct from [`Self::recurrent_reserved_bytes`], which is the total over
+    /// the stores that exist. Admission has to price a store for a sequence
+    /// that has none yet — and dividing the total by the count cannot answer
+    /// that, least of all when the count is zero, which is exactly the moment
+    /// the first store is being priced. Fixed per model, so it is a property of
+    /// the geometry rather than of what happens to be resident.
+    fn recurrent_store_bytes(&self) -> usize {
+        0
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 
@@ -4437,6 +4571,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().recurrent_reserved_bytes()
     }
 
+    fn recurrent_store_bytes(&self) -> usize {
+        self.model().recurrent_store_bytes()
+    }
+
     fn reset_expert_stats(&self) {
         self.model().reset_expert_stats()
     }
@@ -4460,8 +4598,8 @@ impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
         self.model().num_layers()
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
-        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head_rows, tier_budget)
     }
 
     fn sweep(

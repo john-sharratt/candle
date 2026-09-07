@@ -1760,7 +1760,7 @@ pub struct SyntheticSlots {
     pub kvheads: Tensor,
     /// `[n_chunks_total * 16]` u8 — TokenSlice array (all slots concatenated).
     pub slices: Tensor,
-    /// `[num_slots * 24]` u8 — SlotHeader array.
+    /// `[num_slots * 16]` u8 — SlotHeader array.
     pub headers: Tensor,
     /// Per slot: (first chunk index, n_chunks, n_tokens).
     pub slot_meta: Vec<(usize, usize, usize)>,
@@ -1996,18 +1996,16 @@ impl SyntheticSlots {
         };
 
         // SlotHeaders.
-        let mut header_bytes = vec![0u8; windows.len() * 24];
+        let mut header_bytes = vec![0u8; windows.len() * 16];
         for (slot, _) in windows.iter().enumerate() {
             let (first_chunk, n_chunks, _) = slot_meta[slot];
-            let rec = &mut header_bytes[slot * 24..slot * 24 + 24];
+            let rec = &mut header_bytes[slot * 16..slot * 16 + 16];
             rec[0..4].copy_from_slice(&(n_chunks as u32).to_le_bytes());
             rec[4..8].copy_from_slice(&((n_chunks - 1) as u32).to_le_bytes()); // writer = last
             let sa = slices_addr + (first_chunk * 16) as u64;
             rec[8..16].copy_from_slice(&sa.to_le_bytes());
-            // position_map_ptr unused by the DeepSeek kernel.
-            rec[16..24].copy_from_slice(&0u64.to_le_bytes());
         }
-        let headers = Tensor::from_vec(header_bytes, windows.len() * 24, dev)?;
+        let headers = Tensor::from_vec(header_bytes, windows.len() * 16, dev)?;
 
         Ok(Self {
             bands,
@@ -3886,7 +3884,7 @@ mod tests {
         session.set_sequence_offset(seq, case.n_win)?;
 
         let generation = session.begin_stager_generation();
-        let (_pm, headers, _stride) = session.build_decode_metadata(&[seq], &generation)?;
+        let (headers, _stride) = session.build_decode_metadata(&[seq], &generation)?;
         let headers = headers.expect("decode metadata headers");
 
         let qf: Vec<f32> = inp.q.iter().flat_map(|h| h.iter().copied()).collect();
@@ -4058,7 +4056,7 @@ mod tests {
             } else {
                 &[]
             };
-            let (_pm, headers, _stride) = session.build_decode_metadata_at(
+            let (headers, _stride) = session.build_decode_metadata_at(
                 0..session.num_layers(),
                 &[seq],
                 &generation,

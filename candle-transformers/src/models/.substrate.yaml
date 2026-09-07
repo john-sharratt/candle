@@ -1,0 +1,54 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-transformers/src/models/
+  distinctive_terms:
+  - clear_kv_cache
+  - RotaryEmbedding
+  - DecoderLayer
+  - prepare_decoder_attention_mask
+  - apply_rotary_emb_qkv
+  - masked_fill
+  - get_mask
+  - SelfAttention
+  - ModelWeights
+  - apply_rotary_emb
+  - reset_kv_cache
+  - transpose_for_scores
+  - WaveShapes
+  - repeat_kv
+  - LayerWeights
+  - FeedForward
+  - from_gguf
+  - rotate_half
+  - resident_weight_bytes
+  - HiddenAct
+  - ROPE_EXTEND_CHUNK
+  - rope_interleaved
+  - forward_attn
+  - maybe_change_dtype
+  - o_proj
+  - final_norm
+  - max_seq_len
+  - k_low_error_threshold_factor
+  content_hash: 74e64fb1674d65eb21750696c02373a7615313d694888e9645e4a52b6af541ed
+questions:
+  conceptual: []
+  locational: []
+  mechanistic: []
+  systemic: []

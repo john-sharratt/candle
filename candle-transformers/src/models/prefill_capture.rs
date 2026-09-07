@@ -9,7 +9,7 @@
 //! CUDA-only — the kernel and the KV gather are CUDA paths.
 //!
 //! What is NOT captured (regenerated on replay, never round-tripped): GPU
-//! pointers, slot headers, slices, the position_map, resident `meta` records.
+//! pointers, slot headers, slices, resident `meta` records.
 //! `build_slot_headers` rebuilds those from the chunk state every call.
 
 #[cfg(feature = "cuda")]

@@ -260,9 +260,14 @@ __global__ void paged_glue_kernel(
         }
 
         // ── Stream every column [0, kv_len) in TILES of WARPS columns, packed
-        // order via the slot's position_map. This covers the sealed prefix AND
-        // the freshly-written glue (whose columns are in the position_map but NOT
-        // in the writer slices' `len`, so a per-slice scan would miss them).
+        // order via `resolve_pos`, which covers the sealed prefix AND the glue
+        // columns whichever region they occupy. The scheduler reserves the glue
+        // gap ahead of this forward (`reserve_glue_gap_chunk` allocates the gap
+        // chunk with `usage = n_tokens`), so in production those columns are
+        // COMMITTED and the binary search over `rope`/`len` finds them; a caller
+        // that instead leaves them as an unwritten tail past the committed total
+        // has them resolved by the pending-write walk from `write_slice`. Either
+        // way no per-slice scan over `len` alone would be enough.
         // Warp w dequants column c0+w into its slot of k_stage/v_stage — all
         // warps in parallel — then un-permutes + RoPEs it into k_col/v_col, so
         // each column is dequantized exactly once and the block syncs ONCE per

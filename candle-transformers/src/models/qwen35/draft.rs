@@ -47,8 +47,6 @@
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
 
-use std::cell::RefCell;
-
 use super::batched::HybridBatched;
 use super::mtp::{MtpContext, MtpHead};
 use super::quantized_attention::Qwen35AttentionLayer;
@@ -59,7 +57,6 @@ use crate::models::batched_layer::{
 use crate::models::delta_net::SeqSpan;
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::operand_guard::expect_dtype;
-use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_buffers::wave_root;
 
@@ -420,7 +417,7 @@ pub fn draft_cohort(
             let at: Vec<usize> = base.iter().map(|&b| b + step).collect();
             let overrides: Vec<(usize, usize)> =
                 seqs.iter().copied().zip(at.iter().copied()).collect();
-            let (_pm, headers, stride) = session.build_decode_metadata_at(
+            let (headers, stride) = session.build_decode_metadata_at(
                 kv_layer..kv_layer + 1,
                 seqs,
                 &generation,
@@ -440,7 +437,6 @@ pub fn draft_cohort(
             })?;
             let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
             let (cos, sin) = model.rotary().rope_cos_sin(&pos, theta, rope_dtype, dev)?;
-            let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
             let params = BatchedAttentionParams::new(
                 &cos,
                 &sin,
@@ -453,7 +449,6 @@ pub fn draft_cohort(
                 },
                 &q_lens,
                 &generation,
-                &pm,
             );
             let embed = ctx.embed_ids(&ids)?;
             let h_next = {

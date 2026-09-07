@@ -692,12 +692,16 @@ impl Soak {
             .total_regions
             .saturating_sub(self.zone_regions)
             .saturating_sub(self.live);
+        // The last tier placed is the one this step's wave just released — the
+        // soak's per-step tier — so the policy leaves its ground to the next
+        // wave rather than offering it.
         let occ = Occupancy {
             live: self.live,
             free_below_ceiling: free,
             ceiling_blocked: 0,
             tier_bytes: self.tier_bytes,
             tier_high_water: self.tier_high_water,
+            tier_planned: self.tier_bytes,
         };
         if let Ok(spare) = self.policy.spare(occ, SLACK_REGIONS, REGION) {
             // **The engine's own hedge, called rather than restated.** A copy

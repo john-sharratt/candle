@@ -29,7 +29,7 @@
 //!
 //! All host-side metadata construction is shared — the same
 //! `paged_prefill_batched` / `paged_decode_attn` wrappers and the same
-//! `SlotStateHost::from_sealed_chunks` + position_map code that the
+//! `SlotStateHost::from_sealed_chunks` slice-building code that the
 //! production scheduler uses.  Divergence therefore points at the
 //! kernel, not the host.
 
@@ -68,8 +68,8 @@ const HEAD_DIM: usize = 128;
 const MAX_BLOCKS: usize = 256; // Headroom for the larger layouts + quant candidate arenas
 const EXTRA_PREFILL_TOKENS: usize = 8;
 
-/// Tokens the write-region hoist test reserves. A partial chunk (< `CHUNK_SIZE`)
-/// so the extended `position_map` covers a writer chunk that is not full.
+/// Tokens the real-slot position test reserves. A partial chunk (< `CHUNK_SIZE`)
+/// so the write region resolves into a writer chunk that is not full.
 const WRITE_REGION_TOKENS: usize = 7;
 
 /// fp16 attention has ~1e-3 numeric error per dot; the partial-chunk
@@ -227,22 +227,31 @@ fn kernel_layout_prefill_matches_full_vs_partial() -> Result<()> {
     Ok(())
 }
 
-/// Byte-exact gate for the prefill position_map hoist.
+/// Position resolution over a **real** arena-backed slot.
 ///
-/// The per-forward `SharedPm` cache reuses the first layer's uploaded
-/// position_map for every later layer. That is sound only if two invariants of
-/// `from_sealed_chunks` hold, which this test pins as raw-byte equalities:
-///   1. The serialized slices (out-of-line KvHead records + 16-byte slice
-///      headers) — the part re-uploaded per layer — are byte-identical whether
-///      or not the position_map is built. So later layers can rebuild slices
-///      while reusing the first layer's position_map without disagreement.
-///   2. The position_map is a deterministic function of the chunk token layout
-///      (which is identical across every layer of a forward), before and after
-///      the write-region extension the prefill path applies.
+/// The unit tests in `slot_state.rs` check `resolve_pos_reference` against
+/// synthetic slices; this checks it against a slot built the way production
+/// builds one — real sealed chunks, a real writer allocated by
+/// `ensure_for_batch_entries`, real arena pointers — and asserts the two
+/// properties the kernel's read path actually depends on:
+///
+///   1. **Coverage.** Every position in `[0, committed + write_region)` resolves
+///      to a slice/offset pair inside that slice's valid window. A position that
+///      resolved to `None` would be read as `(0, 0)` by the kernel: a legal
+///      address in the wrong chunk, silent.
+///   2. **Injectivity.** No two positions resolve to the same cell. Two
+///      positions sharing a cell means one token's K/V overwrites or masquerades
+///      as another's, which is exactly the aliasing a stale lookup table used to
+///      produce and is the reason the table was removed.
+///
+/// It also pins the serialized slices as byte-deterministic across builds, since
+/// the per-layer upload is now the only description of the layout.
 #[test]
-fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
+fn positions_over_a_real_slot_are_covered_and_unique() -> Result<()> {
     let _serial = gpu_serial();
-    use candle_transformers::models::slot_state::{SlotStateHost, TokenSliceHost};
+    use candle_transformers::models::slot_state::{
+        resolve_pos_reference, SlotStateHost, TokenSliceHost,
+    };
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -252,7 +261,7 @@ fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
     };
     let stager = PinnedStager::new_from_device(&device);
 
-    // Multi-chunk slot so slices + position_map are non-trivial.
+    // Multi-chunk slot so the slice layout is non-trivial.
     let segments: &[usize] = &[40, 40, 24];
     let total: usize = segments.iter().sum();
     let (q_master, k_master, v_master) = make_qkv(total, &device, 0xB17E_EAC7)?;
@@ -272,9 +281,9 @@ fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
 
     // `build_segmented_slot` deliberately truncates the trailing empty writer
     // chunk so it cannot bleed into slot B's layout, which leaves slot 0 holding
-    // sealed chunks only. `extend_for_write_region` below needs a writer chunk
-    // to extend INTO, so allocate one first — the same
-    // allocate-before-you-write contract the production prefill path follows.
+    // sealed chunks only. The write region below needs a writer chunk to land
+    // in, so allocate one first — the same allocate-before-you-write contract
+    // the production prefill path follows.
     backing.ensure_for_batch_entries(&[(0, total)], WRITE_REGION_TOKENS)?;
 
     let arena_info = backing.resolve_arena_info()?;
@@ -297,57 +306,78 @@ fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
         buf
     };
 
-    let with_pm = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-        true,
-    );
-    let no_pm = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-        false,
+    let slot =
+        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
+    let again =
+        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
+    assert_eq!(
+        serialize_slices(&slot),
+        serialize_slices(&again),
+        "slice bytes must be deterministic — they are the only description of \
+         the layout the kernel gets",
     );
 
-    // (1) The per-layer slices must not depend on whether the map was built.
-    assert_eq!(
-        serialize_slices(&with_pm),
-        serialize_slices(&no_pm),
-        "slice bytes must be independent of build_position_map",
-    );
-    assert!(
-        !with_pm.position_map.is_empty(),
-        "expected a non-empty position_map when requested",
-    );
-    assert!(
-        no_pm.position_map.is_empty(),
-        "expected an empty position_map when skipped",
-    );
+    // The write region must exist before anything resolves into it.
+    slot.assert_write_region_capacity(WRITE_REGION_TOKENS, CHUNK_SIZE);
 
-    // (2) Deterministic build — the layer-invariance the cache relies on.
-    let mut a = with_pm;
-    let mut b = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-        true,
-    );
+    let committed: usize = slot.slices.iter().map(|s| s.len as usize).sum();
+    assert_eq!(committed, total, "sealed chunks should cover the slot");
+
+    let mut seen: Vec<(usize, usize)> = Vec::with_capacity(committed + WRITE_REGION_TOKENS);
+    for k in 0..committed + WRITE_REGION_TOKENS {
+        let got = resolve_pos_reference(&slot.slices, slot.write_slice as usize, CHUNK_SIZE, k);
+        let (si, in_blk) = got.unwrap_or_else(|| {
+            panic!(
+                "position {k} of {} resolved to nothing — the kernel would read it as (0, 0)",
+                committed + WRITE_REGION_TOKENS,
+            )
+        });
+        assert!(
+            si < slot.slices.len(),
+            "position {k} → slice {si} is past the slice array"
+        );
+        assert!(
+            in_blk < CHUNK_SIZE,
+            "position {k} → in_blk {in_blk} is outside the chunk",
+        );
+        if k < committed {
+            // Committed: must land inside the slice's own valid window.
+            let s = &slot.slices[si];
+            let lo = s.offset as usize;
+            let hi = lo + s.len as usize;
+            assert!(
+                (lo..hi).contains(&in_blk),
+                "committed position {k} → ({si}, {in_blk}) is outside that slice's \
+                 window [{lo}, {hi})",
+            );
+        } else {
+            // Pending write: at or past the writer, and at or past the cursor
+            // in the writer's own chunk — never back inside sealed tokens.
+            assert!(
+                si >= slot.write_slice as usize,
+                "write position {k} → slice {si} is before the writer \
+                 ({})",
+                slot.write_slice,
+            );
+            if si == slot.write_slice as usize {
+                let ws = &slot.slices[si];
+                let cursor = ws.offset as usize + ws.len as usize;
+                assert!(
+                    in_blk >= cursor,
+                    "write position {k} → in_blk {in_blk} is behind the writer \
+                     cursor {cursor} — it would overwrite a committed token",
+                );
+            }
+        }
+        seen.push((si, in_blk));
+    }
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
     assert_eq!(
-        a.position_map, b.position_map,
-        "position_map must be deterministic across builds",
-    );
-    a.extend_for_write_region(WRITE_REGION_TOKENS, CHUNK_SIZE);
-    b.extend_for_write_region(WRITE_REGION_TOKENS, CHUNK_SIZE);
-    assert_eq!(
-        a.position_map, b.position_map,
-        "write-region-extended position_map must be deterministic",
+        sorted.len(),
+        seen.len(),
+        "two positions resolved to the same cell — one token would alias another",
     );
 
     let _ = &backing;
@@ -672,7 +702,7 @@ fn run_prefill(
     // The writer chunk must exist BEFORE the kernel runs — `paged_prefill_batched`
     // writes into it and does not allocate. The production path does this in
     // `ensure_for_batch_entries_all` (batched_inference.rs) / per-seq in the wave
-    // engine; a harness that skips it trips `extend_for_write_region: no writer
+    // engine; a harness that skips it trips `assert_write_region_capacity: no writer
     // chunk`, which is what every test in this file used to do.
     let kc = cache.k_cache();
     if let (Some(backing), Some(slot)) = (kc.chunked_backing(), kc.chunked_slot()) {
@@ -698,7 +728,6 @@ fn run_prefill(
         rope_cs,
         false,
         &generation,
-        &std::cell::RefCell::new(None),
     )?;
     caches_arr[0].set_current_seq_len(offset + seq_len)?;
     // `paged_prefill_batched` returns the flat attention output
@@ -708,8 +737,8 @@ fn run_prefill(
 }
 
 /// Reaches into a `KvCache` bound to slot 0 of `backing`, builds the
-/// decode metadata (slot header with position_map + slice pointers),
-/// and invokes `paged_decode_attn` for a single decode step.  Mirrors
+/// decode metadata (slot header + slice pointers), and invokes
+/// `paged_decode_attn` for a single decode step.  Mirrors
 /// `BatchedInferenceSession::build_decode_metadata` for one slot, so
 /// the kernel exercise is identical to the production path.
 #[allow(clippy::too_many_arguments)]
@@ -723,8 +752,6 @@ fn decode_one_slot(
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
-    use candle::backend::BackendStorage;
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_transformers::models::slot_state::{
         tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
     };
@@ -739,15 +766,11 @@ fn decode_one_slot(
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
 
-    let mut slot = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-        true,
-    );
-    slot.extend_for_write_region(1, CHUNK_SIZE);
+    let slot =
+        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
+    // The decode writes one token; the kernel resolves its position by walking
+    // from `write_slice`, so that walk must have somewhere to land.
+    slot.assert_write_region_capacity(1, CHUNK_SIZE);
 
     // Two-section layout: out-of-line KvHead records first, then 16-byte slice
     // headers whose kvheads_ptr points at the slice's record. Float/transient
@@ -788,30 +811,13 @@ fn decode_one_slot(
     };
     let slices_base_ptr = tensor_u8_device_ptr(&slices_tensor)?;
 
-    let mut pm = slot.position_map.clone();
-    if pm.is_empty() {
-        pm.push(0);
-    }
-    let pm_tensor = Tensor::from_slice(&pm, pm.len(), device)?;
-    let pm_base_ptr = {
-        let (storage, layout) = pm_tensor.storage_and_layout();
-        let cs = match &*storage {
-            candle::Storage::Cuda(c) => c,
-            _ => candle::bail!("expected CUDA storage"),
-        };
-        let stream = cs.device().cuda_stream();
-        let s = cs.as_cuda_slice::<u32>()?.slice(layout.start_offset()..);
-        let (p, _g) = s.device_ptr(&stream);
-        p
-    };
-
-    let mut hdr = Vec::with_capacity(24);
+    // 16-byte SlotHeader: n_slices, write_slice, slices_ptr.
+    let mut hdr = Vec::with_capacity(16);
     let n_slices = slot.slices.len() as u32;
     let write_slice = slot.write_slice;
     hdr.extend_from_slice(&n_slices.to_le_bytes());
     hdr.extend_from_slice(&write_slice.to_le_bytes());
     hdr.extend_from_slice(&slices_base_ptr.to_le_bytes());
-    hdr.extend_from_slice(&pm_base_ptr.to_le_bytes());
 
     let generation = stager.begin_generation();
     let mut pinned = generation.alloc(hdr.len())?;
@@ -836,7 +842,6 @@ fn decode_one_slot(
     )?;
     drop(headers_gpu);
     drop(slices_tensor);
-    drop(pm_tensor);
     Ok(out)
 }
 
@@ -1548,7 +1553,6 @@ fn run_offset_window_glue_case(
         &rope_cs,
         false,
         &gen_c,
-        &std::cell::RefCell::new(None),
     )?;
     let gen_b = stager.begin_generation();
     let out_b = paged_glue_attn(
@@ -1570,7 +1574,6 @@ fn run_offset_window_glue_case(
         &rope_cs,
         false,
         &gen_b,
-        &std::cell::RefCell::new(None),
     )?;
     let _ = (&backing_b, &backing_c);
 
@@ -1630,7 +1633,6 @@ fn glue_over(
         rope_cs,
         false,
         &gen,
-        &std::cell::RefCell::new(None),
     )?;
     device.synchronize()?;
     Ok(out)
@@ -1711,8 +1713,8 @@ fn kernel_layout_quantized_glue_offset_window() -> Result<()> {
 // reads its [0, split%32) slots (offset 0), the second its [split%32, 32)
 // slots (offset>0). Injecting BOTH back-to-back into one slot and decoding
 // must match a fresh prefill of the whole logical sequence. A host
-// composition bug (rope_base accumulation across the shared chunk, or
-// position_map ordering for the second window) shows up as divergence here
+// composition bug (rope_base accumulation across the shared chunk, or slice
+// ordering for the second window) shows up as divergence here
 // where the single-window tests pass.
 // ──────────────────────────────────────────────────────────────────────
 
@@ -2014,7 +2016,6 @@ fn run_glue_interspersed_case(
         &rope_cs,
         false,
         &gen,
-        &std::cell::RefCell::new(None),
     )?;
     device.synchronize()?;
     cache.set_current_seq_len(total)?;

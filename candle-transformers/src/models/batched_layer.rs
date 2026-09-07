@@ -23,7 +23,7 @@ use crate::models::prefill_utils::paged_decode_attn;
 use crate::models::prefill_utils::paged_decode_attn_q8;
 use crate::models::prefill_utils::{
     int8_prefill_act_dtype, int8_prefill_head_dim, paged_decode_q8_head_dim, paged_glue_attn,
-    paged_prefill_batched, SharedPm,
+    paged_prefill_batched,
 };
 use crate::models::profile::{gpu_span, pipeline_record, profile_now, span};
 use crate::models::quantized_matmul::QMatMul;
@@ -102,11 +102,6 @@ pub struct BatchedAttentionParams<'a> {
     /// Pinned-stager generation guard for quantization kernel metadata allocations.
     /// Threaded from forward_batched through to reconcile → quantize_palette4_convert_buffered.
     pub generation: &'a Generation,
-    /// Per-forward cache of the layer-invariant prefill `position_map`. The first
-    /// layer of a prefill forward populates it; later layers reuse the uploaded
-    /// buffer instead of rebuilding + re-uploading it. Empty (`None`) at forward
-    /// start; unused on the decode and CPU paths.
-    pub shared_prefill_pm: &'a std::cell::RefCell<Option<SharedPm>>,
 }
 
 impl<'a> BatchedAttentionParams<'a> {
@@ -123,7 +118,6 @@ impl<'a> BatchedAttentionParams<'a> {
         decode_headers: DecodeHeaders,
         q_lens: &'a [usize],
         generation: &'a Generation,
-        shared_prefill_pm: &'a std::cell::RefCell<Option<SharedPm>>,
     ) -> Self {
         Self {
             rope_cos: cos,
@@ -134,7 +128,6 @@ impl<'a> BatchedAttentionParams<'a> {
             decode_headers,
             q_lens,
             generation,
-            shared_prefill_pm,
         }
     }
 }
@@ -663,7 +656,6 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
             glue_meta,
             params.rope_cs,
             params.generation,
-            params.shared_prefill_pm,
             wave,
         )?;
         Ok(ret)
@@ -839,7 +831,6 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     glue_meta: Option<&GlueMeta>,
     rope_cs: &Tensor,
     generation: &Generation,
-    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
     wave: WaveRef<'w>,
 ) -> Result<LiveTensor<'w>> {
     // The flat-packed activation has leading dim 1 (x.len() == 1), so validate
@@ -982,7 +973,6 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             rope_cs,
             rope_interleaved,
             generation,
-            shared_pm,
         )?,
         // Shapes and dtypes the int8 prefix-attention kernel is not built for:
         // the float fallback, which keeps the paged cache contract
@@ -1028,7 +1018,6 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             rope_cs,
             rope_interleaved,
             generation,
-            shared_pm,
         )?,
     };
 

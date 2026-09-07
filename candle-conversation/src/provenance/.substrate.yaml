@@ -1,0 +1,102 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-conversation/src/provenance/
+  distinctive_terms:
+  - byte_len
+  - n_cases
+  - WIDE_HEADER
+  - ACTIVE_FOLD
+  - entry_slice
+  - group_agreement
+  - score_batched_gpu
+  - band_layer_indices
+  - from_packed
+  - RawSigEntry
+  - folded_heads
+  - SlotBelief
+  - RAW_NUM_BANDS
+  - read_k_all
+  - from_windows
+  - rotate_head_into
+  - WIDE_MAGIC_PREFIX
+  - read_entry_bytes
+  - SegmentInput
+  - score_provenance_late_fusion_grouped
+  - wide_sig
+  - bytes_per_token
+  - with_mmap
+  - parse_wide_header
+  - with_beta
+  - extract_q_vector_r16
+  - score_slots
+  - WIDE_VERSION_CURRENT
+  content_hash: e902416ab58af0441b18cadeffcb57cde30efafd5422c3dade299daa1a5374b9
+questions:
+  locational:
+  - Where is score_provenance_late_fusion_grouped implemented?
+  - Which code extracts the Q vector from an R16 cache?
+  - Where is a wide_sig written and its header parsed?
+  - Where does score_batched_gpu dispatch the batched scan?
+  - Which part of the code defines WIDE_MAGIC_PREFIX?
+  - Where are band_layer_indices computed?
+  - Where does from_windows build the scan input?
+  - Which code implements rotate_head_into?
+  - Where is bytes_per_token decided for a signature?
+  - Where does read_k_all pull keys for the scan?
+  - Which code holds SlotBelief between reprojections?
+  - Where is WIDE_VERSION_CURRENT checked on load?
+  mechanistic:
+  - How does late fusion combine votes from several fold groups?
+  - How is a Q vector captured during decode rather than precomputed?
+  - What happens when a signature's version does not match the current one?
+  - How does the scan turn sign agreement into a score?
+  - How does with_beta apply carry to an accumulated belief?
+  - How are layers grouped into bands before scoring?
+  - How does the batched GPU path stay numerically equivalent to the CPU one?
+  - How is a signature packed so a whole turn fits in few bytes?
+  - How does score_slots map scores back onto candidate slots?
+  - What makes the scan cost independent of how much is stored?
+  - How does the header let a reader skip a signature it cannot use?
+  - How is a mmap-backed signature read without copying it?
+  conceptual:
+  - What is a wide signature and what does it store?
+  - What does sign agreement measure between a query and a key?
+  - What is a fold group in the scoring model?
+  - What is SlotBelief and how does it accumulate?
+  - What does beta mean in this scoring?
+  - What is a band, and why are layers banded?
+  - What does late fusion mean here?
+  - Why is the Q vector captured live rather than derived from embeddings?
+  - What is the magic prefix on a stored signature for?
+  - What does bytes_per_token tell you about the storage format?
+  - What is the difference between a raw score and a belief?
+  - Why can this search run over an unbounded amount of history?
+  systemic:
+  - How does the assistant find relevant material without reading everything?
+  - What makes searching old conversations cheap no matter how many there are?
+  - How does the system decide that something from long ago matters now?
+  - What is actually stored so that past material can be searched later?
+  - How does relevance build up over several turns rather than resetting?
+  - Where would I look to understand why an unrelated file was retrieved?
+  - How does the search use the model's own attention rather than a separate index?
+  - What is compared when the system looks for relevant history?
+  - How does the search stay accurate as the amount stored grows without limit?
+  - Why does the assistant not simply put the whole history in the prompt?
+  - What is the small stored summary that makes each past turn searchable?
+  - How does the system avoid recomputing search data every time?

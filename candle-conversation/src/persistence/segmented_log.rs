@@ -38,7 +38,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::header_index::IndexEntry;
-use super::log_file::{read_record_at, LogFile, LogSource, Superblock, SUPERBLOCK_SIZE};
+use super::log_file::{read_record_at, LogFile, Superblock, SUPERBLOCK_SIZE};
 use super::manifest::Manifest;
 use super::record::Record;
 use super::recovery;

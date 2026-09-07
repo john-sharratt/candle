@@ -472,7 +472,7 @@ pub fn run_prefill(case: &mut BuiltCase) -> Result<Tensor> {
     // Allocate every sequence's writer chunk BEFORE the kernel runs.
     // `paged_prefill_batched` writes into the write region and does not create
     // it; production does this up front in `ensure_for_batch_entries_all`.
-    // Skipping it trips `extend_for_write_region: no writer chunk`.
+    // Skipping it trips `assert_write_region_capacity: no writer chunk`.
     //
     // ONE batched call over all slots rather than a per-slot loop, matching
     // production's own shape. (Measured: the two forms give bit-identical
@@ -509,7 +509,6 @@ pub fn run_prefill(case: &mut BuiltCase) -> Result<Tensor> {
         &case.rope_cs,
         false,
         &generation,
-        &std::cell::RefCell::new(None),
     )?;
     for (si, seq) in case.spec.seqs.iter().enumerate() {
         let off = offsets[si];

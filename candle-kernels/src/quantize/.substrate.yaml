@@ -1,0 +1,54 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-kernels/src/quantize/
+  distinctive_terms:
+  - quantize_warp_reduce_max
+  - make_half2
+  - d_val
+  - QK_K
+  - fabsf
+  - clamped_li
+  - quantize_warp_reduce_min
+  - dmin_val
+  - fminf
+  - quantization
+  - K_SCALE_SIZE
+  - qh_byte
+  - actual_d
+  - quantize_warp_reduce_sum
+  - q0_warp_sum
+  - qh_bit
+  - coarse_d
+  - sum_x
+  - q0_v_detail
+  - bit_start
+  - new_l
+  - centroid_bits
+  - QK_Q_AWQ
+  - QK_Q_AWQ_G64
+  - total_warps
+  - quant
+  - iscale
+  - clamp
+  content_hash: 5c2bbea152d825caa0563ed3f99f486681cdbc8b8d55d67951ffbaff72928956
+questions:
+  conceptual: []
+  locational: []
+  mechanistic: []
+  systemic: []

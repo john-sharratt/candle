@@ -1,0 +1,102 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-conversation/src/provenance/gallery_arena/
+  distinctive_terms:
+  - resident_bytes
+  - scan_ensure
+  - store_index
+  - transpose_to_pages
+  - pages_for
+  - residency_gen
+  - launch_paged
+  - PagedIndex
+  - scan_weighted_impl
+  - page_addr
+  - tensor_caps
+  - add_slab
+  - ArenaInner
+  - build_index
+  - resident_turns
+  - write_page
+  - drop_turn
+  - INDEX_CACHE_CAP
+  - CachedIndex
+  - alloc_and_upload
+  - cap_bytes
+  - GalleryStorage
+  - fingerprint_segments
+  - PagedBackend
+  - slab_pages
+  - PAGE_TOKENS
+  - replace_locked
+  - scan_weighted_bmma
+  content_hash: 106b3e9f9069902c9f1c0de7e2be97621cb2d05852e40b1b055d9cd6c0fa091c
+questions:
+  locational:
+  - Where is launch_paged implemented?
+  - Which code builds the PagedIndex used by the scan?
+  - Where does scan_weighted_bmma dispatch to the sm_89 kernel?
+  - Where are slab pages allocated and uploaded to the device?
+  - Which part of the code computes a page_addr for a resident turn?
+  - Where is GalleryStorage defined?
+  - Where does drop_turn remove a turn from the resident arena?
+  - Which code caps the index cache at INDEX_CACHE_CAP?
+  - Where is scan_weighted_impl selected between backends?
+  - Where does the arena decide it must add_slab for more room?
+  - Which code tracks resident_turns for the scan?
+  - Where is PAGE_TOKENS defined and applied?
+  mechanistic:
+  - How does launch_paged walk the paged arena in one kernel launch?
+  - What happens when write_page is called for a turn already resident?
+  - How does build_index keep the CachedIndex valid as turns come and go?
+  - How does scan_weighted_bmma differ from the fallback path on older cards?
+  - What does add_slab do when the arena is out of pages?
+  - How does drop_turn free pages without invalidating other turns' addresses?
+  - How does the arena decide which turns stay resident under cap_bytes?
+  - How is fingerprint_segments used to detect that an index is stale?
+  - How does alloc_and_upload move signatures onto the device?
+  - What keeps page_addr stable while the arena grows?
+  - How does the PagedBackend choose between BMMA and the scalar path?
+  - How is tensor_caps consulted before picking a scan kernel?
+  conceptual:
+  - What is a PagedIndex and what does it index?
+  - What does a slab hold in this arena?
+  - What is PAGE_TOKENS and why is it fixed?
+  - What is the difference between GalleryStorage and PagedBackend?
+  - What does CachedIndex cache, and when is it invalidated?
+  - What is a resident turn in this design?
+  - What does cap_bytes bound?
+  - Why does the arena need a fingerprint of its segments?
+  - What is scan_weighted_bmma optimising for?
+  - What role does ArenaInner play behind the lock?
+  - What is INDEX_CACHE_CAP protecting against?
+  - What does drop_turn guarantee about addresses still held elsewhere?
+  systemic:
+  - How does the assistant search its whole memory quickly enough to be useful?
+  - Where is the searchable form of past conversations actually kept on the GPU?
+  - How does the system search millions of stored items in a few milliseconds?
+  - What decides which memories stay on the graphics card and which are dropped?
+  - How does searching stay fast as the amount remembered keeps growing?
+  - Where would I look to understand the fast path of the memory search?
+  - What happens to the search index when new material is added?
+  - How does the search take advantage of specialised hardware instructions?
+  - What limits how much searchable memory can be held at once?
+  - How is stored memory laid out so it can be scanned in bulk?
+  - Where should I look if the memory search is returning stale results?
+  - What makes the search over old material cheap enough to run every token?

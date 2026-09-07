@@ -34,17 +34,15 @@ use candle_nn::kv_cache::WaveGeneration;
 
 /// Uploaded per-slot `SlotHeader[b]` payloads for a chunked attention launch.
 ///
-/// Holds the GPU-resident headers + the host `SlotStateHost` per slot (its
-/// `position_map` drives glue write-target derivation). The three `GpuBuf`
-/// guards keep the stager uploads alive for the duration of the kernel — drop
-/// this only after the launch.
+/// Holds the GPU-resident headers per slot. The three `GpuBuf` guards keep the
+/// stager uploads alive for the duration of the kernel — drop this only after
+/// the launch.
 #[cfg(feature = "cuda")]
 struct SlotHeaderUpload {
-    /// Raw GPU address of `SlotHeader[b]` (24 bytes each).
+    /// Raw GPU address of `SlotHeader[b]` (16 bytes each).
     headers_ptr: u64,
     /// Keeps the stager uploads (headers, slices, records) alive for the
-    /// duration of the kernel launch. The position_map upload is layer-invariant
-    /// and held separately in the per-forward [`SharedPm`] cache.
+    /// duration of the kernel launch.
     _guards: (GpuBuf, GpuBuf, GpuBuf),
     /// Pins every chunk the uploaded slot headers address: an uploaded page
     /// table is a REFERENCE, so it must hold the referenced gids alive. One
@@ -60,43 +58,10 @@ struct SlotHeaderUpload {
     _pinned_gids: Vec<HeadGids>,
 }
 
-/// Per-forward cache of the layer-invariant uploaded `position_map`.
-///
-/// The position_map maps each token position to its `(slice_idx, in-block
-/// offset)`, which depends only on the chunk token layout — **identical across
-/// every layer of a forward** (a sequence's chunks seal at the same boundaries
-/// in all layers; only the K/V values + arena pointers differ per layer). So the
-/// first layer builds + uploads it and every later layer reuses the same device
-/// buffer + per-slot byte offsets, eliminating the dominant per-layer host build
-/// and PCIe upload. Built once per (prefill) forward and dropped with it.
-///
-/// The type is named in the CPU-fallback `paged_prefill_batched` signature too,
-/// so it exists on both targets; only the GPU-buffer guard is CUDA-gated and the
-/// cache is only ever populated on the CUDA path.
-#[allow(dead_code)]
-pub struct SharedPm {
-    /// Keeps the uploaded position_map buffer alive for the whole forward.
-    #[cfg(feature = "cuda")]
-    _gpu: GpuBuf,
-    /// Device base address of the packed position_map buffer.
-    base_ptr: u64,
-    /// Per-slot byte offset into the packed buffer, in slot order.
-    byte_offsets: Vec<usize>,
-    /// Per-slot `(n_slices, covered_tokens)` at map build time, in slot order.
-    /// The map encodes `(slice_idx, in_blk)` pairs that index THAT layout's
-    /// slice array; every later layer re-derives its slice list from live
-    /// state and must match this shape exactly, or the kernel would resolve
-    /// positions through a stale map into a different slice list — a wild
-    /// `slice_idx` walks off the slice array into unrelated stager memory and
-    /// dereferences a garbage `kvheads_ptr` (CUDA_ERROR_ILLEGAL_ADDRESS with
-    /// no attribution). Checked on every cache hit in `build_slot_headers`.
-    per_slot_shape: Vec<(u32, u32)>,
-}
-
-/// Build + upload the per-slot `SlotHeader` payloads (slices, position_map,
-/// header records) for a chunked attention launch. Shared by paged prefill and
-/// the paged-glue forward — both read a sealed prefix + a writer region the
-/// same way; only the kernel they feed differs.
+/// Build + upload the per-slot `SlotHeader` payloads (slices + header records)
+/// for a chunked attention launch. Shared by paged prefill and the paged-glue
+/// forward — both read a sealed prefix + a writer region the same way; only the
+/// kernel they feed differs.
 #[cfg(feature = "cuda")]
 fn build_slot_headers(
     caches: &[&mut KvCache],
@@ -104,7 +69,6 @@ fn build_slot_headers(
     n_kv_head: usize,
     head_dim: usize,
     generation: &Generation,
-    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
     expected_offsets: Option<&[usize]>,
 ) -> Result<SlotHeaderUpload> {
     let t_build = profile_now();
@@ -118,20 +82,11 @@ fn build_slot_headers(
             .ok_or_else(|| candle::Error::Msg("expected chunked resolve_arena_info".into()))??
     };
 
-    // The position_map is layer-invariant (see [`SharedPm`]). The first layer of
-    // a forward populates `shared_pm` and uploads it; later layers reuse it and
-    // skip both the host build and the PCIe upload. When already cached we build
-    // each slot's slices WITHOUT its position_map.
-    let pm_cached = shared_pm.borrow().is_some();
-
     // Zero-clone slice build: visit each cache's live chunks by reference
     // (no SealedChunk materialization — its per-chunk clones and
     // arena_byte_size walks measured ~0.5 ms per layer-call at deep
     // prefixes, ~30x the slice build itself).
     let mut slots: Vec<SlotStateHost> = Vec::with_capacity(caches.len());
-    // Per-slot prefix token count (sum of live-chunk token counts), captured
-    // for the position-map shape guard below.
-    let mut slot_prefix: Vec<u32> = Vec::with_capacity(caches.len());
     // Reference pin: every chunk the headers will address (see
     // `SlotHeaderUpload::_pinned_gids`).
     let mut pinned_gids: Vec<HeadGids> = Vec::new();
@@ -184,28 +139,59 @@ fn build_slot_headers(
             }
         });
         // Count invariant: the slices must cover EXACTLY the slot's recorded
-        // sealed-KV offset. A shortfall means the block table lost chunks (the
-        // host-side "computed write len N is invalid" class); the kernel would
-        // seek a token past the covered range and walk off the END of the slice
-        // array into adjacent stager memory — garbage headers, garbage
-        // kvheads_ptr, CUDA_ERROR_ILLEGAL_ADDRESS with no attribution.
+        // sealed-KV offset, and **both directions are fatal for different
+        // reasons**.
+        //
+        // *Short* — the block table lost chunks. The kernel seeks a token past
+        // the covered range and walks off the END of the slice array into
+        // adjacent stager memory: garbage headers, garbage kvheads_ptr,
+        // CUDA_ERROR_ILLEGAL_ADDRESS with no attribution.
+        //
+        // *Over* — the chunks hold tokens the offset does not count, and they
+        // sit at the END, where the next write goes. The surplus is not merely
+        // unread: it displaces every position after it, so the prefill's tokens
+        // land at `want + surplus` while the model believes they are at `want`.
+        // RoPE then disagrees with the cache and a window of stale positions is
+        // inside the attended range — fluent output, quietly wrong. Refusing is
+        // right; the message just has to stop calling it a shortfall.
+        //
+        // Measured across runs CS and CX: the surplus is always 1 or 2 tokens,
+        // never a shortfall, which is the fingerprint of a speculative block's
+        // rejected tail staying in the KV while the offset rolls back. The tail
+        // of per-chunk usages is printed because it says whether the surplus is
+        // in the final chunk (a write-region rollback that missed) or spread
+        // (a chunk that was never truncated at all).
         if let Some(expected) = expected_offsets {
             let want = expected[slot_i];
             if (cum as usize) != want {
+                // Re-walked here rather than collected above: this is the bail
+                // path, so the second visit costs nothing anyone waits on, and
+                // carrying a per-chunk push through every slot of every layer of
+                // every forward to describe a failure that almost never happens
+                // is the wrong trade.
+                let mut tail: Vec<u16> = Vec::new();
+                cache.k_cache().chunked_visit_live_chunks(|it| {
+                    for c in it {
+                        tail.push(c.token_count);
+                    }
+                });
+                let tail: Vec<u16> = tail.iter().rev().take(6).rev().copied().collect();
+                let delta = cum as i64 - want as i64;
                 candle::bail!(
-                    "slot header build: batch slot {slot_i} slices cover {cum} tokens \
-                     but the slot's recorded offset is {want} ({} slices) — block \
-                     table lost chunks",
-                    slices.len()
+                    "slot header build: batch slot {slot_i} slices cover {cum} tokens but the \
+                     slot's recorded offset is {want} (delta {delta:+}, {} slices) — {}. \
+                     Last chunk usages: {tail:?}",
+                    slices.len(),
+                    if delta < 0 {
+                        "the block table lost chunks"
+                    } else {
+                        "the chunks hold tokens the offset does not count, and they displace \
+                         every position written after them"
+                    },
                 );
             }
         }
-        slot_prefix.push(cum);
-        slots.push(SlotStateHost::from_slices(
-            slices,
-            writer_start_idx,
-            !pm_cached,
-        ));
+        slots.push(SlotStateHost::from_slices(slices, writer_start_idx));
     }
     if let Some((slot_i, raw, arena, offset, tokens)) = dangling {
         candle::bail!(
@@ -215,57 +201,26 @@ fn build_slot_headers(
         );
     }
 
-    // Extend each slot's position_map to cover the write region. Ragged: slot i
-    // writes q_lens[i] new tokens, so after this `position_map.len() ==
-    // offsets[i] + q_lens[i] == kv_lens[i]`, letting the kernel resolve any
-    // k_pos in `[0, kv_lens[i])` via a single lookup. Skipped on a cache hit —
-    // the cached upload already covers the (layer-invariant) write region.
+    // Every slot must be able to address the tokens it is about to write.
+    // Ragged: slot i writes q_lens[i] new tokens past its committed prefix, and
+    // the kernel resolves those by walking from `write_slice`. If the write
+    // region was never allocated the walk runs off the slice array and reports
+    // `(0, 0)` — a legal address, so the write would land in slice 0 and corrupt
+    // the sequence's first chunk silently. Refuse here instead.
     let chunk_size = CHUNK_SIZE;
-    if !pm_cached {
-        for (slot, &add) in slots.iter_mut().zip(q_lens.iter()) {
-            slot.extend_for_write_region(add, chunk_size);
-        }
+    for (slot, &add) in slots.iter().zip(q_lens.iter()) {
+        slot.assert_write_region_capacity(add, chunk_size);
     }
-    // Position-map shape guard (cache hits): the cached map was built from an
-    // earlier layer's slice layout; the kernel resolves every k_pos through it
-    // into THIS layer's slice array. If any slot's layout changed since the
-    // build — a chunk boundary moved, a chunk appeared or vanished — the map's
-    // `(slice_idx, in_blk)` entries index the wrong slices, and a slice_idx
-    // past this layer's slice count sends the kernel through a garbage
-    // `kvheads_ptr` (CUDA_ERROR_ILLEGAL_ADDRESS with no attribution). Refuse
-    // to launch and name the slot + shape delta instead.
-    if pm_cached {
-        let cache = shared_pm.borrow();
-        let s = cache
-            .as_ref()
-            .expect("pm_cached implies shared_pm is populated");
-        if s.per_slot_shape.len() != slots.len() {
-            candle::bail!(
-                "slot header build: cached position_map covers {} slots but this \
-                 layer has {} — wave membership changed mid-forward",
-                s.per_slot_shape.len(),
-                slots.len()
-            );
-        }
-        for (i, slot) in slots.iter().enumerate() {
-            let (want_slices, want_covered) = s.per_slot_shape[i];
-            let this_covered = slot_prefix[i].saturating_add(q_lens[i] as u32);
-            if slot.slices.len() as u32 != want_slices || this_covered != want_covered {
-                candle::bail!(
-                    "slot header build: batch slot {i} slice layout changed \
-                     mid-forward under the cached position_map: map was built \
-                     over {want_slices} slices / {want_covered} covered tokens, \
-                     this layer has {} slices / {} covered tokens (prefix {} + \
-                     q_len {}) — a concurrent mutation moved the slot's chunk \
-                     boundaries between layers",
-                    slot.slices.len(),
-                    this_covered,
-                    slot_prefix[i],
-                    q_lens[i]
-                );
-            }
-        }
-    }
+    // There is no cross-layer shape guard here any more, and none is possible
+    // to need: every layer resolves positions from the slice array it just
+    // built, so a layer whose chunk layout differs from its neighbours' simply
+    // resolves against its own. The guard this replaced existed only because the
+    // uploaded map was built on one layer and reused by the rest, which made a
+    // layout difference between layers a correctness fault rather than a
+    // non-event — and layers differ *legitimately*, since a windowed creep
+    // prefill pushes layer 0's next writer chunk ahead of the layers still
+    // pending resume. Run CM refused 108 forwards on exactly that and lost 102
+    // of 354 directories to it.
     pipeline_record("slot:build", t_build);
 
     let t_pack = profile_now();
@@ -348,64 +303,18 @@ fn build_slot_headers(
     let slices_gpu = generation.submit(slices_pinned)?;
     let slices_base_ptr = slices_gpu.dev_ptr();
 
-    // Position_map: layer-invariant, so build + upload it only on the first
-    // layer of the forward and reuse the device buffer + per-slot byte offsets
-    // for the rest (see [`SharedPm`]). On a cache hit the slots carry no
-    // position_map (built with `build_position_map = false`), so the cached
-    // offsets are authoritative.
-    let pm_byte_offsets: Vec<usize> = if pm_cached {
-        let cache = shared_pm.borrow();
-        let s = cache
-            .as_ref()
-            .expect("pm_cached implies shared_pm is populated");
-        s.byte_offsets.clone()
-    } else {
-        let total_pm_entries: usize = slots.iter().map(|s| s.position_map.len()).sum();
-        let mut pm_buf: Vec<u32> = Vec::with_capacity(total_pm_entries.max(1));
-        let mut byte_offsets: Vec<usize> = Vec::with_capacity(slots.len());
-        for slot in &slots {
-            byte_offsets.push(pm_buf.len() * 4);
-            pm_buf.extend_from_slice(&slot.position_map);
-        }
-        if pm_buf.is_empty() {
-            pm_buf.push(0u32);
-        }
-        let pm_byte_len = pm_buf.len() * std::mem::size_of::<u32>();
-        let mut pm_pinned = generation.alloc(pm_byte_len)?;
-        // SAFETY: u32 has no padding and is trivially copyable; lengths match.
-        let pm_bytes =
-            unsafe { std::slice::from_raw_parts(pm_buf.as_ptr() as *const u8, pm_byte_len) };
-        pm_pinned.copy_from_slice(pm_bytes);
-        let pm_gpu = generation.submit(pm_pinned)?;
-        let base_ptr = pm_gpu.dev_ptr();
-        let per_slot_shape: Vec<(u32, u32)> = slots
-            .iter()
-            .map(|s| (s.slices.len() as u32, s.position_map.len() as u32))
-            .collect();
-        *shared_pm.borrow_mut() = Some(SharedPm {
-            _gpu: pm_gpu,
-            base_ptr,
-            byte_offsets: byte_offsets.clone(),
-            per_slot_shape,
-        });
-        byte_offsets
-    };
-    let pm_base_ptr = shared_pm
-        .borrow()
-        .as_ref()
-        .expect("position_map cache populated above")
-        .base_ptr;
-
-    let mut header_buf: Vec<u8> = Vec::with_capacity(slots.len() * 24);
+    // `SlotHeader` is 16 bytes: (n_slices, write_slice, slices_ptr). The kernel
+    // computes each position's `(slice_idx, in_blk)` from the slice array these
+    // point at, so there is no third section to pack and no per-forward map to
+    // send across PCIe.
+    let mut header_buf: Vec<u8> = Vec::with_capacity(slots.len() * 16);
     for (i, slot) in slots.iter().enumerate() {
         let n_slices = slot.slices.len() as u32;
         let write_slice = slot.write_slice;
         let slices_ptr = slices_base_ptr + slot_byte_offsets[i] as u64;
-        let position_map_ptr = pm_base_ptr + pm_byte_offsets[i] as u64;
         header_buf.extend_from_slice(&n_slices.to_le_bytes());
         header_buf.extend_from_slice(&write_slice.to_le_bytes());
         header_buf.extend_from_slice(&slices_ptr.to_le_bytes());
-        header_buf.extend_from_slice(&position_map_ptr.to_le_bytes());
     }
 
     let mut pinned = generation.alloc(header_buf.len())?;
@@ -452,7 +361,6 @@ fn paged_prefill_batched_impl<'w>(
     rope_cs: &Tensor,
     rope_interleaved: bool,
     generation: &Generation,
-    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<LiveTensor<'w>> {
     // Ragged/varlen prefill. q/k/v arrive FLAT-packed:
     //   q: [total_q, n_head, head_dim], k/v: [total_q, n_kv_head, head_dim]
@@ -669,7 +577,6 @@ fn paged_prefill_batched_impl<'w>(
         n_kv_head,
         head_dim,
         generation,
-        shared_pm,
         Some(offsets),
     )?;
     let headers_ptr = header_upload.headers_ptr;
@@ -771,7 +678,6 @@ pub fn paged_prefill_batched<'w>(
     rope_cs: &Tensor,
     rope_interleaved: bool,
     generation: &Generation,
-    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<LiveTensor<'w>> {
     paged_prefill_batched_impl(
         wave,
@@ -790,7 +696,6 @@ pub fn paged_prefill_batched<'w>(
         rope_cs,
         rope_interleaved,
         generation,
-        shared_pm,
     )
 }
 
@@ -816,7 +721,6 @@ pub fn paged_prefill_batched(
     _rope_cs: &Tensor,
     _rope_interleaved: bool,
     _generation: &Generation,
-    _shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
     // CPU fallback: per-sequence standard attention. The paged CUDA kernel is
     // the production path; this exists only for non-chunked CPU caches.
@@ -916,7 +820,6 @@ pub fn paged_glue_attn(
     _rope_cs: &Tensor,
     _rope_interleaved: bool,
     _generation: &Generation,
-    _shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
     candle::bail!("paged-glue requires the cuda feature")
 }
@@ -1521,7 +1424,6 @@ pub fn paged_glue_attn<'w>(
     rope_cs: &Tensor,
     rope_interleaved: bool,
     generation: &Generation,
-    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<LiveTensor<'w>> {
     if head_dim != 128 {
         candle::bail!("paged-glue requires head_dim==128 (got {head_dim})");
@@ -1614,16 +1516,10 @@ pub fn paged_glue_attn<'w>(
 
     let g_hdr = gpu_span("glue:hdr_meta", device);
     // The gaps are real chunks already (no trailing write region), so the slot
-    // headers cover exactly `[0, kv_len)`; pass zero glue so build_slot_headers
-    // does not extend a write region. `shared_pm` is the forward's glue-group
-    // position-map cache: the map is layer-invariant (chunk boundaries are the
-    // same in every layer), so the first layer builds + uploads it and the
-    // other 47 reuse the device buffer, skipping the host build and the PCIe
-    // copy that otherwise dominate this span.
+    // headers cover exactly `[0, kv_len)`; pass zero glue so no write-region
+    // capacity is required.
     let zero_q = vec![0usize; b_sz];
-    let header_upload = build_slot_headers(
-        caches, &zero_q, n_kv_head, head_dim, generation, shared_pm, None,
-    )?;
+    let header_upload = build_slot_headers(caches, &zero_q, n_kv_head, head_dim, generation, None)?;
     g_hdr.end();
 
     let g_kernel = gpu_span("glue:kernel", device);
@@ -2232,7 +2128,6 @@ mod tests {
             rope_cs,
             rope_interleaved,
             generation,
-            &std::cell::RefCell::new(None),
         )?;
         // Flat [total_q, n_head, head_dim] -> per-seq [1, n_head, seq_len, head_dim].
         let mut per_seq = Vec::with_capacity(b_sz);

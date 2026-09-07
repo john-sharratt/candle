@@ -7,16 +7,14 @@
 //
 // Byte layouts must match the Rust serialization in slot_state.rs exactly.
 //
-// SlotState header (24 bytes, fixed):
+// SlotState header (16 bytes, fixed):
 //   [0..4)   uint32_t n_slices
 //   [4..8)   uint32_t write_slice
 //   [8..16)  uint64_t slices_ptr       (device pointer into slices tensor)
-//   [16..24) uint64_t position_map_ptr (device pointer into per-slot
-//                                        position_map: u32[total_tokens]
-//                                        where each entry packs
-//                                        (slice_idx << 16) | in_blk.
-//                                        Replaces chunk_div/chunk_mod
-//                                        positional math.)
+//
+// There is no position lookup table: `resolve_pos` below computes a position's
+// (slice_idx, in_blk) from the slice array, which already carries everything
+// such a table encoded (rope, len, offset) plus write_slice from this header.
 //
 // TokenSlice (16 bytes, fixed stride):
 //   [0..2)   uint16_t offset
@@ -44,6 +42,10 @@
 
 #include <stdint.h>
 
+#ifndef CHUNK_SIZE
+#define CHUNK_SIZE 32
+#endif
+
 // ============================================================================
 // SlotState header layout
 // ============================================================================
@@ -51,32 +53,15 @@
 struct SlotHeader {
     uint32_t n_slices;
     uint32_t write_slice;
-    uint64_t slices_ptr;        // device pointer into per-slot slice data
-    uint64_t position_map_ptr;  // device pointer into per-slot
-                                // position_map: u32[total_tokens],
-                                // entry = (slice_idx << 16) | in_blk.
+    uint64_t slices_ptr;  // device pointer into per-slot slice data
 };
-static_assert(sizeof(SlotHeader) == 24, "SlotHeader must be 24 bytes");
+static_assert(sizeof(SlotHeader) == 16, "SlotHeader must be 16 bytes");
 
 // Read the SlotHeader for a given slot index from the headers tensor.
 __device__ __forceinline__ const SlotHeader& get_slot_header(const uint8_t* headers, int slot_idx) {
-    return *reinterpret_cast<const SlotHeader*>(headers + (int64_t)slot_idx * 24);
+    return *reinterpret_cast<const SlotHeader*>(headers + (int64_t)slot_idx * 16);
 }
 
-// Resolve a cum_token position to (slice_idx, in_blk) via the slot's
-// position_map.  Replaces `chunk_div(k_pos)` / `chunk_mod(k_pos)` for
-// reads of the slot's prefix region.  Caller must guarantee
-// `k_pos < total_tokens` (i.e., within the slot's valid prefix).
-__device__ __forceinline__ void resolve_pos(
-    const SlotHeader& slot_hdr,
-    int k_pos,
-    int& slice_idx,
-    int& in_blk
-) {
-    uint32_t entry = reinterpret_cast<const uint32_t*>(slot_hdr.position_map_ptr)[k_pos];
-    slice_idx = (int)(entry >> 16);
-    in_blk    = (int)(entry & 0xFFFF);
-}
 
 // ============================================================================
 // Byte-size helpers (compile-time for HEAD_DIM, runtime for n_kv_head)
@@ -127,6 +112,98 @@ __device__ __forceinline__ uint16_t slice_len(const uint8_t* slice) {
 
 __device__ __forceinline__ uint32_t slice_rope(const uint8_t* slice) {
     return *reinterpret_cast<const uint32_t*>(slice + 4);
+}
+
+// Resolve a cum_token position to (slice_idx, in_blk) from the slot's slices.
+//
+// Replaces `chunk_div(k_pos)` / `chunk_mod(k_pos)`, which worked only while
+// every chunk held exactly CHUNK_SIZE tokens; partial chunks, injected
+// substrate windows and glue gaps made chunks variable-length and broke the
+// division.  The host answered that by precomputing a `u32[total_tokens]`
+// position_map — one entry per token, rebuilt and pushed over PCIe every
+// forward — and this computes the same answer from state already on the device.
+//
+// **Two regions, because the slot has two.**
+//
+// *Committed* tokens live in slices that record what they hold: `rope` is a
+// slice's first cum_token position and `len` how many follow, so the owning
+// slice is the one with `rope <= k_pos < rope + len` and the offset inside its
+// chunk is `offset + (k_pos - rope)`.  Slices are ordered by `rope`, so this is
+// a binary search.  Empty slices (`len == 0`) claim no position and the same
+// comparison steps over them.
+//
+// *Pending writes* sit past the committed total, in capacity no slice counts
+// yet, so they cannot be found by searching `len`.  They are laid out by
+// walking forward from `write_slice` — filling the writer's chunk from
+// `offset + len` to CHUNK_SIZE, then each following chunk from its own
+// `offset`.  Every input it needs is here: `write_slice` is in the header and
+// CHUNK_SIZE is a shared constant.  The host mirrors this walk in
+// `resolve_pos_reference`, and `SlotStateHost::assert_write_region_capacity`
+// refuses a forward whose write region the walk would run off the end of.
+//
+// **Why compute rather than look up.**  A table has to be kept consistent with
+// what it describes, and this one had to be identical across all 48 layers to
+// be shared — an invariance nothing structurally guaranteed.  A windowed creep
+// prefill leaves layer 0 holding a trailing empty writer chunk its peers have
+// not pushed, which shifts every later slice index; the launch guard that
+// caught the mismatch cost run CM 102 of 354 directories.  Computed here there
+// is no table to be stale, no invariance to establish, and no guard to trip.
+// It also reads `len` as committed on-device after each decode step, where the
+// map held what the host believed before the forward began.
+//
+// The cost is a handful of L1 reads over an array of tens of 16-byte slices,
+// at call sites that resolve once per warp-column or once per tile rather than
+// once per lane — against a per-forward host build and upload the map needed.
+__device__ __forceinline__ void resolve_pos(
+    const SlotHeader& slot_hdr,
+    int k_pos,
+    int& slice_idx,
+    int& in_blk
+) {
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(slot_hdr.slices_ptr);
+    const int n = (int)slot_hdr.n_slices;
+    if (n <= 0) { slice_idx = 0; in_blk = 0; return; }
+
+    int lo = 0;
+    int hi = n - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) >> 1;
+        const uint8_t* s = base + (int64_t)mid * 16;
+        const int start = (int)slice_rope(s);
+        const int len = (int)slice_len(s);
+        if (k_pos < start) {
+            hi = mid - 1;
+        } else if (k_pos >= start + len) {
+            lo = mid + 1;
+        } else {
+            slice_idx = mid;
+            in_blk = (int)slice_offset(s) + (k_pos - start);
+            return;
+        }
+    }
+
+    // Past every committed token: a pending write. Walk from the writer.
+    const uint8_t* last = base + (int64_t)(n - 1) * 16;
+    const int committed = (int)slice_rope(last) + (int)slice_len(last);
+    int cur = (int)slot_hdr.write_slice;
+    if (cur >= n) { slice_idx = 0; in_blk = 0; return; }
+    const uint8_t* ws = base + (int64_t)cur * 16;
+    int cur_in_blk = (int)slice_offset(ws) + (int)slice_len(ws);
+    int j = k_pos - committed;
+    while (true) {
+        if (cur_in_blk < CHUNK_SIZE) {
+            const int cap = CHUNK_SIZE - cur_in_blk;
+            if (j < cap) {
+                slice_idx = cur;
+                in_blk = cur_in_blk + j;
+                return;
+            }
+            j -= cap;
+        }
+        cur += 1;
+        if (cur >= n) { slice_idx = 0; in_blk = 0; return; }
+        cur_in_blk = (int)slice_offset(base + (int64_t)cur * 16);
+    }
 }
 
 // Increment ws.len by 1. Called by the device-side post-decode commit kernel

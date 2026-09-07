@@ -1,0 +1,54 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-transformers/src/models/segment_anything/
+  distinctive_terms:
+  - tiny_vit
+  - MaskDecoder
+  - prompt_encoder
+  - image_encoder
+  - PatchEmbed
+  - embed_points
+  - MLP_RATIO
+  - STABILITY_SCORE_OFFSET
+  - min_max_indexes
+  - add_decomposed_rel_pos
+  - CropBox
+  - STABILITY_SCORE_THRESHOLD
+  - IMAGE_SIZE
+  - get_dense_pe
+  - TwoWayTransformer
+  - window_unpartition
+  - forward_for_embeddings
+  - build_point_grid
+  - MlpMaskDecoder
+  - new_tiny
+  - pe_encoding
+  - LayerNorm2d
+  - MODEL_MASK_THRESHOLD
+  - crop_len
+  - generate_crop_boxes
+  - TwoWayAttentionBlock
+  - TinyViTBlock
+  - ImageEncoderViT
+  content_hash: e8f20f1dbd3eb892b130e9fd9f722eecb7f4efc6726959670eef5d0f7897b160
+questions:
+  conceptual: []
+  locational: []
+  mechanistic: []
+  systemic: []

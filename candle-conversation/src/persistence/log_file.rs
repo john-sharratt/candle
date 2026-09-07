@@ -287,19 +287,73 @@ impl LogFile {
         self.write_offset = offset;
     }
 
-    /// Read `len` bytes at `offset`. Errors if the file does not hold that
+    /// Read `len` bytes at `offset`. Errors if the log does not hold that
     /// many bytes there.
     pub fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut buf).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                PersistenceError::Truncated { need: len, have: 0 }
-            } else {
-                PersistenceError::Io(e)
-            }
-        })?;
+        self.read_into(offset, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Read `dest.len()` bytes at `offset` into `dest`, from the file for the
+    /// flushed part of the range and from the staging buffer for the rest.
+    ///
+    /// **A staged record is readable at its offset the moment `stage` hands
+    /// that offset out**, because the substrate indexes it there before the
+    /// group commit, and a reader can arrive in between. It did: a turn's
+    /// recurrent snapshot, sealed and indexed, was read back for the very next
+    /// turn as `need 65,867,776 bytes, have 0`, and that conversation carried
+    /// on with no memory of its own history.
+    ///
+    /// **Served by a copy, never by a flush.** The first fix flushed the
+    /// staging buffer when a read reached into it. The buffer holds a whole
+    /// group commit — a sealed ingest chain's 24 turns of K/V — and the reader
+    /// is the scheduler thread resuming a conversation, so that flush was a
+    /// synchronous write of up to a gigabyte on the thread that runs the
+    /// waves: measured as 16–22 s stalls three times in seventeen minutes, each
+    /// a `wave 26.5s` with nothing on the device. The bytes a reader wants are
+    /// already in memory; copying them costs the record's own length and
+    /// leaves the flush to the commit, where it belongs.
+    pub fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()> {
+        let len = dest.len();
+        let end = offset + len as u64;
+        // The staging buffer covers `[write_offset, write_offset + pending)`;
+        // a range that ends at or before the write offset — or any range while
+        // nothing is staged — is the file's, which may hold more than the
+        // write offset says (a log opened read-only, or before recovery has
+        // set its tail).
+        let from_file = if self.pending.is_empty() || end <= self.write_offset {
+            len
+        } else {
+            (self.write_offset.saturating_sub(offset) as usize).min(len)
+        };
+        if from_file > 0 {
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.read_exact(&mut dest[..from_file]).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    PersistenceError::Truncated {
+                        need: from_file,
+                        have: 0,
+                    }
+                } else {
+                    PersistenceError::Io(e)
+                }
+            })?;
+        }
+        if from_file < len {
+            // The staged part: from the write offset on, bounded by what is
+            // staged — a read past that is a truncation with the honest count.
+            let staged_end = self.write_offset + self.pending.len() as u64;
+            if end > staged_end {
+                return Err(PersistenceError::Truncated {
+                    need: len,
+                    have: staged_end.saturating_sub(offset).min(len as u64) as usize,
+                });
+            }
+            let start = (offset + from_file as u64 - self.write_offset) as usize;
+            dest[from_file..].copy_from_slice(&self.pending[start..start + (len - from_file)]);
+        }
+        Ok(())
     }
 
     /// Stage one already-encoded, 4 KB-aligned record into the group-commit
@@ -409,18 +463,7 @@ impl LogSource for LogFile {
     }
 
     fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(dest).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                PersistenceError::Truncated {
-                    need: dest.len(),
-                    have: 0,
-                }
-            } else {
-                PersistenceError::Io(e)
-            }
-        })?;
-        Ok(())
+        LogFile::read_into(self, offset, dest)
     }
 
     fn size(&mut self) -> Result<u64> {
@@ -528,6 +571,68 @@ mod tests {
             token_count: 0,
         };
         encode_record(&header, payload)
+    }
+
+    /// **A record is readable at its offset the moment `stage` returns it.**
+    /// The substrate indexes the record under that offset before the group
+    /// commit, and a reader that arrives in between — the next turn's
+    /// recurrent resume did — must get the bytes, not end-of-file. And it is
+    /// served from the staging buffer, not by flushing it: the flush is a
+    /// group commit's worth of bytes on the reader's thread.
+    #[test]
+    fn a_staged_record_reads_back_before_the_commit() {
+        let path = tmp_path("staged_read");
+        let mut log = LogFile::create(&path).unwrap();
+        let bytes = rec(7, 0, &[0xAB; 100]);
+        let offset = log.stage(&bytes);
+        let staged = log.pending_len();
+        assert!(staged > 0, "still staged, nothing flushed");
+        let back = log.read_at(offset, bytes.len()).unwrap();
+        assert_eq!(back, bytes, "the staged record, byte for byte");
+        assert_eq!(
+            log.pending_len(),
+            staged,
+            "served by a copy, not by a flush"
+        );
+        // And through the stripe path.
+        let offset2 = log.stage(&bytes);
+        let mut dest = vec![0u8; bytes.len()];
+        LogSource::read_into(&mut log, offset2, &mut dest).unwrap();
+        assert_eq!(dest, bytes);
+        assert_eq!(log.pending_len(), 2 * staged, "still nothing flushed");
+        // A read past what is staged is a truncation, with the honest count.
+        let err = log.read_at(offset2, bytes.len() + 1).unwrap_err();
+        assert!(
+            matches!(err, PersistenceError::Truncated { need, have } if need == bytes.len() + 1 && have == bytes.len()),
+            "{err:?}"
+        );
+        drop(log);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A range that starts in the flushed file and ends in the staging buffer
+    /// is stitched from both, byte for byte.
+    #[test]
+    fn a_read_straddling_the_flush_boundary_is_stitched() {
+        let path = tmp_path("straddle_read");
+        let mut log = LogFile::create(&path).unwrap();
+        let r0 = rec(1, 0, &[0x11; 300]);
+        let r1 = rec(2, 0, &[0x22; 500]);
+        let off0 = log.stage(&r0);
+        log.flush().unwrap();
+        let off1 = log.stage(&r1);
+        assert_eq!(off1, off0 + r0.len() as u64);
+        assert!(log.pending_len() > 0);
+        // From the middle of r0 to the middle of r1.
+        let start = off0 + (r0.len() / 2) as u64;
+        let len = r0.len() / 2 + r1.len() / 2;
+        let back = log.read_at(start, len).unwrap();
+        let mut expected = r0[r0.len() / 2..].to_vec();
+        expected.extend_from_slice(&r1[..r1.len() / 2]);
+        assert_eq!(back, expected);
+        assert!(log.pending_len() > 0, "the straddling read flushed nothing");
+        drop(log);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

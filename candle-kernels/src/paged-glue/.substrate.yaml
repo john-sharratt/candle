@@ -1,0 +1,54 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-kernels/src/paged-glue/
+  distinctive_terms:
+  - LAUNCH_GLUE
+  - total_q
+  - row_pos
+  - true_pos
+  - glue_tiles
+  - g_total
+  - win_lo
+  - run_paged_glue_bf16
+  - run_paged_glue_fp16
+  - sub_head_stride
+  - k_arena
+  - write_slice
+  - v_arena
+  - q_start
+  - slot_idx
+  - kv_head_idx
+  - split_idx
+  - num_splits
+  - paged_glue
+  - cudaGetLastError
+  - get_slot_header
+  - kv_len
+  - ahead
+  - workload
+  - orow
+  - within
+  - bound
+  - window
+  content_hash: 5af184ab67f430db57a5673ba30c1629e66e7433b1afac004ef7c73d23256d73
+questions:
+  conceptual: []
+  locational: []
+  mechanistic: []
+  systemic: []

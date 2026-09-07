@@ -1,0 +1,58 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-kernels/src/mma/
+  summary: |-
+    <think>
+    </think>
+
+    The `candle-kernels/src/` folder contains two CUDA header files: an architectural traits file (`arch\_traits.cu`) and a set of MMA (Matrix Multiply-Accumulate) wrapper definitions in `mma/wrappers.h`. These likely provide low-level GPU kernel interfaces for matrix operations used by the Candle ML framework.
+  distinctive_terms:
+  - fused_attn
+  - mmas_per_palette
+  - MmaTraits
+  - ArchTraits
+  - tile_idx
+  - is_supported_arch
+  - b16
+  - col_base
+  - row_base
+  content_hash: 4a5711603204a611758900b4801bc6d1fa5abc449485e46e211cfdac553bcf7b
+questions:
+  conceptual: []
+  locational:
+  - Where is the configuration logic for `fused_attn defined within the codebase?
+  - In which header file is the calculation of `mmas_per_palette implemented?
+  - Which module contains the template definition for the `MmaTraits struct?
+  - Where does the system perform the runtime validation for `is_supported_arch?
+  - What source files define how `tile_idx determines thread mapping inside a block?
+  - Which section initializes parameters related to the `b16 data format?
+  - How is `col_base established relative to the memory layout of the input matrix?
+  - In what component are the architectural requirements checked via `ArchTraits resolved?
+  - Where is the correspondence between logical tiles and physical registers managed using `tile_idx?
+  mechanistic:
+  - How does `fused_attn optimize memory bandwidth by combining attention operations into a single kernel pass?
+  - When does the counter for `mmas_per_palette reset, and under what conditions does it increment?
+  - How do `MmaTraits adapt the execution path based on specific register limits and instruction availability?
+  - What sequence of checks prevents execution if `is_supported_arch evaluates to false for the current device?
+  - How is the value of `tile_idx computed to ensure uniform work distribution among active threads?
+  - Why might the system prefer `b16 precision over FP16 when performing the accumulation step?
+  - How do updates to `col_base influence the addressing mode for subsequent column accesses in a batch?
+  - What happens inside the trait selection mechanism when an architecture lacks the features defined in `ArchTraits?
+  - How does `mmas_per_palette interact with shared memory allocation to avoid bank conflicts or spills?
+  systemic: []

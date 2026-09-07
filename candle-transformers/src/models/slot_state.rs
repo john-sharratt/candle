@@ -560,33 +560,88 @@ impl TokenSliceHost {
 ///
 /// Contains the full slice array. The GPU representation is split:
 /// - Slice data lives in a contiguous slices tensor
-/// - A per-slot `position_map` packs cum_token → (slice_idx, in_blk) for
-///   every position in the slot's valid prefix range.  The kernel uses
-///   this in place of `chunk_div`/`chunk_mod` so partial-tail slices
-///   followed by additional slices read correctly.
-/// - A 24B header holds (n_slices, write_slice, slices_ptr,
-///   position_map_ptr) where the pointers are resolved device pointers
-///   into the slices / position_map tensors.
+/// - A 16B header holds (n_slices, write_slice, slices_ptr), where the
+///   pointer is a resolved device pointer into the slices tensor.
+///
+/// There is no position lookup table. A cum_token position resolves to
+/// `(slice_idx, in_blk)` by *computing* it from the slice array — see
+/// [`resolve_pos_reference`] and the kernel's `resolve_pos`. Everything such a
+/// table would encode is already implied by each slice's `rope`, `len` and
+/// `offset`, so materialising one only created a second copy of the layout that
+/// could disagree with the first: the map was built per forward on the host,
+/// uploaded over PCIe, and — because it was built for one layer and reused for
+/// the rest — went stale the moment a windowed prefill left a layer's chunk
+/// list one entry ahead of its neighbours. Computing the answer cannot go
+/// stale, because there is only ever one description of the layout.
 #[derive(Clone)]
 pub struct SlotStateHost {
     /// Which slice the kernel scatters into.
     pub write_slice: u32,
     /// All token slices for this sequence.
     pub slices: Vec<TokenSliceHost>,
-    /// Per-cum-token-position lookup: `(slice_idx << 16) | in_blk` for
-    /// every k_pos in `[0, total_tokens)`.  Built once per forward pass
-    /// from the slice list — replaces the kernel's `chunk_div`/`chunk_mod`
-    /// positional math.  `slice_idx` is u16, `in_blk` is u16 (only 0–31
-    /// used; CHUNK_SIZE is 32).
-    pub position_map: Vec<u32>,
 }
 
-/// Pack `(slice_idx, in_blk)` into a `position_map` entry.
-#[inline]
-pub fn pack_position_entry(slice_idx: u32, in_blk: u32) -> u32 {
-    debug_assert!(slice_idx <= 0xFFFF, "slice_idx {} exceeds u16", slice_idx);
-    debug_assert!(in_blk <= 0xFFFF, "in_blk {} exceeds u16", in_blk);
-    (slice_idx << 16) | (in_blk & 0xFFFF)
+/// Resolve a cum_token position to `(slice_idx, in_blk)` from slice state alone
+/// — the host mirror of the kernel's `resolve_pos`
+/// (`candle-kernels/src/paged-decode/slot_types.cuh`).
+///
+/// **This is the executable specification of that kernel function**, and the two
+/// must stay identical. It exists because the kernel's version cannot be unit
+/// tested directly, and the half of it that resolves *pending writes* is not
+/// derivable from a slice's `len` — a first attempt at the kernel searched only
+/// committed tokens and would have sent every write to slice 0.
+///
+/// Committed positions are found by binary search (`rope <= k < rope + len`);
+/// positions past the committed total continue from `write_slice`, filling the
+/// writer's chunk from `offset + len` to `chunk_size` and each later chunk from
+/// its own `offset`. `None` means the position is past everything the slot can
+/// address, which the kernel reports as `(0, 0)` — the case
+/// [`SlotStateHost::assert_write_region_capacity`] exists to make unreachable.
+pub fn resolve_pos_reference(
+    slices: &[TokenSliceHost],
+    write_slice: usize,
+    chunk_size: usize,
+    k_pos: usize,
+) -> Option<(usize, usize)> {
+    if slices.is_empty() {
+        return None;
+    }
+    let (mut lo, mut hi) = (0isize, slices.len() as isize - 1);
+    while lo <= hi {
+        let mid = ((lo + hi) / 2) as usize;
+        let s = &slices[mid];
+        let start = s.rope as usize;
+        let len = s.len as usize;
+        if k_pos < start {
+            hi = mid as isize - 1;
+        } else if k_pos >= start + len {
+            lo = mid as isize + 1;
+        } else {
+            return Some((mid, s.offset as usize + (k_pos - start)));
+        }
+    }
+    let last = slices.last()?;
+    let committed = last.rope as usize + last.len as usize;
+    let mut cur = write_slice;
+    if cur >= slices.len() {
+        return None;
+    }
+    let mut cur_in_blk = slices[cur].offset as usize + slices[cur].len as usize;
+    let mut j = k_pos.checked_sub(committed)?;
+    loop {
+        if cur_in_blk < chunk_size {
+            let cap = chunk_size - cur_in_blk;
+            if j < cap {
+                return Some((cur, cur_in_blk + j));
+            }
+            j -= cap;
+        }
+        cur += 1;
+        if cur >= slices.len() {
+            return None;
+        }
+        cur_in_blk = slices[cur].offset as usize;
+    }
 }
 
 impl SlotStateHost {
@@ -626,7 +681,6 @@ impl SlotStateHost {
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
         writer_start_idx: usize,
-        build_position_map: bool,
     ) -> Self {
         let mut cum_tokens: u32 = 0;
         let slices: Vec<TokenSliceHost> = chunks
@@ -637,18 +691,14 @@ impl SlotStateHost {
                 TokenSliceHost::from_sealed_chunk(c, rope_base, n_kv_head, head_dim, arena_info)
             })
             .collect();
-        Self::from_slices(slices, writer_start_idx, build_position_map)
+        Self::from_slices(slices, writer_start_idx)
     }
 
-    /// Assemble a slot from already-built slices: writer selection + the
-    /// per-cum-token position map. The slice list comes from either
+    /// Assemble a slot from already-built slices: the slice list plus writer
+    /// selection. The slice list comes from either
     /// [`TokenSliceHost::from_sealed_chunk`] (owned snapshots) or
     /// [`TokenSliceHost::from_live_chunk`] (the zero-clone visitor path).
-    pub fn from_slices(
-        slices: Vec<TokenSliceHost>,
-        writer_start_idx: usize,
-        build_position_map: bool,
-    ) -> Self {
+    pub fn from_slices(slices: Vec<TokenSliceHost>, writer_start_idx: usize) -> Self {
         // Under cum_token addressing the writer is the *first chunk
         // at or after the writer boundary that still has capacity*.
         // The boundary is set by the host: `inject_sealed_at_tail`
@@ -664,7 +714,7 @@ impl SlotStateHost {
             // The writer region has no chunks (freshly injected prefix whose
             // sealed partial tail is a gap). There is NO valid write target:
             // point write_slice at the end so an actual write attempt fails
-            // loudly in `extend_for_write_region` instead of silently landing
+            // loudly in `assert_write_region_capacity` instead of silently landing
             // in an Arc-shared sealed chunk. Writers (prefill with new
             // tokens) allocate writer chunks first via
             // `ensure_for_batch_entries`, which brings the boundary back
@@ -680,33 +730,6 @@ impl SlotStateHost {
                 }
             }
             wi as u32
-        };
-
-        // Build the per-cum-token-position lookup table.  For each slice
-        // in order, fill positions `[cum, cum + slice.len)` with
-        // `(slice_idx, slice.offset + i)`.  Empty slices contribute zero
-        // entries — they're invisible to the prefix read scan because no
-        // cum_token positions live in them yet.  The total length equals
-        // the slot's logical token count (= sum of slice.len).
-        // Layer-invariant: the position_map depends only on the chunk token
-        // layout (slice offsets/lengths), which is identical across every layer
-        // of a forward (a sequence's chunks are sealed at the same boundaries in
-        // all layers; only the K/V values + arena pointers differ). The prefill
-        // caller therefore builds it on the first layer and reuses it for the
-        // rest — layers after the first pass `build_position_map = false` to skip
-        // this entirely (the dominant per-layer host cost).
-        let position_map: Vec<u32> = if build_position_map {
-            let total_tokens: usize = slices.iter().map(|s| s.len as usize).sum();
-            let mut pm = Vec::with_capacity(total_tokens);
-            for (idx, slice) in slices.iter().enumerate() {
-                let slice_off = slice.offset as u32;
-                for i in 0..(slice.len as u32) {
-                    pm.push(pack_position_entry(idx as u32, slice_off + i));
-                }
-            }
-            pm
-        } else {
-            Vec::new()
         };
 
         // Per-slot trace of the kernel-visible slice layout.  Enable
@@ -741,68 +764,283 @@ impl SlotStateHost {
         Self {
             slices,
             write_slice,
-            position_map,
         }
     }
 
-    /// Append `seq_len` write-region entries to `position_map`, covering
-    /// positions `[total_tokens, total_tokens + seq_len)`.  Each new
-    /// position maps into the slot's write area starting at the
-    /// write_slice's current `(offset + len)` cursor and advancing
-    /// chunk-by-chunk through subsequent slices.
+    /// Assert the slot can address `seq_len` pending writes past its committed
+    /// tokens — i.e. that the caller allocated the write region.
     ///
-    /// Caller must have pre-allocated enough slices past `write_slice`
-    /// (via `ensure_for_offsets` / `push_empty_writer_chunk`) to cover
-    /// `seq_len` chunk overflows.  Asserts on out-of-range — the read
-    /// scan in the kernel relies on the map covering every position it
-    /// touches.
-    pub fn extend_for_write_region(&mut self, seq_len: usize, chunk_size: usize) {
+    /// The kernel resolves a pending write by walking from `write_slice`,
+    /// filling that chunk from `offset + len` to `chunk_size` and each later
+    /// chunk from its own `offset`. If it walks off the end of the slice array
+    /// it has nowhere to put the token and reports `(0, 0)` — which is a *valid
+    /// address*, so the write lands silently in slice 0 and corrupts the
+    /// sequence's first chunk. Nothing downstream can tell that apart from a
+    /// real position, so the condition has to be caught here, on the host,
+    /// where the allocation that should have happened is still nameable.
+    ///
+    /// Callers pre-allocate via `ensure_for_offsets` / `push_empty_writer_chunk`
+    /// (prefill goes through `ensure_for_batch_entries`). This walks the slice
+    /// array once rather than once per token: capacity is `chunk_size` minus the
+    /// writer's cursor, plus `chunk_size - offset` for every slice after it.
+    pub fn assert_write_region_capacity(&self, seq_len: usize, chunk_size: usize) {
         if seq_len == 0 {
             return;
         }
-        let mut cur_slice = self.write_slice as usize;
+        let writer = self.write_slice as usize;
         assert!(
-            cur_slice < self.slices.len(),
-            "extend_for_write_region: no writer chunk (write_slice={} of {} \
+            writer < self.slices.len(),
+            "assert_write_region_capacity: no writer chunk (write_slice={} of {} \
              slices, seq_len={seq_len}) — the write region was not allocated \
              before prefill (ensure_for_batch_entries)",
             self.write_slice,
             self.slices.len(),
         );
-        let mut cur_in_blk = {
-            let ws = &self.slices[cur_slice];
-            ws.offset as u32 + ws.len as u32
-        };
-        for _ in 0..seq_len {
-            // Advance through chunk boundaries (in_blk overflowed past
-            // CHUNK_SIZE) until we find a slice with capacity.  Each
-            // subsequent slice starts at its own `offset` field — for
-            // freshly-pushed empty chunks this is 0.
-            while cur_in_blk as usize >= chunk_size {
-                cur_slice += 1;
-                if cur_slice >= self.slices.len() {
-                    // Dump the full slot layout so the desync is diagnosable in
-                    // release (the bare index panic hides which chunk overflowed).
-                    let layout: String = self
-                        .slices
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| format!("[{i}] off={} len={}", s.offset, s.len))
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    panic!(
-                        "extend_for_write_region overflow: ran out of slices at \
-                         cur_slice={cur_slice} (n_slices={}, write_slice={}, seq_len={seq_len}, \
-                         chunk_size={chunk_size}). Slot layout: {layout}",
-                        self.slices.len(),
-                        self.write_slice,
-                    );
-                }
-                cur_in_blk = self.slices[cur_slice].offset as u32;
-            }
-            self.position_map
-                .push(pack_position_entry(cur_slice as u32, cur_in_blk));
-            cur_in_blk += 1;
+        let cursor = self.slices[writer].offset as usize + self.slices[writer].len as usize;
+        let capacity: usize = chunk_size.saturating_sub(cursor)
+            + self.slices[writer + 1..]
+                .iter()
+                .map(|s| chunk_size.saturating_sub(s.offset as usize))
+                .sum::<usize>();
+        if capacity < seq_len {
+            // Dump the full slot layout so the shortfall is diagnosable in
+            // release, where a bare index panic would hide which chunk ran out.
+            let layout: String = self
+                .slices
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("[{i}] off={} len={}", s.offset, s.len))
+                .collect::<Vec<_>>()
+                .join("  ");
+            panic!(
+                "write region too small: capacity={capacity} < seq_len={seq_len} \
+                 (n_slices={}, write_slice={}, chunk_size={chunk_size}). Slot layout: {layout}",
+                self.slices.len(),
+                self.write_slice,
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_pos_tests {
+    use super::{resolve_pos_reference, SlotStateHost, TokenSliceHost};
+
+    const CHUNK: usize = 32;
+
+    /// The position map the host used to build and upload every forward, kept
+    /// here as the **oracle** these tests check against.
+    ///
+    /// It states the layout the other way round from [`resolve_pos_reference`]:
+    /// walking the slices forward and emitting every position in order, rather
+    /// than searching for one position. Keeping it as test code is the point: it
+    /// is the
+    /// independent statement of what a position *should* resolve to, so
+    /// `resolve_pos_reference` (and through it the kernel) is checked against a
+    /// second implementation rather than against itself. Deleting it with the
+    /// production copy would have left the replacement unverifiable.
+    fn oracle_position_map(
+        slices: &[TokenSliceHost],
+        write_slice: usize,
+        write_len: usize,
+        chunk_size: usize,
+    ) -> Vec<u32> {
+        let pack = |slice_idx: usize, in_blk: usize| ((slice_idx as u32) << 16) | (in_blk as u32);
+        let mut pm = Vec::new();
+        // Committed: every slice contributes `len` consecutive positions.
+        for (idx, s) in slices.iter().enumerate() {
+            for i in 0..s.len as usize {
+                pm.push(pack(idx, s.offset as usize + i));
+            }
+        }
+        // Pending writes: continue from the writer, filling each chunk to
+        // `chunk_size` and resuming at the next slice's own offset.
+        if write_len > 0 {
+            let mut cur = write_slice;
+            let mut cur_in_blk = slices[cur].offset as usize + slices[cur].len as usize;
+            for _ in 0..write_len {
+                while cur_in_blk >= chunk_size {
+                    cur += 1;
+                    cur_in_blk = slices[cur].offset as usize;
+                }
+                pm.push(pack(cur, cur_in_blk));
+                cur_in_blk += 1;
+            }
+        }
+        pm
+    }
+
+    /// Slices with cumulative `rope` bases, from `(offset, len)` pairs.
+    fn slices(spec: &[(u16, u16)]) -> Vec<TokenSliceHost> {
+        let mut cum = 0u32;
+        spec.iter()
+            .map(|&(offset, len)| {
+                let s = TokenSliceHost {
+                    offset,
+                    len,
+                    rope: cum,
+                    heads: Vec::new(),
+                    meta: None,
+                };
+                cum += len as u32;
+                s
+            })
+            .collect()
+    }
+
+    /// **The equivalence the kernel depends on.** Builds the position map the
+    /// host used to upload, and asserts the computed resolution agrees at
+    /// *every* position. The map is the oracle precisely because it no longer
+    /// exists in production: this is what makes its removal a refactor rather
+    /// than a rewrite.
+    fn assert_agrees(spec: &[(u16, u16)], writer_start: usize, write_len: usize) {
+        // `from_slices` still derives `write_slice`, which the kernel reads from
+        // the slot header and `resolve_pos` starts its write-region walk from.
+        let st = SlotStateHost::from_slices(slices(spec), writer_start);
+        // The oracle indexes the write region unconditionally, so a spec that
+        // cannot hold `write_len` would panic there rather than prove anything.
+        st.assert_write_region_capacity(write_len, CHUNK);
+        let expected = oracle_position_map(&st.slices, st.write_slice as usize, write_len, CHUNK);
+        let committed: usize = st.slices.iter().map(|s| s.len as usize).sum();
+        assert_eq!(
+            expected.len(),
+            committed + write_len,
+            "the oracle should cover the committed tokens and the write region",
+        );
+        for (k, &entry) in expected.iter().enumerate() {
+            let want = ((entry >> 16) as usize, (entry & 0xFFFF) as usize);
+            let got = resolve_pos_reference(&st.slices, st.write_slice as usize, CHUNK, k);
+            assert_eq!(
+                got,
+                Some(want),
+                "position {k} of {} (committed {committed}) disagrees: spec={spec:?} \
+                 writer_start={writer_start} write_len={write_len}",
+                expected.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn committed_only_full_chunks() {
+        assert_agrees(&[(0, 32), (0, 32), (0, 32)], 3, 0);
+    }
+
+    /// A partial tail — the ordinary shape, since a turn rarely ends on a
+    /// chunk boundary.
+    #[test]
+    fn committed_with_a_partial_tail() {
+        assert_agrees(&[(0, 32), (0, 32), (0, 7)], 2, 0);
+    }
+
+    /// Injected substrate windows do not start at 0 — `offset` is where the
+    /// valid tokens begin inside the physical chunk.
+    #[test]
+    fn committed_windows_with_nonzero_offsets() {
+        assert_agrees(&[(5, 27), (0, 32), (11, 21)], 3, 0);
+    }
+
+    /// **The write region inside the writer's own chunk** — the common decode
+    /// step, extending a partial tail.
+    #[test]
+    fn writes_extend_the_writers_partial_chunk() {
+        assert_agrees(&[(0, 32), (0, 10)], 1, 8);
+    }
+
+    /// **The write region overflowing into following empty chunks** — the case
+    /// a search over `len` alone cannot resolve, because those chunks hold
+    /// nothing yet. This is the half of `resolve_pos` I first got wrong.
+    #[test]
+    fn writes_overflow_into_empty_chunks() {
+        assert_agrees(&[(0, 32), (0, 30), (0, 0), (0, 0)], 1, 40);
+    }
+
+    /// An empty writer chunk pushed ahead of any write — the trailing-empty
+    /// structure that layers legitimately disagree about.
+    #[test]
+    fn writes_start_at_a_freshly_pushed_empty_chunk() {
+        assert_agrees(&[(0, 32), (0, 32), (0, 0)], 2, 20);
+    }
+
+    /// A writer chunk that is exactly full: the walk must step past it before
+    /// emitting anything.
+    #[test]
+    fn a_full_writer_chunk_is_stepped_over() {
+        assert_agrees(&[(0, 32), (0, 0)], 0, 12);
+    }
+
+    /// Offsets on the overflow chunks too — each continues from its own
+    /// `offset`, not from zero.
+    #[test]
+    fn overflow_chunks_resume_at_their_own_offset() {
+        assert_agrees(&[(0, 20), (4, 0), (9, 0)], 0, 30);
+    }
+
+    /// A position past everything the slot can address resolves to nothing —
+    /// the kernel reports `(0, 0)` there rather than reading out of bounds.
+    #[test]
+    fn a_position_past_the_slot_resolves_to_nothing() {
+        let sl = slices(&[(0, 32), (0, 4)]);
+        assert_eq!(resolve_pos_reference(&sl, 1, CHUNK, 200), None);
+        assert_eq!(resolve_pos_reference(&[], 0, CHUNK, 0), None);
+    }
+
+    /// How many pending writes the slot can actually address, found by walking
+    /// exactly as the kernel does — the definition
+    /// `assert_write_region_capacity` has to agree with.
+    fn walked_capacity(st: &SlotStateHost) -> usize {
+        let mut cur = st.write_slice as usize;
+        if cur >= st.slices.len() {
+            return 0;
+        }
+        let mut in_blk = st.slices[cur].offset as usize + st.slices[cur].len as usize;
+        let mut n = 0;
+        loop {
+            while in_blk >= CHUNK {
+                cur += 1;
+                if cur >= st.slices.len() {
+                    return n;
+                }
+                in_blk = st.slices[cur].offset as usize;
+            }
+            n += 1;
+            in_blk += 1;
+        }
+    }
+
+    /// The closed-form capacity must equal the walk, for writers that are
+    /// partial, exactly full, offset, and followed by offset overflow chunks.
+    #[test]
+    fn capacity_matches_the_walk_it_replaced() {
+        for (spec, writer) in [
+            (&[(0u16, 32u16), (0, 0)][..], 1usize),
+            (&[(0, 32), (0, 0)][..], 0),
+            (&[(0, 20), (4, 0), (9, 0)][..], 0),
+            (&[(8, 10), (0, 0), (0, 0)][..], 0),
+            (&[(0, 32), (0, 32), (0, 0)][..], 2),
+            (&[(0, 4)][..], 0),
+        ] {
+            let st = SlotStateHost::from_slices(slices(spec), writer);
+            let want = walked_capacity(&st);
+            st.assert_write_region_capacity(want, CHUNK);
+            assert!(
+                std::panic::catch_unwind(|| st.assert_write_region_capacity(want + 1, CHUNK))
+                    .is_err(),
+                "capacity {want} should be the maximum accepted for {spec:?} writer={writer}",
+            );
+        }
+    }
+
+    /// A slot whose writer boundary sits past the end has no write target at
+    /// all: the kernel would resolve every pending write to `(0, 0)` and
+    /// scribble over slice 0, so the host refuses it first.
+    #[test]
+    fn a_slot_with_no_writer_chunk_refuses_any_write() {
+        let st = SlotStateHost::from_slices(slices(&[(0, 32)]), 1);
+        assert_eq!(st.write_slice as usize, st.slices.len());
+        st.assert_write_region_capacity(0, CHUNK); // no write: nothing to check
+        assert!(
+            std::panic::catch_unwind(|| st.assert_write_region_capacity(1, CHUNK)).is_err(),
+            "a slot with no writer chunk must refuse a write",
+        );
     }
 }

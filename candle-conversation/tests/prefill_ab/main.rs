@@ -884,7 +884,7 @@ fn ab_sealed_partial_tail_gap() -> Result<()> {
     // tail's free slots are a sealed gap, never writer capacity. The write
     // ensure must size the writer region from ZERO available: q=33 needs 2
     // fresh chunks, q=355 needs 12. Counting the gap under-allocates by one
-    // chunk and panics in extend_for_write_region (production zend restart,
+    // chunk and panics in assert_write_region_capacity (production zend restart,
     // 355-token first turn over a 65-token recovered prefix).
     sweep(
         "ab_sealed_partial_tail_gap_q33",

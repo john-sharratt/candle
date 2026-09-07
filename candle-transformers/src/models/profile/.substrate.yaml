@@ -1,0 +1,54 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-transformers/src/models/profile/
+  distinctive_terms:
+  - GpuSpan
+  - nvtx_name
+  - pipeline_record_duration
+  - gpu_pool
+  - GpuSpanInner
+  - snapshot_and_reset_all
+  - has_data
+  - HIGH_WATER
+  - with_local
+  - span_if
+  - gpu_drain_blocking
+  - ProfileMark
+  - ProfileSnapshot
+  - gpu_span_phase
+  - pipeline_snapshot_and_reset
+  - record_duration
+  - gpu_drain
+  - pending_len
+  - gpu_span_if
+  - profile_now
+  - ProfileEntry
+  - ProfileAccumulator
+  - pipeline_record
+  - Span
+  - RETIRED
+  - pool
+  - live
+  - end
+  content_hash: 186c4b2e25e4e71b511d7cd666254dced5b96d23a9d4e84cebc92fb2f42b2786
+questions:
+  conceptual: []
+  locational: []
+  mechanistic: []
+  systemic: []

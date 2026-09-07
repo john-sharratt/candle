@@ -453,15 +453,11 @@ impl GalleryArena {
     /// Enforced at admission in `ensure_locked`, where no lock is held that
     /// eviction needs.
     pub fn cap_bytes(&self) -> u64 {
-        static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *CAP.get_or_init(|| {
-            let mb = std::env::var("ZEN_GALLERY_CAP_MB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(512);
-            tracing::info!(cap_mb = mb, "gallery arena VRAM ceiling");
-            mb * 1024 * 1024
-        })
+        /// The ceiling itself. Sized so the scan's working set stays resident on
+        /// the smallest card in the fleet without the arena competing with the
+        /// KV side for ground it would only have to give back.
+        const CAP_BYTES: u64 = 512 * 1024 * 1024;
+        CAP_BYTES
     }
 
     /// Evict oldest turns until the arena is back under [`Self::cap_bytes`].

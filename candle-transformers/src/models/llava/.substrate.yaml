@@ -1,0 +1,54 @@
+# Folder metadata for the Zen Code substrate.
+#
+# The daemon reads this file before it generates anything. Questions listed here
+# are used as-is and are NOT regenerated — so hand-written questions win, and
+# they survive `--wipe-substrate`.
+#
+# The `questions` are what makes this folder findable. They are the queries a
+# developer would type whose ANSWER is this folder, written by someone who has
+# NOT yet found it: no paths, no file names, no "this folder".
+#
+#   locational   where something lives
+#   mechanistic  how something works
+#   conceptual   what a name means
+#   systemic     the same subject in plain English, no jargon at all
+#
+# Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
+# one of these files and starts over.
+folder:
+  path: candle-transformers/src/models/llava/
+  distinctive_terms:
+  - get_anyres_image_grid_shape
+  - to_clip_vision_config
+  - IdentityMap
+  - to_llava_config
+  - default_image_aspect_ratio
+  - map_select_feature
+  - to_llama_config
+  - HFLLaVAConfig
+  - HFLLaVATextConfig
+  - default_hf
+  - HFLLaVAVisionConfig
+  - mlp_gelu_match
+  - default_mm_patch_merge_type
+  - HFPreProcessorConfig
+  - ClipVisionTower
+  - default_num_key_value_heads
+  - HFGenerationConfig
+  - encode_images
+  - default_image_token_index
+  - default_max_length
+  - default_rope_theta
+  - prepare_inputs_labels_for_multimodal
+  - map_projector_type
+  - LLaVAConfig
+  - select_best_resolution
+  - num_patches_per_side
+  - unpad_image
+  - default_hidden_size
+  content_hash: da86e3554e31174650e048153a726ec5dc19fdbc7d246e86ce5fbf2f4ac40568
+questions:
+  conceptual: []
+  locational: []
+  mechanistic: []
+  systemic: []
