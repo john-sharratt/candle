@@ -285,8 +285,25 @@ impl QuantizedMlp {
         work_dtype: DType,
         out_dtype: DType,
     ) -> Result<LiveTensor<'w>> {
+        // **The operands, before the arithmetic.** A downstream NaN cannot say
+        // whether the GEMM misbehaved or was handed a bad weight, and those want
+        // opposite investigations — one is numerics, the other is the partition.
+        // `assert_once` because a weight does not change between forwards, so a
+        // per-call check would be the bandwidth perturbation the design avoids.
+        if let Some(w) = &self.gate_up_proj {
+            assert_weight_once(w, "mlp.w.gate_up");
+        }
+        if let Some(w) = &self.gate_proj {
+            assert_weight_once(w, "mlp.w.gate");
+        }
+        if let Some(w) = &self.up_proj {
+            assert_weight_once(w, "mlp.w.up");
+        }
+        assert_weight_once(&self.down_proj, "mlp.w.down");
+
         let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
             let mut gu = w.forward_dynamic(acts.as_dynamic(), work_dtype)?;
+            gu.assert("mlp.gate_up_raw");
             let (_, _, out_dim) = gu.dims3()?;
             let half = Self::fused_half(out_dim)?;
             // Coerce the fused output ONCE, in place, before splitting: `gu`
@@ -294,6 +311,7 @@ impl QuantizedMlp {
             // whereas casting the two aliasing narrows separately forces two
             // fallback allocations.
             gu.to_dtype_mut(work_dtype)?;
+            gu.assert("mlp.gate_up_cast");
             (gu.narrow(2, 0, half)?, gu.narrow(2, half, half)?)
         } else {
             let (gate_proj, up_proj) = self.separate()?;
@@ -302,6 +320,8 @@ impl QuantizedMlp {
                 up_proj.forward_dynamic(acts.as_dynamic(), work_dtype)?,
             )
         };
+        gate.assert("mlp.gate_split");
+        up.assert("mlp.up_split");
         // Run silu/mul in `work_dtype`: the Float path returns the activation
         // dtype (F16), but MLP intermediates can exceed F16's ~65504 range. The
         // fused path already coerced `gu` above and the int8 path already
@@ -309,7 +329,36 @@ impl QuantizedMlp {
         // separate-weight Float path.
         gate.to_dtype_mut(work_dtype)?;
         up.to_dtype_mut(work_dtype)?;
-        let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
-        self.down_proj.forward_live_as(&gated, out_dtype)
+        let activated = self.act_fn.forward_live(&gate)?;
+        activated.assert("mlp.act");
+        let gated = (&activated * &up)?;
+        gated.assert("mlp.gated");
+        let out = self.down_proj.forward_live_as(&gated, out_dtype)?;
+        out.assert("mlp.out");
+        Ok(out)
     }
 }
+
+/// Probe a projection's weight, once per epoch.
+///
+/// Separates "the arithmetic went bad" from "the operand was already bad" —
+/// a distinction a downstream NaN cannot make, and the one that decides whether
+/// to look at numerics or at the memory partition. `assert_once` rather than
+/// `assert` because a weight is fixed between forwards, so re-reading it every
+/// layer of every wave is exactly the bandwidth perturbation that makes a
+/// timing-sensitive fault stop reproducing.
+#[cfg(feature = "tensor-assert")]
+fn assert_weight_once(w: &QMatMul, name: &str) {
+    match w.inner() {
+        candle::quantized::QMatMul::QTensor(qt) => {
+            qt.assert_once(name);
+        }
+        candle::quantized::QMatMul::Tensor(t) | candle::quantized::QMatMul::TensorF16(t) => {
+            t.assert_once(name);
+        }
+    }
+}
+
+#[cfg(not(feature = "tensor-assert"))]
+#[inline(always)]
+fn assert_weight_once(_w: &QMatMul, _name: &str) {}
