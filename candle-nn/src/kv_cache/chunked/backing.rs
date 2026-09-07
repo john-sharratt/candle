@@ -825,6 +825,22 @@ impl ChunkedKvBacking {
 
         let mut moved = 0usize;
         for (_, idx) in order {
+            // **Both halves, or neither — checked BEFORE the move, not hoped
+            // for after it.** `rewrite_arena_records` can only reach chunks a
+            // live sequence holds. A chunk kept by a sealed turn or section is
+            // owned upstream in a `SealedSequence` and is invisible from here,
+            // so relocating an arena holding one leaves that chunk's `KvHead`
+            // naming ground the arena has left — still mapped, by then another
+            // tenant's, and silent. Measured as `attn.ctx_raw` reading over
+            // ±6.5e4 (F16's ceiling) with 3.0M `inf`, against a V whose largest
+            // magnitude anywhere was 9.05.
+            //
+            // So an arena is movable only when every allocated slot in it is
+            // reachable from the block tables. Refusing costs a defragmentation
+            // opportunity; taking it costs correctness.
+            if !self.arena_fully_reachable(idx)? {
+                continue;
+            }
             let Some(new_base) = self.inner.relocate_arena(idx, free_regions)? else {
                 continue;
             };
@@ -834,6 +850,42 @@ impl ChunkedKvBacking {
             moved += 1;
         }
         Ok(moved)
+    }
+
+    /// Whether every allocated slot of `arena_idx` is reachable from the block
+    /// tables, and so would be reached by [`Self::rewrite_arena_records`].
+    ///
+    /// The pool knows how many slots the arena has handed out; this walk finds
+    /// how many of them a live sequence still names. A shortfall is a chunk held
+    /// only by a sealed turn or section — real, resident, and unreachable from
+    /// the backing — and it is exactly the chunk a relocation would strand.
+    ///
+    /// Conservative on purpose: an arena whose count cannot be read at all
+    /// answers `false`, because "I do not know what is in here" and "nothing is
+    /// in here" must not take the same branch.
+    #[cfg(feature = "cuda")]
+    fn arena_fully_reachable(&self, arena_idx: usize) -> candle::Result<bool> {
+        let Some(allocated) = self.inner.pool.arena_live_count(arena_idx) else {
+            return Ok(false);
+        };
+        if allocated == 0 {
+            return Ok(true);
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let mut reached: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for seq in state.sequences.iter().flatten() {
+            for w in seq.chunks_slice() {
+                for g in w.gids.as_slice() {
+                    if g.raw() >= 0 && g.arena_idx() == arena_idx {
+                        reached.insert(g.raw());
+                    }
+                }
+            }
+        }
+        Ok(reached.len() >= allocated)
     }
 
     /// Rebuild the resident `KvHead` record of every chunk whose bands live in

@@ -1541,6 +1541,11 @@ impl Scheduler {
             if let Err(e) = self.model.compact_span() {
                 tracing::debug!("span compaction skipped: {e}");
             }
+            match self.session.compact_kv_arenas() {
+                Ok(0) => {}
+                Ok(moved) => tracing::debug!(moved, "arena compaction: KV arenas packed"),
+                Err(e) => tracing::debug!("arena compaction skipped: {e}"),
+            }
         }
 
         // **Continuations before first turns.** A turn on a sequence that
