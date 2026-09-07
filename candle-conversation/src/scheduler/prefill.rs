@@ -1524,6 +1524,23 @@ impl Scheduler {
             // work, and finishing it is what frees ground for what is queued.
             let hold = interleave::optimal_weight_bytes().unwrap_or(0);
             self.resume_parked(hold);
+
+            // **Pack the span at every admission, not only under pressure.**
+            // Recurrent stores relocate leftward here, so the live set is pulled
+            // to the bottom of the span and `live_end` follows it down — and the
+            // weight zone and the wave tier both grow into
+            // `weight_floor − live_end()`, so what this frees, they get.
+            //
+            // Waiting until the zone is starved means packing a span that is
+            // already full, which is when there is least free ground to move
+            // into and most live data to move. Packing continuously keeps the
+            // extent tight so the pressure does not arrive, and each pass is
+            // cheap because the previous one left little to do. It declines
+            // rather than fails when there is nothing to move, and refuses to
+            // buy ground to compact with.
+            if let Err(e) = self.model.compact_span() {
+                tracing::debug!("span compaction skipped: {e}");
+            }
         }
 
         // **Continuations before first turns.** A turn on a sequence that
