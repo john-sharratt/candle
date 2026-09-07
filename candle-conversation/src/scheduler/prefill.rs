@@ -1519,6 +1519,7 @@ impl Scheduler {
             // for `IDLE_SLOT_DEMOTE_PASSES`. It ran once per wave, which paced
             // demotion by a quantity that lengthens under load — stretching the
             // grace exactly when ground is scarcest.
+            self.demote_idle_slots();
             // Continuations before first turns: a parked turn is already-admitted
             // work, and finishing it is what frees ground for what is queued.
             let hold = interleave::optimal_weight_bytes().unwrap_or(0);
