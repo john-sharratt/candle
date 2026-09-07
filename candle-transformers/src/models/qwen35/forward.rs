@@ -797,6 +797,39 @@ impl WaveSweep for HybridBatched {
         // sequence standing at zero gets its recurrent state reset, not just
         // created (see `ensure_recurrent`).
         let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
+        // **The positional pairing above, checked.** `offsets` is taken from
+        // `contexts` by index and handed to `ensure_recurrent` alongside `seqs`,
+        // which comes from `groups.seq_ids` — two lists built by different code
+        // that are assumed to be in the same order. `SequenceContext` carries no
+        // sequence id, so nothing has ever verified that.
+        //
+        // It matters because the offset decides a RESET: a sequence standing at
+        // zero has its recurrent state reset rather than merely created. Pair a
+        // mid-conversation sequence with someone else's zero and its state is
+        // wiped mid-stream; pair a fresh one with someone else's non-zero offset
+        // and it keeps a stranger's state. Either diverges the one value that
+        // survives between waves, which is exactly what `dn.state_in.s` reports.
+        //
+        // The cache knows its own slot even though the context does not, so the
+        // claim is checkable after all.
+        for (i, c) in contexts.iter().enumerate() {
+            let Some(slot) = c
+                .kv_caches
+                .caches
+                .first()
+                .and_then(|kv| kv.k_cache().chunked_slot())
+            else {
+                continue;
+            };
+            if slot != seqs[i] {
+                candle::bail!(
+                    "recurrent offsets are paired positionally with seq_ids, and the two \
+                     disagree: contexts[{i}] holds slot {slot} while seq_ids[{i}] is {}. \
+                     The offset that decides a state reset would go to the wrong sequence.",
+                    seqs[i],
+                );
+            }
+        }
         self.ensure_recurrent(&seqs, &offsets)?;
         self.begin_recurrent_wave(&seqs)?;
         let mut stores = match self.take_recurrent(&seqs) {

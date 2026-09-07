@@ -1,4 +1,3 @@
-use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
 use super::prefill::VramPhase;
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
@@ -9,6 +8,13 @@ use std::time::{Duration, Instant};
 /// each wave-window flush. The `housekeeping` phase is one band on the
 /// dashboard; these decompose it so a regression can be pinned to the step that
 /// caused it rather than to the aggregate.
+/// How long a decode quantum yields when the fill admitted no decode at all.
+///
+/// Short enough that the first freed region is taken up within a wave's
+/// cadence, long enough that a starved engine does not spin the scheduler
+/// thread through relief passes that have nothing new to free.
+const STARVED_DECODE_PAUSE: Duration = Duration::from_millis(20);
+
 static HOUSE_PROMOTE_US: AtomicU64 = AtomicU64::new(0);
 static HOUSE_ADMIT_US: AtomicU64 = AtomicU64::new(0);
 static HOUSE_DEMOTE_US: AtomicU64 = AtomicU64::new(0);
@@ -18,12 +24,10 @@ static HOUSE_GPUDRAIN_US: AtomicU64 = AtomicU64::new(0);
 /// belongs to — that step dominates housekeeping, so it is decomposed further.
 pub(super) enum PromoteStep {
     Finalise,
-    Reprefill,
     Compression,
 }
 
 static PROMOTE_FINALISE_US: AtomicU64 = AtomicU64::new(0);
-static PROMOTE_REPREFILL_US: AtomicU64 = AtomicU64::new(0);
 static PROMOTE_COMPRESSION_US: AtomicU64 = AtomicU64::new(0);
 
 /// Record one completion-path span (microseconds).
@@ -31,38 +35,15 @@ pub(super) fn note_promote_split(step: PromoteStep, us: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     match step {
         PromoteStep::Finalise => PROMOTE_FINALISE_US.fetch_add(us, Relaxed),
-        PromoteStep::Reprefill => PROMOTE_REPREFILL_US.fetch_add(us, Relaxed),
         PromoteStep::Compression => PROMOTE_COMPRESSION_US.fetch_add(us, Relaxed),
     };
 }
 
-static REPREFILL_WRITE_US: AtomicU64 = AtomicU64::new(0);
-static REPREFILL_TRUNC_US: AtomicU64 = AtomicU64::new(0);
-
-/// Record one turn-reprefill seal's split: the substrate write vs the slot
-/// truncate that follows it.
-pub(super) fn note_reprefill_split(write_us: u64, trunc_us: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    REPREFILL_WRITE_US.fetch_add(write_us, Relaxed);
-    REPREFILL_TRUNC_US.fetch_add(trunc_us, Relaxed);
-}
-
-/// Drain the reprefill-seal split, in ms, as `(write, truncate)`.
-pub(super) fn take_reprefill_split() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (
-        REPREFILL_WRITE_US.swap(0, Relaxed) / 1000,
-        REPREFILL_TRUNC_US.swap(0, Relaxed) / 1000,
-    )
-}
-
-/// Drain the promote-path sub-timers, in ms, as
-/// `(finalise, reprefill, compression)`.
-pub(super) fn take_promote_split() -> (u64, u64, u64) {
+/// Drain the promote-path sub-timers, in ms, as `(finalise, compression)`.
+pub(super) fn take_promote_split() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         PROMOTE_FINALISE_US.swap(0, Relaxed) / 1000,
-        PROMOTE_REPREFILL_US.swap(0, Relaxed) / 1000,
         PROMOTE_COMPRESSION_US.swap(0, Relaxed) / 1000,
     )
 }
@@ -166,7 +147,32 @@ impl Scheduler {
             // decode forward, so a `Static` run costs one prefill rather than N
             // decode steps.  No-op when no sequence has an active stencil.
             self.inject_stencil_prefills();
-            self.batch_decode_step();
+            if !self.batch_decode_step() {
+                // Every eligible decode was refused by the allocators, so no
+                // forward ran and nothing in this quantum can change that.
+                //
+                // **Reap before yielding.** `cleanup_finished` runs nowhere
+                // else in the scheduler, and `decode_width` counts only
+                // unfinished entries — so a wave with live decodes the fill
+                // will not admit and finished ones waiting to be sealed reaches
+                // neither this loop's other reaping call nor the empty-width
+                // one above. Those finished sequences hold the slots and K/V
+                // that releasing is what ends the starvation, so skipping the
+                // reap here makes the pause self-perpetuating. Reprojections
+                // drain first for the same reason they do below: a glue-drain
+                // forward may have queued a swap that re-keys an
+                // `active_decodes` entry, and that must not race the finalize.
+                let t_reproj = Instant::now();
+                self.drain_pending_reprojections();
+                self.wave_stats
+                    .add_phase(WavePhase::Reproject, t_reproj.elapsed().as_millis() as u64);
+                self.cleanup_finished();
+                // Yield rather than spin: the outer loop's relief and
+                // promotion passes are what free ground, and the pause keeps a
+                // starved engine from burning a core while it waits for them.
+                std::thread::sleep(STARVED_DECODE_PAUSE);
+                return;
+            }
             // Drain any continuous-re-projection swaps queued during the
             // batch.  Must run BEFORE cleanup_finished so a swap that
             // re-keys an active_decodes entry doesn't race with finalize.
@@ -204,7 +210,7 @@ impl Scheduler {
     /// time-sliced decode quantum adapts to newly-queued conversations and keeps KV
     /// bounded across a long slice without waiting for the quantum to end. Mirrors
     /// the top-of-loop admission (`drain` → `promote` → `pump`) under the identical
-    /// `admit_budget`/VRAM cap, plus the per-wave ingest throttle + gentle demote.
+    /// wave fill, plus the per-wave gentle demote.
     ///
     /// Returns `false` if the drain observed shutdown/disconnect: the request is
     /// already consumed here (so the top-of-loop drain can't re-read it), so the
@@ -238,7 +244,6 @@ impl Scheduler {
         // once per quantum. Self-gated on an active ingest so a plain dialogue decode
         // pays nothing (the loop-top call still handles the ingest-finished reopen).
         if !self.ingest_timelines.is_empty() {
-            self.regulate_ingest_admission();
             self.demote_cold_ingest_if_pressured();
         }
         true
@@ -293,6 +298,12 @@ impl Scheduler {
     /// wait a whole decode slice when there's no decode work yet.
     pub fn run(&mut self) {
         tracing::info!("scheduler started");
+        // **The residency this machine can reach with nothing in flight** —
+        // measured here before a single conversation opens, and again every
+        // time the engine falls idle (see the idle branch below), because what
+        // is resident at those moments is permanent and everything else is the
+        // wave's to give back. See `interleave::reseed_achievable_weight`.
+        super::interleave::reseed_achievable_weight();
         // One-time snapshot of the governor's budget partition (capacity C, KV
         // floor, ladder thresholds, per-class reserved, live headroom) so a run's
         // starting VRAM state is visible in the log before any waves.
@@ -380,6 +391,9 @@ impl Scheduler {
                 && self.active_section_ingests.is_empty()
                 && self.deferred_glue_fires.is_empty()
             {
+                // Nothing is in flight, so everything resident is permanent:
+                // the one moment the achievable weight residency is exact.
+                super::interleave::reseed_achievable_weight();
                 // Time ONLY the recv block (not the request handling) — this is the
                 // scheduler idle between requests, attributed to the Idle phase so it
                 // isn't mislabeled as Blocked in the GUI.
@@ -484,27 +498,14 @@ impl Scheduler {
                 );
             }
 
-            // Per-wave ingest backpressure + gentle demote. These are cheap (an
-            // atomic backlog read + a bounded warm-backed LRU walk) and self-gate on
-            // `ingest_timelines` (a no-op when not ingesting), so they run EVERY wave
-            // — not on the 2 s telemetry cadence like the footprint defrag below.
-            // CFW's co-batched wave folds a wide prefill cohort into every forward,
-            // so KV grows far faster per wave than the serial passes it replaced; a
-            // 2 s-cadence throttle lets `used` overshoot massively between ticks (the
-            // leak-like climb) and lets ingest outrun the hot→warm drain into
-            // warm-starvation, where the demote finds nothing warm-backed to shed.
-            // Sizing the admission window to the drain backlog and shedding the
-            // warm-backed tail every wave bounds KV production to the drain rate, so
-            // `used` holds at the demote watermark instead of climbing.
-            {
-                let _g = profile::span("loop:ingest_admission");
-                let t = Instant::now();
-                self.regulate_ingest_admission();
-                HOUSE_ADMIT_US.fetch_add(
-                    t.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
+            // Per-wave gentle demote. Cheap (a bounded warm-backed LRU walk) and
+            // self-gates on `ingest_timelines` (a no-op when not ingesting), so it
+            // runs EVERY wave — not on the 2 s telemetry cadence like the footprint
+            // defrag below. CFW's co-batched wave folds a wide prefill cohort into
+            // every forward, so KV grows far faster per wave than the serial passes
+            // it replaced, and a 2 s cadence lets `used` overshoot massively between
+            // ticks (the leak-like climb). Shedding the warm-backed tail every wave
+            // holds `used` at the demote watermark instead.
             {
                 let _g = profile::span("loop:demote_cold_ingest");
                 let t = Instant::now();
@@ -513,52 +514,6 @@ impl Scheduler {
                     t.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-            }
-
-            // AIMD reopen (non-ingest): if a prior pressure episode cut the
-            // admission budget, probe it back open by one quantum per loop once
-            // VRAM is no longer under pressure — gradual recovery so we don't
-            // snap to full width and re-trip on the next wide wave. Gated on the
-            // budget being below the live ceiling so the steady state never pays
-            // the VRAM query twice. Ingest is excluded here: its budget is driven
-            // from the drain backlog at the wave cadence below
-            // (`regulate_ingest_admission`), and a per-loop reopen would fight
-            // that throttle.
-            //
-            // Under CHRONIC nominal pressure (a card whose steady-state
-            // availability sits just under the band — e.g. the expert-resident
-            // budget leaves KV a couple hundred MiB short of it), the
-            // pressure-clear path never fires and the budget wedges at the
-            // floor, serializing e.g. section calibration into single-sequence
-            // mini-forwards. The evidence path reopens it anyway: every check
-            // that finds NEW prefill tokens forwarded OOM-free counts one
-            // streak tick (idle loop iterations neither count nor reset — the
-            // loop spins far faster than forwards complete), and a full streak
-            // grows the budget one quantum. Any cut (real OOM, eviction
-            // survival) resets the streak — multiplicative decrease still wins.
-            if self.ingest_timelines.is_empty() && self.admit_budget < Self::max_admit_budget() {
-                if !self.vram_under_pressure() {
-                    self.admit_grow_streak = 0;
-                    self.raise_admit_budget(ThrottleReason::Throughput);
-                } else {
-                    // A tick requires a real VOLUME of new tokens, not just
-                    // any completion: three 25-token interactive turns are not
-                    // evidence that a wider budget survives this pressure.
-                    // Small forwards accumulate toward the floor rather than
-                    // being discarded (`admit_ok_tokens_seen` advances only
-                    // when a tick fires).
-                    let ok = PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
-                    if ok >= self.admit_ok_tokens_seen + EVIDENCE_MIN_PREFILL_TOKENS {
-                        self.admit_ok_tokens_seen = ok;
-                        self.admit_grow_streak += 1;
-                        let need =
-                            evidence_ticks_for(budget_notches(self.admit_budget, admit_quantum()));
-                        if self.admit_grow_streak >= need {
-                            self.admit_grow_streak = 0;
-                            self.raise_admit_budget(ThrottleReason::Throughput);
-                        }
-                    }
-                }
             }
 
             // Harvest the GPU spans this wave's forwards enqueued. Non-blocking:
@@ -730,9 +685,9 @@ impl Scheduler {
 
             // Livelock guard. If this wave had NO runnable forward work of any class,
             // yet the idle `recv` above did not block (some queue is non-empty), then
-            // work exists that this thread cannot clear by spinning. During ingest a
-            // hot→warm backlog cuts `admit_budget` to the floor (`regulate_ingest_admission`),
-            // so queued prefills/sections can't be admitted and every width reads 0.
+            // work exists that this thread cannot clear by spinning — every width
+            // reading 0 while a queue is non-empty, as when the KV side has no
+            // regions to give and the claims behind them keep being refused.
             // Busy-spinning here burns a core AND continuously re-takes the conversation
             // read lock, starving the persistence thread's install-warm WRITE lock — so
             // the backlog can never drain, the gate never reopens, and the spin never
@@ -845,7 +800,8 @@ impl Scheduler {
         if let Some(r) = candle_nn::kv_cache::region_stats(0) {
             tracing::debug!(
                 "kv-regions: live={} peak={} free={} of {} ({}MiB) | tier={}MiB \
-                 (ceiling {} regions) | weights={}MiB | in-wave-arenas={} in-wave-refusals={}",
+                 (ceiling {} regions) | weights={}MiB | in-wave-arenas={} in-wave-refusals={} \
+                 | stores={} ({}MiB)",
                 r.live,
                 r.peak_live,
                 r.free,
@@ -856,7 +812,43 @@ impl Scheduler {
                 mib(r.weight_bytes),
                 r.fresh_claims_during_wave,
                 r.refusals_during_wave,
+                // **Who the regions belong to.** The classes line above accounts
+                // for the KV arenas; everything else in the span is a
+                // `SpanRegion` tenant, and on a hybrid the recurrent stores are
+                // by far the largest. Reported beside the total because the
+                // difference is the only way to tell "KV grew" from "the state
+                // of every open sequence grew", and those want opposite fixes —
+                // reconstructing that split after the fact cost most of a day.
+                self.model.recurrent_memory_count(),
+                mib(self.model.recurrent_reserved_bytes()),
             );
+            // **The span, decomposed, with the remainder named.** Every tenant
+            // that can hold reservation ground reports here, so a total that
+            // does not add up leaves `unaccounted` non-zero rather than leaving
+            // the gap to be discovered as a wrong number somewhere else. This is
+            // already computed for the memory report and was simply never
+            // logged — a 3.3 GiB hole sat unexplained for want of one line.
+            //
+            // Absent until the first report is published, which is on a
+            // cadence — so this skips its own line and nothing else. Returning
+            // from the whole function here took the transient-peak and
+            // slot-state lines below with it for the entire startup window,
+            // which is exactly the window they describe.
+            if let Some((r, _)) = super::memory_report::latest() {
+                let a = r.accounting;
+                tracing::debug!(
+                    "span accounting: gallery={}MiB dense={}MiB recurrent={}MiB \
+                     transient={}MiB expert_zone={}MiB | outside_span={}MiB \
+                     unaccounted={}MiB",
+                    a.inside_gallery_bytes >> 20,
+                    a.inside_dense_bytes >> 20,
+                    a.inside_recurrent_bytes >> 20,
+                    a.inside_transient_bytes >> 20,
+                    a.expert_zone_bytes >> 20,
+                    a.outside_span_bytes >> 20,
+                    a.unaccounted_bytes / (1 << 20),
+                );
+            }
         }
         // Per-domain transient peaks, the terms the transient tier is sized
         // from: `S = 2*W_wave + W_persist + shelf`.

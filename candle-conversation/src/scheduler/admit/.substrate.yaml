@@ -16,19 +16,26 @@
 # Delete a list to have the daemon regenerate it. `--wipe-metadata` deletes every
 # one of these files and starts over.
 folder:
-  path: candle-transformers/src/generation/
+  path: candle-conversation/src/scheduler/admit/
   distinctive_terms:
-  - from_sampling
-  - sample_topk_topp
-  - sample_gumbel_softmax
-  - sample_topk
-  - sample_argmax
-  - sample_f
-  - sample_topp
-  - sample_multinomial
-  - LogitsProcessor
-  - sample
-  content_hash: 34bd101e9dc2b28d5339eafe089e20fa0090c76f3844e1dff112c583f26536aa
+  - may_start_decode
+  - may_admit
+  - kv_bytes_for_advance
+  - decodes_active
+  - per_block_kv_bytes
+  - Cost
+  - headroom
+  - order
+  - Filled
+  - Ground
+  - midpoint
+  - settled
+  - BANDS
+  - peek
+  - admit
+  - active
+  - gate
+  content_hash: 57c0085e1419201c6febf87873314c4397c40d66f32dfd8b2d1dcb894ad09889
 questions:
   conceptual: []
   locational: []

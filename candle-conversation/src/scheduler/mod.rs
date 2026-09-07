@@ -9,14 +9,16 @@
 //! KV-pool trim run at the wave tail.
 //!
 //! Submodules: `decode.rs` (decode quantum), `prefill.rs` (prefill/section
-//! ingest + VRAM budget-band admission), `run.rs` (top-level wave loop + wave
+//! ingest + the wave fill's ground), `interleave.rs` (the fill itself),
+//! `run.rs` (top-level wave loop + wave
 //! relief), `sample.rs` (batched sampler), `projection_assembler.rs`
 //! (rebuilds a slot's prefix K/V from the substrate every projection, per
 //! `docs/conversation_builder.md`), `phase_ring.rs` (telemetry ring for
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
-mod admission;
+mod admit;
 mod decode;
+mod interleave;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
@@ -1125,6 +1127,35 @@ struct DecodeState {
     event_tx: Sender<TurnEvent>,
     /// Tokens generated so far.
     generated_tokens: TokenBuffer,
+    /// Index in [`Self::generated_tokens`] that `<think>` took, recorded when it
+    /// was sampled. `None` until the block opens.
+    think_open_at: Option<usize>,
+    /// Length of the `<think>…</think>` block in tokens, inclusive of both
+    /// markers, fixed when `</think>` is sampled.
+    ///
+    /// **Measured by the decode, not recovered afterwards.** The seal used to
+    /// locate the block by `find("<think>")` in the display text and then
+    /// *re-tokenise* it to get this length — a round trip through text that is
+    /// not guaranteed to reproduce the token count it started from, over a
+    /// string that has already been stripped and rewritten for display. The
+    /// decode sampled those tokens and knows exactly which they were, so it
+    /// records the count directly and the layout's reasoning span is exact.
+    think_token_len: Option<u32>,
+    /// Generated tokens still inside this slot's lease.
+    ///
+    /// **A slot is admitted for a bounded amount of generation, not for however
+    /// long its answer runs.** `Scheduler::DECODE_LEASE_TOKENS` of arena was
+    /// reserved for it at admission, so this is the ground the engine actually
+    /// holds on its behalf; running past it would be spending ground the gate
+    /// never authorised. When it reaches zero the slot seals what it has, gives
+    /// the ground back, and goes to the back of the queue to be resumed — so the
+    /// engine's exposure to one conversation is its prompt plus this, whatever
+    /// the conversation turns out to cost.
+    lease_left: usize,
+    /// The lease ran out with the turn unfinished, so the slot is to be parked
+    /// and requeued rather than completed. Distinct from [`Self::finished`],
+    /// which means the turn is genuinely done (EOS or `max_tokens`).
+    lease_expired: bool,
     /// Maximum tokens to generate.
     max_tokens: usize,
     /// Sampling configuration for this turn.
@@ -1336,51 +1367,36 @@ struct PendingCompressionSeal {
     response_tx: Sender<Result<TurnIndex, ProbeError>>,
 }
 
-/// A finished dialogue turn whose reasoning-free tokens have been enqueued for
-/// re-prefill on the shared wave, awaiting its seal. Keyed by `pending_id` in
-/// [`Scheduler::pending_turn_seals`]. When the prefill completes,
-/// `complete_turn_reprefill` snapshots the clean K/V, seals the turn (via the
-/// normal `SealAction::Turn` write), and fires the deferred `Done` — the seal
-/// therefore lands one wave after decode, but the client's streamed tokens are
-/// unaffected and `Done` still carries the seal result.
-struct PendingTurnSeal {
-    /// Parent slot the clean turn is re-prefilled onto (the view was already
-    /// finalized in `cleanup_finished`, so this is the plain parent sequence).
-    parent_id: SequenceId,
-    /// First block of the turn's own region on `parent_id` — the clean re-prefill
-    /// appends here, and the seal captures `[seal_block_from, block_count)`.
-    seal_block_from: usize,
-    /// The turn's segment layout: the `<think>…</think>` block is an ETHEREAL
-    /// `Thinking` segment (its text is kept for display, its K/V dropped).
-    layout: TurnLayout,
-    /// Clean replay tokens (reasoning stripped) — pinned as the turn's `token_ids`
-    /// so they match the reasoning-free sealed K/V.
-    token_ids: Vec<u32>,
-    /// Gather-scope tags carried from the decode's `DecodeState`, re-stamped onto
-    /// the sealed turn. (Wide-Q provenance sigs are NOT carried — the seal
-    /// re-gathers them from the reasoning-free re-prefilled grid via
-    /// `gather_wide_sigs`, so they match the sealed K/V.)
-    tags: Vec<String>,
-    /// The caller's event channel — the deferred `Done` fires here once sealed.
-    event_tx: Sender<TurnEvent>,
-    /// `Done` payload, captured at decode-end: the FULL decoded reply (reasoning
-    /// included, exactly as streamed) and the decode stats. Only the SEALED K/V
-    /// is reasoning-free; the client's view is unchanged.
-    done_text: String,
-    done_token_ids: TokenBuffer,
-    stats: TurnStats,
-    /// The re-prefill `PrefillWork`'s private event sink. The prefill machinery
-    /// sends progress/errors on the paired `Sender`; keeping the receiver alive
-    /// here stops those sends from failing before the wave completes. Dropped
-    /// when the pending seal is drained.
-    _sink_rx: Receiver<TurnEvent>,
+/// A turn whose decode lease ran out before its answer did: its K/V moved to the
+/// warm tier, its slot's ground handed back, waiting its turn to resume.
+struct ParkedTurn {
+    /// The slot it will resume on — **the same one it parked from.**
+    ///
+    /// The slot is truncated, not freed. Freeing recycles the id immediately and
+    /// the engine hands it to another conversation while this one still believes
+    /// it owns it, which is precisely how a shedding attempt produced 31
+    /// `sequence appears in more than one group` failures. Keeping the id also
+    /// means every per-slot map — `slot_targets`, `sampling_states`,
+    /// `turn_views`, `slot_tokens` — stays correctly keyed and nothing has to be
+    /// re-keyed on the way back.
+    slot: SequenceId,
+    /// Per-layer K/V on the warm tier. The migration compresses it, so a parked
+    /// turn holds less than it did resident.
+    ///
+    /// **Its K/V leaves the card; its recurrent state does not.** A model
+    /// carrying per-sequence recurrent memory keeps that on the device, because
+    /// the store *is* the turn's memory and releasing it at the lease boundary
+    /// would destroy what the resume needs. What ends its residency is the turn
+    /// seal, which drops it once the substrate snapshot is durable. So the
+    /// ground a park returns is the K/V, not quite all of it.
+    warm: Vec<SealedSequence>,
+    /// Generation state, resumed with a fresh lease.
+    state: DecodeState,
+    /// Consecutive failed resume attempts. A turn that cannot be restored is
+    /// retried at the head of the queue, but not forever — see
+    /// [`Scheduler::PARK_RESUME_ATTEMPTS`].
+    resume_failures: usize,
 }
-
-/// Minimum NEW prefill tokens per evidence tick. A tick certifies "the current
-/// admission budget survives this pressure", which a handful of tiny interactive
-/// turns cannot — one chunk-sized batch per tick is the floor. Small forwards
-/// accumulate toward it rather than being discarded.
-const EVIDENCE_MIN_PREFILL_TOKENS: u64 = 256;
 
 /// What the scheduler does after a [`SubmitTurn`] decode completes,
 /// just before sending `Done`.
@@ -1446,16 +1462,6 @@ pub(crate) enum SealAction {
     /// is written, so out-of-order seals would record the group's turns in a
     /// sequence that does not match their K/V.
     TurnGroup(Arc<Vec<CarvedTurn>>),
-    /// The clean re-prefill of a finished dialogue turn, keyed by `pending_id`
-    /// in [`Scheduler::pending_turn_seals`]. The decode's K/V carried the
-    /// `<think>…</think>` reasoning; this unit re-prefills the turn with the
-    /// reasoning stripped so the SEALED K/V never lets a future projection attend
-    /// its own thoughts. Rides the shared prefill wave (batched with the live
-    /// turn + summaries); once it finishes,
-    /// `promote_finished_prefills_to_decodes` snapshots the clean K/V, seals the
-    /// turn (reasoning kept as ethereal text), and fires the deferred `Done`.
-    /// `max_decode_tokens` is 0 — prefill + seal, no decode.
-    TurnReprefill { pending_id: u64 },
 }
 
 /// Content the substrate pins on a `SealAction::Turn` write — the
@@ -1562,6 +1568,17 @@ pub(super) struct PrefillWork {
     /// Tool-call stencils carried through prefill and installed on the
     /// [`DecodeState`] at decode start.  Empty registry = no constrained decode.
     pub(super) triggers: Arc<TriggerRegistry>,
+    /// Whether this turn's opening [`TurnEvent::Prefill`] +
+    /// [`TurnEvent::PrefillProgress`] pair has already been sent.
+    ///
+    /// Admission is not once per turn. A wave whose transient tier is refused
+    /// placement puts its **unstarted** prefills back at the front of the queue
+    /// ([`Scheduler::note_tier_refusal`]) — nothing ran, so there is nothing to
+    /// unwind but the admission — and they are admitted again on a later fill.
+    /// Announcing on each of those re-admissions echoed the whole prompt to the
+    /// client a second time and rewound its progress bar to zero, which reads
+    /// as the turn restarting when in fact it had never begun.
+    pub(super) announced: bool,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -1667,9 +1684,12 @@ pub(super) struct ActiveSectionIngest {
 /// backing collection can't invalidate it mid-creep.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WaveMember {
-    /// Dialogue-turn prefill — resolved in `active_prefills`; its full token set
-    /// flows through the layers and it is promoted to decode at the head.
-    Prefill { seq_id: usize },
+    /// Dialogue-turn prefill — resolved in `active_prefills`; covers
+    /// `[offset, offset + advance)` of its token set, the chunk the wave's
+    /// transient tier has room for beside the decodes. The offset is stable
+    /// until the head, where the chunk is committed; the turn is promoted to
+    /// decode at the head of the chunk that reaches the end of its tokens.
+    Prefill { seq_id: usize, advance: usize },
     /// Section-ingest chunk — resolved in `active_section_ingests`; covers
     /// `[offset, offset + advance)` (offset is stable until the head, where the
     /// chunk is advanced + sealed). Rides the cohort's creep so its expert loads
@@ -2330,8 +2350,7 @@ impl WaveStats {
         // saturated to 0 — destroying exactly the attribution the split exists
         // for.
         let (promote, admit, demote, gpu) = run::take_housekeeping_split();
-        let (finalise, reprefill, compression) = run::take_promote_split();
-        let (rp_write, rp_trunc) = run::take_reprefill_split();
+        let (finalise, compression) = run::take_promote_split();
         if housekeeping_dur > 0 {
             push(&mut phases, PhaseKind::Housekeeping, housekeeping_dur, 0, 0);
             // Decompose the band for the log: the dashboard draws one
@@ -2343,7 +2362,7 @@ impl WaveStats {
                 // but the sub-timers below are raw measurements taken before it.
                 // `raw_total_ms` is what they actually decompose — subtracting
                 // them from the carved total made `other_ms` saturate to 0
-                // whenever the reprefill seal was material.
+                // whenever a seal was material.
                 total_ms = housekeeping_dur,
                 raw_total_ms = self.housekeeping_us / 1000,
                 promote_ms = promote,
@@ -2354,11 +2373,7 @@ impl WaveStats {
                     .saturating_sub(promote + admit + demote + gpu),
                 // Promote dominates the band, so it carries its own split.
                 promote_finalise_ms = finalise,
-                promote_reprefill_ms = reprefill,
                 promote_compression_ms = compression,
-                // …and the reprefill seal carries its own, since it is ~99% of promote.
-                reprefill_write_ms = rp_write,
-                reprefill_truncate_ms = rp_trunc,
                 "housekeeping split"
             );
         }
@@ -2613,6 +2628,78 @@ pub(crate) struct Scheduler {
 
     /// Periodic forward-pass batch-size telemetry (diagnostic; one line / 2 s).
     wave_stats: WaveStats,
+    /// The decodes the fill admitted for the coming wave — the sequences whose
+    /// KV chunk and recurrent state were claimed — or `None` when it did not
+    /// gate them.
+    ///
+    /// `None` is not "empty" — it means there was no weight point to stop at (a
+    /// model with nothing to keep resident, or no reservation to read), and the
+    /// wave runs every eligible decode exactly as it did before. Only a machine
+    /// that can actually run out of ground is ever narrowed.
+    wave_decode_set: Option<Vec<SequenceId>>,
+    /// Eligible decodes the allocators refused in the last fill. Published in
+    /// the memory report as the engine's "full" signal, so a producer stops
+    /// opening conversations while any resident one cannot be stepped.
+    wave_decode_starved: usize,
+    /// The last decode admitted, so the next fill offers the sequences past it
+    /// first — a fixed order plus a cut would starve a fixed tail.
+    last_decode_admitted: Option<usize>,
+    /// The last fill yielded its decodes so the prefill head could travel
+    /// alone: the wave runs no decode rows and advances the prefill cohort by
+    /// itself, and the decodes are offered again next fill. See
+    /// `interleave::Ground::yield_decodes`.
+    wave_decode_yielded: bool,
+    /// The head of the prefill queue did not fit the tier beside the resident
+    /// decodes last fill. While set, no decode that would take a new recurrent
+    /// store is admitted, so the resident ones finish and make the room the
+    /// head needs; prefills behind the head that do fit keep flowing. See the
+    /// two arms of `WaveFill::admit`.
+    prefill_head_blocked: bool,
+    /// Regions the fill holds back from a wave's tier budget, for the movers
+    /// between the fill and the placement: an arena the compressor creates in
+    /// that window, and the rounding the placement applies. Starts at four and
+    /// doubles on every tier refusal (`note_tier_refusal`), so a partition that
+    /// refuses a wave priced to its measured gap is met with a wider margin
+    /// rather than the same wave again.
+    tier_margin_regions: usize,
+    /// Expert-cache hits and misses as of the last fill, so the fill can read
+    /// the hit rate of the waves since — the residency signal the wave width
+    /// follows (`Scheduler::observe_expert_hit_rate`).
+    expert_hits_seen: usize,
+    expert_misses_seen: usize,
+    /// Exponential average of the per-fill expert hit rate; `None` until the
+    /// first fill that saw any routing.
+    expert_hit_rate: Option<f64>,
+    /// The wave width — sequences a wave carries, decodes and prefills
+    /// together — as it stands. Starts at the model's ceiling
+    /// (`decode_width_target`) and follows the expert hit rate: one narrower
+    /// per fill while the rate stands under the knee, one wider while it
+    /// stands clear above it, never past the ceiling and never under two.
+    wave_width: usize,
+    /// When the memory report was last published, so the next one can carry
+    /// the cadence (`AdmissionSection::publish_interval_ms`).
+    last_report_publish: Option<Instant>,
+    /// When `wave_width` last moved — it moves at most once per wave.
+    last_width_adjust: Option<Instant>,
+    /// Consecutive admission passes each live slot has gone untouched, for
+    /// [`Scheduler::demote_idle_slots`]. Reset the moment the slot is touched.
+    ///
+    /// Counted in admission passes rather than waves or seconds: a pass happens
+    /// when something completed, so a slot ages toward demotion quickly under
+    /// churn and slowly in a quiet engine, and the shed lands in the same pass
+    /// that measures and spends the ground it frees. See
+    /// [`Scheduler::IDLE_SLOT_DEMOTE_PASSES`] for why the wave count it replaced
+    /// had its units inverted.
+    slot_idle_passes: HashMap<SequenceId, u32>,
+    /// Admission passes run, the clock `slot_idle_passes` and `slot_demoted_at`
+    /// are measured against. Wraps; only differences are ever read.
+    admission_passes: u32,
+    /// When each demoted slot was demoted — `(pass, instant)`. Purely an
+    /// instrument: paired with the slot going busy again it yields how long a
+    /// demotion lasted, which is the measurement that settles whether
+    /// [`Scheduler::IDLE_SLOT_DEMOTE_PASSES`] should be one or zero. Entries are
+    /// removed on wake, and bounded by the live slot count either way.
+    slot_demoted_at: HashMap<SequenceId, (u32, std::time::Instant)>,
 
     /// In-flight compression nodes, keyed by job id. A `SubmitSummaryProbe`
     /// registers one entry holding both half-passes; each pass's decode rides
@@ -2628,75 +2715,46 @@ pub(crate) struct Scheduler {
     /// Monotonic id source for `compression_jobs`.
     next_compression_job_id: u64,
 
-    /// Finished dialogue turns whose reasoning-free tokens are re-prefilling on
-    /// the shared wave, keyed by `pending_id`. Drained when the prefill completes
-    /// — see [`PendingTurnSeal`] and `complete_turn_reprefill`.
-    pending_turn_seals: HashMap<u64, PendingTurnSeal>,
-
-    /// Monotonic id source for `pending_turn_seals`.
-    next_turn_seal_id: u64,
-
-    /// AIMD congestion budget over prefill admission, in **bytes** of VRAM the
-    /// inference working set may occupy — the single throttle every pressure
-    /// signal moves and [`Self::promote_new_prefills`] reads. See the
-    /// [`admission`] module header for why the regulated quantity is bytes and
-    /// not sequence count.
+    /// Turns whose lease ran out, oldest first — the back of this queue is where
+    /// a parked turn goes, so the others get the engine before it comes round
+    /// again.
     ///
-    /// A wide ragged prefill forward's transient VRAM peak (MoE expert gather +
-    /// per-sequence activations) isn't visible at admission time, so a fixed cap
-    /// that's fine on an idle card OOMs a busy one. The budget closes
-    /// multiplicatively — halving toward one quantum — whenever VRAM pressure
-    /// survives an eviction pass, a forward reports device-OOM, host RAM falls
-    /// below the ingest floor, or the hot→warm drain falls behind; it reopens
-    /// additively, one quantum at a time, on proven out-of-memory-free
-    /// throughput. Clamped at every read to what the card can actually deliver
-    /// ([`admission::available_bytes`]), so the setpoint can be optimistic
-    /// without the card ever being oversubscribed.
-    admit_budget: u64,
+    /// **Bounded**, because parking moves a turn's K/V from the card to the
+    /// host: an unbounded queue converts VRAM pressure into host pressure, and
+    /// this engine's characteristic hang is the daemon sitting on tens of
+    /// gigabytes of host RAM with VRAM reading healthy. Past
+    /// [`Scheduler::PARKED_TURNS_MAX`] the engine stops parking and lets the
+    /// turns already open finish instead — see `park_expired_leases`.
+    parked: VecDeque<ParkedTurn>,
+
+    /// Slots that have finished and been reaped, monotonically.
+    ///
+    /// **The fast path's whole basis.** A slot is held from admission to
+    /// completion, so nothing new can fit that did not fit before until one
+    /// finishes: a wave where this has not moved needs no eviction pass, no
+    /// pricing and no admission offer, and simply runs the set it holds. That
+    /// turns admission from O(waves) into O(completions).
+    completions: u64,
+    /// [`Self::completions`] as of the last admission pass.
+    admit_completions: u64,
+    /// Whether a forward has actually run since the last admission pass.
+    ///
+    /// **The fast path's escape hatch, and it is not optional.** Skipping
+    /// admission until something completes assumes the admitted set is making
+    /// progress towards completing. When it is not — every eligible sequence
+    /// refused, a wave composing nothing — no slot ever finishes, so the skip
+    /// condition never clears and the engine sits with work queued and nothing
+    /// running. Measured on run BS: `skipped=true active=32 queued=24` for 98
+    /// consecutive waves with no forward at all.
+    wave_ran_forward: bool,
 
     /// Cached OS memory probe for host-tier ingest backpressure, as
-    /// `(checked_at, available_bytes, total_bytes)`. The warm (RAM) KV tier can
-    /// fill host memory faster than warm→cold demotion drains it; when free RAM
-    /// runs low, `regulate_ingest_admission` throttles ingest so the hot→warm
-    /// migration always finds a staging buffer it can allocate (the host-OOM that
-    /// aborted a full overnight load). `sysinfo` is a syscall, so this is
-    /// refreshed at most once per `HOST_RAM_PROBE_INTERVAL`, never per wave.
+    /// `(checked_at, available_bytes, total_bytes)`. Read by
+    /// [`Self::warm_over_budget`], which the persistence trigger consults to
+    /// decide whether the warm (RAM) KV tier has outgrown its host budget.
+    /// `sysinfo` is a syscall, so this is refreshed at most once per
+    /// `HOST_RAM_PROBE_INTERVAL`, never per wave.
     host_ram_probe: Option<(std::time::Instant, u64, u64)>,
-
-    /// Consecutive progress observations (new prefill tokens forwarded
-    /// OOM-free) while growth was blocked ONLY by the VRAM-pressure bit — the
-    /// evidence streak that reopens a wedged budget. Consumed by BOTH reopen
-    /// paths (the ingest regulator via [`admission::evidence_admit_grow`], and
-    /// the non-ingest run-loop reopen); the phases are mutually exclusive, so
-    /// one streak serves both. Reset by any budget cut.
-    admit_grow_streak: usize,
-
-    /// [`PREFILL_OK_TOKENS`] as of the last evidence check.
-    admit_ok_tokens_seen: u64,
-
-    /// When a standing-condition signal last cut the admission budget — see
-    /// [`Self::cut_admit_budget_leveled`]. `None` until the first level cut.
-    last_level_cut: Option<std::time::Instant>,
-
-    /// When the admission pass last traced a starved outcome (queued work the
-    /// budget would not take). Rate-limits that trace to one line per
-    /// `ADMIT_STARVED_LOG_INTERVAL` — the condition persists across every loop
-    /// iteration until the budget or the queue moves, so it would otherwise flood
-    /// the log at the loop rate. `None` until the first starved pass.
-    last_admit_starved_log: Option<std::time::Instant>,
-
-    /// [`PREFILL_OK_TOKENS`] as of the last promote-side pressure episode —
-    /// the "forwards are still completing" evidence that distinguishes chronic
-    /// nominal pressure (hold the width) from a genuine stall (halve it). See
-    /// `promote_new_prefills`.
-    promote_ok_tokens_seen: u64,
-
-    /// When prefill throughput last advanced, as observed by the promote path.
-    /// A shrink fires only after [`PROMOTE_STALL_GRACE`] of complete silence —
-    /// promote runs many times per second while forwards take seconds, so a
-    /// per-pass "no progress" reading is meaningless. `None` until the first
-    /// completed forward (never throttle a pipeline that hasn't started).
-    promote_last_progress: Option<std::time::Instant>,
 
     /// Timelines being ingested append-only (`disable_reprojection` submits, e.g.
     /// `code_reading` / `repo_map`). Their sealed turns are never re-attended
@@ -2844,6 +2902,7 @@ impl Scheduler {
         );
 
         let chunk_size = CHUNK_SIZE;
+        let wave_width = model.decode_width_target();
         Self {
             rx,
             model,
@@ -2855,6 +2914,7 @@ impl Scheduler {
             active_decodes: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
+            parked: VecDeque::new(),
             active_prefills: Vec::new(),
             active_section_ingests: Vec::new(),
             sampler,
@@ -2882,19 +2942,28 @@ impl Scheduler {
             boundary_markers,
             prov_fold,
             wave_stats: WaveStats::new(),
+            wave_decode_set: None,
+            wave_decode_starved: 0,
+            last_decode_admitted: None,
+            wave_decode_yielded: false,
+            prefill_head_blocked: false,
+            tier_margin_regions: 4,
+            expert_hits_seen: 0,
+            expert_misses_seen: 0,
+            expert_hit_rate: None,
+            wave_width,
+            last_report_publish: None,
+            last_width_adjust: None,
+            slot_idle_passes: HashMap::new(),
+            admission_passes: 0,
+            slot_demoted_at: HashMap::new(),
             compression_jobs: HashMap::new(),
             pending_compression_seals: HashMap::new(),
             next_compression_job_id: 0,
-            pending_turn_seals: HashMap::new(),
-            next_turn_seal_id: 0,
-            admit_budget: Self::MAX_PREFILL_WIDTH as u64 * admission::admit_quantum(),
+            completions: 0,
+            admit_completions: 0,
+            wave_ran_forward: false,
             host_ram_probe: None,
-            admit_grow_streak: 0,
-            admit_ok_tokens_seen: 0,
-            last_level_cut: None,
-            last_admit_starved_log: None,
-            promote_ok_tokens_seen: 0,
-            promote_last_progress: None,
             ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
@@ -3522,6 +3591,7 @@ impl Scheduler {
                 // Step 6: queue prefill on the view sequence, carrying the
                 // reprojection policy through to DecodeState.
                 self.prefill_queue.push_back(PrefillWork {
+                    announced: false,
                     sequence_id: view_id,
                     tokens: prefill_tokens,
                     prefill_text,
@@ -3573,6 +3643,8 @@ impl Scheduler {
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
                 self.slot_projection_state.remove(&sequence_id);
+                self.slot_idle_passes.remove(&sequence_id);
+                self.slot_demoted_at.remove(&sequence_id);
                 // Purge any DEFERRED glue plan for this slot. A queued gap-fill
                 // must never outlive the slot layout it was planned against: the
                 // freed id is recycled immediately (the code_read scope workers
@@ -4625,6 +4697,10 @@ impl Scheduler {
             DecodeState {
                 event_tx,
                 generated_tokens: TokenBuffer::from(vec![first]),
+                think_open_at: None,
+                think_token_len: None,
+                lease_left: Self::DECODE_LEASE_TOKENS,
+                lease_expired: false,
                 max_tokens,
                 sampling_config: config,
                 seal_action: SealAction::CompressionPass { job_id },
@@ -4759,27 +4835,6 @@ impl Scheduler {
             return tokens.to_vec();
         }
         let stripped = crate::think_strip::strip_think_blocks(&text);
-        self.tokenizer
-            .encode(stripped.as_str(), false)
-            .map(|e| e.get_ids().to_vec())
-            .unwrap_or_else(|_| tokens.to_vec())
-    }
-
-    /// As [`Self::strip_think_from_tokens`], but PRESERVES the surviving answer's
-    /// formatting (newlines, indentation, code blocks) — only the
-    /// `<think>…</think>` block and the whitespace immediately around it are
-    /// removed. Used for a dialogue turn's clean re-prefill, where collapsing the
-    /// answer's whitespace (as the summary path does) would mangle its layout in
-    /// the re-injected K/V.
-    fn strip_think_from_tokens_keep_layout(&self, tokens: &[u32]) -> Vec<u32> {
-        let Ok(text) = self.tokenizer.decode(tokens, true) else {
-            return tokens.to_vec();
-        };
-        let lower = text.to_ascii_lowercase();
-        if !lower.contains("<think>") && !lower.contains("</think>") {
-            return tokens.to_vec();
-        }
-        let stripped = crate::think_strip::strip_think_blocks_keep_layout(&text);
         self.tokenizer
             .encode(stripped.as_str(), false)
             .map(|e| e.get_ids().to_vec())
@@ -4927,6 +4982,7 @@ impl Scheduler {
             },
         );
         self.prefill_queue.push_back(PrefillWork {
+            announced: false,
             sequence_id: slot,
             tokens: TokenBuffer::from(token_ids),
             prefill_text: String::new(),
@@ -4977,6 +5033,10 @@ impl Scheduler {
         assistant_text: String,
         no_think: bool,
         ethereal_thinking: bool,
+        // Exact `<think>…</think>` token count from the decode that produced this
+        // turn, or `None` when its assistant half was supplied rather than
+        // generated.
+        think_len: Option<u32>,
     ) -> TurnLayout {
         // A `/no_think` decode (dialogue turns under ThinkMode::Off, and every
         // code_read scope summary) collapses its reasoning to a bare
@@ -5027,20 +5087,34 @@ impl Scheduler {
             return layout.with_assistant_split(subs);
         }
         // Split the `<think>…</think>` reasoning out of the assistant body. Its
-        // token length is measured by re-tokenising the block; `ethereal_thinking`
-        // decides whether that length is a real K/V span or dropped.
+        // `ethereal_thinking` decides whether that length is a real K/V span or
+        // dropped.
+        //
+        // **The length comes from the decode when the decode produced it.**
+        // `DecodeState::think_token_len` is counted as the markers are sampled,
+        // so it is the exact number of tokens the block occupies in the grid.
+        // The fallback below is for an assistant half that was *supplied* rather
+        // than generated (a prefill turn whose content the caller provides):
+        // there was no decode to count anything, so the block is located in the
+        // text and its length recovered by re-tokenising it. That recovery is
+        // approximate — re-encoding a stripped display string need not reproduce
+        // the token count the grid actually holds — which is exactly why the
+        // decoded path no longer uses it.
         if let (Some(o), Some(c)) = (
             assistant_text.find("<think>"),
             assistant_text.find("</think>"),
         ) {
             if c >= o {
                 let block = assistant_text[o..c + "</think>".len()].to_string();
-                let think_len = self
-                    .tokenizer
-                    .encode(block.as_str(), false)
-                    .map(|t| t.get_ids().len() as u32)
-                    .unwrap_or(0);
-                return layout.with_thinking_split(block, think_len, ethereal_thinking);
+                let len = match think_len {
+                    Some(exact) => exact,
+                    None => self
+                        .tokenizer
+                        .encode(block.as_str(), false)
+                        .map(|t| t.get_ids().len() as u32)
+                        .unwrap_or(0),
+                };
+                return layout.with_thinking_split(block, len, ethereal_thinking);
             }
         }
         layout
@@ -5126,204 +5200,6 @@ impl Scheduler {
                 kv: KvSpan::new(a4, total.saturating_sub(a4)),
             },
         ])
-    }
-
-    /// Defer a finished dialogue turn's seal: re-prefill it with the
-    /// `<think>…</think>` reasoning stripped so the SEALED K/V is reasoning-free
-    /// (a future projection of the turn can no longer attend its own thoughts),
-    /// then seal + fire the deferred `Done` once the re-prefill wave completes.
-    /// The reasoning TEXT is kept as an ethereal `Thinking` segment, so
-    /// display / history / summaries are unchanged. The caller has already
-    /// truncated the slot to `seal_block_from` (its go/no-go); this only builds
-    /// the clean grid, stashes the [`PendingTurnSeal`], and enqueues the unit.
-    fn enqueue_clean_turn_reprefill(
-        &mut self,
-        parent_id: SequenceId,
-        seal_block_from: usize,
-        state: DecodeState,
-        text: String,
-        stats: TurnStats,
-    ) {
-        // Forwarded generated: drop the last, un-forwarded sampled token (its K/V
-        // never landed in the slot), matching the immediate-seal path.
-        let forwarded_generated: &[u32] = state
-            .generated_tokens
-            .split_last()
-            .map(|(_, rest)| rest)
-            .unwrap_or(&[]);
-        // Reasoning-free answer: strip `<think>…</think>` (+ the whitespace around
-        // it) while keeping the answer's own formatting. A turn with no think
-        // block re-prefills byte-identical (a clean no-op).
-        let clean_answer = self.strip_think_from_tokens_keep_layout(forwarded_generated);
-        // Clean grid: [user_msg][user_end][assistant_start] (already
-        // `/no_think`-free — that glue lives in the prefix, before
-        // `seal_block_from`) + the reasoning-free answer + the closing tail.
-        let mut clean_tokens: Vec<u32> = Vec::with_capacity(
-            state.prefill_tokens.len() + clean_answer.len() + state.post_decode_tokens.len(),
-        );
-        clean_tokens.extend_from_slice(&state.prefill_tokens);
-        clean_tokens.extend_from_slice(&clean_answer);
-        clean_tokens.extend_from_slice(&state.post_decode_tokens);
-        let total = clean_tokens.len() as u32;
-
-        // Display text (verbatim, reasoning included): prefill turns supply it,
-        // decode turns fall back to the streamed text.
-        let assistant_text = if state.prefill_assistant_text.is_empty() {
-            text.clone()
-        } else {
-            state.prefill_assistant_text.clone()
-        };
-        // The `<think>` block becomes an ETHEREAL `Thinking` segment over the
-        // reasoning-free grid — text kept, K/V dropped.
-        let layout = self.build_turn_layout(
-            state.user_content_start,
-            state.user_content_end,
-            state.assistant_content_start,
-            total,
-            state.user_text.clone(),
-            assistant_text,
-            state.no_think,
-            true,
-        );
-
-        let pending_id = self.next_turn_seal_id;
-        self.next_turn_seal_id += 1;
-        tracing::trace!(
-            target: "candle_conversation::scheduler::turn_seal",
-            "clean reprefill enqueued: slot {}, {} clean tokens, post-truncate offset {:?}, \
-             blocks {:?}, writer_start {:?}",
-            parent_id,
-            clean_tokens.len(),
-            self.session.sequence_offset(parent_id.0),
-            self.session.sequence_block_count(parent_id.0),
-            self.session.writer_start_idx(parent_id.0),
-        );
-
-        // Private sink for the re-prefill unit's `PrefillWork`; the real caller
-        // channel (`state.event_tx`) fires `Done` from `complete_turn_reprefill`.
-        let (sink_tx, sink_rx) = crossbeam::channel::unbounded();
-
-        self.pending_turn_seals.insert(
-            pending_id,
-            PendingTurnSeal {
-                parent_id,
-                seal_block_from,
-                layout,
-                token_ids: clean_tokens.clone(),
-                tags: state.tags,
-                event_tx: state.event_tx,
-                done_text: text,
-                done_token_ids: state.generated_tokens,
-                stats,
-                _sink_rx: sink_rx,
-            },
-        );
-
-        // Enqueue the clean grid as a `max_decode=0` prefill unit — it rides the
-        // SAME wave as the next turn's prefill and any summaries, so the
-        // re-prefill batches for maximum parallelism. `complete_turn_reprefill`
-        // seals + fires the deferred `Done`.
-        self.prefill_queue.push_back(PrefillWork {
-            sequence_id: parent_id,
-            tokens: TokenBuffer::from(clean_tokens),
-            prefill_text: String::new(),
-            user_text: String::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            tags: Vec::new(),
-            prefill_assistant_text: String::new(),
-            event_tx: sink_tx,
-            max_decode_tokens: 0,
-            sampling: SamplingConfig::compression(),
-            submitted_at: Instant::now(),
-            reprojection: None,
-            belief: PriorBelief::default(),
-            seal_action: SealAction::TurnReprefill { pending_id },
-            post_decode_tokens: TokenBuffer::default(),
-            projection_offsets: Vec::new(),
-            staged_composition: None,
-            triggers: Arc::new(TriggerRegistry::new()),
-        });
-    }
-
-    /// Seal a finished dialogue turn once its reasoning-free re-prefill completes
-    /// on the wave: snapshot the clean K/V (via the normal `SealAction::Turn`
-    /// write), drop the slot's chunks, and fire the deferred `Done` (the client's
-    /// full reply + the seal result). Mirrors `complete_compression_turn`.
-    fn complete_turn_reprefill(&mut self, pending_id: u64) {
-        let Some(pending) = self.pending_turn_seals.remove(&pending_id) else {
-            return;
-        };
-        let PendingTurnSeal {
-            parent_id,
-            seal_block_from,
-            layout,
-            token_ids,
-            tags,
-            event_tx,
-            done_text,
-            done_token_ids,
-            stats,
-            _sink_rx,
-        } = pending;
-
-        tracing::trace!(
-            target: "candle_conversation::scheduler::turn_seal",
-            "reprefill complete: slot {}, offset {:?}, blocks {:?}, writer_start {:?}",
-            parent_id,
-            self.session.sequence_offset(parent_id.0),
-            self.session.sequence_block_count(parent_id.0),
-            self.session.writer_start_idx(parent_id.0),
-        );
-        let turn_content = TurnContent {
-            role: Role::Assistant,
-            tags,
-            layout,
-            token_ids: TokenBuffer::from(token_ids),
-        };
-        let t_write = Instant::now();
-        let seal_result = self
-            .perform_seal_and_write(
-                parent_id,
-                seal_block_from,
-                // The clean re-prefill truncated the slot to `seal_block_from`
-                // and appended this turn, so the turn IS the slot's tail.
-                SealEnd::SlotEnd,
-                &SealAction::Turn,
-                Some(turn_content),
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("clean turn seal failed for slot {}: {}", parent_id, e);
-                None
-            });
-
-        let write_us = t_write.elapsed().as_micros() as u64;
-
-        // Drop the slot's chunks now the residence owns them (the next projection
-        // rebuilds from the substrate) — same housekeeping as the immediate seal.
-        let t_trunc = Instant::now();
-        if let Err(e) = self.session.truncate_sequence_to_blocks(parent_id.0, 0) {
-            tracing::warn!(
-                "post-seal slot truncate failed for slot {}: {}",
-                parent_id,
-                e
-            );
-        }
-        // Splits the reprefill seal, which the sub-step timers pinned as ~99% of
-        // the housekeeping band, into its two candidate costs — the substrate
-        // write and the slot truncate. The snapshot and sig-gather inside
-        // `perform_seal_and_write` are already timed into the Sealing band and
-        // measure small, so whichever of these two dominates is the hot spot.
-        run::note_reprefill_split(write_us, t_trunc.elapsed().as_micros() as u64);
-
-        let _ = event_tx.send(TurnEvent::Done(TurnResponse {
-            text: done_text,
-            token_ids: done_token_ids,
-            stats,
-            seal: seal_result,
-        }));
     }
 
     /// Seal a re-prefilled compressed turn once the shared wave finishes its
@@ -5494,107 +5370,6 @@ impl Scheduler {
         let _ = response_tx.send(Ok(idx));
     }
 
-    /// Static backstop on the ragged prefill forward's width — how many in-flight
-    /// prefills may coalesce into one `forward_batched`, regardless of what the
-    /// byte budget would allow.
-    ///
-    /// The [`Self::admit_budget`] setpoint is the real throttle; this is the dumb
-    /// ceiling beneath it. It exists so an error in the cost model
-    /// ([`admission::per_block_kv_bytes`] and friends) costs throughput rather
-    /// than the daemon: a cost underestimate can only ever admit this many
-    /// sequences before it is capped, whatever it believes they are worth.
-    pub(super) const MAX_PREFILL_WIDTH: usize = 24;
-
-    /// Throughput floor the admission planner never closes past — one prefill
-    /// always in flight so the engine keeps making progress even under sustained
-    /// pressure (a lone oversized turn is then bounded by the per-arena VRAM gate).
-    const MIN_PREFILL_WIDTH: usize = 1;
-
-    /// Multiplicative-decrease the admission budget: halve it toward one quantum.
-    /// Called from every throttle signal — VRAM pressure surviving an eviction
-    /// pass, a prefill forward reporting device-OOM, host RAM under the ingest
-    /// floor, the hot→warm drain falling behind. `reason` names which, and is
-    /// carried into the throttle log so a collapsed budget is attributable.
-    fn cut_admit_budget(&mut self, reason: admission::ThrottleReason) {
-        // Any cut invalidates the sustainable-budget evidence.
-        self.admit_grow_streak = 0;
-        let before = self.admit_budget;
-        self.admit_budget = admission::cut_budget(self.admit_budget, admission::admit_quantum());
-        if self.admit_budget != before {
-            let ceiling = self.admit_budget_ceiling();
-            self.log_throttle(reason, before, ceiling);
-        }
-    }
-
-    /// Cut the budget for a STANDING CONDITION — host RAM under its floor, the
-    /// hot→warm drain behind — rather than a discrete failure.
-    ///
-    /// Level signals are re-evaluated every wave and stay true until the
-    /// condition clears, so an unguarded multiplicative cut collapses the
-    /// setpoint to the floor in as many waves as it takes to halve: measured at
-    /// 6144→256 MiB in **two seconds**, against a host-RAM condition that only
-    /// moves on the scale of a drain pass. Rate-limiting to one cut per
-    /// [`admission::LEVEL_CUT_COOLDOWN`] lets each cut's effect reach the signal before the
-    /// next is decided.
-    ///
-    /// Device-OOM and relief-that-failed are EVENTS — they name a forward that
-    /// already broke — and go straight to [`Self::cut_admit_budget`].
-    fn cut_admit_budget_leveled(&mut self, reason: admission::ThrottleReason) {
-        let due = self
-            .last_level_cut
-            .is_none_or(|t| t.elapsed() >= admission::LEVEL_CUT_COOLDOWN);
-        if !due {
-            return;
-        }
-        self.last_level_cut = Some(std::time::Instant::now());
-        self.cut_admit_budget(reason);
-    }
-
-    /// The setpoint's static upper bound — [`Self::MAX_PREFILL_WIDTH`] quanta.
-    /// A pure constant, so the reopen paths can cheaply ask "is there anything to
-    /// reopen?" before paying for the live ceiling, which costs a device query
-    /// (`QueryVideoMemoryInfo`) and a walk of the registered relievers.
-    fn max_admit_budget() -> u64 {
-        Self::MAX_PREFILL_WIDTH as u64 * admission::admit_quantum()
-    }
-
-    /// Additive-increase the admission budget by one quantum, toward the live
-    /// ceiling. Called when VRAM is not under pressure, or on proven
-    /// out-of-memory-free throughput under chronic nominal pressure, so a
-    /// transient episode's backoff heals gradually (AIMD) rather than snapping
-    /// straight back to full width and re-tripping on the next wide wave.
-    fn raise_admit_budget(&mut self, reason: admission::ThrottleReason) {
-        let before = self.admit_budget;
-        let ceiling = self.admit_budget_ceiling();
-        self.admit_budget =
-            admission::raise_budget(self.admit_budget, admission::admit_quantum(), ceiling);
-        if self.admit_budget != before {
-            self.log_throttle(reason, before, ceiling);
-        }
-    }
-
-    /// Emit the setpoint-change event, in BOTH directions.
-    ///
-    /// Growth used to be silent while only shrinks logged, which made the
-    /// controller's trajectory unreconstructable from a run: a budget that had
-    /// climbed and collapsed several times was indistinguishable from one wedged
-    /// at the floor the whole run. Every move is logged, with the reason that
-    /// caused it and the live availability it was clamped against. Callers pass
-    /// the `ceiling` they already measured rather than have this re-query it.
-    fn log_throttle(&self, reason: admission::ThrottleReason, was: u64, ceiling: u64) {
-        const MIB: u64 = 1 << 20;
-        tracing::debug!(
-            target: "candle_conversation::scheduler::throttle",
-            reason = reason.as_str(),
-            budget_mib = self.admit_budget / MIB,
-            was_mib = was / MIB,
-            ceiling_mib = ceiling / MIB,
-            prefills = self.active_prefills.len(),
-            queued = self.prefill_queue.len(),
-            "admission budget moved"
-        );
-    }
-
     /// Purge every in-flight scheduling entry keyed by a slot id that is being
     /// freed. The kernel recycles a freed slot id **immediately** (the code_read
     /// scope workers churn fork slots), so any prefill / decode entry left under
@@ -5624,7 +5399,9 @@ impl Scheduler {
         // frees its slot after its prefill has already drained out of the cohort,
         // so `was_member` is false and the held cohort is untouched.
         let was_member = self.wave_prefill_members.iter().any(|m| match m {
-            WaveMember::Prefill { seq_id } | WaveMember::Section { seq_id, .. } => *seq_id == id.0,
+            WaveMember::Prefill { seq_id, .. } | WaveMember::Section { seq_id, .. } => {
+                *seq_id == id.0
+            }
         });
         if was_member {
             self.reset_wave_prefill();
@@ -5862,6 +5639,30 @@ impl Scheduler {
     /// logs a **distinguishable** reason, because "resumed with no memory" and
     /// "resumed correctly" are indistinguishable from the outside — both read
     /// fluently, and only one of them is right.
+    /// Bring `slot`'s recurrent state back from the substrate if it was evicted.
+    ///
+    /// The lazy half of the seal-time eviction: state sealed to the substrate is
+    /// dropped from the device, and this is what pays for that the moment
+    /// something needs it again. A no-op when the slot still holds its state —
+    /// the common case within a turn — and on a model that carries none, where
+    /// `recurrent_resident` is always false and there is nothing to restore.
+    ///
+    /// Silent on a missing conversation or target: those are the slots that
+    /// never had a timeline to restore from, and `restore_recurrent_state`
+    /// already warns loudly about every reason a real restore can fail.
+    fn ensure_recurrent_restored(&mut self, slot: SequenceId) {
+        if self.model.recurrent_resident(slot.0) {
+            return;
+        }
+        let Some(conversation) = self.slot_conversations.get(&slot).cloned() else {
+            return;
+        };
+        let Some(target) = self.slot_targets.get(&slot).copied() else {
+            return;
+        };
+        self.restore_recurrent_state(slot, &conversation, target.timeline);
+    }
+
     fn restore_recurrent_state(
         &mut self,
         slot_id: SequenceId,
@@ -6188,6 +5989,12 @@ impl Scheduler {
             .filter(|(_, s)| s.finished)
             .map(|(&id, _)| id)
             .collect();
+        // A reaped slot is ground given back, and the only event that can make
+        // room for an admission that did not fit before — see
+        // `Scheduler::completions`.
+        self.completions = self
+            .completions
+            .saturating_add(finished_seq_ids.len() as u64);
 
         for seq_id in finished_seq_ids {
             if let Some(state) = self.active_decodes.remove(&seq_id) {
@@ -6418,74 +6225,28 @@ impl Scheduler {
                     }
                 }
 
-                // Clean-reprefill defer (dialogue turns only). The decode's K/V
-                // carries the `<think>…</think>` reasoning; sealing it as-is would
-                // let a future projection of this turn attend its own thoughts. So
-                // re-prefill the turn reasoning-free and seal THAT instead. The
-                // truncate that resets the slot to the turn boundary is the
-                // go/no-go: on success the seal + `Done` defer to the re-prefill
-                // wave (batched with the next wave's normal prefills); on the rare
-                // truncate failure we fall through to the immediate,
-                // reasoning-bearing seal so the turn is never lost.
-                if matches!(state.seal_action, SealAction::Turn)
-                    && self
-                        .session
-                        .truncate_sequence_to_blocks(seal_slot.0, seal_block_from)
-                        .and_then(|_| {
-                            // The kept blocks are the immutable prefix; the
-                            // clean re-prefill must append AT `seal_block_from`
-                            // (the seal anchor), never extend a kept
-                            // partial/empty tail block below it.
-                            self.session.seal_writer_boundary(seal_slot.0)
-                        })
-                        .is_ok()
-                {
-                    // **DISCARD.** The decoded blocks — thinking tokens and all
-                    // — were just truncated away, and the turn is about to be
-                    // re-prefilled clean onto the parent. The recurrent state
-                    // follows the K/V, so the view's advanced state is dropped
-                    // with the blocks it advanced over, leaving the parent at
-                    // the turn boundary. The clean re-prefill then advances it
-                    // over `[user][clean response]` exactly once.
-                    //
-                    // Moving here instead is the `<think>` skew — a state that
-                    // has seen the reasoning as well as the answer while the
-                    // K/V holds only the answer — on every thinking turn, and
-                    // it compounds. It is also invisible: the model stays
-                    // fluent and simply remembers a little more than it said.
-                    if let Some((view_id, _parent_id)) = pending_view_state.take() {
-                        if let Err(e) = self.model.release_sequence(view_id.0) {
-                            tracing::warn!(
-                                "failed to release recurrent state for discarded view {}: {}",
-                                view_id,
-                                e,
-                            );
-                        }
-                    }
-                    let stats = TurnStats {
-                        prefill_ms: state.prefill_ms,
-                        decode_ms,
-                        total_ms,
-                        tokens_generated,
-                        tokens_per_second,
-                        prefill_token_count: state.prefill_token_count,
-                        sequence: sequence_stats,
-                    };
-                    self.enqueue_clean_turn_reprefill(
-                        seal_slot,
-                        seal_block_from,
-                        state,
-                        text,
-                        stats,
-                    );
-                    continue;
-                }
-
-                // **MOVE.** Everything past the clean-reprefill branch keeps the
-                // view's decoded blocks on the parent, so the state it advanced
-                // over them moves with them. Reached both when the seal is not a
-                // turn and when the clean re-prefill could not be set up — in
-                // the latter case the blocks stayed, so the state must too.
+                // **MOVE.** The view's decoded blocks stay on the parent, so the
+                // state it advanced over them moves with them — always, for every
+                // turn, because the decoded K/V is now what gets sealed.
+                //
+                // A dialogue turn used to divert here into a *clean re-prefill*:
+                // its decoded blocks were truncated away and the turn was
+                // re-prefilled from reasoning-free tokens so the seal would
+                // capture a grid with no `<think>…</think>` in it. Reasoning is
+                // hidden at read time now — [`thinking_chunk_skip`] omits its
+                // chunks from every projection of the turn — so the second
+                // prefill bought nothing that the skip does not, and it cost a
+                // full replay of every dialogue turn, a `Done` deferred a wave
+                // behind the decode, and a turn whose stored text (always kept
+                // verbatim, reasoning included) described a grid that did not
+                // contain it. It also made the decode's own K/V unsealable, which
+                // is why an in-flight turn could only ever be finished, never
+                // parked.
+                //
+                // The DISCARD arm went with it. Discarding the view's state was
+                // only ever right because the blocks it advanced over were being
+                // thrown away; now that they are kept, moving the state is the
+                // only disposition that matches the K/V.
                 if let Some((view_id, parent_id)) = pending_view_state.take() {
                     if let Err(e) = self.model.move_recurrent(view_id.0, parent_id.0) {
                         tracing::warn!(
@@ -6598,6 +6359,7 @@ impl Scheduler {
                                 assistant_text,
                                 state.no_think,
                                 false,
+                                state.think_token_len,
                             );
                             Some(TurnContent {
                                 role: Role::Assistant,
@@ -7355,7 +7117,14 @@ impl Scheduler {
         let snapshot_us = t_snap.elapsed().as_micros() as u64;
 
         let chunk_size = self.chunk_size;
-        let turn_token_count: usize = snapshot
+        // Tokens the sealed K/V chunk grid holds over `[block_from, block_to)`.
+        //
+        // **Not the same as a turn's token count**, and named apart from it for
+        // that reason: a turn may begin mid-chunk (section injection leaves
+        // partials), so its first chunk can carry a prefix belonging to whatever
+        // preceded it. For a SECTION the two do coincide — a section owns its
+        // chunks outright — which is why the section arm below still uses this.
+        let chunk_grid_tokens: usize = snapshot
             .chunks
             .get(block_from..block_to)
             .map(|s| s.iter().map(|c| c.token_count as usize).sum())
@@ -7429,11 +7198,32 @@ impl Scheduler {
                 // Snapshot what the resume path needs before the substrate
                 // consumes `delta_gpu` / `token_ids` (Â§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
-                debug_assert_eq!(
-                    persist_token_ids.len(),
-                    turn_token_count,
-                    "persisted token_ids must align 1:1 with the K/V chunk grid \
-                     (off-by-one usually means an unforwarded token slipped through)"
+                // **A turn's token count is its own tokens, not its chunk
+                // grid's.** These are not the same quantity, and asserting they
+                // were cost the scheduler its life on a legitimate layout.
+                //
+                // A turn does not have to begin on a chunk boundary. Section
+                // injection leaves partial chunks — `sequence_block_count`
+                // exists precisely because `offset / CHUNK_SIZE` under-counts
+                // "partials from back-to-back section injection" — so a turn
+                // that follows a section starts mid-chunk and *shares* its first
+                // chunk with whatever preceded it. Measured here: a 25-token
+                // User turn at `block_from=17`, `per_chunk=[32]`, i.e. 7 of that
+                // chunk's tokens belong to the section before it.
+                //
+                // The block range is right: the KV extent this turn needs
+                // includes the whole shared chunk, because that is the
+                // granularity the arena addresses. What was wrong was recording
+                // the grid's token total as the *turn's* token count, which
+                // over-counts the turn by the shared prefix and drifts
+                // `timeline_token_totals`. The turn's own stream is the
+                // authority, and it is exactly what reload re-tokenises against.
+                let turn_token_count = persist_token_ids.len();
+                debug_assert!(
+                    turn_token_count <= chunk_grid_tokens,
+                    "a turn cannot own more tokens than its K/V chunk grid holds \
+                     ({turn_token_count} > {chunk_grid_tokens}) — that direction \
+                     really is an unforwarded token slipping through"
                 );
 
                 // The turn is sealed as one indivisible K/V block; its
@@ -7554,6 +7344,22 @@ impl Scheduler {
                         SNAPSHOT_BYTES.fetch_add(bytes.len() as u64, Relaxed);
                         SNAPSHOT_COUNT.fetch_add(1, Relaxed);
                         conversation.enqueue_recurrent_snapshot(target.timeline, bytes);
+                        // **Sealed, so the device copy is redundant — drop it.**
+                        // A conversation between turns holds ~126 MiB of
+                        // recurrent state per sequence, and the ingest keeps
+                        // hundreds of them open: measured, 642 regions and a
+                        // weight zone driven from 10,398 to 1,417 MiB. The state
+                        // is now in the substrate and the next turn restores it
+                        // before it forks (`ensure_recurrent_restored`).
+                        //
+                        // Only on this branch. `Ok(None)` is an ephemeral
+                        // timeline whose payload is deliberately dropped, and
+                        // `Err` already warns that resume will recompute from
+                        // zeros — evicting either would turn "cannot resume"
+                        // into "resumed, fluent, and forgotten".
+                        // STEP S1a — eviction at seal removed, to see whether the
+                        // evict/restore round trip is what diverges the state.
+                        let _ = seal_slot;
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -7618,7 +7424,7 @@ impl Scheduler {
                     view.set_section_full(
                         *section_id,
                         stream_id,
-                        turn_token_count,
+                        chunk_grid_tokens,
                         Arc::new(delta_gpu),
                         |seqs| Ok(seqs.to_vec()),
                         Arc::clone(tokens),
@@ -7684,18 +7490,17 @@ impl Scheduler {
                     "compression turns seal in promote_finished_prefills_to_decodes, not here"
                 )
             }
-            SealAction::TurnReprefill { .. } => {
-                unreachable!(
-                    "clean turn re-prefill seals via SealAction::Turn in complete_turn_reprefill"
-                )
-            }
         }
 
         Ok(Some(SealResult {
             block_count,
             block_from,
             block_to,
-            turn_token_count,
+            // The GRID total, unchanged: this field describes the K/V extent the
+            // seal covered, which is what its consumers measure against. The
+            // turn's own token count is what went into the substrate record
+            // above, and the two differ exactly when a turn starts mid-chunk.
+            turn_token_count: chunk_grid_tokens,
             chunk_size,
             turn_index: recorded_turn_index,
         }))
@@ -8112,6 +7917,11 @@ impl Scheduler {
         // the sequence-start value while its KV holds the parent's entire
         // history — three quarters of the stack contributing nothing but a
         // function of the current turn, fluently and without an error.
+        // The parent's state is evicted when its previous turn seals, so bring
+        // it back before forking from it — `fork_recurrent` refuses a parent
+        // that carries none, and rightly: handing the child zeros is the
+        // amnesia this whole path exists to prevent.
+        self.ensure_recurrent_restored(parent_id);
         self.model
             .fork_recurrent(parent_id.0, view_id.0)
             .map_err(ConversationError::Model)?;
@@ -11089,7 +10899,10 @@ mod tests {
         // otherwise the recycled slot id re-enters the next wave-group assembly
         // alongside the stale member and trips the "appears in more than one
         // group" guard.
-        scheduler.wave_prefill_members = vec![WaveMember::Prefill { seq_id: seq_id.0 }];
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill {
+            seq_id: seq_id.0,
+            advance: 1,
+        }];
         scheduler.wave_prefill_cursor = 7;
 
         scheduler.handle_request(SchedulerRequest::FreeSequence {
@@ -11115,7 +10928,10 @@ mod tests {
         // A DIFFERENT slot is the sole cohort member. Freeing `freed` must leave
         // the held cohort untouched — resetting it on every unrelated free would
         // throw away the survivors' partial prefill progress each wave.
-        scheduler.wave_prefill_members = vec![WaveMember::Prefill { seq_id: member.0 }];
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill {
+            seq_id: member.0,
+            advance: 1,
+        }];
         scheduler.wave_prefill_cursor = 3;
 
         scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: freed });

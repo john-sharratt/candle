@@ -12,8 +12,6 @@
 
 use std::time::Duration;
 
-use candle::backend::BackendStorage;
-use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
@@ -221,7 +219,7 @@ impl Fixture {
         let span = SlotStateHost::span_layout_for_checks();
 
         let mut keepalive: Vec<Tensor> = Vec::new();
-        let mut hdr_all: Vec<u8> = Vec::with_capacity(24 * sc.num_slots);
+        let mut hdr_all: Vec<u8> = Vec::with_capacity(16 * sc.num_slots);
 
         for cache in self.caches.iter() {
             let chunks = cache
@@ -230,15 +228,16 @@ impl Fixture {
                 .unwrap_or_default();
             let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
 
-            let mut st = SlotStateHost::from_sealed_chunks(
+            let st = SlotStateHost::from_sealed_chunks(
                 &chunks,
                 sc.n_kv_head,
                 sc.head_dim,
                 &arena_info,
                 writer_start,
-                true, // build the position map — extended for the write region below
             );
-            st.extend_for_write_region(1, CHUNK_SIZE);
+            // One decoded token; the kernel resolves its position by walking
+            // from `write_slice`, so that walk needs somewhere to land.
+            st.assert_write_region_capacity(1, CHUNK_SIZE);
 
             let slice_size = TokenSliceHost::record_size(sc.n_kv_head, sc.head_dim);
             let mut sbuf = Vec::with_capacity(st.slices.len() * slice_size);
@@ -252,20 +251,12 @@ impl Fixture {
             };
             let slices_ptr = tensor_u8_device_ptr(&stensor)?;
 
-            let mut pm = st.position_map.clone();
-            if pm.is_empty() {
-                pm.push(0);
-            }
-            let pm_tensor = Tensor::from_slice(&pm, pm.len(), device)?;
-            let pm_ptr = u32_tensor_device_ptr(&pm_tensor)?;
-
+            // 16-byte SlotHeader: n_slices, write_slice, slices_ptr.
             hdr_all.extend_from_slice(&(st.slices.len() as u32).to_le_bytes());
             hdr_all.extend_from_slice(&st.write_slice.to_le_bytes());
             hdr_all.extend_from_slice(&slices_ptr.to_le_bytes());
-            hdr_all.extend_from_slice(&pm_ptr.to_le_bytes());
 
             keepalive.push(stensor);
-            keepalive.push(pm_tensor);
         }
 
         let generation = stager.begin_generation();
@@ -527,21 +518,7 @@ fn run_prefill(
         sc.rope_interleaved,
         &generation,
         // No shared position-map cache in this one-shot fixture prefill.
-        &std::cell::RefCell::new(None),
     )?;
     caches_arr[0].set_current_seq_len(offset + sc.ctx_len)?;
     Ok(())
-}
-
-/// Extract the raw device pointer of a U32 tensor's storage.
-fn u32_tensor_device_ptr(t: &Tensor) -> Result<u64> {
-    let (storage, layout) = t.storage_and_layout();
-    let cs = match &*storage {
-        candle::Storage::Cuda(c) => c,
-        _ => candle::bail!("expected CUDA storage for position_map"),
-    };
-    let stream = cs.device().cuda_stream();
-    let s = cs.as_cuda_slice::<u32>()?.slice(layout.start_offset()..);
-    let (p, _g) = s.device_ptr(&stream);
-    Ok(p)
 }

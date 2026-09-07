@@ -27,7 +27,6 @@ use candle::Device;
 use candle_nn::kv_cache::global_arena_memory_report;
 use serde::Serialize;
 
-use super::admission::admit_quantum;
 use super::Scheduler;
 
 /// One full memory snapshot. All byte quantities are raw bytes; consumers
@@ -362,20 +361,86 @@ pub struct HostSection {
     pub commit_limit_bytes: Option<u64>,
 }
 
-/// The admission throttle's live inputs and setpoint.
+/// The wave fill's live inputs.
 #[derive(Debug, Clone, Serialize)]
 pub struct AdmissionSection {
-    /// The regulated setpoint (AIMD).
-    pub setpoint_bytes: u64,
-    /// Live ceiling the setpoint is clamped to (headroom + evictable − pinned,
-    /// clamped to unreserved device memory).
+    /// Free KV bytes admission could spend right now — the free regions less
+    /// the relief pass's working room.
     pub ceiling_bytes: u64,
-    pub quantum_bytes: u64,
     /// In-flight widths at capture.
     pub prefill_width: usize,
     pub section_width: usize,
     pub decode_width: usize,
     pub queued_prefills: usize,
+    /// Not-yet-fed prefill tokens: the queued FIFO plus the unfed remainder of
+    /// everything in flight.
+    ///
+    /// Published beside `queued_prefills` because a **count cannot express the
+    /// work it stands for**, which is the same argument `admission` makes about
+    /// sequence counts — this layer's queue holds scopes from 48 to 5,980
+    /// tokens, so ten queued items is either a trickle or a flood. A producer
+    /// that paces itself on depth has to pace on tokens.
+    ///
+    /// It is also the one queue signal that is meaningful on **every** model and
+    /// card: it says nothing about VRAM, expert residency or partitioning, so a
+    /// producer keyed on it behaves identically for a dense 3B on a 72 GB card
+    /// and a streaming MoE on a tight one. Only the rate at which the engine
+    /// drains it differs.
+    pub queued_prefill_tokens: u64,
+    /// Tokens completed since the process started. Cumulative rather than a
+    /// rate so a consumer picks its own window and a missed report costs
+    /// nothing.
+    pub completed_tokens: u64,
+    /// Decodes the last wave fill admitted — the conversations the engine is
+    /// carrying to completion right now.
+    pub decode_carried: usize,
+    /// Eligible decodes the last wave fill could **not** admit: resident
+    /// conversations whose KV chunk or model state the allocators refused.
+    ///
+    /// **The engine's "full" signal, and the one a producer paces on.** It is
+    /// the real allocation's answer, not an estimate — a decode is refused only
+    /// when the device has no ground for it — so it means the same thing on
+    /// every model and card: non-zero, and one more open conversation would
+    /// wait behind ones that already cannot step; zero, and everything resident
+    /// is being carried. A producer that opens only at zero cannot pile
+    /// conversations onto a device that has stopped stepping the ones it has,
+    /// which is the wedge this field exists to close.
+    pub decode_starved: usize,
+    /// Conversation slots open on the engine right now — every sequence the
+    /// scheduler holds a conversation for, whoever opened it.
+    ///
+    /// A producer pacing on this report opens conversations faster than the
+    /// report can reflect them: the backlog it reads is a wave behind, so a
+    /// pool of 96 workers passed a gate that read "empty" 96 times in one
+    /// second. This lets the gate count what it has opened that the engine
+    /// has not yet seen, and hold until the engine catches up.
+    pub open_slots: usize,
+    /// Sequences a wave carries right now — the engine's width, which follows
+    /// its expert hit rate. The producer paces its queue and its open count on
+    /// this rather than on a constant: a wave's worth of work waiting is what
+    /// keeps every wave full, and more is K/V waiting.
+    pub wave_width: usize,
+    /// Milliseconds between this report and the one before it — the engine's
+    /// publishing cadence, one wave. A reader deciding whether a report is
+    /// stale compares its age to this, not to a constant: a wave here runs
+    /// three to five seconds and a five-second constant read a report a wave
+    /// old as stale for 95 fills of one run, holding the producer for nothing.
+    pub publish_interval_ms: u64,
+    /// The weight zone as it stands, in bytes, and the hold beneath which the
+    /// model would start streaming its experts.
+    ///
+    /// **The one resource a producer must not spend.** Every open conversation
+    /// takes K/V, the KV side and the weight side share one elastic span, so
+    /// enough of them push the boundary down and evict the resident experts —
+    /// and an engine that streams its experts is slower at everything,
+    /// including finishing the conversations that would give the ground back.
+    ///
+    /// Published so the producer can read the real quantity instead of a
+    /// proxy for it. Counting open conversations against a width was the proxy
+    /// tried before this, and it throttled a run for 409 seconds while the
+    /// zone it was meant to protect never came near its hold.
+    pub weight_zone_bytes: u64,
+    pub weight_hold_bytes: u64,
 }
 
 /// MoE expert residency.
@@ -422,6 +487,7 @@ impl Scheduler {
     /// capturing the line.
     pub(super) fn publish_memory_report(&mut self) {
         let report = self.build_memory_report();
+        self.last_report_publish = Some(std::time::Instant::now());
         match serde_json::to_string(&report) {
             Ok(json) => tracing::trace!(
                 target: "candle_conversation::scheduler::memory",
@@ -518,7 +584,7 @@ impl Scheduler {
             weights_reserved_bytes: budget.weights_reserved_bytes,
             weights_capped: budget.weights_capped,
             kv_warm_budget_bytes: budget.kv_warm_budget_bytes,
-            pipeline_slack_bytes: super::prefill::warm_pipeline_slack_bytes(),
+            pipeline_slack_bytes: super::prefill::WARM_PIPELINE_SLACK_BYTES,
             warm_usage_bytes: warm_usage,
             over_budget,
             pages_in_per_sec: candle::vram::pages_in_per_sec(),
@@ -528,13 +594,29 @@ impl Scheduler {
 
         // ── Admission ───────────────────────────────────────────────────────
         let admission = AdmissionSection {
-            setpoint_bytes: self.admit_budget,
             ceiling_bytes: self.admit_budget_ceiling(),
-            quantum_bytes: admit_quantum(),
             prefill_width: self.prefill_width(),
             section_width: self.section_ingest_width(),
             decode_width: self.decode_width(),
             queued_prefills: self.prefill_queue.len(),
+            queued_prefill_tokens: self.pending_prefill_tokens(),
+            completed_tokens: super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed),
+            // An ungated fill (no weight zone) carries every eligible decode.
+            decode_carried: self
+                .wave_decode_set
+                .as_ref()
+                .map_or_else(|| self.decode_width(), Vec::len),
+            decode_starved: self.wave_decode_starved,
+            open_slots: self.slot_conversations.len(),
+            wave_width: self.wave_width,
+            publish_interval_ms: self
+                .last_report_publish
+                .map_or(0, |t| t.elapsed().as_millis() as u64),
+            // The live-region view, which is what the fill's own residency stop
+            // reads — not the extent, which includes ground a standing tier has
+            // already bought and would read as headroom that is not there.
+            weight_zone_bytes: super::interleave::effective_weight_zone_bytes().unwrap_or(0),
+            weight_hold_bytes: super::interleave::optimal_weight_bytes().unwrap_or(0),
         };
 
         // ── Experts ─────────────────────────────────────────────────────────
@@ -730,13 +812,20 @@ mod tests {
                 commit_limit_bytes: Some(40),
             },
             admission: AdmissionSection {
-                setpoint_bytes: 10,
                 ceiling_bytes: 11,
-                quantum_bytes: 12,
                 prefill_width: 1,
                 section_width: 2,
                 decode_width: 3,
                 queued_prefills: 4,
+                queued_prefill_tokens: 4096,
+                completed_tokens: 1_000_000,
+                decode_carried: 3,
+                decode_starved: 0,
+                open_slots: 7,
+                wave_width: 8,
+                publish_interval_ms: 3_000,
+                weight_zone_bytes: 7 << 30,
+                weight_hold_bytes: 5 << 30,
             },
             experts: ExpertSection {
                 host_pinned_bytes: 11_000_000_000,
@@ -819,7 +908,6 @@ mod tests {
             "weights_reserved_bytes",
             "warm_usage_bytes",
             "over_budget",
-            "setpoint_bytes",
             "ceiling_bytes",
             "host_pinned_bytes",
             "pages_in_per_sec",

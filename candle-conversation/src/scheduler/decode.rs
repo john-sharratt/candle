@@ -1,5 +1,6 @@
 use super::spec_chooser::SpecChooser;
 use super::*;
+use candle_nn::kv_cache::is_tier_refusal;
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use candle_transformers::models::speculative_choice::{AcceptWalk, TokenChooser};
 
@@ -252,11 +253,50 @@ impl Scheduler {
 
     // ── Decode ─────────────────────────────────────────────────────────
 
-    /// Run one decode step for all active (non-finished) sequences.
+    /// The decodes eligible to ride this wave, in the order they will be taken.
+    ///
+    /// Shared by the wave build and by the feeder's interleave
+    /// (`scheduler::interleave`), which gates *how many* of these run. The two
+    /// must agree on the order or the feeder claims KV for one sequence and the
+    /// wave runs another — so the ordering lives here, once.
+    ///
+    /// A slot with a pending deferred glue fire is excluded: it reprojects this
+    /// wave, so its logical offset and block table are mid-rewrite, and listing
+    /// it in both the decode and glue groups collapses the per-unique-id cache
+    /// borrow and desyncs every later member's varlen metadata.
+    ///
+    /// Sorted by sequence id so the order is **stable across waves**.
+    /// `active_decodes` is a `HashMap`, whose iteration order is not, and a
+    /// feeder that gates a prefix of an unstable list would admit a different
+    /// subset every wave — starving whichever sequences kept landing past the
+    /// cut.
+    pub(super) fn decode_wave_candidates(&self) -> Vec<SequenceId> {
+        let glue_pending: std::collections::HashSet<usize> = self
+            .deferred_glue_fires
+            .iter()
+            .map(|p| p.parent_id.0)
+            .collect();
+        let mut ids: Vec<SequenceId> = self
+            .active_decodes
+            .iter()
+            .filter(|(_, s)| !s.finished)
+            .map(|(&id, _)| id)
+            .filter(|id| !glue_pending.contains(&id.0))
+            .collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids
+    }
+
+    /// Run one decode step for the decodes admitted to this wave.
     ///
     /// Each sequence contributes exactly 1 token (its last generated token).
     /// One batched `forward_batched` call processes all sequences in parallel.
-    pub(super) fn batch_decode_step(&mut self) {
+    ///
+    /// Returns `false` when there were eligible decodes and the fill admitted
+    /// none of them — the allocators refused every one — so no forward ran and
+    /// nothing will change until ground is freed. The caller ends the quantum
+    /// on that rather than spinning through it.
+    pub(super) fn batch_decode_step(&mut self) -> bool {
         // A slot with a pending deferred glue fire reprojects THIS wave (the
         // co-batched glue member rewrites its `[sealed | glue]` prefix), so its
         // logical offset and block table are mid-rewrite. It must not also run
@@ -266,19 +306,50 @@ impl Scheduler {
         // desyncing every later member's varlen metadata from its slot headers.
         // Skip it here; its decode resumes next wave against the reprojected
         // backing (the glue fire drains in `take_wave_glue` during this step).
-        let glue_pending: std::collections::HashSet<usize> = self
-            .deferred_glue_fires
-            .iter()
-            .map(|p| p.parent_id.0)
-            .collect();
-        let mut seq_ids: Vec<SequenceId> = self
-            .active_decodes
-            .iter()
-            .filter(|(_, s)| !s.finished)
-            .map(|(&id, _)| id)
-            .filter(|id| !glue_pending.contains(&id.0))
-            .collect();
+        let mut seq_ids = self.decode_wave_candidates();
+        let eligible = seq_ids.len();
 
+        // **The fill's decode set.** `promote_new_prefills` admitted these one
+        // at a time against the real allocators — KV chunk and recurrent state
+        // both claimed — so the sequences that step are exactly the sequences
+        // whose ground was claimed. Anything that stopped being a candidate in
+        // between (finished, glue-pending) drops out; nothing is added.
+        //
+        // `None` means the fill did not gate — no weight zone to defend — and
+        // every eligible decode runs, as it always did.
+        if let Some(set) = &self.wave_decode_set {
+            let admitted: HashSet<usize> = set.iter().map(|id| id.0).collect();
+            seq_ids.retain(|id| admitted.contains(&id.0));
+        }
+        // Every eligible decode was refused. Nothing is forced through: a
+        // sequence the allocators would not take at admission would be refused
+        // again at the wave, loudly, and take the whole wave down with it. The
+        // refusals are published (`decode_starved`) and the caller yields.
+        // The fill yielded the decodes so the prefill head could travel alone:
+        // this wave runs no decode rows and advances the prefill cohort by
+        // itself — the same decode-less sweep the glue drain uses — and the
+        // decodes are offered again next fill.
+        if seq_ids.is_empty() && self.wave_decode_yielded && self.wave_decode_set.is_some() {
+            if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
+                tracing::error!("decode: prefill-only wave (decodes yielded) failed: {e}");
+            }
+            return true;
+        }
+        if seq_ids.is_empty() && eligible > 0 && self.wave_decode_set.is_some() {
+            if !self.deferred_glue_fires.is_empty() {
+                if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
+                    tracing::error!("decode: deferred-glue drain wave failed: {e}");
+                }
+            }
+            return false;
+        }
+
+        self.run_decode_step(seq_ids);
+        true
+    }
+
+    /// The decode forward proper, over the sequences the fill admitted.
+    fn run_decode_step(&mut self, mut seq_ids: Vec<SequenceId>) {
         // ── Interactive-decode priority ──────────────────────────────────────
         // A HIGH-priority (interactive dialogue) decode must not be trapped
         // behind a large bulk-INGEST co-batch — a single dialogue token stuck in
@@ -394,6 +465,12 @@ impl Scheduler {
         ) {
             Ok(d) => d,
             Err(e) => {
+                // The drafter's forward places a tier of its own; a refusal
+                // there is the same wave-too-wide answer as anywhere else.
+                if is_tier_refusal(&e) {
+                    self.note_tier_refusal(&e);
+                    return;
+                }
                 self.fail_all_decodes(&seq_ids, &format!("decode draft failed: {e}"));
                 return;
             }
@@ -471,6 +548,10 @@ impl Scheduler {
                 // stash or a capture left standing outlives the step it belongs
                 // to — the next rewind would replay from it.
                 self.model.abort_verify(&spec_seqs);
+                if is_tier_refusal(&e) {
+                    self.note_tier_refusal(&e);
+                    return;
+                }
                 self.fail_all_decodes(&seq_ids, &format!("verify setup failed: {e}"));
                 return;
             }
@@ -485,6 +566,14 @@ impl Scheduler {
             Ok(l) => l,
             Err(e) => {
                 self.model.abort_verify(&spec_seqs);
+                // A refused tier is a wave composed too wide, not a failure of
+                // the sequences in it: nothing ran and the KV side rolled
+                // back. Requeue its prefills, widen the margin, and let the
+                // next fill compose it narrower.
+                if is_tier_refusal(&e) {
+                    self.note_tier_refusal(&e);
+                    return;
+                }
                 self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
                 return;
             }
@@ -516,6 +605,10 @@ impl Scheduler {
                 Ok(r) => r,
                 Err(e) => {
                     self.model.abort_verify(&spec_seqs);
+                    if is_tier_refusal(&e) {
+                        self.note_tier_refusal(&e);
+                        return;
+                    }
                     self.fail_all_decodes(&seq_ids, &format!("verify readback failed: {e}"));
                     return;
                 }
@@ -1185,12 +1278,22 @@ impl Scheduler {
                     // does NOT exit the block.  Stating that here keeps the invariant local
                     // rather than riding on the dropped token's commit being skipped below.
                     if state.sampling_config.segment_open_token_id >= 0 {
+                        // `next_token` is pushed further down, so this length is
+                        // the index the marker is about to take — which is what
+                        // makes the recorded span exact rather than reconstructed.
+                        let at = state.generated_tokens.len();
                         if next_token == state.sampling_config.segment_open_token_id as u32 {
                             state.health.inside_think_block = true;
+                            state.think_open_at = Some(at);
                         } else if next_token == state.sampling_config.segment_close_token_id as u32
                             && !dropped[i]
                         {
                             state.health.inside_think_block = false;
+                            // Inclusive of both markers. A `</think>` with no
+                            // opener recorded is not a block — a steer retry can
+                            // sample one outside any — so it measures nothing.
+                            state.think_token_len =
+                                state.think_open_at.map(|open| (at + 1 - open) as u32);
                         }
                     }
 
@@ -1411,6 +1514,7 @@ impl Scheduler {
                     }
                 }
 
+                state.lease_left = state.lease_left.saturating_sub(1);
                 if is_eos || state.generated_tokens.len() >= state.max_tokens {
                     state.finished = true;
                 } else {
@@ -1418,6 +1522,15 @@ impl Scheduler {
                     // stop generating.
                     if state.event_tx.send(TurnEvent::Token(next_token)).is_err() {
                         state.finished = true;
+                    }
+                    // **The lease is spent but the turn is not done.** Stop here
+                    // and let the slot be parked: the ground reserved for this
+                    // generation is used up, and carrying on would take ground
+                    // the gate never authorised. The turn is not finished — it
+                    // resumes from its sealed prefix when it reaches the front of
+                    // the queue again — so this is deliberately not `finished`.
+                    if state.lease_left == 0 {
+                        state.lease_expired = true;
                     }
                 }
 
