@@ -396,8 +396,53 @@ expert zone 5,440 → 1,225 slots, decode 26 → **3 t/s**, KV side 8.6 GiB agai
 carries `last_used_epoch`. `set_working_set_pins` — which already computes the
 active set under the write lock — **stamps** it; the demote scan **advances** the
 clock. Residences where `epoch − last_used > IDLE_DEMOTE_GRACE_EPOCHS` **drop
-`hot`**, and only where `warm` already holds the bytes: the demote sheds a copy,
-so it is never the operation that loses the last one.
+`hot`**, and only where a durable copy already holds the bytes: the demote sheds
+a redundant copy, so it is never the operation that loses the last one.
+
+**Durable means warm *or* cold — for a turn.** One that has reached cold and had
+its warm purged is still safely droppable; `elevate_to_hot` lifts it back through
+`recover_turn_chunks` + `load_to_hot`. A residence with neither copy is
+untouchable.
+
+**Sections are pinned, and this pass never sheds one.** The predicate used to be
+`warm.is_some()`, which excluded sections as a *side effect*: a section is
+deliberately absent from `hot_lru` (`install_section_hot` sets `hot` without
+touching the list, because ranking shared prompt content against dialogue turns
+by recency would evict the catalog under load), and the hot→warm drain is a walk
+of `hot_lru` — so a section never acquires a warm copy at all, reaching disk
+through the persistence thread's own section phase instead. That accident was
+load-bearing.
+
+Relaxing the predicate to warm-or-cold was tried, on the reasoning that
+`cold_load_section_into_hot` makes the reload leg sound. It exists, and it is not
+what broke. **One pass shed 463 sections (297 MiB), and a later forward returned
+all 248,320 logits non-finite** — `argmax` on that row is token 0, so the daemon
+answered every prompt with `!!!!!!!!`. No lift failure was logged, because the
+fault is not the reload: a section is *shared prompt content every projection
+reads*, so its absence corrupts the assembled prefix rather than costing a
+re-lift. It also moved the block range the turn seals over, tripping the seal's
+own guard — `persisted token_ids must align 1:1 with the K/V chunk grid`, 25
+against 32.
+
+The refusal is now explicit and sits ahead of any durability test, with its own
+counter (`IdleDemoteReport::section`) so it cannot be removed by a change to an
+unrelated condition. Note that the unit test covering the old behaviour
+**passed**: it manufactured a warm copy on a section via `install_warm`, a state
+production cannot reach. A green test over an impossible path is what made the
+change look safe.
+
+The two ways a section legitimately leaves VRAM are unaffected: a **collection
+member** is offload-only by design (`OffloadCollectionMembers` →
+`quantize_section_batch(mark_evict = true)`) and is freed by `install_cold` when
+its cold copy lands; and any section goes when its timeline is tombstoned.
+
+**Pinning costs little, and is cheaper than churning them.** Sections are
+prefilled during catalog build — at the very start — and chunk allocation is
+biased to the leftmost arena (§8.3), so they occupy the lowest regions and stay
+there: a dense permanent floor rather than fragmentation, and the lowest floor
+available. An evict/reload cycle would re-place them at whatever the low-water
+mark happened to be later, which is *higher*. Measured footprint is ~0.64–1.53
+MiB per section.
 
 **It sets no flag.** The obvious wiring — latch the existing `evict_when_cold`
 and let the persistence thread's `residence_evict_when_cold` → `install_cold`
@@ -454,9 +499,132 @@ if its stamp were somehow stale; (3) the stamp is written by the consumer, so
 "inactive" cannot go stale between decision and action; (4) the scan runs only on
 the persistence thread's between-forward seam — the same one
 `create_deferred_arenas` depends on, past `device.synchronize()`, with no wave in
-flight; (5) it only ever drops a **redundant** copy — `warm.is_some()` is part of
-the predicate, and a residence still owed a quantize (`pending_quantize`, whose
-`hot` is the interim native form the drain is about to replace) is excluded too.
+flight; (5) it only ever drops a **redundant** copy — a durable warm or cold copy
+is part of the predicate, and a residence still owed a quantize
+(`pending_quantize`, whose `hot` is the interim native form the drain is about to
+replace) is excluded too.
+
+**Every refusal is counted, not just the sheds.** The scan returns an
+`IdleDemoteReport`: `turns` / `sections` / `bytes` shed, `considered`, and the
+candidates it declined bucketed by reason — `pinned`, `not_durable`,
+`pending_quantize`, `too_recent`. A pass that frees nothing logs the same `0`
+whether nothing was idle or every idle candidate was blocked, and those want
+opposite responses. Three separate reclaim mechanisms in this tree have sat inert
+for the life of a run behind that ambiguity — this one included, which reported a
+truthful zero for every section on every pass. The call site logs whenever
+`considered > 0`, so the distinction is visible in the run rather than in an
+autopsy: `sections = 0` with `considered` non-zero means the section path has
+closed again, `not_durable` high means the drain is behind, `pinned` high means
+the working set is holding everything.
+
+---
+
+### 8.2 Idle slot demote — the scheduler's half, and the primary shed
+
+§8.1 runs on the persistence thread over *residences*. This runs on the
+scheduler over *slots*, at admission, and is where most VRAM actually comes
+back. `Scheduler::demote_idle_slots`.
+
+**Two holdings, and only one of them is small.** A conversation occupies the
+device twice over: its slot's block table, and the substrate's `hot` copies of
+its sealed turns. They are independent. `apply_projection` truncates the slot to
+zero blocks and rebuilds the prefix from the substrate **at every turn, on every
+slot**, so the block table is a cache that is discarded and rebuilt regardless of
+what this pass does. The hot copies are the durable holding, and they are the
+large one — measured, dropping them freed 8–9 MiB a pass against 5,920 MiB of
+resident K/V.
+
+The pass therefore takes both: `truncate_sequence_to_blocks(slot, 0)` for the
+first, `evict_hot_to_free(keep, u64::MAX)` per conversation for the second, with
+the keep-list built from the working sets of the slots it did *not* demote — so a
+conversation reached by a live fork keeps everything that fork attends. Only
+turns that already hold a warm copy are evicted, so it is hot→warm and the reload
+is a PCIe copy, never a recompute. `release_empty_arenas` follows immediately,
+because an arena only returns its region once its last chunk goes.
+
+**The defect this shape corrects.** The pass required `tokens > 0` — a slot
+holding no blocks was skipped on the reasoning that it had nothing to give back.
+But the slot is truncated at every turn, so a conversation *between* turns — the
+exact population this exists to shed — reads `tokens == 0`. It was classified
+`empty`, never reached the caller, and its hot copies were never swept. The
+census printed `idle_slots = 0` throughout, which reads as "nothing is idle"
+rather than "the classifier is wrong". **Never gate the large holding on the
+small one being non-empty.**
+
+**The idle signal is already exact; the grace is the only heuristic.** `busy`
+spans every phase the engine knows about — active decodes, active prefills,
+section ingests, the prefill queue, pending reprojections, deferred glue fires,
+parked turns, ephemeral slots, both halves of every turn view, and the current
+wave's members. So `!busy` means "not admitted and nothing pending". The grace
+window covers one thing that signal cannot see: the gap between a turn sealing
+and its successor being queued, i.e. a tool round trip, whose latency is external
+to the engine.
+
+**The clock is the admission pass** (`IDLE_SLOT_DEMOTE_PASSES = 1`), for the same
+reason §8.1's is the persistence pass. It was four *waves*, justified as matching
+a tool round trip — which inverts the units, since a round trip is wall-clock and
+a wave is 2–4 s on one card and a fraction of that on another. Worse, waves
+lengthen under load, stretching the grace exactly when ground is scarcest.
+Counting admission passes ages a slot fast under churn and slowly in a quiet
+engine, and lands the shed in the same pass that measures and spends what it
+frees. It fires on `==` the threshold rather than `>=`, so a quiet slot sheds
+once per quiet period; at a grace of one, `>=` would take a substrate write lock
+per idle conversation per pass to shed nothing.
+
+**Why the grace is short: the reload is the mechanism, not the cost.** A warm→hot
+lift allocates fresh chunks through the pool, and the pool is biased to the
+leftmost arena (§8.3), so the lift *re-places* that KV at the bottom of the span
+densely. Within a size class every slot is the same width, so there is no
+external fragmentation and consolidation can only ever mean moving a chunk from a
+high arena into a hole in a low one — which is precisely what evict-and-reallocate
+does, for free. Compaction relocates a *container* and preserves its holes; only
+the reload repacks. Holding a slot back declines that relocation. The two sides
+are not comparable: a lift is bounded PCIe on the copy stream, paid once, while a
+watermark that never falls narrows `weight_floor − live_end()` permanently.
+
+**Ordering.** It runs in the shed slot of `promote_new_prefills`, inside
+`admission_due()`, **before** both compactions and before `admit::fill` measures:
+shed → pack → measure → admit. Chunks must die before packing has anything to
+gain, and the module invariant is that eviction settles the free lists the fill
+then prices against.
+
+**Instruments.** `slots`, `slots_without_blocks` (the two populations — a slot
+mid-conversation handing back a block table, versus one already truncated whose
+bytes are entirely in the substrate), `residences_evicted`, `freed_mib`,
+`arenas_released`, and `live_before` / `live_after` / `regions_free`. The last
+three are the ones that matter: `live` is the watermark, so bytes freed without
+`live` moving means the survivors are scattered — a compaction problem, not an
+eviction one, and the two were previously indistinguishable from the log. A
+separate line reports how long each demoted slot stayed out before re-admission
+(`out_passes`, `out_ms`), which is what settles whether the grace should be one
+or zero.
+
+### 8.3 Leftmost allocation — the half that makes shedding compound
+
+Shedding frees bytes; it only lowers the **watermark** if what survives is dense
+and low. `live_watermark` is the highest non-free region index plus one, so a
+span with two hundred free regions under one live region at the top has exactly
+the headroom of a span with none. Every tenant therefore claims its lowest free
+unit: `claim_region` pops a `BinaryHeap<Reverse<usize>>` for both KV arenas and
+DeltaNet recurrent stores, `RegionBump` bump-allocates upward within a region,
+and chunk-to-arena placement goes through a capacity bitmap **indexed by region**
+so find-first-set names the leftmost arena with room in O(1).
+
+That last one is the subtle one and was wrong for a long time. The bitmap was
+indexed by `arena_idx`, and an arena index says nothing about address: indices
+come from the gid pool's own recycled free list while regions come from a heap
+shared with the recurrent stores and the wave transient tier, so the two
+sequences drift apart the moment another tenant takes a region. Chunks
+concentrated into arenas sitting anywhere, the churn never drained the top, and
+the watermark stayed where its high-water mark had left it. Ranking the bitmap by
+region fixes it without touching the gid encoding
+(`arena_idx * GID_STRIDE + chunk_idx`), so a relocation invalidates nothing;
+`set_arena_rank` republishes the rank when an arena is carved and again when it is
+relocated, so compaction and allocation pull the same way.
+
+Neither half works alone. Allocation without churn packs nothing, because nothing
+frees. Churn without leftmost allocation scatters the refills, and the top never
+empties.
 
 ---
 
@@ -503,15 +671,17 @@ impl VramGovernor {
     }
 }
 ```
-**Forecast as ceiling, AIMD smooths the ramp.** The forecast does not replace the
-AIMD `admit_window` (`mod.rs:4205-4225`) — it **caps** it:
-```
-admit = min(forecast_units(per_seq_kv_bytes), aimd_window)
-```
-AIMD still ramps additively (+1/loop) and backs off multiplicatively, but never
-past the measured ceiling. This keeps the proven anti-thrash ramp (no snapping to
-full width and re-tripping) while grounding the ceiling in real headroom +
-recoverably-freeable KV. The forecast can legitimately exceed raw free headroom
+> **Superseded on the admission side.** This section was written when the
+> scheduler carried an AIMD `admit_window` for the forecast to cap. There is no
+> longer any admission window, budget or estimate: the wave fill claims each
+> sequence's KV and model state through the real allocators and reads the
+> partition back after every admission (`docs/wave_feeder.md` §4.11, §4.11.6).
+> A forecast cannot cap a quantity that no longer exists, and the ramp it was to
+> smooth is now the wave width, which follows the measured expert hit rate. The
+> governor's own job below — measuring headroom and running the relief ladder —
+> is unaffected; only the admission coupling is gone.
+
+The forecast can legitimately exceed raw free headroom
 *because* prefill will free KV under pressure — but it counts only up to `Costly`
 (compress-completed-turns, which quantize on seal anyway, + reversible evict; no
 drop-to-cold, no sync), so it never plans on permanently damaging the cache.
@@ -708,7 +878,8 @@ Resolved in review:
    `kv_floor`), tunable per card class. ✔ (§8)
 3. **DXGI via the `windows` crate**, minimal features, `#[cfg(windows)]`. ✔ (§6, §12)
 4. **Forecast caps AIMD** (`admit = min(forecast, aimd_window)`); AIMD still smooths
-   the ramp. ✔ (§9.2)
+   the ramp. ✔ (§9.2) — **since undone**: the AIMD admission window it capped was
+   deleted with the rest of the byte-budget feeder (`docs/wave_feeder.md` §4.11.6).
 
 Open / defaulted (flag if you disagree):
 5. **`SCRATCH_MARGIN`.** The cushion left above `kv_floor` when computing

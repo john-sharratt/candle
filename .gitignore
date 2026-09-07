@@ -73,6 +73,17 @@ candle-kernels/build_tool/
 # files here at runtime; they are workspace content, never repo content.
 uploads/
 
+# Daemon-owned output directory, created under whatever root the daemon scans.
+# `walk_workspace` already excludes it from the repo map for the same reason it
+# is unwelcome in a commit: nothing in it is repo content.
+#
+# It holds the repo_map probe holdout (`.zend/probe_holdout.json`) among other
+# things, and that file in particular MUST stay out of the tree — it carries the
+# literal held-out query strings, so committing it would put the questions used
+# to score retrieval into the corpus being scored, exactly as the
+# `provenance_queries.json` entry below guards against.
+.zend/
+
 # Stray full prefill-capture dumps: ZEND_PREFILL_CAPTURE writes the untrimmed
 # capture here by default. The committed test fixture is the trimmed copy under
 # candle-transformers/tests/fixtures/ (LFS-tracked via .gitattributes).

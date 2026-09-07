@@ -269,7 +269,10 @@ mod tests {
             .await
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Sitemap: https://tokera.com/sitemap.xml"), "{body}");
+        assert!(
+            body.contains("Sitemap: https://tokera.com/sitemap.xml"),
+            "{body}"
+        );
         assert!(body.contains("Allow: /"), "{body}");
     }
 }
