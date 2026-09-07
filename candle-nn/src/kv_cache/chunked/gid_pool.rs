@@ -810,6 +810,12 @@ impl ArenaPool {
     /// steps past (the tombstoned-arena case). A bit lost at the new rank hides
     /// capacity, which the fallback resync rebuilds from `free_count`. Neither
     /// can strand a slot or hand one out twice.
+    /// Allocated slot count for one arena of this format pool.
+    fn arena_live_count(&self, arena_idx: usize) -> Option<usize> {
+        let tables = self.tables.read().unwrap();
+        tables.get(&arena_idx).map(|t| t.live_count())
+    }
+
     fn set_rank(&self, arena_idx: usize, rank: usize) {
         debug_assert!(
             rank < UNRANKED_BASE,
@@ -1529,6 +1535,24 @@ impl ChunkGidPool {
         if let Some(pool) = key.and_then(|k| self.inner.pools.get(&k)) {
             pool.set_rank(arena_idx, region_idx);
         }
+    }
+
+    /// How many chunk slots of `arena_idx` are currently allocated.
+    ///
+    /// The count a relocation checks itself against. Moving an arena's bytes
+    /// invalidates every `KvHead` record naming them, and the rewrite that
+    /// follows can only reach the chunks held by a live sequence — a chunk kept
+    /// by a sealed turn or section is owned upstream, in a `SealedSequence`, and
+    /// is invisible from the backing. Comparing what the rewrite reached against
+    /// this says whether the move would leave records pointing at ground the
+    /// arena has left. `None` when the index names no registered arena.
+    pub fn arena_live_count(&self, arena_idx: usize) -> Option<usize> {
+        let key = {
+            let state = self.inner.metadata.lock().unwrap();
+            state.arena_registry.get(arena_idx).and_then(|k| *k)
+        };
+        let pool = key.and_then(|k| self.inner.pools.get(&k))?;
+        pool.arena_live_count(arena_idx)
     }
 
     /// Remove from `free_arenas` any indices >= `threshold`.
