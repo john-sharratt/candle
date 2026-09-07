@@ -1024,13 +1024,28 @@ fn run_pass(
     // `elevate_to_hot` lifted it, so every shortfall was met by conceding
     // expert-weight ground, which is one-way.
     {
-        let shed = conversation
+        let r = conversation
             .write()
             .demote_idle_hot(crate::substrate::IDLE_DEMOTE_GRACE_EPOCHS);
-        if shed > 0 {
+        // **Logged whenever there was anything to consider, not only when
+        // something was shed.** A silent pass and a pass that refused every
+        // candidate are the same absence of a line otherwise, and the second is
+        // the failure this pass has actually had. The refusal counts say which:
+        // `not_durable` high means the drain is behind, `pinned` high means the
+        // working set is holding everything, `too_recent` high means the grace
+        // window is simply doing its job.
+        if r.considered > 0 {
             tracing::debug!(
                 target: "candle_conversation::persistence::tier",
-                residences = shed,
+                turns = r.turns,
+                sections = r.sections,
+                freed_mib = r.bytes / (1 << 20),
+                considered = r.considered,
+                skipped_pinned = r.pinned,
+                skipped_not_durable = r.not_durable,
+                skipped_pending_quantize = r.pending_quantize,
+                skipped_too_recent = r.too_recent,
+                skipped_section = r.section,
                 "idle demote: dropped the hot copy of residences no wave has attended"
             );
         }

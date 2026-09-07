@@ -38,7 +38,6 @@
 //! the reservation exists to keep out. The forward below is the same
 //! arithmetic reading weights the guest placed itself.
 
-use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -52,7 +51,7 @@ use memmap2::Mmap;
 use candle::quantized::pinned_staging::{Generation, GpuBuf, PinnedStager};
 use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy, KvCache, KvFormat};
 use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_prefill_batched, SharedPm,
+    compute_rope_cs, paged_decode_attn, paged_prefill_batched,
 };
 
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
@@ -763,16 +762,15 @@ struct PlacedLlama {
 /// Every layer's decode headers for one step, staged and addressable.
 ///
 /// Built once per decode forward and handed to each layer as `base + li * stride`
-/// — the kernel wants one contiguous `SlotHeader` array per layer, and the
-/// position map inside them is shared, so there is nothing per-layer to rebuild.
+/// — the kernel wants one contiguous `SlotHeader` array per layer.
 struct DecodeMeta {
     base: u64,
     /// Bytes between one layer's header array and the next.
     stride: usize,
-    /// The staged buffers. They view the pinned generation's arena, and dropping
-    /// one before the kernel reading it has run is an illegal address rather than
-    /// a wrong answer — so the whole forward holds them.
-    _hold: (GpuBuf, GpuBuf),
+    /// The staged headers. They view the pinned generation's arena, and dropping
+    /// them before the kernel reading them has run is an illegal address rather
+    /// than a wrong answer — so the whole forward holds them.
+    _hold: GpuBuf,
 }
 
 /// One layer's chunked K/V: the shared backing, and a cache bound to each seat.
@@ -1533,7 +1531,6 @@ impl PlacedLlama {
         k: &Tensor,
         v: &Tensor,
         generation: &Generation,
-        shared_pm: &RefCell<Option<SharedPm>>,
         meta: Option<&DecodeMeta>,
     ) -> candle::Result<Tensor> {
         let geo = self.geo;
@@ -1578,7 +1575,6 @@ impl PlacedLlama {
                 &self.rope_cs,
                 geo.arch.rope_is_interleaved(),
                 generation,
-                shared_pm,
                 // No QSA: the prose guest runs a dense stack with no trained
                 // block-selection indexer, so attention is over the whole
                 // window and there is no selection to hand the kernel.
@@ -1611,25 +1607,21 @@ impl PlacedLlama {
 
     /// Build every layer's `SlotHeader` array for one decode step, once.
     ///
-    /// # The header is 24 bytes and carries a position map
+    /// # The header is 16 bytes
     ///
-    /// `{n_slices, write_slice, slices_ptr, position_map_ptr}`, and the kernel
-    /// indexes it as `headers + slot * 24`. Writing the first three and stopping
-    /// at 16 is not a header merely missing a field: every slot after the first
-    /// is then read from the wrong offset entirely. One seat survives it — there
-    /// is no second header to misread, and its garbage `position_map_ptr` goes
-    /// untouched while the whole history sits in the write region. Eleven seats
-    /// faulted on the first decode step of every run.
+    /// `{n_slices, write_slice, slices_ptr}`, and the kernel indexes it as
+    /// `headers + slot * 16` ([`SLOT_HEADER_BYTES`]). A host stride that
+    /// disagrees with the kernel's is not a header merely missing a field: every
+    /// slot after the first is then read from the wrong offset entirely. One seat
+    /// survives it — there is no second header to misread — and eleven seats
+    /// once faulted on the first decode step of every run exactly that way.
     ///
-    /// # One map, shared by every layer
+    /// # Each layer answers from its own slices
     ///
-    /// It is built from layer 0's chunks and every layer's header points at it,
-    /// which is sound only because the layers agree about their block structure —
-    /// what `ensure_for_batch_entries_all` reconciled before this runs. The check
-    /// below is where that is worth confirming, both values being in hand: a
-    /// layer that disagrees scatters the new token into one chunk while attention
-    /// is told to read it from another, with no fault and no wrong-looking number
-    /// anywhere.
+    /// The kernel resolves a position by searching the slice array its own
+    /// header points at, and scatters the new token through that same header's
+    /// `write_slice`, so each layer's header describes that layer alone and
+    /// there is nothing shared across layers to keep in agreement.
     fn decode_meta(
         &mut self,
         seat0: usize,
@@ -1638,59 +1630,6 @@ impl PlacedLlama {
         generation: &Generation,
     ) -> candle::Result<DecodeMeta> {
         let want: Vec<(usize, usize)> = (0..nseats).map(|si| (seat0 + si, starts[si])).collect();
-
-        // One entry per token of each seat's history, then the entry for the
-        // token this step is about to write.
-        let mut pm: Vec<u32> = Vec::new();
-        let mut pm_at: Vec<usize> = Vec::with_capacity(nseats);
-        let mut shape: Vec<(u32, u32)> = Vec::with_capacity(nseats);
-        for &(slot, _) in &want {
-            pm_at.push(pm.len() * 4);
-            let chunks = self.kv[0]
-                .backing
-                .live_chunks_as_sealed(slot)
-                .unwrap_or_default();
-            for (sidx, c) in chunks.iter().enumerate() {
-                let base = (sidx as u32) << 16;
-                pm.extend(
-                    (c.offset as u32..c.offset as u32 + c.token_count as u32)
-                        .map(|in_blk| base | in_blk),
-                );
-            }
-            // The write slot is the first non-full chunk from the writer start,
-            // never `chunks.last()` — which may be a trailing empty sitting past
-            // it. This must match `sync_decode_gpu_chunks`'s own rule, or the
-            // token is scattered into one chunk and read back from another.
-            let wstart = self.kv[0]
-                .backing
-                .writer_start_idx_for_seq(slot)
-                .unwrap_or(0);
-            let n_ch = chunks.len();
-            let wi = if n_ch == 0 {
-                0
-            } else {
-                let start = wstart.min(n_ch - 1);
-                (start..n_ch)
-                    .find(|&i| {
-                        (chunks[i].offset as usize + chunks[i].token_count as usize) < CHUNK_TOKENS
-                    })
-                    .unwrap_or(n_ch - 1)
-            };
-            let within = chunks
-                .get(wi)
-                .map_or(0, |c| c.offset as u32 + c.token_count as u32);
-            pm.push(((wi as u32) << 16) | within);
-            shape.push((n_ch as u32, wi as u32));
-        }
-        if pm.is_empty() {
-            // A valid device pointer even with nothing to say.
-            pm.push(0);
-        }
-        let pm_bytes: Vec<u8> = pm.iter().flat_map(|e| e.to_le_bytes()).collect();
-        let mut pinned = generation.alloc(pm_bytes.len())?;
-        pinned.copy_from_slice(&pm_bytes);
-        let pm_gpu = generation.submit(pinned)?;
-        let pm_base = pm_gpu.dev_ptr();
 
         let mut bytes = Vec::with_capacity(self.kv.len() * nseats * SLOT_HEADER_BYTES);
         for layer in &self.kv {
@@ -1708,20 +1647,10 @@ impl PlacedLlama {
                 generation,
                 &mask,
             )?;
-            for (i, (ptr, n_slices, write_slice)) in ptrs.into_iter().enumerate() {
-                if (n_slices, write_slice) != shape[i] {
-                    candle::bail!(
-                        "prose guest: a layer describes seat {i} as {n_slices} slices writing \
-                         slice {write_slice}, but the position map every layer shares was built \
-                         from layer 0 as {} slices writing slice {}",
-                        shape[i].0,
-                        shape[i].1
-                    );
-                }
+            for (ptr, n_slices, write_slice) in ptrs {
                 bytes.extend_from_slice(&n_slices.to_le_bytes());
                 bytes.extend_from_slice(&write_slice.to_le_bytes());
                 bytes.extend_from_slice(&ptr.to_le_bytes());
-                bytes.extend_from_slice(&(pm_base + pm_at[i] as u64).to_le_bytes());
             }
         }
         let mut pinned = generation.alloc(bytes.len())?;
@@ -1730,7 +1659,7 @@ impl PlacedLlama {
         Ok(DecodeMeta {
             base: gpu.dev_ptr(),
             stride: nseats * SLOT_HEADER_BYTES,
-            _hold: (gpu, pm_gpu),
+            _hold: gpu,
         })
     }
 
@@ -1787,14 +1716,10 @@ impl PlacedLlama {
         // header and slice this pass uploads views the stager's pinned arena, and
         // `Generation::drop` syncs the stream and frees it — so a generation that
         // ended while a later layer's kernel was still in flight would be an
-        // illegal address, not a wrong number. The position map is
-        // layer-invariant and cached across the forward in `shared_pm` for the
-        // same reason it exists in the engine: forty layers would otherwise
-        // upload the same map forty times.
+        // illegal address, not a wrong number.
         // `begin_generation` returns an owned handle, so this borrow of the
         // stager ends here and the layer loop can still take `&mut self`.
         let generation = self.stager.begin_generation();
-        let shared_pm: RefCell<Option<SharedPm>> = RefCell::new(None);
 
         // **The chunks for this pass are allocated across every layer at once,
         // before any of them runs.**
@@ -1804,16 +1729,12 @@ impl PlacedLlama {
         // and why it also unifies the layout: a per-layer allocation lets one
         // layer hold a writable tail that suppresses the allocation the others
         // still needed, and the first layer to reach the gap refuses the step.
-        // The decode metadata builder then collapses every layer onto one
-        // position map, so the invariance this establishes is the thing that map
-        // depends on.
         let entries: Vec<(usize, usize)> = (0..nseats).map(|si| (seat0 + si, starts[si])).collect();
         let backings: Vec<ChunkedKvBacking> = self.kv.iter().map(|l| l.backing.clone()).collect();
         ChunkedKvBacking::ensure_for_batch_entries_all(&backings, &entries, n)?;
         drop(backings);
 
-        // Every layer's decode headers, built once — the position map inside them
-        // is shared, so there is nothing per-layer to rebuild. A prefill needs
+        // Every layer's decode headers, built once for the step. A prefill needs
         // none of this: `paged_prefill_batched` assembles its own.
         let meta = match n {
             1 => Some(self.decode_meta(seat0, nseats, &starts, &generation)?),
@@ -1874,7 +1795,6 @@ impl PlacedLlama {
                 &k,
                 &v,
                 &generation,
-                &shared_pm,
                 meta.as_ref(),
             )?;
             let y = y
@@ -2565,12 +2485,11 @@ const ARENA_CLASSES_PER_LAYER: usize = 3;
 
 /// One `SlotHeader`, as the decode kernel lays it out.
 ///
-/// `{u32 n_slices, u32 write_slice, u64 slices_ptr, u64 position_map_ptr}`, and
-/// `get_slot_header` indexes `headers + slot * 24`. Mirrored here because the
-/// host writes the bytes and nothing checks the two agree — a stride that is
-/// short by the position-map pointer reads every slot after the first from the
-/// wrong offset.
-const SLOT_HEADER_BYTES: usize = 24;
+/// `{u32 n_slices, u32 write_slice, u64 slices_ptr}`, and `get_slot_header`
+/// indexes `headers + slot * 16`. Mirrored here because the host writes the
+/// bytes and nothing checks the two agree — a stride that differs from the
+/// kernel's reads every slot after the first from the wrong offset.
+const SLOT_HEADER_BYTES: usize = 16;
 
 /// Tokens per chunk, which is the paged cache's own `CHUNK_SIZE`.
 ///

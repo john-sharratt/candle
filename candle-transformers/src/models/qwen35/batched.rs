@@ -11,6 +11,7 @@
 //! has none. One [`RecurrentStateStore`] per sequence, keyed by sequence id,
 //! mirroring how `deepseek4` keeps its per-sequence streaming state.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +29,7 @@ use super::spec::{replay_accepted_prefixes, ReplayLayer, StashSpan, VerifyStash}
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ModelCoreProperties, ProvenanceLayerIndices,
 };
+use crate::models::delta_net::validate_snapshot;
 use crate::models::delta_net::DeltaNetConstants;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
@@ -36,6 +38,16 @@ use crate::models::delta_net::RecurrentStateStore;
 use crate::models::draft_ladder::DraftLadder;
 use crate::models::lora::Adapter;
 use crate::models::rotary_layout::RotaryLayout;
+
+/// Waves a sequence must sit out before its recurrent write buffers are given
+/// back.
+///
+/// **Not zero, and that is the whole safety of it.** The pre-wave state a
+/// speculative rewind replays from lives in exactly those buffers, and the
+/// rewind runs in the same decode step as the wave that earned it. One wave of
+/// lag puts the release strictly after that window closes; releasing at commit
+/// would take the buffer while the rewind still wanted it.
+const RECURRENT_IDLE_LAG_WAVES: usize = 1;
 
 /// A loaded hybrid model of this lineage, ready to be driven by the scheduler.
 ///
@@ -325,9 +337,78 @@ impl HybridBatched {
         Ok(())
     }
 
+    /// Pack recurrent stores toward the low end of the span so the region
+    /// watermark falls, and report how many moved.
+    ///
+    /// **Highest first.** A store is relocated into the lowest ground standing
+    /// free, and `relocate_down` refuses a move that would not be leftward — so
+    /// taking the stores in descending address order gives the ground to the one
+    /// stranding the most behind it. Ascending order would let a store already
+    /// near the bottom take the low ground and leave the high one exactly where
+    /// it was.
+    ///
+    /// Runs between forwards: a region may only be claimed there, and
+    /// `RegionBump` refuses to open its window inside one.
+    #[cfg(feature = "cuda")]
+    pub fn compact_recurrent(&self) -> Result<usize> {
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        let mut order: Vec<(u64, usize)> = map
+            .iter()
+            .filter_map(|(seq, store)| store.top_base().map(|top| (top, *seq)))
+            .collect();
+        order.sort_unstable_by_key(|(top, _)| std::cmp::Reverse(*top));
+        // **Report the candidates, not just the moves.** A pass that considered
+        // stores and moved none looks identical from the caller to a pass that
+        // never ran, and the two have opposite fixes — the first is a refusal
+        // worth explaining, the second is a trigger that never fires. The first
+        // build of this shipped without the distinction and cost a run to spot.
+        let considered = order.len();
+        // Read once for the pass — see `relocate_down` for why not per store.
+        let free_regions = candle_nn::kv_cache::region_stats(0).map_or(0, |s| s.free);
+        let mut moved = 0usize;
+        for (_, seq) in order {
+            let Some(store) = map.get_mut(&seq) else {
+                continue;
+            };
+            if store.relocate_down(free_regions)? {
+                moved += 1;
+            }
+        }
+        if considered > 0 {
+            tracing::debug!(
+                target: "candle_transformers::qwen35",
+                considered,
+                moved,
+                "span compaction: recurrent stores packed",
+            );
+        }
+        Ok(moved)
+    }
+
     /// Drop the stash spans of `seqs` without replaying — for a verify forward
     /// that failed, whose spans would otherwise rewind a wave that never
     /// committed. The buffers stay for reuse.
+    /// Sequences whose speculative block is still stashed.
+    ///
+    /// **These are not idle, whatever the wave membership says.** A stash names
+    /// a rewind point *inside* a sequence's recurrent state, and the rollback
+    /// that consumes it lifts that state by sequence id — so parking one out
+    /// from under a live stash fails the rollback with "has no recurrent state",
+    /// which is what 30 directory ingests died of before this guard existed.
+    fn stashed_sequences(&self) -> Vec<usize> {
+        self.verify_stash
+            .lock()
+            .ok()
+            .and_then(|s| {
+                s.as_ref()
+                    .map(|st| st.spans.iter().map(|p| p.seq).collect())
+            })
+            .unwrap_or_default()
+    }
+
     pub fn drop_verify_stashes(&self, seqs: &[usize]) {
         if let Ok(mut slot) = self.verify_stash.lock() {
             if let Some(st) = slot.as_mut() {
@@ -442,33 +523,150 @@ impl HybridBatched {
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
         for (&seq, &offset) in seqs.iter().zip(offsets) {
-            let fresh = || {
-                RecurrentStateStore::new(
-                    &self.model.cfg.layer_kinds,
-                    &self.model.cfg.delta_net,
-                    &self.model.device,
-                )
-            };
-            match map.entry(seq) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(fresh()?);
-                }
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    // The seeded flag is consumed on the FIRST wave either
-                    // way. It protects the one wave that follows a fork or a
-                    // restore — the wave whose slot legitimately stands at
-                    // offset 0 while holding state that was put there on
-                    // purpose. A flag that outlived that wave would go on to
-                    // suppress a later, genuine reset, which is the recycled
-                    // slot defect wearing the fix's own clothes.
-                    let seeded = slot.get_mut().take_seeded();
-                    if offset == 0 && !seeded {
-                        slot.insert(fresh()?);
-                    }
-                }
+            // Loud: every sequence here was admitted against the span by
+            // `reserve_recurrent`, so a refusal now is a fault, not an answer.
+            if !self.materialise_recurrent(&mut map, seq, offset, false)? {
+                candle::bail!(
+                    "qwen35: sequence {seq} was admitted to the wave but the span refused \
+                     its recurrent state between admission and the forward"
+                );
             }
         }
+
+        // **Give back the write buffers of everyone who is not in this wave.**
+        //
+        // A store is created when a turn is *queued* and a queued turn waits
+        // many waves — measured, a backlog of 57–67 turns held 64 stores, and
+        // this half is 63 MiB of the 126 MiB each. Nothing reads it while the
+        // sequence sits out, and the wave it eventually joins overwrites it
+        // whole, so the buffer is pure occupancy taken one-for-one out of the
+        // weight zone.
+        //
+        // **Lagged by a wave rather than released at commit.** The non-live half
+        // holds the pre-wave state that `layer_state_rewind` replays a
+        // speculative block from, and that read happens in the same decode step
+        // as the wave that earned it — while the sequence is still a member.
+        // Releasing at commit would take the buffer out from under it.
+        let members: std::collections::HashSet<usize> = seqs.iter().copied().collect();
+        // **A stashed sequence is not idle, on this path either.** The write
+        // buffer is where `layer_state_rewind` finds the pre-wave state a
+        // speculative block replays from, so releasing it under a live stash
+        // leaves the rollback with nothing to rewind to. Guarding only the
+        // parking sweep below and not this one cost 26 directory ingests, all
+        // failing as "layer N has no entering state to rewind to" — the lag
+        // alone is not enough, because a rollback can arrive more than one wave
+        // after the wave that earned it.
+        let stashed = self.stashed_sequences();
+        for (seq, store) in map.iter_mut() {
+            if members.contains(seq) || stashed.contains(seq) {
+                continue;
+            }
+            // A refusal here is not fatal: it means the store is mid-wave, and
+            // the next sweep will find it idle again.
+            let _ = store.note_idle_wave(RECURRENT_IDLE_LAG_WAVES);
+        }
+
+        // **Recurrent state stays on the device.** An idle sequence used to be
+        // exported to pageable host memory here and its regions handed back,
+        // then imported again on its next admission. What bounds residency
+        // instead is the turn seal: `evict_recurrent` drops the device copy once
+        // the substrate snapshot is durable, so a conversation between turns
+        // holds nothing, and the next turn restores from the snapshot. Idle
+        // *within* a turn is a sequence queued behind others in the same wave
+        // group — a wave or two, not a conversation's lifetime — and the write
+        // buffers released above are the half of it worth reclaiming.
         Ok(())
+    }
+
+    /// Put `seq`'s recurrent state on the device, complete with its write
+    /// buffers, ready for a wave standing at `offset`.
+    ///
+    /// See [`needs_reset`] for the offset-0 rule.
+    ///
+    /// The one place a store is created, reset, unparked or given its write
+    /// half — shared by the admission probe ([`Self::reserve_recurrent`]) and
+    /// the wave path ([`Self::ensure_recurrent`]), so the two cannot disagree
+    /// about what "resident" means.
+    ///
+    /// `quiet` selects how a span refusal comes back: `Ok(false)` for the
+    /// probe, where "no room" is the expected answer to "one more?", or an
+    /// error with the partition dumped for the wave path, where the sequence
+    /// was already admitted and a refusal is a fault.
+    ///
+    /// A refusal leaves the map consistent. A store that could not be created
+    /// is not inserted; one that could not complete its write buffers keeps
+    /// the layers it did fill and resumes from there next time.
+    fn materialise_recurrent(
+        &self,
+        map: &mut HashMap<usize, RecurrentStateStore>,
+        seq: usize,
+        offset: usize,
+        quiet: bool,
+    ) -> Result<bool> {
+        let fresh = || -> Result<Option<RecurrentStateStore>> {
+            let kinds = &self.model.cfg.layer_kinds;
+            let dims = &self.model.cfg.delta_net;
+            let device = &self.model.device;
+            if quiet {
+                RecurrentStateStore::try_new(kinds, dims, device)
+            } else {
+                RecurrentStateStore::new(kinds, dims, device).map(Some)
+            }
+        };
+        let backups = |store: &mut RecurrentStateStore| -> Result<bool> {
+            if quiet {
+                store.try_ensure_backups()
+            } else {
+                store.ensure_backups().map(|()| true)
+            }
+        };
+        match map.entry(seq) {
+            Entry::Vacant(slot) => {
+                let Some(mut store) = fresh()? else {
+                    return Ok(false);
+                };
+                // A vacant slot is a sequence with no state anywhere — either it
+                // has never run a wave, or its state was evicted at the last
+                // turn's seal. Both start from the sequence-start value here;
+                // the second is carried across by `restore_recurrent`, which the
+                // scheduler runs from the substrate snapshot before this.
+                let ready = backups(&mut store)?;
+                slot.insert(store);
+                Ok(ready)
+            }
+            Entry::Occupied(mut slot) => {
+                if needs_reset(slot.get_mut(), offset, quiet) {
+                    let Some(store) = fresh()? else {
+                        return Ok(false);
+                    };
+                    slot.insert(store);
+                }
+                // Every sequence of the coming wave takes its write buffer
+                // here — this is the gap between forwards, the only window
+                // in which a region may be claimed. Idempotent, so a store
+                // that has already run costs one check per layer.
+                backups(slot.into_mut())
+            }
+        }
+    }
+
+    /// The admission probe: make `seq`'s recurrent state resident for a wave
+    /// standing at `offset`, or report that the span has no room for it.
+    ///
+    /// **This is the real allocation, asked one sequence at a time.** The
+    /// scheduler's wave fill calls it for each decode and prefill it would
+    /// admit; `false` is the span saying the wave is as wide as this model can
+    /// carry, and the sequence waits for the next one. Runs between forwards,
+    /// which is the only window a region may be claimed in.
+    ///
+    /// Idempotent and cheap for a sequence already resident with its write
+    /// buffers in place — one map lookup and a per-layer check.
+    pub fn reserve_recurrent(&self, seq: usize, offset: usize) -> Result<bool> {
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        self.materialise_recurrent(&mut map, seq, offset, true)
     }
 
     /// Drop a sequence's recurrent state.
@@ -505,6 +703,24 @@ impl HybridBatched {
             .unwrap_or(0)
     }
 
+    /// What one sequence's state costs — the widest store standing, or zero
+    /// when none is.
+    ///
+    /// Every store has the same geometry, so any of them answers for all; the
+    /// widest is taken because a store that has released its write buffers
+    /// (`release_backups`, after sitting out enough waves) reports the read
+    /// half only, and admission is pricing a store that will need both.
+    ///
+    /// Zero before the first store exists is not a gap: with nothing resident
+    /// the engine has nothing active, and admission at that point is
+    /// unconditional by design — see `admit::gate::may_admit`.
+    pub fn recurrent_store_bytes(&self) -> usize {
+        self.recurrent
+            .lock()
+            .map(|m| m.values().map(|s| s.reserved_bytes()).max().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     /// The turn loop carves a child slot per turn and decodes on it, borrowing
     /// the parent's KV blocks zero-copy. State cannot be borrowed the same way
     /// — the child advances it — so it is copied device-to-device
@@ -514,23 +730,27 @@ impl HybridBatched {
     /// Errors when the parent carries no state: a fork of nothing is a caller
     /// bug, and returning quietly would hand the child zeros — which is the
     /// defect this whole path exists to remove, reintroduced as an error path.
+    ///
     pub fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
+        // The child's state is written from scratch, so any span standing
+        // against that id belongs to whatever last used it — slot ids are
+        // recycled — and would rewind the new sequence into a stranger's state.
+        // The parent is untouched here and keeps its span.
+        self.drop_verify_stashes(&[child]);
         let mut map = self
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        let forked = map
-            .get(&parent)
-            .ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen35: fork_recurrent from sequence {parent}, which carries no \
-                     recurrent state — handing {child} zeros here is the amnesia this \
-                     path exists to prevent"
-                ))
-            })?
-            .fork_from()?;
-        map.insert(child, forked);
-        Ok(())
+        if let Some(store) = map.get(&parent) {
+            let forked = store.fork_from()?;
+            map.insert(child, forked);
+            return Ok(());
+        }
+        Err(candle::Error::Msg(format!(
+            "qwen35: fork_recurrent from sequence {parent}, which carries no \
+             recurrent state — handing {child} zeros here is the amnesia this \
+             path exists to prevent"
+        )))
     }
 
     /// Move `child`'s state onto `parent` — the linear join at `finalize_view`.
@@ -544,19 +764,26 @@ impl HybridBatched {
     /// Errors when the child carries none, for the same reason as
     /// [`Self::fork_recurrent`]: silently leaving the parent's stale state in
     /// place would lose the turn without saying so.
+    ///
     pub fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
+        // Both sequences' rewind points die here: the parent's state is replaced
+        // by the child's, and the child's entry ceases to exist. A span left on
+        // either names a state that is gone — see `restore_recurrent` for what a
+        // surviving span costs the waves that follow.
+        self.drop_verify_stashes(&[child, parent]);
         let mut map = self
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        let store = map.remove(&child).ok_or_else(|| {
-            candle::Error::Msg(format!(
-                "qwen35: move_recurrent from sequence {child}, which carries no \
-                 recurrent state — the turn's decode would be silently lost"
-            ))
-        })?;
-        map.insert(parent, store);
-        Ok(())
+        map.remove(&parent);
+        if let Some(store) = map.remove(&child) {
+            map.insert(parent, store);
+            return Ok(());
+        }
+        Err(candle::Error::Msg(format!(
+            "qwen35: move_recurrent from sequence {child}, which carries no \
+             recurrent state — the turn's decode would be silently lost"
+        )))
     }
 
     /// Read a sequence's state back as the snapshot record's layer rows.
@@ -564,54 +791,92 @@ impl HybridBatched {
     /// `None` when the sequence carries no state — a slot that has never run a
     /// wave has nothing worth persisting, and writing a zero snapshot would be
     /// worse than writing none: resume would install it and report success.
+    ///
     pub fn export_recurrent(&self, seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
         let map = self
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        let Some(store) = map.get(&seq) else {
-            return Ok(None);
-        };
-        // `export` refuses mid-wave itself; the seal runs outside the wave, so
-        // reaching that error means the ordering broke, not that the caller
-        // needs a retry.
-        let layers = store.export()?;
-        Ok(Some((store.schedule_hash(), layers)))
+        if let Some(store) = map.get(&seq) {
+            // `export` refuses mid-wave itself; the seal runs outside the wave,
+            // so reaching that error means the ordering broke, not that the
+            // caller needs a retry.
+            let layers = store.export()?;
+            return Ok(Some((store.schedule_hash(), layers)));
+        }
+        Ok(None)
     }
 
     /// Scatter a snapshot into a sequence's state — the resume path.
     ///
-    /// Creates the store if the slot has none yet (the normal case: resume runs
-    /// at `create_sequence`, before any wave). `import` validates the schedule
-    /// hash and every layer's geometry before touching a tensor, and marks the
-    /// store seeded so the first wave's `offset == 0` reset does not undo it.
+    /// Validates the schedule hash and every layer's geometry first
+    /// ([`validate_snapshot`]), so a foreign or torn snapshot is refused here,
+    /// loudly, and never installed.
+    ///
+    /// **Restores land on the device.** A sequence already resident imports in
+    /// place; one whose state was evicted at its last seal gets a store created
+    /// here and the snapshot scattered into it — seeded, so the first wave's
+    /// `offset == 0` reset does not undo it.
+    ///
+    /// Resume runs at `create_sequence`, which is outside a wave and therefore
+    /// the window in which the span may be claimed from. A refusal is an error
+    /// rather than a deferral: there is nowhere else for the state to wait, and
+    /// a restore that quietly did not happen is a conversation that resumes
+    /// fluent and having forgotten.
     pub fn restore_recurrent(
         &self,
         seq: usize,
         schedule_hash: u64,
         layers: &[ExportedLayerState],
     ) -> Result<()> {
+        validate_snapshot(
+            &self.model.cfg.layer_kinds,
+            &self.model.cfg.delta_net,
+            schedule_hash,
+            layers,
+        )?;
+        // **The state a stash span rewinds into is about to be overwritten.**
+        // A span names a rewind point *inside* this sequence's recurrent state;
+        // importing a snapshot replaces that state wholesale, so the point it
+        // names is gone. Left behind, the span outlives its cohort, and the next
+        // wave that takes the stash finds a span for a sequence it does not
+        // carry — which fails that whole wave, not just this sequence, for as
+        // long as the span survives.
+        //
+        // After `validate_snapshot`, so a rejected snapshot leaves a valid stash
+        // alone, and before the locks below, because `drop_verify_stashes` takes
+        // the stash lock and the two must never be held in both orders.
+        self.drop_verify_stashes(&[seq]);
         let mut map = self
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        let store = match map.entry(seq) {
-            std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(RecurrentStateStore::new(
-                    &self.model.cfg.layer_kinds,
-                    &self.model.cfg.delta_net,
-                    &self.model.device,
-                )?)
-            }
-        };
-        store.import(schedule_hash, layers)
+        if let Some(store) = map.get_mut(&seq) {
+            return store.import(schedule_hash, layers);
+        }
+        let mut store = RecurrentStateStore::new(
+            &self.model.cfg.layer_kinds,
+            &self.model.cfg.delta_net,
+            &self.model.device,
+        )?;
+        // Import before insert: a store that could not take the snapshot must
+        // not be left in the map, where the next wave would advance it from
+        // zeros and call that the conversation's history.
+        store.import(schedule_hash, layers)?;
+        map.insert(seq, store);
+        Ok(())
     }
 
-    /// Whether a sequence currently carries recurrent state — for the
-    /// scheduler's fork/move wiring, which must not call either on a slot the
-    /// model has never seen (a view carved before the parent's first wave).
-    pub fn has_recurrent(&self, seq: usize) -> Result<bool> {
+    /// Whether a sequence's recurrent state stands on the device right now.
+    ///
+    /// Answers both questions a caller can ask, because state exists only on
+    /// the device: the admission probe's ("a resident sequence costs the wave
+    /// nothing to carry, a new one costs a store") and the fork/move/restore
+    /// wiring's ("does this slot carry state at all", which must not fork from
+    /// a slot the model has never seen, nor restore over state that exists).
+    /// Those were two predicates while an idle sequence's state could sit on
+    /// the host; with nothing parked they cannot disagree.
+    pub fn recurrent_resident(&self, seq: usize) -> Result<bool> {
         Ok(self
             .recurrent
             .lock()
@@ -1334,6 +1599,36 @@ impl HybridBatched {
     }
 }
 
+/// Whether a store standing at `offset` must be thrown away and remade at the
+/// sequence-start value.
+///
+/// A sequence at offset 0 has no history, so its state must be the
+/// sequence-start value — except when the state was put there deliberately by a
+/// fork or a restore, which is what the store's seeded flag records. The flag
+/// protects exactly **one** offset-0 wave: one that outlived that wave would go
+/// on to suppress a later, genuine reset, which is the recycled-slot defect
+/// wearing the fix's own clothes.
+///
+/// `quiet` is what makes "one wave" true. It is set by the admission probe
+/// ([`ManagedQwen35::reserve_recurrent`]), which is asked once per sequence per
+/// fill and answers `false` whenever the span has no room — so a sequence can be
+/// probed many times before it ever rides a wave. The probe therefore *reads*
+/// the flag and the wave path *consumes* it. Consuming it in the probe spent it
+/// on a question rather than on the wave it guards: a restored store imports
+/// (seeded), its write buffers are refused part-way so the probe returns `false`
+/// twice, and the third probe finds the flag gone and remakes the state as
+/// zeros — after `materialise_recurrent`'s vacant arm has already dropped the
+/// host copy. The conversation comes back fluent and amnesiac, which is the
+/// exact failure resume exists to remove.
+fn needs_reset(store: &mut RecurrentStateStore, offset: usize, quiet: bool) -> bool {
+    let seeded = if quiet {
+        store.is_seeded()
+    } else {
+        store.take_seeded()
+    };
+    offset == 0 && !seeded
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::config::{DeltaNetDims, Qwen35Config};
@@ -1367,6 +1662,54 @@ mod tests {
         }
     }
 
+    /// A restored store, standing at offset 0, is probed as many times as the
+    /// span refuses it and keeps its state every time — then rides its wave.
+    ///
+    /// The probe is not the wave. It answers "is there room for one more?" and
+    /// says `false` whenever there is not, so it runs repeatedly for a sequence
+    /// that has not run at all; a flag spent there is spent on a question.
+    #[test]
+    fn the_probe_reads_the_seeded_flag_and_the_wave_consumes_it() -> Result<()> {
+        let c = cfg();
+        let dev = Device::Cpu;
+        let mut store = RecurrentStateStore::new(&c.layer_kinds, &c.delta_net, &dev)?;
+        store.mark_seeded();
+
+        for probe in 0..5 {
+            assert!(
+                !needs_reset(&mut store, 0, true),
+                "probe {probe} would have thrown away restored state",
+            );
+        }
+        assert!(
+            store.is_seeded(),
+            "five probes must leave the flag for the wave that follows",
+        );
+
+        // The wave it was guarding: no reset, and the flag is spent.
+        assert!(!needs_reset(&mut store, 0, false));
+        assert!(!store.is_seeded(), "the wave consumes it");
+        // A later offset-0 wave on the same slot is a genuine reset — this is
+        // the recycled-slot case the flag must not go on suppressing.
+        assert!(needs_reset(&mut store, 0, false));
+        Ok(())
+    }
+
+    /// Away from offset 0 there is history to keep, so nothing is reset and
+    /// the flag is irrelevant — but the wave path still spends it, because the
+    /// wave it was reserved for is the one now running.
+    #[test]
+    fn a_store_with_history_is_never_reset() -> Result<()> {
+        let c = cfg();
+        let dev = Device::Cpu;
+        let mut store = RecurrentStateStore::new(&c.layer_kinds, &c.delta_net, &dev)?;
+        assert!(!needs_reset(&mut store, 1, true));
+        assert!(!needs_reset(&mut store, 4096, false));
+        // An unseeded store at offset 0 is the ordinary case: reset it.
+        assert!(needs_reset(&mut store, 0, true));
+        Ok(())
+    }
+
     /// A wave writes the buffer it is NOT reading, so the entry state is intact
     /// whether the wave commits or fails — and a commit installs the wave's
     /// output.
@@ -1375,6 +1718,11 @@ mod tests {
         let c = cfg();
         let dev = Device::Cpu;
         let mut store = RecurrentStateStore::new(&c.layer_kinds, &c.delta_net, &dev)?;
+        // The write half is taken between forwards, never inside one, and a
+        // store that sits out enough waves gives it back — so every wave path
+        // takes it first (`materialise_recurrent`). Without this the store has
+        // only the buffer it reads and `layer_state_pair_mut` refuses.
+        store.ensure_backups()?;
         // Layer 0 is DeltaNet under the 3:1 schedule.
         let entry = store.layer_state(0)?.s.copy()?;
 

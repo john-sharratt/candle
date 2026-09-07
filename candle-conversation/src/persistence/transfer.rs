@@ -717,7 +717,6 @@ mod cuda_impl {
                         chunk_size,
                         sub_head_dim,
                     )?;
-                    let k_off = cursor;
                     cursor += k_bytes;
 
                     let v_ggml = kv_tag_to_ggml(payload.v_formats[sb])?;
@@ -734,17 +733,7 @@ mod cuda_impl {
                         chunk_size,
                         sub_head_dim,
                     )?;
-                    let v_off = cursor;
                     cursor += v_bytes;
-
-                    // Only noisy when hunting the bug — per-sub-band offsets
-                    // help localise a K/V swap or a misaligned V band.
-                    if std::env::var("FZ_TRACE").is_ok() {
-                        eprintln!(
-                            "  sb {sb:>2} (h={h},p={p})  K@{k_off} {k_ggml:?} ({k_bytes}B)  \
-                             V@{v_off} {v_ggml:?} ({v_bytes}B)"
-                        );
-                    }
 
                     // Bands are dim-major (`band[pd*chunk_size+t]`); route each
                     // local dim `pd` to its global head dim via the palette map.

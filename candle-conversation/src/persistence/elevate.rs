@@ -152,13 +152,17 @@ pub fn elevate_to_hot(
     // the incoming RAM cost once and ask the substrate to drop LRU
     // warm residences until the OS would still have at least
     // `max(2 GiB, 5% × total_ram)` available after the upcoming
-    // allocation lands. Section cold-load isn't wired up; only turns
-    // contribute to the incoming budget.
+    // allocation lands.
+    //
+    // **Sections count too.** They were excluded on the reasoning that section
+    // cold-load was not wired up — it is (phase 2b.i's `Section` arm goes
+    // through `cold_load_section_into_hot`), and phase 2b.ii materialises a warm
+    // copy alongside every cold item's hot install without distinguishing kinds.
+    // So a batch of cold sections took RAM this budget had not been told about.
     if !plan.cold_to_hot.is_empty() {
         let incoming_bytes: u64 = plan
             .cold_to_hot
             .iter()
-            .filter(|c| matches!(c.kind, PromotionItemKind::Turn(_)))
             .flat_map(|c| c.cold.iter())
             .flat_map(|s| s.chunks.iter())
             .map(|c| c.record_len)
@@ -187,8 +191,9 @@ pub fn elevate_to_hot(
     // because each turn allocates its own scratch slot inside
     // load_stream.
     //
-    // Section cold-load isn't wired up (see hot_section_or_skip in
-    // scheduler/mod.rs); cold sections are warned and dropped.
+    // Sections take the same route (the `Section` arm below), through
+    // `cold_load_section_into_hot` rather than `recover_turn_chunks`, because a
+    // section has a stream id but no timeline/turn coordinates.
     struct PendingRecall {
         kind: PromotionItemKind,
         residence: ResidenceIndex,

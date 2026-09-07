@@ -146,7 +146,6 @@ fn build_history_slot(
             rope_cs,
             false,
             &generation,
-            &std::cell::RefCell::new(None),
             None,
         )?;
     }
@@ -181,8 +180,6 @@ fn decode_one_slot(
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
-    use candle::backend::BackendStorage;
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_transformers::models::slot_state::{
         tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
     };
@@ -197,15 +194,15 @@ fn decode_one_slot(
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
 
-    let mut slot = SlotStateHost::from_sealed_chunks(
+    let slot = SlotStateHost::from_sealed_chunks(
         &chunks,
         g.n_kv_head,
         g.head_dim,
         &arena_info,
         writer_start,
-        true,
     );
-    slot.extend_for_write_region(1, CHUNK_SIZE);
+    // One decoded token, resolved by walking from `write_slice`.
+    slot.assert_write_region_capacity(1, CHUNK_SIZE);
 
     let mut records_buf: Vec<u8> = Vec::new();
     let mut rec_offset: Vec<Option<usize>> = Vec::with_capacity(slot.slices.len());
@@ -236,30 +233,13 @@ fn decode_one_slot(
     let slices_tensor = Tensor::from_slice(&slice_buf, slice_buf.len(), device)?;
     let slices_base_ptr = tensor_u8_device_ptr(&slices_tensor)?;
 
-    let mut pm = slot.position_map.clone();
-    if pm.is_empty() {
-        pm.push(0);
-    }
-    let pm_tensor = Tensor::from_slice(&pm, pm.len(), device)?;
-    let pm_base_ptr = {
-        let (storage, layout) = pm_tensor.storage_and_layout();
-        let cs = match &*storage {
-            candle::Storage::Cuda(c) => c,
-            _ => candle::bail!("expected CUDA storage"),
-        };
-        let stream = cs.device().cuda_stream();
-        let s = cs.as_cuda_slice::<u32>()?.slice(layout.start_offset()..);
-        let (p, _g) = s.device_ptr(&stream);
-        p
-    };
-
-    let mut hdr = Vec::with_capacity(24);
+    // 16-byte SlotHeader: n_slices, write_slice, slices_ptr.
+    let mut hdr = Vec::with_capacity(16);
     let n_slices = slot.slices.len() as u32;
     let write_slice = slot.write_slice;
     hdr.extend_from_slice(&n_slices.to_le_bytes());
     hdr.extend_from_slice(&write_slice.to_le_bytes());
     hdr.extend_from_slice(&slices_base_ptr.to_le_bytes());
-    hdr.extend_from_slice(&pm_base_ptr.to_le_bytes());
 
     let generation = stager.begin_generation();
     let mut pinned = generation.alloc(hdr.len())?;

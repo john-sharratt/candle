@@ -56,7 +56,6 @@ use super::batched_layer::{
 };
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
-use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
@@ -374,6 +373,13 @@ pub trait BatchedModelCore {
     /// moves with wave width — so a total that omits it makes the span read
     /// emptier than it is.
     fn recurrent_reserved_bytes(&self) -> usize {
+        0
+    }
+
+    /// What **one** sequence's recurrent state costs, resident or not — the
+    /// figure admission prices a not-yet-created store at. Distinct from the
+    /// total above, which cannot answer it when no store exists yet.
+    fn recurrent_store_bytes(&self) -> usize {
         0
     }
 
@@ -920,9 +926,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         let dec_rope = self.compute_rope_for_batch(dec_off, dec_q, embed_dtype)?;
         let pre_rope = self.compute_rope_for_batch(pre_off, pre_q, embed_dtype)?;
         let glue_rope = self.compute_rope_for_batch(glue_off, glue_q, embed_dtype)?;
-        let dec_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
-        let pre_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
-        let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
         let interleaved = self.model.rope_interleaved();
         let dec_params = BatchedAttentionParams::new(
             &dec_rope.0,
@@ -933,7 +936,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             decode_headers,
             dec_q,
             generation,
-            &dec_pm,
         );
         let pre_params = BatchedAttentionParams::new(
             &pre_rope.0,
@@ -944,7 +946,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             prefill_headers,
             pre_q,
             generation,
-            &pre_pm,
         );
         let glue_params = BatchedAttentionParams::new(
             &glue_rope.0,
@@ -955,7 +956,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             glue_headers,
             glue_q,
             generation,
-            &glue_pm,
         );
 
         for layer_idx in layer_start..layer_end {

@@ -11,7 +11,6 @@
 
 #![cfg(feature = "cuda")]
 
-use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use candle::quantized::pinned_staging::PinnedStager;
@@ -214,7 +213,7 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
         // The write region must exist before the kernel runs — `paged_prefill_batched`
         // writes into it and does not allocate it. Production does this up front via
         // `ensure_for_batch_entries_all`; replaying the captured call without it trips
-        // `extend_for_write_region: no writer chunk`.
+        // `assert_write_region_capacity: no writer chunk`.
         for (si, cache) in caches.iter().enumerate() {
             let kc = cache.k_cache();
             if let (Some(backing), Some(slot)) = (kc.chunked_backing(), kc.chunked_slot()) {
@@ -240,7 +239,6 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
             &rope_cs,
             cap.rope_interleaved,
             &generation,
-            &RefCell::new(None),
             None,
         )
     };

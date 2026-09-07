@@ -592,7 +592,6 @@ fn run_prefill(
         rope_cs,
         false,
         &generation,
-        &std::cell::RefCell::new(None),
         None,
     )?;
     caches[0].set_current_seq_len(offset + seq_len)?;
@@ -611,8 +610,6 @@ fn decode_one(
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
-    use candle::backend::BackendStorage;
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_transformers::models::slot_state::{
         tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
     };
@@ -626,15 +623,14 @@ fn decode_one(
         .chunked_live_chunks_as_sealed()
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-    let mut slot = SlotStateHost::from_sealed_chunks(
+    let slot = SlotStateHost::from_sealed_chunks(
         &chunks,
         N_KV_HEAD,
         HEAD_DIM,
         &arena_info,
         writer_start,
-        true,
     );
-    slot.extend_for_write_region(1, CHUNK_SIZE);
+    slot.assert_write_region_capacity(1, CHUNK_SIZE);
 
     let mut records: Vec<u8> = Vec::new();
     let mut rec_off: Vec<Option<usize>> = Vec::with_capacity(slot.slices.len());
@@ -665,28 +661,10 @@ fn decode_one(
     let slices_t = Tensor::from_slice(&slices, slices.len(), device)?;
     let slices_ptr = tensor_u8_device_ptr(&slices_t)?;
 
-    let mut pm = slot.position_map.clone();
-    if pm.is_empty() {
-        pm.push(0);
-    }
-    let pm_t = Tensor::from_slice(&pm, pm.len(), device)?;
-    let pm_ptr = {
-        let (storage, layout) = pm_t.storage_and_layout();
-        let cs = match &*storage {
-            candle::Storage::Cuda(c) => c,
-            _ => candle::bail!("expected CUDA storage"),
-        };
-        let stream = cs.device().cuda_stream();
-        let s = cs.as_cuda_slice::<u32>()?.slice(layout.start_offset()..);
-        let (p, _g) = s.device_ptr(&stream);
-        p
-    };
-
-    let mut hdr = Vec::with_capacity(24);
+    let mut hdr = Vec::with_capacity(16);
     hdr.extend_from_slice(&(slot.slices.len() as u32).to_le_bytes());
     hdr.extend_from_slice(&slot.write_slice.to_le_bytes());
     hdr.extend_from_slice(&slices_ptr.to_le_bytes());
-    hdr.extend_from_slice(&pm_ptr.to_le_bytes());
     let generation = stager.begin_generation();
     let mut pinned = generation.alloc(hdr.len())?;
     pinned.copy_from_slice(&hdr);
@@ -710,7 +688,6 @@ fn decode_one(
     let owned = out.to_owned_tensor()?;
     drop(headers);
     drop(slices_t);
-    drop(pm_t);
     Ok(owned)
 }
 
@@ -757,20 +734,18 @@ fn decode_one_production(
         .chunked_live_chunks_as_sealed()
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-    let mut expect = SlotStateHost::from_sealed_chunks(
+    let expect = SlotStateHost::from_sealed_chunks(
         &chunks,
         N_KV_HEAD,
         HEAD_DIM,
         &arena_info,
         writer_start,
-        true,
     );
-    expect.extend_for_write_region(1, CHUNK_SIZE);
-    let mut hdr = Vec::with_capacity(24);
+    expect.assert_write_region_capacity(1, CHUNK_SIZE);
+    let mut hdr = Vec::with_capacity(16);
     hdr.extend_from_slice(&n_slices.to_le_bytes());
     hdr.extend_from_slice(&write_slice.to_le_bytes());
     hdr.extend_from_slice(&ptr.to_le_bytes());
-    hdr.extend_from_slice(&0u64.to_le_bytes());
     let mut pinned = generation.alloc(hdr.len())?;
     pinned.copy_from_slice(&hdr);
     let headers = generation.submit_resident(pinned)?;

@@ -201,7 +201,6 @@ fn build_history_slot(
             rope_cs,
             false,
             &generation,
-            &std::cell::RefCell::new(None),
             None,
         )?;
     }
@@ -319,15 +318,14 @@ impl SlotHeaders {
             .unwrap_or_default();
         let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
 
-        let mut slot = SlotStateHost::from_sealed_chunks(
+        let slot = SlotStateHost::from_sealed_chunks(
             &chunks,
             g.n_kv_head,
             g.head_dim,
             &arena_info,
             writer_start,
-            false,
         );
-        slot.extend_for_write_region(1, CHUNK_SIZE);
+        slot.assert_write_region_capacity(1, CHUNK_SIZE);
 
         let mut records_buf: Vec<u8> = Vec::new();
         let mut rec_offset: Vec<Option<usize>> = Vec::with_capacity(slot.slices.len());
@@ -358,13 +356,12 @@ impl SlotHeaders {
         let slices = Tensor::from_slice(&slice_buf, slice_buf.len(), device)?;
         let slices_base_ptr = tensor_u8_device_ptr(&slices)?;
 
-        // Decode headers carry no position map (no decode kernel reads one),
-        // exactly as `build_decode_metadata` serialises them.
-        let mut hdr = Vec::with_capacity(24);
+        // The 16-byte header `build_decode_metadata` serialises:
+        // (n_slices, write_slice, slices_ptr).
+        let mut hdr = Vec::with_capacity(16);
         hdr.extend_from_slice(&(slot.slices.len() as u32).to_le_bytes());
         hdr.extend_from_slice(&slot.write_slice.to_le_bytes());
         hdr.extend_from_slice(&slices_base_ptr.to_le_bytes());
-        hdr.extend_from_slice(&0u64.to_le_bytes());
 
         let generation = stager.begin_generation();
         let headers_dev = Tensor::from_slice(&hdr, hdr.len(), device)?;
@@ -839,7 +836,6 @@ fn prefill_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result<()> 
                 &rope_cs,
                 false,
                 &generation,
-                &std::cell::RefCell::new(None),
                 sel,
             )?
         };
@@ -1122,7 +1118,6 @@ fn prefill_walk_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result
                 &rope_cs,
                 false,
                 &generation,
-                &std::cell::RefCell::new(None),
                 Some(sel),
             )?
         };
@@ -1576,7 +1571,6 @@ fn bench_prefill_cost_vs_depth() -> Result<()> {
                     &rope_cs,
                     false,
                     &generation,
-                    &std::cell::RefCell::new(None),
                     s,
                 )?;
                 Ok(())

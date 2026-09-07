@@ -27,8 +27,6 @@
 //!   top rather than silently running them as ordinary prefill against the
 //!   wrong mask.
 
-use std::cell::RefCell;
-
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
@@ -62,7 +60,6 @@ use crate::models::batched_layer::{
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
-use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_buffers::wave_root;
@@ -175,6 +172,23 @@ impl ManagedBatchedModel for HybridBatched {
     /// [`crate::models::draft_ladder`].
     fn draft_budget(&self, width: usize) -> usize {
         self.draft_budget_for(width)
+    }
+
+    /// Measured on the RTX 4090 Mobile (16 GB) by
+    /// `quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b`,
+    /// weight zone 8.7 GiB cedeable: aggregate decode 40, 104, 78, 73 and 53
+    /// tok/s at 1, 4, 5, 8 and 16 sessions. Sixteen is the widest row the gate
+    /// measured, and the ceiling is only a ceiling: the scheduler's wave width
+    /// follows the expert hit rate beneath it, so on this card it settles where
+    /// the rate says. With the ceiling at eight, a run sat at a hit rate of
+    /// 0.59 — clear of the knee — with seven decodes filling the width, the
+    /// prefill row idle and the queue empty: the ceiling was the bound, not the
+    /// residency. Ten is the streaming row; on a card that holds every expert
+    /// the scheduler reads the hit rate at the resident mark and widens past
+    /// this toward the engine's hard cap, so this row bounds only the card it
+    /// was measured on.
+    fn decode_width_target(&self) -> usize {
+        10
     }
 
     /// Draft with the checkpoint's own NextN/MTP head ([`super::mtp`]), for the
@@ -556,8 +570,35 @@ impl ManagedBatchedModel for HybridBatched {
         self.release_recurrent(seq)
     }
 
+    fn compact_span(&self) -> Result<usize> {
+        #[cfg(feature = "cuda")]
+        {
+            HybridBatched::compact_recurrent(self)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Ok(0)
+        }
+    }
+
     fn recurrent_memory_count(&self) -> usize {
         HybridBatched::recurrent_len(self).unwrap_or(0)
+    }
+
+    fn recurrent_resident(&self, seq: usize) -> bool {
+        // A poisoned lock reports "not resident": the fill then prices the
+        // sequence as a new store and the fork/move wiring takes the restore
+        // path — the conservative direction on both counts, since the
+        // alternative is forking from state that may not be there.
+        HybridBatched::recurrent_resident(self, seq).unwrap_or(false)
+    }
+
+    fn evict_recurrent(&self, seq: usize) -> Result<()> {
+        self.release_recurrent(seq)
+    }
+
+    fn admit_recurrent(&self, seq: usize, offset: usize) -> Result<bool> {
+        self.reserve_recurrent(seq, offset)
     }
 
     /// A view carve. The child borrows the parent's KV; its recurrent state has
@@ -569,7 +610,7 @@ impl ManagedBatchedModel for HybridBatched {
     /// store holds exactly that, so the child's own `ensure_recurrent` does the
     /// right thing and there is nothing to copy.
     fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
-        if !self.has_recurrent(parent)? {
+        if !HybridBatched::recurrent_resident(self, parent)? {
             return Ok(());
         }
         HybridBatched::fork_recurrent(self, parent, child)
@@ -581,7 +622,7 @@ impl ManagedBatchedModel for HybridBatched {
     /// Tolerant in the same direction and for the same reason — a view that
     /// never ran a wave has nothing to move, and the parent keeps what it had.
     fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
-        if !self.has_recurrent(child)? {
+        if !HybridBatched::recurrent_resident(self, child)? {
             return Ok(());
         }
         HybridBatched::move_recurrent(self, child, parent)
@@ -681,6 +722,10 @@ impl ManagedBatchedModel for HybridBatched {
         HybridBatched::recurrent_reserved_bytes(self)
     }
 
+    fn recurrent_store_bytes(&self) -> usize {
+        HybridBatched::recurrent_store_bytes(self)
+    }
+
     fn reset_expert_stats(&self) {
         #[cfg(feature = "cuda")]
         if let Some(c) = self.model().experts.as_ref() {
@@ -712,8 +757,8 @@ impl WaveSweep for HybridBatched {
         HybridBatched::num_layers(self)
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
-        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head_rows, tier_budget)
     }
 
     fn kv_layer_range(&self, layer_start: usize, layer_end: usize) -> (usize, usize) {
@@ -987,8 +1032,6 @@ fn sweep_layers(
         pre_sin.reshape((1, pre_rows, half))?,
     );
 
-    let dec_pm: RefCell<Option<SharedPm>> = RefCell::new(None);
-    let pre_pm: RefCell<Option<SharedPm>> = RefCell::new(None);
     // NeoX half-split within the rotary width — the layout `RotaryLayout`
     // permutes the head dims into, never the interleaved GPT-J form.
     let interleaved = false;
@@ -1002,7 +1045,6 @@ fn sweep_layers(
         decode_headers,
         dec_q,
         generation,
-        &dec_pm,
     );
     let pre_params = BatchedAttentionParams::new(
         &pre_rope.0,
@@ -1013,7 +1055,6 @@ fn sweep_layers(
         prefill_headers,
         pre_q,
         generation,
-        &pre_pm,
     );
 
     // Where each sequence's rows sit in the packed buffer — what a recurrent
@@ -1067,6 +1108,15 @@ fn sweep_layers(
     // Every armed sequence rides the same `decode_forward_cobatched` call, so a
     // wave carries all of them or none.
     let verify_seqs = model.verify_row_seqs()?;
+    // Any armed sequence in this window is reason to take the stash: a
+    // segmented sweep carries a subset per window and each stamps the spans it
+    // holds, which is what lets the windows accumulate into the one complete
+    // stash the rewind needs (see the file-back at the end of this function).
+    //
+    // Requiring the WHOLE cohort here was tried and is wrong: run CW measured
+    // the cohort split across windows with no single one carrying all 15, so
+    // the stash was never taken, no span was ever stamped, and every accept
+    // failed with "no verified block covers that offset" instead.
     let carries_verify = spans.iter().any(|s| verify_seqs.contains(&s.seq));
     let mut cohort_stash: Option<VerifyStash> = if carries_verify {
         model.take_verify_stash()?
@@ -1331,12 +1381,20 @@ fn sweep_layers(
     // restamping is idempotent.
     if let Some(mut st) = cohort_stash {
         for sp in st.spans.iter_mut() {
-            let at = spans.iter().position(|s| s.seq == sp.seq).ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen35 wave: stash span for sequence {} has no wave span",
-                    sp.seq
-                ))
-            })?;
+            // **Stamp what this window carries; leave the rest to the window
+            // that carries them.** A cohort's rows are split across the windows
+            // of a segmented sweep, so a span with no row *here* is the normal
+            // case, not a fault — the stash is put back and the next window
+            // stamps its own. Treating it as an error killed the whole forward,
+            // and with it every sequence riding that window: run CV lost 21 of
+            // 53 directories that way, run CS 83 of 175.
+            //
+            // A span that no window ever stamps keeps `start = 0`, which the
+            // accept catches loudly ("no verified block covers that offset")
+            // rather than replaying from the wrong offset.
+            let Some(at) = spans.iter().position(|s| s.seq == sp.seq) else {
+                continue;
+            };
             sp.start = offsets[at];
         }
         model.put_verify_stash(st)?;

@@ -658,6 +658,53 @@ pub struct EvictionReport {
     pub bytes: u64,
 }
 
+/// Per-call summary from [`Substrate::demote_idle_hot`] — what it shed, and for
+/// everything it did not, **why**.
+///
+/// A pass that frees nothing logs the same `0` whether nothing was idle or
+/// every idle candidate was blocked, and those want opposite responses: the
+/// first is healthy, the second is a stall. This tree has had three separate
+/// reclaim mechanisms sit inert for the life of a run behind that ambiguity,
+/// each reporting a perfectly truthful zero. The refusal counts are what make
+/// the difference visible in the log instead of in an autopsy.
+///
+/// `considered` counts residences examined, so the refusal buckets and
+/// `turns + sections` account for all of it bar the ones already cold.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IdleDemoteReport {
+    /// Turn residences whose hot copy was dropped.
+    pub turns: usize,
+    /// Section residences whose hot copy was dropped. **Always zero** — this
+    /// pass does not shed sections (see [`Substrate::demote_idle_hot`]). Kept
+    /// as a field so a change that starts shedding them shows up here rather
+    /// than only in a downstream NaN.
+    pub sections: usize,
+    /// VRAM freed, summed from each shed residence's cached `byte_size`.
+    pub bytes: u64,
+    /// Residences examined this pass (turns on `hot_lru` plus every section).
+    pub considered: usize,
+    /// Refused: the current wave's working set names it.
+    pub pinned: usize,
+    /// Refused: no warm and no cold copy, so the bytes exist only here.
+    pub not_durable: usize,
+    /// Refused: `hot` is an interim native form the scheduler still owes a
+    /// quantize.
+    pub pending_quantize: usize,
+    /// Refused: attended within `grace` epochs.
+    pub too_recent: usize,
+    /// Refused: a section, which this pass never sheds. Expect this to equal
+    /// the resident section count on every pass; it is the standing proof that
+    /// the pin is in force.
+    pub section: usize,
+}
+
+impl IdleDemoteReport {
+    /// Residences shed, of either kind.
+    pub fn total(&self) -> usize {
+        self.turns + self.sections
+    }
+}
+
 /// Which tiers a residence currently occupies. Returned by
 /// [`Substrate::turn_tier_state`] / [`Substrate::section_tier_state`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1482,6 +1529,14 @@ impl Substrate {
     /// counterpart (`docs/vram_governor_design.md` §8.1). Absence from the list
     /// is a statement about *which* policy may take it, not about whether any
     /// policy may.
+    ///
+    /// **That absence is also why the demote's durability test must accept a
+    /// cold copy.** Being off `hot_lru` keeps a section out of the hot→warm
+    /// drain (`snapshot_pending_warm` walks that list), so it never acquires a
+    /// warm copy at all and reaches disk through the persistence thread's own
+    /// section phase. A demote predicate that insisted on `warm` therefore
+    /// rejected every section forever, which is the exact permanence this
+    /// paragraph denies.
     fn install_section_hot(&mut self, residence: ResidenceIndex, sealed: Vec<SealedSequence>) {
         debug_assert!(
             !sealed.is_empty(),
@@ -1714,7 +1769,7 @@ impl Substrate {
     }
 
     /// Drop the hot copy of residences that no wave has attended for `grace`
-    /// epochs and that already have a warm one
+    /// epochs and that already have a durable copy — warm or cold
     /// (`docs/vram_governor_design.md` §8.1). Returns how many were shed.
     ///
     /// **Sets no flag.** An earlier version latched `evict_when_cold`, which was
@@ -1739,13 +1794,45 @@ impl Substrate {
     /// [`Self::set_working_set_pins`] and so fails the staleness test outright;
     /// `working_set_pins` excludes it again; and the drop itself runs only on
     /// the persistence thread's between-wave pass, past a device sync, with no
-    /// wave in flight — and only ever onto a residence whose warm copy already
-    /// holds the same bytes.
+    /// wave in flight — and only ever onto a residence a durable copy already
+    /// holds the same bytes for.
+    ///
+    /// **Sections are pinned, and this pass never sheds one.**
+    ///
+    /// Letting it shed them was tried and produced an incoherent engine: one
+    /// pass dropped **463 sections (297 MiB)** and a later forward returned all
+    /// 248,320 logits non-finite, which `argmax` renders as `!` — the daemon
+    /// answered every prompt with `!!!!!!!!`. No lift failure was logged,
+    /// because the reload leg is not what broke: a section is shared prompt
+    /// content that *every* projection reads, so shedding it is categorically
+    /// unlike shedding a turn, and the assembled prefix went out from under the
+    /// kernels. It also tripped the seal's own alignment guard —
+    /// `persisted token_ids must align 1:1 with the K/V chunk grid`, 25 against
+    /// 32 — because a missing section moves the block range the turn seals over.
+    ///
+    /// The `warm.is_some()` predicate that used to sit here excluded sections by
+    /// accident (a section never acquires a warm copy, being off `hot_lru`).
+    /// That accident was load-bearing. It is now an explicit refusal with its
+    /// own counter, so the protection cannot be removed by a change to an
+    /// unrelated condition.
+    ///
+    /// The two ways a section legitimately leaves VRAM are unaffected: a
+    /// **collection member** is offload-only by design and freed by
+    /// `install_cold` when its cold copy lands, and any section goes when its
+    /// timeline is tombstoned.
+    ///
+    /// **Why pinning costs little.** Sections are prefilled during catalog
+    /// build, i.e. at the very start, and chunk allocation is biased to the
+    /// leftmost arena — so they occupy the lowest regions and stay there. They
+    /// are a dense permanent floor rather than fragmentation, and being fixed at
+    /// the bottom is the *cheapest* place for them: an evict/reload cycle would
+    /// re-place them at whatever the low-water mark happened to be later, which
+    /// is higher. Measured footprint is ~0.64–1.53 MiB per section.
     ///
     /// `pending_quantize` residences are skipped: their `hot` is the interim
     /// native form the scheduler still owes a quantize, and persisting that
     /// would diverge from the final Q form.
-    pub fn demote_idle_hot(&mut self, grace: u64) -> usize {
+    pub fn demote_idle_hot(&mut self, grace: u64) -> IdleDemoteReport {
         // **The pass is the clock.** One tick per call, from the persistence
         // thread's between-forward pass, which wakes on every seal/flush trigger
         // and otherwise on its own 5 s tick. That makes an epoch track real work
@@ -1761,32 +1848,82 @@ impl Substrate {
         // section once `elevate_to_hot` lifted it, and `elevate_to_hot` takes
         // both lists. Dropping a section from `hot_lru` afterwards is a harmless
         // no-op for the same reason it is absent here.
+        let section_residences: HashSet<ResidenceIndex> =
+            self.sections.values().map(|e| e.residence).collect();
         let candidates: Vec<ResidenceIndex> = self
             .hot_lru
             .iter()
             .copied()
-            .chain(self.sections.values().map(|e| e.residence))
+            .chain(section_residences.iter().copied())
             .collect();
+        // **Count why a candidate was refused, not just how many were taken.**
+        // A pass that sheds nothing is the same line in the log whether nothing
+        // was idle or everything idle was blocked, and those want opposite
+        // fixes. Three mechanisms in this tree have sat inert behind exactly
+        // that ambiguity — this one included, which rejected every section for
+        // the life of the process while reporting a truthful `0`.
+        let mut report = IdleDemoteReport {
+            considered: candidates.len(),
+            ..Default::default()
+        };
         let stale: Vec<ResidenceIndex> = candidates
             .into_iter()
-            .filter(|idx| !self.working_set_pins.contains(idx))
+            .filter(|idx| {
+                if self.working_set_pins.contains(idx) {
+                    report.pinned += 1;
+                    return false;
+                }
+                true
+            })
             .filter(|idx| {
                 let slot = &self.residence[idx.0];
-                // `warm.is_some()` is the safety condition AND the whole
-                // mechanism: the copy the drop falls back on must already exist.
-                // A residence without one is simply left for a later pass, by
-                // which time the migrate will have made it.
-                slot.hot.is_some()
-                    && slot.warm.is_some()
-                    && !slot.pending_quantize
-                    && idle_for(slot.last_used_epoch, epoch) > grace
+                if slot.hot.is_none() {
+                    return false;
+                }
+                // **A section is never shed here.** See the note on this
+                // function: sections are pinned resident, and the two ways one
+                // legitimately leaves VRAM are `install_cold` on a
+                // collection member and the timeline going away.
+                if section_residences.contains(idx) {
+                    report.section += 1;
+                    return false;
+                }
+                if slot.pending_quantize {
+                    report.pending_quantize += 1;
+                    return false;
+                }
+                if slot.warm.is_none() && slot.cold.is_none() {
+                    report.not_durable += 1;
+                    return false;
+                }
+                if idle_for(slot.last_used_epoch, epoch) <= grace {
+                    report.too_recent += 1;
+                    return false;
+                }
+                // **Durable anywhere, not warm specifically** — for a *turn*.
+                // The safety condition is that the copy the drop falls back on
+                // already exists, and `elevate_to_hot` lifts from warm or cold.
+                // A turn that has reached cold and had its warm purged is still
+                // safely droppable; requiring `warm` would have left it pinned.
+                //
+                // A residence with neither copy is simply left for a later pass,
+                // by which time the migrate or the cold write will have made
+                // one.
+                true
             })
             .collect();
         for idx in &stale {
-            self.residence[idx.0].hot = None;
+            let slot = &mut self.residence[idx.0];
+            report.bytes += slot.byte_size;
+            slot.hot = None;
+            if section_residences.contains(idx) {
+                report.sections += 1;
+            } else {
+                report.turns += 1;
+            }
             Self::remove_from_lru(&mut self.hot_lru, *idx);
         }
-        stale.len()
+        report
     }
 
     /// Flag every turn residence of `timeline` for full eviction the moment its
@@ -6837,6 +6974,88 @@ mod tests {
         assert!(sub.residence[boundary.0].cold.is_some());
     }
 
+    /// **A section is never shed, cold copy or not.**
+    ///
+    /// Shedding them was tried and made the engine incoherent — 463 sections
+    /// dropped in one pass, then all-NaN logits and `!!!!!!!!` out of every
+    /// prompt. A section is shared prompt content every projection reads, so
+    /// its absence corrupts the assembled prefix rather than costing a reload.
+    ///
+    /// The old predicate excluded sections only as a side effect of demanding a
+    /// warm copy they can never have. This asserts the refusal directly, so it
+    /// survives a change to any other condition — and checks the counter, which
+    /// is the standing evidence in the log that the pin is in force.
+    #[test]
+    fn idle_demote_never_sheds_a_section_however_durable() {
+        let mut sub = Substrate::new();
+        let install = |sub: &mut Substrate, id: u32| {
+            let sealed = Arc::new(vec![minimal_sealed_layer()]);
+            sub.set_section_full(
+                SectionId::new(id),
+                StreamId::default(),
+                32,
+                sealed,
+                identity_migrate,
+                Arc::new(vec![]),
+            )
+            .unwrap();
+            sub.section_residence(SectionId::new(id)).unwrap()
+        };
+
+        let durable = install(&mut sub, 1);
+        let undurable = install(&mut sub, 2);
+        sub.install_cold(
+            durable,
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 0,
+                    record_len: 1024,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }],
+        );
+        assert!(
+            sub.residence[durable.0].hot.is_some(),
+            "an unflagged boundary section stays hot when its cold copy lands",
+        );
+        assert!(
+            sub.residence[durable.0].warm.is_none(),
+            "sections never warm"
+        );
+
+        // Nothing attends either section from here on.
+        let mut shed = 0;
+        let mut last = IdleDemoteReport::default();
+        for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 4) {
+            last = sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+            shed += last.total();
+        }
+
+        assert_eq!(shed, 0, "no section is ever shed by the idle demote");
+        assert_eq!(last.sections, 0, "and the shed counter agrees");
+        // The refusal is attributed, not silent: both sections stay under
+        // consideration every pass and are counted under the reason they are
+        // refused. That counter is the standing evidence in the log that the
+        // pin is in force — a run where it drops to zero while sections are
+        // resident is the signature of this protection being removed.
+        assert_eq!(last.considered, 2, "both sections stay under consideration");
+        assert_eq!(
+            last.section, 2,
+            "both are refused *as sections*, ahead of any durability test",
+        );
+        assert!(
+            sub.residence[durable.0].hot.is_some(),
+            "a section with a durable cold copy is STILL pinned — every \
+             projection reads it, so its absence corrupts the prefix rather \
+             than costing a reload",
+        );
+        assert!(
+            sub.residence[undurable.0].hot.is_some(),
+            "and one with no durable copy at all is untouchable twice over",
+        );
+    }
+
     /// A completed-ingest turn flagged `evict_when_cold` is fully evicted from
     /// BOTH resident tiers when its cold copy lands: `install_cold` drops hot
     /// AND warm and clears both LRUs, leaving it cold-only on NVMe. An unflagged
@@ -7063,7 +7282,7 @@ mod tests {
         let mut shed = 0;
         for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
             sub.set_working_set_pins(&[TurnKey::new(timeline, active_idx)], &[]);
-            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS).total();
         }
         assert_eq!(shed, 1, "only the idle residence is shed");
         assert!(
@@ -7101,13 +7320,13 @@ mod tests {
         // Each pass ticks the clock. Inside the window nothing is shed.
         for pass in 1..=IDLE_DEMOTE_GRACE_EPOCHS {
             assert_eq!(
-                sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS),
+                sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS).total(),
                 0,
                 "pass {pass} is still inside the grace window"
             );
         }
         assert_eq!(
-            sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS),
+            sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS).total(),
             1,
             "the first pass beyond grace sheds it"
         );
@@ -7123,7 +7342,7 @@ mod tests {
         sub.residence[r.0].pending_quantize = true;
         let mut shed = 0;
         for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
-            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS).total();
         }
 
         assert_eq!(
@@ -7133,15 +7352,25 @@ mod tests {
         assert!(sub.residence[r.0].hot.is_some());
     }
 
-    /// **The idle demote reaches SECTIONS, which are not on `hot_lru`.**
+    /// **The idle demote REACHES sections but refuses them — even one holding a
+    /// warm copy.**
     ///
-    /// `elevate_to_hot` lifts sections and turns alike, and §8.1 of
-    /// `docs/vram_governor_design.md` names "nothing demoted a section once it
-    /// was elevated" as the gap this closes. A scan over `hot_lru` alone reaches
-    /// only turns — `install_section_hot` deliberately keeps sections off that
-    /// list — so it would miss the very case it was written for.
+    /// Reaching them matters: `install_section_hot` keeps sections off
+    /// `hot_lru`, so a scan of that list alone would not see them and the
+    /// refusal counter would under-report. Refusing them is the correctness
+    /// half.
+    ///
+    /// This test previously asserted the opposite — that the section is shed —
+    /// and passed, because it manufactures a warm copy with `install_warm`.
+    /// Production cannot reach that state: a section is off `hot_lru`, so
+    /// `snapshot_pending_warm` never sees it and it never acquires warm. The
+    /// test was green over a path that did not exist, which is why relaxing the
+    /// durability predicate looked safe and instead shed 463 sections and made
+    /// the engine emit all-NaN logits. The manufactured warm copy is kept here
+    /// deliberately: it makes the assertion the strongest available form —
+    /// refused *as a section*, ahead of any durability question.
     #[test]
-    fn idle_demote_reaches_sections_not_only_turns() {
+    fn idle_demote_reaches_sections_but_refuses_them() {
         let mut sub = Substrate::new();
         let section = SectionId::new(42);
         sub.set_section_full(
@@ -7165,18 +7394,22 @@ mod tests {
         );
 
         let mut shed = 0;
+        let mut last = IdleDemoteReport::default();
         for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
-            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+            last = sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+            shed += last.total();
         }
 
-        assert_eq!(shed, 1, "the idle section is shed");
-        assert!(
-            sub.residence[r.0].hot.is_none(),
-            "an idle section must give its VRAM back like any other residence",
+        assert_eq!(shed, 0, "a section is never shed, warm copy or not");
+        assert_eq!(
+            last.considered, 1,
+            "but it IS reached — off `hot_lru` and still scanned",
         );
+        assert_eq!(last.section, 1, "and refused under its own reason");
         assert!(
-            sub.residence[r.0].warm.is_some(),
-            "warm survives the demote"
+            sub.residence[r.0].hot.is_some(),
+            "the section keeps its VRAM: every projection reads it, so losing \
+             it corrupts the assembled prefix rather than costing a reload",
         );
     }
 
@@ -7201,7 +7434,7 @@ mod tests {
         let mut shed = 0;
         for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
             sub.set_working_set_pins(&[], &[section]);
-            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS).total();
         }
 
         assert_eq!(shed, 0);
@@ -7357,7 +7590,7 @@ mod tests {
 
         let mut shed = 0;
         for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
-            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
+            shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS).total();
         }
 
         assert_eq!(shed, 0, "a hot-only residence is not the demote's to take");

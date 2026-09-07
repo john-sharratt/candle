@@ -31,7 +31,7 @@ use candle_nn::kv_cache::{
 };
 use candle_transformers::models::prefill_utils::compute_rope_cs;
 use candle_transformers::models::slot_state::{
-    tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
+    resolve_pos_reference, tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
 };
 use std::sync::{Mutex, MutexGuard};
 
@@ -295,8 +295,8 @@ fn dev_ptr_f16(t: &Tensor) -> Result<u64> {
 }
 /// Append `glue` tokens over the cache's prefix via the glue kernel.
 ///
-/// `fwd_window` is the forward B-head window cap; `b_section`, when present, is
-/// staged into this slot's `position_map` at `[kv_len, kv_len+b_len)` so the glue
+/// `fwd_window` is the forward B-head window cap; `b_section`, when present,
+/// occupies this slot's write region at `[kv_len, kv_len+b_len)` so the glue
 /// rows attend `min(fwd_window, b_len)` B columns. `(0, None)` is the
 /// backward-only path (bit-identical to the pre-window kernel).
 #[allow(clippy::too_many_arguments)]
@@ -327,15 +327,9 @@ fn run_glue(
         .chunked_live_chunks_as_sealed()
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-    let mut slot = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-        true,
-    );
-    slot.extend_for_write_region(glue, CHUNK_SIZE);
+    let slot =
+        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
+    slot.assert_write_region_capacity(glue, CHUNK_SIZE);
 
     // Two-section layout, mirroring build_slot_headers: resident slices
     // (meta=Some, quantized prefix) point kvheads_ptr at their device meta-pool
@@ -381,18 +375,19 @@ fn run_glue(
     let slices_tensor = Tensor::from_slice(&slice_buf, slice_buf.len(), device)?;
     let slices_ptr = tensor_u8_device_ptr(&slices_tensor)?;
 
-    // position_map → device (sealed-only reads + write region). entry = (slice<<16)|in_blk.
-    let pm = slot.position_map.clone();
-    let pm_tensor = Tensor::from_slice(&pm, pm.len().max(1), device)?;
-    let pm_ptr = dev_ptr_u32(&pm_tensor)?;
-
-    // Glue write targets: derive from position_map at the write positions.
+    // Glue write targets: the same walk the kernel does, at the write positions.
     let mut wslice = Vec::with_capacity(glue);
     let mut winblk = Vec::with_capacity(glue);
     for t in 0..glue {
-        let e = pm[prefix_len + t];
-        wslice.push(e >> 16);
-        winblk.push(e & 0xffff);
+        let (si, in_blk) = resolve_pos_reference(
+            &slot.slices,
+            slot.write_slice as usize,
+            CHUNK_SIZE,
+            prefix_len + t,
+        )
+        .expect("write position resolves — capacity asserted above");
+        wslice.push(si as u32);
+        winblk.push(in_blk as u32);
     }
     let glue_write_slice = Tensor::from_vec(wslice, glue, device)?;
     let glue_write_in_blk = Tensor::from_vec(winblk, glue, device)?;
@@ -405,12 +400,11 @@ fn run_glue(
     let kv_lens = Tensor::from_vec(vec![kv_len as u32], 1, device)?;
     let fwd_ahead_t = Tensor::from_vec(fwd_ahead.to_vec(), glue.max(1), device)?;
 
-    // 24-byte SlotHeader.
-    let mut hdr = Vec::with_capacity(24);
+    // 16-byte SlotHeader.
+    let mut hdr = Vec::with_capacity(16);
     hdr.extend_from_slice(&(slot.slices.len() as u32).to_le_bytes());
     hdr.extend_from_slice(&slot.write_slice.to_le_bytes());
     hdr.extend_from_slice(&slices_ptr.to_le_bytes());
-    hdr.extend_from_slice(&pm_ptr.to_le_bytes());
     let generation = stager.begin_generation();
     let mut pinned = generation.alloc(hdr.len())?;
     pinned.copy_from_slice(&hdr);
@@ -473,7 +467,6 @@ fn run_glue(
     cache.set_current_seq_len(kv_len)?;
     drop(headers_gpu);
     drop(slices_tensor);
-    drop(pm_tensor);
     Ok((out, kernel_ms))
 }
 
@@ -834,13 +827,11 @@ struct SlotBuild {
     n_slices: u32,
     write_slice: u32,
     slices_ptr: u64,
-    pm_ptr: u64,
     glue: usize,
     kv_len: usize,
     wslice: Vec<u32>,
     winblk: Vec<u32>,
     _slices_tensor: Tensor,
-    _pm_tensor: Tensor,
     _records_tensor: Tensor,
 }
 
@@ -859,15 +850,9 @@ fn build_glue_slot(
         .chunked_live_chunks_as_sealed()
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-    let mut slot = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-        true,
-    );
-    slot.extend_for_write_region(glue, CHUNK_SIZE);
+    let slot =
+        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
+    slot.assert_write_region_capacity(glue, CHUNK_SIZE);
 
     enum KvSrc {
         Resident(u64),
@@ -909,29 +894,30 @@ fn build_glue_slot(
     let slices_tensor = Tensor::from_slice(&slice_buf, slice_buf.len(), device)?;
     let slices_ptr = tensor_u8_device_ptr(&slices_tensor)?;
 
-    let pm = slot.position_map.clone();
-    let pm_tensor = Tensor::from_slice(&pm, pm.len().max(1), device)?;
-    let pm_ptr = dev_ptr_u32(&pm_tensor)?;
-
+    // Write targets: the same walk the kernel does, at the write positions.
     let mut wslice = Vec::with_capacity(glue);
     let mut winblk = Vec::with_capacity(glue);
     for t in 0..glue {
-        let e = pm[prefix_len + t];
-        wslice.push(e >> 16);
-        winblk.push(e & 0xffff);
+        let (si, in_blk) = resolve_pos_reference(
+            &slot.slices,
+            slot.write_slice as usize,
+            CHUNK_SIZE,
+            prefix_len + t,
+        )
+        .expect("write position resolves — capacity asserted above");
+        wslice.push(si as u32);
+        winblk.push(in_blk as u32);
     }
     cache.set_current_seq_len(kv_len)?;
     Ok(SlotBuild {
         n_slices: slot.slices.len() as u32,
         write_slice: slot.write_slice,
         slices_ptr,
-        pm_ptr,
         glue,
         kv_len,
         wslice,
         winblk,
         _slices_tensor: slices_tensor,
-        _pm_tensor: pm_tensor,
         _records_tensor: records_tensor,
     })
 }
@@ -961,7 +947,7 @@ fn run_glue_batched(
         builds.push(build_glue_slot(backing, cache, *glue, device)?);
     }
 
-    let mut hdr = Vec::with_capacity(b * 24);
+    let mut hdr = Vec::with_capacity(b * 16);
     let mut cu = vec![0u32];
     let mut q_lens_v: Vec<u32> = Vec::with_capacity(b);
     let mut kv_lens_v: Vec<u32> = Vec::with_capacity(b);
@@ -973,7 +959,6 @@ fn run_glue_batched(
         hdr.extend_from_slice(&sb.n_slices.to_le_bytes());
         hdr.extend_from_slice(&sb.write_slice.to_le_bytes());
         hdr.extend_from_slice(&sb.slices_ptr.to_le_bytes());
-        hdr.extend_from_slice(&sb.pm_ptr.to_le_bytes());
         acc += sb.glue as u32;
         cu.push(acc);
         q_lens_v.push(sb.glue as u32);

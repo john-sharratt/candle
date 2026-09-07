@@ -57,7 +57,6 @@ use crate::models::delta_net::{
     RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
-use crate::models::prefill_utils::SharedPm;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::attention::RopeTables;
 use crate::models::qwen35::spec::split_block_rows;
@@ -1456,11 +1455,15 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// opens). Bounding one forward's rows keeps the peak inside it; the
     /// pure-prefill slab slicer turns a wider fleet into sequential slabs.
     /// Fusing the GR (the §0.4 work the design doc records) removes this term.
-    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, _tier_budget: usize) -> usize {
         const GR_EAGER_ROW_CAP: usize = 2048;
-        let mut cap = MAX_PREFILL_TOKENS.min(GR_EAGER_ROW_CAP);
+        // The rows already in the wave ride the same forward: they count
+        // against the eager peak and write KV too, so they come off both
+        // bounds, never leaving less than one row. The span tier budget is not
+        // a term — the eager GR rows draw from the pool cushion, not the tier.
+        let mut cap = MAX_PREFILL_TOKENS.min(GR_EAGER_ROW_CAP.saturating_sub(head_rows).max(1));
         if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
-            cap = cap.min(kv_fits);
+            cap = cap.min(kv_fits.saturating_sub(head_rows).max(1));
         }
         cap
     }
@@ -1960,8 +1963,8 @@ impl WaveSweep for Qwen4ExpBatched {
         self.model.cfg.num_layers
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
-        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head_rows, tier_budget)
     }
 
     /// Caches are indexed by KV layer: three quarters of the trunk owns no
@@ -2399,8 +2402,6 @@ impl Qwen4ExpBatched {
             pre_cos.reshape((1, pre_rows, half))?,
             pre_sin.reshape((1, pre_rows, half))?,
         );
-        let dec_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
-        let pre_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
         let dec_params = BatchedAttentionParams::new(
             &dec_rope.0,
             &dec_rope.1,
@@ -2410,7 +2411,6 @@ impl Qwen4ExpBatched {
             decode_headers,
             dec_q,
             generation,
-            &dec_pm,
         );
         let pre_params = BatchedAttentionParams::new(
             &pre_rope.0,
@@ -2421,7 +2421,6 @@ impl Qwen4ExpBatched {
             prefill_headers,
             pre_q,
             generation,
-            &pre_pm,
         );
 
         // QSA: the indexer's rotation tables and this wave's index caches.

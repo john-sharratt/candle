@@ -586,8 +586,6 @@ fn run_prefill(
         rope_cs,
         sc.rope_interleaved,
         &generation,
-        // No shared position-map cache in this one-shot fixture prefill.
-        &std::cell::RefCell::new(None),
         None,
     )?;
     caches_arr[0].set_current_seq_len(offset + n_tokens)?;

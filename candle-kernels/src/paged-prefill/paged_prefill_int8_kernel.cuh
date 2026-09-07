@@ -581,7 +581,9 @@ paged_prefill_int8_kernel(
                 }
             } else {
                 int sl_idx, in_blk;
-                resolve_pos(slot_hdr, pos, sl_idx, in_blk);
+                // A warp's columns run consecutively, so they almost always sit
+                // in the slice it already has bound: try that before searching.
+                resolve_pos_hinted(slot_hdr, pos, bound_slice, sl_idx, in_blk);
                 if (sl_idx != bound_slice) bind_slice(sl_idx); // warp-uniform
                 #pragma unroll
                 for (int w = 0; w < N_WIN; ++w) {

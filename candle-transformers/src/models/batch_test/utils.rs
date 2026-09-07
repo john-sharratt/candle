@@ -1464,8 +1464,11 @@ impl TestParams {
             // few hundred tokens, far below any model's cap, so it still takes
             // exactly one slice and runs the identical single call it always
             // did. Only the last slice's logits are kept — they are the ones
-            // that predict the first generated token.
-            let cap = model.prefill_width_cap(session.activation_dtype()).max(1);
+            // that predict the first generated token. Each slice is a
+            // prefill-only wave, so nothing rides ahead of it in the tier.
+            let cap = model
+                .prefill_width_cap(session.activation_dtype(), 0, session.tier_budget_bytes())
+                .max(1);
             let longest = user_tensors
                 .iter()
                 .map(|t| t.dims().last().copied().unwrap_or(0))

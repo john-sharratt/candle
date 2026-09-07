@@ -45,7 +45,6 @@
 //! draft seed. The zeros are there so head row `i` stays aligned with trunk row
 //! `i` and RoPE agrees, nothing more.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
@@ -63,7 +62,6 @@ use crate::models::batched_layer::{forward_attn_batched, BatchedAttentionParams,
 use crate::models::delta_net::SeqSpan;
 use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
-use crate::models::prefill_utils::SharedPm;
 use crate::models::qwen35::attention::RopeTables;
 use crate::models::tensor_cat::TensorCat;
 use candle::quantized::cuda::to_dynamic;
@@ -613,7 +611,6 @@ impl Qwen4ExpBatched {
          -> Result<(Tensor, Tensor)> {
             let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
             let (cos, sin) = m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev)?;
-            let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
             let params = BatchedAttentionParams::new(
                 &cos,
                 &sin,
@@ -626,7 +623,6 @@ impl Qwen4ExpBatched {
                 },
                 &q_lens,
                 generation,
-                &pm,
             );
             let embeds = m.embed.index_select(ids, 0)?.to_dtype(DType::F32)?;
             self.head_draft_step(

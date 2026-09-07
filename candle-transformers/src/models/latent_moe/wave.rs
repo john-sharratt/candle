@@ -905,7 +905,7 @@ impl ManagedBatchedModel for BatchedEngine {
         }
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, _tier_budget: usize) -> usize {
         // DeepSeek's forward takes its transients from the CUDA pool (it has
         // not adopted the span's wave arenas), so the default cap's FFN-span
         // pricing bounds a tier this model never allocates from — and at the
@@ -918,7 +918,9 @@ impl ManagedBatchedModel for BatchedEngine {
         // (`reclaimable_kv_bytes` below).
         let mut cap = MAX_PREFILL_TOKENS;
         if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
-            cap = cap.min(kv_fits);
+            // The rows ahead of the prefill write KV too, so they come off
+            // the same count; never less than one row.
+            cap = cap.min(kv_fits.saturating_sub(head_rows).max(1));
         }
         cap
     }
@@ -1245,8 +1247,8 @@ impl WaveSweep for BatchedEngine {
         self.engine.layer_count()
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
-        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head_rows, tier_budget)
     }
 
     /// No reconciliation: this model's session offsets are ABSOLUTE while
@@ -1892,7 +1894,7 @@ impl BatchedEngine {
         };
         let hdr_of = |layer: usize, seq_slot: usize| -> u64 {
             let (headers, stride) = &std_meta;
-            headers.dev_ptr() + (layer as u64) * stride + (seq_slot as u64) * 24
+            headers.dev_ptr() + (layer as u64) * stride + (seq_slot as u64) * 16
         };
         // Per-group scatter header: a group's positions share IDENTICAL
         // headers (committed block write length), so its FIRST row's header

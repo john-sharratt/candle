@@ -260,9 +260,14 @@ __global__ void paged_glue_kernel(
         }
 
         // ── Stream every column [0, kv_len) in TILES of WARPS columns, packed
-        // order via the slot's position_map. This covers the sealed prefix AND
-        // the freshly-written glue (whose columns are in the position_map but NOT
-        // in the writer slices' `len`, so a per-slice scan would miss them).
+        // order via `resolve_pos`, which covers the sealed prefix AND the glue
+        // columns whichever region they occupy. The scheduler reserves the glue
+        // gap ahead of this forward (`reserve_glue_gap_chunk` allocates the gap
+        // chunk with `usage = n_tokens`), so in production those columns are
+        // COMMITTED and the binary search over `rope`/`len` finds them; a caller
+        // that instead leaves them as an unwritten tail past the committed total
+        // has them resolved by the pending-write walk from `write_slice`. Either
+        // way no per-slice scan over `len` alone would be enough.
         // Warp w dequants column c0+w into its slot of k_stage/v_stage — all
         // warps in parallel — then un-permutes + RoPEs it into k_col/v_col, so
         // each column is dequantized exactly once and the block syncs ONCE per
@@ -282,7 +287,9 @@ __global__ void paged_glue_kernel(
             int col_pos = 0;
             if (c < win_hi) {
                 int slice_idx = 0, in_blk = 0;
-                resolve_pos(slot, c, slice_idx, in_blk);
+                // This warp's columns advance in order through the slot, so the
+                // slice it resolved last is the likely owner: try it first.
+                resolve_pos_hinted(slot, c, cur_slice, slice_idx, in_blk);
                 const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_idx, n_kv_head);
                 const uint8_t* head_ptr = get_head<HEAD_DIM>(sl, kv_head_idx);
                 if (slice_idx != cur_slice) {
