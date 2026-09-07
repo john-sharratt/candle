@@ -166,7 +166,7 @@ impl ChunkedKvBacking {
                 // Under cum_token addressing a prefill of N tokens
                 // fills consecutive chunks starting at the writer
                 // boundary — the same selection rule the slot's
-                // position_map and `ensure_for_batch_entries` use.
+                // `write_slice` and `ensure_for_batch_entries` use.
                 // Chunks at index < writer_start_idx are Arc-shared
                 // with substrate/parent and MUST NOT be modified.
                 let prior_total: usize = seq.chunks_slice().iter().map(|c| c.usage as usize).sum();

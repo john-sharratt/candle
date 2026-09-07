@@ -69,6 +69,8 @@
 //! GPU-native path's buffers are a subset of the pipeline path's, so the union
 //! costs nothing there.
 
+use super::types::TARGET_ARENA_BYTES;
+use super::wave_spans::WAVE_FORWARD_BYTES;
 use candle::DType;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -579,7 +581,63 @@ impl WavePlan {
             .unwrap_or(0)
     }
 
-    /// The widest wave that fits in `budget` bytes — the admission bound.
+    /// What the transient tier will actually cost for `rows` — the **sum** of
+    /// the phase spans, which is what `plan_wave_transient` buys.
+    ///
+    /// **Not [`Self::wave_bytes`], and that difference is the whole bug this
+    /// exists to fix.** `wave_bytes` is the *max* over phases, because a single
+    /// phase's span is what one layer needs at a time. The tier is every phase
+    /// laid down side by side, so it costs their sum — roughly three times the
+    /// max on this geometry. Sizing waves with the max under-priced the tier by
+    /// that factor, and no choice of budget corrects a formula measuring the
+    /// wrong quantity: measured, waves were composed whose tier wanted 6.5 GiB
+    /// against a 912 MiB guarantee, and were refused 62 times in one run.
+    ///
+    /// Mirrors the arithmetic in the forward exactly, padding included — the
+    /// two must agree or the wave admitted is not the wave priced.
+    pub fn tier_bytes(&self, rows: usize) -> usize {
+        // The forward pads each phase by one region; `TARGET_ARENA_BYTES` is
+        // that size read from the ungated source, as `span_geometry` does —
+        // `region_pool::REGION_BYTES` is CUDA-only and this plan is not.
+        self.phase_bytes(LayerPhase::Attention, rows)
+            + TARGET_ARENA_BYTES
+            + self.phase_bytes(LayerPhase::Ffn, rows)
+            + TARGET_ARENA_BYTES
+            + WAVE_FORWARD_BYTES
+    }
+
+    /// The widest wave whose **tier** fits in `budget` bytes.
+    ///
+    /// The bound a wave is actually composed against. Same bisection as
+    /// [`Self::max_rows_within`] and for the same reason — the `div_ceil` steps
+    /// make the cost a staircase, so dividing the budget by a per-row average
+    /// lands inside a step and over-admits.
+    pub fn max_rows_for_tier(&self, budget: usize) -> usize {
+        if self.tier_bytes(1) > budget {
+            return 0;
+        }
+        let mut lo = 1usize;
+        let mut hi = 2usize;
+        while self.tier_bytes(hi) <= budget {
+            lo = hi;
+            hi = hi.saturating_mul(2);
+        }
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.tier_bytes(mid) <= budget {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// The widest wave that fits in `budget` bytes — a **single phase's** bound.
+    ///
+    /// Not what a wave is sized by: the tier costs every phase together, which
+    /// is [`Self::max_rows_for_tier`]. Kept for callers asking the narrower
+    /// question of whether one phase's span holds a given width.
     ///
     /// Returns `0` when not even a single row fits, which admission must treat
     /// as a configuration error rather than as an empty wave: a budget that
@@ -671,6 +729,49 @@ impl WavePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::WAVE_SPAN_BYTES;
+
+    /// **The tier costs the SUM of the phases, not the largest of them.**
+    ///
+    /// This is the defect the tier bound exists to fix, and nothing else would
+    /// catch its return: sizing waves with `wave_bytes` under-prices the tier by
+    /// roughly the phase count, which let waves ask for a 6.5 GiB tier against a
+    /// 912 MiB guarantee and be refused 62 times in one run.
+    #[test]
+    fn tier_bytes_is_the_sum_of_phases_and_exceeds_the_largest_one() {
+        let p = WavePlan::new(moe());
+        for rows in [1usize, 64, 512, 4096] {
+            assert!(
+                p.tier_bytes(rows) > p.wave_bytes(rows),
+                "rows {rows}: tier {} must exceed the largest single phase {}",
+                p.tier_bytes(rows),
+                p.wave_bytes(rows),
+            );
+        }
+    }
+
+    /// The bound is the inverse of the cost, and it must not overshoot: the
+    /// widest accepted width fits, and one row more does not.
+    #[test]
+    fn max_rows_for_tier_is_exact_on_the_staircase() {
+        let p = WavePlan::new(moe());
+        let budget = WAVE_SPAN_BYTES;
+        let rows = p.max_rows_for_tier(budget);
+        assert!(rows > 0, "the guaranteed span must price at least one row");
+        assert!(p.tier_bytes(rows) <= budget, "the accepted width must fit");
+        assert!(
+            p.tier_bytes(rows + 1) > budget,
+            "one row more must not fit — otherwise the bound is leaving ground unused",
+        );
+    }
+
+    /// A budget too small for a single row answers 0, which callers must treat
+    /// as a configuration error rather than as an empty wave.
+    #[test]
+    fn a_budget_below_one_row_prices_nothing() {
+        let p = WavePlan::new(moe());
+        assert_eq!(p.max_rows_for_tier(1), 0);
+    }
 
     /// Qwen3-30B-A3B's real shapes.
     fn moe() -> ModelGeometry {

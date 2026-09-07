@@ -136,6 +136,24 @@ pub struct Occupancy {
     /// cannot hand back mid-forward, because the floor is refused while a wave
     /// generation is open.
     pub tier_high_water: usize,
+    /// Bytes the most recently planned tier needed.
+    ///
+    /// **The term this policy was written without.** The spare below used to be
+    /// offered whole, with the next wave's tier undeducted because the signature
+    /// could not see it — documented as costing "churn rather than failure", the
+    /// tier buying back through `set_ground_broker` the ground it had just been
+    /// given away.
+    ///
+    /// Measured, that churn is not a rounding error: 19,878 grows against 20,018
+    /// concessions in one run, ~4.6 full evict-and-reload cycles a second, each
+    /// trading ~19 regions and ~165 expert slots. Throughput fell from 12,569 to
+    /// ~40 tok/s and 14 of 353 directories completed. The demand guard above
+    /// cannot see it either: the loop returns demand to where it started, so it
+    /// is flat rather than rising and `Refusal::Pressure` never fires.
+    ///
+    /// The last plan, not the high-water — see `bump_arena::planned_tier_bytes`
+    /// for why the widest-ever figure is the wrong term and what it cost.
+    pub tier_planned: usize,
 }
 
 /// Why a negotiation answered as it did.
@@ -257,8 +275,15 @@ impl GrowthPolicy {
         // and cost five layers of residency. The right term is this wave's
         // planned tier, which `WavePlan` knows and this signature does not — so
         // it is left undeducted deliberately, and named.
+        // **The tier's own ground is not spare.** Offering it is what makes the
+        // weight side take ground the very next forward must buy back, and the
+        // buy-back is an evict-and-reload of the expert slots that stood on it.
         let by_occupancy = occ.free_below_ceiling + occ.ceiling_blocked;
-        match by_occupancy.saturating_sub(slack) {
+        let tier_regions = occ.tier_planned.div_ceil(region_bytes.max(1));
+        match by_occupancy
+            .saturating_sub(slack)
+            .saturating_sub(tier_regions)
+        {
             0 => Err(Refusal::Occupied),
             n => Ok(n),
         }
@@ -278,6 +303,7 @@ mod tests {
             ceiling_blocked: 0,
             tier_bytes: 0,
             tier_high_water: 0,
+            tier_planned: 0,
         }
     }
 
@@ -312,6 +338,52 @@ mod tests {
         assert_eq!(p.spare(steady(10, 500), 32, R), Ok(500 - 32));
     }
 
+    /// **The tier's own ground is not spare, and offering it is what churns.**
+    ///
+    /// Without this deduction the weight side takes ground the very next forward
+    /// must buy back, and the buy-back evicts the expert slots standing on it.
+    /// Measured on the 35B: 19,878 grows against 20,018 concessions in one run,
+    /// ~4.6 evict-and-reload cycles a second, throughput 12,569 → ~40 tok/s.
+    ///
+    /// The demand guard cannot catch it — the loop hands the ground back, so
+    /// demand returns to where it started and never reads as rising.
+    #[test]
+    fn the_next_tiers_ground_is_not_offered_as_spare() {
+        let mut p = GrowthPolicy::new();
+        let occ = Occupancy {
+            live: 100,
+            free_below_ceiling: 60,
+            ceiling_blocked: 0,
+            tier_bytes: 0,
+            tier_high_water: 0,
+            tier_planned: 19 * R,
+        };
+        // Two priming calls: the first is `Observing`, the second establishes a
+        // flat demand so the pressure guard stands down.
+        let _ = p.spare(occ, 32, R);
+        let _ = p.spare(occ, 32, R);
+        // 60 free, less 32 slack, less the 19 the tier is about to want.
+        assert_eq!(p.spare(occ, 32, R), Ok(60 - 32 - 19));
+    }
+
+    /// A tier large enough to swallow the remaining spare leaves nothing to
+    /// grant, which must read as `Occupied` rather than as a grant of zero.
+    #[test]
+    fn a_tier_wider_than_the_spare_refuses_outright() {
+        let mut p = GrowthPolicy::new();
+        let occ = Occupancy {
+            live: 100,
+            free_below_ceiling: 60,
+            ceiling_blocked: 0,
+            tier_bytes: 0,
+            tier_high_water: 0,
+            tier_planned: 40 * R,
+        };
+        let _ = p.spare(occ, 32, R);
+        let _ = p.spare(occ, 32, R);
+        assert_eq!(p.spare(occ, 32, R), Err(Refusal::Occupied));
+    }
+
     /// Tier-blocked ground is offered, because a standing tier is idle between
     /// forwards and its bytes come back at phase 0.
     #[test]
@@ -323,6 +395,7 @@ mod tests {
             ceiling_blocked: 80,
             tier_bytes: 0,
             tier_high_water: 57 * R,
+            tier_planned: 0,
         };
         let _ = p.spare(occ, 32, R);
         let _ = p.spare(occ, 32, R);
