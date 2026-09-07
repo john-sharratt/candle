@@ -149,6 +149,64 @@ pub fn phase_span_of(segments: &[TurnSegment], phase: Phase) -> Option<Range<usi
     (hi > lo && lo != usize::MAX).then_some(lo..hi)
 }
 
+/// The token range a projection must not attend, because it is this turn's
+/// `<think>…</think>` reasoning.
+///
+/// # Reasoning is removed logically, not physically
+///
+/// A turn seals **everything it generated**, reasoning included, and its K/V is
+/// the K/V the decode actually produced. Nothing is rebuilt, and nothing is
+/// thrown away: the `Thinking` segment is real, it carries a [`KvSpan`], and the
+/// tokens behind it persist like any others. What makes reasoning invisible is
+/// that every projection of the turn *omits this range* — the removal is a fact
+/// about how the turn is read, not about what was stored.
+///
+/// It used to be the other way round. A finished dialogue turn was truncated
+/// back to its own first block and **re-prefilled from reasoning-free tokens**
+/// purely so the seal would capture a grid with no thoughts in it, and the
+/// `Thinking` segment was then marked ethereal because its K/V genuinely did not
+/// exist. That cost a second full prefill of every dialogue turn, made the
+/// decode's own K/V unsealable — which is why an in-flight turn could never be
+/// parked or evicted, only finished — and left the turn's stored text (which
+/// always kept the reasoning verbatim) describing a grid that did not contain
+/// it. Skipping at read time gets the same invisibility for none of that.
+///
+/// # Tokens, not chunks — nothing has to align
+///
+/// A chunk is not the unit of address: a `SealedChunk` is a *window* into a
+/// physical chunk, carrying its own `offset` and `token_count`, and two windows
+/// may address disjoint ranges of the same chunk. So a chunk straddling
+/// `</think>` is not a dilemma between keeping reasoning and losing answer — it
+/// is split into the windows either side of the boundary, and the skip is exact
+/// at token granularity for every turn, however its reasoning happened to fall
+/// across chunks. `inject_arc_sealed` does the splitting.
+///
+/// This is why nothing forces a chunk boundary at the markers. Doing so would
+/// work, but it spends a partial chunk at each of `<think>`, `</think>` and the
+/// turn's end — a physical chunk holding a handful of tokens, three times per
+/// turn — to buy an alignment the windows make unnecessary.
+///
+/// # Removing chunks leaves no positional hole
+///
+/// Nothing here has to renumber anything, and the skip costs the answer no
+/// distance from the question it answers. K is stored **un-rotated**: RoPE is
+/// applied inside the attention kernel, to vectors as they are loaded from the
+/// cache, at a position the kernel is handed
+/// (`apply_rope_rotary(vec, cos_cache, sin_cache, lane, pos)` in
+/// `candle-kernels/src/paged-decode/decode_helpers.cuh`). So the chunks that
+/// survive are assigned contiguous positions at read time, exactly as though the
+/// reasoning had never been generated. This is the same property that lets a
+/// sealed turn be injected at any offset in any projection — position is a
+/// property of the read, not of the stored bytes.
+///
+/// Returns `None` when the turn has no reasoning, or when its reasoning is
+/// ethereal — a turn sealed before this became a read-time concern, or one where
+/// `/no_think` suppressed the block outright. In both cases there is no K/V to
+/// leave out.
+pub fn thinking_token_skip(segments: &[TurnSegment]) -> Option<Range<usize>> {
+    phase_span_of(segments, Phase::Thinking)
+}
+
 /// A turn as an ordered list of segments.  Turn-level metadata (role, block span,
 /// layer/group, scores, ids) lives on the owning turn entry, not here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1669,5 +1727,83 @@ mod tests {
                 found: 5,
             })
         );
+    }
+
+    /// A turn whose reasoning is real: user 0..10, thinking 10..80, answer
+    /// 80..120 — deliberately aligned to nothing, because nothing has to align.
+    fn reasoning_turn() -> Vec<TurnSegment> {
+        vec![
+            TurnSegment::User {
+                text: "q".into(),
+                kv: KvSpan::new(0, 10),
+            },
+            TurnSegment::Thinking {
+                text: "<think>…</think>".into(),
+                kv: Some(KvSpan::new(10, 70)),
+            },
+            TurnSegment::Assistant {
+                text: Some("a".into()),
+                kv: KvSpan::new(80, 40),
+            },
+        ]
+    }
+
+    /// **The skip is the reasoning's token range, exactly** — not the chunks it
+    /// happens to fall across. `inject_arc_sealed` splits any chunk this range
+    /// crosses into the windows either side of it.
+    #[test]
+    fn the_skip_is_the_reasoning_token_range() {
+        assert_eq!(thinking_token_skip(&reasoning_turn()), Some(10..80));
+    }
+
+    /// **Ethereal reasoning has nothing to skip** — its K/V was never stored, so
+    /// a turn sealed under the old physical removal still projects correctly.
+    #[test]
+    fn ethereal_reasoning_skips_nothing() {
+        let segments = vec![
+            TurnSegment::User {
+                text: "q".into(),
+                kv: KvSpan::new(0, 10),
+            },
+            TurnSegment::Thinking {
+                text: "dropped".into(),
+                kv: None,
+            },
+            TurnSegment::Assistant {
+                text: None,
+                kv: KvSpan::new(10, 40),
+            },
+        ];
+        assert_eq!(thinking_token_skip(&segments), None);
+    }
+
+    #[test]
+    fn a_turn_without_reasoning_skips_nothing() {
+        let segments = vec![TurnSegment::User {
+            text: "q".into(),
+            kv: KvSpan::new(0, 40),
+        }];
+        assert_eq!(thinking_token_skip(&segments), None);
+    }
+
+    /// Reasoning far shorter than a chunk is still skipped in full: token
+    /// granularity has no minimum.
+    #[test]
+    fn reasoning_shorter_than_a_chunk_is_still_skipped() {
+        let segments = vec![
+            TurnSegment::User {
+                text: "q".into(),
+                kv: KvSpan::new(0, 10),
+            },
+            TurnSegment::Thinking {
+                text: "brief".into(),
+                kv: Some(KvSpan::new(10, 12)),
+            },
+            TurnSegment::Assistant {
+                text: None,
+                kv: KvSpan::new(22, 40),
+            },
+        ];
+        assert_eq!(thinking_token_skip(&segments), Some(10..22));
     }
 }

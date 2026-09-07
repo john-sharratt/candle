@@ -1,13 +1,672 @@
-use super::admission::{
-    admit_quantum, backlog_admit_action, budget_notches, decode_reserve_bytes, evidence_admit_grow,
-    evidence_ticks_for, per_block_kv_bytes, plan_admission, prefill_cost_bytes, BacklogAction,
-    BandParams, ThrottleReason,
-};
+use super::admit;
+use super::interleave;
 use super::*;
+use crate::projection::DecodePriority;
+
+/// The engine as [`interleave::fill`] sees it: a cursor over both queues that
+/// really claims what it takes.
+///
+/// Holds the scheduler mutably for the whole fill because every admission is a
+/// device allocation and every check is a read of the partition that allocation
+/// moved — there is no snapshot to work from, which is the entire point.
+struct WaveFill<'a> {
+    sched: &'a mut Scheduler,
+    /// Decodes eligible this wave, in the order they are offered. Rotated so
+    /// the sequences past last wave's cut are offered first this wave — a
+    /// fixed order plus a cut is a fixed set of starved sequences.
+    decode_order: Vec<SequenceId>,
+    /// How far down `decode_order` the offers have reached, per priority band.
+    /// One cursor cannot serve six passes: the bands are offered in turn and
+    /// each has to resume where *it* left off, not where the previous band did.
+    decode_cursor: [usize; 3],
+    /// The decodes admitted, in order — **the set the wave runs**, handed to
+    /// `batch_decode_step` so the sequences whose ground was claimed here are
+    /// exactly the sequences that step.
+    decodes_taken: Vec<SequenceId>,
+    /// Eligible decodes the allocators refused this fill. Published as the
+    /// engine's "full" signal: a producer reading a non-zero here stops
+    /// opening conversations.
+    decodes_refused: usize,
+    /// Queue indices of the prefills admitted this fill, in admission order.
+    /// A prefix of the band's FIFO order: nothing is passed over, so the plan
+    /// removes exactly these.
+    prefill_admitted: Vec<usize>,
+    /// The next queue index to offer, per priority band — see
+    /// [`Self::decode_cursor`].
+    prefill_cursor: [usize; 3],
+    /// The weight floor this fill defends — the `min` of the range admission
+    /// works inside, and the point past which a claim costs resident experts.
+    optimal: u64,
+}
+
+/// The widest the tier margin grows on repeated refusals, in regions — a
+/// gigabyte, past which a refusal is not a rounding problem.
+const TIER_MARGIN_CAP_REGIONS: usize = 64;
+
+/// The fewest tokens a prefill advances in one wave, when it has that many
+/// left. A dialogue prefill rides the wave in chunks — `[offset, offset +
+/// advance)` per group, exactly as a section ingest does — so a turn of any
+/// length is carried beside the decodes in pieces the transient tier can hold,
+/// instead of needing the tier for its whole token set at once (≈1 MiB a row
+/// on the 35B hybrid: a 2,855-token read turn is a 3 GiB tier, which no
+/// partition on a 16 GiB card places beside twenty decodes). Below this the
+/// chunk amortises its expert load over too few rows to be worth the wave, so
+/// the fill holds the item until the tier has this much room for it.
+pub(super) const PREFILL_MIN_ADVANCE: usize = 128;
+
+/// The slots an idle-demotion pass takes, advancing the idle counters as it
+/// goes: a slot the engine touched restarts its count, and a quiet slot demotes
+/// on the pass that reaches [`Scheduler::IDLE_SLOT_DEMOTE_PASSES`].
+///
+/// **A slot holding no blocks is still demoted, and that is the whole point.**
+/// It used to be skipped, on the reasoning that a slot with nothing on the
+/// device has nothing to give back. That is false, and it made this pass inert
+/// for the population it exists to serve: a slot's block table and the
+/// substrate's *hot* copies of its sealed turns are two different holdings, and
+/// `apply_projection` truncates the slot to zero blocks at every turn. So a
+/// conversation between turns — exactly the case this sheds — reads
+/// `tokens == 0` while its hot turn residences are untouched. Those are the
+/// large half: `hot = None` freed 8–9 MiB a pass against 5,920 MiB of resident
+/// K/V, and the census reported `idle_slots = 0` throughout, because every
+/// waiting conversation had been classified as holding nothing.
+///
+/// Demoting resets the counter rather than leaving it above the threshold, so a
+/// slot sheds once per quiet window instead of re-running the substrate walk on
+/// every wave for the rest of its life.
+///
+/// Pure over `(slots, busy)` so the policy is testable without a session or a
+/// substrate; `slots` carries each live slot with the tokens its block table
+/// currently holds.
+fn idle_slots_to_demote(
+    counters: &mut HashMap<SequenceId, u32>,
+    slots: &[(SequenceId, usize)],
+    busy: &HashSet<SequenceId>,
+) -> IdlePass {
+    let mut pass = IdlePass::default();
+    for (id, tokens) in slots.iter().copied() {
+        if busy.contains(&id) {
+            // Report only slots that were actually being aged. One busy
+            // throughout has no quiet to interrupt and nothing to say about how
+            // long a demotion lasts.
+            if counters.remove(&id).is_some() {
+                pass.woke.push(id);
+            }
+            continue;
+        }
+        // **Exactly on the crossing pass, then never again until touched.** A
+        // `>=` would re-demote a slot that simply stays quiet on every
+        // subsequent pass — with a grace of one, every pass — and each of those
+        // costs a substrate write lock and a walk per conversation, contending
+        // with the persistence thread to shed nothing (the first demote already
+        // took it all). The counter keeps climbing, saturating, so the equality
+        // holds only once per quiet period; a touch resets it and re-arms.
+        let quiet = counters.entry(id).or_insert(0);
+        *quiet = quiet.saturating_add(1);
+        if *quiet == Scheduler::IDLE_SLOT_DEMOTE_PASSES {
+            pass.demote.push((id, tokens));
+        }
+    }
+    // Counters for slots that are gone (freed between passes) would otherwise
+    // accumulate for the life of the process.
+    let live: HashSet<SequenceId> = slots.iter().map(|(id, _)| *id).collect();
+    counters.retain(|id, _| live.contains(id));
+    pass
+}
+
+/// What one [`idle_slots_to_demote`] pass decided.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IdlePass {
+    /// `(slot, tokens)` per demotion. `tokens` is what the caller truncates and
+    /// may be zero — a slot between turns holds no blocks while its bytes sit
+    /// in the substrate's hot copies.
+    demote: Vec<(SequenceId, usize)>,
+    /// Slots that were being aged and have gone busy again. Paired against the
+    /// caller's demotion timestamps this measures how long a demotion actually
+    /// lasts, which is the number that says whether the grace window earns its
+    /// keep or is pure delay.
+    woke: Vec<SequenceId>,
+}
+
+/// The widest wave the engine will compose, whatever the hit rate says: the
+/// widest rung the batched-forwarding gates measure (`C10 × 64`), and the
+/// backstop [`Scheduler::MAX_PREFILL_WIDTH`] is set to match. A model's own
+/// row (`decode_width_target`) bounds the width on a streaming card; this
+/// bounds it on a card that holds every expert, where the hit rate alone
+/// would never stop widening.
+pub(super) const WAVE_WIDTH_HARD_CAP: usize = 64;
+
+impl Scheduler {
+    /// A wave's transient tier was refused placement. Nothing ran and the KV
+    /// side rolled back, so nothing has failed: the wave was composed too wide
+    /// for the ground the placement found, and the next fill composes it
+    /// narrower.
+    ///
+    /// Two things make that so. The margin the fill holds back from the tier
+    /// budget doubles, so the same gap prices to fewer rows. And the prefills
+    /// the refused wave carried go **back to the front of the queue**, in
+    /// order — they were admitted but never started, so there is nothing to
+    /// unwind but the admission itself — and are offered again against the
+    /// wider margin. Measured before this: one wave priced 26 MiB over a
+    /// 4,054 MiB gap failed 18 directories.
+    ///
+    /// **A refusal at the widest margin is final for the prefills that had
+    /// started.** A started prefill (one with chunks already committed) cannot
+    /// be requeued, so it rides the next group — and if the placement refuses
+    /// that group too, and the next, the wave never advances: measured, 1,641
+    /// refusals of one wave with nothing requeued, the margin at its cap from
+    /// the third refusal on. When the margin is already at the cap and the
+    /// refusal comes again, the started prefills are failed with the numbers
+    /// and their sequences released, so the pipeline moves.
+    pub(super) fn note_tier_refusal(&mut self, err: &candle::Error) {
+        let at_cap = self.tier_margin_regions >= TIER_MARGIN_CAP_REGIONS;
+        self.tier_margin_regions = (self.tier_margin_regions * 2).min(TIER_MARGIN_CAP_REGIONS);
+        let mut unstarted = Vec::new();
+        let mut i = 0;
+        while i < self.active_prefills.len() {
+            let p = &self.active_prefills[i];
+            if p.offset == 0 && p.final_logits.is_none() && p.error.is_none() {
+                unstarted.push(self.active_prefills.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let requeued = unstarted.len();
+        // Back to the front, in their original order.
+        for p in unstarted.into_iter().rev() {
+            self.prefill_queue.push_front(p.work);
+        }
+        let mut failed = 0usize;
+        if at_cap {
+            let started: Vec<usize> = self
+                .wave_prefill_members
+                .iter()
+                .filter_map(|m| match m {
+                    WaveMember::Prefill { seq_id, .. } => Some(*seq_id),
+                    WaveMember::Section { .. } => None,
+                })
+                .collect();
+            for p in self.active_prefills.iter_mut() {
+                if p.error.is_none()
+                    && p.final_logits.is_none()
+                    && p.offset > 0
+                    && started.contains(&p.work.sequence_id.0)
+                {
+                    p.error = Some(ConversationError::Channel(format!(
+                        "prefill of {} tokens ({} committed): the wave transient tier refused \
+                         its next chunk at the widest margin ({} regions) — this partition \
+                         cannot place it",
+                        p.work.tokens.len(),
+                        p.offset,
+                        TIER_MARGIN_CAP_REGIONS,
+                    )));
+                    failed += 1;
+                }
+            }
+        }
+        self.prefill_head_blocked = false;
+        tracing::warn!(
+            target: "candle_conversation::scheduler::interleave",
+            margin_regions = self.tier_margin_regions,
+            requeued,
+            failed,
+            "wave transient tier refused placement — wave requeued, margin widened: {err}",
+        );
+    }
+}
+
+impl<'a> WaveFill<'a> {
+    fn new(sched: &'a mut Scheduler, optimal: u64) -> Self {
+        let mut decode_order = sched.decode_wave_candidates();
+        // Start the offers just past the last sequence admitted last wave, so
+        // whatever was refused at the tail goes first now. The list is sorted
+        // by id (`decode_wave_candidates`), so the split point is the first id
+        // above it.
+        if let Some(last) = sched.last_decode_admitted {
+            let split = decode_order.iter().position(|id| id.0 > last).unwrap_or(0);
+            decode_order.rotate_left(split);
+        }
+        Self {
+            sched,
+            decode_order,
+            decode_cursor: [0; 3],
+            decodes_taken: Vec::new(),
+            decodes_refused: 0,
+            prefill_admitted: Vec::new(),
+            prefill_cursor: [0; 3],
+            optimal,
+        }
+    }
+
+    /// The band a sequence belongs to, as an index into the per-band cursors.
+    ///
+    /// A slot whose target or timeline will not resolve is treated as `High` —
+    /// the protective answer, matching `wave_prefill_layer_budget` and the
+    /// decode batch's own ordering. Guessing `Low` for an unresolvable dialogue
+    /// slot would put a person's token behind a repository scan.
+    fn band_of(&self, seq: SequenceId) -> usize {
+        band_index(
+            self.sched
+                .decode_layer_priority(seq)
+                .unwrap_or(DecodePriority::High),
+        )
+    }
+
+    /// Rows the decodes taken so far put at the head of the wave: a drafted
+    /// decode rides as a verify block of `1 + draft` rows in the prefill slot.
+    fn head_rows(&self) -> usize {
+        let decodes = self.decodes_taken.len();
+        decodes * (1 + self.sched.model.draft_budget(decodes))
+    }
+
+    /// Tier bytes a forward worth running needs, held back from admission.
+    ///
+    /// **The tier is the span's third tenant and takes whatever K/V leaves at
+    /// the frontier**, so admission stops this far short of the weight floor.
+    /// Every K/V reservation raises the arena frontier, and the tier lives in
+    /// what is left between the frontier and the weight side.
+    ///
+    /// **It must be a useful forward's worth, not merely a placeable one.**
+    /// Both failures are measured. Reserve nothing and K/V claims to the floor,
+    /// the tier reaches zero and no forward can be planned at all: run CB, wave
+    /// after wave of `(no forwards)` with 73 slots admitted. Reserve one row and
+    /// a forward *can* be placed but not filled — run CG opened 96 slots on the
+    /// freed budget, left the tier 176 MiB, and every forward carried
+    /// `seqs avg=1.0`, one sequence at a time, with 335 of 468 regions standing
+    /// free. A tier that can only place a forward is barely better than one that
+    /// cannot.
+    ///
+    /// So it is [`PREFILL_MIN_ADVANCE`] rows — the least the engine will hand a
+    /// sequence — priced through the same `tier_bytes` that places the tier.
+    /// That is ~1.5 GiB on the 4090 and buys wide forwards: run CE carried it
+    /// and reached 82 directories at 102 tok/s aggregate with a 150 median,
+    /// where CG's one-row reserve produced single-sequence waves.
+    ///
+    /// Reading it through the planner is what makes it portable: it follows the
+    /// model's geometry and the activation dtype rather than being a byte count
+    /// to re-derive per card.
+    fn min_forward_tier_bytes(&self) -> u64 {
+        let dtype = self.sched.session.activation_dtype();
+        let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
+        plan.tier_bytes(PREFILL_MIN_ADVANCE) as u64
+    }
+
+    /// Prefill tokens the transient tier has room for beside `head_rows` rows
+    /// already in the wave, when the next item would add `want` tokens.
+    ///
+    /// **The co-batched wave is bounded here, and nowhere else.** The engine's
+    /// slab packer bounds a *pure* prefill wave; a wave carrying decode rows
+    /// takes its prefill group whole, so a scheduler that admitted freely built
+    /// waves whose tier came to 6.3 GiB against a 6.1 GiB gap — every one of
+    /// them refused, every one a failed directory.
+    ///
+    /// **The tier's ground is bought here, at fill time, or not counted.** The
+    /// gap between the arena frontier and the weight floor is what stands free
+    /// and is small on its own — live arenas are scattered up to the floor. The
+    /// rest of a tier's room is weight-side ground the zone can concede down to
+    /// the hold point. Pricing that concession in and leaving the purchase to
+    /// the placement was measured twice and refused twice (`needs 4,064 MiB
+    /// against a 3,830 MiB gap`, the weight side "could not concede"): the
+    /// placement runs inside the forward, where the boundary may not move. The
+    /// fill runs between forwards, where it may, so when the head's tier would
+    /// exceed the gap and the zone stands far enough above the hold to cover
+    /// the shortfall, the fill asks the weight side for exactly that now
+    /// (`request_kv_ground`) and prices against the gap it then measures. What
+    /// the weight side does not concede is not a budget. The result is
+    /// recorded on the session so the engine's slab packer prices against the
+    /// same number and does not re-slice a group this fill composed.
+    /// Publish this wave's transient-tier budget, so the engine's slab packer
+    /// prices against the same ground the fill did.
+    ///
+    /// The frontier gap, less the margin a refusal widens. **Nothing is bought
+    /// from the weight side.** The old fill asked the zone to concede ground
+    /// when a wave's tier did not fit, and that ask is exactly the thing
+    /// admission now exists to refuse: ground taken there is resident experts,
+    /// and an engine that streams its experts is slower at everything. A wave
+    /// whose tier will not fit the standing gap is a wave that should be
+    /// narrower, which is `admit::gate`'s answer, not the zone's to pay for.
+    fn publish_tier_budget(&mut self) {
+        let margin = self.sched.tier_margin_regions * REGION_BYTES;
+        // **Ground the weight side is owed comes off the top.** When residency
+        // stands under its hold, the frontier gap is not the tier's to take: it
+        // is where the weight side grows back, as fast as it is left free.
+        // Publishing the whole gap is what crushed the weights on run BT — the
+        // tier for a wide wave took its ground from the zone, which fell to
+        // 1,417 MiB against a 4,775 hold, and the forward then failed outright
+        // with `Expert cache full, cannot evict (all pinned)` because every
+        // remaining slot was pinned by the wave needing it. 125 forwards died
+        // that way.
+        //
+        // **The debt is measured against the effective zone, never the extent.**
+        // The extent is where the boundary happens to rest, and nothing moves it
+        // back on its own: the weight side grows only when the expert cache asks
+        // for ground it cannot evict, so an extent that settles under the hold
+        // stays there and the debt never clears. Run BW showed what that costs
+        // within three directories — extent 4,240 MiB against a 4,772 hold, so a
+        // 532 MiB debt was deducted on every wave, the tier reached exactly
+        // zero, prefill forwards carried 2 to 4 sequences with 82 standing
+        // admitted, and the effective zone was a wholly healthy 6,112 MiB the
+        // entire time. Run BV died of the same arithmetic after 26 minutes at 13
+        // tok/s. The effective zone charges every live region the instant it is
+        // claimed, so it says whether residency is *actually* short — which is
+        // the only condition under which the tier owes anything.
+        let owed = interleave::effective_weight_zone_bytes()
+            .map_or(0, |zone| self.optimal.saturating_sub(zone)) as usize;
+        let budget = transient_headroom_bytes(0)
+            .unwrap_or(0)
+            .saturating_sub(margin)
+            .saturating_sub(owed);
+        self.sched.session.set_tier_budget_bytes(budget);
+    }
+}
+
+/// Whether a prefill can contribute nothing more to a wave group.
+///
+/// **This is one predicate on purpose, and both callers must use it.**
+/// `form_wave_group` declines to schedule a prefill this returns true for, and
+/// `promote_finished_prefills_to_decodes` takes exactly those — so every prefill
+/// is either advancing in a wave or being drained, and none can be both
+/// unschedulable and unpromotable.
+///
+/// They used to disagree, and the gap between them stalled the engine outright.
+/// The group skipped on `logits || consumed` while promotion took only
+/// `logits && consumed`, so a prefill that had consumed all its tokens without
+/// producing logits was skipped by the first and refused by the second: it could
+/// never ride a forward, so it could never get the logits that would have let it
+/// be promoted. It simply sat in `active_prefills` forever. Run CE ended that
+/// way at 82 directories — four such slots, no rows to build a forward from,
+/// `(no forwards)` wave after wave with 220 free regions and every resource
+/// standing idle. A slot with logits but tokens left cannot advance either, for
+/// the same reason, so it is drained here too rather than left in the same trap.
+///
+/// A slot whose logits are missing is not silently promoted: the drain reports
+/// it as a failed turn and frees it, which is a bounded loss of one turn instead
+/// of an unbounded loss of the engine.
+fn prefill_done(has_logits: bool, offset: usize, tokens: usize) -> bool {
+    has_logits || offset >= tokens
+}
+
+/// Whether a prefill has no more chunks to submit: its last chunk landed and
+/// produced the logits the first decode step samples from. Such an entry stays
+/// in `active_prefills` — holding its prefix — until it is drained.
+fn prefill_finished(p: &ActivePrefill) -> bool {
+    prefill_done(p.final_logits.is_some(), p.offset, p.work.tokens.len())
+}
+
+/// A priority as an index into the per-band cursors, highest first.
+fn band_index(p: DecodePriority) -> usize {
+    match p {
+        DecodePriority::High => 0,
+        DecodePriority::Normal => 1,
+        DecodePriority::Low => 2,
+    }
+}
+
+impl WaveFill<'_> {
+    /// The next FIFO candidate in this band, as `(queue index, sequence, whole
+    /// turn's tokens, tokens riding this wave)`. Does not consume it.
+    ///
+    /// **The two token counts are different and both matter.** The KV claim is
+    /// for the *whole turn* — every chunk of it lands in this sequence's cache
+    /// and is never given back until the turn seals — while only `advance`
+    /// rides this forward and needs transient tier. Pricing the chunk and
+    /// claiming the turn is what collapsed run BS: the gate authorised a
+    /// quarter of what the allocator then took, the weight zone fell from 5,020
+    /// to 1,417 MiB against a 4,774 hold, and the expert hit rate went to 0.257.
+    fn peek_prefill(&self, band: usize) -> Option<(usize, SequenceId, usize, usize)> {
+        let cap = self.sched.max_prefill_pass_tokens.max(1);
+        let from = self.prefill_cursor[band];
+        for idx in from..self.sched.prefill_queue.len() {
+            let w = &self.sched.prefill_queue[idx];
+            if self.band_of(w.sequence_id) != band {
+                continue;
+            }
+            let whole = w.tokens.len();
+            return Some((idx, w.sequence_id, whole, whole.min(cap)));
+        }
+        None
+    }
+
+    /// The next decode candidate in this band that has not already been taken.
+    fn peek_decode(&self, band: usize) -> Option<SequenceId> {
+        let from = self.decode_cursor[band];
+        self.decode_order[from.min(self.decode_order.len())..]
+            .iter()
+            .copied()
+            .find(|id| self.band_of(*id) == band && !self.decodes_taken.contains(id))
+    }
+
+    /// One 32-token block, in the formats a **live** sequence occupies.
+    fn per_block_bytes(&self) -> u64 {
+        let (k, v) = self.sched.session.active_kv_formats();
+        admit::cost::per_block_kv_bytes(
+            self.sched.session.num_layers(),
+            self.sched.session.n_kv_head(),
+            self.sched.session.head_dim(),
+            k,
+            v,
+        )
+    }
+
+    /// What admitting `seq` would take: `claimed` tokens of K/V — the whole turn,
+    /// which is what the allocator is asked for — and transient tier for the
+    /// `advance` that rides this forward.
+    fn price(&self, seq: SequenceId, claimed: usize, advance: usize) -> admit::Cost {
+        let held = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
+        let kv = admit::cost::kv_bytes_for_advance(held, claimed, self.per_block_bytes());
+        let recurrent = if self.sched.model.carries_recurrent_state()
+            && !self.sched.model.recurrent_resident(seq.0)
+        {
+            self.sched.model.recurrent_store_bytes() as u64
+        } else {
+            0
+        };
+        // The rows this admission adds to the forward, priced through the same
+        // planner that places the tier — so this is the tier's cost, not an
+        // estimate of it.
+        let rows = self.head_rows() + advance;
+        let dtype = self.sched.session.activation_dtype();
+        let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
+        let activations = plan
+            .tier_bytes(rows)
+            .saturating_sub(plan.tier_bytes(self.head_rows())) as u64;
+        admit::Cost {
+            kv,
+            recurrent,
+            activations,
+        }
+    }
+}
+
+impl admit::Ground for WaveFill<'_> {
+    fn active(&self) -> usize {
+        self.sched.active_slots()
+    }
+
+    fn decodes_active(&self) -> usize {
+        self.sched
+            .active_decodes
+            .values()
+            .filter(|s| !s.finished)
+            .count()
+    }
+
+    /// Defers to [`Scheduler::admission_due`], which the eviction pass reads
+    /// too — the two must answer identically or relief and admission fall out of
+    /// step. See that method for the three cases and what each one cost.
+    fn settled(&self) -> bool {
+        self.sched.admission_due()
+    }
+
+    fn headroom(&self) -> admit::Headroom {
+        // **One measure, read once.** The *effective* zone is the residency the
+        // weight side could reach: by its own identity
+        // (`interleave::achievable_weight_bytes`) that is
+        // `extent + non-live regions - reserve`, so it already accounts for
+        // every free region and for every claim the instant it is made. The
+        // boundary's *extent* is deliberately not consulted here — it lags,
+        // moving only between forwards, and every attempt to combine the two
+        // has ended up counting the same ground twice (see below).
+        let zone = interleave::effective_weight_zone_bytes().unwrap_or(u64::MAX);
+        // The KV side and the weight side share one elastic span: a claim that
+        // runs out of free regions buys its ground from the weight zone on the
+        // spot, and that is legitimate all the way down to the hold, which is
+        // the line below which the model would start streaming. Pricing against
+        // the free list alone refused admissions with gigabytes standing above
+        // that line — measured on run BR's calibration: three sequences a
+        // forward where every earlier run carried six, 979 tokens against
+        // 1,958, and the phase aggregate down 29%.
+        let room = admit::Headroom {
+            free_kv: 0,
+            zone,
+            zone_min: self.optimal,
+            zone_max: interleave::achievable_weight_now().unwrap_or(u64::MAX),
+        };
+        // **The spendable ground is one subtraction: how far residency stands
+        // above its floor.**
+        //
+        // The free list is not separate headroom to be added to that. It is the
+        // *same* ground: `effective = extent + non-live regions - reserve`, so
+        // claiming a free region moves it from non-live to live and drops
+        // `effective` by exactly its size. Spending the free list therefore
+        // spends the weight side's residency byte for byte, and any formula that
+        // adds the two lets admission spend the same ground twice.
+        //
+        // Both earlier shapes were that double-count wearing different hats.
+        // `free_list + (effective - floor)` counted the free regions once inside
+        // `effective` and once beside it — run BV stood 95 slots open on 1.6 GiB
+        // that did not exist. Netting a debt off the free list instead
+        // (`free_list - (floor - effective) + cedeable`) still treated the list
+        // as spendable while it lasted, so the zone simply drained before the
+        // debt term grew large enough to bite: run CA opened 40 slots and had
+        // driven residency to 2,314 MiB against a 4,772 MiB hold by its first
+        // directory, and run BZ to 2,617.
+        //
+        // Read as a single quantity it is obvious, and it is self-correcting: as
+        // slots finish and their regions come back, `effective` rises and the
+        // room reopens by the same amount. The floor is the hold *plus* an
+        // eviction margin, because stopping at the hold itself leaves every
+        // expert slot pinned and the forward fails outright rather than
+        // degrading.
+        //
+        // Nothing is subtracted for work already in flight, and nothing should
+        // be: an admission *reserves* its prompt and its decode lease through
+        // `ensure_capacity`, so a live slot's ground is already live ground and
+        // `effective` already reflects it. Charging it again here would refuse
+        // admissions the device could afford.
+        //
+        // **The span holds three tenants, so the floor answers to two of them.**
+        // It is `| persist | KV | wave transient tier | expert weights |`, and
+        // K/V claiming down to the weight side's floor still leaves the tier
+        // nothing: the tier sits between them, at the arena frontier, and takes
+        // what K/V has not. With no tier there is no forward at all — not a
+        // narrow one, none — so nothing completes, no ground comes back, and the
+        // tier cannot recover. Run CB wedged exactly there: `tier=0MiB`, then
+        // `(no forwards)` wave after wave with 73 slots admitted and every one
+        // of them idle.
+        //
+        // **The reserve comes out of the elastic budget, not out of the current
+        // frontier gap.** Those look interchangeable and are not: the gap is
+        // `weight_floor - live_end()`, and the weight floor *moves* — K/V buys
+        // ground from the weight side on the spot, down to the hold. So the gap
+        // is smallest exactly when residency is healthiest, and gating on it
+        // inverts the logic. Measured: run CK refused after two prefills a fill
+        // with an 8,204 MiB weight zone and 3.7 GiB of residency headroom
+        // standing unused, because the momentary gap was 64 MiB. One budget,
+        // with both floors taken out of it, is the shape that holds.
+        let tier_reserve = self.min_forward_tier_bytes();
+        admit::Headroom {
+            free_kv: zone.saturating_sub(room.floor().saturating_add(tier_reserve)),
+            ..room
+        }
+    }
+
+    fn peek(&mut self, kind: admit::Kind, prio: DecodePriority) -> Option<admit::Cost> {
+        use admit::Kind;
+        let band = band_index(prio);
+        match kind {
+            Kind::Prefill => {
+                let (_, seq, whole, advance) = self.peek_prefill(band)?;
+                // **The price is the prompt and the lease that follows it.**
+                // Admitting a prefill commits to the whole slot — prefill, then
+                // decode to the end of its lease — and none of that ground comes
+                // back until it seals. `admit` reserves exactly this, so the
+                // price is what the allocator is about to be handed rather than
+                // a guess at it.
+                let lease = Scheduler::DECODE_LEASE_TOKENS;
+                Some(self.price(seq, whole.saturating_add(lease), advance))
+            }
+            Kind::Decode => {
+                let seq = self.peek_decode(band)?;
+                // **A decode step buys no K/V.** Its whole lease was reserved
+                // through `ensure_capacity` when the slot was admitted, so the
+                // blocks it writes into are blocks it already owns; charging it
+                // again is the same ground counted twice, and this time it
+                // charges the tenant that cannot pay. Run CC showed what that
+                // costs: once the budget closed, every decode was refused, so
+                // prefills promoted into decodes that never stepped, nothing
+                // generated, and 44 slots sat admitted with 52 queued behind
+                // them while the engine ran forwards that produced no tokens.
+                //
+                // What a step *does* cost is the tier for its row, which the
+                // wave has to place whether or not the K/V is already there — so
+                // that term stands and the K/V term is zero.
+                let step = Scheduler::DECODE_CLAIM_TOKENS;
+                Some(admit::Cost {
+                    kv: 0,
+                    ..self.price(seq, step, step)
+                })
+            }
+        }
+    }
+
+    fn admit(&mut self, kind: admit::Kind, prio: DecodePriority) -> bool {
+        use admit::Kind;
+        let band = band_index(prio);
+        match kind {
+            Kind::Prefill => {
+                let Some((idx, seq, whole, _advance)) = self.peek_prefill(band) else {
+                    return false;
+                };
+                self.prefill_cursor[band] = idx + 1;
+                // The whole turn **and its decode lease**, matching what `peek`
+                // priced. `claim_kv` ensures capacity, so this reserves the
+                // ground rather than predicting it: the arena for the generation
+                // is taken here, at admission, and the slot cannot later grow
+                // into ground the gate never authorised.
+                let reserve = whole.saturating_add(Scheduler::DECODE_LEASE_TOKENS);
+                if !self.sched.claim_kv(seq.0, reserve) || !self.sched.claim_recurrent(seq.0) {
+                    return false;
+                }
+                self.prefill_admitted.push(idx);
+                true
+            }
+            Kind::Decode => {
+                let Some(seq) = self.peek_decode(band) else {
+                    return false;
+                };
+                if let Some(at) = self.decode_order.iter().position(|id| *id == seq) {
+                    self.decode_cursor[band] = at + 1;
+                }
+                if !self.sched.claim_kv(seq.0, Scheduler::DECODE_CLAIM_TOKENS)
+                    || !self.sched.claim_recurrent(seq.0)
+                {
+                    self.decodes_refused += 1;
+                    return false;
+                }
+                self.decodes_taken.push(seq);
+                true
+            }
+        }
+    }
+}
+
 use crate::persistence::thread::effective_turn_policy;
 use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
-use candle_nn::kv_cache::{end_wave_transient, is_device_oom};
+use candle_nn::kv_cache::{
+    end_wave_transient, is_device_oom, is_tier_refusal, transient_headroom_bytes, WavePlan,
+    REGION_BYTES,
+};
 use candle_transformers::models::batched_inference::PendingGlue;
 use std::collections::{HashMap, HashSet};
 
@@ -51,34 +710,6 @@ pub(super) struct CompressPass {
     refused: bool,
 }
 
-fn env_regions(var: &str) -> Option<usize> {
-    std::env::var(var)
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-}
-
-/// Per-**sequence** transient-activation reserve for a LOAD-phase (prefill /
-/// ingest) forward, in bytes. The reserve band grows by this coefficient for
-/// each sequence co-batched into the imminent forward (see `vram_band_for`),
-/// so a wide batch — which a large card admits — reserves in proportion to its
-/// peak instead of a flat card fraction. Default 384 MiB: a prefill/ingest
-/// sequence's activation buffers plus its share of the MoE expert gather.
-/// Override with `CANDLE_VRAM_PER_SEQ_LOAD_MB` (the true value depends on the
-/// model's per-token activation footprint and prefill width). Cached on first read.
-const DEFAULT_VRAM_PER_SEQ_LOAD_MB: usize = 384;
-fn per_seq_load_bytes() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        let mb = std::env::var("CANDLE_VRAM_PER_SEQ_LOAD_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(DEFAULT_VRAM_PER_SEQ_LOAD_MB);
-        mb * 1024 * 1024
-    })
-}
-
 /// The region quantum in bytes.
 fn region_bytes() -> u64 {
     candle_nn::kv_cache::REGION_BYTES as u64
@@ -90,10 +721,6 @@ fn setpoint_regions(phase: VramPhase, total: usize) -> usize {
     let (divisor, floor) = match phase {
         VramPhase::Load => (LOAD_SETPOINT_DIVISOR, LOAD_SETPOINT_FLOOR_REGIONS),
         VramPhase::Decode => (DECODE_SETPOINT_DIVISOR, DECODE_SETPOINT_FLOOR_REGIONS),
-    };
-    let floor = match phase {
-        VramPhase::Load => env_regions("CANDLE_KV_FREE_REGIONS_LOAD").unwrap_or(floor),
-        VramPhase::Decode => env_regions("CANDLE_KV_FREE_REGIONS_DECODE").unwrap_or(floor),
     };
     // Never ask for more than half the span: on a card too small to hold the
     // setpoint, demanding it would mean permanent pressure and an eviction pass
@@ -124,83 +751,33 @@ pub(crate) enum VramPhase {
 /// reload churn the old watermark ladder was built to damp.
 const RELIEF_OVERSHOOT_REGIONS: usize = 8;
 
-/// How long prefill throughput must be COMPLETELY silent (no forward
-/// completing) under surviving VRAM pressure before the promote path halves
-/// the admission window. Longer than any healthy forward (the widest
-/// calibration forwards run ~7 s), so completions keep the width; a genuine
-/// wedge still backs off, one halving per grace period. Device-OOM shrinks at
-/// its own site instantly.
-const PROMOTE_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Minimum wall-clock between "admitted nothing" throttle traces. The admission
-/// pass runs many times a second, and a queue the budget won't take reproduces
-/// the same line every iteration until the budget or the queue moves — without a
-/// cooldown a single throttled ingest floods the log at the loop rate. Passes
-/// that DID admit are never suppressed: their rate is bounded by real work.
-const ADMIT_STARVED_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-fn env_pct(var: &str, default: usize, max: usize) -> usize {
-    std::env::var(var)
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&p| p >= 1 && p <= max)
-        .unwrap_or(default)
-}
 /// Capacity fraction (%) at which cold **ingest** KV starts demoting to the warm
 /// (RAM) tier — gentle and early, well before the free-region setpoint is
 /// approached at all. Ingest KV is zero-reload-cost (never
 /// re-attended until query time; it re-elevates warm→hot on demand), so it is the
-/// cheapest relief and sheds first. Env `CANDLE_INGEST_DEMOTE_PCT`, default 50.
-fn ingest_demote_pct() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_pct("CANDLE_INGEST_DEMOTE_PCT", 50, 95))
-}
-/// Target hot→warm drain backlog, as a % of resident capacity, above which
-/// ingest admission throttles down (and below half of which it reopens). This
-/// is the *leading* backpressure signal — it keeps `used` off the warm-starved
-/// climb before the lagging VRAM-pressure trip ever fires. Env
-/// `CANDLE_INGEST_WARM_BACKLOG_PCT`, default 12 (≈ one-to-two passes of headroom
-/// on a ~72 GiB card), clamped to 40.
-fn ingest_warm_backlog_pct() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_pct("CANDLE_INGEST_WARM_BACKLOG_PCT", 12, 40))
-}
+/// cheapest relief and sheds first.
+const INGEST_DEMOTE_PCT: usize = 50;
 /// Backlog (as a % of resident capacity) above which the wave loop blocks on a
 /// device sync after its eviction callbacks — "heavy pressure". Draining the
 /// primary stream lets the (now cross-layer-batched, short) hot→warm pass run
 /// uncontended by ingest forwards, so it catches up instead of interleaving.
-/// Above the throttle target ([`ingest_warm_backlog_pct`]) so the gentle AIMD
-/// throttle acts first; the sync is the harder stop when that isn't enough. Env
-/// `CANDLE_INGEST_SYNC_CEILING_PCT`, default 25, clamped to 80. Set to a high
-/// value to effectively disable.
-fn ingest_sync_ceiling_pct() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_pct("CANDLE_INGEST_SYNC_CEILING_PCT", 25, 80))
-}
+/// This is the *only* backpressure the hot→warm drain applies to ingest: the
+/// gentle byte-setpoint throttle that used to act first was removed with the
+/// admission budget it moved (nothing read that budget once the wave fill
+/// replaced it).
+const INGEST_SYNC_CEILING_PCT: usize = 25;
 /// Slack the warm PIPELINE may hold above the standing budget: hot→warm output
 /// that exists only while the drain moves it to cold. On a zero-budget machine
 /// this is the only warm residency there ever is, and cutting admission for it
 /// would recreate the ratchet-to-the-floor failure — the drain clears it in a
 /// pass. The throttle fires only when `resident + pending` exceeds
-/// `budget + slack`, i.e. when the drain is genuinely not keeping up. Default
-/// 1 GiB; override with `CANDLE_WARM_PIPELINE_SLACK_MB`.
-pub(super) fn warm_pipeline_slack_bytes() -> u64 {
-    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        let mb = std::env::var("CANDLE_WARM_PIPELINE_SLACK_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(1024);
-        mb * 1024 * 1024
-    })
-}
+/// `budget + slack`, i.e. when the drain is genuinely not keeping up.
+pub(super) const WARM_PIPELINE_SLACK_BYTES: u64 = 1024 * 1024 * 1024;
 /// Minimum spacing between OS memory probes for host-RAM backpressure —
 /// `sysinfo` is a syscall, so the scheduler caches the reading between waves.
 const HOST_RAM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 /// Sealed ingest turns kept hot per timeline (the rolling window) before the
-/// gentle-early demote sheds the rest to RAM. Env `CANDLE_INGEST_HOT_WINDOW`,
-/// default 8.
+/// gentle-early demote sheds the rest to RAM.
 ///
 /// **Must cover the ingest projection's gather width.** With the tool-round-trip
 /// ingest, each scope's summary decode projects the `scopes` group (`top_k` turns)
@@ -210,39 +787,20 @@ const HOST_RAM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// The scopes group is `top_k: 4`, so a scope's projected working set is ~4 turns
 /// (2 coupled turns × ~2 scopes); 8 keeps a couple of scopes of margin resident so
 /// the active working set never leaves hot.
-fn ingest_hot_window() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("CANDLE_INGEST_HOT_WINDOW")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(8)
-    })
-}
+const INGEST_HOT_WINDOW: usize = 8;
 
 /// Max float bytes the synchronous compress-to-free rung brings forward per relief
 /// episode. Bounds the per-episode stall: a large accumulated backlog drains over
 /// several episodes (plus the background persistence thread) instead of one
 /// multi-second blocking compression of *everything* pending. This is a WORK/time
 /// budget — compression cost scales with turns × chunks × layers (~model
-/// dependent, not card capacity) — so it is an absolute MB, env-tunable. 1 GiB.
-const DEFAULT_VRAM_COMPRESS_MAX_MB: usize = 1024;
+/// dependent, not card capacity) — so it is an absolute size rather than a
+/// fraction of the card.
+const VRAM_COMPRESS_MAX: u64 = 1024 * 1024 * 1024;
 /// The rung compresses `want × this` per episode (clamped to the max above), so
 /// it overshoots the immediate shortfall a little and coasts rather than
 /// re-tripping on the very next wave.
 const VRAM_COMPRESS_HYSTERESIS: u64 = 4;
-fn vram_compress_max() -> u64 {
-    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        (std::env::var("CANDLE_VRAM_COMPRESS_MAX_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(DEFAULT_VRAM_COMPRESS_MAX_MB) as u64)
-            * 1024
-            * 1024
-    })
-}
 /// Safety cap on the synchronous substrate-offload flush under pressure. The
 /// pass migrates hot→warm *before* its cold-disk writes, so the warm copies
 /// the eviction needs exist well before this fires — a timeout only clips the
@@ -358,7 +916,7 @@ impl Scheduler {
             // pending; the persistence thread is working the same queue.
             let budget = want
                 .saturating_mul(VRAM_COMPRESS_HYSTERESIS)
-                .min(vram_compress_max());
+                .min(VRAM_COMPRESS_MAX);
             let pass = self.compress_pending_turns(budget);
             compressed = pass.compressed;
             compress_refused = pass.refused;
@@ -386,10 +944,17 @@ impl Scheduler {
         // recycling it.** Everything above reclaims KV the engine already owns —
         // compress a turn, evict a cold tail, drop an empty arena — and all of
         // it is worth nothing against a workload with nothing reclaimable. A
-        // base conversation's sections are permanent by design: they are not
-        // turns, so there is no turn to compress and no tail to evict, and a
-        // section prefill that outgrows its ground stalls with every relief
-        // counter reading zero. That is exactly how it failed.
+        // base conversation's sections are not turns, so there is no turn to
+        // compress and no tail to evict *on this ladder*, and a section prefill
+        // that outgrows its ground stalls with every relief counter reading
+        // zero. That is exactly how it failed.
+        //
+        // Sections are no longer permanently resident, though the rung that
+        // reclaims them is not this one: `Substrate::demote_idle_hot` sheds a
+        // dormant section on the persistence thread once a durable copy exists
+        // (`docs/vram_governor_design.md` §8.1). It is a different cadence and
+        // cannot be reached from inside a stalled prefill, so this rung still
+        // has nothing to offer that workload.
         //
         // The weight side is holding ground in that case, and the boundary is
         // meant to move. It could not: the give-back runs at the end of a
@@ -405,19 +970,16 @@ impl Scheduler {
         // was 448 — 28 regions. It conceded 5,752 MiB, evicted 1,598 experts, and
         // put the zone under its pinned working set, after which nothing ran.
         // The number was in this function the whole time; it just was not sent.
-        let mut conceded = 0u64;
-        if self.vram_under_pressure_for(phase) {
-            conceded = self
-                .model
-                .request_kv_ground(want.div_ceil(region_bytes()) as usize);
-        }
-
+        // **Relief does not buy weight-side ground.** The setpoint is a level
+        // of free regions the KV side likes to keep, not a claim that failed,
+        // and a claim that does run out buys exactly what it needs on the spot
+        // (`request_kv_ground` from the claim path). Asking the weight side for
+        // the setpoint shortfall here meant every decode-only wave under the
+        // setpoint took 144–240 MiB from the experts — 260 concessions in 441
+        // waves of one pool phase, the zone falling from 6.1 to 5.0 GiB and the
+        // hit rate through the knee, with nothing having asked for a region.
         let still = self.vram_under_pressure_for(phase);
-        let acted = released > 0
-            || gallery_freed > 0
-            || compressed > 0
-            || evicted.count > 0
-            || conceded > 0;
+        let acted = released > 0 || gallery_freed > 0 || compressed > 0 || evicted.count > 0;
         if acted {
             relief_trace::note("sched", "relieve", want, evicted.bytes);
         }
@@ -439,7 +1001,6 @@ impl Scheduler {
                     turns_evicted = evicted.count,
                     evicted_mib = evicted.bytes / (1 << 20),
                     arenas_released = released,
-                    conceded_mib = conceded / (1 << 20),
                     free_regions = free,
                     setpoint_regions = setpoint,
                     relieved = !still,
@@ -461,49 +1022,7 @@ impl Scheduler {
         still
     }
 
-    /// Bytes one 32-token KV block costs across the whole model, in the formats
-    /// a **live** sequence actually occupies — the unit every admission cost is
-    /// quoted in. See [`per_block_kv_bytes`].
-    ///
-    /// ACTIVE formats, not the configured sealed ones: a block only reaches
-    /// `k_format`/`v_format` once its turn seals and quantizes, and admission is
-    /// deciding whether a sequence fits while it is running. Pricing the sealed
-    /// pair understated the working set by ~3.7x (192 B/block active vs 52 B
-    /// sealed), so admission cleared batches whose real KV was several GiB and
-    /// the allocator then refused them one arena at a time. See
-    /// [`candle_nn::kv_cache::active_kv_formats`].
-    ///
-    /// # The seal's second copy is *not* charged here, and that was tried
-    ///
-    /// `docs/archived/elastic_vram_partition.md` §7 phase 1 asks admit to account for
-    /// "persistence's quantize destinations", and the obvious reading — a block
-    /// occupies its active slot *and* its sealed destination while the
-    /// compressor copies between them, so charge both — was built and reverted.
-    ///
-    /// It is the wrong shape. The overlap lasts one copy; the charge lasts the
-    /// block's whole life. Applying it here doubles the price of **every** block
-    /// in every admission decision, in-flight accounting and decode reserve, so
-    /// admission clears roughly half the work it should. On a live rebuild that
-    /// showed as `(no forwards)` against a `64MiB` budget with a 14k-token
-    /// backlog: nothing admitted, so nothing completed, so nothing freed, so the
-    /// budget never recovered.
-    ///
-    /// A transient double-occupancy is a *reserve* — a fixed pool the compressor
-    /// draws on — not a per-block tariff. That is what §7 means and it is still
-    /// unbuilt.
-    fn per_block_kv_bytes(&self) -> u64 {
-        let (k, v) = self.session.active_kv_formats();
-        per_block_kv_bytes(
-            self.session.num_layers(),
-            self.session.n_kv_head(),
-            self.session.head_dim(),
-            k,
-            v,
-        )
-    }
-
-    /// What the card can actually deliver to admission right now — the live
-    /// ceiling [`Scheduler::admit_budget`] is clamped to on every read.
+    /// What the card can actually deliver to admission right now.
     ///
     /// Free reservation bytes plus reversibly-evictable KV, minus the hot KV the
     /// drain is skipping because it is pinned. The pinned discount is what keeps
@@ -532,172 +1051,589 @@ impl Scheduler {
     /// the relief pass ahead of admission actually evicts it. Measured, not
     /// forecast, which is why nothing has to be added back or discounted.
     pub(super) fn admit_budget_ceiling(&self) -> u64 {
-        // No forward reserve is subtracted here: it is width-dependent, and
-        // `plan_admission` holds it back at the width it is choosing. See
-        // `admit_band_params`. The setpoint IS subtracted — those regions are
-        // the relief pass's working room, not admission's to spend.
+        // The relief setpoint IS subtracted — those regions are the relief
+        // pass's working room, not admission's to spend.
         let Some((free, setpoint)) = self.kv_region_state(VramPhase::Load) else {
             return 0;
         };
         (free.saturating_sub(setpoint) as u64).saturating_mul(region_bytes())
     }
 
-    /// Bytes the work already in flight will still allocate this pass: every
-    /// active prefill's *remaining* tokens, plus the amortised per-step growth of
-    /// the live decodes. This is charged against the budget before anything new
-    /// is admitted — committed work is never displaced by a fresh candidate.
-    fn in_flight_cost_bytes(&self, per_block: u64) -> u64 {
-        // KV only. The transient share of in-flight sequences is priced by the
-        // reserve, which `plan_admission` evaluates at `live_width + n`.
-        let prefill: u64 = self
-            .active_prefills
+    /// One decode step's worth of tokens — what a decode admission claims.
+    const DECODE_CLAIM_TOKENS: usize = 1;
+
+    /// Tokens of generation an admission reserves arena for, up front.
+    ///
+    /// **This is a lease, not a limit on the answer.** A turn that wants more
+    /// runs to the end of its lease, seals what it has into the substrate — the
+    /// seal compresses it, so the ground comes back smaller than it went out —
+    /// and goes to the back of the queue to be resumed from its sealed prefix.
+    /// So the engine's exposure to one conversation is bounded at its prompt
+    /// plus this, however long the conversation turns out to be.
+    ///
+    /// **Reserving it is what makes admission exact.** `claim_kv` calls
+    /// `ensure_capacity`, which allocates — so a lease priced here is ground
+    /// actually taken, visible to `region_stats`, and not an estimate anyone
+    /// can get wrong. Every pricing failure this engine has had came from
+    /// predicting a cost instead of taking it: run BV charged a decode step one
+    /// token, which opens a block once in thirty-two and is free the rest of the
+    /// time, and stood 95 slots open on ground it had never reserved.
+    ///
+    /// 256 is eight 32-token blocks — wide enough to amortise the seal and the
+    /// hot→warm migration that follows it (warm arenas are pageable, so that
+    /// copy runs at about half PCIe bandwidth), and short enough that a slot's
+    /// resident K/V stays bounded while it decodes. It is a token count rather
+    /// than a byte figure, so it carries to the 3090 and the workstation
+    /// unchanged: what a block costs follows the model's own geometry.
+    pub(super) const DECODE_LEASE_TOKENS: usize = 256;
+
+    /// Parked turns the engine will hold before it stops parking.
+    ///
+    /// **A park moves ground from the card to the host**, so an unbounded queue
+    /// does not relieve pressure, it relocates it — and a daemon sitting on tens
+    /// of gigabytes of host RAM with healthy VRAM is this engine's hardest
+    /// failure to read. Past this the lease renews instead and the turn keeps
+    /// decoding: holding more open turns is the lesser problem, and the turns
+    /// already parked are the ones that need the engine back.
+    ///
+    /// It is a safety valve rather than a tuning knob. Parking should be rare —
+    /// it fires only for turns that outrun a whole lease — so reaching this
+    /// bound means resumes are not keeping up, which is worth the log line it
+    /// produces.
+    const PARKED_TURNS_MAX: usize = 32;
+
+    /// Times a parked turn is retried before it is failed to its caller.
+    ///
+    /// A resume needs ground; the first refusals are ordinary backpressure. But
+    /// a turn that can never be restored must not sit at the head of the queue
+    /// forever holding a caller that is still waiting on its channel, so the
+    /// retries are finite and the last one reports.
+    const PARK_RESUME_ATTEMPTS: usize = 8;
+
+    /// Ask the allocator for `add` tokens on `seq`, for real.
+    ///
+    /// Between forwards, which is where arena creation is allowed: a claim
+    /// arriving with a wave's transient tier standing is carved out of ground
+    /// that tier occupies. `promote_new_prefills` runs in the gap, so this is
+    /// legal here and would not be inside the wave.
+    ///
+    /// A refusal is not an error — it is the allocator saying this queue has no
+    /// more to give right now, which is exactly what the interleave's `false`
+    /// means.
+    /// Slots admitted and not yet finished — prefilling or decoding alike.
+    pub(super) fn active_slots(&self) -> usize {
+        self.active_prefills
             .iter()
             .filter(|p| p.error.is_none())
-            .map(|p| prefill_cost_bytes(p.work.tokens.len().saturating_sub(p.offset), per_block))
-            .sum();
-        let sections: u64 = self
-            .active_section_ingests
-            .iter()
-            .filter(|s| s.error.is_none())
-            .map(|s| prefill_cost_bytes(s.tokens.len().saturating_sub(s.offset), per_block))
-            .sum();
-        prefill
-            .saturating_add(sections)
-            .saturating_add(decode_reserve_bytes(self.decode_width(), per_block))
+            .count()
+            + self.active_decodes.values().filter(|s| !s.finished).count()
     }
 
-    /// Admit queued prefills against the VRAM byte budget.
+    /// Whether an admission decision is due this wave.
     ///
-    /// A burst of small parallel scopes (code_read's worker count), a bulk
-    /// collection ingest's per-section prefills, or a batch of calibration cases
-    /// all arrive here. What coalesces into one ragged forward is whatever fits
-    /// the budget: the largest queued candidate that fits, then the rest of the
-    /// queue in submission order (see [`plan_admission`]).
+    /// **One definition, two callers, and they must not drift.** The eviction
+    /// pass exists to settle the free lists the fill then prices against, so a
+    /// wave where one runs and the other does not is either a shed with nothing
+    /// to admit or — worse — an admission priced against a device nobody
+    /// cleaned, which reads as fuller than it is and refuses work the card could
+    /// have taken. [`admit::Ground::settled`] defers to this rather than
+    /// restating it.
     ///
-    /// [`Scheduler::MAX_PREFILL_WIDTH`] is a backstop above this, not the
-    /// control; [`Scheduler::MIN_PREFILL_WIDTH`] keeps ≥1 in flight regardless,
-    /// so an oversized lone turn still runs and is bounded by the per-arena VRAM
-    /// gate (which compacts or fails fast rather than spilling to host memory).
+    /// Due when nothing is running (there is no completion left to wait for),
+    /// when a slot has been reaped since the last offer (ground came back), or
+    /// when the last wave ran no forward at all. That last clause is what stops
+    /// the fast path waiting on a completion that cannot come: without it run BS
+    /// sat at `skipped=true active=32 queued=24` for 98 consecutive waves.
+    pub(super) fn admission_due(&self) -> bool {
+        self.active_slots() == 0
+            || self.completions != self.admit_completions
+            || !self.wave_ran_forward
+    }
+
+    /// Park every slot whose decode lease has run out.
+    ///
+    /// The lease is the ground admission actually reserved for this turn's
+    /// generation, so reaching the end of it is where the slot gives that ground
+    /// back: its K/V goes to the warm tier — compressed on the way, so it holds
+    /// less parked than it did resident, and none of it on the card — the slot's
+    /// blocks are released, and the turn joins the back of the queue.
+    ///
+    /// **A lease ending is a completion as far as admission is concerned**, and
+    /// `completions` is bumped to say so: ground came back, so the next fill is
+    /// due rather than taking the fast path.
+    ///
+    /// A snapshot or migration that fails leaves the turn decoding on a renewed
+    /// lease instead. Losing a turn to a transient tier error would be a far
+    /// worse failure than briefly holding more ground than the gate authorised,
+    /// and the next expiry tries again.
+    fn park_expired_leases(&mut self) {
+        let expired: Vec<SequenceId> = self
+            .active_decodes
+            .iter()
+            .filter(|(_, s)| s.lease_expired && !s.finished)
+            .map(|(&id, _)| id)
+            .collect();
+        for slot in expired {
+            // **Stop parking rather than park unboundedly.** A park relocates
+            // ground from the card to the host; past the bound the queue is
+            // already the problem, so the lease renews and the turn keeps
+            // decoding instead.
+            if self.parked.len() >= Self::PARKED_TURNS_MAX {
+                if let Some(s) = self.active_decodes.get_mut(&slot) {
+                    s.lease_expired = false;
+                    s.lease_left = Self::DECODE_LEASE_TOKENS;
+                }
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::interleave",
+                    parked = self.parked.len(),
+                    "park queue full — lease renewed instead of parking",
+                );
+                continue;
+            }
+            let warm = self
+                .session
+                .snapshot_sequence_per_layer(slot.0)
+                .and_then(|hot| self.session.sealed_to_cpu(&hot));
+            let warm = match warm {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "candle_conversation::scheduler::interleave",
+                        slot = slot.0,
+                        "lease park failed, turn keeps decoding: {e}",
+                    );
+                    if let Some(s) = self.active_decodes.get_mut(&slot) {
+                        s.lease_expired = false;
+                        s.lease_left = Self::DECODE_LEASE_TOKENS;
+                    }
+                    continue;
+                }
+            };
+            let Some(mut state) = self.active_decodes.remove(&slot) else {
+                continue;
+            };
+            state.lease_expired = false;
+            state.lease_left = Self::DECODE_LEASE_TOKENS;
+            // The hot snapshot is dropped by now, so this releases the regions
+            // rather than merely unlinking them.
+            if let Err(e) = self.session.truncate_sequence_to_blocks(slot.0, 0) {
+                tracing::warn!(
+                    target: "candle_conversation::scheduler::interleave",
+                    slot = slot.0,
+                    "parked slot did not release its blocks: {e}",
+                );
+            }
+            tracing::debug!(
+                target: "candle_conversation::scheduler::interleave",
+                slot = slot.0,
+                generated = state.generated_tokens.len(),
+                parked_ahead = self.parked.len(),
+                "decode lease spent — turn parked to warm",
+            );
+            self.parked.push_back(ParkedTurn {
+                slot,
+                warm,
+                state,
+                resume_failures: 0,
+            });
+            self.completions = self.completions.saturating_add(1);
+        }
+    }
+
+    /// Bring the oldest parked turn back onto the slot it left, with a fresh
+    /// lease.
+    ///
+    /// **One per pass, and ahead of new admissions.** A parked turn is work the
+    /// engine already took on, and finishing what is open is what frees ground
+    /// for what is not — the same reason the queue puts continuations before
+    /// first turns. Taking only one keeps that from becoming a convoy that
+    /// crowds out every fresh conversation.
+    fn resume_parked(&mut self, optimal: u64) {
+        if self.parked.is_empty() {
+            return;
+        }
+        // **A resume claims ground, so it answers to the hold like anything
+        // else.** It is the one path that brings K/V back onto the card without
+        // going through `admit::fill`, and left ungated it walks residency under
+        // the line the whole engine is built to defend — quietly, because no
+        // gate reported a refusal. It is held to the hold rather than to
+        // admission's full floor: this is work already taken on, and finishing
+        // it is what frees ground, so it gets the benefit of the margin that a
+        // *new* admission does not.
+        let zone = interleave::effective_weight_zone_bytes().unwrap_or(u64::MAX);
+        if zone <= optimal {
+            return;
+        }
+        let Some(parked) = self.parked.pop_front() else {
+            return;
+        };
+        let ParkedTurn {
+            slot,
+            warm,
+            state,
+            resume_failures,
+        } = parked;
+        let restored = self
+            .session
+            .sealed_to_gpu(&warm)
+            .and_then(|hot| self.session.inject_sealed_at_tail(slot.0, &hot));
+        match restored {
+            Ok(_) => {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::interleave",
+                    slot = slot.0,
+                    generated = state.generated_tokens.len(),
+                    "parked turn resumed on a fresh lease",
+                );
+                self.active_decodes.insert(slot, state);
+            }
+            Err(e) if resume_failures + 1 >= Self::PARK_RESUME_ATTEMPTS => {
+                // **Report rather than hold.** The caller is still blocked on
+                // this turn's channel; a turn that cannot be restored has to
+                // fail visibly instead of sitting at the head of the queue with
+                // nobody able to tell why nothing is happening.
+                tracing::error!(
+                    target: "candle_conversation::scheduler::interleave",
+                    slot = slot.0,
+                    attempts = resume_failures + 1,
+                    "parked turn abandoned after repeated resume failures: {e}",
+                );
+                let _ = state
+                    .event_tx
+                    .send(TurnEvent::Error(ConversationError::Model(e)));
+                let _ = self.session.truncate_sequence_to_blocks(slot.0, 0);
+            }
+            Err(e) => {
+                // Warm is still the only copy, so the turn goes back at the
+                // front rather than being dropped — the ground it needs may
+                // simply not be there yet.
+                tracing::warn!(
+                    target: "candle_conversation::scheduler::interleave",
+                    slot = slot.0,
+                    attempt = resume_failures + 1,
+                    "parked turn could not be resumed this wave: {e}",
+                );
+                self.parked.push_front(ParkedTurn {
+                    slot,
+                    warm,
+                    state,
+                    resume_failures: resume_failures + 1,
+                });
+            }
+        }
+    }
+
+    fn claim_kv(&self, seq: usize, add: usize) -> bool {
+        self.session.ensure_capacity(&[seq], add).is_ok()
+    }
+
+    /// Ask the model to make `seq`'s per-sequence state resident for the
+    /// coming wave, for real.
+    ///
+    /// The other half of an admission: a decode row needs its recurrent state
+    /// on the device as much as it needs its KV chunk, and on a model whose
+    /// state is carved from the same reservation that is the claim that
+    /// actually bounds width. A model with no such state answers yes for free.
+    /// An error is treated as a refusal — the sequence waits a wave — and is
+    /// logged, because "no room" comes back as `Ok(false)` and an `Err` here
+    /// is something else.
+    fn claim_recurrent(&self, seq: usize) -> bool {
+        let offset = self.session.sequence_offset(seq).unwrap_or(0);
+        match self.model.admit_recurrent(seq, offset) {
+            Ok(admitted) => admitted,
+            Err(e) => {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::interleave",
+                    seq,
+                    "recurrent admission errored — treated as a refusal: {e}",
+                );
+                false
+            }
+        }
+    }
+
+    /// Fold the expert cache's routing since the last fill into the running
+    /// hit rate the admission reads. The cache's counters are cumulative;
+    /// the difference is this interval's, and a fill that saw no routing
+    /// (an idle engine) leaves the average where it was. Smoothed over a few
+    /// fills so one wide wave's union does not close the gate by itself.
+    fn observe_expert_hit_rate(&mut self) {
+        let Some(stats) = self.model.expert_stats() else {
+            return;
+        };
+        let hits = stats.expert_hits.saturating_sub(self.expert_hits_seen);
+        let misses = stats.expert_misses.saturating_sub(self.expert_misses_seen);
+        self.expert_hits_seen = stats.expert_hits;
+        self.expert_misses_seen = stats.expert_misses;
+        let routed = hits + misses;
+        if routed == 0 {
+            return;
+        }
+        let rate = hits as f64 / routed as f64;
+        let smoothed = match self.expert_hit_rate {
+            Some(prev) => prev * 0.7 + rate * 0.3,
+            None => rate,
+        };
+        self.expert_hit_rate = Some(smoothed);
+        // **The width follows the hit rate.** Under the knee the wave is
+        // loading experts rather than using them, so it narrows by one; clear
+        // above the knee (a tenth of headroom, so the two sides do not chase
+        // each other) it widens back toward the model's ceiling. The width is
+        // the one thing that bounds how many stores stand, so this is the whole
+        // residency policy: there is no separate gate on a store.
+        let knee = self.model.expert_hit_rate_knee();
+        // **A resident cache is not bounded by the model's row.** The row is
+        // the width the gate's curve peaked at on the card the model was
+        // calibrated on — a streaming card. A card that holds every expert
+        // reports nearly every routing a hit, and there the curve keeps rising
+        // to widths the row never measured; capping it at the row would leave
+        // a 72 GB card running ten sequences. So while the smoothed rate stands
+        // at or above the model's resident mark, the ceiling is the engine's
+        // hard cap instead; when the rate falls back under it, the width comes
+        // down one step at a time toward the row.
+        let ceiling = if smoothed >= self.model.resident_hit_rate() {
+            WAVE_WIDTH_HARD_CAP
+        } else {
+            self.model.decode_width_target()
+        };
+        let before = self.wave_width;
+        // One step per wave at most: the fill runs more than once a wave, and
+        // a step per fill walked the width from eight to two inside one
+        // calibration dip and back, the producer's marks following it down.
+        // Five seconds between steps: the hit rate answers a width change only
+        // after the stores and K/V that width brings have arrived, a few waves
+        // later. Two seconds walked the width from 15 to 5 and back inside a
+        // pool's first ten minutes, overshooting on both sides of the knee.
+        let due = self
+            .last_width_adjust
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+        // The dead band above the knee is a twentieth: a tenth left the width
+        // parked at four for minutes with the rate at 0.55–0.58, a queue of
+        // waiting conversations and the prefill row idle — the rate had
+        // recovered from its dip, the width had not.
+        // The width never narrows below the point the gate's curve peaks at
+        // (four on this card): below it the wave is under-using a zone that
+        // is, by construction, wide open, and a run that narrowed to two on a
+        // thirty-second dip sat there with twenty-five conversations waiting
+        // and the rate back in the dead band.
+        let narrowest = 4.min(ceiling);
+        if due && (smoothed < knee || self.wave_width > ceiling) {
+            self.wave_width = self.wave_width.saturating_sub(1).max(narrowest);
+        } else if due && smoothed > knee + 0.05 {
+            self.wave_width = (self.wave_width + 1).min(ceiling);
+        }
+        if self.wave_width != before {
+            self.last_width_adjust = Some(std::time::Instant::now());
+        }
+        if self.wave_width != before {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::interleave",
+                hit_rate = (smoothed * 1000.0).round() / 1000.0,
+                width = self.wave_width,
+                "wave width follows the expert hit rate",
+            );
+        }
+    }
+
     pub(super) fn promote_new_prefills(&mut self) {
+        // **The tier margin decays as fast as it grew.** A refusal doubles it
+        // (`note_tier_refusal`), and nothing brought it back: after one bad
+        // minute it stood at its 1 GiB cap for the rest of the run, so every
+        // fill priced the tier a gigabyte under the gap, bought that gigabyte
+        // from the weight side, placed a tier that did not use it, and the
+        // weight side grew back into it between forwards — 764 concessions
+        // and 90,017 expert slots evicted in one 45-minute run, every one a
+        // reload. One region back per fill: a refusal still costs a wave and
+        // widens the margin, and a run that places its tiers reaches the base
+        // margin within a minute.
+        self.tier_margin_regions = self.tier_margin_regions.saturating_sub(1).max(4);
+        self.observe_expert_hit_rate();
+        // **Eviction runs before the measurement — always, not only when a
+        // setpoint calls it pressure.** Admission prices against the free lists
+        // this pass leaves behind, so a pass that is skipped hands `admit::cost`
+        // a device that looks fuller than it is, and the gate refuses work the
+        // card could have taken. The condition is therefore the same one the
+        // fill itself uses: shed whenever an admission decision is due.
+        //
+        // It runs on completions rather than on every wave because a wave where
+        // nothing finished has nothing new to shed and nothing new to admit —
+        // that is the fast path, and it is the only reason this is not literally
+        // per-wave.
+        //
+        // **What it sheds is still bounded, deliberately.** The rungs below
+        // reclaim against a measured shortfall; they are not asked to strip the
+        // device to bare weights. The last rung moves the elastic boundary, and
+        // an over-large ask there is what killed a run outright — 5,752 MiB
+        // conceded, 1,598 experts evicted, the zone left under its own pinned
+        // working set, nothing ran afterwards. Removing the gate changes *when*
+        // relief happens; it must not change how hard it pulls.
+        //
+        // **Surviving pressure does not close admission.** It used to — `room`
+        // went to zero while the free-region count sat under the setpoint —
+        // and with the relief pass no longer buying weight-side ground that
+        // was a KV side that never grew: 13 free of 316 regions, 22 queued, 39
+        // of 60 fills admitting no prefill, the hit rate at 0.61 and the width
+        // at 8 with nothing to fill it. A claim that runs out of regions buys
+        // its ground from the weight side on the spot, and the width follows
+        // the hit rate that purchase moves; that is the bound, not this pass.
+        // A spent lease hands ground back, so park before anything measures the
+        // device — and before the fill picks this wave's decode set, so a turn
+        // at the end of its lease does not ride one more forward.
+        self.park_expired_leases();
+        if self.admission_due() {
+            // **Eviction is gated on pressure, not on the admission cadence —
+            // and that is a correctness bound, not a policy preference.**
+            //
+            // The relief ladder compresses sealed turns, replacing a turn's hot
+            // copy with its quantized form. Live slots *borrow those very
+            // chunks*, Arc-shared, from the projection that assembled them — so
+            // compressing a turn a live slot is reading rewrites that slot's
+            // slice layout underneath it. A forward caches its position map
+            // across layers, and when the layout moves between two of them the
+            // map's `(slice_idx, in_blk)` entries address the wrong slices;
+            // `prefill_utils` catches it and refuses to launch rather than
+            // sending the kernel through a garbage pointer.
+            //
+            // Running it every wave a slot completed made that constant instead
+            // of rare, and the count is unambiguous: `slice layout changed
+            // mid-forward` is **0** across runs BP and BV, which gated on
+            // pressure, and 243 / 168 / 189 / 273 across CE, CF, CH and CL,
+            // which did not. Run CL lost 102 of 354 directories to it and the
+            // pass aborted.
+            //
+            // Running relief *more* is only safe once compression can tell which
+            // turns a live slot is borrowing. Until then the setpoint is what
+            // keeps the two off each other, and a per-wave shed is a correctness
+            // regression dressed as a throughput idea.
+            if self.vram_under_pressure() {
+                self.relieve_vram_pressure("wave", VramPhase::Load);
+            }
+            // **Hand back the K/V of conversations that are between turns.**
+            // Here, in the shed slot, for two reasons. It is the eviction the
+            // compactions below want to run after — chunks have to die before
+            // packing has anything to gain — and the fill measures afterwards,
+            // so the ground this frees is ground admission can actually spend
+            // this pass rather than next.
+            //
+            // Calling it here is also what makes the admission pass the clock
+            // for `IDLE_SLOT_DEMOTE_PASSES`. It ran once per wave, which paced
+            // demotion by a quantity that lengthens under load — stretching the
+            // grace exactly when ground is scarcest.
+            // Continuations before first turns: a parked turn is already-admitted
+            // work, and finishing it is what frees ground for what is queued.
+            let hold = interleave::optimal_weight_bytes().unwrap_or(0);
+            self.resume_parked(hold);
+        }
+
+        // **Continuations before first turns.** A turn on a sequence that
+        // already holds K/V is a conversation part-way through its work — an
+        // ingest chain between a tool call and its result, a dialogue mid-reply
+        // — and it holds that K/V (and, on a recurrent model, its recurrent
+        // store) until it finishes. A first turn on an empty sequence holds nothing
+        // yet. FIFO across the two starves the former behind the latter: with
+        // 77 queued, a chain's next turn waited behind 76 fresh openings while
+        // the engine carried twenty decodes for sixteen minutes and no
+        // directory completed, because no chain ever reached its next turn.
+        // Finishing what is open is also what frees ground for what is not.
+        // Stable within each class, so the order a caller submitted in is kept.
+        {
+            let (mut continuing, mut fresh): (Vec<PrefillWork>, Vec<PrefillWork>) = self
+                .prefill_queue
+                .drain(..)
+                .partition(|w| self.session.sequence_offset(w.sequence_id.0).unwrap_or(0) > 0);
+            self.prefill_queue.extend(continuing.drain(..));
+            self.prefill_queue.extend(fresh.drain(..));
+        }
+
+        // **The fill.** Rows are offered in priority order (`admit::order`),
+        // priced against the state the eviction pass just settled
+        // (`admit::cost`), and admitted while the price does not reach the
+        // weight zone (`admit::gate`). A slot admitted here is held to
+        // completion — prefill through its chunks, then the same slot decoding
+        // to EOS — and its reaping is what frees the next admission.
+        let optimal = interleave::optimal_weight_bytes().unwrap_or(0);
+        let (filled, decodes, refused, admitted) = {
+            let mut ground = WaveFill::new(self, optimal);
+            ground.publish_tier_budget();
+            let filled = admit::fill(&mut ground);
+            (
+                filled,
+                ground.decodes_taken,
+                ground.decodes_refused,
+                ground.prefill_admitted,
+            )
+        };
+        // The offer has been made against this generation of completions; the
+        // next pass is a fast path until another slot is reaped — or until a
+        // wave runs no forward at all, which clears the flag below and forces a
+        // re-offer rather than waiting on a completion that cannot come.
+        self.admit_completions = self.completions;
+        self.wave_ran_forward = false;
+        if self.prefill_queue.is_empty() {
+            // No head to be blocked by.
+            self.prefill_head_blocked = false;
+        }
+        self.last_decode_admitted = decodes.last().map(|id| id.0);
+        // Traced only when there was something to fill: this runs on every
+        // scheduler iteration, and an idle engine would otherwise write
+        // ten empty lines a second.
+        if !decodes.is_empty()
+            || refused > 0
+            || filled.prefills > 0
+            || !self.prefill_queue.is_empty()
+        {
+            // **Which band the work actually resolved to.** The band order is
+            // only the order it appears to be if the layer lookup succeeds: a
+            // slot whose target will not resolve is treated as `High`, and a
+            // whole ingest queue reading `High` would put decode back in front
+            // of prefill and make the ordering a silent no-op. `unresolved`
+            // counts exactly that failure, so it is visible in the run rather
+            // than inferred afterwards from a rate that did not move.
+            let band_of = |sid: SequenceId| self.decode_layer_priority(sid);
+            let mut q_hi = 0usize;
+            let mut q_lo = 0usize;
+            let mut q_unresolved = 0usize;
+            for w in &self.prefill_queue {
+                match band_of(w.sequence_id) {
+                    Some(DecodePriority::High) => q_hi += 1,
+                    Some(_) => q_lo += 1,
+                    None => q_unresolved += 1,
+                }
+            }
+            let d_unresolved = decodes.iter().filter(|id| band_of(**id).is_none()).count();
+            tracing::debug!(
+                target: "candle_conversation::scheduler::interleave",
+                optimal_mib = optimal >> 20,
+                weights_mib = interleave::weight_zone_bytes().unwrap_or(0) >> 20,
+                effective_mib = interleave::effective_weight_zone_bytes().unwrap_or(0) >> 20,
+                decodes = decodes.len(),
+                decodes_refused = refused,
+                prefills = filled.prefills,
+                stopped_on_weights = filled.stopped_on_weights,
+                skipped = filled.skipped,
+                active = admit::Ground::active(&WaveFill::new(self, optimal)),
+                expert_hit_rate = self.expert_hit_rate.map_or(-1.0, |r| (r * 1000.0).round() / 1000.0),
+                wave_width = self.wave_width,
+                queued = self.prefill_queue.len(),
+                queued_high = q_hi,
+                queued_background = q_lo,
+                queued_unresolved = q_unresolved,
+                decodes_unresolved = d_unresolved,
+                "wave fill",
+            );
+        }
+        self.wave_decode_set = Some(decodes);
+        self.wave_decode_starved = refused;
+        // The decodes are never yielded now: nothing passes over the queue head
+        // for a cheaper item, so there is no head to clear the wave for.
+        self.wave_decode_yielded = false;
         if self.prefill_queue.is_empty() {
             return;
-        }
-        let in_flight = self.active_prefills.len();
-        if in_flight >= Self::MAX_PREFILL_WIDTH {
-            return;
-        }
-
-        // VRAM-pressure backpressure. Each admitted prefill pins its
-        // conversation's KV in VRAM, so under pressure we shed hot KV to the
-        // substrate rather than piling on more concurrent prefills; if that
-        // doesn't clear it, leave the rest queued this pass.
-        if in_flight > 0
-            && self.vram_under_pressure()
-            && self.relieve_vram_pressure("promote", VramPhase::Load)
-        {
-            // Pressure survived eviction — stop piling on this pass (the
-            // `in_flight > 0` guard keeps ≥1 in flight). The budget halves
-            // only on a genuine THROUGHPUT STALL, never on the mere presence
-            // of nominal pressure: multiplicative decrease is failure
-            // evidence, and a card whose steady state sits just under the
-            // pressure band would otherwise pin every bulk-prefill phase at
-            // the floor.
-            //
-            // Stall detection is time-aware because this branch runs many
-            // times a second while `PREFILL_OK_TOKENS` advances only when a
-            // forward completes (seconds apart for wide forwards): a stall is
-            // real only when NO forward has completed for a full
-            // [`PROMOTE_STALL_GRACE`]. Each elapsed grace period backs off one
-            // halving and re-arms; a device-OOM still cuts instantly at its
-            // own site.
-            let ok = super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
-            if ok > self.promote_ok_tokens_seen {
-                self.promote_ok_tokens_seen = ok;
-                self.promote_last_progress = Some(std::time::Instant::now());
-            }
-            let stalled = self
-                .promote_last_progress
-                .is_some_and(|t| t.elapsed() >= PROMOTE_STALL_GRACE);
-            if stalled {
-                self.cut_admit_budget(ThrottleReason::ReliefSurvived);
-                self.promote_last_progress = Some(std::time::Instant::now());
-            }
-            return;
-        }
-
-        let per_block = self.per_block_kv_bytes();
-        // Two independent limits — see `plan_admission`. `available` is what the
-        // card has and the forward reserve comes out of it; `setpoint` caps how
-        // much KV admission may add. Do not pre-combine them.
-        let available = self.admit_budget_ceiling();
-        let setpoint = self.admit_budget;
-        let live = self.in_flight_cost_bytes(per_block);
-        let live_width = self.prefill_width() + self.section_ingest_width();
-        let band = self.admit_band_params();
-        let costs: Vec<u64> = self
-            .prefill_queue
-            .iter()
-            .map(|w| prefill_cost_bytes(w.tokens.len(), per_block))
-            .collect();
-        let room = Self::MAX_PREFILL_WIDTH - in_flight;
-
-        let mut plan = plan_admission(available, setpoint, live, live_width, &costs, room, &band);
-        // Keep at least one prefill in flight even when nothing fits: an engine
-        // that admits nothing makes no progress, and the alternative to a lone
-        // oversized turn running is it never running at all. A turn forced
-        // through here is still bounded by the per-arena VRAM gate, which
-        // compacts or fails fast rather than spilling to host memory.
-        //
-        // The forced pick is the QUEUE HEAD, not the cheapest candidate.
-        // Cheapest-first looks attractive — it fits the most work into a floored
-        // budget — but under a budget that stays at the floor it becomes a
-        // starvation loop: the expensive directories are never the cheapest, so
-        // they are passed over on every pass while cheap ones keep arriving.
-        // Measured on this workload with the budget pinned at 256 MiB and a
-        // 384 MiB head: every forced admission took a 12-54 MiB candidate and no
-        // large directory ever ran. FIFO bounds each item's wait by the queue
-        // ahead of it.
-        if plan.admitted.is_empty() && in_flight < Self::MIN_PREFILL_WIDTH && !costs.is_empty() {
-            plan.spent = costs[0];
-            plan.admitted.push(0);
-            plan.skipped -= 1;
-        }
-
-        // Trace the pass whenever it admitted something — a real event, bounded in
-        // rate by how fast work actually drains. A pass that admitted NOTHING is
-        // the more interesting signal (queued work the budget won't take) but it
-        // repeats every loop iteration until the budget or the queue moves, so it
-        // is rate-limited to one line per [`ADMIT_STARVED_LOG_INTERVAL`].
-        let starved = plan.admitted.is_empty();
-        let due = self
-            .last_admit_starved_log
-            .is_none_or(|t| t.elapsed() >= ADMIT_STARVED_LOG_INTERVAL);
-        if !starved || due {
-            if starved {
-                self.last_admit_starved_log = Some(std::time::Instant::now());
-            }
-            const MIB: u64 = 1 << 20;
-            tracing::debug!(
-                target: "candle_conversation::scheduler::throttle",
-                available_mib = available / MIB,
-                setpoint_mib = setpoint / MIB,
-                live_mib = live / MIB,
-                spent_mib = plan.spent / MIB,
-                admitted = plan.admitted.len(),
-                skipped = plan.skipped,
-                in_flight,
-                head_cost_mib = costs.iter().copied().max().unwrap_or(0) / MIB,
-                reserve_mib = super::admission::reserve_for_width(
-                    live_width + plan.admitted.len(),
-                    &band,
-                ) / MIB,
-                "admission pass"
-            );
         }
 
         // Remove by descending index so earlier positions stay valid as we take
         // them out of the queue.
-        let mut take = plan.admitted;
+        let mut take = admitted;
         take.sort_unstable_by(|a, b| b.cmp(a));
         let mut admitted: Vec<PrefillWork> = take
             .into_iter()
@@ -706,15 +1642,22 @@ impl Scheduler {
         // …then restore submission order among the admitted set.
         admitted.reverse();
 
-        for work in admitted {
+        for mut work in admitted {
             let total = work.tokens.len();
-            let _ = work
-                .event_tx
-                .send(TurnEvent::Prefill(work.prefill_text.clone()));
-            let _ = work.event_tx.send(TurnEvent::PrefillProgress {
-                tokens_done: 0,
-                tokens_total: total,
-            });
+            // Once per turn, not once per admission — a wave the tier refused
+            // puts its unstarted prefills back at the head of the queue and
+            // they arrive here again (see `note_tier_refusal` and
+            // `PrefillWork::announced`).
+            if !work.announced {
+                work.announced = true;
+                let _ = work
+                    .event_tx
+                    .send(TurnEvent::Prefill(work.prefill_text.clone()));
+                let _ = work.event_tx.send(TurnEvent::PrefillProgress {
+                    tokens_done: 0,
+                    tokens_total: total,
+                });
+            }
             let error = if total == 0 {
                 Some(ConversationError::Channel(
                     "prefill received zero tokens".into(),
@@ -736,35 +1679,6 @@ impl Scheduler {
                 error,
                 prefill_start: None,
             });
-        }
-    }
-
-    /// The load-phase band's terms, for admission to evaluate at the width it is
-    /// choosing rather than the width already in flight. Same `base`, `per_seq`
-    /// and capacity clamp the pressure/relief gates use via
-    /// [`Self::vram_band_for`] — one reserve law, two evaluation points.
-    ///
-    /// Splitting `per_seq` into a shared term (the MoE expert gather, which the
-    /// whole batch pays once) plus a smaller marginal one is a measured dead end,
-    /// however physical the argument sounds. At 512 MiB shared + 128 MiB
-    /// marginal on the 16 GiB card it changed whole-phase calibration by 0.5%
-    /// (981s → 976s, 472 → 475 tok/s) — inside run-to-run noise, because a wider
-    /// batch holds more KV and `available` is measured after that KV lands, so
-    /// width re-equilibrates at the same place. The same pass then lost 9 of 314
-    /// directories to arena refusals where the unsplit law lost none.
-    ///
-    /// The trap that makes it look like a win: throughput decays as the substrate
-    /// fills (the baseline's own halves run 595 then 329 tok/s), so a sample
-    /// taken from the first minutes of calibration reads ~2x a sample taken from
-    /// the middle. Compare whole phases, never windows.
-    fn admit_band_params(&self) -> BandParams {
-        BandParams {
-            per_seq: per_seq_load_bytes() as u64,
-            capacity: self
-                .session
-                .vram_governor()
-                .map(|g| g.capacity())
-                .unwrap_or(0),
         }
     }
 
@@ -855,6 +1769,277 @@ impl Scheduler {
         Some((target.saturating_sub(free) as u64).saturating_mul(region_bytes()))
     }
 
+    /// Admission passes a live slot must go entirely untouched before its
+    /// device K/V is demoted.
+    ///
+    /// **One, and the clock is the admission pass rather than the wave.** The
+    /// signal this rides on — `busy`, which spans every phase the engine knows
+    /// about including the prefill queue, parked turns and views — already means
+    /// "no outstanding work anywhere". The only thing a grace window adds is
+    /// cover for the gap between a turn sealing and its successor being queued:
+    /// a tool round trip, where the latency is external and the engine has no
+    /// predicate for it. One pass is enough for a result already in flight.
+    ///
+    /// It was four *waves*, justified as matching "a chain between its decode
+    /// and its tool result". That inverted the units — a tool round trip is
+    /// wall-clock and does not know what a wave is, while a wave is 2–4 s here
+    /// and a fraction of that on a card holding its experts, so the protection
+    /// varied per machine while the thing protected did not. It also ran
+    /// backwards under load: waves lengthen when the engine is busy, stretching
+    /// the grace exactly when ground is scarcest.
+    ///
+    /// Counting admission passes fixes both. A pass happens when something
+    /// completed, so a slot ages toward demotion fast under churn and slowly in
+    /// a quiet engine — and the shed lands in the same pass that is about to
+    /// measure and spend the ground it frees.
+    ///
+    /// **Short on purpose, because the reload is the mechanism and not the
+    /// cost.** A warm→hot lift allocates fresh chunks through the leftmost-
+    /// biased pool, so it re-places that KV at the bottom of the span *densely*
+    /// — the only thing in the design that repacks the inside of an arena, which
+    /// neither compactor can do (they relocate a container and preserve its
+    /// holes). Holding a slot back declines that relocation. The two sides are
+    /// not comparable: a lift is bounded PCIe on the copy stream, paid once,
+    /// while a watermark that never falls narrows `weight_floor − live_end()`
+    /// permanently — measured here as the weight zone driven from 10,398 to
+    /// 1,417 MiB with the hit rate through the knee.
+    const IDLE_SLOT_DEMOTE_PASSES: u32 = 1;
+
+    /// **Give back the device K/V of live conversations that are between
+    /// turns.** The one tenant nothing could shed, and the ceiling every
+    /// configuration of the feeder eventually hit: a pool holding thirty-odd
+    /// open chains had 375 of 400 KV regions live for six decodes, the weight
+    /// zone under its floor and the hit rate through the knee, with the engine
+    /// working on a handful of sequences and the rest simply *stored*.
+    ///
+    /// **Why this is safe, and why it costs nothing to rebuild.** A turn's
+    /// projection (`apply_projection`) already truncates its slot to zero
+    /// blocks and rebuilds the whole prefix from the substrate — every turn,
+    /// on every slot. So a slot's device K/V between turns is not state: it is
+    /// a cache of what the substrate holds, and the next turn rebuilds it
+    /// whether or not this pass drops it. What the pass changes is *when* the
+    /// ground comes back: at the moment the conversation stops using it,
+    /// rather than when its next turn happens to arrive.
+    ///
+    /// Dropping the slot's block table is only half of it — the substrate's
+    /// hot copy holds the same chunks, which is why `hot = None` alone freed
+    /// 8–9 MiB a pass against 5,920 MiB of ingest K/V (§4.11.5). So the pass
+    /// drops both: the block table here, and the hot copies through
+    /// `evict_hot_to_free` with a keep-list built from the slots it did *not*
+    /// demote — a conversation reached by a live fork keeps everything that
+    /// fork attends. Only turns that already have a warm copy are evicted, so
+    /// this is hot→warm and the reload is a PCIe copy, never a recompute.
+    ///
+    /// The recurrent state is untouched: the store's own idle lag parks it,
+    /// and a demoted slot is not in any wave, so nothing calls the
+    /// `offset == 0` reset that would otherwise wipe it. Its next turn
+    /// re-fills the slot before the prefill is admitted, so the store comes
+    /// back seeded from the parked copy exactly as it does today.
+    ///
+    /// Returns the number of slots demoted.
+    pub(super) fn demote_idle_slots(&mut self) -> usize {
+        // **The pass is the clock** — see [`Self::IDLE_SLOT_DEMOTE_PASSES`].
+        // Ticked here rather than at the call site so a caller cannot advance
+        // the counter without also running the sweep it paces.
+        self.admission_passes = self.admission_passes.wrapping_add(1);
+        if self.slot_conversations.is_empty() {
+            return 0;
+        }
+        // Everything the engine is touching, in any phase. A slot named here
+        // is not idle whatever its counter says, and its counter restarts.
+        let mut busy: HashSet<SequenceId> = HashSet::new();
+        busy.extend(self.active_decodes.keys().copied());
+        busy.extend(self.active_prefills.iter().map(|p| p.work.sequence_id));
+        busy.extend(self.active_section_ingests.iter().map(|s| s.sequence_id));
+        busy.extend(self.prefill_queue.iter().map(|w| w.sequence_id));
+        busy.extend(self.pending_reprojections.iter().copied());
+        busy.extend(self.deferred_glue_fires.iter().map(|p| p.parent_id));
+        // A parked turn holds no K/V on the card, but its slot is still its own
+        // and it is coming back — reaping it as idle would lose the turn.
+        busy.extend(self.parked.iter().map(|p| p.slot));
+        busy.extend(self.ephemeral_slots.iter().copied());
+        for (view, st) in &self.turn_views {
+            busy.insert(*view);
+            busy.insert(st.parent_id);
+        }
+        for m in &self.wave_prefill_members {
+            let seq_id = match m {
+                WaveMember::Prefill { seq_id, .. } | WaveMember::Section { seq_id, .. } => *seq_id,
+            };
+            busy.insert(SequenceId(seq_id));
+        }
+
+        let slots: Vec<(SequenceId, usize)> = self
+            .slot_conversations
+            .keys()
+            .map(|id| (*id, self.session.sequence_offset(id.0).unwrap_or(0)))
+            .collect();
+
+        // **Where the K/V actually is, once a wave.** The pass demoting
+        // nothing is not evidence that nothing is idle — it is equally
+        // consistent with every slot holding K/V being busy, and the two ask
+        // for opposite fixes. So the pass reports the split it sees: tokens
+        // held by the slots it may take, by the slots the engine is working
+        // on, and by slots that hold nothing at all.
+        {
+            // **Busy first, then blocks.** Classifying on `tokens == 0` before
+            // asking whether the engine is touching the slot is what made this
+            // census lie: a conversation between turns holds no blocks (every
+            // turn's projection truncates the slot) and was counted `empty`, so
+            // `idle_slots` read 0 while thousands of MiB of hot turn residence
+            // sat behind those very slots. Idle is now about whether the engine
+            // is working on the slot; `idle_empty_slots` is the subset holding
+            // no blocks, which is a statement about where the bytes are, not
+            // about whether there are any.
+            let (mut idle_tok, mut busy_tok, mut idle_n, mut busy_n, mut idle_empty_n) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            for (id, tokens) in slots.iter().copied() {
+                if busy.contains(&id) {
+                    busy_n += 1;
+                    busy_tok += tokens;
+                } else {
+                    idle_n += 1;
+                    idle_tok += tokens;
+                    if tokens == 0 {
+                        idle_empty_n += 1;
+                    }
+                }
+            }
+            tracing::debug!(
+                target: "candle_conversation::persistence::tier",
+                slots = slots.len(),
+                idle_slots = idle_n,
+                idle_tokens = idle_tok,
+                busy_slots = busy_n,
+                busy_tokens = busy_tok,
+                idle_empty_slots = idle_empty_n,
+                decodes = self.active_decodes.len(),
+                prefills = self.active_prefills.len(),
+                queued = self.prefill_queue.len(),
+                views = self.turn_views.len(),
+                "idle demote: slot K/V census",
+            );
+        }
+
+        let pass = idle_slots_to_demote(&mut self.slot_idle_passes, &slots, &busy);
+
+        // **How long a demotion actually lasted.** The grace window exists to
+        // cover one gap — a turn sealing before its successor is queued, i.e. a
+        // tool round trip, whose latency is external and has no predicate. Only
+        // the distribution of these gaps says whether covering it is worth
+        // declining a relocation: clustered inside a pass or two and the window
+        // is preventing real thrash, long-tailed and it is pure delay and the
+        // grace should go to zero. Reported here rather than inferred later,
+        // because the pairing is only knowable at the moment a slot wakes.
+        for id in &pass.woke {
+            if let Some(at) = self.slot_demoted_at.remove(id) {
+                tracing::debug!(
+                    target: "candle_conversation::persistence::tier",
+                    slot = id.0,
+                    // `wrapping_sub`, matching the wrapping counter: a saturating
+                    // one would read 0 across the wrap instead of the true gap.
+                    out_passes = self.admission_passes.wrapping_sub(at.0),
+                    out_ms = at.1.elapsed().as_millis() as u64,
+                    "idle demote: a demoted slot was re-admitted",
+                );
+            }
+        }
+
+        let mut demoted: Vec<SequenceId> = Vec::new();
+        let mut tokens_released = 0usize;
+        // Slots that still held blocks, so the log can separate the two
+        // populations this pass now covers: a slot mid-conversation giving its
+        // block table back, and one already truncated whose bytes are entirely
+        // in the substrate's hot copies. Only the second was ever the large one.
+        let mut slots_with_blocks = 0usize;
+        for (id, offset) in pass.demote {
+            // A slot already at zero blocks has nothing to truncate, but its
+            // conversation's hot turn residences are the bytes this pass is
+            // actually after — so it goes on the demoted list either way.
+            if offset > 0 {
+                if let Err(e) = self.session.truncate_sequence_to_blocks(id.0, 0) {
+                    tracing::warn!(
+                        target: "candle_conversation::persistence::tier",
+                        slot = id.0,
+                        "idle demote: could not release the slot's blocks: {e}",
+                    );
+                    continue;
+                }
+                slots_with_blocks += 1;
+            }
+            tokens_released += offset;
+            self.slot_tokens.remove(&id);
+            if let Some(st) = self.slot_projection_state.get_mut(&id) {
+                // The working set is the relief path's protect-list; with the
+                // blocks gone it protects nothing but the hot copies this pass
+                // exists to free. The glue islands and the in-flight user
+                // capture are device K/V of a turn that is over.
+                st.working_set.sections.clear();
+                st.working_set.turns.clear();
+                st.glue_islands.clear();
+                st.pending_user_part = None;
+            }
+            self.slot_demoted_at
+                .insert(id, (self.admission_passes, std::time::Instant::now()));
+            demoted.push(id);
+        }
+        if demoted.is_empty() {
+            return 0;
+        }
+
+        // The keep-list is every slot this pass left standing — a conversation
+        // reached by a live fork keeps what that fork attends.
+        let demoted_set: HashSet<SequenceId> = demoted.iter().copied().collect();
+        let mut keep_sections: Vec<SectionId> = Vec::new();
+        let mut keep_turns: Vec<TurnKey> = Vec::new();
+        for (id, st) in &self.slot_projection_state {
+            if demoted_set.contains(id) {
+                continue;
+            }
+            keep_sections.extend(st.working_set.sections.iter().copied());
+            keep_turns.extend(st.working_set.turns.iter().copied());
+        }
+        // **The span before, so the line can show what the pass actually
+        // bought.** Freed bytes and released arenas say what left; only
+        // `live` — the watermark the weight zone and the wave tier both grow
+        // into — says whether the span got tighter, which is the entire purpose.
+        // An eviction that frees megabytes without moving `live` means the
+        // survivors are scattered, and that is a compaction problem, not an
+        // eviction one. Reading it here rather than inferring it later is the
+        // difference between the two being distinguishable in a log.
+        let live_before = self.kv_regions().map(|s| s.live).unwrap_or(0);
+        let mut freed = crate::substrate::EvictionReport { count: 0, bytes: 0 };
+        for id in &demoted {
+            let Some(conv) = self.slot_conversations.get(id).cloned() else {
+                continue;
+            };
+            let r = conv
+                .write()
+                .evict_hot_to_free(&keep_sections, &keep_turns, u64::MAX);
+            freed.count += r.count;
+            freed.bytes += r.bytes;
+        }
+        let arenas = self.session.release_empty_arenas().unwrap_or(0);
+        let (live_after, regions_free) = self
+            .kv_regions()
+            .map(|s| (s.live, s.free))
+            .unwrap_or((0, 0));
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            slots = demoted.len(),
+            slots_without_blocks = demoted.len() - slots_with_blocks,
+            tokens_released,
+            residences_evicted = freed.count,
+            freed_mib = freed.bytes / (1 << 20),
+            arenas_released = arenas,
+            live_before,
+            live_after,
+            regions_free,
+            "idle demote: gave back the K/V of conversations between turns",
+        );
+        demoted.len()
+    }
+
     /// Shed least-recently-used hot turn KV to the warm (RAM) tier across the
     /// resident conversations, freeing up to `target_bytes` of pool VRAM.
     /// Oldest-first and reversible (a reselected turn reloads from RAM). Only
@@ -943,13 +2128,13 @@ impl Scheduler {
         // the `live <= watermark` early-return below can never satisfy. That
         // turns the gentle-early rung into an unconditional full demote of the
         // ingest tail on every wave.
-        let watermark = stats.total * ingest_demote_pct() / 100;
+        let watermark = stats.total * INGEST_DEMOTE_PCT / 100;
         if stats.live <= watermark {
             return;
         }
         let used = stats.live.saturating_mul(region_bytes() as usize);
         let watermark = watermark.saturating_mul(region_bytes() as usize);
-        let window = ingest_hot_window();
+        let window = INGEST_HOT_WINDOW;
         // Relieve back to the watermark, no further: `target` bounds the LRU walk
         // so the demote sheds the least-recently-active ingest tail just enough to
         // clear the pressure, never the whole hot working set.
@@ -1056,80 +2241,7 @@ impl Scheduler {
         usage
             > budget
                 .kv_warm_budget_bytes
-                .saturating_add(warm_pipeline_slack_bytes())
-    }
-
-    pub(super) fn regulate_ingest_admission(&mut self) {
-        if self.ingest_timelines.is_empty() {
-            return;
-        }
-        // Host-tier backpressure: throttle only when the warm KV tier has
-        // outgrown its host-RAM budget plus the drain pipeline's slack — the one
-        // host condition slowing admission can actually relieve. (The old
-        // absolute available-RAM floor sat permanently tripped on any box whose
-        // weights fill RAM, ratcheting the setpoint against structure.)
-        if self.warm_over_budget() {
-            self.cut_admit_budget_leveled(ThrottleReason::WarmOverBudget);
-            return;
-        }
-        let Some(capacity) = self.resident_capacity() else {
-            return;
-        };
-        let target = (capacity / 100 * ingest_warm_backlog_pct()) as u64;
-        let backlog = self.persist_trigger.pending_warm_bytes();
-        // "Is there room to reopen?" is asked against the STATIC bound, not the
-        // live ceiling: this runs every wave, and the live ceiling costs a device
-        // query plus a walk of the registered relievers. The live clamp still
-        // happens where it matters — inside `raise_admit_budget`, and again at
-        // admission time in `promote_new_prefills`.
-        let ceiling = Self::max_admit_budget();
-        // Volume-floored progress: a tick certifies the current width, which a
-        // trickle of tiny forwards cannot (see `EVIDENCE_MIN_PREFILL_TOKENS`).
-        // Sub-floor volume accumulates — `admit_ok_tokens_seen` advances only
-        // when the floor is cleared.
-        let ok_tokens = super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
-        let progressed =
-            ok_tokens >= self.admit_ok_tokens_seen + super::EVIDENCE_MIN_PREFILL_TOKENS;
-        if progressed {
-            self.admit_ok_tokens_seen = ok_tokens;
-        }
-        match backlog_admit_action(
-            backlog,
-            target,
-            self.admit_budget,
-            ceiling,
-            self.vram_under_pressure(),
-        ) {
-            // Drain falling behind the seal rate — throttle admission.
-            BacklogAction::Shrink => self.cut_admit_budget_leveled(ThrottleReason::WarmBacklog),
-            // Drain caught up and VRAM is clear — reopen a quantum.
-            BacklogAction::Grow => {
-                self.admit_grow_streak = 0;
-                self.raise_admit_budget(ThrottleReason::DrainCaughtUp);
-            }
-            // Deadband — or growth blocked only by the pressure bit. The
-            // evidence path reopens a wedged budget on proven OOM-free
-            // throughput (see `evidence_admit_grow`); a real spike still cuts
-            // instantly and resets the streak.
-            BacklogAction::Hold => {
-                let (grow, streak) = evidence_admit_grow(
-                    backlog,
-                    target,
-                    self.admit_budget,
-                    ceiling,
-                    progressed,
-                    self.admit_grow_streak,
-                    // Cost scales with the budget already held, so the climb
-                    // slows as it nears the budget that last collapsed instead
-                    // of charging it at constant speed.
-                    evidence_ticks_for(budget_notches(self.admit_budget, admit_quantum())),
-                );
-                self.admit_grow_streak = streak;
-                if grow {
-                    self.raise_admit_budget(ThrottleReason::Throughput);
-                }
-            }
-        }
+                .saturating_add(WARM_PIPELINE_SLACK_BYTES)
     }
 
     /// Under **heavy** hot→warm backlog, block the wave loop on a device sync so
@@ -1141,13 +2253,17 @@ impl Scheduler {
     /// only *adds* ordering, so there is no KV-before-copy hazard. No-op unless
     /// ingesting and the backlog is over [`ingest_sync_ceiling_pct`].
     pub(super) fn sync_if_backlog_critical(&mut self) {
-        if self.ingest_timelines.is_empty() {
-            return;
-        }
+        // **Not gated on there being an ingest.** The backlog this answers is
+        // hot KV waiting for a warm copy, and every sealed turn produces some —
+        // `demote_idle_slots` can only shed a turn that already has one, so a
+        // dialogue-only workload that outruns the drain stalls the eviction that
+        // gives regions back, with nothing pushing back on the seals causing it.
+        // The ingest guard closed the one backpressure valve for exactly the
+        // population the idle demote now sheds.
         let Some(capacity) = self.resident_capacity() else {
             return;
         };
-        let ceiling = capacity / 100 * ingest_sync_ceiling_pct();
+        let ceiling = capacity / 100 * INGEST_SYNC_CEILING_PCT;
         let backlog = self.persist_trigger.pending_warm_bytes() as usize;
         if backlog <= ceiling {
             return;
@@ -1636,23 +2752,31 @@ impl Scheduler {
             .collect()
     }
 
-    /// Form a FRESH wave group into `wave_prefill_members`: every ready dialogue
-    /// prefill, plus — when `include_sections` and at least one prefill is present
-    /// — section chunks bounded by the per-forward token cap. Section chunks join
+    /// Form a FRESH wave group into `wave_prefill_members`: the ready dialogue
+    /// prefills, each advancing the chunk of its tokens the wave has room for,
+    /// plus — when `include_sections` and at least one prefill is present —
+    /// section chunks bounded by the per-forward token cap. Section chunks join
     /// only alongside a cohort (so they co-batch a creep that is happening anyway);
     /// with no cohort the caller uses the faster full-sweep section path instead.
     /// Members are ordered prefills-then-sections and this order is then fixed for
     /// the group's life (the held residual depends on a stable input order).
-    fn form_wave_group(&mut self, include_sections: bool) {
-        let mut members: Vec<WaveMember> = (0..self.active_prefills.len())
-            .filter(|&i| {
-                let p = &self.active_prefills[i];
-                p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
-            })
-            .map(|i| WaveMember::Prefill {
-                seq_id: self.active_prefills[i].work.sequence_id.0,
-            })
-            .collect();
+    ///
+    /// `prefill_rows` is what the wave's transient tier holds beside the rows
+    /// already at its head — the fill priced its admissions against the same
+    /// tier budget, one chunk per item, so this hands out that room in admission
+    /// order: each prefill takes the smaller of its remaining tokens, the
+    /// per-forward chunk, and the rows still unassigned. A prefill that would
+    /// get less than its least chunk ([`PREFILL_MIN_ADVANCE`], or all it has
+    /// left) waits for the next group rather than riding this one for a handful
+    /// of rows — the decodes at the head run meanwhile and free the ground.
+    /// When the wave has no head at all (`alone`), the first prefill takes its
+    /// least chunk whatever the rows say: nothing else in the wave can make the
+    /// room, so the placement is the judge of that chunk, and a refusal it keeps
+    /// giving ends in [`Self::note_tier_refusal`] rather than in a wave that
+    /// never advances.
+    fn form_wave_group(&mut self, include_sections: bool, prefill_rows: usize, alone: bool) {
+        let cap = self.max_prefill_pass_tokens.max(1);
+        let mut rows_left = prefill_rows;
         // ── One adapter per wave ─────────────────────────────────────────────
         //
         // Same rule the decode cohort follows, applied where the prefill group
@@ -1665,15 +2789,47 @@ impl Scheduler {
         // fact: a section chunk is an ordinary row of this forward, and an
         // unadapted ingest riding an adapted group would be prefilled through
         // the wrong projections and its KV written that way permanently.
-        let group_adapter = members
-            .first()
-            .map(|m| self.session.sequence_adapter(m.seq_id()))
-            .unwrap_or(None)
+        let group_adapter: Option<String> = self
+            .active_prefills
+            .iter()
+            .find(|p| {
+                p.error.is_none()
+                    && !prefill_done(p.final_logits.is_some(), p.offset, p.work.tokens.len())
+            })
+            .and_then(|p| self.session.sequence_adapter(p.work.sequence_id.0))
             .map(|s| s.to_owned());
-        members.retain(|m| self.session.sequence_adapter(m.seq_id()) == group_adapter.as_deref());
-
+        let mut members: Vec<WaveMember> = Vec::new();
+        for i in 0..self.active_prefills.len() {
+            let p = &self.active_prefills[i];
+            // The same predicate the drain uses — see `prefill_done`. A slot
+            // this skips must be one the drain will take, or it is stranded.
+            if p.error.is_some()
+                || prefill_done(p.final_logits.is_some(), p.offset, p.work.tokens.len())
+            {
+                continue;
+            }
+            if self.session.sequence_adapter(p.work.sequence_id.0) != group_adapter.as_deref() {
+                continue;
+            }
+            let remaining = p.work.tokens.len() - p.offset;
+            let least = remaining.min(PREFILL_MIN_ADVANCE);
+            if rows_left < least {
+                if members.is_empty() && alone {
+                    members.push(WaveMember::Prefill {
+                        seq_id: p.work.sequence_id.0,
+                        advance: least,
+                    });
+                }
+                break;
+            }
+            let advance = remaining.min(cap).min(rows_left);
+            members.push(WaveMember::Prefill {
+                seq_id: p.work.sequence_id.0,
+                advance,
+            });
+            rows_left -= advance;
+        }
         if include_sections && !members.is_empty() {
-            let cap = self.max_prefill_pass_tokens;
             let mut sec_tokens = 0usize;
             for i in 0..self.active_section_ingests.len() {
                 let s = &self.active_section_ingests[i];
@@ -1683,7 +2839,19 @@ impl Scheduler {
                 if self.session.sequence_adapter(s.sequence_id.0) != group_adapter.as_deref() {
                     continue;
                 }
-                let advance = (s.tokens.len() - s.offset).min(cap);
+                let remaining = s.tokens.len() - s.offset;
+                // **A section row costs the tier exactly what a dialogue row
+                // costs.** Both put their tokens through the same forward and
+                // both write K/V into the same wave transient tier, so they
+                // draw from one budget: sections that took their rows from a
+                // second, private `cap` composed waves the tier had not been
+                // priced for, and the placement refused them whole — the fill
+                // above having already stopped at the row it could afford.
+                let least = remaining.min(PREFILL_MIN_ADVANCE);
+                if rows_left < least {
+                    break;
+                }
+                let advance = remaining.min(cap).min(rows_left);
                 // Bound the section contribution to the per-forward token budget
                 // (at least one always admitted); the rest ride the next group.
                 if sec_tokens > 0 && sec_tokens + advance > cap {
@@ -1694,14 +2862,15 @@ impl Scheduler {
                     advance,
                 });
                 sec_tokens += advance;
+                rows_left -= advance;
             }
         }
         self.wave_prefill_members = members;
     }
 
     /// Resume the held wave group: rebuild each member's `(seq_id, input tensor)`
-    /// from its live backing (prefill = full token set; section = its stable
-    /// `[offset, offset+advance)` chunk), dropping members that errored/completed.
+    /// from its live backing (both kinds: the stable `[offset, offset+advance)`
+    /// chunk of their tokens), dropping members that errored/completed.
     /// Returns the kept members (aligned with `seq_ids`/`inputs`) plus the
     /// `active_prefills` positions of the prefill members (for OOM/error routing).
     #[allow(clippy::type_complexity)]
@@ -1715,7 +2884,7 @@ impl Scheduler {
         let mut prefill_gidxs: Vec<usize> = Vec::new();
         for m in members {
             match m {
-                WaveMember::Prefill { seq_id } => {
+                WaveMember::Prefill { seq_id, advance } => {
                     let Some(i) = self
                         .active_prefills
                         .iter()
@@ -1731,7 +2900,12 @@ impl Scheduler {
                     if self.active_prefills[i].prefill_start.is_none() {
                         self.active_prefills[i].prefill_start = Some(Instant::now());
                     }
-                    let toks: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+                    let off = self.active_prefills[i].offset;
+                    let end = (off + advance).min(self.active_prefills[i].work.tokens.len());
+                    if end <= off {
+                        continue;
+                    }
+                    let toks: Vec<u32> = self.active_prefills[i].work.tokens[off..end].to_vec();
                     match Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
                         Ok(t) => {
                             kept.push(m);
@@ -1773,14 +2947,20 @@ impl Scheduler {
     }
 
     /// Finish a wave group that reached the final layer: `members`/`member_logits`
-    /// are aligned in caller order. Prefill members commit their offset, emit
-    /// staged/progress events and record `final_logits` for promotion to decode;
-    /// section members advance their chunk + record slot tokens (sealed later by
-    /// `finalize_done_section_ingests`). Clears the group.
+    /// are aligned in caller order. Prefill members commit their chunk — advance
+    /// the sequence, record the slot tokens, emit progress — and the member whose
+    /// chunk reaches the end of its tokens also emits its staged projections and
+    /// records `final_logits` for promotion to decode; one with tokens left stays
+    /// active and rides the next group. Section members advance their chunk +
+    /// record slot tokens (sealed later by `finalize_done_section_ingests`).
+    /// Clears the group.
     fn complete_wave_group(&mut self, members: &[WaveMember], member_logits: &[Tensor]) {
         for (k, m) in members.iter().enumerate() {
             match *m {
-                WaveMember::Prefill { seq_id: sid } => {
+                WaveMember::Prefill {
+                    seq_id: sid,
+                    advance,
+                } => {
                     let Some(i) = self
                         .active_prefills
                         .iter()
@@ -1790,20 +2970,36 @@ impl Scheduler {
                     };
                     let total = self.active_prefills[i].work.tokens.len();
                     let seq_id = self.active_prefills[i].work.sequence_id;
-                    if let Err(e) = self.session.advance_sequence(seq_id.0, total) {
+                    let off = self.active_prefills[i].offset;
+                    let end = (off + advance).min(total);
+                    if let Err(e) = self.session.advance_sequence(seq_id.0, end - off) {
                         self.active_prefills[i].error = Some(ConversationError::Model(e));
                         continue;
                     }
-                    let all_tokens: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+                    let chunk_tokens: Vec<u32> =
+                        self.active_prefills[i].work.tokens[off..end].to_vec();
                     super::Scheduler::record_slot_tokens(
                         &mut self.slot_tokens,
                         seq_id,
-                        &all_tokens,
+                        &chunk_tokens,
                     );
-                    self.active_prefills[i].offset = total;
-                    // Staged calibration prefill: emit every segment's pinned
-                    // projection here at completion (a wave processes the whole
-                    // token set at once).
+                    self.active_prefills[i].offset = end;
+                    let _ =
+                        self.active_prefills[i]
+                            .work
+                            .event_tx
+                            .send(TurnEvent::PrefillProgress {
+                                tokens_done: end,
+                                tokens_total: total,
+                            });
+                    if end < total {
+                        // More chunks to come: the logits of a mid-turn chunk
+                        // are not the turn's first-token distribution.
+                        continue;
+                    }
+                    // Staged calibration prefill: every segment's pinned
+                    // projection is emitted here, at the completion of the
+                    // final chunk, in segment order.
                     if let Some(comp) = self.active_prefills[i].work.staged_composition.clone() {
                         let gen_start = self.active_prefills[i].work.assistant_content_start;
                         let offs = self.active_prefills[i].work.projection_offsets.clone();
@@ -1818,14 +3014,6 @@ impl Scheduler {
                         }
                         self.active_prefills[i].next_projection = offs.len();
                     }
-                    let _ =
-                        self.active_prefills[i]
-                            .work
-                            .event_tx
-                            .send(TurnEvent::PrefillProgress {
-                                tokens_done: total,
-                                tokens_total: total,
-                            });
                     if let Some(l) = member_logits.get(k) {
                         // DEEP-copy the final-logits row at capture. `Tensor::clone`
                         // is shallow (shared storage), and this tensor is HELD until
@@ -1887,11 +3075,15 @@ impl Scheduler {
     ) {
         if candle_nn::kv_cache::is_device_oom(err) {
             self.handle_prefill_oom(prefill_gidxs, err);
+        } else if is_tier_refusal(err) {
+            // The wave never ran: too wide for the placement, not a failure of
+            // anything in it. Requeue and compose it narrower.
+            self.note_tier_refusal(err);
         } else {
             let msg = format!("wave group forward failed: {err}");
             for m in members {
                 match *m {
-                    WaveMember::Prefill { seq_id } => {
+                    WaveMember::Prefill { seq_id, .. } => {
                         if let Some(i) = self
                             .active_prefills
                             .iter()
@@ -2123,7 +3315,14 @@ impl Scheduler {
         // section pass already ran this wave (no decode present).
         let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced {
             if cursor == 0 && self.wave_prefill_residual.is_none() {
-                self.form_wave_group(!self.wave_section_advanced);
+                // The prefill rows the tier holds beside this wave's head, at
+                // the budget the fill set on the session for exactly this wave.
+                let prefill_rows = self.model.prefill_width_cap(
+                    self.session.activation_dtype(),
+                    head_rows,
+                    self.session.tier_budget_bytes(),
+                );
+                self.form_wave_group(!self.wave_section_advanced, prefill_rows, head_rows == 0);
             }
             self.build_wave_group_inputs()
         } else {
@@ -2355,7 +3554,7 @@ impl Scheduler {
             for (m, inp) in members.iter().zip(inputs.iter()) {
                 let tok = inp.dims().get(1).copied().unwrap_or(0);
                 match m {
-                    WaveMember::Prefill { seq_id } => {
+                    WaveMember::Prefill { seq_id, .. } => {
                         pf_seqs += 1;
                         pf_tok += tok;
                         pf_kv += self.session.sequence_offset(*seq_id).unwrap_or(0);
@@ -2367,6 +3566,9 @@ impl Scheduler {
                     }
                 }
             }
+            // A forward ran, so the admitted set is advancing — the admission
+            // fast path may safely wait for a completion (`settled`).
+            self.wave_ran_forward = true;
             if pf_seqs > 0 {
                 self.wave_stats.record(true, pf_seqs, pf_tok, pf_kv, ms);
             }
@@ -2464,7 +3666,6 @@ impl Scheduler {
     /// forward returning and this call.
     fn handle_prefill_oom(&mut self, group_idxs: &[usize], err: &candle::Error) {
         let in_batch: HashSet<usize> = group_idxs.iter().copied().collect();
-        self.cut_admit_budget(ThrottleReason::DeviceOom);
         let msg = format!("batched prefill forward failed: {err}");
         for (i, p) in self.active_prefills.iter_mut().enumerate() {
             if in_batch.contains(&i) {
@@ -2479,11 +3680,24 @@ impl Scheduler {
     /// `active_decodes`).
     pub(super) fn promote_finished_prefills_to_decodes(&mut self) {
         // Use swap_remove for efficiency; iterate from the back.
+        // **Unconditional: a slot is held from admission to completion.** A
+        // finished prefill is not asking for a decode slot — it *is* the slot,
+        // changing phase, and its ground was claimed when it was admitted. So
+        // there is nothing to gate and nothing to wait for.
+        //
+        // Gating this on a free decode slot is what produced the wedge the
+        // admission rewrite removed: finished turns queued here holding their
+        // whole materialised prefixes (19 of them, 30,710 tokens of K/V against
+        // 22 free regions of 395), while the decode side sat at its cap and
+        // could not drain them, and the prefill side was refused the rows that
+        // would have started anything new. Bounding what may be *admitted* is
+        // `admit::gate`'s job; by the time work reaches here it has already
+        // been paid for.
         let mut i = 0;
         while i < self.active_prefills.len() {
             let done = {
                 let p = &self.active_prefills[i];
-                p.error.is_some() || (p.final_logits.is_some() && p.offset >= p.work.tokens.len())
+                p.error.is_some() || prefill_finished(p)
             };
             if !done {
                 i += 1;
@@ -2492,12 +3706,29 @@ impl Scheduler {
             let p = self.active_prefills.swap_remove(i);
             let ActivePrefill {
                 work,
-                offset: _,
+                offset,
                 next_projection: _,
                 final_logits,
                 error,
                 prefill_start,
             } = p;
+            // **A drain that loses tokens says so.** `prefill_done` treats a
+            // slot holding final logits as finished whatever its offset reads,
+            // because such a slot can never advance — `form_wave_group` will not
+            // schedule it, so leaving it undrained strands it and the engine
+            // with it. But finalising it seals the turn short, and content
+            // vanishing quietly is exactly the kind of failure that gets
+            // diagnosed as the model being wrong months later.
+            if error.is_none() && final_logits.is_some() && offset < work.tokens.len() {
+                tracing::warn!(
+                    target: "candle_conversation::scheduler::interleave",
+                    seq_id = work.sequence_id.0,
+                    unread = work.tokens.len() - offset,
+                    total = work.tokens.len(),
+                    "prefill drained holding logits with tokens unread — the turn \
+                     seals short by that many",
+                );
+            }
             // A compression-turn re-prefill carries no decode and reports to the
             // summariser, not a caller. Seal it directly off the wave (snapshot
             // the role-coherent K/V + record the turn) instead of running
@@ -2762,6 +3993,8 @@ impl Scheduler {
                     event_tx: work.event_tx,
                     generated_tokens: TokenBuffer::default(),
                     think_close_at: None,
+                    lease_left: Scheduler::DECODE_LEASE_TOKENS,
+                    lease_expired: false,
                     forwarded_generated: 0,
                     pending_page_cut: false,
                     pending_page_cut_after: None,
@@ -2887,6 +4120,8 @@ impl Scheduler {
             event_tx: work.event_tx,
             generated_tokens: TokenBuffer::default(),
             think_close_at: None,
+            lease_left: Scheduler::DECODE_LEASE_TOKENS,
+            lease_expired: false,
             forwarded_generated: 0,
             pending_page_cut: false,
             pending_page_cut_after: None,
@@ -3218,6 +4453,212 @@ mod think_prefill_slice_tests {
 }
 
 #[cfg(test)]
+mod idle_demote_tests {
+    use super::{idle_slots_to_demote, Scheduler, SequenceId};
+    use std::collections::{HashMap, HashSet};
+
+    const PASSES: u32 = Scheduler::IDLE_SLOT_DEMOTE_PASSES;
+
+    fn slot(n: usize, tokens: usize) -> (SequenceId, usize) {
+        (SequenceId(n), tokens)
+    }
+
+    /// Run every quiet pass *before* the threshold, asserting none of them
+    /// demote. At the current one-pass grace there are none to run; the helper
+    /// exists so each test reads the same whatever the grace is set to, rather
+    /// than spelling a range that is empty for this value of it.
+    fn quiet_below_threshold(
+        counters: &mut HashMap<SequenceId, u32>,
+        slots: &[(SequenceId, usize)],
+        busy: &HashSet<SequenceId>,
+    ) {
+        let below = PASSES.saturating_sub(1);
+        for pass in 0..below {
+            assert!(
+                idle_slots_to_demote(counters, slots, busy)
+                    .demote
+                    .is_empty(),
+                "pass {pass} demoted before the threshold",
+            );
+        }
+    }
+
+    /// A quiet slot is demoted on the pass that reaches the threshold, and not
+    /// before — one admission pass of cover for a tool result already in
+    /// flight, and no more, because holding a slot back declines the
+    /// relocation its reload would perform.
+    #[test]
+    fn a_quiet_slot_demotes_on_the_threshold_pass_and_not_before() {
+        let mut counters = HashMap::new();
+        let slots = [slot(1, 4_000)];
+        let busy = HashSet::new();
+        quiet_below_threshold(&mut counters, &slots, &busy);
+        assert_eq!(
+            idle_slots_to_demote(&mut counters, &slots, &busy).demote,
+            vec![(SequenceId(1), 4_000)],
+            "the threshold pass demotes, and reports the tokens it gives back",
+        );
+    }
+
+    /// **A demoted slot is not demoted again until something touches it.**
+    ///
+    /// With a grace of one pass, a `>=` threshold would re-fire on every
+    /// subsequent quiet pass. Each re-fire takes a substrate write lock and
+    /// walks a conversation that has already given everything back, contending
+    /// with the persistence thread to shed nothing — per idle conversation, per
+    /// admission. Firing on the equality means once per quiet period.
+    #[test]
+    fn a_demoted_slot_is_not_demoted_again_until_it_is_touched() {
+        let mut counters = HashMap::new();
+        let slots = [slot(1, 4_000)];
+        let quiet = HashSet::new();
+        let busy: HashSet<SequenceId> = [SequenceId(1)].into_iter().collect();
+
+        quiet_below_threshold(&mut counters, &slots, &quiet);
+        assert_eq!(
+            idle_slots_to_demote(&mut counters, &slots, &quiet).demote,
+            vec![(SequenceId(1), 4_000)],
+        );
+        for pass in 0..8 {
+            assert!(
+                idle_slots_to_demote(&mut counters, &slots, &quiet)
+                    .demote
+                    .is_empty(),
+                "pass {pass} after the demote fired again on a slot with nothing left",
+            );
+        }
+
+        // A touch re-arms it, and reports the wake so the caller can measure
+        // how long the demotion lasted.
+        let woken = idle_slots_to_demote(&mut counters, &slots, &busy);
+        assert_eq!(woken.woke, vec![SequenceId(1)], "the wake is reported");
+        assert!(woken.demote.is_empty());
+        quiet_below_threshold(&mut counters, &slots, &quiet);
+        assert_eq!(
+            idle_slots_to_demote(&mut counters, &slots, &quiet).demote,
+            vec![(SequenceId(1), 4_000)],
+            "after a touch the slot serves a fresh quiet window and sheds again",
+        );
+    }
+
+    /// A slot that was never being aged reports no wake — there is no quiet to
+    /// interrupt, so pairing it against a demotion timestamp would be noise.
+    #[test]
+    fn a_slot_that_was_never_idle_reports_no_wake() {
+        let mut counters = HashMap::new();
+        let slots = [slot(1, 4_000)];
+        let busy: HashSet<SequenceId> = [SequenceId(1)].into_iter().collect();
+        assert!(idle_slots_to_demote(&mut counters, &slots, &busy)
+            .woke
+            .is_empty());
+    }
+
+    /// Any touch restarts the count: a slot that goes busy short of the
+    /// threshold starts again from zero when it falls quiet.
+    #[test]
+    fn a_touch_restarts_the_count() {
+        let mut counters = HashMap::new();
+        let slots = [slot(1, 4_000)];
+        let quiet = HashSet::new();
+        let busy: HashSet<SequenceId> = [SequenceId(1)].into_iter().collect();
+        quiet_below_threshold(&mut counters, &slots, &quiet);
+        assert!(
+            idle_slots_to_demote(&mut counters, &slots, &busy)
+                .demote
+                .is_empty(),
+            "a busy slot is never demoted",
+        );
+        quiet_below_threshold(&mut counters, &slots, &quiet);
+        assert_eq!(
+            idle_slots_to_demote(&mut counters, &slots, &quiet).demote,
+            vec![(SequenceId(1), 4_000)],
+        );
+    }
+
+    /// **A slot holding no blocks still demotes** — this is the population the
+    /// pass exists for, not an exception to it.
+    ///
+    /// A conversation between turns reads `tokens == 0`, because every turn's
+    /// projection truncates its slot to zero blocks and rebuilds the prefix
+    /// from the substrate. Its bytes are in the substrate's *hot* copies of its
+    /// sealed turns, which only the caller's `evict_hot_to_free` reaches — and
+    /// the caller only reaches slots this function returns. Skipping them made
+    /// the whole pass inert against 5,920 MiB of resident K/V while the census
+    /// reported `idle_slots = 0`.
+    #[test]
+    fn a_slot_holding_no_blocks_still_demotes_for_its_hot_turns() {
+        let mut counters = HashMap::new();
+        let slots = [slot(1, 0)];
+        let busy = HashSet::new();
+        quiet_below_threshold(&mut counters, &slots, &busy);
+        assert_eq!(
+            idle_slots_to_demote(&mut counters, &slots, &busy).demote,
+            vec![(SequenceId(1), 0)],
+            "a zero-block slot must reach the caller, which sheds its hot turns",
+        );
+    }
+
+    /// Counters do not outlive their slots — a freed id is dropped from the
+    /// map, so a recycled id starts from zero rather than inheriting the
+    /// previous tenant's quiet.
+    #[test]
+    fn counters_do_not_outlive_their_slots() {
+        let mut counters = HashMap::new();
+        let busy = HashSet::new();
+        let both = [slot(1, 4_000), slot(2, 4_000)];
+        // Enough quiet passes that both slots are past the threshold and both
+        // carry a counter, whatever the grace is set to.
+        for _ in 0..PASSES {
+            let _ = idle_slots_to_demote(&mut counters, &both, &busy);
+        }
+        assert_eq!(counters.len(), 2);
+
+        // Slot 2 is freed; the next pass sees only slot 1, and slot 2's counter
+        // must not survive it.
+        let one = [slot(1, 4_000)];
+        let _ = idle_slots_to_demote(&mut counters, &one, &busy);
+        assert_eq!(counters.len(), 1, "the freed slot's counter was dropped");
+        assert!(!counters.contains_key(&SequenceId(2)));
+
+        // The recycled id serves its own quiet rather than inheriting slot 2's,
+        // so it sheds on its own threshold pass and not on the first one it
+        // appears in.
+        let recycled = [slot(1, 4_000), slot(2, 4_000)];
+        let mut fired = None;
+        for pass in 1..=PASSES {
+            if idle_slots_to_demote(&mut counters, &recycled, &busy)
+                .demote
+                .iter()
+                .any(|(id, _)| *id == SequenceId(2))
+            {
+                fired = Some(pass);
+                break;
+            }
+        }
+        assert_eq!(
+            fired,
+            Some(PASSES),
+            "the recycled id must serve a full quiet window of its own",
+        );
+    }
+
+    /// Several quiet slots demote in the same pass — the pool's whole idle
+    /// cohort gives its ground back together, which is the point.
+    #[test]
+    fn every_quiet_slot_demotes_in_the_same_pass() {
+        let mut counters = HashMap::new();
+        let slots = [slot(1, 100), slot(2, 200), slot(3, 300)];
+        let busy: HashSet<SequenceId> = [SequenceId(2)].into_iter().collect();
+        quiet_below_threshold(&mut counters, &slots, &busy);
+        assert_eq!(
+            idle_slots_to_demote(&mut counters, &slots, &busy).demote,
+            vec![(SequenceId(1), 100), (SequenceId(3), 300)],
+            "the busy slot is skipped, the quiet ones go together",
+        );
+    }
+}
+
+#[cfg(test)]
 mod setpoint_tests {
     use super::{setpoint_regions, VramPhase};
 
@@ -3250,14 +4691,92 @@ mod setpoint_tests {
 }
 
 #[cfg(test)]
+mod prefill_done_tests {
+    use super::prefill_done;
+
+    /// The whole grid of (logits, tokens consumed), stated explicitly.
+    ///
+    /// `true` means the wave group skips it *and* the drain takes it; `false`
+    /// means it rides a forward. What matters is that one function answers for
+    /// both, so no state can be skipped by the group and refused by the drain —
+    /// which is what stalled run CE at 82 directories with every resource free.
+    /// The cell that did it is the third row.
+    #[test]
+    fn the_done_grid_is_what_the_engine_relies_on() {
+        let cases = [
+            (false, 0usize, 10usize, false), // fresh — runs
+            (false, 9, 10, false),           // nearly through — runs
+            (false, 10, 10, true),           // consumed, no logits — CE's stall
+            (false, 12, 10, true),           // past the end — drained
+            (true, 3, 10, true),             // holding logits — cannot advance
+            (true, 10, 10, true),            // the ordinary finish
+        ];
+        for (has_logits, offset, tokens, want) in cases {
+            assert_eq!(
+                prefill_done(has_logits, offset, tokens),
+                want,
+                "logits={has_logits} offset={offset}/{tokens}",
+            );
+        }
+    }
+
+    /// The cell that stalled CE: all tokens consumed, no logits. It cannot ride
+    /// a forward (nothing left to advance), so it must be drained.
+    #[test]
+    fn a_consumed_prefill_without_logits_is_drained() {
+        assert!(prefill_done(false, 10, 10));
+    }
+
+    /// A slot with logits cannot advance either, whatever its offset says.
+    #[test]
+    fn a_prefill_holding_logits_is_drained_whatever_its_offset() {
+        assert!(prefill_done(true, 3, 10));
+        assert!(prefill_done(true, 10, 10));
+    }
+
+    /// And a prefill with real work left is left alone to do it.
+    #[test]
+    fn a_prefill_with_tokens_left_and_no_logits_still_runs() {
+        assert!(!prefill_done(false, 0, 10));
+        assert!(!prefill_done(false, 9, 10));
+    }
+}
+
+/// The decode lease's shape, checked when the crate is built rather than when a
+/// test is run — a violation is a build error, which is where an invariant on a
+/// constant belongs.
+///
+/// * **Non-zero**, or a slot parks before generating anything and the queue
+///   cycles without progress.
+/// * **A whole number of blocks.** Admission reserves the lease through
+///   `ensure_capacity`, which allocates in blocks, so a lease ending mid-block
+///   makes the allocator round up and the engine hold ground the gate never
+///   priced. Small drift per slot — but it is *per slot*, and every failure this
+///   engine has had was accounting drift multiplied by concurrency.
+/// * **Longer than the step that spends it**, for the same reason as the first.
+/// The park queue's bounds, checked at build time for the same reason as the
+/// lease's: a zero bound would silently disable parking, and a zero retry count
+/// would fail every parked turn on its first refusal.
+const _: () = {
+    assert!(Scheduler::PARKED_TURNS_MAX > 0);
+    assert!(Scheduler::PARK_RESUME_ATTEMPTS > 0);
+};
+
+const _: () = {
+    assert!(Scheduler::DECODE_LEASE_TOKENS > 0);
+    assert!(Scheduler::DECODE_LEASE_TOKENS.is_multiple_of(candle_nn::kv_cache::CHUNK_SIZE));
+    assert!(Scheduler::DECODE_LEASE_TOKENS > Scheduler::DECODE_CLAIM_TOKENS);
+};
+
+#[cfg(test)]
 mod warm_budget_tests {
-    use super::warm_pipeline_slack_bytes;
+    use super::WARM_PIPELINE_SLACK_BYTES;
 
     /// The slack exists so a zero-budget machine's transient drain traffic never
     /// reads as over-budget — tonight's healthy pipeline peaked ~0.7 GiB.
     #[test]
     fn default_slack_clears_a_healthy_drain_pipeline() {
-        let slack = warm_pipeline_slack_bytes();
+        let slack = WARM_PIPELINE_SLACK_BYTES;
         assert!(slack >= 768 * 1024 * 1024, "slack {slack} too small");
     }
 }

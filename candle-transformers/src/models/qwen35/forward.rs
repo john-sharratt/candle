@@ -801,9 +801,11 @@ impl WaveSweep for HybridBatched {
             self.reclaim_spare_ground();
         }
 
-        // Offsets in `seq_ids` order, read from the session — a sequence
+        // Offsets in `seq_ids` order, read from the session by id — a sequence
         // standing at zero gets its recurrent state reset, not just created
-        // (see `ensure_recurrent`).
+        // (see `ensure_recurrent`). Keyed on the id itself, so no positional
+        // pairing between two separately built lists can hand one sequence's
+        // offset to another.
         let offsets: Vec<usize> = seqs
             .iter()
             .map(|&s| session.sequence_offset(s).unwrap_or(0))

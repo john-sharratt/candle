@@ -308,14 +308,13 @@ impl Fixture {
             &snapshot_mask,
         )?;
 
-        // Decode headers carry no position map (the field is zero — the
-        // kernel derives positions from the slice walk).
-        let mut hdr_all: Vec<u8> = Vec::with_capacity(24 * sc.num_slots);
+        // 16-byte SlotHeader: n_slices, write_slice, slices_ptr — the kernel
+        // derives every position from the slice walk.
+        let mut hdr_all: Vec<u8> = Vec::with_capacity(16 * sc.num_slots);
         for &(ptr, n_slices, write_slice) in &seq_ptrs {
             hdr_all.extend_from_slice(&n_slices.to_le_bytes());
             hdr_all.extend_from_slice(&write_slice.to_le_bytes());
             hdr_all.extend_from_slice(&ptr.to_le_bytes());
-            hdr_all.extend_from_slice(&0u64.to_le_bytes());
         }
 
         // Device-resident, as `build_decode_metadata_at` submits them: every

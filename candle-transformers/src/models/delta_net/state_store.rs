@@ -942,13 +942,65 @@ impl RecurrentStateStore {
                  one the open wave is writing into"
             );
         }
+        // **Which regions to free is decided by ADDRESS, not by field name.**
+        //
+        // `commit_wave` swaps `live` and `backup` per slot and leaves `regions`
+        // and `backup_regions` untouched, so after a commit the two fields no
+        // longer describe what is in them: a slot's `live` is carved from
+        // `backup_regions`. Clearing that field here handed a live state's
+        // ground back to the free list, where it was cleaned and re-tenanted
+        // while the store went on reading it. Every layer is carved from one
+        // bump, so they all went together — measured as `seq=4` entering a
+        // 2-token continuation with all three DeltaNet layers at 3.4e38.
+        //
+        // A store-level swap in `commit_wave` cannot fix it: `advanced` is per
+        // slot, so after a partial sweep different slots hold opposite halves
+        // and no single swap describes them. The ownership question is therefore
+        // asked of the addresses that remain live, which is true whatever the
+        // sweep did.
+        //
+        // Reading the live pointers has to happen BEFORE the backups are
+        // dropped, so nothing has been released while the answer is computed.
+        #[cfg(feature = "cuda")]
+        let live_bases: Vec<u64> = match &self.device {
+            Device::Cuda(cuda) => self
+                .slots
+                .iter()
+                .flat_map(|s| [&s.live.s, &s.live.conv_tail])
+                .filter_map(|t| tensor_device_ptr(cuda, t).ok())
+                .collect(),
+            _ => Vec::new(),
+        };
         for slot in &mut self.slots {
             slot.backup = None;
             slot.advanced = false;
         }
-        // Only now: the leases above pointed into these.
+        // Keep every region a live buffer still stands in, wherever it was
+        // filed, and drop the rest — dropping a `SpanRegion` is what returns it.
+        // A region that holds a live buffer and a just-dropped one is kept
+        // whole; the dead half's bytes are simply unused, exactly as a partial
+        // take already leaves them.
         #[cfg(feature = "cuda")]
-        self.backup_regions.clear();
+        {
+            let holds_live = |r: &SpanRegion| {
+                let (lo, hi) = (r.base(), r.base() + SpanRegion::bytes() as u64);
+                live_bases.iter().any(|p| *p >= lo && *p < hi)
+            };
+            let mut kept: Vec<SpanRegion> = Vec::new();
+            for r in self
+                .regions
+                .drain(..)
+                .chain(self.backup_regions.drain(..))
+                .collect::<Vec<_>>()
+            {
+                if holds_live(&r) {
+                    kept.push(r);
+                }
+            }
+            // Normalised: `regions` is the live ground and nothing else, so the
+            // names mean what they say again by the time anyone reads them.
+            self.regions = kept;
+        }
         Ok(())
     }
 

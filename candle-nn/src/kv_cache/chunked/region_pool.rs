@@ -202,6 +202,9 @@ impl Drop for RegionHandle {
             // to decide whether this region still needs a wait, and its being
             // non-zero is what tells the next tenant to clean it at all.
             pool.dirty_epoch[self.index] = pool.quiesce_epoch;
+            if let Some(c) = pool.claimed.get_mut(self.index) {
+                *c = false;
+            }
             pool.free.push(Reverse(self.index));
             pool.live -= 1;
             log::debug!("region {} released, {} live", self.index, pool.live);
@@ -381,6 +384,15 @@ struct RegionPool {
     /// as dirty as a recycled one, and until this was written only the recycled
     /// path checked.
     dirty_epoch: Vec<u64>,
+    /// Whether each region is currently handed out, recorded where the claim and
+    /// the release happen rather than inferred from `free` and `next`.
+    ///
+    /// The boundary guard needs to know "is anyone standing here" for a specific
+    /// range, and both inferences fail at the edges: a never-allocated region is
+    /// absent from `free` without being claimed, and a claimed one can end up
+    /// above `next` after this file pulls it back. A bit per region costs
+    /// nothing and answers the question directly.
+    claimed: Vec<bool>,
     /// Where the wave transient tier sits **while a forward is running**, and
     /// how big it is. `None` between forwards, when it occupies nothing.
     ///
@@ -946,6 +958,7 @@ impl RegionPool {
             // quiesce — otherwise every region on the card claims as dirty once.
             quiesce_epoch: 1,
             dirty_epoch: vec![0; total],
+            claimed: vec![false; total],
             transient_base: None,
             transient_bytes: 0,
             transient_high_water: 0,
@@ -998,6 +1011,7 @@ impl RegionPool {
         self.region_base = layout.region_base;
         self.total = layout.total;
         self.dirty_epoch.resize(layout.total, 0);
+        self.claimed.resize(layout.total, false);
     }
 
     /// The lowest address the wave transient tier may not reach below: one past
@@ -1194,6 +1208,26 @@ impl RegionPool {
                 watermark - 1,
             )
         }
+        // **Every region the weight side takes must actually be unclaimed.**
+        // The watermark above infers that from `free` and `next`, and both are
+        // inferences: a region is "not live" if it is on the free list or was
+        // never handed out. `next` is pulled back by this very function, so a
+        // region still held after a pull-back is outside the scan and invisible.
+        //
+        // `claimed` is the positive record instead — set where a region is
+        // handed out, cleared where its handle drops — so neither `next` nor the
+        // free list can talk it out of existence. It reads false for a region
+        // that was never allocated, which is what made the first version of this
+        // check refuse the very first floor placement at load.
+        if let Some(taken) = (layout.total..self.total).find(|i| self.claimed[*i]) {
+            candle::bail!(
+                "weight floor {floor:#x} would hand regions [{}, {}) to the weight \
+                 side, but region {taken} in that range is still claimed — the \
+                 watermark did not see it. Ask the KV side to release it first.",
+                layout.total,
+                self.total,
+            )
+        }
         let gained = layout.total.saturating_sub(self.total);
         self.weight_floor = floor;
         self.total = layout.total;
@@ -1208,6 +1242,7 @@ impl RegionPool {
         // no readers left to wait for — but the bytes are still there, so it
         // still needs zeroing.
         self.dirty_epoch.resize(layout.total, 0);
+        self.claimed.resize(layout.total, false);
         if gained > 0 {
             let stale = self.quiesce_epoch.saturating_sub(1);
             for slot in self.dirty_epoch.iter_mut().skip(layout.total - gained) {
@@ -1651,6 +1686,12 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
             pool.live,
             pool.total,
         );
+        // The positive half of the record the boundary guard reads. Set here,
+        // where the region actually leaves the pool, and cleared in the handle's
+        // `Drop` — the two points that define "someone is standing here".
+        if let Some(c) = pool.claimed.get_mut(index) {
+            *c = true;
+        }
         Ok(Claim::Got(RegionHandle {
             ordinal: stream.context().ordinal(),
             index,
@@ -2255,6 +2296,7 @@ pub fn reclaim_load_headroom(stream: &std::sync::Arc<CudaStream>) -> Result<usiz
         pool.region_base = layout.region_base;
         pool.total = layout.total;
         pool.dirty_epoch.resize(layout.total, 0);
+        pool.claimed.resize(layout.total, false);
         log::info!(
             "reservation: reclaimed {} MiB of load headroom — span now {} MiB, {} regions",
             gained / (1024 * 1024),
