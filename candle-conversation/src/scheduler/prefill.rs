@@ -390,11 +390,27 @@ impl<'a> WaveFill<'a> {
         // the only condition under which the tier owes anything.
         let owed = interleave::effective_weight_zone_bytes()
             .map_or(0, |zone| self.optimal.saturating_sub(zone)) as usize;
-        let budget = transient_headroom_bytes(0)
-            .unwrap_or(0)
-            .saturating_sub(margin)
-            .saturating_sub(owed);
+        let gap = transient_headroom_bytes(0).unwrap_or(0);
+        let budget = gap.saturating_sub(margin).saturating_sub(owed);
         self.sched.session.set_tier_budget_bytes(budget);
+        // The partition as the wave about to run will find it — or should. A
+        // placement refused after this line means something claimed between
+        // here and the forward, and this is the figure it is diffed against.
+        if let Some(stats) = self.sched.kv_regions() {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::interleave",
+                gap_mib = gap >> 20,
+                budget_mib = budget >> 20,
+                margin_mib = margin >> 20,
+                owed_mib = owed >> 20,
+                head_rows = self.head_rows(),
+                live = stats.live,
+                free = stats.free,
+                blocked = stats.blocked,
+                total = stats.total,
+                "tier budget published",
+            );
+        }
     }
 }
 
@@ -2198,6 +2214,15 @@ impl Scheduler {
         if seq_ids.is_empty() {
             return None;
         }
+        tracing::debug!(
+            target: "candle_conversation::scheduler::interleave",
+            sections = seq_ids.len(),
+            rows = batch_tokens,
+            rows_left,
+            head_rows,
+            budget_mib = self.session.tier_budget_bytes() >> 20,
+            "section batch formed",
+        );
         Some((seq_ids, inputs, group_idxs, advances))
     }
 
