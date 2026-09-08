@@ -31,14 +31,6 @@ pub(super) fn weight_zone_bytes() -> Option<u64> {
 /// caught up later, when the tier had to buy ground, and the zone fell 2 GiB
 /// under the mark in one step. Counting live regions charges each claim the
 /// instant it is made.
-///
-/// **Nothing is reclaimable here, deliberately.** This is what the weight side
-/// holds *now*, and a recurrent store standing in the span occupies its ground
-/// now whatever the seal will later do with it. The hold it is compared against
-/// takes the opposite view (see [`reseed_achievable_weight`]), and the
-/// asymmetry is the mechanism: the floor stays where reclaimable ground says it
-/// could be, this reading falls as stores are claimed, and the gap between them
-/// is what makes admission push back instead of giving way.
 pub(super) fn effective_weight_zone_bytes() -> Option<u64> {
     let r = candle_nn::kv_cache::region_stats(0)?;
     Some(achievable_weight_bytes(
@@ -47,7 +39,6 @@ pub(super) fn effective_weight_zone_bytes() -> Option<u64> {
         r.weight_bytes,
         REGION_BYTES,
         MIN_ELASTIC_RESERVE,
-        0,
     ))
 }
 
@@ -62,61 +53,32 @@ static ACHIEVABLE_WEIGHT: AtomicU64 = AtomicU64::new(0);
 /// zone lags. Measured, the first fill of a run read 5,951 MiB where load held
 /// 10,398 — a mark taken from that reading sat below anything the run would
 /// reach.
-///
-/// **`reclaimable_bytes` is ground that is live but not permanent.**
-///
-/// The recurrent stores. They are span tenants and so are counted in `live`,
-/// but they are exactly the thing the engine *can* give back: a turn's seal
-/// writes the state to the substrate and drops the device copy, and the next
-/// turn restores it. Counting them as immovable is what turns residency into a
-/// feedback loop — every store admitted lowers the residency the weight side is
-/// told it could reach, which lowers the floor admission defends, which admits
-/// more. Measured across one repo_map run: `achievable` fell 8,102 to 4,624 MiB
-/// and the defended hold with it, 4,051 to 2,936, while the weight zone was
-/// squeezed 6,047 to 3,976 MiB and throughput fell 665 to 130 t/s.
-///
-/// The KV arenas are NOT in this term. A live arena belongs to a sequence with
-/// tokens the engine has promised to attend, and giving it back is eviction
-/// with a re-prefill behind it — a different decision, made elsewhere, at a
-/// different price.
 pub(super) fn achievable_weight_bytes(
     total_regions: usize,
     live_regions: usize,
     weight_bytes: usize,
     region_bytes: usize,
     reserve_bytes: usize,
-    reclaimable_bytes: usize,
 ) -> u64 {
     let span = total_regions
         .saturating_mul(region_bytes)
         .saturating_add(weight_bytes);
-    let permanent = live_regions
-        .saturating_mul(region_bytes)
-        .saturating_sub(reclaimable_bytes);
-    span.saturating_sub(permanent)
+    span.saturating_sub(live_regions.saturating_mul(region_bytes))
         .saturating_sub(reserve_bytes) as u64
 }
 
 /// Re-measure the achievable residency from what is resident **now**.
 ///
 /// **Called when the engine is idle, and at its entry.** With nothing in flight,
-/// the live regions that are *permanent* — the system prompt, the tool catalog,
-/// the substrate's resident corpus — are not the wave's to give back, so the
-/// residency the weight side can actually reach is the span less exactly those.
-/// Measuring at load instead defended a residency the tool catalog then made
-/// unreachable: the mark sat 2% above a zone that could never climb.
-///
-/// **Not every live region is permanent, and the difference is load-bearing.**
-/// This once said "every region live is permanent", which was true while the
-/// recurrent state was parked on the host. It is not true now that stores live
-/// in the span: a store is released by its turn's seal and restored from the
-/// substrate on demand, so it is reclaimable ground standing in `live`. Treating
-/// it as immovable made residency self-defeating — see
-/// [`achievable_weight_bytes`] for the measurement.
+/// every region live is permanent — the system prompt, the tool catalog, the
+/// substrate's resident corpus — and none of it is the wave's to give back, so
+/// the residency the weight side can actually reach is the span less exactly
+/// that. Measuring at load instead defended a residency the tool catalog then
+/// made unreachable: the mark sat 2% above a zone that could never climb.
 ///
 /// A reading, not a controller: one identity evaluated at the moment it is
 /// exact.
-pub(super) fn reseed_achievable_weight(reclaimable_bytes: usize) {
+pub(super) fn reseed_achievable_weight() {
     use std::sync::atomic::Ordering;
     let Some(r) = candle_nn::kv_cache::region_stats(0) else {
         return;
@@ -127,7 +89,6 @@ pub(super) fn reseed_achievable_weight(reclaimable_bytes: usize) {
         r.weight_bytes,
         REGION_BYTES,
         MIN_ELASTIC_RESERVE,
-        reclaimable_bytes,
     );
     let before = ACHIEVABLE_WEIGHT.swap(achievable, Ordering::Relaxed);
     // The idle branch runs once per request while the engine waits, so this
@@ -199,50 +160,8 @@ mod tests {
     fn the_achievable_zone_is_the_span_less_what_stands_in_it() {
         // 100 regions of 16 MiB + a 1 GiB zone = a 2.5 GiB span; 40 live and a
         // 256 MiB reserve leave the weight side 1,632 MiB.
-        let got = achievable_weight_bytes(100, 40, 1 << 30, 16 << 20, 256 << 20, 0);
+        let got = achievable_weight_bytes(100, 40, 1 << 30, 16 << 20, 256 << 20);
         assert_eq!(got, (1 << 30) + (60 * (16 << 20)) - (256 << 20));
-    }
-
-    /// **Reclaimable ground does not lower the residency the weight side could
-    /// reach.**
-    ///
-    /// A recurrent store stands in `live` like any other tenant, but its turn's
-    /// seal writes it to the substrate and drops the device copy, so it is
-    /// ground the engine can take back. Counting it as immovable made residency
-    /// self-defeating: every store admitted lowered the achievable figure, which
-    /// lowered the hold derived from it, which let the next admission in.
-    /// Measured over one repo_map run — achievable 8,102 -> 4,624 MiB, hold
-    /// 4,051 -> 2,936, weight zone 6,047 -> 3,976, throughput 665 -> 130 t/s.
-    ///
-    /// Ten of the forty live regions being reclaimable must read exactly as
-    /// thirty live regions would.
-    #[test]
-    fn reclaimable_ground_does_not_lower_the_achievable_zone() {
-        let (total, region, extent) = (100usize, 16usize << 20, 1usize << 30);
-        let with_reclaimable = achievable_weight_bytes(total, 40, extent, region, 0, 10 * region);
-        let as_if_released = achievable_weight_bytes(total, 30, extent, region, 0, 0);
-        assert_eq!(
-            with_reclaimable, as_if_released,
-            "ground that can be given back is not ground that stands in the way",
-        );
-    }
-
-    /// The current reading is the opposite view, and the asymmetry is deliberate.
-    ///
-    /// `effective_weight_zone_bytes` passes zero: a store occupies its ground now
-    /// whatever the seal will later do with it. The floor it is compared against
-    /// does not. That gap is what makes admission push back rather than give way,
-    /// and it is one comparison — not a second controller.
-    #[test]
-    fn a_store_still_costs_the_zone_it_occupies_right_now() {
-        let (total, region, extent) = (100usize, 16usize << 20, 1usize << 30);
-        let now = achievable_weight_bytes(total, 40, extent, region, 0, 0);
-        let floor = achievable_weight_bytes(total, 40, extent, region, 0, 10 * region);
-        assert!(
-            floor > now,
-            "the defended floor sits above what is held while stores stand in the span",
-        );
-        assert_eq!(floor - now, (10 * region) as u64);
     }
 
     /// **The effective zone already counts every free region**, so a caller may
@@ -255,7 +174,7 @@ mod tests {
     #[test]
     fn the_effective_zone_already_counts_every_free_region() {
         let (total, live, region, extent) = (100usize, 40usize, 16usize << 20, 1usize << 30);
-        let effective = achievable_weight_bytes(total, live, extent, region, 0, 0);
+        let effective = achievable_weight_bytes(total, live, extent, region, 0);
         assert_eq!(
             effective,
             (extent + (total - live) * region) as u64,
@@ -275,8 +194,8 @@ mod tests {
     #[test]
     fn claiming_a_region_lowers_the_effective_zone_by_exactly_that_region() {
         let (total, region, extent) = (100usize, 16usize << 20, 1usize << 30);
-        let before = achievable_weight_bytes(total, 40, extent, region, 0, 0);
-        let after = achievable_weight_bytes(total, 41, extent, region, 0, 0);
+        let before = achievable_weight_bytes(total, 40, extent, region, 0);
+        let after = achievable_weight_bytes(total, 41, extent, region, 0);
         assert_eq!(
             before - after,
             region as u64,
@@ -287,8 +206,8 @@ mod tests {
     /// A span already inside its reserve is zero, not a wrap.
     #[test]
     fn a_span_inside_its_reserve_is_zero_not_a_wrap() {
-        assert_eq!(achievable_weight_bytes(1, 1, 0, 16 << 20, 1 << 30, 0), 0);
-        assert_eq!(achievable_weight_bytes(0, 99, 0, 16 << 20, 0, 0), 0);
+        assert_eq!(achievable_weight_bytes(1, 1, 0, 16 << 20, 1 << 30), 0);
+        assert_eq!(achievable_weight_bytes(0, 99, 0, 16 << 20, 0), 0);
     }
 
     /// Off a reservation there is nothing to defend, and the floor says so

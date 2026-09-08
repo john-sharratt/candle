@@ -303,11 +303,7 @@ impl Scheduler {
         // time the engine falls idle (see the idle branch below), because what
         // is resident at those moments is permanent and everything else is the
         // wave's to give back. See `interleave::reseed_achievable_weight`.
-        //
-        // Nothing has opened yet, so no store is resident and the reclaimable
-        // term is zero by construction — passed explicitly rather than assumed,
-        // because the same call in the idle branch below is NOT zero.
-        super::interleave::reseed_achievable_weight(0);
+        super::interleave::reseed_achievable_weight();
         // One-time snapshot of the governor's budget partition (capacity C, KV
         // floor, ladder thresholds, per-class reserved, live headroom) so a run's
         // starting VRAM state is visible in the log before any waves.
@@ -395,18 +391,9 @@ impl Scheduler {
                 && self.active_section_ingests.is_empty()
                 && self.deferred_glue_fires.is_empty()
             {
-                // Nothing is in flight, so what is resident is settled: the one
-                // moment the achievable weight residency is exact.
-                //
-                // "Settled" is not "permanent". The recurrent stores standing
-                // here belong to conversations between turns, and a seal writes
-                // each to the substrate and drops its device copy — so they are
-                // reclaimable ground, and counting them against the residency
-                // the weight side could reach is what made every admitted store
-                // lower the floor the next admission defends.
-                super::interleave::reseed_achievable_weight(
-                    self.model.recurrent_reserved_bytes(),
-                );
+                // Nothing is in flight, so everything resident is permanent:
+                // the one moment the achievable weight residency is exact.
+                super::interleave::reseed_achievable_weight();
                 // Time ONLY the recv block (not the request handling) — this is the
                 // scheduler idle between requests, attributed to the Idle phase so it
                 // isn't mislabeled as Blocked in the GUI.
