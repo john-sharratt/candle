@@ -2356,27 +2356,11 @@ impl ModelWeights {
                     (capacity * slot_bytes) as u64,
                 );
             }
-            let cache = Arc::new(cache);
-            // **Open the shop.** From here a KV arena claim that runs out of
-            // ground can buy more, at the price of expert residency, instead of
-            // refusing and leaving the demand for something else to interpret.
-            //
-            // Registered against this device's ordinal, because the weight zone
-            // it sells from is this device's. A `Weak` so the registry — which
-            // outlives every model, being static — does not keep the cache alive
-            // past the model that owns it; a dead reference answers zero, the
-            // same answer as no seller, and the next model on this ordinal
-            // replaces the registration outright.
-            #[cfg(feature = "cuda")]
-            {
-                let seller = Arc::downgrade(&cache);
-                candle_nn::kv_cache::set_ground_broker(gpu_id, move |regions| {
-                    seller
-                        .upgrade()
-                        .map_or(0, |cache| cache.request_kv_ground(regions))
-                });
-            }
-            Some(cache)
+            // The weight side sells ground to the KV side through
+            // `ExpertCache::request_kv_ground`, reached by the scheduler's
+            // admission via `BatchedModelCore::request_kv_ground` — the one
+            // buyer there is.
+            Some(Arc::new(cache))
         } else {
             None
         };

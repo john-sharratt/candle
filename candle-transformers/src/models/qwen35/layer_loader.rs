@@ -29,7 +29,7 @@ use candle::quantized::{gguf_file, Int8Mode};
 use candle::{Device, Result};
 
 use super::config::Qwen35Config;
-use super::layer_store::{sell_ground, LayerStore, StreamedLayers};
+use super::layer_store::{LayerStore, StreamedLayers};
 use super::quantized_weights::{
     load_layer, narrow_resident_twin, streaming_twin, Loader, QuantLayer, ResidentResidue,
 };
@@ -196,31 +196,12 @@ pub fn build_layer_cache<R: std::io::Read + std::io::Seek>(
     let mut cache = cache;
     cache.warm_start()?;
 
-    // **Open the shop.** A KV arena claim or a transient-tier placement that
-    // runs out of ground buys more here, at the price of layer residency,
-    // instead of refusing — the dense counterpart of what `expert_loader` does
-    // for a routed checkpoint.
-    //
-    // This is a **process-global hook, not a call on the model**, and that is
-    // why it is easy to miss: `BatchedModelCore::request_kv_ground` is a
-    // different caller reaching the same seller, and wiring only that one leaves
-    // `region_pool::buy_ground` answering zero. Measured on the 27B with the
-    // trait method wired and this absent: the first four-context wave died on
-    // "wave transient tier needs 939524096 B below the weight floor … the weight
-    // side could not concede them", with 6 GiB of droppable layer slots sitting
-    // right there.
-    //
-    // `Weak`, so the static registry does not outlive the model that owns the
-    // cache.
+    // The layer zone sells ground to the KV side through
+    // `LayerStore::request_kv_ground` (`sell_ground`), which the scheduler's
+    // admission reaches via `BatchedModelCore::request_kv_ground` — the dense
+    // counterpart of what `expert_loader` provides for a routed checkpoint, and
+    // the one buyer there is.
     let cache = Arc::new(Mutex::new(cache));
-    let seller = Arc::downgrade(&cache);
-    let candle::DeviceLocation::Cuda { gpu_id } = device.location() else {
-        candle::bail!("qwen35: the layer cache is a CUDA-only path")
-    };
-    candle_nn::kv_cache::set_ground_broker(gpu_id, move |regions| {
-        seller.upgrade().map_or(0, |c| sell_ground(&c, regions))
-    });
-
     Ok(LayerStore::Streamed(StreamedLayers::new(cache, residues)))
 }
 

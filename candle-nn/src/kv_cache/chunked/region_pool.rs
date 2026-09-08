@@ -39,17 +39,20 @@
 //!
 //! **`W` is the only boundary that moves**, and it moves in one place, at one
 //! time: the expert pipeline thread, where no expert GEMM for the pass is still
-//! being issued. The KV side never moves it directly — it *buys* ground through
-//! [`set_ground_broker`], which sends the request to that thread and blocks on
-//! the answer, so the eviction still happens where it is safe while the
-//! arithmetic stays with the claim that knows the number.
+//! being issued. This module never moves it. Toward the KV side it is moved by
+//! **admission alone** — the scheduler prices what it is about to admit and asks
+//! the weight side for exactly the shortfall (`request_kv_ground`), between
+//! forwards, bounded by the residency it defends. Toward the weight side it is
+//! moved by the weight side taking regions this pool reports spare
+//! ([`kv_spare_regions`]).
 //!
-//! Outside a wave that purchase is the KV side's whole answer to running out: the
-//! span is one reservation, the cold tier holds a valid copy of every expert, and
-//! so a region can always be had for the price of a reload. The only refusals
-//! left are a tier standing over the ground (which no concession can lift — the
-//! wave must narrow) and the weight zone's own floor, the fewest slots the expert
-//! cache can serve a token with.
+//! So a claim that runs the pool out does not buy more: it is refused, and the
+//! refusal is the pressure signal the caller acts on — an arena waits for the
+//! next admission pass, the transient tier reports the wave too wide. Every
+//! other buyer this pool once had (the claim itself, the tier's placement) moved
+//! the boundary outside the one accounting that knows the hold, and between
+//! them drove the weight zone from 10,398 MiB to its floor in the first minute
+//! of a repository ingest with nothing admitted.
 //!
 //! # Sizing
 //!
@@ -73,7 +76,6 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
@@ -453,8 +455,8 @@ struct RegionPool {
     ///
     /// The same tripwire from the other side: a claim that ran out of ground
     /// *with a tier standing* is a claim that arrived inside a wave. A claim
-    /// that runs out with no tier standing is ordinary pressure and buys more
-    /// (`set_ground_broker`).
+    /// that runs out with no tier standing is ordinary pressure, answered by
+    /// the next admission pass.
     refusals_during_wave: usize,
     /// Whether the weight side may take ground, and the state that decision
     /// carries between negotiations.
@@ -470,133 +472,9 @@ struct RegionPool {
     growth: GrowthPolicy,
 }
 
-/// Regions bought in one go when a claim runs the KV side out of ground.
-///
-/// The buy-side counterpart to [`kv_grow_step`], inverted for the same reason: a purchase
-/// costs a device-wide quiesce (the weight side cannot hand over ground while a
-/// kernel might still be reading it), so buying one region per claim would pay
-/// that sync per arena. A section-quantize drain claimed eighteen regions in one
-/// pass; at a region apiece that is eighteen full device syncs.
-const KV_BUY_STEP: usize = 8;
-
 fn pools() -> &'static Mutex<HashMap<usize, RegionPool>> {
     static POOLS: OnceLock<Mutex<HashMap<usize, RegionPool>>> = OnceLock::new();
     POOLS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Buys KV ground from the weight side: `regions` in, bytes conceded out.
-///
-/// Installed once by the expert cache, which owns the only thing that can pay —
-/// expert residency, whose cold tier holds a valid copy of every expert, so a
-/// slot given up costs a reload and never a loss.
-type GroundBroker = Arc<dyn Fn(usize) -> u64 + Send + Sync>;
-
-/// Sellers by device ordinal.
-///
-/// **Keyed, and replaceable.** A `OnceLock<GroundBroker>` was neither, and both
-/// were wrong: one broker for the process misroutes every purchase on the second
-/// GPU to the first one's expert cache, and a set-once cell means a second model
-/// load leaves the first model's dead `Weak` installed — every later purchase
-/// answers zero and the partition silently reverts to refusing claims it could
-/// have paid for.
-fn ground_brokers() -> &'static Mutex<HashMap<usize, GroundBroker>> {
-    static BROKERS: OnceLock<Mutex<HashMap<usize, GroundBroker>>> = OnceLock::new();
-    BROKERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Install the weight side's seller. Called once, as the expert cache opens.
-///
-/// # Why this is a callback where the old design insisted on a counter
-///
-/// [`RegionPool::kv_pressure`] used to record refusals for the weight side to
-/// read at its own safe point, because `claim_region` runs on whichever thread
-/// wanted an arena while the weight side belongs to the expert pipeline thread,
-/// and evicting from here would be a cross-thread call into a cache that may be
-/// mid-wave. Every word of that is still true — which is why the broker does not
-/// evict anything. It **sends a message and blocks on the reply**, so the
-/// eviction still happens on the pipeline thread, behind its own quiesce, at a
-/// point it chose. The only thing that changed sides is the arithmetic.
-///
-/// And the arithmetic is why it had to. A counter records *events*, and the
-/// weight side spent them as *regions*: one failed section-quantize drain walked
-/// the size-class ladder and left 4,436 units of demand behind it, against a KV
-/// side that was twenty-eight regions short. The boundary paid all of it. A
-/// claim that buys its own ground cannot make that error, because the claim and
-/// the demand are the same object — the allocation *is* the measurement.
-///
-/// Absent broker (CPU builds, inline mode, tests) means no seller: a claim that
-/// runs out then refuses exactly as it always did.
-///
-/// **Replaces any previous seller for `ordinal`.** The newest expert cache on a
-/// device is the one that owns its weight zone, so it is the one that can sell;
-/// keeping an older registration would leave purchases going to a cache whose
-/// model is gone.
-pub fn set_ground_broker(ordinal: usize, broker: impl Fn(usize) -> u64 + Send + Sync + 'static) {
-    let mut map = ground_brokers().lock().unwrap_or_else(|e| e.into_inner());
-    map.insert(ordinal, Arc::new(broker));
-}
-
-thread_local! {
-    /// Whether this thread is already inside a purchase.
-    ///
-    /// The broker blocks on the expert pipeline, which moves the boundary and
-    /// calls back into this pool. Nothing on that path claims a region today, but
-    /// a purchase that re-entered would deadlock on the pool mutex rather than
-    /// fail visibly, so the invariant is enforced rather than assumed.
-    static BUYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Ask the weight side for `regions` of ground; answers the bytes it conceded.
-///
-/// **Called with no pool lock held.** The broker blocks on the pipeline thread,
-/// which takes that lock to move the floor.
-fn buy_ground(stream: &std::sync::Arc<CudaStream>, regions: usize) -> Result<u64> {
-    // Cloned out of the map, so the broker's own lock is not held across a call
-    // that blocks on another thread.
-    let broker = {
-        let map = ground_brokers().lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&stream.context().ordinal()).cloned()
-    };
-    let Some(broker) = broker else {
-        return Ok(0);
-    };
-    if BUYING.with(|b| b.replace(true)) {
-        return Ok(0);
-    }
-    // Cleared on the way out of this scope however it is left. A flag reset only
-    // on the success path would, after one unwind, leave this thread unable to
-    // buy ground for the life of the process — and it would fail as a throughput
-    // collapse with no error, which is the worst way for anything here to fail.
-    struct Buying;
-    impl Drop for Buying {
-        fn drop(&mut self) {
-            BUYING.with(|b| b.set(false));
-        }
-    }
-    let _buying = Buying;
-    let conceded = broker(regions);
-    // Whether the weight side can be made to concede is the question a blocking
-    // claim would exist to answer: a claim only has something to wait *for* if
-    // concessions are being refused for a reason that passes. Counted so that is
-    // measured rather than assumed.
-    SPARE_TALLY[if conceded > 0 { 4 } else { 5 }].fetch_add(1, Ordering::Relaxed);
-    if conceded > 0 {
-        // The KV side just proved it wants more than it holds. Stamping the
-        // moment keeps the weight side from reading the ground it has only just
-        // handed over as spare on its very next pass.
-        //
-        // A purchase is the KV side's own voice, and the next negotiation must
-        // hear it: `spare_regions` refuses once on `kv_asked_since_negotiation`,
-        // which is a statement about *now* — the KV side just ran out — rather
-        // than a forecast. That guard is all this needs to record. The demand
-        // peak it also used to raise is gone: the weight side measures live
-        // occupancy, so a purchase shows up in `live` on its own.
-        with_pool(stream, |pool| {
-            pool.growth.note_demand();
-            Ok(())
-        })?;
-    }
-    Ok(conceded)
 }
 
 /// The span's target size: everything left, less the cushion the CUDA pool keeps.
@@ -1269,11 +1147,12 @@ impl RegionPool {
     /// symmetrically."* The mark was insurance, and the asymmetry was the
     /// premium.
     ///
-    /// **Being short of KV no longer fails a forward.** [`set_ground_broker`]
-    /// means a claim that runs the KV side out buys exactly the ground it needs
-    /// at the moment it needs it, and the weight side concedes on contact.
-    /// Measured over a full 27B gate: thirty purchases, **zero refused**. The
-    /// insurance now covers a loss that cannot occur, and it is not free.
+    /// **Being short of KV no longer fails a forward.** Admission prices every
+    /// item before it claims and asks the weight side for exactly the shortfall
+    /// (`request_kv_ground`), so a wave's ground is bought before the wave and
+    /// the weight side concedes on contact. Measured over a full 27B gate:
+    /// thirty purchases, **zero refused**. The insurance now covers a loss that
+    /// cannot occur, and it is not free.
     ///
     /// What it cost was a **ratchet**. Shrink reads the present exactly —
     /// admission grows KV rightward and evicts weights on contact, no estimate
@@ -1450,25 +1329,17 @@ pub(crate) fn claim_region(stream: &std::sync::Arc<CudaStream>) -> Result<Option
         super::backing::global_release_empty_arenas();
     }
     match with_pool(stream, |pool| try_claim(pool, stream))? {
-        Claim::Got(handle) => return Ok(Some(handle)),
+        Claim::Got(handle) => Ok(Some(handle)),
         // A tier is standing: the ground above it exists but belongs to a
         // running wave, and no amount of weight-side concession reaches it. The
         // answer is a narrower wave, not more ground.
-        Claim::TierBlocked => return Ok(None),
-        Claim::Exhausted => {}
-    }
-    // **Outside a wave, running out is a price, not a wall.** The span is one
-    // reservation with a moving boundary, the cold tier holds a valid copy of
-    // every expert, and so the KV side may buy the ground it needs by evicting
-    // expert residency — which costs a reload and nothing else. The weight
-    // zone's own floor is what finally refuses (`WeightZone::new`), and it is the
-    // only refusal left in this path.
-    if buy_ground(stream, KV_BUY_STEP)? == 0 {
-        return Ok(None);
-    }
-    match with_pool(stream, |pool| try_claim(pool, stream))? {
-        Claim::Got(handle) => Ok(Some(handle)),
-        _ => Ok(None),
+        Claim::TierBlocked => Ok(None),
+        // **Running out is a refusal, not a purchase.** The ground a claim needs
+        // was priced and bought by the admission that authorised the work it is
+        // for; a claim that still finds nothing is either work nobody admitted
+        // or a price that was wrong, and either way the boundary is not this
+        // path's to move. The caller sheds or waits for the next admission pass.
+        Claim::Exhausted => Ok(None),
     }
 }
 
@@ -1755,7 +1626,7 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
 /// before it reads the frontier. With no claims arriving after the placement,
 /// the gap that absorbed them is not needed and the anchor holds.
 ///
-/// # It buys its ground rather than having it withheld
+/// # Its ground is bought by admission, not here
 ///
 /// The tier needs `[W − len, W)` clear of live arenas, and an arena cannot be
 /// asked to move — it holds its region for as long as it lives. The KV side used
@@ -1765,20 +1636,14 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
 /// wider tier nor released what a narrower one had left, and its reliable effect
 /// was refusing arena claims against ground nobody owned.
 ///
-/// So the ground is bought at the moment it is needed. If live arenas reach into
-/// the tier's footprint, this asks the weight side for the shortfall — the same
-/// purchase any claim makes — and places into what that frees. The KV side keeps
-/// every region up to the boundary in the meantime, and the tier is priced
-/// against what this wave actually needs rather than what the last one did.
+/// The placement then bought the shortfall itself, from inside the forward —
+/// and that moved the weight boundary outside the one accounting that knows
+/// what residency the engine defends. Now every row of a wave is admitted with
+/// its tier priced in (`admit::Cost::activations`), and the admission that took
+/// the row bought that ground before the wave began. A tier that still does not
+/// fit is a wave that is too wide, and it says so: the refusal below is what
+/// narrows the next fill.
 pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<u64> {
-    let short = match try_place(stream, bytes)? {
-        Placed::At(base) => return Ok(base),
-        // Not "the KV side is short of regions" — the tier itself does not fit,
-        // and the regions in its way are live. One purchase, for exactly the
-        // shortfall the placement measured.
-        Placed::Short(regions) => regions,
-    };
-    buy_ground(stream, short)?;
     if let Placed::At(base) = try_place(stream, bytes)? {
         return Ok(base);
     }
@@ -1806,9 +1671,8 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
             candle::bail!(
                 "{TIER_REFUSAL_MARKER} {len} B below the weight floor and is \
                  {still_short} regions into ground live KV arenas hold, which cannot \
-                 move. The weight side could not concede them — it is at its own \
-                 floor — so this wave is too wide for a partition that has nothing \
-                 left to trade. (span {span_bytes} B, weight floor at +{floor_off} B, \
+                 move. This wave is wider than the ground its admissions bought. \
+                 (span {span_bytes} B, weight floor at +{floor_off} B, \
                  arena frontier at +{live_off} B, {live}/{total} regions live)"
             )
         }
@@ -2286,10 +2150,9 @@ pub fn span_end(stream: &std::sync::Arc<CudaStream>) -> Result<u64> {
 /// against anything else is guessing: the tier is placed against the frontier as
 /// it stands, and refused if it would cross the floor.
 ///
-/// A lower bound, deliberately. The placement may still buy ground from the
-/// weight side (`buy_ground`) or sweep empty arenas, so a wave priced against
-/// this figure and admitted will fit; one priced against the *post*-concession
-/// figure might not, because the concession can be refused.
+/// A lower bound, deliberately. The placement may still sweep empty arenas, so
+/// a wave priced against this figure and admitted will fit; admission buys what
+/// the gap lacks before the wave, and reads this figure afterwards.
 ///
 /// Zero between the frontier and the floor crossing, which admission must read
 /// as "take nothing more this wave" rather than as an error.
@@ -2370,25 +2233,24 @@ pub fn set_weight_floor(stream: &std::sync::Arc<CudaStream>, floor: u64) -> Resu
 static SWEPT_ARENAS: AtomicU64 = AtomicU64::new(0);
 static SWEEP_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// Why `spare_regions` answered as it did, plus whether the KV side's own
-/// purchases succeed:
+/// Why `spare_regions` answered as it did:
 ///
-/// `[observing, pressure, occupancy_bound, regions_granted, buy_conceded,
-///   buy_refused]`
+/// `[observing, pressure, occupancy_bound, regions_granted]`
 ///
 /// The first three attribute a zero to one of the three things that can produce
 /// it, which is the difference between "the mechanism is inert" and "the
-/// mechanism is working and the ground is genuinely spoken for". The last two
-/// say whether a claim that waited would ever have anything to wait for.
+/// mechanism is working and the ground is genuinely spoken for".
 ///
 /// There were four attributions while the weight side also measured against a
 /// windowed history of KV demand; that term is gone (see
 /// [`RegionPool::spare_regions`]) and its slot with it, rather than being left
-/// to report a permanent zero under a name nothing can produce.
-static SPARE_TALLY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// to report a permanent zero under a name nothing can produce. Two more counted
+/// the pool's own purchases from the weight side; the pool no longer buys, so
+/// those went too.
+static SPARE_TALLY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// See [`SPARE_TALLY`].
-pub fn spare_tally() -> [u64; 6] {
+pub fn spare_tally() -> [u64; 4] {
     std::array::from_fn(|i| SPARE_TALLY[i].load(Ordering::Relaxed))
 }
 
@@ -2445,9 +2307,10 @@ pub fn empty_sweep_stats() -> (u64, u64) {
 /// units of demand behind it against a KV side that was twenty-eight regions
 /// short — and the boundary paid all of it, evicting 1,598 experts and taking the
 /// zone to a capacity below its own pinned working set, from which every
-/// subsequent forward failed. Now a claim buys exactly the ground it needs at the
-/// moment it needs it ([`set_ground_broker`]), so there is nothing to accumulate
-/// and nothing to convert: the allocation *is* the measurement.
+/// subsequent forward failed. Now admission asks for exactly the ground the item
+/// it is admitting needs, at the moment it admits it (`request_kv_ground`), so
+/// there is nothing to accumulate and nothing to convert: the price *is* the
+/// measurement.
 ///
 /// `min_grant` is the caller's own allocation unit in regions — the smallest
 /// grant it can actually spend. A grant below it is not conservative, it is
@@ -2815,9 +2678,9 @@ mod tests {
     /// Measured on the 27B, that held 34 of 64 layers streaming through two
     /// configs needing a quarter of the KV.
     ///
-    /// It is safe because being short of KV no longer fails a forward — a claim
-    /// that runs out buys its ground on the spot, measured at 26 purchases and 0
-    /// refusals over a full gate.
+    /// It is safe because being short of KV no longer fails a forward — every
+    /// row's ground is bought by the admission that took it, before the wave,
+    /// measured at 26 purchases and 0 refusals over a full gate.
     #[test]
     fn spare_is_free_ground_less_the_slack_and_nothing_else() {
         // `spare_regions`' arithmetic once the two present-tense guards pass.

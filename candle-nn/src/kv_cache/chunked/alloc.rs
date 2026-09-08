@@ -573,16 +573,16 @@ impl BackingInner {
         };
         let stream = cuda.cuda_stream();
         let Some(region) = region_pool::claim_region(&stream)? else {
-            // **Name which of the two refusals this is.** A claim that runs out
-            // of ground buys more from the weight side, so reaching here means
-            // one of exactly two things: a wave's tier stands over the free
-            // regions (no concession can reach them — the wave must narrow), or
-            // the purchase itself was refused because the weight zone is at its
-            // floor. They want opposite responses and the message has to say
-            // which. It used to report only `live` and assert the reservation
-            // was occupied, which sent the first investigation of this looking
-            // for a KV leak while the real answer was 31 free regions standing
-            // under a 496 MiB tier.
+            // **Name which of the two refusals this is.** The ground a claim
+            // needs is bought by the admission that authorised its work, so
+            // reaching here means one of exactly two things: a wave's tier
+            // stands over the free regions (no concession can reach them — the
+            // wave must narrow), or the pool is genuinely out and this claim is
+            // for work admission never priced. They want opposite responses and
+            // the message has to say which. It used to report only `live` and
+            // assert the reservation was occupied, which sent the first
+            // investigation of this looking for a KV leak while the real answer
+            // was 31 free regions standing under a 496 MiB tier.
             let s = region_pool::region_stats(stream.context().ordinal());
             let (live, total, blocked, ceiling, tier) = s
                 .map(|s| {

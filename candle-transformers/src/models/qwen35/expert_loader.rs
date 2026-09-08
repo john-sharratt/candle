@@ -232,18 +232,10 @@ pub fn build_expert_cache(
         progress: None,
         int8mode,
     })?;
-    let cache = Arc::new(cache);
-    // Open the shop: a KV arena claim that runs out of ground can now buy
-    // more at the price of expert residency, rather than refusing. `Weak` so
-    // the static registry does not outlive the model that owns the cache.
-    let seller = Arc::downgrade(&cache);
-    let candle::DeviceLocation::Cuda { gpu_id } = device.location() else {
-        candle::bail!("qwen35: expert cache on a non-CUDA device")
-    };
-    candle_nn::kv_cache::set_ground_broker(gpu_id, move |regions| {
-        seller.upgrade().map_or(0, |c| c.request_kv_ground(regions))
-    });
-    Ok(Some(cache))
+    // The weight side sells ground to the KV side through
+    // `ExpertCache::request_kv_ground`, which the scheduler's admission reaches
+    // via `BatchedModelCore::request_kv_ground` — the one buyer there is.
+    Ok(Some(Arc::new(cache)))
 }
 
 // The 35B-pinned stride audit for the merged expert tensors lives with the

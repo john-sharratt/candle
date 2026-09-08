@@ -84,9 +84,9 @@
 /// The layer zone's cost of *undershooting* is a ~160 MiB synchronous transfer
 /// per missing layer per forward, which reads like an argument for taking
 /// everything spare in one negotiation. It is not: tried on the 27B, taking the
-/// full offer overshot, the KV side bought the ground straight back through
-/// `set_ground_broker`, and the purchase set the pressure guard that refuses the
-/// *next* negotiation. Applied grants fell from four to two and the zone settled
+/// full offer overshot, the next admission bought the ground straight back, and
+/// the purchase set the pressure guard that refuses the *next* negotiation.
+/// Applied grants fell from four to two and the zone settled
 /// a layer lower — the churn cost more than the slower convergence it was meant
 /// to avoid. The hedge is what stops that loop, and both consumers want it.
 /// # A grant below the floor is refused, not clamped
@@ -141,7 +141,7 @@ pub struct Occupancy {
     /// **The term this policy was written without.** The spare below used to be
     /// offered whole, with the next wave's tier undeducted because the signature
     /// could not see it — documented as costing "churn rather than failure", the
-    /// tier buying back through `set_ground_broker` the ground it had just been
+    /// next admission buying back for its tier the ground that had just been
     /// given away.
     ///
     /// Measured, that churn is not a rounding error: 19,878 grows against 20,018
@@ -212,12 +212,12 @@ impl GrowthPolicy {
     /// of experts is a slowdown, and the two are not worth trading
     /// symmetrically."*
     ///
-    /// **Being short of KV no longer fails a forward.** A claim that runs the KV
-    /// side out buys exactly the ground it needs at the moment it needs it
-    /// (`set_ground_broker` → `sell_ground`), and the weight side concedes on
-    /// contact. Measured over a full 27B gate: thirty purchases, **zero
-    /// refused**. The forecast was insurance against a loss that can no longer
-    /// occur, and it was not free.
+    /// **Being short of KV no longer fails a forward.** Admission prices every
+    /// row it takes and asks the weight side for exactly the shortfall before
+    /// the wave (`request_kv_ground`), and the weight side concedes on contact.
+    /// Measured over a full 27B gate: thirty purchases, **zero refused**. The
+    /// forecast was insurance against a loss that can no longer occur, and it
+    /// was not free.
     ///
     /// What it cost was a **ratchet**. Shrink reads the present exactly —
     /// admission evicts weights on contact — while grow consulted a forecast, so
@@ -265,8 +265,8 @@ impl GrowthPolicy {
         // the tier need not be deducted since `ceiling_blocked` *is* the tier's
         // ground. It is, during a wave — and never at the one moment this runs.
         // So the next wave's tier is genuinely unaccounted for, and the honest
-        // statement is that this offers ground the tier may then have to buy
-        // back through `set_ground_broker`, at the cost of churn rather than
+        // statement is that this offers ground the next admission may then
+        // have to buy back for its tier, at the cost of churn rather than
         // failure.
         //
         // Deducting `transient_high_water` was tried and is worse: it is the

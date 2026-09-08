@@ -78,8 +78,8 @@ pub use chunked::{
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
-    transient_headroom_bytes, weight_capacity_bytes, weight_floor_after,
+    initial_weight_bytes, kv_spare_regions, set_weight_floor, span_end, transient_headroom_bytes,
+    weight_capacity_bytes, weight_floor_after,
 };
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.

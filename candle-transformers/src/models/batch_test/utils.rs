@@ -2679,8 +2679,8 @@ impl TestParams {
         let s = candle_nn::kv_cache::spare_tally();
         println!(
             "  Spare calc: observing {} | pressure {} | occupancy-bound {} \
-             | granted {} regions || KV purchases: conceded {} / refused {}",
-            s[0], s[1], s[2], s[3], s[4], s[5],
+             | granted {} regions",
+            s[0], s[1], s[2], s[3],
         );
         // The other half of the same question. `Spare calc` says what the pool
         // offered; this says what the layer zone did with it, and a collapse
