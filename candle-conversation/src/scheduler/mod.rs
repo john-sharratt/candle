@@ -1985,6 +1985,38 @@ pub(super) struct ActiveSectionIngest {
     pub(super) error: Option<ConversationError>,
 }
 
+/// Where a slot's recurrent state comes from when admission first materialises
+/// it.
+///
+/// **Recorded at conversation open, consumed at `Scheduler::claim_recurrent`.**
+/// A store is device ground carved from the same span as the KV and the expert
+/// weights, and a slot waiting in the queue is not running: holding a store
+/// for it is residency taken from the experts for nothing. So opening a
+/// conversation records only *which* state its first wave starts from, and the
+/// admission that puts the slot into a wave is what allocates the store and
+/// fills it. Measured before this on a full repo_map ingest: every created
+/// sequence held a store from open to seal, 74 stores standing for 31 queued
+/// and 13 decoding, 6,000 MiB of the 10,318 the weight side could reach.
+///
+/// A slot's own timeline snapshot — a turn sealed on it — is always newer than
+/// any of these and is tried first; the seed is what the slot starts from when
+/// its timeline has never sealed.
+#[derive(Clone)]
+pub(super) enum RecurrentSeed {
+    /// The sequence-start value, whatever the timeline holds: a scratch slot
+    /// bound to a timeline only for address resolution
+    /// ([`StateSeed::Neutral`]).
+    Neutral,
+    /// The prompt-branch checkpoint the conversation was born on
+    /// ([`SchedulerRequest::InstallRecurrentState`]) — both classes, the
+    /// delta-rule layers and the model's aux blob, from one export.
+    Checkpoint(SharedState),
+    /// A fork continuing a live parent's own timeline: the parent's state,
+    /// copied device-to-device if the parent is resident when the child is
+    /// admitted, otherwise whatever the parent itself would start from.
+    Parent(SequenceId),
+}
+
 /// A member of the in-flight continuous-fair-wave prefill group
 /// (`docs/continuous_fair_waves.md`). The group creeps through the layers
 /// together with its residual held whole between waves; members are separated
@@ -2879,6 +2911,11 @@ pub(crate) struct Scheduler {
     /// finalized, new entry inserted for the replacement view, with
     /// `turn_start_parent_blocks` carried across unchanged).
     turn_views: HashMap<SequenceId, ViewState>,
+    /// What each slot's recurrent state starts from the first time admission
+    /// materialises it — see [`RecurrentSeed`]. Absent for a targeted slot
+    /// means its timeline's snapshot or zeros; absent for an untargeted slot
+    /// means zeros.
+    recurrent_seeds: HashMap<SequenceId, RecurrentSeed>,
     /// Each conversation's belief as of its last completed turn, keyed by the
     /// conversation's parent slot. Harvested in `cleanup_finished` when a turn
     /// seals, and seeded into the NEXT turn's submit-time projection and
@@ -3417,6 +3454,7 @@ impl Scheduler {
             ephemeral_slots: std::collections::HashSet::new(),
             ephemeral_sigs: HashMap::new(),
             turn_views: HashMap::new(),
+            recurrent_seeds: HashMap::new(),
             carried_beliefs: HashMap::new(),
             guests,
             pending_reprojections: Vec::new(),
@@ -3552,26 +3590,23 @@ impl Scheduler {
                 parent,
                 response_tx,
             } => {
-                let result = self.create_sequence(conversation, target).and_then(|slot| {
-                    // A live parent's state beats the snapshot: it is current
-                    // rather than as-of-the-last-seal, and the copy is
-                    // device-to-device with no host round trip. `create_sequence`
-                    // already tried the snapshot read, so this overwrites a
-                    // strictly older state when both are available.
+                let result = self.create_sequence(conversation, target).map(|slot| {
+                    // A fork's state is its parent's, taken when the fork is
+                    // admitted (`claim_recurrent`) — not here, where it would
+                    // hold a store for as long as the fork waits in the queue.
                     //
-                    // "Older" is only true because `parent` is `Some` solely
-                    // when the fork targets the parent's OWN timeline
-                    // (`fork_onto` derives it; `fork_inherits_history_tests`
-                    // asserts it). For any other timeline the snapshot is the
-                    // right state and the parent's is a different
-                    // conversation's — overwriting it here is exactly how every
-                    // daemon resume once ran on the base conversation's memory.
+                    // `parent` is `Some` solely when the fork targets the
+                    // parent's OWN timeline (`fork_onto` derives it;
+                    // `fork_inherits_history_tests` asserts it). For any other
+                    // timeline the snapshot is the right state and the
+                    // parent's is a different conversation's — seeding from it
+                    // is exactly how every daemon resume once ran on the base
+                    // conversation's memory.
                     if let Some(parent_id) = parent {
-                        self.model
-                            .fork_recurrent(parent_id.0, slot.0)
-                            .map_err(ConversationError::Model)?;
+                        self.recurrent_seeds
+                            .insert(slot, RecurrentSeed::Parent(parent_id));
                     }
-                    Ok(slot)
+                    slot
                 });
                 let _ = response_tx.send(result);
                 true
@@ -4134,6 +4169,7 @@ impl Scheduler {
                 // bound to this slot.
                 self.slot_conversations.remove(&sequence_id);
                 let freed_target = self.slot_targets.remove(&sequence_id);
+                self.recurrent_seeds.remove(&sequence_id);
                 self.ephemeral_slots.remove(&sequence_id);
                 self.ephemeral_sigs.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
@@ -4478,57 +4514,28 @@ impl Scheduler {
                 state,
                 response_tx,
             } => {
-                // Every slot gets the same state, so the scatter is per-slot but
-                // the queue wait and the host payload are shared.
+                // Every slot gets the same state, so the host payload is shared:
+                // one `SharedState` (the layers and the aux blob, both behind
+                // `Arc`s), recorded per slot and scattered onto the
+                // device when — and only when — that slot is admitted to a wave
+                // (`claim_recurrent`). Nothing is allocated here: a conversation
+                // that has been opened but not yet admitted holds no store.
                 //
-                // EVERY slot is attempted, even after a failure. Stopping at the
-                // first error does not prevent a partial install — the slots
-                // already done stay done — it only adds arbitrarily-skipped slots
-                // on top, which is strictly worse: those conversations start from
-                // zero with no error of their own. There is no rollback here, so
-                // best-effort plus a reported error is the honest contract. The
-                // first error is kept and returned.
-                let mut installed = false;
-                let mut first_err = None;
-                for sequence_id in sequence_ids {
-                    if !state.layers.is_empty() {
-                        match self
-                            .model
-                            .restore_recurrent(sequence_id.0, state.schedule_hash, &state.layers)
-                            .map_err(ConversationError::Model)
-                        {
-                            Ok(did) => installed |= did,
-                            Err(e) => {
-                                if first_err.is_none() {
-                                    first_err = Some(e);
-                                }
-                            }
-                        }
-                    }
-                    // The aux blob is installed even when the layers were
-                    // refused: the two classes validate independently, and a
-                    // schedule-hash mismatch on the delta-rule rows says nothing
-                    // about whether this model can read these bytes.
-                    if !state.aux.is_empty() {
-                        match self
-                            .model
-                            .restore_aux_state(sequence_id.0, &state.aux)
-                            .map_err(ConversationError::Model)
-                        {
-                            Ok(did) => installed |= did,
-                            Err(e) => {
-                                if first_err.is_none() {
-                                    first_err = Some(e);
-                                }
-                            }
-                        }
+                // `true` answers "this model will carry the state", which is what
+                // the caller's `note_branch_checkpoint_installed` counts. A
+                // hash, geometry or foreign-blob refusal surfaces at admission,
+                // where the restore actually runs, and is logged there. Both
+                // classes ride in the one seed, so a slot is always installed
+                // from a single export — never layers from one and a blob from
+                // another.
+                let carries = self.model.carries_recurrent_state();
+                if carries {
+                    for sequence_id in sequence_ids {
+                        self.recurrent_seeds
+                            .insert(sequence_id, RecurrentSeed::Checkpoint(state.clone()));
                     }
                 }
-                let result = match first_err {
-                    Some(e) => Err(e),
-                    None => Ok(installed),
-                };
-                let _ = response_tx.send(result);
+                let _ = response_tx.send(Ok(carries));
                 true
             }
 
@@ -6072,22 +6079,23 @@ impl Scheduler {
         // Register the conversation handle and (optional) projection
         // target for this slot — see [`Self::slot_conversations`] and
         // [`Self::slot_targets`].
-        // Restore the timeline's recurrent state, if it has one.
         //
-        // **Before the first wave, and after the store could exist.**
-        // `create_sequence` is the funnel every entry point routes through
-        // (`NewSequence`, `NewEphemeralSequence`, `ResumeSequence`) and runs
-        // before any `submit_turn`, so both halves of that ordering hold here
-        // and nowhere else.
-        //
-        // Every rejection falls back to a zero state, which is a conversation
-        // that resumes fluent and having forgotten everything the recurrent
-        // layers held. That is the failure this whole path exists to remove, so
-        // it must not be the *quiet* error path: each reason logs at WARN, and
-        // the reasons are distinguishable.
-        if let (Some(target), StateSeed::FromTimeline) = (target, seed) {
-            self.restore_recurrent_state(slot_id, &conversation, target.timeline);
-            self.restore_carried_belief(slot_id, &conversation, target.timeline);
+        // The timeline's recurrent state is NOT restored here. A slot holds no
+        // store until admission materialises one (`claim_recurrent`, through
+        // `materialise_recurrent`), which reads the snapshot then — `create_sequence`
+        // is the funnel every entry point routes through (`NewSequence`,
+        // `NewEphemeralSequence`, `ResumeSequence`), so every slot reaches
+        // admission with its target registered and the restore finds it.
+        match (target, seed) {
+            (Some(target), StateSeed::FromTimeline) => {
+                self.restore_carried_belief(slot_id, &conversation, target.timeline);
+            }
+            // Bound to a timeline for address resolution only: admission must
+            // not read that timeline's snapshot onto this slot.
+            (Some(_), StateSeed::Neutral) => {
+                self.recurrent_seeds.insert(slot_id, RecurrentSeed::Neutral);
+            }
+            (None, _) => {}
         }
 
         self.slot_conversations.insert(slot_id, conversation);
@@ -6215,28 +6223,122 @@ impl Scheduler {
     /// logs a **distinguishable** reason, because "resumed with no memory" and
     /// "resumed correctly" are indistinguishable from the outside — both read
     /// fluently, and only one of them is right.
-    /// Bring `slot`'s recurrent state back from the substrate if it was evicted.
+    /// Put `slot`'s recurrent state on the device, from wherever it comes from.
     ///
-    /// The lazy half of the seal-time eviction: state sealed to the substrate is
-    /// dropped from the device, and this is what pays for that the moment
-    /// something needs it again. A no-op when the slot still holds its state —
-    /// the common case within a turn — and on a model that carries none, where
-    /// `recurrent_resident` is always false and there is nothing to restore.
+    /// **The one place a store is filled.** A store exists only while its
+    /// sequence is admitted to a wave: it is evicted when the turn seals and it
+    /// is never created at conversation open, so admission (`claim_recurrent`)
+    /// calls this at the moment the slot is about to run. A no-op when the slot
+    /// already holds its state — the common case within a turn — and on a model
+    /// that carries none.
     ///
-    /// Silent on a missing conversation or target: those are the slots that
-    /// never had a timeline to restore from, and `restore_recurrent_state`
-    /// already warns loudly about every reason a real restore can fail.
-    fn ensure_recurrent_restored(&mut self, slot: SequenceId) {
-        if self.model.recurrent_resident(slot.0) {
+    /// Precedence, newest first: the slot's own timeline snapshot (a turn sealed
+    /// on it is newer than anything recorded at open); then the seed recorded
+    /// at open ([`RecurrentSeed`]) — a live parent's state copied
+    /// device-to-device, or, when that parent has sealed and been evicted, the
+    /// parent's own seed; the prompt branch's checkpoint; or nothing for a
+    /// scratch slot. A slot that resolves to nothing starts from the
+    /// sequence-start value through `admit_recurrent`'s vacant arm.
+    ///
+    /// Never fails: a conversation that cannot restore its state is still a
+    /// conversation. But every path that leaves the slot at zeros when it should
+    /// not logs a **distinguishable** reason, because "resumed with no memory"
+    /// and "resumed correctly" read identically from the outside.
+    pub(super) fn materialise_recurrent(&mut self, slot: SequenceId) {
+        if !self.model.carries_recurrent_state() || self.model.recurrent_resident(slot.0) {
             return;
         }
-        let Some(conversation) = self.slot_conversations.get(&slot).cloned() else {
+        if matches!(
+            self.recurrent_seeds.get(&slot),
+            Some(RecurrentSeed::Neutral)
+        ) {
             return;
+        }
+        if self.restore_from_timeline(slot) {
+            return;
+        }
+        // No sealed turn on this timeline yet: follow the seed. A fork of a fork
+        // whose parents have all sealed and been evicted still has the prompt
+        // branch's checkpoint to start from, so the chain is walked to the first
+        // ancestor that can supply a state. Bounded by the map: a cycle cannot be
+        // recorded, but the walk does not rely on that.
+        let mut at = slot;
+        for _ in 0..=self.recurrent_seeds.len() {
+            match self.recurrent_seeds.get(&at).cloned() {
+                Some(RecurrentSeed::Parent(parent)) => {
+                    if self.model.recurrent_resident(parent.0) {
+                        if let Err(e) = self.model.fork_recurrent(parent.0, slot.0) {
+                            tracing::warn!(
+                                "RECURRENT FORK REFUSED for slot {slot} from parent {parent}: {e} — \
+                                 the fork continues with NO recurrent memory of its history."
+                            );
+                        }
+                        return;
+                    }
+                    at = parent;
+                }
+                Some(RecurrentSeed::Checkpoint(state)) => {
+                    // Both classes, each validated on its own: a hash or geometry
+                    // refusal of the delta-rule rows says nothing about whether
+                    // this model can read its own blob, and the reverse.
+                    if !state.layers.is_empty() {
+                        match self.model.restore_recurrent(
+                            slot.0,
+                            state.schedule_hash,
+                            &state.layers,
+                        ) {
+                            Ok(_) => tracing::debug!(
+                                "installed prompt branch checkpoint onto slot {slot} at \
+                                 admission ({} layers)",
+                                state.layers.len(),
+                            ),
+                            // `import` validates the schedule hash and every
+                            // layer's geometry before touching a tensor, so this
+                            // is a different model or a changed layer schedule,
+                            // and the store is untouched. Recomputing is correct;
+                            // doing it silently is not.
+                            Err(e) => tracing::warn!(
+                                "BRANCH CHECKPOINT REFUSED (hash or geometry mismatch) for \
+                                 slot {slot}: {e} — the conversation starts with its prompt \
+                                 in K/V and nothing in the recurrent layers."
+                            ),
+                        }
+                    }
+                    if !state.aux.is_empty() {
+                        match self.model.restore_aux_state(slot.0, &state.aux) {
+                            Ok(_) => tracing::debug!(
+                                "installed prompt branch aux state onto slot {slot} at \
+                                 admission ({} bytes)",
+                                state.aux.len(),
+                            ),
+                            Err(e) => tracing::warn!(
+                                "BRANCH CHECKPOINT AUX STATE REFUSED for slot {slot}: {e} — \
+                                 the conversation starts without the model's own carried \
+                                 state beside its layers."
+                            ),
+                        }
+                    }
+                    return;
+                }
+                Some(RecurrentSeed::Neutral) | None => return,
+            }
+        }
+    }
+
+    /// Restore `slot`'s state from its own timeline's snapshot, if it has one.
+    ///
+    /// `false` when the slot has no conversation or target — a scratch slot that
+    /// never had a timeline to restore from — or when the timeline has no
+    /// snapshot; `restore_recurrent_state` warns loudly about every reason a
+    /// real restore can fail.
+    fn restore_from_timeline(&mut self, slot: SequenceId) -> bool {
+        let Some(conversation) = self.slot_conversations.get(&slot).cloned() else {
+            return false;
         };
         let Some(target) = self.slot_targets.get(&slot).copied() else {
-            return;
+            return false;
         };
-        self.restore_recurrent_state(slot, &conversation, target.timeline);
+        self.restore_recurrent_state(slot, &conversation, target.timeline)
     }
 
     fn restore_recurrent_state(
@@ -6244,18 +6346,16 @@ impl Scheduler {
         slot_id: SequenceId,
         conversation: &Conversation,
         timeline: TimelineId,
-    ) {
+    ) -> bool {
         let payload = match conversation.read_recurrent_snapshot(timeline) {
             Ok(Some(p)) => p,
             Ok(None) => {
                 // Not an error and not always worth a warning: a model with no
                 // recurrent state never writes one, and a conversation whose
-                // first turn has not sealed has nothing to write yet.
-                tracing::debug!(
-                    "no recurrent snapshot for timeline {timeline}; starting from the \
-                     sequence-start state"
-                );
-                return;
+                // first turn has not sealed has nothing to write yet — its seed
+                // (`RecurrentSeed`) says what it starts from instead.
+                tracing::debug!("no recurrent snapshot for timeline {timeline}");
+                return false;
             }
             Err(e) => {
                 tracing::warn!(
@@ -6263,7 +6363,7 @@ impl Scheduler {
                      the conversation will continue with NO recurrent memory of its \
                      history. It will read fluently and have forgotten."
                 );
-                return;
+                return false;
             }
         };
 
@@ -6295,7 +6395,7 @@ impl Scheduler {
                  continues with NO recurrent memory of its history.",
                 payload.turn_index,
             );
-            return;
+            return false;
         }
 
         let layers: Vec<ExportedLayerState> = payload
@@ -6313,7 +6413,7 @@ impl Scheduler {
             })
             .collect();
 
-        match self
+        let layers_restored = match self
             .model
             .restore_recurrent(slot_id.0, payload.schedule_hash, &layers)
         {
@@ -6324,6 +6424,7 @@ impl Scheduler {
                     payload.turn_index,
                     payload.layers.len(),
                 );
+                true
             }
             Ok(false) => {
                 // The model carries no recurrent state. A snapshot exists, so
@@ -6335,6 +6436,7 @@ impl Scheduler {
                      timeline {timeline}: a snapshot exists, so this conversation was \
                      sealed by a different model"
                 );
+                false
             }
             Err(e) => {
                 // `import` validates the schedule hash and every layer's
@@ -6347,14 +6449,20 @@ impl Scheduler {
                      NO recurrent memory of its history.",
                     payload.turn_index,
                 );
+                false
             }
-        }
+        };
 
         // The model's own state, restored from the same record. Independent of
         // the layer restore above: a model may carry one, the other, or both,
         // and the delta-rule import failing on geometry says nothing about
         // whether this blob is installable.
-        self.restore_aux_from_payload(slot_id, timeline, payload.turn_index, &payload.aux);
+        let aux_restored =
+            self.restore_aux_from_payload(slot_id, timeline, payload.turn_index, &payload.aux);
+        // Restored from its own timeline if either class landed. The seed is
+        // older than any snapshot, and falling through to it would overwrite
+        // whichever class did land with a state from before the turn it sealed.
+        layers_restored || aux_restored
     }
 
     /// Install a snapshot's model-opaque blob, reporting what happened.
@@ -6370,9 +6478,9 @@ impl Scheduler {
         timeline: TimelineId,
         turn_index: u32,
         aux: &[u8],
-    ) {
+    ) -> bool {
         if aux.is_empty() {
-            return;
+            return false;
         }
         match self.model.restore_aux_state(slot_id.0, aux) {
             Ok(true) => {
@@ -6381,6 +6489,7 @@ impl Scheduler {
                      turn {turn_index}",
                     aux.len(),
                 );
+                true
             }
             Ok(false) => {
                 tracing::warn!(
@@ -6389,6 +6498,7 @@ impl Scheduler {
                      was sealed by a different model",
                     aux.len(),
                 );
+                false
             }
             Err(e) => {
                 tracing::warn!(
@@ -6396,6 +6506,7 @@ impl Scheduler {
                      {turn_index}: {e} — the conversation continues without that \
                      state.",
                 );
+                false
             }
         }
     }
@@ -8264,8 +8375,8 @@ impl Scheduler {
                         // recurrent state per sequence, and the ingest keeps
                         // hundreds of them open: measured, 642 regions and a
                         // weight zone driven from 10,398 to 1,417 MiB. The state
-                        // is now in the substrate and the next turn restores it
-                        // before it forks (`ensure_recurrent_restored`).
+                        // is now in the substrate and the next turn's admission
+                        // restores it (`materialise_recurrent`).
                         //
                         // Only on this branch. `Ok(None)` is an ephemeral
                         // timeline whose payload is deliberately dropped, and
@@ -10895,6 +11006,14 @@ mod tests {
             true
         }
 
+        /// Whether the map holds a store for `seq` — the same answer
+        /// `HybridBatched` gives, and the one the fork/move/restore wiring
+        /// branches on. The trait default (`false`) would make every parent
+        /// read as evicted and send every fork down the seed chain.
+        fn recurrent_resident(&self, seq: usize) -> bool {
+            self.probe.get(seq).is_some()
+        }
+
         fn fork_recurrent(&self, parent: usize, child: usize) -> candle::Result<()> {
             let parent_state = self.probe.get(parent);
             if let Some(state) = parent_state {
@@ -11300,17 +11419,24 @@ mod tests {
         assert!(err.to_string().contains("schedule hash"), "{err}");
     }
 
-    /// **`InstallRecurrentState` is the request the conversation layer uses.**
+    /// **`InstallRecurrentState` records the seed; admission installs it.**
     ///
     /// Dispatched through `handle_request`, so the wiring is covered and not
-    /// just the handler body.
+    /// just the handler body. The install itself must allocate nothing: a
+    /// conversation that has been opened but not admitted holds no store —
+    /// measured before this, every opened conversation held one from open to
+    /// seal, 74 stores for 13 decoding. The state lands when `claim_recurrent`
+    /// admits the slot, and it is exactly the checkpoint's state, seeded so the
+    /// slot's first wave at offset 0 does not reset it.
     #[test]
-    fn install_recurrent_state_request_installs_onto_the_named_slot() {
+    fn install_recurrent_state_request_is_recorded_at_open_and_installed_at_admission() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
             .handle_branch_checkpoint_pass(&[2, 4, 6])
             .expect("pass ran")
             .expect("state");
+        let mut expected = ZERO_STATE;
+        toy_advance(&mut expected, 3);
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
 
         let (tx, rx) = crossbeam::channel::bounded(1);
@@ -11321,9 +11447,20 @@ mod tests {
         });
         assert!(
             rx.recv().expect("reply").expect("install"),
-            "the install reported that no state was carried"
+            "the install reported that no state would be carried"
         );
-        assert!(probe.get(slot.0).is_some(), "the slot has no state");
+        assert_eq!(
+            probe.get(slot.0),
+            None,
+            "an opened, unadmitted slot must hold no store"
+        );
+
+        assert!(sched.claim_recurrent(slot.0), "admission places the store");
+        assert_state_eq(&probe, slot.0, expected);
+        assert!(
+            probe.is_seeded(slot.0),
+            "the checkpoint must be seeded, or the first wave at offset 0 resets it"
+        );
     }
 
     // —— Store and resume: both classes of state ————————————————————————————
@@ -11400,11 +11537,12 @@ mod tests {
         }
     }
 
-    /// **Install puts the aux blob on the slot, and the value is the one that
-    /// was exported.**
+    /// **Install carries the aux blob to the slot, and the value admission puts
+    /// there is the one that was exported.**
     ///
     /// Through `handle_request`, so the wiring is covered rather than the
-    /// handler body alone.
+    /// handler body alone. The blob rides in the same seed as the layers: an
+    /// opened, unadmitted slot holds neither, and admission installs both.
     #[test]
     fn install_recurrent_state_request_installs_the_aux_blob_too() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
@@ -11421,6 +11559,12 @@ mod tests {
             response_tx: tx,
         });
         assert!(rx.recv().expect("reply").expect("install"));
+        assert!(
+            probe.get_index(slot.0).is_none(),
+            "an opened, unadmitted slot must hold no aux state either"
+        );
+
+        assert!(sched.claim_recurrent(slot.0), "admission places the state");
         assert_eq!(
             probe.get_index(slot.0).expect("the slot has no index"),
             ToyIndex { tokens: 5 },
@@ -11528,13 +11672,15 @@ mod tests {
         );
     }
 
-    /// **One request installs the same branch state onto EVERY named slot.**
+    /// **One request seeds EVERY named slot, and each installs on its own
+    /// admission.**
     ///
     /// This is what lets a batch of conversations born on one prompt branch pay
     /// a single queue wait instead of one per conversation, so the multi-slot
     /// case is asserted directly rather than inferred from the single-slot one.
+    /// Admitting one slot must not materialise its siblings' stores.
     #[test]
-    fn install_recurrent_state_request_installs_onto_every_named_slot() {
+    fn install_recurrent_state_request_seeds_every_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
             .handle_branch_checkpoint_pass(&[2, 4, 6])
@@ -11552,14 +11698,133 @@ mod tests {
         });
         assert!(
             rx.recv().expect("reply").expect("install"),
-            "the install reported that no state was carried"
+            "the install reported that no state would be carried"
         );
-        for slot in &slots {
+        assert_eq!(probe.len(), 0, "nothing is on the device before admission");
+
+        assert!(sched.claim_recurrent(slots[1].0));
+        assert!(probe.get(slots[1].0).is_some(), "the admitted slot has its state");
+        assert_eq!(probe.len(), 1, "and only the admitted slot");
+        for slot in [slots[0], slots[2]] {
+            assert!(sched.claim_recurrent(slot.0));
             assert!(
                 probe.get(slot.0).is_some(),
                 "slot {slot} was named in the request but has no state"
             );
         }
+    }
+
+    /// **A fork takes its parent's state at admission, by copy, and holds
+    /// nothing while it waits.**
+    ///
+    /// `NewSequence { parent: Some(..) }` used to fork the parent's store at
+    /// open — one store per queued fork. Now the open records the parent as the
+    /// fork's seed and `claim_recurrent` copies the parent's state if the parent
+    /// is resident then. The parent keeps its own: a fork is a branch, not a
+    /// continuation, so this is a copy where a view's is a move.
+    #[test]
+    fn a_fork_takes_its_parents_recurrent_state_at_admission_not_open() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = SequenceId(sched.session.create_sequence().expect("parent"));
+        let mut parent_state = ZERO_STATE;
+        toy_advance(&mut parent_state, 5);
+        probe.set(parent.0, parent_state);
+
+        let conversation = crate::projection::Conversation::new();
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        sched.handle_request(SchedulerRequest::NewSequence {
+            conversation,
+            target: None,
+            parent: Some(parent),
+            response_tx: tx,
+        });
+        let child = rx.recv().expect("reply").expect("slot");
+        assert_eq!(probe.get(child.0), None, "a queued fork holds no store");
+        assert_eq!(probe.len(), 1, "only the parent's store stands");
+
+        assert!(sched.claim_recurrent(child.0));
+        assert_state_eq(&probe, child.0, parent_state);
+        assert!(probe.is_seeded(child.0));
+        assert_state_eq(&probe, parent.0, parent_state);
+    }
+
+    /// **A fork whose parent has been evicted falls back to the parent's seed.**
+    ///
+    /// The parent sealed and its store went with the seal; the parent itself
+    /// was born on a prompt branch. The fork then starts from that checkpoint
+    /// rather than from zeros — the chain is walked to the first ancestor that
+    /// can supply a state.
+    #[test]
+    fn a_fork_of_an_evicted_parent_starts_from_the_parents_checkpoint() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let state = sched
+            .handle_branch_checkpoint_pass(&[2, 4, 6])
+            .expect("pass ran")
+            .expect("state");
+        let mut expected = ZERO_STATE;
+        toy_advance(&mut expected, 3);
+        let parent = SequenceId(sched.session.create_sequence().expect("parent"));
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        sched.handle_request(SchedulerRequest::InstallRecurrentState {
+            sequence_ids: vec![parent],
+            state: SharedState::from(&state),
+            response_tx: tx,
+        });
+        rx.recv().expect("reply").expect("install");
+
+        let conversation = crate::projection::Conversation::new();
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        sched.handle_request(SchedulerRequest::NewSequence {
+            conversation,
+            target: None,
+            parent: Some(parent),
+            response_tx: tx,
+        });
+        let child = rx.recv().expect("reply").expect("slot");
+        // The parent is not resident: it never ran, or it sealed and was evicted.
+        assert_eq!(probe.get(parent.0), None);
+
+        assert!(sched.claim_recurrent(child.0));
+        assert_state_eq(&probe, child.0, expected);
+        assert_eq!(
+            probe.get(parent.0),
+            None,
+            "resolving the child's seed must not materialise the parent"
+        );
+    }
+
+    /// **A scratch slot bound to a timeline stays at zeros at admission.**
+    ///
+    /// `StateSeed::Neutral` binds a target for address resolution only; the
+    /// timeline's snapshot must not be read onto it.
+    #[test]
+    fn a_neutral_slot_is_not_restored_at_admission() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let conversation = crate::projection::Conversation::new();
+        let timeline = TimelineId::for_test(21);
+        conversation.register_timeline(
+            timeline,
+            crate::projection::LayerId::from_raw(1).unwrap(),
+            crate::projection::GroupId::from_raw(1).unwrap(),
+        );
+        let target = ProjectionTarget {
+            layer: crate::projection::LayerId::from_raw(1).unwrap(),
+            group: crate::projection::GroupId::from_raw(1).unwrap(),
+            timeline,
+        };
+        let slot = sched
+            .create_sequence_seeded(conversation, Some(target), StateSeed::Neutral)
+            .expect("slot");
+        assert!(sched.claim_recurrent(slot.0));
+        assert_eq!(
+            probe.get(slot.0),
+            None,
+            "nothing is installed onto a neutral slot at admission"
+        );
+        // Its first wave gives it the sequence-start value, unseeded.
+        probe.ensure(slot.0, 0);
+        assert_eq!(probe.get(slot.0), Some(ZERO_STATE));
+        assert!(!probe.is_seeded(slot.0));
     }
 
     /// **T7.3 — a snapshot newer than the recovered history is rejected.**
@@ -11918,7 +12183,10 @@ mod tests {
         // No snapshot for this timeline at all — the ordinary case for a model
         // that carries no recurrent state, or a first turn that has not sealed.
         let slot = SequenceId(scheduler.session.create_sequence().unwrap());
-        scheduler.restore_recurrent_state(slot, &conversation, timeline);
+        assert!(
+            !scheduler.restore_recurrent_state(slot, &conversation, timeline),
+            "no snapshot, so nothing was restored"
+        );
         assert_eq!(
             probe.get(slot.0),
             None,
@@ -12200,9 +12468,33 @@ mod tests {
             .unwrap();
     }
 
-    /// **The cut lands on the parent, and it lands before the fork.**
+    /// Register `view` exactly as the `SubmitTurn` handler does, then admit it —
+    /// which is when a view takes its parent's carried state, by move.
+    fn admit_view(
+        scheduler: &mut Scheduler,
+        parent: usize,
+        view: SequenceId,
+        borrowed: BlockCount,
+    ) {
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: SequenceId(parent),
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: borrowed.0,
+                question_tokens: 0,
+            },
+        );
+        assert!(
+            scheduler.claim_recurrent(view.0),
+            "admission must be able to place the view's state"
+        );
+    }
+
+    /// **The cut lands on the parent, and it lands before the view takes its
+    /// state.**
     ///
-    /// `fork_recurrent` copies the index wholesale, live tail included. A
+    /// Admission moves the index to the view wholesale, live tail included. A
     /// boundary taken after the carve leaves the parent's tail open — so it
     /// survives into the view as rows the turn's own tokens then extend, and the
     /// parent re-accumulates the same prefix for the next turn to close again.
@@ -12223,7 +12515,7 @@ mod tests {
             "a forwarded prefix leaves its rows in the live tail"
         );
 
-        let (view_id, _) = scheduler
+        let (view_id, borrowed) = scheduler
             .create_view(SequenceId(parent), &[BlockRange::new(0, 1)])
             .expect("view creation");
 
@@ -12235,13 +12527,15 @@ mod tests {
             },
             "the parent's prefix must be a page of its own once the turn begins"
         );
+        admit_view(&mut scheduler, parent, view_id, borrowed);
         assert_eq!(
             probe.get_pages(view_id.0),
             ToyPages {
                 closed: vec![8],
                 tail: 0
             },
-            "the fork must copy an already-closed cache, or the turn extends the prefix's tail"
+            "admission must hand over an already-closed cache, or the turn extends \
+             the prefix's tail"
         );
     }
 
@@ -12257,9 +12551,10 @@ mod tests {
         let parent = scheduler.session.create_sequence().unwrap();
         forward_on(&mut scheduler, parent, &[1, 2, 3, 4, 5, 6, 7, 8]);
 
-        let (view_id, _) = scheduler
+        let (view_id, borrowed) = scheduler
             .create_view(SequenceId(parent), &[BlockRange::new(0, 1)])
             .expect("view creation");
+        admit_view(&mut scheduler, parent, view_id, borrowed);
         forward_on(&mut scheduler, view_id.0, &[9, 10, 11, 12, 13]);
 
         let pages = probe.get_pages(view_id.0);
@@ -12288,17 +12583,19 @@ mod tests {
         let parent = scheduler.session.create_sequence().unwrap();
         forward_on(&mut scheduler, parent, &[1, 2, 3, 4, 5, 6, 7, 8]);
 
-        let (first, _) = scheduler
+        let (first, first_borrowed) = scheduler
             .create_view(SequenceId(parent), &[BlockRange::new(0, 1)])
             .expect("first view");
+        admit_view(&mut scheduler, parent, first, first_borrowed);
         forward_on(&mut scheduler, first.0, &[9, 10, 11, 12]);
         // The view finalizes: its pages move to the parent, as `move_recurrent`
         // does at the end of every turn.
         scheduler.model.move_recurrent(first.0, parent).unwrap();
 
-        let (second, _) = scheduler
+        let (second, second_borrowed) = scheduler
             .create_view(SequenceId(parent), &[BlockRange::new(0, 1)])
             .expect("second view");
+        admit_view(&mut scheduler, parent, second, second_borrowed);
 
         assert_eq!(
             probe.get_pages(second.0),
