@@ -649,12 +649,29 @@ impl admit::Ground for WaveFill<'_> {
                 // generated, and 44 slots sat admitted with 52 queued behind
                 // them while the engine ran forwards that produced no tokens.
                 //
-                // What a step *does* cost is the tier for its row, which the
+                // What a step *does* cost is the tier for its rows, which the
                 // wave has to place whether or not the K/V is already there — so
                 // that term stands and the K/V term is zero.
+                //
+                // **Its rows, not one row.** A drafted decode rides as a verify
+                // block of `1 + draft` rows, and the draft is the model's ladder
+                // for the width the wave will have — on the 35B, sixteen decodes
+                // came to ~740 rows and a 1,056 MiB tier. Priced at one row
+                // each, no admission bought that tier, the placement was four
+                // regions short on every wave, and run 6 sat at `(no forwards)`
+                // for a quarter of an hour with sixteen decodes admitted.
                 let step = Scheduler::DECODE_CLAIM_TOKENS;
+                let taken = self.decodes_taken.len();
+                let rows_after = (taken + 1) * (1 + self.sched.model.draft_budget(taken + 1));
+                let dtype = self.sched.session.activation_dtype();
+                let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
+                let activations = plan
+                    .tier_bytes(rows_after)
+                    .saturating_sub(plan.tier_bytes(self.head_rows()))
+                    as u64;
                 Some(admit::Cost {
                     kv: 0,
+                    activations,
                     ..self.price(seq, step, step)
                 })
             }
