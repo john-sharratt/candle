@@ -1414,6 +1414,73 @@ cache's hard floor, 1,415 MiB — never by the hold. Four things were buying:
 The rules of §4.11.4 are unchanged. What changed is that nothing else in the
 engine can now move the boundary or place a store without passing them.
 
+### 4.11.8 The refused wave that never narrowed
+
+Run 11 (2026-09-08, S25) carried §4.11.7 through a clean calibration — one
+buyer, 3 refusals in the first minute, none after, 367–557 tok/s — and wedged
+the moment the repo_map ingest began. In the first two minutes of ingest: 199,704
+placement refusals of one wave, 157 waves with no forward, seven decodes admitted
+and never stepping, 87 directories queued, zero ingested. Every refusal read the
+same: `needs 335544320 B … is 4–7 regions into ground live KV arenas hold …
+gap_mib=213..256 least_mib=176 bought_mib=0`. The margin the fill held back had
+doubled to its 1 GiB cap and the budget read zero; the wave asked for 320 MiB
+anyway.
+
+Three things, each visible in the log:
+
+1. **The refused wave was never re-formed.** A creep group lives across waves —
+   members, layer cursor, held residual — and `decode_forward_cobatched` forms a
+   fresh group only when none is held. `note_tier_refusal` requeued the group's
+   unstarted prefills but left the group standing; the next fill re-admitted
+   them (`re-admits=577`), `build_wave_group_inputs` found them under the same
+   ids, and the same 320 MiB (seven verify blocks beside a 287-token turn)
+   went back to the same placement, at 7 Hz, for as long as the daemon ran. The
+   margin ratchet bounded nothing, because the thing it was meant to narrow was
+   never composed again.
+2. **An admission guarded only its own rows.** `buy_kv_ground` kept the gap at
+   `max(this admission's tier, least)`. With a 300-row creep held, one fill
+   admitted a prefill whose prompt-branch checkpoint install took eight regions
+   off the gap (384 → 256 MiB), and the held wave — which the fill had not
+   counted — was refused by four. The wave's tier is one quantity over every
+   row it carries; a purchase that guards an increment lets the next increment
+   eat the last one's ground.
+3. **The least chunk never fit beside a decode.** The fill bought the least
+   wave's tier into the *gap*; the group former reads the *budget*, the gap
+   less the margin. So in steady state the gap held exactly `head + 128 rows`
+   and the budget held one margin less: `budget=141..190 MiB` against a 192 MiB
+   least wave, seven decodes stepping alone while eight admitted prefills sat
+   unstarted for a minute. Prefills ran only when a completion happened to
+   widen the gap.
+
+**The design as built (S26).**
+
+* **A refusal drops the wave.** `note_tier_refusal` resets the held group
+  (members, cursor, residual) before requeueing, so the next build reads the
+  gap as it stands and composes to it; the layers the creep had done are redone
+  from zero, which is idempotent. Nothing is bought at the refusal — the fill's
+  purchase runs on the next pass, every iteration.
+* **The fill's head is every row the next wave already carries**:
+  `WaveFill::head_rows = decode rows + Scheduler::held_creep_rows`. Every
+  admission is priced as an increment over that head (the gate's charge), and
+  `buy_kv_ground(cost, wave_tier)` guards `wave_tier = tier(head) + increment`
+  — the whole wave — in the gap. A parked turn resuming guards the least
+  forward.
+* **The least wave is bought into the budget.** `publish_tier_budget` asks for
+  `(least + margin) − gap` (`least_wave_purchase_regions`), bounded by how far
+  the zone stands above the hold the gate defends, so a zone at its hold buys
+  nothing and the wave runs its decodes alone. The least wave is the head plus
+  one least chunk, or the head alone while a group is held (a held group takes
+  no new member).
+* **The margin is fixed** at four regions (`TIER_MARGIN_REGIONS`), covering only
+  what moves between build and placement — the persistence thread's arena
+  creation and the placement's rounding. The doubling ratchet, its cap and its
+  decay are deleted: they were a second loop on the same budget as the purchase,
+  and both of their measured pathologies (§4.11.4 run AN's churn at the cap;
+  run 11's zero budget) came from that. What the cap's "final for started
+  prefills" did is kept as a streak: `TIER_REFUSALS_BEFORE_FAIL` (8) consecutive
+  refusals — each one a re-formed wave — fail the started prefills so their
+  ground comes back; a placed forward ends the streak.
+
 ## 5. Plan
 
 | phase | deliverable | gate | status |

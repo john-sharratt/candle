@@ -40,9 +40,28 @@ pub(super) struct WaveFill<'a> {
     optimal: u64,
 }
 
-/// The widest the tier margin grows on repeated refusals, in regions — a
-/// gigabyte, past which a refusal is not a rounding problem.
-const TIER_MARGIN_CAP_REGIONS: usize = 64;
+/// Regions the fill holds back from a wave's tier budget, for what moves
+/// between the wave's build and its placement: an arena the persistence thread
+/// creates in that window, and the rounding the placement applies. Fixed. It
+/// used to double on every refusal and decay one region per fill, and that
+/// ratchet was a second loop on the same budget as the fill's purchase: at its
+/// 1 GiB cap the budget read zero and no prefill could join a wave for the
+/// sixty fills the decay took, and at its base the fill bought the least wave
+/// into the *gap* while the group former read the *budget*, so the least chunk
+/// never fit beside a decode and the prefills sat admitted and unstarted (run
+/// 11: seven decodes stepping, eight prefills waiting, `budget=141..190 MiB`
+/// against a 192 MiB least wave, for a minute). A refused wave is now dropped
+/// and re-formed against the gap as it stands ([`Scheduler::note_tier_refusal`]),
+/// which is what a refusal means; the margin covers only the movers.
+pub(super) const TIER_MARGIN_REGIONS: usize = 4;
+
+/// Consecutive placement refusals after which the refused wave's **started**
+/// prefills are failed. Each refusal drops the wave and re-forms it against the
+/// fresh gap, so a wave refused this many times running is one the partition
+/// cannot hold at any width the group former can reach: a lone least chunk
+/// with the weight side at its floor and nothing else in flight to finish and
+/// free ground. Failing the chunk releases its ground so the pipeline moves.
+pub(super) const TIER_REFUSALS_BEFORE_FAIL: usize = 8;
 
 /// The fewest tokens a prefill advances in one wave, when it has that many
 /// left. A dialogue prefill rides the wave in chunks — `[offset, offset +
@@ -139,28 +158,60 @@ pub(super) const WAVE_WIDTH_HARD_CAP: usize = 64;
 impl Scheduler {
     /// A wave's transient tier was refused placement. Nothing ran and the KV
     /// side rolled back, so nothing has failed: the wave was composed too wide
-    /// for the ground the placement found, and the next fill composes it
+    /// for the ground the placement found, and the next wave is composed
     /// narrower.
     ///
-    /// Two things make that so. The margin the fill holds back from the tier
-    /// budget doubles, so the same gap prices to fewer rows. And the prefills
-    /// the refused wave carried go **back to the front of the queue**, in
-    /// order — they were admitted but never started, so there is nothing to
-    /// unwind but the admission itself — and are offered again against the
-    /// wider margin. Measured before this: one wave priced 26 MiB over a
-    /// 4,054 MiB gap failed 18 directories.
+    /// **The wave is dropped, held group and all.** A creep group lives across
+    /// waves — its members, its layer cursor and its held residual — and the
+    /// wave builder re-forms a group only when none is held. So a refusal that
+    /// left the group standing was refused again at exactly the same width,
+    /// whatever the budget said: the requeued prefills were re-admitted by the
+    /// next fill, `build_wave_group_inputs` found them under the same ids, and
+    /// the same rows went back to the same placement. Run 11 wedged there the
+    /// moment ingest began — 199,704 refusals of one 320 MiB wave against a 213
+    /// MiB gap, 157 waves with no forward, seven decodes never stepping, zero
+    /// directories — while the margin the fill held back doubled to its cap and
+    /// bounded nothing, because the group it was meant to narrow was never
+    /// re-formed. Dropping the group is what "compose it narrower" requires:
+    /// the next build reads the gap as it stands and forms a group to it, and
+    /// the layers the creep had done are redone from zero, which is idempotent
+    /// (a member re-feeds its whole chunk and commits its offset only at the
+    /// head).
     ///
-    /// **A refusal at the widest margin is final for the prefills that had
-    /// started.** A started prefill (one with chunks already committed) cannot
-    /// be requeued, so it rides the next group — and if the placement refuses
-    /// that group too, and the next, the wave never advances: measured, 1,641
-    /// refusals of one wave with nothing requeued, the margin at its cap from
-    /// the third refusal on. When the margin is already at the cap and the
-    /// refusal comes again, the started prefills are failed with the numbers
-    /// and their sequences released, so the pipeline moves.
+    /// The prefills the refused wave carried and had not started go **back to
+    /// the front of the queue**, in order — they were admitted but never
+    /// started, so there is nothing to unwind but the admission itself.
+    /// Measured before this: one wave priced 26 MiB over a 4,054 MiB gap
+    /// failed 18 directories.
+    ///
+    /// **A run of refusals is final for the prefills that had started.** A
+    /// started prefill (one with chunks already committed) cannot be requeued,
+    /// so it rides the next group — and if the placement refuses that group
+    /// too, and the next, the wave never advances: measured, 1,641 refusals of
+    /// one wave with nothing requeued. With the group re-formed against the
+    /// fresh gap on every refusal, [`TIER_REFUSALS_BEFORE_FAIL`] refusals
+    /// running mean the partition cannot hold even the least chunk, and the
+    /// started prefills are failed with the numbers and their sequences
+    /// released, so the pipeline moves. A placed forward ends the run
+    /// (`note_wave_placed`).
+    ///
+    /// Nothing is bought here. The fill buys the least wave into the budget on
+    /// the next pass (`WaveFill::publish_tier_budget`), and that pass runs every
+    /// iteration; a second buyer at the refusal was the same purchase made
+    /// twice from two places.
     pub(super) fn note_tier_refusal(&mut self, err: &candle::Error) {
-        let at_cap = self.tier_margin_regions >= TIER_MARGIN_CAP_REGIONS;
-        self.tier_margin_regions = (self.tier_margin_regions * 2).min(TIER_MARGIN_CAP_REGIONS);
+        self.tier_refusal_streak = self.tier_refusal_streak.saturating_add(1);
+        let final_for_started = self.tier_refusal_streak >= TIER_REFUSALS_BEFORE_FAIL;
+        let started: Vec<usize> = self
+            .wave_prefill_members
+            .iter()
+            .filter_map(|m| match m {
+                WaveMember::Prefill { seq_id, .. } => Some(*seq_id),
+                WaveMember::Section { .. } => None,
+            })
+            .collect();
+        let held_rows = self.held_creep_rows();
+        self.reset_wave_prefill();
         let mut unstarted = Vec::new();
         let mut i = 0;
         while i < self.active_prefills.len() {
@@ -177,15 +228,7 @@ impl Scheduler {
             self.prefill_queue.push_front(p.work);
         }
         let mut failed = 0usize;
-        if at_cap {
-            let started: Vec<usize> = self
-                .wave_prefill_members
-                .iter()
-                .filter_map(|m| match m {
-                    WaveMember::Prefill { seq_id, .. } => Some(*seq_id),
-                    WaveMember::Section { .. } => None,
-                })
-                .collect();
+        if final_for_started {
             for p in self.active_prefills.iter_mut() {
                 if p.error.is_none()
                     && p.final_logits.is_none()
@@ -194,45 +237,70 @@ impl Scheduler {
                 {
                     p.error = Some(ConversationError::Channel(format!(
                         "prefill of {} tokens ({} committed): the wave transient tier refused \
-                         its next chunk at the widest margin ({} regions) — this partition \
-                         cannot place it",
+                         its next chunk {} waves running — this partition cannot place it",
                         p.work.tokens.len(),
                         p.offset,
-                        TIER_MARGIN_CAP_REGIONS,
+                        self.tier_refusal_streak,
                     )));
                     failed += 1;
                 }
             }
         }
         self.prefill_head_blocked = false;
-        // **The least wave's shortfall is bought here, so the next wave is not
-        // this one again.** A refusal is measured after every claim that
-        // reached the gap has landed, which is the one figure the fill cannot
-        // see. Admission is still the buyer — this runs between forwards on
-        // the scheduler thread — and what it buys is bounded by the least
-        // useful forward, which the wave cannot compose below. Without it a
-        // refused least chunk re-formed identically at 70 Hz: 29,000 refusals
-        // in seven minutes of run 10, no forward, every widening of the margin
-        // powerless against a chunk the margin does not bound.
-        let least = self.min_forward_tier_bytes() as usize;
         let gap = transient_headroom_bytes(0).unwrap_or(0);
-        let bought = if gap < least {
-            let short = (least - gap).div_ceil(REGION_BYTES);
-            self.model.request_kv_ground(short)
-        } else {
-            0
-        };
         tracing::warn!(
             target: "candle_conversation::scheduler::interleave",
-            margin_regions = self.tier_margin_regions,
+            streak = self.tier_refusal_streak,
             requeued,
             failed,
+            dropped_creep_rows = held_rows,
             gap_mib = gap >> 20,
-            least_mib = least >> 20,
-            bought_mib = bought >> 20,
-            "wave transient tier refused placement — wave requeued, margin widened: {err}",
+            least_mib = self.min_forward_tier_bytes() >> 20,
+            "wave transient tier refused placement — wave dropped and requeued: {err}",
         );
     }
+
+    /// A wave's transient tier was placed and its forward ran: the refusal
+    /// streak [`Self::note_tier_refusal`] counts is over.
+    pub(super) fn note_wave_placed(&mut self) {
+        self.tier_refusal_streak = 0;
+    }
+
+    /// Rows of the creep group held between waves — the prefill and section
+    /// chunks whose residual is standing and which ride the next wave whole,
+    /// whatever else the fill admits into it. Zero when no group is held, in
+    /// which case the next build forms a fresh group.
+    ///
+    /// The fill counts these at the head of the wave it prices
+    /// (`WaveFill::head_rows`): the wave's tier is one quantity sized to every
+    /// row it carries, so an admission that priced only its own rows beside
+    /// the decodes let its claims eat the gap the held rows needed. Run 11: a
+    /// 300-row creep was standing, a fill admitted one prefill whose checkpoint
+    /// install took eight regions off the gap, and the placement refused the
+    /// held wave by four.
+    pub(super) fn held_creep_rows(&self) -> usize {
+        if self.wave_prefill_cursor == 0 && self.wave_prefill_residual.is_none() {
+            return 0;
+        }
+        self.wave_prefill_members
+            .iter()
+            .map(|m| match *m {
+                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
+                    advance
+                }
+            })
+            .sum()
+    }
+}
+
+/// Regions the fill buys so the least wave fits the tier **budget**: what
+/// `need` (the least wave's tier plus the margin) lacks of `gap`, bounded by
+/// `affordable` — how far the weight zone stands above the hold the gate
+/// defends. Pure, so the two bounds are testable without a device.
+fn least_wave_purchase_regions(need: usize, gap: usize, affordable: u64) -> usize {
+    let short = need.saturating_sub(gap).div_ceil(REGION_BYTES);
+    let cap = (affordable / REGION_BYTES as u64) as usize;
+    short.min(cap)
 }
 
 impl<'a> WaveFill<'a> {
@@ -294,11 +362,30 @@ impl<'a> WaveFill<'a> {
         false
     }
 
-    /// Rows the decodes taken so far put at the head of the wave: a drafted
-    /// decode rides as a verify block of `1 + draft` rows in the prefill slot.
-    fn head_rows(&self) -> usize {
-        let decodes = self.decodes_taken.len();
-        decodes * (1 + self.sched.model.draft_budget(decodes))
+    /// Rows `n` decodes put at the head of the wave: a drafted decode rides as
+    /// a verify block of `1 + draft` rows in the prefill slot, and the draft is
+    /// the model's ladder for that width.
+    fn decode_rows(&self, n: usize) -> usize {
+        n * (1 + self.sched.model.draft_budget(n))
+    }
+
+    /// Rows the next wave already carries before this fill adds anything: the
+    /// decodes taken so far, and the creep group held from the last wave
+    /// ([`Scheduler::held_creep_rows`]). The tier is one quantity sized to
+    /// every row of the wave, so every admission is priced as an increment over
+    /// this, and every purchase guards the whole of it.
+    pub(super) fn head_rows(&self) -> usize {
+        self.decode_rows(self.decodes_taken.len()) + self.sched.held_creep_rows()
+    }
+
+    /// The tier of the wave `cost` would be admitted into — the head as it
+    /// stands plus this admission's rows — which is what the frontier gap must
+    /// hold once the admission's claims have landed. `cost.activations` is the
+    /// increment the gate charges; the placement sees the sum.
+    pub(super) fn wave_tier_after(&self, cost: &admit::Cost) -> u64 {
+        let dtype = self.sched.session.activation_dtype();
+        let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
+        (plan.tier_bytes(self.head_rows()) as u64).saturating_add(cost.activations)
     }
 
     /// Tier bytes a forward worth running needs, held back from admission.
@@ -349,7 +436,7 @@ impl<'a> WaveFill<'a> {
     /// `admit::gate`'s answer, not the placement's to pay for.
     ///
     /// **One purchase closes the pass: the least wave the admitted set can run
-    /// must be placeable.** A claim is region-granular where its price is not —
+    /// must fit the budget.** A claim is region-granular where its price is not —
     /// a section's 12 MiB of K/V opens a fresh arena in every layer that has no
     /// room in its current one, each a whole region off the top of the free
     /// list — so the gap an admission measured and bought for is a few regions
@@ -358,30 +445,50 @@ impl<'a> WaveFill<'a> {
     /// else in it makes progress) and the placement refuses by those few
     /// regions: run 6 lost thirteen waves in two minutes, each 1–2 regions
     /// short with a gap of 250–400 MiB. So the fill, still between forwards and
-    /// still the one buyer, asks for exactly what the gap lacks of that least
-    /// wave's tier beside the decodes it took. Nothing when the wave is empty.
-    fn publish_tier_budget(&mut self) {
-        let margin = self.sched.tier_margin_regions * REGION_BYTES;
+    /// still the one buyer, asks for what the gap lacks of that least wave's
+    /// tier **plus the margin the budget holds back** — the group former reads
+    /// the budget, not the gap, and a purchase that stopped at the gap left the
+    /// least chunk exactly one margin short of joining any wave with a decode in
+    /// it (run 11: `budget=141..190 MiB` against a 192 MiB least wave, eight
+    /// prefills admitted and unstarted while seven decodes stepped). The
+    /// purchase is bounded by how far the zone stands above the hold, the same
+    /// line the gate defends: a zone at its hold buys nothing, the wave carries
+    /// its decodes alone, and what they finish makes the room.
+    ///
+    /// The least wave is the head plus one least chunk — or the head alone
+    /// while a creep group is held, since a held group takes no new member
+    /// until it completes. Nothing when the wave is empty.
+    pub(super) fn publish_tier_budget(&mut self) {
+        let margin = TIER_MARGIN_REGIONS * REGION_BYTES;
         if self.sched.active_slots() > 0 || !self.decodes_taken.is_empty() {
             let dtype = self.sched.session.activation_dtype();
             let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
-            let least = plan.tier_bytes(self.head_rows() + PREFILL_MIN_ADVANCE);
+            let next_chunk = if self.sched.held_creep_rows() > 0 {
+                0
+            } else {
+                PREFILL_MIN_ADVANCE
+            };
+            let least = plan.tier_bytes(self.head_rows() + next_chunk);
             // The same figure is what the weight side's growth leaves standing
             // in the gap, so the two sides agree on what the next wave needs.
             if let candle::DeviceLocation::Cuda { gpu_id } = self.sched.device.location() {
                 set_least_tier_bytes(gpu_id, least);
             }
             let gap = transient_headroom_bytes(0).unwrap_or(0);
-            if gap < least {
-                let short = (least - gap).div_ceil(REGION_BYTES);
+            let room = self.headroom();
+            let affordable = room.zone.saturating_sub(room.floor());
+            let short = least_wave_purchase_regions(least + margin, gap, affordable);
+            if short > 0 {
                 let conceded = self.sched.model.request_kv_ground(short);
                 tracing::debug!(
                     target: "candle_conversation::scheduler::interleave",
                     least_mib = least >> 20,
+                    margin_mib = margin >> 20,
                     gap_mib = gap >> 20,
+                    affordable_mib = affordable >> 20,
                     short_regions = short,
                     conceded_mib = conceded >> 20,
-                    "admission bought the gap the least placeable wave lacked",
+                    "admission bought the budget the least placeable wave lacked",
                 );
             }
         }
@@ -692,7 +799,7 @@ impl admit::Ground for WaveFill<'_> {
                 // for a quarter of an hour with sixteen decodes admitted.
                 let step = Scheduler::DECODE_CLAIM_TOKENS;
                 let taken = self.decodes_taken.len();
-                let rows_after = (taken + 1) * (1 + self.sched.model.draft_budget(taken + 1));
+                let rows_after = self.decode_rows(taken + 1) + self.sched.held_creep_rows();
                 let dtype = self.sched.session.activation_dtype();
                 let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
                 let activations = plan
@@ -736,7 +843,8 @@ impl admit::Ground for WaveFill<'_> {
                 // taken here, at admission, and the slot cannot later grow into
                 // ground the gate never authorised.
                 let reserve = whole.saturating_add(Scheduler::DECODE_LEASE_TOKENS);
-                self.sched.buy_kv_ground(&cost);
+                let wave_tier = self.wave_tier_after(&cost);
+                self.sched.buy_kv_ground(&cost, wave_tier);
                 if !self.sched.claim_kv(seq.0, reserve) || !self.sched.claim_recurrent(seq.0) {
                     return false;
                 }
@@ -751,8 +859,9 @@ impl admit::Ground for WaveFill<'_> {
                     self.decode_cursor[band] = at + 1;
                 }
                 // A step's K/V was reserved with its lease; what it buys is the
-                // tier for its row, which `peek` priced.
-                self.sched.buy_kv_ground(&cost);
+                // tier for its rows, which `peek` priced.
+                let wave_tier = self.wave_tier_after(&cost);
+                self.sched.buy_kv_ground(&cost, wave_tier);
                 if !self.sched.claim_kv(seq.0, Scheduler::DECODE_CLAIM_TOKENS)
                     || !self.sched.claim_recurrent(seq.0)
                 {
@@ -766,7 +875,8 @@ impl admit::Ground for WaveFill<'_> {
                 let Some(pending) = self.sched.section_queue.pop_front() else {
                     return false;
                 };
-                self.sched.buy_kv_ground(&cost);
+                let wave_tier = self.wave_tier_after(&cost);
+                self.sched.buy_kv_ground(&cost, wave_tier);
                 let seal_block_from = match self.sched.prepare_section_ingest(
                     pending.sequence_id,
                     pending.section_id,
@@ -1117,15 +1227,21 @@ impl Scheduler {
             Self::DECODE_LEASE_TOKENS,
             self.per_block_kv_bytes(),
         );
-        self.buy_kv_ground(&admit::Cost {
-            kv: sealed_total_bytes(&warm).saturating_add(lease),
-            recurrent: if self.model.recurrent_resident(slot.0) {
-                0
-            } else {
-                self.model.recurrent_store_bytes() as u64
+        // A resumed turn steps as a decode row of the wave the next fill
+        // composes; the tier it guards is the least useful forward's.
+        let least_tier = self.min_forward_tier_bytes();
+        self.buy_kv_ground(
+            &admit::Cost {
+                kv: sealed_total_bytes(&warm).saturating_add(lease),
+                recurrent: if self.model.recurrent_resident(slot.0) {
+                    0
+                } else {
+                    self.model.recurrent_store_bytes() as u64
+                },
+                activations: 0,
             },
-            activations: 0,
-        });
+            least_tier,
+        );
         let restored = self
             .session
             .sealed_to_gpu(&warm)
@@ -1184,10 +1300,10 @@ impl Scheduler {
     /// stands right now**: `(gap, owed, budget)` in bytes.
     ///
     /// The gap is `weight_floor − live_end`, the frontier the tier is placed
-    /// against. Off it come the margin a refusal widens
-    /// (`tier_margin_regions`) and what the weight side is owed — when
-    /// residency stands under its hold the gap is not the tier's to take, it is
-    /// where the weight side grows back. The debt is measured against the
+    /// against. Off it come the fixed margin for what moves between the build
+    /// and the placement ([`TIER_MARGIN_REGIONS`]) and what the weight side is
+    /// owed — when residency stands under its hold the gap is not the tier's to
+    /// take, it is where the weight side grows back. The debt is measured against the
     /// effective zone, never the extent: the extent settles under the hold and
     /// nothing moves it back on its own, so a debt read from it never clears
     /// (run BW: a 532 MiB debt deducted every wave against a wholly healthy
@@ -1203,7 +1319,7 @@ impl Scheduler {
     /// the same wave sized against the figure at build time simply packs two
     /// regions narrower.
     pub(super) fn tier_budget_now(&self) -> (usize, usize, usize) {
-        let margin = self.tier_margin_regions * REGION_BYTES;
+        let margin = TIER_MARGIN_REGIONS * REGION_BYTES;
         let optimal = interleave::optimal_weight_bytes().unwrap_or(0);
         let owed = interleave::effective_weight_zone_bytes()
             .map_or(0, |zone| optimal.saturating_sub(zone)) as usize;
@@ -1270,16 +1386,22 @@ impl Scheduler {
     /// K/V blocks and a recurrent store take regions from anywhere on the free
     /// list; the wave transient tier stands only in the gap between the arena
     /// frontier and the weight floor, and the claims eat into that gap once the
-    /// scattered free regions are spent — see [`ground_shortfall_regions`]. The
-    /// tier bought for is never less than a useful forward's
-    /// (`min_forward_tier_bytes`), so the wave this admits into can always be
-    /// placed, whatever this one item's rows come to.
+    /// scattered free regions are spent — see [`ground_shortfall_regions`].
+    ///
+    /// **`wave_tier` is the tier of the whole wave this admission joins**, not
+    /// the increment `cost.activations` charges the gate: the tier is one
+    /// quantity sized to every row the wave carries, and the gap has to hold
+    /// all of it after this admission's claims land. Guarding only the
+    /// increment let each admission eat the gap down to its own few rows while
+    /// a held creep needed the rest — run 11's refusals began on exactly that
+    /// fill. Never less than a useful forward's (`min_forward_tier_bytes`), so
+    /// the wave this admits into can always be placed.
     ///
     /// Answers the bytes conceded. A weight side at its own floor concedes
     /// less than asked, and the claims that follow then refuse — which is the
     /// gate's `stopped_on_weights`, arriving from the allocator rather than the
     /// arithmetic.
-    pub(super) fn buy_kv_ground(&self, cost: &admit::Cost) -> u64 {
+    pub(super) fn buy_kv_ground(&self, cost: &admit::Cost, wave_tier: u64) -> u64 {
         if cost.total() == 0 {
             return 0;
         }
@@ -1295,7 +1417,7 @@ impl Scheduler {
         let free = stats.free + stats.blocked;
         let gap = regions(transient_headroom_bytes(gpu_id).unwrap_or(0) as u64);
         let claims = regions(cost.kv.saturating_add(cost.recurrent));
-        let tier = regions(cost.activations.max(self.min_forward_tier_bytes()));
+        let tier = regions(wave_tier.max(self.min_forward_tier_bytes()));
         let short = ground_shortfall_regions(claims, tier, free, gap);
         if short == 0 {
             return 0;
@@ -1306,6 +1428,7 @@ impl Scheduler {
             kv_mib = cost.kv >> 20,
             recurrent_mib = cost.recurrent >> 20,
             tier_mib = cost.activations >> 20,
+            wave_tier_mib = wave_tier >> 20,
             free_regions = free,
             gap_regions = gap,
             short_regions = short,
@@ -1489,17 +1612,6 @@ impl Scheduler {
     }
 
     pub(super) fn promote_new_prefills(&mut self) {
-        // **The tier margin decays as fast as it grew.** A refusal doubles it
-        // (`note_tier_refusal`), and nothing brought it back: after one bad
-        // minute it stood at its 1 GiB cap for the rest of the run, so every
-        // fill priced the tier a gigabyte under the gap, bought that gigabyte
-        // from the weight side, placed a tier that did not use it, and the
-        // weight side grew back into it between forwards — 764 concessions
-        // and 90,017 expert slots evicted in one 45-minute run, every one a
-        // reload. One region back per fill: a refusal still costs a wave and
-        // widens the margin, and a run that places its tiers reaches the base
-        // margin within a minute.
-        self.tier_margin_regions = self.tier_margin_regions.saturating_sub(1).max(4);
         self.observe_expert_hit_rate();
         // **Eviction runs at admission, before the measurement, and only when an
         // admission decision is due.** Admission prices against the free lists
@@ -3002,6 +3114,7 @@ impl Scheduler {
                 n,
                 None,
             )?;
+            self.note_wave_placed();
             if has_glue {
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
@@ -3202,6 +3315,7 @@ impl Scheduler {
             // A forward ran, so the admitted set is advancing — the admission
             // fast path may safely wait for a completion (`settled`).
             self.wave_ran_forward = true;
+            self.note_wave_placed();
             if pf_seqs > 0 {
                 self.wave_stats.record(true, pf_seqs, pf_tok, pf_kv, ms);
             }
@@ -4332,6 +4446,65 @@ mod ground_shortfall_tests {
         // 4 claims take the 3 scattered and one of the gap's 2: the tier of 2
         // needs that one back.
         assert_eq!(ground_shortfall_regions(4, 2, 5, 2), 1);
+    }
+}
+
+#[cfg(test)]
+mod least_wave_purchase_tests {
+    use super::least_wave_purchase_regions;
+    use candle_nn::kv_cache::REGION_BYTES;
+
+    /// The purchase is what the *budget* lacks — the least wave plus the
+    /// margin — so a gap that already holds the least wave but not the margin
+    /// still buys the margin's worth. Stopping at the gap is what left the
+    /// least chunk one margin short of every wave with a decode in it.
+    #[test]
+    fn the_margin_is_bought_along_with_the_least_wave() {
+        let least = 11 * REGION_BYTES;
+        let margin = 4 * REGION_BYTES;
+        assert_eq!(
+            least_wave_purchase_regions(least + margin, least, u64::MAX),
+            4,
+            "gap holds the least wave exactly: the margin is what is missing"
+        );
+        assert_eq!(
+            least_wave_purchase_regions(least + margin, least + margin, u64::MAX),
+            0,
+            "budget already holds the least wave: nothing to buy"
+        );
+        assert_eq!(
+            least_wave_purchase_regions(least + margin, least + margin + 1, u64::MAX),
+            0
+        );
+    }
+
+    /// A fraction of a region short buys a whole region — the boundary moves in
+    /// regions and the placement rounds the tier up to one.
+    #[test]
+    fn a_partial_region_short_buys_a_whole_one() {
+        assert_eq!(
+            least_wave_purchase_regions(3 * REGION_BYTES + 1, 3 * REGION_BYTES, u64::MAX),
+            1
+        );
+    }
+
+    /// The hold bounds the purchase: a zone standing this far above the hold
+    /// gives up at most that, and a zone at or under it gives nothing — the
+    /// wave then runs its decodes alone and what they finish makes the room.
+    #[test]
+    fn the_purchase_stops_at_the_hold() {
+        let need = 20 * REGION_BYTES;
+        assert_eq!(
+            least_wave_purchase_regions(need, 0, 3 * REGION_BYTES as u64),
+            3,
+            "three regions above the hold: three bought of twenty wanted"
+        );
+        assert_eq!(least_wave_purchase_regions(need, 0, 0), 0, "at the hold: nothing");
+        assert_eq!(
+            least_wave_purchase_regions(need, 0, REGION_BYTES as u64 - 1),
+            0,
+            "less than a region above the hold is not a region to sell"
+        );
     }
 }
 
