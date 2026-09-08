@@ -184,15 +184,48 @@ fn a_directory_with_no_anchor_still_ingests() {
 
 // ── DirState: what re-ingests and what does not ──────────────────────────────
 
+/// **Editing an unshown file's body re-ingests nothing.**
+///
+/// `handler.rs` is listed by name but its content is never shown, so the
+/// folder's summary is still accurate and re-decoding it would cost for
+/// nothing — a summary plus twenty-five probe decodes, per directory.
+///
+/// This used to rewrite `handle` to `handle_v2` and assert the state held.
+/// That is no longer the contract: `hash_unit` covers the declared SYMBOL SET
+/// precisely so a file that is only named can still move the unit when its API
+/// changes, because the folder's probes are seeded from the terms its files
+/// declare. Renaming a function is API churn and must re-ingest — which is what
+/// `state_moves_when_an_unshown_file_changes_its_api` below now pins. The body
+/// edit here is the case that must stay free.
 #[test]
-fn state_is_stable_when_an_unshown_file_changes() {
+fn state_is_stable_when_an_unshown_file_body_changes() {
     let dir = small_workspace();
     let before = DirState::from_units(&units_of(dir.path()));
-    // `handler.rs` is listed by name but its CONTENT is never shown, so the
-    // folder's summary is still accurate and re-decoding it would cost for
-    // nothing.
+    write(
+        dir.path(),
+        "src/handler.rs",
+        b"pub fn handle() {\n    // reworked, same API\n    let _ = 1 + 1;\n}\n",
+    );
+    assert!(
+        before.equivalent_to(&units_of(dir.path())),
+        "a body edit under an unchanged declaration must not re-ingest the folder"
+    );
+}
+
+/// The other half of that contract: the declaration set IS evidence.
+///
+/// A file nobody shows can still change what questions the folder should
+/// answer, by gaining or losing a name. Renaming `handle` is exactly that, and
+/// it must move the unit even though the listing is unchanged.
+#[test]
+fn state_moves_when_an_unshown_file_changes_its_api() {
+    let dir = small_workspace();
+    let before = DirState::from_units(&units_of(dir.path()));
     write(dir.path(), "src/handler.rs", b"pub fn handle_v2() {}\n");
-    assert!(before.equivalent_to(&units_of(dir.path())));
+    assert!(
+        !before.equivalent_to(&units_of(dir.path())),
+        "a renamed declaration changes the probe terms and must re-ingest"
+    );
 }
 
 #[test]
