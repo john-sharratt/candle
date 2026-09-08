@@ -84,6 +84,7 @@ pub(crate) trait Ground {
 pub(crate) struct Filled {
     pub decodes: usize,
     pub prefills: usize,
+    pub sections: usize,
     /// The pass ran the fast path: nothing had finished, so nothing was offered.
     pub skipped: bool,
     /// An admission was refused because it would have reached the weight zone.
@@ -138,7 +139,17 @@ pub(crate) fn fill<G: Ground>(ground: &mut G) -> Filled {
                 // weight zone from 8,180 MiB to 1,417 with every region live.
                 // The rule is "admit the next one regardless", and the next one
                 // is one.
-                Kind::Prefill => gate::may_admit(ground.active() + out.prefills, total, &room),
+                //
+                // A section is a first admission exactly as a prefill is: fresh
+                // K/V on a scratch slot, a store, a tier row — so it is gated the
+                // same way and counted the same way. Sections used to enter the
+                // wave without passing here at all, and one minute of them took
+                // the weight zone from 10,398 MiB to its hold.
+                Kind::Prefill | Kind::Section => gate::may_admit(
+                    ground.active() + out.prefills + out.sections,
+                    total,
+                    &room,
+                ),
             };
             if !allowed {
                 out.stopped_on_weights = true;
@@ -152,6 +163,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G) -> Filled {
             match kind {
                 Kind::Decode => out.decodes += 1,
                 Kind::Prefill => out.prefills += 1,
+                Kind::Section => out.sections += 1,
             }
         }
     }
@@ -167,6 +179,7 @@ mod tests {
     struct Fake {
         decodes: Vec<u64>,
         prefills: Vec<u64>,
+        sections: Vec<u64>,
         free: u64,
         active: usize,
         decodes_active: usize,
@@ -182,6 +195,7 @@ mod tests {
             Self {
                 decodes,
                 prefills,
+                sections: Vec::new(),
                 free,
                 active: 0,
                 decodes_active: 0,
@@ -196,12 +210,15 @@ mod tests {
             match kind {
                 Kind::Decode => &mut self.decodes,
                 Kind::Prefill => &mut self.prefills,
+                Kind::Section => &mut self.sections,
             }
         }
         fn wants(&self, kind: Kind) -> DecodePriority {
             match kind {
                 Kind::Decode => self.decode_prio,
                 Kind::Prefill => self.prefill_prio,
+                // Sections carry no priority of their own: one band, `Low`.
+                Kind::Section => DecodePriority::Low,
             }
         }
     }
@@ -371,6 +388,32 @@ mod tests {
             ],
             "prefill leads the band, decode follows",
         );
+    }
+
+    /// **A section is an admission, gated and counted like a prefill.** It is
+    /// offered ahead of background prefill, it spends the budget the prefills
+    /// behind it then see, and a section that does not fit stops the section
+    /// band without stopping the prefill band behind it.
+    #[test]
+    fn sections_are_gated_like_prefills_and_offered_ahead_of_background_prefill() {
+        let mut f = Fake::new(Vec::new(), vec![10; 2], 25);
+        f.sections = vec![10, 10, 10];
+        f.active = 1; // something running, so the budget binds
+        f.decodes_active = 1;
+        let got = fill(&mut f);
+        assert_eq!(got.sections, 2, "two sections fit in 25 bytes of room");
+        assert_eq!(got.prefills, 0, "and the prefills behind them found none left");
+        assert!(got.stopped_on_weights);
+        assert_eq!(f.taken, vec![Kind::Section, Kind::Section]);
+        assert_eq!(f.sections.len(), 1, "the third section waits, FIFO");
+
+        // With nothing running, the head — a section — is admitted regardless
+        // of budget, and only the head: the pass counts its own sections.
+        let mut f = Fake::new(Vec::new(), vec![1], 0);
+        f.sections = vec![1_000, 1_000];
+        let got = fill(&mut f);
+        assert_eq!((got.sections, got.prefills), (1, 0));
+        assert!(got.stopped_on_weights);
     }
 
     /// A person waiting is served before any background work.
