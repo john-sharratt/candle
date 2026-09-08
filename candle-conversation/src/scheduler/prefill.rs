@@ -10,7 +10,7 @@ use crate::projection::DecodePriority;
 /// Holds the scheduler mutably for the whole fill because every admission is a
 /// device allocation and every check is a read of the partition that allocation
 /// moved — there is no snapshot to work from, which is the entire point.
-struct WaveFill<'a> {
+pub(super) struct WaveFill<'a> {
     sched: &'a mut Scheduler,
     /// Decodes eligible this wave, in the order they are offered. Rotated so
     /// the sequences past last wave's cut are offered first this wave — a
@@ -216,7 +216,7 @@ impl Scheduler {
 }
 
 impl<'a> WaveFill<'a> {
-    fn new(sched: &'a mut Scheduler, optimal: u64) -> Self {
+    pub(super) fn new(sched: &'a mut Scheduler, optimal: u64) -> Self {
         let mut decode_order = sched.decode_wave_candidates();
         // Start the offers just past the last sequence admitted last wave, so
         // whatever was refused at the tail goes first now. The list is sorted
@@ -346,6 +346,11 @@ impl<'a> WaveFill<'a> {
             let dtype = self.sched.session.activation_dtype();
             let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
             let least = plan.tier_bytes(self.head_rows() + PREFILL_MIN_ADVANCE);
+            // The same figure is what the weight side's growth leaves standing
+            // in the gap, so the two sides agree on what the next wave needs.
+            if let candle::DeviceLocation::Cuda { gpu_id } = self.sched.device.location() {
+                set_least_tier_bytes(gpu_id, least);
+            }
             let gap = transient_headroom_bytes(0).unwrap_or(0);
             if gap < least {
                 let short = (least - gap).div_ceil(REGION_BYTES);
@@ -437,17 +442,26 @@ fn band_index(p: DecodePriority) -> usize {
 
 impl WaveFill<'_> {
     /// The next FIFO candidate in this band, as `(queue index, sequence, whole
-    /// turn's tokens, tokens riding this wave)`. Does not consume it.
+    /// turn's tokens, the least chunk that rides a wave)`. Does not consume it.
     ///
     /// **The two token counts are different and both matter.** The KV claim is
     /// for the *whole turn* — every chunk of it lands in this sequence's cache
-    /// and is never given back until the turn seals — while only `advance`
-    /// rides this forward and needs transient tier. Pricing the chunk and
-    /// claiming the turn is what collapsed run BS: the gate authorised a
-    /// quarter of what the allocator then took, the weight zone fell from 5,020
-    /// to 1,417 MiB against a 4,774 hold, and the expert hit rate went to 0.257.
+    /// and is never given back until the turn seals — while the tier is priced
+    /// for the **least** chunk only ([`PREFILL_MIN_ADVANCE`]). Pricing the
+    /// chunk and claiming the turn is what collapsed run BS: the gate
+    /// authorised a quarter of what the allocator then took, the weight zone
+    /// fell from 5,020 to 1,417 MiB against a 4,774 hold, and the expert hit
+    /// rate went to 0.257.
+    ///
+    /// **Why the least chunk and not the whole chunk.** The tier is transient
+    /// and the wave packs it to whatever gap stands free, so a wider chunk
+    /// costs nothing the K/V side does not already hold. Pricing the whole
+    /// chunk made admission *buy* that width from the weight side: on run 6 a
+    /// 1,575-token turn priced a 1.0–1.8 GiB tier per admission, the fill
+    /// bought it, and the zone went from 10,398 to 5,898 MiB for prefill batch
+    /// width — resident experts traded for a wider forward. The least chunk is
+    /// what the wave needs to make progress; the rest it takes only if free.
     fn peek_prefill(&self, band: usize) -> Option<(usize, SequenceId, usize, usize)> {
-        let cap = self.sched.max_prefill_pass_tokens.max(1);
         let from = self.prefill_cursor[band];
         for idx in from..self.sched.prefill_queue.len() {
             let w = &self.sched.prefill_queue[idx];
@@ -455,7 +469,7 @@ impl WaveFill<'_> {
                 continue;
             }
             let whole = w.tokens.len();
-            return Some((idx, w.sequence_id, whole, whole.min(cap)));
+            return Some((idx, w.sequence_id, whole, whole.min(PREFILL_MIN_ADVANCE)));
         }
         None
     }
@@ -651,11 +665,10 @@ impl admit::Ground for WaveFill<'_> {
                 }
                 let s = self.sched.section_queue.front()?;
                 // The whole section's K/V on an empty scratch slot, a store, and
-                // the tier for the chunk that rides this forward — the same
-                // three terms as a prefill, without a lease: nothing decodes.
+                // the tier for its least chunk — the same three terms as a
+                // prefill, without a lease: nothing decodes.
                 let whole = s.tokens.len();
-                let cap = self.sched.max_prefill_pass_tokens.max(1);
-                Some(self.price(s.sequence_id, whole, whole.min(cap)))
+                Some(self.price(s.sequence_id, whole, whole.min(PREFILL_MIN_ADVANCE)))
             }
         }
     }
@@ -760,7 +773,9 @@ impl admit::Ground for WaveFill<'_> {
 }
 
 use crate::token_buffer::TokenBuffer;
-use candle_nn::kv_cache::{is_tier_refusal, transient_headroom_bytes, WavePlan, REGION_BYTES};
+use candle_nn::kv_cache::{
+    is_tier_refusal, set_least_tier_bytes, transient_headroom_bytes, WavePlan, REGION_BYTES,
+};
 use candle_transformers::models::batched_inference::PendingGlue;
 use std::collections::{HashMap, HashSet};
 

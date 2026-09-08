@@ -136,7 +136,8 @@ pub struct Occupancy {
     /// cannot hand back mid-forward, because the floor is refused while a wave
     /// generation is open.
     pub tier_high_water: usize,
-    /// Bytes the most recently planned tier needed.
+    /// Bytes of the tier the next wave is guaranteed: the least forward worth
+    /// running, as admission prices it (`region_pool::set_least_tier_bytes`).
     ///
     /// **The term this policy was written without.** The spare below used to be
     /// offered whole, with the next wave's tier undeducted because the signature
@@ -151,8 +152,10 @@ pub struct Occupancy {
     /// cannot see it either: the loop returns demand to where it started, so it
     /// is flat rather than rising and `Refusal::Pressure` never fires.
     ///
-    /// The last plan, not the high-water — see `bump_arena::planned_tier_bytes`
-    /// for why the widest-ever figure is the wrong term and what it cost.
+    /// The least tier, not the widest recent one and not the high-water. Both
+    /// of those preserve whatever gap the last wide wave packed itself into —
+    /// the tier is sized to the gap, so deducting it is a ratchet the weight
+    /// side never climbs back out of.
     pub tier_planned: usize,
 }
 

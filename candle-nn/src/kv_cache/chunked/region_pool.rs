@@ -95,13 +95,6 @@ use super::weight_zone::{INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE};
 /// One region of the KV side. Every size class carves its arenas at this size.
 pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
 
-/// Tier placements the weight side's growth term looks back over — the widest
-/// of these is the ground it leaves for the next wave's tier. About a minute
-/// of waves on the 35B: long enough to span the decode-only waves between one
-/// prefill chunk and the next, short enough that a wide calibration tier
-/// stops shaping the grant once the pool phase has run for a minute.
-pub const TIER_RECENT_WAVES: usize = 16;
-
 /// The widest the wave transient tier can ever be — the old fixed reservation,
 /// kept only as the worst case the elastic middle must be able to *reach*.
 ///
@@ -420,20 +413,20 @@ struct RegionPool {
     /// no spare at all. Removing the seed exposed it, and a geometric grow step
     /// made it reachable within a few waves rather than dozens.
     transient_high_water: usize,
-    /// Bytes of the last tier placed — see [`Occupancy::tier_planned`].
-    transient_last: usize,
-    /// Bytes of the last [`TIER_RECENT_WAVES`] tiers placed, a ring; the
-    /// growth term is their maximum ([`Self::recent_tier_bytes`]).
+    /// Bytes of the least forward worth running — the tier admission guarantees
+    /// stands in the frontier gap after every fill, and the ground the growth
+    /// term leaves for the next wave ([`Occupancy::tier_planned`]). Published
+    /// by the scheduler ([`set_least_tier_bytes`]); zero until it is.
     ///
-    /// The last tier alone is the wrong term on a co-batched wave loop: a
-    /// decode-only wave places a tier of a few regions, the weight side then
-    /// takes everything above it, and the next wave's prefill chunk — up to two
-    /// gigabytes on the 35B — buys it back. Measured, 90 grows against 83
-    /// concessions in 102 steady-state waves with the last-tier term. The
-    /// widest tier of the recent past is what the next few waves may need.
-    transient_recent: [usize; TIER_RECENT_WAVES],
-    /// Next slot of `transient_recent` to overwrite.
-    transient_recent_at: usize,
+    /// **Not the widest recent tier.** That term — the maximum of the last
+    /// sixteen placements — made the boundary a ratchet: a wave packs its tier
+    /// to whatever gap stands free, that tier becomes the recent maximum, the
+    /// deduction then preserves exactly that gap, and the weight side never
+    /// grows back into it. Measured on a repository ingest: 130–160 free
+    /// regions standing for ten minutes with the zone flat at 5,713 MiB, a
+    /// 1,440 MiB tier withheld from every negotiation. The tier is sized to the
+    /// gap each wave; a narrower gap is a narrower prefill chunk, not a failure.
+    least_tier_bytes: usize,
     /// Persistence-staging bytes carved from the fixed left block.
     persist_carved: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
@@ -840,9 +833,7 @@ impl RegionPool {
             transient_base: None,
             transient_bytes: 0,
             transient_high_water: 0,
-            transient_last: 0,
-            transient_recent: [0; TIER_RECENT_WAVES],
-            transient_recent_at: 0,
+            least_tier_bytes: 0,
             persist_carved: 0,
             fresh_claims_during_wave: 0,
             refusals_during_wave: 0,
@@ -983,12 +974,6 @@ impl RegionPool {
         {
             *slot = self.quiesce_epoch;
         }
-    }
-
-    /// The widest tier placed in the last [`TIER_RECENT_WAVES`] placements —
-    /// the ground the weight side leaves for the next wave's tier.
-    fn recent_tier_bytes(&self) -> usize {
-        self.transient_recent.iter().copied().max().unwrap_or(0)
     }
 
     /// One past the highest region currently held by an arena.
@@ -1188,14 +1173,14 @@ impl RegionPool {
         // engine actually runs rather than a model of it — the partition's
         // defects have all been trajectory defects, and a trajectory is only
         // testable if it can be run without a device.
-        let recent = self.recent_tier_bytes();
+        let least = self.least_tier_bytes;
         let occ = Occupancy {
             live: self.live,
             free_below_ceiling: self.free_count(),
             ceiling_blocked: self.ceiling_blocked(),
             tier_bytes: self.transient_bytes,
             tier_high_water: self.transient_high_water,
-            tier_planned: recent,
+            tier_planned: least,
         };
         match self.growth.spare(occ, slack, REGION_BYTES) {
             Ok(spare) => {
@@ -1210,12 +1195,12 @@ impl RegionPool {
                 // concession per wave for the length of a run (764 in 45
                 // minutes, 90,017 expert slots evicted and reloaded). What may
                 // be taken is the gap above the live watermark less the slack
-                // and the last tier's ground, whatever the free list says.
+                // and the least forward's tier, whatever the free list says.
                 let gap_regions =
                     (self.weight_floor.saturating_sub(self.live_end()) as usize) / REGION_BYTES;
                 let usable = gap_regions
                     .saturating_sub(slack)
-                    .saturating_sub(recent.div_ceil(REGION_BYTES));
+                    .saturating_sub(least.div_ceil(REGION_BYTES));
                 let spare = spare.min(usable);
                 if spare == 0 {
                     SPARE_TALLY[2].fetch_add(1, Ordering::Relaxed);
@@ -1735,14 +1720,6 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         // Survives the release, so the between-forwards demand reading still
         // knows a tier of this size is about to want its ground back.
         pool.transient_high_water = pool.transient_high_water.max(len);
-        // **The last tier actually placed**, which the spare calculation deducts
-        // so it stops offering the next one's ground away. The high-water above
-        // is the wrong term for that — it is the widest tier the process ever
-        // stood, and deducting it cut applied grants from 17 to 4. The recent
-        // ring sits between the two: the widest of the last few waves.
-        pool.transient_last = len;
-        pool.transient_recent[pool.transient_recent_at] = len;
-        pool.transient_recent_at = (pool.transient_recent_at + 1) % TIER_RECENT_WAVES;
         Ok(Placed::At(base))
     })
 }
@@ -2162,6 +2139,18 @@ pub fn transient_headroom_bytes(ordinal: usize) -> Option<usize> {
     let map = pools().lock().unwrap_or_else(|e| e.into_inner());
     map.get(&ordinal)
         .map(|pool| pool.weight_floor.saturating_sub(pool.live_end()) as usize)
+}
+
+/// Record the tier of the least forward worth running — the ground the weight
+/// side's growth leaves standing in the frontier gap. See
+/// [`RegionPool::least_tier_bytes`]. Published by the scheduler after every
+/// fill, priced through the same planner that places the tier; a no-op before
+/// the reservation exists.
+pub fn set_least_tier_bytes(ordinal: usize, bytes: usize) {
+    let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pool) = map.get_mut(&ordinal) {
+        pool.least_tier_bytes = bytes;
+    }
 }
 
 pub fn weight_capacity_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
