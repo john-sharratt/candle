@@ -1710,6 +1710,9 @@ impl Conversation {
             // floors each exchange's denominator by its size; Concept F max-fuses
             // the normalized question scan; Concept C drags neighbors afterwards.
             let mut cands: Vec<(TurnKey, f32)> = Vec::new();
+            // Per-timeline fused scores, held until the member pass below has had
+            // its say. Indexed in step with `files`.
+            let mut per_file_fused: Vec<(TimelineId, Vec<f32>, Vec<bool>)> = Vec::new();
             // Concept B: mass rides on the RAW fused scores (pre-normalization)
             // — measured (results doc §25): under warm hit levels the
             // normalized band compresses genuine concentration away, while the
@@ -1772,21 +1775,83 @@ impl Conversation {
                     }
                     None => vec![false; f.n_slots],
                 };
-                // Stamp EVERY member turn of an exchange with its (shared) normalized
-                // score, so provenance selecting either half brings in the whole
-                // round-trip — never half a tool call.
+                // Held, not stamped yet. When the group's candidates are whole
+                // conversations rather than moments in one, the folders have still
+                // to compete against each other — see the member pass below — and
+                // stamping here would freeze each folder's score against its own
+                // private denominator.
+                per_file_fused.push((timeline, fused, boosted_flags));
+                group_raw.extend_from_slice(&mass_base_per_file[fi]);
+            }
+
+            // ── Member normalization: the competition BETWEEN timelines ──────────
+            //
+            // Everything above normalizes within one timeline, which answers
+            // "which turn of this conversation matches?". For a group whose
+            // candidates are whole conversations — `repo_map`, where a timeline is
+            // a folder — the question is "which FOLDER matches?", and that
+            // competition has had no normalization at all: each folder was scaled
+            // by its own denominator and the results then compared as though they
+            // shared a scale, so the folder carrying the most turns won. Measured
+            // on the probe layer, four folders took first place from the right
+            // answer 32 times between them, every one of them a folder that
+            // happened to carry probe turns.
+            //
+            // One scope for the group, one child per timeline, exactly as the tool
+            // catalog does it. Each folder's turns are then rescaled by the ratio
+            // its own maximum moved, so within-folder ranking is preserved and
+            // only the cross-folder comparison changes.
+            if group.policy.scan.member_normalization && per_file_fused.len() > 1 {
+                let member_scope = ScopeKey::group_members(group.id.raw() as u64);
+                let member_of = |tl: TimelineId| ChildKey::turn(tl.raw());
+                let peaks: Vec<(ChildKey, f32)> = per_file_fused
+                    .iter()
+                    .map(|(tl, fused, _)| {
+                        let peak = fused.iter().copied().fold(0.0f32, f32::max);
+                        (member_of(*tl), peak)
+                    })
+                    .collect();
+                let normed_members = {
+                    let mut cache = self.normalization.lock().unwrap();
+                    let normed = cache.normalize(&member_scope, &peaks);
+                    if let (true, Some(source)) =
+                        (observe.teaches(&group.policy.tags), observe.source())
+                    {
+                        cache.observe(&member_scope, source, &peaks);
+                    }
+                    normed
+                };
+                for (i, (_, fused, _)) in per_file_fused.iter_mut().enumerate() {
+                    let raw_peak = peaks.get(i).map(|(_, s)| *s).unwrap_or(0.0);
+                    let new_peak = normed_members.get(i).map(|(_, s)| *s).unwrap_or(0.0);
+                    // A folder that scored nothing has no ratio to apply; leaving
+                    // it at zero is correct and avoids dividing by it.
+                    if raw_peak <= f32::EPSILON {
+                        continue;
+                    }
+                    let ratio = new_peak / raw_peak;
+                    for s in fused.iter_mut() {
+                        *s *= ratio;
+                    }
+                }
+            }
+
+            // Stamp EVERY member turn of an exchange with its (shared) normalized
+            // score, so provenance selecting either half brings in the whole
+            // round-trip — never half a tool call.
+            for (fi, (timeline, fused, boosted_flags)) in per_file_fused.iter().enumerate() {
+                let f = &files[fi];
                 for (slot, r) in f.ex_ranges.iter().enumerate() {
                     let sc = fused.get(slot).copied().unwrap_or(0.0);
                     for ai in r.clone() {
                         let idx = f.arc_turn[ai];
-                        scores.set_turn(timeline, idx, sc);
+                        scores.set_turn(*timeline, idx, sc);
                         if boosted_flags[slot] {
-                            scores.mark_locality_boost(timeline, idx);
+                            scores.mark_locality_boost(*timeline, idx);
                         }
-                        cands.push((TurnKey::new(timeline, idx), sc));
+                        cands.push((TurnKey::new(*timeline, idx), sc));
                     }
                 }
-                group_raw.extend_from_slice(&mass_base_per_file[fi]);
             }
             if cands.is_empty() {
                 continue;

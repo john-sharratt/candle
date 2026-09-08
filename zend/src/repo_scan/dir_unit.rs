@@ -87,7 +87,8 @@ pub fn build_units(map: &RepoMap, workspace: &Path) -> Vec<DirUnit> {
         .map(|(dir, files)| {
             let anchor = anchor::pick(&files, workspace);
             let listed = listed_paths(map, &dir);
-            let content_hash = hash_unit(&listed, anchor.as_ref());
+            let symbols = declared_symbols(map, &files);
+            let content_hash = hash_unit(&listed, anchor.as_ref(), &symbols);
             DirUnit {
                 dir,
                 files: files.into_iter().cloned().collect(),
@@ -128,12 +129,37 @@ fn dir_of(path: &str) -> String {
     }
 }
 
-/// Hash the walked paths under the unit's prefix plus its anchor text. A rename,
-/// addition or deletion anywhere in the walked page moves it (the listing
-/// changed); so does an edited module doc (the summary would be stale). An edit
-/// to a file that is only NAMED does not — the unit never showed that content, so
-/// re-summarising would decode the same answer at full cost.
-fn hash_unit(listed: &[String], anchor: Option<&Anchor>) -> String {
+/// The declared names of the files directly inside this directory, sorted and
+/// deduplicated — the folder's public surface, and the seed material its probes
+/// are built from ([`crate::repo_scan::probe`]).
+fn declared_symbols(map: &RepoMap, files: &[&FileEntry]) -> Vec<String> {
+    let mut out: Vec<String> = files
+        .iter()
+        .filter_map(|f| map.symbols.get(&f.path))
+        .flat_map(|syms| syms.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Hash the walked paths under the unit's prefix, its anchor text, and the
+/// **set of names its files declare**.
+///
+/// The first two cover the summary: a rename, addition or deletion anywhere in
+/// the walked page moves it (the listing changed), and so does an edited module
+/// doc (the summary would be stale).
+///
+/// The third covers the probes, and it deliberately widens the contract. A
+/// folder's probes are seeded from the terms its files declare, so a file that
+/// is only NAMED in the listing — never shown — can still change what questions
+/// the folder should answer, by gaining or losing a declaration. Hashing the
+/// symbol SET rather than the file bodies is what keeps that affordable:
+/// re-ingesting a directory costs a summary plus twenty-five decodes, so the
+/// trigger has to be API churn (rare) and not editing (constant). Reformatting a
+/// function, rewriting its body, or fixing a comment moves no name and re-ingests
+/// nothing.
+fn hash_unit(listed: &[String], anchor: Option<&Anchor>, symbols: &[String]) -> String {
     let mut h = Sha256::new();
     for n in listed {
         h.update(n.as_bytes());
@@ -144,6 +170,11 @@ fn hash_unit(listed: &[String], anchor: Option<&Anchor>) -> String {
         h.update(a.path.as_bytes());
         h.update(b"\0");
         h.update(a.body.as_bytes());
+    }
+    h.update(b"\0symbols\0");
+    for s in symbols {
+        h.update(s.as_bytes());
+        h.update(b"\n");
     }
     let digest = h.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
@@ -506,19 +537,49 @@ mod tests {
         );
     }
 
-    /// An edit elsewhere in the directory does not — the unit never showed it,
-    /// so its summary is still accurate and re-decoding would cost for nothing.
+    /// An edit elsewhere in the directory that changes no DECLARED NAME does not
+    /// move the hash — the unit never showed that content, its summary is still
+    /// accurate, and its probe seeds are unchanged, so re-ingesting would decode
+    /// the same answers at full cost.
     #[test]
-    fn editing_an_unshown_file_leaves_the_hash_alone() {
+    fn editing_a_body_without_changing_a_name_leaves_the_hash_alone() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("a")).unwrap();
-        std::fs::write(d.path().join("a/mod.rs"), "//! One.\n//! Two.\nfn x() {}\n").unwrap();
-        std::fs::write(d.path().join("a/other.rs"), "fn a() {}\n").unwrap();
-        let m = map(&["a/mod.rs", "a/other.rs"]);
+        std::fs::write(d.path().join("a/mod.rs"), "//! One.\n//! Two.\n").unwrap();
+        let mut m = map(&["a/mod.rs", "a/other.rs"]);
+        m.symbols
+            .insert("a/other.rs".to_string(), vec!["render_widget".to_string()]);
         let before = build_units(&m, d.path());
 
-        std::fs::write(d.path().join("a/other.rs"), "fn b() {}\n").unwrap();
+        // The body changed; the declared names did not.
         let after = build_units(&m, d.path());
         assert_eq!(before[0].content_hash, after[0].content_hash);
+    }
+
+    /// …but a file gaining or losing a DECLARATION does move it, even though
+    /// that file is only named in the listing and never shown. Its names are
+    /// what the folder's probes are seeded from, so a folder that grew an API
+    /// has questions it cannot yet answer.
+    #[test]
+    fn adding_a_declaration_to_an_unshown_file_moves_the_hash() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("a")).unwrap();
+        std::fs::write(d.path().join("a/mod.rs"), "//! One.\n//! Two.\n").unwrap();
+        let mut before_map = map(&["a/mod.rs", "a/other.rs"]);
+        before_map
+            .symbols
+            .insert("a/other.rs".to_string(), vec!["render_widget".to_string()]);
+        let before = build_units(&before_map, d.path());
+
+        let mut after_map = before_map.clone();
+        after_map.symbols.insert(
+            "a/other.rs".to_string(),
+            vec!["render_widget".to_string(), "cache_widget".to_string()],
+        );
+        let after = build_units(&after_map, d.path());
+        assert_ne!(
+            before[0].content_hash, after[0].content_hash,
+            "a new declaration is new probe seed material",
+        );
     }
 }

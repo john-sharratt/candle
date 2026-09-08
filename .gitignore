@@ -68,6 +68,11 @@ candle-kernels/build_tool/
 # as unwelcome in a commit as the live one.
 .substrate/
 .substrate.*/
+# The per-directory summary the repo_scan ingest writes beside the code it read.
+# A FILE, not a directory, so neither glob above matches it — the trailing slash
+# in `.substrate.*/` restricts that pattern to directories, which let 57 of these
+# into a commit before the omission was noticed.
+.substrate.yaml
 
 # Endpoint-managed upload staging dir — the zend daemon writes user-uploaded
 # files here at runtime; they are workspace content, never repo content.

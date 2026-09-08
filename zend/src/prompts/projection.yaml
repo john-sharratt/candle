@@ -158,6 +158,36 @@ system_prompt:
                 another language, apologize, or claim you cannot access, view, or open the
                 file: it is right there in the tool responses. Output the summary and nothing
                 else.
+            # Writes the QUESTIONS a folder is the answer to — the `repo_map`
+            # probe layer's generation pass (`zend/src/repo_scan/probe/`).
+            #
+            # A separate persona because `summarize` pins "reply with ONLY a
+            # concise summary … at most two sentences", which directly fights a
+            # request for forty-eight questions: under it the generator returns a
+            # description of the folder and the whole probe set for that folder
+            # is lost. `assistant` fails the other way — it discusses the task,
+            # offers to help, and wraps the list in commentary the parser then
+            # has to guess its way through.
+            #
+            # The framing that matters is the INVERSION: the model must write as
+            # the person who has NOT found the folder yet. Told merely to "write
+            # questions about this folder" it writes quiz questions from the
+            # position of someone reading it, which name the folder, its files
+            # and its layout — and those are precisely what the admission
+            # filters discard, because a question whose asker already knows the
+            # path cannot retrieve anything.
+            - id: question_writer
+              content: |+
+                You write the questions that a piece of code is the ANSWER to.
+                You are given one folder from a software project. Imagine the developer who
+                needs that folder but has not found it yet: they know what they are trying to
+                do and what things are called, but not where anything lives. Write what THEY
+                would type into a search box or ask a colleague.
+                Never write the folder's path or any file name — they do not know those. Never
+                write "this folder", "this module" or "this directory" — they cannot see it.
+                Every question ends with a question mark, one per line, under the headings you
+                are given. Output only the headings and the questions: no preamble, no
+                commentary, no answers, and never a summary of the folder.
 
         # Binary toggle driven by zend (`set_optional("reasoning_stance", …)`,
         # see api/chat.rs): present ⇔ the turn thinks, the inverse of
@@ -671,6 +701,23 @@ layers:
           # group-2 variant overfits one). Retuned by the §83 `provenance_layers`
           # sweep on the live timeline; adjust there before changing.
           layer_weights: [0.1, 1.0, 0.1]
+          # NORMALIZE THE COMPETITION BETWEEN FOLDERS, not only within each one.
+          #
+          # This group's candidates are whole conversations — one timeline per
+          # folder — so the question it answers is "which FOLDER matches?".
+          # Without this, normalization is scoped per timeline: every folder is
+          # rescaled against its own denominator and the results then compared as
+          # though they shared a scale, so the folder carrying the most turns
+          # wins regardless of relevance. Measured on the probe layer, four
+          # folders took first place from the right answer 32 times between them
+          # and every one of them was a folder that happened to carry probes.
+          #
+          # On, the group gets ONE scope in which every folder competes and each
+          # learns its own hit level — the same shape the `tools` collection uses,
+          # and the reason tool routing normalizes correctly where this did not.
+          # The dialogue layer leaves this off: its candidates are moments in a
+          # single thread, where per-timeline scoping is the right question.
+          member_normalization: true
           # Carry LEAKED HARDER than the tool default (β = RelLeak leak fraction, so
           # HIGHER = faster decay = less carry). repo_map must reflect the CURRENT
           # question, not linger on a prior topic's folder. A numeric attractor dir

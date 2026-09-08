@@ -189,6 +189,12 @@ struct YamlPolicy {
     /// Concept A.4: size-aware level-prior constants.
     #[serde(default)]
     level_prior: Option<YamlLevelPrior>,
+    /// Normalize the competition BETWEEN this group's timelines, not only within
+    /// each. On for a group whose candidates are whole conversations (a folder
+    /// per timeline); off for a dialogue, whose candidates are moments in one
+    /// thread. Omitted ⇒ off.
+    #[serde(default)]
+    member_normalization: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -808,6 +814,9 @@ fn parse_policy(
         if let Some(c) = lp.floor_cap {
             scan.level_prior_cap = c;
         }
+    }
+    if let Some(m) = yp.member_normalization {
+        scan.member_normalization = m;
     }
     validate_scan(name, &scan)?;
     Ok(SelectionPolicy {

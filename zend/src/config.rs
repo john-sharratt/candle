@@ -31,4 +31,10 @@ pub struct DaemonConfig {
     /// the eager whole-store rewrite instead of deferring it. Opt-in
     /// (`--compact-substrate`).
     pub compact_substrate: bool,
+    /// Delete every folder's `.substrate.yaml` before the scan, so this boot
+    /// regenerates the questions from the model (`--wipe-metadata`). Opt-in and
+    /// destructive of hand-written content, which is exactly why it is a flag
+    /// and not a heuristic — the daemon otherwise never overwrites a question
+    /// someone wrote.
+    pub wipe_metadata: bool,
 }

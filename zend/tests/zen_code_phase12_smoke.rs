@@ -194,6 +194,9 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         &progress,
         "repo_map",
         "structure",
+        // Never wipe folder metadata from a test: the flag deletes hand-written
+        // questions, and this test runs against a real workspace.
+        false,
     )
     .expect("repo map ingest");
     eprintln!(

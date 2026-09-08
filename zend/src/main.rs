@@ -108,6 +108,17 @@ struct Cli {
     #[arg(long)]
     wipe_substrate: bool,
 
+    /// DESTRUCTIVE: delete every folder's `.substrate.yaml` before scanning, so
+    /// the questions in them are regenerated from the model on this boot.
+    ///
+    /// Those files hold each folder's probe questions and are meant to be edited
+    /// by hand — the daemon fills in what is missing and never overwrites what
+    /// is there. This is the flag that says "throw that away and start over",
+    /// and it removes hand-written questions along with generated ones. Scoped
+    /// to the directories the workspace walk actually visits.
+    #[arg(long)]
+    wipe_metadata: bool,
+
     /// Address to bind the HTTP server to. Defaults to loopback only
     /// (`127.0.0.1`) — reachable from this machine alone. Pass `0.0.0.0` to
     /// listen on all IPv4 interfaces (LAN / VPN reachable). WARNING: the daemon
@@ -339,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
         ingest_dirs: ingest_dirs.clone(),
         disable_summariser: cli.disable_summariser,
         compact_substrate: cli.compact_substrate,
+        wipe_metadata: cli.wipe_metadata,
     };
 
     if !disabled_layers.is_empty() {

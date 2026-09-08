@@ -572,6 +572,7 @@ impl InferenceState {
         ingest_dirs: HashMap<String, String>,
         disable_summariser: bool,
         compact_substrate: bool,
+        wipe_metadata: bool,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
@@ -1708,6 +1709,7 @@ impl InferenceState {
                         &progress,
                         &il.name,
                         &il.group,
+                        wipe_metadata,
                     )?;
                     // An incomplete map is reported, not fatal: affected
                     // directories keep their prior generation live and retry on
@@ -4291,6 +4293,7 @@ impl ZendSession {
         let ingest_dirs = self.config.ingest_dirs.clone();
         let disable_summariser = self.config.disable_summariser;
         let compact_substrate = self.config.compact_substrate;
+        let wipe_metadata = self.config.wipe_metadata;
         // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
         // across the process (and the test binary), so clear any cancel left by a
         // prior load/shutdown before this one's ingest starts polling it. The
@@ -4375,6 +4378,7 @@ impl ZendSession {
                     ingest_dirs,
                     disable_summariser,
                     compact_substrate,
+                    wipe_metadata,
                     load_progress_for_blocking,
                     status_tx.clone(),
                 ) {

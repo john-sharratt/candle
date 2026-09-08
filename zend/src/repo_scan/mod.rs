@@ -17,16 +17,20 @@
 pub mod anchor;
 pub mod binary_sniff;
 pub mod dir_unit;
+pub mod metadata;
+pub mod probe;
+pub mod probe_pass;
 pub mod render;
 pub mod types;
 pub mod walk;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::memory_report::MemoryReport;
+use candle_conversation::memory_report::AdmissionSection;
 use candle_conversation::projection::{self, GroupId, LayerId, TimelineId};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend_tools::ToolContext;
@@ -59,12 +63,13 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// batch. Sustaining four or more ready sequences takes roughly twice that many
 /// open conversations, since each spends part of its chain decoding.
 ///
-/// **This is a ceiling on [`scan_width`], not the width itself.** The live value
-/// is derived from the card; this only stops that derivation running away. It
-/// was previously 24, matched to the scheduler's `MAX_PREFILL_WIDTH` on the
-/// reasoning that the pool should never ask for more concurrency than a wave can
-/// carry — but that ceiling is a *prefill* backstop, and it was sizing the pool
-/// for the wrong phase.
+/// **This is the worker-thread count, not the number of open conversations.**
+/// A worker blocked in [`reserve_scan_slot`] holds no conversation and no K/V;
+/// how many are open at once is decided per claim by [`gate_decision`], from
+/// what the engine publishes. It was previously 24, matched to the scheduler's
+/// `MAX_PREFILL_WIDTH` on the reasoning that the pool should never ask for more
+/// concurrency than a wave can carry — but that ceiling is a *prefill*
+/// backstop, and it was sizing the pool for the wrong phase.
 ///
 /// Measured over a full workspace ingest (Qwen3.6-35B-A3B, 201 waves): decode is
 /// **61% of the phase's wall time against prefill's 24%**, and decode has no
@@ -98,246 +103,209 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// tight card the useful width is bounded by eviction churn — and by the
 /// warm-tier drain, which an over-wide ingest can outrun.
 ///
-/// **Caveat worth knowing before changing this.** [`scan_width`]'s per-conversation
-/// costing is meant to be the real governor, with this constant only a backstop.
-/// On the 72 GB card it has never bound: the pool logged `n_workers == ceiling`
-/// at every value swept above (24, 64, 96, 128), so the ceiling — not the
-/// memory estimate — is what actually limits width here, and the 128 regression
-/// was found by throughput rather than refused by the costing. On a smaller card
-/// the estimate does bind and picks the width; on a large one, treat this
-/// constant as the live limit.
+/// **Caveat worth knowing before changing this.** On the 72 GB card the engine's
+/// gate has never bound: the pool logged `n_workers == ceiling` at every value
+/// swept above (24, 64, 96, 128), so the ceiling — not the engine's signal — is
+/// what actually limits width there, and the 128 regression was found by
+/// throughput rather than refused by the gate. On a smaller card the gate binds
+/// and picks the width; on a large one, treat this constant as the live limit.
 pub const REPO_MAP_PARALLELISM: usize = 96;
 
-/// Width used when the card can say NOTHING — neither the memory report nor the
-/// governor is available, which is the normal state at scan start.
+/// **Removed, deliberately: the queue-length and open-conversation marks.**
 ///
-/// Deliberately not [`REPO_MAP_PARALLELISM`]: that is a measured ceiling for a
-/// 72 GB card, and using it as the blind default would open 96 conversations on
-/// a 16 GB one. This is the pre-tuning value, which ran without a single
-/// transient-tier failure on every card in the fleet; the runtime gate widens
-/// from here once the governor reports.
-const REPO_MAP_BLIND_PARALLELISM: usize = 24;
-
-/// Longest a worker will wait for VRAM before claiming its unit anyway.
+/// Both scaled from the engine's `wave_width` and both were flow control. The
+/// open mark held the pool at ~21 conversations against a mark of 15-19 for 409
+/// seconds of one run, starving the queue to a mean depth of 6 against a
+/// ten-wide wave — while the failure it was written to prevent (free KV regions
+/// reaching zero) happened anyway at a *constant* 21 open, and cleared again at
+/// the same 21. It cost throughput and protected nothing.
 ///
-/// A bound, not a timeout to rely on: without it a pathological state where the
-/// pool never drops would stall the scan forever. Reaching it means the gate
-/// failed to help, and the arena allocator's own refusal is the next line of
-/// defence.
-const SCAN_POOL_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// How many conversations this pool may hold open at once, derived from the
-/// card rather than from a thread count.
+/// What they were reaching for is real: enough open conversations will push the
+/// elastic boundary down and evict the resident experts. [`gate_decision`] now
+/// reads that directly, as the weight zone against its hold, instead of
+/// counting conversations as a stand-in for it.
+/// The engine's admission section, or `None` when nothing fresh has been
+/// published (the normal state at scan start).
 ///
-/// Two earlier shapes failed, and both failures are instructive:
-///
-/// 1. A snapshot test ("is the pool full?") blocks new claims but cannot
-///    un-open the conversations already running, so the pool sailed past the
-///    mark while 24 chains were in flight.
-/// 2. A forward-looking test ("would ONE more fit?") is still evaluated by
-///    every worker against the same pre-allocation state. At scan start all 24
-///    read a nearly-empty pool, all passed, and all allocated together — a
-///    thundering herd that put the whole burst over the wall at once. That is
-///    why every configuration produced exactly `n_failed = 24`: one burst, one
-///    wall, 24 casualties.
-///
-/// So the bound is a COUNT, evaluated under a lock, against memory that is not
-/// KV: `(limit - fixed_footprint) / per_conversation`. `fixed_footprint` is the
-/// expert cache plus dense weights — everything the pool holds that a scan can
-/// never free — and `per_conversation` is measured live. Workers then queue on
-/// the count instead of racing a gauge that lags them.
-fn max_live_conversations() -> Option<usize> {
+/// A stale report is worse than none: pacing on figures from ten seconds ago
+/// would let the pool run away exactly when the engine has stalled. Stale is
+/// measured against the engine's own cadence — two of its publishing intervals
+/// plus a wave's worth of slack — not a constant: a fixed five seconds read a
+/// report one wave old as stale for 95 fills of one run, with waves running
+/// three to five seconds, and held the producer while the queue ran empty.
+fn engine_admission() -> Option<AdmissionSection> {
     let (report, age_ms) = candle_conversation::memory_report::latest()?;
-    if age_ms > 10_000 {
+    let cadence = report.admission.publish_interval_ms.max(1_000);
+    if age_ms > 2 * cadence + 2_000 {
+        // At most one line a second across every worker: the numbers are what
+        // matter, and every held worker asks ten times a second.
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+            *last = Some(std::time::Instant::now());
+            tracing::debug!(
+                target: "zend::repo_scan",
+                age_ms,
+                cadence_ms = cadence,
+                "scan pool: engine report is stale",
+            );
+        }
         return None;
     }
-    let kv = kv_reserved(&report);
-    let vram = report.vram?;
-    let governor = vram.governor?;
-    if governor.capacity_bytes == 0 {
-        return None;
-    }
-    Some(scan_width(
-        governor.capacity_bytes,
-        governor.pool_cushion_bytes,
-        vram.pool_used_bytes,
-        kv,
-        SCAN_KV_BASELINE.load(Ordering::Relaxed),
-        SCAN_LIVE_CONVS.load(Ordering::Relaxed),
-    ))
+    Some(report.admission)
 }
 
-/// Total reserved KV arena bytes in a memory report — the quantity the arena
-/// allocator's ceiling actually counts, summed over every size class.
-fn kv_reserved(report: &MemoryReport) -> u64 {
-    report
-        .kv
-        .classes
-        .iter()
-        .fold(0u64, |acc, c| acc.saturating_add(c.reserved_bytes))
+/// Why the gate is holding a worker back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// This pool has opened conversations the engine's report does not yet
+    /// show, beyond the ramp slack — the report is a wave behind, so the pool
+    /// would be opening blind.
+    Unreflected { live: usize, reflected: usize },
+    /// The pool has run away: more conversations open than any healthy state
+    /// explains. See [`SCAN_RUNAWAY_CEILING`].
+    Runaway { live: usize, ceiling: usize },
+    /// The weight zone has been pushed down to the hold: one more conversation
+    /// would come out of the resident experts.
+    Residency { zone_mib: u64, hold_mib: u64 },
 }
 
-/// The count bound, as arithmetic over the report's figures alone.
-///
-/// `(capacity - scratch_margin - fixed - baseline) / per_conversation`, where
-/// `fixed` is what the pool holds that no scan decision can release — the expert
-/// cache plus dense weights — `baseline` is the inherited pre-scan KV corpus
-/// (see [`SCAN_KV_BASELINE`]), and `per_conversation` is measured from the
-/// pool's own growth.
-///
-/// Numerator and denominator must price the same bytes. `fixed` is
-/// `pool_used - kv`, so subtracting it alone hands *every* KV byte back as room
-/// for new conversations — including the inherited corpus, which is resident,
-/// is not the scan's to spend, and is precisely what `per_conversation_kv`
-/// excludes on the other side of the divide. On the measured report below that
-/// counted ~2 GiB of standing arenas as free space and opened ten directories
-/// against room for six.
-///
-/// The thing that costs VRAM is an *open conversation*: it pins its K/V until
-/// its chain completes, and while it is live its K sits in `R16` (4 bytes per
-/// element) and its V in F16, so a directory costs several times what the same
-/// turns cost once sealed and quantized. Admission cannot substitute for this
-/// bound — it throttles prefill *submission*, and by then the conversation
-/// exists and its K/V is already pinned.
-///
-/// The margin held back is the governor's OWN `scratch_margin`, not a fraction
-/// of capacity. A fraction double-charges the expert cache: `fixed` subtracts it
-/// explicitly, then the fraction holds back a share of capacity that is mostly
-/// the same bytes again. Measured on the 16 GiB card, a 0.70 fraction left the
-/// gate 1.87 GiB for scan KV while the governor had ~5 GiB floored for exactly
-/// that — under half the room, and width is what the whole pool is for: up to
-/// the point the card sustains, a wave's throughput scales with the sequences it
-/// carries, because the expert load amortizes across them (prefill 188 t/s at
-/// one sequence against 699 at four; decode 3.4 against 15.9 at nine). Holding
-/// back the scratch margin instead spends the room the governor already reserved
-/// for KV — while [`SCAN_CONV_KV_MIN`] keeps the resulting width on the safe
-/// side of that point.
-fn scan_width(
-    capacity: u64,
-    scratch_margin: u64,
-    pool_used: u64,
-    kv: u64,
-    baseline: u64,
-    live: usize,
-) -> usize {
-    let fixed = pool_used.saturating_sub(kv);
-    let for_kv = capacity
-        .saturating_sub(scratch_margin)
-        .saturating_sub(fixed)
-        .saturating_sub(baseline);
-    let per_conv = per_conversation_kv(kv, baseline, live);
-    ((for_kv / per_conv.max(1)) as usize).clamp(1, REPO_MAP_PARALLELISM)
-}
-
-/// What one more open directory conversation is expected to cost the pool.
-///
-/// Measured rather than assumed, and measured against the pool's OWN growth:
-/// the estimate prices `kv - baseline`, never the whole process's arenas (see
-/// [`SCAN_KV_BASELINE`]). Clamped so a cold start cannot admit unboundedly and
-/// one atypical directory cannot stall the scan.
-fn per_conversation_kv(kv: u64, baseline: u64, live: usize) -> u64 {
-    let grown = kv.saturating_sub(baseline);
-    if live > 0 && grown > 0 {
-        (grown / live as u64).clamp(SCAN_CONV_KV_MIN, SCAN_CONV_KV_MAX)
-    } else {
-        SCAN_CONV_KV_MIN
+impl fmt::Display for Hold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Hold::Unreflected { live, reflected } => write!(
+                f,
+                "{live} open here but the engine reports {reflected} — waiting for it to catch up"
+            ),
+            Hold::Runaway { live, ceiling } => write!(
+                f,
+                "{live} conversations open, past the runaway ceiling of {ceiling}"
+            ),
+            Hold::Residency { zone_mib, hold_mib } => write!(
+                f,
+                "weight zone {zone_mib}MiB is down to its {hold_mib}MiB hold — \
+                 one more would evict resident experts"
+            ),
+        }
     }
 }
 
-/// Reserved KV present when the pool opened — the corpus the scan did not
-/// create, and cannot free by finishing a directory.
+/// Conversations this pool may run ahead of the engine's report of them.
 ///
-/// The tool sections, the base builder's prefill and the calibration exemplars
-/// all live in the same arenas the report totals, and together they run to
-/// gigabytes before a single directory is opened. Charging that to the handful
-/// of conversations in flight pins [`per_conversation_kv`] to
-/// [`SCAN_CONV_KV_MAX`] and throttles the pool to a width of two on a card with
-/// room for more — and the error compounds in the wrong direction, since fewer
-/// live conversations divide the same fixed corpus into a larger per-conversation
-/// estimate. Pricing the delta instead leaves exactly the part a scan decision
-/// influences: a completed directory demotes to the warm tier and gives its
-/// arenas back, so the delta tracks what is genuinely in flight.
-static SCAN_KV_BASELINE: AtomicU64 = AtomicU64::new(0);
+/// The report publishes at the wave cadence, ~2 s; a worker opens and submits
+/// in well under that. Without this bound the gate reads the same "empty"
+/// report for every worker in the burst and admits them all — measured, 96
+/// opened in the first second of a pass, which is the herd every other signal
+/// exists to prevent. Four keeps the pool feeding a report interval ahead
+/// without ever being more than one interval blind.
+const SCAN_OPEN_SLACK: usize = 4;
 
-/// Re-anchor [`SCAN_KV_BASELINE`] on the arenas already in place, so the pool
-/// about to open prices only the KV it goes on to create. Called once per pass,
-/// before any worker claims a directory.
-fn anchor_scan_kv_baseline() {
-    let baseline = candle_conversation::memory_report::latest()
-        .map(|(report, _age_ms)| kv_reserved(&report))
-        .unwrap_or(0);
-    SCAN_KV_BASELINE.store(baseline, Ordering::Relaxed);
-    tracing::debug!(
-        target: "zend::repo_scan",
-        baseline_bytes = baseline,
-        "scan pool: per-conversation KV estimate anchored on the pre-scan corpus",
-    );
+/// Open conversations past which this pool is malfunctioning rather than busy.
+///
+/// **Runaway protection only — never tune this for throughput.** It exists so a
+/// bug (a worker loop that never closes a conversation, a report that never
+/// arrives) cannot open conversations without bound. It is deliberately far
+/// above any healthy state: a normal pass on the 16 GB card sits around twenty,
+/// and the worst measured pathology reached eighty-three. If a run is ever held
+/// here, that is a defect to find, not a number to lower.
+///
+/// It is a flat count and not scaled from the card, the model or the engine's
+/// width, because it is not sizing anything — the wave's own claim-and-refuse
+/// does the sizing on every machine. A larger card simply never approaches it.
+const SCAN_RUNAWAY_CEILING: usize = 256;
+
+/// Whether a worker may open a conversation while `live` are already open.
+///
+/// # This gate is runaway protection. It is NOT flow control.
+///
+/// **Never pace the wave from here.** The wave paces itself: every admission in
+/// `interleave::fill` claims that sequence's KV and its per-sequence model state
+/// through the real allocators, and a refusal is the device itself saying the
+/// wave is as wide as it carries. Nothing this producer can compute adds to
+/// that answer, and anything it computes *instead* is a proxy for it.
+///
+/// Every proxy tried here has been falsified on hardware
+/// (`docs/wave_feeder.md` §4.5–§4.11): a residency estimate, a controller
+/// climbing open conversations against measured throughput, a backlog
+/// watermark, a queue-length mark, and an open-conversation mark scaled from
+/// the engine's wave width. The last of those is why this function is now four
+/// lines. It held the pool at ~21 conversations against a mark of 15-19 for
+/// **409 seconds** of a single run, starving the queue to a mean depth of 6
+/// against a ten-wide wave — while the failure it claimed to prevent happened
+/// anyway, at a *constant* 21 open: free KV regions went 41 → 0 → 149 through
+/// a collapse and a recovery without the open count moving at all. It was
+/// throttling throughput and protecting nothing.
+///
+/// The deeper reason it could not work: `wave_width` is measured from the
+/// expert-union curve of one forward — how many rows fit in a single step. How
+/// many conversations may safely be *open* is a different quantity entirely,
+/// and scaling one from the other is the proxy error this whole design arc is a
+/// catalogue of.
+///
+/// # What is left, and why each is not flow control
+///
+/// * `live == 0` always opens. A pool whose only route to freeing the device is
+///   finishing work it is not allowed to start would deadlock.
+/// * [`SCAN_RUNAWAY_CEILING`] — an absolute bound on unbounded growth, far
+///   above any healthy state, so it never binds in normal operation.
+/// * The ramp bound below — how fast conversations may open *between reports*,
+///   so the pool does not open as a herd against one stale reading. A bound on
+///   rate, not on capacity.
+/// * The weight zone against its hold — the one resource that opening a
+///   conversation can spend irrecoverably, because K/V and the expert weights
+///   share one elastic span. This is a *measured* quantity the engine
+///   publishes, not a count standing in for it.
+///
+/// If the engine cannot keep up, that shows as the allocators refusing claims,
+/// and the fix belongs there — in what the engine can shed — not in a producer
+/// that declines to hand it work.
+fn gate_decision(live: usize, admission: Option<&AdmissionSection>) -> Result<(), Hold> {
+    if live == 0 {
+        return Ok(());
+    }
+    if live >= SCAN_RUNAWAY_CEILING {
+        return Err(Hold::Runaway {
+            live,
+            ceiling: SCAN_RUNAWAY_CEILING,
+        });
+    }
+    // How far the pool may run ahead of the report, which is a RAMP bound, not
+    // a capacity one: it says how fast conversations may be opened between two
+    // reports, never how many may exist. Without it the whole pool reads the
+    // same stale "empty" report and opens as one — measured, 96 in the first
+    // second of a pass. No report at all is the same condition with nothing
+    // reflected yet, so it ramps from zero rather than being a special case.
+    let reflected = admission.map_or(0, |a| a.open_slots);
+    let burst = admission.map_or(SCAN_OPEN_SLACK, |a| (a.wave_width / 2).max(SCAN_OPEN_SLACK));
+    if live > reflected.saturating_add(burst) {
+        return Err(Hold::Unreflected { live, reflected });
+    }
+    // **The one resource this gate spends, measured rather than modelled.**
+    // The KV side and the weight side share one elastic span, so every open
+    // conversation's K/V comes out of somewhere — and once the zone is down to
+    // its hold, what it comes out of is the resident experts. An engine that
+    // streams its experts is slower at everything, including finishing the
+    // conversations that would give the ground back, so this is the one place
+    // holding actually buys something.
+    //
+    // Above the hold the gate opens: headroom is there to be used, and the
+    // wave's own claim-and-refuse decides what fits in any given forward.
+    if let Some(a) = admission {
+        if a.weight_hold_bytes > 0 && a.weight_zone_bytes <= a.weight_hold_bytes {
+            return Err(Hold::Residency {
+                zone_mib: a.weight_zone_bytes >> 20,
+                hold_mib: a.weight_hold_bytes >> 20,
+            });
+        }
+    }
+    Ok(())
 }
 
-/// Pool width from the VRAM governor, for the moment BEFORE any memory report
-/// exists.
-///
-/// The scan starts before the scheduler has published its first report — the
-/// walk runs between calibration and the pool — so [`max_live_conversations`]
-/// has nothing to read and every worker would fall back to the full constant.
-/// The governor is live from model load, and its headroom at this instant is
-/// exactly the VRAM left after weights and the expert cache: the room a scan's
-/// conversations have to share.
-///
-/// A slice is held back for wave activations (measured at ~1 GiB for a wide
-/// prefill, and the wall is only reached when a wave lands on a high base), and
-/// the rest is divided by the per-conversation KV estimate.
-fn scan_width_from_governor() -> Option<usize> {
-    let gov = candle::vram::get(0)?;
-    let headroom = gov.measure().ok()?.headroom;
-    let for_kv = headroom.saturating_sub(SCAN_ACTIVATION_RESERVE);
-    Some(((for_kv / SCAN_CONV_KV_MIN) as usize).clamp(1, REPO_MAP_PARALLELISM))
-}
-
-/// Held back from the scan's share for a wave's transient activations. Measured
-/// at 666-1005 MiB across prefill waves on Qwen3-30B-A3B; the failures all
-/// occurred when a wave of that size landed on an already-high base.
-const SCAN_ACTIVATION_RESERVE: u64 = 1536 * 1024 * 1024;
-
-/// Live conversation count, readable by [`max_live_conversations`] for its
-/// per-conversation estimate without threading the counter through.
-static SCAN_LIVE_CONVS: AtomicUsize = AtomicUsize::new(0);
-
-/// Floor/ceiling on the per-conversation KV estimate.
-///
-/// The floor is measured, not guessed: a 24-conversation burst drove KV arenas
-/// to 5760 MiB, i.e. ~240 MiB of LIVE KV each — and arenas reserve roughly
-/// twice what they hold live (2560 MiB reserved against 1360 live in a steady
-/// sample), because each format keeps its own partially-filled 16 MiB slabs.
-/// So a conversation costs the pool about 480 MiB of *reserved* arena, which is
-/// the quantity the allocator's ceiling actually counts.
-///
-/// The doubling is NOT slack, and halving it to price only the live half is a
-/// measured dead end. The argument for halving is that slab waste belongs to a
-/// *format* rather than to a conversation, so the marginal directory should not
-/// pay it twice; the card says otherwise. At 256 MiB the gate opened 19
-/// directories on the 16 GiB card and the pass hit the wall inside two minutes:
-/// `pool_reserved=14976MiB` against `pool_used=13560MiB` — a 1415 MiB gap of
-/// reserved-but-unfilled arena — 18 MiB free, a 16 MiB quantized arena refused
-/// with `arenas_freed=0`, a device OOM that halved the admission budget, and 15
-/// directories lost in a single millisecond. The gap is exactly the slab
-/// overhead, and it scales with concurrently-live conversations, because each
-/// one's chunks land in different format arenas at different fill levels.
-///
-/// It was also slower, which is the part worth remembering: 10 s per directory
-/// against 6.82 at width 10, with decode throughput at nine co-batched sequences
-/// falling from 15.9 tok/s to 7.9 and degrading further past ten. Past the wall
-/// the extra width buys eviction churn, not throughput.
-const SCAN_CONV_KV_MIN: u64 = 480 * 1024 * 1024;
-const SCAN_CONV_KV_MAX: u64 = 768 * 1024 * 1024;
-
-/// Block until the KV pool has room for another open conversation, then COUNT
+/// Block until the engine has room for another open conversation, then COUNT
 /// THIS ONE IN before releasing the gate.
 ///
-/// `live` is the count of conversations this pool currently holds open. When it
-/// is zero the wait is skipped unconditionally — one conversation must always be
-/// able to proceed, or a pool whose only route to freeing VRAM is finishing the
-/// work it is not allowed to start would deadlock.
+/// `live` is the count of conversations this pool currently holds open. The
+/// decision is [`gate_decision`]; this is the loop around it.
 ///
 /// The reservation happens under the SAME lock as the decision, and that is the
 /// whole point. Deciding under the lock and incrementing after it re-opens the
@@ -345,65 +313,70 @@ const SCAN_CONV_KV_MAX: u64 = 768 * 1024 * 1024;
 /// pre-increment count, each concludes there is room for one more, and they all
 /// proceed — a narrower replay of the herd that put exactly 24 conversations on
 /// the card at once and produced `n_failed = 24` under every configuration.
-/// Callers must therefore pair this with [`release_scan_slot`] on every exit
-/// path, including failures.
+///
+/// **There is no wait cap.** One existed — twenty seconds, after which a worker
+/// took its slot regardless — and it is how 95 conversations came to be open
+/// against a limit of 7: every hold expired into an admission. A hold here ends
+/// only when the engine says there is room, and there is no state in which that
+/// never happens: the conversations already open are being stepped (or the
+/// engine reports them starved, and steps them as ground frees), and every one
+/// that finishes gives its ground back.
 fn reserve_scan_slot(live: &AtomicUsize) {
-    // Serialises the decision so workers cannot all read the same pre-allocation
-    // state and admit together (see `max_live_conversations`).
     static GATE: Mutex<()> = Mutex::new(());
-    let start = std::time::Instant::now();
-    let mut logged = false;
+    let started = std::time::Instant::now();
+    let mut last_logged: Option<Hold> = None;
+    let mut last_log_at = std::time::Instant::now();
     loop {
-        let cap = {
+        let hold = {
             let _turn = GATE.lock().unwrap_or_else(|e| e.into_inner());
-            let cap = max_live_conversations();
             let now = live.load(Ordering::Relaxed);
-            // Always let one through: a pool whose only route to freeing VRAM is
-            // finishing work it is not allowed to start would deadlock.
-            match cap {
-                Some(c) if now >= c && now > 0 => c,
-                _ => {
+            match gate_decision(now, engine_admission().as_ref()) {
+                Ok(()) => {
                     take_scan_slot(live);
+                    if last_logged.is_some() {
+                        tracing::debug!(
+                            target: "zend::repo_scan",
+                            held_ms = started.elapsed().as_millis() as u64,
+                            live_conversations = live.load(Ordering::Relaxed),
+                            "scan pool: released after holding",
+                        );
+                    }
                     return;
                 }
+                Err(hold) => hold,
             }
         };
-        if start.elapsed() >= SCAN_POOL_WAIT_CAP {
-            // Waited long enough that stalling the whole ingest is the worse
-            // outcome. Still taken under the gate, so the count stays exact.
-            let _turn = GATE.lock().unwrap_or_else(|e| e.into_inner());
-            take_scan_slot(live);
-            return;
-        }
-        if !logged {
-            logged = true;
+        // Log the hold when it starts, when its reason changes, and every ten
+        // seconds while it lasts — a hold logged once at its start was 86
+        // workers reading "mark of 10" for twenty minutes in a run whose gate
+        // had long since said something else.
+        let changed = last_logged != Some(hold);
+        if changed || last_log_at.elapsed() >= std::time::Duration::from_secs(10) {
+            last_logged = Some(hold);
+            last_log_at = std::time::Instant::now();
             tracing::debug!(
                 target: "zend::repo_scan",
                 live_conversations = live.load(Ordering::Relaxed),
-                max_live = cap,
-                "scan pool: waiting for KV room before opening another directory",
+                held_ms = started.elapsed().as_millis() as u64,
+                %hold,
+                "scan pool: holding before opening another directory",
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-/// Count one conversation in, on both the pool-local and process-wide gauges.
-/// Called only with the reservation gate held.
+/// Count one conversation in. Called only with the reservation gate held.
 fn take_scan_slot(live: &AtomicUsize) {
     live.fetch_add(1, Ordering::Relaxed);
-    SCAN_LIVE_CONVS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Holds one admitted conversation's slot on both gauges, and gives it back on
-/// drop.
+/// Holds one admitted conversation's slot, and gives it back on drop.
 ///
-/// A guard rather than a paired release call: `SCAN_LIVE_CONVS` is
-/// process-global and never reset, so a slot lost to an unwind is lost for the
-/// life of the daemon. One panic inside an ingest — where the failure paths
-/// already tolerate a directory going wrong — would leave the gate permanently
-/// believing a conversation is open, and enough of them throttle every later
-/// pass toward a width of one.
+/// A guard rather than a paired release call, so a slot lost to an unwind is
+/// not lost for the pass: one panic inside an ingest — where the failure paths
+/// already tolerate a directory going wrong — would otherwise leave the gate
+/// believing a conversation is open for as long as the pool runs.
 struct ScanSlot<'a> {
     live: &'a AtomicUsize,
 }
@@ -420,7 +393,6 @@ impl<'a> ScanSlot<'a> {
 impl Drop for ScanSlot<'_> {
     fn drop(&mut self) {
         self.live.fetch_sub(1, Ordering::Relaxed);
-        SCAN_LIVE_CONVS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -497,6 +469,7 @@ pub fn ingest_repo_map(
     progress: &Arc<LoadProgress>,
     layer_name: &str,
     group_name: &str,
+    wipe_metadata: bool,
 ) -> anyhow::Result<(RepoMap, DirState, IngestReport)> {
     let map = walk_workspace(workspace);
     let units = build_units(&map, workspace);
@@ -511,7 +484,64 @@ pub fn ingest_repo_map(
         "repo map walk complete; ingesting one conversation per directory",
     );
 
-    let plan = IngestPlan::new(engine, &proj_builder, &config, layer_name, group_name)?;
+    // The directory-frequency index spans the WHOLE workspace and is built
+    // before any directory is ingested. A document frequency computed over a
+    // partial corpus is meaningless — every term looks rare when most
+    // directories have not been counted — so this cannot be built incrementally
+    // as the pool advances.
+    let index = Arc::new(probe::idf::TermIndex::build(&units, &map));
+    tracing::info!(
+        target: "zend::repo_scan::probe",
+        n_dirs = index.n_dirs(),
+        rarity_gate = index.rarity_gate(),
+        n_symbol_files = map.symbols.len(),
+        "probe term index built",
+    );
+
+    // `--wipe-metadata`: drop every `.substrate.yaml` before the skeletons are
+    // seeded, so this boot regenerates them all. Keyed on the walked units, so
+    // it can only remove files in directories this workspace actually walked.
+    if wipe_metadata {
+        let removed = metadata::wipe(workspace, &units);
+        tracing::info!(
+            target: "zend::repo_scan::metadata",
+            removed,
+            "--wipe-metadata: folder metadata deleted; it will be regenerated",
+        );
+    }
+    // Seed a skeleton in every folder that has none, so the shape is
+    // discoverable: a person browsing the tree finds the file already there with
+    // its registers named, rather than having to know it could exist. Existing
+    // files are never touched.
+    let seeded = metadata::seed_skeletons(workspace, &units, |unit| {
+        index
+            .distinctive(&unit.dir, probe::render::seed_count())
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    });
+    let authored = units
+        .iter()
+        .filter_map(|u| metadata::load(workspace, u))
+        .filter(|m| m.is_complete())
+        .count();
+    tracing::info!(
+        target: "zend::repo_scan::metadata",
+        seeded,
+        complete = authored,
+        of = units.len(),
+        "folder metadata ready ({} directories need no generation)",
+        authored,
+    );
+
+    let plan = IngestPlan::new(
+        engine,
+        &proj_builder,
+        &config,
+        layer_name,
+        group_name,
+        Arc::clone(&index),
+    )?;
     // Retire conversations for directories that no longer exist, then snapshot
     // the surviving hashes once for O(1) per-unit resume-cache probes.
     let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
@@ -562,12 +592,23 @@ pub fn refresh_repo_map(
         "repo map refresh: re-ingesting changed directories",
     );
 
+    let index = Arc::new(probe::idf::TermIndex::build(&units, map));
+    // A refresh never wipes: it re-ingests changed directories only, and the
+    // metadata for every unchanged one is exactly what it should keep.
+    metadata::seed_skeletons(workspace, &units, |unit| {
+        index
+            .distinctive(&unit.dir, probe::render::seed_count())
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    });
     let plan = IngestPlan::new(
         ctx.engine,
         &ctx.proj_builder,
         &ctx.config,
         layer_name,
         group_name,
+        index,
     )?;
     let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
     reconcile_deleted(ctx.engine, &present);
@@ -586,7 +627,24 @@ struct IngestPlan {
     group: GroupId,
     proj_builder: projection::Builder,
     system_prompt: String,
+    /// System prompt for the throwaway probe-generation conversations — the
+    /// question-writer framing rather than the summariser's.
+    probe_prompt: String,
+    /// System prompt for the per-folder probe-ANSWERING conversations, framed to
+    /// answer with a `<think>` block rather than to summarise without one.
+    answer_prompt: String,
     config: SequenceConfig,
+    /// Directory-frequency index over the whole workspace, built once. Shared
+    /// by every worker: it is read-only after construction, and it has to span
+    /// the *whole* corpus for a document frequency to mean anything.
+    index: Arc<probe::idf::TermIndex>,
+    /// Filler that pads each stuffed probe case out to its block boundary.
+    ///
+    /// The dialect's turn terminator rather than an arbitrary id: it is a token
+    /// the model has seen in exactly this position ten thousand times, so a run
+    /// of them is the most inert tail available, and it lands in the assistant
+    /// half where nothing scores it. Same choice the tool calibration makes.
+    pad_token: u32,
 }
 
 impl IngestPlan {
@@ -596,6 +654,7 @@ impl IngestPlan {
         config: &SequenceConfig,
         layer_name: &str,
         group_name: &str,
+        index: Arc<probe::idf::TermIndex>,
     ) -> anyhow::Result<Self> {
         let layer = proj_builder
             .id_for_layer(layer_name)
@@ -607,13 +666,33 @@ impl IngestPlan {
         // summaries score self-local during ingest, so a summary is grounded in its
         // own folder rather than derailed by cross-directory retrieval.
         validate_summarize_branch(proj_builder)?;
+        let pad_token = {
+            let e = engine.lock().unwrap();
+            e.tokenizer()
+                .encode(config.dialect.assistant_end, false)
+                .ok()
+                .and_then(|enc| enc.get_ids().last().copied())
+                .unwrap_or(0)
+        };
         engine.lock().unwrap().mark_layer_append_only(layer);
         Ok(Self {
             layer,
             group,
             proj_builder: proj_builder.clone(),
             system_prompt: layer_system_prompt(proj_builder, layer_name, config),
+            // Generation: thinking suppressed — its budget is for questions.
+            // Answering: thinking KEPT, because the `<think>` block is exactly
+            // the reasoning-shaped signature a mid-decode scan matches against.
+            probe_prompt: probe_generation_prompt(proj_builder, config),
+            answer_prompt: branch_system_prompt(
+                proj_builder,
+                config,
+                probe_pass::ANSWER_BRANCH,
+                false,
+            ),
             config: utility_config(config.clone()),
+            index,
+            pad_token,
         })
     }
 }
@@ -625,14 +704,20 @@ impl IngestPlan {
 /// supersedes its own stale generation.
 fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present: &HashSet<&str>) {
     let e = engine.lock().unwrap();
-    for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
-        if !present.contains(dir.as_str()) {
-            if let Err(err) = e.tombstone_timeline(tl) {
-                tracing::warn!(
-                    target: "zend::repo_scan",
-                    dir = %dir,
-                    "tombstone of removed directory's conversation failed: {err:#}",
-                );
+    // Both keys: a directory's summary conversation carries `DIR_KEY`, its probe
+    // conversation `PROBE_DIR_KEY`. Sweeping only the first would leave a deleted
+    // folder's probes live and voting in every scan, with no summary behind them
+    // to retrieve.
+    for key in [DIR_KEY, PROBE_DIR_KEY] {
+        for (tl, dir) in e.conversations_with_metadata_key(key) {
+            if !present.contains(dir.as_str()) {
+                if let Err(err) = e.tombstone_timeline(tl) {
+                    tracing::warn!(
+                        target: "zend::repo_scan",
+                        dir = %dir, key,
+                        "tombstone of removed directory's conversation failed: {err:#}",
+                    );
+                }
             }
         }
     }
@@ -692,9 +777,6 @@ fn run_dir_pool(
 ) -> IngestReport {
     let total = units.len();
     progress.set_step_progress(0, total as u64);
-    // Price the pool against the arenas it is about to add, not the ones it
-    // inherits. Must precede the width sizing below, which reads the estimate.
-    anchor_scan_kv_baseline();
     // One snapshot of the live hashes drives every worker's O(1) resume probe.
     let present_hashes = engine
         .lock()
@@ -713,6 +795,11 @@ fn run_dir_pool(
     // the daemon. The cap still stops a flood — `failures.set_abort()` — but as
     // reported state, not as a fatal error. See `report`.
     let failures = Failures::new();
+    // Every directory's admitted + held-out probes, collected for the holdout
+    // file and the pass summary. Bounded by the workspace's directory count, so
+    // a few hundred small structs.
+    let probes: Mutex<Vec<probe::ProbeSet>> = Mutex::new(Vec::new());
+    let probe_stats: Mutex<probe_pass::ProbeStats> = Mutex::new(Default::default());
 
     std::thread::scope(|s| {
         // Size the pool to the CARD before spawning, not to a constant.
@@ -732,14 +819,21 @@ fn run_dir_pool(
         // Over-subscription there is not a slowdown — the wave's transient tier
         // fails and the ingest aborts, losing files (see the table on
         // `MAX_SCOPE_LINES`). Start conservative and let the runtime gate widen.
-        let n_workers = max_live_conversations()
-            .or_else(scan_width_from_governor)
-            .unwrap_or(REPO_MAP_BLIND_PARALLELISM);
+        // **The pool starts WIDE and is paced by the queue, not sized by the
+        // card.** A worker blocked in `reserve_scan_slot` holds no conversation
+        // and no K/V — it is a parked thread — so the thread count costs
+        // essentially nothing and only decides how quickly the queue can be
+        // refilled once it drains. Sizing it from residency is what produced
+        // `n_workers=1` against a healthy expert cache, and a queue that never
+        // held more than one candidate across 226 waves.
+        //
+        // Bounded by the smaller of the measured ceiling and the directories
+        // there actually are: spawning more threads than units is pure waste.
+        let n_workers = REPO_MAP_PARALLELISM.min(units.len().max(1));
         tracing::info!(
             target: "zend::repo_scan",
             n_workers,
-            ceiling = REPO_MAP_PARALLELISM,
-            "repo map pool width sized to available KV",
+            "repo map pool started wide; paced only by the engine's residency",
         );
         let mut handles = Vec::with_capacity(n_workers);
         for _ in 0..n_workers.max(1) {
@@ -785,7 +879,16 @@ fn run_dir_pool(
                         // decide against this state, and an unwind cannot leak
                         // it from the process-global gauge.
                         let _slot = ScanSlot::reserve(&live_convs);
-                        process_one_dir(engine, plan, &ctx, &units[idx], &failures)
+                        process_one_dir(
+                            engine,
+                            plan,
+                            &ctx,
+                            &units[idx],
+                            &failures,
+                            &probes,
+                            &probe_stats,
+                            workspace,
+                        )
                     };
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     progress.set_step_progress(d as u64, total as u64);
@@ -816,6 +919,36 @@ fn run_dir_pool(
     // max, so the last stored value can settle a step short even though every
     // unit ran.
     progress.set_step_progress(total as u64, total as u64);
+
+    // The holdout file is written OUTSIDE the substrate, deliberately. These
+    // queries exist to be scored against a corpus that has never seen them, so
+    // persisting them anywhere the scan can reach would destroy the only
+    // measurement that says whether any of this worked.
+    let sets = probes.into_inner().unwrap_or_else(|e| e.into_inner());
+    let stats = probe_stats.into_inner().unwrap_or_else(|e| e.into_inner());
+    // A final rewrite. Each directory already wrote the file as it finished (see
+    // `process_one_dir`), so this only closes the last one out — but it is the
+    // write that runs even when the pass admitted nothing at all, which is the
+    // difference between an empty holdout file and no file for the harness to
+    // open.
+    if let Err(e) = probe_pass::write_holdout(workspace, &sets) {
+        tracing::warn!(
+            target: "zend::repo_scan::probe",
+            "probe holdout file not written — the retrieval harness has nothing to score: {e:#}",
+        );
+    }
+    tracing::info!(
+        target: "zend::repo_scan::probe",
+        dirs_generated = stats.dirs_generated,
+        dirs_complete = stats.dirs_complete,
+        probes_ingested = stats.probes_ingested,
+        held_out = stats.held_out,
+        dirs_without_seeds = stats.dirs_without_seeds,
+        by_register = ?stats.by_register,
+        rejections = ?stats.rejections,
+        "probe layer complete",
+    );
+
     let report = failures.into_report(total);
     // Say "incomplete" when it is incomplete. The old line said "complete" with
     // the failure count as a field, so a quarter-empty map read as success at a
@@ -848,12 +981,16 @@ fn run_dir_pool(
 /// A per-directory ingest failure is TOLERATED up to [`MAX_DECODE_FAILURES`]:
 /// the attempt's partial is tombstoned, the prior generation is left live, and
 /// the unit simply misses the resume cache next run and is retried.
+#[allow(clippy::too_many_arguments)]
 fn process_one_dir(
     engine: &Mutex<ConversationEngine>,
     plan: &IngestPlan,
     ctx: &ToolContext,
     unit: &DirUnit,
     failures: &Failures,
+    probes: &Mutex<Vec<probe::ProbeSet>>,
+    stats: &Mutex<probe_pass::ProbeStats>,
+    holdout_root: &Path,
 ) -> anyhow::Result<()> {
     // Render BEFORE minting anything: the tool responses come from actually
     // running the tools, so a directory the tools can't read is caught here and
@@ -889,6 +1026,12 @@ fn process_one_dir(
     let (mut conv, superseded) = {
         let e = engine.lock().unwrap();
         let mut superseded = Vec::new();
+        // The prior generation's PROBE conversation is superseded too. It carries
+        // its own key, so the `DIR_KEY` scan below cannot see it — and left alone
+        // it would survive this re-ingest and vote in every scan alongside the
+        // replacement probes, permanently doubling the folder's weight with
+        // questions written against content that has since changed.
+        superseded.extend(e.find_conversations_by_metadata(PROBE_DIR_KEY, &unit.dir));
         for tl in e.find_conversations_by_metadata(DIR_KEY, &unit.dir) {
             let is_good = e
                 .conversation_metadata(tl)
@@ -1013,6 +1156,39 @@ fn process_one_dir(
         }
     };
 
+    // ── Probe layer ──────────────────────────────────────────────────────────
+    // Generate this folder's questions, admit them, and decode each as a turn
+    // on THIS conversation.
+    //
+    // Runs BEFORE the hash tag below, which is what commits the generation. A
+    // crash here therefore re-ingests the whole directory next run — summary and
+    // probes together — rather than leaving it marked complete with a partial
+    // probe set that the resume cache would skip forever.
+    let probe_set = run_probe_pass(engine, plan, &mut conv, unit, holdout_root);
+    if let Some((set, had_seeds)) = probe_set {
+        stats.lock().unwrap().merge(&set, had_seeds);
+        // Rewritten after EVERY directory, not once when the pool drains.
+        //
+        // The held-out queries exist only in memory until this lands, and they
+        // are produced only for directories processed in *this* pass — a
+        // directory that resume-cache hits contributes nothing. So a pool that
+        // is interrupted, aborted, or simply still running at the end of a
+        // session would leave no scoreable corpus at all, and re-running would
+        // not recover it: the directories would hit the cache and be skipped.
+        //
+        // The file is a few hundred KB and the pool completes a directory every
+        // few minutes, so rewriting it whole is cheaper than the bookkeeping an
+        // append would need to stay deterministic.
+        let mut all = probes.lock().unwrap();
+        all.push(set);
+        if let Err(e) = probe_pass::write_holdout(holdout_root, &all) {
+            tracing::warn!(
+                target: "zend::repo_scan::probe",
+                "probe holdout write failed: {e:#}",
+            );
+        }
+    }
+
     let mut tags = BTreeMap::new();
     tags.insert("kind".to_string(), "repo_map".to_string());
     tags.insert(DIR_KEY.to_string(), unit.dir.clone());
@@ -1094,6 +1270,269 @@ fn process_one_dir(
     Ok(())
 }
 
+/// Metadata key naming the directory a PROBE conversation belongs to.
+///
+/// Separate from [`DIR_KEY`] on purpose — see the tagging site in
+/// [`run_probe_pass`]. Both are swept by [`reconcile_deleted`] so a removed
+/// directory takes its probes with it.
+const PROBE_DIR_KEY: &str = "probe_dir";
+
+/// Create the conversation a folder's probes are answered on: framed to answer,
+/// seeded with the folder's summary, and never cold-persisted before its own
+/// eviction.
+fn new_probe_conversation(
+    engine: &Mutex<ConversationEngine>,
+    plan: &IngestPlan,
+    unit: &DirUnit,
+    summary: &str,
+    chunk: &[probe::Probe],
+) -> Option<candle_conversation::Sequence> {
+    if chunk.is_empty() {
+        return None;
+    }
+    let mut conv = {
+        let e = engine.lock().unwrap();
+        match e.new_conversation_with_projection(
+            &plan.answer_prompt,
+            plan.proj_builder.clone(),
+            plan.layer,
+            plan.group,
+            plan.config.clone(),
+        ) {
+            Ok(c) => {
+                e.set_timeline_summarize(c.timeline_id(), false);
+                // Labelled with the BARE directory, exactly as its summary
+                // conversation is. The label is what a projection tile carries,
+                // and the retrieval harness matches tiles against the directory
+                // a probe was written about — so a decorated label ("… probes")
+                // makes every trial read as a miss and reports a formatting
+                // artifact as 0% retrieval. The `kind` metadata is what
+                // distinguishes the two conversations; the label is not.
+                if let Err(err) = e.set_conversation_label(c.timeline_id(), &unit.dir) {
+                    tracing::warn!(target: "zend::repo_scan::probe", "probe label set failed: {err:#}");
+                }
+                c
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "zend::repo_scan::probe",
+                    dir = %unit.dir,
+                    "probe conversation create failed: {err}",
+                );
+                return None;
+            }
+        }
+    };
+    if let Err(err) = probe_pass::seed_context(&mut conv, unit, summary) {
+        tracing::warn!(
+            target: "zend::repo_scan::probe",
+            dir = %unit.dir,
+            "probe context seed failed; probes will answer unGROUNDED: {err:#}",
+        );
+    }
+    Some(conv)
+}
+
+/// Generate, admit and ingest one directory's probes.
+///
+/// Returns the admitted set and whether the directory had any distinctive term
+/// to seed with, or `None` when generation failed outright.
+///
+/// **Never fatal.** A directory whose probes fail keeps its summary and its
+/// place in the map; the probe layer is an index over that summary, and a
+/// missing index entry costs retrieval quality for one folder where a propagated
+/// error would cost the folder itself. Every failure path here logs and returns.
+fn run_probe_pass(
+    engine: &Mutex<ConversationEngine>,
+    plan: &IngestPlan,
+    conv: &mut candle_conversation::Sequence,
+    unit: &DirUnit,
+    root: &Path,
+) -> Option<(probe::ProbeSet, bool)> {
+    let seeds = plan
+        .index
+        .distinctive(&unit.dir, probe::render::seed_count());
+    let had_seeds = !seeds.is_empty();
+    let summary = probe_pass::last_summary(conv);
+
+    // The folder's own `.substrate.yaml` comes first. A complete file means the
+    // questions are already written — by a previous run or, better, by a person —
+    // and the model is not asked for any. That is the whole point of the file:
+    // the expensive artifact survives `--wipe-substrate`, and a fresh substrate
+    // costs a prefill instead of a generation.
+    let mut meta = metadata::load(root, unit)
+        .unwrap_or_else(|| metadata::FolderMetadata::skeleton(unit, Vec::new()));
+    if meta.is_complete() {
+        let set = probe_pass::admit_authored(unit, &plan.index, &meta);
+        tracing::debug!(
+            target: "zend::repo_scan::probe",
+            dir = %unit.dir,
+            authored = meta.question_count(),
+            admitted = set.probes.len(),
+            "probes taken from folder metadata; no generation needed",
+        );
+        let ingested = ingest_probe_chunks(engine, plan, unit, &summary, &set);
+        tracing::debug!(
+            target: "zend::repo_scan::probe",
+            dir = %unit.dir, ingested, "authored probes ingested",
+        );
+        return Some((set, had_seeds));
+    }
+
+    // The generation conversation is a throwaway: it is created only to hold
+    // the evidence block and decode a list of questions, and its answer must
+    // never reach the layer (see `probe_pass`). Marked transient so its K/V is
+    // never cold-persisted, and tombstoned below on every path.
+    let mut gen_conv = {
+        let e = engine.lock().unwrap();
+        let created = e.new_conversation_with_projection(
+            &plan.probe_prompt,
+            plan.proj_builder.clone(),
+            plan.layer,
+            plan.group,
+            plan.config.clone(),
+        );
+        match created {
+            Ok(c) => {
+                e.conversation().mark_timeline_transient(c.timeline_id());
+                e.set_timeline_summarize(c.timeline_id(), false);
+                c
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "zend::repo_scan::probe",
+                    dir = %unit.dir,
+                    "probe generation conversation create failed: {err}",
+                );
+                return None;
+            }
+        }
+    };
+
+    let candidates = probe_pass::generate(&mut gen_conv, unit, &summary, &seeds);
+    let gen_timeline = gen_conv.timeline_id();
+    drop(gen_conv);
+    {
+        let e = engine.lock().unwrap();
+        if let Err(err) = e.tombstone_timeline(gen_timeline) {
+            tracing::warn!(
+                target: "zend::repo_scan::probe",
+                dir = %unit.dir,
+                "tombstone of probe generation conversation failed — its question list \
+                 is now live in the layer: {err:#}",
+            );
+        }
+    }
+
+    let candidates = match candidates {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(
+                target: "zend::repo_scan::probe",
+                dir = %unit.dir,
+                "probe generation failed; folder keeps its summary and no probes: {err:#}",
+            );
+            return None;
+        }
+    };
+
+    let set = probe_pass::admit(unit, &plan.index, &candidates);
+
+    // Write what was generated back to `.substrate.yaml` BEFORE ingesting it, so
+    // the cost is banked even if the ingest below is interrupted. Held-out
+    // queries are written too: they are the same quality of question and a
+    // person reading the file should see the folder's whole harvest, not the
+    // three-quarters that happened to fit.
+    meta.folder.path = unit.dir.clone();
+    meta.folder.content_hash = unit.content_hash.clone();
+    meta.folder.summary = summary.trim().to_string();
+    meta.folder.distinctive_terms = seeds.iter().map(|s| s.to_string()).collect();
+    for register in probe::Register::ALL {
+        let mut authored = meta.register(register);
+        for probe in set
+            .probes
+            .iter()
+            .chain(set.held_out.iter())
+            .filter(|p| p.register == register)
+        {
+            if !authored.iter().any(|q| q == &probe.text) {
+                authored.push(probe.text.clone());
+            }
+        }
+        meta.set_register(register, authored);
+    }
+    if let Err(e) = metadata::save(root, unit, &meta) {
+        tracing::warn!(
+            target: "zend::repo_scan::metadata",
+            dir = %unit.dir,
+            "could not save generated questions — they will be regenerated: {e:#}",
+        );
+    }
+
+    let ingested = ingest_probe_chunks(engine, plan, unit, &summary, &set);
+    tracing::debug!(
+        target: "zend::repo_scan::probe",
+        dir = %unit.dir,
+        seeds = seeds.len(),
+        candidates = candidates.iter().map(|(_, q)| q.len()).sum::<usize>(),
+        admitted = set.probes.len(),
+        ingested,
+        held_out = set.held_out.len(),
+        rejected = set.rejected.len(),
+        "probes generated",
+    );
+    Some((set, had_seeds))
+}
+
+/// Answer a directory's probes in bounded chunks, one conversation each.
+///
+/// The probes are answered on their OWN conversation, framed to answer rather
+/// than to summarise — see [`probe_pass`]. Under the folder conversation's
+/// summariser framing (`thinking_effort: off`) a probe would decode two terse
+/// sentences and no `<think>` block, and the reasoning-shaped signatures a
+/// mid-decode scan matches against would not exist at all.
+///
+/// Chunked because one conversation for all 24 accumulates ~8,000 tokens of live
+/// K/V per directory, which is what put the first full-workspace run into the
+/// partition wall at `dirs_generated=0`. Each chunk is evicted as soon as it is
+/// answered, so a directory's peak is its folder chain plus one chunk.
+fn ingest_probe_chunks(
+    engine: &Mutex<ConversationEngine>,
+    plan: &IngestPlan,
+    unit: &DirUnit,
+    summary: &str,
+    set: &probe::ProbeSet,
+) -> usize {
+    if candle_conversation::ingest_cancelled() {
+        return 0;
+    }
+    let Some(mut probe_conv) = new_probe_conversation(engine, plan, unit, summary, &set.probes)
+    else {
+        return 0;
+    };
+    let ingested = probe_pass::ingest(&mut probe_conv, &set.probes, &unit.dir, plan.pad_token);
+    let timeline = probe_conv.timeline_id();
+    let mut tags = BTreeMap::new();
+    tags.insert("kind".to_string(), "repo_map_probe".to_string());
+    // A key of its OWN, deliberately not `DIR_KEY`. `dir_state_from_substrate`
+    // joins DIR_KEY against HASH_KEY to rebuild the resume record, so a second
+    // conversation carrying DIR_KEY for the same directory would double every
+    // unit in that state — `equivalent_to`'s length check would then never
+    // match a fresh walk and the whole workspace would re-ingest on every
+    // filesystem event.
+    tags.insert(PROBE_DIR_KEY.to_string(), unit.dir.clone());
+    if let Err(e) = probe_conv.set_metadata_many(&tags) {
+        tracing::warn!(
+            target: "zend::repo_scan::probe",
+            dir = %unit.dir,
+            "probe conversation tagging failed: {e:#}",
+        );
+    }
+    drop(probe_conv);
+    engine.lock().unwrap().evict_ingest_timeline(timeline);
+    ingested
+}
+
 /// The section-tree branch an ingest conversation frames on: the terse
 /// code-summarization engine, with the worked request→summary examples stuffed
 /// in. Node id → option id; a node not named here keeps its schema default.
@@ -1139,16 +1578,100 @@ fn layer_system_prompt(
         .format_system_prompt(&ingest_prompt_body(builder))
 }
 
+/// The system prompt for a conversation framed on an arbitrary branch.
+///
+/// The same schema walk as [`layer_system_prompt`], resolved against `branch`.
+/// The probe layer needs two of these and neither is the summariser's: one that
+/// writes questions ([`probe_pass::GENERATE_BRANCH`]) and one that answers them
+/// with a `<think>` block ([`probe_pass::ANSWER_BRANCH`]).
+///
+/// `suppress_thinking` prepends `/no_think` to the assembled body, which is how
+/// the model's soft switch is actually driven (`models::builder`). It is not
+/// reachable through the section tree: the schema's `no_think` toggle carries a
+/// *dialect* marker rather than prompt content, and a conversation created with
+/// an explicit prompt string under `disable_reprojection` never re-projects, so
+/// selecting it resolves cleanly and contributes nothing at all.
+fn branch_system_prompt(
+    builder: &projection::Builder,
+    config: &SequenceConfig,
+    branch: &[(&str, &str)],
+    suppress_thinking: bool,
+) -> String {
+    config
+        .dialect
+        .format_system_prompt(&branch_prompt_body(builder, branch, suppress_thinking))
+}
+
+/// The system prompt for the probe-GENERATION conversation: one option's text
+/// and nothing else.
+///
+/// Deliberately **not** the schema walk every other ingest prompt uses. That
+/// walk emits every fixed section in the shared system prompt — the coding
+/// assistant's framing, the grounding rules, the history stance — and the
+/// question-writer persona is one paragraph inside thousands of tokens of it.
+/// The result was a generator that reasoned at length about what was being asked
+/// of it and never got to the questions: measured blocks of 5,342, 15,102 and
+/// 15,140 characters, one of them concluding the task was to "generate 50 short
+/// paragraphs".
+///
+/// The persona text still comes from the schema, so the prompt stays a config
+/// item rather than a string literal in Rust. What is dropped is only the
+/// scaffolding that belongs to a *dialogue* — which this conversation is not.
+fn probe_generation_prompt(builder: &projection::Builder, config: &SequenceConfig) -> String {
+    use projection::SystemPromptItem;
+    let persona = builder
+        .schema()
+        .system_prompt
+        .items
+        .iter()
+        .find_map(|item| match item {
+            SystemPromptItem::SectionTree(tree) => tree
+                .nodes
+                .iter()
+                .find(|n| n.name == "persona")?
+                .options
+                .iter()
+                .find(|o| o.id == "question_writer")
+                .map(|o| o.content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    config
+        .dialect
+        .format_system_prompt(&format!("/no_think\n{}", persona.trim()))
+}
+
+/// The unwrapped body [`branch_system_prompt`] frames — split out so the
+/// `/no_think` decision can be asserted without constructing a whole
+/// [`SequenceConfig`].
+fn branch_prompt_body(
+    builder: &projection::Builder,
+    branch: &[(&str, &str)],
+    suppress_thinking: bool,
+) -> String {
+    let body = prompt_body_for(builder, branch);
+    if suppress_thinking {
+        format!("/no_think\n{body}")
+    } else {
+        body
+    }
+}
+
 /// The unwrapped body of [`layer_system_prompt`] — the schema walk, with no
 /// dialect framing. Split out so the assembled prompt can be asserted directly.
 fn ingest_prompt_body(builder: &projection::Builder) -> String {
+    prompt_body_for(builder, SUMMARIZE_BRANCH)
+}
+
+/// [`ingest_prompt_body`] over an arbitrary branch.
+fn prompt_body_for(builder: &projection::Builder, branch: &[(&str, &str)]) -> String {
     use projection::SystemPromptItem;
     let mut body = String::new();
     for item in &builder.schema().system_prompt.items {
         match item {
             SystemPromptItem::Section(s) => body.push_str(&s.content),
             SystemPromptItem::SectionTree(tree) => {
-                let (selection, _) = summarize_selection(tree);
+                let (selection, _) = branch_selection(tree, branch);
                 for node in &tree.nodes {
                     // A collection node has no options of its own; its members
                     // are provenance-selected and live-prefilled at projection.
@@ -1176,17 +1699,23 @@ fn ingest_prompt_body(builder: &projection::Builder) -> String {
     body
 }
 
-/// `tree`'s default selection with [`SUMMARIZE_BRANCH`] applied, plus the branch
-/// entries this tree could not resolve.
+/// `tree`'s default selection with `branch` applied, plus the branch entries
+/// this tree could not resolve.
 ///
-/// A node the tree does not declare at all is not a miss — the branch spans two
+/// Used by both ingest framings — [`SUMMARIZE_BRANCH`] for the folder summary
+/// and [`probe_pass::GENERATE_BRANCH`] for the probe questions.
+///
+/// A node the tree does not declare at all is not a miss — a branch spans two
 /// trees, so each sees only its own nodes. A node that IS declared but lacks the
 /// named option is a miss: the schema and this ingest disagree about what the
 /// option is called, and the prompt silently loses that framing.
-fn summarize_selection(tree: &projection::SectionTree) -> (Vec<u8>, Vec<String>) {
+fn branch_selection(
+    tree: &projection::SectionTree,
+    branch: &[(&str, &str)],
+) -> (Vec<u8>, Vec<String>) {
     let mut selection = tree.default_selection.clone();
     let mut unresolved = Vec::new();
-    for (node_id, option_id) in SUMMARIZE_BRANCH {
+    for (node_id, option_id) in branch {
         let Some(node) = tree.nodes.iter().find(|n| n.name == *node_id) else {
             continue;
         };
@@ -1217,17 +1746,39 @@ fn summarize_selection(tree: &projection::SectionTree) -> (Vec<u8>, Vec<String>)
 /// happened: the bundled schema had the option, the workspace copy did not, and
 /// three ingest runs produced garbage behind a single warning line.
 fn validate_summarize_branch(builder: &projection::Builder) -> anyhow::Result<()> {
+    validate_branch(builder, SUMMARIZE_BRANCH, "summarizer")?;
+    // The probe-generation branch fails the same way and just as silently: with
+    // the `question_writer` persona missing, generation falls back to whatever
+    // the schema defaults to and returns a folder description where the parser
+    // expects forty-eight questions. Every probe for every directory is then
+    // lost behind one warning.
+    validate_branch(builder, probe_pass::GENERATE_BRANCH, "probe-generation")?;
+    // And the answering branch, whose silent failure is the subtlest of the
+    // three: a missing `thinking_effort` option leaves the probes decoding
+    // without a `<think>` block, so they still look like perfectly good turns
+    // while carrying none of the reasoning-shaped signatures they exist for.
+    validate_branch(builder, probe_pass::ANSWER_BRANCH, "probe-answering")
+}
+
+/// Fail the ingest if `branch` cannot be resolved against the schema.
+fn validate_branch(
+    builder: &projection::Builder,
+    branch: &[(&str, &str)],
+    what: &str,
+) -> anyhow::Result<()> {
     let unresolved: Vec<String> = builder
         .schema()
         .system_prompt
         .section_trees()
-        .flat_map(|t| summarize_selection(t).1)
+        .flat_map(|t| branch_selection(t, branch).1)
         .collect();
     if unresolved.is_empty() {
         return Ok(());
     }
     Err(anyhow::anyhow!(
-        "projection schema cannot supply the repo_map summarizer framing: {}.          The ingest would decode chat instead of folder summaries — check the          workspace `projection.yaml` is in step with the bundled one.",
+        "projection schema cannot supply the repo_map {what} framing: {}. The ingest \
+         would decode the wrong thing entirely — check the workspace `projection.yaml` \
+         is in step with the bundled one.",
         unresolved.join("; "),
     ))
 }
@@ -1283,6 +1834,300 @@ mod tests {
                 "{tool} is called by the chain but not registered",
             );
         }
+    }
+
+    /// `thinking_effort: off` is only a *sentence* in the prompt ("Answer
+    /// directly, without deliberating first"), not a mechanism. On the
+    /// probe-generation turn the model overrode it routinely and spent the whole
+    /// budget reasoning — 6,363 and 6,735 characters of it, not one question —
+    /// so both directories lost their entire probe set.
+    ///
+    /// The mechanism is `/no_think` on the system prompt body. Selecting the
+    /// schema's `no_think` toggle does NOT achieve it: that node carries a
+    /// dialect marker rather than content, so it resolves cleanly and emits
+    /// nothing into a statically-assembled prompt.
+    #[test]
+    fn the_generation_prompt_suppresses_thinking_and_the_answer_prompt_keeps_it() {
+        let builder = bundled_builder();
+        let answer = branch_prompt_body(&builder, probe_pass::ANSWER_BRANCH, false);
+        assert!(
+            !answer.contains("/no_think"),
+            "the probe ANSWER must think — the block is the signature a \
+             mid-decode scan matches against",
+        );
+    }
+
+    /// The generation prompt is the persona ALONE. Carrying the whole shared
+    /// system prompt buried the instruction in a coding assistant's framing and
+    /// the generator spent its budget reasoning about the request instead of
+    /// answering it.
+    #[test]
+    fn the_generation_prompt_is_the_persona_alone() {
+        let builder = bundled_builder();
+        let dialect = candle_conversation::models::Dialect::chat_ml();
+        let full = dialect.format_system_prompt(&ingest_prompt_body(&builder));
+        let persona = builder
+            .schema()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                projection::SystemPromptItem::SectionTree(tree) => tree
+                    .nodes
+                    .iter()
+                    .find(|n| n.name == "persona")?
+                    .options
+                    .iter()
+                    .find(|o| o.id == "question_writer")
+                    .map(|o| o.content.clone()),
+                _ => None,
+            })
+            .expect("the schema must declare the question_writer persona");
+
+        assert!(
+            persona.contains("You write the questions"),
+            "{persona:.120}",
+        );
+        // Far shorter than the full walk, and that difference is the fix.
+        assert!(
+            persona.len() * 4 < full.len(),
+            "persona {} vs full walk {}",
+            persona.len(),
+            full.len(),
+        );
+    }
+
+    /// Why selecting the schema's `no_think` toggle did not work, pinned so the
+    /// shortcut is not retried.
+    ///
+    /// It is not a no-op — it really does emit the marker — but a
+    /// statically-assembled prompt walks the schema in declaration order, and the
+    /// toggle sits inside the section tree, *after* the fixed sections above it.
+    /// The soft switch is only read at the very start of the prompt, so selecting
+    /// it buries the marker mid-body where the model ignores it: measured, the
+    /// generation still produced 6,700 characters of reasoning and no questions.
+    /// Prepending to the assembled body is what actually puts it at position 0.
+    #[test]
+    fn the_schema_no_think_toggle_lands_mid_prompt_not_at_the_start() {
+        let builder = bundled_builder();
+        let selected = prompt_body_for(&builder, &[("no_think", "present")]);
+        let absent = prompt_body_for(&builder, &[("no_think", "absent")]);
+        assert_ne!(selected, absent, "the toggle does emit its marker");
+        assert!(
+            !selected.starts_with("/no_think"),
+            "…but not where the switch is read — which is the whole defect",
+        );
+        assert!(
+            branch_prompt_body(&builder, &[], true).starts_with("/no_think\n"),
+            "prepending to the body is what puts it at position 0",
+        );
+    }
+
+    /// The `repo_map` group's candidates are whole folders, so its scoring has
+    /// to normalize the competition BETWEEN them. Without this the flag parses,
+    /// the daemon starts, retrieval runs — and every folder is quietly scaled
+    /// against its own denominator, so the one carrying the most turns wins.
+    /// Nothing about that failure is visible except a bad hit rate.
+    #[test]
+    fn the_repo_map_group_normalizes_between_folders() {
+        let builder = bundled_builder();
+        let layer = builder
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.name == "repo_map")
+            .expect("repo_map layer");
+        let group = layer.groups.first().expect("structure group");
+        assert!(
+            group.policy.scan.member_normalization,
+            "repo_map/{} must normalize across folders — see the tools collection, \
+             which is the shape this mirrors",
+            group.name,
+        );
+    }
+
+    /// …and the dialogue layer must NOT, because its candidates are moments in
+    /// one thread rather than competing conversations.
+    #[test]
+    fn the_dialogue_group_keeps_per_timeline_scoping() {
+        let builder = bundled_builder();
+        for layer in &builder.schema().layers {
+            if layer.name == "repo_map" {
+                continue;
+            }
+            for group in &layer.groups {
+                assert!(
+                    !group.policy.scan.member_normalization,
+                    "{}/{} should scope per timeline",
+                    layer.name, group.name,
+                );
+            }
+        }
+    }
+
+    /// An admission section as the engine would publish it, with `open` slots
+    /// showing above the pass's base and the weight zone comfortably clear of
+    /// its hold unless a test says otherwise.
+    fn admission(
+        carried: usize,
+        starved: usize,
+        queued_tokens: u64,
+        open: usize,
+    ) -> AdmissionSection {
+        AdmissionSection {
+            ceiling_bytes: 0,
+            prefill_width: 0,
+            section_width: 0,
+            decode_width: carried,
+            queued_prefills: 0,
+            queued_prefill_tokens: queued_tokens,
+            completed_tokens: 0,
+            decode_carried: carried,
+            decode_starved: starved,
+            open_slots: open,
+            wave_width: 0,
+            publish_interval_ms: 0,
+            weight_zone_bytes: 7 << 30,
+            weight_hold_bytes: 5 << 30,
+        }
+    }
+
+    /// One conversation must always be able to proceed, whatever the engine
+    /// says or fails to say — a pool whose only route to freeing the device is
+    /// finishing work it may not start would deadlock.
+    #[test]
+    fn the_first_conversation_always_opens() {
+        assert_eq!(gate_decision(0, None), Ok(()));
+        let mut a = admission(4, 30, u64::MAX, 0);
+        a.weight_zone_bytes = 0;
+        assert_eq!(gate_decision(0, Some(&a)), Ok(()));
+    }
+
+    /// **No report is a cold start, not a hold.** With nothing reflected the
+    /// ramp bound applies from zero, so the pool opens its first slack's worth
+    /// and then waits for the engine to report them — which is the same rule
+    /// that governs every later burst, rather than a special case.
+    #[test]
+    fn no_report_ramps_from_zero_rather_than_holding() {
+        assert_eq!(gate_decision(1, None), Ok(()));
+        assert_eq!(gate_decision(SCAN_OPEN_SLACK, None), Ok(()));
+        assert_eq!(
+            gate_decision(SCAN_OPEN_SLACK + 1, None),
+            Err(Hold::Unreflected {
+                live: SCAN_OPEN_SLACK + 1,
+                reflected: 0,
+            }),
+        );
+    }
+
+    /// **The burst is bounded by what the engine has seen.** A report a wave
+    /// behind reads "empty" for every worker in the burst; the pool may run at
+    /// most the slack ahead of the slots the engine reports. Measured, 96 opened
+    /// in one second without this.
+    #[test]
+    fn openings_the_engine_has_not_reflected_hold_beyond_the_slack() {
+        // Four open here, the report shows none of them yet: within the slack.
+        assert_eq!(
+            gate_decision(SCAN_OPEN_SLACK, Some(&admission(0, 0, 0, 0))),
+            Ok(()),
+        );
+        // A fifth would be one past it.
+        assert_eq!(
+            gate_decision(SCAN_OPEN_SLACK + 1, Some(&admission(0, 0, 0, 0))),
+            Err(Hold::Unreflected {
+                live: SCAN_OPEN_SLACK + 1,
+                reflected: 0,
+            }),
+        );
+        // Once the report shows them, the same worker opens.
+        assert_eq!(
+            gate_decision(SCAN_OPEN_SLACK + 1, Some(&admission(0, 0, 0, 2))),
+            Ok(()),
+        );
+        // Slots this pool did not open only loosen the bound — never a base to
+        // subtract, which went stale and held a pass to five conversations.
+        assert_eq!(
+            gate_decision(SCAN_OPEN_SLACK + 1, Some(&admission(0, 0, 0, 30))),
+            Ok(()),
+        );
+    }
+
+    /// **The one thing worth holding for: the resident experts.**
+    ///
+    /// K/V and the expert weights share one elastic span, so once the zone is
+    /// down to its hold, another conversation's K/V comes out of the experts —
+    /// and an engine that streams its experts is slower at everything,
+    /// including finishing the conversations that would give the ground back.
+    #[test]
+    fn a_zone_down_to_its_hold_holds_the_producer() {
+        let mut a = admission(8, 0, 0, 8);
+        a.weight_zone_bytes = 5 << 30;
+        a.weight_hold_bytes = 5 << 30;
+        assert_eq!(
+            gate_decision(8, Some(&a)),
+            Err(Hold::Residency {
+                zone_mib: 5 << 10,
+                hold_mib: 5 << 10,
+            }),
+        );
+        // A megabyte of headroom is headroom: the gate opens and the wave's own
+        // claim-and-refuse decides what actually fits.
+        a.weight_zone_bytes = (5 << 30) + (1 << 20);
+        assert_eq!(gate_decision(8, Some(&a)), Ok(()));
+    }
+
+    /// A model with nothing to defend — no reservation, so no hold — is never
+    /// held by this. The generality case: a dense checkpoint sitting resident
+    /// with room over publishes a zero hold and the gate opens every time.
+    #[test]
+    fn no_hold_to_defend_never_holds() {
+        let mut a = admission(8, 0, 0, 8);
+        a.weight_zone_bytes = 0;
+        a.weight_hold_bytes = 0;
+        assert_eq!(gate_decision(8, Some(&a)), Ok(()));
+    }
+
+    /// **Runaway protection, and nothing finer.** Far above any healthy state,
+    /// so it never binds in normal operation — a normal pass sits near twenty
+    /// and the worst measured pathology reached eighty-three.
+    #[test]
+    fn the_runaway_ceiling_is_the_last_resort_only() {
+        assert_eq!(
+            gate_decision(SCAN_RUNAWAY_CEILING, Some(&admission(60, 0, 0, 300))),
+            Err(Hold::Runaway {
+                live: SCAN_RUNAWAY_CEILING,
+                ceiling: SCAN_RUNAWAY_CEILING,
+            }),
+        );
+        assert_eq!(
+            gate_decision(SCAN_RUNAWAY_CEILING - 1, Some(&admission(60, 0, 0, 300))),
+            Ok(()),
+        );
+        const _: () = assert!(SCAN_RUNAWAY_CEILING > 83);
+    }
+
+    /// **The producer does not pace the wave.** A starved engine, a deep queue
+    /// and a long backlog are all the wave's business — it claims through the
+    /// real allocators and refuses what will not fit. None of them holds the
+    /// producer, because every proxy for them that has been tried here
+    /// throttled throughput without protecting anything.
+    #[test]
+    fn engine_load_alone_never_holds_the_producer() {
+        let mut a = admission(5, 3, u64::MAX, 5);
+        a.queued_prefills = 500;
+        assert_eq!(
+            gate_decision(5, Some(&a)),
+            Ok(()),
+            "starved decodes, a full backlog and a 500-deep queue are not this gate's business",
+        );
+    }
+
+    /// The generality case: an engine carrying everything it holds, with room
+    /// above its hold, opens the gate every time, on any card.
+    #[test]
+    fn an_engine_with_residency_to_spare_always_opens() {
+        assert_eq!(gate_decision(60, Some(&admission(60, 0, 100, 60))), Ok(()));
+        assert_eq!(gate_decision(60, Some(&admission(60, 0, 0, 60))), Ok(()));
     }
 
     /// Parse the bundled projection.yaml the way the daemon does.
@@ -1386,145 +2231,5 @@ mod tests {
     fn the_invalidation_key_is_distinct_from_code_reads() {
         assert_eq!(DIR_KEY, "dir");
         assert_ne!(DIR_KEY, "path");
-    }
-
-    /// Measured report from a `repo_map` pass on the 16 GiB card, 21 directories
-    /// in: capacity 13.17 GiB, scratch margin 1 GiB, `pool_used` 9.67 GiB, KV
-    /// arenas 2.31 GiB.
-    const CAPACITY: u64 = 14_143_193_088;
-    const SCRATCH: u64 = 1_073_741_824;
-    const POOL_USED: u64 = 10_380_898_464;
-    const KV: u64 = 2_483_027_968;
-    /// Arenas standing before the first directory opened — tool sections, the
-    /// base builder's prefill, and the calibration exemplars.
-    const PRE_SCAN: u64 = 2_000_000_000;
-
-    /// The estimate must price the KV a scan ADDS. Charged the whole process's
-    /// arenas instead, the per-conversation estimate pinned to its ceiling — and
-    /// the error compounds, since a narrower pool divides the same fixed corpus
-    /// into a still-larger estimate.
-    #[test]
-    fn the_estimate_prices_the_scans_own_kv_not_the_inherited_corpus() {
-        assert!(per_conversation_kv(KV, PRE_SCAN, 2) < per_conversation_kv(KV, 0, 2));
-        assert_eq!(per_conversation_kv(KV, 0, 2), SCAN_CONV_KV_MAX);
-    }
-
-    /// ...and the numerator must price it the same way. `fixed` is
-    /// `pool_used - kv`, so subtracting only `fixed` returns every KV byte as
-    /// free room — including the inherited corpus the denominator deliberately
-    /// excludes. Growing that corpus leaves the same room for new work, so the
-    /// pool must get narrower; unfixed, it stayed exactly as wide.
-    #[test]
-    fn the_inherited_corpus_is_not_free_room() {
-        const EXTRA: u64 = 2 * 1024 * 1024 * 1024;
-        let base = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2);
-        let with_corpus = scan_width(
-            CAPACITY,
-            SCRATCH,
-            POOL_USED + EXTRA,
-            KV + EXTRA,
-            PRE_SCAN + EXTRA,
-            2,
-        );
-        assert!(with_corpus < base, "{with_corpus} vs {base}");
-    }
-
-    /// Holding back a FRACTION of capacity double-charges the expert cache:
-    /// `fixed` subtracts it explicitly, then the fraction holds back a share of
-    /// capacity that is mostly the same bytes again. On the measured report a
-    /// 0.70 fraction left 1.87 GiB for scan KV against the governor's own
-    /// ~5 GiB KV floor — under half the room, and the pool ran that much
-    /// narrower for it.
-    #[test]
-    fn the_margin_held_back_is_the_governors_not_a_fraction_of_capacity() {
-        let per_conv = per_conversation_kv(KV, PRE_SCAN, 2);
-        let held_by_fraction = CAPACITY - ((CAPACITY as f64) * 0.70) as u64;
-        assert!(held_by_fraction > SCRATCH * 3, "{held_by_fraction}");
-        let by_fraction = (((CAPACITY as f64) * 0.70) as u64)
-            .saturating_sub(POOL_USED - KV + PRE_SCAN)
-            / per_conv;
-        let by_governor = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2) as u64;
-        assert_eq!(by_fraction, 0);
-        assert_eq!(by_governor, 6);
-    }
-
-    /// The floor charges a conversation for RESERVED arena, not for the live
-    /// half — and that is the width the card actually sustains.
-    ///
-    /// Pricing only the live ~240 MiB (on the theory that slab waste belongs to
-    /// a format rather than to a conversation) opens 19 directories on this
-    /// report and walks straight into the wall: measured, 15 directories lost in
-    /// one millisecond, a device OOM, 18 MiB free, and a 1415 MiB gap between
-    /// reserved and used arena that is precisely the overhead the halving
-    /// assumed away. Ten is the width that ran clean, and faster.
-    #[test]
-    fn the_floor_charges_reserved_arena_not_just_the_live_half() {
-        assert_eq!(SCAN_CONV_KV_MIN, 480 * 1024 * 1024);
-        let for_kv = CAPACITY - SCRATCH - (POOL_USED - KV) - PRE_SCAN;
-        assert_eq!(for_kv / SCAN_CONV_KV_MIN, 6);
-        // Halving the floor nearly doubles the width — the same argument that
-        // opened 19 directories on this card and walked into the wall.
-        assert_eq!(for_kv / (256 * 1024 * 1024), 11);
-    }
-
-    /// Growing the inherited corpus must not inflate the per-conversation
-    /// estimate: the anchor moves with it, so the same in-flight KV is priced
-    /// the same however large the corpus underneath it grows.
-    #[test]
-    fn a_larger_inherited_corpus_does_not_inflate_the_estimate() {
-        const EXTRA: u64 = 4 * 1024 * 1024 * 1024;
-        assert_eq!(
-            per_conversation_kv(KV, PRE_SCAN, 2),
-            per_conversation_kv(KV + EXTRA, PRE_SCAN + EXTRA, 2),
-        );
-    }
-
-    /// A pool holding nothing open has added nothing, so the estimate is the
-    /// measured floor rather than a division over a corpus it never created.
-    #[test]
-    fn an_idle_pool_estimates_at_the_floor() {
-        assert_eq!(per_conversation_kv(9_000_000_000, 0, 0), SCAN_CONV_KV_MIN);
-        assert_eq!(
-            per_conversation_kv(9_000_000_000, 9_000_000_000, 4),
-            SCAN_CONV_KV_MIN,
-        );
-        // Demotion can hand back more than the scan added; the delta floors.
-        assert_eq!(
-            per_conversation_kv(1_000, 9_000_000_000, 4),
-            SCAN_CONV_KV_MIN
-        );
-    }
-
-    /// The estimate stays inside its measured clamps at both ends: a cold start
-    /// cannot admit unboundedly, and one atypical directory cannot stall the
-    /// scan by pricing every later one off the card.
-    #[test]
-    fn the_per_conversation_estimate_stays_within_its_measured_clamps() {
-        assert_eq!(
-            per_conversation_kv(4 * SCAN_CONV_KV_MAX, 0, 1),
-            SCAN_CONV_KV_MAX,
-        );
-        assert_eq!(
-            per_conversation_kv(SCAN_CONV_KV_MIN / 4, 0, 1),
-            SCAN_CONV_KV_MIN,
-        );
-        assert_eq!(
-            per_conversation_kv(2 * SCAN_CONV_KV_MIN, 0, 2),
-            SCAN_CONV_KV_MIN,
-        );
-    }
-
-    /// The bound is a width, so it never reaches zero — a pool that may not open
-    /// a conversation can never free the VRAM it is waiting on — and never
-    /// exceeds the thread count the pool actually spawns.
-    #[test]
-    fn the_width_stays_between_one_and_the_pool_ceiling() {
-        assert_eq!(scan_width(CAPACITY, SCRATCH, 14_000_000_000, 0, 0, 0), 1);
-        // A margin wider than the card leaves nothing, and still not zero.
-        assert_eq!(scan_width(CAPACITY, 2 * CAPACITY, 0, 0, 0, 0), 1);
-        assert_eq!(
-            scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0),
-            REPO_MAP_PARALLELISM,
-        );
     }
 }
