@@ -630,6 +630,20 @@ impl HybridBatched {
                 // turn's seal. Both start from the sequence-start value here;
                 // the second is carried across by `restore_recurrent`, which the
                 // scheduler runs from the substrate snapshot before this.
+                //
+                // **A fresh store already holds the sequence-start value, so it
+                // is seeded.** Without the flag the wave's own `ensure_recurrent`
+                // found a store standing at offset 0, judged it unseeded, and
+                // remade it — a second 160 MiB store claimed *inside the
+                // forward*, before the transient tier is placed, with the first
+                // freed only afterwards. Those regions came off the top of the
+                // free list, moved the arena frontier up, and the tier the fill
+                // had just measured the gap for was then two to four regions
+                // short: twenty-one refused placements in eight minutes of run
+                // 7, every one a lost wave. The flag is consumed by that first
+                // wave exactly as a restore's is, so a later genuine offset-0
+                // reset on a recycled slot still happens.
+                store.mark_seeded();
                 let ready = backups(&mut store)?;
                 slot.insert(store);
                 Ok(ready)
