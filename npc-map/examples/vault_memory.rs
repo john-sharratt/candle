@@ -42,20 +42,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Every room, and what a body standing in it can reach.
+/// Every room, and what stands in it for a body to work at.
 ///
-/// A corridor comes out empty, which is the whole point: the tool surface is
-/// read off the room rather than declared about the NPC, so walking away from
-/// a terminal takes its tools with it.
+/// A corridor comes out empty, which is the whole point: what a character can
+/// do is read off the room rather than declared about the character, so walking
+/// away from a terminal takes its acts with it.
+///
+/// **The parts, not the tools.** This asked the map which *acts* a room offered
+/// until the attachment was inverted — an act now names the parts it belongs to
+/// (`Tool::at`), and the map went back to saying only what a building contains.
+/// So the room's answer is its furniture, and the catalogue is what turns that
+/// into a vocabulary.
 fn tools(set: &MapSet) {
     for level in set.children("creators-vault") {
         rule(&level.name.to_uppercase());
         for node in &level.nodes {
-            let tools = set.tools_at(node);
-            if tools.is_empty() {
+            let parts = set.part_ids_at(node);
+            if parts.is_empty() {
                 println!("  {:<24} —", node.name);
             } else {
-                println!("  {:<24} {}", node.name, tools.join(", "));
+                println!("  {:<24} {}", node.name, parts.join(", "));
             }
         }
     }

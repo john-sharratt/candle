@@ -196,9 +196,12 @@ pub fn since(world: &World, id: &str) -> Vec<Witnessed> {
         out.push(Witnessed {
             at: e.at,
             actor: e.actor.clone(),
+            // Through `name_of`, which answers for somebody who has already
+            // left — the event outlives the body, and a reader told about a
+            // departure is being told about exactly that case.
             name: world
-                .actor(&e.actor)
-                .map(|a| a.name.clone())
+                .name_of(&e.actor)
+                .map(str::to_string)
                 .unwrap_or_else(|| e.actor.clone()),
             place: e.place.clone(),
             here: reach == Reach::Here,
@@ -400,8 +403,8 @@ fn verb_phrase(world: &World, w: &Witnessed, named: &mut BTreeSet<String>) -> Op
 /// A body as a reader would name it, falling back to its id.
 fn who(world: &World, id: &str) -> String {
     world
-        .actor(id)
-        .map(|a| a.name.clone())
+        .name_of(id)
+        .map(str::to_string)
         .unwrap_or_else(|| id.to_string())
 }
 

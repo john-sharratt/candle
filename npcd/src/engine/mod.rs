@@ -443,7 +443,9 @@ async fn list_interactions(
     let Some(rt) = s.runtime.as_ref() else {
         return Json(json!({ "interactions": [], "engine_connected": false })).into_response();
     };
-    let now = s.world_ms(npc_id).await;
+    // The wall clock: whether a session has gone quiet is a fact about a person
+    // at a console, not about the world's own time. See `Interaction::last_ms`.
+    let now = crate::api::now_ms();
     let live: Vec<Value> = rt
         .interactions
         .for_npc(npc_id, now)
@@ -491,11 +493,31 @@ async fn open_interaction(
             "that character has no body to stand beside — open a messaging mode instead",
         );
     }
-    let now = s.world_ms(npc_id).await;
+    // Two clocks, and they are not interchangeable: going quiet is a fact about
+    // a person at a console, and the world's own instant is only the label the
+    // session carries. See `Interaction::last_ms`.
+    let world_ms = s.world_ms(npc_id).await;
+    let now = crate::api::now_ms();
+    let who = as_interlocutor(&id, &handle);
+    let world = rt.body_of(npc_id).map(|(hosted, _)| hosted.id().to_string());
     let ix = rt
         .interactions
-        .open(npc_id, mode, as_interlocutor(&id, &handle), now);
-    Json(ix.wire(now)).into_response()
+        .open(npc_id, mode, who.clone(), world, now, world_ms);
+
+    // **Physical means physical.** The person walks into the room the character
+    // is standing in, so it appears in `Within::company` — which is what turns
+    // `tell`, `ask`, `give`, `touch` and `gesture` back on. Without a body it
+    // heard you and could not answer you, and went on waiting for somebody to
+    // arrive while you were talking to it.
+    let standing = match mode == crate::engine::tools::Mode::Physical {
+        true => rt.enter_world_beside(npc_id, &ix.body, &who.display),
+        false => None,
+    };
+    let mut wire = ix.wire(now);
+    if let Some(at) = standing {
+        wire["you_are_at"] = json!(at.to_string());
+    }
+    Json(wire).into_response()
 }
 
 async fn interaction(State(s): State<Arc<Authored>>, Path(ix): Path<String>) -> Response {
@@ -512,15 +534,26 @@ async fn interaction(State(s): State<Arc<Authored>>, Path(ix): Path<String>) -> 
     }
 }
 
+/// End one, and walk the person back out of the world.
 async fn end_interaction(State(s): State<Arc<Authored>>, Path(ix): Path<String>) -> Response {
-    let ended = s
-        .runtime
-        .as_ref()
-        .is_some_and(|rt| rt.interactions.end(&ix));
-    match ended {
-        true => Json(json!({ "interaction_id": ix, "state": "ended" })).into_response(),
-        false => err(StatusCode::NOT_FOUND, "interaction_not_found", &ix),
+    let Some(rt) = s.runtime.as_ref() else {
+        return err(StatusCode::NOT_FOUND, "interaction_not_found", &ix);
+    };
+    let session = rt.interactions.get(&ix, crate::api::now_ms());
+    if !rt.interactions.end(&ix) {
+        return err(StatusCode::NOT_FOUND, "interaction_not_found", &ix);
     }
+    // The body goes with the session. A person who closed the conversation has
+    // gone, and a room that still lists them is a room where a character is
+    // told it has company that is not there.
+    let left = match session {
+        Some(was) if was.mode == crate::engine::tools::Mode::Physical => {
+            rt.leave_world(&was.body)
+        }
+        _ => false,
+    };
+    Json(json!({ "interaction_id": ix, "state": "ended", "left_the_world": left }))
+        .into_response()
 }
 
 /// Say something to the character, inside a session.

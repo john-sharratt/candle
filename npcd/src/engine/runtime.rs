@@ -455,7 +455,7 @@ impl Runtime {
             // nobody — that is what makes a large cast affordable — and a
             // checkpoint on a still world would be a world read per 500 ms per
             // world for an answer that cannot have changed.
-            if environment::advance(&moving, &rt.bodies, &rt.scheduler).moved > 0 {
+            if rt.moment(&moving).moved > 0 {
                 rt.checkpoint_places(&moving);
             }
         });
@@ -702,6 +702,126 @@ impl Runtime {
         // without hostiles ends up without `engage`.
         let place = hosted.place_of(&body);
         hosted.sim(|sim| base.clone().from_sim(sim, &body, &place))
+    }
+
+    /// Walk a person into the world, beside the character they came to see.
+    ///
+    /// **A physical interaction is physical.** Until this, "being present" meant
+    /// speech delivered straight to one character's inbox while the person had
+    /// no body at all: they were not in `Within::company`, so `tell`, `ask`,
+    /// `give`, `touch` and `gesture` — every act whose target binds to who is
+    /// standing there — were not even in the character's grammar. It heard you
+    /// and could not answer you, and went on waiting for somebody to arrive
+    /// while you were talking to it.
+    ///
+    /// So the person gets a body. It stands where the character stands, other
+    /// characters in the room see it arrive, and it is taken out again when the
+    /// conversation ends — see [`Runtime::leave_world`].
+    ///
+    /// Returns where they ended up. `None` if the character has no body to
+    /// stand beside.
+    pub fn enter_world_beside(
+        &self,
+        npc_id: u64,
+        visitor: &str,
+        name: &str,
+    ) -> Option<npc_map::world::Where> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        let at = hosted.read(|w| w.actor(&body).map(|a| a.at.clone()))?;
+        hosted.with(|w| {
+            // Already here is not an error — a console that reopens the same
+            // conversation is the ordinary case, and re-entering would log a
+            // second arrival for somebody who never left.
+            match w.actor(visitor).is_some() {
+                true => w.place(visitor, at.clone()).ok(),
+                false => w.enter(visitor, name, at.clone()).ok(),
+            }
+        })?;
+        Some(at)
+    }
+
+    /// Take a person back out of the world.
+    ///
+    /// `false` if they were not in it. Everything a body was holding is given
+    /// up on the way — see [`npc_map::world::World::leave`].
+    pub fn leave_world(&self, visitor: &str) -> bool {
+        self.hosted
+            .ids()
+            .iter()
+            .filter_map(|id| self.hosted.get(id))
+            .any(|hosted| hosted.with(|w| w.leave(visitor).is_ok()))
+    }
+
+    /// Keep every visiting body with the character it came to see.
+    ///
+    /// **A conversation does not end because somebody walked out of the room.**
+    /// A character asked to go to the chronicle goes, and a visitor left behind
+    /// is talking to an empty room while the character it came for is two
+    /// levels away — so the visitor goes too. Placed rather than walked: a
+    /// person at a console is *with* somebody, and making them cover the
+    /// distance would mean arriving after the character had moved again.
+    ///
+    /// Runs in the sweep, after journeys advance, so a visitor follows to where
+    /// the character ended up rather than where it set out from.
+    fn keep_visitors_with_their_hosts(&self, hosted: &Hosted) {
+        let now = crate::api::now_ms();
+        let following: Vec<(String, u64)> = self
+            .interactions
+            .visiting(hosted.id(), now)
+            .into_iter()
+            .collect();
+        if following.is_empty() {
+            return;
+        }
+        for (visitor, npc_id) in following {
+            let Some((_, body)) = self.body_of(npc_id) else {
+                continue;
+            };
+            hosted.with(|w| {
+                let Some(theirs) = w.actor(&body).map(|a| a.at.clone()) else {
+                    return;
+                };
+                let mine = w.actor(&visitor).map(|a| a.at.clone());
+                if mine.as_ref() != Some(&theirs) {
+                    let _ = w.place(&visitor, theirs);
+                }
+            });
+        }
+    }
+
+    /// One moment of world time, and everything a moment entails.
+    ///
+    /// **Everything, in one place.** [`environment::advance`] moves journeys on
+    /// and hands out what was perceived; a moment is also when a visitor
+    /// catches up with whoever it is following and when an abandoned session
+    /// gives its body back. Putting the last two in the metronome's closure
+    /// instead left them out of every other route by which the world advances —
+    /// so a world ticked any other way had visitors standing in rooms the
+    /// character had left, and no test could see it because the tests advance
+    /// the world directly.
+    ///
+    /// The order matters: journeys first, so a visitor follows to where the
+    /// character ended up rather than where it set out from.
+    pub fn moment(&self, hosted: &Hosted) -> environment::Moment {
+        let moment = environment::advance(hosted, &self.bodies, &self.scheduler);
+        self.keep_visitors_with_their_hosts(hosted);
+        self.show_out_the_expired();
+        moment
+    }
+
+    /// Take out the bodies of anybody whose conversation has gone quiet.
+    ///
+    /// **A session expiring has to actually remove somebody.** `is_live` makes
+    /// an abandoned one read as gone, which is enough for a console and does
+    /// nothing whatever to an actor standing in a room — so without this a
+    /// visitor who closed the tab stays in the vault for ever, and the
+    /// character goes on being told it has company.
+    fn show_out_the_expired(&self) {
+        for gone in self.interactions.take_expired(crate::api::now_ms()) {
+            if gone.mode == tools::Mode::Physical {
+                self.leave_world(&gone.body);
+            }
+        }
     }
 
     /// Say something to a character on its handset, as a person outside the

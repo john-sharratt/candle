@@ -379,6 +379,18 @@ export async function render(params) {
       clearInterval(idleTimer);
       document.removeEventListener('selectionchange', flushRendered);
       unwatchVp();
+      /* **Leaving the page leaves the world.**
+       *
+       * A physical interaction puts a real body in the room, so navigating
+       * away has to take it out again — otherwise the character goes on being
+       * told it has company that closed the tab ten minutes ago. The daemon's
+       * idle timeout is the backstop for a browser that never got to run this
+       * (a crash, a lost connection); this is the ordinary path, and it is
+       * immediate.
+       *
+       * Fire-and-forget on purpose: the page is already going, there is
+       * nothing to show a failure to, and the timeout still covers it. */
+      if (!messaging) API.endInteraction(ix).catch(() => {});
     },
   };
 }

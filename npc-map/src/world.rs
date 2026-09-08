@@ -355,6 +355,16 @@ type Done<T = ()> = Result<T, Refused>;
 pub struct World {
     map: MapSet,
     actors: BTreeMap<String, Actor>,
+    /// What every body that has ever been here is called.
+    ///
+    /// **A name has to outlive the body.** The log keeps an event after the
+    /// actor it names has gone, and a reader is shown that event later — so a
+    /// name looked up only in `actors` falls back to the id the moment somebody
+    /// leaves, and the room is told `visitor:u_154797f3 left` instead of who
+    /// went. Keyed by body rather than by event, so it grows with the number of
+    /// distinct people this world has ever held — a cast and its visitors —
+    /// rather than with everything that has happened.
+    names: BTreeMap<String, String>,
     log: Vec<Event>,
     now: Tick,
 }
@@ -364,9 +374,21 @@ impl World {
         World {
             map,
             actors: BTreeMap::new(),
+            names: BTreeMap::new(),
             log: Vec::new(),
             now: 0,
         }
+    }
+
+    /// What a body is called, whether or not it is still here.
+    ///
+    /// The one lookup that answers for somebody who has left, which is what a
+    /// reader being told about a departure needs.
+    pub fn name_of(&self, id: &str) -> Option<&str> {
+        self.actors
+            .get(id)
+            .map(|a| a.name.as_str())
+            .or_else(|| self.names.get(id).map(String::as_str))
     }
 
     pub fn map(&self) -> &MapSet {
@@ -429,12 +451,14 @@ impl World {
         if self.node(&place).is_none() {
             return Err(Refused::NoSuchPlace(place));
         }
+        let name = name.into();
         self.now += 1;
+        self.names.insert(id.clone(), name.clone());
         self.actors.insert(
             id.clone(),
             Actor {
                 id: id.clone(),
-                name: name.into(),
+                name,
                 at: place.clone(),
                 hold: None,
                 walk: None,
@@ -446,6 +470,48 @@ impl World {
             actor: id,
             place,
             what: Happening::Arrived,
+        });
+        Ok(())
+    }
+
+    /// Take a body out of the world.
+    ///
+    /// **The other half of [`World::enter`], and it was missing.** Every actor
+    /// this world had ever seen stayed in it for the life of the daemon, which
+    /// was true enough while the only bodies were characters that never left —
+    /// and stopped being true the moment a person could walk into a room to
+    /// talk to one. Somebody who closes the conversation has gone, and a world
+    /// that still lists them is a world where a character is told it has
+    /// company that is not there.
+    ///
+    /// **The hold goes first.** A body leaving while it holds a station would
+    /// leave that station claimed by nobody, and nothing else releases it: the
+    /// claim is keyed on an actor that no longer exists, so no act could ever
+    /// give it up. That is a chronicle terminal nobody can ever sit at again.
+    ///
+    /// `Err(NoSuchActor)` for a body that was not here, so leaving twice is
+    /// reported rather than silently fine — a caller that thinks it removed
+    /// somebody twice has lost track of which session it is ending.
+    pub fn leave(&mut self, id: &str) -> Done {
+        self.now += 1;
+        let at = self.now;
+        let Some(actor) = self.actors.get(id) else {
+            return Err(Refused::NoSuchActor(id.into()));
+        };
+        let place = actor.at.clone();
+        if actor.hold.is_some() {
+            self.release_at(id, at)?;
+        }
+        self.actors.remove(id);
+        // Logged as a departure, so everybody standing there perceives it the
+        // way they perceive an arrival. Somebody vanishing from a room without
+        // the room being told is the same defect as somebody appearing in it
+        // unannounced.
+        self.log.push(Event {
+            at,
+            actor: id.into(),
+            place,
+            what: Happening::Left,
         });
         Ok(())
     }
@@ -921,6 +987,74 @@ mod tests {
         let mut w = vault();
         w.enter("m1", "Maker-01", at("core")).unwrap();
         assert_eq!(w.actor("m1").unwrap().at, at("core"));
+    }
+
+    // ── leaving ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_body_that_leaves_is_gone_from_the_room_and_the_world() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", at("core")).unwrap();
+        w.enter("op", "Johnathan", at("core")).unwrap();
+        assert_eq!(w.actors_at(&at("core")).len(), 2);
+
+        w.leave("op").unwrap();
+        assert!(w.actor("op").is_none());
+        assert_eq!(w.actors_at(&at("core")).len(), 1);
+    }
+
+    /// **The hold goes with them.** A body leaving while it holds a station
+    /// would leave that station claimed by an actor that no longer exists — and
+    /// nothing else can release it, because every act that would is keyed on
+    /// the actor. That is a terminal nobody can ever sit at again.
+    #[test]
+    fn leaving_gives_up_whatever_was_being_held() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", at("band-one")).unwrap();
+        w.take("m1", Some("cindy")).unwrap();
+        assert!(w.holder_of("cindy").is_some());
+
+        w.leave("m1").unwrap();
+        assert!(
+            w.holder_of("cindy").is_none(),
+            "a station stayed claimed by somebody who had gone"
+        );
+    }
+
+    /// Leaving twice is reported rather than silently fine: a caller that
+    /// thinks it removed somebody twice has lost track of which session it is
+    /// ending.
+    #[test]
+    fn leaving_a_body_that_is_not_here_is_refused() {
+        let mut w = vault();
+        assert!(matches!(w.leave("nobody"), Err(Refused::NoSuchActor(_))));
+        w.enter("m1", "Maker-01", at("core")).unwrap();
+        w.leave("m1").unwrap();
+        assert!(matches!(w.leave("m1"), Err(Refused::NoSuchActor(_))));
+    }
+
+    /// The room is told, the way it is told about an arrival — somebody
+    /// vanishing unannounced is the same defect as somebody appearing that way.
+    #[test]
+    fn the_room_perceives_a_departure() {
+        let mut w = vault();
+        w.enter("watcher", "Maker-01", at("core")).unwrap();
+        w.enter("goer", "Johnathan", at("core")).unwrap();
+        // Spend what is already waiting, so what is left is only the leaving.
+        let mut eyes = crate::delta::Attention::new();
+        eyes.take(&mut w, "watcher");
+        w.leave("goer").unwrap();
+
+        let seen = eyes.take(&mut w, "watcher");
+        let left = seen
+            .events
+            .iter()
+            .find(|e| e.what == Happening::Left)
+            .unwrap_or_else(|| panic!("the room was not told: {seen:?}"));
+        // **Named, not identified.** The body is gone by the time anybody reads
+        // this, so a name looked up in the actor list falls back to the id and
+        // the room is told `visitor:u_8812 left` instead of who went.
+        assert_eq!(left.name, "Johnathan");
     }
 
     #[test]

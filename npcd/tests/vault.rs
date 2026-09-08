@@ -61,9 +61,15 @@ fn maker(rt: &Arc<Runtime>, npc_id: u64, body: &str, room: &str) {
 }
 
 /// One moment of world time, the way the metronome would.
+///
+/// Through `Runtime::moment` rather than `environment::advance`, because a
+/// moment is more than the journeys: it is also when a visitor catches up with
+/// whoever it is following and when an abandoned session gives its body back.
+/// Calling the inner function here would test a world that advances in a way
+/// nothing in the daemon actually uses.
 fn moment(rt: &Arc<Runtime>) {
     let world = rt.hosted.get(WORLD).expect("hosted");
-    environment::advance(&world, &rt.bodies, &rt.scheduler);
+    rt.moment(&world);
 }
 
 /// Let every character that is due take its turn.
@@ -291,6 +297,130 @@ fn messaging_a_character_with_no_body_reaches_nothing() {
     let rt = daemon();
     assert!(rt.message_npc(404, "Wren S", "anything").is_none());
     assert!(rt.messages_with(404, "Wren S").is_none());
+}
+
+// =========================================================================
+// Standing in the room with a character
+// =========================================================================
+
+/// **A physical interaction puts a real body in the world.**
+///
+/// The whole point, and it is not cosmetic: `tell`, `ask`, `give`, `touch` and
+/// `gesture` all bind their target to who is standing there, so a visitor with
+/// no body is not merely unseen — those acts are *absent from the character's
+/// grammar*. It could hear you and had no way to answer you, and went on
+/// waiting for somebody to arrive while you were talking to it.
+#[test]
+fn a_visitor_enters_the_room_and_can_be_addressed() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "band-one");
+
+    let at = rt
+        .enter_world_beside(1, "visitor:u_8812", "Johnathan")
+        .expect("the character has a body to stand beside");
+    assert_eq!(at, standing(&rt, "m1"), "the visitor is not where they are");
+
+    // In the room, by the world's own reckoning.
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    assert!(world.read(|w| w.actor("visitor:u_8812").is_some()));
+    assert_eq!(world.read(|w| w.actors_at(&at).len()), 2);
+
+    // And in what the character can reach — which is what turns the acts on.
+    let within = rt.within(1);
+    assert!(
+        within.company.iter().any(|n| n == "Johnathan"),
+        "the visitor is not company: {:?}",
+        within.company
+    );
+    let offered = npcd::engine::tools::specs_within(
+        npcd::engine::tools::Mode::Physical,
+        &within,
+    );
+    // The acts whose *only* missing piece was somebody to aim at. `give` is
+    // deliberately not here: it needs something to give as well, so it stays
+    // absent for a character carrying nothing — which is the empty-set rule
+    // working rather than this failing.
+    for act in ["tell", "ask", "gesture"] {
+        assert!(
+            offered.iter().any(|t| t.name == act),
+            "`{act}` is still not something it can do to you"
+        );
+    }
+}
+
+/// Leaving takes the body out again, and the room stops listing somebody who
+/// has gone.
+#[test]
+fn a_visitor_who_leaves_is_out_of_the_world() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "band-one");
+    rt.enter_world_beside(1, "visitor:u_8812", "Johnathan");
+
+    assert!(rt.leave_world("visitor:u_8812"));
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    assert!(world.read(|w| w.actor("visitor:u_8812").is_none()));
+    assert!(
+        !rt.within(1).company.iter().any(|n| n == "Johnathan"),
+        "the character still has company that has gone"
+    );
+    assert!(!rt.leave_world("visitor:u_8812"), "left twice");
+}
+
+/// Opening the same conversation again does not leave two of somebody standing
+/// in one room.
+#[test]
+fn entering_twice_is_one_body() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "band-one");
+    rt.enter_world_beside(1, "visitor:u_8812", "Johnathan");
+    rt.enter_world_beside(1, "visitor:u_8812", "Johnathan");
+
+    let at = standing(&rt, "m1");
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    assert_eq!(world.read(|w| w.actors_at(&at).len()), 2, "two of one person");
+}
+
+/// **A conversation does not end because the character walked off.** Asked to
+/// go somewhere it goes, and a visitor left behind would be talking to an empty
+/// room while the character it came for is two levels away.
+#[test]
+fn a_visitor_follows_the_character_it_came_to_see() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "band-one");
+    hand_out_phones(&rt, &[("m1", "Maker-01")]);
+    let ix = rt.interactions.open(
+        1,
+        npcd::engine::tools::Mode::Physical,
+        npcd::engine::interaction::Interlocutor {
+            kind: "operator".into(),
+            id: "u_8812".into(),
+            display: "Johnathan".into(),
+        },
+        Some(WORLD.to_string()),
+        // The wall clock, because that is what going quiet is measured
+        // against — a session opened at world instant 1 would read as expired
+        // before the first moment and take the visitor's body straight back
+        // out again.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default(),
+        1,
+    );
+    rt.enter_world_beside(1, &ix.body, "Johnathan");
+
+    // The character crosses the building.
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    world.with(|w| w.set_off("m1", at("green-room")).unwrap());
+    for _ in 0..8 {
+        moment(&rt);
+    }
+    assert_eq!(standing(&rt, "m1"), at("green-room"), "it never got there");
+    assert_eq!(
+        standing(&rt, &ix.body),
+        at("green-room"),
+        "the visitor was left behind in an empty room"
+    );
 }
 
 // =========================================================================
