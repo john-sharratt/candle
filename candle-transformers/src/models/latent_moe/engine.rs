@@ -437,15 +437,9 @@ impl Engine {
                     (zone_capacity * zone_slot_bytes) as u64,
                 );
             }
-            // Open the shop: a KV arena claim that runs out of ground can buy
-            // more at the price of expert residency (eviction = drop, the pack
-            // re-supplies) instead of refusing.
-            let seller = Arc::downgrade(&experts);
-            candle_nn::kv_cache::set_ground_broker(gpu_id, move |regions| {
-                seller
-                    .upgrade()
-                    .map_or(0, |cache| cache.request_kv_ground(regions))
-            });
+            // The weight side sells ground to the KV side through
+            // `ExpertCache::request_kv_ground`, reached by the scheduler's
+            // admission via `request_kv_ground` below — the one buyer there is.
         }
         #[cfg(not(feature = "cuda"))]
         let _ = (zone_capacity, zone_slot_bytes);

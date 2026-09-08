@@ -421,21 +421,6 @@ const DEFAULT_ROPE_SEQ_LEN: usize = 4096;
 /// Chunk size for extending RoPE tables.
 const ROPE_EXTEND_CHUNK: usize = 1024;
 
-/// Free KV regions a wave wants beyond one per sequence, before phase 0 stops
-/// asking the weight side for ground.
-///
-/// The mirror of the weight side's own `KV_REGION_SLACK`, and the same number for
-/// the same reason: a partition trimmed to exactly what the last wave used has
-/// nothing for the next one to grow into, and every arena that then has to be
-/// created is a region claim mid-wave — which is the claim the transient tier's
-/// ceiling refuses.
-///
-/// The per-sequence term beside it is what makes the target a statement about
-/// *this* wave rather than a constant: ground is spare only if nobody needs it,
-/// and the sequence count is the best cheap estimate of who does.
-#[cfg(feature = "cuda")]
-const KV_FREE_SLACK_REGIONS: usize = 32;
-
 /// Concrete wrapper for batched inference with RoPE caching.
 ///
 /// This struct owns the RoPE cache and provides the `forward_batch` implementation.
@@ -709,48 +694,16 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             //
             self.model.reclaim_spare_ground();
 
-            // **And the shrinking direction, which used to be missing entirely.**
-            //
-            // The comment that stood here said the KV side's direction was not
-            // needed, because "a claim that runs out buys its ground on the spot
-            // (`request_kv_ground`)". That is true only for a claim that runs out
-            // of *owned* ground. A claim refused by the transient tier's ceiling
-            // takes `Claim::TierBlocked`, which returns without buying anything —
-            // deliberately, because a tier standing on the ground wants a
-            // narrower wave rather than more ground. So the zone was never asked,
-            // and the two directions were not symmetric: growth ran here every
-            // forward while retraction ran only on a failure mode that could not
-            // reach it.
-            //
-            // Measured on the 27B: the zone grew to 10,498 MiB during the first
-            // 4-context config and held it across all ten, KV pinned at 162
-            // regions with 80 live at *one* context. C8 then arrived with twenty
-            // sessions and 24 free regions — 384 MiB — and took
-            // `CUDA_ERROR_OUT_OF_MEMORY` on a slot-state upload.
-            //
-            // The demand is scaled by the wave about to run rather than fixed:
-            // what makes ground spare is that no one needs it, and how many
-            // sequences are about to write KV is the best available statement of
-            // who needs it. Asking here is legal for the same reason growth is —
-            // every guard from the previous forward is dropped and this one has
-            // opened none, so `set_weight_floor` will not refuse.
-            let want_free = KV_FREE_SLACK_REGIONS + contexts.len();
-            if let candle::DeviceLocation::Cuda { gpu_id } = self.model.device().location() {
-                if let Some(rs) = candle_nn::kv_cache::region_stats(gpu_id) {
-                    let deficit = want_free.saturating_sub(rs.free);
-                    if deficit > 0 {
-                        let got = self.model.request_kv_ground(deficit);
-                        tracing::debug!(
-                            target: "candle_transformers::batched_model",
-                            free = rs.free,
-                            want_free,
-                            deficit,
-                            conceded_mib = got >> 20,
-                            "KV is short before the wave; asked the weight side for ground"
-                        );
-                    }
-                }
-            }
+            // **The shrinking direction is not this forward's to run.** The
+            // ground this wave writes — every row's K/V, its recurrent stores,
+            // its transient tier — was priced and bought by the admission that
+            // put each row here (`request_kv_ground` from the scheduler's fill),
+            // bounded by the residency it defends. A purchase here stood outside
+            // that bound: it asked for a slack of free regions plus one per
+            // context on every forward, so the wider the wave the more it took,
+            // and it kept taking while admission was refusing on weights —
+            // measured as the zone falling 5,628 → 4,863 MiB in seventy seconds
+            // of decode-only waves with no prefill admitted.
         }
 
         // **Phase 1: admit.** Claim every KV slot this wave will write, for

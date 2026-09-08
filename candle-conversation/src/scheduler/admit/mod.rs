@@ -65,9 +65,18 @@ pub(crate) trait Ground {
     /// the expensive work is never the cheapest.
     fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost>;
 
-    /// Admit the candidate [`Self::peek`] just priced, claiming its ground.
-    /// `false` when the allocators refused it after all.
-    fn admit(&mut self, kind: Kind, prio: DecodePriority) -> bool;
+    /// Admit the candidate [`Self::peek`] just priced at `cost`, buying and
+    /// claiming its ground. `false` when the allocators refused it after all.
+    ///
+    /// **This is the one place the weight boundary is asked to move toward
+    /// K/V.** The gate has already said the price stays above the residency the
+    /// engine defends, so what the K/V side does not hold free of that price is
+    /// bought from the weight side here, before the wave — never by a claim
+    /// that runs out mid-wave, never by the tier's placement, never by a
+    /// forward's own arithmetic. Every one of those bought outside the gate's
+    /// accounting, and between them took the zone to its floor with nothing
+    /// admitted.
+    fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool;
 }
 
 /// What one fill pass took.
@@ -135,7 +144,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G) -> Filled {
                 out.stopped_on_weights = true;
                 break;
             }
-            if !ground.admit(kind, prio) {
+            if !ground.admit(kind, prio, cost) {
                 break;
             }
             room.free_kv = room.free_kv.saturating_sub(total);
@@ -224,15 +233,16 @@ mod tests {
                 ..Default::default()
             })
         }
-        fn admit(&mut self, kind: Kind, prio: DecodePriority) -> bool {
+        fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
             if prio != self.wants(kind) {
                 return false;
             }
             if self.queue(kind).is_empty() {
                 return false;
             }
-            let cost = self.queue(kind).remove(0);
-            self.free = self.free.saturating_sub(cost);
+            let priced = self.queue(kind).remove(0);
+            assert_eq!(cost.kv, priced, "admit is handed the price peek quoted");
+            self.free = self.free.saturating_sub(priced);
             self.active += 1;
             if kind == Kind::Decode {
                 self.decodes_active += 1;
@@ -326,8 +336,8 @@ mod tests {
             fn peek(&mut self, k: Kind, p: DecodePriority) -> Option<Cost> {
                 self.0.peek(k, p)
             }
-            fn admit(&mut self, k: Kind, p: DecodePriority) -> bool {
-                self.0.admit(k, p)
+            fn admit(&mut self, k: Kind, p: DecodePriority, c: Cost) -> bool {
+                self.0.admit(k, p, c)
             }
         }
         // Ten queued, no room at all: without the pass count every one lands.

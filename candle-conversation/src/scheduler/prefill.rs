@@ -290,8 +290,8 @@ impl<'a> WaveFill<'a> {
         plan.tier_bytes(PREFILL_MIN_ADVANCE) as u64
     }
 
-    /// Prefill tokens the transient tier has room for beside `head_rows` rows
-    /// already in the wave, when the next item would add `want` tokens.
+    /// Publish this wave's transient-tier budget, so the engine's slab packer
+    /// prices against the same ground the fill did.
     ///
     /// **The co-batched wave is bounded here, and nowhere else.** The engine's
     /// slab packer bounds a *pure* prefill wave; a wave carrying decode rows
@@ -299,31 +299,14 @@ impl<'a> WaveFill<'a> {
     /// waves whose tier came to 6.3 GiB against a 6.1 GiB gap — every one of
     /// them refused, every one a failed directory.
     ///
-    /// **The tier's ground is bought here, at fill time, or not counted.** The
-    /// gap between the arena frontier and the weight floor is what stands free
-    /// and is small on its own — live arenas are scattered up to the floor. The
-    /// rest of a tier's room is weight-side ground the zone can concede down to
-    /// the hold point. Pricing that concession in and leaving the purchase to
-    /// the placement was measured twice and refused twice (`needs 4,064 MiB
-    /// against a 3,830 MiB gap`, the weight side "could not concede"): the
-    /// placement runs inside the forward, where the boundary may not move. The
-    /// fill runs between forwards, where it may, so when the head's tier would
-    /// exceed the gap and the zone stands far enough above the hold to cover
-    /// the shortfall, the fill asks the weight side for exactly that now
-    /// (`request_kv_ground`) and prices against the gap it then measures. What
-    /// the weight side does not concede is not a budget. The result is
-    /// recorded on the session so the engine's slab packer prices against the
-    /// same number and does not re-slice a group this fill composed.
-    /// Publish this wave's transient-tier budget, so the engine's slab packer
-    /// prices against the same ground the fill did.
-    ///
-    /// The frontier gap, less the margin a refusal widens. **Nothing is bought
-    /// from the weight side.** The old fill asked the zone to concede ground
-    /// when a wave's tier did not fit, and that ask is exactly the thing
-    /// admission now exists to refuse: ground taken there is resident experts,
-    /// and an engine that streams its experts is slower at everything. A wave
-    /// whose tier will not fit the standing gap is a wave that should be
-    /// narrower, which is `admit::gate`'s answer, not the zone's to pay for.
+    /// The budget is the frontier gap as it stands after the fill, less the
+    /// margin a refusal widens. Each admission priced its rows' tier
+    /// (`admit::Cost::activations`) and bought what the gap lacked
+    /// (`Scheduler::buy_kv_ground`), so the gap measured here already holds the
+    /// wave's tier; the placement inside the forward, where the boundary may
+    /// not move, then finds its ground already there. A wave whose tier will
+    /// not fit is a wave that should be narrower, which is `admit::gate`'s
+    /// answer, not the placement's to pay for.
     fn publish_tier_budget(&mut self) {
         let margin = self.sched.tier_margin_regions * REGION_BYTES;
         // **Ground the weight side is owed comes off the top.** When residency
@@ -437,14 +420,7 @@ impl WaveFill<'_> {
 
     /// One 32-token block, in the formats a **live** sequence occupies.
     fn per_block_bytes(&self) -> u64 {
-        let (k, v) = self.sched.session.active_kv_formats();
-        admit::cost::per_block_kv_bytes(
-            self.sched.session.num_layers(),
-            self.sched.session.n_kv_head(),
-            self.sched.session.head_dim(),
-            k,
-            v,
-        )
+        self.sched.per_block_kv_bytes()
     }
 
     /// What admitting `seq` would take: `claimed` tokens of K/V — the whole turn,
@@ -507,14 +483,15 @@ impl admit::Ground for WaveFill<'_> {
         // moving only between forwards, and every attempt to combine the two
         // has ended up counting the same ground twice (see below).
         let zone = interleave::effective_weight_zone_bytes().unwrap_or(u64::MAX);
-        // The KV side and the weight side share one elastic span: a claim that
-        // runs out of free regions buys its ground from the weight zone on the
-        // spot, and that is legitimate all the way down to the hold, which is
-        // the line below which the model would start streaming. Pricing against
-        // the free list alone refused admissions with gigabytes standing above
-        // that line — measured on run BR's calibration: three sequences a
-        // forward where every earlier run carried six, 979 tokens against
-        // 1,958, and the phase aggregate down 29%.
+        // The KV side and the weight side share one elastic span: an admission
+        // whose price exceeds the free regions buys the rest from the weight
+        // zone (`Scheduler::buy_kv_ground`), and that is legitimate all the way
+        // down to the hold, which is the line below which the model would start
+        // streaming. Pricing against the free list alone refused admissions
+        // with gigabytes standing above that line — measured on run BR's
+        // calibration: three sequences a forward where every earlier run
+        // carried six, 979 tokens against 1,958, and the phase aggregate down
+        // 29%.
         let room = admit::Headroom {
             free_kv: 0,
             zone,
@@ -566,8 +543,8 @@ impl admit::Ground for WaveFill<'_> {
         //
         // **The reserve comes out of the elastic budget, not out of the current
         // frontier gap.** Those look interchangeable and are not: the gap is
-        // `weight_floor - live_end()`, and the weight floor *moves* — K/V buys
-        // ground from the weight side on the spot, down to the hold. So the gap
+        // `weight_floor - live_end()`, and the weight floor *moves* — admission
+        // buys ground from the weight side as it admits, down to the hold. So the gap
         // is smallest exactly when residency is healthiest, and gating on it
         // inverts the logic. Measured: run CK refused after two prefills a fill
         // with an 8,204 MiB weight zone and 3.7 GiB of residency headroom
@@ -619,7 +596,7 @@ impl admit::Ground for WaveFill<'_> {
         }
     }
 
-    fn admit(&mut self, kind: admit::Kind, prio: DecodePriority) -> bool {
+    fn admit(&mut self, kind: admit::Kind, prio: DecodePriority, cost: admit::Cost) -> bool {
         use admit::Kind;
         let band = band_index(prio);
         match kind {
@@ -629,11 +606,13 @@ impl admit::Ground for WaveFill<'_> {
                 };
                 self.prefill_cursor[band] = idx + 1;
                 // The whole turn **and its decode lease**, matching what `peek`
-                // priced. `claim_kv` ensures capacity, so this reserves the
-                // ground rather than predicting it: the arena for the generation
-                // is taken here, at admission, and the slot cannot later grow
-                // into ground the gate never authorised.
+                // priced. The ground is bought first and then claimed:
+                // `claim_kv` ensures capacity, so this reserves the ground
+                // rather than predicting it — the arena for the generation is
+                // taken here, at admission, and the slot cannot later grow into
+                // ground the gate never authorised.
                 let reserve = whole.saturating_add(Scheduler::DECODE_LEASE_TOKENS);
+                self.sched.buy_kv_ground(&cost);
                 if !self.sched.claim_kv(seq.0, reserve) || !self.sched.claim_recurrent(seq.0) {
                     return false;
                 }
@@ -647,6 +626,9 @@ impl admit::Ground for WaveFill<'_> {
                 if let Some(at) = self.decode_order.iter().position(|id| *id == seq) {
                     self.decode_cursor[band] = at + 1;
                 }
+                // A step's K/V was reserved with its lease; what it buys is the
+                // tier for its row, which `peek` priced.
+                self.sched.buy_kv_ground(&cost);
                 if !self.sched.claim_kv(seq.0, Scheduler::DECODE_CLAIM_TOKENS)
                     || !self.sched.claim_recurrent(seq.0)
                 {
@@ -713,6 +695,24 @@ pub(super) struct CompressPass {
 /// The region quantum in bytes.
 fn region_bytes() -> u64 {
     candle_nn::kv_cache::REGION_BYTES as u64
+}
+
+/// Regions an admission must buy from the weight side, given that it needs
+/// `total` regions in all, `tier` of them contiguous at the arena frontier, the
+/// K/V side holds `free` regions anywhere, and `gap` of those lie between the
+/// frontier and the weight floor.
+///
+/// Two shortfalls, and the larger is bought: K/V blocks and a recurrent store
+/// take regions from anywhere on the free list, while the transient tier stands
+/// only in the gap — free regions scattered below live ones are no use to it.
+/// Buying moves the floor right, which adds to both counts at once, so one
+/// purchase of the larger shortfall satisfies both.
+///
+/// Pure, so the arithmetic is tested without a device.
+fn ground_shortfall_regions(total: usize, tier: usize, free: usize, gap: usize) -> usize {
+    total
+        .saturating_sub(free)
+        .max(tier.saturating_sub(gap))
 }
 
 /// The free-region setpoint for `phase`, in regions, given a KV side of
@@ -1273,6 +1273,23 @@ impl Scheduler {
             state,
             resume_failures,
         } = parked;
+        // A resume brings the turn's K/V back onto the card and steps it on a
+        // fresh lease, so it buys like the admission it is: the parked K/V,
+        // the lease, and the store `claim_recurrent` will place.
+        let lease = admit::cost::kv_bytes_for_advance(
+            0,
+            Self::DECODE_LEASE_TOKENS,
+            self.per_block_kv_bytes(),
+        );
+        self.buy_kv_ground(&admit::Cost {
+            kv: sealed_total_bytes(&warm).saturating_add(lease),
+            recurrent: if self.model.recurrent_resident(slot.0) {
+                0
+            } else {
+                self.model.recurrent_store_bytes() as u64
+            },
+            activations: 0,
+        });
         let restored = self
             .session
             .sealed_to_gpu(&warm)
@@ -1325,6 +1342,74 @@ impl Scheduler {
 
     fn claim_kv(&self, seq: usize, add: usize) -> bool {
         self.session.ensure_capacity(&[seq], add).is_ok()
+    }
+
+    /// One 32-token K/V block across the model, in the formats a **live**
+    /// sequence occupies — see `admit::cost` for the 3.7x that distinction is
+    /// worth.
+    pub(super) fn per_block_kv_bytes(&self) -> u64 {
+        let (k, v) = self.session.active_kv_formats();
+        admit::cost::per_block_kv_bytes(
+            self.session.num_layers(),
+            self.session.n_kv_head(),
+            self.session.head_dim(),
+            k,
+            v,
+        )
+    }
+
+    /// Buy from the weight side whatever of `cost` the K/V side does not hold
+    /// free — **the one place the weight boundary is asked to move toward K/V.**
+    ///
+    /// The gate has already said this price stays above the residency the
+    /// engine defends (`admit::gate`), so the purchase is bounded by the same
+    /// accounting that admitted the item; nothing else in the engine buys.
+    /// Runs between forwards, which is the only moment the boundary may move
+    /// (`set_weight_floor` refuses while a wave generation is open).
+    ///
+    /// Two shortfalls, and the larger is bought. K/V blocks and a recurrent
+    /// store take regions from anywhere on the free list; the wave transient
+    /// tier stands only in the gap between the arena frontier and the weight
+    /// floor, so free regions scattered below live ones are no use to it.
+    /// Buying moves the floor right, which adds to both.
+    ///
+    /// Answers the bytes conceded. A weight side at its own floor concedes
+    /// less than asked, and the claims that follow then refuse — which is the
+    /// gate's `stopped_on_weights`, arriving from the allocator rather than the
+    /// arithmetic.
+    pub(super) fn buy_kv_ground(&self, cost: &admit::Cost) -> u64 {
+        let total = cost.total();
+        if total == 0 {
+            return 0;
+        }
+        let Some(stats) = self.kv_regions() else {
+            return 0;
+        };
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() else {
+            return 0;
+        };
+        let regions = |bytes: u64| bytes.div_ceil(region_bytes()) as usize;
+        // Regions a standing tier blocks count as free: phase 0 of the forward
+        // this admits for releases that tier before any of its claims run.
+        let free = stats.free + stats.blocked;
+        let gap = regions(transient_headroom_bytes(gpu_id).unwrap_or(0) as u64);
+        let short = ground_shortfall_regions(regions(total), regions(cost.activations), free, gap);
+        if short == 0 {
+            return 0;
+        }
+        let conceded = self.model.request_kv_ground(short);
+        tracing::debug!(
+            target: "candle_conversation::scheduler::interleave",
+            kv_mib = cost.kv >> 20,
+            recurrent_mib = cost.recurrent >> 20,
+            tier_mib = cost.activations >> 20,
+            free_regions = free,
+            gap_regions = gap,
+            short_regions = short,
+            conceded_mib = conceded >> 20,
+            "admission bought weight-side ground",
+        );
+        conceded
     }
 
     /// Ask the model to make `seq`'s per-sequence state resident for the
@@ -4743,6 +4828,40 @@ mod idle_demote_tests {
             vec![(SequenceId(1), 100), (SequenceId(3), 300)],
             "the busy slot is skipped, the quiet ones go together",
         );
+    }
+}
+
+#[cfg(test)]
+mod ground_shortfall_tests {
+    use super::ground_shortfall_regions;
+
+    /// Enough free ground everywhere it is needed: nothing is bought.
+    #[test]
+    fn nothing_is_bought_when_the_free_list_and_the_gap_both_cover_the_price() {
+        assert_eq!(ground_shortfall_regions(10, 4, 12, 6), 0);
+        assert_eq!(ground_shortfall_regions(0, 0, 0, 0), 0, "a free admission buys nothing");
+    }
+
+    /// The total is short of the free list: the difference is bought.
+    #[test]
+    fn a_price_past_the_free_list_buys_the_difference() {
+        assert_eq!(ground_shortfall_regions(10, 0, 7, 0), 3);
+    }
+
+    /// **The tier needs the gap, not the free list.** Plenty of free regions
+    /// scattered below the frontier do not place a tier; the gap decides.
+    #[test]
+    fn a_tier_wider_than_the_gap_is_bought_even_with_free_regions_elsewhere() {
+        assert_eq!(ground_shortfall_regions(4, 4, 40, 1), 3);
+    }
+
+    /// One purchase serves both shortfalls, so the larger is taken, never the
+    /// sum: buying moves the floor right, which adds to the gap and the free
+    /// list at once.
+    #[test]
+    fn the_larger_shortfall_is_bought_once_rather_than_both_summed() {
+        assert_eq!(ground_shortfall_regions(10, 6, 5, 2), 5, "total short 5, tier short 4");
+        assert_eq!(ground_shortfall_regions(10, 6, 9, 0), 6, "total short 1, tier short 6");
     }
 }
 
