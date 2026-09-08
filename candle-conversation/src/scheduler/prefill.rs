@@ -593,6 +593,19 @@ impl admit::Ground for WaveFill<'_> {
                     ..self.price(seq, step, step)
                 })
             }
+            Kind::Section => {
+                // One band: sections carry no priority of their own.
+                if prio != DecodePriority::Low {
+                    return None;
+                }
+                let s = self.sched.section_queue.front()?;
+                // The whole section's K/V on an empty scratch slot, a store, and
+                // the tier for the chunk that rides this forward — the same
+                // three terms as a prefill, without a lease: nothing decodes.
+                let whole = s.tokens.len();
+                let cap = self.sched.max_prefill_pass_tokens.max(1);
+                Some(self.price(s.sequence_id, whole, whole.min(cap)))
+            }
         }
     }
 
@@ -636,6 +649,59 @@ impl admit::Ground for WaveFill<'_> {
                     return false;
                 }
                 self.decodes_taken.push(seq);
+                true
+            }
+            Kind::Section => {
+                let Some(pending) = self.sched.section_queue.pop_front() else {
+                    return false;
+                };
+                self.sched.buy_kv_ground(&cost);
+                let seal_block_from = match self.sched.prepare_section_ingest(
+                    pending.sequence_id,
+                    pending.section_id,
+                    &pending.prefix_section_ids,
+                    &pending.tokens,
+                ) {
+                    Ok(from) => from,
+                    // A section whose setup fails is answered and consumed —
+                    // the band moves on to the next one rather than stopping
+                    // on an item no later pass could set up either.
+                    Err(e) => {
+                        let _ = pending.response_tx.send(Err(e));
+                        return true;
+                    }
+                };
+                if !self.sched.claim_kv(pending.sequence_id.0, pending.tokens.len())
+                    || !self.sched.claim_recurrent(pending.sequence_id.0)
+                {
+                    // Refused: back to the head, FIFO, and the band stops. The
+                    // setup is idempotent — it truncates the slot before it
+                    // injects — so the next pass repeats it.
+                    self.sched.section_queue.push_front(pending);
+                    return false;
+                }
+                let PendingSectionIngest {
+                    sequence_id,
+                    section_id,
+                    tokens,
+                    address,
+                    debug_name,
+                    in_collection,
+                    response_tx,
+                    ..
+                } = pending;
+                self.sched.active_section_ingests.push(ActiveSectionIngest {
+                    sequence_id,
+                    section_id,
+                    tokens,
+                    offset: 0,
+                    seal_block_from,
+                    address,
+                    debug_name,
+                    in_collection,
+                    response_tx,
+                    error: None,
+                });
                 true
             }
         }
@@ -1127,6 +1193,10 @@ impl Scheduler {
             .filter(|p| p.error.is_none())
             .count()
             + self.active_decodes.values().filter(|s| !s.finished).count()
+            // A section in flight holds its K/V, its store and its tier rows
+            // until it seals, exactly as a prefill does — so it is active, and
+            // rule 1's "nothing running" is false while one runs.
+            + self.section_ingest_width()
     }
 
     /// Whether an admission decision is due this wave.
@@ -1753,7 +1823,9 @@ impl Scheduler {
         if !decodes.is_empty()
             || refused > 0
             || filled.prefills > 0
+            || filled.sections > 0
             || !self.prefill_queue.is_empty()
+            || !self.section_queue.is_empty()
         {
             // **Which band the work actually resolved to.** The band order is
             // only the order it appears to be if the layer lookup succeeds: a
@@ -1782,6 +1854,8 @@ impl Scheduler {
                 decodes = decodes.len(),
                 decodes_refused = refused,
                 prefills = filled.prefills,
+                sections = filled.sections,
+                queued_sections = self.section_queue.len(),
                 stopped_on_weights = filled.stopped_on_weights,
                 skipped = filled.skipped,
                 active = admit::Ground::active(&WaveFill::new(self, optimal)),
@@ -2024,6 +2098,7 @@ impl Scheduler {
         busy.extend(self.active_decodes.keys().copied());
         busy.extend(self.active_prefills.iter().map(|p| p.work.sequence_id));
         busy.extend(self.active_section_ingests.iter().map(|s| s.sequence_id));
+        busy.extend(self.section_queue.iter().map(|s| s.sequence_id));
         busy.extend(self.prefill_queue.iter().map(|w| w.sequence_id));
         busy.extend(self.pending_reprojections.iter().copied());
         busy.extend(self.deferred_glue_fires.iter().map(|p| p.parent_id));
@@ -2886,6 +2961,11 @@ impl Scheduler {
                 continue;
             }
             let s = self.active_section_ingests.swap_remove(i);
+            // A section leaving the active set is a completion as far as
+            // admission is concerned: its scratch slot's ground comes back when
+            // the caller frees it, and the next fill is due rather than taking
+            // the fast path.
+            self.completions = self.completions.saturating_add(1);
             if let Some(e) = s.error {
                 let _ = s.response_tx.send(Err(e));
                 continue;

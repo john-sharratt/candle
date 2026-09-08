@@ -1985,6 +1985,27 @@ pub(super) struct ActiveSectionIngest {
     pub(super) error: Option<ConversationError>,
 }
 
+/// A section ingest that has been requested and not yet admitted.
+///
+/// Holds nothing on the device: the scratch slot is empty and no store exists
+/// for it. `WaveFill::admit` (`Kind::Section`) prices it like a prefill — its
+/// K/V, its store, its tier rows — buys and claims that ground, runs the CPU
+/// setup (`prepare_section_ingest`), and only then moves it to
+/// [`Scheduler::active_section_ingests`]. Sections used to skip admission
+/// entirely, running as many as the token cap allowed; one minute of them at
+/// startup took the weight zone from 10,398 MiB to its hold before the first
+/// admission pass had run.
+pub(super) struct PendingSectionIngest {
+    pub(super) sequence_id: SequenceId,
+    pub(super) section_id: SectionId,
+    pub(super) prefix_section_ids: Vec<SectionId>,
+    pub(super) tokens: TokenBuffer,
+    pub(super) address: ContentAddress,
+    pub(super) debug_name: String,
+    pub(super) in_collection: bool,
+    pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
+}
+
 /// Where a slot's recurrent state comes from when admission first materialises
 /// it.
 ///
@@ -2888,6 +2909,9 @@ pub(crate) struct Scheduler {
     /// a later run has its K/V and not its page, and the injection says so
     /// rather than selecting silently against a prefix it never indexed.
     pub(super) turn_positional: HashMap<TurnKey, Arc<Vec<u8>>>,
+    /// Section ingests waiting for admission, FIFO — see
+    /// [`PendingSectionIngest`].
+    pub(super) section_queue: VecDeque<PendingSectionIngest>,
     /// Batched sampler for token generation.
     sampler: BatchedSampler,
     /// When `true`, special tokens are included in streamed text.
@@ -3444,6 +3468,7 @@ impl Scheduler {
             active_section_ingests: Vec::new(),
             section_positional: HashMap::new(),
             turn_positional: HashMap::new(),
+            section_queue: VecDeque::new(),
             sampler,
             show_special_tokens,
             health_config,
@@ -3556,7 +3581,16 @@ impl Scheduler {
             .active_section_ingests
             .iter()
             .map(|s| (s.tokens.token_count(), s.offset));
-        sum_pending_prefill_tokens(queued.chain(active).chain(sections))
+        let queued_sections = self
+            .section_queue
+            .iter()
+            .map(|s| (s.tokens.token_count(), 0));
+        sum_pending_prefill_tokens(
+            queued
+                .chain(active)
+                .chain(sections)
+                .chain(queued_sections),
+        )
     }
 
     fn drain_submissions(&mut self) -> bool {
@@ -4269,56 +4303,21 @@ impl Scheduler {
                 in_collection,
                 response_tx,
             } => {
-                match self.prepare_section_ingest(
+                // Queued, not started. The CPU setup and every claim it makes
+                // run when admission takes it (`WaveFill::admit`), so a section
+                // waiting here holds nothing on the device. An empty section
+                // rides the same path: admitted at no cost, it is complete the
+                // moment it is active and the drain seals it.
+                self.section_queue.push_back(PendingSectionIngest {
                     sequence_id,
                     section_id,
-                    &prefix_section_ids,
-                    &tokens,
-                ) {
-                    Ok(seal_block_from) => {
-                        if tokens.is_empty() {
-                            // No forward pass needed — seal immediately.
-                            let result = self
-                                .perform_seal_and_write(
-                                    sequence_id,
-                                    seal_block_from,
-                                    SealEnd::SlotEnd,
-                                    &SealAction::Section {
-                                        section_id,
-                                        tokens: Arc::new(tokens.to_vec()),
-                                        address,
-                                        debug_name: debug_name.clone(),
-                                        in_collection,
-                                    },
-                                    None,
-                                )
-                                .and_then(|opt| {
-                                    opt.ok_or_else(|| {
-                                        ConversationError::Channel(
-                                            "ingest_section: seal returned None".into(),
-                                        )
-                                    })
-                                });
-                            let _ = response_tx.send(result);
-                        } else {
-                            self.active_section_ingests.push(ActiveSectionIngest {
-                                sequence_id,
-                                section_id,
-                                tokens,
-                                offset: 0,
-                                seal_block_from,
-                                address,
-                                debug_name,
-                                in_collection,
-                                response_tx,
-                                error: None,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        let _ = response_tx.send(Err(e));
-                    }
-                }
+                    prefix_section_ids,
+                    tokens,
+                    address,
+                    debug_name,
+                    in_collection,
+                    response_tx,
+                });
                 true
             }
 
@@ -11791,6 +11790,60 @@ mod tests {
             None,
             "resolving the child's seed must not materialise the parent"
         );
+    }
+
+    /// **A section ingest is queued at request and admitted by the fill.**
+    ///
+    /// The request used to run the CPU setup and push the section straight
+    /// into the active set, so sections entered the wave without ever passing
+    /// admission — one startup minute of them took the weight zone from
+    /// 10,398 MiB to its hold. Now the request queues, the slot holds no K/V
+    /// and no store until the fill takes it, and the fill's `Kind::Section`
+    /// is what runs the setup and claims the ground.
+    #[test]
+    fn a_section_ingest_waits_for_admission_and_holds_nothing_until_then() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (tx, _rx) = crossbeam::channel::bounded(1);
+        scheduler.handle_request(SchedulerRequest::IngestSection {
+            sequence_id: slot,
+            section_id: SectionId::new(7),
+            prefix_section_ids: Vec::new(),
+            tokens: TokenBuffer::from(vec![1u32, 2, 3, 4, 5, 6, 7, 8]),
+            address: ContentAddress {
+                prefix_hash: ContentHash::default(),
+                section_hash: ContentHash::default(),
+            },
+            debug_name: "test-section".into(),
+            in_collection: false,
+            response_tx: tx,
+        });
+        assert_eq!(scheduler.section_queue.len(), 1, "queued, not started");
+        assert!(scheduler.active_section_ingests.is_empty());
+        assert_eq!(
+            scheduler.session.sequence_block_count(slot.0).unwrap_or(0),
+            0,
+            "a queued section holds no K/V"
+        );
+        assert_eq!(
+            scheduler.active_slots(),
+            0,
+            "and is not active: the first admission takes the head regardless"
+        );
+
+        // The admission pass takes it: setup runs, ground is claimed, and it
+        // joins the active set at offset 0 with its seal bound recorded.
+        scheduler.promote_new_prefills();
+        assert!(scheduler.section_queue.is_empty());
+        assert_eq!(scheduler.active_section_ingests.len(), 1);
+        let s = &scheduler.active_section_ingests[0];
+        assert_eq!(s.sequence_id, slot);
+        assert_eq!((s.offset, s.seal_block_from), (0, 0));
+        assert!(
+            scheduler.session.sequence_block_count(slot.0).unwrap_or(0) >= 1,
+            "admission claimed the section's K/V"
+        );
+        assert_eq!(scheduler.active_slots(), 1, "a running section is active");
     }
 
     /// **A scratch slot bound to a timeline stays at zeros at admission.**

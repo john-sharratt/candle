@@ -426,6 +426,7 @@ impl Scheduler {
                 && self.active_prefills.is_empty()
                 && self.prefill_queue.is_empty()
                 && self.active_section_ingests.is_empty()
+                && self.section_queue.is_empty()
                 && self.deferred_glue_fires.is_empty()
             {
                 // Nothing is in flight, so everything resident is permanent:
