@@ -1539,6 +1539,41 @@ the decode lease, the one path run 11 never reached. Two turns outran their
   block exactly as a full or block-quantized tail does, which is the same rule
   the projection path applied by hand with `push_empty_writer_chunk`.
 
+### 4.11.10 A guard that never priced itself
+
+Run 14 (2026-09-08, S28) wedged two minutes into ingest: 241,355 refusals of
+one wave in seven minutes, every one `needs 419430400 B … gap_mib=370..290`,
+with nothing requeued, nothing failed, no creep held and no glue pending. The
+wave was eight decode rows; 400 MiB was the tier the *previous* wave had placed
+for 375 prefill rows beside those decodes. The chain, from the log and the code:
+
+1. `enter_arena_window` — taken by arena creation and by `compact_arenas_down`'s
+   `relocate_arena` in the admission pass — releases a finished forward's tier
+   when the partition is idle (`blocked=29 → 0` between two fills with no wave
+   between them). That is by design: a standing tier belongs to a forward that
+   has finished with it.
+2. The next decode step began with `speculative_draft`, whose per-step attention
+   opens `begin_wave` without ever calling `plan_wave_transient`. With no tier
+   standing, `begin_wave` re-placed `domain.planned` — the previous forward's 400
+   MiB plan, still recorded — into a gap that a checkpoint install had narrowed
+   to 370 MiB. Refused.
+3. `note_tier_refusal` dropped the (empty) group and requeued nothing; the fill
+   bought nothing because the least wave (176 MiB + 64 margin) fit the gap; the
+   next iteration drafted first and hit the same stale plan. The forward that
+   would have recorded a plan sized to eight rows never ran.
+
+This is the hazard §7 of the hot-path invariants describes — a plan recorded by
+one forward standing over another's ground — reached from a caller that opens a
+guard without pricing itself.
+
+**The design as built (S29).** A plan is cleared with the tier it priced:
+`end_wave_transient` and `enter_arena_window` set `planned = None` when they
+release. A guard that then opens unpriced gets the deliberately worst-case
+`fallback_plan`, never another forward's. And the two openers that were unpriced
+now price themselves for their own rows before opening: the draft loop
+(`draft_cohort`, `n` rows a step, after every arena it may create) and the
+verify replay (`replay_accepted_prefixes`, the stash rows it stages).
+
 ## 5. Plan
 
 | phase | deliverable | gate | status |

@@ -45,7 +45,10 @@
 //! not carried over from the draft.
 
 use candle::{DType, Device, Result, Tensor, D};
-use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
+use candle_nn::kv_cache::{
+    begin_wave, plan_wave_transient, KvCache, LayerPhase, WavePlan, REGION_BYTES,
+    WAVE_FORWARD_BYTES,
+};
 
 use super::batched::HybridBatched;
 use super::mtp::{MtpContext, MtpHead};
@@ -406,6 +409,30 @@ pub fn draft_cohort(
     let mut ids = Tensor::from_vec(committed.to_vec(), n, dev)?;
     let mut steps: Vec<Tensor> = Vec::with_capacity(max_len);
     let q_lens = vec![1usize; n];
+
+    // **This forward prices its own tier.** Each step's attention opens a wave
+    // guard (`forward_attn_batched`), and a guard that opens with no plan of its
+    // own is laid out on whatever plan the domain last recorded — the previous
+    // `forward_wave`'s, sized for its rows, not these. Run 14 measured what
+    // that costs: an arena relocation between forwards released a finished
+    // wave's 400 MiB tier, the next draft re-placed that stale plan into a gap
+    // that had narrowed to 370 MiB, and the scheduler refused the same
+    // eight-row decode 241,355 times with nothing ever re-pricing, because the
+    // wave that would have was behind the draft that could not run. Priced here
+    // for `n` rows a step, after every arena this draft may create
+    // (`ensure_for_offset` above), since creating one releases a standing tier.
+    if let Device::Cuda(d) = dev {
+        let plan = WavePlan::new(model.wave_geometry(act_dtype));
+        let pad = |b: usize| b + REGION_BYTES;
+        plan_wave_transient(
+            &d.cuda_stream(),
+            [
+                pad(plan.phase_bytes(LayerPhase::Attention, n)),
+                pad(plan.phase_bytes(LayerPhase::Ffn, n)),
+                WAVE_FORWARD_BYTES,
+            ],
+        )?;
+    }
     let generation = session.begin_stager_generation();
 
     // Every drafted position is rolled back before this returns, whatever

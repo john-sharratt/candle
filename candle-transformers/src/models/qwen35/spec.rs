@@ -51,8 +51,14 @@ use crate::models::delta_net::{
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_empty;
 #[cfg(feature = "cuda")]
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{
+    plan_wave_transient, WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES,
+};
 use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
 
+#[cfg(feature = "cuda")]
+use super::engine::wave_geometry;
 use super::quantized_weights::QuantModel;
 
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
@@ -333,6 +339,26 @@ pub fn replay_accepted_prefixes(
     }
     let dims: &DeltaNetDims = &model.cfg.delta_net;
     let eps = model.cfg.rms_norm_eps;
+
+    // **This replay prices its own tier**, for the rows it stages, before any
+    // guard below opens — the same rule the batched forward and the draft
+    // follow, and for the same reason: a guard with no plan of its own is laid
+    // out on whatever plan the domain last recorded, sized for some other
+    // forward's rows. See `WaveDomain::planned`.
+    #[cfg(feature = "cuda")]
+    if let (Device::Cuda(d), Some(first)) = (&model.device, stash.layers.first()) {
+        let rows: usize = short.iter().map(|(span, _, _)| span.len).sum();
+        let plan = WavePlan::new(wave_geometry(&model.cfg, first.qkv.dtype()));
+        let pad = |b: usize| b + REGION_BYTES;
+        plan_wave_transient(
+            &d.cuda_stream(),
+            [
+                pad(plan.phase_bytes(LayerPhase::Attention, rows)),
+                pad(plan.phase_bytes(LayerPhase::Ffn, rows)),
+                WAVE_FORWARD_BYTES,
+            ],
+        )?;
+    }
 
     // **A generation for the replay, because the stash has no provenance to
     // lend.**
