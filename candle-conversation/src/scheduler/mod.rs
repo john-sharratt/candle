@@ -7357,9 +7357,12 @@ impl Scheduler {
                         // `Err` already warns that resume will recompute from
                         // zeros — evicting either would turn "cannot resume"
                         // into "resumed, fluent, and forgotten".
-                        // STEP S1a — eviction at seal removed, to see whether the
-                        // evict/restore round trip is what diverges the state.
-                        let _ = seal_slot;
+                        if let Err(e) = self.model.evict_recurrent(seal_slot.0) {
+                            tracing::warn!(
+                                "recurrent evict after seal failed for turn {}: {e}",
+                                idx.0,
+                            );
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => {
