@@ -12,7 +12,7 @@
 import { API } from '../lib/api.js';
 import { h, mount, worldTime, ago } from '../lib/dom.js';
 import { go, link } from '../lib/router.js';
-import { toast, MODE_LABEL, MODE_ICON, empty } from '../lib/ui.js';
+import { toast, MODE_LABEL, empty, avatar } from '../lib/ui.js';
 import { parseLine, filterCommands, toLine } from '../lib/cmd.js';
 import { sticky, selectionInside, throttled } from '../lib/live.js';
 import { state as vp, onBreakpoint } from '../lib/viewport.js';
@@ -33,6 +33,20 @@ export async function render(params) {
   const stageInner = h('div', { class: 'stage-inner' });
   const stage = h('div', { class: 'stage' }, stageInner);
   const actsPane = h('div', { class: 'acts' });
+
+  /* **Both columns say what they are.**
+   *
+   * The two-latency stream is the thing worth seeing here — acts committing
+   * while the prose that explains them is still assembling — and it was
+   * invisible: an unlabelled wall of prose beside an unlabelled wall of tool
+   * names reads as a log next to a transcript, and you have to be told which
+   * is which. The front page's sample has carried these headings since it was
+   * written, and it is the reason the sample lands in four seconds and this
+   * did not.
+   *
+   * Sticky, because the point holds at the bottom of a long exchange as much
+   * as at the top. */
+  const paneHd = (text) => h('div', { class: 'pane-hd' }, text);
   const actIndex = new Map();     // act_id -> { data, bubbleBody, actEl }
   const ticks = new Map();        // tick -> stage container
 
@@ -74,11 +88,19 @@ export async function render(params) {
   operatorView = !vp.narrow;
   const unwatchVp = onBreakpoint(() => { operatorView = !vp.narrow; applyActsVisibility(); });
 
+  /* The character, the way the front page's sample presents it: a face, a
+   * name, and one line saying who they are and where — rather than a mode icon
+   * standing in for all three. The portrait is already loaded on the record and
+   * `avatar` falls back to the initial when there is none, so this costs
+   * nothing and is the difference between a header and a toolbar. */
   const head = h('div', { class: 'console-hd' },
     link('/npc/' + npc.npc_id, { class: 'btn ghost sm' }, '←'),
-    h('span', { style: 'font-size:1.1rem' }, MODE_ICON[info.mode] || '◍'),
-    h('strong', {}, npc.name),
-    h('span', { class: 'chip' }, MODE_LABEL[info.mode] || info.mode),
+    avatar(npc),
+    h('div', { class: 'who-hd' },
+      h('div', {}, h('strong', {}, npc.name)),
+      h('div', { class: 'tiny dim' },
+        [npc.personality_name, MODE_LABEL[info.mode] || info.mode]
+          .filter(Boolean).join(' · '))),
     h('span', { class: 'tiny dim' }, 'as ' + (info.interlocutor?.display || '—')),
     h('span', { style: 'flex:1' }),
     idleEl, opsBtn,
@@ -257,13 +279,20 @@ export async function render(params) {
   function onAct(a) {
     // right column — always, with intent (operator view)
     const observable = !a.observable_in || a.observable_in.includes(info.mode);
+    /* One line per act — tick, tool, intent — the way the front page's sample
+     * renders them. It used to stack the intent under the tool behind a rule,
+     * which is a third of the pane per act: four acts filled the column and the
+     * stream stopped reading as a stream, which is the one thing this pane is
+     * for. An act with no observable trace says so in the intent slot rather
+     * than adding a fourth element, because that *is* what it did. */
     const actEl = h('div', { class: 'act-item' + (observable ? '' : ' unobs') },
-      h('div', { class: 'top' },
+      h('div', { class: 'row' },
         h('span', { class: 'tk' }, 't' + a.tick),
         h('span', { class: 'tool' }, a.tool),
-        !observable ? h('span', { class: 'tiny dim' }, '⊘ not observable') : null),
-      a.intent ? h('div', { class: 'intent' }, '→ ' + a.intent) : null,
-      h('div', { class: 'tiny dim mono', 'data-rendered': a.act_id }, observable ? 'rendering…' : ''));
+        h('span', { class: 'intent' },
+          observable ? (a.intent || '') : 'no observable trace')),
+      h('div', { class: 'rendered tiny dim mono', 'data-rendered': a.act_id },
+        observable ? 'rendering…' : ''));
     actsPane.appendChild(actEl);
     actsPane.scrollTop = actsPane.scrollHeight;
 
@@ -355,15 +384,27 @@ export async function render(params) {
 
   // ── assemble ──────────────────────────────────────────────────────────────
 
+  // The left heading follows the mode: in a room you are watching somebody,
+  // on a thread you are reading what was said.
+  stage.insertBefore(
+    paneHd(messaging ? 'the conversation' : 'what you see'),
+    stageInner,
+  );
+  actsPane.appendChild(paneHd('what it does'));
+
   const el = h('div', { class: 'page flush' },
     h('div', { class: 'console' }, head,
       h('div', { class: 'console-body' }, stage, actsPane),
       composer));
 
-  if (!messaging) {
-    stageInner.appendChild(h('div', { class: 'tiny dim', style: 'margin-bottom:14px' },
-      'Every line below is a turn on the interaction layer. Colour and rail come from turn metadata, not a second log.'));
-  }
+  /* What the two columns are, said once — the sample's caption, which says the
+   * point rather than the mechanism. The line here used to explain where the
+   * colours came from, which answers a question nobody has yet on the turn they
+   * open the page. */
+  stageInner.appendChild(h('div', { class: 'tiny dim console-caption' },
+    messaging
+      ? 'The right column is what it actually did; this is what reached you. It acts first and the words follow, so the two can disagree — and when they do, the right column is the true one.'
+      : 'The right column is the character acting. This is the narrator explaining it, one beat later — it moves before it can tell you why, because the mind decides and the surface only ever reports what it did.'));
 
   applyActsVisibility();
 
