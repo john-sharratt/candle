@@ -1343,6 +1343,77 @@ harder stop) and `demote_cold_ingest_if_pressured`. If a gentle throttle is
 wanted back it needs a lever the engine actually reads — the wave width — not a
 byte setpoint.
 
+### 4.11.7 Every buyer but admission, and every gate but the fill
+
+A full `repo_map` ingest with the fill of §4.11.4 in place (2026-09-08, run 4)
+still drove the weight zone from 10,398 MiB to 3,709 and ingested one directory
+in twenty-eight minutes. The gate was working — `stopped_on_weights=true` on 565
+of 942 fills — and the zone fell anyway, because the fill was one of several
+things moving the boundary and the only one that knew the hold. The log, ANSI
+stripped, attributes it:
+
+| window | what ran | admission | weight zone | stores |
+|---|---|---|---|---|
+| 04:17:26–48 (22 s) | 350 section forwards, up to 12 × ~2k tokens | **none** — first `wave fill` line is 04:18:25 | 10,398 → 5,171 MiB (the hold) | 1 → 23 |
+| 04:31:01–04:32:15 | decode only, 13 → 8 seqs | `stopped_on_weights=true`, `prefills=0` | 5,628 → 4,863 MiB | 37 → 58 |
+
+Sixty-three concessions, all stopped only by `floor_slots=769` — the expert
+cache's hard floor, 1,415 MiB — never by the hold. Four things were buying:
+
+1. **Stores at conversation open.** `InstallRecurrentState` (the prompt-branch
+   checkpoint), `create_sequence` (the timeline snapshot) and
+   `NewSequence { parent }` (a fork) each created a device store when a
+   conversation *opened*. Every one of 994 creations was followed within 10 ms
+   by `recurrent stores packed considered=N+1`, with `prefills=0`; the store
+   count tracked `queued + decoding` (31 + 13 against 37) and peaked at 74 —
+   6,000 MiB. §4.11's move of the *view's* store to admission had left the
+   parent's untouched.
+2. **Sections outside admission.** `IngestSection` pushed straight into the
+   active set and `build_section_batch` packed to the token cap. One startup
+   minute of sections took the zone to the hold before any admission pass had
+   run.
+3. **Claims and the tier buying for themselves.** `claim_region` bought
+   `KV_BUY_STEP` on exhaustion (the twenty `wanted=8` concessions), the
+   transient tier's placement bought its shortfall (`wanted=96`, `wanted=1..4`),
+   and `forward_wave` asked for `32 + contexts − free` regions on every forward.
+   All three moved the boundary from inside code that knows only the hard floor.
+4. **Loops beside the admission pass.** `relieve_vram_pressure` ran 865 times
+   from four sites and relieved twice; `demote_idle_slots` ran on every due pass
+   and re-admitted 1,611 of the slots it had just demoted, 241–650 ms later; the
+   producer's scan pool held 9,237 times on the weight zone — the same signal
+   the engine's own gate was already refusing on.
+
+**The design as built (S13–S16).**
+
+* **A store is materialised at admission, never at open.** Opening records a
+  `RecurrentSeed` — the checkpoint payload, the parent, or `Neutral` — and
+  `claim_recurrent` resolves it through `materialise_recurrent`: the slot's own
+  timeline snapshot first, then the seed chain (a live parent is copied; an
+  evicted parent's checkpoint is reached through it). A queued conversation
+  holds nothing on the device. The seal evicts, as before.
+* **Admission is the only buyer.** `claim_region` refuses on exhaustion,
+  `place_transient` refuses when the tier does not fit, the pre-wave purchase is
+  gone, and so is the ground-broker registry they went through.
+  `Scheduler::buy_kv_ground`, called from `WaveFill::admit` for every item the
+  gate passes (and from `resume_parked`), buys the larger of two shortfalls —
+  the price against the free list, and the tier against the frontier gap —
+  between forwards, bounded by the same accounting that admitted the item.
+* **Sections pass the fill.** `IngestSection` queues a `PendingSectionIngest`;
+  `Kind::Section` is a seventh band, Low, ahead of Low prefill (the caller is
+  blocked on the seal before it can submit the turn that attends over it) and
+  behind every interactive band. Priced like a prefill without a lease, gated
+  and counted like one; the setup and the claims run at admission. A running
+  section is an active slot and its finish is a completion.
+* **One eviction pass, run for a reason.** `demote_idle_slots` runs when the
+  head of the queue does not fit the headroom the fill prices with, or when
+  the engine is idle so the weight side grows back to what the card can hold.
+  Decodes never ask; they are continuations. The relief ladder, its setpoints,
+  `evict_cold_tail`, `compress_pending_turns` and the gentle-early ingest demote
+  are deleted, and the producer's gate no longer reads the weight zone.
+
+The rules of §4.11.4 are unchanged. What changed is that nothing else in the
+engine can now move the boundary or place a store without passing them.
+
 ## 5. Plan
 
 | phase | deliverable | gate | status |
