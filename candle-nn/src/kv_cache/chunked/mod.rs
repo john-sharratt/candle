@@ -151,8 +151,8 @@ pub use guest_stage_cpu::guest_stage;
 pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
     freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas,
-    reclaim_load_headroom, region_stats, set_weight_floor, span_end, span_layout,
-    span_region_refusal, spare_tally, transient_headroom_bytes, weight_capacity_bytes,
+    reclaim_load_headroom, region_stats, set_least_tier_bytes, set_weight_floor, span_end,
+    span_layout, span_region_refusal, spare_tally, transient_headroom_bytes, weight_capacity_bytes,
     weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,
 };
 #[cfg(feature = "cuda")]

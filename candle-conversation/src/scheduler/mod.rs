@@ -11853,6 +11853,41 @@ mod tests {
         );
     }
 
+    /// **An admission's tier is priced for its least chunk, not its whole one.**
+    /// A 2,000-token section prices the tier of `PREFILL_MIN_ADVANCE` rows; the
+    /// wave packs wider only into ground already free. Pricing the whole chunk
+    /// had admission buy 1.0–1.8 GiB of weight ground per prefill on run 6.
+    #[test]
+    fn an_admission_prices_the_tier_of_its_least_chunk_only() {
+        use admit::{Ground, Kind};
+        use crate::projection::DecodePriority;
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (tx, _rx) = crossbeam::channel::bounded(1);
+        scheduler.handle_request(SchedulerRequest::IngestSection {
+            sequence_id: slot,
+            section_id: SectionId::new(5),
+            prefix_section_ids: Vec::new(),
+            tokens: TokenBuffer::from(vec![1u32; 2000]),
+            address: ContentAddress::default(),
+            debug_name: "long".into(),
+            in_collection: false,
+            response_tx: tx,
+        });
+        let dtype = scheduler.session.activation_dtype();
+        let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
+        let least = (plan.tier_bytes(prefill::PREFILL_MIN_ADVANCE) - plan.tier_bytes(0)) as u64;
+        let whole = (plan.tier_bytes(2000) - plan.tier_bytes(0)) as u64;
+        assert!(whole > least, "the test only means something if the two differ");
+
+        let mut fill = prefill::WaveFill::new(&mut scheduler, 0);
+        let cost = fill
+            .peek(Kind::Section, DecodePriority::Low)
+            .expect("a queued section is offered");
+        assert_eq!(cost.activations, least, "the least chunk's tier, not the whole's");
+        assert!(cost.kv > 0, "the whole section's K/V is still the K/V price");
+    }
+
     /// **The section batch is bounded by the tier the fill left it.** With no
     /// tier budget published the first section still gets its least chunk —
     /// the wave must make progress and the placement judges that chunk — and
