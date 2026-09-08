@@ -71,15 +71,16 @@ pub(super) fn cut_at(usages: &[u16], tokens: usize) -> Cut {
 ///
 /// **A resume re-derives the slot's offset from the chunks it injects, so the
 /// snapshot has to cover exactly the committed tokens.** A slot's chunks can
-/// hold rows past its recorded offset — a speculative block's rejected tail
-/// that a rollback clamped at a sealed boundary, an empty writer chunk pushed
-/// for the next step — and the prefill-slot header build refuses a slot whose
-/// chunks cover more than its offset counts, because the surplus displaces
-/// every position written after it. Run 12 measured exactly that on the first
-/// decode after each resume — `slices cover 1455 tokens but the slot's recorded
-/// offset is 1453 (delta +2)` — and the refusal failed every sequence in the
-/// wave. Cutting here makes the invariant hold by construction, whatever the
-/// slot looked like at the moment its lease ran out.
+/// hold rows past its recorded offset — an empty writer chunk pushed for the
+/// next step, a speculative block's rejected tail a rollback has not yet
+/// reached — and the prefill-slot header build refuses a slot whose chunks
+/// cover more than its offset counts, because the surplus displaces every
+/// position written after it. Cutting here makes the invariant hold by
+/// construction for what leaves the card, whatever the slot looked like at the
+/// moment its lease ran out. (Run 13 measured `trimmed=0` on every park: the
+/// two-token surplus that failed the resumed slot in runs 12 and 13 was made
+/// *after* the resume, by a write into the sealed partial tail — see
+/// `ChunkedKvBacking::tail_needs_new_block`.)
 pub(super) fn trim_sealed_to_tokens(layers: &mut [SealedSequence], tokens: usize) -> usize {
     let mut surplus = 0usize;
     for seq in layers.iter_mut() {
