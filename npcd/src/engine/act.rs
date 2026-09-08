@@ -6,8 +6,8 @@
 //! each naming a tool and its arguments:
 //!
 //! ```text
-//! {"tool":"speak","intent":"that he will not get the ledger"}
-//! {"tool":"face","target":"the door"}
+//! {"tool":"say","intent":"that he will not get the ledger"}
+//! {"tool":"observe","target":"the door"}
 //! ```
 //!
 //! Not a function-calling API, and not XML. Three reasons, in order of how much
@@ -100,6 +100,37 @@ pub enum Rejected {
     },
 }
 
+impl Rejected {
+    /// What the character is told about a call that did not land.
+    ///
+    /// **Rejections have to come back.** A malformed call that is only logged
+    /// is a character acting into silence: it does not know the act failed, so
+    /// it has no reason to do anything differently, and it makes the same
+    /// mistake every turn for as long as it runs. That is exactly what
+    /// happened — `tell` without a `to`, over and over, each one a warning in a
+    /// log nobody in the world can read.
+    ///
+    /// Second person, like every other thing a character reads, and it names
+    /// what to do instead rather than only what was wrong.
+    pub fn line(&self) -> String {
+        match self {
+            Rejected::NotJson { .. } => {
+                "That did not come out as a call. One JSON object on a line, nothing else."
+                    .to_string()
+            }
+            Rejected::NoTool { .. } => {
+                "That call did not say which tool. Every call needs \"tool\".".to_string()
+            }
+            Rejected::UnknownTool { tool } => {
+                format!("There is no \"{tool}\" you can do. Use one of the tools you were given.")
+            }
+            Rejected::MissingParam { tool, param } => {
+                format!("Your \"{tool}\" needed \"{param}\" and did not have it. Nothing happened.")
+            }
+        }
+    }
+}
+
 /// What one decode produced.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Parsed {
@@ -125,10 +156,51 @@ fn looks_like_call(line: &str) -> bool {
     line.starts_with('{')
 }
 
+/// The envelope a `<tool_call>` block is wrapped in.
+///
+/// The model's own tool-call shape, and — far more importantly — **the shape the
+/// stencil emits**. A constrained decode drives the grammar in
+/// [`crate::engine::tools::specs`], which writes `<tool_call>` and then
+/// `{"name": …, "arguments": {…}}` itself; a parser that only understood the
+/// bare `{"tool": …}` line would reject every call the grammar produced, so the
+/// stencil could never be armed. That is exactly what happened: the catalog
+/// compiled, the registry armed, and nothing ever fired it because the prompt
+/// taught a format the trigger token never appears in.
+const CALL_OPEN: &str = "<tool_call>";
+const CALL_CLOSE: &str = "</tool_call>";
+
+/// One call's JSON, from either shape a character may emit.
+///
+/// Both are one object naming a tool and its arguments; they differ in where the
+/// name lives and whether the arguments are nested. Normalised here to the flat
+/// form the rest of this module works in, so nothing downstream has to know
+/// which the decode used.
+fn flatten(obj: serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let mut obj = obj;
+    // `{"name": "say", "arguments": {"intent": "…"}}` — the stencil's shape.
+    let Some(Value::String(name)) = obj.remove("name") else {
+        return obj;
+    };
+    let mut flat = match obj.remove("arguments") {
+        Some(Value::Object(args)) => args,
+        // A call with a name and no arguments is a call with no arguments —
+        // `wait` takes none — not a malformed one.
+        _ => serde_json::Map::new(),
+    };
+    flat.insert("tool".to_string(), Value::String(name));
+    flat
+}
+
 /// Parse a decode into acts.
 pub fn parse(output: &str) -> Parsed {
     let mut out = Parsed::default();
     let mut narration: Vec<&str> = Vec::new();
+
+    // The envelope is stripped before the line walk rather than inside it,
+    // because a `<tool_call>` block spans lines: the markers and the object sit
+    // on three lines of their own. Removing just the markers leaves the object
+    // on its own line, which is what the walk below already understands.
+    let output = &output.replace(CALL_OPEN, "\n").replace(CALL_CLOSE, "\n");
 
     for raw in output.lines() {
         let line = raw.trim();
@@ -148,7 +220,8 @@ pub fn parse(output: &str) -> Parsed {
             Err(_) => out.rejected.push(Rejected::NotJson {
                 line: line.to_string(),
             }),
-            Ok(Value::Object(mut obj)) => {
+            Ok(Value::Object(obj)) => {
+                let mut obj = flatten(obj);
                 let Some(name) = obj.remove("tool").and_then(|v| match v {
                     Value::String(s) => Some(s),
                     _ => None,
@@ -197,11 +270,91 @@ pub fn parse(output: &str) -> Parsed {
 mod tests {
     use super::*;
 
+    /// **The shape the stencil emits parses.**
+    ///
+    /// The constrained decode writes this envelope itself — `<tool_call>`, then
+    /// `{"name": …, "arguments": {…}}` — so a parser that only knew the bare
+    /// line would reject every call the grammar produced. It did: the catalog
+    /// compiled and the registry armed, and the trigger never fired because the
+    /// prompt taught a format the marker does not appear in.
+    #[test]
+    fn the_stencils_own_envelope_parses() {
+        let p = parse(
+            "<tool_call>\n{\"name\": \"tell\", \"arguments\": {\"to\": \"Wyneth Vayne\", \
+             \"intent\": \"that the gap is filled\"}}\n</tool_call>",
+        );
+        assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
+        assert_eq!(p.acts.len(), 1);
+        assert_eq!(p.acts[0].tool, "tell");
+        assert_eq!(p.acts[0].args["to"], "Wyneth Vayne");
+        assert_eq!(p.acts[0].args["intent"], "that the gap is filled");
+        // The envelope is not narration — it is framing the grammar wrote.
+        assert!(p.narration.is_empty(), "{:?}", p.narration);
+    }
+
+    /// An empty `arguments` is a **call**, refused for what it is missing —
+    /// never mistaken for malformed JSON.
+    ///
+    /// The distinction is the whole reason `rejected` carries a reason: the
+    /// character is told "your `observe` needed `target`", which it can act on,
+    /// rather than "that did not come out as a call", which it cannot. No act
+    /// in the catalog takes no arguments any more — `wait` was the last, and
+    /// every act now makes the character name something — so this is the shape
+    /// an empty envelope actually has.
+    #[test]
+    fn an_envelope_with_no_arguments_is_still_a_call() {
+        let p = parse("<tool_call>\n{\"name\": \"observe\", \"arguments\": {}}\n</tool_call>");
+        assert!(p.acts.is_empty(), "{:?}", p.acts);
+        assert_eq!(
+            p.rejected,
+            vec![Rejected::MissingParam {
+                tool: "observe",
+                param: "target"
+            }],
+            "an empty call must be refused for its parameter, not for its shape"
+        );
+    }
+
+    /// Both shapes in one decode, because a model mid-transition emits both and
+    /// neither should be the one that silently fails.
+    #[test]
+    fn the_bare_line_and_the_envelope_both_still_work() {
+        let p = parse(
+            "{\"tool\":\"observe\",\"target\":\"the door\"}\n\
+             <tool_call>\n{\"name\": \"say\", \"arguments\": {\"intent\": \"that I heard it\"}}\n</tool_call>",
+        );
+        assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
+        let tools: Vec<&str> = p.acts.iter().map(|a| a.tool).collect();
+        assert_eq!(tools, vec!["observe", "say"]);
+    }
+
+    /// A required parameter is still required in the envelope — the grammar
+    /// makes it unreachable, and a decode that arrives without one anyway is
+    /// still refused rather than half-performed.
+    #[test]
+    fn a_missing_required_argument_is_refused_in_either_shape() {
+        for text in [
+            r#"{"tool":"tell","intent":"that I am here"}"#,
+            "<tool_call>\n{\"name\": \"tell\", \"arguments\": {\"intent\": \"that I am here\"}}\n</tool_call>",
+        ] {
+            let p = parse(text);
+            assert!(p.acts.is_empty(), "{text}");
+            assert!(
+                matches!(
+                    p.rejected.first(),
+                    Some(Rejected::MissingParam { tool: "tell", param: "to" })
+                ),
+                "{text}: {:?}",
+                p.rejected
+            );
+        }
+    }
+
     #[test]
     fn a_single_call_parses() {
-        let p = parse(r#"{"tool":"speak","intent":"that I will not"}"#);
+        let p = parse(r#"{"tool":"say","intent":"that I will not"}"#);
         assert_eq!(p.acts.len(), 1);
-        assert_eq!(p.acts[0].tool, "speak");
+        assert_eq!(p.acts[0].tool, "say");
         assert_eq!(p.acts[0].args["intent"], "that I will not");
         assert!(p.rejected.is_empty());
         assert!(p.narration.is_empty());
@@ -210,12 +363,12 @@ mod tests {
     #[test]
     fn several_calls_keep_their_order() {
         let p = parse(
-            "{\"tool\":\"face\",\"target\":\"the door\"}\n\
-             {\"tool\":\"speak\",\"intent\":\"that someone is coming\"}",
+            "{\"tool\":\"observe\",\"target\":\"the door\"}\n\
+             {\"tool\":\"say\",\"intent\":\"that someone is coming\"}",
         );
         assert_eq!(
             p.acts.iter().map(|a| a.tool).collect::<Vec<_>>(),
-            vec!["face", "speak"]
+            vec!["observe", "say"]
         );
     }
 
@@ -226,11 +379,11 @@ mod tests {
     fn prose_around_calls_is_kept_and_not_acted_on() {
         let p = parse(
             "I have had enough of this.\n\
-             {\"tool\":\"refuse\",\"what\":\"handing over the ledger\"}\n\
+             {\"tool\":\"say\",\"intent\":\"that I am not handing over the ledger\",\"manner\":\"final\"}\n\
              He will not like that.",
         );
         assert_eq!(p.acts.len(), 1);
-        assert_eq!(p.acts[0].tool, "refuse");
+        assert_eq!(p.acts[0].tool, "say");
         assert_eq!(
             p.narration,
             "I have had enough of this.\nHe will not like that."
@@ -241,9 +394,9 @@ mod tests {
     /// neither an act nor narration.
     #[test]
     fn a_fenced_block_is_unwrapped() {
-        let p = parse("```json\n{\"tool\":\"wait\"}\n```");
+        let p = parse("```json\n{\"tool\":\"observe\",\"target\":\"the door\"}\n```");
         assert_eq!(p.acts.len(), 1);
-        assert_eq!(p.acts[0].tool, "wait");
+        assert_eq!(p.acts[0].tool, "observe");
         assert!(
             p.narration.is_empty(),
             "the fence became narration: {:?}",
@@ -256,7 +409,7 @@ mod tests {
     /// completely different fixes, so a malformed call is reported.
     #[test]
     fn a_malformed_call_is_rejected_rather_than_dropped() {
-        let p = parse(r#"{"tool":"speak","intent":}"#);
+        let p = parse(r#"{"tool":"say","intent":}"#);
         assert!(p.acts.is_empty());
         assert_eq!(p.rejected.len(), 1);
         assert!(matches!(p.rejected[0], Rejected::NotJson { .. }));
@@ -280,21 +433,71 @@ mod tests {
     /// character did not finish making.
     #[test]
     fn a_missing_required_parameter_is_a_rejection_not_a_best_effort_act() {
-        let p = parse(r#"{"tool":"speak","manner":"flatly"}"#);
+        let p = parse(r#"{"tool":"say","manner":"flatly"}"#);
         assert!(p.acts.is_empty());
         assert_eq!(
             p.rejected[0],
             Rejected::MissingParam {
-                tool: "speak",
+                tool: "say",
                 param: "intent"
             }
         );
     }
 
+    /// **Every rejection has something to say to the character.**
+    ///
+    /// A rejection that is only logged is a character acting into silence: it
+    /// does not know the act failed, so it has no reason to do anything
+    /// differently and makes the same malformed call every turn for as long as
+    /// it runs. That happened — `tell` without a `to`, once every four seconds,
+    /// each one a warning in a log nobody in the world can read.
+    #[test]
+    fn every_rejection_reads_as_something_the_character_can_act_on() {
+        let all = [
+            Rejected::NotJson { line: "{\"".into() },
+            Rejected::NoTool {
+                line: "{\"intent\":\"x\"}".into(),
+            },
+            Rejected::UnknownTool {
+                tool: "speak".into(),
+            },
+            Rejected::MissingParam {
+                tool: "tell",
+                param: "to",
+            },
+        ];
+        for r in all {
+            let line = r.line();
+            assert!(!line.is_empty(), "{r:?} says nothing");
+            assert!(line.ends_with('.'), "{r:?}: {line}");
+            // Written to the character, so it must not carry the machinery's
+            // own vocabulary into the one place the model reads.
+            for leak in ["Rejected", "MissingParam", "NotJson", "{\"", "Err("] {
+                assert!(!line.contains(leak), "{r:?} leaked {leak:?}: {line}");
+            }
+        }
+
+        // And it names the thing that was wrong, so the next attempt can differ.
+        let missing = Rejected::MissingParam {
+            tool: "tell",
+            param: "to",
+        }
+        .line();
+        assert!(
+            missing.contains("tell") && missing.contains("to"),
+            "{missing}"
+        );
+        let unknown = Rejected::UnknownTool {
+            tool: "teleport".into(),
+        }
+        .line();
+        assert!(unknown.contains("teleport"), "{unknown}");
+    }
+
     /// An optional parameter's absence is fine — that is what optional means.
     #[test]
     fn an_absent_optional_parameter_is_not_a_rejection() {
-        let p = parse(r#"{"tool":"speak","intent":"hello"}"#);
+        let p = parse(r#"{"tool":"say","intent":"hello"}"#);
         assert_eq!(p.acts.len(), 1);
         assert!(p.rejected.is_empty());
     }
@@ -343,9 +546,11 @@ mod tests {
     /// alphabetically and `manner` would precede `intent`.
     #[test]
     fn a_summary_follows_the_tools_parameter_order_not_the_maps() {
-        let p = parse(r#"{"tool":"speak","manner":"flatly","intent":"that I refuse","to":"Hess"}"#);
+        // `tell`, because it is the one that declares `to` before `manner` —
+        // the order under test is the tool's, not the map's.
+        let p = parse(r#"{"tool":"tell","manner":"flatly","to":"Hess","intent":"that I refuse"}"#);
         let s = p.acts[0].summary();
-        assert_eq!(s, "speak — that I refuse; Hess; flatly");
+        assert_eq!(s, "tell — Hess; that I refuse; flatly");
         let intent = s.find("that I refuse").unwrap();
         let manner = s.find("flatly").unwrap();
         assert!(
@@ -354,10 +559,17 @@ mod tests {
         );
     }
 
+    /// Built directly rather than parsed: no act in the catalog takes no
+    /// arguments any more, so this property has no witness the parser would
+    /// accept — but it is still the property, and a future act with only
+    /// optional parameters would land on it.
     #[test]
     fn an_argumentless_act_summarises_as_its_name() {
-        let p = parse(r#"{"tool":"wait"}"#);
-        assert_eq!(p.acts[0].summary(), "wait");
+        let a = Act {
+            tool: "observe",
+            args: serde_json::Map::new(),
+        };
+        assert_eq!(a.summary(), "observe");
     }
 
     /// A decode with nothing in it is not an error — a character can be handed

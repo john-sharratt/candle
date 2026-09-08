@@ -1,0 +1,17 @@
+id: survey-desk
+kind: station
+name: survey desk
+binds: one place
+short: >
+  A place's entry and its local history are written from it.
+long: >
+  A desk for one place on the map — a settlement, a ruin, a stretch of road.
+  Sitting at one claims that place and holds it until you get up. Its entry
+  and its own local history are yours to write. The geography itself is not:
+  moving a border or drowning a place changes every place around it, and that
+  is held whole, elsewhere, by one Maker at a time. Nor is a road, which runs
+  between two places and belongs to both.
+tools:
+  - place.read_entry
+  - place.write_entry
+  - place.write_local_history

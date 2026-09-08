@@ -133,6 +133,14 @@ pub struct ToolCallEnvelope {
     /// Closes the arguments object, the outer object, and the call. Default:
     /// `"}}\n</tool_call>"`.
     pub close: String,
+    /// The marker that *starts* a call — `"<tool_call>"`.
+    ///
+    /// Absent from [`Self::open`] because the model emits the marker itself and
+    /// the tree resumes after it, so a single-call grammar never needs to name
+    /// it. [`compile_tool_call_loop`] does: a second call inside one turn has no
+    /// trigger to fire, so the grammar has to offer the marker as the arm that
+    /// means "act again".
+    pub marker: String,
 }
 
 impl ToolCallEnvelope {
@@ -145,6 +153,7 @@ impl ToolCallEnvelope {
             open: "<tool_call>\n{\"name\": \"".to_string(),
             args_open: ", \"arguments\": {".to_string(),
             close: "}}\n</tool_call>".to_string(),
+            marker: "<tool_call>".to_string(),
         }
     }
 }
@@ -191,6 +200,177 @@ pub fn compile_tool_call_tree(
     // Failsafe: if a token ever escapes the mask, close the JSON + the tool-call
     // block so the partial output is at least terminated for the extractor.
     b.spec.bail = env.close.clone();
+    Ok(b.spec)
+}
+
+/// Compile a catalog into a tree that admits **up to `max_calls` calls in one
+/// turn**, then ends.
+///
+/// [`compile_tool_call_tree`] is the assistant shape: one call *is* the whole
+/// reply, so its close carries the turn's EOS and the turn is over. An **action
+/// loop** is a different thing. A character turning as it speaks or moving as it
+/// signals is doing two things in one moment, and a grammar that admits exactly
+/// one act cannot express that — it would silently make every turn a single act
+/// and nothing would report the amputation.
+///
+/// So after each call the grammar offers a choice, and the model makes it:
+///
+/// ```text
+///   …}}</tool_call>  ─┬─ "<tool_call>{"name": "  → another act (levels remain)
+///                     └─ close_turn              → done
+/// ```
+///
+/// `max_calls` is a **bound, not a target**: every level offers the closing arm,
+/// so a character that has said what it means stops at one. The bound exists
+/// because the alternative is an unbounded loop the model can sit in — the same
+/// runaway the reasoning block had, wearing a different hat.
+///
+/// The levels are unrolled rather than cycled: a cycle would make "how many so
+/// far" a property the tree cannot see, and the count is the whole point.
+///
+/// `env.close` must **not** carry the turn terminator here — `close_turn` does,
+/// on the finishing arm only. An `env.close` ending in EOS would end the turn on
+/// the first call and the loop would be unreachable.
+/// Copy `sub`'s nodes into `host`, redirecting its `End` to `tail`, and return
+/// its root's id in `host`.
+///
+/// **One tree, not two joined by a trigger.** A trigger fires on a *decoded*
+/// token, so a marker the grammar injects as static text does not necessarily
+/// fire one — which would leave the model free at exactly the join the grammar
+/// exists to close. Splicing makes the transition a node edge instead: the tree
+/// walks from the end of one part into the start of the next with no moment in
+/// between where control returns to the decoder.
+fn splice(host: &mut TreeSpec, sub: &TreeSpec, tail: SpecId) -> SpecId {
+    let base = host.nodes.len();
+    // `End` becomes `tail`; every other id shifts by the host's current length.
+    let remap = |id: SpecId| -> SpecId {
+        match sub.nodes.get(id.0) {
+            Some(NodeSpec::End) => tail,
+            _ => SpecId(id.0 + base),
+        }
+    };
+    for node in &sub.nodes {
+        let moved = match node {
+            // Kept as a node so ids stay dense and `remap` above stays a pure
+            // index shift; nothing ever reaches it, because every edge that
+            // pointed at it now points at `tail`.
+            NodeSpec::End => NodeSpec::End,
+            NodeSpec::Static { text, next } => NodeSpec::Static {
+                text: text.clone(),
+                next: remap(*next),
+            },
+            NodeSpec::Branch { arms } => NodeSpec::Branch {
+                arms: arms.iter().map(|(t, n)| (t.clone(), remap(*n))).collect(),
+            },
+            NodeSpec::FreeText {
+                term,
+                eos_ends,
+                limits,
+                close_token,
+                suppress_close,
+                next,
+            } => NodeSpec::FreeText {
+                term: *term,
+                eos_ends: *eos_ends,
+                limits: *limits,
+                close_token: *close_token,
+                suppress_close: *suppress_close,
+                next: remap(*next),
+            },
+        };
+        host.nodes.push(moved);
+    }
+    remap(sub.root)
+}
+
+pub fn compile_tool_call_loop(
+    tools: &[ToolSpec],
+    env: &ToolCallEnvelope,
+    max_calls: usize,
+    close_turn: &str,
+) -> Result<TreeSpec, BuildError> {
+    compile_action_loop(tools, env, max_calls, close_turn, None)
+}
+
+/// The action loop, optionally preceded by a reasoning block.
+///
+/// **The whole turn in one grammar.** With `think` set the tree is: the block's
+/// steered spans, its closing tag, then straight into the first call — no moment
+/// between them where the decoder is free. Without it the tree starts at the
+/// call.
+///
+/// This is what a mission-specific thinking dial needs. Some work is a thinking
+/// problem — drafting a story into an eleven-year silence — and some is not, and
+/// the same character must be able to do both. What must not vary is that the
+/// turn ends in acts: a character that thinks and then writes prose has done
+/// nothing, and the world cannot tell that from a character that chose to wait.
+pub fn compile_action_loop(
+    tools: &[ToolSpec],
+    env: &ToolCallEnvelope,
+    max_calls: usize,
+    close_turn: &str,
+    think: Option<&TreeSpec>,
+) -> Result<TreeSpec, BuildError> {
+    if tools.is_empty() {
+        return Err(BuildError::ToolSchema("empty tool catalog".into()));
+    }
+    if max_calls == 0 {
+        return Err(BuildError::ToolSchema(
+            "a turn that may make no calls is a turn that cannot act".into(),
+        ));
+    }
+    let mut b = ToolTreeBuilder {
+        spec: TreeSpec::new(TOOL_CALL_TREE_LABEL),
+        env,
+    };
+    let end = b.spec.push(NodeSpec::End);
+    // The arm that finishes the turn: emit the terminator and stop.
+    let finish = b.spec.push(NodeSpec::Static {
+        text: close_turn.to_string(),
+        next: end,
+    });
+
+    // **Built back to front.** Each level's continuation points at the level
+    // above it, so the deepest is constructed first and the shallowest ends up
+    // as the root. Forwards it would need a node id before the node exists.
+    let mut after_call = finish;
+    let mut root_open = None;
+    for level in (0..max_calls).rev() {
+        // One call: choose a name, fill its arguments, close the block.
+        let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let args_entry = b.build_args(&tool.params, after_call)?;
+            let arm_target = b.spec.push(NodeSpec::Static {
+                text: env.args_open.clone(),
+                next: args_entry,
+            });
+            arms.push((format!("{}\"", tool.name), arm_target));
+        }
+        let name_branch = b.spec.push(NodeSpec::Branch { arms });
+        let open = b.spec.push(NodeSpec::Static {
+            text: env.open.clone(),
+            next: name_branch,
+        });
+
+        // What the *previous* level's close leads to: go again, or finish. The
+        // continuation arm carries the marker the model would have emitted to
+        // start another call, so choosing it is choosing to act again.
+        after_call = b.spec.push(NodeSpec::Branch {
+            arms: vec![(env.marker.clone(), open), (close_turn.to_string(), end)],
+        });
+        if level == 0 {
+            root_open = Some(open);
+        }
+    }
+
+    let first_call = root_open.expect("max_calls > 0 builds at least one level");
+    // With a reasoning block, the turn starts inside it and flows into the first
+    // call as a node edge — see [`splice`] for why that is not a trigger.
+    b.spec.root = match think {
+        Some(prelude) => splice(&mut b.spec, prelude, first_call),
+        None => first_call,
+    };
+    b.spec.bail = format!("{}{}", env.close, close_turn);
     Ok(b.spec)
 }
 
@@ -360,6 +540,120 @@ mod tests {
         .unwrap();
         assert!(tree.len() > 5);
         assert_eq!(tree.label(), "tool_call");
+    }
+
+    /// The envelope the action loop uses: `close` carries no turn terminator,
+    /// because the finishing arm does.
+    fn loop_env() -> ToolCallEnvelope {
+        ToolCallEnvelope {
+            close: "}}\n</tool_call>".to_string(),
+            ..ToolCallEnvelope::qwen3()
+        }
+    }
+
+    /// **The bound binds, and it is a bound rather than a target.**
+    ///
+    /// Every level offers the closing arm, so a character that has said what it
+    /// means stops at one call. What the bound removes is the unbounded loop a
+    /// model can sit in — the same runaway the reasoning block had.
+    #[test]
+    fn the_loop_admits_up_to_its_bound_and_can_always_stop() {
+        for max in 1..=4 {
+            let spec = compile_tool_call_loop(&catalog(), &loop_env(), max, "<|im_end|>").unwrap();
+
+            // One name branch per level. Counted by an arm naming a tool rather
+            // than by arm *count* — an enum parameter also compiles to a branch
+            // with as many arms as the catalog has tools, which is a coincidence
+            // that made the first version of this test pass for the wrong reason.
+            let name_branches = spec
+                .nodes
+                .iter()
+                .filter(|n| {
+                    matches!(n, NodeSpec::Branch { arms }
+                        if arms.iter().any(|(t, _)| t == "read_file\""))
+                })
+                .count();
+            assert_eq!(name_branches, max, "expected {max} levels");
+
+            // And a continuation branch after every call, each of which offers
+            // the closing arm — so stopping is always reachable.
+            let continuations: Vec<&NodeSpec> = spec
+                .nodes
+                .iter()
+                .filter(|n| {
+                    matches!(n, NodeSpec::Branch { arms }
+                        if arms.iter().any(|(t, _)| t == "<|im_end|>"))
+                })
+                .collect();
+            assert_eq!(continuations.len(), max);
+            for c in continuations {
+                let NodeSpec::Branch { arms } = c else {
+                    unreachable!()
+                };
+                assert!(
+                    arms.iter().any(|(text, _)| text == "<|im_end|>"),
+                    "a level with no way to stop is an unbounded loop"
+                );
+            }
+
+            compile(&spec, &TestVocab::new()).expect("the loop must compile");
+        }
+    }
+
+    /// **Thinking flows into acting as a node edge, with no free join.**
+    ///
+    /// The reason it is one tree rather than two composed by a trigger: a
+    /// trigger fires on a *decoded* token, so a marker the grammar injects as
+    /// static text may not fire one — and the model would be free at exactly the
+    /// join the grammar exists to close. Spliced, the block's closing tag walks
+    /// straight into the first call.
+    #[test]
+    fn a_thinking_turn_walks_from_the_block_into_the_calls() {
+        use crate::stencil::think::{compile_think_tree, ThinkMode, ThinkSteerEnvelope};
+
+        let env = ThinkSteerEnvelope {
+            think_open: 1,
+            think_close: 2,
+            eos: 3,
+            after_close: "",
+        };
+        let prelude = compile_think_tree(ThinkMode::Balanced, &env).unwrap();
+        let spec =
+            compile_action_loop(&catalog(), &loop_env(), 2, "<|im_end|>", Some(&prelude)).unwrap();
+
+        // The spliced prelude is present…
+        assert!(
+            spec.nodes
+                .iter()
+                .any(|n| matches!(n, NodeSpec::FreeText { .. })),
+            "the reasoning span did not survive the splice"
+        );
+        // …and nothing still points at an `End` that would have handed control
+        // back between the block and the calls. Every edge out of the prelude
+        // leads onward.
+        let ends: Vec<usize> = spec
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n, NodeSpec::End))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ends.len(), 2, "one live End, one spliced-over remnant");
+
+        // The turn still starts inside the block, not at a call.
+        assert!(
+            !matches!(&spec.nodes[spec.root.0], NodeSpec::Static { text, .. } if text.contains("name")),
+            "a thinking turn must begin in the block"
+        );
+        compile(&spec, &TestVocab::new()).expect("the spliced tree must compile");
+    }
+
+    /// A turn that may make no calls is a turn that cannot act, which for an
+    /// action loop is not a configuration — it is a mistake with no symptom.
+    #[test]
+    fn a_loop_of_zero_calls_is_refused() {
+        assert!(compile_tool_call_loop(&catalog(), &loop_env(), 0, "<|im_end|>").is_err());
+        assert!(compile_tool_call_loop(&[], &loop_env(), 3, "<|im_end|>").is_err());
     }
 
     #[test]

@@ -1,0 +1,22 @@
+id: character-terminal
+kind: station
+name: character terminal
+binds: one character
+short: >
+  Who a character is, what they want, what they hold true and what they have
+  lived are all written from it.
+long: >
+  A terminal onto one whole person. Sitting at it claims a character and holds
+  them until you get up, and it reaches all four of the things that make them:
+  who they are, what they want, what they hold true, and what they have lived.
+  Those are four separate records and this is deliberately one seat, because a
+  background written in four places by four hands is four people wearing one
+  name. What it will not let you write is what stands *between* two
+  characters: that lives in both their records and neither holder can put it
+  there alone.
+tools:
+  - character.read
+  - character.write_identity
+  - character.write_wants
+  - character.write_beliefs
+  - character.write_memories

@@ -225,29 +225,33 @@ mod tests {
     #[test]
     fn a_replacing_turn_retires_its_band_anywhere_in_the_window() {
         let mut w = Window::new(10);
-        w.push_world("map A", 0, Some("map:tactical".into()));
+        w.push_world("in band one", 0, Some("situation".into()));
         world(&mut w, "something happened");
         world(&mut w, "something else happened");
-        w.push_world("map B", 0, Some("map:tactical".into()));
+        w.push_world("in the green room", 0, Some("situation".into()));
 
         let texts: Vec<&str> = w.turns().map(|t| t.text.as_str()).collect();
         assert_eq!(
             texts,
-            vec!["something happened", "something else happened", "map B"],
-            "the stale map survived"
+            vec![
+                "something happened",
+                "something else happened",
+                "in the green room"
+            ],
+            "the stale situation survived"
         );
     }
 
-    /// Bands are independent. A tactical map must not retire the strategic one —
-    /// they describe different things at different scales.
+    /// Bands are independent: replacement is scoped to the band and never
+    /// widens to superseding turns in general.
     #[test]
     fn replacement_is_per_band() {
         let mut w = Window::new(10);
-        w.push_world("tactical", 0, Some("map:tactical".into()));
-        w.push_world("strategic", 0, Some("map:strategic".into()));
-        w.push_world("tactical 2", 0, Some("map:tactical".into()));
+        w.push_world("in band one", 0, Some("situation".into()));
+        w.push_world("finish the redoubt", 0, Some("task".into()));
+        w.push_world("in the green room", 0, Some("situation".into()));
         let texts: Vec<&str> = w.turns().map(|t| t.text.as_str()).collect();
-        assert_eq!(texts, vec!["strategic", "tactical 2"]);
+        assert_eq!(texts, vec!["finish the redoubt", "in the green room"]);
     }
 
     /// Superseding is not fading. Conflating them makes the fade counter — the
@@ -255,10 +259,54 @@ mod tests {
     #[test]
     fn superseding_a_turn_does_not_count_as_a_fade() {
         let mut w = Window::new(10);
-        w.push_world("map A", 0, Some("map:tactical".into()));
-        w.push_world("map B", 0, Some("map:tactical".into()));
+        w.push_world("in band one", 0, Some("situation".into()));
+        w.push_world("in the green room", 0, Some("situation".into()));
         assert_eq!(w.faded(), 0);
         assert_eq!(w.len(), 1);
+    }
+
+    /// **The join.** `replaces()` and `push_world` are each tested at their own
+    /// end; this is the only place the chain the scheduler actually runs is
+    /// exercised whole — an event, through its own band, into a real window.
+    ///
+    /// Broken, it fails silently and in the worst direction: the character
+    /// carries every situation it has ever been in, with the oldest reading as
+    /// current if the newest has faded out of the cap.
+    #[test]
+    fn a_situation_event_leaves_exactly_one_of_itself_in_a_real_window() {
+        use crate::engine::event::{Event, EventKind, Salience};
+
+        let mut w = Window::new(10);
+        for room in ["band one", "the north run", "the green room"] {
+            let e = Event::new(
+                1,
+                0,
+                Salience::IDLE,
+                EventKind::Situation {
+                    text: format!("You are in {room}."),
+                },
+            );
+            w.push_world(e.prose(), e.at_ms, e.kind.replaces());
+            // Something happens between them, so the retirement has to scan
+            // past it rather than only checking the tail.
+            world(&mut w, "somebody came in");
+        }
+
+        let situations: Vec<&str> = w
+            .turns()
+            .map(|t| t.text.as_str())
+            .filter(|t| t.starts_with("You are"))
+            .collect();
+        assert_eq!(
+            situations,
+            vec!["You are in the green room."],
+            "the character is standing in more than one place"
+        );
+        // And the things that happened all survived — only the present replaces.
+        assert_eq!(
+            w.turns().filter(|t| t.text == "somebody came in").count(),
+            3
+        );
     }
 
     #[test]

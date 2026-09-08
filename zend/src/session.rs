@@ -815,7 +815,7 @@ impl InferenceState {
         // The thinking-block steering trees (one per non-off effort dial),
         // compiled once and reused across turns alongside the tool-call base.
         let think_steering = engine
-            .compile_think_steering()
+            .compile_think_steering("")
             .map_err(|e| anyhow::anyhow!("think steering compile: {e}"))?;
         tracing::info!(
             elapsed_ms = t_compile.elapsed().as_millis() as u64,

@@ -4,6 +4,7 @@ use candle_nn::kv_cache::{KvFormat, QuantFormat};
 use candle_transformers::models::batched_inference::BatchedConfig;
 
 use crate::models::Dialect;
+use crate::persistence::SharedSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::ConversationTreeConfig;
@@ -468,7 +469,16 @@ impl SamplingConfig {
             | "qwen38" | "qwen38moe" => Some(
                 Self::for_gguf_architecture(arch)
                     .with_no_segment_close()
-                    .with_dynamic_eos_boost(1.0, 400, 100, 3.0)
+                    // **`500` is the ramp's END, not its length.** The kernel
+                    // computes `span = max(ramp_len - ramp_start, 1)`, so `100`
+                    // here gave `100 - 400 = -300`, clamped to `1` — an
+                    // inverted ramp that collapses to a cliff: no EOS boost at
+                    // all through 400 tokens, then the full 3× multiplier from
+                    // token 401 onward. Every other call site passes an end and
+                    // gets the intended hundred-token span; only this one, the
+                    // preset the non-thinking path actually runs under, had it
+                    // backwards.
+                    .with_dynamic_eos_boost(1.0, 400, 500, 3.0)
                     .with_eos_failsafe(512, 700),
             ),
 
@@ -607,6 +617,87 @@ impl SamplingConfig {
         self
     }
 
+    /// Retune an architecture default for **dialogue that has to be different
+    /// every time** — a character speaking, not an assistant answering.
+    ///
+    /// # The two published pairings
+    ///
+    /// Qwen publishes `temperature=0.7, top_p=0.8` for general tasks and
+    /// `temperature=1.0, top_p=0.95` for reasoning, both with `top_k=20`; its
+    /// technical report used `presence_penalty=1.5` for the Creative Writing v3
+    /// and WritingBench runs. The architecture defaults here take the first
+    /// pairing, which is the right conservative choice for an assistant and the
+    /// wrong one for a cast: 0.7 with `top_p` 0.8 is a narrow nucleus, and a
+    /// character re-answering a situation much like the last one lands on the
+    /// same sentence.
+    ///
+    /// So this takes the wider pairing and leaves `top_k` and the penalties
+    /// alone — `presence_penalty` is already at the figure Qwen used for
+    /// creative work, and raising it further is what their guidance warns
+    /// brings on language mixing.
+    ///
+    /// Applied by the caller rather than folded into the architecture default,
+    /// because the architecture does not say what the model is *for*: the same
+    /// checkpoint serving a coding assistant wants the narrow pairing, and
+    /// silently widening it there would be retuning code generation to fix
+    /// dialogue.
+    ///
+    /// # Repetition: the pressure moves from presence onto runs
+    ///
+    /// Both penalties subtract from the logit, so they are comparable in nats:
+    /// presence takes a flat `p` off **every token used at all this turn**;
+    /// DRY takes `multiplier · base^(match_len − allowed)` off the one token
+    /// that would *continue a repeated run*.
+    ///
+    /// **Presence at the architecture's 1.5 is what makes a character ramble.**
+    /// It cannot see a phrase — the twentieth repetition of a five-word clause
+    /// costs exactly what the second use of "the" costs — and its scope grows
+    /// with the utterance, so the longer a character speaks the more of its own
+    /// natural vocabulary is suppressed and the stranger the continuations it
+    /// has left. A live cast produced two hundred words of "again today
+    /// tomorrow forever more whatever comes first whichever part wins" from
+    /// exactly this: not too little pressure against repetition, too much
+    /// against *reuse*.
+    ///
+    /// Reference guidance puts presence at 0.1–0.35 where DRY is carrying the
+    /// load. 0.3 is the top of that band, because a character restating itself
+    /// is still the thing being fought — it is a fifth of the old pressure,
+    /// not none of it.
+    ///
+    /// DRY is already on from [`Self::with_qwen_thinking_steering`] and is
+    /// strengthened a little here, 0.8 → 1.0, to take up what presence gives
+    /// back — inside the 0.8–1.12 band the reference recommends. With
+    /// `base = 1.75, allowed = 2`:
+    ///
+    /// | repeated run | before (1.5 + 0.8·b^n) | after (0.3 + 1.0·b^n) |
+    /// |---|---|---|
+    /// | ordinary word | 1.50 | **0.30** |
+    /// | 3 tokens | 2.90 | 2.05 |
+    /// | 5 tokens | 5.79 | 5.66 |
+    /// | 7 tokens | 14.63 | **16.71** |
+    ///
+    /// — far less on reuse, the same in the middle, more where a run has become
+    /// a loop.
+    ///
+    /// # What this does not reach
+    ///
+    /// DRY is **span-scoped**: the kernel windows it on `dry_lens[seq]`, reset
+    /// at every `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, so it sees
+    /// only the span being written. It therefore cannot see the previous
+    /// utterance, and cannot see another character's speech quoted in the
+    /// prompt — so a cast echoing each other's phrasing is invisible to it by
+    /// construction, and `range` is bounded by the span long before it reaches
+    /// 512. That scoping is deliberate and right for an assistant reproducing
+    /// identifiers from an earlier span; for dialogue it is the reason a
+    /// stronger multiplier alone will not stop two characters converging on one
+    /// another's words.
+    pub fn for_character_dialogue(mut self) -> Self {
+        self.temperature = 1.0;
+        self.top_p = 0.95;
+        self.presence_penalty = 0.3;
+        self.with_dry_penalty(1.0, 1.75, 2, 512)
+    }
+
     /// Set the repeat window (last N tokens considered for penalties).
     /// `0` = use full history.
     pub fn with_repeat_last_n(mut self, n: i32) -> Self {
@@ -629,17 +720,33 @@ impl SamplingConfig {
     /// Enable dynamic EOS boost with ramp parameters.
     /// `boost` is the base boost; at `ramp_len` tokens it is multiplied by `max_multiplier`.
     /// `ramp_start` is the token count where the ramp begins — zero boost before that.
+    /// `ramp_end` is the **absolute token count at which the boost is full**,
+    /// not a length from `ramp_start`.
+    ///
+    /// Said here because the field it lands in is called `eos_ramp_len` and the
+    /// name is a lie: the kernel computes `span = max(ramp_end - ramp_start, 1)`
+    /// (`batched_sampling.cuh`), so a value *below* `ramp_start` inverts the
+    /// ramp and the clamp turns it into a cliff — no boost at all until
+    /// `ramp_start`, then the whole multiplier one token later. That is not a
+    /// gentler ramp; it is the opposite of one, and it reads as correct at every
+    /// call site.
     pub fn with_dynamic_eos_boost(
         mut self,
         boost: f32,
         ramp_start: i32,
-        ramp_len: i32,
+        ramp_end: i32,
         max_multiplier: f32,
     ) -> Self {
+        debug_assert!(
+            ramp_end > ramp_start,
+            "the EOS ramp ends at {ramp_end} and starts at {ramp_start} — an end below the start \
+             collapses the ramp to a cliff at `ramp_start`, which is the opposite of what a ramp \
+             is for"
+        );
         self.eos_boost = boost;
         self.dynamic_eos_boost = true;
         self.eos_ramp_start = ramp_start;
-        self.eos_ramp_len = ramp_len;
+        self.eos_ramp_len = ramp_end;
         self.eos_boost_max_multiplier = max_multiplier;
         self
     }
@@ -1357,7 +1464,18 @@ pub struct EngineConfig {
     /// Workspace root whose `.substrate/` directory backs the persistence
     /// redo log. When `None`, the engine opens the substrate under the
     /// process working directory (`SubstratePersistence::open`).
+    ///
+    /// Unread when [`Self::substrate`] carries an already-open one.
     pub workspace_path: Option<std::path::PathBuf>,
+
+    /// A substrate the host process opened and goes on writing to itself.
+    ///
+    /// `None` — the ordinary case — and the engine opens
+    /// [`Self::workspace_path`] itself. `Some` is for a host with its own
+    /// record classes in the same log: one `.substrate/` admits exactly one
+    /// writable handle per process, and a second silently loses records rather
+    /// than failing. See [`SharedSubstrate`].
+    pub substrate: Option<SharedSubstrate>,
 
     /// Serialized model identity (HF repo / filename / arch / context length).
     /// Written to the substrate's `ModelSpec` record at engine startup via
@@ -1417,6 +1535,7 @@ impl EngineConfig {
             penalty_log_path: None,
             health: DecodeHealthConfig::default(),
             workspace_path: None,
+            substrate: None,
             model_spec: None,
             tokenizer: None,
             dialect: Dialect::chat_ml(),
@@ -1765,6 +1884,36 @@ mod sampling_config_tests {
             df > 50,
             "sanity: Deep's force budget exceeds the tiny answer budget"
         );
+    }
+
+    /// The numbers were chosen against the formula, so the formula is what the
+    /// test asserts: penalty = `multiplier · base^(match_len − allowed)`, in
+    /// the same nats presence subtracts.
+    #[test]
+    fn character_dialogue_moves_the_pressure_from_reuse_onto_runs() {
+        let base = SamplingConfig::for_gguf_architecture("qwen35");
+        let c = base.clone().for_character_dialogue();
+
+        // Reuse of a word costs a fifth of what it did.
+        assert_eq!(base.presence_penalty, 1.5);
+        assert_eq!(c.presence_penalty, 0.3);
+
+        let d = c.dry.as_ref().expect("DRY carries the repetition load");
+        let run = |n: i32| d.multiplier * d.base.powi(n - d.allowed_length);
+        let was = SamplingConfig::for_gguf_architecture("qwen35");
+        let dw = was.dry.as_ref().expect("already on before this");
+        let run_was = |n: i32| dw.multiplier * dw.base.powi(n - dw.allowed_length);
+
+        // A long run is punished harder than it was, even with presence cut.
+        assert!(
+            0.3 + run(7) > was.presence_penalty + run_was(7),
+            "a seven-token loop got easier, not harder"
+        );
+        // And an ordinary repeated word is punished far less.
+        assert!(c.presence_penalty < was.presence_penalty / 4.0);
+        // Escalation is still monotonic and still ends in an effective ban.
+        assert!(run(3) < run(5) && run(5) < run(7));
+        assert!(run(8) > 20.0, "an eight-token loop must be unreachable");
     }
 
     #[test]

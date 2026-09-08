@@ -1,0 +1,12 @@
+id: house-palette
+kind: fixture
+name: the house palette
+short: >
+  The palette keeps what every face made in this vault has in common, whoever
+  made it.
+long: >
+  The house style: the things every portrait made here shares regardless of
+  who drew it. Read rather than argued with — what a particular family or
+  faction must share is a narrower question and is settled elsewhere.
+tools:
+  - portrait.read_house_style

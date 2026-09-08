@@ -272,6 +272,8 @@ impl SummarizationTask {
                 disable_reprojection: false,
                 // Summarization decodes free text only — no tool stencils.
                 triggers: Arc::new(TriggerRegistry::new()),
+                turn_grammar: None,
+                free_tool_calls_from_penalties: false,
             })
             .is_err()
         {

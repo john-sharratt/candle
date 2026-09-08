@@ -34,35 +34,12 @@ use include_dir::{include_dir, Dir};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use web::{Builder, Config, Roots};
 
-mod accounts;
-mod api;
-mod clock;
-mod collections;
-mod compliance;
-mod console;
-mod describe;
-mod engine;
-mod guard;
-mod guest_routes;
-mod guests;
-mod identity;
-mod images;
-mod lifegen;
-mod logs;
-mod mind;
-mod model;
-mod namegen;
-mod ndjson;
-mod npcs;
-mod ops;
-mod personality_portrait;
-mod portrait;
-mod projection;
-mod refimage;
-mod registry;
-mod substrate;
-mod telemetry;
-mod visibility;
+// The whole core is the library beside this file; the binary is a shim that
+// binds a port over it. See `lib.rs` for why the split exists.
+use npcd::{
+    accounts, api, clock, collections, engine, guard, identity, images, logs, mind, npcs, ops,
+    personality_portrait, projection, registry,
+};
 
 /// The console, compiled in. Two directories, searched in order: a request for
 /// `/lib/dom.js` falls through to the shared framework, `/pages/roster.js` does
@@ -225,9 +202,39 @@ async fn main() -> anyhow::Result<()> {
         None => Roots::embedded(&[&SITE, &COMMON]),
     };
 
-    let data = cli
-        .data
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    // **The compiled-in default is a path on the machine that built this.**
+    //
+    // `CARGO_MANIFEST_DIR` is resolved by the compiler, so the binary carries
+    // one developer's absolute source path as its idea of where the substrate
+    // lives. On the box that built it that is exactly right and is the
+    // documented convenience; anywhere else — a binary copied to another
+    // machine, a tree that has since been moved or renamed — it names somewhere
+    // that does not exist, and the daemon would go looking for accounts and a
+    // substrate under it without ever saying so.
+    //
+    // So it is used when it is really there, and the working directory stands
+    // in when it is not. Either way the choice is logged, because "which
+    // substrate is this daemon actually writing to" is the first question asked
+    // when a cast comes up empty.
+    let data = match cli.data {
+        Some(dir) => dir,
+        None => {
+            let built_at = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            if built_at.is_dir() {
+                built_at
+            } else {
+                let here = std::env::current_dir()?;
+                tracing::warn!(
+                    "the compiled-in data directory {} is not on this machine; \
+                     falling back to the working directory {} — pass --data to be sure",
+                    built_at.display(),
+                    here.display()
+                );
+                here
+            }
+        }
+    };
+    tracing::info!("data: {} (substrate and accounts)", data.display());
 
     // Authored content, read once. Everything after this answers from memory,
     // so a URL id is a key rather than a path — see `registry`.
@@ -372,6 +379,10 @@ async fn main() -> anyhow::Result<()> {
     // the runtime to answer its routes, and the runtime needs `Authored` to know
     // what time it is for a character and who that character is.
     let runtime = engine::runtime::Runtime::new(mind_for_engine, &data);
+    // The engine adopts the substrate the cast was just loaded from, rather than
+    // opening `--data` a second time. One `.substrate/` takes one writable
+    // handle per process; two lose records silently. See `Npcs::substrate`.
+    runtime.set_substrate(authored.npcs.read().await.substrate());
     let authored = authored.with_runtime(runtime.clone());
 
     // The clock resolver closes over the state rather than reading a single
@@ -408,15 +419,65 @@ async fn main() -> anyhow::Result<()> {
             .worlds
             .blocking_read()
             .get(&payload.world_id)
+            // **`setting`, which is what a world document actually calls it.**
+            // This read `description` and so found nothing: every character has
+            // been thinking with an empty "The world you live in" section since
+            // the field was named, and nothing said so because an absent world
+            // is a legitimate state for a world with no document.
             .and_then(|r| {
                 r.body
-                    .get("description")
+                    .get("setting")
                     .and_then(|d| d.as_str())
                     .map(str::to_owned)
             })
             .unwrap_or_default();
         Some(engine::persona::of(payload, &world))
     }));
+
+    // Where bodies are, recorded so a restart can put them back.
+    //
+    // The world itself is not persisted — who is standing where lives in RAM
+    // and goes with the process — so this is what stops every character
+    // re-entering at the arrival door on every boot. `blocking_write`, because
+    // a world's metronome is a plain OS thread with no async context; the
+    // registry's own checkpoint gates make almost every call a map lookup, so
+    // the lock is held for nothing on a still world.
+    let place_state = authored.clone();
+    runtime.set_place_sink(Arc::new(move |npc_id: u64, at: &str| {
+        place_state
+            .npcs
+            .blocking_write()
+            .remember_place(npc_id, at, now_ms_i64() as u64);
+    }));
+
+    // The places the cast stands in, one world at a time.
+    //
+    // `map/<world_id>/` beside `worlds/<world_id>.yaml`, because a world's rooms
+    // are authored exactly like its lore and belong to the same world. Most
+    // worlds have none: a daemon whose characters have lore and no bodies is not
+    // a broken daemon, and every route above works the same either way.
+    {
+        let ids: Vec<String> = authored
+            .worlds
+            .read()
+            .await
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        for (id, hosted) in runtime.host_authored(&authored_dir, ids.iter().map(String::as_str)) {
+            match hosted {
+                Ok(w) => tracing::info!(
+                    "world `{id}` hosted — {} places",
+                    w.read(|w| w.map().areas().map(|a| a.nodes.len()).sum::<usize>())
+                ),
+                // Loud, and not fatal. A map that does not hold together is an
+                // authoring mistake to fix, not a reason for the console and
+                // the whole authored corpus to be unreachable — nor for the
+                // other worlds to go unhosted.
+                Err(e) => tracing::error!("world `{id}`: its map did not load: {e:#}"),
+            }
+        }
+    }
 
     // The load progress is shared, not copied: `/v1/status` answers from it
     // while the loader thread is still writing to it.
@@ -511,14 +572,10 @@ async fn main() -> anyhow::Result<()> {
     // runs on its own OS thread and returns immediately, so the server binds
     // while the model is still being fetched — which is the point: the loading
     // screen has to be reachable during the load it is describing.
-    let cast: Vec<u64> = authored
-        .npcs
-        .read()
-        .await
-        .cast()
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
+    // With the world each belongs to and the room it was last standing in:
+    // waking a character and putting it back in its body are one step, and the
+    // store already knows all three.
+    let cast: Vec<npcs::Casting> = authored.npcs.read().await.cast();
     tracing::info!("engine: loading, {} character(s) to wake", cast.len());
     engine::runtime::start(
         runtime.clone(),
@@ -535,6 +592,46 @@ async fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(|r| r.id.clone())
                 .collect(),
+            // Who each personality, character and world is, for the projection's
+            // identity collections. Read here, where the registries live; the
+            // loader thread installs them — see `engine::identity`.
+            authored: {
+                let (npcs, personalities, worlds) = (
+                    authored.npcs.read().await,
+                    authored.personalities.read().await,
+                    authored.worlds.read().await,
+                );
+                let field = |b: &serde_json::Value, k: &str| {
+                    b.get(k)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                engine::identity::Authored {
+                    anchors: personalities
+                        .iter()
+                        .map(|p| (p.id.clone(), field(&p.body, "anchor")))
+                        .collect(),
+                    // Rendered through the same function the fallback prompt
+                    // uses, so a character reads the same words either way. The
+                    // world is not rendered in — it is its own collection,
+                    // shared by everyone standing in it.
+                    characters: npcs
+                        .cast()
+                        .iter()
+                        .filter_map(|c| {
+                            let payload = npcs.payload(c.npc_id)?;
+                            let owned = engine::persona::of(payload, "");
+                            Some((c.npc_id, engine::prompt::character(&owned.as_persona())))
+                        })
+                        .collect(),
+                    // `setting` — what a world document actually calls it.
+                    settings: worlds
+                        .iter()
+                        .map(|w| (w.id.clone(), field(&w.body, "setting")))
+                        .collect(),
+                }
+            },
         },
     );
 

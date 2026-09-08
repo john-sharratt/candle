@@ -143,9 +143,9 @@ fn upsample_nearest2d_large_cuda_matches_cpu() -> Result<()> {
 
         let up = |dev: &Device| -> Result<Vec<f32>> {
             let t = Tensor::from_vec(data.clone(), (1, c, h, w), dev)?;
-            Ok(t.upsample_nearest2d(2 * h, 2 * w)?
+            t.upsample_nearest2d(2 * h, 2 * w)?
                 .flatten_all()?
-                .to_vec1::<f32>()?)
+                .to_vec1::<f32>()
         };
         let (a, b) = (up(&Device::Cpu)?, up(&cuda)?);
         assert_eq!(a.len(), b.len(), "output element count differs");

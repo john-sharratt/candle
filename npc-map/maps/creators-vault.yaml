@@ -1,0 +1,44 @@
+# The Creator's Vault — the building the Makers work in.
+#
+# Deployed to <mind>/map/. This file names the levels; each level is a file of
+# its own beside it, and they find each other by id rather than by path.
+id: creators-vault
+kind: building
+name: The Creator's Vault
+# A building in Battle Cities, not a world beside it. The Makers are characters
+# of that world like any other — they are simply the ones who work in here.
+within: battle-cities
+# Where a body entering the vault comes in. The room orders are given in, which
+# is where a Maker's day starts and where it is called back to.
+arrival: vault-command/command-room
+summary: >
+  It holds everything the world is made of. The Makers work here and nowhere
+  else: orders are taken on the command level, and whoever takes one descends
+  to whichever level holds the work.
+character: >
+  Nothing in the vault is ever dark and nothing in it ever closes. The Makers
+  do not sleep, so the building has no night and no shift — only whoever
+  happens to be on a level at the time.
+contains:
+  - vault-command
+  - vault-chronicle
+  - vault-story
+  - vault-cartography
+  - vault-casting
+  - vault-portraits
+lacks:
+  - way out of the vault
+# Where a Maker teleports to. The one journey in the building that is not
+# walked; every trip away from it still is.
+teleport_to: vault-command/command-room
+portals:
+  - between: [vault-command/core, vault-chronicle/core]
+    kind: a lift and a stair
+  - between: [vault-chronicle/core, vault-story/core]
+    kind: a lift and a stair
+  - between: [vault-story/core, vault-cartography/core]
+    kind: a lift and a stair
+  - between: [vault-cartography/core, vault-casting/core]
+    kind: a lift and a stair
+  - between: [vault-casting/core, vault-portraits/core]
+    kind: a lift and a stair

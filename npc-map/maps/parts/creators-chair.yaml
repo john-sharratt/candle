@@ -1,0 +1,13 @@
+id: creators-chair
+kind: fixture
+name: the creator's chair
+short: >
+  The chair at the head of the table is the creator's, and no Maker sits in
+  it.
+long: >
+  One chair at the head of the table, kept for the creator. Whether it is
+  occupied is worth noticing, because an order can be asked about when it is
+  and only read when it is not. Nothing else in the vault knows this chair
+  exists.
+tools:
+  - creator.present

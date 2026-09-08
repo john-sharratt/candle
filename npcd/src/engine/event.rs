@@ -81,6 +81,20 @@ impl Default for Salience {
     }
 }
 
+/// A weight read off a place becomes a salience on the way in.
+///
+/// `npc-map` grades what one body made out on a four-rung ladder named for what
+/// to do about it; the scheduler grades everything on one number. This is the
+/// one place they meet, so the correspondence is here rather than spread over
+/// the call sites — and `weight_and_salience_agree_about_preempting` is what
+/// stops the two drifting into disagreeing about the only question that
+/// matters, which is whether a character is interrupted.
+impl From<npc_map::Weight> for Salience {
+    fn from(w: npc_map::Weight) -> Salience {
+        Salience::new(w.as_f32())
+    }
+}
+
 impl<'de> Deserialize<'de> for Salience {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         // Through `new`, so a wire value is clamped by the same code path as a
@@ -88,6 +102,24 @@ impl<'de> Deserialize<'de> for Salience {
         // nowhere else, which is the worst kind of asymmetry to debug.
         Ok(Salience::new(f32::deserialize(d)?))
     }
+}
+
+/// Who an utterance was aimed at, resolved from the receiving character's side.
+///
+/// Resolved at delivery rather than carried raw, so that rendering needs no
+/// second argument and cannot get the comparison wrong: whoever hands the event
+/// over knows both who was addressed and who is receiving it, and that is the
+/// only place both facts are in hand at once.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "at", rename_all = "snake_case")]
+pub enum Addressed {
+    /// Said to the room. You are among those it was for.
+    #[default]
+    Room,
+    /// Said to you.
+    You,
+    /// Said to somebody else, in front of you.
+    Other { who: String },
 }
 
 /// The kinds of thing that can happen to a character.
@@ -105,20 +137,20 @@ pub enum EventKind {
     Speech {
         speaker: String,
         text: String,
-        /// Whether it was addressed to this character or merely overheard. The
-        /// difference decides whether silence is rude or normal, so it cannot be
-        /// left for the model to infer from phrasing.
+        /// Who it was aimed at, from this character's side. Delivery is by
+        /// place — everyone in the room hears it — and direction is a property
+        /// of the utterance, so the two have to be carried separately or
+        /// overhearing becomes indistinguishable from being addressed.
         #[serde(default)]
-        directed: bool,
+        to: Addressed,
     },
-    /// A spatial picture at a zoom band. Maps **replace** within their band —
-    /// see [`EventKind::replaces`].
-    Map {
-        zoom: String,
-        ascii: String,
-        #[serde(default)]
-        legend: Option<String>,
-    },
+    /// Where the character is and what is true there, right now.
+    ///
+    /// **Replaces** the previous one — see [`EventKind::replaces`]. A situation
+    /// is a point in time, so two of them in the window is one stale reading of
+    /// a room the character is no longer standing in, sitting where attention
+    /// weights it highest.
+    Situation { text: String },
     /// A specific entity was observed doing something.
     Entity {
         entity_id: String,
@@ -127,6 +159,18 @@ pub enum EventKind {
     /// The scheduled wake. Carries no content: its whole purpose is that "nothing
     /// arrived" cannot mean "dead forever".
     Heartbeat,
+    /// What the character is set on, restated.
+    ///
+    /// **Replaces** the previous one — see [`EventKind::replaces`]. It is a
+    /// standing instruction, not a thing that happened, so a second one is the
+    /// current one and the first is a task the character has been taken off.
+    ///
+    /// This is the turn that keeps a long run on course. A character with work
+    /// in front of it has quiet turns rather than empty ones, and what fills
+    /// them has to come from **outside** — a nudge derived from the character's
+    /// own state would be its own reasoning read back as instruction, which is
+    /// the runaway loop with extra steps.
+    Nudge { text: String },
     /// The day ended. The character consolidates and its conversation rolls over
     /// — see `engine::sleep`.
     Sleep { day: u64 },
@@ -144,7 +188,8 @@ impl EventKind {
         match self {
             EventKind::Description { .. } => "description",
             EventKind::Speech { .. } => "speech",
-            EventKind::Map { .. } => "map",
+            EventKind::Situation { .. } => "situation",
+            EventKind::Nudge { .. } => "nudge",
             EventKind::Entity { .. } => "entity",
             EventKind::Heartbeat => "heartbeat",
             EventKind::Sleep { .. } => "sleep",
@@ -155,13 +200,21 @@ impl EventKind {
 
     /// The band this event supersedes within, if it supersedes anything.
     ///
-    /// Only maps do. Twelve stale tactical maps in the gather is twelve chances
-    /// to act on a position that no longer exists, so a new map at a zoom retires
-    /// the previous one at that zoom. Descriptions accumulate — a thing that
-    /// happened stays happened.
+    /// **This is how a point in time lives in an append-only window.** A
+    /// situation is the whole of what is true where the character stands, so a
+    /// second one does not add to the first — it replaces it, and keeping both
+    /// would leave a stale reading of a room the character has left sitting in
+    /// the most recent position, which is exactly where attention weights it
+    /// highest.
+    ///
+    /// Everything else accumulates. A thing that happened stays happened.
     pub fn replaces(&self) -> Option<String> {
         match self {
-            EventKind::Map { zoom, .. } => Some(format!("map:{zoom}")),
+            EventKind::Situation { .. } => Some("situation".to_string()),
+            // Its own band, beside the situation. Two standing instructions is
+            // a character working to a task it has been taken off, which reads
+            // as one that has forgotten what it was doing.
+            EventKind::Nudge { .. } => Some("nudge".to_string()),
             _ => None,
         }
     }
@@ -202,35 +255,31 @@ impl Event {
     pub fn prose(&self) -> String {
         match &self.kind {
             EventKind::Description { text } => text.trim().to_string(),
-            EventKind::Speech {
-                speaker,
-                text,
-                directed,
-            } => {
+            EventKind::Speech { speaker, text, to } => {
                 let t = text.trim();
-                if *directed {
-                    format!("{speaker} says to you: \"{t}\"")
-                } else {
-                    format!("You overhear {speaker} say: \"{t}\"")
+                // Three readings of one utterance, and the difference between
+                // them is what makes a shared room worth standing in: being
+                // told something, being among those it was said to, and
+                // watching somebody else be told it.
+                // **Reported, not quoted.** A tool carries intent, never
+                // wording — `speak` takes what a character *means* to convey
+                // and the catalog refuses a finished line of dialogue — so what
+                // arrives here is substance. Quotation marks around it are a
+                // claim that these were the words, which they never are: they
+                // turned "that I am starting now" into `says: "that I am
+                // starting now"`, a sentence nobody has ever spoken. The colon
+                // reports; the quotes would fabricate, and this module's whole
+                // discipline is narrate acts, never fabricate.
+                match to {
+                    Addressed::You => format!("{speaker} says to you: {t}"),
+                    Addressed::Room => format!("{speaker} says: {t}"),
+                    Addressed::Other { who } => format!("{speaker} says to {who}: {t}"),
                 }
             }
-            EventKind::Map {
-                zoom,
-                ascii,
-                legend,
-            } => {
-                let mut s = format!("You take in your surroundings at {zoom} range:\n\n```\n");
-                s.push_str(ascii.trim_end());
-                s.push_str("\n```");
-                if let Some(l) = legend {
-                    // The legend is what makes the glyphs mean anything. Kept
-                    // outside the fence so it reads as explanation rather than as
-                    // more map.
-                    s.push_str("\n\nKey: ");
-                    s.push_str(l.trim());
-                }
-                s
-            }
+            // Both arrive already written — a situation is generated from a
+            // map, a nudge is authored beside the task it belongs to — so
+            // rendering passes them through rather than decorating them.
+            EventKind::Situation { text } | EventKind::Nudge { text } => text.trim().to_string(),
             EventKind::Entity {
                 entity_id,
                 observation,
@@ -305,31 +354,32 @@ mod tests {
         assert!(!Salience::new(Salience::PREEMPT_AT - 0.01).preempts());
     }
 
-    /// Maps replace within a zoom band; nothing else replaces anything. This is
-    /// the one departure from append-only in the whole engine, so it is pinned.
+    /// The situation replaces; nothing else does. This is how a point in time
+    /// lives in an append-only window, so it is pinned — and so is the fact
+    /// that every *change* accumulates, because a thing that happened stays
+    /// happened.
     #[test]
-    fn maps_replace_within_a_band_and_nothing_else_replaces() {
-        let m = EventKind::Map {
-            zoom: "tactical".into(),
-            ascii: "..#..".into(),
-            legend: None,
+    fn the_situation_replaces_and_nothing_else_replaces() {
+        let here = EventKind::Situation {
+            text: "You are in band one.".into(),
         };
-        assert_eq!(m.replaces().as_deref(), Some("map:tactical"));
+        assert_eq!(here.replaces().as_deref(), Some("situation"));
 
-        let other = EventKind::Map {
-            zoom: "strategic".into(),
-            ascii: "..".into(),
-            legend: None,
+        // Two situations share a band whatever they say, or the older one
+        // survives to be read as current.
+        let later = EventKind::Situation {
+            text: "You are in the green room.".into(),
         };
-        assert_ne!(
-            m.replaces(),
-            other.replaces(),
-            "two zoom bands must not supersede each other"
-        );
+        assert_eq!(here.replaces(), later.replaces());
 
         for k in [
             EventKind::Description { text: "x".into() },
             EventKind::Heartbeat,
+            EventKind::Speech {
+                speaker: "H".into(),
+                text: "x".into(),
+                to: Addressed::You,
+            },
             EventKind::Entity {
                 entity_id: "e".into(),
                 observation: "o".into(),
@@ -350,7 +400,10 @@ mod tests {
             EventKind::Speech {
                 speaker: "Hess".into(),
                 text: "Hold the line.".into(),
-                directed: true,
+                to: Addressed::You,
+            },
+            EventKind::Situation {
+                text: "You are in the green room. Maker-04 is here.".into(),
             },
             EventKind::Entity {
                 entity_id: "a scout".into(),
@@ -371,56 +424,61 @@ mod tests {
         }
     }
 
-    /// Directed and overheard speech must not read alike — whether silence is
-    /// rude depends on it, and that is not something to leave to inference.
+    /// One utterance, three readings. Being told something, being among those
+    /// it was said to, and watching somebody else be told it are three
+    /// different facts, and whether silence is rude depends on which — not
+    /// something to leave to inference from phrasing.
     #[test]
-    fn directed_speech_reads_differently_from_overheard() {
-        let d = Event::new(
-            1,
-            0,
-            Salience::NORMAL,
-            EventKind::Speech {
-                speaker: "Hess".into(),
-                text: "Well?".into(),
-                directed: true,
-            },
-        )
-        .prose();
-        let o = Event::new(
-            1,
-            0,
-            Salience::NORMAL,
-            EventKind::Speech {
-                speaker: "Hess".into(),
-                text: "Well?".into(),
-                directed: false,
-            },
-        )
-        .prose();
-        assert_ne!(d, o);
-        assert!(d.contains("to you"));
-        assert!(o.contains("overhear"));
+    fn who_an_utterance_was_aimed_at_changes_how_it_reads() {
+        let said = |to: Addressed| {
+            Event::new(
+                1,
+                0,
+                Salience::NORMAL,
+                EventKind::Speech {
+                    speaker: "Hess".into(),
+                    text: "Well?".into(),
+                    to,
+                },
+            )
+            .prose()
+        };
+        let to_me = said(Addressed::You);
+        let to_room = said(Addressed::Room);
+        let to_other = said(Addressed::Other {
+            who: "Varek".into(),
+        });
+
+        assert_ne!(to_me, to_room);
+        assert_ne!(to_me, to_other);
+        assert_ne!(to_room, to_other);
+        assert!(to_me.contains("to you"), "{to_me}");
+        assert!(to_other.contains("to Varek"), "{to_other}");
+        assert!(!to_room.contains(" to "), "{to_room}");
+        for p in [&to_me, &to_room, &to_other] {
+            assert!(p.contains("Well?"), "{p}");
+            // Reported, never quoted: a tool carries what a character meant to
+            // convey, not the words it used, so quotation marks would put a
+            // sentence in its mouth that it never spoke.
+            assert!(!p.contains('"'), "substance rendered as a quotation: {p}");
+        }
     }
 
-    /// A map's glyphs are meaningless without its key, and the key must not sit
-    /// inside the fence where it reads as more map.
+    /// The situation is already prose when it arrives — it is generated from a
+    /// map, not described by a caller — so rendering must not decorate it.
     #[test]
-    fn a_map_fences_its_ascii_and_keeps_the_legend_outside() {
+    fn a_situation_is_passed_through_untouched() {
+        let text = "You are in the green room. Maker-04 is here.";
         let p = Event::new(
             1,
             0,
-            Salience::NORMAL,
-            EventKind::Map {
-                zoom: "tactical".into(),
-                ascii: "#.#\n...".into(),
-                legend: Some("# wall, . floor".into()),
+            Salience::IDLE,
+            EventKind::Situation {
+                text: format!("  {text}\n"),
             },
         )
         .prose();
-        let body = p.split("```").nth(1).expect("a fenced block");
-        assert!(body.contains("#.#"));
-        assert!(!body.contains("wall"), "the legend leaked inside the fence");
-        assert!(p.contains("Key: # wall"));
+        assert_eq!(p, text);
     }
 
     /// The character is not aware it is being scheduled. A heartbeat that says
@@ -442,12 +500,10 @@ mod tests {
             EventKind::Speech {
                 speaker: String::new(),
                 text: String::new(),
-                directed: false,
+                to: Addressed::Room,
             },
-            EventKind::Map {
-                zoom: String::new(),
-                ascii: String::new(),
-                legend: None,
+            EventKind::Situation {
+                text: String::new(),
             },
             EventKind::Entity {
                 entity_id: String::new(),
@@ -472,7 +528,7 @@ mod tests {
     #[test]
     fn the_wire_shape_is_tagged_by_kind() {
         let k: EventKind = serde_json::from_str(
-            r#"{"kind":"speech","speaker":"Hess","text":"Hold.","directed":true}"#,
+            r#"{"kind":"speech","speaker":"Hess","text":"Hold.","to":{"at":"you"}}"#,
         )
         .expect("parses");
         assert_eq!(
@@ -480,18 +536,60 @@ mod tests {
             EventKind::Speech {
                 speaker: "Hess".into(),
                 text: "Hold.".into(),
-                directed: true
+                to: Addressed::You
             }
         );
-        // `directed` defaults, so a world sim that does not model it still parses.
+
+        let o: EventKind = serde_json::from_str(
+            r#"{"kind":"speech","speaker":"Hess","text":"Hold.","to":{"at":"other","who":"Varek"}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            o,
+            EventKind::Speech {
+                to: Addressed::Other { ref who },
+                ..
+            } if who == "Varek"
+        ));
+
+        // `to` defaults to the room, so a world sim that does not model who an
+        // utterance was aimed at still parses — and defaults to the reading
+        // that claims least, rather than to being addressed.
         let d: EventKind =
             serde_json::from_str(r#"{"kind":"speech","speaker":"H","text":"x"}"#).expect("parses");
         assert!(matches!(
             d,
             EventKind::Speech {
-                directed: false,
+                to: Addressed::Room,
                 ..
             }
         ));
+    }
+
+    /// The two salience scales must agree about the only question that matters:
+    /// whether a character is interrupted. They are separate types in separate
+    /// crates and nothing but this holds them together.
+    #[test]
+    fn weight_and_salience_agree_about_preempting() {
+        use npc_map::Weight;
+
+        assert!(Salience::from(Weight::Preempt).preempts());
+        for quiet in [Weight::Ambient, Weight::Note, Weight::Wake] {
+            assert!(
+                !Salience::from(quiet).preempts(),
+                "{quiet:?} interrupts a character"
+            );
+        }
+
+        // And the ladder's order survives the crossing.
+        let ladder = [Weight::Ambient, Weight::Note, Weight::Wake, Weight::Preempt];
+        for pair in ladder.windows(2) {
+            assert!(
+                Salience::from(pair[0]).get() < Salience::from(pair[1]).get(),
+                "{:?} did not stay below {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

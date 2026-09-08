@@ -30,7 +30,7 @@
 
 use serde::Serialize;
 
-use crate::engine::event::{EventKind, Salience};
+use crate::engine::event::{Addressed, EventKind, Salience};
 
 /// A command an operator can type.
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -79,12 +79,12 @@ pub const CATALOG: &[Command] = &[
         example: "/notice a scout in Hess's colours : moving along the ridge line, unhurried",
     },
     Command {
-        name: "map",
-        argument: "<zoom> : <ascii>",
-        description: "A spatial picture at a zoom band. Replaces the previous map at that band \
-                      rather than adding to it.",
-        salience: 0.4,
-        example: "/map tactical : ..#..\\n.@...",
+        name: "here",
+        argument: "where the character is and what is true there",
+        description: "The situation, in prose. Replaces the previous one rather than adding to \
+                      it — it is a point in time, not a thing that happened.",
+        salience: 0.1,
+        example: "/here You are in the green room. Maker-04 is here.",
     },
     Command {
         name: "hurt",
@@ -220,7 +220,7 @@ pub fn parse(line: &str) -> Result<Parsed, ParseError> {
             kind: EventKind::Speech {
                 speaker: "you".into(),
                 text: line.to_string(),
-                directed: true,
+                to: Addressed::You,
             },
             salience: Salience::new(0.6),
             command: "say",
@@ -257,12 +257,16 @@ pub fn parse(line: &str) -> Result<Parsed, ParseError> {
         "say" => EventKind::Speech {
             speaker: "you".into(),
             text: arg.to_string(),
-            directed: true,
+            to: Addressed::You,
         },
+        // Overheard from the operator's console has no named addressee to
+        // resolve — whoever it was for, it was not this character.
         "overhear" => EventKind::Speech {
             speaker: "someone nearby".into(),
             text: arg.to_string(),
-            directed: false,
+            to: Addressed::Other {
+                who: "somebody else".into(),
+            },
         },
         "see" | "urgent" => EventKind::Description {
             text: arg.to_string(),
@@ -289,28 +293,12 @@ pub fn parse(line: &str) -> Result<Parsed, ParseError> {
                 observation: obs.to_string(),
             }
         }
-        "map" => {
-            let Some((zoom, ascii)) = arg.split_once(':') else {
-                return Err(ParseError::Malformed {
-                    command: "map",
-                    expected: "<zoom> : <ascii>",
-                });
-            };
-            let (zoom, ascii) = (zoom.trim(), ascii.trim());
-            if zoom.is_empty() || ascii.is_empty() {
-                return Err(ParseError::Malformed {
-                    command: "map",
-                    expected: "<zoom> : <ascii>",
-                });
-            }
-            EventKind::Map {
-                zoom: zoom.to_string(),
-                // A console cannot type a newline into a single-line input, so
-                // the escape is what makes multi-line maps reachable at all.
-                ascii: ascii.replace("\\n", "\n"),
-                legend: None,
-            }
-        }
+        // A console cannot type a newline into a single-line input, and a
+        // situation is two sentences, so the escape is what makes the second
+        // one reachable at all.
+        "here" => EventKind::Situation {
+            text: arg.replace("\\n", "\n"),
+        },
         other => {
             // Unreachable while the catalog and this match agree — and
             // `every_command_in_the_catalog_parses` is what keeps them agreeing.
@@ -343,7 +331,7 @@ mod tests {
             EventKind::Speech {
                 speaker: "you".into(),
                 text: "where were you last night?".into(),
-                directed: true
+                to: Addressed::You
             }
         );
     }
@@ -401,11 +389,17 @@ mod tests {
     fn directed_and_overheard_speech_differ() {
         let say = parse("/say answer me").unwrap();
         let hear = parse("/overhear he is lying").unwrap();
-        assert!(matches!(say.kind, EventKind::Speech { directed: true, .. }));
+        assert!(matches!(
+            say.kind,
+            EventKind::Speech {
+                to: Addressed::You,
+                ..
+            }
+        ));
         assert!(matches!(
             hear.kind,
             EventKind::Speech {
-                directed: false,
+                to: Addressed::Other { .. },
                 ..
             }
         ));
@@ -439,16 +433,17 @@ mod tests {
     }
 
     /// A single-line console input cannot contain a newline, so the escape is
-    /// what makes a multi-line map reachable at all.
+    /// what makes a two-sentence situation reachable at all.
     #[test]
-    fn a_map_unescapes_newlines_and_replaces_its_band() {
-        let p = parse("/map tactical : ..#..\\n.@...").unwrap();
-        let EventKind::Map { zoom, ascii, .. } = &p.kind else {
-            panic!("not a map");
+    fn a_situation_unescapes_newlines_and_replaces_the_one_before_it() {
+        let p = parse("/here You are in the green room.\\nMaker-04 is here.").unwrap();
+        let EventKind::Situation { text } = &p.kind else {
+            panic!("not a situation");
         };
-        assert_eq!(zoom, "tactical");
-        assert_eq!(ascii, "..#..\n.@...");
-        assert_eq!(p.kind.replaces().as_deref(), Some("map:tactical"));
+        assert_eq!(text, "You are in the green room.\nMaker-04 is here.");
+        assert_eq!(p.kind.replaces().as_deref(), Some("situation"));
+        // A situation says the world moved, not that anything wants answering.
+        assert!(!p.salience.preempts());
     }
 
     /// `/wake` takes nothing, and must not silently accept and discard an
@@ -523,7 +518,7 @@ mod tests {
         match name {
             "wake" | "sleep" => "",
             "notice" => "a scout : moving",
-            "map" => "tactical : ..#..",
+            "here" => "You are in the green room.",
             _ => "something happened",
         }
     }

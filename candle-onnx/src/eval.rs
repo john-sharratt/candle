@@ -2377,9 +2377,7 @@ fn simple_eval_(
                     // above. Every segmentation decoder worth running needs it:
                     // nearest upsampling in the reconstruction path is the
                     // difference between an alpha edge and a staircase.
-                    "linear" => {
-                        resize_bilinear2d(input, h, w, coordinate_transformation_mode)?
-                    }
+                    "linear" => resize_bilinear2d(input, h, w, coordinate_transformation_mode)?,
                     other => bail!("Unsupported resize mode: {}", other),
                 };
 
@@ -2450,7 +2448,6 @@ fn simple_eval_(
 
                 let indices_shape = indices.dims();
                 let data_shape = data.dims();
-                let updates_shape = updates.dims();
 
                 // Last dimension of indices represents the depth of indexing
                 let k = indices_shape.last().unwrap().clone();

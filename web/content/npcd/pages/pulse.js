@@ -23,20 +23,33 @@
  * ── what you see ──
  *
  * Your characters, because a tick record carries the literal prose a character
- * perceived and somebody else's perceptions are somebody else's world. An admin
- * can ask for the whole cast; the toggle only appears for someone who could
- * actually use it, because a control that appears and then refuses is worse than
- * one that never appears.
+ * perceived and somebody else's perceptions are somebody else's world. The page
+ * only watches; nothing on it speaks into the world, because a character that
+ * heard from an observer would be reacting to the instrument.
  */
 
 import { API } from '../lib/api.js';
 import { h, mount, fmtNum } from '../lib/dom.js';
-import { toast } from '../lib/ui.js';
 
 /* Faster than the shortest heartbeat, so a preempted character's tick lands in
- * the feed while it still feels like a consequence of what you typed. */
+ * the feed while it is still fresh. */
 const POLL_MS = 1800;
+
+/* **How much each poll carries, and how much the page remembers — two numbers,
+ * because they answer different questions.**
+ *
+ * A tick is immutable and its number only goes up, so a poll never needs to
+ * re-send what the page already has: the window only has to be wide enough that
+ * a busy cast cannot outrun one interval. The page then accumulates, and how far
+ * back you can scroll is `FEED_KEEP` rather than whatever fits in a request.
+ *
+ * Asking for the whole history every 1.8 s instead would put ~70 KB on the wire
+ * per poll for a page somebody leaves open all afternoon, and re-render several
+ * hundred tiles to show the one that changed. */
 const FEED_LIMIT = 60;
+/* Ticks the page holds. The scheduler's own ring is 512, so this asks for a
+ * little less than it can actually serve. */
+const FEED_KEEP = 400;
 
 /* Why a character woke, and how that reads. The colours are the point of the
  * column: a run of quiet grey with one amber preempt in it is legible at a
@@ -103,19 +116,77 @@ export async function render() {
   const el = h('div', { class: 'pulse' });
 
   let focus = null;        // npc_id (string) or null for the interlaced stream
-  let showAll = false;
-  let maySeeAll = false;
   let names = {};
   let timer = null;
   let stopped = false;
   let lastTick = -1;       // so only genuinely new rows animate in
 
   const censusHost = h('div', { class: 'pulse-cast' });
+  const worldHost = h('div', { class: 'pulse-world' });
   const feedHost = h('div', { class: 'pulse-stream' });
   const statusEl = h('span', { class: 'pulse-status' });
-  const toggleHost = h('span', {});
 
   const nameOf = (id) => names[String(id)] || ('character ' + String(id).slice(0, 6));
+
+  /* ── where everybody is ──────────────────────────────────────────────────
+   *
+   * The feed says what a character did and the window says what it is holding.
+   * Neither says where anybody *is*, and without that the most important thing
+   * about a cast in one building is invisible: two characters talking and two
+   * characters two floors apart produce the same shape of feed.
+   *
+   * Only rooms with somebody in them are drawn. A building of seventy-eight
+   * places listed in full is a wall of empty rows with the two that matter
+   * somewhere inside it — and the empty ones say nothing that the level
+   * headings do not.
+   */
+  function renderWorld(data) {
+    const worlds = (data && data.worlds) || [];
+    const occupied = [];
+    for (const w of worlds) {
+      for (const r of w.rooms || []) {
+        if ((r.who || []).length) occupied.push(r);
+      }
+    }
+    if (!occupied.length) {
+      mount(worldHost, h('div', { class: 'pulse-empty' },
+        h('p', {}, 'No character has a body in a world yet.')));
+      return;
+    }
+    /* Grouped by level, because a building is read by floor and because two
+     * characters on the same floor is the thing worth seeing at a glance. */
+    const levels = new Map();
+    for (const r of occupied) {
+      if (!levels.has(r.area)) levels.set(r.area, { name: r.area_name || r.area, rooms: [] });
+      levels.get(r.area).rooms.push(r);
+    }
+    const bodies = worlds.reduce((n, w) => n + (w.bodies || 0), 0);
+    mount(worldHost,
+      h('div', { class: 'pulse-world-hd' },
+        h('span', { class: 'pulse-world-title' }, 'Where everybody is'),
+        h('span', { class: 'tiny dim' },
+          `${fmtNum(bodies)} in the world · ${fmtNum(occupied.length)} room${occupied.length === 1 ? '' : 's'} occupied`)),
+      ...[...levels.values()].map((lv) => h('div', { class: 'pulse-level' },
+        h('div', { class: 'pulse-level-name' }, lv.name),
+        ...lv.rooms.map((r) => h('div', { class: 'pulse-room' },
+          h('span', { class: 'pulse-room-name' }, r.name),
+          h('span', { class: 'pulse-room-who' },
+            ...r.who.map((p) => {
+              /* Coloured by the same hue the feed uses, so a person here and
+               * their ticks over there are recognisably one character. */
+              const npcId = (data.bound || {})[p.body];
+              const hue = npcId != null ? hueOf(String(npcId)) : null;
+              return h('span', {
+                class: 'pulse-who' + (r.who.length > 1 ? ' is-together' : ''),
+                style: hue != null ? `--hue:${hue}` : '',
+                title: p.going_to ? 'on its way to ' + p.going_to : 'here',
+              },
+              p.name,
+              p.going_to ? h('span', { class: 'pulse-going' }, ' →') : null,
+              p.holding ? h('span', { class: 'pulse-holding' }, ' · ' + p.holding) : null);
+            })))))),
+    );
+  }
 
   // ── the cast strip ──────────────────────────────────────────────────────
   function renderCast(data) {
@@ -167,15 +238,64 @@ export async function render() {
     }));
   }
 
+  /* ── what the page is holding ─────────────────────────────────────────────
+   *
+   * Keyed by tick number, which is monotonic across the whole cast, so a poll
+   * that overlaps what is already here merges instead of duplicating and the
+   * page keeps history further back than any one request carries.
+   *
+   * Cleared on a focus change, because the accumulated set belongs to the query
+   * that produced it — keeping it would leave one character's tiles standing
+   * under another character's filter. */
+  let held = new Map();
+
+  /* Merge a poll's ticks in. Returns whether anything was actually new: most
+   * polls of a quiet cast add nothing, and re-mounting several hundred tiles to
+   * show no change is the cost that makes a long feed feel broken.
+   *
+   * **A tick number is only monotonic within one run of the daemon.** The
+   * scheduler's counter starts at zero every time the process does, so a page
+   * left open across a restart holds a set of high numbers that the new run
+   * will take hours to reach — and since the trim keeps the highest and the
+   * sort puts them first, every genuinely new tick sorted to the bottom and was
+   * then discarded. The feed froze on the previous run's last minutes while the
+   * cast strip, which is a different call and does not accumulate, carried on
+   * updating. Numbering that goes backwards is a restart, and the only sound
+   * thing to do with what came before is drop it. */
+  function absorb(ticks) {
+    if (!ticks.length) return false;
+    const incoming = Math.max(...ticks.map((t) => t.tick));
+    const newest = held.size ? Math.max(...held.keys()) : -1;
+    if (incoming < newest) {
+      held = new Map();
+      lastTick = -1;
+    }
+    let added = false;
+    for (const t of ticks) {
+      if (!held.has(t.tick)) added = true;
+      held.set(t.tick, t);
+    }
+    if (!added) return false;
+    if (held.size > FEED_KEEP) {
+      /* Oldest out. Insertion order is the arrival order rather than tick
+       * order — a merge can fill a gap behind the newest — so the numbers
+       * decide what goes, not the Map's own order. */
+      const keep = [...held.keys()].sort((a, b) => b - a).slice(0, FEED_KEEP);
+      held = new Map(keep.map((k) => [k, held.get(k)]));
+    }
+    return true;
+  }
+
   // ── the interlaced stream ───────────────────────────────────────────────
   function renderStream(data) {
-    const ticks = (data.ticks || []).slice().reverse();   // newest first
+    if (!absorb(data.ticks || []) && held.size) return;
+    const ticks = [...held.values()].sort((a, b) => b.tick - a.tick);  // newest first
     if (!ticks.length) {
       mount(feedHost, h('div', { class: 'pulse-empty' },
         h('p', {}, focus
           ? 'This character has not thought yet.'
-          : 'Nothing has ticked yet. A quiet character still wakes on its heartbeat — ' +
-            'give it a moment, or send it something below.')));
+          : 'Nothing has ticked yet. A quiet character still wakes on its ' +
+            'heartbeat — give it a moment.')));
       return;
     }
     const newest = ticks[0].tick;
@@ -200,9 +320,11 @@ export async function render() {
             '♥ ' + beat(t.heartbeat_ms)),
         ),
         /* The literal prose the model received. Not a summary of it — a summary
-         * would hide exactly the wording bugs this view exists to catch. */
+         * would hide exactly the wording bugs this view exists to catch. The
+         * tile clamps it visually; the `title` keeps the whole thing reachable,
+         * so what is on screen is a crop rather than an edit. */
         h('div', { class: 'tick-perceived' },
-          ...t.perceived.map((p) => h('p', { class: 'perceive' }, p))),
+          ...t.perceived.map((p) => h('p', { class: 'perceive', title: p }, p))),
         t.acts && t.acts.length
           ? h('div', { class: 'tick-acts' }, ...t.acts.map((a) => {
               const { tool, intent } = splitAct(a);
@@ -221,16 +343,16 @@ export async function render() {
 
   /* **One refresh at a time, and the newest wins.**
    *
-   * The poll and the toggles both call this, so a slow read overlaps the next
+   * The poll and a focus change both call this, so a slow read overlaps the next
    * tick's and the two land in whatever order the network returns them — which
    * on a page whose whole job is *when things happened* renders an older feed
    * over a newer one and leaves it there until the tick after. The guard drops
    * the overlapping call rather than queueing it: the next tick is 1–2 s away
    * and carries fresher data than the one being dropped.
    *
-   * `focus`/`showAll` change the query, so those calls must not be dropped —
-   * they bump `generation`, and an in-flight read whose generation is stale
-   * discards its own result instead of rendering it. */
+   * `focus` changes the query, so that call must not be dropped — it bumps
+   * `generation`, and an in-flight read whose generation is stale discards its
+   * own result instead of rendering it. */
   let generation = 0;
   /* Generation of the read currently running, or -1 for none. Keyed by
    * generation rather than a bare boolean so a control's forced read starts
@@ -251,24 +373,36 @@ export async function render() {
     }
   }
 
-  /* Force a refresh that a stale in-flight read cannot overwrite. For the
-   * controls, whose whole point is that the query changed. */
+  /* Force a refresh that a stale in-flight read cannot overwrite. For a focus
+   * change, whose whole point is that the query changed — so what the page has
+   * accumulated under the old query goes with it. */
   function refetch() {
     generation += 1;
+    held = new Map();
     refresh();
   }
 
   async function read(mine) {
-    const q = { limit: FEED_LIMIT, npc_id: focus || undefined, all: showAll ? 1 : undefined };
+    const q = { limit: FEED_LIMIT, npc_id: focus || undefined };
     try {
-      const [feed, census] = await Promise.all([API.pulse(q), API.pulseCensus(q)]);
+      /* The world comes back with the other two rather than on its own timer,
+       * so the room somebody is in and the tick they took in it are read from
+       * the same instant. Two pollers would show a character acting in a room
+       * it had already left. */
+      const [feed, census, world] = await Promise.all([
+        API.pulse(q),
+        API.pulseCensus(q),
+        // A daemon hosting no world is the ordinary case, not a failure, so
+        // this one may come back empty without taking the page with it.
+        API.pulseWorld().catch(() => ({ worlds: [] })),
+      ]);
       /* The query moved while this was in flight — a focus change, a toggle.
        * Rendering now would put the previous filter's data on screen under the
        * new filter's controls. */
       if (stopped || mine !== generation) return;
-      maySeeAll = !!feed.may_see_all;
       names = Object.assign({}, census.names, feed.names);
       renderCast(census);
+      renderWorld(world);
       renderStream(feed);
 
       statusEl.textContent = feed.ready
@@ -276,7 +410,6 @@ export async function render() {
           (census.thinking != null ? ` · ${fmtNum(census.thinking)} thinking` : '')
         : 'engine loading';
       statusEl.className = 'pulse-status' + (feed.ready ? ' is-live' : '');
-      renderToggle();
     } catch (e) {
       /* A 503 during startup is the ordinary state, not a fault. Saying so is
        * the truth; a red banner would send somebody looking for a problem that
@@ -292,76 +425,6 @@ export async function render() {
     }
   }
 
-  function renderToggle() {
-    if (!maySeeAll) { mount(toggleHost); return; }
-    mount(toggleHost, h('label', { class: 'pulse-toggle' },
-      h('input', {
-        type: 'checkbox', checked: showAll,
-        onChange: (e) => { showAll = e.target.checked; focus = null; lastTick = -1; refetch(); },
-      }),
-      h('span', {}, 'Show all NPCs'),
-    ));
-  }
-
-  // ── the composer ────────────────────────────────────────────────────────
-  const input = h('input', {
-    class: 'input mono', placeholder: 'say something, or /hurt a bolt through the shoulder',
-    onKeydown: (e) => { if (e.key === 'Enter') send(); },
-  });
-
-  async function send() {
-    const line = input.value.trim();
-    if (!line) return;
-    if (!focus) { toast('Pick a character first — an event goes to one inbox.'); return; }
-    try {
-      const r = await API.pulseInject(focus, line);
-      input.value = '';
-      /* Show the prose it became, not just "sent". The rendering is what decides
-       * how the event lands, and seeing it is half the debugging. */
-      toast((r.preempts ? 'Preempt · ' : 'Delivered · ') + r.prose, 'ok');
-      refresh();
-    } catch (e) {
-      toast(e.detail || e.message || 'refused', 'err');
-    }
-  }
-
-  let helpEl = null;
-  /* **Claimed before the await, not after.** The list is fetched from the
-   * daemon, so two clicks inside that round trip both saw `helpEl === null`,
-   * both fetched, and both appended — leaving two panels with only the second
-   * tracked, so the first could never be closed again. The flag is set on the
-   * synchronous path, where a second click cannot get between the test and the
-   * set. */
-  let helpOpening = false;
-  async function toggleHelp() {
-    if (helpEl) { helpEl.remove(); helpEl = null; return; }
-    if (helpOpening) return;
-    helpOpening = true;
-    /* The daemon's own list, never a copy. A console holding its own would offer
-     * a command that gets rejected, and an operator reads a rejection as the
-     * character ignoring them. */
-    let r;
-    try {
-      r = await API.listCommands();
-    } finally {
-      helpOpening = false;
-    }
-    /* Closed, or opened by something else, while the list was in flight. */
-    if (helpEl) return;
-    helpEl = h('div', { class: 'pulse-help' },
-      ...(r.commands || []).map((c) => h('div', { class: 'help-row' },
-        h('code', { class: 'help-cmd' }, '/' + c.name),
-        h('div', {},
-          h('div', { class: 'help-desc' }, c.description || ''),
-          h('code', { class: 'help-eg' }, c.example || '')))));
-    composer.after(helpEl);
-  }
-
-  const composer = h('div', { class: 'pulse-composer' },
-    input,
-    h('button', { class: 'btn primary', onClick: send }, 'Send'),
-    h('button', { class: 'btn ghost', onClick: toggleHelp, title: 'the / vocabulary' }, '?'),
-  );
 
   mount(el,
     h('header', { class: 'pulse-hd' },
@@ -372,10 +435,9 @@ export async function render() {
         'Every character’s loop, interlaced in the order things happened. A character with an ',
         'empty inbox is ', h('em', {}, 'blocked'), ' — it burns no decode and is not in the batch, ',
         'which is what lets a hundred of them run at once.'),
-      toggleHost,
     ),
     censusHost,
-    composer,
+    worldHost,
     feedHost,
   );
 

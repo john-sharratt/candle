@@ -114,6 +114,10 @@ pub fn of(n: &NpcPayload, world: &str) -> OwnedPersona {
         // template supplies it through `persona_description`. Left empty rather
         // than duplicating the description into both slots, which would print
         // the same paragraph twice under two headings.
+        // Slugs, not prose: what a turn pins its personality's anchor and its
+        // world's setting to in the projection.
+        personality: n.personality_id.clone(),
+        world_id: n.world_id.clone(),
         manner: String::new(),
         beliefs: n.beliefs.iter().map(believe).collect(),
         relationships: n.relationships.iter().map(know).collect(),
@@ -122,6 +126,10 @@ pub fn of(n: &NpcPayload, world: &str) -> OwnedPersona {
         world: world.trim().to_string(),
         // Physical until an interaction says otherwise. The restrictive default:
         // a character on the ambient tick is standing somewhere, not messaging.
+        // Filled in by the runtime, which is the only thing that knows whether
+        // this character has a body and what building it stands in. An
+        // authored record carries no map.
+        place: String::new(),
         mode: Mode::Physical,
     }
 }
@@ -161,6 +169,7 @@ mod tests {
             persona_origin: "authored".into(),
             portrait_image_id: None,
             portrait_origin: None,
+            at: None,
             beliefs: Vec::new(),
             relationships: Vec::new(),
             agency: Vec::new(),

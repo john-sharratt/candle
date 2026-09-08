@@ -2629,7 +2629,45 @@ impl Scheduler {
             tokens_total: token_count,
         });
 
-        let first_token = match self.sample_single(&logits, &work.sampling, &mut sampling_state) {
+        // ── a turn that BEGINS inside a grammar ──────────────────────────────
+        //
+        // `triggers` cannot express this. Both registry checks run on *sampled*
+        // tokens — this function's first-token check and the decode loop's
+        // per-token one — so a turn whose grammar is entered on a token the
+        // caller prefilled would never arm at all: the prefill goes into K/V
+        // without passing the sampler. That is not a missed optimisation, it is
+        // a grammar that silently does not apply, and the decode then imitates
+        // the shape it was seeded with while nothing enforces it.
+        //
+        // So the tree is armed here, before anything is sampled. Its opening
+        // scaffold was already appended to `work.tokens` when the turn was
+        // assembled (`Conversation::submit_turn`), which is why the walk starts
+        // by replaying it: the driver has to sit at the same node the K/V does.
+        // What is left is the first genuine choice the grammar leaves open, and
+        // the first sampled token of the turn is taken under its mask.
+        let mut turn_driver = work.turn_grammar.clone().map(StencilDriver::new);
+        let mut sampling = work.sampling.clone();
+        if let Some(driver) = turn_driver.as_mut() {
+            let (scaffold, action) = driver.opening();
+            match &action {
+                StepMask::Branch(set) => {
+                    sampling.stencil = set.tokens().iter().map(|&t| t as i32).collect();
+                }
+                // A tree whose opening is free text or empty constrains nothing
+                // here; the decode loop picks it up from the next step.
+                StepMask::Free { .. } | StepMask::Done | StepMask::Prefill(_) => {}
+            }
+            tracing::debug!(
+                target: "candle_conversation::stencil",
+                seq_id = work.sequence_id.0,
+                tree = driver.tree().label(),
+                scaffold = scaffold.len(),
+                masked = matches!(action, StepMask::Branch(_)),
+                "turn grammar armed at the prefill boundary",
+            );
+        }
+
+        let first_token = match self.sample_single(&logits, &sampling, &mut sampling_state) {
             Ok(t) => t,
             Err(e) => {
                 self.sampling_states
@@ -2762,6 +2800,7 @@ impl Scheduler {
                         non_punct_since_reproject: 0,
                         last_projection_end: 0,
                         in_tool_call: false,
+                        free_tool_calls_from_penalties: work.free_tool_calls_from_penalties,
                         triggers: work.triggers,
                         stencil: None,
                         pending_mask: None,
@@ -2782,22 +2821,38 @@ impl Scheduler {
 
         let _ = work.event_tx.send(TurnEvent::Token(first_token));
 
-        // The first sampled token can itself be a stencil trigger — e.g. the
-        // model emits `<tool_call>` as its very first response token, the common
-        // case under /no_think (the think block is prefilled, so the model goes
-        // straight to the call). The decode-loop trigger check runs only on
-        // tokens sampled in `batch_decode_step`, never this one, so check it here
-        // too — otherwise steering silently never engages for those calls.
-        let stencil = work.triggers.driver_for(first_token);
-        if let Some(d) = &stencil {
-            tracing::debug!(
-                target: "candle_conversation::stencil",
-                seq_id = work.sequence_id.0,
-                tree = d.tree().label(),
-                trigger = first_token,
-                "stencil steering started (trigger on the first decoded token)",
-            );
-        }
+        // An armed turn grammar already owns this token — it was sampled under
+        // the mask above, so it is fed back rather than tested against the
+        // registry. A turn cannot be in both states: beginning inside a tree and
+        // entering one on this token are the same slot.
+        let stencil = match turn_driver {
+            Some(mut driver) => {
+                let bytes = self
+                    .tokenizer
+                    .decode(&[first_token], false)
+                    .unwrap_or_default();
+                driver.accept(first_token, bytes.as_bytes());
+                Some(driver)
+            }
+            // The first sampled token can itself be a stencil trigger — e.g. the
+            // model emits `<tool_call>` as its very first response token. The
+            // decode-loop trigger check runs only on tokens sampled in
+            // `batch_decode_step`, never this one, so check it here too —
+            // otherwise steering silently never engages for those calls.
+            None => {
+                let d = work.triggers.driver_for(first_token);
+                if let Some(d) = &d {
+                    tracing::debug!(
+                        target: "candle_conversation::stencil",
+                        seq_id = work.sequence_id.0,
+                        tree = d.tree().label(),
+                        trigger = first_token,
+                        "stencil steering started (trigger on the first decoded token)",
+                    );
+                }
+                d
+            }
+        };
         // A first-token `<tool_call>` trigger enters the call immediately, so the
         // in-call state must be set HERE — the decode loop's `is_tool_open` scan
         // (which normally sets it) only sees tokens sampled in `batch_decode_step`,
@@ -2860,6 +2915,7 @@ impl Scheduler {
                 non_punct_since_reproject: 0,
                 last_projection_end: 0,
                 in_tool_call: first_token_opens_call,
+                free_tool_calls_from_penalties: work.free_tool_calls_from_penalties,
                 triggers: work.triggers,
                 stencil,
                 pending_mask: None,

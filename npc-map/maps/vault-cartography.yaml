@@ -1,0 +1,77 @@
+id: vault-cartography
+kind: level
+within: creators-vault
+ordinal: 4
+name: the cartography level
+summary: >
+  Where the map and the places on it are kept. A place is written by whoever
+  holds it, but the map itself is another matter: moving a river is not a
+  local edit, so it is taken whole or not at all.
+character: >
+  Three scopes of work sit on one level, and what separates them is what each
+  one locks.
+lacks:
+  - way off this level except the lift and the stair
+spine:
+  name: the ring
+  loop: true
+  through: [ring-north, ring-east, ring-south, ring-west]
+nodes:
+  - { id: ring-north, kind: passage, name: the north run }
+  - { id: ring-east, kind: passage, name: the east run }
+  - { id: ring-south, kind: passage, name: the south run }
+  - { id: ring-west, kind: passage, name: the west run }
+  - { id: cross-upper, kind: passage, name: the upper cross run, off: [ring-east, ring-west] }
+  - { id: cross-lower, kind: passage, name: the lower cross run, off: [ring-east, ring-west] }
+
+  - id: core
+    kind: core
+    name: the lift and the stair
+    plural: true
+    off: [ring-north]
+
+  - id: north-survey
+    kind: work
+    name: the north survey room
+    off: [ring-north]
+    parts: [{ part: survey-desk, count: 6 }]
+
+  - id: middle-survey
+    kind: work
+    name: the middle survey room
+    off: [cross-upper]
+    parts: [{ part: survey-desk, count: 6 }]
+
+  - id: south-survey
+    kind: work
+    name: the south survey room
+    off: [cross-upper]
+    parts: [{ part: survey-desk, count: 4 }]
+
+  - id: map-room
+    kind: work
+    name: the map room
+    off: [ring-south]
+    sees: [gallery]
+    parts: [map-table]
+    character: >
+      A Maker who wants the map waits for it.
+
+  - id: index-room
+    kind: store
+    name: the index room
+    off: [cross-lower]
+    parts: [place-index]
+
+  - id: gallery
+    kind: social
+    name: the survey gallery
+    off: [ring-south]
+    parts: [gallery-rail, { part: seat, count: 8 }]
+
+  - id: road-table
+    kind: social
+    name: the road table
+    stand: at
+    off: [ring-south]
+    parts: [road-table, { part: seat, count: 4 }]

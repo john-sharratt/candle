@@ -48,20 +48,28 @@
 
 pub mod act;
 pub mod authoring;
+pub mod body;
+pub mod driver;
+pub mod environment;
 pub mod event;
+pub mod identity;
 pub mod ingest;
 pub mod life;
 pub mod loading;
 pub mod mind;
+pub mod perceived;
 pub mod persona;
 pub mod prompt;
 pub mod pulse;
+pub mod reach;
 pub mod runtime;
 pub mod schema;
+pub mod simulate;
 pub mod slash;
 pub mod sleep;
 pub mod tick;
 pub mod tools;
+pub mod waiting;
 pub mod watcher;
 pub mod window;
 
@@ -108,6 +116,12 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             get(turn),
         )
         .route("/v1/npc/:nid/memory", Role::User, get(memory))
+        // ── the scenario harness ────────────────────────────────────────────
+        //
+        // Put a situation to a character that does not exist and report
+        // everything about what came back. Admin, because it spends the one
+        // card's time and reports the daemon's own prompt.
+        .route("/v1/simulate", Role::Admin, post(simulate::run))
         // ── instruments ─────────────────────────────────────────────────────
         .route("/v1/npc/:nid/projection", Role::User, get(projection_now))
         .route(
@@ -142,6 +156,13 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // ── Pulse: the cast's loop, as an instrument ────────────────────────
         .route("/v1/pulse", Role::User, get(pulse::feed))
         .route("/v1/pulse/census", Role::User, get(pulse::census))
+        // Where everybody is standing. The one question the feed and the window
+        // between them cannot answer — see [`pulse::world`].
+        //
+        // Under `/v1/pulse`, not `/v1/world`: that one is the authored world
+        // registry, which is a different thing entirely — the documents an
+        // author wrote, not the simulation running from them.
+        .route("/v1/pulse/world", Role::User, get(pulse::world))
         .route("/v1/npc/:nid/pulse", Role::User, post(pulse::inject))
         .route("/v1/npc/:nid/window", Role::User, get(pulse::window))
         // Admin: it reaches characters the caller does not own, which every

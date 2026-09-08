@@ -239,6 +239,12 @@ impl Registry {
         self.items.len()
     }
 
+    /// Whether nothing has been registered. A registry over an empty directory
+    /// is a legitimate state — a world with no personalities authored yet.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     /// Look up by id. This is what a URL segment reaches — a map lookup, never
     /// a path.
     pub fn get(&self, id: &str) -> Option<&Record> {

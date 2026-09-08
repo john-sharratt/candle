@@ -7,6 +7,7 @@ use crate::config::{
 };
 use crate::error::ConversationError;
 use crate::models::DialectType;
+use crate::persistence::SharedSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tree::ConversationTreeConfig;
 use candle::{DType, Device};
@@ -113,7 +114,17 @@ pub struct ModelBuilder {
     max_hot_turns: usize,
     /// Workspace root whose `.substrate/` directory backs the persistence
     /// redo log. `None` falls back to the process working directory.
+    ///
+    /// Ignored when [`Self::substrate`] handed over an already-open one.
     workspace_path: Option<PathBuf>,
+    /// A substrate the host process opened and still writes to itself.
+    ///
+    /// `None` — the ordinary case — means the engine opens the directory
+    /// [`Self::workspace_path`] names. A host that appends its own record
+    /// classes to the same log must pass one instead, because a second writable
+    /// handle to one `.substrate/` silently drops records; see
+    /// [`SharedSubstrate`].
+    substrate: Option<SharedSubstrate>,
     /// When `true`, the engine does not spawn the async summariser thread and
     /// new conversations are not registered for summarisation (the AVL summary
     /// forest is left un-extended). Off by default.
@@ -164,6 +175,7 @@ impl ModelBuilder {
             health_config: DecodeHealthConfig::default(),
             max_hot_turns: 0,
             workspace_path: None,
+            substrate: None,
             disable_summariser: false,
             layer_corrupt_turn: HashMap::new(),
             expert_pack_dir: None,
@@ -285,8 +297,22 @@ impl ModelBuilder {
 
     /// Set the workspace root whose `.substrate/` directory backs the
     /// persistence redo log.
+    ///
+    /// Has no effect once [`Self::substrate`] has handed over an open one —
+    /// that substrate already knows where it lives.
     pub fn workspace_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.workspace_path = Some(path.into());
+        self
+    }
+
+    /// Hand the engine a substrate this process already opened, instead of a
+    /// path to open its own at.
+    ///
+    /// Required of any host that writes its own records into the same redo log:
+    /// one `.substrate/` admits exactly one writable handle per process, and a
+    /// second one loses records rather than failing. See [`SharedSubstrate`].
+    pub fn substrate(mut self, shared: SharedSubstrate) -> Self {
+        self.substrate = Some(shared);
         self
     }
 
@@ -761,6 +787,7 @@ impl ModelBuilder {
         ret.penalty_log_path = self.penalty_log_path.clone();
         ret.health = self.health_config.clone();
         ret.workspace_path = self.workspace_path.clone();
+        ret.substrate = self.substrate.clone();
         ret.model_spec = Some(self.model_spec_blob());
         // The engine uses the model's dialect to pre-tokenise the
         // inter-turn boundary markers once at scheduler construction.
@@ -1611,6 +1638,21 @@ impl ModelBuilder {
 /// can be tested against a temporary cache instead of the machine's real one —
 /// the rule is what keeps a daemon startable when the hub is unreachable, and
 /// it is worth a test that does not depend on what happens to be downloaded.
+/// # A pinned revision does not live behind a ref
+///
+/// `CacheRepo::get` resolves in one way only: read the commit hash out of
+/// `refs/<revision>`, then look under `snapshots/<hash>/`. That is right for a
+/// branch or a tag, which is what a ref *is* — and wrong for a revision pinned
+/// to a commit, because the hub writes `refs/<branch>` and never
+/// `refs/<sha>`. Asked for a sha it reads a path that cannot exist, returns
+/// `None`, and the caller falls through to the network — so the cache-first
+/// rule silently did nothing for exactly the checkpoints that were pinned
+/// because pinning mattered, and a pinned model still could not be opened with
+/// the hub unreachable.
+///
+/// So: the ref lookup first, since a branch has to keep resolving through the
+/// ref it is named by, and the snapshot directly when that finds nothing. A
+/// revision the cache genuinely does not hold misses both and is still a miss.
 #[cfg(feature = "hub")]
 fn cached_repo_file(
     cache: &hf_hub::Cache,
@@ -1619,16 +1661,39 @@ fn cached_repo_file(
     filename: &str,
 ) -> Option<PathBuf> {
     use hf_hub::{Repo, RepoType};
-    match rev {
-        "" => cache.model(repo.to_string()).get(filename),
-        r => cache
-            .repo(Repo::with_revision(
-                repo.to_owned(),
-                RepoType::Model,
-                r.to_owned(),
-            ))
-            .get(filename),
+    let Some(rev) = Some(rev).filter(|r| !r.is_empty()) else {
+        return cache.model(repo.to_string()).get(filename);
+    };
+    let pinned = Repo::with_revision(repo.to_owned(), RepoType::Model, rev.to_owned());
+    if let Some(found) = cache.repo(pinned).get(filename) {
+        return Some(found);
     }
+    let snapshot = cache
+        .path()
+        .join(Repo::model(repo.to_owned()).folder_name())
+        .join("snapshots")
+        .join(rev)
+        .join(filename);
+    snapshot.is_file().then_some(snapshot)
+}
+
+/// **The gap, named, so a green run cannot be read as a covered one.**
+///
+/// `cached_repo_file` needs `hf-hub`, so its test can only exist with the `hub`
+/// feature — and `cargo test -p candle-conversation` does not enable it, which
+/// meant the suite reported `1253 filtered out` and passed. The test was not
+/// passing; it was not being built. It only appeared when another crate in the
+/// same invocation unified the feature in, so the same test both passed and
+/// failed depending on which `-p` flags were on the command line, and a real
+/// failure was written off as flakiness.
+///
+/// An ignored test compiles unconditionally and is *counted* in the summary, so
+/// the absence is now a line of output rather than nothing at all.
+#[cfg(all(test, not(feature = "hub")))]
+mod cache_first_tests {
+    #[test]
+    #[ignore = "the cache-first lookup is only compiled with --features hub"]
+    fn the_cache_first_lookup_is_not_covered_without_the_hub_feature() {}
 }
 
 #[cfg(all(test, feature = "hub"))]

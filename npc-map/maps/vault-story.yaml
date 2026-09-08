@@ -1,0 +1,84 @@
+id: vault-story
+kind: level
+within: creators-vault
+ordinal: 3
+name: the story level
+summary: >
+  Where the silences in the record get filled. A gap is a span between two
+  events that nobody has written into, and the story belonging in it is prose
+  rather than reference, which is why this is not a desk on the chronicle.
+character: >
+  The only level where the work is genuinely independent: two Makers writing
+  into two different silences cannot collide.
+lacks:
+  - way off this level except the lift and the stair
+spine:
+  name: the ring
+  loop: true
+  through: [ring-north, ring-east, ring-south, ring-west]
+nodes:
+  - { id: ring-north, kind: passage, name: the north run }
+  - { id: ring-east, kind: passage, name: the east run }
+  - { id: ring-south, kind: passage, name: the south run }
+  - { id: ring-west, kind: passage, name: the west run }
+  - { id: cross-upper, kind: passage, name: the upper cross run, off: [ring-east, ring-west] }
+  - { id: cross-lower, kind: passage, name: the lower cross run, off: [ring-east, ring-west] }
+
+  - id: core
+    kind: core
+    name: the lift and the stair
+    plural: true
+    off: [ring-north]
+
+  - id: first-room
+    kind: work
+    name: the first writing room
+    off: [ring-north]
+    parts: [{ part: story-desk, count: 6 }]
+
+  - id: second-room
+    kind: work
+    name: the second writing room
+    off: [cross-upper]
+    parts: [{ part: story-desk, count: 6 }]
+
+  - id: third-room
+    kind: work
+    name: the third writing room
+    off: [cross-upper]
+    parts: [{ part: story-desk, count: 4 }]
+
+  - id: ledger-room
+    kind: store
+    name: the ledger room
+    off: [cross-lower]
+    parts: [gap-ledger, filed-stories]
+
+  - id: board-room
+    kind: work
+    name: the board room
+    off: [cross-lower]
+    parts: [structure-board, { part: seat, count: 6 }]
+    habit: busy before a draft exists, empty once one does
+    character: >
+      A piece is pinned up in pieces here and taken apart in front of whoever is
+      standing there. It is the one room where being told the shape is wrong
+      costs a morning instead of a fortnight.
+
+  - id: long-table
+    kind: social
+    name: the long table
+    stand: at
+    off: [ring-south]
+    parts: [reading-table, { part: seat, count: 10 }]
+    habit: busy in the hours after a filing
+
+  - id: quiet-room
+    kind: social
+    name: the quiet room
+    off: [ring-south]
+    parts: [{ part: seat, count: 6 }]
+    habit: quiet by agreement rather than by rule
+    character: >
+      With sixteen Makers on one level, somewhere uninterrupted has to be
+      named or it does not exist.

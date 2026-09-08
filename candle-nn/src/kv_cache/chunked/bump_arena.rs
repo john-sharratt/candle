@@ -989,7 +989,7 @@ where
         // No arena on *this* device, though one is open elsewhere.
         return f(x);
     };
-    let staged = stage_in(x, &cuda, &generation)?;
+    let staged = stage_in(x, cuda, &generation)?;
     let out = f(&staged)?;
     // Out before the rewind, and this is the copy that makes releasing the
     // arena sound — nothing the stage allocated may outlive it.

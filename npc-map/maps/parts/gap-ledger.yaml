@@ -1,0 +1,14 @@
+id: gap-ledger
+kind: fixture
+name: the gap ledger
+short: >
+  The ledger lists every silence in the record, longest first, so there is
+  always work standing whether or not an order says so.
+long: >
+  A standing list of every span the record has nothing written into, longest
+  first. It is generated from the record itself rather than assigned by
+  anybody, which makes it the one place a Maker with no order can find work
+  that is certainly wanted. Taking a silence off it claims that gap.
+tools:
+  - story.read_ledger
+  - story.take_next_silence

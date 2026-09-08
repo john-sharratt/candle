@@ -122,6 +122,30 @@ impl StencilDriver {
         self.session.in_terminal_close_span()
     }
 
+    /// Walk the tree's opening scaffold, for a turn that **begins** inside a
+    /// grammar rather than entering one on a trigger token.
+    ///
+    /// Returns every leading `Static` run concatenated, plus the first action
+    /// that actually needs the sampler.  The runs are deterministic — no token
+    /// has been observed yet, so the walk from the root cannot branch — which is
+    /// what lets the caller seed them into the turn's assistant prefill and then
+    /// re-derive the same position here to keep the driver in step with the K/V.
+    ///
+    /// Prefilling that scaffold rather than decoding it is both cheaper and
+    /// stronger: it costs one prefill pass instead of a decode step per token,
+    /// and the tokens are *written* rather than chosen, so no sampling outcome
+    /// can decline to produce them.  The first sampled token of the turn is then
+    /// the first genuine decision the grammar leaves open — a masked branch.
+    pub fn opening(&mut self) -> (Vec<TokenId>, StepMask) {
+        let mut scaffold = Vec::new();
+        loop {
+            match self.step() {
+                StepMask::Prefill(run) => scaffold.extend_from_slice(&run),
+                action => return (scaffold, action),
+            }
+        }
+    }
+
     /// What to do for the next decode step: prefill a static run, mask a branch,
     /// free-decode a span, or finish.  After a `Prefill` the caller injects the
     /// run and calls `step` again; after `Branch`/`Free` it samples a token under
@@ -465,5 +489,53 @@ mod tests {
             "envelope/close prefilled as static runs: {s:?}"
         );
         assert!(s.free_tokens > 0, "the path value was free-decoded: {s:?}");
+    }
+
+    /// The scaffold a turn can prefill, and where the model's first real choice
+    /// is. `opening` exists so a caller can write the one and mask the other.
+    #[test]
+    fn opening_yields_the_static_scaffold_and_stops_at_the_first_choice() {
+        let v = TestVocab::new();
+        // Two tools, so the name is a genuine decision. With a one-tool catalog
+        // there is nothing to choose and the scaffold correctly runs on through
+        // the name to the first argument value.
+        let tree = tool_tree(
+            r#"[{"name":"read_file","params":[{"name":"path","type":"string","required":true}]},
+                {"name":"say","params":[{"name":"intent","type":"string","required":true}]}]"#,
+        );
+        let (scaffold, action) = StencilDriver::new(tree).opening();
+
+        // Everything up to the tool name is fixed text, so it is *written*
+        // rather than sampled — which is the whole point: no sampling outcome
+        // can decline to produce it or produce something else.
+        assert_eq!(
+            String::from_utf8(v.decode(&scaffold)).unwrap(),
+            "<tool_call>\n{\"name\": \""
+        );
+        // And what stops the walk is the first genuine decision — masked, so an
+        // invented name is not reachable rather than merely discouraged.
+        let StepMask::Branch(set) = action else {
+            panic!("the tool name must be a masked branch, got {action:?}");
+        };
+        assert!(set.contains(b'r' as TokenId), "`read_file` is in the catalog");
+        assert!(set.contains(b's' as TokenId), "`say` is in the catalog");
+        assert!(
+            !set.contains(b'l' as TokenId),
+            "a name outside the catalog — `look` — must be unreachable"
+        );
+    }
+
+    /// Replaying the walk gives the same scaffold and the same frontier. The
+    /// turn path depends on it: the assistant prefill is built from one walk and
+    /// the decode driver is armed by a second, and they must land on one node.
+    #[test]
+    fn opening_is_deterministic_so_two_walks_agree() {
+        let tree = tool_tree(
+            r#"[{"name":"read_file","params":[{"name":"path","type":"string","required":true}]}]"#,
+        );
+        let (a, a_action) = StencilDriver::new(Arc::clone(&tree)).opening();
+        let (b, b_action) = StencilDriver::new(tree).opening();
+        assert_eq!(a, b, "the scaffold moved between two walks of one tree");
+        assert_eq!(a_action, b_action, "the frontier moved");
     }
 }

@@ -1,3 +1,8 @@
+// `chunks_exact_to_as_chunks` — a style lint that became default in a recent
+// clippy and fires on correct, unchanged code that unpacks weight and gallery
+// buffers in fixed strides. See the note in `candle-core/src/lib.rs`.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 //! Model implementations for the unbounded-context inference engine.
 //!
 //! This is the model layer of the fork: a large zoo of upstream architecture

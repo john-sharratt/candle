@@ -1088,6 +1088,30 @@ export const MockAPI = {
     return { ready: true,
              characters: id ? characters.filter((c) => c.npc_id === Number(id)) : characters };
   },
+  /* Two characters in one room and one elsewhere, because the interesting
+   * shape is company: a room with two people in it is the case the panel
+   * exists to make visible. */
+  async pulseWorld() {
+    return {
+      may_see_all: true,
+      moments: [{ world_id: 'battle-cities', moments: 1204, paused: false }],
+      bound: { 'npc-1': '1', 'npc-2': '2' },
+      worlds: [{
+        world_id: 'battle-cities',
+        bodies: 2,
+        rooms: [
+          { area: 'vault-command', area_name: 'the command level', node: 'command-room',
+            name: 'the command room', kind: 'work',
+            who: [{ body: 'npc-1', name: 'Perrin Vastwood', holding: null, going_to: null },
+                  { body: 'npc-2', name: 'Wyneth Vayne', holding: null, going_to: 'anteroom' }] },
+          { area: 'vault-command', area_name: 'the command level', node: 'anteroom',
+            name: 'the anteroom', kind: 'social', who: [] },
+          { area: 'vault-casting', area_name: 'the casting level', node: 'band-one',
+            name: 'band one', kind: 'work', who: [] },
+        ],
+      }],
+    };
+  },
   async npcWindow(_id) {
     return {
       cap: 24, faded: 118, empty: false,

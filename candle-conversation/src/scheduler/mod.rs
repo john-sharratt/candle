@@ -61,7 +61,9 @@ use crate::provenance::{
     GalleryArena, WideQSig,
 };
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
-use crate::stencil::{Healed, StencilDriver, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL};
+use crate::stencil::{
+    Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
+};
 use crate::substrate::{ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
 use crate::summary_tree::{
@@ -276,6 +278,14 @@ pub(crate) enum SchedulerRequest {
         /// their trigger token (e.g. `<tool_call>`).  An empty registry means no
         /// constrained decoding — the turn free-decodes.
         triggers: Arc<TriggerRegistry>,
+        /// A grammar this turn *begins inside* — see [`TurnOptions::turn_grammar`].
+        /// Its opening scaffold is already appended to `tokens`; the driver is
+        /// armed at the prefill boundary so the first sampled token is masked.
+        turn_grammar: Option<Arc<StencilTree>>,
+        /// Whether the schema asked for repetition penalties to be lifted inside
+        /// tool calls — see
+        /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
+        free_tool_calls_from_penalties: bool,
     },
 
     /// Free a sequence slot.
@@ -1261,6 +1271,10 @@ struct DecodeState {
     /// suppressed so the generic call body can't re-orient the committed tool.
     /// Migrates with the decode state across view swaps.
     in_tool_call: bool,
+    /// Whether this turn's schema asked for repetition penalties to be lifted
+    /// while a tool call runs. Off unless the schema names it — see
+    /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
+    free_tool_calls_from_penalties: bool,
     /// Tool-call stencils available this turn, keyed by trigger token.  Empty
     /// registry = free decode.  Carried from the turn's `SubmitTurn`.
     triggers: Arc<TriggerRegistry>,
@@ -1590,6 +1604,13 @@ pub(super) struct PrefillWork {
     /// Tool-call stencils carried through prefill and installed on the
     /// [`DecodeState`] at decode start.  Empty registry = no constrained decode.
     pub(super) triggers: Arc<TriggerRegistry>,
+    /// A grammar the turn begins inside — see [`TurnOptions::turn_grammar`].
+    /// Armed at the prefill boundary, before the first token is sampled.
+    pub(super) turn_grammar: Option<Arc<StencilTree>>,
+    /// Whether this turn's schema asked for repetition penalties to be lifted
+    /// while a tool call is emitted — see
+    /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
+    pub(super) free_tool_calls_from_penalties: bool,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -3129,6 +3150,8 @@ impl Scheduler {
                 reprojection,
                 disable_reprojection,
                 triggers,
+                turn_grammar,
+                free_tool_calls_from_penalties,
             } => {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
@@ -3593,6 +3616,8 @@ impl Scheduler {
                     projection_offsets,
                     staged_composition,
                     triggers,
+                    turn_grammar,
+                    free_tool_calls_from_penalties,
                 });
                 true
             }
@@ -4711,6 +4736,8 @@ impl Scheduler {
                 max_tokens,
                 sampling_config: config,
                 seal_action: SealAction::CompressionPass { job_id },
+                // A compression pass emits no tool calls.
+                free_tool_calls_from_penalties: false,
                 prefill_assistant_text: String::new(),
                 finished: false,
                 decode_start: Instant::now(),
@@ -5031,6 +5058,8 @@ impl Scheduler {
             projection_offsets: Vec::new(),
             staged_composition: None,
             triggers: Arc::new(TriggerRegistry::new()),
+            turn_grammar: None,
+            free_tool_calls_from_penalties: false,
         });
         Ok(())
     }
@@ -5249,13 +5278,10 @@ impl Scheduler {
         clean_tokens.extend_from_slice(&state.post_decode_tokens);
         let total = clean_tokens.len() as u32;
 
-        // Display text (verbatim, reasoning included): prefill turns supply it,
-        // decode turns fall back to the streamed text.
-        let assistant_text = if state.prefill_assistant_text.is_empty() {
-            text.clone()
-        } else {
-            state.prefill_assistant_text.clone()
-        };
+        // Display text (verbatim, reasoning included). Already the whole
+        // assistant half — what was written, then what was decoded — so there is
+        // nothing to choose between; see the sibling seal in `drain_finished`.
+        let assistant_text = text.clone();
         // The `<think>` block becomes an ETHEREAL `Thinking` segment over the
         // reasoning-free grid — text kept, K/V dropped.
         let layout = self.build_turn_layout(
@@ -5328,6 +5354,8 @@ impl Scheduler {
             projection_offsets: Vec::new(),
             staged_composition: None,
             triggers: Arc::new(TriggerRegistry::new()),
+            turn_grammar: None,
+            free_tool_calls_from_penalties: false,
         });
     }
 
@@ -6308,10 +6336,23 @@ impl Scheduler {
                 // want it strip at the point of use (the summariser strips its own
                 // output), and the KV already carries the reasoning tokens either
                 // way. Stripping here would silently drop reasoning on F5/reload.
-                let text = self
-                    .tokenizer
-                    .decode(&state.generated_tokens, skip)
-                    .unwrap_or_default();
+                //
+                // **The written half comes first.** An assistant prefill — a
+                // seeded `<tool_call>`, a turn grammar's opening scaffold — is
+                // assistant content that happens to have been written instead of
+                // sampled. Reporting only the sampled half hands the caller a
+                // fragment starting mid-syntax: it prefilled `{"name": "` to
+                // commit the shape, and then cannot parse the shape back,
+                // because the part it supplied is missing. The substrate had the
+                // same hole, storing a turn whose text began in the middle of
+                // its own JSON.
+                let text = format!(
+                    "{}{}",
+                    state.prefill_assistant_text,
+                    self.tokenizer
+                        .decode(&state.generated_tokens, skip)
+                        .unwrap_or_default()
+                );
                 // Snapshot stats before any view finalize, since the view
                 // slot is dropped during finalize and its sequence stats
                 // become unavailable.
@@ -6659,15 +6700,14 @@ impl Scheduler {
                             full_tokens.extend_from_slice(forwarded_generated);
                             full_tokens.extend_from_slice(&state.post_decode_tokens);
 
-                            // Prefill turns (repo_map / code_reading) supply the
-                            // assistant half verbatim and never decode, so `text`
-                            // is empty — store the supplied content. Decode turns
-                            // leave it empty and fall back to the decoded `text`.
-                            let assistant_text = if state.prefill_assistant_text.is_empty() {
-                                text.clone()
-                            } else {
-                                state.prefill_assistant_text.clone()
-                            };
+                            // `text` is already written-then-decoded, so it is the
+                            // whole assistant half either way: a prefill turn
+                            // (repo_map / code_reading) supplies it verbatim and
+                            // never decodes, and a decode turn with a seeded
+                            // prefix carries both parts. Choosing between them —
+                            // which this did — silently dropped the decoded half
+                            // of any turn that had both.
+                            let assistant_text = text.clone();
                             let total = full_tokens.len() as u32;
                             // Immediate (non-deferred) seal: no re-prefill ran, so
                             // the grid still contains the reasoning tokens — the
@@ -7087,7 +7127,7 @@ impl Scheduler {
             return Ok(());
         }
         let drained: Vec<PendingSectionQuantize> =
-            self.pending_section_quantize.drain(..).collect();
+            std::mem::take(&mut self.pending_section_quantize);
         self.quantize_section_batch(conversation, drained, boundary_policy, member_policy, false)
     }
 

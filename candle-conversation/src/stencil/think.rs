@@ -145,6 +145,21 @@ pub struct ThinkSteerEnvelope {
     pub think_close: TokenId,
     /// The model's end-of-sequence id.
     pub eos: TokenId,
+    /// Text injected immediately after the block's closing tag, before control
+    /// returns to the decoder.
+    ///
+    /// **This is what makes the turn's shape deterministic across the join.**
+    /// Empty — the default — hands control back the moment the block closes, and
+    /// what the model does next is its own business: fine for an assistant whose
+    /// reasoning is followed by prose.
+    ///
+    /// An **action loop** wants the opposite. A character that has finished
+    /// thinking must now act, and leaving it free at that join is leaving it free
+    /// to write an essay instead — which is exactly what turns produced: a
+    /// closed block, then prose, then nothing the world could act on. Setting
+    /// this to the tool-call marker emits it as part of the grammar, which fires
+    /// the act stencil and puts the turn straight into a call.
+    pub after_close: &'static str,
 }
 
 /// Build the steering tree spec for `mode`.  Returns `None` for
@@ -159,12 +174,36 @@ pub struct ThinkSteerEnvelope {
 /// closes the block.
 pub fn compile_think_tree(mode: ThinkMode, env: &ThinkSteerEnvelope) -> Option<TreeSpec> {
     match mode {
-        ThinkMode::Off => None,
+        ThinkMode::Off => Some(off(env)),
         ThinkMode::Quick => Some(quick(env)),
         ThinkMode::Balanced => Some(balanced(env)),
         ThinkMode::Deep => Some(deep(env)),
         ThinkMode::Exhaustive => Some(exhaustive(env)),
     }
+}
+
+/// **Off — the block is emptied the instant it opens.**
+///
+/// No free-text span at all: the trigger fires on `<think>`, the grammar injects
+/// `</think>` as the very next thing, and the decode continues into the answer.
+/// A reasoning block cannot be written because there is nowhere in the tree to
+/// write one.
+///
+/// This is suppression that does not depend on the family's chat template. The
+/// alternatives both do, and each covers only half the field: Qwen3 honours a
+/// `/no_think` marker in the user turn, while Qwen3.5 and Qwen3.8 have no such
+/// marker and suppress by opening the assistant turn with the block already
+/// closed. A caller that only knew the marker turned nothing off on the newer
+/// family and had no way to find out — the dial read as set and reasoning ran
+/// anyway, taking the whole decode with it.
+///
+/// A steering tree needs neither. It acts on the decoded token, so it is the one
+/// mechanism that works the same everywhere and the only one a caller can be
+/// sure of.
+fn off(env: &ThinkSteerEnvelope) -> TreeSpec {
+    let mut spec = TreeSpec::new("think_off");
+    spec.root = close_tag_then_end(&mut spec, env);
+    spec
 }
 
 /// A token-closed thinking span: no byte terminator, never ends on `eos_ends`
@@ -189,10 +228,10 @@ fn think_span(
 
 /// The injected closing tag the block actually ends on (the model's own
 /// `</think>` is always dropped), spliced to `End`.
-fn close_tag_then_end(spec: &mut TreeSpec) -> SpecId {
+fn close_tag_then_end(spec: &mut TreeSpec, env: &ThinkSteerEnvelope) -> SpecId {
     let end = spec.push(NodeSpec::End);
     spec.push(NodeSpec::Static {
-        text: "</think>".to_string(),
+        text: format!("</think>{}", env.after_close),
         next: end,
     })
 }
@@ -227,7 +266,7 @@ const EXHAUSTIVE_PHRASES: &[&str] = &[
 /// `Static("\nOkay, ")` → span(`QUICK_SPAN_CAP`) → `Static("</think>")` → `End`.
 fn quick(env: &ThinkSteerEnvelope) -> TreeSpec {
     let mut spec = TreeSpec::new("think_quick");
-    let close = close_tag_then_end(&mut spec);
+    let close = close_tag_then_end(&mut spec, env);
     let span = think_span(&mut spec, env, QUICK_SPAN_CAP, close);
     let opener = spec.push(NodeSpec::Static {
         text: "\nOkay, ".to_string(),
@@ -242,7 +281,7 @@ fn quick(env: &ThinkSteerEnvelope) -> TreeSpec {
 /// `Static("\nOkay, ")` → span(`BALANCED_SPAN_CAP`) → `Static("</think>")` → `End`.
 fn balanced(env: &ThinkSteerEnvelope) -> TreeSpec {
     let mut spec = TreeSpec::new("think_balanced");
-    let close = close_tag_then_end(&mut spec);
+    let close = close_tag_then_end(&mut spec, env);
     let span = think_span(&mut spec, env, BALANCED_SPAN_CAP, close);
     let opener = spec.push(NodeSpec::Static {
         text: "\nOkay, ".to_string(),
@@ -265,7 +304,7 @@ fn continuation_chain(
     forced_after: u32,
 ) -> TreeSpec {
     let mut spec = TreeSpec::new(label);
-    let close = close_tag_then_end(&mut spec);
+    let close = close_tag_then_end(&mut spec, env);
 
     // The final span's successor is the injected closing tag.
     let mut next = think_span(&mut spec, env, forced_after, close);
@@ -330,6 +369,7 @@ mod tests {
             think_open: THINK_OPEN_ID,
             think_close: THINK_CLOSE_ID,
             eos: vocab().eos(),
+            after_close: "",
         }
     }
 
@@ -370,9 +410,32 @@ mod tests {
 
     // ── One test per mode ────────────────────────────────────────────────────
 
+    /// **Off empties the block rather than declining to steer it.**
+    ///
+    /// It used to compile to nothing, on the reasoning that the dialect's
+    /// `/no_think` glue would yield an empty block. That holds for Qwen3 and is
+    /// false for Qwen3.5 and Qwen3.8, which have no such marker — so on those
+    /// families "off" left the model free to reason with nothing steering it,
+    /// and the block ran to the token ceiling and took the whole decode with it
+    /// while the dial reported itself off.
+    ///
+    /// The tree is the injected close and nothing else: there is no free-text
+    /// span in it, so a reasoning block has nowhere to be written.
     #[test]
-    fn off_registers_no_tree() {
-        assert!(compile_think_tree(ThinkMode::Off, &env()).is_none());
+    fn off_empties_the_block_it_triggers_on() {
+        let spec = compile_think_tree(ThinkMode::Off, &env()).expect("off is a steering spec");
+        let free = spec
+            .nodes
+            .iter()
+            .filter(|n| matches!(n, NodeSpec::FreeText { .. }))
+            .count();
+        assert_eq!(free, 0, "an off block has nowhere to write reasoning");
+        assert!(
+            spec.nodes
+                .iter()
+                .any(|n| matches!(n, NodeSpec::Static { text, .. } if text == "</think>")),
+            "off must inject the closing tag"
+        );
     }
 
     /// The hard-cap closer gate: a close in quick/balanced's single span (and

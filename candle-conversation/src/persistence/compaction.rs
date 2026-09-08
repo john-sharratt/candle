@@ -31,7 +31,7 @@ use super::log_file::LogFile;
 use super::manifest::{encode_conv_state_payload, ConvState, Manifest, RecordLoc};
 use super::record::{
     encode_record, DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType,
-    TombstonePayload,
+    TombstonePayload, TurnCouplingPayload,
 };
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::streams::StreamId;
@@ -158,9 +158,18 @@ fn branch_checkpoints_to_keep(substrate: &Substrate) -> Vec<(StreamId, RecordLoc
 /// `Chunk` / `Tokens` become `Raw` items carrying their source `(segment,
 /// offset, record_size)` and a header synthesized from the substrate/manifest
 /// index; every resident record (`StreamDecl`, `Commit`, `Label`, `ConvState`,
-/// `ProjectionEvents`, `WideQSig`, `TreeMetadata`, `DebugId`, `Distilled`) is a
-/// `Synth` item carrying its freshly-encoded payload. [`write_compacted_log`]
-/// reads the `Raw` bytes back coalesced and stages them verbatim.
+/// `ProjectionEvents`, `WideQSig`, `TreeMetadata`, `TurnCoupling`, `DebugId`,
+/// `Distilled`) is a `Synth` item carrying its freshly-encoded payload.
+/// [`write_compacted_log`] reads the `Raw` bytes back coalesced and stages them
+/// verbatim.
+///
+/// **Every record class must appear here or be deliberately reclaimed.** There
+/// is no fallback that carries an unhandled type forward and nothing warns when
+/// one is missing — the record simply stops existing at the next compaction.
+/// `Npc` and `TurnCoupling` were each lost exactly that way. The exhaustive
+/// match in [`super::accounting::RecordAccounting::record`] is the checklist:
+/// a header-keyed type needs a `Raw` carry-forward from its location map, and a
+/// payload-keyed one needs a `Synth` re-emit from substrate RAM.
 pub fn collect_live_records(
     manifest: &Manifest,
     substrate: &Substrate,
@@ -559,6 +568,37 @@ pub fn collect_live_records(
                 token_count: 0,
             },
             bytes,
+        ));
+    }
+    // Per-(timeline, turn) tool round-trip couplings.
+    //
+    // Resident and payload-keyed, like `Label` and `DebugId` — the accounting
+    // never supersedes one, so the only way it reaches the compacted log is a
+    // re-emit from RAM. Without this every compaction unjoined each tool call
+    // from its response, and `summary_tree::exchange` — which groups an
+    // exchange as the maximal run of coupled turns — began splitting the two
+    // halves of one round-trip into separate exchanges. Nothing failed; the
+    // summaries just quietly got worse.
+    for (timeline_id, from_turn) in substrate.live_couplings() {
+        if tombstoned.contains(&timeline_id) {
+            continue;
+        }
+        let payload = TurnCouplingPayload {
+            timeline_id,
+            from_turn,
+        }
+        .encode();
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: RecordType::TurnCoupling,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            payload,
         ));
     }
     // Per-timeline debug_id.

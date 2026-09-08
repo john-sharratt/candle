@@ -228,6 +228,107 @@ pub async fn census(
     .into_response()
 }
 
+/// `GET /v1/pulse/world` — the worlds this daemon is running, and who is in them.
+///
+/// Not `/v1/world`, which is the authored world *registry* — the documents an
+/// author wrote. This is the simulation running from them, and they are
+/// different enough that sharing a path would be a collision in every sense.
+///
+/// The instrument the pulse feed cannot be. The feed says what a character
+/// *did* and the window says what it is *holding*; neither says where anybody
+/// is standing, which is the one question that makes a moving cast legible —
+/// two characters talking and two characters two floors apart look identical in
+/// a feed, and completely different here.
+///
+/// Rooms come back with who is in each, so the shape of the building is visible
+/// rather than having to be reconstructed from a list of coordinates. An empty
+/// room is included: knowing the green room is empty is why a character walking
+/// to it is interesting.
+pub async fn world(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
+    let (id, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+    // The rooms are the world's and belong to nobody; the *binding* rows are
+    // scoped, so a caller only learns which characters are which bodies for the
+    // characters it may already see.
+    let scope = scope_of(&s, &id, &owner, true).await;
+
+    let mut worlds = Vec::new();
+    for world_id in rt.hosted.ids() {
+        let Some(hosted) = rt.hosted.get(&world_id) else {
+            continue;
+        };
+        // One read of the world, holding it still, so every room in the answer
+        // is from the same instant. Two reads would let a body move between
+        // them and appear in two rooms or in none.
+        let (rooms, bodies) = hosted.read(|w| {
+            let mut rooms: Vec<serde_json::Value> = Vec::new();
+            let mut bodies = 0usize;
+            for area in w.map().areas() {
+                for node in &area.nodes {
+                    let at = npc_map::world::Where::new(area.id.clone(), node.id.clone());
+                    let here: Vec<serde_json::Value> = w
+                        .actors_at(&at)
+                        .into_iter()
+                        .map(|a| {
+                            bodies += 1;
+                            json!({
+                                "body": a.id,
+                                "name": a.name,
+                                // What it is doing here, which is the half a
+                                // position alone does not say.
+                                "holding": a.hold.as_ref().and_then(|h| h.subject.clone()),
+                                "going_to": a.walk.as_ref().map(|k| k.toward.node.clone()),
+                            })
+                        })
+                        .collect();
+                    rooms.push(json!({
+                        "area": area.id,
+                        "area_name": area.name,
+                        "node": node.id,
+                        "name": node.name,
+                        "kind": node.kind,
+                        "who": here,
+                    }));
+                }
+            }
+            (rooms, bodies)
+        });
+
+        worlds.push(json!({
+            "world_id": world_id,
+            "rooms": rooms,
+            "bodies": bodies,
+        }));
+    }
+
+    // Which character is which body, so a row here joins to a row in the feed.
+    let mut bound = serde_json::Map::new();
+    for world_id in rt.hosted.ids() {
+        for (npc_id, body) in rt.bodies.in_world(&world_id) {
+            if scope.admits(npc_id) {
+                bound.insert(body, json!(npc_id.to_string()));
+            }
+        }
+    }
+
+    Json(json!({
+        "worlds": worlds,
+        // `body -> npc_id`, as a string: an id past 2^53 does not survive a
+        // JavaScript client as a number, and this one is read by the console.
+        "bound": bound,
+        "moments": rt.moments().iter().map(|(id, n, paused)| json!({
+            "world_id": id, "moments": n, "paused": paused,
+        })).collect::<Vec<_>>(),
+        "may_see_all": scope.may_see_all,
+    }))
+    .into_response()
+}
+
 /// `GET /v1/npc/:nid/window` — the character's verbatim tail, right now.
 ///
 /// What the character is carrying into its next decode, in order. The

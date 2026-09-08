@@ -3038,10 +3038,15 @@ mod tests {
             PLACEMENT_SLACK_BYTES > 0 && cache > 0,
             "the cache and the slack are separate terms"
         );
-        assert!(
-            PLACEMENT_SLACK_BYTES > candle_nn::kv_cache::REGION_BYTES,
-            "the slack has to cover more than one region: every K/V tensor \
-             strands a run tail, and there are two per layer"
-        );
+        // Both sides are constants, so this holds or fails to compile — a
+        // runtime assertion over two `const`s only reports at the moment a test
+        // happens to run it.
+        const {
+            assert!(
+                PLACEMENT_SLACK_BYTES > candle_nn::kv_cache::REGION_BYTES,
+                "the slack has to cover more than one region: every K/V tensor \
+                 strands a run tail, and there are two per layer"
+            )
+        };
     }
 }

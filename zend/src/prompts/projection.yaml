@@ -59,6 +59,18 @@
 #          NORMALIZED 0–1000 band, docs/provenance_adaptive_projection.md §3) ·
 #          high_recall_scope (β0.40, min40/evict20, budget 1..5) ·
 #          single_pick (budget 1..1).
+# ── Repetition penalties inside tool calls ───────────────────────────────────
+#
+# Off while a call is emitted, because this assistant's tool arguments are
+# QUOTATIONS: file paths, symbol names, line numbers, identifiers lifted from
+# the query or from a span above. Those are only correct when they repeat, and
+# a presence or repeat penalty demotes exactly the token that makes them right
+# — a path comes back with a character missing and the edit lands nowhere.
+#
+# Opt-in, and deliberately not the default: a schema whose tool arguments are
+# PROSE wants the opposite. See `Schema::free_tool_calls_from_penalties`.
+free_tool_calls_from_penalties: true
+
 default_policy:
   preset: high_recall_scope
 

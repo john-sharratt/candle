@@ -16,10 +16,18 @@
 //   carry one heavy variant alongside lightweight ones; the
 //   payloads are consumed at the receiving end and never queued,
 //   so the size disparity is academic.
+// * `chunks_exact_to_as_chunks` — a style lint that became default in a recent
+//   clippy and fires on correct, unchanged code that reads packed bytes in
+//   fixed strides. Rewriting those call sites would change `&[T]` to `&[T; N]`
+//   through the quantization and KV paths of a fork that has to stay mergeable
+//   with upstream candle, for no behavioural gain. Forty-two of them drowned
+//   the `-D warnings` gate, which is worse than the lint: a gate nobody can get
+//   to zero is a gate that hides the next real warning.
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::large_enum_variant)]
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 //! Turn-based conversation engine for the candle inference stack.
 //!

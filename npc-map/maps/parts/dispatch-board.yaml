@@ -1,0 +1,16 @@
+id: dispatch-board
+kind: fixture
+name: the dispatch board
+short: >
+  The board reports the level, the room and the kind of thing each Maker is
+  holding, and how long it has held it. It does not report what any of them
+  has written.
+long: >
+  The one board that shows the whole building at once: for every Maker, the
+  level, the room, the kind of thing held and how long it has been held. That
+  last column is the useful one — a job that has quietly stalled shows up as a
+  number, without anybody going to look. What the board deliberately does not
+  carry is any of the work: what a Maker has written is found by asking the
+  Maker.
+tools:
+  - dispatch.read

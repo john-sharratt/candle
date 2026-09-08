@@ -1,0 +1,13 @@
+id: filed-stories
+kind: fixture
+name: the filed stories
+plural: the filed stories
+short: >
+  The filed stories are everything written into the gaps so far, and are worth
+  reading before writing beside them.
+long: >
+  Every story filed so far. Worth reading before writing into a neighbouring
+  silence, since two stories either side of the same event are the commonest
+  way for the record to end up saying two things.
+tools:
+  - story.read_filed

@@ -1251,6 +1251,28 @@ pub struct Schema {
     /// The one system prompt every projection emits, framed by the target
     /// layer's [`dials`](LayerSchema::dials).
     pub system_prompt: SystemPromptSchema,
+    /// Turn every repetition penalty off for the duration of a tool call.
+    ///
+    /// # Why this is opt-in
+    ///
+    /// It is right for one kind of caller and badly wrong for the other, and
+    /// which one you are is a property of the schema rather than of the engine.
+    ///
+    /// An assistant's tool arguments are *quotations*: file paths, identifiers,
+    /// numbers, names lifted from the prompt or an earlier span. Penalising a
+    /// token because it appeared before is exactly wrong there — the value is
+    /// only correct if it repeats. That caller wants this on.
+    ///
+    /// A character's tool arguments are the opposite. `say` takes what the
+    /// character means; the argument *is* the prose, and it is the one span in
+    /// the turn where repetition control matters most. With this on, a cast
+    /// decoded its every utterance with presence, frequency, repeat and DRY all
+    /// switched off — and one character said the same sentence, word for word,
+    /// for a hundred turns.
+    ///
+    /// Off by default: the penalties a caller configured are the ones it gets.
+    /// A schema that needs verbatim arguments asks for the exemption by name.
+    pub free_tool_calls_from_penalties: bool,
 }
 
 impl Schema {

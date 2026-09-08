@@ -957,6 +957,30 @@ pub struct NpcPayload {
     /// `uploaded` | `generated`; absent with the image.
     pub portrait_origin: Option<String>,
 
+    /// Where this character was last standing, as `area/node`.
+    ///
+    /// **The one piece of world state on this record, and it earns its place by
+    /// the rule stated above**: it is not something a running engine can derive.
+    /// The world — who is standing where, what has just happened — is held in
+    /// RAM by the daemon and has no persistence of its own, so on a restart
+    /// every character re-entered its world at the arrival door regardless of
+    /// where it had walked to. Two Makers who had spent an hour finding each
+    /// other were returned to the front room as strangers, while their
+    /// conversation history said otherwise.
+    ///
+    /// Position only. A journey in flight is *not* here: `Actor::at` is by
+    /// definition the last place actually reached, so nothing is lost by
+    /// dropping the rest of the route, and a character re-forms the intention
+    /// anyway. What a character is holding is not here either — nothing claims a
+    /// station yet, and a field for it would be a guess at a shape.
+    ///
+    /// `None` for a character that has never been embodied, or whose world has
+    /// no map. Written by the tick driver on a bounded cadence rather than per
+    /// move — see `npcd`'s `Npcs::remember_place`, which explains why a record
+    /// per doorway would be the wrong trade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+
     /* ── the authoring plane (§16) ──────────────────────────────────────────
      *
      * What an operator says a character believes, who they know, what they are
@@ -1818,6 +1842,11 @@ mod tests {
             persona_origin: "generated".to_string(),
             portrait_image_id: Some("img_4471".to_string()),
             portrait_origin: Some("uploaded".to_string()),
+            // Absent, deliberately: this fixture backs the byte-pinned encoding
+            // test, and a character that has never been embodied is what those
+            // bytes were pinned against. `where_a_character_stood_round_trips`
+            // covers the field being present.
+            at: None,
             beliefs: vec![AuthoredBelief {
                 belief_id: "hess_word".to_string(),
                 statement: "Hess keeps his word.".to_string(),
@@ -1877,6 +1906,32 @@ mod tests {
         assert_eq!(back.npc_id, full.npc_id);
         assert_eq!(back.name, full.name);
         assert_eq!(back.world_id, full.world_id);
+    }
+
+    /// **Where a character stood round-trips, and its absence is not a place.**
+    ///
+    /// The world holds no persistence of its own — who is standing where lives
+    /// in the daemon's RAM and goes with the process — so this field is the only
+    /// thing a restart has to rebuild the world from. A record written before it
+    /// existed decodes as a character that has never been embodied, which is the
+    /// truth about it: it arrives at the way in, exactly as it did before.
+    #[test]
+    fn where_a_character_stood_round_trips() {
+        let mut placed = npc_fixture();
+        placed.at = Some("vault-casting/green-room".to_string());
+        let back = NpcPayload::decode(&placed.encode()).unwrap();
+        assert_eq!(back.at.as_deref(), Some("vault-casting/green-room"));
+        assert_eq!(back, placed);
+
+        // A record from before the field existed.
+        let mut v = serde_json::to_value(npc_fixture()).unwrap();
+        assert!(
+            v.as_object_mut().unwrap().remove("at").is_none(),
+            "an unplaced character must not write the key at all — it is a \
+             per-move field on a record every compaction carries forward"
+        );
+        let older: NpcPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(older.at, None);
     }
 
     #[test]

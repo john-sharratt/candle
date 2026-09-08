@@ -1,0 +1,14 @@
+id: place-index
+kind: fixture
+name: the place index
+short: >
+  The index lists every settlement, ruin and road, and marks which of them
+  nobody has written.
+long: >
+  A standing list of every place the map carries, marked with which have been
+  written and which have not. Like the gap ledger, it is derived from the
+  world rather than assigned, so it is where a Maker with no order goes to
+  find work that is certainly wanted. Taking a place off it claims that place.
+tools:
+  - place.read_index
+  - place.take_next_unwritten

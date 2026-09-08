@@ -1,0 +1,79 @@
+id: vault-casting
+kind: level
+within: creators-vault
+ordinal: 5
+name: the casting level
+summary: >
+  Where characters are written. One station reaches everything that makes a
+  person, so a whole background is written in one sitting rather than in four
+  places by four hands.
+character: >
+  The busiest level in the vault, and the one the standing orders send the
+  whole crew to most often.
+lacks:
+  - way off this level except the lift and the stair
+spine:
+  name: the ring
+  loop: true
+  through: [ring-north, ring-east, ring-south, ring-west]
+nodes:
+  - { id: ring-north, kind: passage, name: the north run }
+  - { id: ring-east, kind: passage, name: the east run }
+  - { id: ring-south, kind: passage, name: the south run }
+  - { id: ring-west, kind: passage, name: the west run }
+  - { id: cross-upper, kind: passage, name: the upper cross run, off: [ring-east, ring-west] }
+  - { id: cross-lower, kind: passage, name: the lower cross run, off: [ring-east, ring-west] }
+
+  - id: core
+    kind: core
+    name: the lift and the stair
+    plural: true
+    off: [ring-north]
+
+  - id: band-one
+    kind: work
+    name: band one
+    off: [ring-north]
+    parts: [{ part: character-terminal, count: 6 }]
+
+  - id: band-two
+    kind: work
+    name: band two
+    off: [cross-upper]
+    parts: [{ part: character-terminal, count: 6 }]
+
+  - id: band-three
+    kind: work
+    name: band three
+    off: [cross-upper]
+    parts: [{ part: character-terminal, count: 4 }]
+
+  - id: watch
+    kind: work
+    name: the watch
+    off: [cross-lower]
+    parts: [watch-desk]
+
+  - id: roster-room
+    kind: store
+    name: the roster room
+    off: [cross-lower]
+    parts: [roster]
+
+  - id: green-room
+    kind: social
+    name: the green room
+    off: [ring-south]
+    parts: [{ part: seat, count: 12 }]
+    habit: rarely empty
+    character: >
+      A Maker who held a character last week knows things about them that were
+      never written down, and this is the only route by which that reaches the
+      Maker holding them now.
+
+  - id: relations
+    kind: social
+    name: the relations table
+    stand: at
+    off: [ring-south]
+    parts: [relations-table, { part: seat, count: 4 }]

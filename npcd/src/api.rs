@@ -631,8 +631,44 @@ async fn create_npc(
             // idempotent, so doing it here costs nothing on the startup path.
             if let Some(rt) = s.runtime.as_ref() {
                 if let Some(id) = v.get("npc_id").and_then(npc_id_of) {
-                    rt.scheduler.wake(id, 0, s.world_ms(id).await);
+                    let world_ms = s.world_ms(id).await;
+                    rt.scheduler.wake(id, 0, world_ms);
                     tracing::info!("npc {id}: created and woken");
+
+                    // And given a body, if its world has anywhere to stand. A
+                    // character whose world is authored but unmapped is a
+                    // character with lore and no body — which is most of them,
+                    // and not a failure.
+                    let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let world = v
+                        .get("world_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    // Where this kind of character belongs, from its
+                    // personality — a Maker starts in the vault, a soldier in a
+                    // city, and they are the same world. Absent for a
+                    // personality with no particular home, which arrives at the
+                    // world's own door.
+                    let home = {
+                        let personalities = s.personalities.read().await;
+                        v.get("personality_id")
+                            .and_then(Value::as_str)
+                            .and_then(|p| personalities.get(p))
+                            .and_then(|r| r.body.get("home"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    };
+                    // No remembered room: this character has just been created
+                    // and has never stood anywhere. It arrives at the door.
+                    match rt.embody_in_world(id, world, home.as_deref(), name, None, 0) {
+                        Ok(true) => tracing::info!("npc {id}: standing in `{world}`"),
+                        Ok(false) => {}
+                        // Not fatal to the create: the character exists and is
+                        // thinking. Loud, because a character that should have
+                        // a body and has not is invisible otherwise — it looks
+                        // exactly like one whose world was never mapped.
+                        Err(e) => tracing::error!("npc {id}: no body in `{world}` — {e:#}"),
+                    }
                 }
             }
             name_personality(&mut v, &*s.personalities.read().await);

@@ -10,6 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow     = { workspace = true }
+# Places, the bodies in them, and what each body can make out from where it
+# stands. A peer crate with no dependency on the conversation stack — the arrow
+# points this way and never back, because a world does not know it is being
+# perceived by a language model.
+npc-map    = { path = "../npc-map" }
 # The image guest hands back PNG bytes, and they ride in the JSON response
 # beside the seed that produced them — an operator who liked a draw needs the
 # seed to ask for it again, and a header is a worse place for it than the body.
@@ -107,6 +112,10 @@ nvml-wrapper = "0.12"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 
 [dev-dependencies]
+# The scenario harness talks to the *running* daemon over HTTP — it needs the
+# live checkpoint, and the daemon is holding it. A blocking client, because the
+# example is a script and a decode is measured in seconds.
+ureq = { version = "2.12", default-features = false }
 # `test-util` (not in `full`) for the paused clock. The telemetry sampler ticks
 # every 2s, so proving it runs unattended would otherwise mean a test that
 # genuinely sleeps for eight seconds.

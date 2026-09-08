@@ -21,11 +21,13 @@
 //! console shows an engine that is present and broken rather than absent. The
 //! loader logs what failed and exits the process.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use candle_conversation::persistence::SharedSubstrate;
 use candle_conversation::projection::{Builder, ProjectionEvent, SelectionState};
 use candle_conversation::{
     ConversationEngine, Sequence, SequenceConfig, TurnEvent, TurnHandle, TurnResponse,
@@ -39,18 +41,28 @@ use candle_conversation::{
 /// be far stranger than the fourteen bytes.
 const PROJECTION_MARKER: &str = "<|projection|>";
 
+use crate::engine::act::Act;
 use crate::engine::authoring;
+use crate::engine::body::{self, Outcome};
+use crate::engine::driver::{self, Metronome};
+use crate::engine::environment;
+use crate::engine::identity;
 use crate::engine::ingest;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
-use crate::engine::mind::Minds;
-use crate::engine::prompt::Persona;
+use crate::engine::mind::{Minds, Projected};
+use crate::engine::prompt::{self, Persona};
 use crate::engine::schema;
-use crate::engine::tick::{Scheduler, Shared as SharedScheduler};
-use crate::engine::tools::Mode;
+use crate::engine::tick::{Pace, Scheduler, Shared as SharedScheduler};
+use crate::engine::tools::{self, Mode};
+use crate::engine::waiting;
 use crate::engine::watcher::Ledger;
 use crate::mind::Mind;
 use crate::model;
+use crate::npcs::Casting;
+use crate::world::binding::Bindings;
+use crate::world::{Hosted, Worlds};
+use npc_map::world::Where;
 
 /// How often the driver thread looks for characters that are due.
 ///
@@ -86,6 +98,13 @@ pub type WorldClock = Arc<dyn Fn(u64) -> u64 + Send + Sync>;
 #[derive(Debug, Default, Clone)]
 pub struct OwnedPersona {
     pub name: String,
+    /// The personality and world this character belongs to, by slug.
+    ///
+    /// Never rendered — they are what a turn pins its personality's anchor, its
+    /// world's setting and its building to in the projection. See
+    /// [`crate::engine::identity`].
+    pub personality: String,
+    pub world_id: String,
     pub identity: String,
     pub manner: String,
     pub beliefs: Vec<String>,
@@ -93,6 +112,10 @@ pub struct OwnedPersona {
     pub intent: Option<String>,
     pub situation: String,
     pub world: String,
+    /// The building this character lives in, as it remembers it. Filled in by
+    /// the runtime rather than by the persona source: it comes from the map,
+    /// which the authored record knows nothing about.
+    pub place: String,
     pub mode: Mode,
 }
 
@@ -100,6 +123,8 @@ impl OwnedPersona {
     pub fn as_persona(&self) -> Persona<'_> {
         Persona {
             name: &self.name,
+            personality: &self.personality,
+            world_id: &self.world_id,
             identity: &self.identity,
             manner: &self.manner,
             beliefs: &self.beliefs,
@@ -107,12 +132,25 @@ impl OwnedPersona {
             intent: self.intent.as_deref(),
             situation: &self.situation,
             world: &self.world,
+            place: &self.place,
         }
     }
 }
 
 /// Resolves a character's authored state at tick time.
 pub type PersonaSource = Arc<dyn Fn(u64) -> Option<OwnedPersona> + Send + Sync>;
+
+/// Records where a character is, so a restart can put it back there.
+///
+/// A sink rather than a handle to the registry, for the same reason the clock
+/// and the persona are functions: the registry lives in the authored state,
+/// which needs this runtime to answer its own routes. One of the two has to
+/// exist first, and it is this one.
+///
+/// Called from a world's metronome thread, so it must never block on anything
+/// slow — the registry's own checkpoint gates make it a map lookup on almost
+/// every call.
+pub type PlaceSink = Arc<dyn Fn(u64, &str) + Send + Sync>;
 
 /// The live engine, once loaded.
 pub struct Runtime {
@@ -145,6 +183,14 @@ pub struct Runtime {
     /// the authored state — which needs this runtime to answer its own routes.
     /// One of the two has to exist first, and it is this one.
     clock: RwLock<Option<WorldClock>>,
+    /// **The daemon's one handle to `data/.substrate/`**, opened by the
+    /// character registry and adopted here rather than opened a second time.
+    ///
+    /// Installed after construction for the same reason the clock is: the
+    /// registry that opens it lives in the authored state, which needs this
+    /// runtime to answer its routes. See [`crate::npcs::Npcs::substrate`] for
+    /// what the second handle cost.
+    substrate: RwLock<Option<SharedSubstrate>>,
     /// Every character's live conversation. `None` until the model is loaded —
     /// there is nothing to hold a conversation on before then.
     pub minds: RwLock<Option<Arc<Minds>>>,
@@ -155,11 +201,155 @@ pub struct Runtime {
     /// a persona captured at startup would keep the character as it was when the
     /// process began.
     persona: RwLock<Option<PersonaSource>>,
+    /// Where to record a body's room, so a restart reconstructs the world.
+    ///
+    /// Installed after construction, like the clock and the persona, and for
+    /// the same reason. Absent until then, and a world that moves before it is
+    /// installed simply is not checkpointed — nothing is lost that was not
+    /// already going to be.
+    place_sink: RwLock<Option<PlaceSink>>,
+    /// The worlds this daemon is running.
+    ///
+    /// Distinct from `Authored::worlds`, which is the registry of world
+    /// *documents* — the lore and the settings an author writes. These are the
+    /// simulations: who is standing where, what is claimed, what just happened.
+    /// A world can be authored without being hosted, and is, until something
+    /// asks for it.
+    pub hosted: Worlds,
+    /// Which character is which body.
+    pub bodies: Bindings,
+    /// One metronome per hosted world, so a world can be held still without
+    /// stopping the daemon — every question an operator asks of a live world is
+    /// asked of one that is moving underneath the answer.
+    metronomes: Mutex<BTreeMap<String, Metronome>>,
+    /// Each world's building, rendered once. The same text for every character
+    /// in it, and it never changes.
+    places: Mutex<BTreeMap<String, String>>,
     /// Set on shutdown so the driver thread stops rather than being killed
     /// mid-tick with a half-written turn.
     stopping: AtomicBool,
     started: Instant,
 }
+
+/// Where a world's rooms live, under the authored corpus.
+///
+/// `map/<world_id>/`, a sibling of `worlds/<world_id>.yaml` and keyed the same
+/// way. **That key is the whole reason a hosted world has an id**: every
+/// character is created with a `world_id` naming the world document it belongs
+/// to, so the places it can stand in have to be findable by that same name. A
+/// hosted world under any other id would be a world no character could be put
+/// into without a second table to reconcile the two.
+///
+/// A world with no map directory is authored but has nowhere to stand — which
+/// is the common case, and not an error. Its characters have lore and no bodies.
+pub const MAPS: &str = "map";
+
+/// What a character with nothing assigned is set on.
+///
+/// **Not a placeholder.** A person with no task does not stand still, and an
+/// NPC that does reads as scenery — so having nothing to do is itself a
+/// standing instruction, and this is it. When missions exist they replace this
+/// one; they do not fill a hole it was leaving.
+///
+/// Worded as a disposition rather than a script. *Go to the green room* would
+/// be a standing order every character in the world followed identically, which
+/// is the recommendation-not-affordance failure at its worst: it fires on every
+/// idle turn, for every character, and never appears in a log as anything but a
+/// heartbeat.
+/// **Points at the work, not at the map.** The first version sent a character
+/// off to see a room it had not been in, and it did exactly that — three of
+/// them toured a seventy-eight room building for hours and came back with
+/// nothing to say, because a room is not a subject. What a Maker is for is in
+/// front of it: the ledgers, the filed stories, the wall of dates. Naming the
+/// thing within reach gives the next conversation something to be *about*,
+/// which is the difference between two characters talking and two characters
+/// exchanging weather.
+/// **One instruction, and no verb of motion in it.**
+///
+/// This has now been wrong in three ways. It began as *go and see a room you
+/// have not been in*, and characters toured a seventy-eight room building for
+/// hours and arrived with nothing to say, because a room is not a subject. It
+/// was then rewritten to point at the work — and still ended with *then go
+/// where people are*, which is a movement instruction sitting in the most
+/// recent position in the window, where attention weights hardest. Every act in
+/// the harness became `move_to`, nineteen for nineteen.
+///
+/// A standing task restated every ninety seconds does not need to describe a
+/// plan. It needs to name the **next** thing, once. The going will happen on
+/// its own when the character has something worth carrying.
+pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your own. That is \
+                              not nothing to do: the work is in front of you. `observe` one \
+                              thing within reach — a ledger, a filed story, a date on the wall \
+                              — closely enough to have a view about it you could defend.";
+
+/// How long a character must go without news before the standing task is
+/// restated to it.
+///
+/// **A stretch of quiet, not an empty instant.** Long enough that it cannot land
+/// between two turns of a conversation — an exchange runs at roughly the world's
+/// moment, and a companion that is thinking, walking a stop, or simply slower
+/// than the heartbeat can leave a gap of tens of seconds without the
+/// conversation being over. Short enough that a character genuinely left alone
+/// does not stand in a room for minutes with nothing to go on.
+const IDLE_AFTER_MS: u64 = 90_000;
+
+/// Whether somebody else's wait is, in effect, on **me**.
+///
+/// **An unnamed wait for speech is a wait on everybody who could speak.** The
+/// first version of this asked only whether the wait named me, which left the
+/// ambient wait invisible to the rule that stops two characters waiting at each
+/// other: neither named the other, so neither was excluded, and a cast went
+/// completely silent — every act in the feed a `wait_for`, three characters
+/// each waiting for a voice none of them was going to be the first to use.
+///
+/// Arrival and departure are not like this. Waiting for somebody to walk in
+/// asks nothing of the person already standing there.
+fn waiting_on_me(w: &waiting::Waiting, me: &str) -> bool {
+    match &w.who {
+        Some(who) => who.eq_ignore_ascii_case(me),
+        None => w.kind == waiting::Kind::SomeoneSpeaks,
+    }
+}
+
+/// The same instruction, for a character that is not alone.
+///
+/// **Company changes what there is to do, so it changes the instruction.** This
+/// is not advice smuggled into a percept — it is the standing task, and having
+/// somebody in front of you is a different standing task from having nobody.
+///
+/// It exists because of what the first one did on its own. Told to go somewhere
+/// new every quiet turn, two characters explored a seventy-eight room building
+/// beautifully and never once held a conversation: each moved every four
+/// seconds, so being in a room together lasted exactly one tick and neither had
+/// a reason to stay for the second.
+/// **It names them.** `{who}` is filled with who is actually standing there.
+///
+/// The unnamed version — "Somebody else is here" — was the thing that made a
+/// room full of people unusable. `tell` and `ask` both take a name and refuse
+/// one they cannot find, and the *only* place a character is told a name is the
+/// situation percept, which is deliberately suppressed while nothing moves
+/// (see `npc_map::delta`). So a character standing still learns who its company
+/// is exactly once, on arrival, and that line then ages out of the verbatim
+/// window while the person is still in front of it.
+///
+/// What it has after that is this instruction, restated every quiet tick in the
+/// most recent position in the window — telling it to talk to somebody it can
+/// no longer name. It addressed `you` and was refused; it turned to face "the
+/// person standing in the anteroom"; it spoke to the room and nobody was
+/// obliged to answer. Every one of those is a character reaching for an
+/// addressee it has been told it has and not been told the name of.
+/// **Asks for something specific, because the generic version got generic
+/// answers.** "Say what you have been looking at" produced characters agreeing
+/// with each other about silence and gaps for a hundred turns — three of them
+/// converging on one abstraction because none had named a thing. A conversation
+/// about work needs a *piece* of work in it: a page, a date, a disagreement
+/// with a colleague's entry.
+pub const IN_COMPANY: &str = "Nothing has been asked of you, and you are not alone. {who} \
+                              here with you. `say` or `ask` something about the work, now, and \
+                              name a particular thing — a page you read, a date that will not \
+                              reconcile, an entry of theirs you doubt. Ask them something they \
+                              have to answer, or answer what they asked you. Address them \
+                              exactly as written.";
 
 impl Runtime {
     pub fn new(mind_handle: Mind, data: &Path) -> Arc<Self> {
@@ -174,11 +364,446 @@ impl Runtime {
             // between a twelve-second boot and half an hour of one.
             ledger: Arc::new(Ledger::open(data)),
             clock: RwLock::new(None),
+            substrate: RwLock::new(None),
             minds: RwLock::new(None),
             persona: RwLock::new(None),
+            place_sink: RwLock::new(None),
+            hosted: Worlds::new(),
+            bodies: Bindings::new(),
+            metronomes: Mutex::new(BTreeMap::new()),
+            places: Mutex::new(BTreeMap::new()),
             stopping: AtomicBool::new(false),
             started: Instant::now(),
         })
+    }
+
+    /// Host every authored world that has rooms to stand in.
+    ///
+    /// Driven by the world registry rather than by what is on disk, so a map
+    /// directory nothing authored is *not* silently hosted under an id no
+    /// character can name. Each world that does have one is hosted under its own
+    /// id, which is what lets a character's `world_id` find the places it can be.
+    ///
+    /// Reports every world it tried, and what came of it. A map that does not
+    /// hold together is an authoring mistake to fix, not a reason for the rest
+    /// of the cast to have nowhere to stand.
+    pub fn host_authored<'a>(
+        self: &Arc<Self>,
+        authored: &Path,
+        worlds: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<(String, anyhow::Result<Arc<Hosted>>)> {
+        let maps = authored.join(MAPS);
+        worlds
+            .into_iter()
+            .filter(|id| maps.join(id).is_dir())
+            .map(|id| (id.to_string(), self.host(id, &maps.join(id))))
+            .collect()
+    }
+
+    /// Load one world and start it moving.
+    ///
+    /// The metronome holds only a [`Weak`] handle back here. A strong one would
+    /// be a cycle — the runtime owns the metronome and the metronome would own
+    /// the runtime — and the daemon would never drop, which reads as a clean
+    /// shutdown that never finishes.
+    pub fn host(self: &Arc<Self>, id: &str, dir: &Path) -> anyhow::Result<Arc<Hosted>> {
+        let world = self.hosted.load(id, dir)?;
+        let back = Arc::downgrade(self);
+        let name = id.to_string();
+        let moving = world.clone();
+        let beat = Metronome::start(driver::EVERY, move || {
+            let Some(rt) = back.upgrade() else {
+                return;
+            };
+            if rt.stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            // Only when somebody actually covered a leg. Most moments move
+            // nobody — that is what makes a large cast affordable — and a
+            // checkpoint on a still world would be a world read per 500 ms per
+            // world for an answer that cannot have changed.
+            if environment::advance(&moving, &rt.bodies, &rt.scheduler).moved > 0 {
+                rt.checkpoint_places(&moving);
+            }
+        });
+        self.metronomes.lock().unwrap().insert(name, beat);
+        Ok(world)
+    }
+
+    /// Stop a world: its metronome, its minds' bodies, and the world itself.
+    ///
+    /// All three, in that order. Stopping the metronome first means nothing is
+    /// mid-moment while the bindings go, and unbinding before releasing means
+    /// no character is left pointing at a world that is no longer there.
+    pub fn unhost(&self, id: &str) -> bool {
+        if let Some(beat) = self.metronomes.lock().unwrap().remove(id) {
+            beat.stop();
+        }
+        self.bodies.release_world(id);
+        self.hosted.release(id)
+    }
+
+    /// Give a character a body in a hosted world, and set it to a working pace.
+    ///
+    /// A character with a body has somewhere to be and something in front of
+    /// it, so it never goes as quiet as one that is only reacting — see
+    /// [`Pace`]. It is also grounded at once rather than at the world's next
+    /// moment: a character that can act before it has been told where it is
+    /// would act blind.
+    pub fn embody(&self, npc_id: u64, world: &str, body: &str, now_ms: u64) -> anyhow::Result<()> {
+        let Some(hosted) = self.hosted.get(world) else {
+            anyhow::bail!("no world `{world}` is running");
+        };
+        if hosted.read(|w| w.actor(body).is_none()) {
+            anyhow::bail!("`{world}` has no body `{body}`");
+        }
+        self.bodies.bind(npc_id, world, body)?;
+        self.scheduler.set_pace(npc_id, Pace::WORKING, now_ms);
+        environment::push_one(&hosted, &self.scheduler, npc_id, body);
+        Ok(())
+    }
+
+    /// The body id a character acts through.
+    ///
+    /// Derived rather than stored, so a restart reconstructs the same
+    /// correspondence without a table — the same reason a timeline id is
+    /// derived. A body a character is not in is a body nothing can address.
+    pub fn body_id(npc_id: u64) -> String {
+        format!("npc-{npc_id}")
+    }
+
+    /// Put a new character into its world, at the way in.
+    ///
+    /// Called when a character is created, and again on a restart for every
+    /// character whose world is hosted — both are the same operation, because
+    /// entering a body that is already there is not an error and binding one
+    /// that is already bound changes nothing.
+    ///
+    /// Silent when the character's world has no map: most worlds have none, and
+    /// a character with lore and no body is a character, not a failure.
+    pub fn embody_in_world(
+        &self,
+        npc_id: u64,
+        world_id: &str,
+        home: Option<&str>,
+        name: &str,
+        remembered: Option<&str>,
+        now_ms: u64,
+    ) -> anyhow::Result<bool> {
+        let Some(hosted) = self.hosted.get(world_id) else {
+            return Ok(false);
+        };
+        let body = Self::body_id(npc_id);
+        let placed = hosted.with(|w| {
+            if w.actor(&body).is_some() {
+                return Ok(());
+            }
+            // **Back where it was, if the world still has that room.**
+            //
+            // The world itself is not persisted — who is standing where lives in
+            // RAM and goes with the process — so without this every character
+            // re-entered at the arrival door on every restart, however far it
+            // had walked. Two Makers who had spent an hour finding each other
+            // were returned to the front room as strangers while their own
+            // transcripts said otherwise.
+            //
+            // A remembered room the map no longer has is not an error: maps are
+            // authored and rooms get renamed. Fall through to the door, which is
+            // exactly what a character whose room was demolished should do.
+            let recalled = remembered
+                .and_then(Where::parse)
+                .filter(|at| w.map().node_at(at).is_some());
+            let at = match recalled {
+                Some(at) => at,
+                // Where in the world this kind of character belongs. A world is
+                // bigger than any one character's part of it — a Maker starts in
+                // the vault and a soldier starts in a city, and they are the same
+                // world — so the door is the home area's, not the world's.
+                None => match home {
+                    Some(home) => w.map().arrival_in(home).ok_or_else(|| {
+                        anyhow::anyhow!("`{world_id}` has no `{home}` to arrive in")
+                    })?,
+                    None => w.map().arrival().ok_or_else(|| {
+                        anyhow::anyhow!("world `{world_id}` has nowhere to arrive")
+                    })?,
+                },
+            };
+            w.enter(&body, name, at).map_err(anyhow::Error::from)
+        });
+        placed?;
+        self.embody(npc_id, world_id, &body, now_ms)?;
+        Ok(true)
+    }
+
+    /// What a character is set on, as the turn that keeps it on course.
+    ///
+    /// One standing instruction, restated whenever nothing else is happening.
+    /// A character with a mission gets that mission; a character with none gets
+    /// [`NO_MISSION`] — which is not a placeholder for one. A person with
+    /// nothing assigned does not stand still, and neither should a character:
+    /// looking around and talking to people is what there is to do.
+    pub fn nudge_for(&self, npc_id: u64) -> Option<String> {
+        // Only for a character with a body. One with no world has nowhere to
+        // explore and nobody to talk to, and telling it otherwise would be
+        // instructing it to do something it cannot.
+        let (hosted, body) = self.body_of(npc_id)?;
+        // Who is here — which decides *which* standing task this is, and, when
+        // there is company, is itself the most useful thing in it. Reading the
+        // room already told us the names; the version of this that answered
+        // only `alone: bool` threw them away and left the character to guess at
+        // an addressee. See [`IN_COMPANY`].
+        let company: Vec<String> = hosted.read(|w| {
+            let Some(here) = w.actor(&body).map(|a| a.at.clone()) else {
+                return Vec::new();
+            };
+            w.actors_at(&here)
+                .into_iter()
+                .filter(|other| other.id != body)
+                .map(|other| other.name.clone())
+                .collect()
+        });
+        Some(match company.is_empty() {
+            true => NO_MISSION.to_string(),
+            false => IN_COMPANY.replace(
+                "{who}",
+                &format!(
+                    "{} {}",
+                    npc_map::text::list(&company),
+                    if company.len() == 1 { "is" } else { "are" },
+                ),
+            ),
+        })
+    }
+
+    /// Take a character's body away, and let it settle back to reacting.
+    pub fn disembody(&self, npc_id: u64, now_ms: u64) -> bool {
+        if !self.bodies.unbind(npc_id) {
+            return false;
+        }
+        self.scheduler.set_pace(npc_id, Pace::AMBIENT, now_ms);
+        true
+    }
+
+    /// What the world offers this character *right now*, as the grammar's own
+    /// vocabulary.
+    ///
+    /// **The same read the situation and the standing task already do**, handed
+    /// to the stencil so the three cannot disagree. They did: the prompt named
+    /// who was here, the standing task named them again, and the mask let the
+    /// character write any string at all — so it wrote a first name, or a
+    /// person in another room, and was refused. A grammar built from this is
+    /// masked to exactly what the character was told.
+    ///
+    /// Empty for a character with no body, which is the honest answer: nobody
+    /// is standing next to somebody who is nowhere.
+    pub fn within(&self, npc_id: u64) -> tools::Within {
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return tools::Within::nowhere();
+        };
+        // Name *and* body, because the two questions below need different
+        // halves: the grammar binds names, and finding whose mind is behind a
+        // name needs the body it stands in.
+        let (me, here): (Option<String>, Vec<(String, String)>) = hosted.read(|w| {
+            let Some(mine) = w.actor(&body) else {
+                return (None, Vec::new());
+            };
+            let at = mine.at.clone();
+            let name = mine.name.clone();
+            (
+                Some(name),
+                w.actors_at(&at)
+                    .into_iter()
+                    .filter(|a| a.id != body)
+                    .map(|a| (a.name.clone(), a.id.clone()))
+                    .collect(),
+            )
+        });
+        let company: Vec<String> = here.iter().map(|(n, _)| n.clone()).collect();
+        // **Who is already waiting on this character**, so it cannot wait back.
+        //
+        // Waiting on somebody wakes them. If they could return the favour the
+        // two would ping-pong — each waking the other to do nothing — which
+        // costs a decode a turn and is worse than the deadlock it replaced.
+        // Struck from the grammar's list, the only thing left is to act.
+        //
+        // Resolved through the **world and the bindings**, not through authored
+        // personas: the world is what wrote these names down and is what the
+        // character was shown, and a daemon whose authored state has not loaded
+        // must not silently lose the rule that keeps two characters from
+        // staring at each other.
+        let waited_on_by = match me {
+            None => Vec::new(),
+            Some(me) => here
+                .iter()
+                .filter(|(_, other_body)| {
+                    self.bodies
+                        .mind_of(hosted.id(), other_body)
+                        .and_then(|other| self.scheduler.waiting(other))
+                        .is_some_and(|(w, _)| waiting_on_me(&w, &me))
+                })
+                .map(|(n, _)| n.clone())
+                .collect(),
+        };
+        tools::Within {
+            company,
+            // Never where it stands — see [`body::reachable`]. Walking to your
+            // own room was refused, and refusal is not a lesson.
+            places: body::reachable(&hosted, &body),
+            waited_on_by,
+        }
+    }
+
+    /// Arm the scheduling half of a `wait_for` that the world accepted.
+    ///
+    /// See [`waiting_on_me`] for the unnamed case.
+    ///
+    /// Anything else is ignored: a character that walks, speaks or looks is not
+    /// waiting, and a `wait_for` the world refused never stood.
+    fn arm_wait(&self, npc_id: u64, act: &Act, world_ms: u64, within: &tools::Within) {
+        if act.tool != "wait_for" {
+            return;
+        }
+        let Some(kind) = act
+            .args
+            .get("for")
+            .and_then(|v| v.as_str())
+            .and_then(waiting::Kind::parse)
+        else {
+            return;
+        };
+        let who = act
+            .args
+            .get("who")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        self.scheduler.begin_waiting(
+            npc_id,
+            waiting::Waiting::new(kind, who, world_ms),
+            within.company.clone(),
+            world_ms,
+        );
+    }
+
+    /// Ask the world whether anybody's wait has been answered, and wake them.
+    ///
+    /// **Run every drive pass, not per tick**, because a waiting character does
+    /// not tick — that is the whole point of it waiting. Something outside has
+    /// to notice on its behalf, and this is that something.
+    ///
+    /// The two questions are asked of different places on purpose. Speech is
+    /// matched against the character's own inbox, where it arrives structured
+    /// with a speaker; arrivals and departures are asked of the **world**, by
+    /// comparing the room now against the room when the wait was set, because
+    /// they reach a character as one line of narrated prose that no match could
+    /// be written against without matching on prose.
+    fn answer_waits(&self) {
+        for npc_id in self.scheduler.population_ids() {
+            let Some((wait, before)) = self.scheduler.waiting(npc_id) else {
+                continue;
+            };
+            // Per character: two characters in different worlds are at
+            // different instants, and one of those worlds may be paused — a
+            // wait must not time out because somebody else's clock ran.
+            let world_ms = self.world_ms(npc_id);
+            // Patience first: a wait nothing can answer — the person walked
+            // out, or was never going to speak — must end by itself, or the
+            // character sleeps forever while every view of it reads "blocked",
+            // which is also what a merely quiet character reads.
+            let answered = if wait.expired(world_ms) {
+                tracing::debug!("npc {npc_id}: gave up waiting {}", wait.kind.as_done());
+                true
+            } else if self.scheduler.heard_speech(npc_id, |s| wait.answered_by_speech(s)) {
+                true
+            } else {
+                wait.answered_by_room(&before, &self.within(npc_id).company)
+            };
+            if answered {
+                self.scheduler.answer_wait(npc_id);
+            }
+        }
+    }
+
+    /// The world and body a character acts through, if it has one.
+    pub fn body_of(&self, npc_id: u64) -> Option<(Arc<Hosted>, String)> {
+        let at = self.bodies.bound(npc_id)?;
+        Some((self.hosted.get(&at.world)?, at.body))
+    }
+
+    /// Put one act into the world, if it is a body's act and there is a body.
+    ///
+    /// [`Outcome::NotOfTheBody`] when neither is true — a character with no
+    /// body, or an act that happens inside a head. Those are the caller's to
+    /// record as intent.
+    ///
+    /// The **world's** verdict comes back rather than the character's intent,
+    /// and the caller must keep the two apart: an act that was refused and one
+    /// that succeeded must not read the same afterwards, or a character spends
+    /// the rest of the day reasoning from a move it never made.
+    pub fn act_on_world(&self, npc_id: u64, act: &Act) -> Outcome {
+        if !body::is_of_the_body(act.tool) {
+            return Outcome::NotOfTheBody;
+        }
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return Outcome::NotOfTheBody;
+        };
+        // Nothing is pushed here. An act changes the world; **the world's next
+        // moment is when anyone perceives that**, including the character that
+        // acted — one rule, one batched prefill per moment, no path where
+        // perception arrives outside the sweep.
+        //
+        // The actor is not left in the dark meanwhile: a refusal comes back in
+        // the same turn, which is the whole reason it is rendered rather than
+        // logged.
+        body::perform(&hosted, &body, act)
+    }
+
+    /// Put one act into the world and render the single line that goes into the
+    /// character's window and the Pulse feed.
+    ///
+    /// **The world's verdict decides which of two forms this takes.**
+    ///
+    /// An act that landed is recorded as the act: [`Act::summary`], the same
+    /// `tool — intent` shape every act outside a world already has. The world's
+    /// own reply to a successful act reads as narration — "You say, to the
+    /// room: …" — and taking that instead made speech the one act that did not
+    /// look like an act. That is wrong twice over: in the feed, where it broke
+    /// a column of single-word tools, and in the character's own window, where
+    /// the model reads its history and is being shown what an act looks like.
+    ///
+    /// A refusal keeps the world's line, because there the prose *is* the
+    /// information — which rooms are reachable, who is actually here. So the
+    /// two no longer merely differ in wording; they differ in form, which is a
+    /// stronger version of the distinction this path exists to preserve.
+    pub fn record_act(&self, npc_id: u64, act: &Act) -> String {
+        match self.act_on_world(npc_id, act) {
+            Outcome::Refused(why) => why,
+            Outcome::Did(_) | Outcome::NotOfTheBody => act.summary(),
+        }
+    }
+
+    /// Hold a world still, or let it go again. `false` if no such world.
+    pub fn hold_world(&self, id: &str, still: bool) -> bool {
+        let beats = self.metronomes.lock().unwrap();
+        let Some(beat) = beats.get(id) else {
+            return false;
+        };
+        if still {
+            beat.pause();
+        } else {
+            beat.resume();
+        }
+        true
+    }
+
+    /// How many moments each hosted world has taken. What a health check reads:
+    /// a world whose count has stopped rising has lost its metronome.
+    pub fn moments(&self) -> Vec<(String, u64, bool)> {
+        self.metronomes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, beat)| (id.clone(), beat.moments(), beat.is_paused()))
+            .collect()
     }
 
     /// Supply the world-clock resolver. Called once at startup, before the
@@ -193,9 +818,78 @@ impl Runtime {
         *self.persona.write().unwrap() = Some(src);
     }
 
+    /// Supply the sink that records where bodies are. Called once at startup,
+    /// before the driver runs.
+    pub fn set_place_sink(&self, sink: PlaceSink) {
+        *self.place_sink.write().unwrap() = Some(sink);
+    }
+
+    /// Checkpoint every bound body's room after a moment that moved somebody.
+    ///
+    /// Reads the world once, under its own lock, and hands each `(character,
+    /// place)` to the sink — which decides whether that is worth a record. The
+    /// decision lives there rather than here because it is about the durable
+    /// record, and this is a driver thread that should not know what a record
+    /// costs.
+    fn checkpoint_places(&self, hosted: &Hosted) {
+        let Some(sink) = self.place_sink.read().unwrap().clone() else {
+            return;
+        };
+        let bound = self.bodies.in_world(hosted.id());
+        let standing: Vec<(u64, String)> = hosted.read(|w| {
+            bound
+                .iter()
+                .filter_map(|(npc_id, body)| Some((*npc_id, w.actor(body)?.at.to_string())))
+                .collect()
+        });
+        for (npc_id, at) in standing {
+            sink(npc_id, &at);
+        }
+    }
+
+    /// Supply the already-open substrate for the engine to adopt. Called once
+    /// at startup, before [`start`], with the handle
+    /// [`crate::npcs::Npcs::load`] opened.
+    ///
+    /// **Not optional in practice.** Without it the engine opens `--data`
+    /// itself, and this daemon then holds two writable handles to one log —
+    /// which loses characters rather than failing. [`load`] refuses to build an
+    /// engine when this is unset, so a future wiring mistake is a startup error
+    /// instead of a slow leak.
+    pub fn set_substrate(&self, shared: SharedSubstrate) {
+        *self.substrate.write().unwrap() = Some(shared);
+    }
+
     fn persona_of(&self, npc_id: u64) -> Option<OwnedPersona> {
-        let g = self.persona.read().unwrap();
-        g.as_ref().and_then(|f| f(npc_id))
+        let mut who = {
+            let g = self.persona.read().unwrap();
+            g.as_ref().and_then(|f| f(npc_id))
+        }?;
+        // The building it lives in, which the authored record knows nothing
+        // about — it comes from the map. Rendered once per world and kept,
+        // because it is the same two thousand words for every character in it
+        // and it never changes.
+        if let Some((hosted, _)) = self.body_of(npc_id) {
+            who.place = self.remembered_place(&hosted);
+        }
+        Some(who)
+    }
+
+    /// The building a world is, as anyone living in it would describe it.
+    ///
+    /// Cached per world. Generating it is cheap but not free, and every
+    /// character in a building would otherwise re-render the identical text on
+    /// every conversation it opens.
+    fn remembered_place(&self, hosted: &Hosted) -> String {
+        if let Some(known) = self.places.lock().unwrap().get(hosted.id()) {
+            return known.clone();
+        }
+        let text = hosted.read(|w| npc_map::describe::place(w.map()));
+        self.places
+            .lock()
+            .unwrap()
+            .insert(hosted.id().to_string(), text.clone());
+        text
     }
 
     /// What time it is in this character's world.
@@ -228,14 +922,24 @@ impl Runtime {
 
 /// What the loader needs that is not on the [`Runtime`].
 pub struct LoadPlan {
-    /// The characters to wake, by id. From the substrate's character store.
-    pub cast: Vec<u64>,
+    /// The characters to wake, each with the world it belongs to and the room
+    /// it was last standing in. From the substrate's character store.
+    ///
+    /// Both travel with the id because waking a character and putting it back
+    /// in its body are one step on a restart: a character woken without its
+    /// world would think for a while about a place it is not standing in, and
+    /// one woken without its room would do it from the front door.
+    pub cast: Vec<Casting>,
     /// Every personality id the mind declares.
     ///
     /// Not the cast: this is what a *layer directory* can be named after, which
     /// is a personality (`layers/memory/zen/`), not an instantiated character.
     /// A world's biographies exist whether or not anyone has cast them.
     pub characters: Vec<String>,
+    /// Who each personality, character and world *is*, for the projection's
+    /// identity collections. Read in `main` where the registries live and
+    /// installed on the loader thread — see [`crate::engine::identity`].
+    pub authored: identity::Authored,
     /// The world clock at startup.
     pub world_ms: u64,
 }
@@ -312,21 +1016,36 @@ fn load(
         );
     }
 
+    // **The engine adopts the daemon's substrate; it does not open one.**
+    //
+    // The character registry opened `--data/.substrate/` at startup and goes on
+    // appending character records to it. One `.substrate/` admits exactly one
+    // writable handle per process — the log is opened read-write and unlocked,
+    // so a second is a second append cursor and a second record index, and a
+    // compaction carries forward only what its own handle walked. This daemon
+    // ran that way and lost every character created while it was up.
+    //
+    // Naming a path here instead would also revive an older failure: unset, the
+    // conversation layer falls back to the *process working directory*, so a
+    // daemon launched from the repo root wrote its redo log to
+    // `candle/.substrate` while the character store sat correctly under
+    // `--data`. `/v1/substrate/storage` reports on `--data` and showed 65 MB
+    // while the real log reached **190 GB** across a morning of re-ingests. It
+    // filled the disk, and surfaced as a linker error.
+    //
+    // A missing handle is a refusal rather than a fallback: both failures above
+    // are silent, and neither is worth risking to save a startup error.
+    let shared = rt.substrate.read().unwrap().clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the engine was started before the substrate was handed to it — call \
+             `Runtime::set_substrate` with `Npcs::substrate()` first"
+        )
+    })?;
     let mut builder = model::model()
         .builder()
         .guests(guests)
         .prefill_pass_tokens(PREFILL_PASS_TOKENS)
-        // **The engine's redo log goes under `--data`, with everything else this
-        // daemon writes.**
-        //
-        // Unset, it falls back to the *process working directory* — so a daemon
-        // launched from the repo root wrote its substrate to `candle/.substrate`
-        // while the character store sat correctly in `npcd/.substrate`. Two
-        // substrates, one of them somewhere nobody would look, and nothing said
-        // so: `/v1/substrate/storage` reports on `--data` and showed 65 MB while
-        // the real log reached **190 GB** across a morning of re-ingests. It
-        // filled the disk, and the failure surfaced as a linker error.
-        .workspace_path(rt.data.clone());
+        .substrate(shared);
     // The checkpoint's own dialect and sampling. Captured before the builder is
     // consumed, and handed to every conversation — a second opinion about either
     // would run the model outside the settings it was tuned under.
@@ -442,12 +1161,52 @@ fn load(
     // is written under it — which is what gives a document something to gather
     // from and therefore a provenance signature. `None` falls back to a
     // synthetic schema that cannot gather, and says so.
-    let projection = schema::build(rt.mind.as_deref(), "battle-cities");
+    let mut projection = schema::build(rt.mind.as_deref(), "battle-cities");
     if projection.is_none() && rt.mind.is_some() {
         tracing::warn!(
             "no usable projection schema — documents will be written but will produce \
              no provenance signatures, so nothing will gather them"
         );
+    }
+
+    // ── the prompt a character thinks under ────────────────────────────────
+    //
+    // **Everything goes into the schema before anything is written under it.**
+    // The ordering rule `LoadStep::Calibrating` states applies to all of it: a
+    // layer document prefilled while the system prompt is still incomplete
+    // captures its signature — and the wide-Q the gather matches against —
+    // under a prompt no character will ever think under.
+    //
+    // Acts first, then who everybody is. Both are collections, so each member
+    // seals once and is selected per turn: one copy of the vault for the world
+    // rather than one per Maker standing in it.
+    if let Some(p) = projection.as_mut() {
+        crate::engine::tools::install_catalog(&mut p.builder, Mode::Physical)?;
+    }
+    let identities = match projection.as_mut() {
+        Some(p) => {
+            let places: BTreeMap<String, String> = rt
+                .hosted
+                .ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let hosted = rt.hosted.get(&id)?;
+                    Some((id, prompt::building(&rt.remembered_place(&hosted))))
+                })
+                .collect();
+            identity::install(&mut p.builder, &plan.authored, &places)?
+        }
+        None => identity::Installed::default(),
+    };
+
+    if let (Some(p), Some(minds)) = (projection.as_ref(), rt.minds.read().unwrap().as_ref()) {
+        minds.set_projection(Projected {
+            prompt: p.prelude.clone(),
+            builder: p.builder.clone(),
+            layer: p.layer,
+            group: p.group,
+            identities: identities.clone(),
+        });
     }
 
     p.set_step(LoadStep::Layers);
@@ -548,11 +1307,41 @@ fn load(
     p.set_step(LoadStep::Waking);
     p.set_progress(0, plan.cast.len() as u64);
     let now = 0;
-    for (i, id) in plan.cast.iter().enumerate() {
-        rt.scheduler.wake(*id, now, plan.world_ms);
+    let mut embodied = 0;
+    let mut recalled = 0;
+    for (i, casting) in plan.cast.iter().enumerate() {
+        let id = casting.npc_id;
+        let world = &casting.world_id;
+        rt.scheduler.wake(id, now, plan.world_ms);
+        // Back into the body it had. Entering one that is already there is not
+        // an error, so this is the same call the create path makes and the two
+        // do not have to agree about anything beyond the id.
+        let name = rt
+            .persona_of(id)
+            .map(|p| p.name)
+            .unwrap_or_else(|| Runtime::body_id(id));
+        // No home named here: the personality knows where its characters
+        // belong, and the persona source does not carry it. The room the
+        // character was last in is consulted first anyway, so the door is only
+        // reached for one that has none — and the create path, which does know
+        // the home, named it then.
+        match rt.embody_in_world(id, world, None, &name, casting.at.as_deref(), now) {
+            Ok(true) => {
+                embodied += 1;
+                if casting.at.is_some() {
+                    recalled += 1;
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::error!("npc {id}: no body in `{world}` — {e:#}"),
+        }
         p.set_progress(i as u64 + 1, plan.cast.len() as u64);
     }
-    tracing::info!("cast: {} character(s) awake", rt.scheduler.population());
+    tracing::info!(
+        "cast: {} character(s) awake, {embodied} standing in a world \
+         ({recalled} back where they were)",
+        rt.scheduler.population()
+    );
 
     // The engine was published at the substrate step — see there. What changes
     // here is only that the load is over.
@@ -1151,6 +1940,13 @@ pub fn drive(rt: Arc<Runtime>) {
             while !rt.stopping() {
                 let now_ms = start.elapsed().as_millis() as u64;
 
+                // Before anything is due: a waiting character does not tick, so
+                // nothing it does can notice that its wait has been answered.
+                // This is what notices, every pass — finer than the fastest
+                // heartbeat, so "the moment it happens" is true to a tenth of a
+                // second.
+                rt.answer_waits();
+
                 for id in rt.scheduler.due_now(now_ms) {
                     // Per character, not once per pass: two characters in
                     // different worlds are at different instants, and one of
@@ -1168,9 +1964,76 @@ pub fn drive(rt: Arc<Runtime>) {
                             crate::engine::event::EventKind::Wake { day: to },
                         );
                     }
+                    // What this character is set on, restated every turn.
+                    // Delivered rather than synthesised inside the tick: the
+                    // scheduler knows a character has an empty inbox and
+                    // nothing at all about what it is for.
+                    //
+                    // **Only when there is nothing else to answer.** This gate
+                    // has now been wrong in both directions, and the two
+                    // mistakes are instructive.
+                    //
+                    // It was first gated on an *empty inbox*, which never
+                    // happened: a character with a body is handed the situation
+                    // it is standing in every moment, so the depth is never
+                    // zero, so the standing task written for exactly the case of
+                    // having company was the one that never arrived. Two Makers
+                    // met, had nothing telling them to stay, and walked out of
+                    // the room in opposite directions.
+                    //
+                    // Removing the gate fixed that and introduced the opposite
+                    // fault. The task supersedes in its own band, so restating
+                    // it never accumulates — but it does keep moving to the most
+                    // recent position in the window, which is where attention
+                    // weights hardest. A character mid-conversation was being
+                    // told, more recently than anything its companion had
+                    // actually said, that nothing had been asked of it.
+                    //
+                    // The question was never "is the inbox empty", it is "is
+                    // anything *happening*" — and the situation is a fact about
+                    // the room rather than an event. `has_news` was that
+                    // question asked about this instant, which is the third way
+                    // of getting it wrong: a conversation is mostly the gaps
+                    // between its utterances, and in every one of those gaps
+                    // there is momentarily no news queued.
+                    //
+                    // So the task landed *inside* conversations, and because it
+                    // supersedes in its own band it sat in the most recent
+                    // position in the window every time. Two characters
+                    // alternated for a hundred turns — heard the other speak,
+                    // were told nothing had been asked of them, heard the other
+                    // speak — each being told, more recently than anything its
+                    // companion had said, that nothing was going on.
+                    //
+                    // A stretch of quiet is what the task was always described
+                    // as waiting for. See [`IDLE_AFTER_MS`].
+                    // Two clocks, both `IDLE_AFTER_MS`: quiet since anything
+                    // happened, and quiet since the task itself was last
+                    // restated. Without the second the gate latches open — the
+                    // task is not news, so nothing it does moves the first
+                    // clock — and a character nobody is talking to is handed it
+                    // again on every tick.
+                    if rt.scheduler.nudge_due(id, world_ms, IDLE_AFTER_MS) {
+                        if let Some(text) = rt.nudge_for(id) {
+                            rt.scheduler.deliver(
+                                id,
+                                world_ms,
+                                crate::engine::event::Salience::IDLE,
+                                crate::engine::event::EventKind::Nudge { text },
+                            );
+                        }
+                    }
+
                     let minds = rt.minds.read().unwrap().clone();
                     let persona = rt.persona_of(id);
                     let day = crate::engine::sleep::day_of(world_ms);
+                    // What the grammar is built from this turn: the acts that
+                    // are reachable from where this character stands, and the
+                    // names it may address. Read here, once, before the decode —
+                    // the world moves under a decode that takes seconds, and a
+                    // grammar built halfway through it would be masked to a room
+                    // that no longer matches the situation the character read.
+                    let within = rt.within(id);
 
                     rt.scheduler.tick(id, now_ms, world_ms, |events, window| {
                         let (Some(minds), Some(p)) = (minds.as_ref(), persona.as_ref()) else {
@@ -1180,14 +2043,24 @@ pub fn drive(rt: Arc<Runtime>) {
                             // the honest answer rather than an invented one.
                             return Vec::new();
                         };
-                        match minds.think(id, &p.as_persona(), p.mode, day, events, window) {
+                        match minds.think(id, &p.as_persona(), p.mode, day, events, window, &within)
+                        {
                             Ok(t) => {
+                                // Reported, never swallowed: a character failing
+                                // to act and one choosing not to look identical
+                                // from outside and need completely different
+                                // fixes.
+                                //
+                                // And told to the character, not only to the
+                                // log. A rejection it cannot see is a character
+                                // acting into silence — it has no reason to do
+                                // anything differently, so it makes the same
+                                // malformed call every turn for as long as it
+                                // runs.
+                                let mut done: Vec<String> = Vec::new();
                                 for r in &t.parsed.rejected {
-                                    // Reported, never swallowed: a character
-                                    // failing to act and one choosing not to
-                                    // look identical from outside and need
-                                    // completely different fixes.
                                     tracing::warn!("npc {id}: act rejected — {r:?}");
+                                    done.push(r.line());
                                 }
                                 if t.parsed.is_empty() && t.parsed.rejected.is_empty() {
                                     // Chose to do nothing, and said so cleanly.
@@ -1201,7 +2074,25 @@ pub fn drive(rt: Arc<Runtime>) {
                                         t.parsed.narration
                                     );
                                 }
-                                t.parsed.acts.iter().map(|a| a.summary()).collect()
+                                // Acts that belong to a body go to the world
+                                // they stand in, and the world's verdict — not
+                                // the character's intent — decides how each one
+                                // is recorded. A refusal is an ordinary
+                                // outcome, perceived like any other, so the
+                                // character learns it went wrong rather than
+                                // believing it worked. `record_act` holds the
+                                // rule.
+                                for a in &t.parsed.acts {
+                                    done.push(rt.record_act(id, a));
+                                    // A wait that landed stops the character
+                                    // here. Armed after the act rather than
+                                    // inside it because going quiet is
+                                    // scheduling and being seen to wait is the
+                                    // world's — two halves of one act, and only
+                                    // this half knows the clock.
+                                    rt.arm_wait(id, a, world_ms, &within);
+                                }
+                                done
                             }
                             Err(e) => {
                                 tracing::warn!("npc {id}: decode failed — {e:#}");
@@ -1220,6 +2111,7 @@ pub fn drive(rt: Arc<Runtime>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn rt() -> Arc<Runtime> {
         // A temp path: the tests exercise scheduling, not persistence, and an
@@ -1292,5 +2184,973 @@ mod tests {
     #[test]
     fn the_drive_interval_is_finer_than_the_fastest_heartbeat() {
         assert!(DRIVE_INTERVAL < crate::engine::tick::ALERT_HEARTBEAT);
+    }
+
+    // ── the world, hosted ───────────────────────────────────────────────────
+
+    const ROOMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps");
+
+    /// The id the vault is authored under. A world is hosted under the same id
+    /// its document has, because that is what a character's `world_id` names.
+    const WORLD: &str = "creators-vault";
+
+    /// A runtime hosting the vault, with its metronome held still.
+    ///
+    /// Paused on purpose: these assert what hosting, binding and acting *do*,
+    /// and a world moving underneath them would make every one of them a race.
+    /// The metronome's own behaviour is [`crate::engine::driver`]'s to prove.
+    fn vaulted() -> Arc<Runtime> {
+        let rt = rt();
+        rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
+        rt.hold_world(WORLD, true);
+        rt
+    }
+
+    fn at(node: &str) -> npc_map::world::Where {
+        npc_map::world::Where::new("vault-casting", node)
+    }
+
+    /// Put a body in the world and give a character to it.
+    fn embody(rt: &Arc<Runtime>, npc_id: u64, body: &str, room: &str) {
+        let w = rt.hosted.get(WORLD).expect("hosted");
+        w.with(|w| {
+            w.enter(body, format!("Maker-{npc_id:02}"), at(room))
+                .unwrap()
+        });
+        rt.scheduler.wake(npc_id, 0, 0);
+        rt.embody(npc_id, WORLD, body, 0).expect("bound");
+    }
+
+    fn window(rt: &Arc<Runtime>, npc_id: u64) -> Vec<String> {
+        rt.scheduler
+            .window_of(npc_id, |w| {
+                w.turns().map(|t| t.text.clone()).collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Let every due character take its turn, with no decode behind it.
+    fn run(rt: &Arc<Runtime>, at_ms: u64) {
+        for id in rt.scheduler.due_now(at_ms) {
+            rt.scheduler.tick(id, at_ms, at_ms, |_, _| Vec::new());
+        }
+    }
+
+    #[test]
+    fn a_hosted_world_is_reachable_and_moving() {
+        let rt = rt();
+        assert!(rt.hosted.get(WORLD).is_none(), "hosted before it was asked");
+
+        rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
+        assert!(rt.hosted.get(WORLD).is_some());
+        let running = rt.moments();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].0, WORLD);
+        assert!(!running[0].2, "hosted paused");
+    }
+
+    #[test]
+    fn a_map_that_does_not_load_leaves_the_daemon_running() {
+        // An authoring mistake must not take the console and the whole
+        // authored corpus down with it.
+        let rt = rt();
+        assert!(rt
+            .host(WORLD, Path::new(env!("CARGO_MANIFEST_DIR")))
+            .is_err());
+        assert!(rt.hosted.get(WORLD).is_none());
+        assert!(
+            rt.moments().is_empty(),
+            "a metronome outlived a failed load"
+        );
+    }
+
+    #[test]
+    fn a_world_can_be_held_still_and_let_go() {
+        let rt = vaulted();
+        assert!(rt.moments()[0].2, "not paused");
+        assert!(rt.hold_world(WORLD, false));
+        assert!(!rt.moments()[0].2, "not resumed");
+        assert!(
+            !rt.hold_world("nowhere", true),
+            "held a world it has not got"
+        );
+    }
+
+    #[test]
+    fn embodying_a_character_grounds_it_and_quickens_it() {
+        // Both, at once. A character that can act before it has been told where
+        // it is would act blind; one left at an ambient pace would think about
+        // its work every two minutes.
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+
+        assert_eq!(rt.scheduler.pace_of(1), Some(Pace::WORKING));
+        run(&rt, 1);
+        let read = window(&rt, 1);
+        assert!(read.iter().any(|t| t.contains("band one")), "{read:?}");
+    }
+
+    #[test]
+    fn what_is_within_reach_arrives_with_where_the_body_is() {
+        // The two are one fact — both are functions of where it stands — so
+        // they arrive together and go stale together.
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        run(&rt, 1);
+
+        let here = window(&rt, 1)
+            .into_iter()
+            .find(|t| t.starts_with("You are"))
+            .expect("grounded");
+        assert!(here.contains("Within reach"), "{here}");
+        assert!(here.contains("terminal"), "{here}");
+    }
+
+    #[test]
+    fn a_corridor_says_nothing_about_what_is_within_reach() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "ring-north");
+        run(&rt, 1);
+
+        let here = window(&rt, 1)
+            .into_iter()
+            .find(|t| t.starts_with("You are"))
+            .expect("grounded");
+        assert!(!here.contains("Within reach"), "{here}");
+    }
+
+    #[test]
+    fn embodying_the_same_character_twice_elsewhere_is_refused() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        rt.hosted
+            .get(WORLD)
+            .unwrap()
+            .with(|w| w.enter("m2", "Maker-02", at("band-one")).unwrap());
+        assert!(rt.embody(1, WORLD, "m2", 0).is_err());
+        assert!(rt.embody(2, WORLD, "m1", 0).is_err(), "two minds, one body");
+    }
+
+    #[test]
+    fn embodying_into_a_world_or_a_body_that_is_not_there_is_refused() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        let no_world = rt.embody(1, "elsewhere", "m1", 0).unwrap_err().to_string();
+        assert!(no_world.contains("elsewhere"), "{no_world}");
+
+        let no_body = rt.embody(1, WORLD, "nobody", 0).unwrap_err().to_string();
+        assert!(no_body.contains("nobody"), "{no_body}");
+        assert!(!rt.bodies.is_bound(1));
+    }
+
+    #[test]
+    fn disembodying_lets_a_character_settle_back_to_reacting() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        assert!(rt.disembody(1, 0));
+        assert_eq!(rt.scheduler.pace_of(1), Some(Pace::AMBIENT));
+        assert!(rt.body_of(1).is_none());
+        assert!(!rt.disembody(1, 0), "disembodied twice");
+    }
+
+    #[test]
+    fn unhosting_a_world_stops_it_and_frees_the_characters_in_it() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        embody(&rt, 2, "m2", "band-one");
+
+        assert!(rt.unhost(WORLD));
+        assert!(rt.moments().is_empty(), "the metronome kept beating");
+        assert!(rt.hosted.get(WORLD).is_none());
+        assert!(
+            !rt.bodies.is_bound(1),
+            "a character kept a body that is gone"
+        );
+        assert!(!rt.bodies.is_bound(2));
+        assert!(!rt.unhost(WORLD), "unhosted twice");
+    }
+
+    // ── acts, landing on the world ──────────────────────────────────────────
+
+    fn act(tool: &'static str, args: serde_json::Value) -> Act {
+        Act {
+            tool,
+            args: args.as_object().expect("an object").clone(),
+        }
+    }
+
+    #[test]
+    fn an_act_that_happens_inside_a_head_never_reaches_the_world() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        assert_eq!(
+            rt.act_on_world(1, &act("note_concern", json!({}))),
+            Outcome::NotOfTheBody
+        );
+    }
+
+    #[test]
+    fn a_character_with_no_body_cannot_act_on_a_world() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        assert_eq!(
+            rt.act_on_world(1, &act("speak", json!({"intent": "anything"}))),
+            Outcome::NotOfTheBody
+        );
+    }
+
+    #[test]
+    fn speaking_reaches_the_other_character_in_the_room() {
+        // The whole chain, in one daemon: an act from one mind lands in the
+        // world, is perceived by the body beside it, and is read by that
+        // body's mind.
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        run(&rt, 1);
+
+        let said = rt
+            .act_on_world(
+                1,
+                &act(
+                    "speak",
+                    json!({"intent": "the redoubt burned twice", "to": "Maker-02"}),
+                ),
+            )
+            .line()
+            .expect("a body act")
+            .to_string();
+        assert!(said.contains("to Maker-02"), "{said}");
+
+        // Not yet: perception happens on the world's clock, not the speaker's.
+        run(&rt, 2);
+        assert!(!window(&rt, 2).join("\n").contains("redoubt"));
+
+        let world = rt.hosted.get(WORLD).unwrap();
+        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        run(&rt, 3);
+
+        let heard = window(&rt, 2).join("\n");
+        assert!(heard.contains("says to you"), "{heard}");
+        assert!(heard.contains("redoubt"), "{heard}");
+    }
+
+    /// **The deadlock this whole act exists to break, end to end.**
+    ///
+    /// Wyneth waits on Perrin. Perrin is told, so Perrin has something to
+    /// answer — and cannot answer by waiting back, because the grammar it is
+    /// handed has no arm for it. Perrin speaks; the sweep notices; Wyneth is
+    /// woken with the speech in front of her.
+    #[test]
+    fn a_wait_is_answered_by_the_person_it_was_aimed_at() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        run(&rt, 1);
+
+        // Wyneth waits on Perrin. The world takes it, and it is armed.
+        let w = act(
+            "wait_for",
+            json!({"for": "someone_speaks", "who": "Maker-02"}),
+        );
+        assert!(rt.record_act(1, &w).starts_with("wait_for"), "the act stood");
+        rt.arm_wait(1, &w, 0, &rt.within(1));
+        assert!(rt.scheduler.waiting(1).is_some(), "nothing was armed");
+
+        // Perrin now cannot wait back — the only person here is already
+        // waiting on it, so the act has nobody to name and leaves the grammar.
+        let theirs = rt.within(2);
+        assert_eq!(theirs.waited_on_by, vec!["Maker-01".to_string()]);
+        assert!(theirs.waitable().is_empty(), "it could return the stare");
+
+        // Perrin speaks. The sweep runs on the driver's pass, not on a tick —
+        // a waiting character does not tick, so something outside has to
+        // notice for it.
+        assert!(rt.act_on_world(2, &act("say", json!({"intent": "that I am here"})))
+            .happened());
+        let world = rt.hosted.get(WORLD).unwrap();
+        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        rt.answer_waits();
+
+        assert!(rt.scheduler.waiting(1).is_none(), "the wait outlived its answer");
+        assert!(rt.scheduler.due_now(0).contains(&1), "she was not woken");
+    }
+
+    /// A wait nothing can answer ends by itself. Without this the character
+    /// sleeps forever and every view of it reads "blocked" — which is also what
+    /// a merely quiet character reads.
+    #[test]
+    fn a_wait_nobody_answers_gives_up_on_its_own() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        run(&rt, 1);
+
+        let w = act(
+            "wait_for",
+            json!({"for": "someone_speaks", "who": "Maker-02"}),
+        );
+        rt.arm_wait(1, &w, 0, &rt.within(1));
+
+        // Nobody says anything, ever.
+        rt.answer_waits();
+        assert!(rt.scheduler.waiting(1).is_some(), "it gave up at once");
+
+        // The world clock is what the patience is measured against, and this
+        // runtime's is held still — so arm one that has already run out.
+        rt.scheduler.begin_waiting(
+            1,
+            crate::engine::waiting::Waiting {
+                kind: crate::engine::waiting::Kind::SomeoneSpeaks,
+                who: Some("Maker-02".into()),
+                until_ms: 0,
+            },
+            Vec::new(),
+            0,
+        );
+        rt.answer_waits();
+        assert!(rt.scheduler.waiting(1).is_none(), "it waited past its patience");
+    }
+
+    #[test]
+    fn an_act_that_landed_is_recorded_as_an_act_whatever_the_world_said_back() {
+        // Speech is the case that made this visible. The world answers a
+        // successful `say` in narration — "You say, to the room: …" — and
+        // recording *that* put one prose sentence in a column of single-word
+        // acts, both in the feed and in the character's own window.
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        run(&rt, 1);
+
+        let said = rt.record_act(1, &act("say", json!({"intent": "the redoubt burned twice"})));
+        assert_eq!(said, "say — the redoubt burned twice");
+
+        // A body act and a head act now read the same way as each other, which
+        // is the point — one shape, whether or not a world was involved.
+        let noted = rt.record_act(1, &act("note_concern", json!({"about": "the ledger"})));
+        assert!(noted.starts_with("note_concern"), "{noted}");
+
+        // And the world did take the speech: the shape of the record is not
+        // the act being quietly dropped.
+        let world = rt.hosted.get(WORLD).unwrap();
+        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        run(&rt, 10_000);
+        let heard = window(&rt, 2).join("\n");
+        assert!(heard.contains("redoubt"), "{heard}");
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_in_the_world_s_words_because_the_prose_is_the_point() {
+        // The other half of the same rule. A refused act must not read like one
+        // that landed, and the refusal's text is what tells the character where
+        // it could actually have gone — losing it to a uniform shape would be
+        // the reverse of the bug above.
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+
+        let line = rt.record_act(1, &act("move_to", json!({"destination": "the observatory"})));
+        assert!(line.contains("nowhere called \"the observatory\""), "{line}");
+        assert!(line.contains("band one"), "it named nowhere real: {line}");
+        assert!(
+            !line.starts_with("move_to"),
+            "a refusal read as a completed act: {line}"
+        );
+    }
+
+    #[test]
+    fn an_act_the_world_refuses_reads_as_refused_rather_than_as_done() {
+        // The distinction the whole path exists to preserve: a character that
+        // cannot tell a refused act from a successful one spends the rest of
+        // the day reasoning from a move it never made.
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+
+        let out = rt
+            .act_on_world(
+                1,
+                &act("move_to", json!({"destination": "the observatory"})),
+            );
+        let Outcome::Refused(out) = out else {
+            panic!("a walk to nowhere is a refusal, not {out:?}");
+        };
+        assert!(out.contains("nowhere called \"the observatory\""), "{out}");
+        assert!(out.contains("band one"), "it named nowhere real: {out}");
+        assert!(rt
+            .hosted
+            .get(WORLD)
+            .unwrap()
+            .read(|w| w.actor("m1").unwrap().walk.is_none()));
+    }
+
+    #[test]
+    fn moving_is_a_journey_the_world_advances_rather_than_the_act() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let out = rt
+            .act_on_world(1, &act("move_to", json!({"destination": "band one"})))
+            .line()
+            .expect("a body act")
+            .to_string();
+        assert!(out.contains("one stop"), "{out}");
+
+        let world = rt.hosted.get(WORLD).unwrap();
+        // Still where it was: setting off is not arriving.
+        assert_eq!(
+            world.read(|w| w.actor("m1").unwrap().at.clone()),
+            at("green-room")
+        );
+        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        assert_eq!(
+            world.read(|w| w.actor("m1").unwrap().at.clone()),
+            at("band-one")
+        );
+
+        run(&rt, 10_000);
+        let read = window(&rt, 1).join("\n");
+        assert!(read.contains("You got to band one"), "{read}");
+    }
+
+    #[test]
+    fn what_a_character_did_comes_back_in_its_own_turn() {
+        // The actor is not left waiting for the world to tell it what it just
+        // did — the act goes into its own window in the same turn. What it does
+        // wait for is *everyone else* perceiving it.
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        run(&rt, 1);
+
+        let spoke = act("say", json!({"intent": "first"}));
+        assert!(
+            rt.act_on_world(2, &spoke).happened(),
+            "the world took the speech"
+        );
+        // And what gets recorded for it is the act, in the shape every act has.
+        assert_eq!(spoke.summary(), "say — first");
+
+        run(&rt, 2);
+        assert!(
+            !window(&rt, 1).join("\n").contains("first"),
+            "it arrived outside a world moment"
+        );
+    }
+
+    /// Every path into a character's window goes through a world moment. An
+    /// act that pushed perception itself would be a second one, unbatched and
+    /// off the sweep — and it would be invisible, because it would work.
+    #[test]
+    fn nothing_perceives_anything_outside_a_world_moment() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        run(&rt, 1);
+
+        let world = rt.hosted.get(WORLD).unwrap();
+        for intent in ["one", "two", "three"] {
+            rt.act_on_world(1, &act("speak", json!({ "intent": intent })));
+        }
+        run(&rt, 2);
+        let before = window(&rt, 2).len();
+
+        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        // Past its heartbeat: speech to the room is worth a turn but does not
+        // interrupt one, so it waits rather than preempting.
+        run(&rt, 10_000);
+        let after = window(&rt, 2).join("\n");
+        assert!(
+            window(&rt, 2).len() > before,
+            "the moment delivered nothing"
+        );
+        for intent in ["one", "two", "three"] {
+            assert!(after.contains(intent), "{intent} was lost: {after}");
+        }
+    }
+
+    // ── a new character, put into its world ─────────────────────────────────
+
+    #[test]
+    fn a_new_character_arrives_at_the_way_in_and_starts_thinking() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+
+        assert!(rt
+            .embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .unwrap());
+        let (world, body) = rt.body_of(1).expect("it has a body");
+        assert_eq!(body, Runtime::body_id(1));
+        assert_eq!(
+            world.read(|w| w.actor(&body).unwrap().at.clone()),
+            npc_map::world::Where::new("vault-command", "command-room"),
+            "it did not arrive at the way in"
+        );
+        // And at a pace that keeps it working rather than settling.
+        assert_eq!(rt.scheduler.pace_of(1), Some(Pace::WORKING));
+    }
+
+    #[test]
+    fn a_character_whose_world_has_no_map_is_left_without_a_body() {
+        // Most worlds have none. Lore and no body is a character, not a
+        // failure, and the caller has to be able to tell that from an error.
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        assert!(!rt
+            .embody_in_world(1, "unmapped", None, "Maker-01", None, 0)
+            .unwrap());
+        assert!(rt.body_of(1).is_none());
+    }
+
+    #[test]
+    fn putting_a_character_back_in_the_body_it_had_changes_nothing() {
+        // The restart path and the create path are the same call, so it has to
+        // be safe to make twice — once when the character was created, once
+        // every boot after.
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .unwrap();
+
+        // It walks off the command level's arrival room — one stop, same level.
+        let body = Runtime::body_id(1);
+        let elsewhere = npc_map::world::Where::new("vault-command", "anteroom");
+        let world = rt.hosted.get(WORLD).unwrap();
+        world.with(|w| w.set_off(&body, elsewhere.clone()).unwrap());
+        world.tick();
+        assert_eq!(
+            world.read(|w| w.actor(&body).unwrap().at.clone()),
+            elsewhere
+        );
+
+        assert!(rt
+            .embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .unwrap());
+        assert_eq!(
+            world.read(|w| w.actor(&body).unwrap().at.clone()),
+            elsewhere,
+            "it was sent back to the door"
+        );
+    }
+
+    /// **A restart puts a body back where it was, not at the front door.**
+    ///
+    /// The world's own state — who is standing where — is held in RAM and goes
+    /// with the process, so the character record's remembered room is the only
+    /// thing that survives to rebuild it from.
+    #[test]
+    fn a_body_returns_to_the_room_it_was_remembered_in() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        let green = "vault-casting/green-room";
+
+        assert!(rt
+            .embody_in_world(1, WORLD, None, "Maker-01", Some(green), 0)
+            .unwrap());
+        let (world, body) = rt.body_of(1).expect("it has a body");
+        assert_eq!(
+            world.read(|w| w.actor(&body).unwrap().at.clone()),
+            Where::new("vault-casting", "green-room"),
+            "it was sent to the arrival door instead of where it was"
+        );
+    }
+
+    /// A remembered room the map no longer has is not an error — maps are
+    /// authored and rooms get renamed. The character arrives at the door, which
+    /// is what somebody whose room was demolished should do.
+    #[test]
+    fn a_body_whose_remembered_room_is_gone_arrives_at_the_door() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+
+        assert!(rt
+            .embody_in_world(
+                1,
+                WORLD,
+                None,
+                "Maker-01",
+                Some("vault-casting/no-such-room"),
+                0
+            )
+            .unwrap());
+        let (world, body) = rt.body_of(1).expect("it has a body");
+        assert_eq!(
+            world.read(|w| w.actor(&body).unwrap().at.clone()),
+            Where::new("vault-command", "command-room"),
+            "a room the map does not have should fall through to the way in"
+        );
+    }
+
+    #[test]
+    fn a_body_id_is_derived_so_a_restart_finds_the_same_one() {
+        // Derived rather than stored, the same reason a timeline id is: a
+        // restart reconstructs the correspondence without a table that could
+        // be lost or disagree.
+        assert_eq!(Runtime::body_id(7), "npc-7");
+        assert_ne!(Runtime::body_id(7), Runtime::body_id(8));
+    }
+
+    // ── the standing instruction ────────────────────────────────────────────
+
+    #[test]
+    fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
+        // Having nothing to do is itself a standing instruction. An NPC that
+        // stands still because nothing was assigned reads as scenery.
+        //
+        // **At the work, not at the map.** This used to assert "not been in" —
+        // the instruction was to go and see an unvisited room, and characters
+        // did precisely that: a seventy-eight room tour, hours long, that
+        // produced nothing to talk about, because a room is not a subject.
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .unwrap();
+
+        let nudge = rt.nudge_for(1).expect("something to be getting on with");
+        assert_eq!(nudge, NO_MISSION);
+        assert!(nudge.contains("within reach"), "{nudge}");
+        // **No verb of motion.** The standing task is the most recent thing in
+        // the window, so whatever it tells a character to *do* is what the
+        // character does — and every version of this that ended with somewhere
+        // to go produced a cast that only ever went there.
+        for motion in ["go ", "walk", "find somewhere", "where people are"] {
+            assert!(
+                !nudge.to_lowercase().contains(motion),
+                "the standing task tells it to move (`{motion}`): {nudge}"
+            );
+        }
+    }
+
+    /// **Company changes the standing task.** Told to go somewhere new every
+    /// quiet turn, two characters explored a seventy-eight room building and
+    /// never held a conversation: each moved every four seconds, so sharing a
+    /// room lasted one tick and neither had a reason to stay for the second.
+    #[test]
+    fn a_character_that_is_not_alone_is_told_to_stay_and_talk() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
+
+        // Somebody walks in, and what there is to do changes with them.
+        embody(&rt, 2, "m2", "green-room");
+        let together = rt.nudge_for(1).expect("bound");
+        // Speaking, and about something in particular — "say what you have
+        // been looking at" got three characters agreeing about silence for a
+        // hundred turns, because none of them had to name a thing.
+        // **Naming the act is what makes an instruction land.** "Talk to them"
+        // is a wish; "`say` or `ask`" is the branch the grammar has an arm for,
+        // and the difference showed up as a cast that only ever walked.
+        assert!(
+            together.contains("`say`") && together.contains("`ask`"),
+            "the instruction names no act to carry it out: {together}"
+        );
+        assert!(
+            together.contains("particular thing"),
+            "it permits a vague answer: {together}"
+        );
+        // **And it names them.**
+        //
+        // This is the whole difference between an instruction a character can
+        // act on and one it cannot. `tell` and `ask` take a name and refuse one
+        // they cannot find, and the only other place a name appears — the
+        // situation percept — is suppressed while nothing moves. Told to talk
+        // to an unnamed somebody, a live character addressed `you`, was
+        // refused, and did it again.
+        assert!(
+            together.contains("Maker-02"),
+            "the standing task names no addressee: {together}"
+        );
+        assert!(
+            !together.contains("{who}"),
+            "the placeholder was never filled: {together}"
+        );
+        // Each is told about the other, never about itself.
+        let other = rt.nudge_for(2).expect("bound");
+        assert!(other.contains("Maker-01"), "{other}");
+        assert!(!other.contains("Maker-02"), "it was told about itself: {other}");
+
+        // And when they part, it changes back.
+        rt.hosted
+            .get(WORLD)
+            .unwrap()
+            .with(|w| w.set_off("m2", at("band-one")).unwrap());
+        rt.hosted.get(WORLD).unwrap().tick();
+        assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
+    }
+
+    /// **The standing task is for the quiet turns, and the situation is not
+    /// news.**
+    ///
+    /// This gate has been wrong in both directions. Gated on inbox *depth* it
+    /// never fired, because a character with a body is handed the room it is
+    /// standing in every moment, so the depth is never zero — and the task
+    /// written for the case of having company was the one that never arrived.
+    /// Ungated it fired every turn, restating "nothing has been asked of you"
+    /// more recently than anything a companion had actually said.
+    ///
+    /// So the question is whether anything *happened*, which is what
+    /// [`crate::engine::tick::Inbox::has_news`] answers.
+    #[test]
+    fn the_standing_task_waits_for_a_turn_with_nothing_in_it() {
+        use crate::engine::event::{EventKind, Salience};
+
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+
+        // Where a character is standing is a fact about the room, not something
+        // that happened — and this is the case the old depth gate mistook for a
+        // busy character, because a body is handed its situation whenever the
+        // world moves under it.
+        rt.scheduler.deliver(
+            1,
+            0,
+            Salience::IDLE,
+            EventKind::Situation {
+                text: "You are in the green room.".into(),
+            },
+        );
+        assert!(
+            rt.scheduler.inbox_depth(1).unwrap() > 0,
+            "the situation should be queued"
+        );
+        assert_eq!(
+            rt.scheduler.quiet_for(1, 10_000),
+            Some(10_000),
+            "standing in a room is not something that happened"
+        );
+
+        // Nor is the standing task itself, or it would keep its own gate open.
+        rt.scheduler.deliver(
+            1,
+            0,
+            Salience::IDLE,
+            EventKind::Nudge {
+                text: NO_MISSION.into(),
+            },
+        );
+        assert_eq!(rt.scheduler.quiet_for(1, 10_000), Some(10_000));
+
+        // Somebody speaks, and now there is something to answer.
+        rt.scheduler.deliver(
+            1,
+            0,
+            Salience::NORMAL,
+            EventKind::Speech {
+                speaker: "Maker-02".into(),
+                text: "that the redoubt burned twice".into(),
+                to: crate::engine::event::Addressed::You,
+            },
+        );
+        assert_eq!(
+            rt.scheduler.quiet_for(1, 10_000),
+            Some(0),
+            "being spoken to is news"
+        );
+
+        // **And the quiet does not restart the moment it is read.** Draining the
+        // speech leaves the character having been spoken to at t=0, not having
+        // been alone forever — which is the whole point of the clock: the gap
+        // between two turns of a conversation is not idleness.
+        rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
+        assert_eq!(
+            rt.scheduler.quiet_for(1, 10_000),
+            Some(10_000),
+            "ten seconds after the last thing said to it"
+        );
+        assert!(
+            rt.scheduler.quiet_for(1, 10_000).unwrap() < IDLE_AFTER_MS,
+            "ten seconds is a pause in a conversation, not an idle character"
+        );
+    }
+
+    #[test]
+    fn somebody_in_the_next_room_is_not_company() {
+        // Company is who is *here*. Being able to see somebody through a
+        // doorway is a reason to go to them, not a conversation.
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        embody(&rt, 2, "m2", "ring-north");
+        assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
+    }
+
+    #[test]
+    fn a_character_with_no_body_is_not_told_to_explore_anything() {
+        // It has nowhere to go and nobody to talk to; instructing it otherwise
+        // is instructing it to do something it cannot.
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        assert_eq!(rt.nudge_for(1), None);
+    }
+
+    /// The standing instruction is a **disposition**, not a script. A named
+    /// destination would be an order every character in the world followed
+    /// identically — which looks like emergence and is the opposite of it.
+    #[test]
+    fn the_standing_instruction_names_no_particular_place_or_person() {
+        let vault = npc_map::MapSet::load_dir(ROOMS).unwrap();
+        let words = NO_MISSION.to_lowercase();
+        for area in vault.areas() {
+            for node in &area.nodes {
+                assert!(
+                    !words.contains(&node.name.to_lowercase()),
+                    "it names {}",
+                    node.name
+                );
+            }
+        }
+        assert!(!words.contains("maker-"), "it names somebody");
+    }
+
+    #[test]
+    fn a_standing_instruction_replaces_the_one_before_it() {
+        use crate::engine::event::EventKind;
+        let a = EventKind::Nudge { text: "one".into() };
+        let b = EventKind::Nudge { text: "two".into() };
+        assert_eq!(a.replaces().as_deref(), Some("nudge"));
+        assert_eq!(a.replaces(), b.replaces(), "two tasks at once");
+        // Its own band, beside the situation — they are different things and
+        // neither may retire the other.
+        assert_ne!(
+            a.replaces(),
+            EventKind::Situation { text: "x".into() }.replaces()
+        );
+    }
+
+    #[test]
+    fn a_standing_instruction_never_interrupts_and_reads_as_written() {
+        use crate::engine::event::{Event, EventKind, Salience};
+        let e = Event::new(
+            1,
+            0,
+            Salience::IDLE,
+            EventKind::Nudge {
+                text: format!("  {NO_MISSION}\n"),
+            },
+        );
+        assert!(!e.preempts(), "a standing task interrupted a character");
+        assert_eq!(e.prose(), NO_MISSION);
+    }
+
+    // ── one daemon, several worlds ──────────────────────────────────────────
+
+    /// **Why a hosted world has an id at all.** Every character is created with
+    /// a `world_id` naming the world document it belongs to, so the places it
+    /// can stand in must be findable by that same name. Anything else needs a
+    /// second table to reconcile the two, and a second table is a thing that can
+    /// disagree.
+    #[test]
+    fn a_characters_world_id_finds_the_places_it_can_stand_in() {
+        let rt = vaulted();
+        // What a character carries is a string from its own document.
+        let world_id: String = WORLD.to_string();
+        let places = rt.hosted.get(&world_id).expect("hosted under its own id");
+        assert_eq!(places.id(), world_id);
+
+        places.with(|w| w.enter("m1", "Maker-01", at("band-one")).unwrap());
+        rt.scheduler.wake(1, 0, 0);
+        rt.embody(1, &world_id, "m1", 0).expect("bound by world id");
+        assert_eq!(
+            rt.body_of(1).map(|(w, b)| (w.id().to_string(), b)),
+            Some((world_id, "m1".into()))
+        );
+    }
+
+    #[test]
+    fn two_worlds_are_two_places_and_a_body_in_one_is_not_in_the_other() {
+        let rt = rt();
+        rt.host("creators-vault", Path::new(ROOMS)).unwrap();
+        rt.host("second-world", Path::new(ROOMS)).unwrap();
+        rt.hold_world("creators-vault", true);
+        rt.hold_world("second-world", true);
+        assert_eq!(rt.moments().len(), 2);
+
+        let first = rt.hosted.get("creators-vault").unwrap();
+        let second = rt.hosted.get("second-world").unwrap();
+        first.with(|w| w.enter("m1", "Maker-01", at("band-one")).unwrap());
+        assert!(
+            second.read(|w| w.actor("m1").is_none()),
+            "one world, not two"
+        );
+
+        // The same body id in two worlds is two bodies, and two characters may
+        // have them.
+        second.with(|w| w.enter("m1", "Someone Else", at("band-one")).unwrap());
+        rt.scheduler.wake(1, 0, 0);
+        rt.scheduler.wake(2, 0, 0);
+        rt.embody(1, "creators-vault", "m1", 0).unwrap();
+        rt.embody(2, "second-world", "m1", 0)
+            .expect("a different world");
+    }
+
+    #[test]
+    fn unhosting_one_world_leaves_the_others_running() {
+        let rt = rt();
+        rt.host("creators-vault", Path::new(ROOMS)).unwrap();
+        rt.host("second-world", Path::new(ROOMS)).unwrap();
+        rt.hold_world("creators-vault", true);
+        rt.hold_world("second-world", true);
+
+        rt.hosted
+            .get("creators-vault")
+            .unwrap()
+            .with(|w| w.enter("m1", "Maker-01", at("band-one")).unwrap());
+        rt.hosted
+            .get("second-world")
+            .unwrap()
+            .with(|w| w.enter("m9", "Maker-09", at("band-one")).unwrap());
+        rt.scheduler.wake(1, 0, 0);
+        rt.scheduler.wake(9, 0, 0);
+        rt.embody(1, "creators-vault", "m1", 0).unwrap();
+        rt.embody(9, "second-world", "m9", 0).unwrap();
+
+        assert!(rt.unhost("creators-vault"));
+        assert!(rt.body_of(1).is_none(), "its character kept a body");
+        assert!(
+            rt.body_of(9).is_some(),
+            "another world's character lost one"
+        );
+        assert_eq!(rt.moments().len(), 1);
+    }
+
+    #[test]
+    fn only_authored_worlds_with_rooms_are_hosted() {
+        // Driven by the registry rather than by what is on disk: a map
+        // directory nothing authored must not be hosted under an id no
+        // character can name, and an authored world with no map is a world
+        // whose characters have lore and no bodies — the common case.
+        let dir = std::env::temp_dir().join("npcd-host-authored");
+        let _ = std::fs::remove_dir_all(&dir);
+        let maps = dir.join(MAPS);
+        std::fs::create_dir_all(maps.join("has-rooms")).unwrap();
+        std::fs::create_dir_all(maps.join("never-authored")).unwrap();
+        for f in std::fs::read_dir(ROOMS).unwrap().flatten() {
+            if f.path().is_file() {
+                std::fs::copy(f.path(), maps.join("has-rooms").join(f.file_name())).unwrap();
+            }
+        }
+        std::fs::create_dir_all(maps.join("has-rooms").join("parts")).unwrap();
+        for f in std::fs::read_dir(Path::new(ROOMS).join("parts"))
+            .unwrap()
+            .flatten()
+        {
+            std::fs::copy(
+                f.path(),
+                maps.join("has-rooms").join("parts").join(f.file_name()),
+            )
+            .unwrap();
+        }
+
+        let rt = rt();
+        // Only what the registry knows is offered. `never-authored` has a
+        // directory on disk and no document, so it is not among these.
+        let done = rt.host_authored(&dir, ["has-rooms", "no-rooms"]);
+        // `no-rooms` is authored with nowhere to stand — lore and no bodies,
+        // which is the common case and not an error.
+        let ids: Vec<&str> = done.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["has-rooms"]);
+        assert!(done[0].1.is_ok());
+        assert!(rt.hosted.get("has-rooms").is_some());
+        assert!(rt.hosted.get("never-authored").is_none());
+
+        rt.unhost("has-rooms");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

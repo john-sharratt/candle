@@ -86,6 +86,11 @@ pub struct Dialect {
     pub no_think_block: &'static str,
     /// The `/no_think` soft-switch text — emitted by the section tree's
     /// `no_think` node and prepended to prefilled (never-decoded) turns.
+    ///
+    /// **Empty means the family has no such switch**, which is a capability and
+    /// not a formatting detail: see [`Self::has_no_think_switch`]. Prefer asking
+    /// that over testing this for emptiness, so a caller states what it wants to
+    /// know rather than inferring it from a string.
     pub no_think: &'static str,
     /// The open reasoning marker (`"<think>\n"` for Qwen3).  No longer
     /// force-prefilled — a thinking model emits its own `<think>` as the first
@@ -167,6 +172,23 @@ impl std::fmt::Display for DialectTemplate {
 }
 
 impl Dialect {
+    /// Whether this family honours a `/no_think` soft switch in the user turn.
+    ///
+    /// **Qwen3 and ChatML do; Qwen3.5 and Qwen3.8 do not.** To the newer family
+    /// the marker is ordinary text, so a caller that sends it gets a reasoning
+    /// trace back and a truncated generation that looks like the model answering
+    /// the wrong question.
+    ///
+    /// Stated as a capability because callers kept asking the question by
+    /// testing `no_think` for emptiness, which reads as a formatting check and
+    /// hides what is actually being asked. It is also **not** the way to
+    /// suppress reasoning: a `<think>` steering stencil acts on the decoded
+    /// token and works on every family, where this works on one. Ask this only
+    /// when composing the turn's text.
+    pub fn has_no_think_switch(&self) -> bool {
+        !self.no_think.is_empty()
+    }
+
     /// How this dialect suppresses reasoning, as
     /// `(user-turn marker, block prefilled after the assistant header)`.
     ///

@@ -25,7 +25,7 @@
 //!
 //! Skipped without an available CUDA device.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::PinnedBuf;
@@ -61,9 +61,45 @@ const ARENA_CAPACITY: usize = 256;
 /// one block per sub-band, matching the R16 unit-test pattern.
 const QUANT_HEAD_DIM: usize = 128;
 
-fn cuda_device_or_skip() -> Option<Device> {
+/// **These tests share one GPU, so they may not share it at the same time.**
+///
+/// Every test here seeds real turns into a real device arena and measures what
+/// the tiering did with the VRAM. The arena and the persist-staging span are
+/// process-wide, so two tests running concurrently spend the same budget and
+/// move each other's tier state — which surfaces as
+/// `transient span exhausted — 576 B at offset 67108864 exceeds the 67108864 B
+/// budget` in whichever test lost the race, or as a fixture precondition
+/// failing (`a turn must be hot+warm ... got hot: true, warm: false`) because
+/// another test evicted underneath it.
+///
+/// It is a *random* failure: 21 of 21 pass under `--test-threads=1` and a
+/// different two or four fail on each parallel run. That was invisible for as
+/// long as an earlier failure aborted the run before this target was reached.
+///
+/// So a device comes with the right to use it. The guard is held for the body
+/// of the test, and a poisoned lock is taken anyway — one panicking test has
+/// already reported itself, and turning that into twenty more failures hides
+/// which one it was.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+struct Gpu {
+    device: Device,
+    _turn: MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for Gpu {
+    type Target = Device;
+    fn deref(&self) -> &Device {
+        &self.device
+    }
+}
+
+fn cuda_device_or_skip() -> Option<Gpu> {
     match Device::cuda_if_available(0) {
-        Ok(d @ Device::Cuda(_)) => Some(d),
+        Ok(device @ Device::Cuda(_)) => Some(Gpu {
+            device,
+            _turn: ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner),
+        }),
         _ => None,
     }
 }

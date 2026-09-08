@@ -13,6 +13,15 @@
 //! re-synthesises them from live state — so a registry that did not hold the
 //! cast in memory would have no way to survive one.
 //!
+//! # One handle to the substrate, shared with the engine
+//!
+//! [`Npcs::load`] performs the process's **only** open of `--data/.substrate/`,
+//! and the engine adopts that same handle via [`Npcs::substrate`]. A second
+//! `SubstratePersistence` over one directory is a second unlocked append cursor
+//! and a second record index, and the compactor carries forward only what its
+//! own handle walked — so characters created after the engine's open were
+//! silently dropped at the next compaction. See [`Npcs::substrate`].
+//!
 //! # Editing supersedes; deleting is an edit
 //!
 //! Every write appends one record keyed by `npc_id`. The newest wins on replay
@@ -28,7 +37,7 @@ use std::path::Path;
 use candle_conversation::persistence::record::{
     AuthoredBelief, AuthoredRelationship, AuthoredStrategy, Modulation, NpcPayload, RecordType,
 };
-use candle_conversation::persistence::SubstratePersistence;
+use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence};
 use candle_conversation::substrate::Substrate;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -57,6 +66,46 @@ const MAX_NAME: usize = 120;
 const MAX_PERSONA: usize = 8_000;
 const MAX_TAGS: usize = 32;
 const MAX_TAG: usize = 48;
+
+/// How many entries each authoring-plane layer may hold.
+///
+/// **These are the only unbounded collections on the record, and the record is
+/// rewritten whole on every edit.** Each layer is keyed by an id, so revising an
+/// entry replaces it — but a *new* id appended, and nothing stopped that. A
+/// character accumulating beliefs one save at a time grows a record that every
+/// subsequent write copies, every compaction carries forward, and every
+/// maintenance pass relocates.
+///
+/// The figure is operator scale, which is what this plane is for: §16's
+/// authoring layers are "tens of entries, not the thousands an engine would
+/// accumulate". A hundred and twenty-eight beliefs is far past any character
+/// somebody has actually written and still bounds the record.
+///
+/// The cap is on *appending*. An entry that already exists can always be
+/// revised or deleted, so reaching the limit never leaves a character stuck
+/// with content it cannot edit its way out of.
+const MAX_BELIEFS: usize = 128;
+const MAX_RELATIONSHIPS: usize = 128;
+const MAX_STRATEGIES: usize = 128;
+
+/// The shortest interval between two durable records of where a character is.
+///
+/// **Not a tuning knob — the difference between a bounded write rate and an
+/// unbounded one.** A world's metronome runs at `driver::EVERY` (500 ms), and a
+/// walking body covers a leg per tick, so a character crossing the building
+/// changes room twice a second. Writing the record on each of those would append
+/// the whole payload — persona description and all, up to several kilobytes —
+/// twice a second per moving character, and supersede the previous copy each
+/// time. That is megabytes a minute of dead weight for a cast of two, to record
+/// something that is soft state.
+///
+/// So position is *checkpointed*: written when it has actually changed and at
+/// most this often. The cost is that a hard kill can lose up to this much
+/// movement and a character reconstructs a room or two behind — which is
+/// acceptable for state whose whole purpose is to avoid starting everybody at
+/// the front door, and which is the truth about where they were within the last
+/// half minute.
+const PLACE_CHECKPOINT_MS: u64 = 30_000;
 
 /// What the roster's filter bar asks for.
 ///
@@ -109,6 +158,22 @@ impl Filter<'_> {
     }
 }
 
+/// One character to bring back up after a restart.
+///
+/// The world and the room travel with the id because waking a character and
+/// putting it back in its body are one step: a character woken without its world
+/// would think for a while about a place it is not standing in, and one woken
+/// without its room would think from the front door about a conversation it was
+/// having three floors up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Casting {
+    pub npc_id: u64,
+    pub world_id: String,
+    /// Where it was last standing, as `area/node`. `None` for a character that
+    /// has never been embodied — it starts at the way in.
+    pub at: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum NpcError {
     /// The caller is not this character's owner. Deliberately indistinguishable
@@ -124,10 +189,16 @@ pub enum NpcError {
 /// filters them out.
 pub struct Npcs {
     by_id: BTreeMap<u64, NpcPayload>,
-    persistence: SubstratePersistence,
-    /// Held only because `SubstratePersistence` needs one to walk with. This
-    /// daemon runs no inference, so nothing else ever touches it.
-    _substrate: Substrate,
+    /// **The daemon's only handle to the substrate**, shared with the engine
+    /// rather than opened twice. See [`Npcs::substrate`].
+    shared: SharedSubstrate,
+    /// When each character's place was last written durably.
+    ///
+    /// In memory only, and deliberately: it is the debounce for
+    /// [`PLACE_CHECKPOINT_MS`], not a fact about the character. A restart
+    /// forgetting it means the first move after boot checkpoints immediately,
+    /// which is the behaviour you want anyway.
+    place_written_ms: BTreeMap<u64, u64>,
 }
 
 impl Npcs {
@@ -136,6 +207,10 @@ impl Npcs {
     /// The one read of the log. Records arrive in append order, so inserting
     /// each into the map *is* last-writer-wins — no ordering pass, no revision
     /// comparison.
+    ///
+    /// **This is the process's one open of that directory.** The engine adopts
+    /// the same handle through [`Self::substrate`] instead of opening its own —
+    /// see that method for what the second handle destroyed.
     pub fn load(dir: &Path) -> Result<Self, NpcError> {
         let mut substrate = Substrate::new();
         let mut by_id: BTreeMap<u64, NpcPayload> = BTreeMap::new();
@@ -167,9 +242,99 @@ impl Npcs {
 
         Ok(Self {
             by_id,
-            persistence,
-            _substrate: substrate,
+            shared: SharedSubstrate::new(substrate, persistence),
+            place_written_ms: BTreeMap::new(),
         })
+    }
+
+    /// Where a character was last standing, as `area/node`.
+    ///
+    /// What the runtime puts a body back at on a restart, in place of the
+    /// world's arrival door. `None` for a character that has never been
+    /// embodied — or whose recorded room the map no longer has, which the
+    /// caller resolves, not this.
+    pub fn place_of(&self, npc_id: u64) -> Option<&str> {
+        self.by_id
+            .get(&npc_id)
+            .filter(|n| !n.is_tombstoned())
+            .and_then(|n| n.at.as_deref())
+    }
+
+    /// Record where a character is, if it has moved and enough time has passed.
+    ///
+    /// Returns whether a record was written. Called from the tick driver every
+    /// moment a body moves, so **the two gates are what make it affordable**:
+    /// nothing is written for a character standing still, and a character
+    /// walking across the building writes at most once per
+    /// [`PLACE_CHECKPOINT_MS`] rather than twice a second.
+    ///
+    /// Fsynced like any other write, and affordable **because** of the gates
+    /// above: at one record per thirty seconds per moving character, the cost of
+    /// making the checkpoint durable is nothing, and a staged one would be worth
+    /// very little. The failure this exists to prevent is a daemon restart, and
+    /// a restart that took the log's un-flushed tail with it would put the
+    /// character back at the door — the exact outcome the record is for.
+    pub fn remember_place(&mut self, npc_id: u64, at: &str, now_ms: u64) -> bool {
+        let Some(npc) = self.by_id.get(&npc_id).filter(|n| !n.is_tombstoned()) else {
+            return false;
+        };
+        if npc.at.as_deref() == Some(at) {
+            return false;
+        }
+        // A character with no place yet is checkpointed at once: it has just
+        // been embodied, and the whole point is that a restart finds it there.
+        if npc.at.is_some() {
+            let last = self.place_written_ms.get(&npc_id).copied().unwrap_or(0);
+            if now_ms.saturating_sub(last) < PLACE_CHECKPOINT_MS {
+                return false;
+            }
+        }
+
+        let mut npc = npc.clone();
+        npc.at = Some(at.to_string());
+        // **No revision bump and no `updated_ms`.** Those describe authored
+        // change — what somebody edited, and what the console shows as the last
+        // time this character was worked on. A body walking through a door is
+        // neither, and counting it would make every roster sort by "recently
+        // edited" report whoever happens to be walking.
+        let write = {
+            let mut p = self
+                .shared
+                .persistence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            p.write_npc(&npc).and_then(|()| p.commit())
+        };
+        if let Err(e) = write {
+            // Not fatal and not propagated: this is a checkpoint of soft state
+            // on a driver thread with nobody to report to. The character keeps
+            // walking; the next checkpoint tries again.
+            tracing::warn!("could not record where {npc_id} is: {e}");
+            return false;
+        }
+        self.place_written_ms.insert(npc_id, now_ms);
+        self.by_id.insert(npc_id, npc);
+        true
+    }
+
+    /// The substrate handle, for the engine to adopt.
+    ///
+    /// **The engine must take this rather than open `--data` itself.** One
+    /// `.substrate/` admits exactly one writable handle per process: the log
+    /// file is opened read-write and unlocked, so a second
+    /// `SubstratePersistence` is a second append cursor *and* a second view of
+    /// which character records exist. Compaction carries forward only what the
+    /// compacting handle's own walk saw.
+    ///
+    /// That is not a hypothetical. This daemon opened one handle here and let
+    /// the engine open another for conversation turns, and every character
+    /// created *while the daemon ran* was dropped by the engine's next
+    /// compaction — invisible to it, because it had walked the log before that
+    /// character existed. Characters that predated both opens survived, so the
+    /// loss looked intermittent instead of mechanical. Two Makers were lost
+    /// this way before the cause was found.
+    pub fn substrate(&self) -> SharedSubstrate {
+        self.shared.clone()
     }
 
     /// Every character this caller may see, newest first.
@@ -253,11 +418,15 @@ impl Npcs {
     /// ownership. Every route that reaches a character on a user's behalf still
     /// goes through [`Self::visible_to`]; this is for the engine, which serves
     /// the world rather than a caller.
-    pub fn cast(&self) -> Vec<(u64, String)> {
+    pub fn cast(&self) -> Vec<Casting> {
         self.by_id
             .values()
             .filter(|n| !n.is_tombstoned())
-            .map(|n| (n.npc_id, n.world_id.clone()))
+            .map(|n| Casting {
+                npc_id: n.npc_id,
+                world_id: n.world_id.clone(),
+                at: n.at.clone(),
+            })
             .collect()
     }
 
@@ -324,6 +493,11 @@ impl Npcs {
             persona_origin: "authored".to_string(),
             portrait_image_id: None,
             portrait_origin: None,
+            // Nowhere yet. The runtime embodies the character straight after
+            // this and the first checkpoint records where it was put — writing
+            // an arrival door here would be this registry guessing at a map it
+            // has never read.
+            at: None,
             // The authoring plane starts empty. A character nobody has written
             // beliefs for holds none — which is different from one whose
             // beliefs could not be read, and is what the console shows.
@@ -434,7 +608,12 @@ impl Npcs {
         }
         match existing {
             Some(i) => npc.beliefs[i] = belief,
-            None => npc.beliefs.push(belief),
+            None => {
+                if npc.beliefs.len() >= MAX_BELIEFS {
+                    return Err(NpcError::Invalid("beliefs"));
+                }
+                npc.beliefs.push(belief);
+            }
         }
         self.bump(npc, owner, now_ms)
     }
@@ -493,7 +672,12 @@ impl Npcs {
         rel.familiarity = unit(body, "familiarity", rel.familiarity)?;
         match existing {
             Some(i) => npc.relationships[i] = rel,
-            None => npc.relationships.push(rel),
+            None => {
+                if npc.relationships.len() >= MAX_RELATIONSHIPS {
+                    return Err(NpcError::Invalid("relationships"));
+                }
+                npc.relationships.push(rel);
+            }
         }
         self.bump(npc, owner, now_ms)
     }
@@ -547,7 +731,12 @@ impl Npcs {
         }
         match existing {
             Some(i) => npc.agency[i] = st,
-            None => npc.agency.push(st),
+            None => {
+                if npc.agency.len() >= MAX_STRATEGIES {
+                    return Err(NpcError::Invalid("agency"));
+                }
+                npc.agency.push(st);
+            }
         }
         self.bump(npc, owner, now_ms)
     }
@@ -627,20 +816,28 @@ impl Npcs {
     /// memory, vanishes on restart, and is never written again because nothing
     /// knows it is missing.
     fn commit(&mut self, npc: NpcPayload, owner: &str) -> Result<Value, NpcError> {
-        self.persistence
-            .write_npc(&npc)
-            .map_err(|e| NpcError::Persist(e.to_string()))?;
-        // Flush and fsync before returning. `write_npc` only *stages* the
-        // record, and a staged record is lost on a crash — which for a
-        // character somebody just created means the API said "created" about
-        // something that never existed.
-        //
-        // Group-committing instead would be the right call for a hot write
-        // path; this one is a person pressing save, so the fsync is both
-        // affordable and what they are entitled to assume happened.
-        self.persistence
-            .commit()
-            .map_err(|e| NpcError::Persist(e.to_string()))?;
+        {
+            // The engine holds this same lock for its own appends, which is the
+            // point: one cursor, one `npc_locs`, so a compaction on the engine's
+            // side sees this character. Held across both calls so nothing
+            // interleaves between the append and its fsync.
+            let mut p = self
+                .shared
+                .persistence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            p.write_npc(&npc)
+                .map_err(|e| NpcError::Persist(e.to_string()))?;
+            // Flush and fsync before returning. `write_npc` only *stages* the
+            // record, and a staged record is lost on a crash — which for a
+            // character somebody just created means the API said "created" about
+            // something that never existed.
+            //
+            // Group-committing instead would be the right call for a hot write
+            // path; this one is a person pressing save, so the fsync is both
+            // affordable and what they are entitled to assume happened.
+            p.commit().map_err(|e| NpcError::Persist(e.to_string()))?;
+        }
         let view = wire(&npc, owner);
         self.by_id.insert(npc.npc_id, npc);
         Ok(view)
@@ -957,6 +1154,195 @@ mod tests {
         assert_eq!(back["owner_id"], ME);
         assert_eq!(back["revision"], 1);
         assert_eq!(reopened.list(ME, &Filter::default()).len(), 1);
+    }
+
+    /// **A character created while the daemon runs survives the engine's
+    /// maintenance.**
+    ///
+    /// The regression guard for the bug that lost Makers overnight. The engine
+    /// used to open `--data/.substrate/` for itself, so it held a second
+    /// writable handle whose record index had been built before the character
+    /// existed — and its next compaction carried forward only what that index
+    /// knew, dropping every character created since. Characters present at boot
+    /// survived, so it read as an intermittent fault rather than a mechanical
+    /// one.
+    ///
+    /// Here the engine takes the registry's handle, which is the whole fix: the
+    /// compaction runs against the same view the character was written into.
+    #[test]
+    fn a_character_created_at_runtime_survives_an_engine_compaction() {
+        let dir = tmp();
+        let npc_id: u64 = {
+            let mut n = Npcs::load(&dir).unwrap();
+            // Whatever the engine does to this log, it does through this handle
+            // — the one the registry is writing through.
+            let engine = n.substrate();
+
+            let created = n.create(&ident("u1"), ME, &body("Wyneth"), 1_000).unwrap();
+
+            // The engine's routine compaction, on the handle it was handed.
+            {
+                let mut p = engine.persistence.lock().unwrap();
+                let mut s = engine.substrate.write().unwrap();
+                p.compact(&mut s, None).unwrap();
+            }
+            created["npc_id"].as_str().unwrap().parse().unwrap()
+        };
+
+        // A restart.
+        let reopened = Npcs::load(&dir).unwrap();
+        assert_eq!(
+            reopened.get(npc_id, ME).unwrap()["name"],
+            "Wyneth",
+            "a character created at runtime must outlive a compaction"
+        );
+    }
+
+    /// **Each authoring layer is bounded, and reaching the bound still leaves
+    /// the character editable.**
+    ///
+    /// These are the only collections on the record that grow, and the record is
+    /// rewritten whole on every write, carried forward by every compaction and
+    /// relocated by every maintenance pass. An uncapped layer is a character
+    /// that gets more expensive to keep every time somebody saves.
+    ///
+    /// The cap is on appending. Revising or deleting an existing entry works at
+    /// the limit — a full character that could not be edited down would be a
+    /// worse trap than the growth.
+    #[test]
+    fn an_authoring_layer_stops_growing_but_stays_editable() {
+        let dir = tmp();
+        let mut n = Npcs::load(&dir).unwrap();
+        let id: u64 = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()["npc_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        for i in 0..MAX_BELIEFS {
+            let b = json!({ "statement": format!("belief {i}") });
+            n.put_belief(id, ME, &format!("b{i}"), &b, 2_000)
+                .unwrap_or_else(|e| panic!("belief {i} refused: {e:?}"));
+        }
+        assert!(
+            matches!(
+                n.put_belief(id, ME, "one-too-many", &json!({ "statement": "no" }), 3_000),
+                Err(NpcError::Invalid("beliefs"))
+            ),
+            "the layer grew past its cap"
+        );
+
+        // At the cap, an existing belief still revises...
+        n.put_belief(id, ME, "b0", &json!({ "statement": "revised" }), 4_000)
+            .expect("an existing entry must stay editable at the cap");
+        let held = n.payload(id).expect("still there");
+        assert_eq!(
+            held.beliefs.len(),
+            MAX_BELIEFS,
+            "revising must not have appended"
+        );
+        assert_eq!(
+            held.beliefs
+                .iter()
+                .find(|b| b.belief_id == "b0")
+                .map(|b| b.statement.as_str()),
+            Some("revised")
+        );
+        // ...and deleting one makes room again.
+        assert!(n.delete_belief(id, ME, "b0", 5_000).unwrap());
+        n.put_belief(id, ME, "fresh", &json!({ "statement": "yes" }), 6_000)
+            .expect("a deletion frees a slot");
+    }
+
+    /// **Where a character is survives a restart, so the world can be rebuilt
+    /// from the cast.**
+    ///
+    /// The world is not persisted — who stands where lives in RAM and goes with
+    /// the process — so this record is what stops everybody re-entering at the
+    /// arrival door. Two Makers who had spent an hour finding each other were
+    /// returned to the front room as strangers, with their own transcripts
+    /// saying otherwise.
+    #[test]
+    fn where_a_character_is_survives_a_restart() {
+        let dir = tmp();
+        let id: u64 = {
+            let mut n = Npcs::load(&dir).unwrap();
+            let id: u64 = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()["npc_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(n.place_of(id), None, "a new character stands nowhere yet");
+
+            assert!(
+                n.remember_place(id, "vault-casting/green-room", 10_000),
+                "the first place is recorded at once, not after a delay"
+            );
+            assert_eq!(n.place_of(id), Some("vault-casting/green-room"));
+            id
+        };
+
+        let back = Npcs::load(&dir).unwrap();
+        assert_eq!(
+            back.place_of(id),
+            Some("vault-casting/green-room"),
+            "the room did not survive the restart"
+        );
+        // And it rides along with the cast, which is what the loader reads.
+        let casting = back.cast().into_iter().find(|c| c.npc_id == id).unwrap();
+        assert_eq!(casting.at.as_deref(), Some("vault-casting/green-room"));
+    }
+
+    /// **A moving body is checkpointed, not transcribed.**
+    ///
+    /// A world's metronome runs at 500 ms and a walking body covers a leg per
+    /// tick, so recording every room change would append the whole record —
+    /// persona description and all — twice a second per moving character, and
+    /// supersede the previous copy each time. The two gates are what make the
+    /// driver able to call this every moment: unchanged is free, and changed is
+    /// bounded by [`PLACE_CHECKPOINT_MS`].
+    #[test]
+    fn a_moving_body_is_checkpointed_rather_than_written_every_step() {
+        let dir = tmp();
+        let mut n = Npcs::load(&dir).unwrap();
+        let id: u64 = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()["npc_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        assert!(n.remember_place(id, "vault-command/command-room", 1_000));
+        // Standing still costs nothing, however often it is asked.
+        assert!(!n.remember_place(id, "vault-command/command-room", 99_000));
+        // Moving again inside the window is held back...
+        assert!(!n.remember_place(id, "vault-command/anteroom", 2_000));
+        assert!(!n.remember_place(id, "vault-command/dispatch-room", 3_000));
+        assert_eq!(
+            n.place_of(id),
+            Some("vault-command/command-room"),
+            "a checkpoint inside the window must not have been written"
+        );
+        // ...and the next one past it records wherever the body ended up.
+        assert!(n.remember_place(id, "vault-casting/green-room", 1_000 + PLACE_CHECKPOINT_MS));
+        assert_eq!(n.place_of(id), Some("vault-casting/green-room"));
+    }
+
+    /// A checkpoint is not an edit. `revision` and `updated_ms` describe what
+    /// somebody authored, and a body walking through a door is neither — a
+    /// roster sorted by "recently edited" would otherwise rank whoever happens
+    /// to be walking.
+    #[test]
+    fn walking_does_not_count_as_editing_the_character() {
+        let dir = tmp();
+        let mut n = Npcs::load(&dir).unwrap();
+        let made = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
+        let id: u64 = made["npc_id"].as_str().unwrap().parse().unwrap();
+
+        n.remember_place(id, "vault-casting/green-room", 50_000);
+
+        let after = n.get(id, ME).unwrap();
+        assert_eq!(after["revision"], made["revision"]);
+        assert_eq!(after["updated_ms"], made["updated_ms"]);
     }
 
     /// An edit supersedes rather than accumulating: the reopened registry sees

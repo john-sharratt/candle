@@ -28,7 +28,7 @@ use crate::persistence::record::{
 use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
-use crate::persistence::SubstratePersistence;
+use crate::persistence::{SharedSubstrate, SubstratePersistence};
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
@@ -405,9 +405,25 @@ impl Conversation {
     /// [`SubstratePersistence::open_in_with_substrate`] and pass both
     /// here.
     pub fn from_parts(substrate: Substrate, persistence: SubstratePersistence) -> Self {
-        let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
-        let inner = Arc::new(RwLock::new(substrate));
-        let persistence = Arc::new(Mutex::new(persistence));
+        Self::from_shared(SharedSubstrate::new(substrate, persistence))
+    }
+
+    /// Adopt a substrate the host process already opened.
+    ///
+    /// The path for a host that writes records of its own into the same log —
+    /// `npcd` writes its character records there — and so must hold the *only*
+    /// writable handle to the directory. See [`SharedSubstrate`] for what a
+    /// second handle silently destroys.
+    pub fn from_shared(shared: SharedSubstrate) -> Self {
+        let SharedSubstrate {
+            substrate: inner,
+            persistence,
+        } = shared;
+        let segments = persistence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .segment_count();
+        let maintenance = Arc::new(Mutex::new((segments, None, false)));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
             // **No guard.** This conversation's log lives in a directory the

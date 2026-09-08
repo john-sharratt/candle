@@ -244,6 +244,12 @@ export const LiveAPI = {
    * estate. The two panels then disagreed on screen with nothing saying which
    * was right. */
   pulseCensus: (o) => j('/v1/pulse/census' + qs(o || {})),
+  /* Where every body is standing, room by room.
+   *
+   * The one question the feed and the window between them cannot answer. Two
+   * characters talking and two characters two floors apart produce the same
+   * shape of feed; only this says which it was. */
+  pulseWorld: () => j('/v1/pulse/world'),
   /* Send an event into a character's inbox. `line` is the operator's raw input,
    * `/`-prefixed or not — the daemon parses it, because the daemon is the only
    * thing that can be authoritative about which commands exist. */

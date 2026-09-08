@@ -1,0 +1,15 @@
+id: roster
+kind: fixture
+name: the roster
+short: >
+  The roster shows the cast, who is holding whom, and who has never been
+  written. It does not show what anybody has written.
+long: >
+  The whole cast, with who is currently holding each one and which have never
+  been written at all. It shows *that* somebody holds a character and never
+  *what* they have made of them — which is deliberate, and is why the room
+  where Makers talk about characters is worth walking to. Taking an unheld
+  character from here claims them for whichever station you sit at next.
+tools:
+  - roster.read
+  - roster.take_unheld

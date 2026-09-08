@@ -342,7 +342,7 @@ mod tests {
         println!("  {}\n", summary(r));
         let (l, r) = (l, r);
 
-        let d = diff(&l, &r);
+        let d = diff(l, r);
         let (structural, dtypes): (Vec<_>, Vec<_>) = d
             .iter()
             .partition(|x| !matches!(x, Difference::TensorDtype { .. }));
@@ -362,7 +362,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             _ => Vec::new(),
         };
-        let (lt, rt) = (toks(&l), toks(&r));
+        let (lt, rt) = (toks(l), toks(r));
         println!("── token tables ──");
         println!("  lengths: {} vs {}", lt.len(), rt.len());
         if !lt.is_empty() && !rt.is_empty() {
@@ -410,8 +410,8 @@ mod tests {
             ("Llama3", "<|start_header_id|>"),
             ("Llama2", "[INST]"),
         ] {
-            let a = chat_template(&l).is_some_and(|t| t.contains(needle));
-            let b = chat_template(&r).is_some_and(|t| t.contains(needle));
+            let a = chat_template(l).is_some_and(|t| t.contains(needle));
+            let b = chat_template(r).is_some_and(|t| t.contains(needle));
             let flag = if a == b { "  " } else { "!!" };
             println!("  {flag} {label:<9} reference={a:<5} candidate={b}");
         }

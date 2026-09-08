@@ -1,0 +1,17 @@
+id: catalogue
+kind: fixture
+name: the catalogue
+short: >
+  The catalogue describes what the stacks hold, so that one thing can be found
+  inside a body of work far too large to read.
+long: >
+  Not the record itself but the way in: for every body of work, a description
+  of what is in it, how it is arranged, and where within it a particular thing
+  would be. Work nobody can find is work nobody did, and a vault that grows
+  faster than its catalogue becomes steadily less useful the more it holds.
+  Writing a description is a separate craft from writing the thing described —
+  it is done for a reader who does not yet know what they are looking for.
+tools:
+  - record.describe
+  - record.read_description
+  - record.arrange

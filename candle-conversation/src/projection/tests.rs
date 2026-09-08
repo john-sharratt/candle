@@ -296,6 +296,30 @@ layers:
           historical_top_k: 8
 "#;
 
+/// **Lifting repetition penalties inside tool calls is opt-in, and silence
+/// means no.**
+///
+/// It suits a schema whose tool arguments are quotations — paths, identifiers,
+/// numbers that are only right when they repeat. It is the reverse for a schema
+/// whose arguments are prose: a cast decoded every utterance with presence,
+/// frequency, repeat and DRY all off, and one character said the same sentence
+/// word for word for a hundred turns. A default of "on" would keep doing that
+/// to any schema that had not heard of the flag.
+#[test]
+fn tool_calls_keep_their_penalties_unless_the_schema_asks_otherwise() {
+    let quiet = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    assert!(
+        !quiet.schema().free_tool_calls_from_penalties,
+        "a schema that says nothing must keep the penalties it configured"
+    );
+
+    let asked = Builder::from_yaml(&format!(
+        "free_tool_calls_from_penalties: true\n{SIMPLE_YAML}"
+    ))
+    .unwrap();
+    assert!(asked.schema().free_tool_calls_from_penalties);
+}
+
 #[test]
 fn yaml_parses_and_assigns_ids() {
     let b = Builder::from_yaml(SIMPLE_YAML).unwrap();

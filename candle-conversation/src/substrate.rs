@@ -3316,6 +3316,22 @@ impl Substrate {
         out
     }
 
+    /// Emit `(timeline_id, from_turn)` for every coupled turn round-trip.
+    /// Used by compaction to re-emit live `TurnCoupling` records.
+    ///
+    /// Sorted, because compaction's output must be a function of its input: an
+    /// unordered walk of a per-timeline set produces a different file from the
+    /// same store on every pass, which makes two generations impossible to diff.
+    pub fn live_couplings(&self) -> Vec<(u64, u32)> {
+        let mut out: Vec<(u64, u32)> = self
+            .timelines
+            .iter()
+            .flat_map(|(tid, tl)| tl.couplings.iter().map(move |&from| (tid.raw(), from)))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Emit `(timeline_id, debug_id)` for every timeline that has one
     /// set.  Used by compaction to re-emit live `DebugId` records.
     pub fn live_debug_ids(&self) -> Vec<(u64, String)> {

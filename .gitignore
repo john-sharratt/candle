@@ -97,3 +97,8 @@ zend/examples/provenance_queries.json
 # absent, so a clone without one builds and behaves exactly as the presets say.
 # See `candle-conversation/src/models/overrides.rs`.
 /models.override.yaml
+
+# Daemon output, redirected by hand when running npcd from the workspace root.
+# Six of these had accumulated untracked and a `git add -A` would have taken
+# them all — a live daemon's stderr is a debugging artifact, not a source file.
+/npcd*.log

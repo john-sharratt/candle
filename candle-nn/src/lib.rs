@@ -1,3 +1,10 @@
+// `chunks_exact_to_as_chunks` — a style lint that became default in a recent
+// clippy and fires on correct, unchanged code that walks the chunked KV arenas
+// in fixed strides. See the note in `candle-core/src/lib.rs`: the rewrite is
+// churn through a fork's hot paths for no behavioural gain, and the volume was
+// drowning the `-D warnings` gate.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 //! candle-nn
 //!
 //! ## Other Crates

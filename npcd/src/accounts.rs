@@ -83,6 +83,11 @@ impl Accounts {
         self.reg.len()
     }
 
+    /// Whether nobody has ever signed in. A fresh daemon, not a broken one.
+    pub fn is_empty(&self) -> bool {
+        self.reg.is_empty()
+    }
+
     /// The record for a verified identity, created on first sight.
     ///
     /// Fields divide into two kinds and they are treated differently on every

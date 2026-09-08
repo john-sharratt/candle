@@ -159,6 +159,13 @@ impl Library {
         self.sections.len()
     }
 
+    /// Whether this collection has nothing in it. A folder-backed collection
+    /// that found no files is empty rather than absent, and the difference
+    /// matters to whatever is deciding whether to surface it.
+    pub fn is_empty(&self) -> bool {
+        self.sections.is_empty()
+    }
+
     /// How many of these carry provenance examples.
     ///
     /// Worth surfacing: a section with none is selected worse than its

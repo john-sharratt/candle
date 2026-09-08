@@ -46,6 +46,11 @@
   background: var(--panel, #22303f);
   border: 1px solid var(--line-2, #2a3848);
   border-radius: 12px; box-shadow: 0 14px 38px rgba(0, 0, 0, .34);
+  /* Anchored under a header bar, so what is left is the viewport less that bar
+   * and a margin. An estate list grows with the deployment and would otherwise
+   * run off the bottom with its last rows unreachable. */
+  max-height: calc(100vh - 76px); max-height: calc(100dvh - 76px);
+  overflow-y: auto; overscroll-behavior: contain;
 }
 .estate-row {
   display: flex; align-items: center; gap: 9px;

@@ -1,3 +1,11 @@
+// `chunks_exact_to_as_chunks` — a style lint that became default in a recent
+// clippy and fires on correct, unchanged code that reads packed bytes in fixed
+// strides (the k-quant block codecs, the Fletcher checksum, `quantized::prepare`).
+// Rewriting them would change `&[T]` to `&[T; N]` through the quantization core
+// of a fork that has to stay mergeable with upstream candle, for no behavioural
+// gain — and the volume was drowning the `-D warnings` gate.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 //! ML framework for Rust
 //!
 //! ```rust

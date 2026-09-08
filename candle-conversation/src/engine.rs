@@ -6,7 +6,7 @@ use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
-use crate::persistence::SubstratePersistence;
+use crate::persistence::SharedSubstrate;
 use crate::projection::{
     Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId,
 };
@@ -16,7 +16,7 @@ use crate::stencil::{
     compile, compile_think_tree, compile_tool_call_tree, HfVocab, StencilTree, ThinkMode,
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
-use crate::substrate::{ConvCompression, Substrate};
+use crate::substrate::ConvCompression;
 use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
@@ -35,6 +35,8 @@ use std::thread::JoinHandle;
 pub struct ThinkSteering {
     /// `<think>` id — the trigger the dial's tree is bound to.
     think_open: TokenId,
+    /// Empties the block the moment it opens — see [`crate::stencil::think`].
+    off: Arc<StencilTree>,
     quick: Arc<StencilTree>,
     balanced: Arc<StencilTree>,
     deep: Arc<StencilTree>,
@@ -43,12 +45,23 @@ pub struct ThinkSteering {
 
 impl ThinkSteering {
     /// Derive a per-turn registry from `base` (e.g. the tool-call catalog) for
-    /// `mode`: bind the `<think>` trigger to that dial's steering tree, or clear
-    /// it for [`ThinkMode::Off`] (the `/no_think` glue yields the empty block, so
-    /// no tree steers it).  The base is untouched; the result is a fresh registry.
+    /// `mode`: bind the `<think>` trigger to that dial's steering tree.
+    /// The base is untouched; the result is a fresh registry.
+    ///
+    /// **[`ThinkMode::Off`] binds a tree too**, and this is the correction that
+    /// matters. It used to *clear* the trigger on the reasoning that the
+    /// `/no_think` glue would yield an empty block — true for Qwen3, false for
+    /// Qwen3.5 and Qwen3.8, which have no such marker at all. On those families
+    /// clearing the trigger left the model free to reason with nothing steering
+    /// it: the block ran to the token ceiling and the whole decode was discarded,
+    /// while the dial reported itself off.
+    ///
+    /// Binding `off` instead makes suppression a property of the grammar rather
+    /// than of the family's chat template, so it holds for every checkpoint and
+    /// a caller does not have to know which mechanism its model happens to use.
     pub fn registry_for(&self, base: &TriggerRegistry, mode: ThinkMode) -> Arc<TriggerRegistry> {
         let tree = match mode {
-            ThinkMode::Off => return Arc::new(base.without_trigger(self.think_open)),
+            ThinkMode::Off => &self.off,
             ThinkMode::Quick => &self.quick,
             ThinkMode::Balanced => &self.balanced,
             ThinkMode::Deep => &self.deep,
@@ -279,31 +292,52 @@ impl ConversationEngine {
         // Open persistence and drive every record straight into the
         // substrate's in-RAM state in one walker pass — no manifest
         // mirror, no `reconstruct → collected_*` second pass.
-        let mut substrate = Substrate::new();
-        let workspace_dir: std::path::PathBuf = match config.workspace_path.as_ref() {
-            Some(p) => AsRef::<std::path::Path>::as_ref(p).to_path_buf(),
-            None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        };
+        //
+        // A host that writes its own record classes into this same log opens it
+        // first and hands the open pair over ([`SharedSubstrate`]) — one
+        // `.substrate/` admits exactly one writable handle per process. Everyone
+        // else names a directory and the engine opens it here. Resolved once,
+        // into the same pair either way, so nothing downstream knows which.
         let open_start = std::time::Instant::now();
-        let mut persistence = SubstratePersistence::open_in_with_substrate(
-            &workspace_dir,
-            &mut substrate,
-        )
-        .map_err(|e| {
-            ConversationError::from(candle::Error::Msg(format!("substrate persistence: {e}")))
-        })?;
-        tracing::info!(
-            open_ms = open_start.elapsed().as_millis() as u64,
-            log_bytes = persistence.write_offset(),
-            records = persistence.recovered_record_count(),
-            indexed = persistence.last_index().is_some(),
-            streams = substrate.all_streams().count(),
-            "substrate persistence opened"
-        );
+        let adopted = config.substrate.is_some();
+        let shared = match config.substrate.clone() {
+            Some(shared) => shared,
+            None => {
+                let workspace_dir: std::path::PathBuf = match config.workspace_path.as_ref() {
+                    Some(p) => AsRef::<std::path::Path>::as_ref(p).to_path_buf(),
+                    None => {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    }
+                };
+                SharedSubstrate::open_in(&workspace_dir).map_err(|e| {
+                    ConversationError::from(candle::Error::Msg(format!(
+                        "substrate persistence: {e}"
+                    )))
+                })?
+            }
+        };
+        {
+            let persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
+            tracing::info!(
+                open_ms = open_start.elapsed().as_millis() as u64,
+                adopted,
+                log_bytes = persistence.write_offset(),
+                records = persistence.recovered_record_count(),
+                indexed = persistence.last_index().is_some(),
+                streams = shared
+                    .substrate
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .all_streams()
+                    .count(),
+                "substrate persistence opened"
+            );
+        }
         // Persist the model identity into the substrate's `ModelSpec` record —
         // compare-and-insert, so it only appends when the model differs from
         // what the log already records. Makes the log a self-contained image.
         let singletons_start = std::time::Instant::now();
+        let mut persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(spec) = &config.model_spec {
             let wrote = persistence.set_model_spec(spec).map_err(|e| {
                 ConversationError::from(candle::Error::Msg(format!("persist model spec: {e}")))
@@ -333,11 +367,12 @@ impl ConversationEngine {
                 })?;
             }
         }
+        drop(persistence);
         tracing::info!(
             singletons_ms = singletons_start.elapsed().as_millis() as u64,
             "model spec + tokenizer records reconciled"
         );
-        let conversation = Conversation::from_parts(substrate, persistence);
+        let conversation = Conversation::from_shared(shared);
 
         // Register per-layer corrupt-turn policies (from the projection schema)
         // BEFORE the reload thread is spawned, so the startup reconstruct applies
@@ -940,6 +975,25 @@ impl ConversationEngine {
     /// to several pieces), an **empty** registry is returned — constrained
     /// decoding is simply inactive and the model free-decodes tool calls as
     /// before.  This never fails startup over a tokenizer mismatch.
+    /// Compile a stencil spec against **this engine's** vocabulary.
+    ///
+    /// The vocabulary is the tokenizer, the EOS id and the vocab size together,
+    /// and all three belong to the loaded checkpoint — so a caller that built
+    /// its own would be compiling a grammar against a model it is not running.
+    /// Exposed for callers with a tree of their own: `npcd` compiles an action
+    /// loop rather than the single-call assistant shape
+    /// [`Self::compile_tool_stencil`] builds.
+    pub fn compile_stencil(&self, spec: &crate::stencil::TreeSpec) -> crate::Result<StencilTree> {
+        let eos = self.config.eos_tokens.iter().next().copied().unwrap_or(0);
+        let vocab = HfVocab::new(
+            (*self.tokenizer).clone(),
+            eos,
+            self.config.vocab_size as u64,
+        );
+        compile(spec, &vocab)
+            .map_err(|e| ConversationError::from(candle::Error::Msg(format!("stencil: {e}"))))
+    }
+
     pub fn compile_tool_stencil(&self, tools: &[ToolSpec]) -> crate::Result<Arc<TriggerRegistry>> {
         let Some(trigger) = self.tokenizer.token_to_id("<tool_call>") else {
             tracing::warn!(
@@ -960,6 +1014,7 @@ impl ConversationEngine {
             open: "\n{\"name\": \"".to_string(),
             args_open: ", \"arguments\": {".to_string(),
             close: "}}\n</tool_call><|im_end|>".to_string(),
+            marker: "<tool_call>".to_string(),
         };
         let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
@@ -978,11 +1033,21 @@ impl ConversationEngine {
         Ok(Arc::new(registry))
     }
 
-    /// Compile the thinking-block steering trees (one per non-`Off` effort dial)
-    /// once, for reuse across turns via [`ThinkSteering::registry_for`].  Like the
-    /// tool stencil, this is inactive — `Ok(None)` — when the tokenizer lacks a
+    /// Compile the thinking-block steering trees (one per effort dial) once, for
+    /// reuse across turns via [`ThinkSteering::registry_for`].  Like the tool
+    /// stencil, this is inactive — `Ok(None)` — when the tokenizer lacks a
     /// single `<think>`/`</think>` token, so the model free-decodes its reasoning.
-    pub fn compile_think_steering(&self) -> crate::Result<Option<Arc<ThinkSteering>>> {
+    ///
+    /// `after_close` is emitted by the grammar immediately after the block's
+    /// closing tag — see [`ThinkSteerEnvelope::after_close`]. `""` hands control
+    /// back to the decoder, which is what an assistant wants. An action loop
+    /// passes the tool-call marker, so a character that has finished thinking is
+    /// put straight into a call rather than left free to write prose at the one
+    /// join the grammar does not otherwise cover.
+    pub fn compile_think_steering(
+        &self,
+        after_close: &'static str,
+    ) -> crate::Result<Option<Arc<ThinkSteering>>> {
         let (Some(think_open), Some(think_close)) = (
             self.tokenizer.token_to_id("<think>"),
             self.tokenizer.token_to_id("</think>"),
@@ -998,6 +1063,7 @@ impl ConversationEngine {
             think_open,
             think_close,
             eos,
+            after_close,
         };
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),
@@ -1005,8 +1071,7 @@ impl ConversationEngine {
             self.config.vocab_size as u64,
         );
         let compile_mode = |mode: ThinkMode| -> crate::Result<Arc<StencilTree>> {
-            let spec = compile_think_tree(mode, &env)
-                .expect("a non-Off mode always yields a steering spec");
+            let spec = compile_think_tree(mode, &env).expect("every dial yields a steering spec");
             let tree = compile(&spec, &vocab).map_err(|e| {
                 ConversationError::from(candle::Error::Msg(format!("think stencil: {e}")))
             })?;
@@ -1014,6 +1079,7 @@ impl ConversationEngine {
         };
         Ok(Some(Arc::new(ThinkSteering {
             think_open,
+            off: compile_mode(ThinkMode::Off)?,
             quick: compile_mode(ThinkMode::Quick)?,
             balanced: compile_mode(ThinkMode::Balanced)?,
             deep: compile_mode(ThinkMode::Deep)?,
@@ -1418,6 +1484,8 @@ impl ConversationEngine {
                 disable_reprojection: false,
                 // Raw eval/summarisation path: no tools, no constrained decode.
                 triggers: Arc::new(TriggerRegistry::new()),
+                turn_grammar: None,
+                free_tool_calls_from_penalties: false,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
 

@@ -1,0 +1,19 @@
+id: story-desk
+kind: station
+name: story desk
+binds: one gap in the record
+short: >
+  The chronicle either side of a gap can be read from it, a story drafted and
+  the draft filed.
+long: >
+  A desk for writing into the silences. Sitting at one claims a gap — a span
+  between two recorded events that nobody has written into — and holds it
+  until you get up. The chronicle either side of the gap is yours to read, and
+  should be read first: what belongs in a silence is decided by what stands at
+  each end of it. What you write here is prose rather than record, and it is
+  held to the standard of prose. A filed draft can be read aloud to somebody
+  before it is filed; that is a different place and a deliberate walk.
+tools:
+  - story.read_around_gap
+  - story.draft
+  - story.file

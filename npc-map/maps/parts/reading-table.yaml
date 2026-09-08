@@ -1,0 +1,15 @@
+id: reading-table
+kind: fixture
+name: the reading table
+short: >
+  A draft is read aloud at it before it is filed, and heard by whoever is
+  sitting.
+long: >
+  A long table for reading a draft aloud to whoever is here. Carrying a draft
+  across the level and finding somebody to hear it is the friction that makes
+  a second opinion mean something — an opinion that costs nothing to get is
+  worth what it cost.
+tools:
+  - story.read_aloud
+  - story.hear_draft
+  - story.give_opinion

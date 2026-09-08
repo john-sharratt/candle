@@ -1027,8 +1027,19 @@ impl Scheduler {
                 .get(&seq_id)
                 .and_then(|s| s.stencil.as_ref())
                 .map(|d| d.tree().label());
-            let in_stencil = label.is_some();
-            let in_tool_call = label == Some(super::TOOL_CALL_TREE_LABEL);
+            // **Only when the schema asked for it.** Lifting the penalties suits
+            // a caller whose tool arguments are quotations — paths, identifiers,
+            // numbers that are only correct if they repeat. It is the opposite
+            // of what a caller wants when the argument *is* the prose: a cast
+            // whose every utterance is a `say` decoded its dialogue with
+            // presence, frequency, repeat and DRY all off, and repeated itself
+            // word for word. Off unless named.
+            let freed = self
+                .active_decodes
+                .get(&seq_id)
+                .is_some_and(|s| s.free_tool_calls_from_penalties);
+            let in_stencil = freed && label.is_some();
+            let in_tool_call = freed && label == Some(super::TOOL_CALL_TREE_LABEL);
             if let Some(ss) = self.sampling_states.get_mut(&seq_id) {
                 if in_stencil && !ss.dry_suppressed {
                     ss.enter_tool_call();

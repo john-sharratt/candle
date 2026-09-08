@@ -2923,20 +2923,20 @@ impl CudaStorage {
         // Keep the allocated GPU buffers alive until after the kernel call
         let values_dev_f64: Option<CudaSlice<f64>>;
         let values_dev_f32: Option<CudaSlice<f32>>;
-        let values_ptr: *const std::ffi::c_void;
+        
 
-        if self.dtype() == DType::F64 {
+        let values_ptr: *const std::ffi::c_void = if self.dtype() == DType::F64 {
             let values_f64_vec: Vec<f64> = values.iter().map(|&v| v as f64).collect();
             values_dev_f64 = Some(device.memcpy_stod(&values_f64_vec)?);
             values_dev_f32 = None;
             let (ptr, _g) = values_dev_f64.as_ref().unwrap().device_ptr(&stream);
-            values_ptr = ptr as *const std::ffi::c_void;
+            ptr as *const std::ffi::c_void
         } else {
             values_dev_f64 = None;
             values_dev_f32 = Some(device.memcpy_stod(values)?);
             let (ptr, _g) = values_dev_f32.as_ref().unwrap().device_ptr(&stream);
-            values_ptr = ptr as *const std::ffi::c_void;
-        }
+            ptr as *const std::ffi::c_void
+        };
 
         // Keep both buffers alive through the unsafe block
         let _keep_alive_f64 = &values_dev_f64;

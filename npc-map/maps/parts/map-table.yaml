@@ -1,0 +1,20 @@
+id: map-table
+kind: station
+name: map table
+binds: the whole geography
+short: >
+  Borders move from it, places are added or drowned, coasts redrawn.
+long: >
+  The world's geography, held whole. There is one of these and it takes one
+  Maker, because moving a river is not a local edit: every place along it
+  changes, and a change made while somebody else is editing those places
+  cannot be reconciled afterwards. Sitting here claims the entire map until
+  you get up, and everybody wanting a place desk waits on you. That cost is
+  the point — it is what stops the geography being edited by six people who
+  each thought they were making a small change.
+tools:
+  - map.read
+  - map.move_border
+  - map.add_place
+  - map.drown_place
+  - map.redraw_coast

@@ -148,7 +148,14 @@
 .palette {
   position: absolute; left: 18px; right: 18px; bottom: calc(100% + 7px);
   background: var(--panel-2); border: 1px solid var(--line-3); border-radius: var(--radius);
-  box-shadow: var(--shadow-lg); max-height: 340px; overflow-y: auto; z-index: 20;
+  box-shadow: var(--shadow-lg); z-index: 20;
+  /* It opens *upward* from the composer, so a flat 340px still ran off the top
+   * of a short window — the group headings went first, which are the half that
+   * says what the list is. Whichever is smaller: the cap, or what is actually
+   * above it. */
+  max-height: min(340px, calc(100vh - 170px));
+  max-height: min(340px, calc(100dvh - 170px));
+  overflow-y: auto; overscroll-behavior: contain;
 }
 .palette .group {
   padding: 8px 13px 4px; font-size: .635rem; font-weight: 800; letter-spacing: .75px;
@@ -794,7 +801,10 @@ canvas { width: 100%; display: block; }
    and adding a character never reshuffles the others. Saturation and lightness
    are pinned here rather than per-element, so the palette stays coherent across
    however many characters exist. */
-.pulse { padding: 26px var(--gutter) 60px; max-width: 1080px; margin: 0 auto; }
+/* Wider than a reading column, because the stream tiles: at 1080px a square
+   tile grid gets three columns and wastes the fourth. The lede keeps its own
+   `max-width`, so prose is still set at a readable measure. */
+.pulse { padding: 26px var(--gutter) 60px; max-width: 1360px; margin: 0 auto; }
 
 .pulse-hd { margin-bottom: 26px; }
 .pulse-hd-main { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
@@ -823,16 +833,56 @@ canvas { width: 100%; display: block; }
   100% { box-shadow: 0 0 0 0 rgba(108,179,154,0); }
 }
 
-.pulse-toggle {
-  display: inline-flex; align-items: center; gap: 8px; margin-top: 16px;
-  font-size: .82rem; color: var(--ink-soft); cursor: pointer; user-select: none;
-}
-.pulse-toggle input { accent-color: var(--accent); cursor: pointer; }
-
 /* ── the cast strip ─────────────────────────────────────────────────────── */
 .pulse-cast {
   display: grid; gap: 10px; margin-bottom: 22px;
   grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
+}
+
+/* ── where everybody is ──────────────────────────────────────────────────────
+   The building, by floor, showing only rooms with somebody in them. Two
+   characters in one room is the thing this panel exists to make obvious at a
+   glance, so a shared room is the one state that gets its own treatment. */
+.pulse-world {
+  margin-bottom: 22px; padding: 14px 16px;
+  border: 1px solid var(--line-2); border-radius: var(--radius-lg);
+  background: var(--panel);
+}
+.pulse-world-hd {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.pulse-world-title { font-weight: 700; font-size: .9rem; }
+.pulse-level { margin-top: 9px; }
+.pulse-level-name {
+  font-size: .655rem; font-weight: 800; letter-spacing: .7px;
+  text-transform: uppercase; color: var(--ink-ghost); margin-bottom: 4px;
+}
+.pulse-room {
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 5px 8px; border-radius: var(--radius-sm);
+}
+.pulse-room:nth-child(even) { background: var(--bg-deep); }
+.pulse-room-name {
+  font-size: .8rem; color: var(--ink-dim); min-width: 190px; flex: 0 0 auto;
+}
+.pulse-room-who { display: flex; gap: 8px; flex-wrap: wrap; }
+.pulse-who {
+  font-size: .8rem; font-weight: 650;
+  color: hsl(var(--hue, 210) 52% 62%);
+}
+/* Company. The whole reason a building has rooms rather than coordinates, so
+   it is the one thing here worth a background. */
+.pulse-who.is-together {
+  padding: 1px 8px; border-radius: 999px;
+  background: hsl(var(--hue, 210) 52% 58% / .15);
+}
+.pulse-going { opacity: .6; }
+.pulse-holding { color: var(--ink-faint); font-weight: 500; }
+
+@media (max-width: 640px) {
+  .pulse-room { flex-direction: column; gap: 2px; }
+  .pulse-room-name { min-width: 0; }
 }
 .cast-card {
   position: relative; display: grid; gap: 5px; text-align: left; cursor: pointer;
@@ -879,33 +929,32 @@ canvas { width: 100%; display: block; }
 }
 .cast-phase { color: var(--ink-faint); font-style: italic; }
 
-/* ── the composer ───────────────────────────────────────────────────────── */
-.pulse-composer { display: flex; gap: 9px; margin-bottom: 22px; }
-.pulse-composer .input { flex: 1; font-size: .86rem; }
-.pulse-composer .btn.ghost { min-width: 40px; }
-
-.pulse-help {
-  border: 1px solid var(--line-2); border-radius: var(--radius-lg);
-  background: var(--panel); padding: 16px 18px; display: grid; gap: 11px;
-  margin-bottom: 22px;
-}
-.help-row { display: grid; grid-template-columns: 104px 1fr; gap: 14px; align-items: baseline; }
-.help-cmd { font-family: var(--mono); font-size: .76rem; color: var(--accent); font-weight: 700; }
-.help-desc { font-size: .84rem; color: var(--ink-soft); line-height: 1.6; }
-.help-eg {
-  font-family: var(--mono); font-size: .72rem; color: var(--ink-ghost);
-  display: block; margin-top: 3px;
-}
-
 /* ── the interlaced stream ──────────────────────────────────────────────────
-   One column, every character woven together in the order things happened. The
-   ordering is the point: a cast is not a set of independent transcripts, it is
-   several minds running at once. */
-.pulse-stream { display: grid; gap: 10px; }
+   Every character woven together in the order things happened. The ordering is
+   the point: a cast is not a set of independent transcripts, it is several
+   minds running at once.
+
+   Tiles, not rows. A tick is a bounded thing — one character, one wake, what it
+   perceived and what came of it — and a full-width row spends most of its width
+   on nothing while a single verbose perception pushes the next tick off the
+   fold. Squares of a fixed size put a dozen ticks on one screen and make the
+   *shape* of the cast legible: a wall of grey quiet with two coloured preempts
+   in it reads at a glance, which is the question this page exists to answer.
+   Reading order stays left-to-right, top-to-bottom, newest first. */
+.pulse-stream {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
+}
 .tick {
-  position: relative; padding: 13px 16px 13px 19px;
+  position: relative; padding: 13px 15px 13px 18px;
   border: 1px solid var(--line); border-radius: var(--radius-lg);
   background: var(--panel); overflow: hidden;
+  /* Square, so the grid tiles evenly however many columns fit. The content is
+     bounded by the tile rather than the other way round — the acts hold the
+     floor and the perceived prose scrolls above them, because what a character
+     *did* is the answer and what it read is the working. */
+  aspect-ratio: 1 / 1;
+  display: flex; flex-direction: column; min-width: 0;
 }
 .tick-spine {
   position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
@@ -920,11 +969,15 @@ canvas { width: 100%; display: block; }
 .tick.is-new { animation: tick-in .26s ease both; }
 @keyframes tick-in { from { opacity: 0; transform: translateY(-4px); } }
 
-.tick-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.tick-head {
+  display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px;
+  flex: 0 0 auto; min-width: 0;
+}
 .tick-spacer { flex: 1; }
 .tick-who {
-  font-weight: 650; font-size: .88rem; color: hsl(var(--hue) 45% 62%);
+  font-weight: 650; font-size: .84rem; color: hsl(var(--hue) 45% 62%);
   background: none; border: 0; padding: 0; cursor: pointer; font-family: inherit;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
 }
 .tick-who:hover { text-decoration: underline; }
 .tick-cause {
@@ -940,30 +993,54 @@ canvas { width: 100%; display: block; }
 }
 
 /* What the character perceived, verbatim. This is the model's input, not a
-   rendering of it, so it is set apart from the acts rather than mixed in. */
-.tick-perceived { display: grid; gap: 5px; }
+   rendering of it, so it is set apart from the acts rather than mixed in. It is
+   also the one unbounded thing in the tile — a character can perceive a
+   paragraph — so it takes the slack and is clamped, rather than growing the
+   tile and breaking the grid.
+
+   **Clamped, never scrolled.** This was a scroll pane first, and it broke the
+   page: in a grid four tiles wide the pointer is almost always over one, a tile
+   whose prose does not overflow has no scroll range to give, and the wheel event
+   died there instead of reaching the stage. The history could not be scrolled at
+   all. A small pane inside a card inside a long grid must never capture the
+   wheel — so the overflow is clamped, and the full text stays in the DOM and in
+   the element's `title` so nothing is actually lost. */
+.tick-perceived {
+  display: grid; gap: 5px; align-content: start;
+  flex: 1 1 auto; min-height: 0; overflow: hidden;
+}
 .perceive {
-  margin: 0; font-size: .87rem; line-height: 1.62; color: var(--ink-dim);
-  padding-left: 12px; border-left: 2px solid var(--line-2);
+  margin: 0; font-size: .82rem; line-height: 1.58; color: var(--ink-dim);
+  padding-left: 10px; border-left: 2px solid var(--line-2);
   white-space: pre-wrap; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 6; line-clamp: 6;
+  -webkit-box-orient: vertical; overflow: hidden;
 }
 
 /* An act, given the same treatment the landing page's demo gives one — because
-   it is the same thing: a tool in mono, the intent in the body face, italic. */
-.tick-acts { display: grid; gap: 5px; margin-top: 10px; }
-.act { display: grid; grid-template-columns: 132px 1fr; gap: 10px; align-items: baseline; }
-.act-tool {
-  font-family: var(--mono); font-size: .74rem; font-weight: 700;
-  color: var(--accent); overflow: hidden; text-overflow: ellipsis;
+   it is the same thing: a tool in mono, the intent in the body face, italic. In
+   a tile there is no width for a label column, so the tool leads the line and
+   the intent runs on after it. */
+.tick-acts {
+  display: grid; gap: 6px; margin-top: 10px; padding-top: 9px;
+  border-top: 1px solid var(--line-2); flex: 0 0 auto;
 }
-.act-intent { font-size: .87rem; font-style: italic; color: var(--ink-mid); line-height: 1.55; }
+.act { min-width: 0; }
+.act-tool {
+  font-family: var(--mono); font-size: .72rem; font-weight: 700;
+  color: var(--accent); margin-right: 7px;
+}
+.act-intent { font-size: .82rem; font-style: italic; color: var(--ink-mid); line-height: 1.5; }
 .tick-silent {
-  margin-top: 10px; font-size: .8rem; color: var(--ink-ghost); font-style: italic;
+  margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line-2);
+  font-size: .78rem; color: var(--ink-ghost); font-style: italic; flex: 0 0 auto;
 }
 
+/* Mounted into the cast strip and the stream, both of which are column grids —
+   so it spans them rather than being dealt a single 268px column. */
 .pulse-empty {
   border: 1px dashed var(--line-2); border-radius: var(--radius-lg);
-  padding: 30px 24px; text-align: center;
+  padding: 30px 24px; text-align: center; grid-column: 1 / -1;
 }
 .pulse-empty p { margin: 0; color: var(--ink-faint); font-size: .88rem; max-width: 46ch;
   margin-inline: auto; line-height: 1.65; }

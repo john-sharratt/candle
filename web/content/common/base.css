@@ -380,10 +380,20 @@ label.field > span {
 .step.on { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
 .step.done { color: var(--ok); }
 
+/* A menu is as long as its list, and a list of characters has no bound — so it
+ * is capped to what is left of the viewport below it and scrolls past that.
+ * Without this the last entries sit under the fold with no way to reach them,
+ * and the control looks like it simply has fewer options than it has.
+ *
+ * `dvh` after `vh` is the pair used for `#shell`: on a phone the browser's own
+ * chrome comes and goes, and `vh` measures the tallest case, which would put
+ * the end of the menu behind the toolbar. */
 .menu {
   position: absolute; top: 44px; right: 12px; z-index: 40; min-width: 156px; padding: 5px;
   background: var(--panel-2); border: 1px solid var(--line-2);
   border-radius: var(--radius); box-shadow: var(--shadow-lg);
+  max-height: calc(100vh - 60px); max-height: calc(100dvh - 60px);
+  overflow-y: auto; overscroll-behavior: contain;
 }
 .menu button {
   display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px;
@@ -492,6 +502,8 @@ label.field > span {
   position: absolute; top: 46px; left: 12px; z-index: 45; min-width: 190px; padding: 5px;
   background: var(--panel-2); border: 1px solid var(--line-2);
   border-radius: var(--radius); box-shadow: var(--shadow-lg);
+  max-height: calc(100vh - 62px); max-height: calc(100dvh - 62px);
+  overflow-y: auto; overscroll-behavior: contain;
 }
 .nav-menu-item {
   display: block; padding: 9px 12px; border-radius: var(--radius-sm);

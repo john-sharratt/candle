@@ -145,7 +145,7 @@ pub(crate) fn window_sealed_tokens(
     layers
 }
 
-use crate::stencil::{ThinkMode, TriggerRegistry};
+use crate::stencil::{StencilDriver, StencilTree, ThinkMode, TriggerRegistry};
 use crossbeam::channel::Sender;
 use std::sync::Arc;
 
@@ -1781,7 +1781,38 @@ impl Sequence {
             user_message, self.config.dialect.user_end, assistant_start_marker,
         );
         let formatted = format!("{assistant_head}{assistant_prefill}");
-        let prefill_tokens = self.tokenize(&formatted)?;
+        let mut prefill_tokens = self.tokenize(&formatted)?;
+
+        // A turn that begins inside a grammar carries that grammar's opening
+        // scaffold in its prefill: everything from the tree's root up to the
+        // first choice it actually leaves open. Those tokens are structural —
+        // `{"name": "` and the like — so writing them costs one prefill pass
+        // where decoding them costs a step each, and they cannot come out any
+        // other way because they are not sampled at all.
+        //
+        // Appended as **token ids**, not text: they come from the compiled tree,
+        // so re-tokenizing a rendering of them could merge across the join and
+        // put the driver and the K/V on different nodes. The scheduler replays
+        // the same walk to arrive at the same place.
+        //
+        // The same tokens are also recorded as the turn's *written* assistant
+        // text, so the reply the caller gets back is the whole assistant half
+        // rather than only the sampled tail. A caller that seeds `{"name": "` to
+        // commit the shape and is then handed a fragment starting mid-JSON
+        // cannot parse the shape it just enforced.
+        let mut assistant_written = assistant_prefill.to_string();
+        if let Some(tree) = options.turn_grammar.clone() {
+            let (scaffold, _) = StencilDriver::new(tree).opening();
+            // Specials kept: `<tool_call>` and friends are part of the syntax
+            // the caller is going to parse, not decoration around it.
+            assistant_written.push_str(
+                &self
+                    .tokenizer
+                    .decode(&scaffold, false)
+                    .unwrap_or_default(),
+            );
+            prefill_tokens.extend_from_slice(&scaffold);
+        }
 
         // No post-decode tail in the turn layout.  The model's
         // `<|im_end|>` EOS doesn't get forwarded (sampling stops on
@@ -1859,14 +1890,21 @@ impl Sequence {
             // Decode path: reprojection fires from the decode loop, not staged
             // prefill offsets.
             Vec::new(),
-            // Decode path: the assistant half is produced by the model, so the
-            // seal stores its decoded text — nothing to pre-supply here.
-            String::new(),
+            // Decode path: whatever was *written* into the assistant half — a
+            // seeded prefix, a turn grammar's opening scaffold. The decoded text
+            // is appended to it, so both the reply and the seal carry the whole
+            // turn. Empty for an ordinary turn, which then reads as before.
+            assistant_written,
             post_decode_tokens,
             max_tokens,
             sampling,
             reprojection,
             options.triggers,
+            options.turn_grammar,
+            // Read off the schema, not the turn: whether tool arguments are
+            // quotations or prose is a property of what this conversation *is*,
+            // and a per-turn switch would be a way to get it wrong on one turn.
+            self.projection.schema().free_tool_calls_from_penalties,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -1987,8 +2025,12 @@ impl Sequence {
             self.config.sampling.clone(),
             // No reprojection policy: there is no decode loop to trigger it.
             None,
-            // No tool stencils on a calibration prefill.
+            // No tool stencils on a calibration prefill, and no grammar to
+            // begin inside — the trajectory is supplied, not decoded.
             Arc::new(TriggerRegistry::new()),
+            None,
+            // Nothing is sampled, so no penalty applies to exempt from.
+            false,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2152,6 +2194,10 @@ impl Sequence {
                 reprojection: None,
                 disable_reprojection: self.config.disable_reprojection,
                 triggers: Arc::new(TriggerRegistry::new()),
+                // Every case's assistant half is supplied in the grid, so there
+                // is nothing to constrain and nothing to exempt.
+                turn_grammar: None,
+                free_tool_calls_from_penalties: false,
                 seal_group: Some(Arc::new(turns)),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -2199,6 +2245,8 @@ impl Sequence {
         sampling: SamplingConfig,
         reprojection: Option<ReprojectionPolicy>,
         triggers: Arc<TriggerRegistry>,
+        turn_grammar: Option<Arc<StencilTree>>,
+        free_tool_calls_from_penalties: bool,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2294,6 +2342,8 @@ impl Sequence {
                 reprojection,
                 disable_reprojection,
                 triggers,
+                turn_grammar,
+                free_tool_calls_from_penalties,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -2511,8 +2561,11 @@ impl Sequence {
             0,
             self.config.sampling.clone(),
             None,
-            // A no-decode insert never samples, so no stencil can fire.
+            // A no-decode insert never samples, so no stencil can fire, none
+            // can be entered, and no penalty applies to exempt from.
             Arc::new(TriggerRegistry::new()),
+            None,
+            false,
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -2939,7 +2992,23 @@ impl Sequence {
     /// Automatically records the assistant response, prefills the next
     /// user header, and clears in-flight.
     pub fn send_turn(&mut self, user_message: &str) -> crate::Result<TurnResponse> {
-        let handle = self.submit_turn(user_message)?;
+        self.send_turn_with_options(user_message, TurnOptions::default())
+    }
+
+    /// Blocking convenience with per-turn options: submit + wait.
+    ///
+    /// The [`Self::send_turn`] path for callers that arm a stencil — pass a
+    /// tool-call [`TriggerRegistry`](crate::stencil::TriggerRegistry) in
+    /// `options.triggers` and any `<tool_call>` the model starts is forced to
+    /// the catalog's exact shape. Without one the turn free-decodes, which for a
+    /// caller that then *parses* the output means hoping for a shape rather than
+    /// requiring it.
+    pub fn send_turn_with_options(
+        &mut self,
+        user_message: &str,
+        options: TurnOptions,
+    ) -> crate::Result<TurnResponse> {
+        let handle = self.submit_turn_with_options(user_message, options)?;
         let response = handle.wait()?;
 
         // Record the assistant turn and prefill next user header.
@@ -4459,6 +4528,9 @@ impl ProbeCtx {
                 reprojection: None,
                 disable_reprojection: false,
                 triggers: Arc::new(TriggerRegistry::new()),
+                // A one-token wide-Q probe constrains nothing.
+                turn_grammar: None,
+                free_tool_calls_from_penalties: false,
             })
             .is_err()
         {

@@ -1,3 +1,7 @@
+// `chunks_exact_to_as_chunks` — see the note in `candle-core/src/lib.rs`; this
+// walks the SNAC codec's fixed-width frames.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 //! Orpheus TTS: Llama backbone generating SNAC-codec audio tokens.
 //!
 //! Runs `canopylabs/orpheus-3b-0.1-ft` (a `candle_transformers::models::

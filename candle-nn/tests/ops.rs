@@ -397,9 +397,9 @@ fn softmax_wide_rows_cuda_matches_cpu() -> Result<()> {
 
         let on = |dev: &Device| -> Result<Vec<f32>> {
             let t = Tensor::from_vec(data.clone(), (rows, width), dev)?;
-            Ok(candle_nn::ops::softmax(&t, 1)?
+            candle_nn::ops::softmax(&t, 1)?
                 .flatten_all()?
-                .to_vec1::<f32>()?)
+                .to_vec1::<f32>()
         };
         let (a, b) = (on(&Device::Cpu)?, on(&cuda)?);
         let worst = a

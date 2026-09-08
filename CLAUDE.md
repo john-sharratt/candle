@@ -286,6 +286,12 @@ cargo test -p candle-nn kv_cache    # single module
 cargo test --features cuda          # GPU tests
 cargo test --release
 
+# A feature-gated test that is not built is reported as `filtered out`, not as a
+# gap, so `-p candle-conversation` alone silently drops every `hub` test — and
+# the same test then passes or fails depending on whether another `-p` in the
+# same invocation unified the feature in. Run the crate with it explicitly:
+cargo test -p candle-conversation --features hub --lib
+
 # Linting (enforced in CI)
 cargo fmt --all -- --check
 cargo clippy --workspace --tests --examples -- -D warnings

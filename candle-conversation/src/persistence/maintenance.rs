@@ -67,6 +67,7 @@ use super::manifest::{
 };
 use super::record::{
     DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, TombstonePayload,
+    TurnCouplingPayload,
 };
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
@@ -232,6 +233,15 @@ pub struct MaintenancePlan {
     snapshot_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(branch stream, source_loc)` prompt branch checkpoints to relocate.
     branch_checkpoint_relocs: Vec<(StreamId, RecordLoc)>,
+    /// `(npc stream, source_loc)` character records to relocate.
+    ///
+    /// **Relocated, never re-emitted.** An NPC's payload is not in this
+    /// process's RAM — the registry that owns it lives in the daemon above — so
+    /// unlike every other resident record it cannot be rebuilt from substrate
+    /// state and must be carried across byte-for-byte, exactly as `Snapshot` is.
+    /// Omitting it deleted characters whenever the segment holding them was
+    /// maintained.
+    npc_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(type, source_loc)` singleton records to relocate.
     singleton_relocs: Vec<(RecordType, RecordLoc)>,
 }
@@ -295,6 +305,14 @@ impl MaintenanceResult {
 /// drop-safety net (re-emitted so no dropped segment holds the only copy of
 /// live metadata), including a `Tombstone` marker per tombstoned timeline and a
 /// `Distilled` marker per distilled timeline. Pure read; no I/O.
+///
+/// **Resident means "the substrate holds its decoded state".** A record class
+/// that does not — `Npc`, whose payload belongs to the daemon above, and the
+/// read-back `Chunk` / `Tokens` / `Snapshot` / `BranchCheckpoint` bulk — cannot
+/// appear here and must be *relocated* instead ([`SubstratePersistence::gather_relocations`]
+/// and the `npc_relocs` worklist). Every class must be in exactly one of those
+/// two sets: a class in neither is deleted by the first op that touches its
+/// segment, silently. `Npc` and `TurnCoupling` were each in neither.
 fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
     let tombstoned: HashSet<u64> = substrate
         .tombstoned_timelines()
@@ -394,6 +412,21 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             stream_id: 0,
             chunk_index: 0,
             payload: p.encode(),
+        });
+    }
+    for (tl, from_turn) in substrate.live_couplings() {
+        if tombstoned.contains(&tl) {
+            continue;
+        }
+        out.push(Resident {
+            rt: RecordType::TurnCoupling,
+            stream_id: 0,
+            chunk_index: 0,
+            payload: TurnCouplingPayload {
+                timeline_id: tl,
+                from_turn,
+            }
+            .encode(),
         });
     }
     for (tl, id) in substrate.live_debug_ids() {
@@ -511,6 +544,7 @@ impl SubstratePersistence {
             branch_checkpoint_relocs,
             singleton_relocs,
         ) = self.gather_relocations(substrate, &op.targets());
+        let npc_relocs = self.npc_relocations(&op.targets());
         Ok(Some(MaintenancePlan {
             op,
             resident,
@@ -518,6 +552,7 @@ impl SubstratePersistence {
             token_relocs,
             snapshot_relocs,
             branch_checkpoint_relocs,
+            npc_relocs,
             singleton_relocs,
         }))
     }
@@ -666,6 +701,27 @@ impl SubstratePersistence {
             .collect();
         let branch_updates =
             self.relocate_stream_records(RecordType::BranchCheckpoint, &live_branch)?;
+
+        // Characters — the same verbatim path, behind the same supersession
+        // check snapshots use: an edit between plan and execute rewrites the
+        // record, and relocating the stale copy would append it *after* the
+        // newer one, so the next reload's walk would install the superseded
+        // character as the winner (an edit silently rolled back).
+        //
+        // `npc_locs` is repointed here rather than through `MaintenanceResult`,
+        // because it lives on this store rather than in the substrate — nothing
+        // in `apply_to_substrate` could reach it.
+        let live_npcs: Vec<(StreamId, RecordLoc)> = plan
+            .npc_relocs
+            .iter()
+            .filter(|(sid, old)| self.npc_locs.get(&sid.0) == Some(old))
+            .copied()
+            .collect();
+        for (sid, old, new) in self.relocate_stream_records(RecordType::Npc, &live_npcs)? {
+            if self.npc_locs.get(&sid.0) == Some(&old) {
+                self.npc_locs.insert(sid.0, new);
+            }
+        }
 
         // Singletons — few (≤3); the encoding append repoints them via
         // `manifest.ingest`.
@@ -828,6 +884,7 @@ impl SubstratePersistence {
             token_relocs,
             snapshot_relocs,
             branch_checkpoint_relocs,
+            npc_relocs: self.npc_relocations(&op.targets()),
             singleton_relocs,
         };
         let result = self.execute_maintenance(&plan)?;
@@ -838,6 +895,24 @@ impl SubstratePersistence {
     /// Gather the relocation worklist for `targets` — the live read-back records
     /// (`Chunk` / `Tokens` / singletons) physically in those segments, with the
     /// same distill/tombstone filter as [`Self::segment_liveness`]. Read-only.
+    /// Character records physically inside a target segment.
+    ///
+    /// Read from this store's own `npc_locs` rather than the substrate, which
+    /// has never held a character: their payloads belong to the daemon above.
+    /// That is also why they are relocated rather than re-emitted — there is
+    /// nothing in RAM here to re-encode them from.
+    fn npc_relocations(&self, targets: &[SegmentId]) -> Vec<(StreamId, RecordLoc)> {
+        let mut out: Vec<(StreamId, RecordLoc)> = self
+            .npc_locs
+            .iter()
+            .filter(|(_, loc)| targets.contains(&loc.segment))
+            .map(|(&id, &loc)| (StreamId(id), loc))
+            .collect();
+        // Deterministic, so the same store plans the same work twice running.
+        out.sort_unstable_by_key(|(sid, _)| sid.0);
+        out
+    }
+
     fn gather_relocations(
         &self,
         substrate: &Substrate,
@@ -1574,6 +1649,114 @@ mod tests {
             assert_eq!(substrate.live_chunk_count(), 1);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A character survives the maintenance of the segment holding it.**
+    ///
+    /// Maintenance is a second carry-forward path beside
+    /// [`super::compaction::collect_live_records`], with its own two sets: the
+    /// resident records it re-emits from substrate RAM, and the read-back
+    /// records it relocates verbatim. A character can only be in the second —
+    /// its payload belongs to the daemon above and is not in this process at all
+    /// — and it was in neither, so the first pass that touched its segment
+    /// deleted it.
+    ///
+    /// That is the bug that lost a Maker roughly every quarter of an hour: the
+    /// character was written into the active segment, the segment sealed, and
+    /// the next maintenance pass rewrote it out of existence. Fixing the
+    /// duplicate-handle bug was not enough on its own, because this path never
+    /// consulted `npc_locs` at all.
+    #[test]
+    fn a_character_survives_segment_maintenance() {
+        let dir = tmp_dir("npc_maintenance");
+        let sid = StreamId(303);
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            // seg 1: the character, beside a chunk that a later write supersedes
+            // — the dead weight is what makes maintenance choose this segment.
+            sp.write_npc(&crate::persistence::test_npc(7, "Wyneth"))
+                .unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1))
+                .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(
+                sp.npc_locs.get(&7).map(|l| l.segment),
+                Some(SegmentId(1)),
+                "the character starts in the segment about to be maintained"
+            );
+            // Forced, so the test does not have to wait out the settle age —
+            // the same phased path the daemon runs, and the same path the
+            // `POST /v1/debug/maintenance` trigger takes.
+            let plan = sp
+                .plan_maintenance(&substrate, true)
+                .unwrap()
+                .expect("seg 1 carries dead weight, so a pass runs");
+            let op = plan.op();
+            let result = sp.execute_maintenance(&plan).unwrap();
+            result.apply_to_substrate(&mut substrate);
+            sp.finish_maintenance(&plan).unwrap();
+            assert!(
+                op.targets().contains(&SegmentId(1)),
+                "the pass targets the segment holding the character, got {op:?}"
+            );
+            assert_eq!(
+                sp.read_npc(7).unwrap().map(|n| n.name),
+                Some("Wyneth".to_string()),
+                "the character is readable immediately after the pass"
+            );
+        }
+        // And across a restart, which is where the loss actually showed.
+        let mut substrate = Substrate::new();
+        let mut cast = Vec::new();
+        SubstratePersistence::open_in_with_substrate_and_sink(&dir, &mut substrate, |entry| {
+            if entry.record.header.record_type == RecordType::Npc {
+                cast.push(entry.record.header.stream_id);
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            cast,
+            vec![7],
+            "the character must still be on disk after maintenance rewrote its segment"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tool round-trip's coupling is in the resident set, so segment
+    /// maintenance re-emits it rather than dropping it with its segment.
+    ///
+    /// The maintenance twin of
+    /// [`super::super::tests::a_turn_coupling_survives_compaction`] — the two
+    /// carry-forward paths are separate lists and a record class has to be in
+    /// both.
+    #[test]
+    fn a_turn_coupling_is_in_the_resident_set() {
+        let mut substrate = Substrate::new();
+        substrate.register_timeline(
+            crate::projection::TimelineId::from_raw(9).unwrap(),
+            crate::projection::LayerId::from_raw(1).unwrap(),
+            crate::projection::GroupId::from_raw(1).unwrap(),
+        );
+        substrate.couple_turn(crate::projection::TimelineId::from_raw(9).unwrap(), 4);
+
+        let resident = gather_resident_set(&substrate);
+        let coupling = resident
+            .iter()
+            .find(|r| r.rt == RecordType::TurnCoupling)
+            .expect("the coupling must be re-emitted by segment maintenance");
+        let decoded = TurnCouplingPayload::decode(&coupling.payload).unwrap();
+        assert_eq!((decoded.timeline_id, decoded.from_turn), (9, 4));
     }
 
     /// A stream's CURRENT per-stream metadata (here a `WideQSig`) counts as LIVE
