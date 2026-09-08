@@ -388,14 +388,8 @@ impl<'a> WaveFill<'a> {
         // tok/s. The effective zone charges every live region the instant it is
         // claimed, so it says whether residency is *actually* short — which is
         // the only condition under which the tier owes anything.
-        let owed = interleave::effective_weight_zone_bytes()
-            .map_or(0, |zone| self.optimal.saturating_sub(zone)) as usize;
-        let gap = transient_headroom_bytes(0).unwrap_or(0);
-        let budget = gap.saturating_sub(margin).saturating_sub(owed);
+        let (gap, owed, budget) = self.sched.tier_budget_now();
         self.sched.session.set_tier_budget_bytes(budget);
-        // The partition as the wave about to run will find it — or should. A
-        // placement refused after this line means something claimed between
-        // here and the forward, and this is the figure it is diffed against.
         if let Some(stats) = self.sched.kv_regions() {
             tracing::debug!(
                 target: "candle_conversation::scheduler::interleave",
@@ -1164,6 +1158,37 @@ impl Scheduler {
 
     fn claim_kv(&self, seq: usize, add: usize) -> bool {
         self.session.ensure_capacity(&[seq], add).is_ok()
+    }
+
+    /// The ground the next wave's transient tier may be sized against, **as it
+    /// stands right now**: `(gap, owed, budget)` in bytes.
+    ///
+    /// The gap is `weight_floor − live_end`, the frontier the tier is placed
+    /// against. Off it come the margin a refusal widens
+    /// (`tier_margin_regions`) and what the weight side is owed — when
+    /// residency stands under its hold the gap is not the tier's to take, it is
+    /// where the weight side grows back. The debt is measured against the
+    /// effective zone, never the extent: the extent settles under the hold and
+    /// nothing moves it back on its own, so a debt read from it never clears
+    /// (run BW: a 532 MiB debt deducted every wave against a wholly healthy
+    /// 6,112 MiB effective zone, the tier at zero, 82 slots admitted and 2–4
+    /// sequences a forward).
+    ///
+    /// **Read when the wave is built, not when the fill ran.** The two are a
+    /// wave quantum apart, and the section seals and the persistence thread's
+    /// deferred arena creation run in between; each is a region claim, and with
+    /// the scattered free regions spent those come off the top of the gap. A
+    /// wave sized against the fill's figure was then two regions wide of the
+    /// gap it found — 73 refused placements in twenty minutes of run 7 — while
+    /// the same wave sized against the figure at build time simply packs two
+    /// regions narrower.
+    pub(super) fn tier_budget_now(&self) -> (usize, usize, usize) {
+        let margin = self.tier_margin_regions * REGION_BYTES;
+        let optimal = interleave::optimal_weight_bytes().unwrap_or(0);
+        let owed = interleave::effective_weight_zone_bytes()
+            .map_or(0, |zone| optimal.saturating_sub(zone)) as usize;
+        let gap = transient_headroom_bytes(0).unwrap_or(0);
+        (gap, owed, gap.saturating_sub(margin).saturating_sub(owed))
     }
 
     /// The transient tier of the least forward worth running —
@@ -2802,14 +2827,21 @@ impl Scheduler {
         // was already advanced this wave. A fresh group folds section chunks in to
         // co-batch the creep (`form_wave_group(true)`), unless the standalone
         // section pass already ran this wave (no decode present).
+        // **The tier budget is read here, as the wave is built.** The fill
+        // published one a quantum ago; the section seals and the persistence
+        // thread's arena creation have claimed since, and a wave sized against
+        // the stale figure is refused by exactly what they took. The session
+        // carries the fresh figure so the engine's own slab packer prices
+        // against the same ground this wave was composed for.
+        let (_, _, tier_budget) = self.tier_budget_now();
+        self.session.set_tier_budget_bytes(tier_budget);
         let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced {
             if cursor == 0 && self.wave_prefill_residual.is_none() {
-                // The prefill rows the tier holds beside this wave's head, at
-                // the budget the fill set on the session for exactly this wave.
+                // The prefill rows the tier holds beside this wave's head.
                 let prefill_rows = self.model.prefill_width_cap(
                     self.session.activation_dtype(),
                     head_rows,
-                    self.session.tier_budget_bytes(),
+                    tier_budget,
                 );
                 self.form_wave_group(!self.wave_section_advanced, prefill_rows, head_rows == 0);
             }
