@@ -1481,6 +1481,55 @@ Three things, each visible in the log:
   refusals — each one a re-formed wave — fail the started prefills so their
   ground comes back; a placed forward ends the streak.
 
+### 4.11.9 The lease boundary
+
+Run 12 (2026-09-08, S26) carried §4.11.8 through calibration and into ingest
+without a wedge — one refusal in 37 minutes, 7 directories in the first 15
+minutes of ingest against run 4's one in 28 — and then lost 39 directories to
+the decode lease, the one path run 11 never reached. Two turns outran their
+256-token lease; each cost the engine three minutes and a wave of failures:
+
+| event | slot 51 | slot 82 |
+|---|---|---|
+| lease spent, parked | 09:50:05 | 09:53:53 |
+| resumed | 09:51:20 | 09:55:49 |
+| the wave it took | 170.2 s, `promote_ms=168,487` | 216.8 s, `promote_ms=215,483` |
+| first decode after | `slices cover 1455 tokens but the slot's recorded offset is 1453 (delta +2)` | the same, 1686 vs 1684 |
+
+1. **The park and the resume copied chunk by chunk.** `sealed_to_cpu` and
+   `sealed_to_gpu` called the per-chunk migrate — a state lock, an allocation
+   and a copy for every chunk of every KV layer — on the scheduler thread, so a
+   ~10k-token slot took ~90 s out and ~75 s back with nothing else running. The
+   persistence thread's batched path moved 83 residences in 3.4 s in the same
+   log.
+2. **The resumed slot came back two tokens wide of its offset.** The snapshot
+   carried rows the sequence had not committed, the resume re-derived the
+   offset from the chunks it injected, and the prefill-slot header build
+   refused the slot on its first speculative step — failing every sequence in
+   that wave. The first five failures were this; the resumed slot then failed
+   every wave it joined.
+3. **A sticky CUDA out-of-memory followed the second resume** (1,140 log lines
+   of `recycling region N: CUDA_ERROR_OUT_OF_MEMORY` from 09:56:45), failing 24
+   more directories until zend's failure cap stopped the ingest.
+
+**The design as built (S27).**
+
+* **A spent lease is an admission decision.** `park_expired_leases` offers the
+  turn to the gate for another lease first — `admit::gate::may_admit` against
+  the fill's headroom, priced as `DECODE_LEASE_TOKENS` of K/V — and a zone that
+  can afford it renews in place: `buy_kv_ground` then `claim_kv`, the claim
+  real so the next fill sees it. Each admission still never exceeds one lease.
+  The warm-tier round trip is for a gate that refuses.
+* **Park and resume run the batched async migration** (`sealed_to_cpu` /
+  `sealed_to_gpu` on `migrate_sealed_to_{cpu,gpu}_batch_async`, per layer, on
+  the device stream through the scheduler's pinned staging), the same path the
+  persistence thread and `elevate_to_hot` run.
+* **The snapshot is trimmed to the committed offset** before it leaves the card
+  (`lease::trim_sealed_to_tokens`): trailing rows past the offset and empty
+  writer chunks are cut, so the resume's re-derived offset equals what the turn
+  had committed, whatever the slot looked like at the moment its lease ran out.
+  Both log lines carry `tokens`, `trimmed`, `park_ms` / `resume_ms`.
+
 ## 5. Plan
 
 | phase | deliverable | gate | status |
