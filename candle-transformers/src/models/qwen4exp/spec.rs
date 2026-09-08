@@ -44,7 +44,7 @@ use super::indexer::{append_wave, AppendSpan, IndexCache, IndexSnapshot};
 use super::ple::PleState;
 use super::qsa::IndexerWeights;
 use super::wave::Qwen4ExpBatched;
-use crate::models::batched_inference::BatchedInferenceSession;
+use crate::models::batched_inference::{BatchedInferenceSession, ManagedBatchedModel};
 use crate::models::delta_net::{
     DeltaNetConstants, DeltaNetDims, LayerKind, RecurrentStateStore, SpanOperands,
 };
@@ -322,6 +322,7 @@ impl Qwen4ExpBatched {
                 &cfg.delta_net,
                 cfg.rms_norm_eps,
                 &self.model.device,
+                |d| self.wave_geometry(d),
                 &cap.delta,
                 &mut full,
             )?;

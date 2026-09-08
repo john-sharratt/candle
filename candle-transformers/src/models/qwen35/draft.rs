@@ -48,7 +48,10 @@ use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
-use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
+use candle_nn::kv_cache::{
+    begin_wave, plan_wave_transient, KvCache, LayerPhase, WavePlan, REGION_BYTES,
+    WAVE_FORWARD_BYTES,
+};
 
 use super::batched::HybridBatched;
 use super::mtp::{MtpContext, MtpHead};
@@ -405,10 +408,33 @@ pub fn draft_cohort(
         committed,
         &seed_block,
         max_len,
-        // Nothing to open: this head's block runs through
-        // `forward_layer_batched_mixed`, which lays its spans out in whatever
-        // tier is already placed rather than wanting one of its own.
-        || Ok(()),
+        // **This forward prices its own tier**, here — after both of the
+        // walk's allocators have run, since creating an arena releases a
+        // standing tier, and before the first step's attention opens a wave
+        // guard. A guard that opens with no plan of its own is laid out on
+        // whatever plan the domain last recorded — the previous
+        // `forward_wave`'s, sized for its rows, not these. Run 14 measured what
+        // that costs: an arena relocation between forwards released a finished
+        // wave's 400 MiB tier, the next draft re-placed that stale plan into a
+        // gap that had narrowed to 370 MiB, and the scheduler refused the same
+        // eight-row decode 241,355 times with nothing ever re-pricing, because
+        // the wave that would have was behind the draft that could not run.
+        // Priced for `n` rows a step.
+        || -> Result<()> {
+            if let Device::Cuda(d) = dev {
+                let plan = WavePlan::new(model.wave_geometry(act_dtype));
+                let pad = |b: usize| b + REGION_BYTES;
+                plan_wave_transient(
+                    &d.cuda_stream(),
+                    [
+                        pad(plan.phase_bytes(LayerPhase::Attention, n)),
+                        pad(plan.phase_bytes(LayerPhase::Ffn, n)),
+                        WAVE_FORWARD_BYTES,
+                    ],
+                )?;
+            }
+            Ok(())
+        },
         &mut step,
     )
 }

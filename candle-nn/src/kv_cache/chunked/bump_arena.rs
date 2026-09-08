@@ -742,6 +742,17 @@ struct WaveDomain {
     /// `None` until a forward has priced itself, which is the case for every
     /// path that opens a wave without going through the batched forward — tests,
     /// the migration helpers — and those get [`fallback_plan`].
+    ///
+    /// **Cleared with the tier it priced.** A plan belongs to one forward; once
+    /// that forward's tier is released between forwards ([`end_wave_transient`],
+    /// [`enter_arena_window`]) the plan is spent, and a later guard that opens
+    /// without pricing itself must not inherit it. It did: an arena relocation
+    /// released a finished wave's 400 MiB tier, the drafter's per-step attention
+    /// opened a guard with no plan of its own, `begin_wave` re-placed the stale
+    /// 400 MiB plan into a gap that had since narrowed to 370 MiB, and the
+    /// scheduler refused the same eight-row decode 241,355 times in seven minutes
+    /// (run 14) — nothing in that loop ever re-priced, because the forward that
+    /// would have never got to run.
     planned: Option<[usize; 3]>,
     /// Where the tier currently sits, while it exists.
     placed_at: Option<u64>,
@@ -1251,6 +1262,8 @@ pub fn enter_arena_window(stream: &Arc<CudaStream>) -> Result<ArenaWindow> {
         domain.placed_bytes = None;
         if had_tier {
             domain.reserved_by_forward = false;
+            // The plan priced that tier and goes with it — see `planned`.
+            domain.planned = None;
         }
         // Counted before the lock drops, so a forward cannot begin placing a
         // tier in the gap between here and the release below.
@@ -1411,6 +1424,8 @@ pub fn end_wave_transient(stream: &Arc<CudaStream>) {
             domain.placed_bytes = None;
             release_transient(&stream);
             domain.reserved_by_forward = false;
+            // The plan priced that tier and goes with it — see `planned`.
+            domain.planned = None;
         }
         Ok(())
     });

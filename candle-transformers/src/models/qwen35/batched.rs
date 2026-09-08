@@ -1360,6 +1360,7 @@ impl HybridBatched {
             &self.model.cfg.delta_net,
             self.model.cfg.rms_norm_eps,
             &self.model.device,
+            |d| self.wave_geometry(d),
             stash,
             &mut full,
         )

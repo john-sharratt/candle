@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use candle::Device;
 
-use super::prefill::VramPhase;
 use super::Scheduler;
 use crate::guest::drain::EngineRoom;
 use crate::guest::ground::{GroundError, GuestGround};
@@ -46,10 +45,12 @@ impl EngineRoom for Scheduler {
 
     fn shed(&mut self, _bytes: usize) -> u64 {
         let before = self.free_region_bytes();
-        // The same ladder ordinary KV pressure walks. `VramPhase::Load` is the
-        // right setpoint: a guest drain is a load — it is about to put a
-        // checkpoint on the card — not a decode step trying not to stall.
-        self.relieve_vram_pressure("guest", VramPhase::Load);
+        // The engine's one eviction pass, run for the reason it exists: work
+        // needs ground the K/V side holds. A guest drain is such work — it is
+        // about to put a checkpoint on the card — so the K/V of conversations
+        // between turns is handed back before the claim, exactly as for a
+        // queue head that does not fit.
+        self.demote_idle_slots();
         self.free_region_bytes().saturating_sub(before)
     }
 

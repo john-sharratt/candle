@@ -40,7 +40,7 @@
 //! projections, attention, and a 512-expert MoE. On the measured hybrid that is
 //! a few percent of the wave it lets us skip.
 
-use candle::{Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 
 #[cfg(feature = "cuda")]
 use crate::models::delta_net::state_store::RegionBump;
@@ -52,6 +52,9 @@ use crate::models::delta_net::{
 use crate::models::wave_buffers::wave_empty;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{plan_wave_transient, WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES};
+use candle_nn::kv_cache::ModelGeometry;
 
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
 /// one set of shared buffers, so the replay that consumes them advances every
@@ -297,12 +300,16 @@ pub struct ReplayLayer<'a> {
 ///
 /// Model-agnostic: everything specific to a checkpoint is resolved by the
 /// caller into `layers` — see [`ReplayLayer`]. Both the hybrid and `qwen4exp`
-/// run this, because the recurrence they rewind is the same one.
+/// run this, because the recurrence they rewind is the same one. `geometry` is
+/// the caller's wave geometry at a given activation dtype, which the replay
+/// prices its own tier from.
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 pub fn replay_accepted_prefixes(
     layers: &[ReplayLayer<'_>],
     dims: &DeltaNetDims,
     eps: f64,
     device: &Device,
+    geometry: impl Fn(DType) -> ModelGeometry,
     stash: &VerifyStash,
     jobs: &mut [(StashSpan, usize, &mut RecurrentStateStore)],
 ) -> Result<()> {
@@ -359,6 +366,26 @@ pub fn replay_accepted_prefixes(
              some layers and not others",
             stash.filled.len(),
         );
+    }
+
+    // **This replay prices its own tier**, for the rows it stages, before any
+    // guard below opens — the same rule the batched forward and the draft
+    // follow, and for the same reason: a guard with no plan of its own is laid
+    // out on whatever plan the domain last recorded, sized for some other
+    // forward's rows. See `WaveDomain::planned`.
+    #[cfg(feature = "cuda")]
+    if let (Device::Cuda(d), Some(first)) = (device, stash.layers.first()) {
+        let rows: usize = short.iter().map(|(span, _, _)| span.len).sum();
+        let plan = WavePlan::new(geometry(first.qkv.dtype()));
+        let pad = |b: usize| b + REGION_BYTES;
+        plan_wave_transient(
+            &d.cuda_stream(),
+            [
+                pad(plan.phase_bytes(LayerPhase::Attention, rows)),
+                pad(plan.phase_bytes(LayerPhase::Ffn, rows)),
+                WAVE_FORWARD_BYTES,
+            ],
+        )?;
     }
 
     // **A generation for the replay, because the stash has no provenance to

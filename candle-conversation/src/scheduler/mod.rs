@@ -3366,9 +3366,10 @@ impl Scheduler {
         //
         // The arena used to register an eviction closure with the VRAM
         // governor, at a cheap relief rung, so the governor would shed resident
-        // galleries before it ever evicted model KV. The rungs are gone;
-        // `relieve_vram_pressure` calls `evict_lru` directly and does it before
-        // touching KV, which is the same priority expressed as call order.
+        // galleries before it ever evicted model KV. The rungs are gone: the
+        // arena evicts to its own ceiling as it admits a gallery, and its slabs
+        // come from the CUDA pool rather than the KV reservation, so no K/V-side
+        // eviction pass could hand their bytes to the card anyway.
         // **What this checkpoint actually brings to a decode.** Every one of
         // these is a capability the engine silently degrades around rather than
         // failing on: a model with no drafter reports `draft_budget == 0`, every
@@ -11974,6 +11975,8 @@ mod tests {
             projection_offsets: Vec::new(),
             staged_composition: None,
             triggers: Arc::new(TriggerRegistry::new()),
+            turn_grammar: None,
+            free_tool_calls_from_penalties: false,
         }
     }
 
@@ -12171,13 +12174,16 @@ mod tests {
         DecodeState {
             event_tx,
             generated_tokens: TokenBuffer::from(vec![1u32; 8]),
-            think_open_at: None,
-            think_token_len: None,
+            think_close_at: None,
             lease_left: Scheduler::DECODE_LEASE_TOKENS,
             lease_expired: false,
+            forwarded_generated: 0,
+            pending_page_cut: false,
+            pending_page_cut_after: None,
             max_tokens: 1024,
             sampling_config: SamplingConfig::compression(),
             seal_action: SealAction::None,
+            free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
             decode_start: Instant::now(),
