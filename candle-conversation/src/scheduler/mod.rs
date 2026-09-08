@@ -2218,7 +2218,8 @@ impl WaveStats {
         }
     }
 
-    /// Accumulate one eviction event (relief-ladder shed of resident KV).
+    /// Accumulate one eviction event — the admission pass handing back the K/V
+    /// of conversations between turns (`demote_idle_slots`).
     fn add_evict(&mut self, bytes: u64, count: u64, ms: u64) {
         self.evict_bytes += bytes;
         self.evict_count += count;
@@ -2711,7 +2712,7 @@ impl WaveStats {
         // reported a multi-window sum against one window's total and `other_ms`
         // saturated to 0 — destroying exactly the attribution the split exists
         // for.
-        let (promote, admit, demote, gpu) = run::take_housekeeping_split();
+        let (promote, admit, gpu) = run::take_housekeeping_split();
         let (finalise, compression) = run::take_promote_split();
         if housekeeping_dur > 0 {
             push(&mut phases, PhaseKind::Housekeeping, housekeeping_dur, 0, 0);
@@ -2729,10 +2730,9 @@ impl WaveStats {
                 raw_total_ms = self.housekeeping_us / 1000,
                 promote_ms = promote,
                 admit_ms = admit,
-                demote_ms = demote,
                 gpu_drain_ms = gpu,
                 other_ms = (self.housekeeping_us / 1000)
-                    .saturating_sub(promote + admit + demote + gpu),
+                    .saturating_sub(promote + admit + gpu),
                 // Promote dominates the band, so it carries its own split.
                 promote_finalise_ms = finalise,
                 promote_compression_ms = compression,
@@ -4357,18 +4357,6 @@ impl Scheduler {
                     // `inject_sealed_section` would warn-and-skip
                     // and the primed slot would be missing every
                     // persisted section from the schema's prelude.
-                    // Load-phase VRAM gate: elevation scatters sealed KV into
-                    // fresh GPU arenas BEFORE the projection attends over it — a
-                    // "load KV into VRAM before attention" phase. The freed-float
-                    // free-list is the destination of that load, so relieve first
-                    // (compress/evict make real headroom) rather than allocating
-                    // straight into space the load will consume. Without this the
-                    // elevation had no scheduler pressure gate at all — only the
-                    // per-arena `vram_has_room` check, which OOMs per-arena instead
-                    // of shedding ahead of the load.
-                    if self.vram_under_pressure_for(prefill::VramPhase::Load) {
-                        self.relieve_vram_pressure("elevate", prefill::VramPhase::Load);
-                    }
                     if let Some(conversation) = self.slot_conversations.get(&sequence_id).cloned() {
                         let backings = self.session.backings().to_vec();
                         let device = self.session.device().clone();
@@ -4759,33 +4747,12 @@ impl Scheduler {
         }
 
         // Backpressure: a model-decode compression pass lifts its children to hot
-        // and adds VRAM churn. The summariser is a background task, so when VRAM is
-        // under pressure defer this node — a Soft error it retries on its next
-        // reconcile pass — rather than piling onto a tight card and starving
-        // foreground decode + the persist thread's hot→warm drain. (The structural
-        // path above is deterministic and cheap, so it is deliberately not gated.)
-        //
-        // **Relief runs before the deferral, or the deferral never ends.** The
-        // free-region count this gate reads is not scarcity under the elastic
-        // partition — ground can be recycled from released arenas or bought back
-        // from a weight side that took the span's slack while the engine was
-        // quiet. And pressure is otherwise relieved only at end of wave, so on an
-        // idle engine whose only pending work IS the summariser, a bare deferral
-        // is a livelock: no waves without the probe, no relief without a wave, no
-        // probe under pressure. Measured: the weight side had grown to 9.9 GiB
-        // against a 124-region KV span, free sat at 9–22 under a setpoint of 24,
-        // and the same turn was deferred at ~4 Hz for six minutes — thousands of
-        // warns, and the summary tree starved for the life of the run. The
-        // scheduler is by definition between waves here, which is exactly where
-        // the relief ladder is legal — same call the elevate and section paths
-        // make. Deferral remains for the case relief cannot fix: a genuinely
-        // busy card, which is what this gate was built for.
-        if self.vram_under_pressure() {
-            self.relieve_vram_pressure("summary", prefill::VramPhase::Load);
-            if self.vram_under_pressure() {
-                return Err("SubmitSummaryProbe: deferred — VRAM under pressure".to_string());
-            }
-        }
+        // and adds VRAM churn. The summariser's decode is admitted through the
+        // same fill as everything else, so a tight card is answered there — by
+        // the gate refusing it until ground comes back — rather than by a
+        // pressure gate here. A deferral keyed on free regions livelocked an
+        // idle engine whose only pending work was the summariser: no waves
+        // without the probe, no ground without a wave, no probe under pressure.
 
         // Reserve the job id up front so both passes tag their `SealAction`
         // with it; the job entry registers once both passes are set up.
@@ -11844,6 +11811,46 @@ mod tests {
             "admission claimed the section's K/V"
         );
         assert_eq!(scheduler.active_slots(), 1, "a running section is active");
+    }
+
+    /// **The eviction pass runs when the head needs ground or the engine is
+    /// idle — not on every due pass.** `demote_idle_slots` ticks
+    /// `admission_passes` whenever it runs, so the tick is the observation.
+    /// With a section queued that fits (a CPU session has no reservation, so
+    /// the headroom is unbounded) the pass does not shed; with nothing queued
+    /// and nothing active it does, so the weight side gets its ground back.
+    #[test]
+    fn the_eviction_pass_runs_only_when_the_head_is_short_or_the_engine_is_idle() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (tx, _rx) = crossbeam::channel::bounded(1);
+        scheduler.handle_request(SchedulerRequest::IngestSection {
+            sequence_id: slot,
+            section_id: SectionId::new(3),
+            prefix_section_ids: Vec::new(),
+            tokens: TokenBuffer::from(vec![1u32, 2, 3, 4]),
+            address: ContentAddress::default(),
+            debug_name: "fits".into(),
+            in_collection: false,
+            response_tx: tx,
+        });
+        let before = scheduler.admission_passes;
+        scheduler.promote_new_prefills();
+        assert_eq!(
+            scheduler.admission_passes, before,
+            "a head that fits sheds nothing"
+        );
+        assert_eq!(scheduler.active_section_ingests.len(), 1, "and was admitted");
+
+        // Drain the section so the engine is idle, then the pass sheds.
+        scheduler.active_section_ingests.clear();
+        let before = scheduler.admission_passes;
+        scheduler.promote_new_prefills();
+        assert_eq!(
+            scheduler.admission_passes,
+            before + 1,
+            "an idle engine sheds so the weight side can grow back"
+        );
     }
 
     /// **A scratch slot bound to a timeline stays at zeros at admission.**

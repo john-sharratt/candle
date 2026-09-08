@@ -166,9 +166,6 @@ enum Hold {
     /// The pool has run away: more conversations open than any healthy state
     /// explains. See [`SCAN_RUNAWAY_CEILING`].
     Runaway { live: usize, ceiling: usize },
-    /// The weight zone has been pushed down to the hold: one more conversation
-    /// would come out of the resident experts.
-    Residency { zone_mib: u64, hold_mib: u64 },
 }
 
 impl fmt::Display for Hold {
@@ -181,11 +178,6 @@ impl fmt::Display for Hold {
             Hold::Runaway { live, ceiling } => write!(
                 f,
                 "{live} conversations open, past the runaway ceiling of {ceiling}"
-            ),
-            Hold::Residency { zone_mib, hold_mib } => write!(
-                f,
-                "weight zone {zone_mib}MiB is down to its {hold_mib}MiB hold — \
-                 one more would evict resident experts"
             ),
         }
     }
@@ -281,24 +273,13 @@ fn gate_decision(live: usize, admission: Option<&AdmissionSection>) -> Result<()
     if live > reflected.saturating_add(burst) {
         return Err(Hold::Unreflected { live, reflected });
     }
-    // **The one resource this gate spends, measured rather than modelled.**
-    // The KV side and the weight side share one elastic span, so every open
-    // conversation's K/V comes out of somewhere — and once the zone is down to
-    // its hold, what it comes out of is the resident experts. An engine that
-    // streams its experts is slower at everything, including finishing the
-    // conversations that would give the ground back, so this is the one place
-    // holding actually buys something.
-    //
-    // Above the hold the gate opens: headroom is there to be used, and the
-    // wave's own claim-and-refuse decides what fits in any given forward.
-    if let Some(a) = admission {
-        if a.weight_hold_bytes > 0 && a.weight_zone_bytes <= a.weight_hold_bytes {
-            return Err(Hold::Residency {
-                zone_mib: a.weight_zone_bytes >> 20,
-                hold_mib: a.weight_hold_bytes >> 20,
-            });
-        }
-    }
+    // **The gate spends no device resource, and does not read one.** An open
+    // conversation holds nothing on the card until the engine's admission
+    // takes its turn: no K/V, no recurrent store. What fits, and when, is the
+    // engine's fill to decide against the residency it defends; a second gate
+    // here keyed on the same weight zone was a second controller on one
+    // signal, and it held every worker for the length of a run while the
+    // engine's own gate was already refusing.
     Ok(())
 }
 
@@ -2201,39 +2182,18 @@ mod tests {
         );
     }
 
-    /// **The one thing worth holding for: the resident experts.**
-    ///
-    /// K/V and the expert weights share one elastic span, so once the zone is
-    /// down to its hold, another conversation's K/V comes out of the experts —
-    /// and an engine that streams its experts is slower at everything,
-    /// including finishing the conversations that would give the ground back.
+    /// **The weight zone is the engine's to defend, not the producer's.** A
+    /// zone at or under its hold does not hold a worker: an open conversation
+    /// holds nothing on the card until the engine admits its turn, and the
+    /// engine's own gate is what refuses when residency is short.
     #[test]
-    fn a_zone_down_to_its_hold_holds_the_producer() {
+    fn the_weight_zone_does_not_hold_the_producer() {
         let mut a = admission(8, 0, 0, 8);
         a.weight_zone_bytes = 5 << 30;
         a.weight_hold_bytes = 5 << 30;
-        assert_eq!(
-            gate_decision(8, Some(&a)),
-            Err(Hold::Residency {
-                zone_mib: 5 << 10,
-                hold_mib: 5 << 10,
-            }),
-        );
-        // A megabyte of headroom is headroom: the gate opens and the wave's own
-        // claim-and-refuse decides what actually fits.
-        a.weight_zone_bytes = (5 << 30) + (1 << 20);
         assert_eq!(gate_decision(8, Some(&a)), Ok(()));
-    }
-
-    /// A model with nothing to defend — no reservation, so no hold — is never
-    /// held by this. The generality case: a dense checkpoint sitting resident
-    /// with room over publishes a zero hold and the gate opens every time.
-    #[test]
-    fn no_hold_to_defend_never_holds() {
-        let mut a = admission(8, 0, 0, 8);
-        a.weight_zone_bytes = 0;
-        a.weight_hold_bytes = 0;
-        assert_eq!(gate_decision(8, Some(&a)), Ok(()));
+        a.weight_zone_bytes = 1 << 30;
+        assert_eq!(gate_decision(8, Some(&a)), Ok(()), "even well under the hold");
     }
 
     /// **Runaway protection, and nothing finer.** Far above any healthy state,

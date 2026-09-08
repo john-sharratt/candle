@@ -1,4 +1,3 @@
-use super::prefill::VramPhase;
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use std::sync::atomic::AtomicU64;
@@ -17,7 +16,6 @@ const STARVED_DECODE_PAUSE: Duration = Duration::from_millis(20);
 
 static HOUSE_PROMOTE_US: AtomicU64 = AtomicU64::new(0);
 static HOUSE_ADMIT_US: AtomicU64 = AtomicU64::new(0);
-static HOUSE_DEMOTE_US: AtomicU64 = AtomicU64::new(0);
 static HOUSE_GPUDRAIN_US: AtomicU64 = AtomicU64::new(0);
 
 /// Which completion path inside `promote_finished_prefills_to_decodes` a span
@@ -49,13 +47,12 @@ pub(super) fn take_promote_split() -> (u64, u64) {
 }
 
 /// Drain the housekeeping sub-timers, in milliseconds, as
-/// `(promote, admit, demote, gpu_drain)`.
-pub(super) fn take_housekeeping_split() -> (u64, u64, u64, u64) {
+/// `(promote, admit, gpu_drain)`.
+pub(super) fn take_housekeeping_split() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         HOUSE_PROMOTE_US.swap(0, Relaxed) / 1000,
         HOUSE_ADMIT_US.swap(0, Relaxed) / 1000,
-        HOUSE_DEMOTE_US.swap(0, Relaxed) / 1000,
         HOUSE_GPUDRAIN_US.swap(0, Relaxed) / 1000,
     )
 }
@@ -111,14 +108,6 @@ impl Scheduler {
     /// other phases get airtime), but we DO admit newly-queued work mid-quantum via
     /// `mid_wave_admission` so a long generation can't starve fresh conversations.
     fn run_decode_until_budget(&mut self) {
-        // Phase-b VRAM relief: a sustained decode grows KV every step with no
-        // admission gate of its own, so relieve once at the quantum boundary when
-        // under pressure — the governor's cheapest-first ladder sheds cold turns,
-        // and the reprojection drain below handles working-set turnover. One check
-        // per quantum (not per step) keeps it cheap.
-        if self.vram_under_pressure_for(VramPhase::Decode) {
-            self.relieve_vram_pressure("decode", VramPhase::Decode);
-        }
         // Fire any reprojection queued by the just-completed prefill quantum
         // BEFORE the first decode step of this quantum. The turn's first
         // reprojection is queued in `finalise_prefill`, right after the first
@@ -210,15 +199,14 @@ impl Scheduler {
     /// time-sliced decode quantum adapts to newly-queued conversations and keeps KV
     /// bounded across a long slice without waiting for the quantum to end. Mirrors
     /// the top-of-loop admission (`drain` → `promote` → `pump`) under the identical
-    /// wave fill, plus the per-wave gentle demote.
+    /// wave fill.
     ///
     /// Returns `false` if the drain observed shutdown/disconnect: the request is
     /// already consumed here (so the top-of-loop drain can't re-read it), so the
     /// caller records the intent and the main loop breaks on it.
     ///
     /// Cheap on the common path: the rx peek skips the whole admission block when
-    /// nothing queued, and the ingest relief self-gates on `ingest_timelines`
-    /// (a no-op outside a workspace ingest).
+    /// nothing queued.
     fn mid_wave_admission(&mut self) -> bool {
         if !self.rx.is_empty() {
             // Flag the drain so the assembler attributes its sub-timers to the
@@ -239,12 +227,6 @@ impl Scheduler {
             self.promote_new_prefills();
             self.wave_stats
                 .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
-        }
-        // Bound KV production to the hot→warm drain rate across the slice, not just
-        // once per quantum. Self-gated on an active ingest so a plain dialogue decode
-        // pays nothing (the loop-top call still handles the ingest-finished reopen).
-        if !self.ingest_timelines.is_empty() {
-            self.demote_cold_ingest_if_pressured();
         }
         true
     }
@@ -345,20 +327,13 @@ impl Scheduler {
                 break; // Shutdown requested or channel closed.
             }
 
-            // 1b. Drain any background-compression VRAM-starvation signal. A
-            // persistence hot→warm compress-to-free that couldn't allocate its
-            // quant arena leaves its turn hot-float + consistent (retried next
-            // pass) but signals the governor; make room here so that retry has
-            // some, before we admit more prefills that would tighten VRAM
-            // further. Cheap atomic swap in the common (no-starvation) case.
-            //
-            // Starvation used to get its own escalated recovery path — a
-            // footprint reclaim, then a bulk eviction that overrode the "only
-            // evict when `used` is high" watermark. It needed the override
-            // because the watermark was a guess about the card; the free-region
-            // count is not, and a compressor that could not get an arena is
-            // exactly the state the ordinary pressure signal reports. So it
-            // takes the ordinary path, at the load setpoint.
+            // 1b. Drain the background compressor's starvation signal. A
+            // persistence hot→warm compress-to-free that could not claim its
+            // quant arena leaves its turn hot-float and consistent, retried on
+            // its next pass; the ground it wants comes back through the
+            // admission pass below — seals and completions free regions, and
+            // the fill's eviction runs when the head needs them. Logged so a
+            // starved compressor is visible; cheap atomic swap otherwise.
             let starved = self
                 .session
                 .vram_governor()
@@ -370,7 +345,6 @@ impl Scheduler {
                     starvation_events = starved,
                     "background compression starved of VRAM"
                 );
-                self.relieve_vram_pressure("starvation", VramPhase::Load);
             }
 
             // 1c. **Serve any co-resident model waiting for the card.**
@@ -536,24 +510,6 @@ impl Scheduler {
                 );
             }
 
-            // Per-wave gentle demote. Cheap (a bounded warm-backed LRU walk) and
-            // self-gates on `ingest_timelines` (a no-op when not ingesting), so it
-            // runs EVERY wave — not on the 2 s telemetry cadence like the footprint
-            // defrag below. CFW's co-batched wave folds a wide prefill cohort into
-            // every forward, so KV grows far faster per wave than the serial passes
-            // it replaced, and a 2 s cadence lets `used` overshoot massively between
-            // ticks (the leak-like climb). Shedding the warm-backed tail every wave
-            // holds `used` at the demote watermark instead.
-            {
-                let _g = profile::span("loop:demote_cold_ingest");
-                let t = Instant::now();
-                self.demote_cold_ingest_if_pressured();
-                HOUSE_DEMOTE_US.fetch_add(
-                    t.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-
             // Harvest the GPU spans this wave's forwards enqueued. Non-blocking:
             // a pair whose work is still in flight stays pending for a later
             // pass, so this costs a few `cuEventQuery` calls and never stalls
@@ -664,10 +620,10 @@ impl Scheduler {
                 // (hot→warm) and eviction free chunks scattered across arenas,
                 // and an arena only gives its region back once its last chunk
                 // goes — so nothing surfaces without a sweep looking for it.
-                // Running it here, ahead of pressure, is what keeps the
-                // free-region count honest: the setpoint is compared against
-                // regions that are genuinely claimable, not against a count
-                // that would only be right after the next relief pass.
+                // Running it here keeps the free-region count the admission
+                // pass prices against honest: regions that are genuinely
+                // claimable, not a count that would only be right after the
+                // next sweep.
                 let swept = self.session.release_empty_arenas().unwrap_or(0);
                 if swept > 0 {
                     relief_trace::note("sched", "arena_sweep", swept as u64, 0);
