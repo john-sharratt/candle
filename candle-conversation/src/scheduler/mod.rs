@@ -2718,13 +2718,13 @@ pub(crate) struct Scheduler {
     /// head needs; prefills behind the head that do fit keep flowing. See the
     /// two arms of `WaveFill::admit`.
     prefill_head_blocked: bool,
-    /// Regions the fill holds back from a wave's tier budget, for the movers
-    /// between the fill and the placement: an arena the compressor creates in
-    /// that window, and the rounding the placement applies. Starts at four and
-    /// doubles on every tier refusal (`note_tier_refusal`), so a partition that
-    /// refuses a wave priced to its measured gap is met with a wider margin
-    /// rather than the same wave again.
-    tier_margin_regions: usize,
+    /// Consecutive wave placements the transient tier has refused
+    /// (`note_tier_refusal`), cleared by the next forward that runs
+    /// (`note_wave_placed`). Each refusal drops the wave and re-forms it against
+    /// the gap as it stands, so a run of them is a wave the partition cannot
+    /// hold at any width — at `TIER_REFUSALS_BEFORE_FAIL` the started prefills
+    /// it carried are failed so the pipeline moves.
+    tier_refusal_streak: usize,
     /// Expert-cache hits and misses as of the last fill, so the fill can read
     /// the hit rate of the waves since — the residency signal the wave width
     /// follows (`Scheduler::observe_expert_hit_rate`).
@@ -3012,7 +3012,7 @@ impl Scheduler {
             last_decode_admitted: None,
             wave_decode_yielded: false,
             prefill_head_blocked: false,
-            tier_margin_regions: 4,
+            tier_refusal_streak: 0,
             expert_hits_seen: 0,
             expert_misses_seen: 0,
             expert_hit_rate: None,
@@ -9539,9 +9539,17 @@ mod tests {
         /// survive exactly one `offset == 0` reset. The store-level `seeded`
         /// flag of §10 decision 2, modelled per sequence.
         seeded: Arc<Mutex<HashSet<usize>>>,
+        /// Every `request_kv_ground` the scheduler made, in regions — what
+        /// admission asked the weight side to concede. The double concedes
+        /// nothing, so a test reads the ask, not the answer.
+        ground_requests: Arc<Mutex<Vec<usize>>>,
     }
 
     impl RecurrentProbe {
+        fn ground_requests(&self) -> Vec<usize> {
+            self.ground_requests.lock().unwrap().clone()
+        }
+
         fn get(&self, seq: usize) -> Option<ToyState> {
             self.states.lock().unwrap().get(&seq).copied()
         }
@@ -9695,6 +9703,13 @@ mod tests {
         /// read as evicted and send every fork down the seed chain.
         fn recurrent_resident(&self, seq: usize) -> bool {
             self.probe.get(seq).is_some()
+        }
+
+        /// Records the ask and concedes nothing, like a weight side at its
+        /// floor.
+        fn request_kv_ground(&self, regions: usize) -> u64 {
+            self.probe.ground_requests.lock().unwrap().push(regions);
+            0
         }
 
         fn fork_recurrent(&self, parent: usize, child: usize) -> candle::Result<()> {
@@ -10364,6 +10379,225 @@ mod tests {
         let (seqs, _, _, advances) = scheduler.build_section_batch(0).expect("a batch");
         assert_eq!(seqs.len(), 2, "room for both");
         assert_eq!(advances, vec![200, 200]);
+    }
+
+    /// A dialogue prefill of `tokens` tokens as the queue would hold it, with
+    /// nothing to seal and no client to announce to.
+    fn test_prefill_work(sequence_id: SequenceId, tokens: usize) -> PrefillWork {
+        let (event_tx, _rx) = crossbeam::channel::bounded(1);
+        PrefillWork {
+            announced: true,
+            sequence_id,
+            tokens: TokenBuffer::from(vec![1u32; tokens]),
+            prefill_text: String::new(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            prefill_assistant_text: String::new(),
+            event_tx,
+            max_decode_tokens: 0,
+            sampling: SamplingConfig::compression(),
+            submitted_at: Instant::now(),
+            reprojection: None,
+            belief: PriorBelief::default(),
+            seal_action: SealAction::None,
+            post_decode_tokens: TokenBuffer::default(),
+            projection_offsets: Vec::new(),
+            staged_composition: None,
+            triggers: Arc::new(TriggerRegistry::new()),
+        }
+    }
+
+    /// An admitted prefill `offset` tokens in — started when `offset > 0`.
+    fn active_prefill(sequence_id: SequenceId, tokens: usize, offset: usize) -> ActivePrefill {
+        ActivePrefill {
+            work: test_prefill_work(sequence_id, tokens),
+            offset,
+            next_projection: 0,
+            final_logits: None,
+            error: None,
+            prefill_start: None,
+        }
+    }
+
+    /// Hold a creep group of one prefill member across waves: a layer cursor
+    /// past zero is what the wave builder reads as "a group is standing".
+    fn hold_creep(scheduler: &mut Scheduler, seq: SequenceId, advance: usize) {
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill {
+            seq_id: seq.0,
+            advance,
+        }];
+        scheduler.wave_prefill_cursor = 1;
+    }
+
+    /// **A refused wave is dropped, held group and all.** The wave builder
+    /// re-forms a group only when none is held, so a refusal that left the
+    /// group standing was refused again at the same width for as long as the
+    /// gap stayed short — run 11's 199,704 refusals of one 320 MiB wave. The
+    /// unstarted members go back to the front of the queue.
+    #[test]
+    fn a_tier_refusal_drops_the_held_creep_so_the_next_wave_re_forms() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().unwrap());
+        scheduler.active_prefills.push(active_prefill(seq, 300, 0));
+        hold_creep(&mut scheduler, seq, 300);
+        assert_eq!(scheduler.held_creep_rows(), 300);
+
+        scheduler.note_tier_refusal(&candle::Error::Msg("refused".into()));
+
+        assert!(scheduler.wave_prefill_members.is_empty(), "the group is dropped");
+        assert_eq!(scheduler.wave_prefill_cursor, 0, "and its creep restarts from layer 0");
+        assert_eq!(scheduler.held_creep_rows(), 0);
+        assert!(
+            scheduler.active_prefills.is_empty(),
+            "an unstarted member is requeued, not kept active"
+        );
+        assert_eq!(scheduler.prefill_queue.len(), 1);
+        assert_eq!(scheduler.prefill_queue[0].sequence_id, seq);
+    }
+
+    /// **The fill's head is every row the next wave already carries**: the
+    /// decodes it takes and the creep group held from the last wave. A group
+    /// with members but no cursor and no residual is not held — the next build
+    /// re-forms it — so it counts for nothing.
+    #[test]
+    fn the_fill_counts_a_held_creeps_rows_in_the_wave_head() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().unwrap());
+        assert_eq!(
+            prefill::WaveFill::new(&mut scheduler, 0).head_rows(),
+            0,
+            "nothing held, nothing taken"
+        );
+        hold_creep(&mut scheduler, seq, 200);
+        assert_eq!(prefill::WaveFill::new(&mut scheduler, 0).head_rows(), 200);
+        scheduler.wave_prefill_cursor = 0;
+        assert_eq!(
+            prefill::WaveFill::new(&mut scheduler, 0).head_rows(),
+            0,
+            "members without a cursor or a residual are re-formed, not held"
+        );
+    }
+
+    /// **An admission's purchase guards the tier of the whole wave it joins.**
+    /// The gate is charged the increment this admission adds over the head;
+    /// the frontier gap has to hold the sum, or the claims of one admission eat
+    /// the ground a held creep was standing on — the fill that began run 11's
+    /// refusals took eight regions off a gap a 300-row creep needed.
+    #[test]
+    fn an_admission_guards_the_tier_of_the_wave_it_joins_not_its_own_rows() {
+        use admit::{Ground, Kind};
+        use crate::projection::DecodePriority;
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (tx, _rx) = crossbeam::channel::bounded(1);
+        scheduler.handle_request(SchedulerRequest::IngestSection {
+            sequence_id: slot,
+            section_id: SectionId::new(5),
+            prefix_section_ids: Vec::new(),
+            tokens: TokenBuffer::from(vec![1u32; 100_000]),
+            address: ContentAddress::default(),
+            debug_name: "long".into(),
+            in_collection: false,
+            response_tx: tx,
+        });
+        // A held creep wide enough that the test double's tiny geometry prices
+        // its head at a region or more — the tier is priced in whole regions.
+        let held_rows = 100_000;
+        let held = SequenceId(scheduler.session.create_sequence().unwrap());
+        hold_creep(&mut scheduler, held, held_rows);
+        let dtype = scheduler.session.activation_dtype();
+        let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
+        let head = plan.tier_bytes(held_rows) as u64;
+        let whole = plan.tier_bytes(held_rows + prefill::PREFILL_MIN_ADVANCE) as u64;
+        assert!(head > 0, "the test only means something if the head has a tier");
+
+        let mut fill = prefill::WaveFill::new(&mut scheduler, 0);
+        let cost = fill
+            .peek(Kind::Section, DecodePriority::Low)
+            .expect("a queued section is offered");
+        assert_eq!(
+            cost.activations,
+            whole - head,
+            "the gate is charged the increment over the held head"
+        );
+        assert_eq!(
+            fill.wave_tier_after(&cost),
+            whole,
+            "the purchase guards the tier of the whole wave"
+        );
+        assert!(
+            fill.wave_tier_after(&cost) > cost.activations,
+            "the whole wave, not this admission's increment"
+        );
+    }
+
+    /// **The fill buys the least wave into the budget, not the gap.** The
+    /// group former reads the budget — the gap less the margin — so a purchase
+    /// that stopped at the gap left the least chunk one margin short of every
+    /// wave with a decode in it. On a device with no reservation the gap reads
+    /// zero, so the ask is the least wave plus the margin, whole regions.
+    #[test]
+    fn the_fill_buys_the_least_wave_and_the_margin_into_the_budget() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let seq = SequenceId(scheduler.session.create_sequence().unwrap());
+        scheduler.active_prefills.push(active_prefill(seq, 300, 0));
+        let dtype = scheduler.session.activation_dtype();
+        let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
+        let least = plan.tier_bytes(prefill::PREFILL_MIN_ADVANCE);
+        let margin = prefill::TIER_MARGIN_REGIONS * candle_nn::kv_cache::REGION_BYTES;
+        let want = (least + margin).div_ceil(candle_nn::kv_cache::REGION_BYTES);
+
+        prefill::WaveFill::new(&mut scheduler, 0).publish_tier_budget();
+
+        assert_eq!(
+            probe.ground_requests(),
+            vec![want],
+            "one ask: the least wave and the margin, in regions"
+        );
+    }
+
+    /// **A run of refusals is final for the started prefills; a placed wave
+    /// ends the run.** A started prefill cannot be requeued, so it rides the
+    /// re-formed group each time; once the group has been re-formed against the
+    /// fresh gap this many times and refused every time, the partition cannot
+    /// hold its chunk and it is failed so its ground comes back.
+    #[test]
+    fn a_run_of_refusals_fails_the_started_prefills_and_a_placed_wave_ends_the_run() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().unwrap());
+        scheduler.active_prefills.push(active_prefill(seq, 300, 128));
+        let err = candle::Error::Msg("refused".into());
+
+        for _ in 0..prefill::TIER_REFUSALS_BEFORE_FAIL - 1 {
+            hold_creep(&mut scheduler, seq, 128);
+            scheduler.note_tier_refusal(&err);
+            assert!(
+                scheduler.active_prefills[0].error.is_none(),
+                "a started prefill rides the next group while the run is short"
+            );
+        }
+        assert_eq!(scheduler.active_prefills.len(), 1, "started: never requeued");
+
+        scheduler.note_wave_placed();
+        hold_creep(&mut scheduler, seq, 128);
+        scheduler.note_tier_refusal(&err);
+        assert!(
+            scheduler.active_prefills[0].error.is_none(),
+            "a placed wave ended the run; this refusal is the first of a new one"
+        );
+
+        for _ in 0..prefill::TIER_REFUSALS_BEFORE_FAIL - 1 {
+            hold_creep(&mut scheduler, seq, 128);
+            scheduler.note_tier_refusal(&err);
+        }
+        assert!(
+            scheduler.active_prefills[0].error.is_some(),
+            "the run reached its length: the started prefill is failed"
+        );
     }
 
     /// **A scratch slot bound to a timeline stays at zeros at admission.**
