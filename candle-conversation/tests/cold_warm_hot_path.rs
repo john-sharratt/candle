@@ -61,9 +61,34 @@ const ARENA_CAPACITY: usize = 256;
 /// one block per sub-band, matching the R16 unit-test pattern.
 const QUANT_HEAD_DIM: usize = 128;
 
-fn cuda_device_or_skip() -> Option<Device> {
+/// **These tests share one device reservation, so they run one at a time.**
+///
+/// `ChunkedKvBacking::new` claims from the process-wide region pool at ordinal
+/// 0 — there is one reservation per process by design — and every test here
+/// builds backings, seeds turns and drives a persistence pass against it. Run
+/// concurrently they claim and release each other's ground, and the failure
+/// surfaces somewhere harmless-looking: `demoting_every_turn_returns_its_vram`
+/// asserting a turn is hot+warm and finding it hot-only, because the pass it
+/// was counting on drained a sibling's queue instead.
+///
+/// The guard is handed out with the device rather than taken separately so a
+/// new test cannot forget it: there is no way to obtain a device here without
+/// also holding the lock for as long as the device is in scope.
+///
+/// Poisoning is absorbed. A panicking test is a failing test and its report is
+/// the useful one; turning every later test in the binary into a poison panic
+/// would bury it.
+fn gpu_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn cuda_device_or_skip() -> Option<(Device, std::sync::MutexGuard<'static, ()>)> {
     match Device::cuda_if_available(0) {
-        Ok(d @ Device::Cuda(_)) => Some(d),
+        Ok(d @ Device::Cuda(_)) => {
+            let guard = gpu_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+            Some((d, guard))
+        }
         _ => None,
     }
 }
@@ -258,7 +283,7 @@ fn section_state(conv: &Conversation, section: SectionId) -> TierState {
 
 #[test]
 fn full_cold_warm_hot_round_trip() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -674,7 +699,7 @@ fn snapshot_bytes_at(
 /// `#[ignore]`d — see that test's doc for the open production bug).
 #[test]
 fn quant_blend_warm_round_trip() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -806,7 +831,7 @@ fn quant_blend_warm_round_trip() {
 /// surfaces with a specific format name rather than getting buried
 /// inside the blend test.
 fn single_format_cold_round_trip(label: &str, target_format: Option<KvFormat>) {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -919,7 +944,7 @@ fn cold_round_trip_q4_0() {
 #[test]
 fn cold_marker_turn_passes_existence_check() {
     use candle_conversation::substrate::TierState;
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1007,7 +1032,7 @@ fn cold_marker_turn_passes_existence_check() {
 /// regression for the cold→hot Quantized scatter path.
 #[test]
 fn cold_load_q8_single_chunk_diagnostic() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1149,7 +1174,7 @@ fn cold_load_q8_single_chunk_diagnostic() {
 /// as the projection cycled prior turns through the cold path.
 #[test]
 fn quant_blend_cold_round_trip() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1271,7 +1296,7 @@ fn quant_blend_cold_round_trip() {
 ///   drops only the unkept turns; kept turns stay hot.
 #[test]
 fn elevate_edge_cases() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1429,7 +1454,7 @@ fn elevate_edge_cases() {
 /// `StoredSequence` reconstruction.
 #[test]
 fn multi_chunk_turn_round_trip() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1550,7 +1575,7 @@ fn multi_chunk_turn_round_trip() {
 /// (which goes through the reload) would forget it.
 #[test]
 fn archive_state_survives_restart() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1663,7 +1688,7 @@ fn make_backings_adaptive(
 /// F16 through.
 #[test]
 fn quantize_on_evict_full_round_trip() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1718,7 +1743,7 @@ fn quantize_on_evict_full_round_trip() {
 /// tier carries, so it's a faithful proxy for warm byte count).
 #[test]
 fn quantize_on_evict_actually_compresses() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let timeline = TimelineAllocator::new().next();
@@ -1791,7 +1816,7 @@ fn quantize_on_evict_actually_compresses() {
 /// reload itself).
 #[test]
 fn quantize_on_evict_cold_reload_round_trip() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -2355,7 +2380,7 @@ fn seed_turn_varied_per_sub_band(
 #[test]
 #[ignore = "heavy 32-layer GPU+disk tier round-trip (~20s); run with --ignored"]
 fn quantize_on_evict_metadata_round_trip() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     run_quantize_on_evict_metadata_round_trip(&device, N_LAYERS_METADATA, false);
@@ -2367,7 +2392,7 @@ fn quantize_on_evict_metadata_round_trip() {
 /// `#[ignore]`d.
 #[test]
 fn quantize_on_evict_metadata_round_trip_mini() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     run_quantize_on_evict_metadata_round_trip(&device, N_LAYERS_METADATA_MINI, true);
@@ -2627,7 +2652,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
 #[test]
 #[ignore = "heavy 32-layer GPU+disk tier round-trip (~10s); run with --ignored"]
 fn no_policy_metadata_round_trip() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     run_no_policy_metadata_round_trip(&device, N_LAYERS_METADATA, false);
@@ -2638,7 +2663,7 @@ fn no_policy_metadata_round_trip() {
 /// above is `#[ignore]`d.
 #[test]
 fn no_policy_metadata_round_trip_mini() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     run_no_policy_metadata_round_trip(&device, N_LAYERS_METADATA_MINI, true);
@@ -3006,7 +3031,7 @@ fn drive_section_round_trip<F>(
         SectionId,
     ) -> Vec<SealedSequence>,
 {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let tmpdir = tempfile::tempdir().unwrap();
@@ -3459,7 +3484,7 @@ fn demote_fixture(device: &Device) -> DemoteFixture {
 /// long run.
 #[test]
 fn demoting_every_turn_returns_its_vram() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let f = demote_fixture(&device);
@@ -3512,7 +3537,7 @@ fn demoting_every_turn_returns_its_vram() {
 /// otherwise show up only as corruption much later.
 #[test]
 fn a_kept_turn_keeps_its_vram_while_the_rest_comes_back() {
-    let Some(device) = cuda_device_or_skip() else {
+    let Some((device, _serial)) = cuda_device_or_skip() else {
         return;
     };
     let f = demote_fixture(&device);
