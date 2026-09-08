@@ -47,13 +47,17 @@
 //! exist — not obviously fake, and in the place the real thing belongs.
 
 pub mod act;
+pub mod acts;
 pub mod authoring;
+pub mod bench;
 pub mod body;
 pub mod driver;
+pub mod enact;
 pub mod environment;
 pub mod event;
 pub mod identity;
 pub mod ingest;
+pub mod interaction;
 pub mod life;
 pub mod loading;
 pub mod mind;
@@ -62,22 +66,26 @@ pub mod persona;
 pub mod prompt;
 pub mod pulse;
 pub mod reach;
+pub mod retention;
 pub mod runtime;
 pub mod schema;
 pub mod simulate;
 pub mod slash;
 pub mod sleep;
+pub mod station;
 pub mod tick;
 pub mod tools;
 pub mod waiting;
 pub mod watcher;
 pub mod window;
+pub mod work;
 
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -85,6 +93,7 @@ use serde_json::{json, Value};
 use web::auth::Role;
 
 use crate::api::{err, owner_of, Authored};
+use crate::engine::interaction::Interlocutor;
 use crate::guard::Api;
 use crate::projection;
 
@@ -145,6 +154,19 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         )
         .route("/v1/interaction/:ix/inject", Role::User, post(inject))
         .route("/v1/interaction/:ix/stream", Role::User, get(stream))
+        // ── messaging a character ───────────────────────────────────────────
+        //
+        // **Real, and the same handset the characters use.** Not a private
+        // channel between a console and a mind: a person messaging a character
+        // is one more party on a thread, and the character answers with the
+        // same `message` act it would use to answer anybody. That is what makes
+        // the reply worth having — it is the character speaking to you, from
+        // inside the world, rather than a chat window bolted to the side of it.
+        .route(
+            "/v1/npc/:nid/message",
+            Role::User,
+            get(get_messages).post(post_message),
+        )
         // ── the act vocabulary ──────────────────────────────────────────────
         //
         // Real: the catalog and the `/` command list are compiled in, and both
@@ -399,45 +421,396 @@ async fn perceive(
     no_engine("delivering an event to a character")
 }
 
-/// Interactions this character is in. None, because opening one needs an engine.
+/// Who this caller is, to a character.
+fn as_interlocutor(id: &web::auth::session::Identity, handle: &str) -> Interlocutor {
+    Interlocutor {
+        kind: "operator".into(),
+        id: handle.to_string(),
+        display: speaking_as(id, handle),
+    }
+}
+
+/// Interactions this character is in.
 async fn list_interactions(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(nid): Path<String>,
 ) -> Response {
-    if let Err(r) = owned(&s, &headers, &nid).await {
-        return *r;
-    }
-    Json(json!({ "interactions": [], "engine_connected": false })).into_response()
+    let npc_id = match owned(&s, &headers, &nid).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return Json(json!({ "interactions": [], "engine_connected": false })).into_response();
+    };
+    let now = s.world_ms(npc_id).await;
+    let live: Vec<Value> = rt
+        .interactions
+        .for_npc(npc_id, now)
+        .iter()
+        .map(|ix| ix.wire(now))
+        .collect();
+    Json(json!({ "interactions": live, "engine_connected": true })).into_response()
 }
 
+/// Open one, or continue the one already open with this person in this mode.
 async fn open_interaction(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(nid): Path<String>,
+    Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = owned(&s, &headers, &nid).await {
+    let (id, handle) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let npc_id = match owned(&s, &headers, &nid).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("opening an interaction");
+    };
+    // Physical by default: standing in the room together is the ordinary way to
+    // be present to a character, and the one an operator who did not say means.
+    let wanted = body.get("mode").and_then(Value::as_str).unwrap_or("physical");
+    let Some(mode) = crate::engine::tools::Mode::parse(wanted) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "bad_mode",
+            "a mode is physical, instant_message, voice_call or video_call",
+        );
+    };
+    // A character with no body cannot be stood next to. The messaging modes
+    // reach somebody who is nowhere near, which is the whole point of them, so
+    // only the physical one needs a place.
+    if mode == crate::engine::tools::Mode::Physical && rt.body_of(npc_id).is_none() {
+        return err(
+            StatusCode::CONFLICT,
+            "not_in_a_world",
+            "that character has no body to stand beside — open a messaging mode instead",
+        );
+    }
+    let now = s.world_ms(npc_id).await;
+    let ix = rt
+        .interactions
+        .open(npc_id, mode, as_interlocutor(&id, &handle), now);
+    Json(ix.wire(now)).into_response()
+}
+
+async fn interaction(State(s): State<Arc<Authored>>, Path(ix): Path<String>) -> Response {
+    let Some(rt) = s.runtime.as_ref() else {
+        return err(StatusCode::NOT_FOUND, "interaction_not_found", &ix);
+    };
+    let now = crate::api::now_ms();
+    match rt.interactions.get(&ix, now) {
+        Some(found) => Json(found.wire(now)).into_response(),
+        // A session that has gone quiet reads as gone rather than as ended:
+        // there is nothing left to look at either way, and the console's own
+        // "no such interaction" is the honest thing to show.
+        None => err(StatusCode::NOT_FOUND, "interaction_not_found", &ix),
+    }
+}
+
+async fn end_interaction(State(s): State<Arc<Authored>>, Path(ix): Path<String>) -> Response {
+    let ended = s
+        .runtime
+        .as_ref()
+        .is_some_and(|rt| rt.interactions.end(&ix));
+    match ended {
+        true => Json(json!({ "interaction_id": ix, "state": "ended" })).into_response(),
+        false => err(StatusCode::NOT_FOUND, "interaction_not_found", &ix),
+    }
+}
+
+/// Say something to the character, inside a session.
+///
+/// **The same door everything else goes through.** The line is parsed by
+/// [`crate::engine::slash`] and delivered by the scheduler, exactly as
+/// `/v1/npc/:nid/pulse` does — so what is said here is a thing that happened to
+/// the character rather than a private aside, and the rest of the world sees it
+/// the way it sees anything else.
+async fn inject(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(ix): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("speaking to a character");
+    };
+    let now = crate::api::now_ms();
+    let Some(session) = rt.interactions.get(&ix, now) else {
+        return err(StatusCode::NOT_FOUND, "interaction_not_found", &ix);
+    };
+    // The session says which character; ownership is still checked, because an
+    // interaction id is not a capability.
+    if let Err(r) = owned(&s, &headers, &session.npc_id.to_string()).await {
         return *r;
     }
-    // Opening one forks the character's substrate and starts a decode loop.
-    no_engine("opening an interaction")
+    let line = body
+        .get("line")
+        .or_else(|| body.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if line.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "empty_line",
+            "there is nothing in that to say",
+        );
+    }
+    let parsed = match crate::engine::slash::parse(line) {
+        // Named, or the character is told "you says to you" — see
+        // [`crate::engine::slash::Parsed::spoken_by`].
+        Ok(p) => p.spoken_by(&session.interlocutor.display),
+        // A typo is a 400 naming the near miss, never speech — sending `/hrut`
+        // to a character as dialogue is the one outcome that looks like it
+        // worked.
+        Err(e) => return err(StatusCode::BAD_REQUEST, "bad_command", &e.message()),
+    };
+    let world_ms = s.world_ms(session.npc_id).await;
+    let kind = match parsed.kind {
+        crate::engine::event::EventKind::Sleep { .. } => crate::engine::event::EventKind::Sleep {
+            day: crate::engine::sleep::day_of(world_ms),
+        },
+        other => other,
+    };
+    let prose = crate::engine::event::Event::new(0, world_ms, parsed.salience, kind.clone()).prose();
+    if !rt
+        .scheduler
+        .deliver(session.npc_id, world_ms, parsed.salience, kind)
+    {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_awake",
+            "that character is not awake, so nothing can reach it",
+        );
+    }
+    rt.interactions.touched(&ix, now);
+    Json(json!({ "delivered": true, "prose": prose })).into_response()
 }
 
-/// There are no interactions, so no id names one.
-async fn interaction(Path(ix): Path<String>) -> Response {
-    err(StatusCode::NOT_FOUND, "interaction_not_found", &ix)
+/// What a person is called, on a thread with a character.
+///
+/// **The name the world writes down**, because a thread addresses people the
+/// same way a room does and one person must never be two. An account handle
+/// (`u_1a2b3c4d`) would read as a stranger in the prose the character is handed
+/// — "u_1a2b3c4d messages you" — so the identity's own name is used when the
+/// provider gave one, and the handle is the fallback that at least stays
+/// stable.
+pub(crate) fn speaking_as(id: &web::auth::session::Identity, handle: &str) -> String {
+    match id.name.trim() {
+        "" => handle.to_string(),
+        name => name.to_string(),
+    }
 }
 
-async fn end_interaction(Path(ix): Path<String>) -> Response {
-    err(StatusCode::NOT_FOUND, "interaction_not_found", &ix)
+/// `POST /v1/npc/:nid/message` — say something to a character on its handset.
+///
+/// Goes onto the same thread the characters use, so the character is told about
+/// it by the ordinary sweep and answers with the ordinary `message` act. A
+/// person is a party to the conversation rather than an operator poking at one.
+async fn post_message(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let (id, handle) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let npc_id = match owned(&s, &headers, &nid).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let text = body
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "empty_message",
+            "a message needs something in it",
+        );
+    }
+    let me = speaking_as(&id, &handle);
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("messaging a character");
+    };
+    let Some(sent) = rt.message_npc(npc_id, &me, text) else {
+        return err(
+            StatusCode::CONFLICT,
+            "not_in_a_world",
+            "that character has no body in a world, so there is nothing to reach it on",
+        );
+    };
+    Json(json!({
+        "sent": text,
+        "from": me,
+        "to": sent.with,
+        "waiting_for_them": sent.waiting_for_them,
+        "can_reply": sent.can_reply,
+    }))
+    .into_response()
 }
 
-async fn inject(Path(_ix): Path<String>) -> Response {
-    no_engine("speaking to a character")
+/// `GET /v1/npc/:nid/message` — the conversation so far, oldest first.
+async fn get_messages(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    let (id, handle) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let npc_id = match owned(&s, &headers, &nid).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let me = speaking_as(&id, &handle);
+    let said = s.runtime.as_ref().and_then(|rt| rt.messages_with(npc_id, &me));
+    let Some((them, messages)) = said else {
+        // Not an error: a character with no body has nothing to say on a
+        // handset yet, and the console renders an empty conversation.
+        return Json(json!({ "messages": [], "in_a_world": false })).into_response();
+    };
+    let messages: Vec<Value> = messages
+        .into_iter()
+        .map(|(from, text)| json!({ "from": from, "text": text }))
+        .collect();
+    Json(json!({
+        "messages": messages,
+        "in_a_world": true,
+        "with": them,
+        "as": me,
+    }))
+    .into_response()
 }
 
-async fn stream(Path(_ix): Path<String>) -> Response {
-    no_engine("streaming an interaction")
+/// How often the stream looks for new ticks.
+///
+/// **Polled off the scheduler's own ring rather than pushed from the decode
+/// loop.** A broadcast channel out of `record_act` would be a second path by
+/// which an act becomes observable, and the two would drift — the Pulse view
+/// already reads this ring, so a session watching the same rows is watching the
+/// same truth. The cost is the latency below, against a character that thinks
+/// in seconds.
+const STREAM_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `GET /v1/interaction/:ix/stream` — what the character does, as it does it.
+///
+/// Frames are the console's: `open` once, then `act` per act with `tick` at the
+/// close of each. There is no `narration` frame, and its absence is honest —
+/// this daemon renders an act *as* its own line rather than producing a
+/// separate account afterwards, so a narration frame would be prose nothing
+/// wrote.
+async fn stream(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(ix): Path<String>,
+) -> Response {
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("streaming an interaction");
+    };
+    let now = crate::api::now_ms();
+    let Some(session) = rt.interactions.get(&ix, now) else {
+        return err(StatusCode::NOT_FOUND, "interaction_not_found", &ix);
+    };
+    if let Err(r) = owned(&s, &headers, &session.npc_id.to_string()).await {
+        return *r;
+    }
+
+    let rt = rt.clone();
+    let npc_id = session.npc_id;
+    let open = Event::default().event("open").data(
+        json!({
+            "interaction_id": ix,
+            "mode": session.mode.as_wire(),
+            "resume_from": null,
+        })
+        .to_string(),
+    );
+
+    // Start from what has already happened, so a console attaching to a live
+    // session does not replay the character's whole afternoon.
+    let mut seen: u64 = rt
+        .scheduler
+        .recent(512)
+        .iter()
+        .filter(|t| t.npc_id == npc_id)
+        .map(|t| t.tick)
+        .max()
+        .unwrap_or(0);
+
+    // A channel and a task rather than a generator: `async-stream` is not a
+    // dependency here, and the task ends by itself when the receiver is dropped
+    // — a console that navigates away closes the connection, the send fails,
+    // and the loop stops. Nothing has to notice the disconnect separately.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+    tokio::spawn(async move {
+        if tx.send(Ok(open)).await.is_err() {
+            return;
+        }
+        loop {
+            tokio::time::sleep(STREAM_POLL).await;
+            let now = crate::api::now_ms();
+            // The session going quiet ends the stream, so a console left open
+            // is not holding a connection against a conversation that is over.
+            if rt.interactions.get(&ix, now).is_none() {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("state")
+                        .data(json!({ "state": "ended" }).to_string())))
+                    .await;
+                return;
+            }
+            let fresh: Vec<_> = rt
+                .scheduler
+                .recent(512)
+                .into_iter()
+                .filter(|t| t.npc_id == npc_id && t.tick > seen)
+                .collect();
+            for t in fresh {
+                seen = seen.max(t.tick);
+                for (n, act) in t.acts.iter().enumerate() {
+                    // `Act::summary` renders `tool — args`; the console wants
+                    // the two apart so it can label one and quote the other.
+                    let (tool, intent) = match act.split_once(" — ") {
+                        Some((a, b)) => (a, b),
+                        None => (act.as_str(), ""),
+                    };
+                    let frame = Event::default().event("act").data(
+                        json!({
+                            "act_id": format!("{}-{n}", t.tick),
+                            "tick": t.tick,
+                            "tool": tool,
+                            "intent": intent,
+                            "world_ms": t.world_ms,
+                        })
+                        .to_string(),
+                    );
+                    if tx.send(Ok(frame)).await.is_err() {
+                        return;
+                    }
+                }
+                let close = Event::default()
+                    .event("tick")
+                    .data(json!({ "tick": t.tick, "acts": t.acts.len() }).to_string());
+                if tx.send(Ok(close)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// The act vocabulary.

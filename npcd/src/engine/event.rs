@@ -144,6 +144,24 @@ pub enum EventKind {
         #[serde(default)]
         to: Addressed,
     },
+    /// Something said to the character on its handset, from wherever the sender
+    /// is.
+    ///
+    /// **Not [`EventKind::Speech`], and the difference is the whole point of a
+    /// phone.** Speech is delivered by place: everybody in the room hears it,
+    /// and overhearing is the normal case. A message reaches one thread and
+    /// nobody else, from somebody who may be nowhere near — so it carries the
+    /// thread it arrived on rather than a room, and the character answers it by
+    /// naming that thread.
+    Message {
+        /// The thread, by the name *this* character calls it — which is the
+        /// other party for a direct thread and the group's name otherwise. It
+        /// is the argument `message` takes, so what the character is told is
+        /// what it would have to type back.
+        thread: String,
+        from: String,
+        text: String,
+    },
     /// Where the character is and what is true there, right now.
     ///
     /// **Replaces** the previous one — see [`EventKind::replaces`]. A situation
@@ -188,6 +206,7 @@ impl EventKind {
         match self {
             EventKind::Description { .. } => "description",
             EventKind::Speech { .. } => "speech",
+            EventKind::Message { .. } => "message",
             EventKind::Situation { .. } => "situation",
             EventKind::Nudge { .. } => "nudge",
             EventKind::Entity { .. } => "entity",
@@ -274,6 +293,24 @@ impl Event {
                     Addressed::You => format!("{speaker} says to you: {t}"),
                     Addressed::Room => format!("{speaker} says: {t}"),
                     Addressed::Other { who } => format!("{speaker} says to {who}: {t}"),
+                }
+            }
+            // **Named as a message, and the thread named with it.** A character
+            // that is told only who spoke cannot tell whether it was heard by a
+            // room or read off a handset, and the two are answered by different
+            // acts. Naming the thread here means the argument `message` needs
+            // is already in front of it.
+            //
+            // Reported rather than quoted, for the reason `Speech` gives: what
+            // a phone carries is intent, and quoting it would fabricate wording
+            // nobody chose.
+            EventKind::Message { thread, from, text } => {
+                let t = text.trim();
+                match thread == from {
+                    // A direct thread is named for the other party, so saying
+                    // both would read as "Wren, on Wren".
+                    true => format!("{from} messages you: {t}"),
+                    false => format!("{from} messages you, on {thread}: {t}"),
                 }
             }
             // Both arrive already written — a situation is generated from a

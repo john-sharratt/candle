@@ -189,7 +189,14 @@ pub fn frame(mode: Mode, tools: &[&Tool]) -> String {
     // ── how acting works ───────────────────────────────────────────────────
     s.push_str(match mode {
         Mode::Physical => "You are physically present with whoever is here. They can see you.\n\n",
-        Mode::Messaging => {
+        Mode::VideoCall => {
+            "You are not present — they can see and hear you, and nothing else about where you \
+             are.\n\n"
+        }
+        Mode::VoiceCall => {
+            "You are not present — they can hear you and cannot see you at all.\n\n"
+        }
+        Mode::InstantMessage => {
             "You are not present — you are reaching them at a distance, in writing.\n\n"
         }
     });
@@ -499,7 +506,12 @@ mod tests {
     /// accepts. A tool listed but not offered is an invitation to a refusal.
     #[test]
     fn the_prompt_lists_exactly_the_tools_offered_in_that_mode() {
-        for mode in [Mode::Physical, Mode::Messaging] {
+        for mode in [
+            Mode::Physical,
+            Mode::VideoCall,
+            Mode::VoiceCall,
+            Mode::InstantMessage,
+        ] {
             let tools = for_mode(mode);
             let s = build(&persona(), mode, &tools);
             for t in &tools {
@@ -521,7 +533,11 @@ mod tests {
     #[test]
     fn mode_changes_how_presence_is_described() {
         let phys = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
-        let msg = build(&persona(), Mode::Messaging, &for_mode(Mode::Messaging));
+        let msg = build(
+            &persona(),
+            Mode::InstantMessage,
+            &for_mode(Mode::InstantMessage),
+        );
         assert!(phys.contains("physically present"));
         assert!(msg.contains("not present"));
     }

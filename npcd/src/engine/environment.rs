@@ -39,10 +39,12 @@
 use npc_map::delta::Delta;
 use npc_map::world::World;
 
+use crate::engine::event::{EventKind, Salience};
 use crate::engine::perceived::{digest, situation, Perceived};
 use crate::engine::reach;
 use crate::engine::tick::Scheduler;
 use crate::engine::tools::{self, Mode};
+use crate::sim::phone;
 use crate::world::binding::Bindings;
 use crate::world::Hosted;
 
@@ -161,7 +163,86 @@ pub fn push(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
 pub fn advance(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> Moment {
     let moved = hosted.tick();
     let told = push(hosted, bindings, sched);
-    Moment { moved, told }
+    let messaged = deliver_messages(hosted, bindings, sched);
+    Moment {
+        moved,
+        told,
+        messaged,
+    }
+}
+
+/// Hand every mind the messages that arrived for it on its handset.
+///
+/// **The phone's half of the sweep, and it needs its own because a phone is not
+/// a room.** What a body perceives comes off the map, which knows who was
+/// standing where and keeps a cursor per reader. A message reaches somebody who
+/// may be on the other side of the world, so the map has nothing to say about
+/// it — without this pass a message was written into a thread that nothing ever
+/// read, and the sender was told "they will see it when they next look" while
+/// the recipient was never told there was anything to look at.
+///
+/// Delivered here rather than at the moment of sending for the reason the whole
+/// module is built on: one batched pass per moment, no path where perception
+/// arrives outside the sweep. It also means the act stays a pure world change
+/// and does not need the scheduler.
+///
+/// Returns how many minds were handed something.
+fn deliver_messages(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
+    // Name → body, off the world: threads address people the way a room does,
+    // by the name the world writes down, and the bindings key on the body.
+    let who_is_where: Vec<(String, String)> = hosted.read(|w| {
+        w.actors()
+            .map(|a| (a.name.clone(), a.id.clone()))
+            .collect()
+    });
+    if who_is_where.is_empty() {
+        return 0;
+    }
+    let at_ms = hosted.read(|w| w.now());
+    let mut told = 0;
+    for (name, body) in who_is_where {
+        let Some(npc_id) = bindings.mind_of(hosted.id(), &body) else {
+            continue;
+        };
+        // Taken and marked under one acquisition, so a message cannot be
+        // handed out twice by two moments overlapping.
+        let waiting = hosted.with_sim(|s| {
+            let waiting = s.threads.undelivered_for(&name);
+            if !waiting.is_empty() {
+                s.threads.mark_delivered_for(&name);
+            }
+            waiting
+        });
+        if waiting.is_empty() {
+            continue;
+        }
+        for (thread, kind, messages) in waiting {
+            // **Somebody messaging you directly gets your attention; a group
+            // does not.** A direct thread is one person addressing this
+            // character and nobody else, which is the same claim on it as being
+            // spoken to in a room. A group of six would otherwise preempt
+            // whatever it was doing six times over a conversation it is only
+            // one of the audience for.
+            let salience = match kind {
+                phone::Kind::Direct => Salience::URGENT,
+                phone::Kind::Group => Salience::NORMAL,
+            };
+            for m in messages {
+                sched.deliver(
+                    npc_id,
+                    at_ms,
+                    salience,
+                    EventKind::Message {
+                        thread: thread.clone(),
+                        from: m.from,
+                        text: m.intent,
+                    },
+                );
+            }
+        }
+        told += 1;
+    }
+    told
 }
 
 /// What one moment of world time came to.
@@ -171,6 +252,11 @@ pub struct Moment {
     pub moved: usize,
     /// Minds that were told something.
     pub told: usize,
+    /// Minds handed something off a handset. Counted apart from `told` because
+    /// the two travel by different routes — one off the map, one off the
+    /// threads — and a moment where the room was silent and the phones were not
+    /// is a real and different thing.
+    pub messaged: usize,
 }
 
 impl Moment {
@@ -324,7 +410,14 @@ mod tests {
     fn a_moment_that_moves_nobody_and_tells_nobody_is_quiet() {
         let (h, b, s) = crew(3);
         let m = advance(&h, &b, &s);
-        assert_eq!(m, Moment { moved: 0, told: 0 });
+        assert_eq!(
+            m,
+            Moment {
+                moved: 0,
+                told: 0,
+                messaged: 0
+            }
+        );
         assert!(m.is_quiet());
     }
 

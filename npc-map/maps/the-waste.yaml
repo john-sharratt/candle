@@ -1,0 +1,53 @@
+# The waste — open ground outside the Redoubt.
+#
+# A region rather than a building: nothing bounds anything out here, so its
+# places are named landmarks joined by tracks rather than rooms off a corridor.
+id: the-waste
+kind: region
+name: The Waste
+within: battle-cities
+arrival: the-waste/tower-approach
+summary: >
+  Open ground under the Redoubt's guns and beyond them. What is worth having is
+  in the ground or in a wreck, and so is most of what wants you dead.
+character: >
+  Everything out here was somewhere else before the war moved it, and none of
+  it is maintained by anybody.
+lacks:
+  - anywhere to make anything
+spine:
+  name: the track
+  through: [tower-approach, the-cut]
+nodes:
+  # The track itself is walked rather than stood on, which makes it plumbing
+  # like any corridor. What it joins is open ground.
+  - { id: tower-approach, kind: passage, name: the tower approach }
+  - { id: the-cut, kind: passage, name: the cut }
+
+  - id: east-ridge
+    kind: ground
+    name: the east ridge
+    off: [the-cut]
+    habit: worked in daylight and avoided after
+    character: >
+      A spine of broken rock with ore close enough to the surface to be worth
+      the walk. Drones nest in the lee of it, which is the reason nobody works
+      it alone.
+
+  - id: ruins
+    kind: ground
+    name: the ruins
+    off: [the-cut]
+    habit: picked over and still not empty
+    character: >
+      A carrier column that stopped here and was never recovered. There is
+      metal in it and something living in the shell of the lead vehicle.
+
+  - id: glass-flats
+    kind: ground
+    name: the glass flats
+    off: [the-cut]
+    habit: crossed quickly
+    character: >
+      Ground fused smooth where something enormous happened. Crystals grow out
+      of it in blooms, and there is no cover on it anywhere at all.

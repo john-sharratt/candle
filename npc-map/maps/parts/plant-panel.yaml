@@ -11,7 +11,3 @@ long: >
   always a reading that has been slightly wrong for a long time. The panel is
   read, not driven. Anyone can look at it; the skill is in noticing the figure
   that has quietly drifted, and in knowing which drifts matter.
-tools:
-  - plant.read_panel
-  - plant.note_drift
-  - plant.raise_fault

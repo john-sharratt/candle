@@ -10,6 +10,3 @@ long: >
   *what* they have made of them — which is deliberate, and is why the room
   where Makers talk about characters is worth walking to. Taking an unheld
   character from here claims them for whichever station you sit at next.
-tools:
-  - roster.read
-  - roster.take_unheld

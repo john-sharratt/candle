@@ -184,6 +184,12 @@ pub async fn run(
             company: scenario.company.clone(),
             places: scenario.places.clone(),
             waited_on_by: scenario.waited_on_by.clone(),
+            // A probe stands in no world, so it carries nothing, works nothing
+            // and has nothing to shoot. The acts that need those are absent
+            // from what it is offered, which is the right answer rather than a
+            // limitation: a scenario asks what a character would say, and the
+            // things it would say them about are what the scenario supplies.
+            ..Default::default()
         };
         minds.probe(
             &persona,

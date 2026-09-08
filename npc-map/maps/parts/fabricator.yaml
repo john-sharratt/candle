@@ -1,0 +1,18 @@
+id: fabricator
+kind: station
+name: fabricator
+binds: one production run
+short: >
+  A fabricator turns stock into things, one run at a time, on one of the eight
+  queues.
+long: >
+  An assembly bay with articulated arms and a nanite haze over the bed. Standing
+  at one takes a production run and holds it, so two bodies cannot queue over
+  each other; what can be made is whatever the stockpile actually covers, which
+  means the tower's poverty is felt here before it is felt anywhere else. Simple
+  ammunition is minutes. A companion is weeks.
+modes:
+  - idle
+  - running
+  - paused
+  - purging

@@ -13,7 +13,3 @@ long: >
   plainly when it does not. An enquiry that cannot be answered is the most
   valuable thing that arrives here, because it names a hole nobody inside had
   noticed.
-tools:
-  - enquiry.take_question
-  - enquiry.answer_from_record
-  - enquiry.name_the_gap

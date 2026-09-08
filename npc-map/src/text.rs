@@ -21,6 +21,24 @@ pub fn list(items: &[String]) -> String {
     }
 }
 
+/// "a", "a or b", "a, b or c".
+///
+/// The disjunctive twin of [`list`], for a set where any one member will do —
+/// the stations an act can be done at, the ways out of a room. Using "and"
+/// there reads as needing all of them, which is the opposite of what is meant
+/// and the sort of thing a reader believes.
+pub fn list_or(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} or {b}"),
+        _ => {
+            let (last, rest) = items.split_last().expect("non-empty");
+            format!("{} or {}", rest.join(", "), last)
+        }
+    }
+}
+
 /// Small numbers as words, large ones as digits.
 ///
 /// "Six levels" reads like prose and "6 levels" reads like a form; past twenty

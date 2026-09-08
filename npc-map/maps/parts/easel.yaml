@@ -12,7 +12,7 @@ long: >
   the work, because a portrait is judged against the ones beside it, and what
   a family or a faction must share is settled with somebody else rather than
   decided here.
-tools:
-  - portrait.read_background
-  - portrait.draw
-  - portrait.redraw
+modes:
+  - reading
+  - working
+  - offered

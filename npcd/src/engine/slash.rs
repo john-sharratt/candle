@@ -128,6 +128,27 @@ pub struct Parsed {
     pub command: &'static str,
 }
 
+impl Parsed {
+    /// Say who was speaking.
+    ///
+    /// **The parser cannot know.** It turns a typed line into an event and has
+    /// no idea whose console it came from, so it writes the placeholder `you` —
+    /// which renders as *"you says to you: …"*, a sentence that is both
+    /// ungrammatical and wrong about who spoke. The caller knows the name and
+    /// substitutes it here.
+    ///
+    /// Only [`EventKind::Speech`] carries a speaker; everything else is
+    /// untouched, so this is safe to call on any parse.
+    pub fn spoken_by(mut self, who: &str) -> Parsed {
+        if let EventKind::Speech { speaker, .. } = &mut self.kind {
+            if speaker == "you" && !who.trim().is_empty() {
+                *speaker = who.trim().to_string();
+            }
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ParseError {
     /// Not a command this daemon has. Carries the closest match, if there is a
@@ -322,6 +343,46 @@ mod tests {
 
     /// The common case is talking to the character, so it is the one that needs
     /// no syntax.
+    /// **The speaker is named, or the character reads "you says to you".**
+    ///
+    /// The parser cannot know whose console a line came from, so it writes a
+    /// placeholder and the caller substitutes. Left unsubstituted it renders
+    /// through `EventKind::prose` as an ungrammatical sentence that is also
+    /// wrong about who spoke — and it went to the model exactly like that.
+    #[test]
+    fn a_speaker_can_be_named_after_parsing() {
+        let p = parse("where were you last night?")
+            .unwrap()
+            .spoken_by("Johnathan Sharratt");
+        let EventKind::Speech { speaker, to, .. } = &p.kind else {
+            panic!("a bare line is speech");
+        };
+        assert_eq!(speaker, "Johnathan Sharratt");
+        assert_eq!(*to, Addressed::You, "naming the speaker moved the aim");
+
+        let rendered = crate::engine::event::Event::new(0, 0, p.salience, p.kind.clone()).prose();
+        assert_eq!(rendered, "Johnathan Sharratt says to you: where were you last night?");
+        assert!(!rendered.starts_with("you says"), "{rendered}");
+    }
+
+    /// Naming a speaker on something nobody said leaves it alone.
+    #[test]
+    fn naming_a_speaker_touches_nothing_that_is_not_speech() {
+        let before = parse("/sleep").unwrap();
+        let after = parse("/sleep").unwrap().spoken_by("Johnathan Sharratt");
+        assert_eq!(before.kind, after.kind);
+    }
+
+    /// An overheard line already names its speaker, and is not the caller.
+    #[test]
+    fn an_overheard_line_keeps_its_own_speaker() {
+        let p = parse("/overhear the gate is open").unwrap().spoken_by("Johnathan");
+        let EventKind::Speech { speaker, .. } = &p.kind else {
+            panic!("overhearing is speech");
+        };
+        assert_eq!(speaker, "someone nearby");
+    }
+
     #[test]
     fn a_bare_line_is_speech_to_the_character() {
         let p = parse("where were you last night?").unwrap();

@@ -51,6 +51,7 @@ use crate::engine::act::{self, Parsed};
 use crate::engine::event::Event;
 use crate::engine::identity;
 use crate::engine::prompt::{self, Persona};
+use crate::engine::retention;
 use crate::engine::sleep::conversation_id;
 use crate::engine::tools::{self, for_mode, Mode};
 use crate::engine::window::{Speaker, Window};
@@ -75,6 +76,13 @@ struct Live {
     /// is what triggers the roll-over.
     day: u64,
     id: String,
+    /// The first turn retention has **not** yet retired.
+    ///
+    /// Zero for a conversation just opened, which is always safe: a turn already
+    /// tombstoned costs a lookup and no write, so a daemon restarted against an
+    /// existing conversation walks its watermark forward over the first few
+    /// inserts without rewriting anything. See [`retention::retire_expired`].
+    retired_through: u32,
 }
 
 /// Every character's conversation, and the engine they run on.
@@ -124,6 +132,14 @@ pub struct Minds {
     /// Each conversation behind its own lock, so a decode holds only the
     /// character that is thinking — see the module's *Locking* note.
     live: Mutex<HashMap<u64, Arc<Mutex<Live>>>>,
+    /// How many turns stay verbatim in the redo log, or `None` to keep them all.
+    ///
+    /// **Off unless the projection asks for it**, because most conversations are
+    /// finite and their transcript is the product. A character's is neither: it
+    /// never ends, so nothing else would ever make one of its turns dead, and a
+    /// log with no dead records is a log compaction cannot reclaim. See
+    /// [`crate::engine::retention`] for what that cost in practice.
+    keep_turns: Option<u64>,
 }
 
 /// The schema a character's conversation opens against, with its acts and
@@ -276,6 +292,13 @@ pub struct Thought {
     pub parsed: Parsed,
     /// Set when this tick opened a new day's conversation.
     pub rolled_over: Option<(u64, u64)>,
+    /// How many turns this tick retired from the log.
+    ///
+    /// Reported rather than silent so an operator watching the pulse can see
+    /// retention working — a log that quietly stops growing looks identical to
+    /// one that quietly stopped being written. Ordinarily one; more than one
+    /// means a gap was being closed.
+    pub retired: u32,
 }
 
 impl Minds {
@@ -363,7 +386,27 @@ impl Minds {
             grammar_ok: ok,
             projection: RwLock::new(None),
             live: Mutex::new(HashMap::new()),
+            keep_turns: None,
         }
+    }
+
+    /// Bound how much of every character's conversation stays verbatim on disk.
+    ///
+    /// Set from the projection's `turn_retention`, so a deployment that wants
+    /// whole transcripts simply omits it. See [`crate::engine::retention`].
+    pub fn keeping_turns(mut self, keep: Option<u64>) -> Self {
+        match keep {
+            Some(n) => tracing::info!(
+                "conversations keep {n} turns verbatim; older turns are retired from the log so \
+                 compaction can reclaim them"
+            ),
+            None => tracing::info!(
+                "conversations keep every turn — the log grows without bound unless something \
+                 else retires them"
+            ),
+        }
+        self.keep_turns = keep;
+        self
     }
 
     /// Hand over the schema characters think under, once it is filled.
@@ -713,7 +756,12 @@ impl Minds {
                              will not be attributable to this character"
                         );
                     }
-                    Arc::clone(slot.insert(Arc::new(Mutex::new(Live { sequence, day, id }))))
+                    Arc::clone(slot.insert(Arc::new(Mutex::new(Live {
+                        sequence,
+                        day,
+                        id,
+                        retired_through: 0,
+                    }))))
                 }
             }
         };
@@ -768,11 +816,39 @@ impl Minds {
             assistant_prefill: self.opening(identity::Deliberation::default()),
             ..Default::default()
         };
-        let response = conversation
-            .lock()
-            .unwrap()
-            .sequence
-            .send_turn_with_options(&perception, options)?;
+        let (response, timeline, depth, watermark) = {
+            let mut live = conversation.lock().unwrap();
+            let response = live
+                .sequence
+                .send_turn_with_options(&perception, options)?;
+            (
+                response,
+                live.sequence.timeline_id(),
+                live.sequence.turn_count(),
+                live.retired_through,
+            )
+        };
+        // **Retire whatever now sits below the horizon.**
+        //
+        // On the insert rather than on a timer: a turn is the only thing that
+        // pushes another one out, so the moment one lands is exactly when the
+        // question has a new answer. The sweep looks *back* rather than
+        // assuming one turn fell out since last time, which is what makes a
+        // failed write or a restarted daemon catch up instead of stranding
+        // those turns below the horizon for good.
+        //
+        // The conversation's own lock is released first: retiring takes the
+        // engine lock to write, and holding both would put every other
+        // character's decode behind this one's bookkeeping.
+        if let Some(keep) = self.keep_turns {
+            if let Ok(engine) = self.engine.lock() {
+                let (through, retired) =
+                    retention::retire_expired(&engine, timeline, depth, keep, watermark);
+                drop(engine);
+                conversation.lock().unwrap().retired_through = through;
+                thought.retired = retired;
+            }
+        }
         thought.parsed = act::parse(&response.text);
         Ok(thought)
     }

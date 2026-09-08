@@ -77,8 +77,8 @@ impl Format {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Canon,
-    Agency,
-    Beliefs,
+    Eras,
+    Stories,
     Memory,
     Responses,
     Moods,
@@ -89,10 +89,16 @@ pub enum Section {
 
 /// Every section, in the order the console shows them: the world first, then
 /// what characters are made of, then the settings that bind them.
+///
+/// **`Agency` and `Beliefs` are gone.** They pointed at `layers/agency` and
+/// `layers/beliefs`, which stopped existing when those layers came out of
+/// `projection.yaml` — so the console listed two sections that could never
+/// contain anything and reported `count: 0` for both. Putting them back is this
+/// list, the enum, and the four `match` arms the compiler will demand.
 pub const SECTIONS: [Section; 9] = [
     Section::Canon,
-    Section::Agency,
-    Section::Beliefs,
+    Section::Eras,
+    Section::Stories,
     Section::Memory,
     Section::Responses,
     Section::Moods,
@@ -106,8 +112,8 @@ impl Section {
     pub fn slug(self) -> &'static str {
         match self {
             Section::Canon => "canon",
-            Section::Agency => "agency",
-            Section::Beliefs => "beliefs",
+            Section::Eras => "eras",
+            Section::Stories => "stories",
             Section::Memory => "memory",
             Section::Responses => "responses",
             Section::Moods => "moods",
@@ -121,8 +127,8 @@ impl Section {
     pub fn title(self) -> &'static str {
         match self {
             Section::Canon => "World knowledge",
-            Section::Agency => "Agency",
-            Section::Beliefs => "Beliefs",
+            Section::Eras => "Eras",
+            Section::Stories => "Stories",
             Section::Memory => "Memory",
             Section::Responses => "Responses",
             Section::Moods => "Moods",
@@ -143,8 +149,13 @@ impl Section {
                 "History, technology, factions, geography, combat — the game's own knowledge, \
                  and the largest part of the mind."
             }
-            Section::Agency => "What characters want, and how they go about it.",
-            Section::Beliefs => "What each character holds to be true.",
+            Section::Eras => {
+                "The main storyline: what happened, in order, and when. Shared by everybody."
+            }
+            Section::Stories => {
+                "Backstory — accounts of the corners the eras leave out, and fallible the way an \
+                 account is."
+            }
             Section::Memory => "What each character remembers having lived.",
             Section::Responses => "The structural shapes a reply can take.",
             Section::Moods => "The registers a reply can be spoken in.",
@@ -162,8 +173,8 @@ impl Section {
     fn dir(self) -> Option<&'static str> {
         match self {
             Section::Canon => Some("layers/world"),
-            Section::Agency => Some("layers/agency"),
-            Section::Beliefs => Some("layers/beliefs"),
+            Section::Eras => Some("layers/eras"),
+            Section::Stories => Some("layers/stories"),
             Section::Memory => Some("layers/memory"),
             Section::Responses => Some("responses"),
             Section::Moods => Some("moods"),
@@ -179,7 +190,7 @@ impl Section {
 
     pub fn format(self) -> Format {
         match self {
-            Section::Canon | Section::Agency | Section::Beliefs | Section::Memory => {
+            Section::Canon | Section::Eras | Section::Stories | Section::Memory => {
                 Format::Markdown
             }
             Section::Responses
@@ -192,11 +203,12 @@ impl Section {
 
     /// Whether entries nest. A response is one document; a canon topic holds
     /// entries, and some of those hold more.
+    ///
+    /// Eras and stories are flat: each is one document that names itself with a
+    /// first-level heading, which is what `Record::index_canon` reads to find
+    /// the thing a Maker asks for by name.
     pub fn nests(self) -> bool {
-        matches!(
-            self,
-            Section::Canon | Section::Agency | Section::Beliefs | Section::Memory
-        )
+        matches!(self, Section::Canon | Section::Memory)
     }
 }
 
@@ -603,8 +615,8 @@ mod tests {
     fn only_the_named_sections_exist() {
         for good in [
             "canon",
-            "agency",
-            "beliefs",
+            "eras",
+            "stories",
             "memory",
             "responses",
             "moods",

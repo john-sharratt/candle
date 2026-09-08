@@ -12,7 +12,3 @@ long: >
   that somebody has to walk the racks against the list and find out what has
   drifted. What turns up in the wrong drawer usually says something about who
   was working on what.
-tools:
-  - stores.put_back
-  - stores.take_out
-  - stores.walk_the_racks

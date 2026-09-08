@@ -66,12 +66,20 @@ pub fn in_world(world: &World, body: &str) -> Vec<Within> {
     world
         .map()
         .parts_at(node)
-        .filter(|(part, _)| !part.tools.is_empty())
+        // Everything a body could work, whether or not any act attaches to it
+        // yet. A part with no acts is still a thing standing in the room, and
+        // saying so is what the reach line is for.
         .map(|(part, count)| Within {
             thing: part.count_name(count),
             count,
             about: part.long.clone(),
-            tools: part.tools.clone(),
+            // The acts an act attaches here — asked of the catalogue, because
+            // the part no longer carries a list of them.
+            tools: crate::engine::tools::CATALOG
+                .iter()
+                .filter(|t| t.at.contains(&part.id.as_str()))
+                .map(|t| t.name.to_string())
+                .collect(),
         })
         .collect()
 }
@@ -153,7 +161,7 @@ mod tests {
             .find(|w| w.thing.contains("terminal"))
             .expect("band one has terminals");
         assert_eq!(terminal.count, 6);
-        assert!(terminal.tools.iter().any(|t| t.starts_with("character.")));
+        assert!(terminal.tools.iter().any(|t| t.starts_with("character_")));
         assert!(!terminal.about.is_empty(), "a part with no provenance");
     }
 
@@ -171,12 +179,12 @@ mod tests {
     #[test]
     fn walking_out_of_a_room_takes_its_tools_with_you() {
         let h = standing("band-one");
-        assert!(can_reach(&h, "m1", "character.write_identity"));
+        assert!(can_reach(&h, "m1", "character_write_identity"));
 
         h.with(|w| w.set_off("m1", at("ring-north")).unwrap());
         h.tick();
         assert!(
-            !can_reach(&h, "m1", "character.write_identity"),
+            !can_reach(&h, "m1", "character_write_identity"),
             "a terminal followed the body out of the room"
         );
     }
@@ -197,7 +205,7 @@ mod tests {
         let reachable = tools(&h, "painter");
         assert!(!reachable.is_empty(), "the studio offers nothing at all");
         assert!(
-            !reachable.iter().any(|t| t.starts_with("chronicle.")),
+            !reachable.iter().any(|t| t.starts_with("chronicle_")),
             "{reachable:?}"
         );
     }
@@ -220,17 +228,25 @@ mod tests {
                 })
                 .collect()
         });
-        let mut rooms_with_tools = 0;
+        let mut described = 0;
+        let mut affording = 0;
         for place in places {
             h.with(|w| w.enter("wanderer", "The Wanderer", place.clone()).unwrap());
             for part in within(&h, "wanderer") {
-                rooms_with_tools += 1;
+                described += 1;
                 assert!(!part.thing.is_empty(), "{place}");
                 assert!(part.about.len() > 20, "{place}: {}", part.about);
-                assert!(!part.tools.is_empty(), "{place}");
+                // **Not every part affords an act, and that is right.** A seat
+                // is a thing standing in a room with nothing to do at it, and
+                // saying so is what the reach line is for. What must hold is
+                // that everything present is *described*.
+                if !part.tools.is_empty() {
+                    affording += 1;
+                }
             }
         }
-        assert!(rooms_with_tools > 10, "only {rooms_with_tools} checked");
+        assert!(described > 10, "only {described} parts checked");
+        assert!(affording > 5, "only {affording} parts afford anything");
     }
 
     #[test]

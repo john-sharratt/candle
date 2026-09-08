@@ -80,6 +80,11 @@ fn a_part_clause_stands_on_its_own_in_a_sentence() {
             " overlooks ",
             " move ",
             " names ",
+            // The machines: a turret fires, a fabricator turns stock into
+            // things, a door opens.
+            " fires ",
+            " turns ",
+            " opens ",
         ];
         assert!(
             verbs.iter().any(|v| flat.contains(v)),
@@ -203,48 +208,28 @@ fn a_station_that_binds_something_says_what() {
     assert!(set.part("watch-desk").unwrap().binds.is_none());
 }
 
+/// **What is within reach is read off the room a body is in.**
+///
+/// This crate's half of the payoff of parts being referenced rather than
+/// described in place. Which *acts* those parts afford is the engine's to say —
+/// an act names the stations it attaches to — so this asserts the things, and
+/// `npcd`'s own suite asserts the vocabulary.
 #[test]
-fn every_station_carries_the_tools_it_makes_reachable() {
-    // The whole point of parts: what an NPC can do is a function of what its
-    // body is next to. A station with no tools is a seat.
-    let set = vault();
-    for level in set.children("creators-vault") {
-        for node in &level.nodes {
-            for (part, _) in set.parts_of(node, PartKind::Station) {
-                assert!(
-                    !part.tools.is_empty(),
-                    "{}/{} places `{}`, which affords nothing",
-                    level.id,
-                    node.id,
-                    part.id
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn the_tool_surface_is_read_off_the_room_a_body_is_in() {
+fn what_is_within_reach_is_read_off_the_room_a_body_is_in() {
     let set = vault();
     let casting = set.get("vault-casting").expect("the casting level");
 
     let band = casting.node("band-one").expect("band one");
-    let at_a_station = set.tools_at(band);
-    assert!(
-        at_a_station.contains(&"character.write_beliefs"),
-        "{at_a_station:?}"
-    );
+    let here = set.part_ids_at(band);
+    assert!(here.contains(&"character-terminal"), "{here:?}");
 
-    // Step into the corridor and the same tool is gone, because the terminal
-    // is not within reach any more.
+    // Step into the corridor and it is gone, because the terminal is not
+    // within reach any more.
     let corridor = casting.node("ring-north").expect("the north run");
-    assert!(set.tools_at(corridor).is_empty());
+    assert!(set.part_ids_at(corridor).is_empty());
 
-    // And a tool that belongs to another level is never reachable here.
-    assert!(
-        !at_a_station.contains(&"chronicle.rewrite_page"),
-        "{at_a_station:?}"
-    );
+    // And a station belonging to another level is never reachable here.
+    assert!(!here.contains(&"chronicle-terminal"), "{here:?}");
 }
 
 #[test]

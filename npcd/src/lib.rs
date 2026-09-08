@@ -47,6 +47,7 @@ pub mod portrait;
 pub mod projection;
 pub mod refimage;
 pub mod registry;
+pub mod sim;
 pub mod substrate;
 pub mod telemetry;
 pub mod visibility;

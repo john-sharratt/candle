@@ -2837,6 +2837,36 @@ impl Conversation {
         Ok(())
     }
 
+    /// Tombstone **one turn** of a live timeline — in-RAM and on disk — leaving
+    /// the rest of the conversation untouched.
+    ///
+    /// The difference from [`Self::tombstone_timeline`] is what survives. A
+    /// timeline tombstone retires a whole conversation; this drops one turn's
+    /// *content* while the turn itself stays in the index, so the compactor
+    /// sheds its bulk records and a reload restores it as an empty hole. Turn
+    /// numbering is therefore stable across the drop — nothing downstream has to
+    /// renumber, and nothing dangles.
+    ///
+    /// **This is what makes an endless conversation affordable.** A transcript
+    /// that never ends is a transcript no compaction pass can ever reclaim: a
+    /// sealed segment is only relocated once enough of it is dead, and turns
+    /// that stay live forever never make it dead. Retiring the tail past a depth
+    /// is what turns an unbounded log into a bounded one.
+    pub fn tombstone_turn(&self, timeline: TimelineId, turn_index: u32) -> candle::Result<()> {
+        self.write().tombstone_turn(timeline, turn_index);
+        let mut p = self.persistence.lock().unwrap();
+        p.write_turn_tombstone(timeline.raw(), turn_index, Some("retention"))
+            .map_err(|e| candle::Error::Msg(format!("write_turn_tombstone: {e}")))?;
+        Ok(())
+    }
+
+    /// Whether `(timeline, turn)` has already been dropped by a turn-scoped
+    /// tombstone. Callers retiring a tail consult this so a turn is written
+    /// once rather than on every pass.
+    pub fn is_turn_tombstoned(&self, timeline: TimelineId, turn_index: u32) -> bool {
+        self.read().is_turn_tombstoned(timeline, turn_index)
+    }
+
     /// Mark a code_read scope fork's timeline as transient scratch — its sealed KV is
     /// spliced by reference onto the file timeline and never persisted to cold, so a
     /// cold copy can't be stranded as an orphan when the fork is tombstoned. In-memory

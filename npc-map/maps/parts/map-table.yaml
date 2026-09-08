@@ -12,9 +12,7 @@ long: >
   you get up, and everybody wanting a place desk waits on you. That cost is
   the point — it is what stops the geography being edited by six people who
   each thought they were making a small change.
-tools:
-  - map.read
-  - map.move_border
-  - map.add_place
-  - map.drown_place
-  - map.redraw_coast
+modes:
+  - reading
+  - working
+  - offered

@@ -8,7 +8,3 @@ long: >
   Where a finished portrait is filed, and beside it the standing list of
   characters with no face yet. Taking one off that list claims the character
   for whichever easel you go to next.
-tools:
-  - portrait.file_plate
-  - portrait.read_unmade
-  - portrait.take_faceless

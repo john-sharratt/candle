@@ -132,9 +132,10 @@ fn a_room_with_no_stations_says_nothing_about_stations() {
     let p = flat(&w, "m1");
     assert!(p.contains("You are in the green room."), "{p}");
     assert!(!p.contains("stand free"), "{p}");
-    // But sitting and talking are still within reach.
-    let tools = within_reach(&w, "m1");
-    assert!(tools.contains(&"room.talk"), "{tools:?}");
+    // But a seat is still within reach. What sitting on one *is* — an act — is
+    // the engine's to say; this crate only knows the thing is there.
+    let here = within_reach(&w, "m1");
+    assert!(here.contains(&"seat"), "{here:?}");
 }
 
 // =========================================================================
@@ -189,7 +190,7 @@ fn the_watch_is_a_station_that_holds_nobody() {
     let p = flat(&w, "m1");
     assert!(p.contains("You are working in the watch."), "{p}");
     assert!(!p.contains("holding"), "{p}");
-    assert!(within_reach(&w, "m1").contains(&"cast.read_all"));
+    assert!(within_reach(&w, "m1").contains(&"watch-desk"));
 }
 
 #[test]
@@ -213,8 +214,7 @@ fn a_store_has_nothing_to_sit_at_but_plenty_to_reach() {
         Refused::NothingToWorkAt
     );
     let tools = within_reach(&w, "m1");
-    assert!(tools.contains(&"roster.read"), "{tools:?}");
-    assert!(tools.contains(&"roster.take_unheld"), "{tools:?}");
+    assert!(tools.contains(&"roster"), "{tools:?}");
 }
 
 #[test]
@@ -566,22 +566,18 @@ fn two_holders_can_meet_at_a_table_neither_of_them_could_use_alone() {
     let p = flat(&w, "m1");
     assert!(p.contains("You are at the relations table."), "{p}");
     assert!(p.contains("Maker-02 is here."), "{p}");
-    assert!(within_reach(&w, "m1").contains(&"character.settle_relation"));
+    assert!(within_reach(&w, "m1").contains(&"relations-table"));
 }
 
 #[test]
 fn each_level_has_its_own_shared_table_within_reach() {
     let mut w = vault();
     for (level, node, tool) in [
-        (
-            "vault-chronicle",
-            "concordance",
-            "chronicle.settle_boundary",
-        ),
-        ("vault-story", "long-table", "story.read_aloud"),
-        ("vault-cartography", "road-table", "place.settle_route"),
-        ("vault-casting", "relations", "character.settle_relation"),
-        ("vault-portraits", "likeness", "portrait.settle_likeness"),
+        ("vault-chronicle", "concordance", "concordance-table"),
+        ("vault-story", "long-table", "reading-table"),
+        ("vault-cartography", "road-table", "road-table"),
+        ("vault-casting", "relations", "relations-table"),
+        ("vault-portraits", "likeness", "likeness-table"),
     ] {
         w.enter("m1", "Maker-01", Where::new(level, node)).unwrap();
         let tools = within_reach(&w, "m1");

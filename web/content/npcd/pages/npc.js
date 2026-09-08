@@ -59,6 +59,9 @@ export async function render(params) {
     // question anybody has about a character and there was previously nowhere on
     // this page to answer it — the loop was only visible from the global view.
     railItem('pulse', 'Pulse', npc.tick?.ticks),
+    // Above Interactions deliberately: this is the one that works, and it is
+    // the thing anybody opening a character's page actually wants to do.
+    railItem('messages', 'Messages'),
     railItem('interactions', 'Interactions', npc.live_interactions),
 
     h('div', { class: 'rail-sec' }, 'layers'),
@@ -101,14 +104,22 @@ export async function render(params) {
   const bodyHost = h('div', {});
   el.appendChild(bodyHost);
 
+  /// The Messages tab's poll, declared here because the tab switch below clears
+  /// it and a `let` beside the function it belongs to would be in the temporal
+  /// dead zone when that runs.
+  let messagePoll = null;
+
   // ── tabs ──────────────────────────────────────────────────────────────────
 
   const TABS = {
-    overview, interactions, beliefs, relationships, agency, projection, monitor, manage,
+    overview, messages, interactions, beliefs, relationships, agency, projection, monitor, manage,
     environment: environmentTab,
     pulse: pulseTab,
   };
   const fn = TABS[tab] || (LAYERS.includes(tab) ? () => streamLayer(tab) : overview);
+  // Any tab other than Messages stops its poll — otherwise the timer runs
+  // against a detached node for as long as the console is open.
+  if (tab !== 'messages') clearInterval(messagePoll);
   await fn();
 
   // ── pulse ─────────────────────────────────────────────────────────────────
@@ -517,6 +528,71 @@ export async function render(params) {
       h('div', { class: 'tiny dim', style: 'margin-top:9px' },
         'The expressive band is where a brooding character lives. The instrument exists to let you push toward a ' +
         'characterful near-edge deliberately, and to see when it is about to tip past character into incoherence.'));
+  }
+
+  /* Messaging the character on its handset.
+   *
+   * **The same threads the characters use between themselves.** What is sent
+   * here goes into the world rather than into a private channel: the character
+   * is told about it by the ordinary perception sweep and answers with the
+   * ordinary `message` act, from wherever it is standing. That is what makes
+   * the reply worth having — it is the character speaking from inside the
+   * world, and everything else in the world can see the conversation happened.
+   *
+   * Polled rather than streamed, and the shape follows from that: a reply
+   * arrives on the character's own schedule, when its next turn comes round,
+   * because it is deciding to answer rather than being queried. There is no
+   * event to stream — the thread simply has one more line on it.
+   */
+  async function messages() {
+    const paint = (r, pending) => mount(bodyHost,
+      h('div', { class: 'tiny dim', style: 'margin-bottom:11px' },
+        r.in_a_world
+          ? `On ${r.with}’s handset, as ${r.as}. It answers on its own schedule — when its next turn comes round.`
+          : 'This character has no body in a world, so there is nothing to reach it on.'),
+      h('div', { class: 'msg-thread' },
+        (r.messages || []).length
+          ? (r.messages || []).map((m) => h('div', {
+            class: 'msg' + (m.from === r.as ? ' mine' : ''),
+          },
+            h('div', { class: 'npc-meta' }, m.from),
+            h('div', {}, m.text)))
+          : empty('◍', 'Nothing said yet', 'Send something and it will reach their handset.')),
+      pending ? h('div', { class: 'tiny dim' }, 'waiting for them to look…') : null,
+      r.in_a_world
+        ? h('form', {
+          class: 'row', style: 'gap:8px;margin-top:11px',
+          onSubmit: async (e) => {
+            e.preventDefault();
+            const box = e.target.querySelector('input');
+            const text = (box.value || '').trim();
+            if (!text) return;
+            box.value = '';
+            await API.sendMessage(id, text).catch(() => {});
+            await messages();
+          },
+        },
+          h('input', {
+            class: 'in', style: 'flex:1',
+            placeholder: 'Say something to ' + (r.with || 'them') + '…',
+          }),
+          h('button', { class: 'btn sm primary', type: 'submit' }, 'Send'))
+        : null);
+
+    const r = await API.getMessages(id).catch(() => ({ messages: [], in_a_world: false }));
+    paint(r, false);
+
+    // Poll while this tab is the one showing. Cleared by `show`, so leaving the
+    // tab stops the timer rather than leaving it running against a detached
+    // node for as long as the console is open.
+    clearInterval(messagePoll);
+    if (r.in_a_world) {
+      messagePoll = setInterval(async () => {
+        const next = await API.getMessages(id).catch(() => null);
+        if (!next) return;
+        if ((next.messages || []).length !== (r.messages || []).length) await messages();
+      }, 4000);
+    }
   }
 
   // ── interactions / environment / manage ───────────────────────────────────

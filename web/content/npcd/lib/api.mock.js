@@ -7,6 +7,10 @@
  * landing page. */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/// Threads the mock is holding, by character. See `getMessages`: a conversation
+/// has to accumulate across calls or the tab looks right and shows nothing.
+const mockThreads = {};
 const flag = (k) => { try { return new URLSearchParams(location.search).has(k); } catch (_) { return false; } };
 const EMPTY = flag('empty');
 
@@ -552,6 +556,27 @@ export const MockAPI = {
         const t = i / w;
         return { tick: 312 + i, value: +(0.12 + 0.1 * Math.abs(Math.sin(t * 6)) + 0.06 * t).toFixed(3) };
       }) };
+  },
+
+  /* Messaging a character on its handset.
+   *
+   * Kept in the mock so the console's Messages tab renders standalone. The
+   * thread is held in memory here rather than invented per call, because the
+   * one thing this page has to look right is a conversation *accumulating* —
+   * a mock that returned a fresh pair of lines every poll would show the tab
+   * working while hiding the only behaviour it has.
+   */
+  async getMessages(id) {
+    mockThreads[id] = mockThreads[id] || [
+      { from: 'Wren', text: 'Are you at a terminal, and what are you working on?' },
+      { from: 'Maker-01', text: 'The third era. Two entries disagree about the same spring.' },
+    ];
+    return { messages: mockThreads[id], in_a_world: true, with: 'Maker-01', as: 'Wren' };
+  },
+  async sendMessage(id, text) {
+    mockThreads[id] = mockThreads[id] || [];
+    mockThreads[id].push({ from: 'Wren', text });
+    return { sent: text, from: 'Wren', to: 'Maker-01', waiting_for_them: 1, can_reply: true };
   },
 
   async listInteractions(id) {

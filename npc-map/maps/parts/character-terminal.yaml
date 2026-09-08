@@ -14,9 +14,7 @@ long: >
   name. What it will not let you write is what stands *between* two
   characters: that lives in both their records and neither holder can put it
   there alone.
-tools:
-  - character.read
-  - character.write_identity
-  - character.write_wants
-  - character.write_beliefs
-  - character.write_memories
+modes:
+  - reading
+  - working
+  - offered

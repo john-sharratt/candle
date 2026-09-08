@@ -149,6 +149,16 @@ export const LiveAPI = {
   getProjection:(id, tick) => j(`/v1/npc/${id}/projection` + (tick ? '/' + tick : '')),
   getMonitor:   (id, w) => j(`/v1/npc/${id}/monitor` + qs({ window: w })),
 
+  // Messaging a character on its handset.
+  //
+  // The same threads the characters use between themselves, not a private pipe
+  // to a mind: what is posted here lands in the world, the character is told
+  // about it by the ordinary perception sweep, and it answers with the ordinary
+  // `message` act. So a reply arrives on the character's own schedule — there
+  // is nothing to stream, and polling the thread is the honest shape.
+  getMessages:  (id) => j(`/v1/npc/${id}/message`),
+  sendMessage:  (id, text) => j(`/v1/npc/${id}/message`, { method: 'POST', body: { text } }),
+
   listInteractions: (id) => j(`/v1/npc/${id}/interaction`),
   openInteraction:  (id, spec) => j(`/v1/npc/${id}/interaction`, { method: 'POST', body: spec }),
   getInteraction:   (ix) => j(`/v1/interaction/${ix}`),

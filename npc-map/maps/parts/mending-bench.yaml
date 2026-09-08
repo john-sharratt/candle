@@ -10,7 +10,7 @@ long: >
   live through it. Mending is stabilising what is failing while leaving the
   evidence that it failed. A repair passed off as an original is worse than the
   damage, because the next Maker has no way to know what they are looking at.
-tools:
-  - record.mend
-  - record.mark_repair
-  - record.read_condition
+modes:
+  - reading
+  - working
+  - offered

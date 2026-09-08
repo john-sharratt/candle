@@ -1,0 +1,12 @@
+id: muster-board
+kind: fixture
+name: muster board
+short: >
+  Standing orders are set on the muster board and handed to whoever is to carry
+  them out.
+long: >
+  Where work is given rather than taken. An order set here carries the name of
+  whoever set it and, where the two differ, the name of whoever it was set on
+  behalf of — which matters, because an order issued in the Tower Lord's name by
+  somebody else is a different thing from one that body issued itself, and
+  anybody reading the board can tell.

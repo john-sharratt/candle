@@ -8,6 +8,3 @@ long: >
   A seat. Sitting claims nothing and blocks nobody. What it affords is talking
   to whoever else is here, which is the only route by which something a Maker
   learned and never wrote down reaches the Maker who needs it.
-tools:
-  - room.sit
-  - room.talk

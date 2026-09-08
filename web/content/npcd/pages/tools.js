@@ -30,7 +30,9 @@ export async function render() {
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'Tools'),
       h('div', { class: 'sub' },
-        'The act vocabulary. Every tool carries intent, not output — the narrator renders the words.')),
+        'The act vocabulary. Every tool carries intent, not output — the narrator renders the words. '
+        + 'What a character is offered is narrowed per turn by where it is standing, so this is the '
+        + 'whole catalog rather than any one character\'s.')),
     h('div', { class: 'row' },
       // Reading the catalog is every signed-in operator's; running a
       // calibration pass is not. It is a daemon-wide side effect that changes
@@ -91,6 +93,18 @@ export async function render() {
             title: '/' + t.name,
             body: h('div', {},
               h('p', { style: 'color:var(--ink-soft)' }, t.description),
+              /* Where the act can be done, in full.
+               *
+               * The table's chip summarises — six station names wrap the row
+               * and are unreadable at a glance — but the list is exactly what
+               * somebody asking "why can my character not do this?" needs, and
+               * here there is room for it. */
+              (t.at_named || []).length
+                ? h('div', { style: 'margin:10px 0' },
+                  h('div', { class: 'tiny dim' }, 'Reachable at'),
+                  h('div', { class: 'row wrap', style: 'gap:4px;margin-top:4px' },
+                    t.at_named.map((n) => h('span', { class: 'chip accent' }, n))))
+                : null,
               h('h3', {}, 'Parameters — the schema the model actually sees'),
               h('pre', {
                 class: 'mono',
@@ -98,15 +112,26 @@ export async function render() {
                   'padding:11px;overflow:auto;font-size:.75rem',
               }, JSON.stringify(t.parameters || { type: 'object', properties: {} }, null, 2)),
               h('div', { class: 'tiny dim' },
-                'Derived from the Rust request type by schemars — never hand-written, so the prompt and the parser cannot disagree.')),
+                'Built from the same parameter list the turn grammar compiles from, so the prompt, '
+                + 'the grammar and the parser cannot disagree about what an act takes. '
+                + 'An "x-bound-to" argument has no fixed list: the world enumerates it per turn — '
+                + 'the people actually here, the rooms actually reachable, the things actually carried '
+                + '— and a value outside that set is unrepresentable rather than refused.')),
           }),
         },
           h('td', {}, h('code', { class: 'mono', style: 'color:var(--accent)' }, t.name)),
           h('td', { class: 'tiny', style: 'color:var(--ink-soft)' }, t.description),
           h('td', {}, h('div', { class: 'row wrap', style: 'gap:4px' },
-            (t.modes || []).length === 4
-              ? h('span', { class: 'chip' }, 'all')
-              : (t.modes || []).map((m) => h('span', { class: 'chip accent' }, MODE_SHORT[m] || m)))),
+            [
+              (t.modes || []).length === 4
+                ? h('span', { class: 'chip' }, 'all')
+                : (t.modes || []).map((m) => h('span', { class: 'chip accent' }, MODE_SHORT[m] || m)),
+              /* What the act needs beyond a mode. An act is ABSENT when its
+               * condition does not hold, never refused — so an operator
+               * looking for a tool a character never calls needs to see the
+               * condition, or the absence reads as the model ignoring it. */
+              t.needs ? h('span', { class: 'chip warn', title: 'absent unless this holds' }, t.needs) : null,
+            ])),
           h('td', {}, h('span', { class: 'chip' + (t.source === 'extension' ? ' violet' : '') }, t.source)),
           h('td', {}, t.calibrated
             ? h('span', { class: 'chip ok' }, 'yes')

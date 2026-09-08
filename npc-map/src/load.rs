@@ -230,19 +230,20 @@ impl MapSet {
         area.nodes.iter().map(|n| self.stations_at(n)).sum()
     }
 
-    /// **The tool surface at a node**: every tool the parts within reach carry.
+    /// **The parts within reach at a node**, by id.
     ///
     /// This is the payoff of parts being referenced rather than described in
-    /// place. What an NPC can do is a function of where its body is, computed
-    /// from the map, so a tool it is not standing next to is never offered and
-    /// cannot be reasoned about wrongly.
-    pub fn tools_at<'a>(&'a self, node: &'a Node) -> Vec<&'a str> {
+    /// place: what is standing next to a body is a function of where the body
+    /// is, computed from the map.
+    ///
+    /// It stops here. Which *acts* those parts make available is the engine's
+    /// to say — an act names the stations it attaches to — so this crate never
+    /// carries a vocabulary it cannot check and cannot use.
+    pub fn part_ids_at<'a>(&'a self, node: &'a Node) -> Vec<&'a str> {
         let mut out: Vec<&str> = Vec::new();
         for (part, _) in self.parts_at(node) {
-            for tool in &part.tools {
-                if !out.contains(&tool.as_str()) {
-                    out.push(tool);
-                }
+            if !out.contains(&part.id.as_str()) {
+                out.push(&part.id);
             }
         }
         out

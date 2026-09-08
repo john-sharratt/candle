@@ -72,6 +72,42 @@ impl Outcome {
 /// Every name here is answered by [`perform`]. It used to list two — `wait` and
 /// `observe` — that fell through to [`Outcome::NotOfTheBody`], which read as
 /// "this happens in a head" when it actually meant "nothing happens at all".
+/// The acts whose whole product is the line they come back with.
+///
+/// **An act that answers a question keeps the world's words**, for the same
+/// reason a refusal does: there the prose *is* the information, and there is no
+/// later moment that will deliver it. Nothing in the world perceives a document
+/// being read — the contents exist in the outcome and nowhere else, so
+/// recording `file_read — layers/eras/third.md` and dropping the rest hands a
+/// character the fact that it read something and not what it read. It then
+/// reads it again, having learned nothing, for as long as it runs.
+///
+/// A side table rather than a field on [`Tool`], matching how `LIVE` names the
+/// world-bound parameters — and held to the catalog by
+/// [`tests::every_answering_act_is_a_real_one`] so a rename cannot leave a
+/// silent entry behind.
+pub const ANSWERS: &[&str] = &[
+    // The documents.
+    "file_read",
+    "file_list",
+    "library_read",
+    "portrait_prompt_read",
+    // The bench's own history, which is not the character's to write.
+    "bench_diff",
+    "bench_status",
+    "bench_log",
+    "bench_blame",
+    // Reading a thing that stands in a room, which has the same shape and the
+    // same defect: what a board says is only ever in the outcome.
+    "read",
+    "scan",
+];
+
+/// Whether this act's product is the line it answers with.
+pub fn answers(tool: &str) -> bool {
+    ANSWERS.contains(&tool)
+}
+
 pub fn is_of_the_body(tool: &str) -> bool {
     matches!(
         tool,
@@ -85,7 +121,8 @@ pub fn is_of_the_body(tool: &str) -> bool {
             | "flee"
             | "observe"
             | "wait_for"
-    )
+    ) || crate::engine::enact::is_mine(tool)
+        || crate::engine::work::is_mine(tool)
 }
 
 /// Perform one act against the world a body stands in.
@@ -104,7 +141,14 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         "flee" | "follow" => move_to(hosted, body, &act.args),
         "observe" => observe(hosted, body, &act.args),
         "wait_for" => wait_for(hosted, body, &act.args),
-        _ => Outcome::NotOfTheBody,
+        // The acts that reach what the world *holds* rather than its shape —
+        // carrying, working, digging, fighting, the tower. Same dispatch, one
+        // file down, because they need the sim as well as the map.
+        // What a body does through a station — the record's own acts and the
+        // working loop over them. Checked first because the station surface is
+        // the larger of the two and its names are unambiguous.
+        t if crate::engine::work::is_mine(t) => crate::engine::work::perform(hosted, body, act),
+        _ => crate::engine::enact::perform(hosted, body, act),
     }
 }
 
@@ -630,6 +674,22 @@ fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A rename would otherwise leave a dead entry that silently stops an act
+    /// answering — the same failure the `LIVE` guard exists for.
+    #[test]
+    fn every_answering_act_is_a_real_one() {
+        for tool in ANSWERS {
+            assert!(
+                crate::engine::tools::by_name(tool).is_some(),
+                "`{tool}` answers but is not in the catalog"
+            );
+            assert!(
+                is_of_the_body(tool),
+                "`{tool}` answers but never reaches a world"
+            );
+        }
+    }
 
     fn vault() -> Hosted {
         Hosted::load(

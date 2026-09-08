@@ -831,6 +831,20 @@ impl ConversationEngine {
             .map_err(ConversationError::Model)
     }
 
+    /// Tombstone one turn of a live timeline — see
+    /// [`crate::projection::Conversation::tombstone_turn`].
+    pub fn tombstone_turn(&self, timeline: TimelineId, turn_index: u32) -> crate::Result<()> {
+        self.conversation
+            .tombstone_turn(timeline, turn_index)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Whether `(timeline, turn)` was already dropped by a turn-scoped
+    /// tombstone.
+    pub fn is_turn_tombstoned(&self, timeline: TimelineId, turn_index: u32) -> bool {
+        self.conversation.is_turn_tombstoned(timeline, turn_index)
+    }
+
     /// Mark `timeline` for distillation at `mode` (shed content at compaction) —
     /// see [`crate::projection::Conversation::distill_timeline`]. A later call may
     /// upgrade the mode; gate on [`Self::is_timeline_distilled`] only to avoid

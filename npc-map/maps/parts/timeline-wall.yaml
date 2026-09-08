@@ -9,6 +9,3 @@ long: >
   each era, and every date that contradicts another. It is what a level uses
   instead of being told what to do — the thin places and the disagreements are
   standing there whether or not an order mentions them.
-tools:
-  - chronicle.read_density
-  - chronicle.read_conflicts

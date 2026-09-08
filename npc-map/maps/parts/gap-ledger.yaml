@@ -9,6 +9,3 @@ long: >
   first. It is generated from the record itself rather than assigned by
   anybody, which makes it the one place a Maker with no order can find work
   that is certainly wanted. Taking a silence off it claims that gap.
-tools:
-  - story.read_ledger
-  - story.take_next_silence

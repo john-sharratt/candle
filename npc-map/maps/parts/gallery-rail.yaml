@@ -9,6 +9,3 @@ long: >
   talked about, and nothing on it can be changed. That is the point: a Maker
   who wants to argue about a border does not have to take the map to do it,
   and whoever is holding the map can hear the argument.
-tools:
-  - map.read
-  - room.talk

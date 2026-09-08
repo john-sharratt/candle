@@ -7,5 +7,3 @@ long: >
   Every page of the record, shelved. Reading takes no hold on anything, so any
   number of Makers can pull from it at once and none of them blocks another —
   which is why it is a wall of shelves rather than a station.
-tools:
-  - chronicle.read_any_page

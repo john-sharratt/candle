@@ -101,6 +101,47 @@ pub fn build(mind: Option<&Path>, world_name: &str) -> Option<Projection> {
     })
 }
 
+/// How many turns the mind's schema asks to keep verbatim in the redo log.
+///
+/// `None` when the mind declares no `turn_retention`, which keeps every turn —
+/// the behaviour every deployment had before this existed, and the right default
+/// for a conversation that ends.
+///
+/// Read straight from the YAML rather than through [`Builder`], because this is
+/// a property of the *daemon's* storage rather than of the projection: the
+/// schema decides what a turn is composed from, and this decides how long the
+/// log carries one. Threading it through the builder would put a storage policy
+/// in the vocabulary of prompt composition, where nothing else in the schema
+/// would ever read it.
+///
+/// A malformed value is a warning and a `None`, on the same reasoning as
+/// [`build`]: a typo should cost retention, not the daemon.
+pub fn turn_retention(mind: Option<&Path>) -> Option<u64> {
+    let path = mind?.join("projection.yaml");
+    let yaml = std::fs::read_to_string(&path).ok()?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).ok()?;
+    let block = doc.get("turn_retention")?;
+    match block.get("keep_turns").and_then(|v| v.as_u64()) {
+        Some(n) if n > 0 => Some(n),
+        Some(_) => {
+            tracing::warn!(
+                "turn_retention.keep_turns is 0 in {} — a conversation that keeps no turns \
+                 would retire what it just said, so retention is off",
+                path.display()
+            );
+            None
+        }
+        None => {
+            tracing::warn!(
+                "turn_retention in {} has no numeric `keep_turns` — retention is off and the \
+                 log will grow without bound",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// The live conversation layer's `(layer, group)`.
 ///
 /// Identified by its `Sequence` selection rule — the recent-N plus

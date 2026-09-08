@@ -21,13 +21,15 @@
 pub mod binding;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use npc_map::delta::{Attention, Delta};
 use npc_map::world::World;
 use npc_map::MapSet;
+
+use crate::sim::{seed, Sim};
 
 /// One world, and everything about who has been told what in it.
 pub struct Hosted {
@@ -38,6 +40,14 @@ pub struct Hosted {
 struct State {
     world: World,
     attention: Attention,
+    /// Everything about the world that is not its shape — see [`crate::sim`].
+    ///
+    /// **Under the same lock as the world, deliberately.** Composing a situation
+    /// reads where a body is standing *and* what is within reach of it there,
+    /// and two locks taken in two orders by two threads is the one bug this
+    /// design would otherwise have. It is the same argument the attention
+    /// bookkeeping is here for.
+    sim: Sim,
 }
 
 impl Hosted {
@@ -51,11 +61,16 @@ impl Hosted {
         let dir = dir.as_ref();
         let map = MapSet::load_dir(dir)
             .with_context(|| format!("world `{id}` from {}", dir.display()))?;
+        // Seeded from the map it was just loaded from, so what stands in a room
+        // is written down in exactly one place. A second list here would be
+        // free to disagree with the building, and would.
+        let sim = seed::for_world(&id, Some(&map));
         Ok(Hosted {
             id,
             state: Mutex::new(State {
                 world: World::new(map),
                 attention: Attention::new(),
+                sim,
             }),
         })
     }
@@ -63,11 +78,14 @@ impl Hosted {
     /// Host a world already in memory. What a generated world arrives as, and
     /// what a test uses.
     pub fn of(id: impl Into<String>, world: World) -> Hosted {
+        let id = id.into();
+        let sim = seed::for_world(&id, Some(world.map()));
         Hosted {
-            id: id.into(),
+            id,
             state: Mutex::new(State {
                 world,
                 attention: Attention::new(),
+                sim,
             }),
         }
     }
@@ -92,6 +110,46 @@ impl Hosted {
         f(&state.world)
     }
 
+    /// Change what the world holds — packs, machines, ground, the tower.
+    pub fn with_sim<T>(&self, f: impl FnOnce(&mut Sim) -> T) -> T {
+        let mut state = self.state.lock().expect("world lock");
+        f(&mut state.sim)
+    }
+
+    /// Read what the world holds.
+    pub fn sim<T>(&self, f: impl FnOnce(&Sim) -> T) -> T {
+        let state = self.state.lock().expect("world lock");
+        f(&state.sim)
+    }
+
+    /// Both halves at once, under one acquisition.
+    ///
+    /// The one an act needs: performing `gather` reads where a body is standing
+    /// and writes what it now carries, and taking the lock twice would let the
+    /// world move between the two.
+    pub fn with_both<T>(&self, f: impl FnOnce(&mut World, &mut Sim) -> T) -> T {
+        let mut state = self.state.lock().expect("world lock");
+        let State { world, sim, .. } = &mut *state;
+        f(world, sim)
+    }
+
+    /// Point this world's benches at the documents they work on.
+    pub fn set_bench_root(&self, root: impl Into<std::path::PathBuf>) {
+        self.with_sim(|s| s.set_bench_root(root));
+    }
+
+    /// Where a body is standing, as the `area/node` string the sim keys on.
+    ///
+    /// Empty for a body that is not in the world, which is the honest answer:
+    /// nothing is within reach of somewhere that is not a place.
+    pub fn place_of(&self, body: &str) -> String {
+        self.read(|w| {
+            w.actor(body)
+                .map(|a| format!("{}/{}", a.at.area, a.at.node))
+                .unwrap_or_default()
+        })
+    }
+
     /// Advance one moment: everybody on their way covers a leg.
     ///
     /// Returns how many bodies moved. Nobody walking is the common case and
@@ -108,14 +166,14 @@ impl Hosted {
     /// move between two bodies' readings of the same moment.
     pub fn sweep(&self) -> Vec<Delta> {
         let mut state = self.state.lock().expect("world lock");
-        let State { world, attention } = &mut *state;
+        let State { world, attention, .. } = &mut *state;
         attention.sweep(world)
     }
 
     /// What one body has to be told, marking it as delivered.
     pub fn delta(&self, body: &str) -> Delta {
         let mut state = self.state.lock().expect("world lock");
-        let State { world, attention } = &mut *state;
+        let State { world, attention, .. } = &mut *state;
         attention.take(world, body)
     }
 
@@ -145,6 +203,13 @@ impl std::fmt::Debug for Hosted {
 #[derive(Default)]
 pub struct Worlds {
     worlds: Mutex<BTreeMap<String, Arc<Hosted>>>,
+    /// Where the documents a bench edits live, for every world hosted here.
+    ///
+    /// Held once rather than passed to each `load`, because it is one fact
+    /// about this daemon — where its authored content is — and a per-call
+    /// argument would be a chance for two worlds to disagree about it. `None`
+    /// in a daemon started without a mind, and then every bench act refuses.
+    bench_root: Mutex<Option<PathBuf>>,
 }
 
 impl Worlds {
@@ -161,8 +226,24 @@ impl Worlds {
         Ok(hosted)
     }
 
+    /// Name where the documents a bench edits live.
+    ///
+    /// Applies to the worlds already hosted as well as the ones still to come,
+    /// so the order of startup — mind resolved before or after the first world
+    /// is loaded — cannot leave a world without its documents.
+    pub fn set_bench_root(&self, root: impl Into<PathBuf>) {
+        let root = root.into();
+        for hosted in self.worlds.lock().expect("worlds lock").values() {
+            hosted.set_bench_root(root.clone());
+        }
+        *self.bench_root.lock().expect("bench root lock") = Some(root);
+    }
+
     /// Keep a world that was built rather than loaded.
     pub fn keep(&self, hosted: Arc<Hosted>) -> Arc<Hosted> {
+        if let Some(root) = self.bench_root.lock().expect("bench root lock").clone() {
+            hosted.set_bench_root(root);
+        }
         let mut worlds = self.worlds.lock().expect("worlds lock");
         worlds.insert(hosted.id.clone(), hosted.clone());
         hosted

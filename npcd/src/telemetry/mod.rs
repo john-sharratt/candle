@@ -132,6 +132,24 @@ impl Telemetry {
         })
     }
 
+    /// The same store, told when it started.
+    ///
+    /// Only the uptime differs, and only the test for uptime uses it: asserting
+    /// that `uptime_s` counts real elapsed time otherwise means sleeping past a
+    /// whole-second boundary, which cost 1.1 s — more than half the crate's
+    /// entire test run — to check one subtraction.
+    #[cfg(test)]
+    fn started_at(started: Instant) -> Arc<Self> {
+        Arc::new(Self {
+            devices: Devices::open(),
+            started,
+            ring: Mutex::new(Ring::new()),
+            engine: Mutex::new(None),
+            loading: Mutex::new(None),
+            model: model::spec(),
+        })
+    }
+
     /// The engine's hook: set the value the *next* sample will carry.
     ///
     /// A set rather than a push of its own sample — one timer owns the cadence,
@@ -394,10 +412,17 @@ mod tests {
     /// Uptime is the one thing that is always true, and it has to move.
     #[test]
     fn uptime_is_real() {
-        let t = Telemetry::new();
-        assert_eq!(t.read().uptime_s, 0);
-        std::thread::sleep(Duration::from_millis(1_100));
-        assert!(t.read().uptime_s >= 1);
+        // Wound back rather than waited out. `uptime_s` is
+        // `started.elapsed().as_secs()`, so a store told it began 90 seconds ago
+        // proves the same arithmetic a 1.1 s sleep did — and proves it harder,
+        // because the exact number is asserted rather than "at least one".
+        let now = Telemetry::new();
+        assert_eq!(now.read().uptime_s, 0);
+
+        let began = Instant::now()
+            .checked_sub(Duration::from_secs(90))
+            .expect("this machine has been up longer than the offset");
+        assert_eq!(Telemetry::started_at(began).read().uptime_s, 90);
     }
 
     /// The sampler must actually run without anybody asking it to.

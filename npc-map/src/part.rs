@@ -72,12 +72,46 @@ pub struct Part {
     /// What this is and what it does, for the provenance carried with the
     /// tools. **Never** appears in a level description.
     pub long: String,
-    /// The tools being within reach of this part makes available.
+    // **A part does not name the acts it offers, and that is deliberate.**
+    //
+    // It used to carry a `tools:` list, which put an engine's vocabulary inside
+    // the crate whose only job is describing buildings — a part could name an
+    // act that did not exist and produce nothing, and one act reaching six
+    // stations meant the same line written into six files.
+    //
+    // The act names the station instead (`npcd`'s `Tool::at`), so a building
+    // says what it *contains* and the engine says what you can *do* with it.
+    // Neither crate has to know the other's list.
+    /// The states this part can be put into, in the order they are offered.
+    ///
+    /// **What makes a part a machine.** A part with modes is something a body
+    /// works rather than merely reads: a door that opens, a turret under a
+    /// firing policy, a terminal with a branch open at it. `operate` binds its
+    /// `mode` argument to exactly this list, for exactly the part named — the
+    /// one place in the engine where an argument's live set depends on another
+    /// argument's value.
+    ///
+    /// Empty for anything consulted rather than run, which is most fixtures. A
+    /// part with no modes is not offered to `operate` at all, so a wall of
+    /// hung portraits is never mistaken for something with a switch on it.
+    ///
+    /// The first entry is the state one starts in, which is what makes a seeded
+    /// world read the same on two runs.
     #[serde(default)]
-    pub tools: Vec<String>,
+    pub modes: Vec<String>,
 }
 
 impl Part {
+    /// Whether this is something a body works, rather than reads.
+    pub fn is_machine(&self) -> bool {
+        !self.modes.is_empty()
+    }
+
+    /// The state one of these stands in before anybody touches it.
+    pub fn resting_mode(&self) -> Option<&str> {
+        self.modes.first().map(String::as_str)
+    }
+
     /// The name, in the right number.
     pub fn count_name(&self, n: u32) -> String {
         if n == 1 {
@@ -138,7 +172,7 @@ mod tests {
             binds: None,
             short: None,
             long: "l".into(),
-            tools: vec![],
+            modes: vec![],
         }
     }
 

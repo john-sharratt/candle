@@ -216,6 +216,10 @@ pub struct Runtime {
     /// A world can be authored without being hosted, and is, until something
     /// asks for it.
     pub hosted: Worlds,
+    /// Who is present to which character, and in what mode — see
+    /// [`crate::engine::interaction`]. Not behind an `RwLock` with the rest:
+    /// it owns its own map and nothing else reads it.
+    pub interactions: crate::engine::interaction::Interactions,
     /// Which character is which body.
     pub bodies: Bindings,
     /// One metronome per hosted world, so a world can be held still without
@@ -243,6 +247,13 @@ pub struct Runtime {
 /// A world with no map directory is authored but has nowhere to stand — which
 /// is the common case, and not an error. Its characters have lore and no bodies.
 pub const MAPS: &str = "map";
+
+// A bench works on the mind itself — see `Runtime::new`, which points the
+// worlds at it. **The root is wide and the reach is narrow**, rather than the
+// other way round: `sim::bench::EDITABLE_AREAS` decides which parts of the mind
+// answer, which keeps the dangerous set (`projection.yaml`, `mind.yaml`,
+// `schema/`) named in one place beside the guard that enforces it instead of
+// implied by a directory nobody would think to check.
 
 /// What a character with nothing assigned is set on.
 ///
@@ -351,8 +362,29 @@ pub const IN_COMPANY: &str = "Nothing has been asked of you, and you are not alo
                               have to answer, or answer what they asked you. Address them \
                               exactly as written.";
 
+/// What came of saying something to a character on its handset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageSent {
+    /// What the character is called, by the world.
+    pub with: String,
+    /// How much is now waiting for it, unread.
+    pub waiting_for_them: usize,
+    /// Whether it carries a handset, and so can answer at all.
+    pub can_reply: bool,
+}
+
 impl Runtime {
     pub fn new(mind_handle: Mind, data: &Path) -> Arc<Self> {
+        // **The benches are pointed at the mind this daemon was given**, before
+        // any world is hosted. Derived from the handle rather than set on a
+        // hosting call: a world reached through `host` and one reached through
+        // `host_authored` are the same world, and making only the second of
+        // them able to edit documents was a difference nothing in the fiction
+        // justifies and nothing in the signature announces.
+        let hosted = Worlds::new();
+        if let Some(root) = mind_handle.root() {
+            hosted.set_bench_root(root);
+        }
         Arc::new(Self {
             scheduler: Arc::new(Scheduler::default()),
             progress: Arc::new(LoadProgress::new()),
@@ -368,7 +400,8 @@ impl Runtime {
             minds: RwLock::new(None),
             persona: RwLock::new(None),
             place_sink: RwLock::new(None),
-            hosted: Worlds::new(),
+            hosted,
+            interactions: crate::engine::interaction::Interactions::new(),
             bodies: Bindings::new(),
             metronomes: Mutex::new(BTreeMap::new()),
             places: Mutex::new(BTreeMap::new()),
@@ -531,6 +564,16 @@ impl Runtime {
             w.enter(&body, name, at).map_err(anyhow::Error::from)
         });
         placed?;
+        // **A handset on arrival, and a line on the roster.** Two halves of one
+        // thing: carrying the phone is what makes the messaging acts reachable,
+        // and being on the roster is what makes this character reachable *by*
+        // them. Issued here rather than in the seed because the cast is not
+        // known when a world is built — a character that arrives an hour later
+        // has to be callable too.
+        let display = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()));
+        if let Some(display) = display {
+            hosted.with_sim(|s| crate::sim::seed::issue_handset(s, &body, &display));
+        }
         self.embody(npc_id, world_id, &body, now_ms)?;
         Ok(true)
     }
@@ -644,13 +687,79 @@ impl Runtime {
                 .map(|(n, _)| n.clone())
                 .collect(),
         };
-        tools::Within {
+        let base = tools::Within {
             company,
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
             places: body::reachable(&hosted, &body),
             waited_on_by,
-        }
+            me: hosted.read(|w| w.actor(&body).map(|a| a.name.clone()).unwrap_or_default()),
+            ..Default::default()
+        };
+        // What the world's own state adds: what this body carries, what stands
+        // in the room with it, what is outside. An empty answer to any of them
+        // takes the acts that need it out of the grammar, which is how a world
+        // without hostiles ends up without `engage`.
+        let place = hosted.place_of(&body);
+        hosted.sim(|sim| base.clone().from_sim(sim, &body, &place))
+    }
+
+    /// Say something to a character on its handset, as a person outside the
+    /// world.
+    ///
+    /// **The same thread the characters use, not a side channel.** A person
+    /// messaging a character is one more party on a conversation: it lands in
+    /// [`crate::sim::phone`], the character is told about it by the ordinary
+    /// sweep, and it answers with the ordinary `message` act. A private pipe
+    /// between a console and a mind would be a different thing wearing the same
+    /// word — the reply would not be the character speaking from inside the
+    /// world, and nothing else in the world could ever see that it had happened.
+    ///
+    /// Returns what the character is called and whether it can answer. `None`
+    /// when it has no body, because there is then nothing to reach it on.
+    pub fn message_npc(&self, npc_id: u64, from: &str, text: &str) -> Option<MessageSent> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        let them = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
+        let sent = hosted.with_sim(|sim| {
+            sim.threads.reach(from, &them);
+            let _ = sim.threads.send(from, &them, text);
+            // Everybody a handset can reach comes from the cast rather than the
+            // room, so a person on a thread has to be written into the roster
+            // or the character is offered nobody to answer.
+            let mut roster = sim.contacts_roster();
+            if !roster.iter().any(|n| n == from) {
+                roster.push(from.to_string());
+                roster.sort();
+                sim.set_roster(roster);
+            }
+            MessageSent {
+                with: them.clone(),
+                waiting_for_them: sim.threads.waiting_for(&them),
+                // A character with no handset cannot answer at all — the
+                // messaging acts are gated on carrying one — and saying so is
+                // better than a console that looks like it is working.
+                can_reply: sim.has_phone(&body),
+            }
+        });
+        Some(sent)
+    }
+
+    /// The conversation between a person and a character, oldest first.
+    pub fn messages_with(&self, npc_id: u64, from: &str) -> Option<(String, Vec<(String, String)>)> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        let them = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
+        let said = hosted.sim(|sim| {
+            sim.threads
+                .direct_between(from, &them)
+                .map(|t| {
+                    t.messages
+                        .iter()
+                        .map(|m| (m.from.clone(), m.intent.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        Some((them, said))
     }
 
     /// Arm the scheduling half of a `wait_for` that the world accepted.
@@ -774,9 +883,15 @@ impl Runtime {
     /// information — which rooms are reachable, who is actually here. So the
     /// two no longer merely differ in wording; they differ in form, which is a
     /// stronger version of the distinction this path exists to preserve.
+    /// **An act that answers keeps the world's line too**, on the same
+    /// reasoning as a refusal — see [`body::ANSWERS`]. Reading a document is
+    /// not something the room perceives, so the contents are in the outcome and
+    /// nowhere else; summarising it would record that the character read
+    /// something and drop what it read.
     pub fn record_act(&self, npc_id: u64, act: &Act) -> String {
         match self.act_on_world(npc_id, act) {
             Outcome::Refused(why) => why,
+            Outcome::Did(line) if body::answers(act.tool) => line,
             Outcome::Did(_) | Outcome::NotOfTheBody => act.summary(),
         }
     }
@@ -1117,10 +1232,12 @@ fn load(
     // waits behind a layer. The routes that need the *cast* still report an
     // empty one until the wake phase, which is true rather than a refusal.
     let engine: SharedEngine = Arc::new(Mutex::new(engine));
-    *rt.minds.write().unwrap() = Some(Arc::new(Minds::new(
-        Arc::clone(&engine),
-        conv_config.clone(),
-    )));
+    // Retention is read from the mind's own schema, so a deployment that wants
+    // whole transcripts omits the block and nothing changes for it.
+    let keep_turns = crate::engine::schema::turn_retention(rt.mind.as_deref());
+    *rt.minds.write().unwrap() = Some(Arc::new(
+        Minds::new(Arc::clone(&engine), conv_config.clone()).keeping_turns(keep_turns),
+    ));
 
     // ── tool calibration ───────────────────────────────────────────────────
     //
@@ -1131,7 +1248,7 @@ fn load(
     // under. Nothing would fail; retrieval would simply be worse than it should
     // be, for the life of that substrate.
     p.set_step(LoadStep::Calibrating);
-    let tools = crate::engine::tools::CATALOG;
+    let tools = &*crate::engine::tools::CATALOG;
     p.set_progress(0, tools.len() as u64);
     for (i, t) in tools.iter().enumerate() {
         p.set_detail(t.name);
@@ -1177,12 +1294,16 @@ fn load(
     // captures its signature — and the wide-Q the gather matches against —
     // under a prompt no character will ever think under.
     //
-    // Acts first, then who everybody is. Both are collections, so each member
-    // seals once and is selected per turn: one copy of the vault for the world
-    // rather than one per Maker standing in it.
-    if let Some(p) = projection.as_mut() {
-        crate::engine::tools::install_catalog(&mut p.builder, Mode::Physical)?;
-    }
+    // Who everybody is. A collection, so each member seals once and is selected
+    // per turn: one copy of the vault for the world rather than one per Maker
+    // standing in it.
+    //
+    // **The acts used to be installed here too, and are not any more.** The turn
+    // grammar decides what is possible and the calibration examples teach which
+    // act suits a situation; a list of one-line summaries beside them could only
+    // agree with the grammar or contradict it, and contradicting it is what
+    // costs a character an evening — being told it may do a thing the mask will
+    // not let it do. See the note in the mind's `projection.yaml`.
     let identities = match projection.as_mut() {
         Some(p) => {
             let places: BTreeMap<String, String> = rt

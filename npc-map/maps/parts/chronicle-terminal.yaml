@@ -13,8 +13,8 @@ long: >
   job, because a date is only right against the dates either side of it. What
   you cannot do here is settle where two eras meet: a boundary belongs to both
   of them and neither holder can decide it alone.
-tools:
-  - chronicle.read_era
-  - chronicle.rewrite_page
-  - chronicle.add_entry
-  - chronicle.retire_entry
+# Reading is always on; a change is branched, offered and merged.
+modes:
+  - reading
+  - working
+  - offered

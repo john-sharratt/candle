@@ -404,7 +404,7 @@ mod tests {
         // And the reverse: nothing a character does at run time can be invoked
         // by a life story, so an author cannot make a character `speak` in its
         // own history and have it reach the world.
-        for t in tools::CATALOG {
+        for t in tools::CATALOG.iter() {
             assert!(by_name(t.name).is_none(), "{} is in both catalogs", t.name);
         }
     }
@@ -413,7 +413,7 @@ mod tests {
     /// that does not work is documentation that lies.
     #[test]
     fn every_documented_example_executes() {
-        for t in CATALOG {
+        for t in CATALOG.iter() {
             let p = parse(&format!("<tool_call>{}</tool_call>", t.example));
             assert_eq!(
                 p.calls.len(),
@@ -437,7 +437,7 @@ mod tests {
     /// a field the executor will not read.
     #[test]
     fn examples_only_pass_declared_parameters() {
-        for t in CATALOG {
+        for t in CATALOG.iter() {
             let p = parse(&format!("<tool_call>{}</tool_call>", t.example));
             for key in p.calls[0].args.keys() {
                 assert!(
@@ -473,7 +473,7 @@ mod tests {
         n.sort_unstable();
         n.dedup();
         assert_eq!(n.len(), len, "two authoring tools share a name");
-        for t in CATALOG {
+        for t in CATALOG.iter() {
             assert!(!t.writes.is_empty());
             assert!(!t.description.is_empty());
             assert!(!t.required.is_empty(), "{} requires nothing", t.name);

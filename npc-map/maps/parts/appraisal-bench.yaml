@@ -11,7 +11,9 @@ long: >
   a heap answers no questions. Appraising is refusing, mostly, and the refusals
   have to be defensible: whoever comes after will want to know why a thing was
   let go, and the only honest answer is one written at the time.
-tools:
-  - record.appraise
-  - record.record_reason
-  - record.let_go
+# Letting a thing go is deliberate, so it is reached through a mode that has
+# to be entered rather than offered to anybody standing near the bench.
+modes:
+  - reading
+  - working
+  - offered

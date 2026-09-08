@@ -11,7 +11,8 @@ long: >
   faster than its catalogue becomes steadily less useful the more it holds.
   Writing a description is a separate craft from writing the thing described —
   it is done for a reader who does not yet know what they are looking for.
-tools:
-  - record.describe
-  - record.read_description
-  - record.arrange
+# Reading the catalogue is open to anyone; arranging it takes the claim.
+modes:
+  - reading
+  - working
+  - offered

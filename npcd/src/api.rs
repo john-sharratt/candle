@@ -3372,8 +3372,8 @@ mod tests {
             ids,
             [
                 "canon",
-                "agency",
-                "beliefs",
+                "eras",
+                "stories",
                 "memory",
                 "responses",
                 "moods",

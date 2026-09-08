@@ -444,7 +444,7 @@ pub async fn inject(
     headers: HeaderMap,
     Json(body): Json<InjectBody>,
 ) -> Response {
-    let (_, owner) = match owner_of(&s, &headers).await {
+    let (id, owner) = match owner_of(&s, &headers).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -456,7 +456,11 @@ pub async fn inject(
     };
 
     let parsed = match slash::parse(&body.line) {
-        Ok(p) => p,
+        // **Named.** The parser writes the placeholder `you` because it cannot
+        // know whose console the line came from, and that rendered as "you says
+        // to you: …" — ungrammatical, and wrong about who spoke. See
+        // [`slash::Parsed::spoken_by`].
+        Ok(p) => p.spoken_by(&crate::engine::speaking_as(&id, &owner)),
         // A typo is a 400 with the near miss named, never speech. Sending
         // `/hrut` to the character as dialogue is the one outcome that looks
         // like it worked.
@@ -510,12 +514,233 @@ pub async fn commands() -> Response {
 }
 
 /// `GET /v1/tools` — the act vocabulary, with its calibration examples.
-pub async fn tools() -> Response {
-    Json(json!({
-        "tools": crate::engine::tools::CATALOG,
-        "examples": crate::engine::tools::CATALOG.iter().map(|t| t.examples.len()).sum::<usize>(),
-    }))
-    .into_response()
+/// The act vocabulary, in the shape the console reads it.
+///
+/// **Not the catalog serialised raw.** It used to be, and three of the table's
+/// five columns were therefore blank: `Tool` has no `modes`, no `source` and no
+/// `calibrated` field, and the parameter modal read `t.parameters`, which did
+/// not exist either — so the one view of the vocabulary an operator has showed a
+/// name, a description, and three empty cells over an empty schema.
+///
+/// Composed here rather than added to `Tool` because these are facts about how
+/// the daemon *offers* an act, not about the act: which modes reach it is
+/// `Availability` resolved against each mode, and whether it is calibrated is
+/// whether anybody wrote it examples. Putting them on the struct would be
+/// caching four derived values next to the thing they derive from.
+/// What each station is called, by the id an act attaches to.
+///
+/// Read off whatever worlds are loaded rather than restated in this file, so
+/// renaming a part in the map renames it in the console and the two cannot
+/// drift. Empty before any world is open, which is the honest answer: with no
+/// map, nothing here knows what a station is called.
+type PartNames = std::collections::BTreeMap<String, String>;
+
+/// "a" or "an", by the sound the name starts with.
+///
+/// A vowel letter is the rule almost all the time, and the exceptions in
+/// English are about *sound* rather than spelling — "a universal", "an hour".
+/// Neither shape occurs among the parts, so the letter is the whole rule here;
+/// a part that needed otherwise would be authored with its own article, which
+/// the caller already honours.
+fn article_for(name: &str) -> &'static str {
+    match name.chars().next().map(|c| c.to_ascii_lowercase()) {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+        _ => "a",
+    }
+}
+
+/// How many stations a condition names before it stops naming them.
+///
+/// Two fits a line and is worth reading. Six does not: it wraps, it pushes
+/// every other column out of shape, and by the third name the reader has
+/// stopped taking any of them in. Past this the summary gives the count, and
+/// the full list goes where the detail view has room for it.
+const NAME_AT_MOST: usize = 2;
+
+/// Each station an act attaches to, in the words the map uses.
+fn named_stations(at: &[&str], names: &PartNames) -> Vec<String> {
+    at.iter()
+        .map(|id| match names.get(*id) {
+            // The map's own name, with the article a reader expects. A part
+            // authored with its own article keeps it — "the appraisal bench"
+            // is one bench and saying "a the appraisal bench" would be worse
+            // than saying nothing.
+            Some(n) if n.starts_with("the ") => n.clone(),
+            Some(n) => format!("{} {n}", article_for(n)),
+            // An id no loaded world places. Said plainly rather than dressed
+            // up: it means the act is unreachable, and somebody should notice.
+            None => format!("`{id}` (nothing places one)"),
+        })
+        .collect()
+}
+
+/// The one-line answer to *where do I have to be*.
+///
+/// **Named when naming helps, counted when it does not.** "Standing at the
+/// station that carries it" was true of every station act at once and told an
+/// operator hunting a missing one nothing — so a condition names its station.
+/// But an act reaching six of them produced a sentence longer than the column
+/// it sat in, and a reader made to parse six noun phrases to learn "a
+/// workstation" has been given less rather than more.
+///
+/// The full list is not lost: it goes in `at_named`, which the detail view
+/// renders and which has the room for it.
+fn where_it_is(at: &[&str], names: &PartNames) -> Option<String> {
+    if at.is_empty() {
+        return None;
+    }
+    let named = named_stations(at, names);
+    Some(match named.len() > NAME_AT_MOST {
+        false => format!("standing at {}", npc_map::text::list_or(&named)),
+        true => format!("standing at any of {} stations", named.len()),
+    })
+}
+
+pub async fn tools(State(s): State<Arc<Authored>>) -> Response {
+    let mut part_names = PartNames::new();
+    if let Some(rt) = s.runtime.as_ref() {
+        for world_id in rt.hosted.ids() {
+            if let Some(hosted) = rt.hosted.get(&world_id) {
+                hosted.read(|w| {
+                    for area in w.map().areas() {
+                        for node in &area.nodes {
+                            for (part, _) in w.map().parts_at(node) {
+                                part_names
+                                    .entry(part.id.clone())
+                                    .or_insert_with(|| part.name.clone());
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    Json(describe_catalog(&part_names)).into_response()
+}
+
+/// The catalogue as the console reads it.
+///
+/// Separated from the route because it is the part with the decisions in it and
+/// takes only the station names — so a test asserts what an operator will
+/// actually see, against a real name map, without standing a daemon up.
+fn describe_catalog(part_names: &PartNames) -> Value {
+    use crate::engine::tools::{self, Availability, Mode};
+
+    const MODES: [Mode; 4] = [
+        Mode::Physical,
+        Mode::VideoCall,
+        Mode::VoiceCall,
+        Mode::InstantMessage,
+    ];
+
+    let described: Vec<Value> = tools::CATALOG
+        .iter()
+        .map(|t| {
+            // **Which channels the act can reach at all**, which is not the
+            // same question `for_mode` answers. That one builds the *prompt*, so
+            // it drops everything conditional on the situation — a `Nearby` act
+            // is absent from it in every mode, and reading modes off it reported
+            // that `tell` works nowhere.
+            //
+            // A condition that is not about the channel does not narrow the
+            // channel: needing company, or a body, is true down a phone line as
+            // much as face to face. Those conditions are reported in `needs`,
+            // where an operator can act on them.
+            let modes: Vec<&str> = MODES
+                .iter()
+                .filter(|m| match t.availability {
+                    Availability::Always | Availability::Nearby | Availability::Embodied => true,
+                    Availability::PhysicalOnly => **m == Mode::Physical,
+                    Availability::MessagingOnly => m.remote(),
+                    Availability::Pictorial => m.carries_pictures(),
+                    // Standing next to the right thing is not a fact about the
+                    // channel, so it narrows nothing here and is said in
+                    // `needs` instead.
+                    Availability::AtPart => true,
+                })
+                .map(|m| m.as_wire())
+                .collect();
+
+            // The schema the model actually sees, in the JSON Schema shape the
+            // modal renders. Built from the same `params` the grammar compiles
+            // from, so the two cannot disagree about what an act takes.
+            let properties: serde_json::Map<String, Value> = t
+                .params
+                .iter()
+                .map(|p| {
+                    let mut prop = json!({ "type": p.ty, "description": p.description });
+                    if let Some(vs) = tools::fixed_values(t.name, p.name) {
+                        prop["enum"] = json!(vs);
+                    } else if let Some(c) = tools::live_choice(t.name, p.name) {
+                        // A live set has no fixed membership to publish — what
+                        // it admits is a fact about a room, and saying so is
+                        // more use to an operator than a list that would be
+                        // wrong everywhere except where it was taken.
+                        prop["x-bound-to"] = json!(format!("{c:?}"));
+                    }
+                    (p.name.to_string(), prop)
+                })
+                .collect();
+            let required: Vec<&str> = t
+                .params
+                .iter()
+                .filter(|p| p.required)
+                .map(|p| p.name)
+                .collect();
+
+            json!({
+                "name": t.name,
+                "category": t.category,
+                "description": t.description,
+                "plane": t.plane,
+                "modes": modes,
+                "needs": match t.availability {
+                    Availability::Always => Value::Null,
+                    Availability::Nearby => json!("somebody else here"),
+                    Availability::Embodied => json!("a body"),
+                    Availability::PhysicalOnly => json!("being present"),
+                    Availability::MessagingOnly => json!("being at a distance"),
+                    Availability::Pictorial => json!("a channel that carries pictures"),
+                    // Named, not generic. "Standing at the station that carries
+                    // it" is true of every station act and tells an operator
+                    // hunting a missing one exactly nothing.
+                    Availability::AtPart => match where_it_is(t.at, part_names) {
+                        Some(where_) => json!(where_),
+                        // An `AtPart` act naming no station is a contradiction
+                        // the catalogue's own tests refuse; said here rather
+                        // than unwrapped so a route never panics over it.
+                        None => json!("standing at a station"),
+                    },
+                },
+                // Every station, named, however many there are. The `needs`
+                // line above summarises for the table; this is what the detail
+                // view shows, where a list of six costs nothing.
+                "at_named": named_stations(t.at, part_names),
+                "source": "builtin",
+                // Calibration is examples: a tool with none selects measurably
+                // worse, which is exactly what the column is for.
+                "calibrated": !t.examples.is_empty(),
+                "examples": t.examples.len(),
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            })
+        })
+        .collect();
+
+    let uncalibrated = tools::CATALOG
+        .iter()
+        .filter(|t| t.examples.is_empty())
+        .count();
+
+    json!({
+        "tools": described,
+        "uncalibrated": uncalibrated,
+        "acts_per_turn": tools::ACTS_PER_TURN,
+        "examples": tools::CATALOG.iter().map(|t| t.examples.len()).sum::<usize>(),
+    })
 }
 
 fn no_scheduler() -> Response {
@@ -544,6 +769,141 @@ mod tests {
             let got = asked.unwrap_or(DEFAULT_FEED).clamp(1, MAX_FEED);
             assert_eq!(got, want, "limit={asked:?}");
         }
+    }
+
+    /// **Every field the tools page reads is a field this route sends.**
+    ///
+    /// The console renders `name`, `description`, `modes`, `source`,
+    /// `calibrated` and `parameters`. The route used to serialise `Tool`
+    /// directly, which has none of the last four — so three of the table's five
+    /// columns were blank and the schema modal showed `{}`, on a page whose
+    /// whole job is to say what a character can do. Nothing failed; the page
+    /// simply rendered `undefined` as empty.
+    ///
+    /// Asserted against the names the page actually uses, so adding a column
+    /// there and forgetting this breaks a test rather than a view.
+    /// The station names the shipped maps actually give, which is what an
+    /// operator will read.
+    fn shipped_part_names() -> PartNames {
+        let set = npc_map::MapSet::load_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../npc-map/maps"
+        ))
+        .expect("the shipped maps must load");
+        let mut names = PartNames::new();
+        for area in set.areas() {
+            for node in &area.nodes {
+                for (part, _) in set.parts_at(node) {
+                    names
+                        .entry(part.id.clone())
+                        .or_insert_with(|| part.name.clone());
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn the_tools_route_sends_every_field_the_console_renders() {
+        let v = describe_catalog(&shipped_part_names());
+
+        assert_eq!(v["uncalibrated"].as_u64(), Some(0), "an act shipped with no examples");
+        assert!(v["acts_per_turn"].as_u64().unwrap() >= 1);
+
+        let ts = v["tools"].as_array().expect("an array");
+        assert_eq!(ts.len(), crate::engine::tools::CATALOG.len());
+        for t in ts {
+            for field in ["name", "category", "description", "modes", "source", "calibrated"] {
+                assert!(!t[field].is_null(), "`{}` has no `{field}`", t["name"]);
+            }
+            assert_eq!(t["parameters"]["type"], "object", "{}", t["name"]);
+            assert!(t["parameters"]["properties"].is_object());
+            assert!(t["parameters"]["required"].is_array());
+            assert!(
+                !t["modes"].as_array().unwrap().is_empty(),
+                "`{}` is offered in no mode at all",
+                t["name"]
+            );
+        }
+    }
+
+    /// The page prints a `needs` chip to explain an act's absence. An act that
+    /// is conditional must therefore say what its condition is, or an operator
+    /// hunting a tool a character never calls has nothing to read.
+    #[test]
+    fn a_conditional_act_says_what_it_needs() {
+        let v = describe_catalog(&shipped_part_names());
+        let ts = v["tools"].as_array().unwrap();
+        let find = |n: &str| ts.iter().find(|t| t["name"] == n).expect("in the catalog").clone();
+
+        assert!(find("say")["needs"].is_null(), "`say` is always available");
+        assert_eq!(find("tell")["needs"], "somebody else here");
+        assert_eq!(find("move_to")["needs"], "a body");
+        assert_eq!(find("touch")["needs"], "being present");
+
+        // **A station act names the station**, in the words the map uses for
+        // it. "Standing at the station that carries it" is true of every one of
+        // them and answers nothing.
+        assert_eq!(
+            find("chronicle_add_entry")["needs"],
+            "standing at a world history terminal"
+        );
+        assert_eq!(find("record_appraise")["needs"], "standing at the appraisal bench");
+
+        // An act reaching several says so as alternatives — you need one of
+        // them, not all six.
+        // **An act reaching many stations is counted, not listed.** Six noun
+        // phrases in a table cell wrap the row and are unreadable at a glance,
+        // and a reader made to parse all six to learn "a workstation" has been
+        // given less rather than more.
+        let bench = find("bench_branch");
+        assert_eq!(bench["needs"], "standing at any of 6 stations");
+
+        // The list is not lost — it is in the field the detail view renders,
+        // where there is room for it, with the article each name calls for.
+        let at: Vec<String> = bench["at_named"]
+            .as_array()
+            .expect("the full list")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(at.len(), 6, "{at:?}");
+        assert!(at.contains(&"a world history terminal".to_string()), "{at:?}");
+        assert!(at.contains(&"an easel".to_string()), "the article was assumed: {at:?}");
+
+        // The mode split the two-valued `Mode` could not express: a picture
+        // goes down video and text and not down a voice line.
+        let img = find("send_image");
+        let modes: Vec<String> = img["modes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect();
+        let modes: Vec<&str> = modes.iter().map(String::as_str).collect();
+        assert!(modes.contains(&"video_call") && modes.contains(&"instant_message"));
+        assert!(!modes.contains(&"voice_call"), "a picture went down a phone call");
+        assert!(!modes.contains(&"physical"));
+    }
+
+    /// With no world open there is no map to read a name off, and the field
+    /// says the honest generic thing rather than inventing one.
+    #[test]
+    fn a_station_with_no_map_loaded_is_not_given_an_invented_name() {
+        let v = describe_catalog(&PartNames::new());
+        let ts = v["tools"].as_array().unwrap();
+        let needs = ts
+            .iter()
+            .find(|t| t["name"] == "chronicle_add_entry")
+            .expect("in the catalog")["needs"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(needs.contains("chronicle-terminal"), "{needs}");
+        assert!(
+            needs.contains("nothing places one"),
+            "an unplaced station should say so: {needs}"
+        );
     }
 
     /// The console's autocomplete is the daemon's own list. A console holding

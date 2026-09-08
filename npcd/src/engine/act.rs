@@ -587,7 +587,7 @@ mod tests {
     /// would be taught to the model as correct.
     #[test]
     fn every_catalog_example_parses_as_an_act() {
-        for t in tools::CATALOG {
+        for t in tools::CATALOG.iter() {
             for e in t.examples {
                 let mut obj: Map<String, Value> = serde_json::from_str(e.call).unwrap();
                 obj.insert("tool".into(), Value::String(t.name.into()));

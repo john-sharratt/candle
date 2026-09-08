@@ -12,5 +12,3 @@ long: >
   number, without anybody going to look. What the board deliberately does not
   carry is any of the work: what a Maker has written is found by asking the
   Maker.
-tools:
-  - dispatch.read

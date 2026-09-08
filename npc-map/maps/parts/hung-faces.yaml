@@ -10,6 +10,3 @@ long: >
   this level: a face is judged against the ones beside it, and the only way to
   know what the world already looks like is to stand back and look at all of
   it at once.
-tools:
-  - portrait.read_hung
-  - room.talk

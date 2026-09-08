@@ -510,8 +510,8 @@ mod tests {
             titles(&got),
             [
                 "World knowledge",
-                "Agency",
-                "Beliefs",
+                "Eras",
+                "Stories",
                 "Memory",
                 "Responses",
                 "Moods",
@@ -532,8 +532,10 @@ mod tests {
     fn a_section_with_no_folder_yet_is_empty_rather_than_missing() {
         let root = tmp("empty");
         seed(&root);
-        // `layers/beliefs` was never created by the seed.
-        let got = children(&root, &addr("beliefs"), &Scope::unscoped(), &no_cat).unwrap();
+        // `layers/stories` was never created by the seed — a section whose
+        // folder is not there yet lists as empty rather than failing, because
+        // an author who has not written a story yet is a normal state.
+        let got = children(&root, &addr("stories"), &Scope::unscoped(), &no_cat).unwrap();
         assert!(got.is_empty());
     }
 

@@ -12,7 +12,7 @@ long: >
   and no amount of later work supplies one. So the first thing done to anything
   is to write down where it came from, and only then may it be worked on.
   Nothing skips this desk, including work a Maker made itself.
-tools:
-  - record.accession
-  - record.write_provenance
-  - record.trace_custody
+modes:
+  - reading
+  - working
+  - offered

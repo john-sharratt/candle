@@ -13,7 +13,7 @@ long: >
   each end of it. What you write here is prose rather than record, and it is
   held to the standard of prose. A filed draft can be read aloud to somebody
   before it is filed; that is a different place and a deliberate walk.
-tools:
-  - story.read_around_gap
-  - story.draft
-  - story.file
+modes:
+  - reading
+  - working
+  - offered

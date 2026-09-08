@@ -205,17 +205,17 @@ fn around(world: &World, actor: &Actor) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// The tools a body could reach from where it stands.
+/// The parts a body could reach from where it stands, by id.
 ///
-/// Read off the parts in the room, so walking away takes them with it. This is
-/// what gets offered alongside the percept; the provenance for each is the
-/// part's own long description.
+/// Read off the room, so walking away takes them with it. What *acts* those
+/// parts make available is the engine's to say — an act names the stations it
+/// attaches to — which is why this returns the things and not a vocabulary.
 pub fn within_reach<'a>(world: &'a World, id: &str) -> Vec<&'a str> {
     let Some(actor) = world.actor(id) else {
         return Vec::new();
     };
     match world.node(&actor.at) {
-        Some(node) => world.map().tools_at(node),
+        Some(node) => world.map().part_ids_at(node),
         None => Vec::new(),
     }
 }

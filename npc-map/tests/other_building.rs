@@ -32,7 +32,7 @@ fn node(id: &str, kind: NodeKind, name: &str, off: &[&str]) -> Node {
     }
 }
 
-fn part(id: &str, kind: PartKind, name: &str, short: Option<&str>, tools: &[&str]) -> Part {
+fn part(id: &str, kind: PartKind, name: &str, short: Option<&str>) -> Part {
     Part {
         id: id.into(),
         kind,
@@ -41,7 +41,8 @@ fn part(id: &str, kind: PartKind, name: &str, short: Option<&str>, tools: &[&str
         binds: None,
         short: short.map(String::from),
         long: format!("What a {name} is, at length."),
-        tools: tools.iter().map(|s| s.to_string()).collect(),
+        // Consulted rather than worked: nothing here has a state to be put into.
+        modes: vec![],
     }
 }
 
@@ -78,21 +79,14 @@ fn inn() -> MapSet {
 /// A part catalogue that has nothing to do with the vault.
 fn catalogue() -> Vec<Part> {
     vec![
-        part("bench", PartKind::Seat, "bench", None, &["room.sit"]),
+        part("bench", PartKind::Seat, "bench", None),
         part(
             "barrels",
             PartKind::Fixture,
             "the barrels",
             Some("The barrels are stacked three deep against the far wall."),
-            &["cellar.draw"],
         ),
-        part(
-            "water-butt",
-            PartKind::Fixture,
-            "a water butt",
-            None,
-            &["yard.drink"],
-        ),
+        part("water-butt", PartKind::Fixture, "a water butt", None),
     ]
 }
 
