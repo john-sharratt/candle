@@ -2694,33 +2694,67 @@ impl BatchedInferenceSession {
         Ok(out)
     }
 
-    /// Migrate a per-layer sealed snapshot from the GPU (hot) tier to the CPU (warm) tier.
+    /// Migrate a per-layer sealed snapshot from the GPU (hot) tier to the CPU
+    /// (warm) tier, one batched gather + DtoH per layer on `copy_stream` through
+    /// `pinned` host staging.
     ///
     /// `sealed` must have one entry per layer (same length as `self.backings()`).
-    /// Each entry is migrated by the matching layer's [`ChunkedKvBacking`].
     /// Returns a new per-layer vec with CPU-resident [`SealedSequence`]s.
+    ///
+    /// **Batched per layer, never per chunk.** The per-chunk migrate takes a
+    /// state lock, an allocation and a copy for every chunk of every layer; on
+    /// a ~10k-token slot across eleven KV layers that came to ninety seconds on
+    /// the scheduler thread (run 12: a lease park at 09:50:05, its resume at
+    /// 09:51:20, the whole engine stalled between). The batched path is the one
+    /// the persistence thread runs hot→warm on — 83 passes, 3.4 s, in the same
+    /// log.
+    #[cfg(feature = "cuda")]
     pub fn sealed_to_cpu(
         &self,
         sealed: &[candle_nn::kv_cache::SealedSequence],
+        copy_stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
+        pinned: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
     ) -> Result<Vec<candle_nn::kv_cache::SealedSequence>> {
         sealed
             .iter()
             .zip(self.backings.iter())
-            .map(|(seq, backing)| backing.migrate_sealed_to_cpu(seq))
+            .map(|(seq, backing)| {
+                backing
+                    .migrate_sealed_to_cpu_batch_async(self.device(), copy_stream, pinned, &[seq])?
+                    .pop()
+                    .ok_or_else(|| {
+                        candle::Error::Msg(
+                            "sealed_to_cpu: the batched migrate answered nothing for a layer".into(),
+                        )
+                    })
+            })
             .collect()
     }
 
-    /// Migrate a per-layer sealed snapshot from the CPU (warm) tier back to the GPU (hot) tier.
-    ///
-    /// Symmetric inverse of [`sealed_to_cpu`].
+    /// Migrate a per-layer sealed snapshot from the CPU (warm) tier back to the
+    /// GPU (hot) tier. Symmetric inverse of [`Self::sealed_to_cpu`]: one batched
+    /// HtoD + scatter per layer on `copy_stream`, and the resident KV-head
+    /// records rebuilt at the new placement.
+    #[cfg(feature = "cuda")]
     pub fn sealed_to_gpu(
         &self,
         sealed: &[candle_nn::kv_cache::SealedSequence],
+        copy_stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
+        pinned: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
     ) -> Result<Vec<candle_nn::kv_cache::SealedSequence>> {
         sealed
             .iter()
             .zip(self.backings.iter())
-            .map(|(seq, backing)| backing.migrate_sealed_to_gpu(seq))
+            .map(|(seq, backing)| {
+                backing
+                    .migrate_sealed_to_gpu_batch_async(self.device(), copy_stream, pinned, &[seq])?
+                    .pop()
+                    .ok_or_else(|| {
+                        candle::Error::Msg(
+                            "sealed_to_gpu: the batched migrate answered nothing for a layer".into(),
+                        )
+                    })
+            })
             .collect()
     }
 

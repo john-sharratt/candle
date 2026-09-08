@@ -19,6 +19,7 @@
 mod admit;
 mod decode;
 mod interleave;
+mod lease;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
@@ -10598,6 +10599,97 @@ mod tests {
             scheduler.active_prefills[0].error.is_some(),
             "the run reached its length: the started prefill is failed"
         );
+    }
+
+    /// A decode state part-way through its turn, as admission builds one.
+    fn test_decode_state(scheduler: &Scheduler, event_tx: Sender<TurnEvent>) -> DecodeState {
+        DecodeState {
+            event_tx,
+            generated_tokens: TokenBuffer::from(vec![1u32; 8]),
+            think_open_at: None,
+            think_token_len: None,
+            lease_left: Scheduler::DECODE_LEASE_TOKENS,
+            lease_expired: false,
+            max_tokens: 1024,
+            sampling_config: SamplingConfig::compression(),
+            seal_action: SealAction::None,
+            prefill_assistant_text: String::new(),
+            finished: false,
+            decode_start: Instant::now(),
+            decode_busy_us: 0,
+            prefill_ms: 0.0,
+            prefill_token_count: 0,
+            turn_start: Instant::now(),
+            health: DecodeHealthState::new(
+                scheduler.health_config.repetition_window,
+                scheduler.health_config.health_log_capacity,
+            ),
+            reprojection: None,
+            non_punct_since_reproject: 0,
+            last_projection_end: 0,
+            post_decode_tokens: TokenBuffer::default(),
+            belief: PriorBelief::default(),
+            prefill_tokens: TokenBuffer::default(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            in_tool_call: false,
+            triggers: Arc::new(TriggerRegistry::new()),
+            stencil: None,
+            pending_mask: None,
+        }
+    }
+
+    /// **A spent lease is offered to the gate before it is parked.** With the
+    /// zone able to afford another lease's K/V, the turn keeps its slot and its
+    /// decode state, its lease is whole again, and nothing is parked — the
+    /// warm-tier round trip is for a gate that refuses.
+    #[test]
+    fn a_spent_lease_renews_through_the_gate_instead_of_parking() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (event_tx, _rx) = crossbeam::channel::bounded(4);
+        let mut state = test_decode_state(&scheduler, event_tx);
+        state.lease_left = 0;
+        state.lease_expired = true;
+        scheduler.active_decodes.insert(seq, state);
+
+        scheduler.park_expired_leases();
+
+        let renewed = scheduler
+            .active_decodes
+            .get(&seq)
+            .expect("the turn stays active on its slot");
+        assert!(!renewed.lease_expired, "the lease is whole again");
+        assert_eq!(renewed.lease_left, Scheduler::DECODE_LEASE_TOKENS);
+        assert!(scheduler.parked.is_empty(), "nothing went to the warm tier");
+    }
+
+    /// A turn whose lease has not run out is not the pass's business, and a
+    /// finished one is the drain's.
+    #[test]
+    fn only_a_spent_unfinished_lease_is_renewed_or_parked() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let live = SequenceId(scheduler.session.create_sequence().unwrap());
+        let done = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (event_tx, _rx) = crossbeam::channel::bounded(4);
+        let mut fresh = test_decode_state(&scheduler, event_tx.clone());
+        fresh.lease_left = 3;
+        scheduler.active_decodes.insert(live, fresh);
+        let mut finished = test_decode_state(&scheduler, event_tx);
+        finished.lease_left = 0;
+        finished.lease_expired = true;
+        finished.finished = true;
+        scheduler.active_decodes.insert(done, finished);
+
+        scheduler.park_expired_leases();
+
+        assert_eq!(scheduler.active_decodes[&live].lease_left, 3, "untouched");
+        assert!(scheduler.active_decodes[&done].lease_expired, "left for the drain");
+        assert!(scheduler.parked.is_empty());
     }
 
     /// **A scratch slot bound to a timeline stays at zeros at admission.**

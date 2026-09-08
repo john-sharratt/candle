@@ -1,6 +1,7 @@
 use super::admit;
 use super::admit::{Ground, Order};
 use super::interleave;
+use super::lease::trim_sealed_to_tokens;
 use super::*;
 use crate::projection::DecodePriority;
 
@@ -1096,13 +1097,26 @@ impl Scheduler {
             || !self.wave_ran_forward
     }
 
-    /// Park every slot whose decode lease has run out.
+    /// Renew or park every slot whose decode lease has run out.
     ///
     /// The lease is the ground admission actually reserved for this turn's
-    /// generation, so reaching the end of it is where the slot gives that ground
-    /// back: its K/V goes to the warm tier — compressed on the way, so it holds
-    /// less parked than it did resident, and none of it on the card — the slot's
-    /// blocks are released, and the turn joins the back of the queue.
+    /// generation, so its end is an admission decision again. **The turn is
+    /// offered to the gate for another lease first**, priced as a fresh
+    /// admission of [`Self::DECODE_LEASE_TOKENS`] tokens of K/V against the
+    /// headroom the fill prices with (`admit::gate::may_admit`). A zone that can
+    /// afford it renews the lease in place: the claim is real, so the next fill
+    /// sees the ground as live, and nothing moves. Each admission still never
+    /// exceeds one lease; what a renewal removes is a round trip through the
+    /// warm tier that bought nothing. Run 12 parked and resumed two turns the
+    /// zone could have carried, at ~90 s out and ~75 s back each, with the
+    /// engine stalled throughout.
+    ///
+    /// **A gate that refuses is what parks the turn.** Its K/V goes to the warm
+    /// tier through the batched migration, trimmed to the tokens it has
+    /// committed ([`super::lease::trim_sealed_to_tokens`]) so the resume
+    /// re-derives a consistent offset, the slot's blocks are released, and the
+    /// turn joins the parked queue to resume ahead of new admissions once the
+    /// zone stands above the hold again.
     ///
     /// **A lease ending is a completion as far as admission is concerned**, and
     /// `completions` is bumped to say so: ground came back, so the next fill is
@@ -1112,23 +1126,53 @@ impl Scheduler {
     /// lease instead. Losing a turn to a transient tier error would be a far
     /// worse failure than briefly holding more ground than the gate authorised,
     /// and the next expiry tries again.
-    fn park_expired_leases(&mut self) {
+    pub(super) fn park_expired_leases(&mut self) {
         let expired: Vec<SequenceId> = self
             .active_decodes
             .iter()
             .filter(|(_, s)| s.lease_expired && !s.finished)
             .map(|(&id, _)| id)
             .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let optimal = interleave::optimal_weight_bytes().unwrap_or(0);
         for slot in expired {
+            let held = self.session.sequence_offset(slot.0).unwrap_or(0);
+            let lease_kv = admit::cost::kv_bytes_for_advance(
+                held,
+                Self::DECODE_LEASE_TOKENS,
+                self.per_block_kv_bytes(),
+            );
+            let room = WaveFill::new(self, optimal).headroom();
+            if admit::gate::may_admit(self.active_slots(), lease_kv, &room) {
+                let least_tier = self.min_forward_tier_bytes();
+                self.buy_kv_ground(
+                    &admit::Cost {
+                        kv: lease_kv,
+                        recurrent: 0,
+                        activations: 0,
+                    },
+                    least_tier,
+                );
+                if self.claim_kv(slot.0, Self::DECODE_LEASE_TOKENS) {
+                    self.renew_lease(slot);
+                    tracing::debug!(
+                        target: "candle_conversation::scheduler::interleave",
+                        slot = slot.0,
+                        held,
+                        lease_kv_mib = lease_kv >> 20,
+                        "decode lease renewed through the gate",
+                    );
+                    continue;
+                }
+            }
             // **Stop parking rather than park unboundedly.** A park relocates
             // ground from the card to the host; past the bound the queue is
             // already the problem, so the lease renews and the turn keeps
             // decoding instead.
             if self.parked.len() >= Self::PARKED_TURNS_MAX {
-                if let Some(s) = self.active_decodes.get_mut(&slot) {
-                    s.lease_expired = false;
-                    s.lease_left = Self::DECODE_LEASE_TOKENS;
-                }
+                self.renew_lease(slot);
                 tracing::debug!(
                     target: "candle_conversation::scheduler::interleave",
                     parked = self.parked.len(),
@@ -1136,11 +1180,24 @@ impl Scheduler {
                 );
                 continue;
             }
+            let copy_stream = match self.session.device() {
+                Device::Cuda(d) => d.cuda_stream(),
+                _ => {
+                    self.renew_lease(slot);
+                    continue;
+                }
+            };
+            let t_park = Instant::now();
             let warm = self
                 .session
                 .snapshot_sequence_per_layer(slot.0)
-                .and_then(|hot| self.session.sealed_to_cpu(&hot));
-            let warm = match warm {
+                .and_then(|mut hot| {
+                    let trimmed = trim_sealed_to_tokens(&mut hot, held);
+                    self.session
+                        .sealed_to_cpu(&hot, &copy_stream, &mut self.elevate_pinned_scratch)
+                        .map(|warm| (warm, trimmed))
+                });
+            let (warm, trimmed) = match warm {
                 Ok(w) => w,
                 Err(e) => {
                     tracing::warn!(
@@ -1148,10 +1205,7 @@ impl Scheduler {
                         slot = slot.0,
                         "lease park failed, turn keeps decoding: {e}",
                     );
-                    if let Some(s) = self.active_decodes.get_mut(&slot) {
-                        s.lease_expired = false;
-                        s.lease_left = Self::DECODE_LEASE_TOKENS;
-                    }
+                    self.renew_lease(slot);
                     continue;
                 }
             };
@@ -1173,8 +1227,11 @@ impl Scheduler {
                 target: "candle_conversation::scheduler::interleave",
                 slot = slot.0,
                 generated = state.generated_tokens.len(),
+                tokens = held,
+                trimmed,
+                park_ms = t_park.elapsed().as_millis() as u64,
                 parked_ahead = self.parked.len(),
-                "decode lease spent — turn parked to warm",
+                "decode lease spent — the gate refused another; turn parked to warm",
             );
             self.parked.push_back(ParkedTurn {
                 slot,
@@ -1183,6 +1240,14 @@ impl Scheduler {
                 resume_failures: 0,
             });
             self.completions = self.completions.saturating_add(1);
+        }
+    }
+
+    /// Give `slot` a fresh lease in place: it keeps decoding.
+    fn renew_lease(&mut self, slot: SequenceId) {
+        if let Some(s) = self.active_decodes.get_mut(&slot) {
+            s.lease_expired = false;
+            s.lease_left = Self::DECODE_LEASE_TOKENS;
         }
     }
 
@@ -1242,9 +1307,16 @@ impl Scheduler {
             },
             least_tier,
         );
+        let copy_stream = match self.session.device() {
+            Device::Cuda(d) => d.cuda_stream(),
+            // A turn is parked only through the CUDA path above; the same
+            // device brings it back.
+            _ => panic!("scheduler: a parked turn requires a CUDA device"),
+        };
+        let t_resume = Instant::now();
         let restored = self
             .session
-            .sealed_to_gpu(&warm)
+            .sealed_to_gpu(&warm, &copy_stream, &mut self.elevate_pinned_scratch)
             .and_then(|hot| self.session.inject_sealed_at_tail(slot.0, &hot));
         match restored {
             Ok(_) => {
@@ -1252,6 +1324,8 @@ impl Scheduler {
                     target: "candle_conversation::scheduler::interleave",
                     slot = slot.0,
                     generated = state.generated_tokens.len(),
+                    tokens = self.session.sequence_offset(slot.0).unwrap_or(0),
+                    resume_ms = t_resume.elapsed().as_millis() as u64,
                     "parked turn resumed on a fresh lease",
                 );
                 self.active_decodes.insert(slot, state);
