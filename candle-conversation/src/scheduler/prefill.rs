@@ -323,13 +323,43 @@ impl<'a> WaveFill<'a> {
     /// The budget is the frontier gap as it stands after the fill, less the
     /// margin a refusal widens. Each admission priced its rows' tier
     /// (`admit::Cost::activations`) and bought what the gap lacked
-    /// (`Scheduler::buy_kv_ground`), so the gap measured here already holds the
-    /// wave's tier; the placement inside the forward, where the boundary may
-    /// not move, then finds its ground already there. A wave whose tier will
-    /// not fit is a wave that should be narrower, which is `admit::gate`'s
-    /// answer, not the placement's to pay for.
+    /// (`Scheduler::buy_kv_ground`); the placement inside the forward, where
+    /// the boundary may not move, then finds its ground already there. A wave
+    /// whose tier will not fit is a wave that should be narrower, which is
+    /// `admit::gate`'s answer, not the placement's to pay for.
+    ///
+    /// **One purchase closes the pass: the least wave the admitted set can run
+    /// must be placeable.** A claim is region-granular where its price is not —
+    /// a section's 12 MiB of K/V opens a fresh arena in every layer that has no
+    /// room in its current one, each a whole region off the top of the free
+    /// list — so the gap an admission measured and bought for is a few regions
+    /// narrower once its claims have landed. The wave then asks for its least
+    /// chunk regardless ([`PREFILL_MIN_ADVANCE`] rows, so a wave with nothing
+    /// else in it makes progress) and the placement refuses by those few
+    /// regions: run 6 lost thirteen waves in two minutes, each 1–2 regions
+    /// short with a gap of 250–400 MiB. So the fill, still between forwards and
+    /// still the one buyer, asks for exactly what the gap lacks of that least
+    /// wave's tier beside the decodes it took. Nothing when the wave is empty.
     fn publish_tier_budget(&mut self) {
         let margin = self.sched.tier_margin_regions * REGION_BYTES;
+        if self.sched.active_slots() > 0 || !self.decodes_taken.is_empty() {
+            let dtype = self.sched.session.activation_dtype();
+            let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
+            let least = plan.tier_bytes(self.head_rows() + PREFILL_MIN_ADVANCE);
+            let gap = transient_headroom_bytes(0).unwrap_or(0);
+            if gap < least {
+                let short = (least - gap).div_ceil(REGION_BYTES);
+                let conceded = self.sched.model.request_kv_ground(short);
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::interleave",
+                    least_mib = least >> 20,
+                    gap_mib = gap >> 20,
+                    short_regions = short,
+                    conceded_mib = conceded >> 20,
+                    "admission bought the gap the least placeable wave lacked",
+                );
+            }
+        }
         // **Ground the weight side is owed comes off the top.** When residency
         // stands under its hold, the frontier gap is not the tier's to take: it
         // is where the weight side grows back, as fast as it is left free.
