@@ -205,11 +205,31 @@ impl Scheduler {
             }
         }
         self.prefill_head_blocked = false;
+        // **The least wave's shortfall is bought here, so the next wave is not
+        // this one again.** A refusal is measured after every claim that
+        // reached the gap has landed, which is the one figure the fill cannot
+        // see. Admission is still the buyer — this runs between forwards on
+        // the scheduler thread — and what it buys is bounded by the least
+        // useful forward, which the wave cannot compose below. Without it a
+        // refused least chunk re-formed identically at 70 Hz: 29,000 refusals
+        // in seven minutes of run 10, no forward, every widening of the margin
+        // powerless against a chunk the margin does not bound.
+        let least = self.min_forward_tier_bytes() as usize;
+        let gap = transient_headroom_bytes(0).unwrap_or(0);
+        let bought = if gap < least {
+            let short = (least - gap).div_ceil(REGION_BYTES);
+            self.model.request_kv_ground(short)
+        } else {
+            0
+        };
         tracing::warn!(
             target: "candle_conversation::scheduler::interleave",
             margin_regions = self.tier_margin_regions,
             requeued,
             failed,
+            gap_mib = gap >> 20,
+            least_mib = least >> 20,
+            bought_mib = bought >> 20,
             "wave transient tier refused placement — wave requeued, margin widened: {err}",
         );
     }

@@ -11868,7 +11868,10 @@ mod tests {
             sequence_id: slot,
             section_id: SectionId::new(5),
             prefix_section_ids: Vec::new(),
-            tokens: TokenBuffer::from(vec![1u32; 2000]),
+            // Long enough that even the test double's tiny geometry prices the
+            // whole section a region or more above its least chunk — the tier
+            // is priced in whole regions.
+            tokens: TokenBuffer::from(vec![1u32; 100_000]),
             address: ContentAddress::default(),
             debug_name: "long".into(),
             in_collection: false,
@@ -11877,7 +11880,7 @@ mod tests {
         let dtype = scheduler.session.activation_dtype();
         let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
         let least = (plan.tier_bytes(prefill::PREFILL_MIN_ADVANCE) - plan.tier_bytes(0)) as u64;
-        let whole = (plan.tier_bytes(2000) - plan.tier_bytes(0)) as u64;
+        let whole = (plan.tier_bytes(100_000) - plan.tier_bytes(0)) as u64;
         assert!(whole > least, "the test only means something if the two differ");
 
         let mut fill = prefill::WaveFill::new(&mut scheduler, 0);
