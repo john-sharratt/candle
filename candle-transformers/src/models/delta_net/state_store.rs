@@ -321,12 +321,6 @@ pub struct RecurrentStateStore {
     /// the whole state came from rather than of which layers a sweep reached.
     seeded: bool,
     device: Device,
-    /// Waves this store has sat out since it last ran one.
-    ///
-    /// Drives [`Self::release_backups`]: a sequence that is not in the wave is
-    /// not writing a state, so its write buffer is 63 MiB of the reservation
-    /// doing nothing.
-    idle_waves: usize,
     /// The reservation regions every buffer above is a view into.
     ///
     /// **This is the store's lifetime, and its cleanup.** Held for as long as
@@ -698,7 +692,6 @@ impl RecurrentStateStore {
             // nothing for a reset to destroy.
             seeded: false,
             device: device.clone(),
-            idle_waves: 0,
             #[cfg(feature = "cuda")]
             regions: bump.map_or_else(Vec::new, |b| b.regions),
             #[cfg(feature = "cuda")]
@@ -915,109 +908,7 @@ impl RecurrentStateStore {
         if let Some(b) = bump {
             self.backup_regions.extend(b.into_regions());
         }
-        if complete {
-            self.idle_waves = 0;
-        }
         Ok(complete)
-    }
-
-    /// Give the write buffers back.
-    ///
-    /// Called for a sequence that is **not** in the wave about to run. The next
-    /// wave it joins takes fresh ones: nothing is copied and nothing is lost,
-    /// because a wave fully overwrites this half before reading it — which is
-    /// why it is allocated uninitialised in the first place.
-    ///
-    /// **What this does cost is the rewind.** After a commit the non-live half
-    /// holds the pre-wave state for [`Self::layer_state_rewind`], so releasing
-    /// it discards the point a speculative block would replay from. The caller
-    /// therefore lags eviction behind the wave rather than doing it at commit:
-    /// a rewind happens in the same decode step as the wave that earned it,
-    /// while the sequence is still a member. Refuses outright mid-wave, where
-    /// the buffer is the one the open wave is writing.
-    pub fn release_backups(&mut self) -> Result<()> {
-        if self.open {
-            candle::bail!(
-                "recurrent store: release_backups mid-wave — that buffer is the \
-                 one the open wave is writing into"
-            );
-        }
-        // **Which regions to free is decided by ADDRESS, not by field name.**
-        //
-        // `commit_wave` swaps `live` and `backup` per slot and leaves `regions`
-        // and `backup_regions` untouched, so after a commit the two fields no
-        // longer describe what is in them: a slot's `live` is carved from
-        // `backup_regions`. Clearing that field here handed a live state's
-        // ground back to the free list, where it was cleaned and re-tenanted
-        // while the store went on reading it. Every layer is carved from one
-        // bump, so they all went together — measured as `seq=4` entering a
-        // 2-token continuation with all three DeltaNet layers at 3.4e38.
-        //
-        // A store-level swap in `commit_wave` cannot fix it: `advanced` is per
-        // slot, so after a partial sweep different slots hold opposite halves
-        // and no single swap describes them. The ownership question is therefore
-        // asked of the addresses that remain live, which is true whatever the
-        // sweep did.
-        //
-        // Reading the live pointers has to happen BEFORE the backups are
-        // dropped, so nothing has been released while the answer is computed.
-        #[cfg(feature = "cuda")]
-        let live_bases: Vec<u64> = match &self.device {
-            Device::Cuda(cuda) => self
-                .slots
-                .iter()
-                .flat_map(|s| [&s.live.s, &s.live.conv_tail])
-                .filter_map(|t| tensor_device_ptr(cuda, t).ok())
-                .collect(),
-            _ => Vec::new(),
-        };
-        for slot in &mut self.slots {
-            slot.backup = None;
-            slot.advanced = false;
-        }
-        // Keep every region a live buffer still stands in, wherever it was
-        // filed, and drop the rest — dropping a `SpanRegion` is what returns it.
-        // A region that holds a live buffer and a just-dropped one is kept
-        // whole; the dead half's bytes are simply unused, exactly as a partial
-        // take already leaves them.
-        #[cfg(feature = "cuda")]
-        {
-            let holds_live = |r: &SpanRegion| {
-                let (lo, hi) = (r.base(), r.base() + SpanRegion::bytes() as u64);
-                live_bases.iter().any(|p| *p >= lo && *p < hi)
-            };
-            let mut kept: Vec<SpanRegion> = Vec::new();
-            for r in self
-                .regions
-                .drain(..)
-                .chain(self.backup_regions.drain(..))
-                .collect::<Vec<_>>()
-            {
-                if holds_live(&r) {
-                    kept.push(r);
-                }
-            }
-            // Normalised: `regions` is the live ground and nothing else, so the
-            // names mean what they say again by the time anyone reads them.
-            self.regions = kept;
-        }
-        Ok(())
-    }
-
-    /// Note that a wave ran without this sequence, and give back its write
-    /// buffers once it has sat out `lag` of them.
-    ///
-    /// Returns whether anything was released.
-    pub fn note_idle_wave(&mut self, lag: usize) -> Result<bool> {
-        self.idle_waves = self.idle_waves.saturating_add(1);
-        if self.open || self.idle_waves <= lag {
-            return Ok(false);
-        }
-        if self.slots.iter().all(|s| s.backup.is_none()) {
-            return Ok(false);
-        }
-        self.release_backups()?;
-        Ok(true)
     }
 
     /// This layer's write buffer, which the first wave must have taken.
@@ -1333,7 +1224,6 @@ impl RecurrentStateStore {
             open: false,
             seeded: true,
             device: self.device.clone(),
-            idle_waves: 0,
             #[cfg(feature = "cuda")]
             regions: bump.map_or_else(Vec::new, |b| b.regions),
             #[cfg(feature = "cuda")]
@@ -1765,70 +1655,23 @@ mod tests {
             "a CPU store has no regions to pack, and that is not a failure",
         );
 
-        // And with them released, still a clean decline.
-        store.note_idle_wave(0).unwrap();
-        assert!(store.slots.iter().all(|s| s.backup.is_none()));
-        assert!(!store.relocate_down(64).unwrap());
     }
 
-    /// **The eviction, and its lag.** A sequence that sits out a wave gives its
-    /// write buffers back — but not on the first one, because the pre-wave state
-    /// a speculative rewind replays from lives in exactly those buffers and that
-    /// read happens in the same decode step as the wave that earned it.
+    /// **A store keeps its write buffers between waves.** Sitting a wave out
+    /// used to give them back, and the next wave the sequence rode re-took them
+    /// inside the forward — a region claim under a tier the fill had already
+    /// sized against the frontier. The buffers are priced into the store at
+    /// admission and stay until the store is dropped.
     #[test]
-    fn sitting_out_waves_gives_the_write_buffers_back_after_the_lag() {
-        let mut store = filled_store();
-        assert!(store.slots.iter().all(|s| s.backup.is_some()));
-
-        // One wave missed at lag 1 is inside the rewind window — keep them.
-        assert!(!store.note_idle_wave(1).unwrap());
-        assert!(
-            store.slots.iter().all(|s| s.backup.is_some()),
-            "released inside the lag, where a rewind may still read them",
-        );
-
-        // The next one is past it.
-        assert!(store.note_idle_wave(1).unwrap());
-        assert!(
-            store.slots.iter().all(|s| s.backup.is_none()),
-            "a sequence out of the wave should not hold write buffers",
-        );
-
-        // Idempotent: nothing left to give back.
-        assert!(!store.note_idle_wave(1).unwrap());
-    }
-
-    /// Rejoining a wave takes fresh buffers, and the state half is untouched by
-    /// the round trip — nothing is copied out or back, because a wave
-    /// overwrites this half whole before reading it.
-    #[test]
-    fn a_store_that_rejoins_takes_fresh_buffers_and_keeps_its_state() {
+    fn a_store_keeps_its_write_buffers_across_the_waves_it_sits_out() {
         let mut store = filled_store();
         let before = store.export().unwrap();
+        assert!(store.slots.iter().all(|s| s.backup.is_some()));
 
-        store.note_idle_wave(0).unwrap();
-        assert!(store.slots.iter().all(|s| s.backup.is_none()));
-
+        // Waves it is not in: nothing on the store changes.
         store.ensure_backups().unwrap();
         assert!(store.slots.iter().all(|s| s.backup.is_some()));
-        assert_eq!(
-            store.export().unwrap(),
-            before,
-            "evicting the write half must not disturb the state half",
-        );
-    }
-
-    /// Mid-wave the write buffer is the one being written, so releasing it is a
-    /// sequencing bug rather than a no-op.
-    #[test]
-    fn releasing_write_buffers_mid_wave_is_refused() {
-        let mut store = filled_store();
-        store.begin_wave().unwrap();
-        assert!(store.release_backups().is_err(), "mid-wave release");
-        assert!(
-            store.slots.iter().all(|s| s.backup.is_some()),
-            "the refusal must leave the buffers in place",
-        );
+        assert_eq!(store.export().unwrap(), before);
     }
 
     /// Taking the write buffers twice must not take them twice — the wave path

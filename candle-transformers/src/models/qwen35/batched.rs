@@ -39,16 +39,6 @@ use crate::models::draft_ladder::DraftLadder;
 use crate::models::lora::Adapter;
 use crate::models::rotary_layout::RotaryLayout;
 
-/// Waves a sequence must sit out before its recurrent write buffers are given
-/// back.
-///
-/// **Not zero, and that is the whole safety of it.** The pre-wave state a
-/// speculative rewind replays from lives in exactly those buffers, and the
-/// rewind runs in the same decode step as the wave that earned it. One wave of
-/// lag puts the release strictly after that window closes; releasing at commit
-/// would take the buffer while the rewind still wanted it.
-const RECURRENT_IDLE_LAG_WAVES: usize = 1;
-
 /// A loaded hybrid model of this lineage, ready to be driven by the scheduler.
 ///
 /// Generic across the family: the per-model files
@@ -391,24 +381,6 @@ impl HybridBatched {
     /// Drop the stash spans of `seqs` without replaying — for a verify forward
     /// that failed, whose spans would otherwise rewind a wave that never
     /// committed. The buffers stay for reuse.
-    /// Sequences whose speculative block is still stashed.
-    ///
-    /// **These are not idle, whatever the wave membership says.** A stash names
-    /// a rewind point *inside* a sequence's recurrent state, and the rollback
-    /// that consumes it lifts that state by sequence id — so parking one out
-    /// from under a live stash fails the rollback with "has no recurrent state",
-    /// which is what 30 directory ingests died of before this guard existed.
-    fn stashed_sequences(&self) -> Vec<usize> {
-        self.verify_stash
-            .lock()
-            .ok()
-            .and_then(|s| {
-                s.as_ref()
-                    .map(|st| st.spans.iter().map(|p| p.seq).collect())
-            })
-            .unwrap_or_default()
-    }
-
     pub fn drop_verify_stashes(&self, seqs: &[usize]) {
         if let Ok(mut slot) = self.verify_stash.lock() {
             if let Some(st) = slot.as_mut() {
@@ -533,48 +505,20 @@ impl HybridBatched {
             }
         }
 
-        // **Give back the write buffers of everyone who is not in this wave.**
-        //
-        // A store is created when a turn is *queued* and a queued turn waits
-        // many waves — measured, a backlog of 57–67 turns held 64 stores, and
-        // this half is 63 MiB of the 126 MiB each. Nothing reads it while the
-        // sequence sits out, and the wave it eventually joins overwrites it
-        // whole, so the buffer is pure occupancy taken one-for-one out of the
-        // weight zone.
-        //
-        // **Lagged by a wave rather than released at commit.** The non-live half
-        // holds the pre-wave state that `layer_state_rewind` replays a
-        // speculative block from, and that read happens in the same decode step
-        // as the wave that earned it — while the sequence is still a member.
-        // Releasing at commit would take the buffer out from under it.
-        let members: std::collections::HashSet<usize> = seqs.iter().copied().collect();
-        // **A stashed sequence is not idle, on this path either.** The write
-        // buffer is where `layer_state_rewind` finds the pre-wave state a
-        // speculative block replays from, so releasing it under a live stash
-        // leaves the rollback with nothing to rewind to. Guarding only the
-        // parking sweep below and not this one cost 26 directory ingests, all
-        // failing as "layer N has no entering state to rewind to" — the lag
-        // alone is not enough, because a rollback can arrive more than one wave
-        // after the wave that earned it.
-        let stashed = self.stashed_sequences();
-        for (seq, store) in map.iter_mut() {
-            if members.contains(seq) || stashed.contains(seq) {
-                continue;
-            }
-            // A refusal here is not fatal: it means the store is mid-wave, and
-            // the next sweep will find it idle again.
-            let _ = store.note_idle_wave(RECURRENT_IDLE_LAG_WAVES);
-        }
-
-        // **Recurrent state stays on the device.** An idle sequence used to be
-        // exported to pageable host memory here and its regions handed back,
-        // then imported again on its next admission. What bounds residency
-        // instead is the turn seal: `evict_recurrent` drops the device copy once
-        // the substrate snapshot is durable, so a conversation between turns
-        // holds nothing, and the next turn restores from the snapshot. Idle
-        // *within* a turn is a sequence queued behind others in the same wave
-        // group — a wave or two, not a conversation's lifetime — and the write
-        // buffers released above are the half of it worth reclaiming.
+        // **A store keeps its write buffers for as long as its sequence is
+        // admitted.** They used to be given back when the sequence sat out a
+        // wave and re-taken here when it next rode one — a region claim inside
+        // the forward, before the transient tier is placed, for a sequence the
+        // scheduler had already priced at the full store. Those claims came off
+        // the top of the free list, the frontier rose under the tier the fill
+        // had just sized the wave against, and the placement was refused by
+        // the regions they took: run 9, five regions in one millisecond, no
+        // forward. Admission prices every sequence at `recurrent_store_bytes`
+        // — both halves — and a sequence that is admitted has not lost its
+        // admittance by sitting out one wave, so the buffers stay. What bounds
+        // residency is the turn seal: `evict_recurrent` drops the whole store
+        // once the substrate snapshot is durable, and the next turn restores
+        // it at its own admission.
         Ok(())
     }
 

@@ -1191,6 +1191,29 @@ impl Scheduler {
         (gap, owed, gap.saturating_sub(margin).saturating_sub(owed))
     }
 
+    /// Hold this wave's transient tier against the weight side's growth.
+    ///
+    /// The weight side takes spare K/V ground at phase 0 of every forward —
+    /// after the scheduler has sized the wave against the frontier gap and
+    /// before the tier is placed in it. Its growth term leaves standing
+    /// whatever the pool's `least_tier_bytes` says (`spare_regions`), which the
+    /// fill sets to the least useful forward. A wave packed wider than that,
+    /// into ground that was free when it was composed, then lost it to the
+    /// growth: run 9, `tier budget published gap=882`, `weight side took free
+    /// KV regions gained=69 spare=8` four hundred microseconds later, and the
+    /// 816 MiB tier refused by four regions. So the wave, once composed, is
+    /// what the growth must leave — `rows` is every row it carries.
+    fn hold_wave_tier(&self, rows: usize) {
+        let dtype = self.session.activation_dtype();
+        let plan = WavePlan::new(self.model.wave_geometry(dtype));
+        let tier = plan
+            .tier_bytes(rows)
+            .max(self.min_forward_tier_bytes() as usize);
+        if let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() {
+            set_least_tier_bytes(gpu_id, tier);
+        }
+    }
+
     /// The transient tier of the least forward worth running —
     /// [`PREFILL_MIN_ADVANCE`] rows, priced through the same planner that
     /// places the tier, so it follows the model's geometry and the activation
@@ -2942,6 +2965,11 @@ impl Scheduler {
             let pre_seqs: Vec<usize> = verify_seqs.iter().chain(&sec_seqs).copied().collect();
             let pre_inputs: Vec<Tensor> =
                 verify_inputs.iter().chain(&sec_inputs).cloned().collect();
+            let sec_tok: usize = sec_inputs
+                .iter()
+                .map(|t| t.dims().get(1).copied().unwrap_or(0))
+                .sum();
+            self.hold_wave_tier(head_rows + sec_tok + glue_tok);
             let out = self.model.forward_wave(
                 &mut self.session,
                 decode_seqs,
@@ -3039,6 +3067,11 @@ impl Scheduler {
                 }
             }
         }
+
+        // Every segment of this wave places a tier for the rows it carries; the
+        // widest — head, creep and glue together — is what the growth must
+        // leave standing across all of them.
+        self.hold_wave_tier(head_rows + creep_tok + glue_tok);
 
         // Segment 1 — full-sweep members only over [0, cursor). Runs when there is
         // any full-sweep member (decode or glue) and cursor > 0; the creep resumes
