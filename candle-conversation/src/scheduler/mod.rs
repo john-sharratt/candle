@@ -8949,51 +8949,26 @@ impl Scheduler {
         let view_id = SequenceId(vs.view_idx);
         let borrowed = BlockCount(vs.borrowed_block_count);
 
-        // The view borrows the parent's KV blocks zero-copy; per-sequence model
-        // state cannot be borrowed the same way, because the view is about to
-        // advance it. Copy it instead.
+        // The view borrows the parent's KV blocks zero-copy. Its recurrent state
+        // is NOT touched here: the view takes the parent's store at admission
+        // (`Scheduler::claim_recurrent`), the first moment it will actually run,
+        // and holds nothing while it waits in the queue.
         //
-        // Without this a hybrid's recurrent layers carry nothing across a turn
-        // boundary: the view is a distinct sequence id, so it would start from
-        // the sequence-start value while its KV holds the parent's entire
-        // history — three quarters of the stack contributing nothing but a
-        // function of the current turn, fluently and without an error.
-        // The parent's state is evicted when its previous turn seals, so bring
-        // it back before forking from it — `fork_recurrent` refuses a parent
-        // that carries none, and rightly: handing the child zeros is the
-        // amnesia this whole path exists to prevent.
-        self.ensure_recurrent_restored(parent_id);
-        self.model
-            .fork_recurrent(parent_id.0, view_id.0)
-            .map_err(ConversationError::Model)?;
-        FORK_RECURRENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // The view borrows the parent's K/V blocks but copies its per-position
-        // state, so the two have to agree at the moment of the carve. A view
-        // that starts short stays short for its whole life and says nothing
-        // until a selection past the identity threshold refuses — so the
-        // mismatch is named here, where the parent that caused it is still in
-        // hand.
-        if let Some(cov) = self.model.positional_coverage(view_id.0) {
-            let parent_tokens = self.session.sequence_offset(parent_id.0).unwrap_or(0);
-            if cov < parent_tokens {
-                // **The PARENT's coverage too, because it decides where to look.**
-                // A child short of a parent that is itself complete is a fork
-                // that dropped rows; a child short of a parent that was already
-                // short is the parent's prefix having arrived unindexed, and the
-                // fork is faithfully copying nothing. Without both numbers the
-                // warning names the carve for a loss that happened before it.
-                let parent_cov = self.model.positional_coverage(parent_id.0);
-                tracing::warn!(
-                    parent = parent_id.0,
-                    view = view_id.0,
-                    parent_tokens,
-                    parent_coverage = ?parent_cov,
-                    view_coverage = cov,
-                    "create_view: carved a view over {} token(s) its index does not cover",
-                    parent_tokens - cov
-                );
-            }
-        }
+        // This used to restore the parent's store from the substrate and copy it
+        // into a fresh store for the view — at submission, before any wave had
+        // admitted anything. Two consequences, both measured on a full repo_map
+        // ingest of this repo. Every in-flight turn held TWO stores, the
+        // parent's copy sitting idle for the whole turn only to be dropped at
+        // finalize (`move_recurrent` replaces it): 38 views, 74 stores, 6 GiB.
+        // And admission could not refuse a view, because `claim_recurrent` found
+        // the store already there — so residency was bounded by how fast the
+        // ingest opened conversations, not by anything the span could say. The
+        // weight zone was squeezed 6,047 to 1,417 MiB and throughput fell 665 to
+        // 32 t/s, with zero errors, because nothing on that path was wrong.
+        //
+        // A view is a linear continuation of its parent — what it advances IS
+        // what the parent's state becomes — so the state is moved, not copied,
+        // and moved back at finalize as it always was.
 
         // Seed sampling state for the view (clone parent's state so
         // the DRY window survives the carve).
@@ -11040,11 +11015,16 @@ mod tests {
 
         /// Move: the child's entry is gone afterwards and the parent's old
         /// state is replaced. Tolerant of a child that never ran a wave.
+        ///
+        /// The destination is marked seeded, as the real store is: a moved state
+        /// was put there deliberately, which is what the flag records, and a
+        /// destination at offset 0 would otherwise reset it on its first wave.
         fn move_recurrent(&self, child: usize, parent: usize) -> candle::Result<()> {
             let taken = self.probe.states.lock().unwrap().remove(&child);
             self.probe.seeded.lock().unwrap().remove(&child);
             if let Some(state) = taken {
                 self.probe.set(parent, state);
+                self.probe.seeded.lock().unwrap().insert(parent);
             }
             let taken_idx = self.probe.index.lock().unwrap().remove(&child);
             if let Some(idx) = taken_idx {
@@ -12079,14 +12059,23 @@ mod tests {
         assert_eq!(probe.get(1), Some(ZERO_STATE), "and it starts from zero");
     }
 
-    /// **The wiring, not just the hook.** Drives `Scheduler::create_view`
-    /// itself and asserts the view came out carrying the parent's state.
+    /// **The wiring, not just the hook.** Drives `Scheduler::create_view` and
+    /// then admission itself, and asserts the state lands where the design says
+    /// and nowhere else.
     ///
-    /// The hook-level tests above would all pass with `create_view` never
-    /// calling `fork_recurrent` at all — which is exactly the shape of the
-    /// defect this phase fixes, so the wiring needs its own assertion.
+    /// Two halves. `create_view` must leave the recurrent state ALONE: a view
+    /// waiting in the queue holds nothing, so the parent still carries its
+    /// state and the view carries none. Then `claim_recurrent` — admission, the
+    /// first moment the view will actually run — MOVES the parent's state onto
+    /// the view: the view carries exactly what the parent had, seeded so its
+    /// first wave does not reset it, and the parent carries none, because a
+    /// view is a linear continuation and there is nothing for the parent to keep.
+    ///
+    /// The previous shape of this test asserted the copy at `create_view`. That
+    /// contract put two stores on the span per in-flight turn and made
+    /// admission unable to refuse a view; it is gone, and this pins its absence.
     #[test]
-    fn scheduler_create_view_forks_the_parents_recurrent_state() {
+    fn a_view_takes_its_parents_recurrent_state_at_admission_not_creation() {
         let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
@@ -12126,15 +12115,47 @@ mod tests {
         toy_advance(&mut expected, tokens.len());
         assert_state_eq(&probe, parent_raw, expected);
 
-        let (view_id, _) = scheduler
+        let (view_id, borrowed) = scheduler
             .create_view(parent_id, &[BlockRange::new(0, 1)])
             .expect("view creation");
 
+        // Half one: creation touches nothing. The view is queued, not admitted,
+        // so it holds no store and the parent keeps its own.
+        assert_eq!(
+            probe.get(view_id.0),
+            None,
+            "a view holds no recurrent state until it is admitted"
+        );
+        assert_state_eq(&probe, parent_raw, expected);
+
+        // Register the view exactly as the `SubmitTurn` handler does, so
+        // admission can find its parent.
+        scheduler.turn_views.insert(
+            view_id,
+            ViewState {
+                parent_id,
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: borrowed.0,
+                question_tokens: 0,
+            },
+        );
+
+        // Half two: admission moves the state. Not a copy — the parent is left
+        // with none, because what the view advances is what the parent becomes.
+        assert!(
+            scheduler.claim_recurrent(view_id.0),
+            "admission must be able to place the view's store"
+        );
         assert_state_eq(&probe, view_id.0, expected);
         assert!(
             probe.is_seeded(view_id.0),
-            "the forked view must be seeded, or its first wave at offset 0 \
-             resets the state the fork just copied"
+            "the view must be seeded, or its first wave at offset 0 resets the \
+             state the move just handed it"
+        );
+        assert_eq!(
+            probe.get(parent_raw),
+            None,
+            "moved, not copied: the parent holds nothing while its view runs"
         );
     }
 

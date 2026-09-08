@@ -776,7 +776,14 @@ impl HybridBatched {
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
         map.remove(&parent);
-        if let Some(store) = map.remove(&child) {
+        if let Some(mut store) = map.remove(&child) {
+            // A moved state was put there deliberately, which is precisely what
+            // `seeded` records — the same mark `fork_from` set when the view's
+            // state was a copy. Without it a destination standing at offset 0
+            // would read `needs_reset` as true on its first wave and wipe the
+            // state this move just handed it; the flag protects exactly that one
+            // wave and is consumed by it.
+            store.mark_seeded();
             map.insert(parent, store);
             return Ok(());
         }

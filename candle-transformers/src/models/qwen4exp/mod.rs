@@ -23,6 +23,10 @@
 
 #[cfg(feature = "cuda")]
 pub mod batched_attention;
+/// Moving one class of a sequence's carried state between slots — the wave's
+/// view move. Pure, so its tests run without a device.
+#[cfg(any(feature = "cuda", test))]
+mod carried_move;
 pub mod config;
 pub mod convert;
 pub mod convert_bench;

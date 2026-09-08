@@ -1337,7 +1337,69 @@ impl Scheduler {
     /// An error is treated as a refusal — the sequence waits a wave — and is
     /// logged, because "no room" comes back as `Ok(false)` and an `Err` here
     /// is something else.
-    fn claim_recurrent(&self, seq: usize) -> bool {
+    pub(super) fn claim_recurrent(&mut self, seq: usize) -> bool {
+        // **A view takes its parent's state here, not at submission.** This is
+        // the first moment the view is actually going to run, so it is the
+        // first moment holding a store is justified; a view waiting in the queue
+        // holds nothing, and a fill that cannot place one more store refuses
+        // here with `Ok(false)` — a real refusal, where before it found the
+        // store already claimed and had nothing left to decide.
+        //
+        // Moved, not copied. A view is a linear continuation of its parent —
+        // what it advances IS what the parent's state becomes — and
+        // `finalize_view` already moves it back. The copy that used to be made
+        // at submission left the parent's store resident and idle for the whole
+        // turn, only to be dropped at finalize: two stores per in-flight turn.
+        //
+        // The parent's store is evicted when its previous turn seals, so it is
+        // restored first; `move_recurrent` is tolerant of a parent that carries
+        // none (a brand-new conversation's first turn), and the view then starts
+        // from the sequence-start value through `admit_recurrent`'s vacant arm,
+        // which is right.
+        let view_id = SequenceId(seq);
+        if let Some(parent) = self.turn_views.get(&view_id).map(|st| st.parent_id) {
+            if !self.model.recurrent_resident(seq) {
+                self.ensure_recurrent_restored(parent);
+                // Read before the move: afterwards the parent holds none, and
+                // the coverage warning below has to say whether the parent was
+                // already short.
+                let parent_coverage = self.model.positional_coverage(parent.0);
+                if let Err(e) = self.model.move_recurrent(parent.0, seq) {
+                    tracing::warn!(
+                        target: "candle_conversation::scheduler::interleave",
+                        seq,
+                        parent = parent.0,
+                        "recurrent state could not be moved onto the view — refused: {e}",
+                    );
+                    return false;
+                }
+                FORK_RECURRENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The view borrows the parent's K/V blocks and now holds its
+                // per-position state, so the two have to agree at this moment. A
+                // view that starts short stays short for its whole life and says
+                // nothing until a selection past the identity threshold refuses —
+                // so the mismatch is named here, where the parent that caused it
+                // is still in hand. The parent's coverage decides where to look:
+                // a view short of a complete parent is a move that dropped rows;
+                // a view short of a parent that was already short is the parent's
+                // prefix having arrived unindexed.
+                if let Some(cov) = self.model.positional_coverage(seq) {
+                    let parent_tokens = self.session.sequence_offset(parent.0).unwrap_or(0);
+                    if cov < parent_tokens {
+                        tracing::warn!(
+                            parent = parent.0,
+                            view = seq,
+                            parent_tokens,
+                            parent_coverage = ?parent_coverage,
+                            view_coverage = cov,
+                            "claim_recurrent: the view borrows {} token(s) of its parent's \
+                             history that its index does not cover",
+                            parent_tokens - cov
+                        );
+                    }
+                }
+            }
+        }
         let offset = self.session.sequence_offset(seq).unwrap_or(0);
         match self.model.admit_recurrent(seq, offset) {
             Ok(admitted) => admitted,

@@ -34,6 +34,7 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{KvCache, ModelGeometry, QWEN4EXP_KV_FACTORS};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
+use super::carried_move::move_entry;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hyper::{hc_combine, hc_mix};
@@ -868,45 +869,23 @@ impl Qwen4ExpBatched {
         Ok(())
     }
 
-    /// A view finalizes: `child`'s state becomes `parent`'s.
+    /// `child`'s carried state becomes `parent`'s: a view finalizing onto its
+    /// parent, or — with the roles reversed — a view taking its parent's state
+    /// at admission.
     ///
     /// A move, not a merge — a view is a linear continuation of its parent, so
-    /// what it holds now is what the parent's state becomes. The child's
-    /// entries are gone afterwards and the parent's previous ones are dropped.
+    /// what one holds now is what the other's state becomes. **Each carried
+    /// class moves on its own terms**, exactly as [`Self::fork_recurrent`]
+    /// forks them: a source can hold an index without a recurrent store — an
+    /// injected, never-decoded prefix is exactly that shape — and returning on
+    /// the missing store took the index with it, handing the destination K/V it
+    /// holds no index for. A class the source does not hold leaves the
+    /// destination's own entry in place, so a view that never ran a wave hands
+    /// its parent nothing and the parent keeps what it had.
     pub fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
-        let store = {
-            let mut map = self
-                .recurrent
-                .write()
-                .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
-            match map.remove(&child) {
-                Some(s) => s,
-                // The view never ran a wave; the parent keeps what it had.
-                None => return Ok(()),
-            }
-        };
-        self.recurrent
-            .write()
-            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
-            .insert(parent, store);
-        {
-            let mut map = self
-                .ple
-                .write()
-                .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?;
-            if let Some(p) = map.remove(&child) {
-                map.insert(parent, p);
-            }
-        }
-        {
-            let mut map = self
-                .index
-                .write()
-                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
-            if let Some(i) = map.remove(&child) {
-                map.insert(parent, i);
-            }
-        }
+        let mut moved = move_entry(&self.recurrent, "recurrent", child, parent)?;
+        moved |= move_entry(&self.ple, "ple", child, parent)?;
+        moved |= move_entry(&self.index, "index", child, parent)?;
         {
             let mut map = self
                 .seeds
@@ -914,7 +893,13 @@ impl Qwen4ExpBatched {
                 .map_err(|_| candle::Error::Msg("qwen4exp: seeds lock poisoned".into()))?;
             if let Some(s) = map.remove(&child) {
                 map.insert(parent, s);
+                moved = true;
             }
+        }
+        // Put there deliberately, as a fork's copy is: the destination must
+        // survive one `offset == 0` reset rather than start over without it.
+        if moved {
+            self.mark_seeded(parent)?;
         }
         Ok(())
     }
@@ -1512,8 +1497,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::fork_recurrent(self, parent, child)
     }
 
-    /// A view finalizes: its decoded blocks transfer to the parent, and its
-    /// carried state goes with them.
+    /// A view finalizes — its decoded blocks transfer to the parent, and its
+    /// carried state goes with them — or, roles reversed, takes its parent's
+    /// state at admission.
     fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
         Qwen4ExpBatched::move_recurrent(self, child, parent)
     }
