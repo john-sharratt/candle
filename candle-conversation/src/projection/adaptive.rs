@@ -44,6 +44,23 @@ pub struct ScanPolicy {
     pub level_prior_base: f32,
     /// Concept A.4: maximum size-scaling multiple for tiny children.
     pub level_prior_cap: f32,
+    /// Normalize the competition BETWEEN this group's timelines, not just within
+    /// each one.
+    ///
+    /// This is a statement about what the group's candidates *are*. A dialogue
+    /// group's candidates are moments in one thread, so per-timeline scoping is
+    /// correct and this stays off. A group whose candidates are whole
+    /// conversations — `repo_map`, where a timeline is a folder — is asking
+    /// "which folder?", and without this each folder is normalized against its
+    /// own denominator and the results compared as if they shared a scale. The
+    /// folder carrying the most turns then wins regardless of relevance.
+    ///
+    /// On, the group gets one [`ScopeKey::GroupMembers`] scope in which every
+    /// timeline competes and each learns its own hit level — the same shape the
+    /// tool catalog uses, and the reason tool routing normalizes correctly.
+    ///
+    /// [`ScopeKey::GroupMembers`]: crate::normalization::ScopeKey::GroupMembers
+    pub member_normalization: bool,
 }
 
 impl Default for ScanPolicy {
@@ -55,6 +72,7 @@ impl Default for ScanPolicy {
             mass_rho: 2.0,
             level_prior_base: 0.0,
             level_prior_cap: 8.0,
+            member_normalization: false,
         }
     }
 }

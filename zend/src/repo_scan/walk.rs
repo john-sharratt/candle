@@ -139,6 +139,14 @@ pub fn walk_workspace(root: &Path) -> RepoMap {
         }
 
         let (line_count, module_hint) = describe_file(path, &bytes, language);
+        // Declared symbols, scanned from the SAME bytes — the folder-probe
+        // layer's raw material (`super::probe`). Recorded here rather than in a
+        // later pass precisely because the file is already read and decoded at
+        // this point; a separate pass would re-read the whole corpus to learn
+        // what these few lines already know.
+        if let Ok(body) = std::str::from_utf8(&bytes) {
+            super::probe::idf::record_symbols(&mut map, &rel_normalised, body, language);
+        }
         map.files.push(FileEntry {
             path: rel_normalised,
             line_count,

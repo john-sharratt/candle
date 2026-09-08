@@ -1,5 +1,7 @@
 //! Data types shared by the workspace walker and the per-directory unit builder.
 
+use std::collections::HashMap;
+
 /// Languages we recognise by extension.  Each variant either maps to
 /// a tree-sitter grammar (proper scope-aware carving) or to a
 /// header-based / fixed-window fallback (see
@@ -167,6 +169,14 @@ pub struct RepoMap {
     pub files_skipped_oversize: usize,
     /// Files skipped because their extension wasn't allowlisted.
     pub files_skipped_extension: usize,
+    /// Declared symbols per retained file path — the folder-probe layer's raw
+    /// material (see [`crate::repo_scan::probe`]).
+    ///
+    /// A side-table rather than a [`FileEntry`] field because it is a derived
+    /// index, not file metadata: the walk records it, the directory-frequency
+    /// index consumes it, and nothing that merely describes a file needs it.
+    /// Files declaring nothing are simply absent.
+    pub symbols: HashMap<String, Vec<String>>,
     /// Files skipped because their content classified as binary (the
     /// statistical NUL-count + non-text-byte-ratio classifier in
     /// [`super::binary_sniff::is_binary_sample`]) despite carrying an

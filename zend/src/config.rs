@@ -54,6 +54,12 @@ pub struct DaemonConfig {
     /// Which model the daemon runs (`--model <PRESET>`). Defaults to the
     /// measured-VRAM ladder in `model_choice`.
     pub model: ModelChoice,
+    /// Delete every folder's `.substrate.yaml` before the scan, so this boot
+    /// regenerates the questions from the model (`--wipe-metadata`). Opt-in and
+    /// destructive of hand-written content, which is exactly why it is a flag
+    /// and not a heuristic — the daemon otherwise never overwrites a question
+    /// someone wrote.
+    pub wipe_metadata: bool,
 }
 
 /// Which model a daemon runs.

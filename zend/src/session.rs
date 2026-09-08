@@ -580,6 +580,7 @@ impl InferenceState {
         skipped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
         compact_substrate: bool,
+        wipe_metadata: bool,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
@@ -1818,6 +1819,7 @@ impl InferenceState {
                         &progress,
                         &il.name,
                         &il.group,
+                        wipe_metadata,
                     )?;
                     // An incomplete map is reported, not fatal: affected
                     // directories keep their prior generation live and retry on
@@ -4478,6 +4480,7 @@ impl ZendSession {
         // Resolved once, here, and handed to both the downloader and the engine
         // builder, so the artifact fetched and the model built are the same one.
         let model = model_choice::resolve(&self.config.model);
+        let wipe_metadata = self.config.wipe_metadata;
         // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
         // across the process (and the test binary), so clear any cancel left by a
         // prior load/shutdown before this one's ingest starts polling it. The
@@ -4563,6 +4566,7 @@ impl ZendSession {
                     skipped_layers,
                     ingest_dirs,
                     compact_substrate,
+                    wipe_metadata,
                     load_progress_for_blocking,
                     status_tx.clone(),
                 ) {

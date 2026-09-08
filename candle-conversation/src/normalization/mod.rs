@@ -55,6 +55,28 @@ pub enum ScopeKey {
         name: String,
         phase: Phase,
     },
+    /// The competition **between a turn group's members** — one scope for the
+    /// whole group, children being timelines rather than turns.
+    ///
+    /// [`ScopeKey::TurnGroup`] scopes per timeline, so its children are the turns
+    /// inside ONE conversation and its question is "which turn of this
+    /// conversation matches?". That is right for a dialogue, whose candidates are
+    /// moments in a single thread. It is wrong for a group whose candidates are
+    /// whole conversations — the `repo_map` layer, where each timeline is a
+    /// folder and the question is "which FOLDER matches?".
+    ///
+    /// Under per-timeline scoping every folder is normalized against its own
+    /// denominator and the results are then compared as if they shared a scale,
+    /// so a conversation carrying more turns simply wins: measured on the probe
+    /// layer, four folders took first place from the right answer 32 times
+    /// between them, and every one of them was a folder that happened to carry
+    /// probe turns.
+    ///
+    /// This is the shape the tool catalog already uses — one
+    /// [`ScopeKey::Collection`] in which every tool competes and each learns its
+    /// own hit level — and it is why tool routing normalizes correctly where this
+    /// did not.
+    GroupMembers { group: u64 },
     /// A sub-window within one turn (future — file-within-listing selection).
     SubWindow { turn: u64 },
 }
@@ -75,6 +97,9 @@ impl ScopeKey {
             name: name.into(),
             phase,
         }
+    }
+    pub fn group_members(group: u64) -> Self {
+        ScopeKey::GroupMembers { group }
     }
     pub fn sub_window(turn: u64) -> Self {
         ScopeKey::SubWindow { turn }
