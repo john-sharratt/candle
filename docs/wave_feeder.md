@@ -1525,10 +1525,19 @@ the decode lease, the one path run 11 never reached. Two turns outran their
   the device stream through the scheduler's pinned staging), the same path the
   persistence thread and `elevate_to_hot` run.
 * **The snapshot is trimmed to the committed offset** before it leaves the card
-  (`lease::trim_sealed_to_tokens`): trailing rows past the offset and empty
-  writer chunks are cut, so the resume's re-derived offset equals what the turn
-  had committed, whatever the slot looked like at the moment its lease ran out.
-  Both log lines carry `tokens`, `trimmed`, `park_ms` / `resume_ms`.
+  (`lease::trim_sealed_to_tokens`), so the resume's re-derived offset equals
+  what the turn had committed whatever the slot looked like when its lease ran
+  out. Both log lines carry `tokens`, `trimmed`, `park_ms` / `resume_ms`.
+* **A sealed tail is never extended** (`ChunkedKvBacking::tail_needs_new_block`).
+  Run 13 (S27) parked in 424 ms and resumed in 66 ms with `trimmed=0`, and the
+  resumed slot still failed by two tokens — so the surplus was made *after* the
+  resume, not carried through it. `inject_sealed_at_tail` puts every injected
+  chunk under the writer boundary, partial tail included; the drafter's
+  `ensure_for_offset` then found a 27-token tail with room and landed its two
+  rows in it, bumping a sealed chunk's usage that `truncate_sequence_to_tokens`
+  clamps at and cannot undo. A tail below the writer boundary now needs a fresh
+  block exactly as a full or block-quantized tail does, which is the same rule
+  the projection path applied by hand with `push_empty_writer_chunk`.
 
 ## 5. Plan
 

@@ -488,6 +488,55 @@ mod tests {
         }
     }
 
+    /// A slot whose every chunk sits under the writer boundary — what
+    /// `inject_sealed_at_tail` leaves behind on a resumed decode lease — with a
+    /// partial tail that still has room. The next write must not land in it.
+    mod sealed_tail_tests {
+        use super::*;
+
+        fn slot_with_tail(usage: u32, writer_start: usize) -> ChunkedKvBacking {
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            backing.ensure_for_offset(0, 0, 64).unwrap();
+            backing.set_block_window(0, 0, 0, 32).unwrap();
+            backing.set_block_window(0, 1, 0, usage).unwrap();
+            backing.test_set_writer_start(0, writer_start).unwrap();
+            backing
+        }
+
+        fn windows(backing: &ChunkedKvBacking) -> Vec<(u16, u32)> {
+            let state = backing.state.read().expect("lock");
+            let slot = state.sequences[0].as_ref().expect("slot");
+            slot.chunks_slice()
+                .iter()
+                .map(|c| (c.offset, c.usage))
+                .collect()
+        }
+
+        /// The measured case: 32 + 27 tokens, both chunks sealed, two drafted
+        /// rows arriving at position 59. The sealed tail keeps its 27 and the
+        /// rows get a fresh writer chunk — which the rollback can then trim.
+        #[test]
+        fn a_write_past_a_sealed_partial_tail_opens_a_fresh_chunk() {
+            let backing = slot_with_tail(27, 2);
+            backing.ensure_for_offset(0, 59, 2).unwrap();
+            assert_eq!(
+                windows(&backing),
+                vec![(0, 32), (0, 27), (0, 0)],
+                "a sealed tail is never extended, whatever room it has"
+            );
+        }
+
+        /// The ordinary decode tail — writable, partial, float — still takes
+        /// the rows in place: no chunk is pushed for a write that fits.
+        #[test]
+        fn a_writable_partial_tail_still_takes_the_rows_in_place() {
+            let backing = slot_with_tail(27, 1);
+            backing.ensure_for_offset(0, 59, 2).unwrap();
+            assert_eq!(windows(&backing), vec![(0, 32), (0, 27)]);
+        }
+    }
+
     mod fork_sequence_tests {
         use super::*;
 
