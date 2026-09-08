@@ -595,15 +595,24 @@ impl WavePlan {
     ///
     /// Mirrors the arithmetic in the forward exactly, padding included — the
     /// two must agree or the wave admitted is not the wave priced.
+    ///
+    /// **Rounded up to a whole region, because the placement is.** The tier is
+    /// carved in regions (`place_transient` rounds its length to one), so a
+    /// plan whose phases sum to 160.5 MiB stands 176 MiB tall. Priced unrounded,
+    /// the scheduler saw a 163 MiB gap as enough for the least chunk, bought
+    /// nothing, and the placement was refused by one region — on every wave,
+    /// 29,000 times in seven minutes, the same wave re-formed each time because
+    /// nothing in its price had changed.
     pub fn tier_bytes(&self, rows: usize) -> usize {
         // The forward pads each phase by one region; `TARGET_ARENA_BYTES` is
         // that size read from the ungated source, as `span_geometry` does —
         // `region_pool::REGION_BYTES` is CUDA-only and this plan is not.
-        self.phase_bytes(LayerPhase::Attention, rows)
+        let raw = self.phase_bytes(LayerPhase::Attention, rows)
             + TARGET_ARENA_BYTES
             + self.phase_bytes(LayerPhase::Ffn, rows)
             + TARGET_ARENA_BYTES
-            + WAVE_FORWARD_BYTES
+            + WAVE_FORWARD_BYTES;
+        raw.div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES
     }
 
     /// The widest wave whose **tier** fits in `budget` bytes.
@@ -746,6 +755,22 @@ mod tests {
                 "rows {rows}: tier {} must exceed the largest single phase {}",
                 p.tier_bytes(rows),
                 p.wave_bytes(rows),
+            );
+        }
+    }
+
+    /// **The tier is priced in whole regions, as it is placed.** The placement
+    /// rounds its length up to a region; a price that did not read a gap as
+    /// enough when the placement then asked for one region more.
+    #[test]
+    fn tier_bytes_is_a_whole_number_of_regions() {
+        let p = WavePlan::new(moe());
+        for rows in [1usize, 64, 128, 512, 4096] {
+            assert_eq!(
+                p.tier_bytes(rows) % TARGET_ARENA_BYTES,
+                0,
+                "rows {rows}: {} is not region-aligned",
+                p.tier_bytes(rows),
             );
         }
     }
