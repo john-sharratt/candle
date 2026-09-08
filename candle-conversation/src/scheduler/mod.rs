@@ -11853,6 +11853,46 @@ mod tests {
         );
     }
 
+    /// **The section batch is bounded by the tier the fill left it.** With no
+    /// tier budget published the first section still gets its least chunk —
+    /// the wave must make progress and the placement judges that chunk — and
+    /// nothing rides behind it; with room for everything, everything rides.
+    #[test]
+    fn the_section_batch_packs_to_the_tier_budget_not_the_token_cap() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        for n in 0..2 {
+            let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+            let (tx, _rx) = crossbeam::channel::bounded(1);
+            scheduler.active_section_ingests.push(ActiveSectionIngest {
+                sequence_id: slot,
+                section_id: SectionId::new(10 + n),
+                // Two of these fit the test scheduler's 512-token cap, so the
+                // tier budget is the only thing that can stop the second.
+                tokens: TokenBuffer::from(vec![1u32; 200]),
+                offset: 0,
+                seal_block_from: 0,
+                address: ContentAddress::default(),
+                debug_name: "bounded".into(),
+                in_collection: false,
+                response_tx: tx,
+                error: None,
+            });
+        }
+        scheduler.session.set_tier_budget_bytes(0);
+        let (seqs, _, _, advances) = scheduler.build_section_batch(0).expect("a batch");
+        assert_eq!(seqs.len(), 1, "no tier: the first section alone");
+        assert_eq!(
+            advances,
+            vec![prefill::PREFILL_MIN_ADVANCE],
+            "and only its least chunk"
+        );
+
+        scheduler.session.set_tier_budget_bytes(1 << 40);
+        let (seqs, _, _, advances) = scheduler.build_section_batch(0).expect("a batch");
+        assert_eq!(seqs.len(), 2, "room for both");
+        assert_eq!(advances, vec![200, 200]);
+    }
+
     /// **A scratch slot bound to a timeline stays at zeros at admission.**
     ///
     /// `StateSeed::Neutral` binds a target for address resolution only; the

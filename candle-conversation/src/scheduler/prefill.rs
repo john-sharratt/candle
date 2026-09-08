@@ -308,9 +308,7 @@ impl<'a> WaveFill<'a> {
     /// model's geometry and the activation dtype rather than being a byte count
     /// to re-derive per card.
     fn min_forward_tier_bytes(&self) -> u64 {
-        let dtype = self.sched.session.activation_dtype();
-        let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
-        plan.tier_bytes(PREFILL_MIN_ADVANCE) as u64
+        self.sched.min_forward_tier_bytes()
     }
 
     /// Publish this wave's transient-tier budget, so the engine's slab packer
@@ -741,22 +739,30 @@ fn region_bytes() -> u64 {
     candle_nn::kv_cache::REGION_BYTES as u64
 }
 
-/// Regions an admission must buy from the weight side, given that it needs
-/// `total` regions in all, `tier` of them contiguous at the arena frontier, the
-/// K/V side holds `free` regions anywhere, and `gap` of those lie between the
-/// frontier and the weight floor.
+/// Regions an admission must buy from the weight side so that, after its
+/// `claims` regions of K/V and store are taken, `tier` regions still stand
+/// contiguous at the arena frontier — given the K/V side holds `free` regions
+/// anywhere and `gap` of those lie between the frontier and the weight floor.
 ///
-/// Two shortfalls, and the larger is bought: K/V blocks and a recurrent store
-/// take regions from anywhere on the free list, while the transient tier stands
-/// only in the gap — free regions scattered below live ones are no use to it.
-/// Buying moves the floor right, which adds to both counts at once, so one
-/// purchase of the larger shortfall satisfies both.
+/// Claims recycle the free list lowest-first, so they spend the regions
+/// scattered below the frontier before they reach into the gap; the tier stands
+/// only in the gap, so what the claims eat of it has to be bought back. Buying
+/// moves the floor right, which adds to the gap and the free list at once.
+///
+/// The first shape of this — the larger of `claims + tier − free` and
+/// `tier − gap` — let an admission's own claims consume the gap it had just
+/// checked: run 5 admitted 42 sections, each measured the gap as sufficient,
+/// each then claimed its store from the top of the span, and the wave's tier
+/// found the gap three regions short with twelve regions free below it. No
+/// forward ran for the rest of the run.
 ///
 /// Pure, so the arithmetic is tested without a device.
-fn ground_shortfall_regions(total: usize, tier: usize, free: usize, gap: usize) -> usize {
-    total
+fn ground_shortfall_regions(claims: usize, tier: usize, free: usize, gap: usize) -> usize {
+    let scattered = free.saturating_sub(gap);
+    let gap_eaten = claims.saturating_sub(scattered);
+    claims
         .saturating_sub(free)
-        .max(tier.saturating_sub(gap))
+        .max(tier.saturating_add(gap_eaten).saturating_sub(gap))
 }
 
 /// Backlog (as a % of resident capacity) above which the wave loop blocks on a
@@ -1082,6 +1088,16 @@ impl Scheduler {
         self.session.ensure_capacity(&[seq], add).is_ok()
     }
 
+    /// The transient tier of the least forward worth running —
+    /// [`PREFILL_MIN_ADVANCE`] rows, priced through the same planner that
+    /// places the tier, so it follows the model's geometry and the activation
+    /// dtype rather than being a byte count re-derived per card.
+    pub(super) fn min_forward_tier_bytes(&self) -> u64 {
+        let dtype = self.session.activation_dtype();
+        let plan = WavePlan::new(self.model.wave_geometry(dtype));
+        plan.tier_bytes(PREFILL_MIN_ADVANCE) as u64
+    }
+
     /// One 32-token K/V block across the model, in the formats a **live**
     /// sequence occupies — see `admit::cost` for the 3.7x that distinction is
     /// worth.
@@ -1105,19 +1121,20 @@ impl Scheduler {
     /// Runs between forwards, which is the only moment the boundary may move
     /// (`set_weight_floor` refuses while a wave generation is open).
     ///
-    /// Two shortfalls, and the larger is bought. K/V blocks and a recurrent
-    /// store take regions from anywhere on the free list; the wave transient
-    /// tier stands only in the gap between the arena frontier and the weight
-    /// floor, so free regions scattered below live ones are no use to it.
-    /// Buying moves the floor right, which adds to both.
+    /// K/V blocks and a recurrent store take regions from anywhere on the free
+    /// list; the wave transient tier stands only in the gap between the arena
+    /// frontier and the weight floor, and the claims eat into that gap once the
+    /// scattered free regions are spent — see [`ground_shortfall_regions`]. The
+    /// tier bought for is never less than a useful forward's
+    /// (`min_forward_tier_bytes`), so the wave this admits into can always be
+    /// placed, whatever this one item's rows come to.
     ///
     /// Answers the bytes conceded. A weight side at its own floor concedes
     /// less than asked, and the claims that follow then refuse — which is the
     /// gate's `stopped_on_weights`, arriving from the allocator rather than the
     /// arithmetic.
     pub(super) fn buy_kv_ground(&self, cost: &admit::Cost) -> u64 {
-        let total = cost.total();
-        if total == 0 {
+        if cost.total() == 0 {
             return 0;
         }
         let Some(stats) = self.kv_regions() else {
@@ -1131,7 +1148,9 @@ impl Scheduler {
         // this admits for releases that tier before any of its claims run.
         let free = stats.free + stats.blocked;
         let gap = regions(transient_headroom_bytes(gpu_id).unwrap_or(0) as u64);
-        let short = ground_shortfall_regions(regions(total), regions(cost.activations), free, gap);
+        let claims = regions(cost.kv.saturating_add(cost.recurrent));
+        let tier = regions(cost.activations.max(self.min_forward_tier_bytes()));
+        let short = ground_shortfall_regions(claims, tier, free, gap);
         if short == 0 {
             return 0;
         }
@@ -1436,8 +1455,10 @@ impl Scheduler {
         let optimal = interleave::optimal_weight_bytes().unwrap_or(0);
         let (filled, decodes, refused, admitted) = {
             let mut ground = WaveFill::new(self, optimal);
-            ground.publish_tier_budget();
             let filled = admit::fill(&mut ground);
+            // After the fill: its purchases widened the frontier gap, and the
+            // wave the engine now builds is packed against the gap as it stands.
+            ground.publish_tier_budget();
             (
                 filled,
                 ground.decodes_taken,
@@ -2036,11 +2057,22 @@ impl Scheduler {
     /// card ceiling and paged. Sections beyond the budget ride the next chunk —
     /// the wave loop pumps until every section seals — so throughput is unchanged
     /// (each forward still fills to the expert-amortization target) while the peak
-    /// stays bounded. At least one section is always admitted so the wave makes
-    /// progress.
+    /// stays bounded.
+    ///
+    /// **And bound the rows to the tier the fill left this wave**, exactly as
+    /// `form_wave_group` does for a dialogue cohort. The tier is placed in the
+    /// gap between the arena frontier and the weight floor, and nothing buys
+    /// ground at placement; a batch packed to the token cap alone asked for a
+    /// 160 MiB tier against a 112 MiB gap on run 5 and failed every wave for
+    /// the rest of the run with forty-two sections admitted and idle. `head_rows`
+    /// is what the wave already carries ahead of the sections. The first
+    /// section always gets its least chunk whatever the rows say, so a wave with
+    /// nothing else in it makes progress and the placement is the judge of that
+    /// chunk.
     #[allow(clippy::type_complexity)]
     pub(super) fn build_section_batch(
         &mut self,
+        head_rows: usize,
     ) -> Option<(Vec<usize>, Vec<Tensor>, Vec<usize>, Vec<usize>)> {
         // Sections already creeping inside the wave group are excluded — their
         // offset isn't advanced until that group's head, so picking them here would
@@ -2058,6 +2090,11 @@ impl Scheduler {
             return None;
         }
         let cap = self.max_prefill_pass_tokens;
+        let mut rows_left = self.model.prefill_width_cap(
+            self.session.activation_dtype(),
+            head_rows,
+            self.session.tier_budget_bytes(),
+        );
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
         let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
         let mut group_idxs: Vec<usize> = Vec::with_capacity(active.len());
@@ -2066,7 +2103,16 @@ impl Scheduler {
         for &i in &active {
             let s = &mut self.active_section_ingests[i];
             let off = s.offset;
-            let advance = (s.tokens.len() - off).min(cap);
+            let remaining = s.tokens.len() - off;
+            let least = remaining.min(PREFILL_MIN_ADVANCE);
+            let advance = if seq_ids.is_empty() {
+                remaining.min(cap).min(rows_left.max(least))
+            } else {
+                if rows_left < least {
+                    break;
+                }
+                remaining.min(cap).min(rows_left)
+            };
             // Stop packing once this forward has reached the per-forward budget
             // (but never emit an empty forward).
             if !seq_ids.is_empty() && batch_tokens + advance > cap {
@@ -2080,6 +2126,7 @@ impl Scheduler {
                     group_idxs.push(i);
                     advances.push(advance);
                     batch_tokens += advance;
+                    rows_left = rows_left.saturating_sub(advance);
                 }
                 Err(e) => {
                     s.error = Some(ConversationError::Model(e));
@@ -2752,7 +2799,7 @@ impl Scheduler {
         // trail and are discarded).
         if seq_ids.is_empty() {
             let section = if !self.wave_cohort_advanced && !self.wave_section_advanced {
-                self.build_section_batch()
+                self.build_section_batch(head_rows)
             } else {
                 None
             };
@@ -4076,16 +4123,19 @@ mod idle_demote_tests {
 mod ground_shortfall_tests {
     use super::ground_shortfall_regions;
 
-    /// Enough free ground everywhere it is needed: nothing is bought.
+    /// Enough free ground everywhere it is needed: nothing is bought. The
+    /// claims fit in the regions scattered below the frontier, so the gap is
+    /// untouched and already holds the tier.
     #[test]
-    fn nothing_is_bought_when_the_free_list_and_the_gap_both_cover_the_price() {
-        assert_eq!(ground_shortfall_regions(10, 4, 12, 6), 0);
+    fn nothing_is_bought_when_the_claims_fit_below_the_gap_and_the_gap_holds_the_tier() {
+        assert_eq!(ground_shortfall_regions(10, 4, 20, 6), 0);
         assert_eq!(ground_shortfall_regions(0, 0, 0, 0), 0, "a free admission buys nothing");
     }
 
-    /// The total is short of the free list: the difference is bought.
+    /// Claims past the whole free list: the difference is bought, and with no
+    /// tier to stand that is all.
     #[test]
-    fn a_price_past_the_free_list_buys_the_difference() {
+    fn claims_past_the_free_list_buy_the_difference() {
         assert_eq!(ground_shortfall_regions(10, 0, 7, 0), 3);
     }
 
@@ -4096,13 +4146,20 @@ mod ground_shortfall_tests {
         assert_eq!(ground_shortfall_regions(4, 4, 40, 1), 3);
     }
 
-    /// One purchase serves both shortfalls, so the larger is taken, never the
-    /// sum: buying moves the floor right, which adds to the gap and the free
-    /// list at once.
+    /// **Claims that reach into the gap are bought back for the tier.** Run 5:
+    /// each of 42 admissions saw a gap that held its tier, then claimed its
+    /// store from the top of the span and left the next wave's tier three
+    /// regions short with twelve regions free below it.
     #[test]
-    fn the_larger_shortfall_is_bought_once_rather_than_both_summed() {
-        assert_eq!(ground_shortfall_regions(10, 6, 5, 2), 5, "total short 5, tier short 4");
-        assert_eq!(ground_shortfall_regions(10, 6, 9, 0), 6, "total short 1, tier short 6");
+    fn claims_that_would_eat_the_gap_are_bought_back() {
+        // 5 free, 2 of them the gap: 10 claims spend the 3 scattered, then eat
+        // the gap, then need 5 more — and the tier of 6 must still stand after.
+        assert_eq!(ground_shortfall_regions(10, 6, 5, 2), 11);
+        // 3 claims fit in the 3 scattered: only the tier's own shortfall.
+        assert_eq!(ground_shortfall_regions(3, 6, 5, 2), 4);
+        // 4 claims take the 3 scattered and one of the gap's 2: the tier of 2
+        // needs that one back.
+        assert_eq!(ground_shortfall_regions(4, 2, 5, 2), 1);
     }
 }
 
