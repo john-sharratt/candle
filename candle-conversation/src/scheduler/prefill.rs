@@ -1338,38 +1338,40 @@ impl Scheduler {
     /// logged, because "no room" comes back as `Ok(false)` and an `Err` here
     /// is something else.
     pub(super) fn claim_recurrent(&mut self, seq: usize) -> bool {
-        // **A view takes its parent's state here, not at submission.** This is
-        // the first moment the view is actually going to run, so it is the
-        // first moment holding a store is justified; a view waiting in the queue
+        // **A slot's state is materialised here, not at open.** This is the
+        // first moment the slot is actually going to run, so it is the first
+        // moment holding a store is justified; a slot waiting in the queue
         // holds nothing, and a fill that cannot place one more store refuses
         // here with `Ok(false)` — a real refusal, where before it found the
-        // store already claimed and had nothing left to decide.
+        // store already claimed at conversation open and had nothing left to
+        // decide. What the state is — the timeline's snapshot, the prompt
+        // branch's checkpoint, a live parent's copy, or zeros — was recorded
+        // at open (`RecurrentSeed`) and is resolved by `materialise_recurrent`.
         //
-        // Moved, not copied. A view is a linear continuation of its parent —
-        // what it advances IS what the parent's state becomes — and
-        // `finalize_view` already moves it back. The copy that used to be made
-        // at submission left the parent's store resident and idle for the whole
-        // turn, only to be dropped at finalize: two stores per in-flight turn.
-        //
-        // The parent's store is evicted when its previous turn seals, so it is
-        // restored first; `move_recurrent` is tolerant of a parent that carries
-        // none (a brand-new conversation's first turn), and the view then starts
-        // from the sequence-start value through `admit_recurrent`'s vacant arm,
-        // which is right.
+        // A view takes its parent's state by MOVE, not copy: a view is a linear
+        // continuation of its parent — what it advances IS what the parent's
+        // state becomes — and `finalize_view` moves it back. The parent's store
+        // is evicted when its previous turn seals, so the parent is
+        // materialised first; `move_recurrent` is tolerant of a parent that
+        // carries none, and the view then starts from the sequence-start value
+        // through `admit_recurrent`'s vacant arm, which is right.
         let view_id = SequenceId(seq);
-        if let Some(parent) = self.turn_views.get(&view_id).map(|st| st.parent_id) {
-            if !self.model.recurrent_resident(seq) {
-                self.ensure_recurrent_restored(parent);
-                if let Err(e) = self.model.move_recurrent(parent.0, seq) {
-                    tracing::warn!(
-                        target: "candle_conversation::scheduler::interleave",
-                        seq,
-                        parent = parent.0,
-                        "recurrent state could not be moved onto the view — refused: {e}",
-                    );
-                    return false;
+        if !self.model.recurrent_resident(seq) {
+            match self.turn_views.get(&view_id).map(|st| st.parent_id) {
+                Some(parent) => {
+                    self.materialise_recurrent(parent);
+                    if let Err(e) = self.model.move_recurrent(parent.0, seq) {
+                        tracing::warn!(
+                            target: "candle_conversation::scheduler::interleave",
+                            seq,
+                            parent = parent.0,
+                            "recurrent state could not be moved onto the view — refused: {e}",
+                        );
+                        return false;
+                    }
+                    FORK_RECURRENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                FORK_RECURRENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None => self.materialise_recurrent(view_id),
             }
         }
         let offset = self.session.sequence_offset(seq).unwrap_or(0);
