@@ -144,11 +144,33 @@ fn load_effective(workspace: &Path) -> Vec<ToolDef> {
     }
 }
 
+/// Whether a file in a tools directory is a tool definition at all.
+///
+/// `.yaml` alone is not enough. The repo_scan ingest writes a `.substrate.yaml`
+/// summary beside the code it reads, and `src/prompts/tools/` is code it reads —
+/// so one landed in the catalog directory, `include_dir!` baked it into the
+/// binary at compile time, and every startup logged
+/// `tool definition parse failed: questions: invalid type: map, expected a
+/// sequence` for a file that was never a tool.
+///
+/// A dotfile is never a tool definition: the catalog's own entries are all named
+/// after the tool they define, and nothing that starts with `.` can be. Filtering
+/// on that rather than on `.substrate.yaml` by name covers the editor swapfiles
+/// and the next generated artefact too.
+fn is_tool_definition(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+        return false;
+    }
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| !n.starts_with('.'))
+}
+
 /// Parse the embedded (compile-time) built-in catalog.
 fn load_bundled() -> Vec<ToolDef> {
     let mut defs: Vec<ToolDef> = TOOLS_DIR
         .files()
-        .filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("yaml"))
+        .filter(|f| is_tool_definition(f.path()))
         .filter_map(|f| parse_def(&f.path().display().to_string(), f.contents_utf8()?))
         .collect();
     defs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -161,7 +183,7 @@ fn load_disk(dir: &Path) -> Vec<ToolDef> {
         Ok(rd) => rd
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
+            .filter(|p| is_tool_definition(p))
             .collect(),
         Err(_) => return Vec::new(),
     };
@@ -209,6 +231,45 @@ pub fn category_for(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The ingest writes into the catalog directory, and it is not a tool.**
+    ///
+    /// `src/prompts/tools/` is code the repo_scan ingest reads, so it gets a
+    /// `.substrate.yaml` summary like every other directory — and `include_dir!`
+    /// embeds whatever is there at compile time. Filtering on the `.yaml`
+    /// extension alone admitted it, and every startup logged a parse failure for
+    /// a file that was never a tool definition.
+    ///
+    /// Pinned on the dotfile rule rather than on the name, so the next generated
+    /// artefact and any editor swapfile are covered by the same test.
+    #[test]
+    fn a_dotfile_in_the_catalog_is_not_a_tool_definition() {
+        assert!(!is_tool_definition(Path::new(
+            "src/prompts/tools/.substrate.yaml"
+        )));
+        assert!(!is_tool_definition(Path::new(".substrate.yaml")));
+        assert!(!is_tool_definition(Path::new("tools/.hidden.yaml")));
+        assert!(is_tool_definition(Path::new("tools/file_list.yaml")));
+        assert!(!is_tool_definition(Path::new("tools/README.md")));
+    }
+
+    /// The bundled catalog parses clean — no file in it fails `parse_def`.
+    ///
+    /// This is the assertion the startup error was really violating: the
+    /// built-in catalog is compiled in, so a bad entry is a build-time fact and
+    /// belongs in a test rather than in a runtime log line nobody reads.
+    #[test]
+    fn every_bundled_catalog_entry_parses() {
+        let embedded = TOOLS_DIR.files().filter(|f| is_tool_definition(f.path()));
+        for f in embedded {
+            let text = f.contents_utf8().expect("catalog entries are utf-8");
+            assert!(
+                serde_yaml::from_str::<ToolDef>(text).is_ok(),
+                "bundled tool definition {} does not parse",
+                f.path().display(),
+            );
+        }
+    }
 
     fn def(description: &str, params: Value) -> ToolDef {
         ToolDef {
