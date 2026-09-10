@@ -3053,6 +3053,36 @@ impl Scheduler {
         // galleries before it ever evicted model KV. The rungs are gone;
         // `relieve_vram_pressure` calls `evict_lru` directly and does it before
         // touching KV, which is the same priority expressed as call order.
+        // **What this checkpoint actually brings to a decode.** Every one of
+        // these is a capability the engine silently degrades around rather than
+        // failing on: a model with no drafter reports `draft_budget == 0`, every
+        // sequence takes a one-token row, and the speculative path becomes an
+        // expensive no-op that logs nothing. That is a ~5x throughput difference
+        // — measured 4.85 accepted/step in the batched-forward harness against
+        // one token per forward in the daemon — and until now the only way to
+        // tell the two apart was arithmetic on wave timings.
+        //
+        // Logged once, at load, so "what is running" is a fact in the log rather
+        // than an inference from throughput.
+        // The widths are the ladder's answer AT LOAD. A model may also clamp the
+        // budget per wave against free VRAM (`affordable_draft_budget`), and that
+        // clamp is inert here — nothing is resident yet — so a wide wave can run
+        // shallower than the wide figure suggests. `w1` is the one to read for
+        // "does this checkpoint speculate at all": 0 there means no drafter.
+        tracing::info!(
+            target: "candle_conversation::engine_caps",
+            draft_budget_w1 = model.draft_budget(1),
+            draft_budget_w8 = model.draft_budget(8),
+            draft_ladder_w64_unclamped = model.draft_budget(64),
+            speculative_rewind = model.can_rewind_speculative_block(),
+            recurrent_state = model.carries_recurrent_state(),
+            positional_state = model.carries_positional_state(),
+            recurrent_memories = model.recurrent_memory_count(),
+            layers = model.num_layers(),
+            vocab_size,
+            "decode capabilities at load (draft_budget 0 ⇒ NO speculation: one token per forward)"
+        );
+
         let gallery_arena = GalleryArena::new(&device, 24, 3).map(Arc::new).ok();
         let sampler = BatchedSampler::new(
             device.clone(),

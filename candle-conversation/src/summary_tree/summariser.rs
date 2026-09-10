@@ -135,8 +135,10 @@ impl SummariserThread {
 
     /// A disabled handle: spawns no thread. `trigger`/`trigger_handle().fire()`
     /// and `shutdown` are no-ops (the receivers are dropped, so sends fail
-    /// silently and there is no thread to join). Used when the engine is
-    /// configured with `disable_summariser`.
+    /// silently and there is no thread to join).
+    ///
+    /// **This is the only handle the engine builds** — the summariser is
+    /// disconnected (see `Engine::new`), so nothing spawns the real thread.
     pub fn disabled() -> Self {
         let (trigger_tx, _) = channel::bounded::<()>(1);
         let (shutdown_tx, _) = channel::bounded::<()>(1);

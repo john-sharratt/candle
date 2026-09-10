@@ -1850,10 +1850,10 @@ impl Sequence {
         // `[0, len(user_msg))`.
         let user_content_start = 0;
         let user_content_end = self.tokenize(user_message)?.len();
-        // Assistant content begins at the `assistant_start` boundary — before any
-        // prefilled prefix — so the prefix's K/V seals as part of the assistant
-        // turn. With no prefill this is exactly `prefill_tokens.len()` (the head
-        // IS the whole prefill), preserving the ordinary-turn layout byte-for-byte.
+        // Assistant content begins after the assistant header AND after any
+        // suppression block, but BEFORE a caller's own prefill — so that prefill's
+        // K/V seals as part of the assistant turn while the block's does not.
+        //
         // **The suppression block is scaffolding, not assistant content.** It is
         // prefilled, never decoded, and `strip_empty_think_blocks` removes it from
         // the stored text — so a span that began before it would describe ~4 more
@@ -1866,9 +1866,19 @@ impl Sequence {
         // boundary sits between the two — after the block, before the seed. With
         // neither present this is `prefill_tokens.len()`, the ordinary turn's
         // "content starts where decoding starts".
-        let assistant_content_start = self
-            .tokenize(&format!("{assistant_head}{closed_think}"))?
-            .len();
+        //
+        // With no caller prefill this is `prefill_tokens.len()` — the block, when
+        // there is one, is the whole tail of the grid, so content begins exactly
+        // where decoding does. Taking that route matters: `assistant_head` embeds
+        // the user message, so the `else` arm re-tokenises the entire message, and
+        // routing every turn through it would pay that on each submit (a
+        // `<tool_response>` carrying a file excerpt on the ingest path).
+        let assistant_content_start = if assistant_prefill.is_empty() {
+            prefill_tokens.len()
+        } else {
+            self.tokenize(&format!("{assistant_head}{closed_think}"))?
+                .len()
+        };
         // Clamp to the prefill length and force monotonic so a tokenizer that
         // merges across a join can never invert the windows at seal time.
         let total = prefill_tokens.len();

@@ -472,6 +472,8 @@ impl BatchedSampler {
         // full-vocab device kernel.  When nothing is constrained (the common wave)
         // every row is a kernel row.
         let mut kernel_idx: Vec<usize> = Vec::new();
+        let mut kernel_states: Vec<&mut SequenceSamplingState> = Vec::new();
+        let mut kernel_configs: Vec<&SamplingConfig> = Vec::new();
         for (i, slot) in states.iter_mut().enumerate() {
             let state: &mut SequenceSamplingState = slot;
             let config = configs[i];
@@ -485,8 +487,14 @@ impl BatchedSampler {
                 }
                 // Small allow-list: a tiny gather + sample, CPU-side.
                 [_, _, ..] => results[i] = self.sample_allow_list(&logits2d, i, config, state)?,
-                // Unconstrained: defer to the device kernel below.
-                [] => kernel_idx.push(i),
+                // Unconstrained: defer to the device kernel below. Collected in
+                // this same pass — a second walk filtering on `kernel_idx` would
+                // re-scan it per row, on a path that runs once per decode step.
+                [] => {
+                    kernel_idx.push(i);
+                    kernel_states.push(state);
+                    kernel_configs.push(config);
+                }
             }
         }
 
@@ -525,14 +533,6 @@ impl BatchedSampler {
                 )?;
                 logits2d.index_select(&idx, 0)?
             };
-            let mut kernel_states: Vec<&mut SequenceSamplingState> = states
-                .iter_mut()
-                .enumerate()
-                .filter(|(i, _)| kernel_idx.contains(i))
-                .map(|(_, s)| &mut **s)
-                .collect();
-            let kernel_configs: Vec<&SamplingConfig> =
-                kernel_idx.iter().map(|&i| configs[i]).collect();
             let tokens =
                 self.sample_full_vocab(&kernel_logits, &mut kernel_states, &kernel_configs)?;
             for (k, &i) in kernel_idx.iter().enumerate() {
@@ -1584,9 +1584,16 @@ fn apply_banned(logits: &Tensor, config: &SamplingConfig) -> candle::Result<Tens
 /// Lifting the ban for suppressed turns was tried and is **wrong**: any
 /// `</think>` sets `think_close_at` and cuts an index page at a reasoning
 /// boundary (`scheduler::mod`), so a stray close outside a block would carve a
-/// spurious page into the turn's K/V. A leaked tag is cosmetic and
-/// `strip_orphan_close_tags` removes it; a mis-cut index page is not. The ban
-/// stays, and the stripper owns the cleanup.
+/// spurious page into the turn's K/V. A mis-cut index page is the worse of the
+/// two, so the ban stays.
+///
+/// What the ban leaves behind is only partly cleaned up, and knowingly so.
+/// `think_strip::strip_trailing_orphan_close` removes a leaked closer when it is
+/// the LAST thing in a turn that opened no block — the shape actually measured.
+/// A block the model spelled out in plain text mid-answer is NOT recovered: the
+/// text is paired with its K/V span by offset, and editing the middle of it
+/// would shift that pairing for every consumer that maps text onto tokens. The
+/// leaked run is stored verbatim in that case.
 ///
 fn think_close_ban_active(config: &SamplingConfig, state: &SequenceSamplingState) -> bool {
     config.segment_close_token_id >= 0 && !state.in_segment

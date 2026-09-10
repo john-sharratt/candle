@@ -115,6 +115,16 @@ fn strip_trailing_orphan_close(text: &str) -> String {
     let Some(start) = lower.rfind("</think") else {
         return text.to_string();
     };
+    // **An opener in ANY spelling means this closes something.** The caller's
+    // guard is spelling-exact (`<think>`), but the tag match below is tolerant,
+    // so `<thinking>…</thinking>` slips past it: the guard sees no `<think>`
+    // (the `>` does not follow `think`), and stripping the tail would then
+    // delete the closer and leave the opener dangling — turning a complete block
+    // into an unterminated one in the stored text. Match the opener as loosely
+    // as the closer, and only strip when nothing opened at all.
+    if lower[..start].contains("<think") {
+        return text.to_string();
+    }
     match close_tag_len(&lower[start..]) {
         // The tag must BE the tail — a `</think>` with prose after it is being
         // used as text, not as a stray closer.
@@ -315,6 +325,22 @@ mod tests {
         // exactly this sort of thing, and the ingest reads them back.
         let quoted = "The gate holds until </think> arrives, then opens.";
         assert_eq!(strip_empty_think_blocks(quoted), quoted);
+    }
+
+    /// **A block written in a non-canonical spelling is left whole.**
+    ///
+    /// The caller's guard tests for `<think>` exactly, which `<thinking>` does
+    /// not contain — the `>` has to follow `think`. Without an opener check as
+    /// tolerant as the closer match, the tail strip would delete the closer and
+    /// leave the opener dangling, turning a complete block into an unterminated
+    /// one in the stored text.
+    #[test]
+    fn a_non_canonical_block_keeps_its_closer() {
+        let s = "<thinking>\nreasoning\n</thinking>";
+        assert_eq!(strip_empty_think_blocks(s), s);
+        // Mixed spellings still count as "something opened".
+        let mixed = "<think>reasoning</thinking>";
+        assert_eq!(strip_empty_think_blocks(mixed), mixed);
     }
 
     /// A turn that opened a block is never touched by the orphan strip — it has
