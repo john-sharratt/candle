@@ -383,8 +383,8 @@ pub fn tools() -> Value {
         json!({ "name": name, "category": cat, "description": desc, "source": src,
                 "calibrated": cal, "writes_layers": ["action"], "modes": modes })
     };
-    let all = json!(["physical", "video_call", "voice_call", "instant_message"]);
-    let msg = json!(["video_call", "instant_message"]);
+    let all = json!(["physical", "instant_message"]);
+    let msg = json!(["instant_message"]);
     json!({ "uncalibrated": 1, "tools": [
         t("speak", "speech", "Say something. Carries intent, not words — the narrator renders it.", "generic", true, all.clone()),
         t("send_image", "messaging", "Send a picture to a named interlocutor. Messaging modes only.", "generic", true, msg),
@@ -501,8 +501,9 @@ pub fn script() -> Vec<Value> {
                 "rendered": if text.is_empty() { Value::Null } else { json!({"text": text}) },
                 "world_ms": world_ms(), "at_ms": now_ms() })
     };
-    let all = json!(["physical", "video_call", "voice_call", "instant_message"]);
-    let vis = json!(["physical", "video_call"]);
+    let all = json!(["physical", "instant_message"]);
+    // Something you can only make out by being there to see it.
+    let vis = json!(["physical"]);
     let none = json!([]);
     vec![
         a(

@@ -182,10 +182,12 @@ impl Benches {
     /// not depend on branching, because it compares against the disk rather
     /// than against a claim.
     fn working(&mut self, body: &str, about: &str) -> &mut Working {
-        self.open.entry(body.to_string()).or_insert_with(|| Working {
-            about: about.to_string(),
-            ..Working::default()
-        })
+        self.open
+            .entry(body.to_string())
+            .or_insert_with(|| Working {
+                about: about.to_string(),
+                ..Working::default()
+            })
     }
 
     /// What a body has open, if anything.
@@ -230,8 +232,7 @@ impl Benches {
                 )),
             };
         }
-        std::fs::read_to_string(&full)
-            .map_err(|_| format!("There is no document at {key}."))
+        std::fs::read_to_string(&full).map_err(|_| format!("There is no document at {key}."))
     }
 
     /// Read a document as a numbered excerpt, capped at [`MAX_READ_LINES`].
@@ -591,8 +592,9 @@ impl Benches {
             let (_, full) = self.doc(key)?;
             match &c.now {
                 Some(text) => put(&full, text)?,
-                None => std::fs::remove_file(&full)
-                    .map_err(|e| format!("{key} would not go: {e}"))?,
+                None => {
+                    std::fs::remove_file(&full).map_err(|e| format!("{key} would not go: {e}"))?
+                }
             }
             self.last.insert(key.clone(), body.to_string());
             written.push(key.clone());
@@ -762,11 +764,14 @@ mod tests {
 
     /// A root with two documents in it, at a path unique to this test.
     fn rooted(name: &str) -> (Benches, PathBuf) {
-        let root = std::env::temp_dir()
-            .join(format!("npcd-bench-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("npcd-bench-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("layers/eras")).unwrap();
-        std::fs::write(root.join("layers/eras/third.md"), "the third era\nburned in the spring\n").unwrap();
+        std::fs::write(
+            root.join("layers/eras/third.md"),
+            "the third era\nburned in the spring\n",
+        )
+        .unwrap();
         std::fs::write(root.join("layers/eras/fourth.md"), "the fourth era\n").unwrap();
         let mut b = Benches::new();
         b.set_root(&root);
@@ -795,7 +800,8 @@ mod tests {
     #[test]
     fn a_write_stays_in_memory_until_it_is_committed() {
         let (mut b, root) = rooted("memory");
-        b.write("m1", "the third era", "layers/eras/third.md", "rewritten\n").unwrap();
+        b.write("m1", "the third era", "layers/eras/third.md", "rewritten\n")
+            .unwrap();
 
         assert_eq!(b.read("m1", "layers/eras/third.md").unwrap(), "rewritten\n");
         assert_eq!(
@@ -804,7 +810,10 @@ mod tests {
             "the disk moved before the commit"
         );
         // And invisible to anybody else, which is what makes it *yours*.
-        assert!(b.read("m2", "layers/eras/third.md").unwrap().starts_with("the third era"));
+        assert!(b
+            .read("m2", "layers/eras/third.md")
+            .unwrap()
+            .starts_with("the third era"));
 
         b.commit("m1").unwrap();
         assert_eq!(
@@ -816,10 +825,15 @@ mod tests {
     #[test]
     fn committing_clears_the_working_set_and_names_what_it_wrote() {
         let (mut b, _) = rooted("clears");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "a\n").unwrap();
-        b.write("m1", "layers/eras", "layers/eras/fourth.md", "b\n").unwrap();
+        b.write("m1", "layers/eras", "layers/eras/third.md", "a\n")
+            .unwrap();
+        b.write("m1", "layers/eras", "layers/eras/fourth.md", "b\n")
+            .unwrap();
         let written = b.commit("m1").unwrap();
-        assert_eq!(written, vec!["layers/eras/fourth.md", "layers/eras/third.md"]);
+        assert_eq!(
+            written,
+            vec!["layers/eras/fourth.md", "layers/eras/third.md"]
+        );
         assert!(b.opened("m1").is_none());
         assert!(b.diff("m1").is_empty());
     }
@@ -827,8 +841,13 @@ mod tests {
     #[test]
     fn a_new_document_is_created_with_its_directory() {
         let (mut b, root) = rooted("create");
-        b.write("m1", "a silence", "layers/stories/deep/new.md", "a night at the gate\n")
-            .unwrap();
+        b.write(
+            "m1",
+            "a silence",
+            "layers/stories/deep/new.md",
+            "a night at the gate\n",
+        )
+        .unwrap();
         b.commit("m1").unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("layers/stories/deep/new.md")).unwrap(),
@@ -839,9 +858,16 @@ mod tests {
     #[test]
     fn removing_a_document_takes_it_off_the_disk_at_the_commit() {
         let (mut b, root) = rooted("remove");
-        b.remove("m1", "layers/eras", "layers/eras/fourth.md").unwrap();
-        assert!(root.join("layers/eras/fourth.md").exists(), "gone before the commit");
-        assert!(b.read("m1", "layers/eras/fourth.md").unwrap_err().contains("taken"));
+        b.remove("m1", "layers/eras", "layers/eras/fourth.md")
+            .unwrap();
+        assert!(
+            root.join("layers/eras/fourth.md").exists(),
+            "gone before the commit"
+        );
+        assert!(b
+            .read("m1", "layers/eras/fourth.md")
+            .unwrap_err()
+            .contains("taken"));
         b.commit("m1").unwrap();
         assert!(!root.join("layers/eras/fourth.md").exists());
     }
@@ -857,7 +883,14 @@ mod tests {
     #[test]
     fn an_edit_replaces_the_one_place_its_target_appears() {
         let (mut b, _) = rooted("edit-one");
-        b.edit("m1", "layers/eras", "layers/eras/third.md", "spring", "autumn").unwrap();
+        b.edit(
+            "m1",
+            "layers/eras",
+            "layers/eras/third.md",
+            "spring",
+            "autumn",
+        )
+        .unwrap();
         assert_eq!(
             b.read("m1", "layers/eras/third.md").unwrap(),
             "the third era\nburned in the autumn\n"
@@ -870,22 +903,43 @@ mod tests {
     fn an_edit_whose_target_appears_twice_is_refused_and_counts_them() {
         let (mut b, root) = rooted("edit-two");
         std::fs::write(root.join("layers/eras/third.md"), "a fire\nand a fire\n").unwrap();
-        let err = b.edit("m1", "layers/eras", "layers/eras/third.md", "a fire", "a flood").unwrap_err();
+        let err = b
+            .edit(
+                "m1",
+                "layers/eras",
+                "layers/eras/third.md",
+                "a fire",
+                "a flood",
+            )
+            .unwrap_err();
         assert!(err.contains('2'), "{err}");
-        assert!(b.opened("m1").is_none_or(|w| w.is_empty()), "a refused edit still landed");
+        assert!(
+            b.opened("m1").is_none_or(|w| w.is_empty()),
+            "a refused edit still landed"
+        );
     }
 
     #[test]
     fn an_edit_whose_target_is_not_there_is_refused() {
         let (mut b, _) = rooted("edit-none");
-        let err = b.edit("m1", "layers/eras", "layers/eras/third.md", "a flood", "a fire").unwrap_err();
+        let err = b
+            .edit(
+                "m1",
+                "layers/eras",
+                "layers/eras/third.md",
+                "a flood",
+                "a fire",
+            )
+            .unwrap_err();
         assert!(err.contains("does not appear"), "{err}");
     }
 
     #[test]
     fn replacing_the_empty_string_is_refused() {
         let (mut b, _) = rooted("edit-empty");
-        assert!(b.edit("m1", "layers/eras", "layers/eras/third.md", "", "x").is_err());
+        assert!(b
+            .edit("m1", "layers/eras", "layers/eras/third.md", "", "x")
+            .is_err());
     }
 
     /// Edits compound in memory: the second reads the first's result, not the
@@ -893,8 +947,22 @@ mod tests {
     #[test]
     fn a_second_edit_sees_the_first() {
         let (mut b, _) = rooted("edit-compound");
-        b.edit("m1", "layers/eras", "layers/eras/third.md", "third", "thirteenth").unwrap();
-        b.edit("m1", "layers/eras", "layers/eras/third.md", "spring", "autumn").unwrap();
+        b.edit(
+            "m1",
+            "layers/eras",
+            "layers/eras/third.md",
+            "third",
+            "thirteenth",
+        )
+        .unwrap();
+        b.edit(
+            "m1",
+            "layers/eras",
+            "layers/eras/third.md",
+            "spring",
+            "autumn",
+        )
+        .unwrap();
         assert_eq!(
             b.read("m1", "layers/eras/third.md").unwrap(),
             "the thirteenth era\nburned in the autumn\n"
@@ -907,13 +975,18 @@ mod tests {
     #[test]
     fn a_commit_over_somebody_elses_commit_is_refused_and_names_them() {
         let (mut b, _) = rooted("collide");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "mine\n").unwrap();
-        b.write("m2", "layers/eras", "layers/eras/third.md", "mine too\n").unwrap();
+        b.write("m1", "layers/eras", "layers/eras/third.md", "mine\n")
+            .unwrap();
+        b.write("m2", "layers/eras", "layers/eras/third.md", "mine too\n")
+            .unwrap();
 
         assert_eq!(b.commit("m1").unwrap(), vec!["layers/eras/third.md"]);
         let err = b.commit("m2").unwrap_err();
         assert!(err.contains("m1"), "the other party was not named: {err}");
-        assert!(b.opened("m2").is_some(), "a refused commit threw the work away");
+        assert!(
+            b.opened("m2").is_some(),
+            "a refused commit threw the work away"
+        );
     }
 
     /// A refusal on one document leaves the others alone — the character still
@@ -921,8 +994,10 @@ mod tests {
     #[test]
     fn a_collision_writes_none_of_the_batch() {
         let (mut b, root) = rooted("collide-batch");
-        b.write("m1", "layers/eras", "layers/eras/fourth.md", "safe\n").unwrap();
-        b.write("m1", "layers/eras", "layers/eras/third.md", "contested\n").unwrap();
+        b.write("m1", "layers/eras", "layers/eras/fourth.md", "safe\n")
+            .unwrap();
+        b.write("m1", "layers/eras", "layers/eras/third.md", "contested\n")
+            .unwrap();
         // Somebody else moves one of the two under it.
         std::fs::write(root.join("layers/eras/third.md"), "theirs\n").unwrap();
 
@@ -939,8 +1014,10 @@ mod tests {
     #[test]
     fn two_bodies_on_different_documents_both_commit() {
         let (mut b, _) = rooted("parallel");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "a\n").unwrap();
-        b.write("m2", "layers/eras", "layers/eras/fourth.md", "b\n").unwrap();
+        b.write("m1", "layers/eras", "layers/eras/third.md", "a\n")
+            .unwrap();
+        b.write("m2", "layers/eras", "layers/eras/fourth.md", "b\n")
+            .unwrap();
         assert!(b.commit("m1").is_ok());
         assert!(b.commit("m2").is_ok(), "an unrelated document collided");
     }
@@ -950,7 +1027,13 @@ mod tests {
     #[test]
     fn writing_what_is_already_there_changes_nothing() {
         let (mut b, _) = rooted("noop");
-        b.write("m1", "layers/eras", "layers/eras/fourth.md", "the fourth era\n").unwrap();
+        b.write(
+            "m1",
+            "layers/eras",
+            "layers/eras/fourth.md",
+            "the fourth era\n",
+        )
+        .unwrap();
         assert!(b.diff("m1").is_empty());
         assert!(b.commit("m1").unwrap().is_empty());
     }
@@ -960,10 +1043,14 @@ mod tests {
     #[test]
     fn setting_aside_keeps_the_work_and_picking_it_up_restores_it() {
         let (mut b, _) = rooted("stash");
-        b.write("m1", "the third era", "layers/eras/third.md", "half done\n").unwrap();
+        b.write("m1", "the third era", "layers/eras/third.md", "half done\n")
+            .unwrap();
         assert!(b.stash("m1"));
         assert!(b.diff("m1").is_empty(), "set-aside work is still open");
-        assert!(b.read("m1", "layers/eras/third.md").unwrap().starts_with("the third era"));
+        assert!(b
+            .read("m1", "layers/eras/third.md")
+            .unwrap()
+            .starts_with("the third era"));
 
         assert_eq!(b.pop("m1").unwrap(), "the third era");
         assert_eq!(b.read("m1", "layers/eras/third.md").unwrap(), "half done\n");
@@ -972,9 +1059,11 @@ mod tests {
     #[test]
     fn picking_up_set_aside_work_over_live_changes_is_refused() {
         let (mut b, _) = rooted("stash-bury");
-        b.write("m1", "the third era", "layers/eras/third.md", "first\n").unwrap();
+        b.write("m1", "the third era", "layers/eras/third.md", "first\n")
+            .unwrap();
         b.stash("m1");
-        b.write("m1", "the fourth era", "layers/eras/fourth.md", "second\n").unwrap();
+        b.write("m1", "the fourth era", "layers/eras/fourth.md", "second\n")
+            .unwrap();
         let err = b.pop("m1").unwrap_err();
         assert!(err.contains("bury"), "{err}");
         assert_eq!(b.read("m1", "layers/eras/fourth.md").unwrap(), "second\n");
@@ -983,17 +1072,29 @@ mod tests {
     #[test]
     fn throwing_the_work_away_puts_the_document_back() {
         let (mut b, _) = rooted("discard");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "wrong from the start\n").unwrap();
+        b.write(
+            "m1",
+            "layers/eras",
+            "layers/eras/third.md",
+            "wrong from the start\n",
+        )
+        .unwrap();
         assert!(b.discard("m1"));
         assert!(!b.discard("m1"), "threw away twice");
-        assert!(b.read("m1", "layers/eras/third.md").unwrap().starts_with("the third era"));
+        assert!(b
+            .read("m1", "layers/eras/third.md")
+            .unwrap()
+            .starts_with("the third era"));
     }
 
     #[test]
     fn opening_a_second_thing_while_one_is_open_is_refused() {
         let (mut b, _) = rooted("open-twice");
         assert!(b.open_on("m1", "the third era").unwrap());
-        assert!(!b.open_on("m1", "the third era").unwrap(), "opened it twice");
+        assert!(
+            !b.open_on("m1", "the third era").unwrap(),
+            "opened it twice"
+        );
         let err = b.open_on("m1", "the fourth era").unwrap_err();
         assert!(err.contains("the third era"), "{err}");
     }
@@ -1012,9 +1113,12 @@ mod tests {
     #[test]
     fn a_diff_names_what_kind_of_change_each_one_is() {
         let (mut b, _) = rooted("diff");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "changed\n").unwrap();
-        b.write("m1", "layers/eras", "layers/eras/new.md", "made\n").unwrap();
-        b.remove("m1", "layers/eras", "layers/eras/fourth.md").unwrap();
+        b.write("m1", "layers/eras", "layers/eras/third.md", "changed\n")
+            .unwrap();
+        b.write("m1", "layers/eras", "layers/eras/new.md", "made\n")
+            .unwrap();
+        b.remove("m1", "layers/eras", "layers/eras/fourth.md")
+            .unwrap();
         assert_eq!(
             b.diff("m1"),
             vec![
@@ -1030,27 +1134,45 @@ mod tests {
     #[test]
     fn a_listing_shows_the_disk_plus_your_own_uncommitted_work() {
         let (mut b, _) = rooted("list");
-        assert_eq!(b.list("m1", "layers/eras").unwrap(), vec!["fourth.md", "third.md"]);
+        assert_eq!(
+            b.list("m1", "layers/eras").unwrap(),
+            vec!["fourth.md", "third.md"]
+        );
         // The root lists the areas that can be worked in, not the mind's own
         // configuration sitting beside them.
         assert_eq!(
             b.list("m1", "").unwrap(),
-            EDITABLE_AREAS.iter().map(|a| format!("{a}/")).collect::<Vec<_>>()
+            EDITABLE_AREAS
+                .iter()
+                .map(|a| format!("{a}/"))
+                .collect::<Vec<_>>()
         );
 
-        b.write("m1", "layers/eras", "layers/eras/fifth.md", "new\n").unwrap();
-        b.remove("m1", "layers/eras", "layers/eras/fourth.md").unwrap();
-        assert_eq!(b.list("m1", "layers/eras").unwrap(), vec!["fifth.md", "third.md"]);
+        b.write("m1", "layers/eras", "layers/eras/fifth.md", "new\n")
+            .unwrap();
+        b.remove("m1", "layers/eras", "layers/eras/fourth.md")
+            .unwrap();
+        assert_eq!(
+            b.list("m1", "layers/eras").unwrap(),
+            vec!["fifth.md", "third.md"]
+        );
         // …and nobody else's view moved.
-        assert_eq!(b.list("m2", "layers/eras").unwrap(), vec!["fourth.md", "third.md"]);
+        assert_eq!(
+            b.list("m2", "layers/eras").unwrap(),
+            vec!["fourth.md", "third.md"]
+        );
     }
 
     /// A listing of one directory does not leak the ones below it.
     #[test]
     fn a_listing_stops_at_its_own_directory() {
         let (mut b, _) = rooted("list-depth");
-        b.write("m1", "x", "layers/eras/deep/buried.md", "…").unwrap();
-        assert!(!b.list("m1", "layers/eras").unwrap().contains(&"buried.md".to_string()));
+        b.write("m1", "x", "layers/eras/deep/buried.md", "…")
+            .unwrap();
+        assert!(!b
+            .list("m1", "layers/eras")
+            .unwrap()
+            .contains(&"buried.md".to_string()));
         assert_eq!(b.list("m1", "layers/eras/deep").unwrap(), vec!["buried.md"]);
     }
 
@@ -1142,10 +1264,16 @@ mod tests {
             return;
         }
         let err = b.list("m1", "layers/alias").unwrap_err();
-        assert!(err.contains("link"), "a listing walked through a junction: {err}");
+        assert!(
+            err.contains("link"),
+            "a listing walked through a junction: {err}"
+        );
         // The real directory is still readable — the guard is about the link,
         // not about the documents behind it.
-        assert_eq!(b.list("m1", "layers/eras").unwrap(), vec!["fourth.md", "third.md"]);
+        assert_eq!(
+            b.list("m1", "layers/eras").unwrap(),
+            vec!["fourth.md", "third.md"]
+        );
     }
 
     /// A link pointing **out** of the root is caught by containment — resolving
@@ -1153,10 +1281,10 @@ mod tests {
     #[test]
     fn a_link_out_of_the_root_cannot_be_read_through() {
         let (b, root) = rooted("link-out");
-        let outside = root.parent().unwrap().join(format!(
-            "npcd-bench-outside-{}.md",
-            std::process::id()
-        ));
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("npcd-bench-outside-{}.md", std::process::id()));
         std::fs::write(&outside, "not yours\n").unwrap();
         if !try_symlink(&outside, &root.join("layers/eras/out.md")) {
             eprintln!("SKIPPED the link half: this OS would not create a symlink");
@@ -1176,7 +1304,10 @@ mod tests {
     #[test]
     fn a_link_inside_the_root_is_refused_rather_than_followed() {
         let (mut b, root) = rooted("link-in");
-        if !try_symlink(&root.join("layers/eras/third.md"), &root.join("layers/eras/alias.md")) {
+        if !try_symlink(
+            &root.join("layers/eras/third.md"),
+            &root.join("layers/eras/alias.md"),
+        ) {
             eprintln!("SKIPPED the link half: this OS would not create a symlink");
             return;
         }
@@ -1185,7 +1316,10 @@ mod tests {
         assert!(b.write("m1", "x", "layers/eras/alias.md", "…").is_err());
         assert!(b.remove("m1", "x", "layers/eras/alias.md").is_err());
         // …and the document it pointed at is untouched.
-        assert!(b.read("m1", "layers/eras/third.md").unwrap().starts_with("the third era"));
+        assert!(b
+            .read("m1", "layers/eras/third.md")
+            .unwrap()
+            .starts_with("the third era"));
     }
 
     // ── the read cap ────────────────────────────────────────────────────────
@@ -1259,14 +1393,18 @@ mod tests {
         std::fs::write(root.join("layers/eras/blank.md"), "").unwrap();
         let out = b.excerpt("m1", "layers/eras/blank.md", 1).unwrap();
         assert!(out.contains("(empty)"), "{out}");
-        assert!(!out.contains("lines 1-0"), "a range that reads as a bug: {out}");
+        assert!(
+            !out.contains("lines 1-0"),
+            "a range that reads as a bug: {out}"
+        );
     }
 
     /// The excerpt shows the reader's own uncommitted work, like a plain read.
     #[test]
     fn an_excerpt_shows_your_own_changes() {
         let (mut b, _) = rooted("excerpt-mine");
-        b.write("m1", "x", "layers/eras/third.md", "one\ntwo\nthree\n").unwrap();
+        b.write("m1", "x", "layers/eras/third.md", "one\ntwo\nthree\n")
+            .unwrap();
         let mine = b.excerpt("m1", "layers/eras/third.md", 1).unwrap();
         assert!(mine.contains("3  three"), "{mine}");
         let theirs = b.excerpt("m2", "layers/eras/third.md", 1).unwrap();
@@ -1289,8 +1427,18 @@ mod tests {
     #[test]
     fn an_edit_matches_the_document_and_not_its_numbering() {
         let (mut b, _) = rooted("raw");
-        b.edit("m1", "x", "layers/eras/third.md", "the third era", "the fourth era").unwrap();
-        assert!(b.read("m1", "layers/eras/third.md").unwrap().starts_with("the fourth era"));
+        b.edit(
+            "m1",
+            "x",
+            "layers/eras/third.md",
+            "the third era",
+            "the fourth era",
+        )
+        .unwrap();
+        assert!(b
+            .read("m1", "layers/eras/third.md")
+            .unwrap()
+            .starts_with("the fourth era"));
     }
 
     // ── isolation ───────────────────────────────────────────────────────────
@@ -1312,11 +1460,29 @@ mod tests {
         // Both open work on the same thing, and both change the same document.
         assert!(b.open_on("m1", "the third era").unwrap());
         assert!(b.open_on("m2", "the third era").unwrap());
-        b.write("m1", "the third era", "layers/eras/shared.md", "m1's version\n").unwrap();
-        b.write("m2", "the third era", "layers/eras/shared.md", "m2's version\n").unwrap();
+        b.write(
+            "m1",
+            "the third era",
+            "layers/eras/shared.md",
+            "m1's version\n",
+        )
+        .unwrap();
+        b.write(
+            "m2",
+            "the third era",
+            "layers/eras/shared.md",
+            "m2's version\n",
+        )
+        .unwrap();
 
-        assert_eq!(b.read("m1", "layers/eras/shared.md").unwrap(), "m1's version\n");
-        assert_eq!(b.read("m2", "layers/eras/shared.md").unwrap(), "m2's version\n");
+        assert_eq!(
+            b.read("m1", "layers/eras/shared.md").unwrap(),
+            "m1's version\n"
+        );
+        assert_eq!(
+            b.read("m2", "layers/eras/shared.md").unwrap(),
+            "m2's version\n"
+        );
         assert_eq!(
             b.read("m3", "layers/eras/shared.md").unwrap(),
             "as it stands\n",
@@ -1324,22 +1490,53 @@ mod tests {
         );
 
         // An edit compounds only on its own author's version.
-        b.edit("m1", "x", "layers/eras/shared.md", "m1's", "m1 has edited its").unwrap();
-        assert_eq!(b.read("m2", "layers/eras/shared.md").unwrap(), "m2's version\n");
+        b.edit(
+            "m1",
+            "x",
+            "layers/eras/shared.md",
+            "m1's",
+            "m1 has edited its",
+        )
+        .unwrap();
+        assert_eq!(
+            b.read("m2", "layers/eras/shared.md").unwrap(),
+            "m2's version\n"
+        );
 
         // A creation is invisible, and so is a removal.
-        b.write("m1", "x", "layers/eras/mine.md", "only m1 has this\n").unwrap();
+        b.write("m1", "x", "layers/eras/mine.md", "only m1 has this\n")
+            .unwrap();
         b.remove("m2", "x", "layers/eras/fourth.md").unwrap();
-        assert!(b.read("m2", "layers/eras/mine.md").is_err(), "a new document leaked");
-        assert!(b.read("m1", "layers/eras/fourth.md").is_ok(), "a removal leaked");
-        assert!(b.list("m2", "layers/eras").unwrap().iter().all(|n| n != "mine.md"));
-        assert!(b.list("m1", "layers/eras").unwrap().iter().any(|n| n == "fourth.md"));
+        assert!(
+            b.read("m2", "layers/eras/mine.md").is_err(),
+            "a new document leaked"
+        );
+        assert!(
+            b.read("m1", "layers/eras/fourth.md").is_ok(),
+            "a removal leaked"
+        );
+        assert!(b
+            .list("m2", "layers/eras")
+            .unwrap()
+            .iter()
+            .all(|n| n != "mine.md"));
+        assert!(b
+            .list("m1", "layers/eras")
+            .unwrap()
+            .iter()
+            .any(|n| n == "fourth.md"));
 
         // Diffs, excerpts and offers are each their own body's.
         assert!(b.diff("m1").iter().any(|d| d.contains("mine.md")));
         assert!(b.diff("m2").iter().all(|d| !d.contains("mine.md")));
-        assert!(b.excerpt("m1", "layers/eras/shared.md", 1).unwrap().contains("m1 has edited"));
-        assert!(b.excerpt("m2", "layers/eras/shared.md", 1).unwrap().contains("m2's version"));
+        assert!(b
+            .excerpt("m1", "layers/eras/shared.md", 1)
+            .unwrap()
+            .contains("m1 has edited"));
+        assert!(b
+            .excerpt("m2", "layers/eras/shared.md", 1)
+            .unwrap()
+            .contains("m2's version"));
         b.set_offered("m1", true);
         assert!(b.opened("m1").unwrap().offered);
         assert!(!b.opened("m2").unwrap().offered, "an offer leaked");
@@ -1354,7 +1551,10 @@ mod tests {
         // Throwing one away leaves the other standing.
         b.discard("m2");
         assert!(b.diff("m2").is_empty());
-        assert!(!b.diff("m1").is_empty(), "one body's discard took another's work");
+        assert!(
+            !b.diff("m1").is_empty(),
+            "one body's discard took another's work"
+        );
 
         // And a commit publishes exactly one body's changes.
         b.commit("m1").unwrap();
@@ -1382,14 +1582,22 @@ mod tests {
         )
         .unwrap();
 
-        b.write_field("m1", "x", "moods/undone.yaml", &["description"], "m1's wording.")
-            .unwrap();
+        b.write_field(
+            "m1",
+            "x",
+            "moods/undone.yaml",
+            &["description"],
+            "m1's wording.",
+        )
+        .unwrap();
         assert_eq!(
-            b.read_field("m1", "moods/undone.yaml", &["description"]).unwrap(),
+            b.read_field("m1", "moods/undone.yaml", &["description"])
+                .unwrap(),
             "m1's wording."
         );
         assert_eq!(
-            b.read_field("m2", "moods/undone.yaml", &["description"]).unwrap(),
+            b.read_field("m2", "moods/undone.yaml", &["description"])
+                .unwrap(),
             "As it stands.",
             "an uncommitted field change leaked"
         );
@@ -1406,9 +1614,12 @@ mod tests {
         let build = |name: &str| {
             let (mut b, _) = rooted(name);
             b.open_on("m1", "the third era").unwrap();
-            b.write("m1", "the third era", "layers/eras/third.md", "a\n").unwrap();
-            b.write("m1", "the third era", "layers/eras/new.md", "b\n").unwrap();
-            b.remove("m1", "the third era", "layers/eras/fourth.md").unwrap();
+            b.write("m1", "the third era", "layers/eras/third.md", "a\n")
+                .unwrap();
+            b.write("m1", "the third era", "layers/eras/new.md", "b\n")
+                .unwrap();
+            b.remove("m1", "the third era", "layers/eras/fourth.md")
+                .unwrap();
             b.set_offered("m1", true);
             b
         };

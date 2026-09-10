@@ -51,6 +51,7 @@ pub mod acts;
 pub mod authoring;
 pub mod bench;
 pub mod body;
+pub mod cooldown;
 pub mod driver;
 pub mod enact;
 pub mod environment;
@@ -67,23 +68,25 @@ pub mod prompt;
 pub mod pulse;
 pub mod reach;
 pub mod retention;
+pub mod rooms;
 pub mod runtime;
 pub mod schema;
 pub mod simulate;
 pub mod slash;
 pub mod sleep;
 pub mod station;
+pub mod stir;
 pub mod tick;
 pub mod tools;
-pub mod waiting;
 pub mod watcher;
 pub mod window;
 pub mod work;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -167,6 +170,21 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::User,
             get(get_messages).post(post_message),
         )
+        // ── the world's open channel ────────────────────────────────────────
+        //
+        // The standing group every character joins on arrival — see
+        // `sim::phone::CHANNEL`. Registered twice because the two methods need
+        // different roles, which is what one line each is for: reading it is a
+        // `User`'s, and speaking on it is a `Creator`'s, because it reaches
+        // every character in a world at once and ownership cannot express that.
+        // See [`post_channel`].
+        .route("/v1/world/:wid/channel", Role::User, get(get_channel))
+        .route("/v1/world/:wid/channel", Role::Creator, post(post_channel))
+        // Words left on something in a world, for whoever comes to it — the
+        // world's half of `post_notice`. Creator for the same reason the
+        // channel's write side is: it writes into a world rather than into a
+        // character somebody owns.
+        .route("/v1/world/:wid/posting", Role::Creator, post(post_posting))
         // ── the act vocabulary ──────────────────────────────────────────────
         //
         // Real: the catalog and the `/` command list are compiled in, and both
@@ -422,11 +440,15 @@ async fn perceive(
 }
 
 /// Who this caller is, to a character.
-fn as_interlocutor(id: &web::auth::session::Identity, handle: &str) -> Interlocutor {
+fn as_interlocutor(
+    id: &web::auth::session::Identity,
+    handle: &str,
+    roles: &web::auth::Roles,
+) -> Interlocutor {
     Interlocutor {
         kind: "operator".into(),
         id: handle.to_string(),
-        display: speaking_as(id, handle),
+        display: speaking_as(id, handle, roles),
     }
 }
 
@@ -475,12 +497,15 @@ async fn open_interaction(
     };
     // Physical by default: standing in the room together is the ordinary way to
     // be present to a character, and the one an operator who did not say means.
-    let wanted = body.get("mode").and_then(Value::as_str).unwrap_or("physical");
+    let wanted = body
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("physical");
     let Some(mode) = crate::engine::tools::Mode::parse(wanted) else {
         return err(
             StatusCode::BAD_REQUEST,
             "bad_mode",
-            "a mode is physical, instant_message, voice_call or video_call",
+            "a mode is physical or instant_message",
         );
     };
     // A character with no body cannot be stood next to. The messaging modes
@@ -498,8 +523,10 @@ async fn open_interaction(
     // session carries. See `Interaction::last_ms`.
     let world_ms = s.world_ms(npc_id).await;
     let now = crate::api::now_ms();
-    let who = as_interlocutor(&id, &handle);
-    let world = rt.body_of(npc_id).map(|(hosted, _)| hosted.id().to_string());
+    let who = as_interlocutor(&id, &handle, &s.roles);
+    let world = rt
+        .body_of(npc_id)
+        .map(|(hosted, _)| hosted.id().to_string());
     let ix = rt
         .interactions
         .open(npc_id, mode, who.clone(), world, now, world_ms);
@@ -547,13 +574,10 @@ async fn end_interaction(State(s): State<Arc<Authored>>, Path(ix): Path<String>)
     // gone, and a room that still lists them is a room where a character is
     // told it has company that is not there.
     let left = match session {
-        Some(was) if was.mode == crate::engine::tools::Mode::Physical => {
-            rt.leave_world(&was.body)
-        }
+        Some(was) if was.mode == crate::engine::tools::Mode::Physical => rt.leave_world(&was.body),
         _ => false,
     };
-    Json(json!({ "interaction_id": ix, "state": "ended", "left_the_world": left }))
-        .into_response()
+    Json(json!({ "interaction_id": ix, "state": "ended", "left_the_world": left })).into_response()
 }
 
 /// Say something to the character, inside a session.
@@ -596,8 +620,8 @@ async fn inject(
     }
     let parsed = match crate::engine::slash::parse(line) {
         // Named, or the character is told "you says to you" — see
-        // [`crate::engine::slash::Parsed::spoken_by`].
-        Ok(p) => p.spoken_by(&session.interlocutor.display),
+        // [`crate::engine::slash::Parsed::attributed_to`].
+        Ok(p) => p.attributed_to(&session.interlocutor.display),
         // A typo is a 400 naming the near miss, never speech — sending `/hrut`
         // to a character as dialogue is the one outcome that looks like it
         // worked.
@@ -610,7 +634,8 @@ async fn inject(
         },
         other => other,
     };
-    let prose = crate::engine::event::Event::new(0, world_ms, parsed.salience, kind.clone()).prose();
+    let prose =
+        crate::engine::event::Event::new(0, world_ms, parsed.salience, kind.clone()).prose();
     if !rt
         .scheduler
         .deliver(session.npc_id, world_ms, parsed.salience, kind)
@@ -625,6 +650,20 @@ async fn inject(
     Json(json!({ "delivered": true, "prose": prose })).into_response()
 }
 
+/// How the person who made these worlds is marked, in the world.
+///
+/// **Part of the name rather than a field beside it**, because a name is the
+/// whole of how anybody is addressed here: threads, rooms and the roster all
+/// key on it, and `tell`, `ask` and `message` bind their addressee to a closed
+/// set of exactly these strings. A separate "is the creator" flag would have to
+/// be carried to every one of those places and rendered into the prose at each,
+/// and the first one that forgot would be a character talking to a stranger.
+///
+/// Carried in the name, it needs no plumbing at all: it is what a character
+/// reads when the message arrives, and it is what the grammar offers back when
+/// the character answers.
+const CREATOR_MARK: &str = "(The Creator)";
+
 /// What a person is called, on a thread with a character.
 ///
 /// **The name the world writes down**, because a thread addresses people the
@@ -633,10 +672,27 @@ async fn inject(
 /// — "u_1a2b3c4d messages you" — so the identity's own name is used when the
 /// provider gave one, and the handle is the fallback that at least stays
 /// stable.
-pub(crate) fn speaking_as(id: &web::auth::session::Identity, handle: &str) -> String {
-    match id.name.trim() {
-        "" => handle.to_string(),
-        name => name.to_string(),
+///
+/// # Why the role is read here
+///
+/// This is the one place a person outside the world acquires a name inside it,
+/// so it is the only place [`Role::Creator`] can be turned into something the
+/// fiction can see. The role is derived from the identity through the same
+/// [`Roles::of`] the guard used, rather than passed in — two computations of
+/// "is this the creator" could disagree, and the one that decided what a
+/// character *reads* would be the one nothing tested.
+pub(crate) fn speaking_as(
+    id: &web::auth::session::Identity,
+    handle: &str,
+    roles: &web::auth::Roles,
+) -> String {
+    let name = match id.name.trim() {
+        "" => handle,
+        name => name,
+    };
+    match roles.of(Some(id)).is_creator() {
+        true => format!("{name} {CREATOR_MARK}"),
+        false => name.to_string(),
     }
 }
 
@@ -671,7 +727,7 @@ async fn post_message(
             "a message needs something in it",
         );
     }
-    let me = speaking_as(&id, &handle);
+    let me = speaking_as(&id, &handle, &s.roles);
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("messaging a character");
     };
@@ -706,8 +762,11 @@ async fn get_messages(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let me = speaking_as(&id, &handle);
-    let said = s.runtime.as_ref().and_then(|rt| rt.messages_with(npc_id, &me));
+    let me = speaking_as(&id, &handle, &s.roles);
+    let said = s
+        .runtime
+        .as_ref()
+        .and_then(|rt| rt.messages_with(npc_id, &me));
     let Some((them, messages)) = said else {
         // Not an error: a character with no body has nothing to say on a
         // handset yet, and the console renders an empty conversation.
@@ -726,6 +785,152 @@ async fn get_messages(
     .into_response()
 }
 
+/// `POST /v1/world/:wid/posting` — leave words on something in a world.
+///
+/// **Creator only**, for the reason the channel's write side is: it writes into
+/// a world rather than into a character somebody owns, and ownership has
+/// nothing to say about that.
+///
+/// The body names `at` (the room, as `area/node`), `on` (the surface), and
+/// `text`. A surface the map never named is stood up on the spot, so a world can
+/// grow a board without its map being edited and reloaded — but the *room* must
+/// exist, or the board would be writable, unreachable, and invisible.
+async fn post_posting(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(wid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let (id, handle) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let field = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (at, on, text) = (field("at"), field("on"), field("text"));
+    if at.is_empty() || on.is_empty() || text.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "incomplete",
+            "a posting needs `at` (area/node), `on` (what to write on) and `text`",
+        );
+    }
+    let me = speaking_as(&id, &handle, &s.roles);
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("posting into a world");
+    };
+    let Some(lines) = rt.post_in_world(&wid, &at, &on, &me, &text) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "no_such_place",
+            "that world is not hosted, or it has no such room — a board in a room that does not \
+             exist could never be read",
+        );
+    };
+    Json(json!({
+        "posted": text,
+        "world": wid,
+        "at": at,
+        "on": on,
+        "by": me,
+        "lines": lines,
+    }))
+    .into_response()
+}
+
+/// `GET /v1/world/:wid/channel` — what has been said on a world's open channel.
+///
+/// Read as the caller, so it shows what the channel has carried since they
+/// joined it and not the hours before — the same rule every other member reads
+/// it under.
+async fn get_channel(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(wid): Path<String>,
+) -> Response {
+    let (id, handle) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let me = speaking_as(&id, &handle, &s.roles);
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("reading a world's channel");
+    };
+    let Some(said) = rt.channel(&wid, &me) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "no_such_world",
+            "that world is not hosted, so it has no channel",
+        );
+    };
+    let messages: Vec<Value> = said
+        .into_iter()
+        .map(|(from, text)| json!({ "from": from, "text": text }))
+        .collect();
+    Json(json!({
+        "channel": crate::sim::phone::CHANNEL,
+        "world": wid,
+        "as": me,
+        "messages": messages,
+    }))
+    .into_response()
+}
+
+/// `POST /v1/world/:wid/channel` — say something on a world's open channel.
+///
+/// **Creator only.** Everything else on this daemon is scoped by ownership: a
+/// route reaches the characters the caller owns and no others. This one reaches
+/// every character in a world at once, which is not a thing ownership can
+/// express — so it is bound to the one role that is *about* standing outside
+/// the whole world rather than owning part of it.
+async fn post_channel(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(wid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let (id, handle) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let text = body
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "empty_message",
+            "a message needs something in it",
+        );
+    }
+    let me = speaking_as(&id, &handle, &s.roles);
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("speaking on a world's channel");
+    };
+    let Some(heard) = rt.say_on_channel(&wid, &me, text) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "no_such_world",
+            "that world is not hosted, so it has no channel",
+        );
+    };
+    Json(json!({
+        "sent": text,
+        "channel": crate::sim::phone::CHANNEL,
+        "world": wid,
+        "from": me,
+        "heard_by": heard,
+    }))
+    .into_response()
+}
+
 /// How often the stream looks for new ticks.
 ///
 /// **Polled off the scheduler's own ring rather than pushed from the decode
@@ -736,6 +941,31 @@ async fn get_messages(
 /// in seconds.
 const STREAM_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Which tick a console's attachment starts after.
+///
+/// **`since` is what makes coming back different from starting again.** A
+/// conversation outlives the page it is watched from: look at Pulse for a
+/// minute and the character goes on acting the whole time. Starting every
+/// attachment from the newest tick threw all of that away — you came back to
+/// the transcript you left and the minute in between had simply not happened,
+/// which is the wrong answer to the one question somebody returning is asking.
+///
+/// So a console names the last tick it already has and gets what followed.
+/// Clamped to `latest`, because a tick from the future — a console that
+/// outlived a daemon restart, a hand-typed URL — would otherwise produce a
+/// stream that connects and never sends anything, which is indistinguishable
+/// from a character that has stopped thinking. Absent or unparseable means a
+/// fresh attachment: `latest`, so nobody is replayed a whole afternoon.
+///
+/// The honest limit is above this function: the scheduler keeps a bounded
+/// window, so a console away for longer than that memory gets what is left of
+/// the interval rather than all of it.
+fn resume_from(since: Option<&str>, latest: u64) -> u64 {
+    since
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(latest, |t| t.min(latest))
+}
+
 /// `GET /v1/interaction/:ix/stream` — what the character does, as it does it.
 ///
 /// Frames are the console's: `open` once, then `act` per act with `tick` at the
@@ -743,10 +973,15 @@ const STREAM_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 /// this daemon renders an act *as* its own line rather than producing a
 /// separate account afterwards, so a narration frame would be prose nothing
 /// wrote.
+///
+/// `?since=<tick>` resumes an attachment where a console left off — see
+/// [`resume_from`], which is the difference between coming back to a
+/// conversation and starting a new one.
 async fn stream(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(ix): Path<String>,
+    Query(q): Query<BTreeMap<String, String>>,
 ) -> Response {
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("streaming an interaction");
@@ -761,18 +996,10 @@ async fn stream(
 
     let rt = rt.clone();
     let npc_id = session.npc_id;
-    let open = Event::default().event("open").data(
-        json!({
-            "interaction_id": ix,
-            "mode": session.mode.as_wire(),
-            "resume_from": null,
-        })
-        .to_string(),
-    );
 
-    // Start from what has already happened, so a console attaching to a live
-    // session does not replay the character's whole afternoon.
-    let mut seen: u64 = rt
+    // The newest tick this character has taken. Where a fresh console starts,
+    // so attaching to a live session does not replay the whole afternoon.
+    let latest: u64 = rt
         .scheduler
         .recent(512)
         .iter()
@@ -780,6 +1007,17 @@ async fn stream(
         .map(|t| t.tick)
         .max()
         .unwrap_or(0);
+
+    let mut seen: u64 = resume_from(q.get("since").map(String::as_str), latest);
+
+    let open = Event::default().event("open").data(
+        json!({
+            "interaction_id": ix,
+            "mode": session.mode.as_wire(),
+            "resume_from": seen,
+        })
+        .to_string(),
+    );
 
     // A channel and a task rather than a generator: `async-stream` is not a
     // dependency here, and the task ends by itself when the receiver is dropped
@@ -793,6 +1031,13 @@ async fn stream(
         loop {
             tokio::time::sleep(STREAM_POLL).await;
             let now = crate::api::now_ms();
+            // **Holding this stream open is being in the room.** Idle catches
+            // the person who walked off; without this it also caught the one
+            // who sat and listened, because it was measured from the last line
+            // rather than from the last sign of anybody being there. A console
+            // that navigates away closes the connection and this loop ends, so
+            // the timeout still does its job the moment nobody is watching.
+            rt.interactions.attended(&ix, now);
             // The session going quiet ends the stream, so a console left open
             // is not holding a connection against a conversation that is over.
             if rt.interactions.get(&ix, now).is_none() {
@@ -925,4 +1170,111 @@ async fn image_queue() -> Response {
         "engine_connected": false,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod speaking_as_tests {
+    use super::{speaking_as, CREATOR_MARK};
+    use web::auth::session::Identity;
+    use web::auth::Roles;
+
+    fn id(email: &str, name: &str) -> Identity {
+        Identity {
+            provider: "google".into(),
+            sub: "g1".into(),
+            email: email.into(),
+            name: name.into(),
+            picture: String::new(),
+            exp: 0,
+        }
+    }
+
+    fn roles(yaml: &str) -> Roles {
+        serde_yaml::from_str(yaml).expect("parses")
+    }
+
+    /// **The point of the whole flag.** A character reads this string and
+    /// answers to it, so the mark has to be in the name itself.
+    #[test]
+    fn the_creator_is_named_as_such_inside_the_world() {
+        let r = roles("creators:\n  - email: me@example.com\n");
+        let me = speaking_as(&id("me@example.com", "Johnathan Sharratt"), "u_1", &r);
+        assert_eq!(me, format!("Johnathan Sharratt {CREATOR_MARK}"));
+        assert!(me.contains("(The Creator)"));
+    }
+
+    /// And nobody else is. An ordinary signed-in player carries their own name
+    /// and nothing more — a mark everybody had would say nothing.
+    #[test]
+    fn an_ordinary_person_is_just_their_name() {
+        let r = roles("creators:\n  - email: me@example.com\n");
+        assert_eq!(
+            speaking_as(&id("someone@example.com", "Wren"), "u_2", &r),
+            "Wren"
+        );
+        // Nor is an admin, who is trusted with the files and is still not the
+        // person the fiction was made by.
+        let r = roles("admins:\n  - email: boss@example.com\n");
+        assert_eq!(
+            speaking_as(&id("boss@example.com", "Boss"), "u_3", &r),
+            "Boss"
+        );
+    }
+
+    /// The handle is the fallback when the provider gave no display name, and
+    /// the mark still lands — a creator whose gateway dropped the name header
+    /// must not silently become an anonymous stranger to its own cast.
+    #[test]
+    fn a_creator_with_no_display_name_still_carries_the_mark() {
+        let r = roles("creators:\n  - email: me@example.com\n");
+        let me = speaking_as(&id("me@example.com", ""), "u_1a2b3c4d", &r);
+        assert_eq!(me, format!("u_1a2b3c4d {CREATOR_MARK}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_from;
+
+    /// The ordinary case: nobody names a tick, so the attachment starts at the
+    /// newest one and does not replay the character's whole afternoon.
+    #[test]
+    fn a_fresh_attachment_starts_at_the_newest_tick() {
+        assert_eq!(resume_from(None, 400), 400);
+    }
+
+    /// **The point of the parameter.** A console that has already read up to
+    /// tick 380 gets 381 onwards, which is what it missed while its reader was
+    /// looking at another page.
+    #[test]
+    fn a_returning_console_resumes_where_it_left_off() {
+        assert_eq!(resume_from(Some("380"), 400), 380);
+    }
+
+    /// **A tick from the future must not stall the stream.** Unclamped, `seen`
+    /// would start above every tick the character has taken and the loop would
+    /// send nothing at all — a connection that opens and stays silent, which is
+    /// indistinguishable from a mind that has stopped thinking. A daemon
+    /// restart resets tick numbering, so a console outliving one arrives here
+    /// with exactly that.
+    #[test]
+    fn a_tick_from_the_future_falls_back_to_a_fresh_attachment() {
+        assert_eq!(resume_from(Some("9000"), 400), 400);
+    }
+
+    /// Junk in the query string is not a reason to serve a broken stream.
+    #[test]
+    fn an_unparseable_since_is_a_fresh_attachment() {
+        for junk in ["", "abc", "-5", "3.5", "١٢٣"] {
+            assert_eq!(resume_from(Some(junk), 400), 400, "since={junk:?}");
+        }
+    }
+
+    /// A character that has never ticked has no history to resume into, and
+    /// asking for one must not underflow into replaying from zero for ever.
+    #[test]
+    fn a_character_that_has_never_ticked_resumes_at_nothing() {
+        assert_eq!(resume_from(Some("12"), 0), 0);
+        assert_eq!(resume_from(None, 0), 0);
+    }
 }

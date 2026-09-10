@@ -165,8 +165,13 @@ export const LiveAPI = {
   inject:           (ix, p) => j(`/v1/interaction/${ix}/inject`, { method: 'POST', body: p }),
   endInteraction:   (ix) => j(`/v1/interaction/${ix}`, { method: 'DELETE' }),
 
-  streamInteraction(ix, handlers) {
-    const es = new EventSource(`/v1/interaction/${ix}/stream`);
+  /* `since` is the last tick this console already has. Without it the daemon
+   * starts every attachment from the character's newest tick, so re-opening a
+   * conversation you wandered away from silently loses everything it did while
+   * you were gone. */
+  streamInteraction(ix, handlers, since) {
+    const es = new EventSource(
+      `/v1/interaction/${ix}/stream` + (since ? `?since=${encodeURIComponent(since)}` : ''));
     const bind = (n, fn) => es.addEventListener(n, (e) => { try { fn(JSON.parse(e.data)); } catch (_) {} });
     bind('open', handlers.onOpen || (() => {}));
     bind('act', handlers.onAct || (() => {}));

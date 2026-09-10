@@ -199,6 +199,32 @@ impl MapSet {
         self.areas.values()
     }
 
+    /// What the address system plays in an area, taken from the nearest
+    /// enclosing area that has anything to play.
+    ///
+    /// A tannoy is fitted to a *building*, not to a room, so the recordings are
+    /// authored on the building and every level and room inside it hears the
+    /// same ones. Walking up rather than requiring each area to repeat the list
+    /// is what keeps them authored once — and a level that wants its own can
+    /// still declare them and be answered first.
+    ///
+    /// Empty for a building nobody left a message in, which the caller must
+    /// treat as silence rather than substituting anything.
+    pub fn announcements_for(&self, area: &str) -> &[String] {
+        let mut at = self.areas.get(area);
+        // Bounded by the depth of the containment chain, and by a hard limit
+        // besides: `within` is authored, and a file that names its own parent as
+        // itself would otherwise spin here for ever.
+        for _ in 0..16 {
+            let Some(here) = at else { break };
+            if !here.announcements.is_empty() {
+                return &here.announcements;
+            }
+            at = here.within.as_deref().and_then(|up| self.areas.get(up));
+        }
+        &[]
+    }
+
     pub fn part(&self, id: &str) -> Option<&Part> {
         self.parts.get(id)
     }
@@ -442,6 +468,7 @@ mod tests {
             summary: "a place".into(),
             character: None,
             lacks: vec![],
+            announcements: vec![],
             contains: vec![],
             portals: vec![],
             arrival: None,

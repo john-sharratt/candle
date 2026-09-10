@@ -63,6 +63,7 @@ fn area(id: &str, kind: AreaKind, name: &str, nodes: Vec<Node>) -> Area {
         summary: "A place that is not the vault.".into(),
         character: None,
         lacks: vec![],
+        announcements: vec![],
         contains: vec![],
         portals: vec![],
         arrival: None,

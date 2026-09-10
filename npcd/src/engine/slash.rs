@@ -9,10 +9,11 @@
 //! is how you *inject* into it, from inside a conversation, without standing up a
 //! world simulation first.
 //!
-//! Typing `/hurt badly, left arm` into the console is a debugging instrument. It
-//! puts an event on the character's inbox exactly as a world would, at a salience
-//! high enough to preempt, and the Pulse view shows the tick it causes and what
-//! comes out. That loop — poke, watch, poke again — is the whole point.
+//! Typing `/act puts a knife against your throat` into the console is both an
+//! instrument and a way to play. It puts an event on the character's inbox
+//! exactly as a world would, at a salience high enough to preempt, and the Pulse
+//! view shows the tick it causes and what comes out. That loop — poke, watch,
+//! poke again — is the whole point.
 //!
 //! # Why parsing lives here rather than in the console
 //!
@@ -36,9 +37,17 @@ use crate::engine::event::{Addressed, EventKind, Salience};
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Command {
     pub name: &'static str,
+    /// Which heading it sits under in the palette. The console groups by this,
+    /// and a catalogue this size is unreadable as one flat list.
+    pub group: &'static str,
+    /// One line, for the palette. [`Command::description`] is the long form and
+    /// is shown once a command has actually been chosen.
+    pub summary: &'static str,
     /// What the rest of the line means for this command.
     pub argument: &'static str,
     pub description: &'static str,
+    /// The kind of event it puts on the inbox, for the palette's hint.
+    pub emits: &'static str,
     /// How urgently the resulting event is taken. Named on the command rather
     /// than typed each time, because "does this preempt" is a property of the
     /// kind of thing that happened, not of the operator's mood.
@@ -47,73 +56,132 @@ pub struct Command {
 }
 
 /// Every `/` command. Served at `GET /v1/commands`.
+///
+/// # A command is a difference the engine can tell, not a verb
+///
+/// Battle Cities is a war, and for a while the only physical act an operator
+/// had was `/hurt` — which describes damage arriving from nowhere: **"You are
+/// hurt: a bolt through the shoulder"**, with nobody holding the bow. A
+/// character told only that it has been hit cannot fear anybody, answer
+/// anybody, or hold it against anybody afterwards, and the person who did it is
+/// standing in the room.
+///
+/// The first fix for that was thirteen verbs — strike, stab, shoot, kill, grab,
+/// shove, restrain, disarm and the rest. That was the wrong shape, and the
+/// reason is worth keeping written down: **every one of them produced the same
+/// event.** Same kind, same agent, same side of the preempt bar. They differed
+/// only in the sentence they rendered, and the operator was already typing that
+/// sentence in the argument. A catalogue of synonyms is a menu you have to read
+/// to discover it had one entry.
+///
+/// So there is [`one`](CATALOG) command for doing something to a character, and
+/// the words are the operator's. What earns a separate command is a difference
+/// the engine can act on — who is named, what kind of event it is, which side of
+/// the preempt bar it falls — which is exactly what separates `do` from `hurt`,
+/// `say` from `overhear`, and `see` from `urgent`.
 pub const CATALOG: &[Command] = &[
+    // ── speech ──────────────────────────────────────────────────────────────
     Command {
         name: "say",
+        group: "speech",
+        summary: "Speak to the character",
         argument: "what is said to the character",
         description: "Someone speaks directly to the character. The default if you type a bare \
                       line with no slash at all.",
+        emits: "speech",
         salience: 0.6,
         example: "/say Hess is at the gate and he is asking for you by name",
     },
     Command {
         name: "overhear",
+        group: "speech",
+        summary: "Speech it catches but is not part of",
         argument: "what is said nearby",
         description: "Speech the character catches but is not part of. Whether silence is rude \
                       depends on this, so it is its own command.",
+        emits: "speech",
         salience: 0.4,
         example: "/overhear two guards, quietly: the quartermaster has been selling the grain",
     },
+    // ── contact ─────────────────────────────────────────────────────────────
+    Command {
+        name: "act",
+        group: "contact",
+        summary: "Do something — you are named as the one who did it",
+        argument: "what you do, and to whom",
+        description: "Anything you do rather than say: shake its hand, hit it, hold it, take its \
+                      weapon, put a knife against its throat — or do something to yourself it \
+                      can see you do. Your words are the act, so say who it lands on: `punches \
+                      you in the face`, `reloads his own rifle`. It reaches the character with \
+                      your name on it, which is what lets it fear you, answer you, or hold it \
+                      against you afterwards. Preempts: nothing anybody was doing survives being \
+                      taken hold of.",
+        emits: "description",
+        salience: 0.95,
+        example: "/act shakes your hand, and holds it a moment too long",
+    },
+    // ── the room ────────────────────────────────────────────────────────────
     Command {
         name: "see",
+        group: "the room",
+        summary: "Something happens in front of it",
         argument: "what happens, described",
         description: "Something happens in front of the character. The general-purpose event.",
+        emits: "description",
         salience: 0.5,
         example: "/see the east granary is burning and nobody is fighting it",
     },
     Command {
+        name: "urgent",
+        group: "the room",
+        summary: "Something that cannot wait",
+        argument: "what happens",
+        description: "Something that cannot wait. Like /see, but preempts.",
+        emits: "description",
+        salience: 0.9,
+        example: "/urgent the roof beam above you cracks and begins to give",
+    },
+    Command {
         name: "notice",
+        group: "the room",
+        summary: "A named thing is observed doing something",
         argument: "<entity> : <what it is doing>",
         description: "A specific entity is observed. Splits on the first colon.",
+        emits: "entity",
         salience: 0.5,
         example: "/notice a scout in Hess's colours : moving along the ridge line, unhurried",
     },
     Command {
         name: "here",
+        group: "the room",
+        summary: "Where it is, and what is true there",
         argument: "where the character is and what is true there",
         description: "The situation, in prose. Replaces the previous one rather than adding to \
                       it — it is a point in time, not a thing that happened.",
+        emits: "situation",
         salience: 0.1,
         example: "/here You are in the green room. Maker-04 is here.",
     },
-    Command {
-        name: "hurt",
-        argument: "what happened and how badly",
-        description: "The character takes damage. High salience — preempts whatever it was \
-                      doing and forces a tick now.",
-        salience: 0.95,
-        example: "/hurt a crossbow bolt through the left shoulder, badly",
-    },
-    Command {
-        name: "urgent",
-        argument: "what happens",
-        description: "Something that cannot wait. Like /see, but preempts.",
-        salience: 0.9,
-        example: "/urgent the roof beam above you cracks and begins to give",
-    },
+    // ── the loop ────────────────────────────────────────────────────────────
     Command {
         name: "wake",
+        group: "the loop",
+        summary: "Force a tick with nothing new",
         argument: "(nothing)",
         description: "Force a tick now with no new information. Shows you what the character \
                       does with what it already has.",
+        emits: "heartbeat",
         salience: 0.85,
         example: "/wake",
     },
     Command {
         name: "sleep",
+        group: "the loop",
+        summary: "End its day now",
         argument: "(nothing)",
         description: "End the character's day now: fold the conversation into memory, tombstone \
                       it, and open tomorrow's. Normally the clock does this.",
+        emits: "sleep",
         salience: 0.7,
         example: "/sleep",
     },
@@ -129,21 +197,34 @@ pub struct Parsed {
 }
 
 impl Parsed {
-    /// Say who was speaking.
+    /// Say who did this.
     ///
     /// **The parser cannot know.** It turns a typed line into an event and has
-    /// no idea whose console it came from, so it writes the placeholder `you` —
-    /// which renders as *"you says to you: …"*, a sentence that is both
-    /// ungrammatical and wrong about who spoke. The caller knows the name and
-    /// substitutes it here.
+    /// no idea whose console it came from, so speech is written with the
+    /// placeholder speaker `you` — which renders as *"you says to you: …"*, a
+    /// sentence both ungrammatical and wrong about who spoke — and a physical
+    /// act is written with `{who}` standing where the name goes.
     ///
-    /// Only [`EventKind::Speech`] carries a speaker; everything else is
-    /// untouched, so this is safe to call on any parse.
-    pub fn spoken_by(mut self, who: &str) -> Parsed {
-        if let EventKind::Speech { speaker, .. } = &mut self.kind {
-            if speaker == "you" && !who.trim().is_empty() {
-                *speaker = who.trim().to_string();
+    /// Both are filled in here, by the one caller that knows the account.
+    ///
+    /// **A blow has to name the person who landed it.** A character told only
+    /// that it has been hit cannot fear anybody, answer anybody, or hold it
+    /// against anybody afterwards — and whoever did it is standing in the room
+    /// with a name the world already knows.
+    ///
+    /// Safe on any parse: an event with neither a speaker nor a `{who}` is
+    /// returned untouched.
+    pub fn attributed_to(mut self, who: &str) -> Parsed {
+        let who = who.trim();
+        if who.is_empty() {
+            return self;
+        }
+        match &mut self.kind {
+            EventKind::Speech { speaker, .. } if speaker == "you" => {
+                *speaker = who.to_string();
             }
+            EventKind::Description { text } => *text = text.replace("{who}", who),
+            _ => {}
         }
         self
     }
@@ -229,6 +310,19 @@ fn distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// One physical act, as the character will read it.
+///
+/// `{arg}` is the operator's own words and `{who}` is left standing for
+/// [`Parsed::attributed_to`]. Trailing punctuation in the argument is not
+/// doubled: an operator who ends the line with a full stop meant it, and
+/// `hard.` followed by the template's own `.` reads as a typo in the world.
+fn did(template: &str, arg: &str) -> EventKind {
+    let arg = arg.trim_end_matches(['.', '!', ' ']);
+    EventKind::Description {
+        text: template.replace("{arg}", arg),
+    }
+}
+
 /// Turn an operator's line into an event.
 ///
 /// A line with no leading `/` is `say` — the common case is talking to the
@@ -292,9 +386,27 @@ pub fn parse(line: &str) -> Result<Parsed, ParseError> {
         "see" | "urgent" => EventKind::Description {
             text: arg.to_string(),
         },
-        "hurt" => EventKind::Description {
-            text: format!("You are hurt: {arg}"),
-        },
+        /* **Somebody did this to you, and the character has to know who.**
+         *
+         * The shape deliberately mirrors how speech reads to a character —
+         * *"X says to you: …"* — so an act and an utterance from the same person
+         * in the same room arrive as the same kind of sentence with the same
+         * name at the front. `{who}` is filled in by [`Parsed::attributed_to`],
+         * written as a placeholder rather than passed in because the parser is
+         * handed a line and nothing else.
+         *
+         * The colon is what makes the operator's own words safe to drop in:
+         * they can write `shakes your hand` or `puts a boot through your knee`
+         * without having to conjugate it into somebody else's sentence.
+         *
+         * **It does not say "to you", and that is the point.** An act does not
+         * always land on the character — the person in the room can reload
+         * their own weapon, bind their own arm, put a hand on the wall — and a
+         * template that asserted a target would make every one of those a lie
+         * the character then reasons from. Who it lands on is in the operator's
+         * own words, which is the same answer the character's `act` gives with
+         * its `on` argument. */
+        "act" => did("{who} does this: {arg}", arg),
         "notice" => {
             let Some((entity, obs)) = arg.split_once(':') else {
                 return Err(ParseError::Malformed {
@@ -353,7 +465,7 @@ mod tests {
     fn a_speaker_can_be_named_after_parsing() {
         let p = parse("where were you last night?")
             .unwrap()
-            .spoken_by("Johnathan Sharratt");
+            .attributed_to("Johnathan Sharratt");
         let EventKind::Speech { speaker, to, .. } = &p.kind else {
             panic!("a bare line is speech");
         };
@@ -361,7 +473,10 @@ mod tests {
         assert_eq!(*to, Addressed::You, "naming the speaker moved the aim");
 
         let rendered = crate::engine::event::Event::new(0, 0, p.salience, p.kind.clone()).prose();
-        assert_eq!(rendered, "Johnathan Sharratt says to you: where were you last night?");
+        assert_eq!(
+            rendered,
+            "Johnathan Sharratt says to you: where were you last night?"
+        );
         assert!(!rendered.starts_with("you says"), "{rendered}");
     }
 
@@ -369,14 +484,156 @@ mod tests {
     #[test]
     fn naming_a_speaker_touches_nothing_that_is_not_speech() {
         let before = parse("/sleep").unwrap();
-        let after = parse("/sleep").unwrap().spoken_by("Johnathan Sharratt");
+        let after = parse("/sleep").unwrap().attributed_to("Johnathan Sharratt");
         assert_eq!(before.kind, after.kind);
+    }
+
+    // ── who did it ──────────────────────────────────────────────────────────
+
+    /// **A blow has to name the person who landed it.** A character told only
+    /// that it has been hit cannot fear anybody, answer anybody, or hold it
+    /// against anybody afterwards — and whoever did it is standing in the room.
+    #[test]
+    fn a_physical_act_names_who_did_it() {
+        let p = parse("/act shakes your hand")
+            .unwrap()
+            .attributed_to("Wren");
+        let EventKind::Description { text } = &p.kind else {
+            panic!("an act reads as something that happened");
+        };
+        assert_eq!(text, "Wren does this: shakes your hand");
+    }
+
+    /// **An act does not always land on the character.** The person in the room
+    /// can reload their own weapon or bind their own arm, and a template that
+    /// asserted a target would make every one of those a lie the character then
+    /// reasons from. Who it lands on is in the operator's own words.
+    #[test]
+    fn an_act_does_not_assert_who_it_landed_on() {
+        let p = parse("/act reloads his own rifle, not looking at you")
+            .unwrap()
+            .attributed_to("Wren");
+        let EventKind::Description { text } = &p.kind else {
+            panic!("an act reads as something that happened");
+        };
+        assert!(!text.contains("to you"), "{text}");
+    }
+
+    /// **One command, not a menu of synonyms.** Thirteen verbs — strike, stab,
+    /// shoot, kill, grab, shove and the rest — all produced the same event: same
+    /// kind, same agent, same side of the preempt bar. They differed only in the
+    /// sentence they rendered, which the operator was already typing. A command
+    /// earns its place by being a difference the engine can act on.
+    #[test]
+    fn there_is_one_way_to_act_on_a_character() {
+        for gone in [
+            "strike", "stab", "shoot", "kill", "aim", "threaten", "grab", "shove", "restrain",
+            "disarm", "touch", "give", "take", "hurt",
+        ] {
+            assert!(
+                lookup(gone).is_none(),
+                "/{gone} is back — say it with /act, or show what the engine does differently"
+            );
+        }
+        assert!(lookup("act").is_some());
+    }
+
+    /// The operator's words go in whole, so any phrasing works without being
+    /// conjugated into somebody else's sentence.
+    #[test]
+    fn an_act_takes_the_operators_own_words() {
+        for what in [
+            "shakes your hand",
+            "puts a boot through your knee",
+            "drags you off the console by the collar",
+        ] {
+            let p = parse(&format!("/act {what}"))
+                .unwrap()
+                .attributed_to("Wren");
+            let EventKind::Description { text } = &p.kind else {
+                panic!("an act reads as something that happened");
+            };
+            assert!(text.ends_with(what), "{text}");
+        }
+    }
+
+    /// An act reads the way speech from the same person in the same room does —
+    /// name, then colon, then what it was. Two channels, one sentence shape.
+    #[test]
+    fn an_act_reads_like_speech_from_the_same_person() {
+        let said = parse("/say get back").unwrap().attributed_to("Wren");
+        let did = parse("/act shoves you back").unwrap().attributed_to("Wren");
+        let rendered =
+            |p: &Parsed| crate::engine::event::Event::new(0, 0, p.salience, p.kind.clone()).prose();
+        assert!(rendered(&said).starts_with("Wren "), "{}", rendered(&said));
+        assert!(rendered(&did).starts_with("Wren "), "{}", rendered(&did));
+    }
+
+    /// **No placeholder ever reaches a character.** `{who}` is machinery, and a
+    /// character handed `{who} strikes you` reads it as literally as anything
+    /// else it is told.
+    #[test]
+    fn the_placeholder_never_survives_into_the_world() {
+        for cmd in CATALOG {
+            let p = parse(cmd.example).expect(cmd.example).attributed_to("Wren");
+            let rendered = format!("{:?}", p.kind);
+            assert!(
+                !rendered.contains("{who}"),
+                "/{} leaked its placeholder: {rendered}",
+                cmd.name
+            );
+        }
+    }
+
+    /// Harm with nobody behind it — a round out of the dark, masonry off a roof
+    /// — is the room happening to the character, not somebody acting on it.
+    #[test]
+    fn harm_from_nobody_names_nobody() {
+        // No attacker to name — masonry off a roof, a round from the dark. That
+        // is `/urgent`, and it is the same event `/hurt` used to make with a
+        // prefix the operator can type themselves.
+        let p = parse("/urgent a bolt comes out of the dark and takes you through the shoulder")
+            .unwrap()
+            .attributed_to("Wren");
+        let EventKind::Description { text } = &p.kind else {
+            panic!("urgent is a description");
+        };
+        assert!(!text.contains("Wren"), "{text}");
+        assert!(p.salience.preempts());
+    }
+
+    /// Being taken hold of is not something anybody finishes their turn first.
+    #[test]
+    fn an_act_preempts() {
+        let cmd = lookup("act").expect("in the catalogue");
+        assert!(
+            Salience::new(cmd.salience).preempts(),
+            "/act let the character finish what it was doing"
+        );
+    }
+
+    /// The console groups the palette by this and shows the summary in it. A
+    /// catalogue this size is unreadable as one flat list, and a command with
+    /// neither reads as a blank row.
+    #[test]
+    fn every_command_is_grouped_and_summarised() {
+        for c in CATALOG {
+            assert!(!c.group.is_empty(), "/{} has no group", c.name);
+            assert!(!c.summary.is_empty(), "/{} has no summary", c.name);
+            assert!(
+                !c.emits.is_empty(),
+                "/{} says nothing about what it emits",
+                c.name
+            );
+        }
     }
 
     /// An overheard line already names its speaker, and is not the caller.
     #[test]
     fn an_overheard_line_keeps_its_own_speaker() {
-        let p = parse("/overhear the gate is open").unwrap().spoken_by("Johnathan");
+        let p = parse("/overhear the gate is open")
+            .unwrap()
+            .attributed_to("Johnathan");
         let EventKind::Speech { speaker, .. } = &p.kind else {
             panic!("overhearing is speech");
         };
@@ -401,18 +658,18 @@ mod tests {
     /// speech is the worst possible outcome, because it looks like it worked.
     #[test]
     fn an_unknown_command_is_an_error_and_never_speech() {
-        let e = parse("/hrut badly").unwrap_err();
+        let e = parse("/ubrgent badly").unwrap_err();
         match e {
             ParseError::Unknown {
                 ref typed,
                 did_you_mean,
             } => {
-                assert_eq!(typed, "hrut");
-                assert_eq!(did_you_mean, Some("hurt"));
+                assert_eq!(typed, "ubrgent");
+                assert_eq!(did_you_mean, Some("urgent"));
             }
             other => panic!("expected Unknown, got {other:?}"),
         }
-        assert!(e.message().contains("did you mean `/hurt`"));
+        assert!(e.message().contains("did you mean `/urgent`"));
     }
 
     /// A loose suggestion bound is worse than none — it sends somebody down the
@@ -436,11 +693,8 @@ mod tests {
     }
 
     #[test]
-    fn hurt_preempts_and_ordinary_sight_does_not() {
-        assert!(parse("/hurt a bolt through the shoulder")
-            .unwrap()
-            .salience
-            .preempts());
+    fn what_cannot_wait_preempts_and_ordinary_sight_does_not() {
+        assert!(parse("/act shoves you back").unwrap().salience.preempts());
         assert!(parse("/urgent the beam gives").unwrap().salience.preempts());
         assert!(!parse("/see it is raining").unwrap().salience.preempts());
         assert!(!parse("/overhear a rumour").unwrap().salience.preempts());
@@ -531,7 +785,7 @@ mod tests {
 
     #[test]
     fn commands_are_case_insensitive() {
-        assert_eq!(parse("/HURT the arm").unwrap().command, "hurt");
+        assert_eq!(parse("/ACT shakes your hand").unwrap().command, "act");
         assert_eq!(parse("/Say hello").unwrap().command, "say");
     }
 

@@ -32,12 +32,13 @@
 //! it is the same rule as the tools within reach, which is that **what a body
 //! can do is a function of where it is.**
 
+use std::collections::BTreeSet;
+
 use serde_json::{Map, Value};
 
 use npc_map::world::{Refused, Where};
 
 use crate::engine::act::Act;
-use crate::engine::waiting::Kind;
 use crate::world::Hosted;
 
 /// What came of an act.
@@ -67,11 +68,6 @@ impl Outcome {
     }
 }
 
-/// Whether this tool is one a body performs.
-///
-/// Every name here is answered by [`perform`]. It used to list two — `wait` and
-/// `observe` — that fell through to [`Outcome::NotOfTheBody`], which read as
-/// "this happens in a head" when it actually meant "nothing happens at all".
 /// The acts whose whole product is the line they come back with.
 ///
 /// **An act that answers a question keeps the world's words**, for the same
@@ -108,19 +104,17 @@ pub fn answers(tool: &str) -> bool {
     ANSWERS.contains(&tool)
 }
 
+/// Whether this tool is one a body performs.
+///
+/// Every name here is answered by [`perform`]. It once listed two — `wait` and
+/// `observe` — that fell through to [`Outcome::NotOfTheBody`], which read as
+/// "this happens in a head" when it actually meant "nothing happens at all".
+/// Both are gone from the catalog entirely now, which is the more thorough
+/// version of the same fix.
 pub fn is_of_the_body(tool: &str) -> bool {
     matches!(
         tool,
-        "say"
-            | "tell"
-            | "ask"
-            | "speak"
-            | "gesture"
-            | "move_to"
-            | "follow"
-            | "flee"
-            | "observe"
-            | "wait_for"
+        "say" | "tell" | "ask" | "speak" | "gesture" | "move_to" | "follow" | "flee" | "reflect"
     ) || crate::engine::enact::is_mine(tool)
         || crate::engine::work::is_mine(tool)
 }
@@ -139,8 +133,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         // Breaking away and following are journeys with a reason attached. The
         // reason is the character's; the journey is the same one.
         "flee" | "follow" => move_to(hosted, body, &act.args),
-        "observe" => observe(hosted, body, &act.args),
-        "wait_for" => wait_for(hosted, body, &act.args),
+        "reflect" => reflect(hosted, body, &act.args),
         // The acts that reach what the world *holds* rather than its shape —
         // carrying, working, digging, fighting, the tower. Same dispatch, one
         // file down, because they need the sim as well as the map.
@@ -152,35 +145,48 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     }
 }
 
-/// Stop and wait for one named thing, and let the person it is about see it.
+/// Take stock, standing still where the room can see you do it.
 ///
-/// **The arming is the caller's**, in `engine::runtime` — this half is what the
-/// room sees. Waiting on somebody is not invisible: you look at them, and the
-/// silence is aimed rather than empty. That visibility is the whole mechanism
-/// against a deadlock: two characters waiting on each other used to sit until
-/// something else moved, and now the first wait wakes the second, who has
-/// something to answer.
-///
-/// The pair is `Outcome::Did` plus the parsed wait, so the caller does not have
-/// to re-read the arguments to arm what was just announced.
-pub fn wait_for(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
-    let Some(kind) = text(args, "for").as_deref().and_then(Kind::parse) else {
-        return Outcome::Refused(
-            "You meant to wait, but not for what. Wait for someone_speaks, someone_arrives or \
-             someone_leaves."
-                .into(),
-        );
-    };
-    // Nobody named: the ambient wait. Nothing to show, because nobody is being
-    // asked for anything.
-    let Some(to) = text(args, "who") else {
-        return Outcome::Did(format!("You settle down to wait {}.", kind.as_done()));
-    };
-    let Some(id) = here_by_name(hosted, body, &to) else {
-        return Outcome::Refused(format!("{to} is not here. {}", who_is_here(hosted, body)));
-    };
-    match hosted.with(|w| w.show(body, Some(&id), kind.as_seen())) {
-        Ok(()) => Outcome::Did(format!("You wait, and {to} can see you waiting.")),
+/// **The scheduling half is the caller's**, in `engine::runtime` — this is only
+/// what the room sees and what the character reads back. See `tools::REFLECT`
+/// for why it is named for the thinking rather than for the standing still.
+pub fn reflect(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    // **The thought is read back and the room is not told it.** That asymmetry
+    // is the whole of what makes it an inner one: it lands in this character's
+    // own window, where it is carried into the next decode and nowhere else, so
+    // nobody can answer it and nobody can hold the character to it.
+    //
+    // Nothing here is refused when it is missing, though the grammar requires
+    // all three. The act is complete without them — a character that stopped
+    // and said nothing about why has still stopped — and refusing it would put
+    // one that could not fill a field into a loop of trying to.
+    let mut mine = String::from("You stop, and let the moment pass.");
+    if let Some(thought) = text(args, "inner_thoughts") {
+        mine.push_str(&format!(" You are thinking: {thought}"));
+    }
+    // The register, said back plainly. **This is what a mood would later be set
+    // from** — a character that named `cornered` and then read itself back as
+    // cornered is the loop closing, and it starts by the word surviving the
+    // turn it was said in.
+    if let Some(feeling) = text(args, "feeling") {
+        mine.push_str(&format!(" What you feel, standing there, is {feeling}."));
+    }
+    // Kept apart from the thought on purpose: one is what is passing through,
+    // the other is what has settled, and running them together would lose the
+    // difference the two fields exist to draw.
+    if let Some(reflection) = text(args, "my_reflections") {
+        mine.push_str(&format!(" What you have come to think: {reflection}"));
+    }
+    // **The stopping happens in the room.** Standing still is something people
+    // can see you do, and a character that went quiet invisibly would leave
+    // everybody else reading the silence as absence. It is also what stops two
+    // characters pausing at each other in mutual silence: the first one to stop
+    // gives the second something to react to.
+    match hosted.with(|w| w.show(body, None, "stops, and lets the moment pass")) {
+        Ok(()) => Outcome::Did(mine),
+        // A body that is not in a world has nothing to be seen doing, and
+        // pausing is still a perfectly good thing for it to have done.
+        Err(Refused::NoSuchActor(_)) => Outcome::Did(mine),
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }
@@ -206,7 +212,14 @@ fn ask(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         return Outcome::Refused(format!("{to} is not here. {}", who_is_here(hosted, body)));
     };
     match hosted.with(|w| w.tell(body, &id, format!("asking {about}"))) {
-        Ok(()) => Outcome::Did(format!("You ask {to} {about}")),
+        Ok(()) => {
+            // **The question outlives the turn it was asked in.** Delivered, it
+            // is one line of perception among the weather; written down, it is
+            // something the other one is told it owes, every turn, until they
+            // speak. See [`crate::sim::ledger::Ledger::asked`].
+            hosted.with_sim(|s| s.ledger.asked(body, &id, &about));
+            Outcome::Did(format!("You ask {to} {about}"))
+        }
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }
@@ -225,53 +238,25 @@ fn gesture(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         Some(to) => match here_by_name(hosted, body, &to) {
             Some(id) => Some((to, id)),
             None => {
-                return Outcome::Refused(format!(
-                    "{to} is not here. {}",
-                    who_is_here(hosted, body)
-                ))
+                return Outcome::Refused(format!("{to} is not here. {}", who_is_here(hosted, body)))
             }
         },
     };
     let at = aimed.as_ref().map(|(_, id)| id.clone());
-    match hosted.with(|w| w.show(body, at.as_deref(), intent.clone())) {
+    // **Shown as a predicate, because that is what the room renders.** The
+    // witness line is `"{who} {what}"`, so a bare intent arrives with its verb
+    // missing: nine gestures reached the other characters as "Yaelis Vayne
+    // towards the table, indicating the standing orders" — legible as a fragment
+    // and not as a deed, next to a pause that read correctly because it passes
+    // one. The target is *not* named here; `to` carries it and the room adds
+    // ", at X" once. See [`npc_map::world::World::show`].
+    match hosted.with(|w| w.show(body, at.as_deref(), format!("gestures {intent}"))) {
         Ok(()) => Outcome::Did(match aimed {
             Some((to, _)) => format!("You show {to}: {intent}"),
             None => format!("You show it: {intent}"),
         }),
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
-}
-
-/// Spend the turn finding out rather than doing.
-///
-/// **It has to come back with something.** An `observe` that returned nothing
-/// was a turn spent to learn nothing, which is worse than idling because it
-/// looks like diligence. What it returns is what the body can actually make out
-/// from where it stands — the same reading the environment gives it, asked for
-/// deliberately instead of waiting to be handed one.
-fn observe(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
-    let Some(target) = text(args, "target") else {
-        return Outcome::Refused("You meant to look at something, but not what.".into());
-    };
-    let found = hosted.read(|w| {
-        let here = w.actor(body).map(|a| a.at.clone())?;
-        let place = w.node(&here).map(|n| n.name.clone())?;
-        let others: Vec<String> = w
-            .actors_at(&here)
-            .into_iter()
-            .filter(|a| a.id != body)
-            .map(|a| a.name.clone())
-            .collect();
-        Some((place, others))
-    });
-    let Some((place, others)) = found else {
-        return Outcome::Refused("You are nowhere you can look around.".into());
-    };
-    let company = match others.len() {
-        0 => "You are alone here.".to_string(),
-        _ => format!("{} is here with you.", npc_map::text::list(&others)),
-    };
-    Outcome::Did(format!("You look at {target}. You are in {place}. {company}"))
 }
 
 fn say(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
@@ -308,7 +293,14 @@ fn tell(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         return Outcome::Refused(format!("{to} is not here. {}", who_is_here(hosted, body)));
     };
     match hosted.with(|w| w.tell(body, &id, intent.clone())) {
-        Ok(()) => Outcome::Did(format!("You say, to {to}: {intent}")),
+        Ok(()) => {
+            // Speaking to somebody discharges whatever they were waiting on —
+            // any speech, not a matched answer, because the obligation exists
+            // to restart the conversation rather than to grade it. See
+            // [`crate::sim::ledger::Ledger::answered`].
+            hosted.with_sim(|s| s.ledger.answered(body, &id));
+            Outcome::Did(format!("You say, to {to}: {intent}"))
+        }
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }
@@ -430,37 +422,88 @@ fn thing_here_called(hosted: &Hosted, body: &str, want: &str) -> Option<String> 
     })
 }
 
-/// Everywhere this body may walk to: the rooms off its own level and the other
-/// levels, **never where it is standing**.
+/// Everywhere this body may walk to, and the exact place each name means.
 ///
-/// The grammar's list for `move_to`. Excluding the current room is the point:
-/// walking to where you already are was refused, and a refusal is not a lesson
-/// — a live cast emitted it every tick for an evening, read its own refusal
-/// back as the most recent thing in the window, and emitted it again. Absent
-/// from the branch, it is not a mistake the character can make.
-pub fn reachable(hosted: &Hosted, body: &str) -> Vec<String> {
+/// **The one list, and the whole of the movement graph.** The grammar's arms
+/// for `move_to` are the names in it and [`place_by_name`] resolves against it,
+/// so the set a character may *say* and the set it may *reach* are the same set
+/// by construction. They were two functions computing two different answers,
+/// and every disagreement between them was a move the grammar offered and the
+/// world then refused — which is the one shape of mistake a character cannot
+/// learn its way out of, because the refusal is the most recent thing in its
+/// window and reads as a fact about the room rather than about the word.
+///
+/// Three rules, each one a defect that was live:
+///
+/// * **Never where it stands.** Walking to your own room was refused, and being
+///   refused taught nothing: a live cast emitted it every tick for an evening,
+///   read the refusal back, and emitted it again. The resolver searched the
+///   whole area including the current node, so a name the grammar had excluded
+///   still resolved to a no-op journey.
+/// * **Never anywhere there is no way to.** A route is checked here, once, off
+///   a single breadth-first pass — so a walled-off wing is absent rather than
+///   offered and refused.
+/// * **One name, one place.** Two rooms that read the same are ambiguous to a
+///   reader and would resolve to whichever the resolver happened to scan first.
+///   First mention wins and the duplicate is dropped, which also keeps the
+///   grammar's arms a genuine set — a duplicate arm fails the *whole* stencil
+///   to compile and every turn afterwards free-decodes.
+///
+/// Rooms on this level, then the other levels by name, because that is the
+/// vocabulary the character's own memory uses — "Level 2, the chronicle" — and
+/// a list that named sixty rooms would be a list nobody could read.
+pub fn destinations(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
     hosted.read(|w| {
         let Some(here) = w.actor(body).map(|a| a.at.clone()) else {
             return Vec::new();
         };
-        let rooms = w.map().get(&here.area).into_iter().flat_map(|area| {
-            area.nodes
-                .iter()
-                .filter(|n| n.kind != npc_map::NodeKind::Passage && n.id != here.node)
-                .map(|n| n.name.clone())
-                .collect::<Vec<_>>()
-        });
-        // The other levels too, so somewhere off this floor is still nameable —
-        // otherwise the answer to "I want the chronicle" is a list without the
-        // chronicle in it.
-        let levels = w
-            .map()
-            .areas()
-            .filter(|a| !a.nodes.is_empty() && a.id != here.area)
-            .map(|a| a.name.clone())
-            .collect::<Vec<_>>();
-        rooms.chain(levels).collect()
+        // One pass over the graph. Everything below asks this rather than
+        // computing a route of its own.
+        let open: BTreeSet<Where> = npc_map::route::reachable_from(w.map(), &here)
+            .into_iter()
+            .collect();
+
+        let mut out: Vec<(String, Where)> = Vec::new();
+        // The rooms off this level. Passages are how you get between them
+        // rather than somewhere to be, so they are not destinations.
+        if let Some(area) = w.map().get(&here.area) {
+            for node in &area.nodes {
+                let place = Where::new(here.area.clone(), node.id.clone());
+                if node.kind == npc_map::NodeKind::Passage || !open.contains(&place) {
+                    continue;
+                }
+                out.push((node.name.clone(), place));
+            }
+        }
+        // The other levels, each by the way in. Without these the answer to "I
+        // want the chronicle" is a list with no chronicle in it.
+        for area in w.map().areas() {
+            if area.id == here.area || area.nodes.is_empty() {
+                continue;
+            }
+            let Some(way_in) = w.map().arrival_in(&area.id) else {
+                continue;
+            };
+            if !open.contains(&way_in) {
+                continue;
+            }
+            out.push((area.name.clone(), way_in));
+        }
+
+        // One name, one place. First mention wins, so a room on this level
+        // keeps the word over a level that shares it.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        out.retain(|(name, _)| seen.insert(name.to_ascii_lowercase()));
+        out
     })
+}
+
+/// The names alone — the grammar's arms for `move_to`.
+pub fn reachable(hosted: &Hosted, body: &str) -> Vec<String> {
+    destinations(hosted, body)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
 fn rooms_on_this_level(hosted: &Hosted, body: &str) -> String {
@@ -523,10 +566,7 @@ fn here_by_name(hosted: &Hosted, body: &str, name: &str) -> Option<String> {
             .collect();
         // The whole name, as the situation writes it. Always wins, so two
         // people whose first names collide are still each reachable.
-        if let Some(a) = others
-            .iter()
-            .find(|a| a.name.eq_ignore_ascii_case(want))
-        {
+        if let Some(a) = others.iter().find(|a| a.name.eq_ignore_ascii_case(want)) {
             return Some(a.id.clone());
         }
         // **Otherwise the name people are actually called by.**
@@ -566,49 +606,70 @@ fn here_by_name(hosted: &Hosted, body: &str, name: &str) -> Option<String> {
 /// it cannot reach is refused before it stands up.
 fn place_by_name(hosted: &Hosted, body: &str, want: &str) -> Option<Where> {
     let want = want.trim();
+    let asked = bare(want);
+    let open = destinations(hosted, body);
+
+    // **What the grammar offered, first and by the name it offered it under.**
+    // Nearest first, so *the green room* is the one on your own floor when both
+    // floors have one.
+    let named = |name: &str| name.eq_ignore_ascii_case(want) || bare(name) == asked;
+    if let Some((_, place)) = open.iter().find(|(name, _)| named(name)) {
+        return Some(place.clone());
+    }
+
     hosted.read(|w| {
         let here = w.actor(body)?.at.clone();
-        let matches = |place: &Where| -> bool {
-            w.node(place).is_some_and(|n| {
-                n.name.eq_ignore_ascii_case(want) || n.id.eq_ignore_ascii_case(want)
-            })
-        };
 
-        // This level.
-        if let Some(area) = w.map().get(&here.area) {
-            if let Some(node) = area
-                .nodes
-                .iter()
-                .find(|n| n.name.eq_ignore_ascii_case(want) || n.id.eq_ignore_ascii_case(want))
-            {
-                return Some(Where::new(here.area.clone(), node.id.clone()));
-            }
-        }
-        // Anywhere else in the world, in a stable order so the same word means
-        // the same room twice.
-        if let Some(room) = w
-            .map()
-            .areas()
-            .flat_map(|a| {
-                a.nodes
-                    .iter()
-                    .map(move |n| Where::new(a.id.clone(), n.id.clone()))
-            })
-            .find(|place| matches(place))
+        // **Your own room resolves, and is then refused properly.** Not an
+        // oversight: `move_to` answers this case with a refusal that names
+        // where the character actually is and turns it back to the work in
+        // front of it, which is a far better thing to read than "there is
+        // nowhere called that" about the room you are standing in.
+        if w.node(&here)
+            .is_some_and(|n| named(&n.name) || n.id.eq_ignore_ascii_case(want))
         {
-            return Some(room);
+            return Some(here);
         }
 
-        // **A level is somewhere to go.** The memory names levels as well as
-        // rooms — "Level 2, the chronicle" — so a character reading it asks for
-        // the chronicle, meaning the floor rather than any room on it. Refusing
-        // that is refusing the map's own vocabulary: it is exactly what a
-        // person means, and the way in is the way in.
-        let asked = bare(want);
+        // Everywhere else there is a way to. The grammar names only this
+        // level's rooms and the other levels, because a list of sixty is a list
+        // nobody reads — but a character whose memory named a corridor, or a
+        // room three floors up, should not be told the place does not exist.
+        // Anything unreachable stays absent, which is the half that matters.
+        let open: BTreeSet<Where> = npc_map::route::reachable_from(w.map(), &here)
+            .into_iter()
+            .collect();
+        // **This level before anywhere else.** Every level has a north run, and
+        // asking for it from the casting floor must not send a body to the
+        // chronicle's. The offered list above already reads this way — it is
+        // built from this area first — and the fallback has to agree with it or
+        // the two orders differ for exactly the names the grammar left out.
+        let find_in = |area: &str| -> Option<Where> {
+            let a = w.map().get(area)?;
+            a.nodes
+                .iter()
+                .map(|n| (n, Where::new(area.to_string(), n.id.clone())))
+                .find(|(n, place)| {
+                    open.contains(place) && (named(&n.name) || n.id.eq_ignore_ascii_case(want))
+                })
+                .map(|(_, place)| place)
+        };
+        if let Some(near) = find_in(&here.area) {
+            return Some(near);
+        }
+        let ids: Vec<String> = w.map().areas().map(|a| a.id.clone()).collect();
+        if let Some(far) = ids.iter().find_map(|id| find_in(id)) {
+            return Some(far);
+        }
+
+        // And a level is somewhere to go. The memory names levels as well as
+        // rooms — "Level 2, the chronicle" — so asking for the chronicle means
+        // the floor, and the way in is the way in.
         w.map()
             .areas()
-            .find(|a| a.id.eq_ignore_ascii_case(want) || bare(&a.name).eq_ignore_ascii_case(&asked))
+            .find(|a| a.id.eq_ignore_ascii_case(want) || bare(&a.name) == asked)
             .and_then(|a| w.map().arrival_in(&a.id))
+            .filter(|way_in| open.contains(way_in))
     })
 }
 
@@ -635,7 +696,15 @@ fn bare(name: &str) -> String {
 /// Every one of these names the fact that stopped the act, and where there is
 /// somebody to go and ask, it names them. That is the difference between a
 /// refusal a mind can act on and one it can only be stuck behind.
-fn refusal(hosted: &Hosted, why: &Refused) -> String {
+///
+/// **Every path that turns a [`Refused`] into something a character reads goes
+/// through here.** The alternative is `format!("{why:?}")`, which is one
+/// character shorter and puts a Rust type name in a person's mouth: five sites
+/// in `enact` did exactly that, and a character was told
+/// `AlreadyAtAStation` — not a sentence, not English, and nothing it could act
+/// on. [`tests::every_refusal_reads_as_a_sentence`] holds this function to
+/// prose; a `{:?}` elsewhere is invisible to it.
+pub fn refusal(hosted: &Hosted, why: &Refused) -> String {
     match why {
         Refused::NoSuchActor(_) => "You are not anywhere.".into(),
         Refused::NoSuchPlace(_) => "There is no such place.".into(),
@@ -949,6 +1018,68 @@ mod tests {
     /// a character got pinned: standing in the command room, it emitted
     /// `move_to — the command room` every tick for a hundred turns and was told
     /// each time that the act succeeded.
+    /// **The grammar's arms and the resolver are one set.**
+    ///
+    /// They were two functions computing two different answers, and every
+    /// disagreement was a move the grammar offered and the world then refused.
+    /// A character cannot learn its way out of that: the refusal is the most
+    /// recent thing in its window and reads as a fact about the room rather
+    /// than about the word.
+    #[test]
+    fn every_destination_the_grammar_offers_resolves_to_somewhere_else() {
+        let h = vault();
+        for room in ["band-one", "green-room", "watch", "core", "relations"] {
+            h.with(|w| w.leave("m1").ok());
+            h.with(|w| w.enter("m1", "Maker-01", at(room)).unwrap());
+            let here = h.read(|w| w.actor("m1").unwrap().at.clone());
+
+            let offered = destinations(&h, "m1");
+            assert!(!offered.is_empty(), "nowhere to go from {room}");
+            for (name, place) in &offered {
+                assert_ne!(place, &here, "{room}: offered where it already stands");
+                assert_eq!(
+                    place_by_name(&h, "m1", name).as_ref(),
+                    Some(place),
+                    "{room}: `{name}` resolves somewhere other than what was offered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_name_means_one_place() {
+        // Two arms with the same text tokenise to one common prefix with
+        // nothing left over, which the stencil refuses as `EmptyArm` — and that
+        // fails the *whole* grammar, so every turn afterwards free-decodes.
+        let h = vault();
+        h.with(|w| w.enter("m1", "Maker-01", at("band-one")).unwrap());
+        let mut names: Vec<String> = destinations(&h, "m1")
+            .into_iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect();
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(before, names.len(), "the same name offered twice");
+    }
+
+    #[test]
+    fn nowhere_unreachable_is_ever_offered() {
+        // A walled-off wing absent rather than offered and refused. Checked
+        // against the router rather than against a list, so the two cannot
+        // drift.
+        let h = vault();
+        h.with(|w| w.enter("m1", "Maker-01", at("green-room")).unwrap());
+        let here = h.read(|w| w.actor("m1").unwrap().at.clone());
+        for (name, place) in destinations(&h, "m1") {
+            let there = h.read(|w| npc_map::route::distance(w.map(), &here, &place));
+            assert!(
+                there.is_some_and(|n| n > 0),
+                "`{name}` is offered and there is no way to walk to it"
+            );
+        }
+    }
+
     #[test]
     fn going_where_you_already_are_is_no_journey() {
         let h = room();
@@ -957,7 +1088,10 @@ mod tests {
             "m1",
             &act("move_to", json!({"destination": "the green room"})),
         );
-        assert!(!out.happened(), "a walk to nowhere read as a journey: {out:?}");
+        assert!(
+            !out.happened(),
+            "a walk to nowhere read as a journey: {out:?}"
+        );
         let why = out.line().unwrap();
         assert!(why.contains("already"), "{why}");
         assert!(h.read(|w| w.actor("m1").unwrap().walk.is_none()));
@@ -1023,7 +1157,11 @@ mod tests {
             w.enter("m2", "Perrin Vastwood", at("green-room")).unwrap();
             w.enter("m3", "Perrin Aldis", at("green-room")).unwrap();
         });
-        assert_eq!(here_by_name(&h, "m1", "Perrin"), None, "guessed between two");
+        assert_eq!(
+            here_by_name(&h, "m1", "Perrin"),
+            None,
+            "guessed between two"
+        );
         assert_eq!(
             here_by_name(&h, "m1", "Perrin Aldis").as_deref(),
             Some("m3")
@@ -1049,13 +1187,14 @@ mod tests {
         assert!(many.contains("are here"), "{many}");
     }
 
-    /// **The person waited on is told**, and that is the mechanism.
+    /// **Stopping is something the room can see**, and that is the mechanism.
     ///
     /// Two characters waiting on each other used to sit until something else
-    /// moved. Now the first wait reaches the second as something they perceive,
-    /// so they have a reason to speak, and speaking is what ends the wait.
+    /// moved, and the typed wait needed a rule of its own to prevent it. This
+    /// needs none: the first one to stop gives the other something to react to,
+    /// and both come back on their own clock regardless.
     #[test]
-    fn waiting_on_somebody_is_something_they_can_see() {
+    fn stopping_is_something_the_room_can_see() {
         let h = vault();
         h.with(|w| {
             w.enter("m1", "Wyneth Vayne", at("green-room")).unwrap();
@@ -1065,69 +1204,125 @@ mod tests {
             h.delta(b);
         }
 
-        let out = perform(
-            &h,
-            "m1",
-            &act("wait_for", json!({"for": "someone_speaks", "who": "Perrin Vastwood"})),
-        );
+        let out = perform(&h, "m1", &act("reflect", json!({})));
         assert!(out.happened(), "{out:?}");
 
-        // It reaches the room, aimed at them — the same channel a gesture uses.
-        let seen = h.delta("m2");
-        let text = format!("{seen:?}");
+        // It reaches the room — the same channel a gesture uses, aimed at
+        // nobody, because stopping asks nothing of anyone.
+        let seen = format!("{:?}", h.delta("m2"));
         assert!(
-            text.contains("waiting for you to say something"),
-            "the one waited on was not told: {text}"
+            seen.contains("lets the moment pass"),
+            "the room did not see it: {seen}"
+        );
+        assert!(
+            !seen.contains(", at "),
+            "a pause was aimed at somebody: {seen}"
         );
     }
 
-    /// A wait on nobody asks nothing of anybody, so nothing is shown — and it
-    /// is still a wait.
+    /// A pause refuses nothing — which is the whole of why it replaced the
+    /// typed wait, whose `for` could be missing, unparseable, or name somebody
+    /// who was not there, and every one of those was a refusal a character
+    /// could not learn from.
     #[test]
-    fn an_unnamed_wait_puts_nobody_under_an_obligation() {
+    fn stopping_refuses_nothing() {
         let h = room();
-        let out = perform(&h, "m1", &act("wait_for", json!({"for": "someone_arrives"})));
+        for args in [
+            json!({}),
+            json!({"inner_thoughts": "that this room is colder than it was"}),
+            // Anything a model might tack on is ignored rather than refused.
+            json!({"for": "someone_speaks", "who": "Maker-02"}),
+        ] {
+            let out = perform(&h, "m1", &act("reflect", args.clone()));
+            assert!(out.happened(), "{args} was refused: {out:?}");
+        }
+    }
+
+    /// **An inner thought is read back by the one who had it, and by nobody
+    /// else.** That asymmetry is the whole of what makes it inner: it is
+    /// carried into this character's next decode and into no other, so nobody
+    /// can answer it and nobody can hold the character to it.
+    #[test]
+    fn what_a_character_thinks_while_it_stops_stays_inside_it() {
+        let h = room();
+        h.delta("m1");
+        h.delta("m2");
+
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "reflect",
+                json!({"inner_thoughts": "that Maker-02 has been lying about the ledger"}),
+            ),
+        );
+        let Outcome::Did(mine) = &out else {
+            panic!("{out:?}");
+        };
+        assert!(mine.contains("lying about the ledger"), "{mine}");
+
+        let theirs = format!("{:?}", h.delta("m2"));
+        assert!(
+            theirs.contains("lets the moment pass"),
+            "the room did not see it stop: {theirs}"
+        );
+        assert!(
+            !theirs.contains("lying about the ledger"),
+            "the thought was said out loud: {theirs}"
+        );
+    }
+
+    /// **How it feels and what it has settled on are read back to it too.**
+    ///
+    /// Nothing acts on the register yet — a mood is set by provenance at a
+    /// barrier, not by a character announcing one — but the word has to survive
+    /// the turn it was said in before anything can. Read back, it is in the
+    /// window on the next decode, which is the smallest version of the loop.
+    #[test]
+    fn a_character_reads_back_what_it_felt_and_what_it_worked_out() {
+        let h = room();
+        h.delta("m1");
+        h.delta("m2");
+
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "reflect",
+                json!({
+                    "inner_thoughts": "that the ledger does not add up",
+                    "feeling": "cornered",
+                    "my_reflections": "that I have been covering for somebody out of habit"
+                }),
+            ),
+        );
+        let Outcome::Did(mine) = &out else {
+            panic!("{out:?}");
+        };
+        assert!(mine.contains("cornered"), "{mine}");
+        assert!(mine.contains("covering for somebody"), "{mine}");
+        // And the two are not run together — one is what is passing through,
+        // the other is what has settled, which is the whole reason for two
+        // fields.
+        assert!(
+            mine.find("does not add up") < mine.find("covering for somebody"),
+            "{mine}"
+        );
+
+        // The room sees none of it.
+        let theirs = format!("{:?}", h.delta("m2"));
+        for private in ["cornered", "covering for somebody", "does not add up"] {
+            assert!(!theirs.contains(private), "`{private}` reached the room");
+        }
+    }
+
+    #[test]
+    fn a_body_that_is_nowhere_can_still_stop() {
+        // Nothing to be seen doing it, and stopping is still a perfectly good
+        // thing to have done.
+        let h = vault();
+        let out = perform(&h, "nobody", &act("reflect", json!({})));
         assert!(out.happened(), "{out:?}");
-        let seen = h.delta("m2");
-        assert!(
-            !format!("{seen:?}").contains("waiting"),
-            "an unnamed wait leaned on somebody: {seen:?}"
-        );
-    }
-
-    #[test]
-    fn a_wait_for_nothing_in_particular_is_refused() {
-        let h = room();
-        // No `for`: the old `wait`, and the thing the typed act exists to
-        // prevent — a wait nothing in the world can ever answer.
-        let out = perform(&h, "m1", &act("wait_for", json!({"who": "Maker-02"})));
-        let Outcome::Refused(why) = out else {
-            panic!("a wait for nothing was allowed: {out:?}");
-        };
-        assert!(why.contains("someone_speaks"), "{why}");
-
-        // A kind the world cannot settle is refused the same way.
-        let out = perform(
-            &h,
-            "m1",
-            &act("wait_for", json!({"for": "the silence to speak"})),
-        );
-        assert!(!out.happened(), "{out:?}");
-    }
-
-    #[test]
-    fn waiting_on_somebody_who_is_not_here_is_refused_and_names_who_is() {
-        let h = room();
-        let out = perform(
-            &h,
-            "m1",
-            &act("wait_for", json!({"for": "someone_speaks", "who": "Hess"})),
-        );
-        let Outcome::Refused(why) = out else {
-            panic!("waited on a ghost: {out:?}");
-        };
-        assert!(why.contains("Hess is not here"), "{why}");
-        assert!(why.contains("Maker-02"), "it did not name who is: {why}");
     }
 
     #[test]
@@ -1274,6 +1469,46 @@ mod tests {
             assert!(line.ends_with('.'), "{why:?}: {line}");
             for leak in ["{", "}", "Refused", "vault-casting", "_"] {
                 assert!(!line.contains(leak), "{why:?} leaked {leak:?}: {line}");
+            }
+        }
+    }
+
+    /// **No act turns a refusal into prose by debug-formatting it.**
+    ///
+    /// The test above holds [`refusal`] to English, and cannot see a caller
+    /// that never calls it. Five sites in `enact` wrote
+    /// `Outcome::Refused(format!("{why:?}"))` instead — one character shorter,
+    /// and it put a Rust type name in somebody's mouth. Live, a character was
+    /// told `AlreadyAtAStation`: not a sentence, not English, and nothing it
+    /// could act on. The variant had a perfectly good rendering all along
+    /// — "You are already working at something." — three files away.
+    ///
+    /// Read from the source because that is where the mistake is: any new act
+    /// that reaches for `{:?}` on the refusal path fails here, whether or not
+    /// anybody thought to test the act itself.
+    #[test]
+    fn no_act_hands_a_character_a_debug_formatted_refusal() {
+        // **Assembled, so this test is not itself a hit.** Written out whole,
+        // the needles appear in this file and the scan below finds its own
+        // source — which is what happened on the first run.
+        let refused = concat!("Outcome::", "Refused");
+        let debugged = concat!(":", "?}");
+
+        for (name, src) in [
+            ("body.rs", include_str!("body.rs")),
+            ("enact.rs", include_str!("enact.rs")),
+            ("work.rs", include_str!("work.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !(line.contains(refused) && line.contains(debugged)),
+                    "{name}:{}: a refusal is debug-formatted — call `body::refusal` instead:\n{}",
+                    n + 1,
+                    line.trim()
+                );
             }
         }
     }

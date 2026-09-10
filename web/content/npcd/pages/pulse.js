@@ -55,13 +55,18 @@ const FEED_KEEP = 400;
  * column: a run of quiet grey with one amber preempt in it is legible at a
  * glance in a way a text column never is. */
 const CAUSE = {
-  blocked:   { label: 'quiet',   hint: 'the heartbeat fired on an empty inbox' },
+  quiet:     { label: 'quiet',   hint: 'came back on its own from a pause, with nothing waiting' },
   pending:   { label: 'batch',   hint: 'drained the events that were waiting' },
   preempted: { label: 'preempt', hint: 'a high-salience event forced this tick now' },
 };
 
+/* The same three states, read as "what is it doing now" rather than "why did it
+ * wake". `quiet` was `blocked` on both maps and rendered under two different
+ * words — and "blocked" is wrong twice over: it reads as stuck, and since idle
+ * ticks were removed it is the resting state of every character with nothing
+ * happening to it rather than a rare one. */
 const READY = {
-  blocked:   { label: 'blocked',   hint: 'inbox empty — burns no decode, not in the batch' },
+  quiet:     { label: 'quiet',     hint: 'inbox empty — burns no decode, waiting on the world' },
   pending:   { label: 'pending',   hint: 'events waiting for the next tick' },
   preempted: { label: 'preempted', hint: 'ticking now' },
 };
@@ -79,23 +84,81 @@ function hueOf(id) {
   return (acc % 360 + 47 * (acc % 7)) % 360;
 }
 
-/* A heartbeat is the character's idle metabolism. Rendered as a duration
- * because "4s" and "2m" say something a raw millisecond count does not. */
-function beat(ms) {
-  if (ms == null) return '—';
-  if (ms >= 60000) return Math.round(ms / 60000) + 'm';
-  if (ms >= 1000) return Math.round(ms / 1000) + 's';
-  return ms + 'ms';
+/* How long ago, for a card that is re-rendered every poll.
+ *
+ * The server sends an age rather than a timestamp, so nothing here has to
+ * reconcile this browser's clock with the daemon's — see `Census::acted_ms_ago`.
+ * `null` is a character that has not acted yet, which is a different fact from
+ * a long silence and reads as one. */
+function ago(ms) {
+  if (ms == null) return 'no acts yet';
+  if (ms < 1000) return 'just now';
+  if (ms < 60000) return Math.round(ms / 1000) + 's ago';
+  if (ms < 3600000) return Math.round(ms / 60000) + 'm ago';
+  return Math.round(ms / 3600000) + 'h ago';
 }
 
-/* An act arrives as "tool — intent; intent". Split so the tool can be set in
- * mono and the intent in the body face, italic — the same treatment the landing
- * page's demo gives an act, because it is the same thing. */
+/* An act arrives as "tool — what was asked → what came of it", with `✗` in
+ * place of the arrow when the world refused it. Three parts, set in three
+ * faces: the tool in mono, what it asked for in the body face, and what came
+ * back in a quieter one — green-ish when it landed, warn when it did not.
+ *
+ * Split on the marks rather than parsed, because they are single characters
+ * chosen for exactly this (`runtime::LANDED` / `runtime::REFUSED`) and cannot
+ * appear inside either half's prose. An act with nothing to report — one that
+ * happens in a head — has no arrow and simply has no outcome part.
+ *
+ * The intent half is searched for the mark rather than the whole string: an
+ * outcome can quote a room name containing an em-dash, and splitting the tool
+ * off first means only the tail is ever scanned for the arrow. */
 function splitAct(text) {
   const i = text.indexOf(' — ');
-  return i === -1
-    ? { tool: text, intent: '' }
-    : { tool: text.slice(0, i), intent: text.slice(i + 3) };
+  let tool = text;
+  let intent = '';
+  if (i !== -1) {
+    tool = text.slice(0, i);
+    intent = text.slice(i + 3);
+  }
+  for (const [mark, ok] of [[' → ', true], [' ✗ ', false]]) {
+    const j = intent.indexOf(mark);
+    if (j !== -1) {
+      return { tool, intent: intent.slice(0, j), said: intent.slice(j + mark.length), ok };
+    }
+    /* A no-argument act — `recall`, `reflect` with nothing — puts the mark
+     * straight after the tool, so the whole tail is the outcome. */
+    if (i === -1 && tool.indexOf(mark.trimEnd()) !== -1) {
+      const k = tool.indexOf(mark.trimEnd());
+      return { tool: tool.slice(0, k), intent: '', said: tool.slice(k + mark.length - 1), ok };
+    }
+  }
+  return { tool, intent, said: '', ok: true };
+}
+
+/* The arguments half of an act, as one node per argument.
+ *
+ * A multi-argument act arrives as `name: value; name: value` (`Act::summary`),
+ * so each part gets its label set apart from its value — "to" and "about" in a
+ * small dim mono, the values in the body face. A single-argument act arrives
+ * bare and stays bare: a label in front of the only thing worth reading is
+ * noise.
+ *
+ * The label is taken only when the part *starts* with a short bare word and a
+ * colon-space. A value that happens to contain ": " later on — a quoted line, a
+ * ratio — cannot be mistaken for one, and a value that begins with prose keeps
+ * its whole self.
+ */
+function actArgs(intent) {
+  if (!intent) return [];
+  return intent.split('; ').flatMap((part, n) => {
+    const m = /^([a-z_]{1,20}): ([\s\S]+)$/.exec(part);
+    const sep = n ? h('span', { class: 'act-sep' }, '·') : null;
+    if (!m) return [sep, h('span', { class: 'act-intent' }, part)].filter(Boolean);
+    return [
+      sep,
+      h('span', { class: 'act-key' }, m[1]),
+      h('span', { class: 'act-val' }, m[2]),
+    ].filter(Boolean);
+  });
 }
 
 /* Where a character is in its day, as a word. A phase of 0.53 means nothing to
@@ -199,7 +262,7 @@ export async function render() {
       return;
     }
     mount(censusHost, ...cast.map((c) => {
-      const r = READY[c.readiness] || READY.blocked;
+      const r = READY[c.readiness] || READY.quiet;
       const id = String(c.npc_id);
       const on = focus === id;
       const hue = hueOf(id);
@@ -211,13 +274,21 @@ export async function render() {
         onClick: () => { focus = on ? null : id; lastTick = -1; refetch(); },
       },
         h('span', { class: 'cast-spine' }),
+        /* **How long since it last did anything**, in the corner, because it is
+         * the one figure on this card that says whether the cast is alive at
+         * all. It replaced the idle metabolism — a heartbeat that has scheduled
+         * nothing since idle ticks were removed, so an operator could watch its
+         * number while the world did not move. */
+        h('span', {
+          class: 'cast-age',
+          title: 'how long since this character last acted',
+        }, ago(c.acted_ms_ago)),
         h('span', { class: 'cast-name' }, nameOf(id)),
         h('span', { class: 'cast-state' },
           h('span', { class: 'cast-dot' }), r.label),
         h('div', { class: 'cast-figs' },
           h('span', {}, fmtNum(c.ticks) + ' ticks'),
           c.inbox_depth ? h('span', { class: 'cast-inbox' }, c.inbox_depth + ' waiting') : null,
-          h('span', { title: 'the idle metabolism — salience sets it' }, '♥ ' + beat(c.heartbeat_ms)),
         ),
         /* The window's occupancy. `faded` is not a loss — those turns are in
          * the substrate and the gather can pull them back — but a full bar with
@@ -294,13 +365,17 @@ export async function render() {
       mount(feedHost, h('div', { class: 'pulse-empty' },
         h('p', {}, focus
           ? 'This character has not thought yet.'
-          : 'Nothing has ticked yet. A quiet character still wakes on its ' +
-            'heartbeat — give it a moment.')));
+          /* Not "wakes on its heartbeat", which it has not done since idle
+           * ticks were removed. A character thinks when something reaches it —
+           * somebody speaking, a message, or the room it is standing in doing
+           * something — and at no other time. */
+          : 'Nothing has ticked yet. A character thinks when something reaches ' +
+            'it — give the room a moment.')));
       return;
     }
     const newest = ticks[0].tick;
     mount(feedHost, ...ticks.map((t) => {
-      const c = CAUSE[t.cause] || CAUSE.blocked;
+      const c = CAUSE[t.cause] || CAUSE.quiet;
       const id = String(t.npc_id);
       const fresh = t.tick > lastTick;
       return h('article', {
@@ -316,8 +391,13 @@ export async function render() {
           }, nameOf(id)),
           h('span', { class: 'tick-cause', title: c.hint }, c.label),
           h('span', { class: 'tick-spacer' }),
-          h('span', { class: 'tick-beat', title: 'metabolism after this tick' },
-            '♥ ' + beat(t.heartbeat_ms)),
+          /* When this happened, not the metabolism after it. A heartbeat has
+           * scheduled nothing since idle ticks were removed, so `♥ 4s` was the
+           * same figure on every row of the feed whatever the world was doing —
+           * where the age tells you at a glance whether you are looking at a
+           * live world or the last thing it did an hour ago. */
+          h('span', { class: 'tick-beat', title: 'when this tick ran' },
+            ago(t.ms_ago)),
         ),
         /* The literal prose the model received. Not a summary of it — a summary
          * would hide exactly the wording bugs this view exists to catch. The
@@ -327,10 +407,15 @@ export async function render() {
           ...t.perceived.map((p) => h('p', { class: 'perceive', title: p }, p))),
         t.acts && t.acts.length
           ? h('div', { class: 'tick-acts' }, ...t.acts.map((a) => {
-              const { tool, intent } = splitAct(a);
-              return h('div', { class: 'act' },
+              const { tool, intent, said, ok } = splitAct(a);
+              /* The tool, each argument as its own labelled part, then what
+               * came of it — and the whole line in `title`, so what is on
+               * screen is a crop rather than an edit. */
+              return h('div', { class: ok ? 'act' : 'act refused', title: a },
                 h('span', { class: 'act-tool' }, tool),
-                intent ? h('span', { class: 'act-intent' }, intent) : null);
+                ...actArgs(intent),
+                said ? h('span', { class: 'act-mark' }, ok ? '→' : '✗') : null,
+                said ? h('span', { class: 'act-said' }, said) : null);
             }))
           /* Absent, not "no acts". A character choosing to do nothing is a
            * different and much more interesting fact than a decode that did not
@@ -431,10 +516,6 @@ export async function render() {
       h('div', { class: 'pulse-hd-main' },
         h('h1', {}, 'Pulse'),
         statusEl),
-      h('p', { class: 'pulse-lede' },
-        'Every character’s loop, interlaced in the order things happened. A character with an ',
-        'empty inbox is ', h('em', {}, 'blocked'), ' — it burns no decode and is not in the batch, ',
-        'which is what lets a hundred of them run at once.'),
     ),
     censusHost,
     worldHost,

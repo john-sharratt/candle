@@ -300,12 +300,13 @@ async fn main() -> anyhow::Result<()> {
         // Save is broken", and an operator should learn it here rather than
         // from a 403 an hour later.
         tracing::warn!(
-            "roles: no admins configured — worlds and personalities are read-only to everyone"
+            "roles: nobody configured — worlds and personalities are read-only to everyone"
         );
     } else {
         tracing::info!(
-            "roles: {} admin principal(s) configured",
-            roles.admins.len()
+            "roles: {} admin and {} creator principal(s) configured",
+            roles.admins.len(),
+            roles.creators.len(),
         );
     }
 
@@ -320,6 +321,21 @@ async fn main() -> anyhow::Result<()> {
         libraries.moods.len(),
         libraries.moods.with_examples(),
     );
+
+    // The registers a character may say it is in, taken here because the
+    // library itself is about to be handed to the authoring state.
+    //
+    // Captured once rather than resolved per tick, unlike the persona: the
+    // libraries are read once and do not change while the daemon runs, and this
+    // list is compiled into a decoding grammar — a set that could change under
+    // the engine would mean recompiling the stencil on a turn nobody asked to
+    // be different.
+    let feelings: Vec<String> = libraries
+        .moods
+        .sections
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
 
     // The mind directory, for the file editor. Taken from the resolved schema
     // rather than from `--mind` directly, so the editor and the collections
@@ -404,6 +420,8 @@ async fn main() -> anyhow::Result<()> {
         )
     }));
 
+    runtime.set_feelings(feelings);
+
     // Who each character is, resolved at tick time rather than captured at
     // startup. A belief edited through the authoring API has to reach the next
     // tick — a persona snapshot taken here would keep every character as it was
@@ -448,6 +466,16 @@ async fn main() -> anyhow::Result<()> {
             .npcs
             .blocking_write()
             .remember_place(npc_id, at, now_ms_i64() as u64);
+    }));
+
+    // And how it feels, for the same reason and by the same route: a mood is
+    // what a character *is* between one thought and the next, and holding it
+    // only in RAM meant a restart returned everybody to no register at all.
+    // Written only when the register has actually changed, so almost every call
+    // is a map lookup.
+    let mood_state = authored.clone();
+    runtime.set_mood_sink(Arc::new(move |npc_id: u64, mood: &str| {
+        mood_state.npcs.blocking_write().remember_mood(npc_id, mood);
     }));
 
     // The places the cast stands in, one world at a time.

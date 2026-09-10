@@ -55,7 +55,6 @@ use crate::engine::prompt::{self, Persona};
 use crate::engine::schema;
 use crate::engine::tick::{Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode};
-use crate::engine::waiting;
 use crate::engine::watcher::Ledger;
 use crate::mind::Mind;
 use crate::model;
@@ -88,6 +87,37 @@ const PREFILL_PASS_TOKENS: usize = 8192;
 /// Reading it per tick is what makes a pause take effect on the next tick
 /// instead of whenever something happened to re-read a cached value.
 pub type WorldClock = Arc<dyn Fn(u64) -> u64 + Send + Sync>;
+
+/// What separates an act from what came of it in a feed line, when it landed.
+///
+/// A single character with spaces around it, because the console splits on it
+/// to set the two halves in different faces — see `pulse.js::splitAct`. A word
+/// would appear inside the prose on either side of it and the split would land
+/// in the middle of a sentence.
+pub const LANDED: &str = "→";
+
+/// The same, when the world refused. Distinct from [`LANDED`] so a refusal is
+/// legible as one at a glance rather than by reading the sentence.
+pub const REFUSED: &str = "✗";
+
+/// What one act left behind, for the two readers that want different things.
+///
+/// **A person watching and the character that acted need different sentences.**
+/// The feed wants the act — `move_to — the command room` — in a scannable
+/// column beside every other act. The character wants the world's verdict —
+/// "You got to the command room." — because that is the only thing that says
+/// whether what it tried happened.
+///
+/// These were one string while the feed was the only channel. Handing that
+/// string to the model as a `<tool_response>` sent it its own arguments back
+/// as though they were an outcome. See [`Runtime::record_act`].
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    /// The Pulse line, and the character's window.
+    pub feed: String,
+    /// What the character is told came of the act.
+    pub answer: String,
+}
 
 /// Everything the prompt needs about one character, owned.
 ///
@@ -152,6 +182,15 @@ pub type PersonaSource = Arc<dyn Fn(u64) -> Option<OwnedPersona> + Send + Sync>;
 /// every call.
 pub type PlaceSink = Arc<dyn Fn(u64, &str) + Send + Sync>;
 
+/// Records the register a character has named for itself, so it survives a
+/// restart the way its position does.
+///
+/// A sink for the same reason [`PlaceSink`] is one, and called from the tick
+/// thread — so it must never block on anything slow. The registry writes only
+/// when the register has actually changed, which makes almost every call a map
+/// lookup.
+pub type MoodSink = Arc<dyn Fn(u64, &str) + Send + Sync>;
+
 /// The live engine, once loaded.
 pub struct Runtime {
     // No `engine` handle here. `Minds` holds the one `Arc<Mutex<…>>` there is,
@@ -208,6 +247,9 @@ pub struct Runtime {
     /// installed simply is not checkpointed — nothing is lost that was not
     /// already going to be.
     place_sink: RwLock<Option<PlaceSink>>,
+    /// Where a named register goes to be remembered. Absent until installed,
+    /// and a character that names one before then simply is not recorded.
+    mood_sink: RwLock<Option<MoodSink>>,
     /// The worlds this daemon is running.
     ///
     /// Distinct from `Authored::worlds`, which is the registry of world
@@ -229,6 +271,19 @@ pub struct Runtime {
     /// Each world's building, rendered once. The same text for every character
     /// in it, and it never changes.
     places: Mutex<BTreeMap<String, String>>,
+    /// The registers `<mind>/moods/` has a mood written for.
+    ///
+    /// Injected at startup rather than read here, the same as the persona
+    /// source: the libraries are the daemon's to load, and the engine's job is
+    /// to offer whatever it is given. Empty until then, and empty for a daemon
+    /// with no mind — which drops the parameter rather than the act.
+    feelings: RwLock<Vec<String>>,
+    /// How soon each character may take each act again.
+    ///
+    /// Here rather than on a world, because the limit belongs to the person
+    /// acting: a character that moved between bodies mid-fight would otherwise
+    /// get a free swing.
+    pub cooldowns: crate::engine::cooldown::Cooldowns,
     /// Set on shutdown so the driver thread stops rather than being killed
     /// mid-tick with a half-written turn.
     stopping: AtomicBool,
@@ -289,9 +344,9 @@ pub const MAPS: &str = "map";
 /// plan. It needs to name the **next** thing, once. The going will happen on
 /// its own when the character has something worth carrying.
 pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your own. That is \
-                              not nothing to do: the work is in front of you. `observe` one \
-                              thing within reach — a ledger, a filed story, a date on the wall \
-                              — closely enough to have a view about it you could defend.";
+                              not nothing to do: the work is in front of you. Take up one thing \
+                              within reach — a ledger, a filed story, a date on the wall — and \
+                              carry it far enough to have a view about it you could defend.";
 
 /// How long a character must go without news before the standing task is
 /// restated to it.
@@ -303,24 +358,6 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
 /// conversation being over. Short enough that a character genuinely left alone
 /// does not stand in a room for minutes with nothing to go on.
 const IDLE_AFTER_MS: u64 = 90_000;
-
-/// Whether somebody else's wait is, in effect, on **me**.
-///
-/// **An unnamed wait for speech is a wait on everybody who could speak.** The
-/// first version of this asked only whether the wait named me, which left the
-/// ambient wait invisible to the rule that stops two characters waiting at each
-/// other: neither named the other, so neither was excluded, and a cast went
-/// completely silent — every act in the feed a `wait_for`, three characters
-/// each waiting for a voice none of them was going to be the first to use.
-///
-/// Arrival and departure are not like this. Waiting for somebody to walk in
-/// asks nothing of the person already standing there.
-fn waiting_on_me(w: &waiting::Waiting, me: &str) -> bool {
-    match &w.who {
-        Some(who) => who.eq_ignore_ascii_case(me),
-        None => w.kind == waiting::Kind::SomeoneSpeaks,
-    }
-}
 
 /// The same instruction, for a character that is not alone.
 ///
@@ -400,11 +437,14 @@ impl Runtime {
             minds: RwLock::new(None),
             persona: RwLock::new(None),
             place_sink: RwLock::new(None),
+            mood_sink: RwLock::new(None),
             hosted,
             interactions: crate::engine::interaction::Interactions::new(),
             bodies: Bindings::new(),
             metronomes: Mutex::new(BTreeMap::new()),
             places: Mutex::new(BTreeMap::new()),
+            feelings: RwLock::new(Vec::new()),
+            cooldowns: crate::engine::cooldown::Cooldowns::new(),
             stopping: AtomicBool::new(false),
             started: Instant::now(),
         })
@@ -643,56 +683,30 @@ impl Runtime {
         let Some((hosted, body)) = self.body_of(npc_id) else {
             return tools::Within::nowhere();
         };
-        // Name *and* body, because the two questions below need different
-        // halves: the grammar binds names, and finding whose mind is behind a
-        // name needs the body it stands in.
-        let (me, here): (Option<String>, Vec<(String, String)>) = hosted.read(|w| {
+        // Names, because that is what the grammar binds and what the character
+        // was shown. It used to carry the body ids alongside, to look up whose
+        // mind was behind each name and ask what it was waiting for; nothing
+        // waits any more, so the second half went with the wait.
+        let company: Vec<String> = hosted.read(|w| {
             let Some(mine) = w.actor(&body) else {
-                return (None, Vec::new());
+                return Vec::new();
             };
-            let at = mine.at.clone();
-            let name = mine.name.clone();
-            (
-                Some(name),
-                w.actors_at(&at)
-                    .into_iter()
-                    .filter(|a| a.id != body)
-                    .map(|a| (a.name.clone(), a.id.clone()))
-                    .collect(),
-            )
+            w.actors_at(&mine.at.clone())
+                .into_iter()
+                .filter(|a| a.id != body)
+                .map(|a| a.name.clone())
+                .collect()
         });
-        let company: Vec<String> = here.iter().map(|(n, _)| n.clone()).collect();
-        // **Who is already waiting on this character**, so it cannot wait back.
-        //
-        // Waiting on somebody wakes them. If they could return the favour the
-        // two would ping-pong — each waking the other to do nothing — which
-        // costs a decode a turn and is worse than the deadlock it replaced.
-        // Struck from the grammar's list, the only thing left is to act.
-        //
-        // Resolved through the **world and the bindings**, not through authored
-        // personas: the world is what wrote these names down and is what the
-        // character was shown, and a daemon whose authored state has not loaded
-        // must not silently lose the rule that keeps two characters from
-        // staring at each other.
-        let waited_on_by = match me {
-            None => Vec::new(),
-            Some(me) => here
-                .iter()
-                .filter(|(_, other_body)| {
-                    self.bodies
-                        .mind_of(hosted.id(), other_body)
-                        .and_then(|other| self.scheduler.waiting(other))
-                        .is_some_and(|(w, _)| waiting_on_me(&w, &me))
-                })
-                .map(|(n, _)| n.clone())
-                .collect(),
-        };
         let base = tools::Within {
             company,
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
             places: body::reachable(&hosted, &body),
-            waited_on_by,
+            // What this body has done too recently to do again. Asked here, at
+            // the one place a situation is composed, so no route can build a
+            // grammar that has forgotten about it.
+            cooling: self.cooldowns.cooling(npc_id),
+            feelings: self.feelings.read().unwrap().clone(),
             me: hosted.read(|w| w.actor(&body).map(|a| a.name.clone()).unwrap_or_default()),
             ..Default::default()
         };
@@ -844,14 +858,10 @@ impl Runtime {
             sim.threads.reach(from, &them);
             let _ = sim.threads.send(from, &them, text);
             // Everybody a handset can reach comes from the cast rather than the
-            // room, so a person on a thread has to be written into the roster
-            // or the character is offered nobody to answer.
-            let mut roster = sim.contacts_roster();
-            if !roster.iter().any(|n| n == from) {
-                roster.push(from.to_string());
-                roster.sort();
-                sim.set_roster(roster);
-            }
+            // room, so a person messaging in from outside has to be made known
+            // to the world's phones or the character is offered nobody to
+            // answer. See [`crate::sim::Sim::enrol`].
+            sim.enrol(from);
             MessageSent {
                 with: them.clone(),
                 waiting_for_them: sim.threads.waiting_for(&them),
@@ -865,7 +875,11 @@ impl Runtime {
     }
 
     /// The conversation between a person and a character, oldest first.
-    pub fn messages_with(&self, npc_id: u64, from: &str) -> Option<(String, Vec<(String, String)>)> {
+    pub fn messages_with(
+        &self,
+        npc_id: u64,
+        from: &str,
+    ) -> Option<(String, Vec<(String, String)>)> {
         let (hosted, body) = self.body_of(npc_id)?;
         let them = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
         let said = hosted.sim(|sim| {
@@ -882,73 +896,130 @@ impl Runtime {
         Some((them, said))
     }
 
-    /// Arm the scheduling half of a `wait_for` that the world accepted.
+    /// Say something on a world's standing channel, as a person outside it.
     ///
-    /// See [`waiting_on_me`] for the unnamed case.
+    /// **The same channel the cast is on, not an operator broadcast.** There is
+    /// already an act that reaches every character regardless of where they are
+    /// standing — `pulse::broadcast` — and it is a different thing on purpose:
+    /// it puts words into a mind from outside the fiction, and nothing in the
+    /// world can see that it happened or answer it. This is a person speaking
+    /// on a conversation, so it lands in [`crate::sim::phone`], arrives through
+    /// the ordinary sweep, and can be answered with the ordinary `message` act
+    /// by any character that has something to say back.
     ///
-    /// Anything else is ignored: a character that walks, speaks or looks is not
-    /// waiting, and a `wait_for` the world refused never stood.
-    fn arm_wait(&self, npc_id: u64, act: &Act, world_ms: u64, within: &tools::Within) {
-        if act.tool != "wait_for" {
-            return;
-        }
-        let Some(kind) = act
-            .args
-            .get("for")
-            .and_then(|v| v.as_str())
-            .and_then(waiting::Kind::parse)
-        else {
-            return;
-        };
-        let who = act
-            .args
-            .get("who")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        self.scheduler.begin_waiting(
-            npc_id,
-            waiting::Waiting::new(kind, who, world_ms),
-            within.company.clone(),
-            world_ms,
-        );
+    /// Returns who is on the channel to hear it. `None` when the world is not
+    /// hosted.
+    pub fn say_on_channel(&self, world_id: &str, from: &str, text: &str) -> Option<Vec<String>> {
+        let hosted = self.hosted.get(world_id)?;
+        Some(hosted.with_sim(|sim| {
+            // Enrolled first, so somebody speaking for the first time is on the
+            // channel before their own words go onto it — otherwise `send`
+            // refuses, having correctly found that they are on no such thread.
+            sim.enrol(from);
+            sim.threads
+                .send(from, crate::sim::phone::CHANNEL, text)
+                .unwrap_or_default()
+        }))
     }
 
-    /// Ask the world whether anybody's wait has been answered, and wake them.
+    /// What has been said on a world's standing channel, oldest first.
     ///
-    /// **Run every drive pass, not per tick**, because a waiting character does
-    /// not tick — that is the whole point of it waiting. Something outside has
-    /// to notice on its behalf, and this is that something.
+    /// Read as `who`, because a channel is named the same way to everybody on
+    /// it but only shows what was said after each member arrived.
+    pub fn channel(&self, world_id: &str, who: &str) -> Option<Vec<(String, String)>> {
+        let hosted = self.hosted.get(world_id)?;
+        Some(hosted.sim(|sim| {
+            sim.threads
+                .by_name_for(who, crate::sim::phone::CHANNEL)
+                .map(|t| {
+                    t.messages
+                        .iter()
+                        .skip(t.arrived_at(who))
+                        .map(|m| (m.from.clone(), m.intent.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }))
+    }
+
+    /// Leave words on something in a world, as a person outside it.
     ///
-    /// The two questions are asked of different places on purpose. Speech is
-    /// matched against the character's own inbox, where it arrives structured
-    /// with a speaker; arrivals and departures are asked of the **world**, by
-    /// comparing the room now against the room when the wait was set, because
-    /// they reach a character as one line of narrated prose that no match could
-    /// be written against without matching on prose.
-    fn answer_waits(&self) {
-        for npc_id in self.scheduler.population_ids() {
-            let Some((wait, before)) = self.scheduler.waiting(npc_id) else {
-                continue;
-            };
-            // Per character: two characters in different worlds are at
-            // different instants, and one of those worlds may be paused — a
-            // wait must not time out because somebody else's clock ran.
-            let world_ms = self.world_ms(npc_id);
-            // Patience first: a wait nothing can answer — the person walked
-            // out, or was never going to speak — must end by itself, or the
-            // character sleeps forever while every view of it reads "blocked",
-            // which is also what a merely quiet character reads.
-            let answered = if wait.expired(world_ms) {
-                tracing::debug!("npc {npc_id}: gave up waiting {}", wait.kind.as_done());
-                true
-            } else if self.scheduler.heard_speech(npc_id, |s| wait.answered_by_speech(s)) {
-                true
-            } else {
-                wait.answered_by_room(&before, &self.within(npc_id).company)
-            };
-            if answered {
-                self.scheduler.answer_wait(npc_id);
-            }
+    /// **The world's half of `post_notice`.** A character can write on a board
+    /// it is standing at; this is how whoever runs the world puts something on
+    /// one without a body to do it — a notice that was there before the cast
+    /// arrived, an instruction from outside, a sign somebody hung years ago.
+    ///
+    /// It stands the surface up if the map never named one, so a world can grow
+    /// a board where it needs one rather than needing its map edited and
+    /// reloaded.
+    ///
+    /// Returns how many lines the surface now holds. `None` when the world is
+    /// not hosted.
+    pub fn post_in_world(
+        &self,
+        world_id: &str,
+        at: &str,
+        on: &str,
+        by: &str,
+        text: &str,
+    ) -> Option<usize> {
+        let hosted = self.hosted.get(world_id)?;
+        // A place that is not in the map would be a board nobody can ever stand
+        // at to read — writable, invisible, and impossible to diagnose from the
+        // outside. Refused here rather than written and lost.
+        let real =
+            hosted.read(|w| npc_map::world::Where::parse(at).is_some_and(|p| w.node(&p).is_some()));
+        if !real {
+            return None;
+        }
+        Some(hosted.with_sim(|s| {
+            s.post(at, on, by, text);
+            s.postings
+                .by_name_at(at, on)
+                .map(|p| p.lines.len())
+                .unwrap_or(0)
+        }))
+    }
+
+    /// Arm the scheduling half of an act the world accepted — the **stall**.
+    ///
+    /// Read from [`crate::engine::cooldown::Cost::stall`] rather than named
+    /// here, so an act's two costs are chosen together in one table instead of
+    /// one being a rate and the other an `if` in this file. Most acts stall for
+    /// nothing: only crossing a room and putting a hand on somebody take time
+    /// the world can see.
+    ///
+    /// **The mood is recorded either way.** It rode inside the stall while
+    /// `reflect` was the only act that stalled, which made a scheduling
+    /// decision quietly load-bearing for a durable record: giving reflection
+    /// its honest zero-length stall would have stopped every character's
+    /// feeling being written down, and nothing would have said so. They are two
+    /// unrelated things about the same act and are now spelled that way.
+    fn arm_pause(&self, npc_id: u64, act: &Act, now_ms: u64) {
+        if let Some(stall) = crate::engine::cooldown::stall_after(act.tool) {
+            self.scheduler
+                .pause_for(npc_id, now_ms, stall.as_millis() as u64);
+        }
+        self.note_feeling(npc_id, act);
+    }
+
+    /// Give a character another turn when its act came back with something.
+    ///
+    /// **The world answered, so the character has to get to use the answer.**
+    /// What a board says exists in the act's outcome and nowhere else — nothing
+    /// in the world perceives a document being read, so no sweep will ever
+    /// deliver it — and a character is otherwise unscheduled the moment its
+    /// queue empties. The result was a Maker that read the muster board, had the
+    /// contents written into its window, went to sleep, and read the board again
+    /// the next time anything woke it.
+    ///
+    /// Only [`body::ANSWERS`], never every act. A free follow-up after *any* act
+    /// is the treadmill: a character that speaks and is immediately asked again
+    /// speaks again, into the same silence, until its own window holds nothing
+    /// but its own voice.
+    fn arm_followup(&self, npc_id: u64, act: &Act) {
+        if body::answers(act.tool) {
+            self.scheduler.think_again(npc_id);
         }
     }
 
@@ -983,7 +1054,16 @@ impl Runtime {
         // The actor is not left in the dark meanwhile: a refusal comes back in
         // the same turn, which is the whole reason it is rendered rather than
         // logged.
-        body::perform(&hosted, &body, act)
+        let done = body::perform(&hosted, &body, act);
+        // **Only what actually happened costs a wait.** A refused act is not a
+        // thing the body did, and charging for one would leave a character that
+        // mis-named a room standing still for fifteen seconds over a typo.
+        if done.happened() {
+            // The act, not its name: `act` is two rates wearing one word, and
+            // this is the only caller that knows which of them happened.
+            self.cooldowns.took_act(npc_id, act);
+        }
+        done
     }
 
     /// Put one act into the world and render the single line that goes into the
@@ -1008,12 +1088,52 @@ impl Runtime {
     /// not something the room perceives, so the contents are in the outcome and
     /// nowhere else; summarising it would record that the character read
     /// something and drop what it read.
-    pub fn record_act(&self, npc_id: u64, act: &Act) -> String {
-        match self.act_on_world(npc_id, act) {
-            Outcome::Refused(why) => why,
-            Outcome::Did(line) if body::answers(act.tool) => line,
-            Outcome::Did(_) | Outcome::NotOfTheBody => act.summary(),
-        }
+    ///
+    /// # Two readers, two lines
+    ///
+    /// Everything above is about the **feed** — what a person watching Pulse
+    /// reads. The character is a different reader with a different need, and
+    /// [`Recorded::answer`] is its line: always the world's own verdict, for
+    /// every act, because that is the only thing that tells it whether what it
+    /// tried actually happened.
+    ///
+    /// One string served both while nothing carried results back to the model.
+    /// Now that `<tool_response>` does, the summary is the wrong thing to send:
+    /// it hands a character *its own arguments* back as though they were an
+    /// outcome. Measured live, `gesture — for Wailen to see that the room is
+    /// ours for now` — which is what the character asked for, not what came of
+    /// it. `body::ANSWERS` was an early, narrower version of exactly this
+    /// concern, written when the feed was the only channel there was.
+    pub fn record_act(&self, npc_id: u64, act: &Act) -> Recorded {
+        let outcome = self.act_on_world(npc_id, act);
+        // What the character is told, whatever the verdict. `NotOfTheBody` has
+        // no line of its own — nothing in a world happened — so it says so
+        // rather than echoing the call back.
+        let answer = match outcome.line() {
+            Some(line) => line.to_string(),
+            None => format!("Nothing in the world answers `{}`.", act.tool),
+        };
+        // **Both halves, always, in one shape.**
+        //
+        // The feed used to show one or the other and the choice depended on the
+        // verdict: an act that landed showed the *call*, an act refused showed
+        // the *world's reply*. So "Wailen Wylde is already on it." sat beside
+        // "invite — Yaelis Vayne; …" with nothing saying they were the same
+        // kind of event, that one had failed, or which act the sentence was
+        // even about.
+        //
+        // Now every line reads `tool — what was asked → what came of it`, with
+        // `✗` in place of the arrow when it did not land. The console splits on
+        // exactly those marks to set each part in its own face
+        // (`pulse.js::splitAct`), which is why they are single characters with
+        // spaces around them and not words.
+        let feed = match outcome {
+            Outcome::Refused(why) => format!("{} {REFUSED} {why}", act.summary()),
+            Outcome::Did(line) => format!("{} {LANDED} {line}", act.summary()),
+            // Nothing in a world happened, so there is nothing to arrow to.
+            Outcome::NotOfTheBody => act.summary(),
+        };
+        Recorded { feed, answer }
     }
 
     /// Hold a world still, or let it go again. `false` if no such world.
@@ -1053,10 +1173,60 @@ impl Runtime {
         *self.persona.write().unwrap() = Some(src);
     }
 
+    /// Supply the registers a character may say it is in — the ids of whatever
+    /// `<mind>/moods/` holds. Called once at startup, before the driver runs.
+    ///
+    /// The engine offers what it is given and has no opinion about the list:
+    /// which registers a world's people have is that world's content, and a
+    /// second copy compiled in here would be free to disagree with the mind.
+    pub fn set_feelings(&self, feelings: Vec<String>) {
+        *self.feelings.write().unwrap() = feelings;
+    }
+
+    /// The registers this daemon's mind holds. What the probe builds its
+    /// grammar from, so a scenario runs against the same vocabulary a live
+    /// character does.
+    pub fn feelings(&self) -> Vec<String> {
+        self.feelings.read().unwrap().clone()
+    }
+
     /// Supply the sink that records where bodies are. Called once at startup,
     /// before the driver runs.
     pub fn set_place_sink(&self, sink: PlaceSink) {
         *self.place_sink.write().unwrap() = Some(sink);
+    }
+
+    /// Supply the sink that records how characters feel. Called once at
+    /// startup, before the driver runs.
+    pub fn set_mood_sink(&self, sink: MoodSink) {
+        *self.mood_sink.write().unwrap() = Some(sink);
+    }
+
+    /// Remember a register a character has just named for itself.
+    ///
+    /// **Only from an act the world accepted**, and only `pause` names one —
+    /// so this sits beside [`Runtime::arm_pause`] rather than inside the act,
+    /// for the reason the deadline does: what a room sees is the world's, and
+    /// what outlives the process is the registry's.
+    ///
+    /// A word the mind has no mood for is still recorded. The grammar steers to
+    /// the library where there is one, and where there is not the character is
+    /// free-decoding — refusing what it said would mean a character that felt
+    /// something the daemon had no vocabulary for felt nothing at all.
+    fn note_feeling(&self, npc_id: u64, act: &Act) {
+        if act.tool != "reflect" {
+            return;
+        }
+        let Some(feeling) = act.args.get("feeling").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let feeling = feeling.trim();
+        if feeling.is_empty() {
+            return;
+        }
+        if let Some(sink) = self.mood_sink.read().unwrap().as_ref() {
+            sink(npc_id, feeling);
+        }
     }
 
     /// Checkpoint every bound body's room after a moment that moved somebody.
@@ -1550,6 +1720,7 @@ fn load(
     let now = 0;
     let mut embodied = 0;
     let mut recalled = 0;
+    let mut felt = 0;
     for (i, casting) in plan.cast.iter().enumerate() {
         let id = casting.npc_id;
         let world = &casting.world_id;
@@ -1576,11 +1747,34 @@ fn load(
             Ok(false) => {}
             Err(e) => tracing::error!("npc {id}: no body in `{world}` — {e:#}"),
         }
+        // **And back into the register it was in.** A mood is what a character
+        // *is* between one thought and the next, and it lives in the window —
+        // which a restart empties. Without this a character that had spent the
+        // afternoon getting angrier came back with no sign of it, while its
+        // conversation history said otherwise, which is the same wrong as
+        // returning it to the arrival door.
+        //
+        // Delivered as an arrival rather than written into the prompt: the
+        // prompt is rendered once when a conversation opens, so a register in
+        // it would go on asserting an afternoon's mood for ever.
+        if let Some(mood) = &casting.mood {
+            felt += 1;
+            rt.scheduler.deliver(
+                id,
+                plan.world_ms,
+                crate::engine::event::Salience::IDLE,
+                crate::engine::event::EventKind::Description {
+                    text: format!(
+                        "What you were feeling, when you last stopped to notice, was {mood}."
+                    ),
+                },
+            );
+        }
         p.set_progress(i as u64 + 1, plan.cast.len() as u64);
     }
     tracing::info!(
         "cast: {} character(s) awake, {embodied} standing in a world \
-         ({recalled} back where they were)",
+         ({recalled} back where they were, {felt} back in the register they were in)",
         rt.scheduler.population()
     );
 
@@ -2181,13 +2375,6 @@ pub fn drive(rt: Arc<Runtime>) {
             while !rt.stopping() {
                 let now_ms = start.elapsed().as_millis() as u64;
 
-                // Before anything is due: a waiting character does not tick, so
-                // nothing it does can notice that its wait has been answered.
-                // This is what notices, every pass — finer than the fastest
-                // heartbeat, so "the moment it happens" is true to a tenth of a
-                // second.
-                rt.answer_waits();
-
                 for id in rt.scheduler.due_now(now_ms) {
                     // Per character, not once per pass: two characters in
                     // different worlds are at different instants, and one of
@@ -2298,10 +2485,16 @@ pub fn drive(rt: Arc<Runtime>) {
                                 // anything differently, so it makes the same
                                 // malformed call every turn for as long as it
                                 // runs.
+                                // Two lists, because the feed and the character
+                                // read different sentences — see `Recorded`.
+                                // A rejection is the one case where they agree:
+                                // the world's words are all there is.
                                 let mut done: Vec<String> = Vec::new();
+                                let mut answers: Vec<String> = Vec::new();
                                 for r in &t.parsed.rejected {
                                     tracing::warn!("npc {id}: act rejected — {r:?}");
                                     done.push(r.line());
+                                    answers.push(r.line());
                                 }
                                 if t.parsed.is_empty() && t.parsed.rejected.is_empty() {
                                     // Chose to do nothing, and said so cleanly.
@@ -2324,15 +2517,35 @@ pub fn drive(rt: Arc<Runtime>) {
                                 // believing it worked. `record_act` holds the
                                 // rule.
                                 for a in &t.parsed.acts {
-                                    done.push(rt.record_act(id, a));
-                                    // A wait that landed stops the character
+                                    let r = rt.record_act(id, a);
+                                    done.push(r.feed);
+                                    answers.push(r.answer);
+                                    // A pause that landed stops the character
                                     // here. Armed after the act rather than
                                     // inside it because going quiet is
-                                    // scheduling and being seen to wait is the
+                                    // scheduling and being seen to stop is the
                                     // world's — two halves of one act, and only
                                     // this half knows the clock.
-                                    rt.arm_wait(id, a, world_ms, &within);
+                                    rt.arm_pause(id, a, now_ms);
+                                    // And an act that answered brings it
+                                    // straight back, so it has a turn in which
+                                    // to use what it was told.
+                                    rt.arm_followup(id, a);
                                 }
+                                // **And the character is told what came of it.**
+                                //
+                                // One answer per call it made, riding at the
+                                // head of its next turn as `<tool_response>` —
+                                // the half of the protocol that was missing.
+                                // Without it a character acts and reads the
+                                // weather back, which is how every one of them
+                                // came to do nothing but reflect.
+                                //
+                                // The world's verdict, not the feed line: what
+                                // a person watching wants to read and what the
+                                // character needs to know are different
+                                // sentences. See `Recorded`.
+                                minds.deliver_outcomes(id, answers);
                                 done
                             }
                             Err(e) => {
@@ -2475,6 +2688,62 @@ mod tests {
         for id in rt.scheduler.due_now(at_ms) {
             rt.scheduler.tick(id, at_ms, at_ms, |_, _| Vec::new());
         }
+    }
+
+    /// **A message sent to a character has to reach its mind.**
+    ///
+    /// The whole path, end to end, because every piece of it was individually
+    /// correct while the thing a person actually does — message a character and
+    /// wait for an answer — did nothing at all. Sending writes a thread; the
+    /// world's next moment is what carries it to the inbox; and until it is in
+    /// the inbox the character has not been told anything.
+    #[test]
+    fn a_message_reaches_the_characters_inbox_on_the_next_moment() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let hosted = rt.hosted.get(WORLD).expect("hosted");
+
+        let sent = rt
+            .message_npc(1, "Johnathan Sharratt", "are you there")
+            .expect("the character could be messaged");
+        assert_eq!(sent.with, "Maker-01");
+        assert_eq!(sent.waiting_for_them, 1, "it was not written to the thread");
+
+        // Drain what embodying already queued, so what is asserted below can
+        // only have come from the message.
+        rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
+        assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "not drained");
+
+        let moment = environment::advance(&hosted, &rt.bodies, &rt.scheduler);
+        assert_eq!(moment.messaged, 1, "the moment carried nothing to anybody");
+
+        assert_eq!(
+            rt.scheduler.inbox_depth(1),
+            Some(1),
+            "the message never reached the inbox"
+        );
+    }
+
+    /// And it is handed over **once**. The sweep runs twice a second; a cursor
+    /// that did not move would read the same message to the character for ever,
+    /// which is the failure the phone's own cursor exists to prevent.
+    #[test]
+    fn a_message_is_handed_to_the_mind_exactly_once() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let hosted = rt.hosted.get(WORLD).expect("hosted");
+        rt.message_npc(1, "Johnathan Sharratt", "are you there");
+        rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
+
+        assert_eq!(
+            environment::advance(&hosted, &rt.bodies, &rt.scheduler).messaged,
+            1
+        );
+        assert_eq!(
+            environment::advance(&hosted, &rt.bodies, &rt.scheduler).messaged,
+            0,
+            "the same message was handed over twice"
+        );
     }
 
     #[test]
@@ -2676,81 +2945,74 @@ mod tests {
         assert!(heard.contains("redoubt"), "{heard}");
     }
 
-    /// **The deadlock this whole act exists to break, end to end.**
+    /// **A pause is visible, and being spoken to ends it.**
     ///
-    /// Wyneth waits on Perrin. Perrin is told, so Perrin has something to
-    /// answer — and cannot answer by waiting back, because the grammar it is
-    /// handed has no arm for it. Perrin speaks; the sweep notices; Wyneth is
-    /// woken with the speech in front of her.
+    /// The deadlock the typed wait needed three mechanisms to prevent cannot
+    /// form here: Wyneth stops, Perrin sees her stop and has something to react
+    /// to, and Perrin speaking brings her straight back through the ordinary
+    /// sweep. No condition to satisfy, no patience, no rule excluding Perrin
+    /// from waiting back.
     #[test]
-    fn a_wait_is_answered_by_the_person_it_was_aimed_at() {
+    fn a_pause_is_seen_by_the_room_and_ended_by_it() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         embody(&rt, 2, "m2", "green-room");
         run(&rt, 1);
 
-        // Wyneth waits on Perrin. The world takes it, and it is armed.
-        let w = act(
-            "wait_for",
-            json!({"for": "someone_speaks", "who": "Maker-02"}),
+        let w = act("reflect", json!({}));
+        assert!(
+            rt.record_act(1, &w).feed.starts_with("reflect"),
+            "the act stood"
         );
-        assert!(rt.record_act(1, &w).starts_with("wait_for"), "the act stood");
-        rt.arm_wait(1, &w, 0, &rt.within(1));
-        assert!(rt.scheduler.waiting(1).is_some(), "nothing was armed");
+        rt.arm_pause(1, &w, 0);
+        assert!(
+            !rt.scheduler.due_now(1).contains(&1),
+            "she did not actually stop"
+        );
 
-        // Perrin now cannot wait back — the only person here is already
-        // waiting on it, so the act has nobody to name and leaves the grammar.
-        let theirs = rt.within(2);
-        assert_eq!(theirs.waited_on_by, vec!["Maker-01".to_string()]);
-        assert!(theirs.waitable().is_empty(), "it could return the stare");
-
-        // Perrin speaks. The sweep runs on the driver's pass, not on a tick —
-        // a waiting character does not tick, so something outside has to
-        // notice for it.
-        assert!(rt.act_on_world(2, &act("say", json!({"intent": "that I am here"})))
-            .happened());
+        // Perrin can see it. That is what gives the room something to break the
+        // silence with, and it is the whole of the anti-deadlock mechanism.
         let world = rt.hosted.get(WORLD).unwrap();
         environment::advance(&world, &rt.bodies, &rt.scheduler);
-        rt.answer_waits();
+        run(&rt, 2);
+        let seen = window(&rt, 2).join("\n");
+        assert!(seen.contains("lets the moment pass"), "{seen}");
 
-        assert!(rt.scheduler.waiting(1).is_none(), "the wait outlived its answer");
-        assert!(rt.scheduler.due_now(0).contains(&1), "she was not woken");
+        // And Perrin speaking brings her back at once, through nothing but the
+        // ordinary delivery path.
+        assert!(rt
+            .act_on_world(2, &act("say", json!({"intent": "that I am here"})))
+            .happened());
+        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        assert!(rt.scheduler.due_now(1).contains(&1), "she was not woken");
     }
 
-    /// A wait nothing can answer ends by itself. Without this the character
-    /// sleeps forever and every view of it reads "blocked" — which is also what
-    /// a merely quiet character reads.
+    /// A stall nobody interrupts ends by itself.
+    ///
+    /// The failure this replaces: a wait nothing could answer left the
+    /// character asleep forever while every view of it read the same word a
+    /// merely quiet character reads, so the two were indistinguishable from
+    /// outside. A stall cannot do that — its deadline is the whole of it.
+    ///
+    /// Driven by `move_to`, which is one of the two acts that occupy a body.
+    /// It was `reflect`, from when reflection was the only thing that stalled;
+    /// a thought does not take time, so it no longer does.
     #[test]
-    fn a_wait_nobody_answers_gives_up_on_its_own() {
+    fn a_pause_nobody_interrupts_ends_on_its_own() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
-        embody(&rt, 2, "m2", "green-room");
         run(&rt, 1);
 
-        let w = act(
-            "wait_for",
-            json!({"for": "someone_speaks", "who": "Maker-02"}),
+        rt.arm_pause(1, &act("move_to", json!({"destination": "band one"})), 0);
+        assert!(
+            !rt.scheduler.due_now(1_000).contains(&1),
+            "it came back a second later"
         );
-        rt.arm_wait(1, &w, 0, &rt.within(1));
-
-        // Nobody says anything, ever.
-        rt.answer_waits();
-        assert!(rt.scheduler.waiting(1).is_some(), "it gave up at once");
-
-        // The world clock is what the patience is measured against, and this
-        // runtime's is held still — so arm one that has already run out.
-        rt.scheduler.begin_waiting(
-            1,
-            crate::engine::waiting::Waiting {
-                kind: crate::engine::waiting::Kind::SomeoneSpeaks,
-                who: Some("Maker-02".into()),
-                until_ms: 0,
-            },
-            Vec::new(),
-            0,
+        // Nobody says anything, ever, and it comes back anyway.
+        assert!(
+            rt.scheduler.due_now(10_000_000).contains(&1),
+            "it stopped for good"
         );
-        rt.answer_waits();
-        assert!(rt.scheduler.waiting(1).is_none(), "it waited past its patience");
     }
 
     #[test]
@@ -2764,13 +3026,26 @@ mod tests {
         embody(&rt, 2, "m2", "green-room");
         run(&rt, 1);
 
-        let said = rt.record_act(1, &act("say", json!({"intent": "the redoubt burned twice"})));
-        assert_eq!(said, "say — the redoubt burned twice");
+        let said = rt.record_act(
+            1,
+            &act("say", json!({"intent": "the redoubt burned twice"})),
+        );
+        // The feed carries both halves: what was asked, then what came of it.
+        assert_eq!(
+            said.feed,
+            "say — the redoubt burned twice → You say, to the room: the redoubt burned twice"
+        );
+        // The character, meanwhile, is told only what the world did with it —
+        // it does not need to be told the name of the act it just chose.
+        assert_eq!(
+            said.answer,
+            "You say, to the room: the redoubt burned twice"
+        );
 
         // A body act and a head act now read the same way as each other, which
         // is the point — one shape, whether or not a world was involved.
         let noted = rt.record_act(1, &act("note_concern", json!({"about": "the ledger"})));
-        assert!(noted.starts_with("note_concern"), "{noted}");
+        assert!(noted.feed.starts_with("note_concern"), "{}", noted.feed);
 
         // And the world did take the speech: the shape of the record is not
         // the act being quietly dropped.
@@ -2781,22 +3056,69 @@ mod tests {
         assert!(heard.contains("redoubt"), "{heard}");
     }
 
+    /// A refusal keeps the world's words **and** names the act it refused.
+    ///
+    /// The prose is what tells the character where it could actually have gone,
+    /// so losing it to a uniform shape would be the reverse of the bug above.
+    /// But the words alone read as a sentence dropped into a column of acts —
+    /// "Wailen Wylde is already on it." beside "invite — …", with nothing
+    /// saying they were the same kind of event or that one had failed.
     #[test]
     fn a_refusal_is_recorded_in_the_world_s_words_because_the_prose_is_the_point() {
-        // The other half of the same rule. A refused act must not read like one
-        // that landed, and the refusal's text is what tells the character where
-        // it could actually have gone — losing it to a uniform shape would be
-        // the reverse of the bug above.
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
 
-        let line = rt.record_act(1, &act("move_to", json!({"destination": "the observatory"})));
-        assert!(line.contains("nowhere called \"the observatory\""), "{line}");
-        assert!(line.contains("band one"), "it named nowhere real: {line}");
+        let r = rt.record_act(
+            1,
+            &act("move_to", json!({"destination": "the observatory"})),
+        );
+        let line = r.feed;
         assert!(
-            !line.starts_with("move_to"),
+            line.contains("nowhere called \"the observatory\""),
+            "{line}"
+        );
+        assert!(line.contains("band one"), "it named nowhere real: {line}");
+        // Scannable like every other line: the act's name first.
+        assert!(line.starts_with("move_to"), "{line}");
+        // And unmistakably not a completed one.
+        assert!(
+            line.contains('✗'),
             "a refusal read as a completed act: {line}"
         );
+
+        // The character is told the world's words and nothing else — the mark
+        // and the act's name are for somebody watching the feed, and a
+        // character does not need to be told the name of the act it just chose.
+        assert!(!r.answer.contains('✗'), "{}", r.answer);
+        assert!(r.answer.contains("nowhere called"), "{}", r.answer);
+    }
+
+    /// **The character is told what happened, not what it asked for.**
+    ///
+    /// The feed renders an act as an act — `gesture — …` — which is right for
+    /// a column somebody scans. Sent to the model as a `<tool_response>` it is
+    /// the character's own arguments handed back as though they were an
+    /// outcome, which is what it read live: "gesture — for Wailen to see that
+    /// the room is ours for now", every turn, never once told whether anybody
+    /// saw it.
+    #[test]
+    fn the_answer_is_the_worlds_verdict_and_the_feed_line_is_the_act() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        run(&rt, 1);
+
+        let r = rt.record_act(1, &act("gesture", json!({"intent": "at the door"})));
+        // The feed names the act, what it asked for, and what came of it.
+        assert!(r.feed.starts_with("gesture — at the door → "), "{}", r.feed);
+        assert!(r.feed.contains("You show"), "{}", r.feed);
+        // The character gets the verdict alone — not its own arguments back.
+        assert!(
+            r.answer.starts_with("You show"),
+            "the character was handed its own arguments: {}",
+            r.answer
+        );
+        assert!(!r.answer.contains("gesture —"), "{}", r.answer);
     }
 
     #[test]
@@ -2807,11 +3129,10 @@ mod tests {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
 
-        let out = rt
-            .act_on_world(
-                1,
-                &act("move_to", json!({"destination": "the observatory"})),
-            );
+        let out = rt.act_on_world(
+            1,
+            &act("move_to", json!({"destination": "the observatory"})),
+        );
         let Outcome::Refused(out) = out else {
             panic!("a walk to nowhere is a refusal, not {out:?}");
         };
@@ -3106,7 +3427,10 @@ mod tests {
         // Each is told about the other, never about itself.
         let other = rt.nudge_for(2).expect("bound");
         assert!(other.contains("Maker-01"), "{other}");
-        assert!(!other.contains("Maker-02"), "it was told about itself: {other}");
+        assert!(
+            !other.contains("Maker-02"),
+            "it was told about itself: {other}"
+        );
 
         // And when they part, it changes back.
         rt.hosted

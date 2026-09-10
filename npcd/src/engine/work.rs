@@ -69,8 +69,8 @@ fn subject(args: &Map<String, Value>) -> Option<String> {
     // rather than found — and reaching the dispatch at all is what lets them
     // say so themselves rather than being turned away as subjectless.
     for key in [
-        "what", "of", "in", "to", "for", "from", "on", "about", "between", "under", "path",
-        "why", "called",
+        "what", "of", "in", "to", "for", "from", "on", "about", "between", "under", "path", "why",
+        "called",
     ] {
         if let Some(v) = text(args, key) {
             return Some(v);
@@ -89,16 +89,24 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     if matches!(act.tool, "library_read" | "library_write") {
         return library(hosted, body, act.tool, a);
     }
-    let Some(what) = subject(a).or_else(|| Some(String::new())).filter(|s| !s.is_empty()) else {
+    let Some(what) = subject(a)
+        .or_else(|| Some(String::new()))
+        .filter(|s| !s.is_empty())
+    else {
         // Only the argument-free bench acts get here legitimately.
         return bench_no_subject(hosted, body, act.tool);
     };
 
     match act.tool {
         // ── writing into the record ─────────────────────────────────────────
-        "chronicle_add_entry" | "story_draft" | "character_write_identity"
-        | "character_write_wants" | "character_write_memories" | "place_write_entry"
-        | "place_write_local_history" | "chronicle_rewrite_page" => {
+        "chronicle_add_entry"
+        | "story_draft"
+        | "character_write_identity"
+        | "character_write_wants"
+        | "character_write_memories"
+        | "place_write_entry"
+        | "place_write_local_history"
+        | "chronicle_rewrite_page" => {
             // **The subject is the naming argument, never `what`.** Every act
             // here carries its text in `what` and the thing it writes into in a
             // preposition — `to` an era, `for` a gap, `in` a page, `of` a
@@ -133,7 +141,10 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             };
             let path = personality_path(&what);
             hosted.with_sim(|s| {
-                match s.bench.write_field(body, &what, &path, PORTRAIT_PROMPT, &carrying) {
+                match s
+                    .bench
+                    .write_field(body, &what, &path, PORTRAIT_PROMPT, &carrying)
+                {
                     Ok(p) => Outcome::Did(format!(
                         "{what} is drawn from these words now ({p}): {carrying}"
                     )),
@@ -149,14 +160,16 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             })
         }
 
-
         // ── moving something along ──────────────────────────────────────────
         "story_file" | "portrait_file_plate" => set_state(hosted, body, &what, State::Filed),
         "chronicle_retire_entry" => set_state(hosted, body, &what, State::Retired),
 
         // ── settling, which takes two ───────────────────────────────────────
-        "chronicle_settle_boundary" | "portrait_settle_likeness" | "character_settle_relation"
-        | "place_settle_route" | "map_settle_border" => settle(hosted, body, a, &what),
+        "chronicle_settle_boundary"
+        | "portrait_settle_likeness"
+        | "character_settle_relation"
+        | "place_settle_route"
+        | "map_settle_border" => settle(hosted, body, a, &what),
 
         // ── the map ─────────────────────────────────────────────────────────
         "map_add_place" => {
@@ -171,9 +184,15 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             };
             hosted.with_sim(|s| {
                 if s.record.by_name(&called).is_some() {
-                    return Outcome::Refused(format!("There is already somewhere called {called}."));
+                    return Outcome::Refused(format!(
+                        "There is already somewhere called {called}."
+                    ));
                 }
-                let mut i = Item::new(called.to_lowercase().replace(' ', "_"), &called, Kind::Place);
+                let mut i = Item::new(
+                    called.to_lowercase().replace(' ', "_"),
+                    &called,
+                    Kind::Place,
+                );
                 i.body = wheres.clone();
                 i.state = State::Draft;
                 i.holder = Some(body.to_string());
@@ -181,13 +200,15 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 Outcome::Did(format!("{called} is on the map, {wheres}."))
             })
         }
-        "map_remove_place" => hosted.with_sim(|s| match s.record.let_go(&what, "taken out of the world") {
-            Ok(n) => Outcome::Did(format!(
+        "map_remove_place" => {
+            hosted.with_sim(|s| match s.record.let_go(&what, "taken out of the world") {
+                Ok(n) => Outcome::Did(format!(
                 "{n} is off the map. Everything written about it still stands and now has to be \
                  reckoned with."
             )),
-            Err(why) => Outcome::Refused(why),
-        }),
+                Err(why) => Outcome::Refused(why),
+            })
+        }
 
         // ── custody, appraisal, description, condition ──────────────────────
         "record_accession" => {
@@ -200,7 +221,11 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             };
             hosted.with_sim(|s| {
                 if s.record.by_name(&what).is_none() {
-                    let mut i = Item::new(what.to_lowercase().replace(' ', "_"), &what, Kind::Accession);
+                    let mut i = Item::new(
+                        what.to_lowercase().replace(' ', "_"),
+                        &what,
+                        Kind::Accession,
+                    );
                     i.provenance = Some(from.clone());
                     i.holder = Some(body.to_string());
                     i.state = State::Held;
@@ -267,7 +292,9 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             })
         }
         "record_describe" => with_second(hosted, a, "how", &what, |s, w, how| {
-            s.record.describe(w, how).map(|n| format!("The way in to {n}: {how}"))
+            s.record
+                .describe(w, how)
+                .map(|n| format!("The way in to {n}: {how}"))
         }),
         "record_arrange" => with_second(hosted, a, "under", &what, |s, w, under| {
             s.record
@@ -275,7 +302,9 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 .map(|n| format!("{n} now sits under {under}, where somebody would look for it."))
         }),
         "record_cross_reference" => with_second(hosted, a, "to", &what, |s, w, to| {
-            s.record.cross_reference(w, to).map(|t| format!("{w} now points at {t}."))
+            s.record
+                .cross_reference(w, to)
+                .map(|t| format!("{w} now points at {t}."))
         }),
         "record_leave_note" => with_second(hosted, a, "what", &what, |s, w, note| {
             s.record
@@ -304,13 +333,15 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 .set_condition(w, Condition::Mended)
                 .map(|n| format!("You mend {n}: {how}"))
         }),
-        "record_mark_repair" => hosted.with_sim(|s| match s.record.set_condition(&what, Condition::Mended) {
-            Ok(n) => Outcome::Did(format!(
-                "The repair to {n} is left visible. A mend passed off as an original is worse \
+        "record_mark_repair" => {
+            hosted.with_sim(|s| match s.record.set_condition(&what, Condition::Mended) {
+                Ok(n) => Outcome::Did(format!(
+                    "The repair to {n} is left visible. A mend passed off as an original is worse \
                  than the damage."
-            )),
-            Err(why) => Outcome::Refused(why),
-        }),
+                )),
+                Err(why) => Outcome::Refused(why),
+            })
+        }
 
         // ── the record facing outward ───────────────────────────────────────
         "enquiry_take_question" => hosted.with_sim(|s| match s.record.take(&what, body) {
@@ -318,7 +349,9 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             Err(why) => Outcome::Refused(why),
         }),
         "enquiry_answer_from_record" => with_second(hosted, a, "answer", &what, |s, w, ans| {
-            s.record.write(w, "", ans).map(|n| format!("You answer {n}: {ans}"))
+            s.record
+                .write(w, "", ans)
+                .map(|n| format!("You answer {n}: {ans}"))
         }),
         "enquiry_name_the_gap" => with_second(hosted, a, "missing", &what, |s, w, missing| {
             s.record
@@ -346,7 +379,9 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         }),
         "orders_hand_to" => {
             let Some(to) = text(a, "to") else {
-                return Outcome::Refused("You meant to hand an order to somebody, but not who.".into());
+                return Outcome::Refused(
+                    "You meant to hand an order to somebody, but not who.".into(),
+                );
             };
             hosted.with_sim(|s| match s.ledger.hand_to(&what, &to) {
                 Ok(()) => Outcome::Did(format!("{to} has it: {what}")),
@@ -379,12 +414,16 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
 
         // ── the plant and the stores ────────────────────────────────────────
         "plant_note_drift" => with_second(hosted, a, "drift", &what, |s, w, drift| {
-            s.ledger.set_order(&format!("look at {w}: {drift}"), "the panel", None);
+            s.ledger
+                .set_order(&format!("look at {w}: {drift}"), "the panel", None);
             Ok(format!("Noted, so somebody looks: {w} is {drift}"))
         }),
         "plant_raise_fault" => with_second(hosted, a, "why", &what, |s, w, why| {
-            s.ledger.set_order(&format!("the fault in {w}"), "the panel", None);
-            Ok(format!("Raised, and you may be wrong in public: {w} — {why}"))
+            s.ledger
+                .set_order(&format!("the fault in {w}"), "the panel", None);
+            Ok(format!(
+                "Raised, and you may be wrong in public: {w} — {why}"
+            ))
         }),
         // **Putting back something you are not holding is not putting it
         // back.** This reported success on every failure — a thing nobody has
@@ -414,7 +453,8 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 return Outcome::Refused(format!("There is nothing called {what} to lay out."));
             };
             let name = i.name.clone();
-            s.ledger.record_verdict(&name, body, "laid out as its scenes", None);
+            s.ledger
+                .record_verdict(&name, body, "laid out as its scenes", None);
             Outcome::Did(format!(
                 "{name} is pinned up as its scenes. The one where nobody wants anything shows \
                  itself from here and could not from inside the prose."
@@ -452,8 +492,14 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             ))
         }),
         "gather_call" => with_second(hosted, a, "who", &what, |s, about, who| {
-            s.ledger.set_order(&format!("come to the reading about {about}"), "the table", Some(who));
-            Ok(format!("Called: everybody whose work touches {about} — {who}"))
+            s.ledger.set_order(
+                &format!("come to the reading about {about}"),
+                "the table",
+                Some(who),
+            );
+            Ok(format!(
+                "Called: everybody whose work touches {about} — {who}"
+            ))
         }),
 
         // ── the bench ───────────────────────────────────────────────────────
@@ -489,13 +535,15 @@ fn library(hosted: &Hosted, body: &str, tool: &str, args: &Map<String, Value>) -
             LIBRARY_FIELDS.join(" or ")
         ));
     }
-    hosted.with_sim(|s| match s.bench.write_field(body, &path, &path, &[&field], &t) {
-        Ok(p) => Outcome::Did(format!(
-            "The {field} of {p} says what you wrote. It is how everybody here reads, once you \
+    hosted.with_sim(
+        |s| match s.bench.write_field(body, &path, &path, &[&field], &t) {
+            Ok(p) => Outcome::Did(format!(
+                "The {field} of {p} says what you wrote. It is how everybody here reads, once you \
              commit it."
-        )),
-        Err(why) => Outcome::Refused(why),
-    })
+            )),
+            Err(why) => Outcome::Refused(why),
+        },
+    )
 }
 
 /// Where a likeness's art direction lives inside a personality.
@@ -658,9 +706,9 @@ fn bench_no_subject(hosted: &Hosted, body: &str, tool: &str) -> Outcome {
                     "Changed by you and not yet committed: {}.",
                     changed.join(", ")
                 )),
-                (true, Some(w)) => {
-                    Outcome::Did(format!("{w} is open and you have not changed anything in it."))
-                }
+                (true, Some(w)) => Outcome::Did(format!(
+                    "{w} is open and you have not changed anything in it."
+                )),
                 (true, None) => Outcome::Did("You have nothing open.".into()),
             }
         }
@@ -681,9 +729,7 @@ fn bench_no_subject(hosted: &Hosted, body: &str, tool: &str) -> Outcome {
             }
         }
         "bench_stash_pop" => hosted.with_sim(|s| match s.bench.pop(body) {
-            Ok(about) => Outcome::Did(format!(
-                "You pick {about} back up, where you left it."
-            )),
+            Ok(about) => Outcome::Did(format!("You pick {about} back up, where you left it.")),
             Err(why) => Outcome::Refused(why),
         }),
         "bench_restore" => {
@@ -694,7 +740,9 @@ fn bench_no_subject(hosted: &Hosted, body: &str, tool: &str) -> Outcome {
                     hosted.with_sim(|s| {
                         let _ = s.record.give_back(&w, body);
                     });
-                    Outcome::Did(format!("Your changes to {w} are gone. It is back to what it was."))
+                    Outcome::Did(format!(
+                        "Your changes to {w} are gone. It is back to what it was."
+                    ))
                 }
                 None if threw => Outcome::Did(
                     "Your changes are gone. The documents are back to what they were.".into(),
@@ -724,8 +772,12 @@ fn bench_no_subject(hosted: &Hosted, body: &str, tool: &str) -> Outcome {
             }
         }
         "bench_status" => {
-            let (changed, offered) =
-                hosted.sim(|s| (s.bench.diff(body), s.bench.opened(body).is_some_and(|w| w.offered)));
+            let (changed, offered) = hosted.sim(|s| {
+                (
+                    s.bench.diff(body),
+                    s.bench.opened(body).is_some_and(|w| w.offered),
+                )
+            });
             let mut lines: Vec<String> = Vec::new();
             if !held.is_empty() {
                 lines.push(format!("Open: {}", held.join(", ")));
@@ -847,12 +899,11 @@ fn bench(
         }
         // A document that has been committed answers for itself, and the answer
         // is not the holder's to write: it is who the commit was made by.
-        "bench_blame" | "bench_log" if hosted.sim(|s| s.bench.last_hand(what).is_some()) => {
-            hosted.sim(|s| {
+        "bench_blame" | "bench_log" if hosted.sim(|s| s.bench.last_hand(what).is_some()) => hosted
+            .sim(|s| {
                 let who = s.bench.last_hand(what).unwrap_or_default().to_string();
                 Outcome::Did(format!("{what} was last committed by {who}."))
-            })
-        }
+            }),
         "bench_blame" => hosted.sim(|s| match s.record.by_name(what) {
             Some(i) => Outcome::Did(match (&i.holder, &i.provenance) {
                 (Some(h), _) => format!("{} is held by {h}.", i.name),
@@ -956,7 +1007,10 @@ mod tests {
     use serde_json::json;
 
     fn act(tool: &'static str, args: Value) -> Act {
-        Act { tool, args: args.as_object().unwrap().clone() }
+        Act {
+            tool,
+            args: args.as_object().unwrap().clone(),
+        }
     }
 
     fn vault() -> Hosted {
@@ -966,10 +1020,18 @@ mod tests {
         )
         .expect("the vault must load");
         h.with(|w| {
-            w.enter("m1", "Perrin Vastwood", Where::new("vault-chronicle", "early-range"))
-                .unwrap();
-            w.enter("m2", "Orion Vance", Where::new("vault-chronicle", "early-range"))
-                .unwrap();
+            w.enter(
+                "m1",
+                "Perrin Vastwood",
+                Where::new("vault-chronicle", "early-range"),
+            )
+            .unwrap();
+            w.enter(
+                "m2",
+                "Orion Vance",
+                Where::new("vault-chronicle", "early-range"),
+            )
+            .unwrap();
         });
         h
     }
@@ -979,12 +1041,14 @@ mod tests {
     /// A world without a root is a world with nothing to edit, so every test
     /// below that touches a document needs this rather than [`vault`].
     fn vault_with_documents(name: &str) -> (Hosted, std::path::PathBuf) {
-        let root = std::env::temp_dir()
-            .join(format!("npcd-work-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("npcd-work-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("layers/eras")).unwrap();
-        std::fs::write(root.join("layers/eras/third.md"), "the third era\nburned in the spring\n")
-            .unwrap();
+        std::fs::write(
+            root.join("layers/eras/third.md"),
+            "the third era\nburned in the spring\n",
+        )
+        .unwrap();
         std::fs::write(root.join("layers/eras/fourth.md"), "the fourth era\n").unwrap();
 
         // A mood and a personality, both carrying the comments that are the
@@ -1020,12 +1084,22 @@ mod tests {
         let wrote = perform(
             &h,
             "m1",
-            &act("file_write", json!({"path":"layers/eras/fifth.md","content":"the fifth era\n"})),
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/fifth.md","content":"the fifth era\n"}),
+            ),
         );
         assert!(wrote.happened(), "{wrote:?}");
-        assert!(!root.join("layers/eras/fifth.md").exists(), "the disk moved early");
+        assert!(
+            !root.join("layers/eras/fifth.md").exists(),
+            "the disk moved early"
+        );
 
-        let out = perform(&h, "m1", &act("bench_commit", json!({"why":"named the fifth"})));
+        let out = perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"named the fifth"})),
+        );
         assert!(out.happened(), "{out:?}");
         assert_eq!(
             std::fs::read_to_string(root.join("layers/eras/fifth.md")).unwrap(),
@@ -1040,12 +1114,23 @@ mod tests {
         perform(
             &h,
             "m1",
-            &act("file_write", json!({"path":"layers/eras/third.md","content":"rewritten\n"})),
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/third.md","content":"rewritten\n"}),
+            ),
         );
-        let mine = perform(&h, "m1", &act("file_read", json!({"path":"layers/eras/third.md"})));
+        let mine = perform(
+            &h,
+            "m1",
+            &act("file_read", json!({"path":"layers/eras/third.md"})),
+        );
         assert!(mine.line().unwrap().contains("rewritten"), "{mine:?}");
 
-        let theirs = perform(&h, "m2", &act("file_read", json!({"path":"layers/eras/third.md"})));
+        let theirs = perform(
+            &h,
+            "m2",
+            &act("file_read", json!({"path":"layers/eras/third.md"})),
+        );
         assert!(
             theirs.line().unwrap().contains("burned in the spring"),
             "a working set leaked: {theirs:?}"
@@ -1062,12 +1147,18 @@ mod tests {
         perform(
             &h,
             "m1",
-            &act("file_write", json!({"path":"layers/eras/sixth.md","content":"a night at the gate"})),
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/sixth.md","content":"a night at the gate"}),
+            ),
         );
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
         assert!(root.join("layers/eras/sixth.md").exists());
         assert!(
-            !root.join("layers/eras").join("a night at the gate").exists(),
+            !root
+                .join("layers/eras")
+                .join("a night at the gate")
+                .exists(),
             "wrote into the prose"
         );
     }
@@ -1082,7 +1173,10 @@ mod tests {
         perform(
             &h,
             "m1",
-            &act("file_write", json!({"path":"layers/eras/fifth.md","content":"a line\n\nand another\n"})),
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/fifth.md","content":"a line\n\nand another\n"}),
+            ),
         );
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
         assert_eq!(
@@ -1101,7 +1195,10 @@ mod tests {
         let out = perform(
             &h,
             "m1",
-            &act("file_edit", json!({"path":"layers/eras/third.md","old_str":"  b: 1","new_str":"  b: 2"})),
+            &act(
+                "file_edit",
+                json!({"path":"layers/eras/third.md","old_str":"  b: 1","new_str":"  b: 2"}),
+            ),
         );
         assert!(out.happened(), "{out:?}");
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
@@ -1119,17 +1216,30 @@ mod tests {
         let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
         std::fs::write(root.join("layers/eras/long.md"), &body).unwrap();
 
-        let first = perform(&h, "m1", &act("file_read", json!({"path":"layers/eras/long.md"})));
+        let first = perform(
+            &h,
+            "m1",
+            &act("file_read", json!({"path":"layers/eras/long.md"})),
+        );
         let shown = first.line().unwrap();
         assert!(shown.contains("(lines 1-200 of 900)"), "{shown}");
-        assert!(!shown.contains("line 201"), "the cap did not hold at the act");
+        assert!(
+            !shown.contains("line 201"),
+            "the cap did not hold at the act"
+        );
 
         let next = perform(
             &h,
             "m1",
-            &act("file_read", json!({"path":"layers/eras/long.md","start_line":"201"})),
+            &act(
+                "file_read",
+                json!({"path":"layers/eras/long.md","start_line":"201"}),
+            ),
         );
-        assert!(next.line().unwrap().contains("(lines 201-400 of 900)"), "{next:?}");
+        assert!(
+            next.line().unwrap().contains("(lines 201-400 of 900)"),
+            "{next:?}"
+        );
     }
 
     /// `start_line` is a string because the grammar cannot bound an integer, so
@@ -1142,7 +1252,10 @@ mod tests {
             let out = perform(
                 &h,
                 "m1",
-                &act("file_read", json!({"path":"layers/eras/third.md","start_line":junk})),
+                &act(
+                    "file_read",
+                    json!({"path":"layers/eras/third.md","start_line":junk}),
+                ),
             );
             assert!(out.happened(), "{junk:?}: {out:?}");
             assert!(out.line().unwrap().contains("the third era"), "{junk:?}");
@@ -1178,10 +1291,20 @@ mod tests {
         let out = perform(
             &h,
             "m1",
-            &act("file_edit", json!({"path":"layers/eras/third.md","old_str":"spring","new_str":"autumn"})),
+            &act(
+                "file_edit",
+                json!({"path":"layers/eras/third.md","old_str":"spring","new_str":"autumn"}),
+            ),
         );
         assert!(out.happened(), "{out:?}");
-        perform(&h, "m1", &act("bench_commit", json!({"why":"dated it against its neighbours"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "bench_commit",
+                json!({"why":"dated it against its neighbours"}),
+            ),
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("layers/eras/third.md")).unwrap(),
             "the third era\nburned in the autumn\n"
@@ -1195,7 +1318,10 @@ mod tests {
         let out = perform(
             &h,
             "m1",
-            &act("file_edit", json!({"path":"layers/eras/third.md","old_str":"a fire","new_str":"a flood"})),
+            &act(
+                "file_edit",
+                json!({"path":"layers/eras/third.md","old_str":"a fire","new_str":"a flood"}),
+            ),
         );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains('2'), "{out:?}");
@@ -1204,7 +1330,14 @@ mod tests {
     #[test]
     fn an_edit_missing_half_of_itself_says_which_half() {
         let (h, _) = vault_with_documents("half");
-        let out = perform(&h, "m1", &act("file_edit", json!({"path":"layers/eras/third.md","old_str":"x"})));
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "file_edit",
+                json!({"path":"layers/eras/third.md","old_str":"x"}),
+            ),
+        );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains("both"), "{out:?}");
     }
@@ -1215,7 +1348,14 @@ mod tests {
         let before = perform(&h, "m1", &act("file_list", json!({"path":"layers/eras"})));
         assert!(before.line().unwrap().contains("third.md"), "{before:?}");
 
-        perform(&h, "m1", &act("file_write", json!({"path":"layers/eras/fifth.md","content":"…"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/fifth.md","content":"…"}),
+            ),
+        );
         let after = perform(&h, "m1", &act("file_list", json!({"path":"layers/eras"})));
         assert!(after.line().unwrap().contains("fifth.md"), "{after:?}");
         // …and not to anybody else, because it is not committed.
@@ -1226,9 +1366,16 @@ mod tests {
     #[test]
     fn a_deleted_document_goes_from_the_disk_at_the_commit() {
         let (h, root) = vault_with_documents("delete");
-        let out = perform(&h, "m1", &act("file_delete", json!({"path":"layers/eras/fourth.md"})));
+        let out = perform(
+            &h,
+            "m1",
+            &act("file_delete", json!({"path":"layers/eras/fourth.md"})),
+        );
         assert!(out.happened(), "{out:?}");
-        assert!(root.join("layers/eras/fourth.md").exists(), "gone before the commit");
+        assert!(
+            root.join("layers/eras/fourth.md").exists(),
+            "gone before the commit"
+        );
         perform(&h, "m1", &act("bench_commit", json!({"why":"never canon"})));
         assert!(!root.join("layers/eras/fourth.md").exists());
     }
@@ -1238,42 +1385,94 @@ mod tests {
     #[test]
     fn two_makers_on_one_document_collide_at_the_commit() {
         let (h, _) = vault_with_documents("collide");
-        perform(&h, "m1", &act("file_write", json!({"path":"layers/eras/third.md","content":"mine\n"})));
-        perform(&h, "m2", &act("file_write", json!({"path":"layers/eras/third.md","content":"mine too\n"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/third.md","content":"mine\n"}),
+            ),
+        );
+        perform(
+            &h,
+            "m2",
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/third.md","content":"mine too\n"}),
+            ),
+        );
 
         assert!(perform(&h, "m1", &act("bench_commit", json!({"why":"first"}))).happened());
         let out = perform(&h, "m2", &act("bench_commit", json!({"why":"second"})));
         assert!(!out.happened());
-        assert!(out.line().unwrap().contains("m1"), "no other party named: {out:?}");
+        assert!(
+            out.line().unwrap().contains("m1"),
+            "no other party named: {out:?}"
+        );
         assert!(
             out.line().unwrap().contains("talk to"),
             "a collision read as a retryable error: {out:?}"
         );
         // The refused body still has all of its work.
         let still = perform(&h, "m2", &act("bench_diff", json!({})));
-        assert!(still.line().unwrap().contains("layers/eras/third.md"), "{still:?}");
+        assert!(
+            still.line().unwrap().contains("layers/eras/third.md"),
+            "{still:?}"
+        );
     }
 
     #[test]
     fn setting_work_aside_and_picking_it_up_again_survives_the_round_trip() {
         let (h, _) = vault_with_documents("stash");
-        perform(&h, "m1", &act("file_write", json!({"path":"layers/eras/third.md","content":"half\n"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/third.md","content":"half\n"}),
+            ),
+        );
         assert!(perform(&h, "m1", &act("bench_stash", json!({}))).happened());
-        let gone = perform(&h, "m1", &act("file_read", json!({"path":"layers/eras/third.md"})));
-        assert!(gone.line().unwrap().contains("burned in the spring"), "{gone:?}");
+        let gone = perform(
+            &h,
+            "m1",
+            &act("file_read", json!({"path":"layers/eras/third.md"})),
+        );
+        assert!(
+            gone.line().unwrap().contains("burned in the spring"),
+            "{gone:?}"
+        );
 
         assert!(perform(&h, "m1", &act("bench_stash_pop", json!({}))).happened());
-        let back = perform(&h, "m1", &act("file_read", json!({"path":"layers/eras/third.md"})));
+        let back = perform(
+            &h,
+            "m1",
+            &act("file_read", json!({"path":"layers/eras/third.md"})),
+        );
         assert!(back.line().unwrap().contains("half"), "{back:?}");
     }
 
     #[test]
     fn throwing_the_work_away_puts_the_document_back() {
         let (h, _) = vault_with_documents("restore");
-        perform(&h, "m1", &act("file_write", json!({"path":"layers/eras/third.md","content":"wrong\n"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/third.md","content":"wrong\n"}),
+            ),
+        );
         assert!(perform(&h, "m1", &act("bench_restore", json!({}))).happened());
-        let back = perform(&h, "m1", &act("file_read", json!({"path":"layers/eras/third.md"})));
-        assert!(back.line().unwrap().contains("burned in the spring"), "{back:?}");
+        let back = perform(
+            &h,
+            "m1",
+            &act("file_read", json!({"path":"layers/eras/third.md"})),
+        );
+        assert!(
+            back.line().unwrap().contains("burned in the spring"),
+            "{back:?}"
+        );
     }
 
     #[test]
@@ -1282,9 +1481,21 @@ mod tests {
         let quiet = perform(&h, "m1", &act("bench_status", json!({})));
         assert!(quiet.line().unwrap().contains("Nothing open"), "{quiet:?}");
 
-        perform(&h, "m1", &act("file_write", json!({"path":"layers/eras/third.md","content":"changed\n"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/third.md","content":"changed\n"}),
+            ),
+        );
         let diff = perform(&h, "m1", &act("bench_diff", json!({})));
-        assert!(diff.line().unwrap().contains("layers/eras/third.md (changed)"), "{diff:?}");
+        assert!(
+            diff.line()
+                .unwrap()
+                .contains("layers/eras/third.md (changed)"),
+            "{diff:?}"
+        );
 
         perform(&h, "m1", &act("bench_stage", json!({})));
         let staged = perform(&h, "m1", &act("bench_status", json!({})));
@@ -1296,8 +1507,17 @@ mod tests {
     #[test]
     fn a_path_that_leaves_the_world_is_refused_at_the_act() {
         let (h, root) = vault_with_documents("escape");
-        for bad in ["../stolen.md", "layers/eras/../../stolen.md", "c:/windows/x.md", "layers/eras/x.exe"] {
-            let out = perform(&h, "m1", &act("file_write", json!({"path":bad,"content":"owned"})));
+        for bad in [
+            "../stolen.md",
+            "layers/eras/../../stolen.md",
+            "c:/windows/x.md",
+            "layers/eras/x.exe",
+        ] {
+            let out = perform(
+                &h,
+                "m1",
+                &act("file_write", json!({"path":bad,"content":"owned"})),
+            );
             assert!(!out.happened(), "{bad} was written");
             assert!(!perform(&h, "m1", &act("file_read", json!({"path":bad}))).happened());
         }
@@ -1311,7 +1531,10 @@ mod tests {
         let h = vault();
         for a in [
             act("file_read", json!({"path":"layers/eras/third.md"})),
-            act("file_write", json!({"path":"layers/eras/third.md","content":"x"})),
+            act(
+                "file_write",
+                json!({"path":"layers/eras/third.md","content":"x"}),
+            ),
             act("file_list", json!({"path":"layers/eras"})),
         ] {
             let out = perform(&h, "m1", &a);
@@ -1324,9 +1547,20 @@ mod tests {
     #[test]
     fn blame_on_a_document_names_whoever_committed_it() {
         let (h, _) = vault_with_documents("blame");
-        perform(&h, "m1", &act("file_write", json!({"path":"layers/eras/third.md","content":"mine\n"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/third.md","content":"mine\n"}),
+            ),
+        );
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
-        let out = perform(&h, "m2", &act("bench_blame", json!({"what":"layers/eras/third.md"})));
+        let out = perform(
+            &h,
+            "m2",
+            &act("bench_blame", json!({"what":"layers/eras/third.md"})),
+        );
         assert!(out.line().unwrap().contains("m1"), "{out:?}");
     }
 
@@ -1341,11 +1575,19 @@ mod tests {
     #[test]
     fn an_entry_written_into_an_era_lands_in_the_era_document() {
         let (h, root) = vault_with_documents("era-entry");
-        assert!(perform(&h, "m1", &act("bench_branch", json!({"what":"the third era"}))).happened());
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_branch", json!({"what":"the third era"}))
+        )
+        .happened());
         let out = perform(
             &h,
             "m1",
-            &act("chronicle_add_entry", json!({"to":"the third era","what":"The redoubt fell in the spring."})),
+            &act(
+                "chronicle_add_entry",
+                json!({"to":"the third era","what":"The redoubt fell in the spring."}),
+            ),
         );
         assert!(out.happened(), "{out:?}");
         assert!(
@@ -1353,23 +1595,52 @@ mod tests {
             "the disk moved before the commit"
         );
 
-        assert!(perform(&h, "m1", &act("bench_commit", json!({"why":"dated the fall"}))).happened());
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"dated the fall"}))
+        )
+        .happened());
         let written = std::fs::read_to_string(root.join("layers/eras/the-third-era.md")).unwrap();
-        assert!(written.contains("The redoubt fell in the spring."), "{written}");
+        assert!(
+            written.contains("The redoubt fell in the spring."),
+            "{written}"
+        );
     }
 
     /// A second entry is added to the first, not written over it.
     #[test]
     fn a_second_entry_is_added_rather_than_replacing_the_first() {
         let (h, root) = vault_with_documents("era-append");
-        perform(&h, "m1", &act("bench_branch", json!({"what":"the third era"})));
-        perform(&h, "m1", &act("chronicle_add_entry", json!({"to":"the third era","what":"First."})));
-        perform(&h, "m1", &act("chronicle_add_entry", json!({"to":"the third era","what":"Second."})));
+        perform(
+            &h,
+            "m1",
+            &act("bench_branch", json!({"what":"the third era"})),
+        );
+        perform(
+            &h,
+            "m1",
+            &act(
+                "chronicle_add_entry",
+                json!({"to":"the third era","what":"First."}),
+            ),
+        );
+        perform(
+            &h,
+            "m1",
+            &act(
+                "chronicle_add_entry",
+                json!({"to":"the third era","what":"Second."}),
+            ),
+        );
         perform(&h, "m1", &act("bench_commit", json!({"why":"two entries"})));
 
         let written = std::fs::read_to_string(root.join("layers/eras/the-third-era.md")).unwrap();
         assert!(written.contains("First."), "{written}");
-        assert!(written.contains("Second."), "the second entry replaced the first: {written}");
+        assert!(
+            written.contains("Second."),
+            "the second entry replaced the first: {written}"
+        );
         assert!(
             written.find("First.") < written.find("Second."),
             "the record came back out of order: {written}"
@@ -1407,18 +1678,31 @@ mod tests {
     #[test]
     fn a_draft_written_into_a_silence_lands_in_the_stories_layer() {
         let (h, root) = vault_with_documents("story-draft");
-        perform(&h, "m1", &act("bench_branch", json!({"what":"the third silence"})));
+        perform(
+            &h,
+            "m1",
+            &act("bench_branch", json!({"what":"the third silence"})),
+        );
         let out = perform(
             &h,
             "m1",
-            &act("story_draft", json!({"for":"the third silence","what":"A night at the gate."})),
+            &act(
+                "story_draft",
+                json!({"for":"the third silence","what":"A night at the gate."}),
+            ),
         );
         assert!(out.happened(), "{out:?}");
-        perform(&h, "m1", &act("bench_commit", json!({"why":"filled the longest silence"})));
+        perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"filled the longest silence"})),
+        );
 
         let p = root.join("layers/stories/the-third-silence.md");
         assert!(p.exists(), "the draft did not reach the stories layer");
-        assert!(std::fs::read_to_string(p).unwrap().contains("A night at the gate."));
+        assert!(std::fs::read_to_string(p)
+            .unwrap()
+            .contains("A night at the gate."));
     }
 
     /// **A filed document is not written over casually.** It refuses until the
@@ -1429,16 +1713,30 @@ mod tests {
         let closed = perform(
             &h,
             "m1",
-            &act("chronicle_add_entry", json!({"to":"the fourth era","what":"…"})),
+            &act(
+                "chronicle_add_entry",
+                json!({"to":"the fourth era","what":"…"}),
+            ),
         );
         assert!(!closed.happened());
-        assert!(closed.line().unwrap().contains("Open it first"), "{closed:?}");
+        assert!(
+            closed.line().unwrap().contains("Open it first"),
+            "{closed:?}"
+        );
 
-        assert!(perform(&h, "m1", &act("bench_branch", json!({"what":"the fourth era"}))).happened());
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_branch", json!({"what":"the fourth era"}))
+        )
+        .happened());
         let open = perform(
             &h,
             "m1",
-            &act("chronicle_add_entry", json!({"to":"the fourth era","what":"And then not."})),
+            &act(
+                "chronicle_add_entry",
+                json!({"to":"the fourth era","what":"And then not."}),
+            ),
         );
         assert!(open.happened(), "{open:?}");
     }
@@ -1447,14 +1745,28 @@ mod tests {
     #[test]
     fn two_makers_writing_one_era_collide_at_the_commit() {
         let (h, _) = vault_with_documents("era-collide");
-        perform(&h, "m1", &act("bench_branch", json!({"what":"the third era"})));
-        perform(&h, "m1", &act("chronicle_add_entry", json!({"to":"the third era","what":"Mine."})));
+        perform(
+            &h,
+            "m1",
+            &act("bench_branch", json!({"what":"the third era"})),
+        );
+        perform(
+            &h,
+            "m1",
+            &act(
+                "chronicle_add_entry",
+                json!({"to":"the third era","what":"Mine."}),
+            ),
+        );
         // m1 is holding it, so m2 is refused by custody before it reaches the
         // document at all — the record's own rule, still doing its job.
         let blocked = perform(
             &h,
             "m2",
-            &act("chronicle_add_entry", json!({"to":"the third era","what":"Mine too."})),
+            &act(
+                "chronicle_add_entry",
+                json!({"to":"the third era","what":"Mine too."}),
+            ),
         );
         assert!(!blocked.happened());
         assert!(blocked.line().unwrap().contains("m1"), "{blocked:?}");
@@ -1468,12 +1780,18 @@ mod tests {
         let out = perform(
             &h,
             "m1",
-            &act("record_appraise", json!({"what":"the third era","verdict":"sound"})),
+            &act(
+                "record_appraise",
+                json!({"what":"the third era","verdict":"sound"}),
+            ),
         );
         assert!(out.happened(), "{out:?}");
         h.sim(|s| assert!(s.record.path_of("the western intake").is_none()));
         assert!(
-            !root.join("layers/eras").join("the-western-intake.md").exists(),
+            !root
+                .join("layers/eras")
+                .join("the-western-intake.md")
+                .exists(),
             "an accession was given a document"
         );
     }
@@ -1483,22 +1801,42 @@ mod tests {
     #[test]
     fn a_mood_can_be_read_and_changed_and_lands_on_the_disk() {
         let (h, root) = vault_with_documents("mood");
-        let read = perform(&h, "m1", &act("library_read", json!({"kind":"mood","id":"undone"})));
-        assert!(read.line().unwrap().contains("Something has been opened"), "{read:?}");
+        let read = perform(
+            &h,
+            "m1",
+            &act("library_read", json!({"kind":"mood","id":"undone"})),
+        );
+        assert!(
+            read.line().unwrap().contains("Something has been opened"),
+            "{read:?}"
+        );
 
         let out = perform(
             &h,
             "m1",
-            &act("library_write", json!({
-                "kind":"mood","id":"undone","field":"description",
-                "text":"So thoroughly opened that the whole interior has rearranged."
-            })),
+            &act(
+                "library_write",
+                json!({
+                    "kind":"mood","id":"undone","field":"description",
+                    "text":"So thoroughly opened that the whole interior has rearranged."
+                }),
+            ),
         );
         assert!(out.happened(), "{out:?}");
-        perform(&h, "m1", &act("bench_commit", json!({"why":"it read as two things at once"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "bench_commit",
+                json!({"why":"it read as two things at once"}),
+            ),
+        );
 
         let on_disk = std::fs::read_to_string(root.join("moods/undone.yaml")).unwrap();
-        assert!(on_disk.contains("whole interior has rearranged"), "{on_disk}");
+        assert!(
+            on_disk.contains("whole interior has rearranged"),
+            "{on_disk}"
+        );
     }
 
     /// **The comments survive.** This is the entire reason the write goes
@@ -1510,9 +1848,12 @@ mod tests {
         perform(
             &h,
             "m1",
-            &act("library_write", json!({
-                "kind":"mood","id":"undone","field":"description","text":"Rearranged."
-            })),
+            &act(
+                "library_write",
+                json!({
+                    "kind":"mood","id":"undone","field":"description","text":"Rearranged."
+                }),
+            ),
         );
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
 
@@ -1521,8 +1862,14 @@ mod tests {
             on_disk.contains("# The felt register — its KV is loaded"),
             "the comment was lost: {on_disk}"
         );
-        assert!(on_disk.contains("category: mood"), "an untouched field moved: {on_disk}");
-        assert!(on_disk.contains("Something has been opened"), "the template was rewritten");
+        assert!(
+            on_disk.contains("category: mood"),
+            "an untouched field moved: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("Something has been opened"),
+            "the template was rewritten"
+        );
     }
 
     #[test]
@@ -1531,7 +1878,10 @@ mod tests {
         let out = perform(
             &h,
             "m1",
-            &act("library_write", json!({"kind":"weather","id":"x","field":"template","text":"y"})),
+            &act(
+                "library_write",
+                json!({"kind":"weather","id":"x","field":"template","text":"y"}),
+            ),
         );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains("mood"), "{out:?}");
@@ -1546,18 +1896,24 @@ mod tests {
             let out = perform(
                 &h,
                 "m1",
-                &act("library_write", json!({
-                    "kind":"mood","id":"undone","field":field,"text":"x"
-                })),
+                &act(
+                    "library_write",
+                    json!({
+                        "kind":"mood","id":"undone","field":field,"text":"x"
+                    }),
+                ),
             );
             assert!(!out.happened(), "{field} was accepted");
         }
         let ok = perform(
             &h,
             "m1",
-            &act("library_write", json!({
-                "kind":"mood","id":"undone","field":"template","text":"Steady."
-            })),
+            &act(
+                "library_write",
+                json!({
+                    "kind":"mood","id":"undone","field":"template","text":"Steady."
+                }),
+            ),
         );
         assert!(ok.happened(), "{ok:?}");
     }
@@ -1572,25 +1928,41 @@ mod tests {
             "m1",
             &act("portrait_prompt_read", json!({"of":"ash-the-drifter"})),
         );
-        assert!(read.line().unwrap().contains("lean sun-darkened man"), "{read:?}");
+        assert!(
+            read.line().unwrap().contains("lean sun-darkened man"),
+            "{read:?}"
+        );
 
         let out = perform(
             &h,
             "m1",
-            &act("portrait_prompt_edit", json!({
-                "of":"ash-the-drifter",
-                "carrying":"the same man after the winter, quieter and harder to read"
-            })),
+            &act(
+                "portrait_prompt_edit",
+                json!({
+                    "of":"ash-the-drifter",
+                    "carrying":"the same man after the winter, quieter and harder to read"
+                }),
+            ),
         );
         assert!(out.happened(), "{out:?}");
-        perform(&h, "m1", &act("bench_commit", json!({"why":"the winter changed him"})));
+        perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"the winter changed him"})),
+        );
 
         let on_disk =
             std::fs::read_to_string(root.join("personalities/ash-the-drifter.yaml")).unwrap();
         assert!(on_disk.contains("after the winter"), "{on_disk}");
         // The picture it names is untouched — a redraw follows the words.
-        assert!(on_disk.contains("image: portraits/ash-the-drifter.png"), "{on_disk}");
-        assert!(on_disk.contains("# Biography is NOT here."), "the header was lost");
+        assert!(
+            on_disk.contains("image: portraits/ash-the-drifter.png"),
+            "{on_disk}"
+        );
+        assert!(
+            on_disk.contains("# Biography is NOT here."),
+            "the header was lost"
+        );
     }
 
     #[test]
@@ -1616,14 +1988,27 @@ mod tests {
         let h = vault();
         let before = h.sim(|s| s.ledger.verdicts_on("the third era").len());
 
-        assert!(perform(&h, "m1", &act("structure_lay_out_scenes", json!({"what":"the third era"}))).happened());
         assert!(perform(
             &h,
             "m1",
-            &act("structure_test_the_want", json!({"what":"the third era","scene":"the gate"})),
+            &act("structure_lay_out_scenes", json!({"what":"the third era"}))
         )
         .happened());
-        assert!(perform(&h, "m1", &act("structure_find_the_slack", json!({"what":"the third era"}))).happened());
+        assert!(perform(
+            &h,
+            "m1",
+            &act(
+                "structure_test_the_want",
+                json!({"what":"the third era","scene":"the gate"})
+            ),
+        )
+        .happened());
+        assert!(perform(
+            &h,
+            "m1",
+            &act("structure_find_the_slack", json!({"what":"the third era"}))
+        )
+        .happened());
 
         let after: Vec<String> = h.sim(|s| {
             s.ledger
@@ -1646,8 +2031,19 @@ mod tests {
     #[test]
     fn tidying_an_index_writes_the_way_in() {
         let h = vault();
-        h.sim(|s| assert!(s.record.by_name("the third era").unwrap().description.is_none()));
-        let out = perform(&h, "m1", &act("record_tidy_index", json!({"what":"the third era"})));
+        h.sim(|s| {
+            assert!(s
+                .record
+                .by_name("the third era")
+                .unwrap()
+                .description
+                .is_none())
+        });
+        let out = perform(
+            &h,
+            "m1",
+            &act("record_tidy_index", json!({"what":"the third era"})),
+        );
         assert!(out.happened(), "{out:?}");
         h.sim(|s| {
             let entry = s
@@ -1666,14 +2062,21 @@ mod tests {
     #[test]
     fn a_reading_of_nothing_is_refused() {
         let h = vault();
-        for tool in ["structure_lay_out_scenes", "structure_find_the_slack", "record_tidy_index"] {
+        for tool in [
+            "structure_lay_out_scenes",
+            "structure_find_the_slack",
+            "record_tidy_index",
+        ] {
             let out = perform(&h, "m1", &act(tool, json!({"what":"a thing nobody has"})));
             assert!(!out.happened(), "{tool} reported work on nothing");
         }
         let out = perform(
             &h,
             "m1",
-            &act("structure_test_the_want", json!({"what":"a thing nobody has","scene":"x"})),
+            &act(
+                "structure_test_the_want",
+                json!({"what":"a thing nobody has","scene":"x"}),
+            ),
         );
         assert!(!out.happened(), "{out:?}");
     }
@@ -1684,7 +2087,11 @@ mod tests {
             .iter()
             .chain(crate::engine::bench::BENCH_ACTS)
         {
-            assert!(is_mine(t.name), "`{}` is declared and not dispatched", t.name);
+            assert!(
+                is_mine(t.name),
+                "`{}` is declared and not dispatched",
+                t.name
+            );
         }
     }
 
@@ -1694,7 +2101,10 @@ mod tests {
         let out = perform(
             &h,
             "m1",
-            &act("story_draft", json!({"for":"the third silence","what":"a night at the gate"})),
+            &act(
+                "story_draft",
+                json!({"for":"the third silence","what":"a night at the gate"}),
+            ),
         );
         assert!(out.happened(), "{out:?}");
         h.sim(|s| {
@@ -1716,22 +2126,43 @@ mod tests {
         perform(
             &h,
             "m1",
-            &act("story_draft", json!({"for":"the third silence","what":"a night at the gate"})),
+            &act(
+                "story_draft",
+                json!({"for":"the third silence","what":"a night at the gate"}),
+            ),
         );
         h.sim(|s| {
-            assert!(s.record.by_name("a night at the gate").is_none(), "wrote into the prose");
-            assert!(!s.record.by_name("the third silence").unwrap().body.is_empty());
+            assert!(
+                s.record.by_name("a night at the gate").is_none(),
+                "wrote into the prose"
+            );
+            assert!(!s
+                .record
+                .by_name("the third silence")
+                .unwrap()
+                .body
+                .is_empty());
         });
     }
 
     #[test]
     fn a_second_maker_cannot_write_into_work_somebody_is_holding() {
         let h = vault();
-        perform(&h, "m1", &act("story_draft", json!({"for":"the third silence","what":"mine"})));
+        perform(
+            &h,
+            "m1",
+            &act(
+                "story_draft",
+                json!({"for":"the third silence","what":"mine"}),
+            ),
+        );
         let out = perform(
             &h,
             "m2",
-            &act("story_draft", json!({"for":"the third silence","what":"mine too"})),
+            &act(
+                "story_draft",
+                json!({"for":"the third silence","what":"mine too"}),
+            ),
         );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains("m1"), "{out:?}");
@@ -1745,7 +2176,10 @@ mod tests {
         let out = perform(
             &h,
             "m1",
-            &act("chronicle_add_entry", json!({"to":"the third era","what":"…"})),
+            &act(
+                "chronicle_add_entry",
+                json!({"to":"the third era","what":"…"}),
+            ),
         );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains("filed"), "{out:?}");
@@ -1755,19 +2189,48 @@ mod tests {
     fn a_commit_that_collides_names_the_other_party_rather_than_failing_blankly() {
         let h = vault();
         // m1 opens it; m2 tries to take it and is told who has it.
-        assert!(perform(&h, "m1", &act("bench_branch", json!({"what":"the third era"}))).happened());
-        let out = perform(&h, "m2", &act("bench_branch", json!({"what":"the third era"})));
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_branch", json!({"what":"the third era"}))
+        )
+        .happened());
+        let out = perform(
+            &h,
+            "m2",
+            &act("bench_branch", json!({"what":"the third era"})),
+        );
         assert!(!out.happened());
-        assert!(out.line().unwrap().contains("m1"), "the holder was not named: {out:?}");
+        assert!(
+            out.line().unwrap().contains("m1"),
+            "the holder was not named: {out:?}"
+        );
     }
 
     #[test]
     fn the_working_loop_runs_branch_to_commit() {
         let h = vault();
-        assert!(perform(&h, "m1", &act("bench_branch", json!({"what":"the third silence"}))).happened());
-        assert!(perform(&h, "m1", &act("story_draft", json!({"for":"the third silence","what":"a night at the gate"}))).happened());
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_branch", json!({"what":"the third silence"}))
+        )
+        .happened());
+        assert!(perform(
+            &h,
+            "m1",
+            &act(
+                "story_draft",
+                json!({"for":"the third silence","what":"a night at the gate"})
+            )
+        )
+        .happened());
         assert!(perform(&h, "m1", &act("bench_stage", json!({}))).happened());
-        let out = perform(&h, "m1", &act("bench_commit", json!({"why":"filled the longest silence"})));
+        let out = perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"filled the longest silence"})),
+        );
         assert!(out.happened(), "{out:?}");
         h.sim(|s| {
             let i = s.record.by_name("the third silence").unwrap();
@@ -1779,7 +2242,11 @@ mod tests {
     #[test]
     fn letting_something_go_without_a_reason_is_refused() {
         let h = vault();
-        let out = perform(&h, "m1", &act("record_let_go", json!({"what":"the third era"})));
+        let out = perform(
+            &h,
+            "m1",
+            &act("record_let_go", json!({"what":"the third era"})),
+        );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains("reason"), "{out:?}");
     }
@@ -1787,14 +2254,24 @@ mod tests {
     #[test]
     fn settling_needs_the_other_side_named() {
         let h = vault();
-        let alone = perform(&h, "m1", &act("chronicle_settle_boundary", json!({"between":"the third era"})));
+        let alone = perform(
+            &h,
+            "m1",
+            &act(
+                "chronicle_settle_boundary",
+                json!({"between":"the third era"}),
+            ),
+        );
         assert!(!alone.happened());
         assert!(alone.line().unwrap().contains("two"), "{alone:?}");
 
         let both = perform(
             &h,
             "m1",
-            &act("chronicle_settle_boundary", json!({"between":"the third era","and":"the fourth era"})),
+            &act(
+                "chronicle_settle_boundary",
+                json!({"between":"the third era","and":"the fourth era"}),
+            ),
         );
         assert!(both.happened(), "{both:?}");
     }
@@ -1802,25 +2279,53 @@ mod tests {
     #[test]
     fn blame_says_where_the_chain_goes_quiet() {
         let h = vault();
-        let out = perform(&h, "m1", &act("bench_blame", json!({"what":"the third era"})));
+        let out = perform(
+            &h,
+            "m1",
+            &act("bench_blame", json!({"what":"the third era"})),
+        );
         assert!(out.line().unwrap().contains("quiet"), "{out:?}");
 
         perform(
             &h,
             "m1",
-            &act("record_write_provenance", json!({"of":"the third era","from":"the western intake"})),
+            &act(
+                "record_write_provenance",
+                json!({"of":"the third era","from":"the western intake"}),
+            ),
         );
-        let then = perform(&h, "m1", &act("bench_blame", json!({"what":"the third era"})));
+        let then = perform(
+            &h,
+            "m1",
+            &act("bench_blame", json!({"what":"the third era"})),
+        );
         assert!(then.line().unwrap().contains("western intake"), "{then:?}");
     }
 
     #[test]
     fn a_filed_document_is_not_deleted_as_though_it_were_scratch() {
         let h = vault();
-        perform(&h, "m1", &act("bench_branch", json!({"what":"the third silence"}))).happened();
-        perform(&h, "m1", &act("story_draft", json!({"for":"the third silence","what":"x"})));
-        perform(&h, "m1", &act("story_file", json!({"what":"the third silence"})));
-        let out = perform(&h, "m1", &act("file_delete", json!({"path":"the third silence"})));
+        perform(
+            &h,
+            "m1",
+            &act("bench_branch", json!({"what":"the third silence"})),
+        )
+        .happened();
+        perform(
+            &h,
+            "m1",
+            &act("story_draft", json!({"for":"the third silence","what":"x"})),
+        );
+        perform(
+            &h,
+            "m1",
+            &act("story_file", json!({"what":"the third silence"})),
+        );
+        let out = perform(
+            &h,
+            "m1",
+            &act("file_delete", json!({"path":"the third silence"})),
+        );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains("record_let_go"), "{out:?}");
     }

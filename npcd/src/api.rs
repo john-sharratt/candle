@@ -1144,6 +1144,20 @@ async fn delete_npc(
             // ever, and its conversation is never retired.
             if let Some(rt) = s.runtime.as_ref() {
                 rt.scheduler.retire(npc_id);
+                // And what its body was waiting on, or a world running for a
+                // week keeps a row per act for every character it ever had.
+                rt.cooldowns.forget(npc_id);
+                // **And the questions it was part of, in both directions.**
+                //
+                // A question is an obligation the percept repeats every turn
+                // until the two of them speak — so one left behind by somebody
+                // who no longer exists is one the other character is told about
+                // for ever and can never discharge, because there is nobody in
+                // the room answering to that name. That is the exact shape of
+                // defect the obligation was added to remove.
+                if let Some((hosted, body)) = rt.body_of(npc_id) {
+                    hosted.with_sim(|s| s.ledger.forget_questions(&body));
+                }
                 if let Some(minds) = rt.minds.read().unwrap().as_ref() {
                     minds.retire_npc(npc_id);
                 }

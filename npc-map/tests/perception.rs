@@ -13,6 +13,7 @@
 
 use npc_map::perceive::{percept, within_reach};
 use npc_map::route;
+use npc_map::witness::{narrate, since};
 use npc_map::world::{Refused, Where, World};
 use npc_map::MapSet;
 
@@ -108,6 +109,92 @@ fn a_body_alone_in_a_quiet_corridor_gets_one_sentence() {
     // Nothing is within reach in a corridor, which is the whole point of
     // hanging tools on parts.
     assert!(within_reach(&w, "m1").is_empty());
+}
+
+/// **A room describes itself when you walk into it, and not otherwise.**
+///
+/// It began in the percept, which is what is true *now* and is re-sent whenever
+/// any of it changes — so a character that had stood in one room for an hour was
+/// handed the room's description again every time somebody walked past. Walking
+/// in is the moment it is news; after that it is furniture.
+#[test]
+fn a_body_that_walks_in_is_told_what_the_room_is() {
+    let mut w = vault();
+    w.enter("m1", "Maker-01", Where::new("vault-command", "receiving"))
+        .unwrap();
+    w.mark_seen("m1");
+
+    // Standing there says nothing about the room.
+    let standing = flat(&w, "m1");
+    assert!(
+        standing.starts_with("You are in the receiving room"),
+        "{standing}"
+    );
+    assert!(
+        !standing.contains("Everything entering the vault stops here"),
+        "the description is back in the percept: {standing}"
+    );
+
+    // Walking in does.
+    walk(&mut w, "m1", "core");
+    let told = narrate(&w, &since(&w, "m1")).expect("it got somewhere");
+    assert!(
+        told.contains("The car and the stairwell share one shaft at the corner"),
+        "the room said nothing about itself: {told}"
+    );
+}
+
+#[test]
+fn what_the_room_is_comes_after_the_line_saying_you_got_there() {
+    // Before it, the description is a sentence about a room the reader has not
+    // been told it is standing in yet.
+    let mut w = vault();
+    w.enter("m1", "Maker-01", Where::new("vault-command", "receiving"))
+        .unwrap();
+    w.mark_seen("m1");
+    walk(&mut w, "m1", "core");
+
+    let told = narrate(&w, &since(&w, "m1")).expect("it got somewhere");
+    let arrived = told.find("got to the lift and the stair");
+    let described = told.find("The car and the stairwell");
+    assert!(arrived.is_some() && described.is_some(), "{told}");
+    assert!(arrived < described, "{told}");
+}
+
+#[test]
+fn a_room_nobody_has_described_says_nothing_extra() {
+    // Absent rather than invented. Two thirds of the vault has no line
+    // authored yet, and a generated stand-in would be the renderer having
+    // opinions about somebody else's building.
+    let mut w = vault();
+    w.enter("m1", "Maker-01", casting("green-room")).unwrap();
+    w.mark_seen("m1");
+    walk(&mut w, "m1", "band-one");
+
+    let told = narrate(&w, &since(&w, "m1")).expect("it got somewhere");
+    assert_eq!(told, "You got to band one.", "it invented a room: {told}");
+}
+
+#[test]
+fn watching_somebody_else_walk_in_says_nothing_about_the_room() {
+    // You already know what room you are in. Only your own arrival is news
+    // about the place, and `GotThere` is private to the walker anyway.
+    let mut w = vault();
+    w.enter("m1", "Maker-01", Where::new("vault-command", "core"))
+        .unwrap();
+    w.enter("m2", "Maker-02", Where::new("vault-command", "receiving"))
+        .unwrap();
+    w.mark_seen("m1");
+
+    let to = Where::new("vault-command", "core");
+    w.set_off("m2", to).expect("a way there");
+    w.settle();
+
+    let told = narrate(&w, &since(&w, "m1")).expect("somebody came in");
+    assert!(
+        !told.contains("The car and the stairwell"),
+        "it described the room to somebody already standing in it: {told}"
+    );
 }
 
 #[test]

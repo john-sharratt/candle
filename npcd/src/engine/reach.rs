@@ -93,12 +93,55 @@ pub fn in_world(world: &World, body: &str) -> Vec<Within> {
 ///
 /// Nothing when the room offers nothing, because a corridor saying so every
 /// turn is a sentence that adds no fact.
-pub fn line(world: &World, body: &str) -> Option<String> {
+///
+/// # Why the state of a machine is here and not in an act
+///
+/// A body standing at a blast door can see whether it is shut. That was
+/// answered by `read`, which reported the mode and nothing else — and reading a
+/// thing to find out what it looks like is the `observe` mistake: a turn spent
+/// to learn something the character was standing in front of the whole time.
+///
+/// It is a fact about where the body is, so it arrives the way every other such
+/// fact does — pushed with the situation, the moment it changes, for everybody
+/// in the room at once. Perception here is pushed and never pulled; an act for
+/// looking at a door is an act for a world this is not.
+///
+/// Only where there is something to say: a machine with one state has no state
+/// worth reporting, and saying so every turn is a sentence that adds no fact.
+pub fn line(world: &World, sim: &crate::sim::Sim, body: &str) -> Option<String> {
     let here = in_world(world, body);
     if here.is_empty() {
         return None;
     }
-    let things: Vec<String> = here.into_iter().map(|w| w.thing).collect();
+    let place = world
+        .actor(body)
+        .map(|a| format!("{}/{}", a.at.area, a.at.node))
+        .unwrap_or_default();
+    // **The two halves name the same thing differently.** A part's `count_name`
+    // is bare — "blast door" — because articles are the describing sentence's
+    // business; the device seeded from it carries one, because a character has
+    // to name it back exactly. So the lookup tries both rather than either
+    // naming rule being bent to suit this line.
+    let device = |thing: &str| {
+        sim.devices
+            .by_name_at(&place, thing)
+            .or_else(|| sim.devices.by_name_at(&place, &format!("the {thing}")))
+    };
+    let things: Vec<String> = here
+        .into_iter()
+        .map(|w| match device(&w.thing) {
+            // More than one state is the only case where the current one is
+            // news. A counted part — six terminals — is not looked up at all,
+            // because its `thing` is the plural and six states in a row is
+            // noise rather than a fact.
+            Some(d) if d.modes.len() > 1 => match d.working {
+                true => format!("{} ({})", w.thing, d.mode),
+                false => format!("{} ({}, not working)", w.thing, d.mode),
+            },
+            Some(d) if !d.working => format!("{} (not working)", w.thing),
+            _ => w.thing,
+        })
+        .collect();
     Some(format!("Within reach: {}.", npc_map::text::list(&things)))
 }
 

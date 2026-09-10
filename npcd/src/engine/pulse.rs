@@ -17,7 +17,7 @@
 //! # Why it is a first-class surface rather than a debug flag
 //!
 //! Because the same view is the authoring instrument. Somebody building a
-//! character needs to see it react — poke it with `/hurt`, watch the tick, see
+//! character needs to see it react — poke it with `/act`, watch the tick, see
 //! what the window held when it decided. A debug flag would make that a
 //! developer-only affordance, and it is the main thing an author does.
 
@@ -77,7 +77,13 @@ struct Scope {
 /// An admin may ask for everything with `?all=1`, and gets it only if they
 /// actually are one: the flag is a request, never a grant.
 async fn scope_of(s: &Arc<Authored>, id: &Identity, owner: &str, all: bool) -> Scope {
-    let may_see_all = matches!(s.roles.of(Some(id)), Role::Admin);
+    // **A bar, not an equality.** This read `matches!(.., Role::Admin)`, which
+    // was the same thing while `Admin` was the top of the ladder and stopped
+    // being it the moment `Creator` went above — the person who owns the estate
+    // signed in and silently lost a control an admin has. An exact match on a
+    // level in an *ordered* enum is a demotion waiting for the next level to be
+    // added, and it does not fail, it just quietly refuses.
+    let may_see_all = s.roles.of(Some(id)).at_least(Role::Admin);
     if all && may_see_all {
         return Scope {
             // `None`, not an empty set — an empty set reads as "nothing to
@@ -459,8 +465,8 @@ pub async fn inject(
         // **Named.** The parser writes the placeholder `you` because it cannot
         // know whose console the line came from, and that rendered as "you says
         // to you: …" — ungrammatical, and wrong about who spoke. See
-        // [`slash::Parsed::spoken_by`].
-        Ok(p) => p.spoken_by(&crate::engine::speaking_as(&id, &owner)),
+        // [`slash::Parsed::attributed_to`].
+        Ok(p) => p.attributed_to(&crate::engine::speaking_as(&id, &owner, &s.roles)),
         // A typo is a 400 with the near miss named, never speech. Sending
         // `/hrut` to the character as dialogue is the one outcome that looks
         // like it worked.
@@ -626,12 +632,7 @@ pub async fn tools(State(s): State<Arc<Authored>>) -> Response {
 fn describe_catalog(part_names: &PartNames) -> Value {
     use crate::engine::tools::{self, Availability, Mode};
 
-    const MODES: [Mode; 4] = [
-        Mode::Physical,
-        Mode::VideoCall,
-        Mode::VoiceCall,
-        Mode::InstantMessage,
-    ];
+    const MODES: [Mode; 2] = [Mode::Physical, Mode::InstantMessage];
 
     let described: Vec<Value> = tools::CATALOG
         .iter()
@@ -649,7 +650,12 @@ fn describe_catalog(part_names: &PartNames) -> Value {
             let modes: Vec<&str> = MODES
                 .iter()
                 .filter(|m| match t.availability {
-                    Availability::Always | Availability::Nearby | Availability::Embodied => true,
+                    // Where a body is standing, like who is standing with it,
+                    // is not a fact about the channel.
+                    Availability::Always
+                    | Availability::Nearby
+                    | Availability::Embodied
+                    | Availability::AwayFromHome => true,
                     Availability::PhysicalOnly => **m == Mode::Physical,
                     Availability::MessagingOnly => m.remote(),
                     Availability::Pictorial => m.carries_pictures(),
@@ -698,6 +704,7 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     Availability::Always => Value::Null,
                     Availability::Nearby => json!("somebody else here"),
                     Availability::Embodied => json!("a body"),
+                    Availability::AwayFromHome => json!("being somewhere that is not home"),
                     Availability::PhysicalOnly => json!("being present"),
                     Availability::MessagingOnly => json!("being at a distance"),
                     Availability::Pictorial => json!("a channel that carries pictures"),
@@ -785,11 +792,9 @@ mod tests {
     /// The station names the shipped maps actually give, which is what an
     /// operator will read.
     fn shipped_part_names() -> PartNames {
-        let set = npc_map::MapSet::load_dir(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../npc-map/maps"
-        ))
-        .expect("the shipped maps must load");
+        let set =
+            npc_map::MapSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"))
+                .expect("the shipped maps must load");
         let mut names = PartNames::new();
         for area in set.areas() {
             for node in &area.nodes {
@@ -807,13 +812,24 @@ mod tests {
     fn the_tools_route_sends_every_field_the_console_renders() {
         let v = describe_catalog(&shipped_part_names());
 
-        assert_eq!(v["uncalibrated"].as_u64(), Some(0), "an act shipped with no examples");
+        assert_eq!(
+            v["uncalibrated"].as_u64(),
+            Some(0),
+            "an act shipped with no examples"
+        );
         assert!(v["acts_per_turn"].as_u64().unwrap() >= 1);
 
         let ts = v["tools"].as_array().expect("an array");
         assert_eq!(ts.len(), crate::engine::tools::CATALOG.len());
         for t in ts {
-            for field in ["name", "category", "description", "modes", "source", "calibrated"] {
+            for field in [
+                "name",
+                "category",
+                "description",
+                "modes",
+                "source",
+                "calibrated",
+            ] {
                 assert!(!t[field].is_null(), "`{}` has no `{field}`", t["name"]);
             }
             assert_eq!(t["parameters"]["type"], "object", "{}", t["name"]);
@@ -834,12 +850,26 @@ mod tests {
     fn a_conditional_act_says_what_it_needs() {
         let v = describe_catalog(&shipped_part_names());
         let ts = v["tools"].as_array().unwrap();
-        let find = |n: &str| ts.iter().find(|t| t["name"] == n).expect("in the catalog").clone();
+        let find = |n: &str| {
+            ts.iter()
+                .find(|t| t["name"] == n)
+                .expect("in the catalog")
+                .clone()
+        };
 
-        assert!(find("say")["needs"].is_null(), "`say` is always available");
+        // Speech reaches whoever is in the room, so an empty room is the one
+        // place it does nothing — the same condition `tell` has always carried,
+        // and it now carries it too.
+        assert_eq!(find("say")["needs"], "somebody else here");
         assert_eq!(find("tell")["needs"], "somebody else here");
+        assert_eq!(find("gesture")["needs"], "somebody else here");
+        assert!(
+            find("reflect")["needs"].is_null(),
+            "stopping must be available whatever else is not, or a character \
+             with nothing it can do has no way to spend a turn"
+        );
         assert_eq!(find("move_to")["needs"], "a body");
-        assert_eq!(find("touch")["needs"], "being present");
+        assert_eq!(find("act")["needs"], "being present");
 
         // **A station act names the station**, in the words the map uses for
         // it. "Standing at the station that carries it" is true of every one of
@@ -848,7 +878,10 @@ mod tests {
             find("chronicle_add_entry")["needs"],
             "standing at a world history terminal"
         );
-        assert_eq!(find("record_appraise")["needs"], "standing at the appraisal bench");
+        assert_eq!(
+            find("record_appraise")["needs"],
+            "standing at the appraisal bench"
+        );
 
         // An act reaching several says so as alternatives — you need one of
         // them, not all six.
@@ -868,11 +901,20 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(at.len(), 6, "{at:?}");
-        assert!(at.contains(&"a world history terminal".to_string()), "{at:?}");
-        assert!(at.contains(&"an easel".to_string()), "the article was assumed: {at:?}");
+        assert!(
+            at.contains(&"a world history terminal".to_string()),
+            "{at:?}"
+        );
+        assert!(
+            at.contains(&"an easel".to_string()),
+            "the article was assumed: {at:?}"
+        );
 
-        // The mode split the two-valued `Mode` could not express: a picture
-        // goes down video and text and not down a voice line.
+        // **An act narrowed by channel reports the narrowing.** `send_image`
+        // goes down a thread and not into a room — you are standing in front of
+        // them, so you hold the thing up — and the catalogue the console reads
+        // has to say so, or an operator is shown an act as if it worked
+        // everywhere.
         let img = find("send_image");
         let modes: Vec<String> = img["modes"]
             .as_array()
@@ -881,9 +923,7 @@ mod tests {
             .map(|m| m.as_str().unwrap().to_string())
             .collect();
         let modes: Vec<&str> = modes.iter().map(String::as_str).collect();
-        assert!(modes.contains(&"video_call") && modes.contains(&"instant_message"));
-        assert!(!modes.contains(&"voice_call"), "a picture went down a phone call");
-        assert!(!modes.contains(&"physical"));
+        assert_eq!(modes, vec!["instant_message"], "{modes:?}");
     }
 
     /// With no world open there is no map to read a name off, and the field

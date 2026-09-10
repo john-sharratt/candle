@@ -1024,11 +1024,24 @@ impl ConversationEngine {
         // Without this the stencil releases control after `</tool_call>` and the
         // model free-decodes a hallucinated answer past the call. The decode
         // loop detects the EOS in the injected close run and seals the turn.
+        //
+        // **Taken from the dialect, not written here.** The shape of a call is
+        // decided by the template the weights were trained against — Qwen3.5
+        // writes a nested function element, ChatML writes a JSON object — and a
+        // literal in this function is a second opinion about that, free to
+        // disagree with the checkpoint actually loaded.
+        let d = &self.config.dialect;
+        let base = ToolCallEnvelope::for_dialect(d);
         let envelope = ToolCallEnvelope {
-            open: "\n{\"name\": \"".to_string(),
-            args_open: ", \"arguments\": {".to_string(),
-            close: "}}\n</tool_call><|im_end|>".to_string(),
-            marker: "<tool_call>".to_string(),
+            // Minus the marker the model has already emitted, plus the turn
+            // terminator on the close.
+            open: base
+                .open
+                .strip_prefix(&base.marker)
+                .unwrap_or(&base.open)
+                .to_string(),
+            close: format!("{}{}", base.close, d.assistant_end),
+            ..base
         };
         let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))

@@ -170,6 +170,7 @@ mod tests {
             portrait_image_id: None,
             portrait_origin: None,
             at: None,
+            mood: None,
             beliefs: Vec::new(),
             relationships: Vec::new(),
             agency: Vec::new(),

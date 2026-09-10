@@ -53,7 +53,7 @@ use crate::world::Hosted;
 /// The order is both how it reads and how it caches: the situation leads, so an
 /// unchanged one that *is* re-sent still matches the tokens above it, and the
 /// volatile half is appended after that boundary rather than through it.
-pub fn carried(world: &World, delta: &Delta) -> Vec<Perceived> {
+pub fn carried(world: &World, sim: &crate::sim::Sim, delta: &Delta) -> Vec<Perceived> {
     let mut out = Vec::new();
     if let Some(here) = &delta.percept {
         // What is within reach goes *in* the situation rather than beside it.
@@ -61,7 +61,7 @@ pub fn carried(world: &World, delta: &Delta) -> Vec<Perceived> {
         // and go stale together — and one band holding both is what guarantees
         // a character never reads the tools of a room it has left.
         let mut text = here.trim_end().to_string();
-        if let Some(reach) = reach::line(world, &delta.who) {
+        if let Some(reach) = reach::line(world, sim, &delta.who) {
             text.push_str("\n\n");
             text.push_str(&reach);
         }
@@ -73,10 +73,70 @@ pub fn carried(world: &World, delta: &Delta) -> Vec<Perceived> {
             text.push_str("\n\n");
             text.push_str(&near);
         }
+        // **What somebody is still waiting on from you.** Part of the situation
+        // rather than an event, and that is the whole of the fix: a question
+        // arrived once, as one line among the weather, and was gone by the next
+        // turn. Standing here it is in front of the character every turn until
+        // the two of them speak.
+        if let Some(owed) = awaiting_line(world, sim, &delta.who) {
+            text.push_str("\n\n");
+            text.push_str(&owed);
+        }
         out.push(situation(text));
     }
     out.extend(digest(world, &delta.events));
     out
+}
+
+/// Who is waiting on an answer from this character, as a line it reads.
+///
+/// **A question is the one obligation nothing wrote down.** A promise outlives
+/// the meeting because the ledger holds it; a question existed for exactly the
+/// turn it was delivered in — one line of perception between a sagging jacket
+/// and a humming conduit — and by the next turn there was nothing saying
+/// anybody was still waiting.
+///
+/// The consequence was measurable and total: three `ask`s delivered and
+/// perceived correctly, zero replies. One character was asked directly twice in
+/// forty ticks and reflected both times. They will start a conversation and
+/// never return one.
+///
+/// Named as an obligation rather than as news, and in the second person,
+/// because that is what it is. Nothing when nobody is waiting — the same
+/// discipline as [`company_line`]: a character shown a way to answer somebody
+/// while nobody has asked anything will answer nobody at length.
+fn awaiting_line(world: &World, sim: &crate::sim::Sim, body: &str) -> Option<String> {
+    let waiting = sim.ledger.awaiting_from(body);
+    if waiting.is_empty() {
+        return None;
+    }
+    // **By the name the world writes down, or not at all.**
+    //
+    // The ledger keeps body ids and a character has never heard of one: being
+    // told that `m2` is waiting is being told nothing it could act on, and
+    // `tell` would refuse the id straight back because nobody answers to it.
+    //
+    // An asker the world cannot resolve is one that is no longer in it, so the
+    // line is dropped rather than falling back to the id. That fallback was
+    // here and was the very thing the comment above it warned against — it
+    // would have put an unanswerable name in front of a character every turn,
+    // which is the defect this whole obligation exists to avoid.
+    let named: Vec<String> = waiting
+        .iter()
+        .filter_map(|(who, what)| {
+            let name = world.actor(who).map(|a| a.name.clone())?;
+            Some(format!("\n- {name}, who asked {what}"))
+        })
+        .collect();
+    if named.is_empty() {
+        return None;
+    }
+    let mut s = String::from("Waiting on an answer from you:");
+    s.push_str(&named.join(""));
+    s.push_str(
+        "\n\nSay something to them. A question you leave standing is one they asked into silence.",
+    );
+    Some(s)
 }
 
 /// What a body can do because somebody else is in the room, as a line it reads.
@@ -120,7 +180,7 @@ pub fn push_one(hosted: &Hosted, sched: &Scheduler, npc_id: u64, body: &str) -> 
     if delta.is_empty() {
         return false;
     }
-    let (events, at_ms) = hosted.read(|w| (carried(w, &delta), w.now()));
+    let (events, at_ms) = hosted.with_both(|w, s| (carried(w, s, &delta), w.now()));
     for Perceived { kind, salience } in events {
         sched.deliver(npc_id, at_ms, salience, kind);
     }
@@ -143,7 +203,7 @@ pub fn push(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
         let Some(npc_id) = bindings.mind_of(hosted.id(), &delta.who) else {
             continue;
         };
-        let events = hosted.read(|w| carried(w, delta));
+        let events = hosted.with_both(|w, s| carried(w, s, delta));
         if events.is_empty() {
             continue;
         }
@@ -157,15 +217,28 @@ pub fn push(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
 
 /// One moment of world time, and everything that follows from it.
 ///
-/// Journeys advance first and perception is taken after, because a body that
-/// moved this moment has to be told where it ended up rather than where it set
-/// out from. Both under the world's own lock, in that order, always.
+/// Journeys advance first, then the building has its say, and perception is
+/// taken after both. The order is the whole of it:
+///
+/// * A body that moved this moment has to be told where it ended up rather than
+///   where it set out from.
+/// * A stirring written *after* the sweep is read a moment late by everybody in
+///   the room, and never at all by the body that walked out during it.
+///
+/// **And the building's say belongs here, not in the metronome's closure.**
+/// Idle ticks are gone — a mind thinks when something reaches it and not
+/// otherwise — so in a room where nobody is talking, [`Hosted::stir`] is the
+/// only thing that will ever wake anybody. A route that advanced the world
+/// without it would be a route on which characters are inert, and every test
+/// advances the world directly.
 pub fn advance(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> Moment {
     let moved = hosted.tick();
+    let stirred = hosted.stir();
     let told = push(hosted, bindings, sched);
     let messaged = deliver_messages(hosted, bindings, sched);
     Moment {
         moved,
+        stirred,
         told,
         messaged,
     }
@@ -190,11 +263,8 @@ pub fn advance(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> Momen
 fn deliver_messages(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
     // Name → body, off the world: threads address people the way a room does,
     // by the name the world writes down, and the bindings key on the body.
-    let who_is_where: Vec<(String, String)> = hosted.read(|w| {
-        w.actors()
-            .map(|a| (a.name.clone(), a.id.clone()))
-            .collect()
-    });
+    let who_is_where: Vec<(String, String)> =
+        hosted.read(|w| w.actors().map(|a| (a.name.clone(), a.id.clone())).collect());
     if who_is_where.is_empty() {
         return 0;
     }
@@ -250,6 +320,9 @@ fn deliver_messages(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> 
 pub struct Moment {
     /// Bodies that covered a leg.
     pub moved: usize,
+    /// Rooms in which the building did something. Nearly always none: a room
+    /// waits minutes between looks and a moment is half a second.
+    pub stirred: usize,
     /// Minds that were told something.
     pub told: usize,
     /// Minds handed something off a handset. Counted apart from `told` because
@@ -408,17 +481,54 @@ mod tests {
 
     #[test]
     fn a_moment_that_moves_nobody_and_tells_nobody_is_quiet() {
+        // The building's first look is minutes away, so the moment after a crew
+        // walks in is genuinely still. That is the common case and is what makes
+        // a large cast affordable.
         let (h, b, s) = crew(3);
         let m = advance(&h, &b, &s);
         assert_eq!(
             m,
             Moment {
                 moved: 0,
+                stirred: 0,
                 told: 0,
                 messaged: 0
             }
         );
         assert!(m.is_quiet());
+    }
+
+    /// **The whole point of the building, end to end.**
+    ///
+    /// Idle ticks are gone, so a Maker standing alone in a room has nothing to
+    /// think about and never will unless the room gives it something. This is
+    /// that path: the building says a thing, the sweep carries it, and the mind
+    /// reads it and is woken to act on it.
+    #[test]
+    fn what_the_building_does_reaches_a_mind_standing_in_the_room() {
+        let (h, b, s) = crew(1);
+        run(&s, 0);
+        h.with(|w| {
+            w.stir(
+                &at("green-room"),
+                "The lights in the ceiling flicker and steady.",
+                npc_map::salience::Weight::Note,
+            )
+            .unwrap()
+        });
+
+        assert_eq!(push(&h, &b, &s), 1, "nobody was told");
+        let woken = run(&s, 1);
+        assert!(
+            woken.iter().any(|(id, _)| *id == 101),
+            "the room spoke and nothing woke to hear it"
+        );
+        let read = woken
+            .iter()
+            .find(|(id, _)| *id == 101)
+            .map(|(_, lines)| lines.join(" "))
+            .expect("ticked");
+        assert!(read.contains("flicker and steady"), "{read}");
     }
 
     #[test]
@@ -439,8 +549,18 @@ mod tests {
         assert!(here.contains("band one"), "{here}");
     }
 
+    /// **Both hear it; they differ in whether it interrupted them.**
+    ///
+    /// The bystander used to be left unscheduled — its line sat in the queue
+    /// until something else woke it. That only worked while a heartbeat was
+    /// coming along behind to collect it; with idle ticks gone, an arrival
+    /// nobody wakes for is one nobody ever reads, and overhearing would be
+    /// silently discarded.
+    ///
+    /// So the distinction moved from *whether* to *how*: being addressed
+    /// preempts, overhearing is pending. Both get read.
     #[test]
-    fn being_spoken_to_wakes_a_mind_and_overhearing_does_not() {
+    fn being_addressed_preempts_and_overhearing_merely_pends() {
         let (h, b, s) = crew(3);
         run(&s, 0);
         h.with(|w| w.tell("m1", "m2", "get out of here").unwrap());
@@ -449,7 +569,19 @@ mod tests {
         let woken = run(&s, 1);
         let ids: Vec<u64> = woken.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&102), "the addressed mind was not woken");
-        assert!(!ids.contains(&103), "the bystander was woken");
+        assert!(ids.contains(&103), "the bystander never read what it heard");
+
+        // And they read different sentences: one was told, the other watched it
+        // happen to somebody else.
+        let heard = |id: u64| {
+            woken
+                .iter()
+                .find(|(who, _)| *who == id)
+                .map(|(_, lines)| lines.join(" "))
+                .expect("ticked")
+        };
+        assert!(heard(102).contains("to you"), "{}", heard(102));
+        assert!(!heard(103).contains("to you"), "{}", heard(103));
     }
 
     #[test]
@@ -593,7 +725,7 @@ mod tests {
         h.tick();
 
         let delta = h.peek("m2");
-        let events = h.read(|w| carried(w, &delta));
+        let events = h.with_both(|w, s| carried(w, s, &delta));
         assert!(events.len() > 1, "nothing to tell apart");
         for e in &events {
             match e.kind {

@@ -194,10 +194,31 @@ impl Pack {
     }
 
     /// The names of what `use` should offer.
+    ///
+    /// # A thing whose acts live elsewhere is not a thing you *use*
+    ///
+    /// [`Kind::Gear`] is usable because a scanner is worked and stays — that is
+    /// what `use` is for. The handset passes the same test and is nothing like
+    /// it: everything a phone does has its own act (`message`, `reach_out`,
+    /// `invite`, `open_group`, `sign_off`), so `use` on one has no behaviour to
+    /// run and never had. [`crate::engine::enact`] holds no per-item branch at
+    /// all, so it fell through to the generic ending and answered *"You work
+    /// the handset."* — success, no effect, nothing learnt, and therefore done
+    /// again on the next turn.
+    ///
+    /// It was reached for because every messaging act **sends** and none of
+    /// them reads, so a character wondering whether anybody had answered had
+    /// this and nothing else. It does not need one: `environment::deliver_messages`
+    /// pushes every message on the sweep, so an answer arrives without being
+    /// fetched. An act for checking would be a turn spent pulling what is
+    /// already pushed — the `observe` mistake, in a pocket.
+    ///
+    /// So the phone leaves the set, and the ordinary empty-set rule does the
+    /// rest: what a character cannot say, it cannot get stuck saying.
     pub fn usable(&self) -> Vec<String> {
         self.items
             .values()
-            .filter(|i| i.kind.usable())
+            .filter(|i| i.kind.usable() && i.id != crate::sim::phone::PHONE)
             .map(|i| i.name.clone())
             .collect()
     }
@@ -225,6 +246,42 @@ mod tests {
 
     fn rounds(n: u32) -> Item {
         Item::new("bolt", "bolt rounds", Kind::Ammunition, n)
+    }
+
+    /// **The phone is not a thing you `use`.**
+    ///
+    /// It is `Gear`, so it passed the kind test and was offered — and `use` has
+    /// no per-item behaviour, so it answered "You work the handset.": success,
+    /// no effect, nothing learnt, repeated next turn. A live cast reached for it
+    /// because every messaging act sends and none of them reads, and this was
+    /// the only thing that looked like checking a phone.
+    ///
+    /// Everything a phone actually does has its own act, and messages arrive on
+    /// the sweep without being fetched. So it leaves the set, and the ordinary
+    /// empty-set rule stops the act being sayable at all.
+    #[test]
+    fn a_handset_is_not_offered_as_something_to_use() {
+        let mut p = Pack::new();
+        p.add(Item::new(
+            crate::sim::phone::PHONE,
+            "handset",
+            Kind::Gear,
+            1,
+        ));
+        assert!(
+            p.usable().is_empty(),
+            "the phone was offered to `use`, which does nothing to it: {:?}",
+            p.usable()
+        );
+
+        // And the gear that `use` is genuinely for is untouched — the rule is
+        // about this one item, not about the kind.
+        p.add(Item::new("scanner", "advanced scanner", Kind::Gear, 1));
+        assert_eq!(p.usable(), vec!["advanced scanner"]);
+
+        // It is still carried, still given, still taken off you — only the one
+        // act that had nothing to run is gone.
+        assert!(p.names().iter().any(|n| n == "handset"));
     }
 
     #[test]
@@ -277,7 +334,11 @@ mod tests {
         // Gear is both: worn, and operated. A consumable is only ever used, so
         // the two sets overlap rather than partition — and readying something
         // takes it out of `equippable` without taking it out of `usable`.
-        assert_eq!(p.equippable(), vec!["advanced scanner"], "the sword is readied");
+        assert_eq!(
+            p.equippable(),
+            vec!["advanced scanner"],
+            "the sword is readied"
+        );
         assert!(p.equip("scanner"));
         assert_eq!(p.usable(), vec!["advanced scanner", "stimpak"]);
         assert!(p.equippable().is_empty(), "everything wearable is now worn");
@@ -298,7 +359,10 @@ mod tests {
         p.add(Item::new("mono_sword", "mono sword", Kind::Weapon, 1));
         assert!(p.by_name("Mono Sword").is_some());
         assert!(p.by_name("  mono sword ").is_some());
-        assert!(p.by_name("mono_sword").is_some(), "the id should resolve too");
+        assert!(
+            p.by_name("mono_sword").is_some(),
+            "the id should resolve too"
+        );
         assert!(p.by_name("plasma rifle").is_none());
     }
 

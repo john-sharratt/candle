@@ -44,6 +44,88 @@ impl DialectType {
     }
 }
 
+/// How a model family writes a tool call, and how many it may write at once.
+///
+/// **A property of the checkpoint, not of the application.** Two families that
+/// share ChatML's turn markers can still disagree completely about what an
+/// assistant turn containing a tool call looks like, and a caller that assumed
+/// one shape produced calls the other family's template cannot represent. The
+/// axis lives beside the turn markers because it is decided by the same thing:
+/// which chat template the weights were trained against.
+///
+/// Every consumer that renders a call, parses one back, constrains a decode to
+/// one, or explains the format in a system prompt asks this rather than
+/// assuming — so adding a family is adding a variant and the arms the compiler
+/// then demands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallStyle {
+    /// One JSON object per line, as ordinary assistant prose:
+    /// `{"tool":"say","intent":"…"}`.
+    ///
+    /// **No native markers at all**, which is what makes it the right default
+    /// for a family whose template has no tool section: nothing structural is
+    /// emitted, so nothing can be malformed against a template that never
+    /// expected it. Several calls are several lines.
+    ///
+    /// It also cannot carry a result. A family on this style has no
+    /// `tool`-role turn to put one in, so an outcome has to reach the model as
+    /// ordinary user text or not at all.
+    Lines,
+    /// Qwen2.5 / Qwen3: a JSON object wrapped in the template's own markers.
+    ///
+    /// ```text
+    /// <tool_call>
+    /// {"name": "say", "arguments": {"intent": "…"}}
+    /// </tool_call>
+    /// ```
+    ///
+    /// Several calls are several consecutive blocks in one assistant turn.
+    JsonBlock,
+    /// Qwen3.5 / Qwen3.8: a nested function block, with one element per
+    /// argument and **unquoted, possibly multi-line values**.
+    ///
+    /// ```text
+    /// <tool_call>
+    /// <function=say>
+    /// <parameter=intent>
+    /// what I mean, which may run to several lines
+    /// </parameter>
+    /// </function>
+    /// </tool_call>
+    /// ```
+    ///
+    /// The values not being JSON strings is the substantive difference and not
+    /// a cosmetic one: nothing needs escaping, and a parameter may hold prose
+    /// with newlines in it, which the single-line JSON forms cannot express.
+    FunctionBlock,
+}
+
+impl CallStyle {
+    /// Whether one assistant turn may carry more than one call.
+    ///
+    /// True for every style here — each has a way to write a second call — and
+    /// asked rather than assumed because it is the question a caller actually
+    /// has, and because a family that cannot will eventually be added.
+    pub fn multi_call(self) -> bool {
+        match self {
+            CallStyle::Lines | CallStyle::JsonBlock | CallStyle::FunctionBlock => true,
+        }
+    }
+
+    /// Whether the template has a turn a tool *result* can be put in.
+    ///
+    /// [`CallStyle::Lines`] has none — it is plain prose in an assistant turn,
+    /// so there is no `tool` role and no `<tool_response>` for a caller to
+    /// address. A caller with a result to deliver on that style has to fold it
+    /// into the next user turn, and this is how it knows to.
+    pub fn carries_results(self) -> bool {
+        match self {
+            CallStyle::Lines => false,
+            CallStyle::JsonBlock | CallStyle::FunctionBlock => true,
+        }
+    }
+}
+
 /// Structural tokens for a chat template dialect.
 ///
 /// Each field is a static string fragment used to assemble prompts.
@@ -101,6 +183,15 @@ pub struct Dialect {
     pub tool_block_close: &'static str,
     pub tool_response_open: &'static str,
     pub tool_response_close: &'static str,
+    /// How this family writes a call. See [`CallStyle`].
+    ///
+    /// **The style, and not the strings that spell it out.** The markers live
+    /// in `candle_conversation::stencil::ToolCallEnvelope`, which is what
+    /// compiles them into a grammar — and one syntax written down twice is two
+    /// things free to disagree, with the disagreement showing up as a decode
+    /// constrained to one shape and parsed as another. So this says *which*
+    /// shape, and the layer that has to emit it owns *what* it looks like.
+    pub call_style: CallStyle,
 }
 
 /// Catalog of named structural-template fragments callable by YAML schemas.
@@ -235,6 +326,16 @@ impl Dialect {
             tool_block_close: "</tools>\n",
             tool_response_open: "<tool_response>\n",
             tool_response_close: "</tool_response>\n",
+            // **Plain lines, which is what every caller here already emits.**
+            //
+            // ChatML's own template can carry `<tool_call>` JSON blocks, and a
+            // family on this dialect may well support them — but what the
+            // engine has always produced is one JSON object per line as
+            // ordinary assistant prose, and saying so is the difference
+            // between a described default and an assumed one. A family that
+            // should use its native blocks says so in its own constructor, the
+            // way `qwen35` does below.
+            call_style: CallStyle::Lines,
         }
     }
 
@@ -251,11 +352,34 @@ impl Dialect {
     ///
     /// `document_end` is `<|im_end|>`, not `<|endoftext|>`: the checkpoint's
     /// `tokenizer.ggml.eos_token_id` points at the turn terminator.
+    /// # It also calls tools differently, and that is the larger difference
+    ///
+    /// The published template does not put JSON inside `<tool_call>`. It emits
+    /// a nested function element with one child per argument and **unquoted
+    /// values that may span lines**:
+    ///
+    /// ```text
+    /// <tool_call>
+    /// <function=say>
+    /// <parameter=intent>
+    /// what I mean, which may run to several lines
+    /// </parameter>
+    /// </function>
+    /// </tool_call>
+    /// ```
+    ///
+    /// Taken from the shipped checkpoint's own `chat_template`, which iterates
+    /// `message.tool_calls` — so several calls are several blocks in one
+    /// assistant turn — and merges consecutive `tool` messages into a single
+    /// following user turn, each wrapped in `<tool_response>`. Every one of
+    /// those tags is a real token in this vocabulary rather than text that
+    /// happens to look like one.
     pub fn qwen35() -> Self {
         Self {
             dialect_type: DialectType::Qwen35,
             no_think: "",
             document_end: "<|im_end|>",
+            call_style: CallStyle::FunctionBlock,
             ..Self::chat_ml()
         }
     }
@@ -285,6 +409,10 @@ impl Dialect {
             tool_block_close: "</tools>\n",
             tool_response_open: "<tool_response>\n",
             tool_response_close: "</tool_response>\n",
+            // Plain lines — what this engine has always emitted. Stated rather
+            // than inherited: a family that silently took another's call style
+            // would produce calls its own template cannot represent.
+            call_style: CallStyle::Lines,
         }
     }
 
@@ -313,6 +441,10 @@ impl Dialect {
             tool_block_close: "</tools>\n",
             tool_response_open: "<tool_response>\n",
             tool_response_close: "</tool_response>\n",
+            // Plain lines — what this engine has always emitted. Stated rather
+            // than inherited: a family that silently took another's call style
+            // would produce calls its own template cannot represent.
+            call_style: CallStyle::Lines,
         }
     }
 
@@ -347,6 +479,10 @@ impl Dialect {
             tool_block_close: "</tools>\n",
             tool_response_open: "<tool_response>\n",
             tool_response_close: "</tool_response>\n",
+            // Plain lines — what this engine has always emitted. Stated rather
+            // than inherited: a family that silently took another's call style
+            // would produce calls its own template cannot represent.
+            call_style: CallStyle::Lines,
         }
     }
 
@@ -502,5 +638,45 @@ mod tests {
             // The Llama dialects have no dedicated no-think prefix.
             assert_eq!(d.template(DialectTemplate::NoThinkPrefix), "");
         }
+    }
+
+    // ── how a family writes a call ──────────────────────────────────────────
+
+    /// **Which shape each family writes, which is all this type decides.**
+    ///
+    /// What the shape *looks like* belongs to
+    /// `candle_conversation::stencil::ToolCallEnvelope`, which compiles it into
+    /// a grammar — and is where the strings are asserted against the shipped
+    /// checkpoint's own template. Writing them here as well would be one syntax
+    /// recorded twice, and the copy nothing compiles is the one that goes stale.
+    #[test]
+    fn each_family_declares_the_call_shape_its_template_uses() {
+        assert_eq!(Dialect::qwen35().call_style, CallStyle::FunctionBlock);
+        for d in [
+            Dialect::chat_ml(),
+            Dialect::llama2(),
+            Dialect::llama3(),
+            Dialect::deepseek(),
+        ] {
+            assert_eq!(d.call_style, CallStyle::Lines, "{:?}", d.dialect_type);
+        }
+    }
+
+    /// Every style here can write more than one call in a turn; only the ones
+    /// with a `tool` role can carry a result back. A caller asks rather than
+    /// assumes, because the second answer decides whether an outcome has
+    /// anywhere to go.
+    #[test]
+    fn multi_call_is_universal_and_results_are_not() {
+        for s in [
+            CallStyle::Lines,
+            CallStyle::JsonBlock,
+            CallStyle::FunctionBlock,
+        ] {
+            assert!(s.multi_call(), "{s:?}");
+        }
+        assert!(!CallStyle::Lines.carries_results());
+        assert!(CallStyle::JsonBlock.carries_results());
+        assert!(CallStyle::FunctionBlock.carries_results());
     }
 }

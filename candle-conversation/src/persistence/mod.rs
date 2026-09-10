@@ -125,6 +125,7 @@ pub(crate) fn test_npc(id: u64, name: &str) -> NpcPayload {
         portrait_image_id: None,
         portrait_origin: None,
         at: None,
+        mood: None,
         beliefs: Vec::new(),
         relationships: Vec::new(),
         agency: Vec::new(),

@@ -302,7 +302,11 @@ mod tests {
         // The next insert resumes at the watermark rather than at the horizon.
         assert_eq!(f.sweep(depth + 1, KEEP_TURNS), 51);
         assert!(f.contiguous_from_zero(), "the catch-up left a hole");
-        assert_eq!(f.sweep(depth + 2, KEEP_TURNS), 1, "steady state, one a turn");
+        assert_eq!(
+            f.sweep(depth + 2, KEEP_TURNS),
+            1,
+            "steady state, one a turn"
+        );
     }
 
     #[test]

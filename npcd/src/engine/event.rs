@@ -17,10 +17,20 @@
 //! # Salience gates the tick, never the write
 //!
 //! The mind design is explicit that a filter dropping contradictory evidence
-//! before it lands makes a delusion permanent. So salience does two things here
-//! — it decides whether an arrival *preempts* (forces a tick now) and it biases
-//! what the gather pulls — and it never decides whether the event is recorded.
+//! before it lands makes a delusion permanent. So salience does three things
+//! here — it decides whether an arrival *preempts* (forces a tick now), whether
+//! it *rouses* (ends a standing wait), and how strongly it biases what the
+//! gather pulls — and it never decides whether the event is recorded.
 //! Everything that arrives, lands.
+//!
+//! # The two bars, and what sits between them
+//!
+//! [`Salience::PREEMPT_AT`] is 0.8 and [`Salience::ROUSES_AT`] is 0.6, so there
+//! is a band that ends a wait without cutting into a working character:
+//! somebody speaking to the room, somebody walking in, a gesture aimed at you.
+//! That band is the whole point — being spoken to in a room you were listening
+//! in is exactly the case that must not have to survive two minutes of patience
+//! before anybody notices it.
 
 use std::fmt;
 
@@ -46,6 +56,41 @@ impl Salience {
     /// scheduled tick.
     pub const PREEMPT_AT: f32 = 0.8;
 
+    /// At or above this, an arrival **ends a standing wait**.
+    ///
+    /// # Why this is a second, lower bar rather than the same one
+    ///
+    /// The two questions are not the same question, because the character is
+    /// not in the same state when each is asked.
+    ///
+    /// [`Self::PREEMPT_AT`] asks whether to *cut into* a character that is
+    /// already thinking on its own schedule. That bar is high on purpose: a
+    /// room where every shifted chair interrupted everybody would leave nobody
+    /// able to finish a thought.
+    ///
+    /// This asks whether to rouse one that has gone quiet on a
+    /// [`crate::engine::waiting::Waiting`] — deliberately doing nothing, with
+    /// its next thought two minutes out. There is nothing to interrupt, so the
+    /// bar is the rung the map already calls "worth a turn at the next
+    /// opportunity" (`npc_map::Weight::Wake`): for a waiting character, this
+    /// *is* the next opportunity, and the alternative is sitting silent through
+    /// the very thing it was listening for.
+    ///
+    /// **This is what makes a wait a wait rather than a deafness.** A wait is a
+    /// subscription to one named thing; without a bar like this, everything
+    /// else that happened — being spoken to by the wrong person, somebody
+    /// messaging you, walking into the room — landed in the inbox and was read
+    /// two minutes later, by which time whoever did it had gone.
+    ///
+    /// Below the bar and therefore *not* an interrupt, each deliberately:
+    /// the heartbeat and the standing task (they are the quiet itself), a
+    /// situation (where you are standing is not something that happened),
+    /// speech aimed past you, things done in the room, somebody leaving, and a
+    /// group thread — which is the phone's ambient traffic in the same way
+    /// `Weight::Note` is the room's. A wait that anything at all could end
+    /// would be a four-second heartbeat spelled differently.
+    pub const ROUSES_AT: f32 = 0.6;
+
     pub fn new(v: f32) -> Self {
         // NaN compares false against every bound, so it would survive a naive
         // clamp and then poison every ordering it takes part in. Mapped to
@@ -65,6 +110,15 @@ impl Salience {
         self.0 >= Self::PREEMPT_AT
     }
 
+    /// Whether this arrival is worth ending a standing wait for. See
+    /// [`Self::ROUSES_AT`].
+    ///
+    /// Everything that preempts also rouses — the bar is lower — so no caller
+    /// has to ask both.
+    pub fn rouses(self) -> bool {
+        self.0 >= Self::ROUSES_AT
+    }
+
     /// The more urgent of two. `f32` has no `Ord`, so this cannot be `max`.
     pub fn max_of(self, other: Salience) -> Salience {
         if other.0 > self.0 {
@@ -74,6 +128,16 @@ impl Salience {
         }
     }
 }
+
+/// **Rousing is the lower bar.** If the two ever crossed, an arrival could cut
+/// into a character that was working and leave a waiting one asleep — which is
+/// exactly backwards, and it is why no caller has to ask both questions.
+///
+/// A `const` rather than a test: both bars are compile-time constants, so this
+/// can be a fact about the build instead of something a test run has to
+/// discover.
+const BARS_ARE_ORDERED: () = assert!(Salience::ROUSES_AT <= Salience::PREEMPT_AT);
+const _: () = BARS_ARE_ORDERED;
 
 impl Default for Salience {
     fn default() -> Self {
@@ -174,8 +238,18 @@ pub enum EventKind {
         entity_id: String,
         observation: String,
     },
-    /// The scheduled wake. Carries no content: its whole purpose is that "nothing
-    /// arrived" cannot mean "dead forever".
+    /// A turn taken with nothing new to take it on. Carries no content.
+    ///
+    /// **Nothing schedules this any more.** It was the idle wake — a character
+    /// with an empty inbox thought anyway, so that "nothing arrived" could not
+    /// mean "dead forever". What that actually bought was a character writing
+    /// an act into its own window every few seconds in a quiet room, until the
+    /// window held nothing but its own last line and the next token was
+    /// certain. A character with nothing to react to now does not think.
+    ///
+    /// It survives as the operator's instrument: `/wake` forces a turn on what
+    /// the character already has, which is the point of being able to poke a
+    /// mind and watch what comes out.
     Heartbeat,
     /// What the character is set on, restated.
     ///
@@ -601,6 +675,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// **The rouse bar is a rung of the map's ladder, not a number beside it.**
+    ///
+    /// `ROUSES_AT` has to be written as a literal — `Weight::as_f32` is not
+    /// `const` — so this is what stops it becoming a second, quietly diverging
+    /// source of truth. Move `Weight::Wake` and this fails rather than silently
+    /// leaving "worth a turn at the next opportunity" unable to end a wait.
+    #[test]
+    fn the_rouse_bar_is_the_maps_own_wake_rung() {
+        use npc_map::Weight;
+
+        assert_eq!(Salience::ROUSES_AT, Weight::Wake.as_f32());
+        assert!(Salience::from(Weight::Wake).rouses());
+        for quiet in [Weight::Ambient, Weight::Note] {
+            assert!(!Salience::from(quiet).rouses(), "{quiet:?} ended a wait");
+        }
+    }
+
+    /// **Rousing is the lower bar, so everything that preempts also rouses.**
+    /// The ordering itself is a compile-time guarantee — see `BARS_ARE_ORDERED`
+    /// — and this is the behaviour that guarantee exists for.
+    #[test]
+    fn anything_that_preempts_also_rouses() {
+        for s in [Salience::URGENT, Salience::new(0.8), Salience::new(1.0)] {
+            assert!(s.preempts() && s.rouses(), "{s:?}");
+        }
+    }
+
+    /// The band between the bars: ends a wait, does not cut into a character
+    /// that is already thinking. Somebody speaking to the room, somebody
+    /// walking in, a gesture aimed at you — the whole reason there are two
+    /// bars rather than one.
+    #[test]
+    fn there_is_a_band_that_rouses_without_preempting() {
+        for s in [Salience::new(0.6), Salience::new(0.7), Salience::new(0.79)] {
+            assert!(s.rouses(), "{s:?} did not rouse");
+            assert!(!s.preempts(), "{s:?} interrupted a working character");
+        }
+    }
+
+    /// Below the bar, and each for its own stated reason — see `ROUSES_AT`.
+    /// A wait anything at all could end is a heartbeat spelled differently.
+    #[test]
+    fn the_quiet_traffic_does_not_end_a_wait() {
+        // The heartbeat and the standing task: they *are* the quiet.
+        assert!(!Salience::IDLE.rouses());
+        // Ordinary traffic, which is what a group thread is graded as.
+        assert!(!Salience::NORMAL.rouses());
     }
 
     /// The two salience scales must agree about the only question that matters:

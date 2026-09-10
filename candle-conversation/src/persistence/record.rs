@@ -981,6 +981,27 @@ pub struct NpcPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
 
+    /// The register this character last said it was in, by mood id.
+    ///
+    /// **The second piece of lived state here, and it earns its place the same
+    /// way `at` does**: a running engine cannot derive it. A mood is what a
+    /// character *is* between one thought and the next, and holding it only in
+    /// RAM meant a restart returned everybody to no register at all — so a
+    /// character that had spent the afternoon getting angrier came back with no
+    /// sign of it, while its conversation history said otherwise.
+    ///
+    /// Written when a character names one for itself and it has changed. Not an
+    /// authoring act: it bumps no revision and moves no `updated_ms`, for the
+    /// reason `at` does not — those describe what somebody *edited*, and a
+    /// roster that sorted by "recently edited" would report whoever was feeling
+    /// something.
+    ///
+    /// `None` for a character that has never said. Absent rather than a
+    /// default register, because "nobody has asked it yet" and "it is calm" are
+    /// different facts and only one of them is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mood: Option<String>,
+
     /* ── the authoring plane (§16) ──────────────────────────────────────────
      *
      * What an operator says a character believes, who they know, what they are
@@ -1847,6 +1868,7 @@ mod tests {
             // bytes were pinned against. `where_a_character_stood_round_trips`
             // covers the field being present.
             at: None,
+            mood: None,
             beliefs: vec![AuthoredBelief {
                 belief_id: "hess_word".to_string(),
                 statement: "Hess keeps his word.".to_string(),

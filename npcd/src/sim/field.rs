@@ -371,11 +371,23 @@ mod tests {
     #[test]
     fn working_a_seam_takes_from_it_until_it_is_out() {
         let mut f = ridge();
-        assert_eq!(f.work("waste/ridge", "the ore seam"), Some((Resource::Ore, 10)));
-        assert_eq!(f.work("waste/ridge", "the ore seam"), Some((Resource::Ore, 10)));
+        assert_eq!(
+            f.work("waste/ridge", "the ore seam"),
+            Some((Resource::Ore, 10))
+        );
+        assert_eq!(
+            f.work("waste/ridge", "the ore seam"),
+            Some((Resource::Ore, 10))
+        );
         // Twenty-five, so the third act yields the remainder and not a full ten.
-        assert_eq!(f.work("waste/ridge", "the ore seam"), Some((Resource::Ore, 5)));
-        assert_eq!(f.work("waste/ridge", "the ore seam"), Some((Resource::Ore, 0)));
+        assert_eq!(
+            f.work("waste/ridge", "the ore seam"),
+            Some((Resource::Ore, 5))
+        );
+        assert_eq!(
+            f.work("waste/ridge", "the ore seam"),
+            Some((Resource::Ore, 0))
+        );
     }
 
     #[test]

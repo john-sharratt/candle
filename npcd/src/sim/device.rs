@@ -273,7 +273,10 @@ mod tests {
             all.modes_of("tower/gatehouse", "the south blast door"),
             vec!["open", "closed", "locked"]
         );
-        assert_eq!(all.modes_of("tower/rampart", "the wall railgun")[0], "hold fire");
+        assert_eq!(
+            all.modes_of("tower/rampart", "the wall railgun")[0],
+            "hold fire"
+        );
     }
 
     #[test]
@@ -282,7 +285,8 @@ mod tests {
         all.install(turret());
         assert!(all.operable_at("tower/gatehouse").is_empty());
         assert!(
-            all.modes_of("tower/gatehouse", "the wall railgun").is_empty(),
+            all.modes_of("tower/gatehouse", "the wall railgun")
+                .is_empty(),
             "a device two rooms away offered its modes"
         );
     }

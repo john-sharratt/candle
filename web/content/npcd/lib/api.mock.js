@@ -68,8 +68,9 @@ const NPCS = EMPTY ? [] : [
     'Ageless in the way of people who sit in booths. Has opinions about everyone who crosses, and shares them for a fee.'),
 ];
 
-const ALL_MODES = ['physical', 'video_call', 'voice_call', 'instant_message'];
-const VIS = ['physical', 'video_call'];
+const ALL_MODES = ['physical', 'instant_message'];
+// Something you can only make out by being there to see it.
+const VIS = ['physical'];
 
 const act = (id, tick, tool, intent, args, obs) =>
   ({ t: 'act', d: { act_id: id, tick, tool, intent, args, observable_in: obs, committed: true, rendered: null } });
@@ -1054,7 +1055,7 @@ export const MockAPI = {
   async listTools() {
     return { uncalibrated: 1, tools: [
       T('speak', 'speech', 'Say something. Carries intent, not words — the narrator renders it.', 'generic', true),
-      T('send_image', 'messaging', 'Send a picture to a named interlocutor. Messaging modes only.', 'generic', true, ['video_call', 'instant_message']),
+      T('send_image', 'messaging', 'Send a picture to a named interlocutor. Messaging modes only.', 'generic', true, ['instant_message']),
       T('move_to', 'movement', 'Move to a named location.', 'generic', true),
       T('face', 'movement', 'Turn to face a direction or entity.', 'generic', true),
       T('follow', 'movement', 'Follow an entity.', 'generic', true),
@@ -1084,16 +1085,16 @@ export const MockAPI = {
    * live daemon exactly when you are trying to lay the page out. */
   async pulse(o) {
     const ticks = [
-      { npc_id: 1, tick: 41, at_ms: 610000, world_ms: 51_840_000, cause: 'blocked',
+      { npc_id: 1, tick: 41, at_ms: 610000, world_ms: 51_840_000, cause: 'quiet',
         perceived: ['Time passes quietly. Nothing demands you.'], acts: [],
-        heartbeat_ms: 120000, inbox_after: 0 },
+        heartbeat_ms: 120000, inbox_after: 0, ms_ago: 96_000 },
       { npc_id: 2, tick: 42, at_ms: 612400, world_ms: 51_842_000, cause: 'pending',
         perceived: ['Hess says to you: "Where is the ledger?"'], acts: [],
-        heartbeat_ms: 32000, inbox_after: 0 },
+        heartbeat_ms: 32000, inbox_after: 0, ms_ago: 41_000 },
       { npc_id: 1, tick: 43, at_ms: 615100, world_ms: 51_845_000, cause: 'preempted',
         perceived: ['You are hurt: a crossbow bolt through the left shoulder, badly',
                     'You overhear someone nearby say: "That is the one."'],
-        acts: [], heartbeat_ms: 4000, inbox_after: 0 },
+        acts: [], heartbeat_ms: 4000, inbox_after: 0, ms_ago: 2_100 },
     ];
     const id = o && o.npc_id;
     return { ticks: id ? ticks.filter((t) => t.npc_id === Number(id)) : ticks,
@@ -1105,9 +1106,11 @@ export const MockAPI = {
   async pulseCensus(o) {
     const characters = [
       { npc_id: 1, readiness: 'preempted', inbox_depth: 2, heartbeat_ms: 4000,
-        ticks: 43, events_seen: 51, window_turns: 24, window_cap: 24, faded: 118, day: 3 },
-      { npc_id: 2, readiness: 'blocked', inbox_depth: 0, heartbeat_ms: 120000,
-        ticks: 12, events_seen: 12, window_turns: 6, window_cap: 24, faded: 0, day: 3 },
+        ticks: 43, events_seen: 51, window_turns: 24, window_cap: 24, faded: 118, day: 3,
+        acted_ms_ago: 2_400 },
+      { npc_id: 2, readiness: 'quiet', inbox_depth: 0, heartbeat_ms: 120000,
+        ticks: 12, events_seen: 12, window_turns: 6, window_cap: 24, faded: 0, day: 3,
+        acted_ms_ago: 96_000 },
     ];
     const id = o && o.npc_id;
     return { ready: true,

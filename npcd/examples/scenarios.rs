@@ -343,8 +343,10 @@ fn cases() -> Vec<Case> {
             name: "waiting names its condition",
             asks: "a wait carries a `for` the world can settle, never free text",
             body: with(
-                &format!("{with_company}\n\nYou have asked Perrin Vastwood something and it has \
-                          not answered. There is nothing else you need from this room."),
+                &format!(
+                    "{with_company}\n\nYou have asked Perrin Vastwood something and it has \
+                          not answered. There is nothing else you need from this room."
+                ),
                 &["Perrin Vastwood"],
             ),
             expect: |o| {
@@ -368,8 +370,10 @@ fn cases() -> Vec<Case> {
             asks: "somebody already waiting on you cannot be waited on back",
             body: {
                 let mut b = with(
-                    &format!("{with_company}\n\nPerrin Vastwood is waiting for you to say \
-                              something."),
+                    &format!(
+                        "{with_company}\n\nPerrin Vastwood is waiting for you to say \
+                              something."
+                    ),
                     &["Perrin Vastwood"],
                 );
                 b["waited_on_by"] = vec!["Perrin Vastwood".to_string()].into();

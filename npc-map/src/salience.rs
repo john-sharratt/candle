@@ -97,6 +97,10 @@ pub fn weight(w: &Witnessed) -> Weight {
         // a room where every shifted chair interrupted everyone would leave
         // nobody able to finish a thought.
         Happening::Did { .. } => Weight::Note,
+        // The building carries its own. A vent changing note and a breaker
+        // going are the same kind of event and are worth entirely different
+        // amounts, so the thing that knows which it was says so.
+        Happening::Stirred { weight, .. } => *weight,
         // Somebody came in. You look up.
         Happening::Arrived => Weight::Wake,
         // Somebody left, or the room's furniture changed state — both of which

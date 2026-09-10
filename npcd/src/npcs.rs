@@ -172,6 +172,10 @@ pub struct Casting {
     /// Where it was last standing, as `area/node`. `None` for a character that
     /// has never been embodied — it starts at the way in.
     pub at: Option<String>,
+    /// The register it was last in, by mood id. `None` for one that has never
+    /// said — which is a different fact from being calm, and is left absent
+    /// rather than defaulted.
+    pub mood: Option<String>,
 }
 
 #[derive(Debug)]
@@ -317,6 +321,57 @@ impl Npcs {
         true
     }
 
+    /// The register a character last said it was in.
+    ///
+    /// What the persona reads back to it on the next turn, so a mood survives a
+    /// restart the way a position does.
+    pub fn mood_of(&self, npc_id: u64) -> Option<&str> {
+        self.by_id
+            .get(&npc_id)
+            .filter(|n| !n.is_tombstoned())
+            .and_then(|n| n.mood.as_deref())
+    }
+
+    /// Record the register a character has named for itself.
+    ///
+    /// Returns whether a record was written. **No cadence gate, unlike
+    /// [`Self::remember_place`]**, and the difference is in what produces them:
+    /// a body writes a position twice a second while it walks, where a mood is
+    /// named only by a character stopping to say so — at most once every couple
+    /// of minutes, and usually the same word as last time. The change check
+    /// alone is the whole of the cost control.
+    ///
+    /// Not an authoring act: no revision bump, no `updated_ms`. See
+    /// [`Self::remember_place`] for why.
+    pub fn remember_mood(&mut self, npc_id: u64, mood: &str) -> bool {
+        let Some(npc) = self.by_id.get(&npc_id).filter(|n| !n.is_tombstoned()) else {
+            return false;
+        };
+        if npc.mood.as_deref() == Some(mood) {
+            return false;
+        }
+        let mut npc = npc.clone();
+        npc.mood = Some(mood.to_string());
+        let write = {
+            let mut p = self
+                .shared
+                .persistence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            p.write_npc(&npc).and_then(|()| p.commit())
+        };
+        if let Err(e) = write {
+            // Not fatal and not propagated, for the reason a place checkpoint
+            // is not: soft state on a driver thread with nobody to report to.
+            // The character goes on feeling it; the next time it says so, this
+            // tries again.
+            tracing::warn!("could not record how {npc_id} feels: {e}");
+            return false;
+        }
+        self.by_id.insert(npc_id, npc);
+        true
+    }
+
     /// The substrate handle, for the engine to adopt.
     ///
     /// **The engine must take this rather than open `--data` itself.** One
@@ -426,6 +481,7 @@ impl Npcs {
                 npc_id: n.npc_id,
                 world_id: n.world_id.clone(),
                 at: n.at.clone(),
+                mood: n.mood.clone(),
             })
             .collect()
     }
@@ -498,6 +554,9 @@ impl Npcs {
             // an arrival door here would be this registry guessing at a map it
             // has never read.
             at: None,
+            // Nobody has asked it how it feels yet, which is a different fact
+            // from it being calm.
+            mood: None,
             // The authoring plane starts empty. A character nobody has written
             // beliefs for holds none — which is different from one whose
             // beliefs could not be read, and is what the console shows.
@@ -894,6 +953,12 @@ fn wire(n: &NpcPayload, caller: &str) -> Value {
         },
         // Same reason: the monitor is an engine measurement.
         "monitor": Value::Null,
+        // The register it last said it was in, by mood id.
+        //
+        // **Null, never a default register.** A character nobody has asked yet
+        // and one that is calm are different facts, and only one of them is a
+        // measurement — the same rule the live tick figures above follow.
+        "mood": n.mood,
         "modulation": {
             "affect": round3(n.modulation.affect),
             "threat": round3(n.modulation.threat),
@@ -1291,6 +1356,74 @@ mod tests {
         // And it rides along with the cast, which is what the loader reads.
         let casting = back.cast().into_iter().find(|c| c.npc_id == id).unwrap();
         assert_eq!(casting.at.as_deref(), Some("vault-casting/green-room"));
+    }
+
+    /// **How a character feels survives a restart, the same as where it is.**
+    ///
+    /// A mood is what a character *is* between one thought and the next, and it
+    /// otherwise lives only in the window — which a restart empties. Without
+    /// this, one that had spent the afternoon getting angrier came back in no
+    /// register at all while its own transcript said otherwise, which is the
+    /// same wrong as returning it to the arrival door.
+    #[test]
+    fn how_a_character_feels_survives_a_restart() {
+        let dir = tmp();
+        let id: u64 = {
+            let mut n = Npcs::load(&dir).unwrap();
+            let id: u64 = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()["npc_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            // Absent, not calm. Nobody has asked it yet, and those are
+            // different facts about a character.
+            assert_eq!(n.mood_of(id), None);
+
+            assert!(n.remember_mood(id, "wary"));
+            assert_eq!(n.mood_of(id), Some("wary"));
+            // Feeling the same thing again costs nothing, however often it is
+            // said — which is the whole of the write gate, because a register
+            // is named at most once a pause and is usually last time's word.
+            assert!(!n.remember_mood(id, "wary"));
+            assert!(n.remember_mood(id, "cornered"));
+            id
+        };
+
+        let back = Npcs::load(&dir).unwrap();
+        assert_eq!(
+            back.mood_of(id),
+            Some("cornered"),
+            "the register did not survive the restart"
+        );
+        // And it rides along with the cast, which is what the loader reads to
+        // put the character back into it.
+        let casting = back.cast().into_iter().find(|c| c.npc_id == id).unwrap();
+        assert_eq!(casting.mood.as_deref(), Some("cornered"));
+    }
+
+    /// Feeling something is not an authoring act.
+    ///
+    /// The same rule `at` follows: a revision bump and an `updated_ms` describe
+    /// what somebody *edited*, and a roster that sorted by "recently edited"
+    /// would report whoever happened to be feeling something.
+    #[test]
+    fn feeling_something_is_not_an_edit() {
+        let dir = tmp();
+        let mut n = Npcs::load(&dir).unwrap();
+        let made = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
+        let id: u64 = made["npc_id"].as_str().unwrap().parse().unwrap();
+        let before = n.payload(id).unwrap().clone();
+
+        assert!(n.remember_mood(id, "bitter"));
+        let after = n.payload(id).unwrap();
+        assert_eq!(
+            after.revision, before.revision,
+            "a mood bumped the revision"
+        );
+        assert_eq!(
+            after.updated_ms, before.updated_ms,
+            "a mood counted as an edit"
+        );
     }
 
     /// **A moving body is checkpointed, not transcribed.**

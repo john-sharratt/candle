@@ -83,6 +83,23 @@ struct Live {
     /// existing conversation walks its watermark forward over the first few
     /// inserts without rewriting anything. See [`retention::retire_expired`].
     retired_through: u32,
+    /// What became of the acts this conversation's **last** decode called for,
+    /// waiting to be handed back on the next turn.
+    ///
+    /// One entry per call the character made, in the order it made them —
+    /// refusals and malformed calls included, because "that did not work" is
+    /// the result a character most needs to read.
+    ///
+    /// # Why this is held here and not by the caller
+    ///
+    /// These are answers to calls made in *this conversation's* previous
+    /// assistant turn, so they are only meaningful against that history. Held
+    /// beside the sequence, they die with it: a day roll-over replaces the
+    /// `Live` and yesterday's answers go with it rather than being delivered
+    /// into a conversation that never asked the questions.
+    ///
+    /// See [`Minds::deliver_outcomes`] and [`compose`].
+    pending: Vec<String>,
 }
 
 /// Every character's conversation, and the engine they run on.
@@ -216,14 +233,25 @@ fn compile_act_loop(
              cannot be forced into shape"
         );
     };
+    // **The call's shape comes from the checkpoint's own dialect.**
+    //
+    // It was written out here, in Qwen3's JSON form, for every model this
+    // daemon might ever load — so a checkpoint whose template says otherwise
+    // was constrained to a syntax it was never trained on, and nothing said so
+    // because a grammar always produces *something*. Asking the dialect makes
+    // the shape a property of the weights, which is the only place that can
+    // know it. See `candle_transformers::models::dialect::CallStyle`.
+    let base = ToolCallEnvelope::for_dialect(&cfg.dialect);
     let env = ToolCallEnvelope {
         // The tree resumes *after* the marker, which the turn's prefill has
         // already written — so the walk starts here, at the first thing that was
         // ever actually in question.
-        open: "\n{\"name\": \"".to_string(),
-        args_open: ", \"arguments\": {".to_string(),
-        close: "}}\n</tool_call>".to_string(),
-        marker: "<tool_call>".to_string(),
+        open: base
+            .open
+            .strip_prefix(&base.marker)
+            .unwrap_or(&base.open)
+            .to_string(),
+        ..base
     };
 
     // **Where the turn is entered decides what the tree has to cover.**
@@ -482,7 +510,14 @@ impl Minds {
                 (seq, p.prompt.clone(), sel)
             }
             None => {
-                let system = prompt::build(persona, mode, &for_mode(mode));
+                // The same envelope `compile_act_loop` compiles, so what the prompt
+                // shows a character is what the grammar will hold it to.
+                let system = prompt::build(
+                    persona,
+                    mode,
+                    &for_mode(mode),
+                    &ToolCallEnvelope::for_dialect(&self.base_config.dialect),
+                );
                 let seq = self.engine.lock().unwrap().new_conversation(&system, cfg)?;
                 // The dial applies with no schema to pin members in — it is the
                 // turn's own, not the projection's.
@@ -736,7 +771,14 @@ impl Minds {
                     // remaining fault is below the prompt, and a character that
                     // cannot act is worse than one whose prompt is a rendered
                     // copy — which is what this is until that is found.
-                    let system = prompt::build(persona, mode, &for_mode(mode));
+                    // The same envelope `compile_act_loop` compiles, so what the prompt
+                    // shows a character is what the grammar will hold it to.
+                    let system = prompt::build(
+                        persona,
+                        mode,
+                        &for_mode(mode),
+                        &ToolCallEnvelope::for_dialect(&self.base_config.dialect),
+                    );
                     let sequence = self.engine.lock().unwrap().new_conversation(&system, cfg)?;
                     // **The derived id, given to the substrate.** Minting it and keeping it
                     // in this struct made it a log label and nothing else: the timeline went
@@ -761,16 +803,22 @@ impl Minds {
                         day,
                         id,
                         retired_through: 0,
+                        pending: Vec::new(),
                     }))))
                 }
             }
         };
 
-        // Everything drained this tick, as one message. A fat batch is one
-        // better-informed thinking step rather than several thrashing ones —
-        // the mind design is explicit that this is what a busy character should
-        // get.
-        let perception = compose(events, window);
+        // **The answers to last turn's acts, then everything that has happened
+        // since — one message.**
+        //
+        // The results ride at the head because the protocol puts them there:
+        // what a character did is answered before the world is allowed to speak
+        // again. A fat batch is one better-informed thinking step rather than
+        // several thrashing ones — the mind design is explicit that this is
+        // what a busy character should get.
+        let answers = std::mem::take(&mut conversation.lock().unwrap().pending);
+        let perception = compose(&answers, events, window);
         // **The act stencil is armed here, not hoped for.** `act::parse` reads
         // the decode, and what it reads is a grammar's output rather than a
         // guess at one: the name is a real tool, the required parameters are
@@ -818,9 +866,7 @@ impl Minds {
         };
         let (response, timeline, depth, watermark) = {
             let mut live = conversation.lock().unwrap();
-            let response = live
-                .sequence
-                .send_turn_with_options(&perception, options)?;
+            let response = live.sequence.send_turn_with_options(&perception, options)?;
             (
                 response,
                 live.sequence.timeline_id(),
@@ -853,6 +899,29 @@ impl Minds {
         Ok(thought)
     }
 
+    /// Hand back what became of the acts this character just called for.
+    ///
+    /// One entry per call it made, in the order it made them, whatever the
+    /// verdict — an act that was refused, or a call that was malformed, needs
+    /// an answer at least as much as one that worked. They ride at the head of
+    /// this character's next turn as `<tool_response>` blocks; see [`compose`].
+    ///
+    /// Called after the acts have been enacted, because that is when their
+    /// outcomes exist. A character with no live conversation is a no-op rather
+    /// than an error: it has no turn for them to ride on, so there is nothing
+    /// to hold them against.
+    pub fn deliver_outcomes(&self, npc_id: u64, outcomes: Vec<String>) {
+        if outcomes.is_empty() {
+            return;
+        }
+        // Cloned out of the map before locking the conversation, so a character
+        // mid-decode is waited on without the map held behind it.
+        let live = self.live.lock().unwrap().get(&npc_id).map(Arc::clone);
+        if let Some(l) = live {
+            l.lock().unwrap().pending.extend(outcomes);
+        }
+    }
+
     /// Retire a character's conversation — on delete, or on shutdown.
     pub fn retire_npc(&self, npc_id: u64) {
         // Taken out of the map first, then locked: a character mid-decode is
@@ -881,16 +950,61 @@ fn retire(engine: &Arc<Mutex<ConversationEngine>>, l: &Live) {
     }
 }
 
-/// What the character reads this tick.
+/// What the character reads this tick: the answers to what it did, then what
+/// has happened since.
 ///
-/// The events, as prose, in arrival order. The window is *not* pasted in: the
-/// sequence carries its own bounded tail (`context_window_turns`) and the
-/// substrate carries the rest, so repeating the window here would put the same
-/// turns in the context twice — once verbatim from us and once from the
-/// sequence's own history — and teach the model that everything happens twice.
-fn compose(events: &[Event], window: &Window) -> String {
+/// # The shape, and why it is this shape
+///
+/// A character calls acts and the world answers them. The template that answer
+/// arrives in is not ours to choose — Qwen and Hermes both return a result in
+/// the **user** half of the next turn, wrapped in `<tool_response>`, one block
+/// per call, and the model is trained to read that wrapper as "this is what
+/// came back" rather than as something a person said.
+///
+/// So the turn is built in two parts, in this order:
+///
+/// ```text
+/// <tool_response>
+/// You moved to the sorting room.
+/// </tool_response>
+///
+/// The air near the door is noticeably fresher than the air by the wall.
+/// ```
+///
+/// The results come **first** because they answer the turn before, and the
+/// world's own events follow as ordinary prose. Reversing them would put the
+/// world's voice between a call and its answer, which is the one arrangement
+/// every tool-calling protocol forbids.
+///
+/// Before this, results were never returned at all: measured over 23 turns of
+/// three characters, the substrate held 23 calls and zero responses. A
+/// character acted and the next thing it read was the weather. Every one of
+/// those 23 acts was `reflect` — with no act ever visibly causing anything,
+/// there was nothing to prefer about acting over thinking.
+///
+/// # The window
+///
+/// Still *not* pasted in: the sequence carries its own bounded tail
+/// (`context_window_turns`) and the substrate carries the rest, so repeating
+/// the window here would put the same turns in the context twice — once
+/// verbatim from us and once from the sequence's own history — and teach the
+/// model that everything happens twice.
+fn compose(answers: &[String], events: &[Event], window: &Window) -> String {
     let _ = window;
     let mut s = String::new();
+    for a in answers {
+        // The block is newline-delimited inside the tags because an outcome is
+        // a sentence, not a JSON scalar — the same allowance zend's
+        // `format_tool_responses` makes for an already-rendered result.
+        s.push_str("<tool_response>\n");
+        s.push_str(a.trim());
+        s.push_str("\n</tool_response>\n");
+    }
+    // One blank line between the answers and the world, so the two are visibly
+    // different kinds of thing rather than one run-on block.
+    if !answers.is_empty() && !events.is_empty() {
+        s.push('\n');
+    }
     for (i, e) in events.iter().enumerate() {
         if i > 0 {
             s.push_str("\n\n");
@@ -927,8 +1041,82 @@ mod tests {
     #[test]
     fn a_batch_composes_in_arrival_order() {
         let w = Window::with_default_cap();
-        let s = compose(&[ev("the gate opens"), ev("someone shouts")], &w);
+        let s = compose(&[], &[ev("the gate opens"), ev("someone shouts")], &w);
         assert_eq!(s, "the gate opens\n\nsomeone shouts");
+    }
+
+    /// **An act is answered, and the answer comes first.**
+    ///
+    /// The protocol admits no other order: a result answers the turn before it,
+    /// so nothing may come between a call and its response. Measured before
+    /// this existed — 23 calls, 0 responses, and all 23 acts `reflect`.
+    #[test]
+    fn an_answer_leads_the_turn_and_the_world_follows_it() {
+        let w = Window::with_default_cap();
+        let s = compose(
+            &["You moved to the sorting room.".to_string()],
+            &[ev("the air near the door is fresher")],
+            &w,
+        );
+        assert_eq!(
+            s,
+            "<tool_response>\nYou moved to the sorting room.\n</tool_response>\n\n\
+             the air near the door is fresher"
+        );
+    }
+
+    /// One block per call, in the order the character called them — so a
+    /// character reading them back can tell which answer belongs to which act.
+    #[test]
+    fn every_call_gets_its_own_block_in_call_order() {
+        let w = Window::with_default_cap();
+        let s = compose(
+            &[
+                "You moved to the sorting room.".to_string(),
+                "Nobody there answered to that name.".to_string(),
+            ],
+            &[],
+            &w,
+        );
+        assert_eq!(s.matches("<tool_response>").count(), 2);
+        assert_eq!(s.matches("</tool_response>").count(), 2);
+        assert!(
+            s.find("You moved").unwrap() < s.find("Nobody there").unwrap(),
+            "answers must keep the order the acts were called in: {s}"
+        );
+    }
+
+    /// A refusal is an answer too — the only signal that separates "that did
+    /// not work" from "nothing happened", and the two want different next acts.
+    #[test]
+    fn a_refusal_is_returned_like_any_other_answer() {
+        let w = Window::with_default_cap();
+        let s = compose(
+            &["You cannot reach the vault from here.".to_string()],
+            &[],
+            &w,
+        );
+        assert!(s.starts_with("<tool_response>\n"));
+        assert!(s.contains("cannot reach the vault"));
+    }
+
+    /// With nothing to report the turn is exactly what it always was — no
+    /// empty wrapper for the model to read as a result that never came.
+    #[test]
+    fn a_turn_with_no_acts_behind_it_carries_no_wrapper() {
+        let w = Window::with_default_cap();
+        let s = compose(&[], &[ev("it rains")], &w);
+        assert_eq!(s, "it rains");
+        assert!(!s.contains("tool_response"));
+    }
+
+    /// An answer with no world event behind it still stands on its own — a
+    /// character that acted during a quiet moment is told what happened.
+    #[test]
+    fn an_answer_alone_does_not_trail_a_blank_line() {
+        let w = Window::with_default_cap();
+        let s = compose(&["You put it down.".to_string()], &[], &w);
+        assert_eq!(s, "<tool_response>\nYou put it down.\n</tool_response>\n");
     }
 
     /// **The window must not be pasted in.** The sequence carries its own
@@ -939,14 +1127,14 @@ mod tests {
         let mut w = Window::with_default_cap();
         w.push_world("something that already happened", 0, None);
         w.push_npc("and what I did about it", 0);
-        let s = compose(&[ev("something new")], &w);
+        let s = compose(&[], &[ev("something new")], &w);
         assert_eq!(s, "something new");
         assert!(!s.contains("already happened"));
     }
 
     #[test]
     fn an_empty_batch_composes_to_nothing() {
-        assert_eq!(compose(&[], &Window::with_default_cap()), "");
+        assert_eq!(compose(&[], &[], &Window::with_default_cap()), "");
     }
 
     /// A restart mid-day opens a second timeline, and it must carry the same

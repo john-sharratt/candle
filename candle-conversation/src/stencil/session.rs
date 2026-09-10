@@ -70,6 +70,15 @@ enum Cursor {
         term: TerminatorState,
         emitted: u32,
     },
+    /// A span ended without its terminator firing — emit the closing text it
+    /// therefore never wrote, then carry on at `then`.
+    ///
+    /// Distinct from [`Cursor::Bailing`], which abandons the walk: this one
+    /// *resumes* it. See [`crate::stencil::tree::FreeTextSpan::close_run`].
+    Closing {
+        run: Vec<TokenId>,
+        then: NodeId,
+    },
     /// The failsafe fired — emit the tree's bail tokens, then finish.
     Bailing,
     Done,
@@ -180,6 +189,14 @@ impl StencilSession {
             Cursor::InFreeText { node, emitted, .. } => {
                 let span = self.free_span(node);
                 Self::free_decode_action(span, emitted)
+            }
+            Cursor::Closing { ref run, then } => {
+                let run = run.clone();
+                self.cursor = Cursor::At(then);
+                match run.is_empty() {
+                    true => self.next_action(),
+                    false => StencilAction::Prefill(run),
+                }
             }
             Cursor::Bailing => {
                 self.cursor = Cursor::Done;
@@ -322,18 +339,55 @@ impl StencilSession {
             } => {
                 let span = self.free_span(node).clone();
                 let emitted = emitted + 1;
-                if span.eos_ends && token == self.tree.eos() {
-                    self.cursor = Cursor::At(span.next);
-                    return Ok(Observe::SpanEos);
+                // **EOS never ends a turn the stencil is still steering.**
+                //
+                // It is intercepted here and the cursor moves on, whatever kind
+                // of span this is. What the stencil has not finished emitting,
+                // it emits — the structural statics after this span are injected
+                // in the EOS's place, so the call is closed rather than
+                // abandoned half-written.
+                //
+                // This used to be reachable only through `eos_ends` or a
+                // `close_token`, which coupled "may EOS end this span" to
+                // "does this span have a closing token" — two unrelated
+                // questions. A byte-terminated span had neither, so EOS fell
+                // through to `term.feed`, matched nothing, and left the cursor
+                // parked in the value while the decode loop sealed the turn on
+                // the EOS it had just sampled. Measured on the persisted
+                // substrate: **244 of 259 turns** wrote a complete, correct
+                // function block and never closed it, every one discarded.
+                //
+                // A stencil is a guarantee about what can be emitted; a token
+                // that ends the turn from inside one is a hole in it, and the
+                // free-decode span was the only place that hole existed.
+                if token == self.tree.eos() {
+                    // The span's terminator never fired, so whatever closing
+                    // text it would have consumed was never written. The tree
+                    // writes it now, then carries on — the element is closed
+                    // properly rather than running into whatever follows.
+                    self.cursor = match span.close_run.is_empty() {
+                        true => Cursor::At(span.next),
+                        false => Cursor::Closing {
+                            run: span.close_run.clone(),
+                            then: span.next,
+                        },
+                    };
+                    return Ok(match span.eos_ends {
+                        // The span is allowed to end this way — the think-steer
+                        // tree's final span, whose whole job is to run to EOS.
+                        true => Observe::SpanEos,
+                        // It is not. Swallow the token so it never reaches the
+                        // sequence (and never seals it) and let the tree close
+                        // the structure itself.
+                        false => Observe::TokenClosedDrop,
+                    });
                 }
                 // A close *token* ends the span before any byte terminator runs.
-                // A token-closed span closes on EITHER its close token OR EOS —
-                // both are intercepted by this normal decode (never banned) and
-                // replaced.  `suppress_close` drops the closing token (the successor
+                // `suppress_close` drops the closing token (the successor
                 // prefills the continuation in its place); otherwise it is kept
                 // (committed).
                 if let Some(ct) = span.close_token {
-                    if token == ct || token == self.tree.eos() {
+                    if token == ct {
                         self.cursor = Cursor::At(span.next);
                         return Ok(if span.suppress_close {
                             Observe::TokenClosedDrop

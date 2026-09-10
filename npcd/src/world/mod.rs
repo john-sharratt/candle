@@ -1,9 +1,14 @@
 //! The worlds this daemon hosts, and the bodies standing in them.
 //!
 //! A world is a directory of map files loaded into one [`npc_map::World`]: who
-//! is where, what is claimed, what just happened. This module owns them and
-//! nothing else — it does not know that anything perceives them, which is why
-//! it has no dependency on the engine and can be exercised without one.
+//! is where, what is claimed, what just happened. This module owns them, and it
+//! still knows nothing about anything *perceiving* them — no scheduler, no
+//! minds, no windows — so it can be exercised without an engine.
+//!
+//! It does own the building's own doings ([`crate::engine::rooms`]), because a
+//! stirring is written into the world log and producing one is therefore a
+//! world mutation like any other. Holding it anywhere else would mean a second
+//! lock, or a route that advances the world without the building noticing.
 //!
 //! # One lock, one world
 //!
@@ -29,6 +34,7 @@ use npc_map::delta::{Attention, Delta};
 use npc_map::world::World;
 use npc_map::MapSet;
 
+use crate::engine::rooms::Rooms;
 use crate::sim::{seed, Sim};
 
 /// One world, and everything about who has been told what in it.
@@ -48,6 +54,13 @@ struct State {
     /// design would otherwise have. It is the same argument the attention
     /// bookkeeping is here for.
     sim: Sim,
+    /// What the building itself is doing, room by room — see
+    /// [`crate::engine::rooms`].
+    ///
+    /// Under the world's lock for the plainest of the reasons: a stirring is
+    /// written into the world log, so producing one *is* a world mutation and
+    /// has to be serialised with every other.
+    rooms: Rooms,
 }
 
 impl Hosted {
@@ -71,6 +84,7 @@ impl Hosted {
                 world: World::new(map),
                 attention: Attention::new(),
                 sim,
+                rooms: Rooms::new(),
             }),
         })
     }
@@ -86,6 +100,7 @@ impl Hosted {
                 world,
                 attention: Attention::new(),
                 sim,
+                rooms: Rooms::new(),
             }),
         }
     }
@@ -159,6 +174,22 @@ impl Hosted {
         state.world.tick()
     }
 
+    /// Let the building have its say in every room somebody is standing in.
+    ///
+    /// Returns how many rooms stirred, which is nearly always none — each room
+    /// waits minutes between looks, and this runs twice a second.
+    pub fn stir(&self) -> usize {
+        let mut state = self.state.lock().expect("world lock");
+        let State { world, rooms, .. } = &mut *state;
+        rooms.stir(world)
+    }
+
+    /// How many rooms have a building running in them. A room is fitted the
+    /// first time anybody stands in it and is never asked while empty.
+    pub fn rooms_running(&self) -> usize {
+        self.state.lock().expect("world lock").rooms.len()
+    }
+
     /// What every body has to be told, and nothing for the ones with nothing.
     ///
     /// One pass under one lock, because the alternative — a lock per body — is
@@ -166,14 +197,18 @@ impl Hosted {
     /// move between two bodies' readings of the same moment.
     pub fn sweep(&self) -> Vec<Delta> {
         let mut state = self.state.lock().expect("world lock");
-        let State { world, attention, .. } = &mut *state;
+        let State {
+            world, attention, ..
+        } = &mut *state;
         attention.sweep(world)
     }
 
     /// What one body has to be told, marking it as delivered.
     pub fn delta(&self, body: &str) -> Delta {
         let mut state = self.state.lock().expect("world lock");
-        let State { world, attention, .. } = &mut *state;
+        let State {
+            world, attention, ..
+        } = &mut *state;
         attention.take(world, body)
     }
 

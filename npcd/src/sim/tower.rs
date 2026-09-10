@@ -208,7 +208,9 @@ impl Tower {
             return Err("A batch of none is not a batch.".into());
         }
         if queue == 0 || queue > QUEUES {
-            return Err(format!("There are {QUEUES} queues, numbered 1 to {QUEUES}."));
+            return Err(format!(
+                "There are {QUEUES} queues, numbered 1 to {QUEUES}."
+            ));
         }
         if !self.affords(&recipe, count) {
             let short: Vec<String> = recipe
@@ -223,7 +225,10 @@ impl Tower {
                     )
                 })
                 .collect();
-            return Err(format!("The stockpile will not cover it: {}.", short.join(", ")));
+            return Err(format!(
+                "The stockpile will not cover it: {}.",
+                short.join(", ")
+            ));
         }
         for (r, per) in &recipe.cost {
             self.draw(*r, per.saturating_mul(count as u64));
@@ -381,7 +386,11 @@ mod tests {
         assert!(err.contains("nanobots"), "{err}");
         assert!(err.contains("50"), "the shortfall was not named: {err}");
         assert!(t.queued().is_empty(), "a refused batch was queued anyway");
-        assert_eq!(t.stock_of(Resource::Metal), 400, "a refused batch spent stock");
+        assert_eq!(
+            t.stock_of(Resource::Metal),
+            400,
+            "a refused batch spent stock"
+        );
     }
 
     #[test]

@@ -103,6 +103,34 @@ fn the_vault_loads_and_every_join_holds() {
 }
 
 #[test]
+fn the_vault_has_enough_standing_recordings_to_go_days_without_repeating() {
+    // `npcd`'s tannoy fixture holds no words of its own and deals these from a
+    // shuffled bag, so the length of this list *is* how long a Maker goes before
+    // hearing one twice. At roughly one every half hour, two hundred is about
+    // four days; far fewer and the building starts sounding like a loop.
+    let set = vault();
+    let said = &set
+        .get("creators-vault")
+        .expect("the building")
+        .announcements;
+    assert!(
+        said.len() >= 200,
+        "only {} standing recordings — the vault will start repeating itself inside a day",
+        said.len()
+    );
+
+    // They are quoted verbatim inside a framing sentence, so each has to be a
+    // whole one. `validate` refuses the file otherwise; this says what the rule
+    // is for anybody adding to the list.
+    for line in said {
+        assert!(
+            line.ends_with('.') && line.starts_with(char::is_uppercase),
+            "a recording is not a finished sentence: {line:?}"
+        );
+    }
+}
+
+#[test]
 fn the_levels_are_numbered_one_to_six_in_the_order_the_building_names_them() {
     let set = vault();
     let ordinals: Vec<u32> = set

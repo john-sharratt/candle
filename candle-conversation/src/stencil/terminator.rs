@@ -35,6 +35,28 @@ pub enum Terminator {
     /// thinking-block steering tree, whose `</think>` close is a token, not a
     /// byte pattern.
     Never,
+    /// Raw text ending at a literal marker — `"\n</parameter>"`.
+    ///
+    /// **The value is not JSON**, which is the whole reason this exists.
+    /// Qwen3.5's tool-call syntax puts each argument in its own element and
+    /// takes the value as unescaped text, so a quote, a backslash or a newline
+    /// inside it is ordinary content rather than something to escape. None of
+    /// the JSON terminators can express that: `JsonString` would close on the
+    /// first bare `"` in a character's prose.
+    ///
+    /// The marker is **consumed**, exactly as `JsonString` consumes its closing
+    /// quote. Two consequences, both deliberate:
+    ///
+    /// * The tree does not emit the marker as a static after the span, because
+    ///   the span has already produced it.
+    /// * The model has to write it, and a decode that never does runs to
+    ///   `forced_after` — the same contract `JsonString` has always had for its
+    ///   closing quote, rather than a new failure mode.
+    ///
+    /// Matching runs across token boundaries: a marker is several BPE pieces
+    /// (`</parameter>` is not a special token in any vocabulary this targets),
+    /// so a partial match at the end of one token has to survive into the next.
+    Until { marker: &'static str },
 }
 
 impl Terminator {
@@ -45,6 +67,28 @@ impl Terminator {
         matches!(self, Terminator::JsonNumber { .. } | Terminator::JsonValue)
     }
 
+    /// The text this terminator **consumes** when it fires — and therefore the
+    /// text the grammar has to write itself if the span ends any other way.
+    ///
+    /// A consuming terminator leaves its delimiter in the output only because
+    /// the model wrote it. That holds on the path where the model reaches the
+    /// delimiter and nowhere else: a span cut short by an intercepted EOS
+    /// closed with nothing, so a JSON string ran on unquoted and an element ran
+    /// into the next tag. Both make the whole call unreadable, which costs the
+    /// arguments the model *did* finish as well as the one it did not.
+    ///
+    /// `None` for the lookahead terminators, whose delimiter belongs to the
+    /// successor and is emitted by it regardless, and for [`Terminator::Never`],
+    /// which has no delimiter of its own.
+    pub fn consumed_close(self) -> Option<String> {
+        match self {
+            Terminator::JsonString => Some("\"".to_string()),
+            Terminator::Balanced { close, .. } => Some((close as char).to_string()),
+            Terminator::Until { marker } => Some(marker.to_string()),
+            Terminator::JsonNumber { .. } | Terminator::JsonValue | Terminator::Never => None,
+        }
+    }
+
     pub fn start(self) -> TerminatorState {
         TerminatorState {
             kind: self,
@@ -52,6 +96,7 @@ impl Terminator {
             in_string: false,
             escaped: false,
             started: false,
+            matched: 0,
         }
     }
 }
@@ -69,6 +114,12 @@ pub struct TerminatorState {
     /// `Balanced` has seen its first `open` (so a later return to depth 0 is a
     /// real close, not the pre-open state).
     started: bool,
+    /// [`Terminator::Until`]: how many bytes of the marker match so far.
+    ///
+    /// Carried on the state rather than recomputed per token because a marker
+    /// spans tokens — `</parameter>` is several BPE pieces — so a partial match
+    /// at the end of one token must survive into the next.
+    matched: usize,
 }
 
 /// The outcome of feeding one token's bytes.
@@ -101,7 +152,51 @@ impl TerminatorState {
             // No byte pattern ever closes this span — only a close token, EOS,
             // or the hard limit (all handled by the session, not the lexer).
             Terminator::Never => Feed::Continue,
+            Terminator::Until { marker } => self.feed_until(bytes, marker.as_bytes()),
         }
+    }
+
+    /// Raw bytes until `marker`, which is consumed. See [`Terminator::Until`].
+    ///
+    /// The rescan on a mismatch is the part worth reading. A naive
+    /// implementation resets the match to zero, which loses a marker that
+    /// overlaps its own failed prefix — for `</p</parameter>` the `</p` matches
+    /// three bytes, the `<` that follows is not `a`, and dropping to zero skips
+    /// past the real marker's opening `<`. So a failure retries the current
+    /// byte against progressively shorter prefixes, which is the naive-but-
+    /// correct search; the markers here are a dozen bytes and appear once, so
+    /// the cost of a proper failure function would buy nothing measurable.
+    fn feed_until(&mut self, bytes: &[u8], marker: &[u8]) -> Feed {
+        if marker.is_empty() {
+            return Feed::Continue;
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            loop {
+                if b == marker[self.matched] {
+                    self.matched += 1;
+                    if self.matched == marker.len() {
+                        self.matched = 0;
+                        // Consumed through this byte, as `JsonString` consumes
+                        // its closing quote. Anything after it in this token
+                        // belongs to the next node; the session heals that.
+                        return Feed::Close { consumed: i + 1 };
+                    }
+                    break;
+                }
+                if self.matched == 0 {
+                    break;
+                }
+                // Retry this byte against the next-shortest prefix that could
+                // still be live.
+                self.matched -= 1;
+                let keep = self.matched;
+                self.matched = (1..=keep)
+                    .rev()
+                    .find(|&n| marker[..n] == marker[keep + 1 - n..=keep])
+                    .unwrap_or(0);
+            }
+        }
+        Feed::Continue
     }
 
     fn feed_value(&mut self, bytes: &[u8]) -> Feed {
@@ -427,5 +522,84 @@ mod tests {
     #[test]
     fn never_is_not_lookahead() {
         assert!(!Terminator::Never.is_lookahead());
+    }
+
+    // ── Until: raw text to a literal marker ─────────────────────────────────
+
+    const PARAM: Terminator = Terminator::Until {
+        marker: "\n</parameter>",
+    };
+
+    /// Feed `chunks` in order; give back where it closed and how much of that
+    /// chunk the span took. Chunks stand in for tokens, which is the whole
+    /// point — a marker is several BPE pieces and the match has to survive the
+    /// boundaries between them.
+    fn feed_all(t: Terminator, chunks: &[&str]) -> Option<(usize, usize)> {
+        let mut st = t.start();
+        for (n, c) in chunks.iter().enumerate() {
+            if let Feed::Close { consumed } = st.feed(c.as_bytes()) {
+                return Some((n, consumed));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn until_closes_on_the_marker_and_consumes_it() {
+        assert_eq!(feed_all(PARAM, &["hello\n</parameter>"]), Some((0, 18)));
+        assert!(
+            !PARAM.is_lookahead(),
+            "the marker is consumed, not pushed back"
+        );
+    }
+
+    /// **The property the whole thing turns on.** `</parameter>` is not a
+    /// special token in any vocabulary this targets, so it arrives in pieces —
+    /// a matcher that reset between tokens would never fire.
+    #[test]
+    fn until_matches_a_marker_split_across_tokens() {
+        assert_eq!(
+            feed_all(PARAM, &["hello", "\n</", "param", "eter>"]),
+            Some((3, 5))
+        );
+        // Byte at a time is the same answer — the state is what carries it.
+        let split: Vec<String> = "x\n</parameter>".chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = split.iter().map(|s| s.as_str()).collect();
+        assert!(feed_all(PARAM, &refs).is_some());
+    }
+
+    /// The value is raw text, so what would end a JSON string is ordinary
+    /// content here. This is the reason `JsonString` could not be reused.
+    #[test]
+    fn until_does_not_close_on_quotes_backslashes_or_newlines() {
+        let prose = "she said \"no\" \\ and left\nthen came back\n";
+        assert_eq!(
+            feed_all(PARAM, &[prose]),
+            None,
+            "closed early on JSON syntax"
+        );
+        assert!(feed_all(PARAM, &[prose, "\n</parameter>"]).is_some());
+    }
+
+    /// A near-miss that overlaps the real marker's opening byte. Resetting the
+    /// match to zero on a mismatch loses this — the `<` that begins the true
+    /// marker is skipped, and the span never closes.
+    #[test]
+    fn until_recovers_from_a_false_start_that_overlaps_the_marker() {
+        assert!(
+            feed_all(PARAM, &["a\n</p\n</parameter>"]).is_some(),
+            "a failed partial match swallowed the marker that followed it"
+        );
+        assert!(feed_all(PARAM, &["\n</paramX\n</parameter>"]).is_some());
+    }
+
+    /// Bytes after the marker in the same token belong to the next node, and
+    /// `consumed` is what says so.
+    #[test]
+    fn until_reports_only_the_bytes_that_belong_to_the_span() {
+        let (chunk, consumed) =
+            feed_all(PARAM, &["v\n</parameter>\n<parameter=next>"]).expect("closed");
+        assert_eq!(chunk, 0);
+        assert_eq!(consumed, "v\n</parameter>".len());
     }
 }

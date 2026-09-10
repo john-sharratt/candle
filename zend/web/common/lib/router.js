@@ -9,17 +9,84 @@ const PAGES = [];
 let outlet = null;
 let current = null;
 
-/* The roles a page may be declared at, weakest first — the same three the
- * daemon uses, and the same ordering, so `rank(have) >= rank(need)` is the
- * whole check on this side too. */
-const RANK = { unauthenticated: 0, user: 1, admin: 2 };
+/* The roles a page may be declared at, weakest first — the same ladder the
+ * daemon uses (`web::auth::Role`), and the same ordering, so
+ * `rank(have) >= rank(need)` is the whole check on this side too.
+ *
+ * **This table has to be extended whenever the daemon's enum is.** It was not,
+ * when `creator` went in above `admin`, and the failure was silent and total:
+ * `/v1/me` answered `role: "creator"`, `RANK['creator']` was `undefined`,
+ * `undefined >= 1` is false — so every gated page in the console refused the
+ * one account that owns the estate. It read as a broken sign-in rather than as
+ * a missing table entry, because the chrome had the identity and the pages did
+ * not. See `rankOf`. */
+const RANK = { unauthenticated: 0, user: 1, admin: 2, creator: 3 };
 
 /* Who is looking, as the SERVER decided. Set once at boot from `/v1/me`; a
  * page never computes it. `viewerRole` is a function rather than a value
  * because boot resolves the account after the registry is built. */
 let viewerRole = () => 'unauthenticated';
 export function setViewerRole(fn) { viewerRole = fn; }
-export function can(need) { return RANK[viewerRole()] >= RANK[need]; }
+
+/* A role's rank, and a **loud** answer for one this table has never heard of.
+ *
+ * The bare `RANK[role]` lookup returned `undefined` for an unknown role, and
+ * every comparison against `undefined` is false — so a daemon that grew a new
+ * level locked its own users out of every page and said nothing anywhere. A
+ * console one release behind the daemon it talks to is an ordinary deployment
+ * state, and it must not be an outage.
+ *
+ * Unknown is treated as the level below the lowest gate anything is declared
+ * at — the viewer sees what a signed-out visitor sees, which is wrong but
+ * recoverable — and it says so on the console, once, so the missing entry is
+ * findable instead of being diagnosed from a screenshot. */
+const warned = new Set();
+function rankOf(role) {
+  if (role in RANK) return RANK[role];
+  if (!warned.has(role)) {
+    warned.add(role);
+    console.error(
+      `router: the daemon reports role '${role}', which this console's RANK table `
+      + `does not list (${Object.keys(RANK).join(', ')}). Every gated page will `
+      + `refuse until it is added. This console is older than the daemon it is `
+      + `talking to.`,
+    );
+  }
+  return RANK.unauthenticated;
+}
+
+export function can(need) { return rankOf(viewerRole()) >= rankOf(need); }
+
+/* The two links that get somebody past a refused page, as plain anchors.
+ *
+ * Anchors to the gateway rather than calls into the app's own sign-in helpers,
+ * because this renders on the screen you reach when something about identity is
+ * already wrong — a control that depends on the state that broke is not a way
+ * out. `next` carries the whole URL because the provider returns the browser to
+ * one host for the estate and a relative target would resolve there instead;
+ * the gateway's `safe_next` refuses anything outside the cookie domain, so this
+ * cannot become an open redirect.
+ *
+ * Both are offered, and deliberately: signed out, you want to sign in; signed
+ * in as the wrong thing — the case with no answer before this existed — you
+ * want to sign out and come back as somebody else. */
+function authWayOut() {
+  const row = document.createElement('div');
+  row.style.cssText = 'margin-top:14px;display:flex;gap:8px;justify-content:center';
+  const here = encodeURIComponent(location.href);
+  const link = (href, text, cls) => {
+    const a = document.createElement('a');
+    a.href = href;
+    a.className = cls;
+    a.textContent = text;
+    return a;
+  };
+  row.append(
+    link('/auth/login?next=' + here, 'Sign in', 'btn sm primary'),
+    link('/auth/logout?next=' + here, 'Sign out', 'btn sm ghost'),
+  );
+  return row;
+}
 
 /**
  * Register a page.
@@ -167,6 +234,22 @@ export function start(host, onRoute) {
       detail.textContent = hit.page.role === 'admin'
         ? 'This page needs the admin role. You are signed in as ' + viewerRole() + '.'
         : 'This page needs you to be signed in.';
+      /* **The way out has to be on this screen.**
+       *
+       * It had no controls at all, and that turned an expired session into a
+       * trap: the console's only Sign out button lives on the profile page,
+       * the profile page is declared `user`, so the screen you land on when
+       * your session dies is the screen that cannot offer you the one action
+       * that fixes it. The chrome still showed a name and a face, so it read
+       * as signed in and refused everything, with no way to sign out and try
+       * again.
+       *
+       * Signing out is precisely the control you reach for when authorization
+       * is wrong, so it belongs on the page that says authorization is wrong —
+       * and it is a plain link to the gateway rather than anything this router
+       * has to be taught, so it works even when the app's own state is the
+       * thing that is broken. */
+      page.querySelector('div.empty').appendChild(authWayOut());
       outlet.replaceChildren(page);
       if (onRoute) onRoute(hit.page, hit.params);
       return;

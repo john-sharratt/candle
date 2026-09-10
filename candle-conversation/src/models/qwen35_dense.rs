@@ -49,8 +49,32 @@ const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
 const ARCH: &str = "qwen35";
 
 /// Qwen3.5-9B Q6_K — the stock instruct model, 9 B dense.
+///
+/// # Why the dialect is `Qwen35` and not `ChatML`
+///
+/// It was `ChatML`, and [`DialectType::Qwen35`] — written for this family,
+/// documented at length — had no users at all. The two agree on every turn
+/// marker, so the mistake produced a model that loaded, ran, and answered;
+/// they differ in exactly one place, and it is one this checkpoint cannot
+/// ignore.
+///
+/// ChatML prepends `/no_think\n` to every user turn as a soft switch.
+/// **This checkpoint's chat template contains no such switch** — grepping the
+/// shipped GGUF for `no_think` returns nothing — so the marker is not a switch
+/// to it, it is the first line of text in every situation a character reads.
+/// The family suppresses reasoning by opening the assistant turn with an
+/// already-closed think block instead, which `Dialect::qwen35` says by leaving
+/// `no_think` empty.
+///
+/// That also explains a fault recorded as unsolved in `npcd::engine::mind`:
+/// the checkpoint opening `<think>` and never closing it, every turn discarded
+/// whole as reasoning, and three separate suppression attempts — the `no_think`
+/// glue, `thinking_effort`, the `ThinkMode::Off` close budget — all failing.
+/// Every one of those is a ChatML mechanism, and none of them is what this
+/// family honours. The note there concludes "the remaining fault is below the
+/// prompt"; this line is what was below it.
 pub(super) fn qwen35_9b_q6() -> ModelSpec {
-    let chat_format = DialectType::ChatML;
+    let chat_format = DialectType::Qwen35;
     ModelSpec {
         arch: ModelArch::Qwen35Dense,
         loras: Vec::new(),
@@ -93,6 +117,7 @@ pub(super) fn qwen35_9b_q6() -> ModelSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_transformers::models::dialect::{CallStyle, Dialect};
 
     /// The stock preset and the gate must name the same bytes. If they drift,
     /// the KV threshold row tuned on the gate's checkpoint is being applied to a
@@ -126,14 +151,47 @@ mod tests {
     /// five minutes loading and then fail with `is a dense checkpoint` from a
     /// loader it should never have reached.
     #[test]
-    fn it_declares_the_dense_arch_and_speaks_chatml() {
+    fn it_declares_the_dense_arch_and_its_own_dialect() {
         let s = qwen35_9b_q6();
         assert!(
             matches!(s.arch, ModelArch::Qwen35Dense),
             "arch {:?} routes to the MoE loader, which refuses a dense checkpoint",
             s.arch
         );
-        assert!(matches!(s.chat_format, DialectType::ChatML));
+        assert!(matches!(s.chat_format, DialectType::Qwen35));
+    }
+
+    /// **The switch this family does not have must not be sent to it.**
+    ///
+    /// This asserted `ChatML`, which is where the bug lived: the two dialects
+    /// agree on every marker and differ only here, so the wrong one loads,
+    /// runs, and answers — while `/no_think\n` is prepended to every user turn
+    /// as literal text, because the checkpoint's own template has no such
+    /// switch to consume it. Asserted on the resolved dialect rather than on
+    /// the enum, so the thing checked is what the conversation layer will
+    /// actually emit.
+    #[test]
+    fn it_does_not_send_a_soft_switch_this_family_would_read_as_prose() {
+        let d = qwen35_9b_q6().dialect;
+        assert_eq!(d.no_think, "", "a `/no_think` marker reaches the character");
+        assert!(!d.has_no_think_switch());
+        // Suppression is the closed block prefilled after the assistant header,
+        // which is the mechanism this family actually honours.
+        assert_eq!(d.no_think_block, "<think>\n\n</think>\n\n");
+        // And the markers are still ChatML's — the families differ in one
+        // place, and a change here would be a different bug.
+        assert_eq!(d.user_start, Dialect::chat_ml().user_start);
+        assert_eq!(d.assistant_start, Dialect::chat_ml().assistant_start);
+    }
+
+    /// It writes calls in its own syntax, which is not JSON. See
+    /// `candle_transformers::models::dialect::CallStyle`.
+    #[test]
+    fn it_calls_tools_the_way_its_template_does() {
+        let d = qwen35_9b_q6().dialect;
+        assert_eq!(d.call_style, CallStyle::FunctionBlock);
+        assert!(d.call_style.multi_call());
+        assert!(d.call_style.carries_results());
     }
 
     /// The assembled character prompt is large before any history. A context

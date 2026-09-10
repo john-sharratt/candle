@@ -31,6 +31,21 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// A question one body put to another and has not had answered.
+///
+/// The lightest obligation in here and the one that carries a conversation:
+/// unlike a promise it has no deadline and nothing to keep, it simply stands
+/// until the two of them speak. See [`Ledger::asked`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Asked {
+    /// Who asked, and is waiting.
+    pub by: String,
+    /// Who was asked, and owes the answer.
+    pub of: String,
+    /// What was asked, in the asker's words.
+    pub what: String,
+}
+
 /// A commitment one body made to another, with a time on it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Promise {
@@ -82,11 +97,27 @@ pub struct Verdict {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     next: u64,
+    /// Questions put and not yet answered — see [`Ledger::asked`].
+    questions: Vec<Asked>,
     promises: Vec<Promise>,
     orders: Vec<Order>,
     verdicts: Vec<Verdict>,
     /// body → the world time it means to wake at.
     sleepers: BTreeMap<String, String>,
+    /// body → the standing orders as that body last read them.
+    ///
+    /// **The same cursor a posting keeps, for the same reason.** The unheld
+    /// orders are readable from anywhere and read the same every time, so `read`
+    /// on them was repeatable with an unchanged answer — and `read` is in
+    /// `body::ANSWERS`, which brings a character straight back to use what it
+    /// learnt. That is the treadmill that had a live cast spending forty-seven
+    /// of fifty acts on one line, and fixing it only for
+    /// [`crate::sim::posting`] would have moved it here rather than ended it.
+    ///
+    /// The whole text rather than a count: an order taken and another set in its
+    /// place leaves the count identical and the board different.
+    #[serde(default)]
+    orders_read: BTreeMap<String, String>,
 }
 
 impl Ledger {
@@ -99,15 +130,71 @@ impl Ledger {
         self.next
     }
 
+    // ---- questions somebody is still waiting on ----
+
+    /// Somebody put a question to somebody else.
+    ///
+    /// **A question is an obligation, and it was the only one nothing wrote
+    /// down.** A promise outlives the meeting because it is here; a question
+    /// did not, so it existed for exactly one turn — as one line of perception
+    /// among a sagging jacket and a humming conduit — and was gone.
+    ///
+    /// Measured live: three `ask`s delivered and perceived correctly, and not
+    /// one `say` or `tell` in reply. One character was asked directly twice in
+    /// forty ticks and reflected both times. They will *start* a conversation
+    /// and never return one, because by its next turn there is nothing left
+    /// saying anybody is waiting.
+    ///
+    /// Idempotent per pair-and-question: asking the same thing twice does not
+    /// stack up two debts.
+    pub fn asked(&mut self, by: &str, of: &str, what: &str) {
+        let already = self
+            .questions
+            .iter()
+            .any(|q| q.by == by && q.of == of && q.what == what);
+        if already {
+            return;
+        }
+        self.questions.push(Asked {
+            by: by.to_string(),
+            of: of.to_string(),
+            what: what.to_string(),
+        });
+    }
+
+    /// `me` said something to `to`, which discharges whatever they were waiting
+    /// on.
+    ///
+    /// **Any speech clears it, not a matched answer.** Deciding whether a
+    /// sentence answered a question needs a judge this engine does not have and
+    /// should not grow; what it can see is that the two of them are talking,
+    /// which is the thing the obligation exists to restart. A debt that could
+    /// only be cleared by the right words would outlive every conversation it
+    /// was meant to start.
+    pub fn answered(&mut self, me: &str, to: &str) {
+        self.questions.retain(|q| !(q.of == me && q.by == to));
+    }
+
+    /// Somebody left, or is otherwise no longer anybody's to answer.
+    pub fn forget_questions(&mut self, who: &str) {
+        self.questions.retain(|q| q.by != who && q.of != who);
+    }
+
+    /// Who is waiting on an answer from `me`, and what they asked.
+    ///
+    /// What the percept reports every turn until it is discharged — which is
+    /// the whole point, against an event that scrolled past in one.
+    pub fn awaiting_from(&self, me: &str) -> Vec<(String, String)> {
+        self.questions
+            .iter()
+            .filter(|q| q.of == me)
+            .map(|q| (q.by.clone(), q.what.clone()))
+            .collect()
+    }
+
     // ---- promises ----
 
-    pub fn promise(
-        &mut self,
-        by: &str,
-        to: &str,
-        what: &str,
-        by_when: &str,
-    ) -> Promise {
+    pub fn promise(&mut self, by: &str, to: &str, what: &str, by_when: &str) -> Promise {
         let p = Promise {
             id: self.id(),
             by: by.to_string(),
@@ -188,6 +275,29 @@ impl Ledger {
             .collect()
     }
 
+    /// The standing orders as they read now, when they say something this body
+    /// has not already been told.
+    ///
+    /// `None` when there is nothing unheld, and `None` when there is but this
+    /// body has read exactly that — which is what takes them out of
+    /// [`crate::sim::Sim::readable_at`] and so out of the grammar.
+    pub fn unheld_unseen_by(&self, who: &str) -> Option<String> {
+        let unheld = self.unheld();
+        if unheld.is_empty() {
+            return None;
+        }
+        let now = unheld.join("; ");
+        match self.orders_read.get(who) {
+            Some(seen) if seen == &now => None,
+            _ => Some(now),
+        }
+    }
+
+    /// Remember that this body has read the orders as they now stand.
+    pub fn mark_orders_read(&mut self, who: &str, text: &str) {
+        self.orders_read.insert(who.to_string(), text.to_string());
+    }
+
     /// What one body is holding.
     pub fn held_by(&self, who: &str) -> Vec<&Order> {
         self.orders
@@ -248,9 +358,11 @@ impl Ledger {
     /// Report one finished.
     pub fn finish(&mut self, who: &str, what: &str) -> bool {
         let want = what.trim().to_lowercase();
-        match self.orders.iter_mut().find(|o| {
-            !o.done && o.held_by.as_deref() == Some(who) && o.what.to_lowercase() == want
-        }) {
+        match self
+            .orders
+            .iter_mut()
+            .find(|o| !o.done && o.held_by.as_deref() == Some(who) && o.what.to_lowercase() == want)
+        {
             Some(o) => {
                 o.done = true;
                 o.held_by = None;
@@ -332,6 +444,90 @@ pub const WAKE_TIMES: &[&str] = &[
 mod tests {
     use super::*;
 
+    /// **A question stands until the two of them speak.**
+    ///
+    /// This is the whole point of writing it down: as an event it existed for
+    /// one turn and was gone, and a live cast delivered three questions and
+    /// returned zero answers.
+    #[test]
+    fn a_question_is_owed_by_the_person_it_was_put_to() {
+        let mut l = Ledger::new();
+        l.asked("m1", "m2", "what orders have changed");
+        assert_eq!(
+            l.awaiting_from("m2"),
+            vec![("m1".to_string(), "what orders have changed".to_string())]
+        );
+        // Not the other way round — the asker owes nothing.
+        assert!(l.awaiting_from("m1").is_empty());
+    }
+
+    /// Speaking to them clears it, whatever was said. Judging whether a
+    /// sentence *answered* would need a judge this engine does not have, and a
+    /// debt only the right words could clear would outlive every conversation
+    /// it was meant to start.
+    #[test]
+    fn speaking_to_somebody_discharges_what_they_were_waiting_on() {
+        let mut l = Ledger::new();
+        l.asked("m1", "m2", "what orders have changed");
+        l.answered("m2", "m1");
+        assert!(l.awaiting_from("m2").is_empty());
+    }
+
+    /// And it clears only that pair. Answering one person does not discharge
+    /// what somebody else is waiting on.
+    #[test]
+    fn answering_one_person_leaves_everybody_else_waiting() {
+        let mut l = Ledger::new();
+        l.asked("m1", "m2", "what orders have changed");
+        l.asked("m3", "m2", "where the third era is");
+        l.answered("m2", "m1");
+        assert_eq!(
+            l.awaiting_from("m2"),
+            vec![("m3".to_string(), "where the third era is".to_string())]
+        );
+    }
+
+    /// Asking the same thing twice is one debt, not two — otherwise a
+    /// character that repeats itself builds a list nobody could ever clear.
+    #[test]
+    fn asking_the_same_thing_twice_is_still_one_question() {
+        let mut l = Ledger::new();
+        l.asked("m1", "m2", "what orders have changed");
+        l.asked("m1", "m2", "what orders have changed");
+        assert_eq!(l.awaiting_from("m2").len(), 1);
+    }
+
+    /// **Every way of speaking to somebody discharges it, not just the one in
+    /// the room.**
+    ///
+    /// The obligation is cleared by `tell` and by `message`, and the second was
+    /// missed at first: a character that walked out and texted the answer
+    /// stayed marked as owing one, with a standing nudge it could only clear by
+    /// finding the person again in the flesh. Both call the same function, so
+    /// what this pins is that the function does not care which act reached it.
+    #[test]
+    fn any_way_of_reaching_them_clears_what_they_were_waiting_on() {
+        let mut l = Ledger::new();
+        l.asked("m1", "m2", "who came through the door");
+        assert_eq!(l.awaiting_from("m2").len(), 1);
+        // Whether that came from speech in the room or a handset two levels up,
+        // the ledger sees one thing: m2 reached m1.
+        l.answered("m2", "m1");
+        assert!(l.awaiting_from("m2").is_empty());
+    }
+
+    /// Somebody retired takes their questions with them, in both directions —
+    /// a debt owed to nobody is one a character can never discharge.
+    #[test]
+    fn a_body_that_is_gone_leaves_no_obligations_behind() {
+        let mut l = Ledger::new();
+        l.asked("m1", "m2", "a");
+        l.asked("m2", "m3", "b");
+        l.forget_questions("m2");
+        assert!(l.awaiting_from("m2").is_empty());
+        assert!(l.awaiting_from("m3").is_empty());
+    }
+
     #[test]
     fn a_promise_is_owed_to_the_person_it_was_made_to() {
         let mut l = Ledger::new();
@@ -375,7 +571,10 @@ mod tests {
 
         assert!(l.finish("c1", "survey the eastern ridge"));
         assert!(l.held_by("c1").is_empty());
-        assert!(l.unheld().is_empty(), "a finished order went back on the board");
+        assert!(
+            l.unheld().is_empty(),
+            "a finished order went back on the board"
+        );
     }
 
     #[test]
@@ -415,7 +614,12 @@ mod tests {
     #[test]
     fn a_verdict_attaches_to_the_thing_and_a_refusal_names_its_remedy() {
         let mut l = Ledger::new();
-        l.record_verdict("the third era", "m2", "it cannot be filed", Some("dates either side"));
+        l.record_verdict(
+            "the third era",
+            "m2",
+            "it cannot be filed",
+            Some("dates either side"),
+        );
         l.record_verdict("the third era", "m3", "it reads well enough", None);
 
         let on = l.verdicts_on("The Third Era");

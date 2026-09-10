@@ -190,9 +190,7 @@ impl Section {
 
     pub fn format(self) -> Format {
         match self {
-            Section::Canon | Section::Eras | Section::Stories | Section::Memory => {
-                Format::Markdown
-            }
+            Section::Canon | Section::Eras | Section::Stories | Section::Memory => Format::Markdown,
             Section::Responses
             | Section::Moods
             | Section::Characters

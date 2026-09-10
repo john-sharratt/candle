@@ -31,6 +31,18 @@ use npcd::engine::environment::carried;
 use npcd::engine::event::{Addressed, EventKind, Salience};
 use npcd::engine::perceived::{situation, Perceived};
 use npcd::engine::tick::Scheduler;
+use npcd::sim::Sim;
+
+/// A world with nothing in it but its map.
+///
+/// These drive `carried` against a bare `World`, which is the point of them —
+/// the composition has to hold for a caller that owns its own world rather than
+/// only for the shape the daemon hosts. The situation also carries what the
+/// machines here are set to, and a world with no machines has nothing to say
+/// about them, so an empty one is the honest stand-in rather than a stub.
+fn bare() -> Sim {
+    Sim::new()
+}
 
 /// The shipped vault, which is the Makers' whole world.
 fn vault() -> World {
@@ -70,7 +82,7 @@ fn crew(world: &mut World, sched: &Scheduler, who: &[(&'static str, &str, &str)]
 /// and not only for the one shape the daemon happens to host.
 fn deliver(world: &mut World, attention: &mut Attention, sched: &Scheduler, m: &Maker) -> Delta {
     let delta = attention.take(world, m.id);
-    for Perceived { kind, salience } in carried(world, &delta) {
+    for Perceived { kind, salience } in carried(world, &bare(), &delta) {
         sched.deliver(m.npc_id, world.now(), salience, kind);
     }
     delta
@@ -144,10 +156,15 @@ fn a_maker_spoken_to_is_woken_and_reads_that_it_was_spoken_to() {
 }
 
 #[test]
-fn a_maker_overhearing_the_same_words_is_not_woken_by_them() {
+fn a_maker_overhearing_the_same_words_is_not_interrupted_by_them() {
     // The other half, and the one that would be invisible if it broke: a
     // third Maker in the room hears it, reads it as somebody else's business,
     // and is not interrupted.
+    //
+    // It *is* read. Overhearing used to be left unscheduled, which worked only
+    // while an idle heartbeat was coming along behind to collect it; with those
+    // gone, an arrival nobody wakes for is one nobody ever sees. So the
+    // distinction is preempt against pending, not woken against ignored.
     let mut w = vault();
     let s = Scheduler::new(64);
     let mut a = Attention::new();
@@ -169,17 +186,15 @@ fn a_maker_overhearing_the_same_words_is_not_woken_by_them() {
     let bystander = deliver(&mut w, &mut a, &s, &crew[2]);
 
     assert!(!bystander.preempts(), "overhearing interrupted a Maker");
-    // One call, because it pops: what is due at this instant, and the bystander
-    // is not among it.
-    assert!(
-        !s.due_now(1).contains(&crew[2].npc_id),
-        "the bystander was woken"
-    );
-
-    // It still *heard* it — nothing was dropped, only left to wait.
-    let runs = run_due(&s, 200_000); // past the idle heartbeat
+    // Scheduled, because nothing else would ever come to collect it.
+    let runs = run_due(&s, 1);
     let heard = read(&runs, crew[2].npc_id).join("\n");
-    assert!(heard.contains("Maker-01 says to Maker-02"), "{heard}");
+    assert!(
+        heard.contains("Maker-01 says to Maker-02"),
+        "the bystander never read what it overheard: {heard}"
+    );
+    // And it reads as somebody else's business, not as being addressed.
+    assert!(!heard.contains("says to you"), "{heard}");
 }
 
 #[test]
@@ -469,7 +484,7 @@ fn a_situation_and_the_news_arrive_as_separate_things() {
     w.tick();
 
     let d = deliver(&mut w, &mut a, &s, &crew[0]);
-    let carried = carried(&w, &d);
+    let carried = carried(&w, &bare(), &d);
     let situations = carried
         .iter()
         .filter(|p| matches!(p.kind, EventKind::Situation { .. }))
@@ -511,8 +526,8 @@ fn the_addressee_survives_every_hop_between_the_world_and_the_model() {
 
     w.tell("m1", "m2", "get out of here").unwrap();
 
-    let told = carried(&w, &a.peek(&w, "m2"));
-    let heard = carried(&w, &a.peek(&w, "m3"));
+    let told = carried(&w, &bare(), &a.peek(&w, "m2"));
+    let heard = carried(&w, &bare(), &a.peek(&w, "m3"));
     assert!(told.iter().any(|p| matches!(
         &p.kind,
         EventKind::Speech {

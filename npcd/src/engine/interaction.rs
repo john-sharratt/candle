@@ -52,7 +52,6 @@ use crate::engine::tools::Mode;
 fn idle_timeout_secs(mode: Mode) -> u64 {
     match mode {
         Mode::Physical => 300,
-        Mode::VoiceCall | Mode::VideoCall => 900,
         Mode::InstantMessage => 86_400,
     }
 }
@@ -222,7 +221,29 @@ impl Interactions {
     pub fn for_npc(&self, npc_id: u64, now_ms: u64) -> Vec<Interaction> {
         let mut live = self.live.lock().expect("interactions");
         self.sweep(&mut live, now_ms);
-        live.values().filter(|ix| ix.npc_id == npc_id).cloned().collect()
+        live.values()
+            .filter(|ix| ix.npc_id == npc_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Note that somebody is **there**, without anything having been said.
+    ///
+    /// A console holding the stream open is a person in the room. Going quiet is
+    /// meant to catch the one who walked off, and measuring it from the last
+    /// *line* instead of the last sign of life threw out anybody who sat and
+    /// listened for five minutes — which is most of what being in a room with
+    /// somebody consists of. Distinct from [`Interactions::touched`] because it
+    /// is not an act and must not be counted as one.
+    pub fn attended(&self, id: &str, now_ms: u64) -> bool {
+        let mut live = self.live.lock().expect("interactions");
+        match live.get_mut(id) {
+            Some(ix) if !ix.closed => {
+                ix.last_ms = now_ms;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Note that something was said, so the session does not go quiet under
@@ -378,6 +399,29 @@ mod tests {
         assert_eq!(ix.get(&one.id, T0 + 400_000).unwrap().act_count, 1);
     }
 
+    /// **Listening is being there.** Idle is meant to catch the person who
+    /// walked off, and it was measured from the last thing *said* — so somebody
+    /// who sat and listened for five minutes had their body taken out of the
+    /// room from under them while they were still watching.
+    #[test]
+    fn a_console_holding_the_stream_open_is_somebody_in_the_room() {
+        let ix = Interactions::new();
+        let one = ix.open(7, Mode::Physical, me(), here(), T0, WORLD_T0);
+        assert!(ix.attended(&one.id, T0 + 200_000));
+        assert_eq!(ix.for_npc(7, T0 + 400_000).len(), 1);
+        // Being there is not an act. `act_count` is what the console shows as
+        // the character's own doing, and a poll tick is nobody's.
+        assert_eq!(ix.get(&one.id, T0 + 400_000).unwrap().act_count, 0);
+    }
+
+    #[test]
+    fn attending_a_session_that_is_over_says_so() {
+        let ix = Interactions::new();
+        let one = ix.open(7, Mode::Physical, me(), here(), T0, WORLD_T0);
+        assert!(ix.end(&one.id));
+        assert!(!ix.attended(&one.id, T0), "an ended session took a poll");
+    }
+
     #[test]
     fn ending_one_takes_it_off_the_list() {
         let ix = Interactions::new();
@@ -393,12 +437,19 @@ mod tests {
     #[test]
     fn the_wire_shape_carries_the_character_id_as_a_string() {
         let ix = Interactions::new();
-        let one = ix.open(6_817_662_845_163_923_144, Mode::VoiceCall, me(), here(), T0, WORLD_T0);
+        let one = ix.open(
+            6_817_662_845_163_923_144,
+            Mode::InstantMessage,
+            me(),
+            here(),
+            T0,
+            WORLD_T0,
+        );
         let w = one.wire(T0);
         assert_eq!(w["npc_id"], "6817662845163923144");
-        assert_eq!(w["mode"], "voice_call");
+        assert_eq!(w["mode"], "instant_message");
         assert_eq!(w["state"], "live");
-        assert_eq!(w["idle_timeout_secs"], 900);
+        assert_eq!(w["idle_timeout_secs"], 86_400);
         assert_eq!(w["interlocutor"]["display"], "Wren");
     }
 
@@ -425,7 +476,6 @@ mod tests {
         let ix = Interactions::new();
         ix.open(7, Mode::Physical, me(), here(), T0, WORLD_T0);
         ix.open(8, Mode::InstantMessage, me(), None, T0, WORLD_T0);
-        ix.open(9, Mode::VoiceCall, me(), None, T0, WORLD_T0);
 
         let standing = ix.visiting("creators-vault", T0);
         assert_eq!(standing.len(), 1, "{standing:?}");
@@ -448,7 +498,10 @@ mod tests {
         let ix = Interactions::new();
         let one = ix.open(7, Mode::Physical, me(), here(), T0, WORLD_T0);
 
-        assert!(ix.take_expired(T0 + 10_000).is_empty(), "taken while still live");
+        assert!(
+            ix.take_expired(T0 + 10_000).is_empty(),
+            "taken while still live"
+        );
         let gone = ix.take_expired(T0 + 301_000);
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0].id, one.id);

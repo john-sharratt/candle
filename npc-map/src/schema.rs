@@ -348,6 +348,20 @@ pub struct Area {
     /// What this place has not got, so nobody searches for it.
     #[serde(default)]
     pub lacks: Vec<String>,
+    /// What the address system plays here, from time to time.
+    ///
+    /// The building's standing recordings, in the words of whoever left them.
+    /// `npcd`'s [`stir`](../../npcd/src/engine/stir) fixtures are facts about
+    /// buildings in general and carry their own prose; a tannoy is the one that
+    /// is not, because what a place says to itself is the most particular thing
+    /// about it. So the engine holds none and quotes these verbatim.
+    ///
+    /// Each is a whole sentence ending in a full stop, because it is quoted
+    /// inside a framing sentence and a fragment would read as one. They are
+    /// dealt from a shuffled bag rather than drawn at random, so the length of
+    /// this list is exactly how long the building goes before repeating itself.
+    #[serde(default)]
+    pub announcements: Vec<String>,
     /// Child areas, by id.
     #[serde(default)]
     pub contains: Vec<String>,

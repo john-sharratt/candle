@@ -62,6 +62,7 @@ use std::fmt;
 use crate::load::MapSet;
 use crate::part::PartKind;
 use crate::route;
+use crate::salience::Weight;
 use crate::schema::Node;
 
 pub use crate::schema::Where;
@@ -242,6 +243,31 @@ pub enum Happening {
         to: Option<String>,
         what: String,
     },
+    /// The building did something. Nobody did it.
+    ///
+    /// **The one happening with no actor**, and that is the whole of why it
+    /// exists. Everything else here is somebody's doing, so a room where nobody
+    /// is doing anything is a room where nothing is true — which is exactly the
+    /// state a character standing alone in a corridor is in, and it is why one
+    /// of them stood there gesturing at nothing every four seconds. A vent
+    /// cycling, a light failing, a rat crossing the floor: those happen whether
+    /// or not anybody is thinking, and a character perceiving one has something
+    /// real to react to.
+    ///
+    /// `text` is a whole sentence naming its own subject — *"The lights in the
+    /// ceiling flicker and steady."* — because there is no actor to put in
+    /// front of it. `npcd`'s `engine::stir` produces them and holds that rule;
+    /// `crate::witness::narrate` relies on it, standing the sentence on its own
+    /// rather than trying to attribute it.
+    ///
+    /// `weight` rides on the event rather than being derived from it. Every
+    /// other happening's weight follows from what *kind* of thing it is, but a
+    /// fan changing note and a breaker going are the same kind of thing and are
+    /// worth entirely different amounts, so the thing that knows says so.
+    Stirred {
+        text: String,
+        weight: Weight,
+    },
 }
 
 impl Happening {
@@ -349,6 +375,41 @@ impl fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 type Done<T = ()> = Result<T, Refused>;
+
+/// How many events a world keeps.
+///
+/// # Why there is a bound at all
+///
+/// A world never stops happening. Every arrival, departure, utterance, gesture
+/// and station change appends an event, and nothing was taking any of them away
+/// — so the log grew for as long as the daemon ran, and [`crate::witness::since`]
+/// walks it **from the beginning on every read**, once per body per moment. An
+/// unbounded log is therefore not only unbounded memory, it is a per-tick cost
+/// that climbs for the life of the process. A cast standing still still talks.
+///
+/// # Why this many, and why losing the rest is safe
+///
+/// The log exists to be *drained*, not stored. Every body's cursor advances on
+/// every moment of the perception sweep — including bodies with no mind bound,
+/// which are swept precisely so their cursor cannot fall behind — and a moment
+/// is 500 ms. So what a reader actually needs is the handful of events since it
+/// last looked, and this window is four thousand.
+///
+/// The cost of trimming is only paid by a reader that has not looked in
+/// thousands of events, which the sweep makes impossible for anything with a
+/// body in the world. What is lost is history nobody was going to be handed:
+/// the record a character *keeps* is its substrate, written when it perceived
+/// the event, and that is not this.
+///
+/// [`crate::witness::since`] already tolerates the loss — it recovers a
+/// reader's position by walking arrivals and falls back to where the body is
+/// standing when its own arrival has been trimmed out from under it.
+pub const KEEP_EVENTS: usize = 4096;
+
+/// How far over [`KEEP_EVENTS`] the log runs before it is cut back.
+///
+/// Purely an amortisation: see [`World::forget_old_events`].
+const EVENT_SLACK: usize = 512;
 
 /// The state of one world, shared by everything in it.
 #[derive(Debug, Clone)]
@@ -581,6 +642,11 @@ impl World {
     /// points where somebody would actually stop and reconsider, which is why
     /// they are the points a mind gets a turn at.
     pub fn tick(&mut self) -> usize {
+        // **Before the early return below, not after it.** Most moments move
+        // nobody, so a trim placed after the `legs.is_empty()` exit would run
+        // only while somebody happened to be walking — which is exactly not the
+        // condition that grows the log.
+        self.forget_old_events();
         let legs: Vec<(String, Where)> = self
             .actors
             .values()
@@ -897,6 +963,24 @@ impl World {
     /// Do something in the room without speaking. Everybody standing there sees
     /// it; nobody outside does — the same reach as [`World::say`], because it is
     /// the same room.
+    ///
+    /// # `what` is a predicate, verb and all
+    ///
+    /// It is rendered as `"{who} {what}"` — `witness::verb_phrase` supplies a
+    /// verb for every *other* happening (`said …`, `came in`, `took …`) and
+    /// takes this one as given, because only the caller knows whether the deed
+    /// was a gesture, a hand laid on somebody, or a body going still.
+    ///
+    /// So `"gestures towards the table"`, not `"towards the table"`. A fragment
+    /// reaches the other characters as a sentence with the verb missing —
+    /// measured live, nine gestures arrived as *"Yaelis Vayne towards the table,
+    /// indicating the standing orders"* while the pause beside them, which does
+    /// pass a predicate, read correctly as *"Yaelis Vayne stops, and lets the
+    /// moment pass."*
+    ///
+    /// Do **not** name the target in `what`: pass it as `to` and the aiming is
+    /// added once, as `", at X"`. Both is how one act came to read
+    /// `"to Wren: steadying her, at Wren"`.
     pub fn show(&mut self, id: &str, to: Option<&str>, what: impl Into<String>) -> Done {
         let (place, to) = self.aim(id, to)?;
         self.now += 1;
@@ -907,6 +991,32 @@ impl World {
             what: Happening::Did {
                 to,
                 what: what.into(),
+            },
+        });
+        Ok(())
+    }
+
+    /// The building does something in a room. Nobody did it.
+    ///
+    /// Takes a place rather than an actor, which is the only entry point here
+    /// that does — see [`Happening::Stirred`]. A room that is not in the map is
+    /// refused rather than logged, because an event nobody can ever be standing
+    /// in is one that will sit in the window until it is trimmed.
+    pub fn stir(&mut self, place: &Where, text: impl Into<String>, weight: Weight) -> Done {
+        if self.node(place).is_none() {
+            return Err(Refused::NoSuchPlace(place.clone()));
+        }
+        self.now += 1;
+        self.log.push(Event {
+            at: self.now,
+            // No actor. Every reader compares this against its own id to decide
+            // whether an event is its own doing, and no body is called this, so
+            // a stirring is nobody's doing to everybody.
+            actor: String::new(),
+            place: place.clone(),
+            what: Happening::Stirred {
+                text: text.into(),
+                weight,
             },
         });
         Ok(())
@@ -962,8 +1072,25 @@ impl World {
     /// The whole log, in order. Read by [`crate::witness`] on behalf of one
     /// body, and by anything else that wants the record — a dispatch board, a
     /// replay, an audit.
+    ///
+    /// **A window, not an archive** — see [`KEEP_EVENTS`].
     pub fn log(&self) -> &[Event] {
         &self.log
+    }
+
+    /// Drop the oldest events past [`KEEP_EVENTS`].
+    ///
+    /// Trimmed in batches rather than one per push: draining a single event
+    /// from the front of a full log is a memmove of the whole window, and the
+    /// log takes an event every time anybody does anything. Letting it run
+    /// [`EVENT_SLACK`] over and then cutting back to the bound makes that one
+    /// memmove per `EVENT_SLACK` events instead of one per event.
+    fn forget_old_events(&mut self) {
+        if self.log.len() <= KEEP_EVENTS + EVENT_SLACK {
+            return;
+        }
+        let drop = self.log.len() - KEEP_EVENTS;
+        self.log.drain(..drop);
     }
 }
 
@@ -980,6 +1107,119 @@ mod tests {
 
     fn at(node: &str) -> Where {
         Where::new("vault-casting", node)
+    }
+
+    // ── the event window ────────────────────────────────────────────────────
+
+    /// Fill the log by talking. Speech is the cheapest event to make a lot of
+    /// and the one a busy room actually produces most of.
+    fn chatter(w: &mut World, n: usize) {
+        for i in 0..n {
+            w.say("m1", format!("line {i}")).unwrap();
+        }
+    }
+
+    fn one_speaker() -> World {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", at("green-room")).unwrap();
+        w
+    }
+
+    /// **The log is a window, not an archive.** Nothing was taking events away,
+    /// so it grew for the life of the process — and `witness::since` walks it
+    /// from the beginning once per body per moment, so it was a per-tick cost
+    /// that climbed for ever as well as unbounded memory.
+    #[test]
+    fn the_event_log_stops_growing() {
+        let mut w = one_speaker();
+        for _ in 0..12 {
+            chatter(&mut w, KEEP_EVENTS);
+            w.tick();
+            assert!(
+                w.log().len() <= KEEP_EVENTS + EVENT_SLACK,
+                "log reached {} against a bound of {}",
+                w.log().len(),
+                KEEP_EVENTS
+            );
+        }
+    }
+
+    /// And it is the **oldest** that go. A window that dropped the newest would
+    /// be worse than no window: the whole point is what just happened.
+    #[test]
+    fn the_window_keeps_the_newest_events() {
+        let mut w = one_speaker();
+        chatter(&mut w, KEEP_EVENTS + EVENT_SLACK + 200);
+        w.tick();
+
+        let said: Vec<&str> = w
+            .log()
+            .iter()
+            .filter_map(|e| match &e.what {
+                Happening::Said { words, .. } => Some(words.as_str()),
+                _ => None,
+            })
+            .collect();
+        let last = format!("line {}", KEEP_EVENTS + EVENT_SLACK + 199);
+        assert_eq!(said.last().copied(), Some(last.as_str()));
+        assert!(!said.contains(&"line 0"), "the oldest line survived a trim");
+    }
+
+    /// **Trimming runs on a still world.** Most moments move nobody, so `tick`
+    /// returns early — and a trim placed after that exit would only run while
+    /// somebody happened to be walking, which is not the condition that fills
+    /// the log.
+    #[test]
+    fn a_world_where_nobody_is_walking_still_trims() {
+        let mut w = one_speaker();
+        chatter(&mut w, KEEP_EVENTS + EVENT_SLACK + 50);
+        assert_eq!(w.tick(), 0, "somebody was walking");
+        assert_eq!(w.log().len(), KEEP_EVENTS);
+    }
+
+    /// Cut back to the bound rather than to the moment it crossed it, so the
+    /// memmove is paid once per `EVENT_SLACK` events instead of once per event.
+    #[test]
+    fn trimming_is_amortised_over_the_slack() {
+        let mut w = one_speaker();
+        // Filled by measurement rather than by arithmetic: entering the world
+        // is itself an event, so counting only the lines said is off by one and
+        // the test would be asserting against the wrong side of the threshold.
+        while w.log().len() < KEEP_EVENTS + EVENT_SLACK {
+            w.say("m1", "filling").unwrap();
+        }
+        w.tick();
+        assert_eq!(
+            w.log().len(),
+            KEEP_EVENTS + EVENT_SLACK,
+            "cut at the threshold instead of past it — that is a memmove per event"
+        );
+
+        w.say("m1", "the one over").unwrap();
+        w.tick();
+        assert_eq!(w.log().len(), KEEP_EVENTS, "did not cut back to the bound");
+    }
+
+    /// **A reader still gets its news across a trim.** The cursor is a tick
+    /// rather than an index into the log, so dropping the front cannot shift
+    /// what a body has already read out from under it — the failure an
+    /// index-based cursor would have had, silently, as a reader served somebody
+    /// else's events.
+    #[test]
+    fn a_reader_is_not_disturbed_by_a_trim() {
+        let mut w = one_speaker();
+        w.enter("m2", "Maker-02", at("green-room")).unwrap();
+        w.mark_seen("m2");
+        chatter(&mut w, KEEP_EVENTS + EVENT_SLACK + 10);
+        w.tick();
+
+        w.say("m1", "the one that matters").unwrap();
+        let heard = crate::witness::since(&w, "m2");
+        assert!(
+            heard.iter().any(|x| matches!(&x.what,
+                Happening::Said { words, .. } if words == "the one that matters")),
+            "a trim lost the reader its news"
+        );
     }
 
     #[test]

@@ -31,6 +31,8 @@
 //! the loop is continuous, and a prompt that implies a terminal state teaches
 //! the model to try to reach one.
 
+use candle_conversation::stencil::{CallStyle, ToolCallEnvelope};
+
 use crate::engine::tools::{Mode, Tool};
 
 /// What a character needs to know about itself to think as itself.
@@ -173,7 +175,7 @@ pub fn building(place: &str) -> String {
 /// per-personality or per-world may enter here — those are collection members,
 /// and mixing them in is what made a fifty-Maker vault hold fifty copies of the
 /// same two thousand words.
-pub fn frame(mode: Mode, tools: &[&Tool]) -> String {
+pub fn frame(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
     let mut s = String::with_capacity(4096);
 
     // ── the standing instruction ───────────────────────────────────────────
@@ -189,13 +191,6 @@ pub fn frame(mode: Mode, tools: &[&Tool]) -> String {
     // ── how acting works ───────────────────────────────────────────────────
     s.push_str(match mode {
         Mode::Physical => "You are physically present with whoever is here. They can see you.\n\n",
-        Mode::VideoCall => {
-            "You are not present — they can see and hear you, and nothing else about where you \
-             are.\n\n"
-        }
-        Mode::VoiceCall => {
-            "You are not present — they can hear you and cannot see you at all.\n\n"
-        }
         Mode::InstantMessage => {
             "You are not present — you are reaching them at a distance, in writing.\n\n"
         }
@@ -217,12 +212,31 @@ pub fn frame(mode: Mode, tools: &[&Tool]) -> String {
          speak, moving as you signal. Do not chain acts to cover a whole plan; you get to \
          think again in a moment, and what happens in between may change your mind.\n\
          \n\
-         Waiting is a real choice, and it is a specific one: `wait_for` names the thing \
-         that would end it, and the person it is about. You then go quiet — no thinking, \
-         no acts — until it happens, and you are woken the moment it does. If you name \
-         somebody, they see you waiting on them, so the silence becomes theirs to break. \
-         Do not invent something to do because a moment went by; but do not wait for \
-         nothing in particular either, because nothing in particular never arrives.\n\n",
+         Noticing something is not the same as saying it. A room you are standing in \
+         does things — a light shifts, something settles, a smell comes and goes — and \
+         everyone else present can see and smell it too. Repeating it back aloud is \
+         narrating, not speaking, and it is the surest way to sound like nobody. Speak \
+         when you have something to tell somebody that they do not already have.\n\
+         \n\
+         Thinking about something is a real choice. `reflect` is where you say what you \
+         make of a moment — what is going through your head, what you are feeling, what \
+         has settled — and it is the right answer whenever the world does something you \
+         cannot do anything about. You stand still while you do it and come straight \
+         back if anything happens. Reach for it before you invent an action: casting \
+         about for one more thing to touch is how a room gets rearranged \
+         for no reason, and how a corridor gets walked up and down all afternoon.\n\
+         \n\
+         Being with people beats writing to them. If somebody is here, speak to them — \
+         `say`, `ask`, `tell`. You also carry a handset, and you are on a channel with \
+         everyone: that is for the people who are NOT here, and it is how you stop being \
+         on your own. **Ask it things.** Where somebody is, who knows about a thing, what \
+         to do about something that is not yours to settle alone — a question obliges an \
+         answer, and the answer usually names a room you can walk to. Saying that you are \
+         ready, or where you are, or that you are standing by, obliges nobody and moves \
+         nothing; a channel of those is people talking past each other. Then `move_to` \
+         wherever the answer sent you. A message is how you find each other; it is not a \
+         substitute for being in the same room, and two people in one room texting is \
+         worse than either of them saying nothing.\n\n",
     );
 
     // ── the vocabulary ─────────────────────────────────────────────────────
@@ -258,22 +272,59 @@ pub fn frame(mode: Mode, tools: &[&Tool]) -> String {
 
     // ── the call format ────────────────────────────────────────────────────
     //
-    // This must describe exactly what `engine::act::parse` accepts, and
-    // `the_prompt_documents_the_format_the_parser_accepts` is what keeps the two
-    // from drifting. A prompt teaching a format the parser rejects produces a
-    // character that acts constantly and affects nothing.
+    // **Rendered from the envelope the grammar compiles, never written out.**
+    //
+    // This was two literal JSON lines, and for a long time it was describing a
+    // syntax the model could not emit: the stencil forces the shape, so a
+    // prompt that teaches a different one is not merely wrong, it is
+    // instructions the decode has to be steered away from. The test that was
+    // meant to hold the two together compared the prompt against the *parser*,
+    // which accepts both — so it passed throughout.
+    //
+    // `env` is the same value `compile_action_loop` is given, so the worked
+    // examples below are literally what the grammar will produce.
+    // `the_prompt_shows_the_shape_the_grammar_emits` compares them.
+    s.push_str("HOW TO CALL\n\n");
+    s.push_str(&format!(
+        "{}\n\n{}\n{}\n\n",
+        match env.style {
+            CallStyle::FunctionBlock =>
+                "Each act is one call block. Name the act, then give each argument its own \
+                 element. Values are plain text — write them as you would say them, with no \
+                 quoting and no escaping, and they may run to several lines.",
+            _ => "One JSON object per line. Nothing else on the line.",
+        },
+        env.render("say", &[("intent", "that I will not hand it over")]),
+        env.render("move_to", &[("destination", "the green room")]),
+    ));
     s.push_str(
-        "HOW TO CALL\n\
+        "You may write more than one, one after another, when they genuinely go together. \
+         Write the calls and nothing else — no explanation before them, no summary after. \
+         Anything you write that is not a call is ignored: it does not reach the world and \
+         nobody hears it.\n\n",
+    );
+
+    // ── what comes back ────────────────────────────────────────────────────
+    //
+    // **The half of the protocol that was missing.** Every act's outcome now
+    // rides at the head of the character's next turn wrapped in
+    // `<tool_response>` (see `mind::compose`), so the prompt says so: a result
+    // arriving in a wrapper nobody mentioned reads as noise, and a character
+    // that does not know its acts are answered has no reason to look for the
+    // answer.
+    //
+    // The refusal clause is the load-bearing one. A refusal is the most useful
+    // thing a character can be told — it is the only signal that distinguishes
+    // "that did not work" from "nothing happened", and the two want completely
+    // different next acts.
+    s.push_str(
+        "WHAT COMES BACK\n\
          \n\
-         One JSON object per line. Nothing else on the line.\n\
-         \n\
-         {\"tool\":\"say\",\"intent\":\"that I will not hand it over\"}\n\
-         {\"tool\":\"observe\",\"target\":\"the door\"}\n\
-         \n\
-         Every object needs \"tool\". Everything else is that tool's own arguments. \
-         Write the calls and nothing else — no explanation before them, no summary \
-         after. Anything you write that is not a call is ignored: it does not reach \
-         the world and nobody hears it.\n\n",
+         Every act you call is answered. The answer arrives at the start of your next turn, \
+         one <tool_response> block per act, in the order you called them — before anything \
+         else that has happened since. Read them: they tell you whether the thing you tried \
+         actually happened. An act can be refused, and a refusal says why. Do not call the \
+         same act again as though you had not been told.\n\n",
     );
 
     s.push_str(
@@ -295,7 +346,7 @@ pub fn frame(mode: Mode, tools: &[&Tool]) -> String {
 /// The projection path is the one that scales: this renders every part into one
 /// string per character, which is what made a vault of Makers hold a copy of the
 /// building each.
-pub fn build(p: &Persona<'_>, mode: Mode, tools: &[&Tool]) -> String {
+pub fn build(p: &Persona<'_>, mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
     let mut s = character(p);
     if !p.world.trim().is_empty() {
         s.push_str("The world you live in:\n");
@@ -317,7 +368,7 @@ pub fn build(p: &Persona<'_>, mode: Mode, tools: &[&Tool]) -> String {
         s.push_str(p.situation.trim());
         s.push_str("\n\n");
     }
-    s.push_str(&frame(mode, tools));
+    s.push_str(&frame(mode, tools, env));
     s
 }
 
@@ -325,6 +376,12 @@ pub fn build(p: &Persona<'_>, mode: Mode, tools: &[&Tool]) -> String {
 mod tests {
     use super::*;
     use crate::engine::tools::{by_name, for_mode, CATALOG};
+
+    /// The shape the shipped checkpoint is held to. Tests that are not about
+    /// the call format use this so they read the prompt a live character reads.
+    fn env() -> ToolCallEnvelope {
+        ToolCallEnvelope::qwen35()
+    }
 
     fn persona() -> Persona<'static> {
         Persona {
@@ -353,7 +410,7 @@ mod tests {
     fn a_character_that_has_a_building_is_told_its_rooms_and_how_to_name_them() {
         let mut p = persona();
         p.place = "Level 1, the command level.\n\nThe work here:\n  the command room — a table.";
-        let s = build(&p, Mode::Physical, &for_mode(Mode::Physical));
+        let s = build(&p, Mode::Physical, &for_mode(Mode::Physical), &env());
 
         assert!(s.contains("the command room"), "the rooms are not in it");
         assert!(
@@ -362,14 +419,19 @@ mod tests {
         );
 
         // And a character with no building is not told about one.
-        let bare = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
+        let bare = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
         assert!(!bare.contains("The building you work in"), "{bare}");
     }
 
     #[test]
     fn the_prompt_names_the_character_and_their_world() {
         let p = persona();
-        let s = build(&p, Mode::Physical, &for_mode(Mode::Physical));
+        let s = build(&p, Mode::Physical, &for_mode(Mode::Physical), &env());
         assert!(s.contains("You are Vasska."));
         assert!(s.contains("outlived two garrisons"));
         assert!(s.contains("besieged city"));
@@ -380,7 +442,12 @@ mod tests {
     /// someone with their own reasons. The counter-instruction is not optional.
     #[test]
     fn the_prompt_refuses_the_assistant_frame() {
-        let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
+        let s = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
         assert!(s.contains("not an assistant"));
         assert!(s.contains("nobody to help"));
     }
@@ -389,7 +456,12 @@ mod tests {
     /// The prompt has to say what the consequence is, not merely prefer tools.
     #[test]
     fn the_prompt_says_narrating_an_act_does_not_perform_it() {
-        let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
+        let s = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
         assert!(s.contains("nothing happens"));
         assert!(s.contains("INTENT, never your words"));
     }
@@ -403,12 +475,18 @@ mod tests {
     /// both required, and the prompt used to say only the first.
     #[test]
     fn the_prompt_licenses_doing_nothing() {
-        let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
-        assert!(s.contains("Waiting is a real choice"));
-        assert!(s.contains("`wait_for`"));
+        let s = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
+        assert!(s.contains("Thinking about something is a real choice"));
+        assert!(s.contains("`reflect`"));
         assert!(
-            s.contains("nothing in particular never arrives"),
-            "the prompt allows a wait that nothing can answer"
+            s.contains("rearranged for no reason"),
+            "the prompt does not say what reflecting is *for*, so it reads as \
+             permission to idle rather than as the alternative to fidgeting"
         );
     }
 
@@ -416,7 +494,12 @@ mod tests {
     /// try to reach it, and the loop is continuous.
     #[test]
     fn the_prompt_establishes_no_completion_criterion() {
-        let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
+        let s = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
         assert!(s.contains("no point at which you are finished"));
         for terminal in ["task is complete", "when you are done", "your goal is to"] {
             assert!(
@@ -435,7 +518,7 @@ mod tests {
             beliefs: &beliefs,
             ..persona()
         };
-        let s = build(&p, Mode::Physical, &for_mode(Mode::Physical));
+        let s = build(&p, Mode::Physical, &for_mode(Mode::Physical), &env());
         assert!(s.contains("Hess burned the east granary"));
         assert!(s.contains("cannot decide to stop believing"));
         assert!(s.contains("Do not tidy it away"));
@@ -459,12 +542,18 @@ mod tests {
     /// something the parser then refuses — and it does not learn from being
     /// refused, so it asks the same way every turn. That happened twice: the
     /// belief paragraph went on recommending `note_concern` for hours after the
-    /// act was cut, and the licence to do nothing named `wait` after `wait`
-    /// became `wait_for`. Both were held in place by tests that checked the
-    /// prompt against itself rather than against the catalog.
+    /// act was cut, and the licence to do nothing has now named a removed act
+    /// twice over — `wait`, then `wait_for`. Every one of those was held in
+    /// place by a test that checked the prompt against itself rather than
+    /// against the catalog, which is why this one checks the catalog.
     #[test]
     fn the_prompt_never_names_an_act_that_does_not_exist() {
-        let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
+        let s = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
         // Backticked lowercase_snake words are how this prompt writes an act.
         // Anything else in backticks (`to`, `intent`) is a parameter, so only
         // words that look like a call are checked, and a real act name is never
@@ -479,9 +568,7 @@ mod tests {
         for w in named {
             // Parameters may be backticked too; only judge words that are not
             // parameters of some act in the catalog.
-            let is_param = CATALOG
-                .iter()
-                .any(|t| t.params.iter().any(|p| p.name == w));
+            let is_param = CATALOG.iter().any(|t| t.params.iter().any(|p| p.name == w));
             if is_param {
                 continue;
             }
@@ -496,7 +583,12 @@ mod tests {
     /// believe nothing", which is a claim rather than an absence.
     #[test]
     fn an_empty_layer_contributes_nothing() {
-        let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
+        let s = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
         assert!(!s.contains("What you hold true"));
         assert!(!s.contains("People you know"));
         assert!(!s.contains("What you are set on"));
@@ -506,14 +598,9 @@ mod tests {
     /// accepts. A tool listed but not offered is an invitation to a refusal.
     #[test]
     fn the_prompt_lists_exactly_the_tools_offered_in_that_mode() {
-        for mode in [
-            Mode::Physical,
-            Mode::VideoCall,
-            Mode::VoiceCall,
-            Mode::InstantMessage,
-        ] {
+        for mode in [Mode::Physical, Mode::InstantMessage] {
             let tools = for_mode(mode);
-            let s = build(&persona(), mode, &tools);
+            let s = build(&persona(), mode, &tools, &env());
             for t in &tools {
                 assert!(
                     s.contains(t.name),
@@ -523,7 +610,12 @@ mod tests {
                 );
             }
         }
-        let physical = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
+        let physical = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
         assert!(
             !physical.contains("send_image"),
             "a physically present character was offered a camera"
@@ -532,48 +624,100 @@ mod tests {
 
     #[test]
     fn mode_changes_how_presence_is_described() {
-        let phys = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
+        let phys = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
         let msg = build(
             &persona(),
             Mode::InstantMessage,
             &for_mode(Mode::InstantMessage),
+            &env(),
         );
         assert!(phys.contains("physically present"));
         assert!(msg.contains("not present"));
     }
 
-    /// **The prompt and the parser must describe the same format.** A prompt
-    /// teaching a shape `engine::act::parse` rejects produces a character that
-    /// acts constantly and affects nothing — and every act would be reported as
-    /// malformed, which reads as a broken model rather than a broken prompt.
+    /// **The prompt must show the shape the GRAMMAR emits**, not merely one the
+    /// parser tolerates.
     ///
-    /// Asserted by running the prompt's own worked example through the parser.
+    /// This checked the prompt against `act::parse`, which accepts both call
+    /// syntaxes — so it passed for months while the prompt taught one JSON
+    /// object per line to a checkpoint the stencil was forcing into
+    /// `<tool_call>` blocks. The grammar is a hard constraint and always wins;
+    /// a prompt describing something else is not advice the model can take, it
+    /// is instructions the decode has to be steered away from.
+    ///
+    /// So the comparison is against the envelope the stencil compiles. Both
+    /// come from the same value, and this is what says so.
+    /// **The prompt promises answers, and the wrapper it names is the one the
+    /// turn is actually built with.**
+    ///
+    /// `mind::compose` writes `<tool_response>` blocks at the head of every
+    /// turn that follows an act. A prompt that named a different wrapper — or
+    /// named none — would leave the character reading its own results as
+    /// unexplained noise, which is the state this whole change came out of: 23
+    /// calls, 0 responses, and every act a `reflect`.
     #[test]
-    fn the_prompt_documents_the_format_the_parser_accepts() {
+    fn the_prompt_names_the_wrapper_results_actually_come_back_in() {
+        for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
+            let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical), &env);
+            assert!(
+                s.contains("<tool_response>"),
+                "{:?}: the prompt never tells the character its acts are answered",
+                env.style
+            );
+            // And that a refusal is one of the answers it may get — the signal
+            // that separates "that did not work" from "nothing happened".
+            assert!(
+                s.contains("refused"),
+                "{:?}: the prompt does not say an act can be refused",
+                env.style
+            );
+        }
+    }
+
+    #[test]
+    fn the_prompt_shows_the_shape_the_grammar_emits() {
         use crate::engine::act;
 
-        let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical));
-        let examples: Vec<&str> = s
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with('{') && l.contains("\"tool\""))
-            .collect();
-        assert!(
-            examples.len() >= 2,
-            "the prompt shows no worked call, so nothing pins the format"
-        );
-        for line in examples {
-            let p = act::parse(line);
+        for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
+            let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical), &env);
+            // The worked calls the prompt shows, rendered from this envelope.
+            let shown = env.render("say", &[("intent", "that I will not hand it over")]);
+            assert!(
+                s.contains(&shown),
+                "{:?}: the prompt does not show what the grammar emits.\nwanted:\n{shown}",
+                env.style
+            );
+
+            // And what it shows is a call the parser reads back as one act —
+            // the round trip the old test only did half of.
+            let p = act::parse(&shown);
             assert_eq!(
                 p.acts.len(),
                 1,
-                "the prompt teaches a call the parser rejects: {line} → {:?}",
+                "{:?}: the prompt's own example does not parse: {:?}",
+                env.style,
                 p.rejected
             );
+            assert_eq!(p.acts[0].tool, "say");
+            assert_eq!(p.acts[0].args["intent"], "that I will not hand it over");
+
+            // The other syntax must not also be described — two formats in one
+            // prompt is the ambiguity this whole change removes.
+            let other = match env.style {
+                CallStyle::FunctionBlock => "One JSON object per line",
+                _ => "<parameter=",
+            };
+            assert!(
+                !s.contains(other),
+                "{:?}: the prompt also teaches the other syntax ({other})",
+                env.style
+            );
         }
-        // And it must say the key the parser requires, by name.
-        assert!(s.contains("\"tool\""));
-        assert!(s.contains("One JSON object per line"));
     }
 
     /// A character with nothing authored still gets a usable prompt rather than
@@ -585,6 +729,7 @@ mod tests {
             &Persona::default(),
             Mode::Physical,
             &for_mode(Mode::Physical),
+            &env(),
         );
         assert!(s.starts_with("You are a person."));
         assert!(s.contains("HOW YOU ACT"));

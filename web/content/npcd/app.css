@@ -68,97 +68,106 @@
 .rail-item:hover { background: var(--panel); color: var(--ink-dim); }
 .rail-item.on { background: var(--panel-2); color: var(--ink); border-left-color: var(--accent); font-weight: 600; }
 .rail-item .n { margin-left: auto; font-family: var(--mono); font-size: .69rem; color: var(--ink-ghost); }
+.rail-item .n.live { color: var(--ok); font-size: .6rem; }
 .rail-item .swatch { width: 3px; height: 14px; border-radius: 2px; flex: 0 0 3px; }
-
-/* ── console ─────────────────────────────────────────────────────────────── */
-
-.console { display: flex; flex-direction: column; height: 100%; }
-.console-hd {
-  display: flex; align-items: center; gap: 11px; padding: 10px 18px;
-  border-bottom: 1px solid var(--line); background: var(--panel); flex: 0 0 auto;
+/* A face-sized initial or mode glyph, so the conversation list in the rail
+   scans the way the roster does rather than as a column of bare words. */
+.rail-item .ri-icon {
+  width: 22px; height: 22px; border-radius: 6px; flex: 0 0 22px;
+  display: grid; place-items: center; background: var(--panel-3);
+  color: var(--accent); font-size: .72rem; font-weight: 700;
 }
-/* Name over one line of who-and-where, beside the face — the sample's header
- * shape. A single strong name in a row of controls reads as a toolbar; this
- * reads as somebody you are with. */
-.console-caption {
-  margin-bottom: 16px; padding-bottom: 12px; line-height: 1.6;
-  border-bottom: 1px solid var(--line);
-}
+.rail-item.on .ri-icon { background: var(--accent-soft); }
+.rail-item .ri-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.who-hd { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-.who-hd strong { font-size: .95rem; }
+/* ── the scene ───────────────────────────────────────────────────────────────
+ *
+ * What a character does, read as the room it happens in. Lives inside a
+ * `.lane`, so it has no height or scroll of its own — see `.lane-frame`.
+ *
+ * The console's own chrome is gone with it: `.console`, `.console-hd`,
+ * `.console-body`, `.stage`, `.acts`, `.bubble` and the typing indicator all
+ * belonged to a page at `/interaction/:ix` that no longer exists. Talking to a
+ * character is two tabs on the character's page now.
+ */
+.stage-inner { min-width: 0; }
 
-.console-body { flex: 1; display: flex; min-height: 0; }
-.stage { flex: 1; overflow-y: auto; padding: 22px 26px; min-width: 0; }
-.stage-inner { max-width: 780px; margin: 0 auto; }
-/* Wider than it was, because an act is now one line and the intent is the half
- * of it worth reading. At 320 the intent had about 160px and wrapped to three
- * lines, which put back exactly the height the one-line row was for. */
-.acts {
-  width: 368px; flex: 0 0 368px; border-left: 1px solid var(--line);
-  background: var(--bg-deep); overflow-y: auto; padding: 14px 15px;
-}
-.acts.hidden { display: none; }
-
-.bubble { max-width: 76%; margin-bottom: 14px; }
-.bubble.me { margin-left: auto; }
-.bubble .body {
-  padding: 10px 14px; border-radius: 15px; background: var(--panel-2);
-  font-size: .89rem; line-height: 1.55;
-}
-.bubble.me .body { background: var(--accent); color: var(--accent-ink); }
-.bubble .who { font-size: .69rem; color: var(--ink-ghost); margin-top: 4px; font-family: var(--mono); }
-.bubble.me .who { text-align: right; }
-.bubble img { max-width: 100%; border-radius: 10px; display: block; margin-bottom: 8px; }
-
-.typing { display: inline-flex; gap: 4px; padding: 4px 0; }
-.typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--ink-faint); animation: bounce 1.3s infinite; }
-.typing i:nth-child(2) { animation-delay: .16s } .typing i:nth-child(3) { animation-delay: .32s }
-@keyframes bounce { 0%,60%,100% { transform: translateY(0); opacity: .4 } 30% { transform: translateY(-4px); opacity: 1 } }
-
-.beat { display: flex; gap: 13px; margin-bottom: 14px; animation: rise .22s ease both; }
+/* One turn on the stage: a colour rail, the line itself, and what kind of turn
+ * it was. The type is the sample's — `.93rem` at 1.72 — because this is prose
+ * somebody is reading, not a log they are scanning. */
+.beat { display: flex; gap: 14px; margin-bottom: 15px; animation: rise .22s ease both; }
 @keyframes rise { from { opacity: 0; transform: translateY(5px) } to { opacity: 1; transform: none } }
 .beat .rail-mark { width: 2px; border-radius: 2px; flex: 0 0 2px; background: var(--line-2); }
-.beat .txt { font-size: .9rem; line-height: 1.68; flex: 1; }
+.beat .txt { font-size: .93rem; line-height: 1.72; flex: 1; color: var(--ink-dim); min-width: 0; }
 .beat .tag {
   font-size: .63rem; font-family: var(--mono); color: var(--ink-ghost);
-  text-transform: uppercase; letter-spacing: .6px; padding-top: 4px;
-  flex: 0 0 62px; text-align: right;
+  text-transform: uppercase; letter-spacing: .6px; padding-top: 6px;
+  flex: 0 0 62px; text-align: right; overflow: hidden; text-overflow: ellipsis;
 }
-.beat.say .rail-mark { background: var(--l-action); }
-.beat.act .rail-mark { background: var(--l-interaction); }
-.beat.scene .rail-mark { background: var(--l-environment); }
-.beat.scene .txt { color: var(--ink-mid); font-style: italic; }
-.beat.world .rail-mark { background: var(--l-world); }
-.beat.world .txt { color: var(--ink-mid); }
+
+/* **Speech is the thing you came to read.** Full ink, and the speaker named on
+ * the line rather than in the tag column — an exchange where every turn is the
+ * same grey as the stage directions is one you have to work to follow. */
+.beat.said .rail-mark { background: var(--l-action); }
+.beat.said .txt { color: var(--ink); }
+.beat .speaker {
+  font-weight: 700; color: var(--ink-mid); margin-right: 8px;
+  font-size: .8rem; letter-spacing: .2px;
+}
+.beat.me .rail-mark { background: var(--accent); }
+.beat.me .speaker { color: var(--accent); }
+
+/* **Hands, not words.** One body doing something to another — `act` and
+ * `gesture` — is the other thing a person standing in the room registers as an
+ * event, so it belongs on the stage beside speech. Italic and on the
+ * interaction colour, because the whole point is that it reads *apart* from
+ * what was said at a glance.
+ *
+ * Only these. There is no `.narration`, `.scene` or `.world` beat any more:
+ * mirroring every act here rendered the right lane a second time, one column
+ * over in a different shape, and buried the exchange under the character's
+ * errands. */
+.beat.contact .rail-mark { background: var(--l-interaction); }
+.beat.contact .txt { font-style: italic; color: var(--ink-soft); }
+.beat.contact .speaker { font-style: normal; color: var(--l-interaction); }
+/* Yours keeps the accent it has everywhere else, so who did it is the first
+   thing you read on either kind of line. */
+.beat.contact.me .rail-mark { background: var(--accent); }
+.beat.contact.me .speaker { color: var(--accent); }
+
+/* The two kinds of line that are yours: a cue, and a beat you called for. */
 .beat.cue .rail-mark { background: var(--warn); }
+.beat.cue .txt { color: var(--warn); font-family: var(--mono); font-size: .82rem; }
 .beat.beat_ .rail-mark { background: var(--violet); }
 .beat.beat_ .txt { color: var(--violet); font-size: .8rem; font-family: var(--mono); }
 
-.scene-img { margin: 8px 0 18px; border-radius: 12px; overflow: hidden; background: var(--panel); }
-.scene-img .ph { height: 186px; display: grid; place-items: center; color: var(--ink-ghost); background: var(--panel-3); font-size: .8rem; }
-.tickline {
-  display: flex; align-items: center; gap: 12px; margin: 20px 0 15px;
-  font-family: var(--mono); font-size: .665rem; color: var(--ink-ghost);
-}
-.tickline::before, .tickline::after { content: ""; flex: 1; height: 1px; background: var(--line); }
-
-/* What each column is, said once at the top of it.
+/* Something happened to the scene itself rather than in it — currently only
+ * "you are no longer in the room". A ruled line across the pane, because it
+ * divides the exchange rather than joining it.
  *
- * The two-latency stream is what this page exists to show, and unlabelled it
- * reads as a log beside a transcript — you have to be told which is which. The
- * front page's sample has carried these headings since it was written, and it
- * is why the sample lands in four seconds. Sticky, because the point holds at
- * the bottom of a long exchange as much as at the top. */
-.pane-hd {
-  position: sticky; top: 0; z-index: 2;
-  font-size: .655rem; text-transform: uppercase; letter-spacing: .9px;
-  color: var(--ink-ghost); font-weight: 800;
-  padding: 12px 0 10px; margin-bottom: 4px;
-  background: inherit;
+ * This was `.tickline` and drew `tick 412 · 1 acts` between turns. Ticks are the
+ * machine's beat and belong on an act's own row in the right lane, not
+ * interleaved with what people said. */
+.scene-note {
+  display: flex; align-items: center; gap: 12px; margin: 22px 0 17px;
+  font-family: var(--mono); font-size: .665rem; color: var(--warn);
 }
-.stage > .pane-hd { padding-left: 26px; padding-right: 26px; margin: -22px -26px 8px; background: var(--bg); }
-.acts > .pane-hd { margin: -14px -15px 8px; padding-left: 15px; padding-right: 15px; background: var(--bg-deep); }
+.scene-note::before, .scene-note::after {
+  content: ""; flex: 1; height: 1px; background: var(--line-2);
+}
+
+/* What each lane is, said once at the top of it. Unlabelled, the two read as a
+ * log beside a transcript and you have to be told which is which — the front
+ * page's sample has carried these headings since it was written, and it is why
+ * the sample lands in four seconds.
+ *
+ * A plain heading rather than a sticky one: it was sticky with negative margins
+ * once, and a negative top margin pulls everything after it up by the same
+ * amount, so the first thing it introduced sat behind it. */
+.pane-hd {
+  font-size: .655rem; text-transform: uppercase; letter-spacing: .9px;
+  color: var(--ink-ghost); font-weight: 800; margin-bottom: 12px;
+}
 
 /* One line each, the way the sample renders them: tick, tool, intent. It used
  * to stack the intent under the tool behind a rule, which is a third of the
@@ -175,10 +184,16 @@
   font-family: var(--font); font-size: .78rem; color: var(--ink-soft);
   font-style: italic; line-height: 1.5;
 }
-.act-item .rendered { padding-left: 131px; }
-.act-item .rendered:empty { display: none; }
 .act-item.unobs { opacity: .45; }
 .act-item.unobs .tool { color: var(--ink-faint); }
+
+/* "Carry on" on the roster — the conversations still running, above the cast.
+ * A conversation outlives the page it was watched from, so this is the answer
+ * to "where was I", and it earns the accent rail for being the one thing on
+ * that page that is mid-flight rather than merely available. */
+.list.talking { margin-bottom: 22px; }
+.list.talking .npc-row { border-left: 2px solid var(--accent); }
+.list.talking .avatar { color: var(--accent); }
 
 .composer { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--panel); padding: 12px 18px; position: relative; }
 .composer .textarea { min-height: 40px; max-height: 150px; }
@@ -848,12 +863,6 @@ canvas { width: 100%; display: block; }
 .pulse-hd { margin-bottom: 26px; }
 .pulse-hd-main { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 .pulse-hd h1 { font-size: 2.1rem; letter-spacing: -1px; margin: 0; }
-.pulse-lede {
-  font-size: .95rem; color: var(--ink-soft); line-height: 1.7;
-  max-width: 60ch; margin: 10px 0 0;
-}
-.pulse-lede em { font-style: normal; color: var(--ink-dim); font-weight: 600; }
-
 .pulse-status {
   font-family: var(--mono); font-size: .7rem; text-transform: uppercase;
   letter-spacing: 1px; font-weight: 700; color: var(--ink-faint);
@@ -938,10 +947,21 @@ canvas { width: 100%; display: block; }
   position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
   background: hsl(var(--hue) 52% 58%);
 }
-.cast-card.is-blocked .cast-spine { opacity: .45; }
+.cast-card.is-quiet .cast-spine { opacity: .45; }
 .cast-name {
   font-weight: 650; font-size: .96rem; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap;
+  /* Room for the age in the corner, so a long name ellipsises rather than
+     running underneath it. */
+  padding-right: 58px;
+}
+/* How long since this character last acted. In the corner and out of the flow:
+   it is the figure an operator scans down the strip for, and it must not move
+   as the rows below it change height. */
+.cast-age {
+  position: absolute; top: 12px; right: 14px;
+  font-family: var(--mono); font-size: .7rem; color: var(--ink-ghost);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 .cast-state {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1001,8 +1021,8 @@ canvas { width: 100%; display: block; }
 }
 /* A quiet tick is present but recessive — a wall of them is what an idle cast
    looks like, and it should not compete with the one preempt among them. */
-.tick.is-blocked { background: var(--bg-deep); }
-.tick.is-blocked .tick-spine { opacity: .4; }
+.tick.is-quiet { background: var(--bg-deep); }
+.tick.is-quiet .tick-spine { opacity: .4; }
 .tick.is-preempted { border-color: var(--accent-line); }
 /* Only genuinely new rows animate, so a poll does not re-animate the page. */
 .tick.is-new { animation: tick-in .26s ease both; }
@@ -1070,6 +1090,41 @@ canvas { width: 100%; display: block; }
   color: var(--accent); margin-right: 7px;
 }
 .act-intent { font-size: .82rem; font-style: italic; color: var(--ink-mid); line-height: 1.5; }
+
+/* What came of it. Three faces on one line — the tool in mono accent, what was
+   asked in the body face, and the world's answer after a mark — because the
+   feed used to show only one of the two halves and *which* one depended on the
+   verdict: an act that landed showed the call, an act refused showed the reply.
+   A sentence with no act name sat beside an act name with no outcome, and
+   neither said whether anything had happened.
+
+   The mark carries the colour rather than the text, so a scanned column reads
+   as a row of arrows with the failures picked out, and the answer itself stays
+   quiet enough not to compete with the act. */
+/* Each argument as a labelled part: the parameter's name in a small dim mono,
+   its value in the body face. Bare values were the problem — `ask — Yaelis
+   Vayne; where the data chips are` leaves a reader working out which half is
+   the person, and `act — steady them; Soren` can be read either way round. */
+.act-key {
+  font-family: var(--mono); font-size: .66rem; color: var(--ink-ghost);
+  margin-right: 4px;
+}
+.act-val { font-size: .82rem; color: var(--ink-mid); line-height: 1.5; }
+/* Between arguments, so several read as several rather than as one sentence
+   with semicolons in it. */
+.act-sep { color: var(--line-2); margin: 0 7px; }
+
+.act-mark {
+  font-family: var(--mono); font-size: .72rem; font-weight: 700;
+  color: var(--ok, var(--accent)); margin: 0 6px;
+}
+.act-said { font-size: .78rem; color: var(--ink-faint); line-height: 1.5; }
+.act.refused .act-mark { color: var(--warn); }
+/* A refused act is not a quieter success: the thing it asked for did not
+   happen, so the request reads as struck through rather than merely dim. */
+.act.refused .act-intent,
+.act.refused .act-val { color: var(--ink-faint); text-decoration: line-through; }
+.act.refused .act-said { color: var(--warn); }
 .tick-silent {
   margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line-2);
   font-size: .78rem; color: var(--ink-ghost); font-style: italic; flex: 0 0 auto;
@@ -1465,38 +1520,219 @@ canvas { width: 100%; display: block; }
 }
 
 
+/* ── Being in the room ───────────────────────────────────────────────────────
+ *
+ * The scene, embedded in the character's own page rather than filling a console
+ * of its own — so it is a panel with a bounded height, not a viewport.
+ *
+ * The presence bar is deliberately at the BOTTOM and deliberately looks like a
+ * status bar rather than a toolbar: it states a fact about you ("you are with
+ * them", "you are not in the world") and carries the one control that changes
+ * it. Anything that reads as a row of actions invites the reader to look for
+ * more of them, and there is exactly one.
+ */
+/* ── the two-lane frame ──────────────────────────────────────────────────────
+ *
+ * The front page's sample, as a component: what it *does* beside what reached
+ * you, in a bordered card with a composer under both. Used by the scene and by
+ * the message thread, so the split reads the same wherever it appears.
+ *
+ * **The height is on the frame, not on the lanes.** The lanes were sized with
+ * `height` while also being `flex: 1` children of an auto-height column, so
+ * their content grew the card instead of scrolling inside it — a long exchange
+ * pushed the presence bar off the bottom of the page rather than scrolling up
+ * to meet it. A definite height here plus `min-height: 0` on the lanes is what
+ * makes a flex child actually scroll; without the `min-height` its automatic
+ * minimum is its content and it refuses to shrink.
+ */
+/* **The frame fills the page rather than being a box on it.**
+ *
+ * It was `height: min(58vh, 580px)`, which left a band of dead page under the
+ * composer — the page's own 72px bottom padding plus whatever the viewport had
+ * spare. Capping a conversation at 580px to leave a gap below it is the wrong
+ * trade twice over.
+ *
+ * So the height comes from the flex chain instead: `.page` → `.talk-host` →
+ * here. `min-height` is the floor for the case where that chain is broken by a
+ * page that forgot the class, so a frame is never squashed to nothing. */
+.lane-frame {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 320px;
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-lg);
+  /* **Not `overflow: hidden`.** The composer's slash palette is absolutely
+     positioned and opens *upward* out of it, so clipping here would cut off the
+     command list — the frame is clipped at `.lane-body` instead, which is the
+     only part with a background that could bleed past a rounded corner. */
+}
+.lane-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+}
+.lane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 18px;
+}
+/* The right lane is the narrower one and sits on the deep ground, the way the
+   sample's narration column does — one surface reads as the page, the other as
+   the instrument beside it. */
+.lane.acts {
+  flex: 0 0 340px;
+  border-left: 1px solid var(--line);
+  background: var(--bg-deep);
+}
+.lane-frame .stage-inner { max-width: none; }
+.lane-frame .composer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  padding: 11px 14px;
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+}
+.lane-frame .composer-inner { max-width: none; align-items: flex-end; }
+/* The send box grows with what is typed and the button stays put beside it. */
+.lane-frame .composer .textarea { min-height: 38px; }
+
+@media (max-width: 900px) {
+  /* Two lanes will not read side by side at this width. The acts go under the
+     conversation rather than being dropped — it is the half that cannot be seen
+     any other way on a thread. */
+  .lane-body { flex-direction: column; }
+  .lane.acts { flex: 0 0 auto; max-height: 34%; border-left: none; border-top: 1px solid var(--line); }
+}
+
+.presence-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding: 12px 16px;
+  background: var(--panel);
+  border-radius: var(--radius);
+  border-left: 2px solid var(--line-3);
+}
+.presence-where {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+  font-size: .88rem;
+  color: var(--ink-dim);
+}
+/* Standing in a room is a live state, so the rail agrees with the dot. */
+.presence-bar:has(.dot.active) { border-left-color: var(--ok); }
+
+/* ── a conversation tab fills the page ───────────────────────────────────────
+ *
+ * `.talk-host` is the tab body of Messages and In the room. Both are one frame
+ * that should reach the bottom of the window, so the chain from `.page` down to
+ * `.lane-frame` is flex the whole way and nothing in it is sized by content.
+ *
+ * The page's 72px of bottom padding is for content that runs past the fold — it
+ * keeps the last row off the status bar on a page you scroll. Neither of these
+ * scrolls: the frame does, internally. So the padding was a band of dead page
+ * under the composer, and trimming it alone still left whatever the viewport
+ * had spare above it. Filling is the fix; the smaller padding is the trim.
+ */
+.page:has(.talk-host) {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 22px;
+}
+/* The character's name and chips keep their height; only the frame gives. */
+.page:has(.talk-host) > .hd { flex: none; }
+.talk-host {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* Captions and the presence bar keep their own height; the frame takes what is
+   left. `min-height: 0` on the growing child is what lets it shrink far enough
+   to scroll rather than pushing the page taller. */
+.talk-host > * { flex: 0 0 auto; }
+.talk-host > .lane-frame,
+.talk-host > .presence-body { flex: 1 1 auto; min-height: 0; }
+
+.presence-body { display: flex; flex-direction: column; min-height: 0; }
+.presence-body > .lane-frame { flex: 1; min-height: 0; }
+
 /* ── Messaging a character ───────────────────────────────────────────────────
  *
- * A thread, not a transcript: the character's lines and yours are the same
- * kind of thing, so they differ by alignment and ground rather than by one of
- * them being decorated as "the reply". What is said on a handset is said in
- * the world, and both parties are in it.
+ * A thread, not a transcript: the character's lines and yours are the same kind
+ * of thing. What is said on a handset is said in the world, and both parties
+ * are in it — so both get a bubble, and they differ by side and ground rather
+ * than by one of them being the message and the other being a note about one.
+ *
+ * **Both sides have to read as a message, and the character's did not.** It was
+ * given `--panel-2` on a card that is `--panel` — #272320 against #221f1d, a
+ * step the eye does not resolve — so all that showed was the hairline border,
+ * which reads as a rule between entries. Yours had `--accent-soft` and did
+ * read. The reply looked like a caption on somebody else's conversation.
+ *
+ * Same vocabulary as the interaction console's `.bubble`, deliberately: a
+ * message from a character should look the same wherever you happen to be
+ * reading it. The squared corner is on the speaker's side, which is what makes
+ * a rounded rectangle read as something *said* rather than as a box.
  */
+/* No height and no scroll of its own: it lives inside a `.lane`, and two nested
+ * scrollers means the wheel moves whichever one the pointer happens to be over. */
 .msg-thread {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-height: 58vh;
-  overflow-y: auto;
+  gap: 14px;
   padding: 2px;
 }
 
 .msg {
-  max-width: 82%;
+  max-width: 78%;
   align-self: flex-start;
-  background: var(--panel-2, rgba(255, 255, 255, 0.04));
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
-  border-radius: 10px;
-  padding: 7px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.msg .words {
+  padding: 11px 15px;
+  border-radius: 15px 15px 15px 4px;
+  background: var(--panel-3);
+  color: var(--ink);
+  font-size: .91rem;
+  line-height: 1.6;
   overflow-wrap: anywhere;
 }
-
-/* Yours, on the other side. Aligned rather than coloured, so the distinction
- * survives a theme that has no accent to spare. */
-.msg.mine {
-  align-self: flex-end;
-  background: var(--accent-soft, rgba(120, 170, 255, 0.10));
+/* Who said it, under what they said — the console's `.bubble .who`. Above the
+ * bubble it read as a heading introducing a block; below, it is an attribution
+ * on something already said. */
+.msg .who {
+  font-size: .69rem;
+  font-family: var(--mono);
+  color: var(--ink-ghost);
+  padding-left: 5px;
 }
+
+/* Yours, on the other side and in the accent — the same treatment the console
+ * gives your own turn. */
+.msg.mine { align-self: flex-end; }
+.msg.mine .words {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-radius: 15px 15px 4px 15px;
+}
+.msg.mine .who { text-align: right; padding: 0 5px 0 0; }
 
 @media (max-width: 559px) {
   .msg { max-width: 92%; }

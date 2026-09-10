@@ -394,7 +394,11 @@ impl Record {
                     continue;
                 };
                 let path = format!("{dir}/{stem}.md");
-                if self.items.values().any(|i| i.path.as_deref() == Some(&path)) {
+                if self
+                    .items
+                    .values()
+                    .any(|i| i.path.as_deref() == Some(&path))
+                {
                     continue;
                 }
                 let name = heading_of(&file).unwrap_or_else(|| stem.replace(['-', '_'], " "));
@@ -415,7 +419,9 @@ impl Record {
                 // after a filename. The failure looked like the era had never
                 // existed.
                 let id = format!("doc_{}_{stem}", dir.replace('/', "_"));
-                let item = Item::new(id, name, kind).in_state(State::Filed).at_path(path);
+                let item = Item::new(id, name, kind)
+                    .in_state(State::Filed)
+                    .at_path(path);
                 self.put(item);
             }
         }
@@ -631,7 +637,11 @@ mod tests {
         let mut r = Record::new();
         r.put(Item::new("gap_third", "the third silence", Kind::Gap));
         r.put(Item::new("era_third", "the third era", Kind::Era).in_state(State::Filed));
-        r.put(Item::new("face_wren", "a face nobody has drawn", Kind::Portrait));
+        r.put(Item::new(
+            "face_wren",
+            "a face nobody has drawn",
+            Kind::Portrait,
+        ));
         r
     }
 
@@ -639,8 +649,7 @@ mod tests {
 
     /// A mind with eras and stories in it, at a path unique to this test.
     fn canon(name: &str) -> PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("npcd-canon-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("npcd-canon-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("layers/eras")).unwrap();
         std::fs::create_dir_all(root.join("layers/stories")).unwrap();
@@ -683,8 +692,14 @@ mod tests {
         let root = canon("naming");
         let mut r = Record::new();
         r.index_canon(&root);
-        assert!(r.by_name("the third era").is_some(), "the heading was not read");
-        assert!(r.by_name("fourth").is_some(), "the filename was not the fallback");
+        assert!(
+            r.by_name("the third era").is_some(),
+            "the heading was not read"
+        );
+        assert!(
+            r.by_name("fourth").is_some(),
+            "the filename was not the fallback"
+        );
     }
 
     /// **A thing the world already names becomes that document**, rather than
@@ -699,8 +714,14 @@ mod tests {
 
         let named: Vec<&Item> = r.iter().filter(|i| i.name == "the third era").collect();
         assert_eq!(named.len(), 1, "indexing made a twin");
-        assert_eq!(named[0].id, "era_third", "the world's own item was replaced");
-        assert_eq!(named[0].path.as_deref(), Some("layers/eras/the-third-era.md"));
+        assert_eq!(
+            named[0].id, "era_third",
+            "the world's own item was replaced"
+        );
+        assert_eq!(
+            named[0].path.as_deref(),
+            Some("layers/eras/the-third-era.md")
+        );
     }
 
     /// Re-indexing must not release work somebody is holding — the world learns
@@ -727,8 +748,16 @@ mod tests {
         let root = canon("filter");
         let mut r = Record::new();
         r.index_canon(&root);
-        assert!(r.iter().all(|i| i.name != ".gitkeep"), "a keep-file became an era");
-        assert_eq!(r.len(), 3, "{:?}", r.iter().map(|i| &i.name).collect::<Vec<_>>());
+        assert!(
+            r.iter().all(|i| i.name != ".gitkeep"),
+            "a keep-file became an era"
+        );
+        assert_eq!(
+            r.len(),
+            3,
+            "{:?}",
+            r.iter().map(|i| &i.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -821,10 +850,14 @@ mod tests {
     fn the_state_machine_refuses_a_move_it_does_not_have() {
         let mut r = record();
         // Nothing goes straight from unwritten to filed.
-        assert!(r.set_state("the third silence", "m1", State::Filed).is_err());
+        assert!(r
+            .set_state("the third silence", "m1", State::Filed)
+            .is_err());
 
         r.write("the third silence", "m1", "a draft").unwrap();
-        assert!(r.set_state("the third silence", "m1", State::Offered).is_ok());
+        assert!(r
+            .set_state("the third silence", "m1", State::Offered)
+            .is_ok());
         assert!(r.set_state("the third silence", "m1", State::Filed).is_ok());
         assert_eq!(r.get("gap_third").unwrap().state, State::Filed);
         // Filing releases it, so the next thing can be taken.
@@ -835,7 +868,9 @@ mod tests {
     fn letting_something_go_needs_a_reason_somebody_can_disagree_with() {
         let mut r = record();
         assert!(r.let_go("the third era", "   ").is_err());
-        assert!(r.let_go("the third era", "kept for years, never once asked for").is_ok());
+        assert!(r
+            .let_go("the third era", "kept for years, never once asked for")
+            .is_ok());
         let i = r.get("era_third").unwrap();
         assert_eq!(i.state, State::Retired);
         assert!(i.let_go_because.is_some());
@@ -851,16 +886,25 @@ mod tests {
     #[test]
     fn a_cross_reference_must_point_at_something_that_exists() {
         let mut r = record();
-        assert!(r.cross_reference("the third era", "a thing nobody wrote").is_err());
-        assert!(r.cross_reference("the third era", "the third silence").is_ok());
-        assert_eq!(r.get("era_third").unwrap().refers_to, vec!["the third silence"]);
+        assert!(r
+            .cross_reference("the third era", "a thing nobody wrote")
+            .is_err());
+        assert!(r
+            .cross_reference("the third era", "the third silence")
+            .is_ok());
+        assert_eq!(
+            r.get("era_third").unwrap().refers_to,
+            vec!["the third silence"]
+        );
     }
 
     #[test]
     fn provenance_and_description_and_condition_attach_to_the_thing() {
         let mut r = record();
-        r.set_provenance("the third era", "came in with the western intake").unwrap();
-        r.describe("the third era", "what to read first, and why").unwrap();
+        r.set_provenance("the third era", "came in with the western intake")
+            .unwrap();
+        r.describe("the third era", "what to read first, and why")
+            .unwrap();
         r.set_condition("the third era", Condition::Stale).unwrap();
         let i = r.get("era_third").unwrap();
         assert!(i.provenance.is_some() && i.description.is_some());

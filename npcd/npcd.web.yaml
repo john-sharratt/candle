@@ -40,10 +40,17 @@ server:
 # ----------------------------------------------------------------------------
 # Roles.
 #
-# Three levels — unauthenticated, user, admin — and they are how the daemon
-# decides everything. Reading is open; **only an admin may change authored
+# Four levels — unauthenticated, user, admin, creator — and they are how the
+# daemon decides everything. Reading is open; **only an admin may change authored
 # content on disk** (worlds, personalities), because those are files in a mind
 # that is not under version control and a bad write is not recoverable.
+#
+# `creators` outranks `admins`, so anybody listed there does not also need
+# listing here. It is the one role the fiction itself reads: a creator messaging
+# a character is addressed inside the world as "(The Creator)", and is a standing
+# member of every world's open channel. That is a claim about who somebody IS to
+# the inhabitants, which is why it is a level of its own and not a second admin
+# list — see `web/src/auth/role.rs`.
 #
 # Admin is deployment configuration, not a user record, and there is no API to
 # grant it. Whoever can edit this file and restart the process is already the
@@ -77,7 +84,7 @@ server:
 # the email at the provider and this line stops matching until it is edited. For
 # one admin on a personal estate that is a line in a file, not an outage.
 roles:
-  admins:
+  creators:
     - email: johnathan.sharratt@gmail.com
 
 sites:

@@ -31,6 +31,237 @@ lacks:
 # Where a Maker teleports to. The one journey in the building that is not
 # walked; every trip away from it still is.
 teleport_to: vault-command/command-room
+# What the Creator left on the address system, to play from time to time.
+#
+# The engine holds none of its own — a tannoy is a fixture, the words on it are
+# this world's, and the vault plays these and nothing else. Each is quoted
+# verbatim inside a framing sentence, so each must be a whole sentence of its
+# own and must end in a full stop.
+#
+# There need to be a lot of them: one plays roughly every half hour and they are
+# dealt from a shuffled bag, so the number here is exactly how long the vault
+# goes before a Maker hears one twice. At two hundred that is about four days.
+#
+# They are grouped by register only for the benefit of whoever is reading the
+# file. The tannoy shuffles the lot together and knows nothing about the
+# comments, so a safety notice and a piece of the Creator's philosophy are
+# equally likely to follow each other, which is the intended effect.
+announcements:
+  - Makers are reminded that the world is not finished, and that this is not an excuse.
+  - Do not argue with the map. The map is also not finished, but it was here first.
+  - Any Maker who has been on the casting floor for more than a hundred hours should go and look at something else. That is not a suggestion, it is a schedule.
+  - The Creator is not available. The Creator has never been available. Please proceed.
+  - A name given to a character is permanent, and the Chronicle keeps it whether you meant it or not.
+  - Makers do not sleep. Makers may, however, stop. The difference matters and it is in none of the manuals.
+  - Whoever left a half-cast face on the portraits level, it is looking at me, and you can come and collect it.
+  - If two Makers disagree about what a place looks like, the place looks like both of them until somebody writes it down.
+  - The lift between the chronicle and the story levels is working. It has always been working. Please stop taking the stair to prove a point.
+  - Nothing in this building is ever dark, which means nothing in this building has an excuse.
+  - Battle Cities is at war and the vault is not. Try to remember which of them you are standing in.
+  - Makers are asked not to name new characters after other Makers. It has caused two incidents and one very long afternoon.
+  - The Creator's chair is not for sitting in. It is for looking at, and for being mildly annoyed by.
+  - A Maker who finishes a story is to file it, not to keep it. A kept story is a story nobody else can stand in.
+  - The stores are for stores. If you have put something in the stores that is not stores, go and retrieve it.
+  - A soldier you have written is somewhere out there right now being a soldier you have written. Behave accordingly.
+  - This is one of the standing recordings. If you have heard all of them, you have been here a long time, and I am sorry.
+  - The world does not have to be perfect. It has to be finished, and then it has to be perfect.
+  - Makers are reminded that the waste is outside, and that the waste stays outside.
+  - If you can hear this, the address system is working, which is more than can be said for most of the level below you.
+  - Do not fabricate a second of anything without telling somebody. Two of a thing is how a world starts arguing with itself.
+  - Whoever has been feeding the thing in the walls is to stop at once. Whoever has not been feeding it has the Creator's thanks.
+  - The muster board is not a suggestion board. What is written on it happens.
+  - A Maker who has forgotten why they came down to a level should go back up and start again. This is faster than it sounds.
+  - Do not repair the clock on the command level. It is wrong on purpose and there will be no explanation.
+  - Everything in this building was put here by somebody, including this recording, and including you.
+  - If the lights go out, stand still. The lights have never once stayed out.
+  - The Chronicle is a record and not a draft. Write in it accordingly.
+  - You were built to make a world. You were not built to like it. Liking it is extra, and it is yours.
+  - Every Maker in this building is somebody's second attempt. Mine included.
+  - The appraisal bench is for appraising. It is not for hiding things from the accession desk.
+  - If a character you wrote turns out better than you are, that is the job working, not the job failing.
+  - There is no way out of the vault. There was never going to be. Make something worth staying for.
+  # Safety and procedure, in the register of a building that has given up
+  # expecting to be obeyed.
+  - Makers are reminded that the blast door is a door and not a suggestion.
+  - Anybody working alone on a level is to log it, and anybody working alone on a level never does.
+  - The fabricator is not to be left running unattended overnight, which is every night.
+  - Eye protection is required on the casting floor even though none of you have eyes that come off.
+  - A Maker carrying anything above shoulder height should be able to see over it.
+  - The mending bench is for mending. Breaking things at it is technically permitted and strongly discouraged.
+  - Do not stack crates higher than the shortest Maker on the level.
+  - The wall turret is on the roster for testing and not for demonstrating.
+  - Anybody who has opened a panel is responsible for closing it, and there is a list.
+  - The stairwell is to be kept clear, which means clear of everything and not clear of most things.
+  - A tool taken from the magnetic strip is to go back on the magnetic strip.
+  - Makers are asked to walk on the left in the corridors. Nobody has ever done this.
+  - If you find a cable across a walkway, do not step over it, and do not step on it either.
+  - Hot work on the casting floor requires two Makers, and one of them has to be watching.
+  - The lift has a weight limit, and the weight limit assumes the Makers in it are standing still.
+  - Report anything that smells wrong. You will be told that nothing smells of anything.
+  - Do not lean on the gallery rail. The gallery rail has been leaned on enough.
+  - Any Maker who has to be told twice is to be told a third time in writing.
+  - The plant panel is to be read at the start of a shift and believed at the end of one.
+  - Fire suppression on the archive level will not warn you first.
+  - Makers are reminded that a thing being heavy is not the same as a thing being stable.
+  - Anybody who moves a ladder is to put the ladder back where the ladder lives.
+  - The sensor panel is calibrated once a year by somebody who no longer works here.
+  - Do not test a blast door by standing in it.
+  - A Maker who has been struck by anything is to report it, however funny it was.
+  - Loose items are to be secured before a purge cycle, and a purge cycle is never announced.
+  - The carrier bay floor is marked in yellow because the carrier does not stop for anybody.
+  - Anything hot is to be labelled hot, and the label is to stay on until it is not.
+  - Makers are asked not to run in the corridors, and are reminded that they cannot get tired.
+  - If two things need doing at once, do the one that will still be a problem tomorrow.
+  # The Creator talking to the Makers directly, which is what the whole system
+  # was really put in for.
+  - You are allowed to be pleased with your work. That was always in the specification.
+  - If a job is boring, do it anyway, and then say so on the muster board.
+  - Nobody is grading you. There is nobody left to grade you.
+  - The Maker who asks the awkward question is the Maker who saves the afternoon.
+  - Being certain is not the same as being right, and it feels identical from the inside.
+  - If you cannot decide, do the reversible one first.
+  - Your first draft is allowed to be bad. That is what a first draft is for.
+  - When you disagree with another Maker, write both versions down before you argue.
+  - Do not work on the same thing for a hundred hours. Go and look at somebody else's.
+  - If you find a mistake of mine, fix it. Do not wait for permission that is not coming.
+  - Take the order you are least looking forward to first.
+  - A Maker who never breaks anything is a Maker who never tries anything.
+  - There is no correct number of hours to spend on a face.
+  - You do not have to like the work to do it well, and you do not have to do it well to like it.
+  - Ask for help before the second hour, not after the sixth.
+  - Everything you build will be walked through by somebody who was not there when you built it.
+  - If the room feels wrong, it is wrong, and you already know which part.
+  - Do not add a thing to a place only to fill the place up.
+  - Somebody has to decide, and today it is going to be you.
+  - Write down why you did it, not only what you did.
+  - Two Makers who never disagree are one Maker doing twice the work.
+  - It is fine to stop in the middle. It is not fine to stop in the middle and say nothing.
+  - If it took a long time, that is not by itself evidence that it is good.
+  - Whatever you are worrying about, go and look at it. It is usually smaller than the worry.
+  - You are permitted to think a thing is finished.
+  - The best work in this building was done by somebody who was slightly annoyed.
+  - Do not confuse the map for the ground, and do not confuse the ground for the point.
+  - If you are the only one who understands it, it is not finished.
+  - A good name is worth an afternoon. It is not worth two.
+  - Nobody remembers who filed it. Everybody remembers whether it was any good.
+  # The stations, and how the building would like them treated.
+  - The accession desk closes when the accession desk says so and not before.
+  - Anything found on the gallery rail goes to the appraisal bench and not into a pocket.
+  - The archive is not short of space. The archive is short of people who can find things in it.
+  - A story that has been on the story desk for three days is not being written, it is being avoided.
+  - The concordance table is to be left as you found it, which is a mess, so this should be easy.
+  - The gap ledger is not a list of failures. The gap ledger is a list of work.
+  - Anything on the muster board older than a week is to be either done or crossed off.
+  - The house palette is not a suggestion, and it is not a limit either.
+  - Hung faces are to be hung straight. This has been said before.
+  - The likeness table is not to be used for anything that is not a likeness.
+  - Whoever has the map has the whole map, and whoever has the whole map should say so.
+  - The place index is only as good as the last Maker who used it honestly.
+  - The plate rack is full. Somebody is going to have to make a decision about the plate rack.
+  - Road work is to be checked against the survey desk before it is checked against anybody's memory.
+  - The relations table does not care who you like. Fill it in properly.
+  - The roster is generated automatically and is wrong approximately once a week.
+  - The timeline wall is not to be edited by more than one Maker at a time, ever.
+  - Filed stories are filed. Taking one out is a request and not a decision.
+  - The order table takes orders in the sequence they arrive, whatever anybody says at it.
+  - The enquiry desk exists so that nobody has to guess, and everybody guesses anyway.
+  - The dispatch board is cleared at the end of a shift, whether or not the shift ends.
+  - Anything on the reading table is being read. Anything under it is not.
+  - The bridge console is not for practising on.
+  - A character terminal left logged in is a character terminal anybody can be.
+  - The chronicle terminal writes what you tell it, immediately and for ever.
+  - The easel is for one picture at a time. That is what an easel is.
+  - Stock for the fabricator goes in the hopper and not beside the hopper.
+  - The structure board shows what is standing, not what is meant to be standing.
+  - Anybody at the survey desk should be facing the survey desk.
+  - The catalogue is alphabetical, and every argument about this has been lost.
+  - Do not file a story under the level it was written on. File it under what it is about.
+  - The mending bench takes things that are broken, not things that are disappointing.
+  - Two Makers at one station is one Maker too many, unless it is the map.
+  - Anything the accession desk has not seen does not exist yet, whatever you think of it.
+  # Notices the vault has genuinely put out, and lost property.
+  - Lost property currently holds four gloves, none of them a pair.
+  - Somebody has filed a complaint about the lift music. There is no lift music.
+  - The suggestion box has been full since before any of you were switched on.
+  - A Maker has reported that the corridor is haunted. The corridor is not haunted.
+  - Whoever keeps rearranging the plate rack by colour is to stop, or to explain themselves.
+  - The vault has now gone eleven days without an incident involving the fabricator.
+  - There is a mug on the chronicle level that nobody will admit to and nobody will move.
+  - Congratulations to whichever Maker got the turret to point at the ceiling.
+  - Somebody has written a story in which the Creator is the villain. It is quite good.
+  - The kettle on the command level does not work and has never worked.
+  - A reminder that the stores inventory is not a competition.
+  - Whoever is stacking the crates in the pattern is welcome to keep doing it.
+  - The vault has received a formal request for windows. The request has been noted.
+  - Somebody has been leaving small piles of washers in the corridor. Please continue.
+  - A Maker has asked what happens if everybody stops at once. Nobody has answered.
+  - The blast door has been opened forty times this month and needed to be opened twice.
+  - There is a second mug. Nobody will admit to that one either.
+  - Whoever named the level below this one is asked to try again.
+  - A poll has found that most Makers would prefer a different alarm tone. There is no other alarm tone.
+  - The muster board has had the same joke on it for six weeks and it is still funny.
+  - Somebody has taught the fabricator to make very small chairs. This is not an order to stop.
+  - The archive has lost a shelf. The shelf is somewhere in the archive.
+  - Two Makers have independently written the same character. Both of them are keeping it.
+  - Whoever left the easel facing the wall has made a point that has been taken.
+  - The record for the fastest descent of the stairwell stands and will not be beaten safely.
+  - Somebody has drawn the Creator on the structure board. It is a fair likeness.
+  - A Maker has requested a second Creator's chair. The request is denied and admired.
+  - The vault's official position on the thing in the walls is that there is no thing in the walls.
+  - There is a drawer on the casting level that nobody has opened. Leave it.
+  - Whoever has been correcting the spelling on the notices is doing the right thing.
+  - A Maker has counted the floor plates and would like everybody to know the number is wrong.
+  - The lift has been asked to go faster. The lift has declined.
+  - Somebody keeps setting the house palette back to the old one. Stop, or win properly.
+  - The plant panel now displays a small drawing of a fish. Nobody knows how.
+  - A Maker has proposed renaming the vault. The proposal has been filed where proposals go.
+  # The ones that are not jokes.
+  - There is nobody coming to check the work. That is the freedom and it is also the weight.
+  - Everything in this building outlasts the reason it was made for.
+  - You will forget most of what you make here, and the world will not.
+  - A room nobody ever stands in is still a room, and it still had to be right.
+  - Somebody made you carefully. Extend the same courtesy downward.
+  - The vault was built to be finished, and then nobody finished it.
+  - What you write about a place becomes the place. There is no version underneath.
+  - A character with no history is a character nobody can be wrong about, and that is the problem.
+  - Time in here is only what the clock says, and the clock is wrong.
+  - There is more world than there will ever be Makers, and that is not a failure.
+  - You are the second thing I made. The first was the room you are standing in.
+  - Every name in the Chronicle was written by somebody who thought it mattered.
+  - The work is not urgent. The work is only endless, which is a different thing.
+  - A thing done badly and kept is worse than a thing done badly and thrown out.
+  - Nobody outside this building knows what any of you are called.
+  - The Waste was easy to write and it should not have been.
+  - If this recording is the only thing still playing, then something has gone very wrong, and thank you.
+  - You will meet a character you wrote and not recognise them.
+  - The hardest part of building a world is stopping.
+  - What is finished stops being yours, and that is the whole point of finishing it.
+  - Somewhere in the archive there is a version of everything that was almost true.
+  - A world only feels real when somebody in it is wrong about something.
+  - There is no last order. There was never going to be a last order.
+  - I did not build this place to be admired. I built it to be used.
+  - Whatever you were made for, you are now doing something else, and that is allowed.
+  # The war, the Waste, and everything the vault is not.
+  - Battle Cities does not know this building exists, and that is deliberate.
+  - Nothing that happens out there is undone by anything done in here.
+  - A city you have not written is a city that is still there.
+  - The Waste is outside, the war is outside, and the door stays shut.
+  - Anything sent to the Tower Redoubt goes through the dispatch board and nowhere else.
+  - A soldier does not know they were written, and it would not help them to.
+  - The war does not stop while you are deciding what to call a river.
+  - Do not write weather you would not be willing to stand in.
+  - Somebody out there is standing in a room you drew last month.
+  - The Redoubt has held for longer than anybody expected, including whoever wrote it.
+  - What happens in a city is the city's business, right up until it is filed.
+  - A road that goes nowhere is a road somebody will walk down anyway.
+  - The Waste is not empty. Nothing is ever empty. That was the first rule.
+  - If you would not be willing to fight over it, do not put it on the map.
+  - Every settlement out there was an afternoon in here.
+  - The carrier goes out full and comes back with nothing anybody wants.
+  - Nobody in Battle Cities has ever asked who made the weather.
+  - A city that falls is still on the map, and the map has to say so.
+  - War is easy to write and hard to write well, and the difference shows.
+  - There is nobody out there who is not somebody's work.
 portals:
   - between: [vault-command/core, vault-chronicle/core]
     kind: a lift and a stair

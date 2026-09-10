@@ -24,7 +24,8 @@
 use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
-use crate::engine::body::Outcome;
+use crate::engine::body::{destinations, refusal, Outcome};
+use crate::engine::tools::SELF;
 use crate::sim::field::Stance;
 use crate::sim::item::{Item, Kind as ItemKind};
 use crate::world::Hosted;
@@ -33,10 +34,11 @@ use crate::world::Hosted;
 pub fn is_mine(tool: &str) -> bool {
     matches!(
         tool,
-        "touch"
+        "act"
             | "sleep"
             | "give"
             | "read"
+            | "post_notice"
             | "claim"
             | "release"
             | "equip"
@@ -63,10 +65,11 @@ pub fn is_mine(tool: &str) -> bool {
 pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     let a = &act.args;
     match act.tool {
-        "touch" => touch(hosted, body, a),
+        "act" => act_on(hosted, body, a),
         "sleep" => sleep(hosted, body, a),
         "give" => give(hosted, body, a),
         "read" => read(hosted, body, a),
+        "post_notice" => post_notice(hosted, body, a),
         "claim" => claim(hosted, body, a),
         "release" => release(hosted, body),
         "equip" => equip(hosted, body, a),
@@ -125,21 +128,52 @@ fn here_named(hosted: &Hosted, body: &str, name: &str) -> Option<String> {
     })
 }
 
-fn touch(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
-    let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {
+/// `act` — one body doing something to another.
+///
+/// Named `act_on` rather than `act` because [`crate::engine::act::Act`] is the
+/// type every tool call arrives as, and a free function called `act` beside it
+/// reads as the general thing rather than this one tool.
+fn act_on(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    let (Some(on), Some(intent)) = (text(args, "on"), text(args, "intent")) else {
         return Outcome::Refused(
-            "You meant to reach for somebody, but not who, or not what by it.".into(),
+            "You meant to do something to somebody, but not who, or not what by it.".into(),
         );
     };
-    let Some(id) = here_named(hosted, body, &to) else {
-        return Outcome::Refused(format!("{to} is not here."));
+
+    /* **Your own body is a thing you can act on.**
+     *
+     * Aimed at nobody rather than at yourself: the world refuses a body that
+     * addresses itself (`Refused::SpeakingToYourself`), and it is right to —
+     * *to* somebody means somebody who receives it. Closing your own wound is
+     * seen by everyone standing there and felt by nobody else, which is exactly
+     * what an unaimed showing is.
+     */
+    if on.eq_ignore_ascii_case(SELF) {
+        return match hosted.with(|w| w.show(body, None, format!("does it: {intent}"))) {
+            Ok(()) => Outcome::Did(format!("You do it to yourself: {intent}.")),
+            Err(why) => Outcome::Refused(refusal(hosted, &why)),
+        };
+    }
+
+    let Some(id) = here_named(hosted, body, &on) else {
+        return Outcome::Refused(format!("{on} is not here."));
     };
     // Shown to the room and aimed at one person — the same channel a gesture
     // uses, because what everybody else sees is a body doing something to
     // another body either way. What differs is that this one lands.
-    match hosted.with(|w| w.show(body, Some(&id), format!("reaching for {to}: {intent}"))) {
-        Ok(()) => Outcome::Did(format!("You take hold: {intent}. {to} feels it and may refuse.")),
-        Err(why) => Outcome::Refused(format!("{why:?}")),
+    //
+    // Neutral about what it was: this act covers steadying somebody and putting
+    // them through a railing, and the world does not need to know which. The
+    // intent is the act, and the narrator is what turns it into prose.
+    // A predicate, and the target named **once**. This passed `"to {on}: …"`
+    // while also aiming at `on`, so the room rendered the name twice —
+    // "to Wren: steadying her, at Wren". The aiming belongs to `to`; the verb
+    // belongs here. See [`npc_map::world::World::show`].
+    match hosted.with(|w| w.show(body, Some(&id), format!("does it: {intent}"))) {
+        Ok(()) => Outcome::Did(format!(
+            "You do it: {intent}. {on} feels it and may refuse."
+        )),
+        Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }
 
@@ -155,7 +189,9 @@ fn sleep(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
 
 fn give(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let (Some(what), Some(to)) = (text(args, "what"), text(args, "to")) else {
-        return Outcome::Refused("You meant to hand something over, but not what, or not to whom.".into());
+        return Outcome::Refused(
+            "You meant to hand something over, but not what, or not to whom.".into(),
+        );
     };
     let Some(id) = here_named(hosted, body, &to) else {
         return Outcome::Refused(format!("{to} is not here."));
@@ -167,25 +203,93 @@ fn give(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     }
 }
 
+/// Read what something here says.
+///
+/// # It returns words, and it used to return a switch position
+///
+/// This was bound to the machines in the room and answered with the mode one was
+/// set to — *"You read the accession desk. It stands at `reading`."* A `Device`
+/// carries no text, so that was the only thing it *could* answer with, and the
+/// answer was the question restated. It also put a raw mode identifier, in
+/// backticks, into what a character reads, which is machinery in the prose.
+///
+/// What a room actually has to read is [`crate::sim::posting`], and that is the
+/// only branch left. The set `what` binds to is now what this body has not seen,
+/// so an act that arrives here has something to hand back by construction —
+/// which is why the empty answer below is a refusal about *timing* rather than a
+/// normal outcome.
 fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let Some(what) = text(args, "what") else {
         return Outcome::Refused("You meant to read something, but not what.".into());
     };
     let place = hosted.place_of(body);
-    hosted.sim(|s| {
-        if let Some(d) = s.devices.by_name_at(&place, &what) {
-            return Outcome::Did(format!(
-                "You read {}. It stands at `{}`{}.",
-                d.name,
-                d.mode,
-                if d.working { "" } else { ", and it is not working" }
-            ));
+    let me = my_name(hosted, body);
+    hosted.with_sim(|s| {
+        // Marked read as it is handed over, which is what makes the act
+        // terminate: the same board offers this body nothing next turn.
+        if let Some(fresh) = s.postings.read(&place, &what, body) {
+            if fresh.is_empty() {
+                return Outcome::Refused(format!(
+                    "You have read everything on {what}. Nothing has been added since."
+                ));
+            }
+            // Attributed, because who wrote a thing is half of what reading it
+            // tells you — and a line whose author is this character reads as
+            // its own, which is worth knowing before acting on it.
+            let said = fresh
+                .iter()
+                .map(|l| match l.by == me {
+                    true => format!("{} (yours)", l.text),
+                    false => format!("{} — {}", l.text, l.by),
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Outcome::Did(format!("You read {what}: {said}"));
         }
-        let orders = s.ledger.unheld();
-        if !orders.is_empty() && what.contains("order") {
-            return Outcome::Did(format!("Standing and unheld: {}.", orders.join("; ")));
+        if what.contains("order") {
+            // Marked as this body has now seen them, which is what stops the
+            // orders becoming the next thing to be read on a loop.
+            if let Some(now) = s.ledger.unheld_unseen_by(body) {
+                s.ledger.mark_orders_read(body, &now);
+                return Outcome::Did(format!("Standing and unheld: {now}."));
+            }
+            if !s.ledger.unheld().is_empty() {
+                return Outcome::Refused(
+                    "You have read the standing orders as they are. Nothing has changed on them."
+                        .into(),
+                );
+            }
         }
         Outcome::Refused(format!("There is nothing here called {what} to read."))
+    })
+}
+
+/// Leave words on something here, for whoever comes to it next.
+///
+/// **The writer is marked as having read its own line.** Otherwise posting a
+/// notice immediately makes the board unread *for the person who just wrote on
+/// it*, so `read` reappears in their grammar, they read their own line back,
+/// and the pair of acts is a two-step version of the treadmill this whole
+/// change removed. You know what you just wrote.
+fn post_notice(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    let (Some(on), Some(what)) = (text(args, "on"), text(args, "what")) else {
+        return Outcome::Refused(
+            "You meant to write something down, but not where, or not what.".into(),
+        );
+    };
+    let place = hosted.place_of(body);
+    let me = my_name(hosted, body);
+    hosted.with_sim(|s| {
+        if s.postings.by_name_at(&place, &on).is_none() {
+            return Outcome::Refused(format!("There is nothing here called {on} to write on."));
+        }
+        s.post(&place, &on, &me, &what);
+        if let Some(p) = s.postings.by_name_at_mut(&place, &on) {
+            p.mark_read(body);
+        }
+        Outcome::Did(format!(
+            "You write it on {on}, where whoever comes next will read it: {what}"
+        ))
     })
 }
 
@@ -205,7 +309,7 @@ fn claim(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     if station.is_some() {
         return match hosted.with(|w| w.take(body, Some(&what))) {
             Ok(_) => Outcome::Did(format!("You take {what}. It is yours until you leave it.")),
-            Err(why) => Outcome::Refused(format!("{why:?}")),
+            Err(why) => Outcome::Refused(refusal(hosted, &why)),
         };
     }
     match hosted.with_sim(|s| s.ledger.take_order(&what, body)) {
@@ -279,7 +383,9 @@ fn gather(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let place = hosted.place_of(body);
     hosted.with_sim(|s| match s.field.work(&place, &what) {
         None => Outcome::Refused(format!("There is nothing here called {what} to work.")),
-        Some((_, 0)) => Outcome::Refused(format!("{what} is worked out. There is nothing left in it.")),
+        Some((_, 0)) => Outcome::Refused(format!(
+            "{what} is worked out. There is nothing left in it."
+        )),
         Some((resource, took)) => {
             s.pack_mut(body).add(Item::new(
                 resource.name(),
@@ -287,7 +393,10 @@ fn gather(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                 ItemKind::Resource,
                 took,
             ));
-            Outcome::Did(format!("You work {what} and come away with {took} {}.", resource.name()))
+            Outcome::Did(format!(
+                "You work {what} and come away with {took} {}.",
+                resource.name()
+            ))
         }
     })
 }
@@ -320,12 +429,16 @@ fn engage(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         (None, None) => posture.clone(),
     };
     hosted.with_sim(|s| s.field.set_stance(body, stance));
-    Outcome::Did(format!("You set yourself: {told}. It stands until you change it."))
+    Outcome::Did(format!(
+        "You set yourself: {told}. It stands until you change it."
+    ))
 }
 
 fn operate(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let (Some(what), Some(mode)) = (text(args, "what"), text(args, "mode")) else {
-        return Outcome::Refused("You meant to work something, but not what, or not into what state.".into());
+        return Outcome::Refused(
+            "You meant to work something, but not what, or not into what state.".into(),
+        );
     };
     let place = hosted.place_of(body);
     hosted.with_sim(|s| {
@@ -337,6 +450,16 @@ fn operate(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         }
         let name = d.name.clone();
         let modes = d.modes.join(", ");
+        // **Already there is not a thing that can be done.** `Device::set`
+        // accepts the state a machine is currently in, so this reported success
+        // and changed nothing — three identical `operate` calls in a row, live,
+        // with no way for the character to tell. The grammar no longer offers
+        // the current state (`Sim::modes_here`); this is the backstop for the
+        // API and the harness, which are not grammar-constrained, and it says
+        // *where the thing already is* rather than merely refusing.
+        if d.mode.eq_ignore_ascii_case(&mode) {
+            return Outcome::Refused(format!("{name} is already {}.", d.mode));
+        }
         if d.set(&mode) {
             Outcome::Did(format!("You set {name} to {}.", d.mode))
         } else {
@@ -359,26 +482,92 @@ fn recall(hosted: &Hosted, body: &str) -> Outcome {
         return Outcome::Refused("Nothing answers the recall.".into());
     };
     let to = npc_map::world::Where::new(area, node);
+    // **Being called home while you are already home is not a thing that can
+    // happen.** `World::place` accepts it, changes nothing, and answers "the
+    // ground goes out from under you" — a success with no effect, which is the
+    // shape every treadmill in this engine has had. Measured live the hour it
+    // became reachable: twenty-four of sixty acts across the whole cast, and
+    // the characters could see it — "I'm standing here again. The same loop.
+    // The same board, the same man."
+    if hosted.read(|w| w.actor(body).map(|a| a.at.clone())) == Some(to.clone()) {
+        return Outcome::Refused("You are already home.".into());
+    }
     match hosted.with(|w| w.place(body, to.clone())) {
         Ok(()) => Outcome::Did("The ground goes out from under you, and you are home.".into()),
-        Err(why) => Outcome::Refused(format!("{why:?}")),
+        Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }
 
 fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     if let Some(at) = text(args, "at") {
-        let seen = hosted.sim(|s| (s.hostiles(&at), s.extractable(&at)));
-        return Outcome::Did(match seen {
-            (h, d) if h.is_empty() && d.is_empty() => format!("You look at {at}. Nothing moving."),
-            (h, d) => format!(
-                "You look at {at}. {}{}",
-                if h.is_empty() { String::new() } else { format!("Standing there: {}. ", h.join(", ")) },
-                if d.is_empty() { String::new() } else { format!("Worth taking: {}.", d.join(", ")) }
-            ),
+        // **A name has to be turned into a place before anything can be asked
+        // about it.**
+        //
+        // This passed the character's word straight to `Sim::hostiles` and
+        // `Sim::extractable`, which match on a place *key* — `area/node`. A
+        // display name never equals one, so both lists came back empty for
+        // every scan of everywhere, and the act answered "Nothing moving"
+        // unconditionally. It was not reporting an empty room; it was reporting
+        // a failed lookup, in the same words.
+        //
+        // `destinations` already holds the name→place mapping the grammar's own
+        // arm is built from, so the name a character was offered is exactly the
+        // name that resolves here.
+        // A raw `area/node` key is accepted too. The grammar never emits one —
+        // it offers names — but the API and the harness are not
+        // grammar-constrained, and this is the same latitude `operate` gives a
+        // mode a device does not admit.
+        let by_key = npc_map::world::Where::parse(at.trim())
+            .filter(|w| hosted.read(|world| world.node(w).is_some()));
+        let Some(place) = destinations(hosted, body)
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(at.trim()))
+            .map(|(_, w)| w)
+            .or(by_key)
+        else {
+            return Outcome::Refused(format!("You cannot see {at} from here."));
+        };
+        let key = format!("{}/{}", place.area, place.node);
+
+        // **Who is standing there is the answer worth having.**
+        //
+        // Hostiles and deposits are the waste's vocabulary; a vault has neither,
+        // so a scan of it could only ever have said nothing. What a character in
+        // a building wants to know about a room it is not in is who is in it —
+        // and that is the question this act exists to answer without walking.
+        let who = hosted.read(|w| {
+            w.actors_at(&place)
+                .into_iter()
+                .filter(|a| a.id != body)
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>()
+        });
+        let seen = hosted.sim(|s| (s.hostiles(&key), s.extractable(&key)));
+        let mut parts: Vec<String> = Vec::new();
+        if !who.is_empty() {
+            // Agreement, because this line is read by a model about to write
+            // dialogue — the same reason `who_is_here` bothers.
+            parts.push(format!(
+                "{} {} there",
+                npc_map::text::list(&who),
+                npc_map::text::is_are(who.len())
+            ));
+        }
+        if !seen.0.is_empty() {
+            parts.push(format!("standing there: {}", seen.0.join(", ")));
+        }
+        if !seen.1.is_empty() {
+            parts.push(format!("worth taking: {}", seen.1.join(", ")));
+        }
+        return Outcome::Did(match parts.is_empty() {
+            true => format!("You look at {at}. Nobody there, and nothing moving."),
+            false => format!("You look at {at}. {}.", parts.join("; ")),
         });
     }
     let (Some(x), Some(y)) = (text(args, "x"), text(args, "y")) else {
-        return Outcome::Refused("You meant to look somewhere, but gave neither a place nor a reference.".into());
+        return Outcome::Refused(
+            "You meant to look somewhere, but gave neither a place nor a reference.".into(),
+        );
     };
     let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) else {
         return Outcome::Refused("A grid reference is two numbers.".into());
@@ -393,7 +582,9 @@ fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         ));
     }
     let _ = body;
-    Outcome::Did(format!("You put the instruments on {x},{y}. Empty ground, so far as they show."))
+    Outcome::Did(format!(
+        "You put the instruments on {x},{y}. Empty ground, so far as they show."
+    ))
 }
 
 fn command_tower(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
@@ -445,8 +636,13 @@ fn command_tower(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
                 })
             }
             "drill down" => {
-                let depth: u32 = text(args, "depth").and_then(|d| d.parse().ok()).unwrap_or(20);
-                tower.draw(Resource::Energy, crate::sim::tower::DRILL_COST_PER_METRE * depth as u64);
+                let depth: u32 = text(args, "depth")
+                    .and_then(|d| d.parse().ok())
+                    .unwrap_or(20);
+                tower.draw(
+                    Resource::Energy,
+                    crate::sim::tower::DRILL_COST_PER_METRE * depth as u64,
+                );
                 tower.depth = depth;
                 tower.posture = Posture::DugIn;
                 Outcome::Did(format!("The tower drills in, {depth} metres down."))
@@ -506,12 +702,16 @@ fn promise(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let me = my_name(hosted, body);
     hosted.with_sim(|s| s.ledger.promise(&me, &to, &what, &by));
     let _ = hosted.with(|w| w.tell(body, &id, format!("promising {what} by {by}")));
-    Outcome::Did(format!("You promise {to}: {what}, by {by}. It stands until you keep it."))
+    Outcome::Did(format!(
+        "You promise {to}: {what}, by {by}. It stands until you keep it."
+    ))
 }
 
 fn remind(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let (Some(who), Some(which)) = (text(args, "who"), text(args, "which")) else {
-        return Outcome::Refused("You meant to remind somebody of something, but not who, or not what.".into());
+        return Outcome::Refused(
+            "You meant to remind somebody of something, but not who, or not what.".into(),
+        );
     };
     let Some(id) = here_named(hosted, body, &who) else {
         return Outcome::Refused(format!("{who} is not here."));
@@ -523,7 +723,7 @@ fn remind(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     }
     match hosted.with(|w| w.tell(body, &id, format!("reminding them of {which}"))) {
         Ok(()) => Outcome::Did(format!("You put {who} in mind of it: {which}.")),
-        Err(why) => Outcome::Refused(format!("{why:?}")),
+        Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }
 
@@ -532,9 +732,14 @@ fn record_verdict(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Out
         return Outcome::Refused("A verdict needs a thing judged and a judgement.".into());
     };
     let remedy = text(args, "what_would_change_it");
-    hosted.with_sim(|s| s.ledger.record_verdict(&on, body, &judgement, remedy.as_deref()));
+    hosted.with_sim(|s| {
+        s.ledger
+            .record_verdict(&on, body, &judgement, remedy.as_deref())
+    });
     Outcome::Did(match remedy {
-        Some(r) => format!("Your verdict on {on} stands against it: {judgement}. What would change it: {r}."),
+        Some(r) => format!(
+            "Your verdict on {on} stands against it: {judgement}. What would change it: {r}."
+        ),
         None => format!("Your verdict on {on} stands against it: {judgement}."),
     })
 }
@@ -552,13 +757,39 @@ fn message(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         );
     };
     let me = my_name(hosted, body);
-    hosted.with_sim(|s| match s.threads.send(&me, &to, &intent) {
-        Ok(reached) => Outcome::Did(format!(
-            "You send it to {to}: {intent}. {} will see it when they next look.",
-            npc_map::text::list(&reached)
-        )),
+    let sent = hosted.with_sim(|s| s.threads.send(&me, &to, &intent));
+    match sent {
+        Ok(reached) => {
+            // **Answering by handset is answering.** The obligation a question
+            // leaves is keyed on bodies and cleared when the two of them speak;
+            // `tell` cleared it and this did not, so a character that walked out
+            // of the room and texted the answer stayed marked as owing one — a
+            // standing nudge it could only discharge by finding the person
+            // again in the flesh.
+            //
+            // The thread deals in names and the ledger in body ids, so the
+            // names it reached are resolved back through the world. Anybody it
+            // reached who is not a body in this world — the Creator, somebody
+            // outside — simply matches nothing, which is the right answer:
+            // they had no question standing here to begin with.
+            let ids: Vec<String> = hosted.read(|w| {
+                w.actors()
+                    .filter(|a| reached.iter().any(|n| n.eq_ignore_ascii_case(&a.name)))
+                    .map(|a| a.id.clone())
+                    .collect()
+            });
+            hosted.with_sim(|s| {
+                for asker in &ids {
+                    s.ledger.answered(body, asker);
+                }
+            });
+            Outcome::Did(format!(
+                "You send it to {to}: {intent}. {} will see it when they next look.",
+                npc_map::text::list(&reached)
+            ))
+        }
         Err(why) => Outcome::Refused(why),
-    })
+    }
 }
 
 fn invite(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
@@ -570,9 +801,9 @@ fn invite(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let me = my_name(hosted, body);
     hosted.with_sim(|s| match s.threads.invite(&me, &to, &who) {
         Ok(kind) => Outcome::Did(match kind {
-            crate::sim::phone::Kind::Group => format!(
-                "{who} is on it. What is said there now reaches all of you."
-            ),
+            crate::sim::phone::Kind::Group => {
+                format!("{who} is on it. What is said there now reaches all of you.")
+            }
             crate::sim::phone::Kind::Direct => format!("{who} is on it."),
         }),
         Err(why) => Outcome::Refused(why),
@@ -711,16 +942,33 @@ mod tests {
     fn giving_moves_the_thing_and_leaves_the_giver_short() {
         let h = waste();
         let before = h.sim(|s| s.pack("c1").get("bolt").unwrap().count);
-        let out = perform(&h, "c1", &act("give", json!({"what":"bolt rounds","to":"Soren","count":"20"})));
+        let out = perform(
+            &h,
+            "c1",
+            &act(
+                "give",
+                json!({"what":"bolt rounds","to":"Soren","count":"20"}),
+            ),
+        );
         assert!(out.happened(), "{out:?}");
-        assert_eq!(h.sim(|s| s.pack("c1").get("bolt").unwrap().count), before - 20);
+        assert_eq!(
+            h.sim(|s| s.pack("c1").get("bolt").unwrap().count),
+            before - 20
+        );
         assert_eq!(h.sim(|s| s.pack("c2").get("bolt").unwrap().count), 80);
     }
 
     #[test]
     fn giving_more_than_is_carried_moves_nothing() {
         let h = waste();
-        let out = perform(&h, "c1", &act("give", json!({"what":"bolt rounds","to":"Soren","count":"999"})));
+        let out = perform(
+            &h,
+            "c1",
+            &act(
+                "give",
+                json!({"what":"bolt rounds","to":"Soren","count":"999"}),
+            ),
+        );
         assert!(!out.happened());
         assert_eq!(h.sim(|s| s.pack("c1").get("bolt").unwrap().count), 60);
     }
@@ -728,7 +976,12 @@ mod tests {
     #[test]
     fn a_stimpak_used_on_somebody_is_spent_and_a_scanner_is_not() {
         let h = waste();
-        assert!(perform(&h, "c1", &act("use", json!({"what":"stimpak","on":"Soren"}))).happened());
+        assert!(perform(
+            &h,
+            "c1",
+            &act("use", json!({"what":"stimpak","on":"Soren"}))
+        )
+        .happened());
         assert_eq!(h.sim(|s| s.pack("c1").get("stimpak").unwrap().count), 2);
 
         assert!(perform(&h, "c1", &act("use", json!({"what":"advanced scanner"}))).happened());
@@ -742,10 +995,20 @@ mod tests {
     #[test]
     fn gathering_takes_from_the_ground_and_puts_it_in_the_pack() {
         let h = waste();
-        let out = perform(&h, "c1", &act("gather", json!({"what":"the burnt-out carrier"})));
+        let out = perform(
+            &h,
+            "c1",
+            &act("gather", json!({"what":"the burnt-out carrier"})),
+        );
         assert!(out.happened(), "{out:?}");
-        assert_eq!(h.sim(|s| s.pack("c1").get("metal").map(|i| i.count)), Some(10));
-        assert_eq!(h.sim(|s| s.field.deposit("burnt_carrier").unwrap().remaining), 20);
+        assert_eq!(
+            h.sim(|s| s.pack("c1").get("metal").map(|i| i.count)),
+            Some(10)
+        );
+        assert_eq!(
+            h.sim(|s| s.field.deposit("burnt_carrier").unwrap().remaining),
+            20
+        );
     }
 
     #[test]
@@ -761,19 +1024,32 @@ mod tests {
         let out = perform(
             &h,
             "c1",
-            &act("engage", json!({"posture":"press","target":"a mech","priority":"nearest"})),
+            &act(
+                "engage",
+                json!({"posture":"press","target":"a mech","priority":"nearest"}),
+            ),
         );
         assert!(out.happened(), "{out:?}");
-        assert_eq!(h.sim(|s| s.field.stance("c1").unwrap().posture.clone()), "press");
+        assert_eq!(
+            h.sim(|s| s.field.stance("c1").unwrap().posture.clone()),
+            "press"
+        );
 
         assert!(perform(&h, "c1", &act("engage", json!({"posture":"break off"}))).happened());
-        assert!(h.sim(|s| s.field.stance("c1").is_none()), "breaking off left a stance");
+        assert!(
+            h.sim(|s| s.field.stance("c1").is_none()),
+            "breaking off left a stance"
+        );
     }
 
     #[test]
     fn engaging_something_that_is_not_here_is_refused() {
         let h = waste();
-        let out = perform(&h, "c1", &act("engage", json!({"posture":"press","target":"a stinger"})));
+        let out = perform(
+            &h,
+            "c1",
+            &act("engage", json!({"posture":"press","target":"a stinger"})),
+        );
         assert!(!out.happened());
         assert!(h.sim(|s| s.field.stance("c1").is_none()));
     }
@@ -781,11 +1057,19 @@ mod tests {
     #[test]
     fn a_door_takes_its_own_states_and_not_a_turrets() {
         let h = waste();
-        h.with(|w| w.place("c1", Where::new("tower-redoubt", "gatehouse")).unwrap());
-        let out = perform(&h, "c1", &act("operate", json!({"what":"the blast door","mode":"locked"})));
+        h.with(|w| {
+            w.place("c1", Where::new("tower-redoubt", "gatehouse"))
+                .unwrap()
+        });
+        let out = perform(
+            &h,
+            "c1",
+            &act("operate", json!({"what":"the blast door","mode":"locked"})),
+        );
         assert!(out.happened(), "{out:?}");
         assert_eq!(
-            h.sim(|s| s.devices
+            h.sim(|s| s
+                .devices
                 .by_name_at("tower-redoubt/gatehouse", "the blast door")
                 .unwrap()
                 .mode
@@ -793,7 +1077,14 @@ mod tests {
             "locked"
         );
 
-        let bad = perform(&h, "c1", &act("operate", json!({"what":"the blast door","mode":"air only"})));
+        let bad = perform(
+            &h,
+            "c1",
+            &act(
+                "operate",
+                json!({"what":"the blast door","mode":"air only"}),
+            ),
+        );
         assert!(!bad.happened());
         assert!(
             bad.line().unwrap().contains("open"),
@@ -805,7 +1096,10 @@ mod tests {
     fn sleeping_is_recorded_so_something_can_wake_you() {
         let h = waste();
         assert!(perform(&h, "c1", &act("sleep", json!({"until":"dawn"}))).happened());
-        assert_eq!(h.sim(|s| s.ledger.asleep("c1").map(str::to_string)), Some("dawn".into()));
+        assert_eq!(
+            h.sim(|s| s.ledger.asleep("c1").map(str::to_string)),
+            Some("dawn".into())
+        );
     }
 
     #[test]
@@ -814,15 +1108,26 @@ mod tests {
         assert!(perform(
             &h,
             "c1",
-            &act("promise", json!({"to":"Soren","what":"the eastern sweep","by":"dusk"}))
+            &act(
+                "promise",
+                json!({"to":"Soren","what":"the eastern sweep","by":"dusk"})
+            )
         )
         .happened());
 
         // Soren reminding Wren of it works; reminding of something never
         // promised does not.
-        let good = perform(&h, "c2", &act("remind", json!({"who":"Wren","which":"the eastern sweep"})));
+        let good = perform(
+            &h,
+            "c2",
+            &act("remind", json!({"who":"Wren","which":"the eastern sweep"})),
+        );
         assert!(good.happened(), "{good:?}");
-        let bad = perform(&h, "c2", &act("remind", json!({"who":"Wren","which":"the western sweep"})));
+        let bad = perform(
+            &h,
+            "c2",
+            &act("remind", json!({"who":"Wren","which":"the western sweep"})),
+        );
         assert!(!bad.happened(), "a promise nobody made was recalled");
     }
 
@@ -832,7 +1137,10 @@ mod tests {
         let out = perform(
             &h,
             "c1",
-            &act("record_verdict", json!({"on":"the ridge survey","judgement":"it will not do","what_would_change_it":"the count checked"})),
+            &act(
+                "record_verdict",
+                json!({"on":"the ridge survey","judgement":"it will not do","what_would_change_it":"the count checked"}),
+            ),
         );
         assert!(out.happened(), "{out:?}");
         assert_eq!(h.sim(|s| s.ledger.verdicts_on("the ridge survey").len()), 1);
@@ -853,7 +1161,14 @@ mod tests {
             let t = s.tower.as_mut().unwrap();
             t.draw(Resource::Energy, t.stock_of(Resource::Energy));
         });
-        let out = perform(&h, "c1", &act("command_tower", json!({"action":"relocate","x":"10","y":"10"})));
+        let out = perform(
+            &h,
+            "c1",
+            &act(
+                "command_tower",
+                json!({"action":"relocate","x":"10","y":"10"}),
+            ),
+        );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains("cannot relocate"), "{out:?}");
     }
@@ -862,7 +1177,14 @@ mod tests {
     fn folding_the_tower_moves_it_and_spends_the_energy() {
         let h = waste();
         let before = h.sim(|s| s.tower.as_ref().unwrap().stock_of(Resource::Energy));
-        let out = perform(&h, "c1", &act("command_tower", json!({"action":"relocate","x":"-300","y":"180"})));
+        let out = perform(
+            &h,
+            "c1",
+            &act(
+                "command_tower",
+                json!({"action":"relocate","x":"-300","y":"180"}),
+            ),
+        );
         assert!(out.happened(), "{out:?}");
         h.sim(|s| {
             let t = s.tower.as_ref().unwrap();

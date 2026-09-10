@@ -135,15 +135,25 @@ fn a_message_reaches_the_other_characters_mind() {
     maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
     hand_out_phones(&rt, &[("m1", "Maker-01"), ("m2", "Maker-02")]);
 
-    let opened = rt.record_act(
-        1,
-        &act("reach_out", json!({"to": "Maker-02", "intent": "that I need a word"})),
-    );
+    let opened = rt
+        .record_act(
+            1,
+            &act(
+                "reach_out",
+                json!({"to": "Maker-02", "intent": "that I need a word"}),
+            ),
+        )
+        .feed;
     assert!(!opened.contains("meant to reach"), "{opened}");
-    let sent = rt.record_act(
-        1,
-        &act("message", json!({"to": "Maker-02", "intent": "that the redoubt burned twice"})),
-    );
+    let sent = rt
+        .record_act(
+            1,
+            &act(
+                "message",
+                json!({"to": "Maker-02", "intent": "that the redoubt burned twice"}),
+            ),
+        )
+        .feed;
     assert!(!sent.contains("no conversation"), "{sent}");
 
     // Nothing has reached the other mind until the world moves.
@@ -155,7 +165,337 @@ fn a_message_reaches_the_other_characters_mind() {
         read.contains("that the redoubt burned twice"),
         "the message never reached the other character: {read}"
     );
-    assert!(read.contains("Maker-01"), "the sender was not named: {read}");
+    assert!(
+        read.contains("Maker-01"),
+        "the sender was not named: {read}"
+    );
+}
+
+// =========================================================================
+// The open channel
+// =========================================================================
+
+/// **Nobody opens it and nobody joins it — it is simply there.**
+///
+/// The capability a character is supposed to have without asking. If this needs
+/// an act to be taken first, a cast spends its isolated hours not taking it,
+/// which is the state the channel exists to end.
+#[test]
+fn every_character_is_on_the_open_channel_without_asking_for_it() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "band-one");
+    maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
+    hand_out_phones(&rt, &[("m1", "Maker-01"), ("m2", "Maker-02")]);
+
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    for name in ["Maker-01", "Maker-02"] {
+        let on = world.sim(|s| s.threads.names_for(name));
+        assert!(
+            on.iter().any(|t| t == npcd::sim::phone::CHANNEL),
+            "{name} is not on the channel: {on:?}"
+        );
+    }
+
+    // And `message` binds to it, so it is reachable from the grammar rather
+    // than merely present in the data.
+    let threads = world.sim(|s| s.threads_for("Maker-01", "m1"));
+    assert!(threads.iter().any(|t| t == npcd::sim::phone::CHANNEL));
+}
+
+/// One send on the channel reaches every other character's mind, wherever they
+/// are standing.
+///
+/// **The gap this was built for.** A character alone could reach nobody it
+/// could not already see: the percept names who is in this room, and `move_to`
+/// offers rooms with no sign of who is in any of them. Saying where you are is
+/// what hands somebody else a room worth walking to.
+#[test]
+fn what_is_said_on_the_channel_reaches_every_other_mind() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "band-one");
+    maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
+    maker(&rt, 3, "m3", "green-room");
+    hand_out_phones(
+        &rt,
+        &[("m1", "Maker-01"), ("m2", "Maker-02"), ("m3", "Maker-03")],
+    );
+
+    let sent = rt
+        .record_act(
+            1,
+            &act(
+                "message",
+                json!({
+                    "to": npcd::sim::phone::CHANNEL,
+                    "intent": "that I am in band one with the third era open and cannot make it reconcile",
+                }),
+            ),
+        )
+        .feed;
+    assert!(!sent.contains("no conversation"), "{sent}");
+
+    moment(&rt);
+    think(&rt, 1);
+
+    for npc_id in [2, 3] {
+        let read = reads(&rt, npc_id);
+        assert!(
+            read.contains("cannot make it reconcile"),
+            "character {npc_id} never heard the channel: {read}"
+        );
+        assert!(
+            read.contains("Maker-01"),
+            "the speaker was not named: {read}"
+        );
+        // The room it named is the whole point — it is what the listener can
+        // then walk to.
+        assert!(read.contains("band one"), "{read}");
+    }
+}
+
+/// **The Creator speaks on the same channel the cast is on, and is known.**
+///
+/// Not an operator broadcast: it goes onto a thread, arrives through the
+/// ordinary sweep, and can be answered with the ordinary `message` act. What
+/// makes it the Creator rather than a stranger is the name, which is how every
+/// addressee in this world is identified — see `engine::CREATOR_MARK`.
+#[test]
+fn the_creator_can_speak_on_the_channel_and_the_cast_knows_who_it_is() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "band-one");
+    maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
+    hand_out_phones(&rt, &[("m1", "Maker-01"), ("m2", "Maker-02")]);
+
+    let me = "Johnathan Sharratt (The Creator)";
+    let heard = rt
+        .say_on_channel(WORLD, me, "that the lift on five has been left running")
+        .expect("the vault is hosted");
+    assert_eq!(heard.len(), 2, "it did not reach the cast: {heard:?}");
+
+    moment(&rt);
+    think(&rt, 1);
+
+    for npc_id in [1, 2] {
+        let read = reads(&rt, npc_id);
+        assert!(
+            read.contains("left running"),
+            "character {npc_id} was not told: {read}"
+        );
+        assert!(
+            read.contains("(The Creator)"),
+            "the cast cannot tell who said it: {read}"
+        );
+    }
+
+    // And a character can answer, because the Creator is on the roster and the
+    // channel is one of its threads — being spoken to by somebody unanswerable
+    // would be worse than not being spoken to.
+    let replied = rt
+        .record_act(
+            1,
+            &act(
+                "message",
+                json!({"to": npcd::sim::phone::CHANNEL, "intent": "that I will go up and look"}),
+            ),
+        )
+        .feed;
+    assert!(!replied.contains("no conversation"), "{replied}");
+    let back = rt.channel(WORLD, me).expect("hosted");
+    assert!(
+        back.iter().any(|(_, t)| t.contains("go up and look")),
+        "the answer never landed on the channel: {back:?}"
+    );
+}
+
+// =========================================================================
+// Things to read, and the loop that used to be
+// =========================================================================
+
+/// **A board is offered until you have read it, and then it is not.**
+///
+/// The whole shape of the fix. `read` was bound to the machines in the room and
+/// answered with the mode one was switched to — *"You read the accession desk.
+/// It stands at `reading`."* — which told a character nothing, reported success,
+/// and (because `read` is in `body::ANSWERS`) brought it straight back to use
+/// what it had learnt. Forty-seven of fifty live acts were that line.
+///
+/// Bound to what this body has *not read*, the act runs out: the set empties,
+/// the empty-set rule takes `read` out of the grammar, and the loop stops being
+/// something a character can say rather than something it is asked not to do.
+#[test]
+fn reading_something_takes_it_out_of_your_grammar_until_it_changes() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "green-room");
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    let place = world.read(|w| {
+        w.actor("m1")
+            .map(|a| format!("{}/{}", a.at.area, a.at.node))
+            .expect("standing")
+    });
+
+    // What is readable here, ignoring the vault's standing orders — those are
+    // world-wide and keep a cursor of their own, and a character that has never
+    // read them genuinely does have something new.
+    let boards = || {
+        world
+            .sim(|s| s.readable_at(&place, "m1"))
+            .into_iter()
+            .filter(|n| n != "the standing orders")
+            .collect::<Vec<_>>()
+    };
+
+    // Nobody has written anything, so there is no board to read and `read` is
+    // not offered one.
+    assert!(
+        boards().is_empty(),
+        "a room where nobody has written anything offered a board to read"
+    );
+
+    world.with_sim(|s| {
+        s.post(
+            &place,
+            "the muster board",
+            "the vault",
+            "the lift on five is out",
+        )
+    });
+    assert_eq!(boards(), vec!["the muster board"]);
+
+    let got = rt
+        .record_act(1, &act("read", json!({"what": "the muster board"})))
+        .feed;
+    assert!(got.contains("the lift on five is out"), "{got}");
+    assert!(
+        !got.contains('`'),
+        "a raw identifier reached the prose: {got}"
+    );
+
+    // And now it has nothing further to offer this body — which is what the old
+    // one could never say.
+    assert!(
+        boards().is_empty(),
+        "the board was offered again with nothing new on it"
+    );
+
+    // Until somebody writes on it again.
+    world.with_sim(|s| s.post(&place, "the muster board", "the vault", "the lift is back"));
+    assert_eq!(boards(), vec!["the muster board"]);
+    let again = rt
+        .record_act(1, &act("read", json!({"what": "the muster board"})))
+        .feed;
+    assert!(again.contains("the lift is back"), "{again}");
+    assert!(
+        !again.contains("the lift on five is out"),
+        "the whole board was handed over again rather than what is new: {again}"
+    );
+}
+
+/// A character can leave something for whoever comes next, and it is there when
+/// they do — with their name on it.
+#[test]
+fn what_one_character_writes_another_reads_and_knows_who_wrote_it() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "green-room");
+    maker(&rt, 2, "m2", "green-room");
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    let place = world.read(|w| {
+        w.actor("m1")
+            .map(|a| format!("{}/{}", a.at.area, a.at.node))
+            .expect("standing")
+    });
+    // A surface to write on, the way the map stands one up.
+    world.with_sim(|s| s.postings.stand_up(&place, "the muster board"));
+
+    let wrote = rt
+        .record_act(
+            1,
+            &act(
+                "post_notice",
+                json!({
+                    "on": "the muster board",
+                    "what": "that the third era is written twice and I have not settled which is right",
+                }),
+            ),
+        )
+        .feed;
+    assert!(!wrote.contains("nothing here called"), "{wrote}");
+
+    // **The writer does not read its own notice back.** Otherwise posting makes
+    // the board unread for the person who just wrote on it, `read` reappears in
+    // their grammar, and the pair of acts is the treadmill in two steps.
+    let boards = |who: &str| {
+        world
+            .sim(|s| s.readable_at(&place, who))
+            .into_iter()
+            .filter(|n| n != "the standing orders")
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        boards("m1").is_empty(),
+        "the writer was offered its own notice to read"
+    );
+
+    // The other character has something to read, and is told whose it is.
+    assert_eq!(boards("m2"), vec!["the muster board"]);
+    let read = rt
+        .record_act(2, &act("read", json!({"what": "the muster board"})))
+        .feed;
+    assert!(read.contains("written twice"), "{read}");
+    assert!(
+        read.contains("Maker-01"),
+        "the author was not named: {read}"
+    );
+}
+
+/// The world's own half: somebody outside can put something on a board, and the
+/// cast reads it as an ordinary notice.
+#[test]
+fn the_creator_can_leave_something_on_a_board_from_outside_the_world() {
+    let rt = daemon();
+    maker(&rt, 1, "m1", "green-room");
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    let place = world.read(|w| {
+        w.actor("m1")
+            .map(|a| format!("{}/{}", a.at.area, a.at.node))
+            .expect("standing")
+    });
+
+    let lines = rt
+        .post_in_world(
+            WORLD,
+            &place,
+            "the muster board",
+            "Johnathan Sharratt (The Creator)",
+            "that the vault is being watched today and everything written will be read",
+        )
+        .expect("the world is hosted and the room is real");
+    assert_eq!(lines, 1);
+
+    let got = rt
+        .record_act(1, &act("read", json!({"what": "the muster board"})))
+        .feed;
+    assert!(got.contains("being watched today"), "{got}");
+    assert!(got.contains("(The Creator)"), "{got}");
+
+    // A room that does not exist is refused rather than written into — a board
+    // nowhere is writable, unreachable and impossible to diagnose.
+    assert!(rt
+        .post_in_world(WORLD, "vault-casting/nowhere", "a board", "x", "y")
+        .is_none());
+    assert!(rt
+        .post_in_world("no-such-world", &place, "a board", "x", "y")
+        .is_none());
+}
+
+/// A world that is not hosted has no channel, and saying so is better than
+/// silently succeeding into nothing.
+#[test]
+fn speaking_on_a_channel_of_a_world_that_is_not_hosted_is_refused() {
+    let rt = daemon();
+    assert!(rt
+        .say_on_channel("no-such-world", "Somebody", "anything")
+        .is_none());
+    assert!(rt.channel("no-such-world", "Somebody").is_none());
 }
 
 /// Handed over once, not on every moment afterwards.
@@ -168,9 +508,15 @@ fn a_message_is_delivered_once_and_not_again_every_moment() {
 
     rt.record_act(
         1,
-        &act("reach_out", json!({"to": "Maker-02", "intent": "that I need a word"})),
+        &act(
+            "reach_out",
+            json!({"to": "Maker-02", "intent": "that I need a word"}),
+        ),
     );
-    rt.record_act(1, &act("message", json!({"to": "Maker-02", "intent": "once only"})));
+    rt.record_act(
+        1,
+        &act("message", json!({"to": "Maker-02", "intent": "once only"})),
+    );
     for _ in 0..4 {
         moment(&rt);
         think(&rt, 1);
@@ -193,9 +539,15 @@ fn your_own_message_does_not_come_back_to_you() {
 
     rt.record_act(
         1,
-        &act("reach_out", json!({"to": "Maker-02", "intent": "that I need a word"})),
+        &act(
+            "reach_out",
+            json!({"to": "Maker-02", "intent": "that I need a word"}),
+        ),
     );
-    rt.record_act(1, &act("message", json!({"to": "Maker-02", "intent": "mine alone"})));
+    rt.record_act(
+        1,
+        &act("message", json!({"to": "Maker-02", "intent": "mine alone"})),
+    );
     moment(&rt);
     think(&rt, 1);
 
@@ -225,7 +577,10 @@ fn a_person_can_message_a_character_and_it_is_told() {
         .message_npc(1, "Wren S", "that the third era will not reconcile")
         .expect("the character has a body");
     assert_eq!(sent.with, "Maker-01");
-    assert!(sent.can_reply, "a character with a handset could not answer");
+    assert!(
+        sent.can_reply,
+        "a character with a handset could not answer"
+    );
     assert_eq!(sent.waiting_for_them, 1);
 
     moment(&rt);
@@ -250,10 +605,15 @@ fn a_character_answers_a_person_on_the_same_thread() {
 
     // The character answers with the ordinary act, naming the thread the way it
     // was told it — which is the person's own name.
-    let replied = rt.record_act(
-        1,
-        &act("message", json!({"to": "Wren S", "intent": "that I dated it against both neighbours"})),
-    );
+    let replied = rt
+        .record_act(
+            1,
+            &act(
+                "message",
+                json!({"to": "Wren S", "intent": "that I dated it against both neighbours"}),
+            ),
+        )
+        .feed;
     assert!(!replied.contains("no conversation"), "{replied}");
 
     let (with, said) = rt.messages_with(1, "Wren S").expect("a body");
@@ -305,7 +665,7 @@ fn messaging_a_character_with_no_body_reaches_nothing() {
 
 /// **A physical interaction puts a real body in the world.**
 ///
-/// The whole point, and it is not cosmetic: `tell`, `ask`, `give`, `touch` and
+/// The whole point, and it is not cosmetic: `tell`, `ask`, `give`, `act` and
 /// `gesture` all bind their target to who is standing there, so a visitor with
 /// no body is not merely unseen — those acts are *absent from the character's
 /// grammar*. It could hear you and had no way to answer you, and went on
@@ -332,10 +692,7 @@ fn a_visitor_enters_the_room_and_can_be_addressed() {
         "the visitor is not company: {:?}",
         within.company
     );
-    let offered = npcd::engine::tools::specs_within(
-        npcd::engine::tools::Mode::Physical,
-        &within,
-    );
+    let offered = npcd::engine::tools::specs_within(npcd::engine::tools::Mode::Physical, &within);
     // The acts whose *only* missing piece was somebody to aim at. `give` is
     // deliberately not here: it needs something to give as well, so it stays
     // absent for a character carrying nothing — which is the empty-set rule
@@ -377,7 +734,11 @@ fn entering_twice_is_one_body() {
 
     let at = standing(&rt, "m1");
     let world = rt.hosted.get(WORLD).expect("hosted");
-    assert_eq!(world.read(|w| w.actors_at(&at).len()), 2, "two of one person");
+    assert_eq!(
+        world.read(|w| w.actors_at(&at).len()),
+        2,
+        "two of one person"
+    );
 }
 
 /// **A conversation does not end because the character walked off.** Asked to
@@ -483,8 +844,13 @@ fn an_act_from_the_decode_loop_reaches_a_document_on_disk() {
 
     // The era the mind holds is a thing the world knows about, because hosting
     // indexed it.
-    let opened = rt.record_act(1, &act("bench_branch", json!({"what": "the third era"})));
-    assert!(!opened.contains("nothing called"), "the era was not indexed: {opened}");
+    let opened = rt
+        .record_act(1, &act("bench_branch", json!({"what": "the third era"})))
+        .feed;
+    assert!(
+        !opened.contains("nothing called"),
+        "the era was not indexed: {opened}"
+    );
 
     rt.record_act(
         1,
@@ -501,8 +867,14 @@ fn an_act_from_the_decode_loop_reaches_a_document_on_disk() {
 
     rt.record_act(1, &act("bench_commit", json!({"why": "dated the fall"})));
     let after = std::fs::read_to_string(mind.join("layers/eras/third.md")).unwrap();
-    assert!(after.contains("The redoubt fell before the thaw."), "{after}");
-    assert!(after.contains("It burned in the spring."), "the entry replaced the document");
+    assert!(
+        after.contains("The redoubt fell before the thaw."),
+        "{after}"
+    );
+    assert!(
+        after.contains("It burned in the spring."),
+        "the entry replaced the document"
+    );
 }
 
 /// The file acts, through the same door, including the read that a model would
@@ -512,18 +884,32 @@ fn the_file_acts_reach_the_mind_through_the_runtime() {
     let (rt, mind) = daemon_with_a_mind("files");
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
 
-    let read = rt.record_act(1, &act("file_read", json!({"path": "layers/eras/third.md"})));
-    assert!(read.contains("1  # the third era"), "not the real numbered read: {read}");
+    let read = rt
+        .record_act(
+            1,
+            &act("file_read", json!({"path": "layers/eras/third.md"})),
+        )
+        .feed;
+    assert!(
+        read.contains("1  # the third era"),
+        "not the real numbered read: {read}"
+    );
 
     rt.record_act(
         1,
-        &act("file_edit", json!({
-            "path": "layers/eras/third.md",
-            "old_str": "in the spring",
-            "new_str": "in the autumn"
-        })),
+        &act(
+            "file_edit",
+            json!({
+                "path": "layers/eras/third.md",
+                "old_str": "in the spring",
+                "new_str": "in the autumn"
+            }),
+        ),
     );
-    rt.record_act(1, &act("bench_commit", json!({"why": "against its neighbours"})));
+    rt.record_act(
+        1,
+        &act("bench_commit", json!({"why": "against its neighbours"})),
+    );
     assert!(std::fs::read_to_string(mind.join("layers/eras/third.md"))
         .unwrap()
         .contains("in the autumn"));
@@ -539,16 +925,28 @@ fn a_mood_edited_at_a_story_desk_keeps_its_comments() {
 
     rt.record_act(
         1,
-        &act("library_write", json!({
-            "kind": "mood", "id": "undone",
-            "field": "description", "text": "The whole interior rearranged."
-        })),
+        &act(
+            "library_write",
+            json!({
+                "kind": "mood", "id": "undone",
+                "field": "description", "text": "The whole interior rearranged."
+            }),
+        ),
     );
-    rt.record_act(1, &act("bench_commit", json!({"why": "it read as two things"})));
+    rt.record_act(
+        1,
+        &act("bench_commit", json!({"why": "it read as two things"})),
+    );
 
     let on_disk = std::fs::read_to_string(mind.join("moods/undone.yaml")).unwrap();
-    assert!(on_disk.contains("The whole interior rearranged."), "{on_disk}");
-    assert!(on_disk.contains("# why it reads this way"), "the splice was bypassed: {on_disk}");
+    assert!(
+        on_disk.contains("The whole interior rearranged."),
+        "{on_disk}"
+    );
+    assert!(
+        on_disk.contains("# why it reads this way"),
+        "the splice was bypassed: {on_disk}"
+    );
 }
 
 /// **The guard is live too.** A path out of the mind is refused by the act, not
@@ -558,12 +956,22 @@ fn a_path_out_of_the_mind_is_refused_through_the_runtime() {
     let (rt, mind) = daemon_with_a_mind("escape");
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
 
-    for bad in ["../stolen.md", "projection.yaml", "layers/eras/../../stolen.md"] {
-        rt.record_act(1, &act("file_write", json!({"path": bad, "content": "owned"})));
+    for bad in [
+        "../stolen.md",
+        "projection.yaml",
+        "layers/eras/../../stolen.md",
+    ] {
+        rt.record_act(
+            1,
+            &act("file_write", json!({"path": bad, "content": "owned"})),
+        );
     }
     rt.record_act(1, &act("bench_commit", json!({"why": "…"})));
     assert!(!mind.parent().unwrap().join("stolen.md").exists());
-    assert!(!mind.join("projection.yaml").exists(), "the daemon's own schema was written");
+    assert!(
+        !mind.join("projection.yaml").exists(),
+        "the daemon's own schema was written"
+    );
 }
 
 /// A world hosted by a daemon with no mind has nothing to edit, and says so
@@ -572,7 +980,12 @@ fn a_path_out_of_the_mind_is_refused_through_the_runtime() {
 fn a_daemon_with_no_mind_refuses_the_editing_acts() {
     let rt = daemon();
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
-    let out = rt.record_act(1, &act("file_read", json!({"path": "layers/eras/third.md"})));
+    let out = rt
+        .record_act(
+            1,
+            &act("file_read", json!({"path": "layers/eras/third.md"})),
+        )
+        .feed;
     assert!(out.contains("no documents"), "{out}");
 }
 

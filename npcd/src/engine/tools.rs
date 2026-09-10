@@ -101,6 +101,21 @@ pub enum Availability {
     /// invited to address somebody, because there is nobody to address and the
     /// invitation is what makes it try.
     Nearby,
+    /// Only while standing somewhere that is not home.
+    ///
+    /// **Being called back to where you already are is not a thing that can
+    /// happen**, and it was the most-taken act in the cast: twenty-four of
+    /// sixty, because `World::place` accepts a move to the room the body is
+    /// already in, reports "the ground goes out from under you", and changes
+    /// nothing. The characters could see it and could not stop —
+    /// *"I'm standing here again. The same loop."*
+    ///
+    /// `recall` takes no arguments, so the ordinary empty-set rule has no
+    /// parameter to empty and cannot reach it. The condition is about the body
+    /// rather than about anything it could name, which is exactly what this
+    /// ladder is for — the same shape as [`Availability::Nearby`], where what
+    /// decides is a fact about the room rather than a value in the call.
+    AwayFromHome,
     /// Only for a mind with a body.
     ///
     /// **Not a special case for one character.** Keeper has no body and never
@@ -174,22 +189,41 @@ pub struct Tool {
 
 /// Speech to the room, and speech to a person.
 ///
-/// **Two tools, not one with an optional target.** Saying something aloud where
-/// people are and addressing one of them are different acts: the first is
-/// always possible and the second needs somebody to address. As one tool with
-/// an optional `to`, a character alone in a corridor is invited to name
-/// somebody every turn, and it does — a model handed a field fills it in.
-///
-/// Splitting them makes the impossible one *absent* rather than refused, which
-/// is the same discipline `send_image` follows in a physical encounter. It also
-/// makes the difference legible in what everyone else perceives, because the
+/// **Two tools, not one with an optional target.** Saying something aloud to a
+/// room and addressing one person in it are different acts, and as one tool
+/// with an optional `to` a character is invited to name somebody every turn —
+/// which it does, because a model handed a field fills it in. Split, the
+/// difference is also legible in what everybody else perceives, because the
 /// world carries who an utterance was aimed at and renders it three ways.
+///
+/// # Both of them need somebody to hear
+///
+/// This was `Always`, on the reasoning that speaking aloud is possible whether
+/// or not anybody is listening. It is, and it was still wrong: **speech into an
+/// empty room reaches nobody and changes nothing**, which by this catalog's own
+/// standard is an act that does not act.
+///
+/// What it did instead was worse than nothing. Three characters stood alone in
+/// three rooms, and every time the building did something — a box sagging, a
+/// smell of hot plastic, a shadow moving under a bench — each of them said it
+/// back out loud, paraphrased, to nobody:
+///
+/// ```text
+/// perceived: A smell of hot plastic comes and goes with no source anybody could point at.
+/// act:       say — The scent of burnt plastic drifts through the air, vanishing as
+///                  quickly as it arrived, with no source I can find.
+/// ```
+///
+/// That is not a character reacting to its world, it is a character narrating
+/// it — and twelve of the last fourteen acts in the feed were exactly this.
+/// Absent when alone, it is not a thing the character can do, which is the same
+/// discipline `tell` and `ask` already follow and the reason they follow it.
 const SAY: Tool = Tool {
     name: "say",
     at: &[],
     category: "Speech",
     plane: Plane::Speech,
-    availability: Availability::Always,
+    availability: Availability::Nearby,
     description: "Say something aloud, to whoever is here. You give what you MEAN — the \
                   substance and the stance — not the sentence; the narrator renders your intent \
                   in your own voice. Everyone in the room hears it. Nobody outside it does.",
@@ -433,12 +467,17 @@ const FOLLOW: Tool = Tool {
 /// Absorbs what `express` used to be. They were one act split by whether the
 /// showing was chosen — a distinction the world cannot represent and nobody
 /// watching can tell, since both arrive as *somebody did something*.
+///
+/// Needs company for the reason `say` does: a signal nobody is there to read is
+/// a signal that reaches nobody, and offering it to a character alone is what
+/// makes it perform to an empty room. What is left for a solitary body is
+/// `act`, which is a thing done rather than a thing shown.
 const GESTURE: Tool = Tool {
     name: "gesture",
     at: &[],
     category: "Gesture",
     plane: Plane::World,
-    availability: Availability::Always,
+    availability: Availability::Nearby,
     description: "Do something without speaking — a signal, a warning, a refusal, or just what \
                   shows on you. Everyone here sees it. Like `say`, you give the meaning and not \
                   the movement.",
@@ -476,43 +515,28 @@ const GESTURE: Tool = Tool {
     ],
 };
 
-/// Looking, as a way of *getting* something.
-///
-/// Absorbs `listen` and `inspect`, which were the same act named for the sense
-/// or the range. What matters is that a step spent looking comes back with
-/// something the character did not have, which is the only thing that made any
-/// of the three worth a turn.
-const OBSERVE: Tool = Tool {
-    name: "observe",
-    at: &[],
-    category: "Attention",
-    plane: Plane::Internal,
-    availability: Availability::Always,
-    description: "Look, listen, or examine something properly. Spends your turn on finding out \
-                  rather than on doing, and what you find comes straight back to you. Use it \
-                  when acting on a guess would be worse than spending a moment.",
-    params: &[Param {
-        name: "target",
-        ty: "string",
-        required: true,
-        description: "What you attend to — a thing here, a person, or the room itself.",
-    }],
-    examples: &[
-        Example {
-            situation: "The map shows a shape at the tree line that the legend does not account \
-                        for.",
-            call: r#"{"target":"the unaccounted shape at the tree line"}"#,
-            because: "Acting on an ambiguity is worse than spending a step resolving it. \
-                      Choosing to look is a real decision, not a null one.",
-        },
-        Example {
-            situation: "You have just come into a room you have not been in before.",
-            call: r#"{"target":"the room, and what is in it"}"#,
-            because: "What comes back is what is actually here, which is what the next act has \
-                      to be built on.",
-        },
-    ],
-};
+/* **`observe` was here, and looking is not an act in this world.**
+ *
+ * It absorbed `listen` and `inspect` — the same act named for the sense or the
+ * range — on the rule that a step spent looking has to come back with something
+ * the character did not have. The survivor never did either. Its whole
+ * implementation interpolated the target into a sentence and threw it away, then
+ * reported the room's name and who was in it: both of which the percept hands
+ * over free at the top of the same turn.
+ *
+ * It was not fixable, because there is nothing left for it to return. Sight here
+ * is binary — the same room, a room you can see into, or nothing — so there is
+ * no gradient for looking harder to move along. What a room *is* and what every
+ * part in it does are in the building memory, carried in the prompt prefix and
+ * known permanently. What somebody else is holding is withheld on purpose, and
+ * has to stay withheld: needing to walk to the green room and ask is the whole
+ * social mechanism of the vault.
+ *
+ * So every answer it could give is one the character already has, and the doc it
+ * shipped with named its own defect: *an `observe` that returned nothing was a
+ * turn spent to learn nothing, which is worse than idling because it looks like
+ * diligence.* Perception here is pushed the moment anything changes; an act for
+ * pulling it is an act for a world this is not. */
 
 const SEND_IMAGE: Tool = Tool {
     name: "send_image",
@@ -547,109 +571,147 @@ const SEND_IMAGE: Tool = Tool {
     }],
 };
 
-/// Waiting for a **named thing**, aimed at a **named person**, and visible to
-/// them.
+/// Taking stock — and standing still for a moment while you do.
 ///
-/// # Why `wait` had to go
+/// # Why it is `reflect` and not `pause`
 ///
-/// It was not a wait. It was a no-op the character had to re-choose every four
-/// seconds: `until` was free text — "the silence speaks", "they finish
-/// speaking" — that nothing in the world could read, so nothing could ever
-/// satisfy it, so it never ended. A character did not wait for Orion to speak;
-/// it decided to wait, spent a decode, forgot, and decided again. Three of them
-/// did this at each other for hours, and it was the last act in the catalog
-/// that changed nothing.
+/// **It was `pause`, and the name was describing the machinery instead of the
+/// act.** What a character does here is notice something and say what it makes
+/// of it; stopping for [`PAUSE`] is only what that costs. Named for the cost,
+/// it read as *the option that does nothing* — and a model choosing among named
+/// tools reads the name first, so it chose almost anything else.
 ///
-/// Typed and referenced, it becomes a **subscription**: the character goes
-/// genuinely quiet, and the world wakes it when the thing it named happens.
+/// That was measurable. A solitary cast chose `act` on itself fifty-three times
+/// out of fifty-three; with `act` cooling it chose `move_to` six times out of
+/// six. It never once chose to stop and think, which is the honest answer to a
+/// room that has just done something a character can do nothing about — and the
+/// three fields below are exactly that answer.
 ///
-/// # And the person it is aimed at is told
+/// The scheduler still calls it a pause internally (`Inbox::pause`, [`PAUSE`],
+/// `Runtime::arm_pause`), because from there it *is* one: a deadline and
+/// nothing else. Two names for two different things, which is why neither is
+/// wrong.
 ///
-/// Waiting on somebody is not invisible. In a room you look at them, and the
-/// silence is aimed rather than empty — so this emits into the room like any
-/// other act, and the person waited on perceives it. That is what breaks the
-/// deadlock without a timeout: two characters waiting on each other used to sit
-/// there until something else moved, and now the first wait wakes the other,
-/// who has something to answer.
+/// # Why the stopping is a fixed span and not a subscription
 ///
-/// It also closes the loop that would replace the deadlock. Somebody already
-/// waiting on you is **not in your own `who` list** — see
-/// [`Within::waited_on_by`] — so you cannot wait back at them, and one of you
-/// has to speak. Mutual waiting is unreachable rather than discouraged.
-const WAIT_FOR: Tool = Tool {
-    name: "wait_for",
+/// It has been both. As free text — *wait until the silence speaks* — it was a
+/// no-op the character re-chose every four seconds, because nothing in the world
+/// could read the condition, so nothing could ever satisfy it. Typed and
+/// referenced it became a real subscription: name a thing, go quiet, be woken
+/// when it happens.
+///
+/// That worked and it cost more than it was worth. A subscription needs a
+/// condition language the world can answer, a patience clock so a wait nothing
+/// can satisfy still ends, a rousing bar so being messaged mid-wait is not read
+/// two minutes late, and a deadlock guard so two characters cannot wait at each
+/// other — four mechanisms, each with its own failure, to express *I have
+/// nothing to do this second*.
+///
+/// **A pause says that directly.** The character stops for [`PAUSE`] and then
+/// thinks again, and anything that arrives meanwhile wakes it at once, because
+/// that is already true of every character with an empty queue. Nothing to
+/// name, nothing to satisfy, nothing to time out. The deadlock it was guarding
+/// against cannot form either: two characters pausing at each other both wake
+/// on their own clock rather than on each other's.
+const REFLECT: Tool = Tool {
+    name: "reflect",
     at: &[],
-    category: "Meta",
+    category: "Attention",
     plane: Plane::World,
     availability: Availability::Always,
-    description: "Stop and wait for one particular thing to happen. You go quiet until it does — \
-                  no thinking, no acts — and the moment it happens you are woken with it in front \
-                  of you. If you name somebody, they see you waiting on them.",
+    description: "Take stock of where you are and what has just happened. Say what is going \
+                  through your head, what you are actually feeling, and what you have made of \
+                  it — nobody hears any of it. **This is the act for a moment you cannot do \
+                  anything about**: a room settles, a light goes, somebody laughs two floors \
+                  away. You stand still while you think, and anything happening around you \
+                  brings you straight back.",
     params: &[
+        // **Required, and that is the point of it.** Stopping is the one act
+        // whose outward half is nothing at all, so without this the record of a
+        // character's quietest hours is a column of identical rows and there is
+        // no way to tell a character that is thinking from one that has run out
+        // of things to do. A model asked to fill this in has to have an answer,
+        // and the answer is the only trace of an inner life the engine gets for
+        // free.
         Param {
-            name: "for",
+            name: "inner_thoughts",
             ty: "string",
             required: true,
-            description: "What would end the wait: `someone_speaks`, `someone_arrives`, or \
-                          `someone_leaves`.",
+            description: "What is actually going through your head as you stand there. Nobody \
+                          hears it and nobody can ask you about it later, so it is worth being \
+                          honest — what you are turning over, what is nagging at you, what you \
+                          have decided not to say.",
         },
+        // **Required, and safe to require**, because [`Choices::Feelings`] is a
+        // vocabulary rather than a possibility: a mind with no moods authored
+        // leaves this free text instead of taking the whole act out of the
+        // grammar. A character always has a feeling; the only question is
+        // whether this world has written a word for it.
         Param {
-            name: "who",
+            name: "feeling",
             ty: "string",
-            required: false,
-            description: "The one person it is about, by the name they go by here. They see that \
-                          you are waiting on them. Leave it out to wait on whoever is around.",
+            required: true,
+            description: "The register you are actually in, named from the list. Not what you \
+                          think you ought to feel — what is true while you stand there.",
+        },
+        // Distinct from `inner_thoughts` on purpose: thoughts are what is going
+        // through your head *now*, unshaped; a reflection is what you have made
+        // of something over time. Both are worth having and they are not the
+        // same act of mind.
+        Param {
+            name: "my_reflections",
+            ty: "string",
+            required: true,
+            description: "What you have come to think, as against what is passing through your \
+                          head. Something you have worked out, changed your mind about, or \
+                          finally admitted to yourself. If nothing has settled, say that — it is \
+                          an answer, and pretending otherwise is how a character invents \
+                          convictions it does not hold.",
         },
     ],
     examples: &[
         Example {
             situation: "You have asked Maker-04 something and it has not answered yet. There is \
                         nothing else you need from this room.",
-            call: r#"{"for":"someone_speaks","who":"Maker-04"}"#,
-            because: "Naming them is the difference between waiting and hoping: they are told you \
-                      are waiting on them, so the silence is now theirs to break.",
+            call: r#"{"inner_thoughts":"it heard me and is deciding whether to tell me, and I would rather know why it hesitated than have the answer","feeling":"alert","my_reflections":"nothing has settled yet, and I would rather wait than decide early what the hesitation means"}"#,
+            because: "The answer is theirs to give and there is nothing to do until it comes. \
+                      What you notice while waiting is worth more than filling the silence.",
         },
         Example {
-            situation: "You are alone in the reading room and have decided to stay until somebody \
-                        comes.",
-            call: r#"{"for":"someone_arrives"}"#,
-            because: "Nobody to name. The wait is on the room rather than a person, and it costs \
-                      nothing until it is answered.",
+            situation: "You are alone in the reading room, your work is filed, and no order has \
+                        come down.",
+            call: r#"{"inner_thoughts":"the filing went too easily, which usually means I have missed something, and I cannot find what","feeling":"uneasy","my_reflections":"I have stopped trusting a quiet afternoon, and I am not sure that is caution rather than superstition"}"#,
+            because: "Nothing here needs doing. Standing still is the honest act, and casting \
+                      about for one more thing to touch is how a room gets rearranged for no \
+                      reason. The reflection is the half worth keeping — it is a thing about \
+                      itself the character did not know an hour ago.",
+        },
+        // **The case that was being answered wrongly.** The room does something
+        // small, and a character with nothing to do about it reached for the
+        // nearest physical verb and did that instead — fifty-three times out of
+        // fifty-three, on its own body, because a box sagging is not something
+        // you can act on and the catalog offered no other way to have noticed
+        // it.
+        Example {
+            situation: "A cardboard box on the floor gives up a fold and sags. Nobody is here \
+                        and nothing about it is yours to see to.",
+            call: r#"{"inner_thoughts":"another thing in here has quietly given up while nobody was watching it","feeling":"weary","my_reflections":"this place is not being kept, it is being outlasted, and I have started counting the evidence"}"#,
+            because: "There is nothing to *do* to a sagging box. Touching it, or walking off \
+                      somewhere, would be a character inventing an action to fill a moment that \
+                      called for a thought.",
         },
     ],
 };
 
-/// The things a [`WAIT_FOR`] may be for.
+/// How a character names its own body as the target of an act.
 ///
-/// Every one has to be a question the **world** can answer, or it is `until`
-/// with extra syntax. These three are settled by looking at the room: who spoke,
-/// who is standing in it now, who was and is not.
-pub const WAIT_KINDS: &[&str] = &["someone_speaks", "someone_arrives", "someone_leaves"];
-
-/// The kinds that make sense *here*.
-///
-/// **Waiting for speech in an empty room is waiting for nothing**, and it is
-/// not a hypothetical: a scattered cast settled on `someone_speaks` almost
-/// every turn, each alone, each waiting for a voice that could not come until
-/// somebody walked in — a deadlock that costs nothing and goes nowhere. Alone,
-/// the only thing that can happen is that somebody arrives; that is the only
-/// wait offered. The same rule as everywhere else in this catalog: an act the
-/// world cannot answer is absent rather than available and futile.
-/// **And somebody already waiting on you cannot be answered with a wait.**
-/// Excluding them from `who` was not enough: an *unnamed* wait for speech names
-/// nobody, so two characters could both make one and neither was struck from
-/// the other's list. A cast went silent on exactly that. If anyone here is
-/// waiting for you to speak, speech is not something you may wait for.
-pub fn wait_kinds(within: &Within) -> Vec<String> {
-    WAIT_KINDS
-        .iter()
-        .filter(|k| match **k {
-            "someone_speaks" => !within.alone() && within.waited_on_by.is_empty(),
-            _ => !within.alone() || **k == "someone_arrives",
-        })
-        .map(|k| k.to_string())
-        .collect()
-}
+/// A word rather than the character's own name, for two reasons. The name is
+/// what everybody *else* in the room is offered, so a character choosing its own
+/// name off that list is picking a third party who happens to be itself — and
+/// the model would have to know its own name to find it. And a name can collide:
+/// two bodies called the same thing in one room would make the set a duplicate,
+/// which is the `EmptyArm` failure that stops the whole grammar compiling.
+pub const SELF: &str = "yourself";
 
 /// The generic catalog: what every character can do, before any world adds to it.
 ///
@@ -703,33 +765,35 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
 const BODY_ACTS: &[Tool] = &[
     // Speech, attention, movement — what a body does with other bodies and
     // with rooms.
-    SAY,
-    TELL,
-    ASK,
-    GESTURE,
-    MOVE_TO,
-    FOLLOW,
-    OBSERVE,
-    WAIT_FOR,
-    SEND_IMAGE,
+    SAY, TELL, ASK, GESTURE, MOVE_TO, FOLLOW, REFLECT, SEND_IMAGE,
 ];
 
 /// The interaction modes a character can be in. Decides which tools are offered.
 ///
 /// `Physical` is the default, and it is the safe one to default to: it offers
-/// strictly fewer tools. Defaulting to `Messaging` would hand a camera to a
-/// character standing in front of you whenever a mode failed to resolve.
+/// strictly fewer tools. Defaulting to `InstantMessage` would hand a handset to
+/// a character standing in front of you whenever a mode failed to resolve.
+///
+/// # Two, not four
+///
+/// There were a video call and a voice call as well. They were the same two
+/// pieces of machinery as these — is the other party in the room, and can a
+/// picture go down the channel — sliced a second time to no purpose: a voice
+/// call was a message thread that could not send a picture, and a video call
+/// was one that could. Neither had a surface anybody used, and both had to be
+/// carried by every match on this enum.
+///
+/// Standing in a room together and reaching somebody who is nowhere near are
+/// genuinely different — different tools, different idle patience, one puts a
+/// body in a room and the other does not. That difference is the whole of what
+/// this type is for, and it takes two values to say it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// Face to face.
     #[default]
     Physical,
-    /// Seen and heard, but not present.
-    VideoCall,
-    /// Heard only.
-    VoiceCall,
-    /// Text.
+    /// Text, to somebody who may be nowhere near.
     InstantMessage,
 }
 
@@ -741,21 +805,25 @@ impl Mode {
 
     /// Whether a picture can be sent down this channel.
     ///
-    /// **Not the same question as [`Self::remote`], and collapsing the two was a
-    /// real defect.** A two-valued mode made every remote channel a messaging
-    /// channel, which handed an NPC on a voice call a way to text a photo down
-    /// it. Sending a picture is a thing people do over video and over text and
-    /// cannot do on a phone call, so the two questions are asked separately.
+    /// Kept as its own question rather than folded into [`Self::remote`], even
+    /// though the two now agree on both values. They are not the same question:
+    /// "are we apart" is about where the parties are, and this is about what
+    /// the channel can carry. A channel that is remote and cannot carry a
+    /// picture is an ordinary thing — a voice call was exactly that — and it
+    /// would differ here and nowhere else. Collapsing them is what once handed
+    /// a character on the telephone a way to text a photo down it.
+    ///
+    /// Physical is false for the opposite reason to a voice call's: not that
+    /// the channel is too thin, but that there is no channel. You are standing
+    /// in front of them; you hold the thing up.
     pub fn carries_pictures(self) -> bool {
-        matches!(self, Mode::VideoCall | Mode::InstantMessage)
+        matches!(self, Mode::InstantMessage)
     }
 
     /// What the interaction contract calls it on the wire.
     pub fn as_wire(self) -> &'static str {
         match self {
             Mode::Physical => "physical",
-            Mode::VideoCall => "video_call",
-            Mode::VoiceCall => "voice_call",
             Mode::InstantMessage => "instant_message",
         }
     }
@@ -763,8 +831,6 @@ impl Mode {
     pub fn parse(s: &str) -> Option<Mode> {
         match s.trim().to_lowercase().as_str() {
             "physical" => Some(Mode::Physical),
-            "video_call" | "video" => Some(Mode::VideoCall),
-            "voice_call" | "voice" => Some(Mode::VoiceCall),
             "instant_message" | "message" | "messaging" => Some(Mode::InstantMessage),
             _ => None,
         }
@@ -802,6 +868,10 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             // Depends on who is standing next to you, which the prompt cannot
             // know and the situation can. See `nearby`.
             Availability::Nearby => false,
+            // Depends on where the body is standing, which changes every time
+            // it walks. The prompt is written once, so this is the situation's
+            // to offer — the same reason `Nearby` is absent here.
+            Availability::AwayFromHome => false,
         })
         .collect()
 }
@@ -888,16 +958,38 @@ pub fn specs() -> Vec<ToolSpec> {
 pub enum Choices {
     /// Somebody standing here, by the name the world writes down.
     Company,
-    /// Somebody standing here **who is not already waiting on you**.
+    /// Somebody standing here, **or your own body**.
     ///
-    /// The narrower list, and the reason a deadlock cannot re-form. Waiting on
-    /// somebody wakes them; if they could wait back, the two would ping-pong —
-    /// each waking the other to do nothing — which is worse than the deadlock
-    /// it replaced, because it costs a decode a turn. Excluded from the branch,
-    /// the only thing left to do is act.
-    Waitable,
-    /// One of [`WAIT_KINDS`] — a question the world can actually answer.
-    WaitKind,
+    /// The set `act` binds, and the difference from [`Choices::Company`] is not
+    /// cosmetic: the addressee is grammar-constrained, so a value that is not in
+    /// this list is one the decoder is physically unable to emit. A character
+    /// binding its own wound, getting its own weapon clear or dragging itself up
+    /// off the floor could not say so — not because the world refused it, but
+    /// because there was no token path to the sentence.
+    ///
+    /// It also keeps `act` reachable for a character that is **alone**, where
+    /// `company` is empty and the empty-set rule would otherwise take the whole
+    /// tool out of the grammar. Your own body is always here.
+    ///
+    /// That reachability is right and it is not free: a solitary cast chose
+    /// `act` on itself every single turn, because the room kept handing it
+    /// physical things to notice and this was the only physical verb within
+    /// reach. The rate is governed by [`crate::engine::cooldown::SELF_ACT`]
+    /// rather than by taking the target away.
+    CompanyOrSelf,
+    /// A register the world has a mood written for.
+    ///
+    /// **The one closed set whose values are authored content rather than
+    /// world state.** `<mind>/moods/` holds a hundred and sixteen of them,
+    /// curated one at a time, and the projection already selects among them by
+    /// provenance — so a character naming how it feels has to name one of the
+    /// registers the mind can actually *hold*, or the answer is a word nothing
+    /// downstream can act on.
+    ///
+    /// Empty for a daemon with no mind, which drops the parameter rather than
+    /// the act: saying how you feel is optional because the catalogue may be
+    /// absent, never because it does not matter.
+    Feelings,
     /// Somewhere this character can actually walk to, **never where it stands**.
     ///
     /// Walking to your own room was refused, and being refused taught nothing:
@@ -960,8 +1052,25 @@ pub enum Choices {
     /// What can be taken and held from here: an unheld order, or a station
     /// nobody else has.
     Claimable,
-    /// What there is here to read — a board, a panel, a terminal's subject.
+    /// What there is here to read **that this body has not read**.
+    ///
+    /// Bound to the reader rather than to the room, which is what lets the act
+    /// run out. Bound to the room it offered the same thing every turn with the
+    /// same answer, and `read` is in `body::ANSWERS` — so a character was
+    /// brought straight back to use what it had learnt, had learnt nothing, and
+    /// read it again. Forty-seven of fifty acts in a live feed were one line.
+    ///
+    /// Empty is the ordinary state of a quiet room and takes `read` out of the
+    /// grammar, so the loop is not a thing a character can say rather than a
+    /// thing it is asked not to do.
     Readable,
+    /// A surface here that words can be left on — see [`crate::sim::posting`].
+    ///
+    /// **Not [`Choices::Readable`], and the difference is the point:** you write
+    /// on a blank board and you do not read one. Bound to what is standing here
+    /// regardless of what is on it, so a character can start a board that
+    /// nobody has written on, and cannot invent one that is not there.
+    Postable,
     /// The conversations on this character's phone, as it names them.
     ///
     /// Empty for a character carrying no handset, which takes every phone act
@@ -969,6 +1078,51 @@ pub enum Choices {
     /// something the world can *do* to somebody rather than a flag anybody has
     /// to remember to set.
     Threads,
+    /// The conversations this character can actually **leave**.
+    ///
+    /// [`Choices::Threads`] less the world's standing channels, and the
+    /// difference is not cosmetic. `sign_off` bound to every thread meant a
+    /// character could leave the open channel — one ordinary-looking act, after
+    /// which it is unreachable by anybody it cannot see, nothing in the world
+    /// reports it, and nothing brings it back until the daemon restarts and it
+    /// is embodied again. That is the isolated state the channel was added to
+    /// end, reachable in a single turn.
+    ///
+    /// Absent from the branch rather than refused, like everything else here: a
+    /// character cannot get stuck trying to leave something it has no way to
+    /// say. Empty for a character on nothing but channels, which takes
+    /// `sign_off` out of the grammar entirely — correctly, because there is
+    /// then nothing it could leave.
+    Leavable,
+    /// The conversations somebody could actually be brought **into**.
+    ///
+    /// [`Choices::Threads`] less the ones everybody invitable is already on —
+    /// the mirror of [`Choices::Leavable`], and for the same reason. The
+    /// world's channel holds the whole cast by construction, so `invite`
+    /// against it is refused every single time: there is nobody on the roster
+    /// who is not already there.
+    ///
+    /// Measured over 48 turns of three characters: 17 invites, all of them to
+    /// the channel, 16 refused. It was the second-most-called act in the cast
+    /// and not one of them could have worked. A character cannot learn its way
+    /// out of that — the act looks available, the target looks reachable, and
+    /// the refusal names a condition it has no way to see. So the thread leaves
+    /// the branch, like everything else here that cannot succeed.
+    ///
+    /// Empty for a character whose only conversation is the channel, which
+    /// takes `invite` out of the grammar entirely — correctly, because there is
+    /// then nowhere to bring anybody.
+    Invitable,
+    /// Who could be brought into **any** of the conversations on offer.
+    ///
+    /// The other half of [`Choices::Invitable`], and it exists because the two
+    /// arms of an `invite` are not independent: narrowing the threads and the
+    /// people separately still lets a character name a thread and somebody
+    /// already on it, which is a refusal it had no way to foresee. This is the
+    /// conservative intersection — nobody who is on any thread being offered —
+    /// so every pair the grammar admits is a pair that works. See
+    /// [`crate::sim::Sim::invitees_for`].
+    Invitees,
     /// Who this character could start a conversation with and has not.
     ///
     /// Deliberately excludes people it is already talking to: reaching out to
@@ -983,6 +1137,30 @@ pub enum Choices {
     /// fixed one so the ordinary empty-set rule takes `engage` out of a library
     /// instead of a special case doing it.
     Postures,
+}
+
+impl Choices {
+    /// Whether an empty set means the act cannot be performed.
+    ///
+    /// **Two kinds of closed set live in this enum, and the empty-set rule is
+    /// right for only one of them.**
+    ///
+    /// Nearly all of these enumerate what is *possible*: who is in the room,
+    /// where there is a way to, what is in the pack. An empty one is the world
+    /// saying no — there is nobody to address, nowhere to walk, nothing to hand
+    /// over — and the act genuinely cannot happen, so it leaves the grammar.
+    /// That rule is load-bearing and every one of those sets keeps it.
+    ///
+    /// [`Choices::Feelings`] is the other kind: a *vocabulary*. It does not say
+    /// whether a character has a feeling — it always does — only which words
+    /// the mind has written moods for. An empty one means nobody has authored
+    /// the vocabulary yet, and applying the empty-set rule to it would take
+    /// away the character's ability to **stop**, which is how the pacing came
+    /// back the last time. So it falls back to free text: unsteered, still
+    /// answered, still required.
+    pub fn steers(self) -> bool {
+        !matches!(self, Choices::Feelings)
+    }
 }
 
 /// A closed set fixed in the catalog rather than supplied by the world.
@@ -1031,18 +1209,24 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("send_image", "to", Choices::Threads),
     // ---- the phone ----
     ("message", "to", Choices::Threads),
-    ("invite", "to", Choices::Threads),
-    ("invite", "who", Choices::Contacts),
+    // Not `Threads`: a character may bring somebody into a conversation, and
+    // may not bring them into the one they are already on. The world's channel
+    // holds everybody, so it is never a place anybody can be invited to. See
+    // [`Choices::Invitable`].
+    ("invite", "to", Choices::Invitable),
+    // Not `Contacts`: the two arms of an invite have to agree, and a set of
+    // people narrowed without reference to the threads on offer still admits a
+    // pair that cannot work. See [`Choices::Invitees`].
+    ("invite", "who", Choices::Invitees),
     ("open_group", "with", Choices::Contacts),
-    ("sign_off", "to", Choices::Threads),
+    // Not `Threads`: a character may leave a conversation it is in, and may not
+    // leave the world's open channel. See [`Choices::Leavable`].
+    ("sign_off", "to", Choices::Leavable),
     ("reach_out", "to", Choices::Contacts),
-    // Not [`Choices::Company`]: somebody already waiting on *you* is excluded,
-    // which is what makes two characters waiting at each other impossible.
-    ("wait_for", "who", Choices::Waitable),
-    ("wait_for", "for", Choices::WaitKind),
+    ("reflect", "feeling", Choices::Feelings),
     ("move_to", "destination", Choices::Reachable),
     // ---- contact and obligation ----
-    ("touch", "to", Choices::Company),
+    ("act", "on", Choices::CompanyOrSelf),
     ("give", "what", Choices::Carried),
     ("give", "to", Choices::Company),
     ("promise", "to", Choices::Company),
@@ -1050,8 +1234,15 @@ const LIVE: &[(&str, &str, Choices)] = &[
     // Bound to what this person actually owes you, so reminding somebody of a
     // thing they never promised is not a mistake available to a character.
     ("remind", "which", Choices::Owed),
+    // Somewhere this character is not. Bound to the places it could walk to,
+    // which is a narrowing of "anywhere on the map" and the right one: a name
+    // the world handed it cannot be a name that does not exist. A world with
+    // nowhere to go has nothing to look at either, and `scan` leaves the
+    // grammar by the ordinary empty-set rule.
+    ("scan", "at", Choices::Reachable),
     // ---- working the world ----
     ("read", "what", Choices::Readable),
+    ("post_notice", "on", Choices::Postable),
     ("claim", "what", Choices::Claimable),
     ("operate", "what", Choices::Operable),
     ("operate", "mode", Choices::DeviceModes),
@@ -1079,13 +1270,17 @@ pub struct Within {
     /// Empty for a character with nowhere to go, which takes `move_to` out of
     /// the grammar entirely.
     pub places: Vec<String>,
-    /// Which of [`Self::company`] are already waiting on **this** character.
+    /// Acts this body has taken too recently to take again — see
+    /// [`crate::engine::cooldown`].
     ///
-    /// Subtracted from what it may wait on, so a pair cannot wait at each
-    /// other — see [`Choices::Waitable`]. Not subtracted from what it may
-    /// *address*: somebody waiting on you is the most natural person in the
-    /// room to speak to, and that is the whole point of telling you.
-    pub waited_on_by: Vec<String>,
+    /// Struck from the grammar rather than refused afterwards, the same as
+    /// everything else here: a character cannot get stuck emitting an act it
+    /// has no way to say. Nearly always empty.
+    pub cooling: Vec<String>,
+    /// The registers `<mind>/moods/` has a mood written for — see
+    /// [`Choices::Feelings`]. The same list for every character in the daemon,
+    /// because the library is ingested untagged and shared.
+    pub feelings: Vec<String>,
 
     /// Everything in the pack, by the name the world wrote for it.
     pub carried: Vec<String>,
@@ -1125,14 +1320,33 @@ pub struct Within {
     pub claimable: Vec<String>,
     /// What there is here to read.
     pub readable: Vec<String>,
+    /// The surfaces here that can be written on, whether or not anything is on
+    /// them yet — see [`Choices::Postable`].
+    pub postable: Vec<String>,
     /// The stances available, which is nothing at all when nothing is hostile.
     pub postures: Vec<String>,
     /// The conversations on this character's phone, as it names them.
     pub threads: Vec<String>,
+    /// The subset of [`Self::threads`] it is able to leave — see
+    /// [`Choices::Leavable`].
+    pub leavable: Vec<String>,
+    /// The subset of [`Self::threads`] somebody could still be brought into —
+    /// see [`Choices::Invitable`].
+    pub invitable: Vec<String>,
+    /// Who could be brought into any of [`Self::invitable`] — see
+    /// [`Choices::Invitees`].
+    pub invitees: Vec<String>,
     /// Who it could start one with and has not.
     pub contacts: Vec<String>,
     /// The acts the parts standing here carry, straight off the map.
     pub station: Vec<String>,
+    /// Whether this body is standing somewhere that is not where it musters
+    /// from — what [`Availability::AwayFromHome`] reads.
+    ///
+    /// `false` for a body with no world and for one standing at home, both of
+    /// which are the same answer to the only question it is asked: is there a
+    /// journey home to make.
+    pub away_from_home: bool,
     /// This character's own name, as the world writes it.
     ///
     /// Needed because some live sets are about the *relationship* between this
@@ -1208,28 +1422,27 @@ impl Within {
             .collect();
         let _ = body;
         self.claimable = sim.claimable_at(place);
-        self.readable = sim.readable_at(place);
+        // By body id, not by display name: a read cursor is bookkeeping nobody
+        // addresses, so it keys on the thing a rename cannot move.
+        self.readable = sim.readable_at(place, body);
+        self.postable = sim.postable_at(place);
         self.station = sim.station_tools(place);
+        // A world with no muster point is one nobody can be called back to, so
+        // there is no journey home from anywhere in it.
+        self.away_from_home = sim.homes().iter().any(|home| home != place);
         // The phone. Empty without a handset in the pack, which is what takes
         // every messaging act out of the grammar for somebody who has not got
         // one — or has had it taken off them.
         self.threads = sim.threads_for(&self.me, body);
+        self.leavable = sim.leavable_for(&self.me, body);
+        self.invitable = sim.invitable_for(&self.me, body);
+        self.invitees = sim.invitees_for(&self.me, body);
         self.contacts = sim.contacts_for(&self.me, body);
         self
     }
 
     pub fn alone(&self) -> bool {
         self.company.is_empty()
-    }
-
-    /// Who this character may put a wait on: company, less anyone already
-    /// waiting on it.
-    pub fn waitable(&self) -> Vec<String> {
-        self.company
-            .iter()
-            .filter(|n| !self.waited_on_by.contains(n))
-            .cloned()
-            .collect()
     }
 }
 
@@ -1257,6 +1470,11 @@ impl Within {
 pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
     CATALOG
         .iter()
+        // **A body that has just done this cannot do it again yet.** Absent
+        // rather than refused, for the reason every other absence here is: a
+        // refusal is the most recent thing in the character's window, and a
+        // live cast read its own refusals back and emitted the same act again.
+        .filter(|t| !within.cooling.iter().any(|c| c == t.name))
         .filter(|t| match t.availability {
             Availability::Always => true,
             Availability::MessagingOnly => mode.remote(),
@@ -1267,6 +1485,8 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             // in [`for_body`], which is what builds its prompt.
             Availability::Embodied => true,
             Availability::Nearby => !within.alone(),
+            // A journey home is only a journey from somewhere else.
+            Availability::AwayFromHome => within.away_from_home,
             // The map decides. A station in the room is what puts its acts in
             // reach, and walking out takes them with you.
             Availability::AtPart => within.station.iter().any(|s| s == t.name),
@@ -1315,7 +1535,15 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
                     // names something present is the machinery declining to let
                     // it name what is not.
                     enum_values: match live_choice(t.name, p.name) {
-                        Some(c) => Some(live_set(c, within)),
+                        // **A vocabulary with nothing in it steers nothing.**
+                        // The empty set here would be a branch with no arms, so
+                        // it falls back to free text — see [`Choices::steers`]
+                        // for why that is right for a vocabulary and wrong for
+                        // everything else.
+                        Some(c) => match live_set(c, within) {
+                            v if v.is_empty() => None,
+                            v => Some(v),
+                        },
                         // Not world-enumerated. A fixed set is still a closed
                         // branch — the difference is only who computed it.
                         None => fixed_values(t.name, p.name)
@@ -1365,9 +1593,15 @@ fn live_set(choice: Choices, within: &Within) -> Vec<String> {
 fn live_values(choice: Choices, within: &Within) -> Vec<String> {
     match choice {
         Choices::Company => within.company.clone(),
-        Choices::Waitable => within.waitable(),
+        Choices::CompanyOrSelf => {
+            // Yourself last: the offered order is the order the model reads, and
+            // acting on somebody else is the ordinary case.
+            let mut who = within.company.clone();
+            who.push(SELF.to_string());
+            who
+        }
         Choices::Reachable => within.places.clone(),
-        Choices::WaitKind => wait_kinds(within),
+        Choices::Feelings => within.feelings.clone(),
         Choices::Carried => within.carried.clone(),
         Choices::Equippable => within.equippable.clone(),
         Choices::Usable => within.usable.clone(),
@@ -1381,8 +1615,12 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Owed => within.owed.clone(),
         Choices::Claimable => within.claimable.clone(),
         Choices::Readable => within.readable.clone(),
+        Choices::Postable => within.postable.clone(),
         Choices::Postures => within.postures.clone(),
         Choices::Threads => within.threads.clone(),
+        Choices::Leavable => within.leavable.clone(),
+        Choices::Invitable => within.invitable.clone(),
+        Choices::Invitees => within.invitees.clone(),
         Choices::Contacts => within.contacts.clone(),
     }
 }
@@ -1392,11 +1630,9 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
 fn live_empty(tool: &str, param: &str, within: &Within) -> bool {
     // **Asked, not assumed, and asked of the same function the spec is built
     // from.** An earlier version answered some of these from a constant on the
-    // reasoning that a closed set is never empty — but [`wait_kinds`] filters
-    // by where the character is standing, so its set is as live as any other,
-    // and it is non-empty today only because `someone_arrives` survives every
-    // branch of that filter. That is a property of one string in one constant
-    // and nothing checks it.
+    // reasoning that a closed set is never empty. That reasoning was wrong for
+    // any set filtered by where the character is standing — which most of them
+    // are — and it was wrong in the direction that does not announce itself.
     //
     // Were it to stop being true, the parameter would be *kept* by a check that
     // believed it had values and then *built* with an empty enum: a branch with
@@ -1405,6 +1641,10 @@ fn live_empty(tool: &str, param: &str, within: &Within) -> bool {
     // free-decodes prose where a call belongs. Two sources of truth for one
     // question is the whole bug; there is now one.
     match live_choice(tool, param) {
+        // A vocabulary is never *empty* in the sense this question is asking —
+        // see [`Choices::steers`]. It falls back to free text, so the parameter
+        // stays and its act stays with it.
+        Some(c) if !c.steers() => false,
         Some(c) => live_set(c, within).is_empty(),
         // A fixed set is written down in this file and cannot go empty without
         // somebody deleting it, but the same argument applies, so it is checked
@@ -1496,10 +1736,7 @@ mod tests {
         // In company, because `tell` needs somebody to tell — alone it is not
         // in the grammar at all, which is the point of
         // [`a_character_alone_cannot_reach_the_acts_that_need_company`].
-        let specs = specs_within(
-            Mode::Physical,
-            &Within::among(&["Maker-02"]),
-        );
+        let specs = specs_within(Mode::Physical, &Within::among(&["Maker-02"]));
         // Not the whole catalog: a room with company but nothing in it offers
         // no `gather`, no `operate`, no `produce`, because those bind required
         // arguments to sets this world has nothing in. That is the empty-set
@@ -1508,7 +1745,7 @@ mod tests {
         // `give` is absent from this list on purpose: it binds `what` to the
         // pack, and a character carrying nothing has nothing to hand over.
         // Company is necessary for it and not sufficient.
-        for expected in ["say", "tell", "ask", "gesture", "touch", "promise"] {
+        for expected in ["say", "tell", "ask", "gesture", "act", "promise"] {
             assert!(
                 specs.iter().any(|s| s.name == expected),
                 "`{expected}` was dropped in a room with somebody in it"
@@ -1766,94 +2003,131 @@ mod tests {
     /// thing that actually has to work.
     #[test]
     fn the_grammar_compiles_for_an_empty_room_and_for_a_full_one() {
-        use candle_conversation::stencil::{compile, compile_action_loop, TestVocab, ToolCallEnvelope};
-
-        let env = ToolCallEnvelope {
-            open: "\n{\"name\": \"".to_string(),
-            args_open: ", \"arguments\": {".to_string(),
-            close: "}}\n</tool_call>".to_string(),
-            marker: "<tool_call>".to_string(),
+        use candle_conversation::stencil::{
+            compile, compile_action_loop, TestVocab, ToolCallEnvelope,
         };
-        for within in [
-            Within::nowhere(),
-            Within::among(&["Perrin Vastwood"]),
-            Within::among(&["Perrin Vastwood", "Orion Vance"]),
-            // The room where everybody present is already waiting on you: the
-            // `who` list is empty while the company is not, which is the shape
-            // that produced a zero-arm branch the first time.
-            Within {
-                waited_on_by: vec!["Perrin Vastwood".into()],
-                ..Within::among(&["Perrin Vastwood"])
-            },
-            // Nowhere to walk to: `move_to` has a *required* destination, so
-            // the act goes rather than the parameter — the other half of the
-            // empty-set rule, and the half that would otherwise leave a
-            // zero-arm branch and stop the whole grammar compiling.
-            Within {
-                places: Vec::new(),
-                ..Within::among(&["Perrin Vastwood"])
-            },
-            // **Exactly one thread, and exactly one contact.** A live set of
-            // one is the ordinary state of a character that has spoken to one
-            // person — and it is the state the daemon was observed failing in,
-            // every four seconds, with `branch arm "none\"" tokenizes empty`
-            // and the whole turn falling through to a free decode.
-            Within {
-                threads: vec!["none".into()],
-                contacts: vec!["Wren Wylde".into()],
-                ..Within::among(&["Perrin Vastwood"])
-            },
-            // **Two threads of the same name.** A live set is a set only by
-            // intention: nothing stops a character opening two groups called
-            // the same thing, and two identical arms tokenize to one common
-            // prefix with nothing left over, which is
-            // `BuildError::EmptyArm` — the whole grammar, gone, for every turn
-            // that character takes afterwards.
-            Within {
-                threads: vec!["none".into(), "none".into()],
-                ..Within::among(&["Perrin Vastwood"])
-            },
-        ] {
-            let specs = specs_within(Mode::Physical, &within);
-            assert!(!specs.is_empty(), "no acts at all for {within:?}");
-            // No parameter may carry an empty closed set — that is the node the
-            // compile refuses, and naming it here says which act is at fault
-            // rather than which node number.
-            for t in &specs {
-                for p in &t.params {
-                    assert!(
-                        p.enum_values.as_ref().is_none_or(|v| !v.is_empty()),
-                        "`{}` offers `{}` with nothing to choose, in {within:?}",
-                        t.name,
-                        p.name
-                    );
+
+        // **Both call shapes, because both are shipped.** The catalog has to
+        // compile into whichever syntax the loaded checkpoint's template says —
+        // and the two differ structurally, not just in their strings, so a
+        // catalog that is a valid grammar in one is not thereby a valid grammar
+        // in the other. An empty arm, a duplicate arm, a name that tokenizes to
+        // nothing: each has to be absent from both.
+        for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
+            for within in [
+                Within::nowhere(),
+                Within::among(&["Perrin Vastwood"]),
+                Within::among(&["Perrin Vastwood", "Orion Vance"]),
+                // Nowhere to walk to: `move_to` has a *required* destination, so
+                // the act goes rather than the parameter — the other half of the
+                // empty-set rule, and the half that would otherwise leave a
+                // zero-arm branch and stop the whole grammar compiling.
+                Within {
+                    places: Vec::new(),
+                    ..Within::among(&["Perrin Vastwood"])
+                },
+                // **Exactly one thread, and exactly one contact.** A live set of
+                // one is the ordinary state of a character that has spoken to one
+                // person — and it is the state the daemon was observed failing in,
+                // every four seconds, with `branch arm "none\"" tokenizes empty`
+                // and the whole turn falling through to a free decode.
+                Within {
+                    threads: vec!["none".into()],
+                    contacts: vec!["Wren Wylde".into()],
+                    ..Within::among(&["Perrin Vastwood"])
+                },
+                // **Two threads of the same name.** A live set is a set only by
+                // intention: nothing stops a character opening two groups called
+                // the same thing, and two identical arms tokenize to one common
+                // prefix with nothing left over, which is
+                // `BuildError::EmptyArm` — the whole grammar, gone, for every turn
+                // that character takes afterwards.
+                Within {
+                    threads: vec!["none".into(), "none".into()],
+                    ..Within::among(&["Perrin Vastwood"])
+                },
+                // **Mid-fight, with everything physical cooling at once.** The
+                // state a character reaches by throwing a punch and then walking:
+                // three acts gone from the catalog in the same turn. Whatever is
+                // left has to still be a grammar, or the fight ends in a free
+                // decode.
+                Within {
+                    cooling: vec!["move_to".into(), "act".into(), "gesture".into()],
+                    ..Within::among(&["Perrin Vastwood"])
+                },
+            ] {
+                let specs = specs_within(Mode::Physical, &within);
+                assert!(!specs.is_empty(), "no acts at all for {within:?}");
+                // No parameter may carry an empty closed set — that is the node the
+                // compile refuses, and naming it here says which act is at fault
+                // rather than which node number.
+                for t in &specs {
+                    for p in &t.params {
+                        assert!(
+                            p.enum_values.as_ref().is_none_or(|v| !v.is_empty()),
+                            "`{}` offers `{}` with nothing to choose, in {within:?}",
+                            t.name,
+                            p.name
+                        );
+                    }
                 }
+                let spec = compile_action_loop(&specs, &env, ACTS_PER_TURN, "<|im_end|>", None)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "the grammar will not build for {within:?} in {:?}: {e}",
+                            env.style
+                        )
+                    });
+                compile(&spec, &TestVocab::new()).unwrap_or_else(|e| {
+                    panic!(
+                        "the grammar will not compile for {within:?} in {:?}: {e}",
+                        env.style
+                    )
+                });
             }
-            let spec = compile_action_loop(&specs, &env, ACTS_PER_TURN, "<|im_end|>", None)
-                .unwrap_or_else(|e| panic!("the grammar will not build for {within:?}: {e}"));
-            compile(&spec, &TestVocab::new())
-                .unwrap_or_else(|e| panic!("the grammar will not compile for {within:?}: {e}"));
         }
     }
 
-    /// The act that keeps its aim optional: alone, `gesture` stays but its `to`
-    /// goes — a thing shown to nobody is still a thing you can do.
+    /// The act that keeps its aim optional: alone, `use` stays but its `on`
+    /// goes — a stimpak used on nobody is still a stimpak used.
+    ///
+    /// This was `gesture` until gesture came to need company. The rule it
+    /// demonstrates is unchanged and is the other half of the empty-set rule: a
+    /// *required* parameter with nothing to choose takes its act out of the
+    /// grammar, an *optional* one takes only itself.
     #[test]
     fn an_optional_addressee_drops_rather_than_emptying_its_branch() {
-        let alone = specs_within(Mode::Physical, &Within::nowhere());
-        let g = alone.iter().find(|t| t.name == "gesture").expect("kept");
+        let alone = Within {
+            usable: vec!["a stimpak".into()],
+            ..Within::nowhere()
+        };
+        let specs = specs_within(Mode::Physical, &alone);
+        let g = specs.iter().find(|t| t.name == "use").expect("kept");
         assert!(
-            g.params.iter().all(|p| p.name != "to"),
+            g.params.iter().all(|p| p.name != "on"),
             "an aim at nobody: {:?}",
             g.params.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
-        assert!(g.params.iter().any(|p| p.name == "intent"), "still shows something");
+        assert!(
+            g.params.iter().any(|p| p.name == "what"),
+            "still uses something"
+        );
 
-        let with = Within::among(&["Perrin Vastwood"]);
+        let with = Within {
+            usable: vec!["a stimpak".into()],
+            ..Within::among(&["Perrin Vastwood"])
+        };
         let together = specs_within(Mode::Physical, &with);
-        let g = together.iter().find(|t| t.name == "gesture").unwrap();
-        let to = g.params.iter().find(|p| p.name == "to").expect("aimable again");
-        assert_eq!(to.enum_values.as_deref(), Some(&["Perrin Vastwood".to_string()][..]));
+        let g = together.iter().find(|t| t.name == "use").unwrap();
+        let to = g
+            .params
+            .iter()
+            .find(|p| p.name == "on")
+            .expect("aimable again");
+        assert_eq!(
+            to.enum_values.as_deref(),
+            Some(&["Perrin Vastwood".to_string()][..])
+        );
     }
 
     /// **No parameter may declare a type the grammar cannot bound.**
@@ -1923,6 +2197,11 @@ mod tests {
         within.claimable = vec!["fabricator 1".into()];
         within.readable = vec!["the muster board".into()];
         within.owed = vec!["the eastern span".into()];
+        // **The widest closed set in the catalog by a factor of ten.** The
+        // shipped mind holds a hundred and sixteen moods, and `pause` offers
+        // every one — so this is the arm most likely to be the one that puts a
+        // future change over the bound.
+        within.feelings = (0..116).map(|i| format!("mood-{i}")).collect();
 
         let specs = specs_within(Mode::Physical, &within);
         let paths = estimated_paths(&specs);
@@ -1967,20 +2246,33 @@ mod tests {
             .into_iter()
             .map(|t| t.name)
             .collect();
-        assert!(!alone.contains(&"ask".to_string()), "{alone:?}");
-        assert!(!alone.contains(&"tell".to_string()), "{alone:?}");
-        // What it can still do alone is untouched — including speaking, which
-        // needs no addressee.
-        assert!(alone.contains(&"say".to_string()), "{alone:?}");
+        for needs_company in ["ask", "tell", "say", "gesture"] {
+            assert!(
+                !alone.contains(&needs_company.to_string()),
+                "`{needs_company}` reaches nobody and was offered anyway: {alone:?}"
+            );
+        }
+        // **`say` and `gesture` are in that list**, which they were not. Speech
+        // into an empty room reaches nobody and changes nothing, and offering
+        // it produced a cast that narrated the scenery at itself: three
+        // characters alone in three rooms, saying every noise the building made
+        // back out loud, twelve of the last fourteen acts in the feed.
+        //
+        // What it can still do alone is untouched.
         assert!(alone.contains(&"move_to".to_string()), "{alone:?}");
+        assert!(alone.contains(&"reflect".to_string()), "{alone:?}");
 
-        // And with nowhere to go, walking leaves the grammar too.
+        // And with nowhere to go, walking leaves the grammar too — while
+        // **stopping never does**. It is the floor: a character with nobody to
+        // speak to and nowhere to walk must still have a way to spend a turn,
+        // and `pause` is the one act that is always available whatever the room
+        // is like.
         let stuck: Vec<String> = specs_within(Mode::Physical, &Within::nowhere())
             .into_iter()
             .map(|t| t.name)
             .collect();
         assert!(!stuck.contains(&"move_to".to_string()), "{stuck:?}");
-        assert!(stuck.contains(&"say".to_string()), "{stuck:?}");
+        assert!(stuck.contains(&"reflect".to_string()), "{stuck:?}");
 
         let with = Within::among(&["Perrin Vastwood"]);
         let together: Vec<String> = specs_within(Mode::Physical, &with)
@@ -2018,107 +2310,176 @@ mod tests {
         assert!(say.params.iter().all(|p| p.enum_values.is_none()));
     }
 
-    /// **Two characters cannot wait at each other.**
+    /// **Stopping has nothing to *choose*, anywhere.**
     ///
-    /// Waiting on somebody wakes them, so if they could wait back the pair
-    /// would ping-pong — each waking the other to do nothing, a decode a turn,
-    /// worse than the deadlock it replaced. Struck from the branch, the only
-    /// thing left to do is act.
+    /// The whole reason it replaced the typed wait. That act needed a condition
+    /// the world could answer, which needed a live set of kinds filtered by who
+    /// was in the room, which needed a rule excluding anybody already waiting on
+    /// you so a pair could not wait at each other — and every one of those was a
+    /// closed branch that could go empty and take the whole grammar with it.
+    ///
+    /// What a pause takes instead is free text about the character's own head,
+    /// which the world never has to answer and which therefore cannot be empty.
     #[test]
-    fn somebody_already_waiting_on_you_cannot_be_waited_on_back() {
-        let mutual = Within {
-            waited_on_by: vec!["Perrin Vastwood".into()],
-            ..Within::among(&["Perrin Vastwood", "Orion Vance"])
-        };
-        let specs = specs_within(Mode::Physical, &mutual);
-        let w = specs.iter().find(|t| t.name == "wait_for").expect("offered");
-        let who = w.params.iter().find(|p| p.name == "who").unwrap();
-        assert_eq!(
-            who.enum_values.as_deref(),
-            Some(&["Orion Vance".to_string()][..]),
-            "the one already waiting is still on the list"
-        );
-
-        // **But they may still be spoken to** — being waited on is the best
-        // reason in the room to say something to somebody, and telling them is
-        // the whole point.
-        let ask = specs.iter().find(|t| t.name == "ask").unwrap();
-        let to = ask.params.iter().find(|p| p.name == "to").unwrap();
+    fn stopping_has_nothing_to_choose_and_so_cannot_go_wrong() {
+        for within in [
+            Within::nowhere(),
+            Within::among(&["Perrin Vastwood"]),
+            Within::among(&["Perrin Vastwood", "Orion Vance"]),
+        ] {
+            let specs = specs_within(Mode::Physical, &within);
+            let p = specs
+                .iter()
+                .find(|t| t.name == "reflect")
+                .expect("a character can always stop");
+            for param in &p.params {
+                assert!(
+                    param.enum_values.is_none(),
+                    "`{}` is a closed set, so a pause can now be taken out of the grammar by an \
+                     empty room",
+                    param.name
+                );
+            }
+        }
         assert!(
-            to.enum_values
-                .as_deref()
-                .is_some_and(|v| v.contains(&"Perrin Vastwood".to_string())),
-            "the one waiting on you became unaddressable"
+            by_name("wait_for").is_none(),
+            "`wait_for` is back — one concept, one act"
         );
     }
 
-    /// When everybody present is already waiting on you, the act goes — rather
-    /// than staying with nobody to name, which is the zero-arm branch that
-    /// silently stops the whole grammar compiling.
+    /// **Stopping asks what is on your mind, and it is not optional.**
+    ///
+    /// It is the one act whose outward half is nothing at all, so without this
+    /// the record of a character's quietest hours is a column of identical rows
+    /// and there is no telling a character that is thinking from one that has
+    /// run out of things to do.
     #[test]
-    fn waiting_is_unreachable_when_everybody_here_is_waiting_on_you() {
-        let cornered = Within {
-            waited_on_by: vec!["Perrin Vastwood".into()],
+    fn stopping_asks_what_the_character_is_thinking() {
+        let p = by_name("reflect").expect("a character can always stop and think");
+        let thoughts = p
+            .params
+            .iter()
+            .find(|p| p.name == "inner_thoughts")
+            .expect("a pause says nothing about the inside");
+        assert!(thoughts.required, "a silent pause records nothing at all");
+
+        // **Every one of them, always.** A field a model may skip is a field a
+        // model does skip, and the quiet turns are exactly the ones with
+        // nothing else in them to read. "Nothing has settled" is an answer, and
+        // the description says so — which is what keeps a required reflection
+        // from becoming an invented conviction.
+        for name in ["inner_thoughts", "feeling", "my_reflections"] {
+            let param = p
+                .params
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("a pause does not ask `{name}`"));
+            assert!(param.required, "`{name}` is one a character may skip");
+        }
+    }
+
+    /// **How it feels is chosen from the moods the mind actually holds.**
+    ///
+    /// A free-text register is a word nothing downstream can act on. Steered to
+    /// the library, a character naming `cornered` has named a register the
+    /// projection can select, which is what makes it worth recording at all.
+    #[test]
+    fn how_a_character_feels_is_one_of_the_registers_the_mind_holds() {
+        let held = Within {
+            feelings: vec!["alert".into(), "cornered".into(), "battle_weary".into()],
             ..Within::among(&["Perrin Vastwood"])
         };
-        let specs = specs_within(Mode::Physical, &cornered);
-        let w = specs.iter().find(|t| t.name == "wait_for").expect("kept");
-        assert!(
-            w.params.iter().all(|p| p.name != "who"),
-            "an aim at nobody: {:?}",
-            w.params.iter().map(|p| &p.name).collect::<Vec<_>>()
+        let specs = specs_within(Mode::Physical, &held);
+        let p = specs.iter().find(|t| t.name == "reflect").expect("offered");
+        let feeling = p
+            .params
+            .iter()
+            .find(|p| p.name == "feeling")
+            .expect("nowhere to say how it feels");
+        assert_eq!(
+            feeling.enum_values.as_deref(),
+            Some(
+                &[
+                    "alert".to_string(),
+                    "cornered".to_string(),
+                    "battle_weary".to_string()
+                ][..]
+            )
         );
-        // The ambient wait survives — it asks nothing of anybody.
-        assert!(w.params.iter().any(|p| p.name == "for"));
     }
 
-    /// The kinds are a closed set the world can answer, not free text — the
-    /// defect the old `wait` had, where `until` was prose nothing could read.
+    /// **A daemon with no moods still stops, and is still asked.**
+    ///
+    /// A vocabulary is not a possibility — see [`Choices::steers`]. An empty
+    /// list of registers means nobody has authored the words yet, not that the
+    /// character has no feeling, so the parameter falls back to free text
+    /// rather than emptying its branch and taking `pause` out of the grammar.
+    /// A character that cannot stop is how the pacing came back last time.
     #[test]
-    fn what_a_wait_is_for_is_a_closed_set() {
+    fn a_daemon_with_no_moods_can_still_stop_and_is_still_asked() {
         let specs = specs_within(Mode::Physical, &Within::nowhere());
-        let w = specs.iter().find(|t| t.name == "wait_for").unwrap();
-        let f = w.params.iter().find(|p| p.name == "for").unwrap();
-        assert!(f.required, "a wait with no named condition is the old `wait`");
-        // **Alone, only arrival can happen.** Waiting for speech in an empty
-        // room is waiting for nothing, and a scattered cast chose exactly that
-        // almost every turn — each alone, each waiting for a voice that could
-        // not come until somebody walked in.
-        assert_eq!(
-            f.enum_values.as_deref(),
-            Some(&["someone_arrives".to_string()][..])
-        );
+        let p = specs
+            .iter()
+            .find(|t| t.name == "reflect")
+            .expect("a mindless daemon took away stopping");
 
-        // In company all three are back: there is now somebody who could speak,
-        // and somebody who could leave.
-        let together = specs_within(Mode::Physical, &Within::among(&["Perrin Vastwood"]));
-        let w = together.iter().find(|t| t.name == "wait_for").unwrap();
-        let f = w.params.iter().find(|p| p.name == "for").unwrap();
-        assert_eq!(
-            f.enum_values.as_deref().map(|v| v.len()),
-            Some(WAIT_KINDS.len())
-        );
-
-        // **And speech is not a thing you may wait for while somebody is
-        // waiting on you to speak.** Excluding them from `who` was not enough:
-        // an unnamed wait names nobody, so both could make one and neither was
-        // struck from the other's list. A live cast went completely silent on
-        // exactly that — every act in the feed a `wait_for`.
-        let cornered = specs_within(
-            Mode::Physical,
-            &Within {
-                waited_on_by: vec!["Perrin Vastwood".into()],
-                ..Within::among(&["Perrin Vastwood"])
-            },
-        );
-        let w = cornered.iter().find(|t| t.name == "wait_for").unwrap();
-        let f = w.params.iter().find(|p| p.name == "for").unwrap();
-        let kinds = f.enum_values.as_deref().unwrap();
+        let feeling = p
+            .params
+            .iter()
+            .find(|p| p.name == "feeling")
+            .expect("the question went with the vocabulary");
         assert!(
-            !kinds.contains(&"someone_speaks".to_string()),
-            "it can answer a wait with a wait: {kinds:?}"
+            feeling.required,
+            "it became skippable rather than unsteered"
         );
-        assert!(!kinds.is_empty(), "an empty branch stops the grammar compiling");
+        assert!(
+            feeling.enum_values.is_none(),
+            "a branch with no arms, which stops the whole grammar compiling"
+        );
+    }
+
+    /// **The vocabulary rule applies to exactly one set.**
+    ///
+    /// Every other closed set here enumerates what is *possible*, and an empty
+    /// one has to take its act out of the grammar — `ask` with nobody to name,
+    /// `move_to` with nowhere to go. Loosening that for anything else would
+    /// turn a refusal a character cannot learn from into a branch it can
+    /// free-decode into.
+    #[test]
+    fn only_a_vocabulary_survives_being_empty() {
+        for c in [
+            Choices::Company,
+            Choices::CompanyOrSelf,
+            Choices::Reachable,
+            Choices::Carried,
+            Choices::Operable,
+            Choices::Threads,
+            Choices::Postures,
+        ] {
+            assert!(c.steers(), "{c:?} stopped meaning what is possible");
+        }
+        assert!(!Choices::Feelings.steers());
+    }
+
+    /// **Two characters cannot deadlock on it.**
+    ///
+    /// The old wait needed a dedicated rule for this: waiting on somebody woke
+    /// them, so if they could wait back the pair ping-ponged, and a live cast
+    /// went completely silent — every act in the feed a `wait_for`. A pause
+    /// wakes nobody and is on nobody, so two characters pausing at each other
+    /// each come back on their own clock.
+    #[test]
+    fn two_characters_pausing_at_each_other_both_come_back() {
+        let together = Within::among(&["Perrin Vastwood"]);
+        let specs = specs_within(Mode::Physical, &together);
+        assert!(specs.iter().any(|t| t.name == "reflect"));
+        // And they can still speak to each other, which is the way out.
+        let ask = specs.iter().find(|t| t.name == "ask").unwrap();
+        let to = ask.params.iter().find(|p| p.name == "to").unwrap();
+        assert!(to
+            .enum_values
+            .as_deref()
+            .is_some_and(|v| v.contains(&"Perrin Vastwood".to_string())));
     }
 
     fn named(mode: Mode) -> Vec<&'static str> {
@@ -2132,20 +2493,31 @@ mod tests {
         assert!(named(Mode::InstantMessage).contains(&"send_image"));
     }
 
-    /// **A voice call is not a messaging channel, and collapsing the two handed
-    /// a character on the telephone a way to text a photo down it.**
+    /// **Carrying a picture is asked separately from being apart**, and it has
+    /// to stay that way even while the two answers agree.
     ///
-    /// The interaction contract gives `send_image` to video and to text and
-    /// withholds it from voice; a two-valued mode could not express that and so
-    /// did not. This is the regression test for the mode set itself.
+    /// They agree on both current modes, so nothing distinguishes the two
+    /// predicates by behaviour any more and `carries_pictures` could be deleted
+    /// in favour of `remote` without a single test going red. It must not be:
+    /// the questions are different — where the parties are, and what the
+    /// channel can carry — and the last time they were collapsed a character on
+    /// a voice call was handed a way to text a photo down it. This is the test
+    /// that says so out loud.
     #[test]
-    fn nobody_sends_a_picture_down_a_voice_call() {
-        assert!(!named(Mode::VoiceCall).contains(&"send_image"));
-        assert!(named(Mode::VideoCall).contains(&"send_image"));
-        // Leaving and opening a conversation belong to every remote channel,
-        // including the one that cannot carry a picture.
-        assert!(named(Mode::VoiceCall).contains(&"sign_off"));
-        assert!(named(Mode::VoiceCall).contains(&"reach_out"));
+    fn carrying_a_picture_is_a_question_about_the_channel() {
+        // Remote and carries a picture: writing.
+        assert!(Mode::InstantMessage.remote() && Mode::InstantMessage.carries_pictures());
+        // Neither — and *not* because the channel is too thin. There is no
+        // channel; you are standing in front of them holding the thing.
+        assert!(!Mode::Physical.remote() && !Mode::Physical.carries_pictures());
+        assert!(!named(Mode::Physical).contains(&"send_image"));
+    }
+
+    /// Leaving and opening a conversation belong to every remote channel.
+    #[test]
+    fn a_remote_channel_can_be_opened_and_left() {
+        assert!(named(Mode::InstantMessage).contains(&"sign_off"));
+        assert!(named(Mode::InstantMessage).contains(&"reach_out"));
     }
 
     /// **The phone is carried, not entered — so it is not gated by mode.**
@@ -2158,12 +2530,7 @@ mod tests {
     /// phone is offered them wherever it happens to be.
     #[test]
     fn the_phone_acts_are_not_gated_by_mode() {
-        for mode in [
-            Mode::Physical,
-            Mode::VideoCall,
-            Mode::VoiceCall,
-            Mode::InstantMessage,
-        ] {
+        for mode in [Mode::Physical, Mode::InstantMessage] {
             let acts = named(mode);
             for phone in ["message", "reach_out", "invite", "open_group", "sign_off"] {
                 assert!(
@@ -2174,13 +2541,113 @@ mod tests {
         }
     }
 
-    /// Touching somebody is the mirror of sending a picture: face to face only.
+    /// Laying a hand on somebody is the mirror of sending a picture: face to
+    /// face only.
     #[test]
     fn nobody_puts_a_hand_on_anybody_down_a_line() {
-        assert!(named(Mode::Physical).contains(&"touch"));
-        for remote in [Mode::VideoCall, Mode::VoiceCall, Mode::InstantMessage] {
-            assert!(!named(remote).contains(&"touch"), "{remote:?}");
+        assert!(named(Mode::Physical).contains(&"act"));
+        assert!(!named(Mode::InstantMessage).contains(&"act"));
+    }
+
+    /// **One word for one idea, on both sides of the room.** A character does
+    /// something to a person with `act`; the person at the console does it back
+    /// with `/act` (`engine::slash`). It was `touch` here, which read as gentle
+    /// contact in a game about a war and did not match the console — so the two
+    /// halves of one exchange had different names for the same thing.
+    #[test]
+    fn a_character_can_act_on_its_own_body() {
+        // **The addressee is grammar-constrained.** A value that is not in this
+        // set is one the decoder physically cannot emit, so a character binding
+        // its own wound could not say so — not because the world refused it,
+        // but because there was no token path to the sentence.
+        let with_company = Within {
+            company: vec!["Perrin Vastwood".into()],
+            ..Within::default()
+        };
+        let who = live_set(Choices::CompanyOrSelf, &with_company);
+        assert!(who.contains(&SELF.to_string()), "{who:?}");
+        assert!(who.contains(&"Perrin Vastwood".to_string()), "{who:?}");
+    }
+
+    /// And **alone**, where `company` is empty and the empty-set rule would
+    /// otherwise take the whole tool out of the grammar. Your own body is always
+    /// here, so `act` never leaves for want of somebody to act on.
+    ///
+    /// **That reachability is deliberate and it is not free.** A solitary cast
+    /// chose it every single turn, because the room kept handing it physical
+    /// things to notice and this was the nearest verb. The answer is the
+    /// cooldown a self-act serves, not taking the target away — see
+    /// [`crate::engine::cooldown::SELF_ACT`].
+    #[test]
+    fn acting_survives_being_alone() {
+        let alone = Within::default();
+        assert!(live_set(Choices::Company, &alone).is_empty());
+        assert_eq!(live_set(Choices::CompanyOrSelf, &alone), vec![SELF]);
+        let offered: Vec<String> = specs_within(Mode::Physical, &alone)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(
+            offered.contains(&"act".to_string()),
+            "a character alone lost the ability to act on itself: {offered:?}"
+        );
+    }
+
+    /// **An act a body has just taken is absent, not refused.**
+    ///
+    /// The same discipline as every other absence here, and for the same
+    /// reason: a live cast read its own refusals back as the most recent thing
+    /// in its window and emitted the same act again. Thirty-eight of its last
+    /// fifty acts were `move_to`.
+    #[test]
+    fn an_act_that_is_cooling_is_not_in_the_grammar_at_all() {
+        let ready = Within::among(&["Perrin Vastwood"]);
+        let name = |ts: &[ToolSpec]| ts.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+
+        let before = name(&specs_within(Mode::Physical, &ready));
+        assert!(before.contains(&"move_to".to_string()));
+        assert!(before.contains(&"act".to_string()));
+
+        let cooling = Within {
+            cooling: vec!["move_to".into()],
+            ..ready
+        };
+        let after = name(&specs_within(Mode::Physical, &cooling));
+        assert!(
+            !after.contains(&"move_to".to_string()),
+            "a body that just walked was offered another walk: {after:?}"
+        );
+        // And only that one. A cooldown that took the rest of the catalog with
+        // it would leave a character with nothing to do but stand there.
+        assert!(after.contains(&"act".to_string()));
+        assert!(after.contains(&"say".to_string()));
+        assert_eq!(after.len() + 1, before.len(), "{after:?}");
+    }
+
+    #[test]
+    fn every_act_that_cools_is_an_act_that_exists() {
+        // The table names acts by string. A rename would otherwise leave a
+        // cooldown on nothing, silently, and the act it was meant to slow would
+        // run free.
+        for (tool, _) in crate::engine::cooldown::all() {
+            assert!(
+                by_name(tool).is_some(),
+                "`{tool}` has a cooldown and is not in the catalog"
+            );
         }
+    }
+
+    #[test]
+    fn a_character_acts_on_somebody_with_the_same_word_the_console_uses() {
+        assert!(by_name("act").is_some());
+        assert!(
+            by_name("touch").is_none(),
+            "`touch` is back — one concept, one word, whichever side it comes from"
+        );
+        assert!(
+            crate::engine::slash::lookup("act").is_some(),
+            "the console lost /act, so the two sides no longer agree"
+        );
     }
 
     /// **A mind with no body is not offered a way to walk.**
@@ -2199,24 +2666,39 @@ mod tests {
             .map(|t| t.name)
             .collect();
 
-        for gone in ["move_to", "follow", "touch", "gather", "engage", "equip", "use", "recall"] {
+        for gone in [
+            "move_to", "follow", "act", "gather", "engage", "equip", "use",
+        ] {
             assert!(bodied.contains(&gone), "{gone} should exist for a body");
             assert!(
                 !bodiless.contains(&gone),
                 "{gone} was offered to a mind with no body"
             );
         }
-        // What it keeps is what it can actually do without a body: speak,
-        // attend, reach somewhere it is not, and read.
+        // What it keeps is what it can actually do without a body: attend,
+        // reach somewhere it is not, and read.
         //
-        // `command_tower` and `produce` are not in this list and should not be:
-        // they are reached by standing at a console or a bay, so they arrive
-        // with the situation rather than with the prompt — the same as every
-        // other station act. A mind with no body reaches them the same way
-        // anything else does, which is a question about where it is rather than
-        // about what it is.
-        for kept in ["say", "observe", "scan", "read"] {
+        // **`say` is not in this list and is not missing.** Speech needs
+        // somebody to hear it, so like `ask` and `tell` it arrives with the
+        // situation rather than with the prompt — this is `for_body`, which is
+        // the prompt's half and deliberately withholds everything conditional
+        // on the room. `command_tower` and `produce` are absent for the same
+        // reason, one step further out: they are reached by standing at a
+        // console or a bay.
+        for kept in ["scan", "read", "reflect"] {
             assert!(bodiless.contains(&kept), "{kept} was taken from Keeper");
+        }
+        // **`recall` is conditional on the *room* rather than on company, and
+        // it belongs here for the same reason.** A body standing at its own
+        // muster point has no journey home to make, so the act arrives with the
+        // situation once it is somewhere else. It was `Embodied` — true, and
+        // not enough: offered at home it reported crossing the building and
+        // moved nobody, twenty-four times in sixty acts.
+        for conditional in ["say", "ask", "tell", "gesture", "recall"] {
+            assert!(
+                !bodiless.contains(&conditional) && !bodied.contains(&conditional),
+                "{conditional} depends on the situation, so the prompt cannot know it"
+            );
         }
     }
 
@@ -2232,15 +2714,17 @@ mod tests {
     /// Every mode round-trips through the name the interaction contract uses.
     #[test]
     fn every_mode_answers_to_its_own_wire_name() {
-        for m in [
-            Mode::Physical,
-            Mode::VideoCall,
-            Mode::VoiceCall,
-            Mode::InstantMessage,
-        ] {
+        for m in [Mode::Physical, Mode::InstantMessage] {
             assert_eq!(Mode::parse(m.as_wire()), Some(m));
         }
         assert_eq!(Mode::parse("carrier pigeon"), None);
+        // The two that were removed are gone from the wire too, rather than
+        // quietly parsing to something else — a console still asking for a
+        // voice call gets a `bad_mode` naming what it can have, not a silent
+        // downgrade into a room.
+        for withdrawn in ["voice_call", "voice", "video_call", "video"] {
+            assert_eq!(Mode::parse(withdrawn), None, "{withdrawn} still parses");
+        }
     }
 
     /// **Every act declared in a module reaches the catalogue, exactly once.**
@@ -2290,7 +2774,14 @@ mod tests {
     /// pointlessly is not. See [`CATALOG`].
     #[test]
     fn the_catalog_covers_every_category_the_design_names() {
-        for c in ["Speech", "Movement", "Gesture", "Attention", "Messaging", "Meta"] {
+        for c in [
+            "Speech",
+            "Movement",
+            "Gesture",
+            "Attention",
+            "Messaging",
+            "Meta",
+        ] {
             assert!(
                 CATALOG.iter().any(|t| t.category == c),
                 "no tool in category {c}"

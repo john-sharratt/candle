@@ -33,13 +33,12 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::sleep::{DayAction, DayTracker};
-use crate::engine::waiting::Waiting;
 use crate::engine::window::Window;
 
 /// The slowest a wholly idle character thinks. Long, because a character with
@@ -50,10 +49,14 @@ pub const IDLE_HEARTBEAT: Duration = Duration::from_secs(120);
 /// The fastest a character settles back to after something happened.
 pub const ALERT_HEARTBEAT: Duration = Duration::from_secs(4);
 
-/// How much of the way back toward idle a character relaxes per quiet tick.
-/// Below 1.0 so alertness decays rather than snapping back — a character that
-/// heard something stays tight for a while, which is what reads as alert.
-const RELAX: f32 = 1.6;
+/// A character that is not scheduled to think at all.
+///
+/// **The ordinary state of a quiet character**, and the whole of what "no idle
+/// events" means: nothing is due, so nothing thinks, until the world puts
+/// something in its inbox. Spelled as a deadline past any clock rather than as
+/// an `Option`, so the one comparison in [`Scheduler::due_now`] answers both
+/// "is it time" and "is it scheduled".
+const NEVER: u64 = u64::MAX;
 
 /// The slowest a character is allowed to become.
 ///
@@ -112,8 +115,18 @@ impl Default for Pace {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Readiness {
-    /// Inbox empty, waiting on the heartbeat. Costs nothing.
-    Blocked,
+    /// Inbox empty. Costs nothing, and is where a character spends nearly all
+    /// of its life.
+    ///
+    /// **It was called `Blocked`, and that was a lie an instrument told.** Every
+    /// view of the cast reported the healthiest possible state with a word that
+    /// means stuck — and since idle ticks were removed this is the *resting*
+    /// state of every quiet character, not a rare one. It read as a fault to
+    /// everybody who saw it, including the people who wrote it.
+    ///
+    /// Its doc named a heartbeat too. There is no heartbeat: a character with an
+    /// empty inbox is waiting on the world, not on a clock.
+    Quiet,
     /// Events waiting; will tick at its scheduled moment.
     Pending,
     /// A high-salience arrival is forcing a tick now.
@@ -144,19 +157,24 @@ pub struct Inbox {
     /// character that has never been told anything is exactly the one the
     /// standing task is for.
     last_news_ms: u64,
-    /// What this character has stopped to wait for, if anything.
+    /// When this character last did something, measured from
+    /// [`Scheduler::born`].
     ///
-    /// Scheduling state, beside `heartbeat` and `due_at`, because that is what
-    /// a wait *is*: the character is not thinking until the thing happens or
-    /// the patience runs out. See [`crate::engine::waiting`].
-    waiting: Option<Waiting>,
-    /// Who was in the room when the wait was set.
+    /// Only a tick that produced **acts** sets it: a character can think and
+    /// decide to do nothing, and the question this answers is how long it has
+    /// been since it last *acted*, not since it last ran.
     ///
-    /// Arrivals and departures reach a character as one line of narrated prose,
-    /// so "did somebody come in" cannot be answered from the event stream — it
-    /// is answered by comparing the room then against the room now, and this is
-    /// *then*.
-    waiting_room: Vec<String>,
+    /// `None` until the first one, which is a different fact from "a long time
+    /// ago" and is shown as such.
+    last_act_at: Option<Duration>,
+    /// Set when the tick that is still running has already decided when the
+    /// next one is — by pausing, or by asking the world something it must come
+    /// back to read.
+    ///
+    /// It exists only to survive the line at the end of [`Scheduler::tick`],
+    /// which otherwise puts the deadline back to `NEVER` on the empty queue
+    /// both of those cases have by definition. Cleared there.
+    scheduled: bool,
     /// World time (ms) the standing task was last restated to this character.
     ///
     /// **The task has to be quiet about itself too.** It is not news, so it
@@ -182,69 +200,65 @@ impl Inbox {
             day: DayTracker::new(),
             ticks: 0,
             events_seen: 0,
-            waiting: None,
-            waiting_room: Vec::new(),
+            last_act_at: None,
+            scheduled: false,
             last_news_ms: 0,
             last_nudge_ms: 0,
         }
     }
 
-    /// Stop and wait. The character goes quiet until the wait is answered or
-    /// its patience runs out — whichever the world decides first.
-    pub fn begin_waiting(&mut self, waiting: Waiting, room: Vec<String>, now_ms: u64) {
-        // The deadline *is* the heartbeat while a wait stands. A character that
-        // kept its ordinary beat would go on thinking every four seconds about
-        // a thing it had already decided to wait for, which is the busy-loop the
-        // typed wait exists to end.
-        self.due_at = now_ms.saturating_add(
-            waiting
-                .until_ms
-                .saturating_sub(self.waiting_now_ms(&waiting)),
-        );
-        self.waiting_room = room;
-        self.waiting = Some(waiting);
-    }
-
-    /// The world clock the wait was stamped against, recovered from its own
-    /// deadline. Keeps `begin_waiting` honest when scheduler time and world
-    /// time are not the same clock — which they are not.
-    fn waiting_now_ms(&self, w: &Waiting) -> u64 {
-        w.until_ms.saturating_sub(crate::engine::waiting::PATIENCE_MS)
-    }
-
-    /// What this character is waiting for, if anything.
-    pub fn waiting(&self) -> Option<&Waiting> {
-        self.waiting.as_ref()
-    }
-
-    /// Who was here when the wait was set.
-    pub fn waiting_room(&self) -> &[String] {
-        &self.waiting_room
-    }
-
-    /// The wait is over. Returns whether one was actually standing, so a caller
-    /// can tell "answered" from "there was nothing to answer".
-    pub fn stop_waiting(&mut self) -> bool {
-        self.waiting_room.clear();
-        self.waiting.take().is_some()
-    }
-
-    /// Whether anything queued is speech `f` accepts.
-    fn heard_speech(&self, f: &impl Fn(&str) -> bool) -> bool {
-        self.queue.iter().any(|e| match &e.kind {
-            EventKind::Speech { speaker, .. } => f(speaker),
-            _ => false,
-        })
-    }
-
-    /// Think on the next pass rather than on the next heartbeat.
+    /// Stop for a while and then come back to it.
     ///
-    /// The same flag an arriving high-salience event sets, reached from the
-    /// other direction: there the world decided this was worth interrupting
-    /// for, here the character said so in advance.
-    fn wake_now(&mut self) {
-        self.preempted = true;
+    /// **The whole of what a pause is.** It moves the next think out by `for_ms`
+    /// and does nothing else — no condition to satisfy, no patience to run out,
+    /// nothing to answer. Anything arriving meanwhile still wakes the character
+    /// at once, because that is already true of every character with an empty
+    /// queue, and it is why the pause needs no rousing rule of its own.
+    ///
+    /// # How long is the act's to say, not this function's
+    ///
+    /// It comes from [`crate::engine::cooldown::Cost::stall`], where it sits
+    /// beside the same act's cooldown so the two are chosen against each other.
+    /// `Runtime::arm_pause` reads it and passes it here; nothing in this file
+    /// restates the number, so there is no second copy to drift.
+    ///
+    /// **Chosen by the character, not imposed on it** — the difference between
+    /// this and the idle heartbeat that was removed. A heartbeat wakes
+    /// everybody on a timer whether or not there is anything to think about; a
+    /// stall only ever runs because a character looked at its situation and
+    /// decided there was nothing to do this second.
+    ///
+    /// What the table charges `reflect` is two minutes, which is what the old
+    /// wait's patience was and for the same reason: long enough that a
+    /// companion who is thinking or walking a stop is worth waiting for, short
+    /// enough that a character which stopped when it should not have is doing
+    /// something else within the minute after. It is also the ceiling on how
+    /// often a character can stop in a loop — at two minutes, thirty decodes an
+    /// hour spent standing still.
+    pub fn pause_for(&mut self, now_ms: u64, for_ms: u64) {
+        self.due_at = now_ms.saturating_add(for_ms);
+        self.scheduled = true;
+    }
+
+    /// Come straight back, because the last act answered with something.
+    ///
+    /// **An act that told the character something has to be followed by a turn
+    /// in which it can use it.** A Maker that reads the muster board gets the
+    /// board's contents in its outcome and nowhere else — nothing in the world
+    /// perceives a document being read, so no sweep will ever deliver it — and
+    /// then went to sleep with `due_at` at `NEVER`. It had the answer written
+    /// into its window and no turn in which to act on it, so the next thing it
+    /// did, whenever the room finally woke it, was read the board again.
+    ///
+    /// Narrow on purpose: only the acts in [`crate::engine::body::ANSWERS`].
+    /// Giving *every* act a free follow-up is the treadmill — a character that
+    /// speaks and is immediately asked again will speak again, into the same
+    /// silence, and its own window fills with its own voice until the nucleus
+    /// collapses. Asking the world a question is different from talking: the
+    /// world said something back.
+    pub fn think_again(&mut self) {
         self.due_at = 0;
+        self.scheduled = true;
     }
 
     pub fn depth(&self) -> usize {
@@ -321,7 +335,7 @@ impl Inbox {
         if self.preempted {
             Readiness::Preempted
         } else if self.queue.is_empty() {
-            Readiness::Blocked
+            Readiness::Quiet
         } else {
             Readiness::Pending
         }
@@ -330,7 +344,9 @@ impl Inbox {
     /// Accept an event. Never refuses: the mind design is explicit that a filter
     /// dropping evidence before it lands makes a delusion permanent.
     ///
-    /// Returns whether this arrival forces a tick now.
+    /// Returns whether this arrival means the character thinks **now** — either
+    /// because it preempts whatever was planned, or because it roused one that
+    /// was waiting.
     pub fn push(&mut self, event: Event) -> bool {
         self.events_seen += 1;
         // Stamped on arrival rather than on drain: the clock the standing task
@@ -346,6 +362,26 @@ impl Inbox {
             self.last_nudge_ms = self.last_nudge_ms.max(event.at_ms);
         }
         let preempts = event.preempts();
+        // **Anything at all is enough to think about.** Nothing polls any more,
+        // so an event that does not schedule a thought is an event nobody ever
+        // reads — it would sit in the queue until something louder happened to
+        // arrive behind it. The salience below still decides how *urgently*, and
+        // whether a standing wait survives it.
+        let wake = true;
+        // **Anything arriving cuts a pause short**, and nearly all of that is
+        // free: a pause is only a due time, and `deliver` moves every
+        // character's due time to now. That is the whole benefit over the
+        // subscription it replaced — being messaged mid-pause is read at once
+        // rather than two minutes later.
+        //
+        // The one line it does cost is this. `scheduled` tells the end of a tick
+        // to leave the deadline alone, and a pause that has been cut short no
+        // longer has a deadline worth keeping — so without clearing it here the
+        // *next* tick skips its reset too, leaves `due_at` at zero, and the
+        // character ticks flat out on an empty queue. Which is precisely the
+        // busy-loop the old wait's rousing rule existed to close, arriving by a
+        // different door.
+        self.scheduled = false;
         if preempts {
             self.preempted = true;
             // Something happened. Tighten the metabolism — this is the whole of
@@ -353,7 +389,11 @@ impl Inbox {
             self.heartbeat = ALERT_HEARTBEAT;
         }
         self.queue.push_back(event);
-        preempts
+        // Always. `readiness` still tells a preempt from a pending arrival, so
+        // the Pulse feed keeps its "why did it wake" column — what has gone is
+        // the idea that some arrivals are not worth waking for, which only made
+        // sense while something else was polling.
+        wake
     }
 
     /// Take everything waiting. A busy character drains a fat batch — one
@@ -363,13 +403,14 @@ impl Inbox {
         self.queue.drain(..).collect()
     }
 
-    /// Relax toward idle after a quiet tick, as far as this character's pace
-    /// allows.
-    fn relax(&mut self) {
-        let next = self.heartbeat.mul_f32(RELAX);
-        self.heartbeat = next.min(self.pace.slowest());
-    }
-
+    /// There is no `relax`, because there are no quiet ticks to relax on.
+    ///
+    /// Alertness used to decay over ticks where nothing arrived — which was the
+    /// only kind of tick a quiet character had. With those gone the decay has
+    /// nothing to run on: a character is either answering something or it is
+    /// not scheduled at all. `heartbeat` now records only that something
+    /// recently happened, which is what the Pulse feed reports.
+    ///
     /// How slow this character may become, and how slow it currently is.
     pub fn pace(&self) -> Pace {
         self.pace
@@ -433,6 +474,20 @@ pub struct TickRecord {
     /// Heartbeat after this tick, in ms — the character's current alertness.
     pub heartbeat_ms: u64,
     pub inbox_after: usize,
+    /// When this tick ran, against [`Scheduler::born`]. Never serialised: it is
+    /// the raw material for `ms_ago`, and a duration on the wire would only
+    /// hand the reader the clock problem this field exists to solve.
+    #[serde(skip)]
+    at: Duration,
+    /// How long ago this tick ran, in milliseconds.
+    ///
+    /// **Filled in by [`Scheduler::recent`], not at construction**, because a
+    /// record's age is not a property of the record — it changes every second it
+    /// sits in the ring. It is an age rather than a timestamp for the same
+    /// reason [`Census::acted_ms_ago`] is: the reader is a browser on another
+    /// machine, and `at_ms` beside it is the *driver's* clock, which starts
+    /// minutes after this one.
+    pub ms_ago: u64,
 }
 
 /// The scheduler: every character's loop, and the order they run in.
@@ -447,6 +502,15 @@ pub struct Scheduler {
     /// Recent ticks, newest last. Bounded — this is an instrument, not a log.
     recent: Mutex<VecDeque<TickRecord>>,
     recent_cap: usize,
+    /// The scheduler's own clock, for answering *how long ago*.
+    ///
+    /// Its own rather than the driver's: `drive` starts an `Instant` when the
+    /// loop begins, minutes after `Runtime::new`, so a duration measured against
+    /// one and read against the other is out by however long loading took. And
+    /// its own rather than the wall clock, because the answer is handed to a
+    /// browser whose clock is not this machine's — an age computed here is
+    /// right whatever the reader's clock says, where a timestamp is not.
+    born: Instant,
 }
 
 impl Default for Scheduler {
@@ -464,63 +528,58 @@ impl Scheduler {
             ticks: AtomicU64::new(0),
             recent: Mutex::new(VecDeque::new()),
             recent_cap: recent_cap.max(1),
+            born: Instant::now(),
         }
     }
 
     /// Bring a character into the scheduler. Idempotent — a character already
     /// present keeps its inbox, which is what makes this safe to call from a
     /// mind-file reload.
-    pub fn wake(&self, npc_id: u64, now_ms: u64, world_ms: u64) {
+    pub fn wake(&self, npc_id: u64, _now_ms: u64, world_ms: u64) {
         let mut inboxes = self.inboxes.lock().unwrap();
         if inboxes.contains_key(&npc_id) {
             return;
         }
         let mut inbox = Inbox::new(npc_id);
         inbox.day.start_at(world_ms);
-        // Staggered by id rather than all due at once: a hundred characters
-        // waking on the same millisecond is a thundering herd against a single
-        // GPU, and the stagger costs nothing.
-        inbox.due_at = now_ms + (npc_id % IDLE_HEARTBEAT.as_millis() as u64);
-        let due = Due {
-            at: inbox.due_at,
-            npc_id,
-        };
+        /* **Waking is not a reason to think.**
+         *
+         * A character was given a first thought here, staggered by id so a
+         * hundred of them coming up at once did not stampede one GPU. There is
+         * nothing to stagger any more: a character that has just woken has an
+         * empty inbox, and thinking about an empty inbox is what this whole
+         * change removed.
+         *
+         * It still gets going the moment there is anything to get going about —
+         * `embody` hands it its situation, and the world's sweep hands it
+         * whatever is happening — and each of those schedules it on arrival. A
+         * cast that boots into a quiet world simply costs nothing until the
+         * world does something. */
+        inbox.due_at = NEVER;
         inboxes.insert(npc_id, inbox);
-        drop(inboxes);
-        self.due.lock().unwrap().push(due);
     }
 
-    /// Set how slow a character is allowed to become.
+    /// Set how alert a character is allowed to be.
     ///
-    /// Takes effect immediately in both directions: quickening pulls a
-    /// character that was settled into a long wait forward to the new floor,
-    /// rather than leaving it to sit out an interval it is no longer allowed to
-    /// have. Without that, giving a Maker its working pace could leave it two
-    /// minutes from its next thought — which is exactly the state the pace was
-    /// set to prevent.
+    /// **This no longer schedules anything, and that is the change.** It used
+    /// to pull a character forward to the new floor, on the reasoning that a
+    /// Maker given its working pace should not sit out an interval it is no
+    /// longer allowed to have. That reasoning held only while a pace *was* a
+    /// schedule — and it is what made being in a world mean thinking every four
+    /// seconds into a quiet room, which filled the character's window with its
+    /// own output until it could not say anything else.
+    ///
+    /// A character now thinks when something reaches it. The pace is the ceiling
+    /// on how alert it reads as, not a promise of a thought.
     ///
     /// `false` if there is no such character.
-    pub fn set_pace(&self, npc_id: u64, pace: Pace, now_ms: u64) -> bool {
+    pub fn set_pace(&self, npc_id: u64, pace: Pace, _now_ms: u64) -> bool {
         let mut inboxes = self.inboxes.lock().unwrap();
         let Some(inbox) = inboxes.get_mut(&npc_id) else {
             return false;
         };
         inbox.pace = pace;
-        let slowest = pace.slowest().as_millis() as u64;
         inbox.heartbeat = inbox.heartbeat.min(pace.slowest());
-
-        let sooner = now_ms + slowest;
-        if inbox.due_at > sooner {
-            inbox.due_at = sooner;
-            let due = Due { at: sooner, npc_id };
-            drop(inboxes);
-            // The entry for the old, later moment stays in the heap and will
-            // pop in its own time. Harmless: an early wake with an empty inbox
-            // is a heartbeat, which relaxes and re-queues. Being woken sooner
-            // than necessary costs a cheap tick; being woken later than the
-            // pace allows is the thing this exists to prevent.
-            self.due.lock().unwrap().push(due);
-        }
         true
     }
 
@@ -555,54 +614,36 @@ impl Scheduler {
         self.inboxes.lock().unwrap().keys().copied().collect()
     }
 
-    /// Whether anything queued for this character is speech `f` accepts.
+    /// Stop a character for a while. See [`Inbox::pause_for`].
     ///
-    /// Peeked, not drained: the character is about to be woken *for* this, and
-    /// it has to still be there when it reads its batch.
-    pub fn heard_speech(&self, npc_id: u64, f: impl Fn(&str) -> bool) -> bool {
-        self.inboxes
-            .lock()
-            .unwrap()
-            .get(&npc_id)
-            .is_some_and(|i| i.heard_speech(&f))
+    /// Returns whether there was a character to stop.
+    pub fn pause_for(&self, npc_id: u64, now_ms: u64, for_ms: u64) -> bool {
+        let at = {
+            let mut g = self.inboxes.lock().unwrap();
+            let Some(i) = g.get_mut(&npc_id) else {
+                return false;
+            };
+            i.pause_for(now_ms, for_ms);
+            i.due_at
+        };
+        // Queued explicitly, for the reason every scheduling change here is: the
+        // entry this character was carrying was consumed by the tick that
+        // decided to pause, so moving `due_at` alone would leave it due and
+        // unqueued — awake with nothing to notice it.
+        self.due.lock().unwrap().push(Due { at, npc_id });
+        true
     }
 
-    /// Stop a character to wait. See [`Inbox::begin_waiting`].
-    pub fn begin_waiting(&self, npc_id: u64, waiting: Waiting, room: Vec<String>, now_ms: u64) {
-        if let Some(i) = self.inboxes.lock().unwrap().get_mut(&npc_id) {
-            i.begin_waiting(waiting, room, now_ms);
-        }
-    }
-
-    /// What a character is waiting for, and who was here when it started.
-    pub fn waiting(&self, npc_id: u64) -> Option<(Waiting, Vec<String>)> {
-        let g = self.inboxes.lock().unwrap();
-        let i = g.get(&npc_id)?;
-        Some((i.waiting()?.clone(), i.waiting_room().to_vec()))
-    }
-
-    /// End a wait and wake the character **now**.
-    ///
-    /// The preempt is the point. A wait that was answered and then sat until the
-    /// next heartbeat would have the character replying to a question four
-    /// seconds after it was asked, with the answer buried in whatever else
-    /// arrived meanwhile — which is the batching working exactly against the one
-    /// case where the character has said in advance what it cares about.
-    pub fn answer_wait(&self, npc_id: u64) -> bool {
+    /// Bring a character straight back, because its last act answered with
+    /// something. See [`Inbox::think_again`].
+    pub fn think_again(&self, npc_id: u64) -> bool {
         {
             let mut g = self.inboxes.lock().unwrap();
             let Some(i) = g.get_mut(&npc_id) else {
                 return false;
             };
-            if !i.stop_waiting() {
-                return false;
-            }
-            i.wake_now();
+            i.think_again();
         }
-        // Queued explicitly: the entry this character was carrying was consumed
-        // by whichever `due_now` deferred it back, or by the tick that began the
-        // wait, so clearing `due_at` alone would leave it due and unqueued —
-        // awake with nothing to notice it.
         self.due.lock().unwrap().push(Due { at: 0, npc_id });
         true
     }
@@ -646,8 +687,10 @@ impl Scheduler {
         let Some(inbox) = inboxes.get_mut(&npc_id) else {
             return false;
         };
-        let preempts = inbox.push(event);
-        if preempts {
+        // Preempted whatever it was doing, or roused out of a wait — either way
+        // it thinks on the next pass rather than on its own schedule.
+        let wake_now = inbox.push(event);
+        if wake_now {
             // Due immediately — but only *entered* as due once. `due_at == 0`
             // already means an at-zero entry is standing in the heap and has not
             // been served, so a second one would be a duplicate wake for a
@@ -767,20 +810,56 @@ impl Scheduler {
             (inbox.drain(), cause)
         };
 
-        // Nothing waiting: this is the heartbeat firing on a quiet character. It
-        // still thinks — that is what stops "nothing arrived" meaning "dead
-        // forever" — but on a synthetic event rather than on emptiness.
-        let events = if events.is_empty() {
-            let seq = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
-            vec![Event::new(
-                seq,
-                world_ms,
-                Salience::IDLE,
-                EventKind::Heartbeat,
-            )]
-        } else {
-            events
-        };
+        /* **Nothing happened, so there is nothing to think about.**
+         *
+         * This used to synthesise a heartbeat event and think anyway, on the
+         * reasoning that "nothing arrived" must not mean "dead forever". The
+         * cost of that was not the decode — it was what the decode *wrote*.
+         *
+         * An embodied character is paced `WORKING`, which floors its heartbeat
+         * at four seconds and never relaxes, so a character standing in a quiet
+         * room produced an act every four seconds for as long as it stood
+         * there. Each act is appended to its own window, and within a couple of
+         * minutes the twenty-four-turn window held nothing but copies of the
+         * character's last gesture. At that point the next token is certain: a
+         * `top_p` nucleus of one, sampled identically whatever the RNG says.
+         *
+         * That is the collapse, and no sampler can undo it — a penalty of a
+         * fifth of a logit against p ≈ 1 is nothing. The evidence has to not
+         * pile up, and the way it does not pile up is that a character with
+         * nothing to react to does not speak.
+         *
+         * Liveness is somebody else's question now. "Waiting on input" and
+         * "dead" are told apart by asking the scheduler, not by spending a
+         * decode a minute per character to have it say so in prose. */
+        /* **And going quiet has to be *recorded*, not merely returned.**
+         *
+         * This returned straight out, leaving `due_at` at whatever made the
+         * character due — which is `0`. That looks harmless and is a permanent
+         * wedge, because `deliver` reads `due_at == 0` as "an entry for this
+         * character is already standing in the heap, so do not push another".
+         * The entry that made it due has just been consumed by the pop that led
+         * here, so the character is left claiming to be queued while nothing
+         * anywhere will ever run it: events accumulate, `preempted` stays set,
+         * and the tick count never moves again.
+         *
+         * It is reachable whenever a tick ends `scheduled` with an empty queue
+         * — `think_again` is the common way, since an act that answered sets
+         * `due_at = 0` and the answer arrives in the outcome rather than as a
+         * queued event. Measured live: three characters wedged this way inside
+         * a minute of starting, with inboxes at sixty and climbing, and an
+         * URGENT broadcast that preempts everything could not move them.
+         *
+         * Setting it back to `NEVER` is what the module already says an empty
+         * queue means — unscheduled until the world says otherwise — and it is
+         * what lets the next `deliver` see a character that needs queueing. */
+        if events.is_empty() {
+            let mut inboxes = self.inboxes.lock().unwrap();
+            if let Some(inbox) = inboxes.get_mut(&npc_id) {
+                inbox.due_at = NEVER;
+            }
+            return None;
+        }
 
         // **Three phases, because the middle one is a model decode.**
         //
@@ -815,24 +894,40 @@ impl Scheduler {
         for a in &acts {
             inbox.window.push_npc(a.clone(), world_ms);
         }
-
-        // A tick where nothing arrived is a quiet one; relax toward idle.
-        if events
-            .iter()
-            .all(|e| matches!(e.kind, EventKind::Heartbeat))
-        {
-            inbox.relax();
+        // Only when it actually did something. A tick that decided on nothing is
+        // a character that thought, and "how long since it last acted" has to
+        // keep counting through those or it answers a different question.
+        if !acts.is_empty() {
+            inbox.last_act_at = Some(self.born.elapsed());
         }
+
         inbox.ticks += 1;
-        // **A wait begun during this tick keeps its own deadline.**
-        //
-        // The act loop arms the wait inside `act`, and this line used to
-        // overwrite it a moment later with the ordinary heartbeat — so a
-        // character that had just decided to wait was scheduled to think again
-        // in four seconds, which is precisely the busy-loop the typed wait
-        // replaced. While a wait stands, its patience is the heartbeat.
-        if inbox.waiting.is_none() {
-            inbox.due_at = now_ms + inbox.heartbeat.as_millis() as u64;
+        /* **What happens next is decided by the world, not by a timer.**
+         *
+         * A character is scheduled when something reaches it — see
+         * [`Scheduler::deliver`] — and not otherwise. So the only thing to
+         * settle here is whether anything arrived *during* the decode, which
+         * takes seconds and is exactly when it is most likely to.
+         *
+         * Empty means unscheduled, and unscheduled means asleep until the world
+         * says otherwise. That is what stops a quiet character writing its own
+         * window full.
+         *
+         * **Unless this tick already decided.** The act loop runs inside the
+         * closure above, so a `pause` or an act that answered has set the
+         * deadline before this line is reached — and without the flag this
+         * overwrites it with `NEVER`, on the empty queue both of those cases
+         * have by definition. For a pause that is not "wait two minutes" but
+         * "never think again"; for an answer it is a character holding what it
+         * just read with no turn in which to use it. */
+        match inbox.scheduled {
+            true => inbox.scheduled = false,
+            false => {
+                inbox.due_at = match inbox.queue.is_empty() {
+                    true => NEVER,
+                    false => 0,
+                }
+            }
         }
         let record = TickRecord {
             npc_id,
@@ -844,13 +939,21 @@ impl Scheduler {
             acts,
             heartbeat_ms: inbox.heartbeat.as_millis() as u64,
             inbox_after: inbox.depth(),
+            at: self.born.elapsed(),
+            // Filled in on the way out — see `recent`.
+            ms_ago: 0,
         };
-        let next = Due {
+        // An unscheduled character gets no heap entry at all. Pushing one at
+        // `NEVER` would be an entry that is never served and never removed, so
+        // the heap would grow by one per quiet tick for the life of the daemon.
+        let next = (inbox.due_at != NEVER).then_some(Due {
             at: inbox.due_at,
             npc_id,
-        };
+        });
         drop(inboxes);
-        self.due.lock().unwrap().push(next);
+        if let Some(next) = next {
+            self.due.lock().unwrap().push(next);
+        }
 
         let mut recent = self.recent.lock().unwrap();
         recent.push_back(record.clone());
@@ -877,13 +980,27 @@ impl Scheduler {
 
     /// Recent ticks, newest last. The Pulse view's feed.
     pub fn recent(&self, limit: usize) -> Vec<TickRecord> {
+        // Once, outside the walk, so every row in one page is measured against
+        // the same instant.
+        let now = self.born.elapsed();
         let r = self.recent.lock().unwrap();
         let skip = r.len().saturating_sub(limit);
-        r.iter().skip(skip).cloned().collect()
+        r.iter()
+            .skip(skip)
+            .cloned()
+            .map(|mut t| {
+                t.ms_ago = now.saturating_sub(t.at).as_millis() as u64;
+                t
+            })
+            .collect()
     }
 
     /// A snapshot of every character's loop state.
     pub fn census(&self) -> Vec<Census> {
+        // Read once, outside the map, so every row in one census is measured
+        // against the same instant — otherwise a large cast reports ages that
+        // disagree by however long the walk took.
+        let now = self.born.elapsed();
         let inboxes = self.inboxes.lock().unwrap();
         let mut v: Vec<Census> = inboxes
             .values()
@@ -898,6 +1015,12 @@ impl Scheduler {
                 window_cap: i.window.cap(),
                 faded: i.window.faded(),
                 day: i.day.current(),
+                acted_ms_ago: i
+                    .last_act_at
+                    // `saturating_sub`: a tick that landed between the reading
+                    // above and this line would otherwise be an age in the
+                    // future, which renders as a very large number.
+                    .map(|at| now.saturating_sub(at).as_millis() as u64),
             })
             .collect();
         v.sort_by_key(|c| c.npc_id);
@@ -924,6 +1047,17 @@ pub struct Census {
     pub window_cap: usize,
     pub faded: u64,
     pub day: Option<u64>,
+    /// How long ago this character last **acted**, in milliseconds.
+    ///
+    /// An age rather than a timestamp, computed here against
+    /// [`Scheduler::born`]. A timestamp would have to be read against a clock,
+    /// and the reader is a browser on somebody else's machine — so "at
+    /// 23:51:02" is a question about clock skew where "nine seconds ago" is
+    /// just true.
+    ///
+    /// `None` for a character that has not acted yet, which reads as *never*
+    /// rather than as a very large number.
+    pub acted_ms_ago: Option<u64>,
 }
 
 /// Shared handle.
@@ -937,8 +1071,102 @@ mod tests {
         Scheduler::new(8)
     }
 
+    /// A stall long enough to be visible against the heartbeat.
+    ///
+    /// **A number of this module's own, on purpose.** What is under test here
+    /// is the scheduler's stall *mechanism* — that a stalled character leaves
+    /// the schedule, comes back on time, and is woken early by anything that
+    /// arrives. Which acts stall, and for how long, is a question for the cost
+    /// table and is answered by its own tests. Reading the table from here
+    /// coupled the two: when `reflect` stopped stalling, seven scheduler tests
+    /// failed for a reason that had nothing to do with scheduling.
+    fn pause_ms() -> u64 {
+        30_000
+    }
+
     fn say(text: &str) -> EventKind {
         EventKind::Description { text: text.into() }
+    }
+
+    /// **A character that runs out of things to think about must stay
+    /// reachable.**
+    ///
+    /// The wedge this closes, in the order it happens live:
+    ///
+    /// 1. An act that answered calls `think_again` — `due_at = 0`, `scheduled`
+    ///    set — and nothing new arrives, so the tick ends with an empty queue
+    ///    and `due_at` still `0`.
+    /// 2. The next pass pops the character's heap entry and ticks it. The drain
+    ///    yields nothing, so the tick returns early.
+    /// 3. That early return used to leave `due_at` at `0` with the entry now
+    ///    consumed — so `deliver`'s `already_queued` check (`due_at == 0`, read
+    ///    as "an entry is standing in the heap") suppressed every future push.
+    ///
+    /// From there the character is unschedulable for the life of the daemon:
+    /// events accumulate, `readiness` reports `Preempted`, and nothing runs it.
+    /// Measured on the live daemon — three characters wedged inside a minute,
+    /// inboxes past sixty, and an URGENT broadcast could not move them.
+    #[test]
+    fn a_tick_that_finds_nothing_leaves_the_character_reachable() {
+        let s = sched();
+        s.wake(1, 0, 0);
+
+        // An act that answered: due now, and no event behind it.
+        s.deliver(1, 0, Salience::NORMAL, say("the board says three names"));
+        assert_eq!(s.due_now(1_000), vec![1]);
+        s.tick(1, 1_000, 0, |_, _| vec!["read the board".into()]);
+        s.think_again(1);
+
+        // The pass that finds an empty queue.
+        assert_eq!(s.due_now(2_000), vec![1], "it was not even due");
+        assert!(
+            s.tick(1, 2_000, 0, |_, _| vec![]).is_none(),
+            "there was nothing to drain, so there is no record"
+        );
+
+        // The character must now be schedulable again by an ordinary arrival.
+        s.deliver(1, 0, Salience::NORMAL, say("somebody comes in"));
+        assert_eq!(
+            s.due_now(3_000),
+            vec![1],
+            "the character was left claiming to be queued while nothing could \
+             ever run it — every later arrival is silently dropped on the floor"
+        );
+        let rec = s.tick(1, 3_000, 0, |_, _| vec![]).expect("ticked");
+        assert_eq!(rec.perceived.len(), 1);
+    }
+
+    /// The neighbouring path, which does **not** wedge — and is here to keep it
+    /// that way.
+    ///
+    /// A pause leaves `due_at` at a real deadline rather than at `0`, so
+    /// `deliver`'s `already_queued` check reads false and an arrival still
+    /// queues it. That is the whole reason `think_again` was the one that broke:
+    /// the two differ only in the value they park `due_at` at, and one of those
+    /// values happens to be the sentinel the queue check keys on. Anything that
+    /// makes a pause park at zero brings the wedge back here.
+    #[test]
+    fn a_character_that_wakes_from_a_pause_to_an_empty_queue_stays_reachable() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("a light goes out"));
+        s.due_now(1_000);
+        s.tick(1, 1_000, 0, |_, _| vec!["reflect".into()]);
+        s.pause_for(1, 1_000, pause_ms());
+
+        // Its deadline comes round with nothing waiting.
+        let due = s.due_now(1_000 + pause_ms() + 1);
+        assert_eq!(due, vec![1]);
+        assert!(s
+            .tick(1, 1_000 + pause_ms() + 1, 0, |_, _| vec![])
+            .is_none());
+
+        s.deliver(1, 0, Salience::URGENT, say("a door slams"));
+        assert_eq!(
+            s.due_now(1_000 + pause_ms() + 2_000),
+            vec![1],
+            "an urgent arrival could not wake it"
+        );
     }
 
     #[test]
@@ -969,12 +1197,13 @@ mod tests {
         assert!(!s.deliver(99, 0, Salience::NORMAL, say("x")));
     }
 
-    /// Idle means blocked, and blocked is the state that costs nothing.
+    /// An empty inbox is **quiet**, not blocked — the state that costs nothing
+    /// and the one a character is in nearly all the time.
     #[test]
-    fn an_empty_inbox_reads_blocked() {
+    fn an_empty_inbox_reads_quiet() {
         let s = sched();
         s.wake(1, 0, 0);
-        assert_eq!(s.census()[0].readiness, Readiness::Blocked);
+        assert_eq!(s.census()[0].readiness, Readiness::Quiet);
         s.deliver(1, 0, Salience::NORMAL, say("a noise"));
         assert_eq!(s.census()[0].readiness, Readiness::Pending);
     }
@@ -1023,9 +1252,10 @@ mod tests {
         for _ in 0..20 {
             s.deliver(1, 0, Salience::URGENT, say("the beam gives"));
         }
-        // Two: the heartbeat entry `wake` stood up, and one at-zero wake for the
-        // whole burst. Twenty-one is the bug — an entry per arrival.
-        assert_eq!(s.due_len(), 2, "the burst queued one wake per arrival");
+        // One, for the whole burst. Twenty is the bug — an entry per arrival.
+        // (`wake` no longer stands one up: a character with an empty inbox is
+        // not scheduled at all.)
+        assert_eq!(s.due_len(), 1, "the burst queued one wake per arrival");
 
         // And the one wake still drains all twenty.
         assert_eq!(s.due_now(10_000), vec![1]);
@@ -1056,11 +1286,18 @@ mod tests {
     #[test]
     fn the_soonest_character_is_due_first() {
         let s = sched();
-        // Staggered by id, so 1 is due before 300.
         s.wake(1, 0, 0);
         s.wake(300, 0, 0);
+        // Both are due only because something reached them; 300's arrived
+        // later, so 1 must come off the heap first.
+        s.deliver(1, 0, Salience::NORMAL, say("first"));
+        s.tick(1, 0, 0, |_, _| vec![]);
+        s.deliver(1, 1, Salience::NORMAL, say("again"));
+        s.deliver(300, 2, Salience::NORMAL, say("later"));
+
         let ready = s.due_now(1_000_000);
         assert_eq!(ready.first(), Some(&1), "the heap ran the later one first");
+        assert!(ready.contains(&300));
     }
 
     /// A busy character drains everything at once — one better-informed step,
@@ -1080,30 +1317,55 @@ mod tests {
             .expect("ticked");
         assert_eq!(rec.perceived.len(), 5);
         assert_eq!(rec.inbox_after, 0);
-        assert_eq!(s.census()[0].readiness, Readiness::Blocked);
+        assert_eq!(s.census()[0].readiness, Readiness::Quiet);
     }
 
-    /// "Nothing arrived" must not mean "dead forever": the heartbeat ticks on a
-    /// synthetic event rather than on emptiness.
+    /// **A character with nothing to react to does not think.**
+    ///
+    /// It used to: an empty inbox synthesised a heartbeat event and the
+    /// character took a turn on it, so that "nothing arrived" could not mean
+    /// "dead forever". The cost was not the decode, it was what the decode
+    /// wrote — an act, appended to the character's own window, every beat. An
+    /// embodied character is floored at four seconds, so a quiet room filled a
+    /// twenty-four-turn window with copies of one gesture inside two minutes,
+    /// and after that the next token was certain and the character could not
+    /// say anything else.
     #[test]
-    fn a_quiet_character_still_thinks_on_its_heartbeat() {
+    fn a_quiet_character_does_not_think_at_all() {
         let s = sched();
         s.wake(1, 0, 0);
-        let rec = s
-            .tick(1, 0, 0, |events, _| {
-                assert_eq!(events.len(), 1);
-                assert!(matches!(events[0].kind, EventKind::Heartbeat));
-                vec![]
-            })
+        assert!(
+            s.tick(1, 0, 0, |_, _| panic!(
+                "thought with nothing to think about"
+            ))
+            .is_none(),
+            "an empty inbox produced a turn"
+        );
+    }
+
+    /// And it is not *scheduled*, either — nothing to serve, so nothing is due
+    /// however long you wait. Being quiet costs no decodes and no heap.
+    #[test]
+    fn a_quiet_character_is_never_due() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("something"));
+        assert!(s.due_now(0).contains(&1));
+        s.tick(1, 0, 0, |_, _| vec!["speak — yes".into()])
             .expect("ticked");
-        assert_eq!(rec.perceived.len(), 1);
-        assert_eq!(rec.cause, Readiness::Blocked);
+
+        for at in [0, 10_000, 600_000, u64::MAX - 1] {
+            assert!(
+                !s.due_now(at).contains(&1),
+                "a character with an empty inbox came due at {at}"
+            );
+        }
     }
 
     /// Alertness with no combat branch: something happens, the metabolism
     /// tightens, and it decays back rather than snapping.
     #[test]
-    fn alertness_tightens_on_a_preempt_and_decays_when_quiet() {
+    fn alertness_tightens_on_a_preempt() {
         let s = sched();
         s.wake(1, 0, 0);
         assert_eq!(
@@ -1113,49 +1375,42 @@ mod tests {
 
         s.deliver(1, 0, Salience::URGENT, say("a bolt"));
         s.tick(1, 0, 0, |_, _| vec![]);
-        let alert = s.census()[0].heartbeat_ms;
-        assert_eq!(alert, ALERT_HEARTBEAT.as_millis() as u64);
-
-        // Quiet ticks relax it, monotonically, and never past idle.
-        let mut prev = alert;
-        for _ in 0..20 {
-            s.tick(1, 0, 0, |_, _| vec![]);
-            let now = s.census()[0].heartbeat_ms;
-            assert!(now >= prev, "alertness went the wrong way");
-            prev = now;
-        }
-        assert_eq!(prev, IDLE_HEARTBEAT.as_millis() as u64, "never settled");
+        assert_eq!(
+            s.census()[0].heartbeat_ms,
+            ALERT_HEARTBEAT.as_millis() as u64
+        );
+        // It does not decay from here. Alertness used to relax over the ticks a
+        // quiet character took, and a quiet character no longer takes any — so
+        // what this number records is that something recently happened, which
+        // is what the Pulse feed shows. Nothing schedules from it.
     }
 
-    /// A character with work in front of it never goes as quiet as one that is
-    /// only reacting. The relax curve is the same; how far it is allowed to run
-    /// is not.
+    /// **A pace no longer schedules anything**, and this is what that means.
+    ///
+    /// `Pace::WORKING` floored an embodied character's heartbeat at four
+    /// seconds and never let it relax, so *being in a world* meant thinking
+    /// every four seconds whether or not anything had happened. That floor was
+    /// the engine of the repetition: not the sampler, not the grammar — a
+    /// character scheduled to speak fifteen times a minute into a room where
+    /// nothing was going on.
+    ///
+    /// Neither pace makes a character due now. Whether it thinks is decided by
+    /// its inbox, and both of these are empty.
     #[test]
-    fn a_working_character_never_settles_as_far_as_an_ambient_one() {
+    fn no_pace_makes_a_quiet_character_think() {
         let s = sched();
         s.wake(1, 0, 0);
         s.wake(2, 0, 0);
         assert!(s.set_pace(2, Pace::WORKING, 0));
 
-        s.deliver(1, 0, Salience::URGENT, say("a bolt"));
-        s.deliver(2, 0, Salience::URGENT, say("a bolt"));
-        s.tick(1, 0, 0, |_, _| vec![]);
-        s.tick(2, 0, 0, |_, _| vec![]);
-
-        for _ in 0..20 {
-            s.tick(1, 0, 0, |_, _| vec![]);
-            s.tick(2, 0, 0, |_, _| vec![]);
+        for at in [0, 4_000, 120_000, 600_000] {
+            let due = s.due_now(at);
+            assert!(!due.contains(&1), "the ambient one was due at {at}");
+            assert!(
+                !due.contains(&2),
+                "a working pace still put a quiet character on the schedule at {at}"
+            );
         }
-        let beat = |id: u64| {
-            s.census()
-                .into_iter()
-                .find(|c| c.npc_id == id)
-                .expect("in the cast")
-                .heartbeat_ms
-        };
-        assert_eq!(beat(1), IDLE_HEARTBEAT.as_millis() as u64);
-        assert_eq!(beat(2), ALERT_HEARTBEAT.as_millis() as u64);
-        assert!(beat(2) < beat(1), "the pace floor did nothing");
     }
 
     #[test]
@@ -1170,49 +1425,30 @@ mod tests {
         );
     }
 
-    /// Quickening has to take effect now. A Maker given its working pace while
-    /// settled two minutes out would sit through the wait it was just told it
-    /// may not have — the exact state the pace exists to prevent.
+    /// **Changing a pace must not conjure a thought.**
+    ///
+    /// It used to pull a character forward to the new floor, which is how
+    /// `embody` — which sets `WORKING` — put every character in a world onto a
+    /// four-second treadmill. Setting a pace now says how alert the character
+    /// reads as and nothing else.
     #[test]
-    fn quickening_a_character_pulls_its_next_thought_forward() {
+    fn changing_a_pace_does_not_schedule_a_thought() {
         let s = sched();
         s.wake(1, 0, 0);
-        // Waking staggers a character by its id so a cast does not all think on
-        // the same millisecond. That entry has to be taken off before the queue
-        // says anything about the pace.
-        s.due_now(u64::MAX);
-        for _ in 0..20 {
-            s.tick(1, 0, 0, |_, _| vec![]);
-        }
+        s.due_now(u64::MAX); // clear the stagger entry `wake` leaves.
 
-        let far = IDLE_HEARTBEAT.as_millis() as u64;
-        assert!(s.due_now(far / 2).is_empty(), "settled sooner than idle");
-
-        s.set_pace(1, Pace::WORKING, far / 2);
-        let soon = far / 2 + ALERT_HEARTBEAT.as_millis() as u64;
-        assert_eq!(s.due_now(soon), vec![1], "it kept the wait it was denied");
-    }
-
-    /// Slowing a character must not drag it forward, and must not leave it
-    /// due at a moment it has already passed.
-    #[test]
-    fn slowing_a_character_leaves_its_next_thought_where_it_was() {
-        let s = sched();
-        s.wake(1, 0, 0);
         s.set_pace(1, Pace::WORKING, 0);
-        for _ in 0..5 {
-            s.tick(1, 0, 0, |_, _| vec![]);
+        assert_eq!(s.pace_of(1), Some(Pace::WORKING));
+        for at in [0, 4_000, 120_000] {
+            assert!(
+                !s.due_now(at).contains(&1),
+                "quickening scheduled a character with an empty inbox at {at}"
+            );
         }
+
         s.set_pace(1, Pace::AMBIENT, 0);
         assert_eq!(s.pace_of(1), Some(Pace::AMBIENT));
-        // It relaxes the rest of the way now that it is allowed to.
-        for _ in 0..20 {
-            s.tick(1, 0, 0, |_, _| vec![]);
-        }
-        assert_eq!(
-            s.census()[0].heartbeat_ms,
-            IDLE_HEARTBEAT.as_millis() as u64
-        );
+        assert!(!s.due_now(u64::MAX - 1).contains(&1));
     }
 
     /// A pace cannot be set faster than the world moves — below that a
@@ -1418,76 +1654,244 @@ mod tests {
         );
     }
 
-    /// **A waiting character stops thinking**, which is the whole difference
-    /// between this and the act it replaced.
+    /// **A paused character stops thinking**, which is the whole of what a
+    /// pause is for.
     ///
-    /// The old `wait` left the heartbeat alone, so the character woke four
-    /// seconds later and decided to wait again, and again — a busy-loop wearing
-    /// the word "wait". Here the deadline *is* the heartbeat: nothing is due
-    /// until the wait is answered or its patience runs out.
+    /// The free-text `wait` it began as left the heartbeat alone, so the
+    /// character woke four seconds later and decided to wait again, and again —
+    /// a busy-loop wearing the word. Here the deadline *is* the schedule.
     #[test]
-    fn a_wait_takes_the_character_out_of_the_schedule() {
+    fn a_pause_takes_the_character_out_of_the_schedule() {
         let s = sched();
         s.wake(1, 0, 0);
-        assert!(s.due_now(10_000).contains(&1), "a woken character is due");
+        // Due because something reached it, not because it woke.
+        s.deliver(1, 0, Salience::NORMAL, say("anything"));
+        assert!(
+            s.due_now(10_000).contains(&1),
+            "an arrival did not schedule it"
+        );
+        s.tick(1, 0, 0, |_, _| vec![]);
 
-        s.begin_waiting(
-            1,
-            Waiting::new(crate::engine::waiting::Kind::SomeoneSpeaks, None, 0),
-            Vec::new(),
-            0,
+        assert!(
+            s.pause_for(1, 0, pause_ms()),
+            "there was a character to stop"
         );
         assert!(
-            !s.due_now(10_000).contains(&1),
-            "it kept its heartbeat while waiting"
+            !s.due_now(pause_ms() - 1).contains(&1),
+            "it came back before the pause was up"
         );
-        assert!(s.waiting(1).is_some());
+        assert!(
+            s.due_now(pause_ms() + 1).contains(&1),
+            "the pause never ended, so it will never think again"
+        );
     }
 
-    /// And the answer wakes it **now**, not on the next heartbeat.
+    #[test]
+    fn pausing_a_character_that_is_not_there_says_so() {
+        let s = sched();
+        assert!(!s.pause_for(99, 0, pause_ms()));
+    }
+
+    /// **Anything that reaches a paused character brings it straight back**,
+    /// and nothing had to be written to make it so.
     ///
-    /// A character replying four seconds after the question, with the answer
-    /// buried in whatever else arrived meanwhile, is the batching working
-    /// against the one case where the character said in advance what it cared
-    /// about.
+    /// This is the whole benefit over the typed wait it replaced. That was a
+    /// subscription to one named thing, so everything *else* the world did —
+    /// being messaged, being spoken to by the wrong person, an operator saying
+    /// something in the room — landed in the inbox and sat there until the
+    /// patience ran out, two minutes after whoever did it had gone. It needed a
+    /// rousing bar, tuned against a ladder, to get half of that back.
+    ///
+    /// A pause is only a due time, and `deliver` moves every character's due
+    /// time to now, so all of it comes back at once — including the quiet
+    /// traffic, which under the old rule was deliberately left out and is the
+    /// one case here that changed.
     #[test]
-    fn answering_a_wait_wakes_the_character_immediately() {
-        let s = sched();
-        s.wake(1, 0, 0);
-        s.begin_waiting(
-            1,
-            Waiting::new(crate::engine::waiting::Kind::SomeoneSpeaks, None, 0),
-            Vec::new(),
-            0,
-        );
-        assert!(!s.due_now(10_000).contains(&1));
+    fn anything_arriving_at_all_cuts_a_pause_short() {
+        for (what, salience, kind) in [
+            (
+                "being spoken to",
+                Salience::URGENT,
+                EventKind::Speech {
+                    speaker: "Orion Vance".into(),
+                    text: "look at me".into(),
+                    to: crate::engine::event::Addressed::You,
+                },
+            ),
+            (
+                "a message",
+                Salience::URGENT,
+                EventKind::Message {
+                    thread: "Johnathan Sharratt".into(),
+                    from: "Johnathan Sharratt".into(),
+                    text: "where are you".into(),
+                },
+            ),
+            (
+                "somebody talking past you",
+                Salience::from(npc_map::Weight::Note),
+                EventKind::Speech {
+                    speaker: "Orion Vance".into(),
+                    text: "to somebody else".into(),
+                    to: crate::engine::event::Addressed::Other {
+                        who: "Maker-03".into(),
+                    },
+                },
+            ),
+            (
+                "the room changing under you",
+                Salience::IDLE,
+                EventKind::Situation {
+                    text: "You are in the green room.".into(),
+                },
+            ),
+        ] {
+            let s = sched();
+            s.wake(1, 0, 0);
+            s.pause_for(1, 0, pause_ms());
+            assert!(!s.due_now(1).contains(&1), "it did not stop");
 
-        assert!(s.answer_wait(1), "there was a wait to answer");
-        assert!(s.due_now(0).contains(&1), "it did not wake at once");
-        assert!(s.waiting(1).is_none(), "the wait outlived its answer");
-        // Answering twice is not an error, it is a no-op — two things can
-        // notice the same speech on the same pass.
-        assert!(!s.answer_wait(1));
+            s.deliver(1, 0, salience, kind);
+            assert!(s.due_now(1).contains(&1), "{what} did not bring it back");
+        }
     }
 
-    /// Speech is matched by speaker where it arrives structured, so a wait on
-    /// one person is not ended by somebody else talking.
+    /// **A pause cut short goes back to the ordinary schedule.**
+    ///
+    /// The path that used to spin: `deliver` sets `due_at = 0` for an arrival,
+    /// and the end of `tick` puts the deadline back. A pause that survived its
+    /// own interruption left the character due at zero for ever, ticking flat
+    /// out on an empty queue, and every view of it read "healthy".
     #[test]
-    fn a_named_wait_is_not_ended_by_the_wrong_voice() {
+    fn a_pause_cut_short_does_not_leave_the_character_spinning() {
         let s = sched();
         s.wake(1, 0, 0);
+        s.pause_for(1, 0, pause_ms());
         s.deliver(
             1,
             0,
-            Salience::NORMAL,
+            Salience::URGENT,
             EventKind::Speech {
                 speaker: "Orion Vance".into(),
-                text: "something".into(),
-                to: crate::engine::event::Addressed::Room,
+                text: "look at me".into(),
+                to: crate::engine::event::Addressed::You,
             },
         );
-        assert!(s.heard_speech(1, |sp| sp == "Orion Vance"));
-        assert!(!s.heard_speech(1, |sp| sp == "Perrin Vastwood"));
+        assert!(s.due_now(0).contains(&1), "it did not wake");
+        s.tick(1, 0, 0, |_, _| vec!["speak — yes".to_string()])
+            .expect("it ticked");
+        assert!(
+            !s.due_now(0).contains(&1),
+            "due again at the same instant — the busy-loop is back"
+        );
+    }
+
+    /// **A pause taken during a tick survives the end of that tick.**
+    ///
+    /// The act loop arms the pause from inside the closure, and the line at the
+    /// end of `tick` runs afterwards. Without the flag it overwrites the
+    /// deadline with `NEVER` — on the empty queue a paused character has by
+    /// definition — which is not "wait two minutes" but "never think again",
+    /// and reads from every angle as a healthy quiet character.
+    #[test]
+    fn a_pause_taken_mid_tick_is_not_overwritten_by_the_end_of_it() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("something to answer"));
+        s.tick(1, 0, 0, |_, _| {
+            s.pause_for(1, 0, pause_ms());
+            vec!["reflect — that nothing here needs me".to_string()]
+        })
+        .expect("it ticked");
+
+        assert!(
+            !s.due_now(pause_ms() - 1).contains(&1),
+            "the pause was cut short"
+        );
+        assert!(
+            s.due_now(pause_ms() + 1).contains(&1),
+            "the pause became a character that never thinks again"
+        );
+    }
+
+    /// **An act that answered brings the character straight back.**
+    ///
+    /// What a board says exists in that act's outcome and nowhere else —
+    /// nothing in the world perceives a document being read — so a character
+    /// left unscheduled after asking is one holding the answer with no turn in
+    /// which to use it. It read the board, went to sleep, and read the board
+    /// again the next time anything woke it.
+    #[test]
+    fn an_act_that_answered_gets_a_turn_to_use_the_answer() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("go and read the board"));
+        s.tick(1, 0, 0, |_, _| {
+            s.think_again(1);
+            vec!["read — the muster board".to_string()]
+        })
+        .expect("it ticked");
+
+        assert!(
+            s.due_now(0).contains(&1),
+            "it was told something and given nowhere to put it"
+        );
+    }
+
+    /// **How long since it last acted**, which is the figure the cast strip
+    /// leads with — and the one that says whether a world is alive at all.
+    ///
+    /// An age rather than a timestamp, measured against the scheduler's own
+    /// clock. Neither of the other two would do: the driver's starts minutes
+    /// after `Scheduler::new`, so a duration written by one and read against the
+    /// other is out by however long loading took, and the wall clock belongs to
+    /// this machine while the reader is a browser on somebody else's.
+    #[test]
+    fn a_character_reports_how_long_since_it_last_acted() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        // Never, not "a very long time" — a character that has not acted is a
+        // different fact from one that has gone quiet, and the strip says so.
+        assert_eq!(s.census()[0].acted_ms_ago, None);
+
+        // Thinking is not acting. A tick that decided on nothing leaves the
+        // question where it was, or it answers "how long since it last ran".
+        s.deliver(1, 0, Salience::NORMAL, say("something"));
+        s.tick(1, 0, 0, |_, _| Vec::new()).expect("it ticked");
+        assert_eq!(
+            s.census()[0].acted_ms_ago,
+            None,
+            "a turn that produced nothing counted as an act"
+        );
+
+        s.deliver(1, 0, Salience::NORMAL, say("something else"));
+        s.tick(1, 0, 0, |_, _| vec!["say — anything".to_string()])
+            .expect("it ticked");
+        let age = s.census()[0]
+            .acted_ms_ago
+            .expect("it acted and reported nothing");
+        assert!(
+            age < 5_000,
+            "the age is measured against the wrong clock: {age}"
+        );
+    }
+
+    /// And every *other* act leaves it unscheduled, which is the half that
+    /// stops the treadmill: a character that speaks and is immediately asked
+    /// again speaks again, into the same silence, until its own window holds
+    /// nothing but its own voice.
+    #[test]
+    fn an_ordinary_act_does_not_buy_another_turn() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("anything"));
+        s.tick(1, 0, 0, |_, _| vec!["say — something back".to_string()])
+            .expect("it ticked");
+
+        assert!(
+            !s.due_now(u64::MAX - 1).contains(&1),
+            "speaking scheduled its own next turn"
+        );
     }
 
     /// The feed is an instrument, not a log. It must stay bounded under load.
@@ -1495,7 +1899,10 @@ mod tests {
     fn the_recent_feed_is_bounded() {
         let s = Scheduler::new(4);
         s.wake(1, 0, 0);
-        for _ in 0..20 {
+        for i in 0..20 {
+            // Something to think about each time: a character with an empty
+            // inbox does not tick, so a bare `tick` produces no record at all.
+            s.deliver(1, i, Salience::NORMAL, say("something"));
             s.tick(1, 0, 0, |_, _| vec![]);
         }
         let r = s.recent(100);
@@ -1519,7 +1926,8 @@ mod tests {
 
         let s = sched();
         s.wake(big, 0, 0);
-        s.tick(big, 0, 0, |_, _| vec![]);
+        s.deliver(big, 0, Salience::NORMAL, say("something to answer"));
+        s.tick(big, 0, 0, |_, _| vec![]).expect("ticked");
 
         let json = serde_json::to_string(&s.recent(1)[0]).unwrap();
         assert!(

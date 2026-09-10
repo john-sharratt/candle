@@ -42,6 +42,38 @@ pub fn steps_from(map: &MapSet, at: &Where) -> Vec<Where> {
     out
 }
 
+/// Everywhere there is any way to get to from here, nearest first, **never
+/// including where you already are**.
+///
+/// One breadth-first pass rather than a [`route`] per candidate. The difference
+/// matters at the call site it exists for: `move_to`'s destination list is
+/// rebuilt for every character on every turn, and asking "is there a way to
+/// that room" separately of sixty rooms is sixty traversals of the same graph
+/// to compute what one traversal already knows.
+///
+/// Nearest first because the offered order is the order a model reads, and a
+/// list that opens with the room next door is a list whose first answer is
+/// usually the right one.
+pub fn reachable_from(map: &MapSet, at: &Where) -> Vec<Where> {
+    if map.node_at(at).is_none() {
+        return Vec::new();
+    }
+    let mut seen: BTreeSet<Where> = BTreeSet::from([at.clone()]);
+    let mut queue: VecDeque<Where> = VecDeque::from([at.clone()]);
+    let mut out: Vec<Where> = Vec::new();
+
+    while let Some(here) = queue.pop_front() {
+        for next in steps_from(map, &here) {
+            if !seen.insert(next.clone()) {
+                continue;
+            }
+            out.push(next.clone());
+            queue.push_back(next);
+        }
+    }
+    out
+}
+
 /// The shortest way between two places, both ends included.
 ///
 /// `None` when there is no way at all; a one-element route when you are asking

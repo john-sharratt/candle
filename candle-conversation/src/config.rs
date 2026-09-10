@@ -691,10 +691,34 @@ impl SamplingConfig {
     /// identifiers from an earlier span; for dialogue it is the reason a
     /// stronger multiplier alone will not stop two characters converging on one
     /// another's words.
+    /// # What `cross_turn_penalty` adds, and what it does not
+    ///
+    /// DRY cannot see the previous utterance (above), so nothing here reached
+    /// across a turn boundary at all: a character repeating one sentence every
+    /// turn was invisible to every penalty on this config. `cross_turn_penalty`
+    /// is the one that does — a flat subtraction from any token the character
+    /// has already used today.
+    ///
+    /// **Lighter than `presence_penalty` on purpose.** It is a blunt instrument:
+    /// the kernel takes `min(count, 1)`, so a token used once is penalised
+    /// exactly as hard as one used a hundred times, and the counts accumulate
+    /// all day without decay. Set high it would push a character out of its own
+    /// vocabulary — its name, the words its persona is written in — for no
+    /// reason beyond having used them.
+    ///
+    /// **It also saturates, and that is worth knowing before relying on it.**
+    /// Once most of a character's working vocabulary has been used, the penalty
+    /// is close to a uniform shift, and softmax is shift-invariant — so it does
+    /// most of its work early in a day and fades. It will not break a
+    /// distribution that has already collapsed: a character whose window holds
+    /// ten copies of one act is choosing the next token at p ≈ 1, and 0.2 of a
+    /// logit against that is nothing. That collapse is a context problem, not a
+    /// sampling one, and it is fixed where the context is built.
     pub fn for_character_dialogue(mut self) -> Self {
         self.temperature = 1.0;
         self.top_p = 0.95;
         self.presence_penalty = 0.3;
+        self.cross_turn_penalty = 0.2;
         self.with_dry_penalty(1.0, 1.75, 2, 512)
     }
 
@@ -1914,6 +1938,44 @@ mod sampling_config_tests {
         // Escalation is still monotonic and still ends in an effective ban.
         assert!(run(3) < run(5) && run(5) < run(7));
         assert!(run(8) > 20.0, "an eight-token loop must be unreachable");
+    }
+
+    /// **Something has to reach across a turn boundary.**
+    ///
+    /// DRY is span-scoped — the kernel resets its window at every `<think>` and
+    /// `<tool_call>` — and presence and frequency are per-turn, cleared by
+    /// `end_turn`. So before this, *nothing* on a character's config could see
+    /// the previous utterance, and a character emitting one identical sentence
+    /// every turn was invisible to the whole sampler.
+    ///
+    /// Lighter than presence because it is flat: the kernel takes
+    /// `min(count, 1)`, so it cannot tell a word used once from one used a
+    /// hundred times, and it must not price a character out of its own
+    /// vocabulary.
+    #[test]
+    fn a_character_is_penalised_for_repeating_itself_across_turns() {
+        let c = SamplingConfig::for_gguf_architecture("qwen35").for_character_dialogue();
+        assert!(
+            c.cross_turn_penalty > 0.0,
+            "nothing on this config reaches past the current turn"
+        );
+        assert!(
+            c.cross_turn_penalty < c.presence_penalty,
+            "a flat all-day penalty must not outweigh the within-turn one"
+        );
+    }
+
+    /// The assistant presets are untouched: this is a dialogue setting, and a
+    /// model reproducing an identifier from an earlier turn is doing its job.
+    #[test]
+    fn cross_turn_repetition_is_only_penalised_for_characters() {
+        for arch in ["qwen3", "qwen35", "qwen3moe"] {
+            assert_eq!(
+                SamplingConfig::for_gguf_architecture(arch).cross_turn_penalty,
+                0.0,
+                "{arch} penalises an assistant for reusing a name"
+            );
+        }
     }
 
     #[test]

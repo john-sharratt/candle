@@ -20,6 +20,8 @@ use std::collections::{BTreeSet, HashMap};
 use serde::Deserialize;
 use serde_json::Value;
 
+use candle_transformers::models::dialect::{CallStyle, Dialect};
+
 use super::error::BuildError;
 use super::spec::{NodeSpec, SpecId, TreeSpec};
 use super::terminator::Terminator;
@@ -122,8 +124,42 @@ fn parse_param_type(pschema: &Value) -> ParamType {
 }
 
 /// The dialect-specific tool-call envelope strings.
+///
+/// # Two shapes, not one shape with different strings
+///
+/// This began as three strings around a JSON object, which is all the ChatML
+/// families need. Qwen3.5 does not put JSON in a tool call at all — it writes a
+/// nested element per argument, with unescaped values — so the difference is
+/// structural and the builder has to branch. [`ToolCallEnvelope::style`] is what
+/// it branches on, and every field below says which shapes it belongs to, so a
+/// reader can tell at a glance which half of the file a string reaches.
 #[derive(Debug, Clone)]
 pub struct ToolCallEnvelope {
+    /// Which shape the fields below describe. See [`CallStyle`].
+    pub style: CallStyle,
+    /// What ends the act's name, riding on each branch arm.
+    ///
+    /// On the arm rather than in the following static so a name that is a
+    /// prefix of another (`read` / `read_back`) stays distinguishable in the
+    /// trie — the arms differ at the terminator even when one name runs out
+    /// first. `"` closes a JSON string; `>\n` closes `<function=…`.
+    pub name_close: String,
+    /// [`CallStyle::FunctionBlock`]: what opens one argument, before its name.
+    pub param_open: String,
+    /// [`CallStyle::FunctionBlock`]: what follows the argument's name, before
+    /// its value.
+    pub param_name_close: String,
+    /// [`CallStyle::FunctionBlock`]: what ends one argument's value.
+    ///
+    /// **Consumed by the value span rather than emitted after it** — see
+    /// [`Terminator::Until`]. A raw value has no delimiter of its own, so the
+    /// marker is what ends it, and a static node emitting the marker as well
+    /// would write it twice.
+    ///
+    /// `&'static str` rather than `String` because it becomes a
+    /// [`Terminator`], which is `Copy` and therefore cannot own one. Every
+    /// envelope here is built from literals, so nothing is lost.
+    pub param_close: &'static str,
     /// Up to and including the opening quote of the name. Default:
     /// `"<tool_call>\n{\"name\": \""`.
     pub open: String,
@@ -150,10 +186,133 @@ impl ToolCallEnvelope {
     /// vs `ssh_session_exec_async`) is disambiguated by the quote.
     pub fn qwen3() -> Self {
         ToolCallEnvelope {
+            style: CallStyle::JsonBlock,
             open: "<tool_call>\n{\"name\": \"".to_string(),
             args_open: ", \"arguments\": {".to_string(),
             close: "}}\n</tool_call>".to_string(),
             marker: "<tool_call>".to_string(),
+            name_close: "\"".to_string(),
+            param_open: String::new(),
+            param_name_close: String::new(),
+            param_close: "",
+        }
+    }
+
+    /// The Qwen3.5 / Qwen3.8 envelope: a nested function element, one child per
+    /// argument, values raw.
+    ///
+    /// ```text
+    /// <tool_call>
+    /// <function=say>
+    /// <parameter=intent>
+    /// what I mean
+    /// </parameter>
+    /// </function>
+    /// </tool_call>
+    /// ```
+    ///
+    /// `open` runs up to and including `<function=`, so the name branch's arms
+    /// carry `name + ">\n"` — the closing `>` rides on the arm for the reason
+    /// the quote does in [`Self::qwen3`]: a name that prefixes another
+    /// (`read` / `read_back`) stays distinguishable in the trie.
+    ///
+    /// `args_open` is empty because nothing separates the name from the first
+    /// argument, and there are no separators *between* arguments either — each
+    /// is a self-delimiting element, which is what removes the whole
+    /// `emitted_any` comma problem the JSON shape has to carry.
+    pub fn qwen35() -> Self {
+        ToolCallEnvelope {
+            style: CallStyle::FunctionBlock,
+            open: "<tool_call>\n<function=".to_string(),
+            args_open: String::new(),
+            // **The layout newlines belong to the grammar, the tags to the
+            // model.** Each piece leads with the newline that separates it from
+            // whatever came before, so the tree emits every line break in the
+            // call and the model is never required to produce one.
+            close: "\n</function>\n</tool_call>".to_string(),
+            marker: "<tool_call>".to_string(),
+            name_close: ">".to_string(),
+            param_open: "\n<parameter=".to_string(),
+            param_name_close: ">\n".to_string(),
+            // **The tag alone, with no surrounding whitespace.**
+            //
+            // This was `"\n</parameter>\n"`, which made a line break part of the
+            // delimiter the model had to produce. It does not reliably produce
+            // one: taken from the persisted substrate, it wrote
+            // `…to pass again.</parameter>` — tag correct, newline absent — so
+            // the terminator never fired, the span stayed open, and every
+            // element after it was swallowed into the value. The parser then
+            // read a later call's arguments as this one's and reported the
+            // missing ones, which is how an `ask` came to be missing `to` while
+            // carrying `reflect`'s three arguments.
+            //
+            // A delimiter has to be something the model either wrote or did
+            // not. Layout is not that.
+            param_close: "</parameter>",
+        }
+    }
+
+    /// One call, written out — what a worked example in a system prompt has to
+    /// look like.
+    ///
+    /// **Here, beside the grammar, and nowhere else.** A prompt that teaches one
+    /// syntax while the stencil forces another is not a prompt that is merely
+    /// wrong: the grammar wins, so the model is held to a shape its instructions
+    /// never described, and the instructions become noise it has to work around.
+    /// That was live — the prompt documented one JSON object per line for a
+    /// checkpoint whose grammar emitted `<tool_call>` blocks — and it survived
+    /// because the only test in the area compared the prompt against the
+    /// *parser*, which accepted both.
+    ///
+    /// Built from the same fields [`compile_tool_call_tree`] compiles, so the
+    /// two cannot drift without a test noticing.
+    pub fn render(&self, name: &str, args: &[(&str, &str)]) -> String {
+        let mut s = String::with_capacity(96);
+        s.push_str(&self.open);
+        s.push_str(name);
+        s.push_str(&self.name_close);
+        s.push_str(&self.args_open);
+        match self.style {
+            CallStyle::FunctionBlock => {
+                for (k, v) in args {
+                    s.push_str(&self.param_open);
+                    s.push_str(k);
+                    s.push_str(&self.param_name_close);
+                    s.push_str(v);
+                    s.push_str(self.param_close);
+                }
+            }
+            CallStyle::JsonBlock | CallStyle::Lines => {
+                for (i, (k, v)) in args.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    // The value is a JSON string here, so a quote in it would
+                    // end the string early. Examples are authored prose and do
+                    // contain them.
+                    s.push_str(&format!("\"{k}\": {}", Value::String((*v).to_string())));
+                }
+            }
+        }
+        s.push_str(&self.close);
+        s
+    }
+
+    /// The envelope a dialect calls for.
+    ///
+    /// **The one place a call style becomes a grammar.** Asked of the dialect
+    /// rather than chosen by the caller, so a checkpoint's own template decides
+    /// the shape its decode is constrained to — which is the property that was
+    /// missing when the prompt described one syntax and the grammar forced
+    /// another.
+    pub fn for_dialect(d: &Dialect) -> Self {
+        match d.call_style {
+            CallStyle::FunctionBlock => Self::qwen35(),
+            // `Lines` has no envelope of its own. It gets the JSON block's,
+            // which is what this engine has always compiled — the markers are
+            // prefilled into the assistant turn and stripped again by the
+            // parser, so the shape on the wire is the same either way.
+            CallStyle::JsonBlock | CallStyle::Lines => Self::qwen3(),
         }
     }
 }
@@ -187,9 +346,9 @@ pub fn compile_tool_call_tree(
             text: env.args_open.clone(),
             next: args_entry,
         });
-        // The arm carries the name's closing `"` so prefix-related names stay
-        // distinguishable in the trie.
-        arms.push((format!("{}\"", tool.name), arm_target));
+        // The arm carries the name's own terminator so prefix-related names
+        // stay distinguishable in the trie — see `ToolCallEnvelope::name_close`.
+        arms.push((format!("{}{}", tool.name, env.name_close), arm_target));
     }
     let name_branch = b.spec.push(NodeSpec::Branch { arms });
     let open = b.spec.push(NodeSpec::Static {
@@ -344,7 +503,11 @@ pub fn compile_action_loop(
                 text: env.args_open.clone(),
                 next: args_entry,
             });
-            arms.push((format!("{}\"", tool.name), arm_target));
+            // The name's own terminator, from the envelope — a hardcoded `"`
+            // here spliced a JSON quote into a function block and produced act
+            // names like `reflect"<parameter=inner_thoughts"`, rejected on
+            // every turn. See `ToolCallEnvelope::name_close`.
+            arms.push((format!("{}{}", tool.name, env.name_close), arm_target));
         }
         let name_branch = b.spec.push(NodeSpec::Branch { arms });
         let open = b.spec.push(NodeSpec::Static {
@@ -397,14 +560,31 @@ impl ToolTreeBuilder<'_> {
 
         // Prepend the required fields, in order, building backwards.
         for (i, p) in required.iter().enumerate().rev() {
-            let sep = if i == 0 { "" } else { ", " };
             let (leadin, value) = self.build_value(p, opt_entry)?;
             opt_entry = self.spec.push(NodeSpec::Static {
-                text: format!("{sep}\"{}\": {leadin}", p.name),
+                text: self.key(p, i == 0, leadin),
                 next: value,
             });
         }
         Ok(opt_entry)
+    }
+
+    /// What opens one argument, up to the point its value begins.
+    ///
+    /// `first` says whether a separator is needed before it — which only the
+    /// JSON shapes have. A function block's arguments are self-delimiting
+    /// elements, so there is nothing between them and the flag is ignored.
+    fn key(&self, p: &Param, first: bool, leadin: &'static str) -> String {
+        match self.env.style {
+            CallStyle::FunctionBlock => format!(
+                "{}{}{}",
+                self.env.param_open, p.name, self.env.param_name_close
+            ),
+            CallStyle::JsonBlock | CallStyle::Lines => {
+                let sep = if first { "" } else { ", " };
+                format!("{sep}\"{}\": {leadin}", p.name)
+            }
+        }
     }
 
     /// The gate over optionals `idx..`, given whether a field was already emitted.
@@ -428,14 +608,13 @@ impl ToolTreeBuilder<'_> {
             memo.insert((idx, emitted_any), id);
             return Ok(id);
         }
-        let sep = if emitted_any { ", " } else { "" };
         let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(opts.len() - idx + 1);
         for (j, p) in opts.iter().enumerate().skip(idx) {
             // Include optional j: a field is emitted, so everything after has
             // emitted_any = true.
             let after = self.opt_gates(opts, j + 1, true, end, memo)?;
             let (leadin, value) = self.build_value(p, after)?;
-            arms.push((format!("{sep}\"{}\": {leadin}", p.name), value));
+            arms.push((self.key(p, !emitted_any, leadin), value));
         }
         // The "stop" arm: close the object.
         arms.push((self.env.close.clone(), end));
@@ -455,6 +634,39 @@ impl ToolTreeBuilder<'_> {
         p: &Param,
         next: SpecId,
     ) -> Result<(&'static str, SpecId), BuildError> {
+        // **A function block's values are raw**, so the closing delimiter is the
+        // element's own end marker rather than a quote, and nothing is escaped.
+        // Handled before the JSON cases because both the enum branch and the
+        // free span differ, not just one of them.
+        if self.env.style == CallStyle::FunctionBlock {
+            let close = self.env.param_close;
+            if let Some(values) = &p.enum_values {
+                // The end marker rides on each arm for the reason the quote
+                // does below: a value that prefixes another stays
+                // distinguishable in the trie.
+                let branch = self.spec.push(NodeSpec::Branch {
+                    arms: values
+                        .iter()
+                        .map(|v| (format!("{v}{close}"), next))
+                        .collect(),
+                });
+                return Ok(("", branch));
+            }
+            // Every type is raw text here — there is no JSON to be structurally
+            // valid against, and the act that receives the call parses its own
+            // scalars exactly as it does on the other styles.
+            let span = self.spec.push(NodeSpec::FreeText {
+                term: Terminator::Until {
+                    marker: self.env.param_close,
+                },
+                eos_ends: false,
+                limits: FreeTextLimits::json_string(),
+                close_token: None,
+                suppress_close: false,
+                next,
+            });
+            return Ok(("", span));
+        }
         if let Some(values) = &p.enum_values {
             // `"` <branch over `value"`> — the closing quote rides on each arm
             // so a value that prefixes another stays distinguishable.  The
@@ -540,6 +752,170 @@ mod tests {
         .unwrap();
         assert!(tree.len() > 5);
         assert_eq!(tree.label(), "tool_call");
+    }
+
+    // ── the function-block shape ────────────────────────────────────────────
+
+    /// Every static string the tree can emit, in id order — enough to see what
+    /// shape a decode is being held to without walking edges.
+    fn statics(spec: &TreeSpec) -> Vec<String> {
+        spec.nodes
+            .iter()
+            .filter_map(|n| match n {
+                NodeSpec::Static { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every branch arm the tree offers.
+    fn arms(spec: &TreeSpec) -> Vec<String> {
+        spec.nodes
+            .iter()
+            .flat_map(|n| match n {
+                NodeSpec::Branch { arms } => arms.iter().map(|(t, _)| t.clone()).collect(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// **The grammar emits Qwen3.5's own syntax**, not JSON wearing its
+    /// markers. Nothing checked this before: the prompt described one shape,
+    /// the grammar forced another, and the only test in the area compared the
+    /// prompt against the *parser*.
+    #[test]
+    fn the_function_block_tree_emits_elements_not_json() {
+        let spec = compile_tool_call_tree(&catalog(), &ToolCallEnvelope::qwen35()).unwrap();
+        let st = statics(&spec);
+        let all = st.join("");
+
+        assert!(all.contains("<tool_call>\n<function="), "{st:?}");
+        assert!(all.contains("<parameter=path>\n"), "{st:?}");
+        assert!(all.contains("</function>\n</tool_call>"), "{st:?}");
+
+        // None of the JSON scaffolding survives — no quoted keys, no argument
+        // object, no comma separators between arguments.
+        assert!(!all.contains("\"arguments\""), "{st:?}");
+        assert!(!all.contains("\"path\""), "{st:?}");
+        assert!(!all.contains(", "), "a JSON separator leaked in: {st:?}");
+    }
+
+    /// The act name's closing `>` rides on each arm, so a name that prefixes
+    /// another stays distinguishable in the trie — the same rule the JSON
+    /// shape's closing quote follows.
+    #[test]
+    fn a_function_name_arm_carries_its_own_terminator() {
+        let spec = compile_tool_call_tree(&catalog(), &ToolCallEnvelope::qwen35()).unwrap();
+        let a = arms(&spec);
+        assert!(a.iter().any(|s| s == "read_file>"), "{a:?}");
+        assert!(a.iter().any(|s| s == "write_file>"), "{a:?}");
+    }
+
+    /// An enumerated value is raw text with the element's end marker on it —
+    /// no quotes, because there is no JSON string to close.
+    #[test]
+    fn an_enum_value_is_unquoted_and_carries_the_end_marker() {
+        let spec = compile_tool_call_tree(&catalog(), &ToolCallEnvelope::qwen35()).unwrap();
+        let a = arms(&spec);
+        assert!(a.iter().any(|s| s == "read</parameter>"), "{a:?}");
+        assert!(
+            !a.iter().any(|s| s.contains("\"")),
+            "an enum arm was quoted: {a:?}"
+        );
+    }
+
+    /// A free value ends at the element marker rather than at a quote, which
+    /// is what lets a character's prose hold quotes and newlines untouched.
+    ///
+    /// The marker is the **bare tag**, with no layout newlines on either side.
+    /// A marker of `"\n</parameter>\n"` only fires when the model happens to put
+    /// the tag on its own line, and it does not always: measured live, an `ask`
+    /// ended a value `...pass again.</parameter>` with the tag hard against the
+    /// prose. The span stayed open, swallowed the two elements that followed —
+    /// so the `ask` appeared to carry `reflect`'s arguments — and the injected
+    /// close then wrote a second tag on top. The tag alone is the model's
+    /// close; the newlines around it belong to the grammar.
+    #[test]
+    fn a_free_value_is_terminated_by_the_element_and_not_by_a_quote() {
+        let spec = compile_tool_call_tree(&catalog(), &ToolCallEnvelope::qwen35()).unwrap();
+        let terms: Vec<Terminator> = spec
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                NodeSpec::FreeText { term, .. } => Some(*term),
+                _ => None,
+            })
+            .collect();
+        assert!(!terms.is_empty(), "no free span at all");
+        assert!(
+            terms.iter().all(|t| matches!(
+                t,
+                Terminator::Until {
+                    marker: "</parameter>"
+                }
+            )),
+            "{terms:?}"
+        );
+    }
+
+    /// It still compiles against a real vocabulary — the shape being right is
+    /// not the same as the trie accepting it.
+    #[test]
+    fn the_function_block_tree_compiles() {
+        let tree = compile(
+            &compile_tool_call_tree(&catalog(), &ToolCallEnvelope::qwen35()).unwrap(),
+            &TestVocab::new(),
+        )
+        .unwrap();
+        assert!(tree.len() > 5);
+        assert_eq!(tree.label(), "tool_call");
+    }
+
+    /// **The action loop is the tree npcd actually compiles**, and it builds its
+    /// own name arms.
+    ///
+    /// It had a hardcoded `"` where the single-call tree had one too — fixing
+    /// only the latter left the loop splicing a JSON quote into a function
+    /// block, so every live act arrived named `reflect"<parameter=inner_thoughts"`
+    /// and was rejected as an unknown tool. Twenty-two of twenty-two ticks.
+    /// The single-call tree is not what runs; this is.
+    #[test]
+    fn the_action_loop_writes_the_same_shape_as_a_single_call() {
+        let spec = compile_action_loop(
+            &catalog(),
+            &ToolCallEnvelope::qwen35(),
+            2,
+            "<|im_end|>",
+            None,
+        )
+        .unwrap();
+        let a = arms(&spec);
+        assert!(
+            a.iter().any(|s| s == "read_file>"),
+            "the loop's name arms are not the envelope's: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|s| s.starts_with("read_file\"")),
+            "a JSON quote leaked into a function block: {a:?}"
+        );
+        // And it still compiles for both styles at the bound npcd uses.
+        for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
+            let spec = compile_action_loop(&catalog(), &env, 2, "<|im_end|>", None).unwrap();
+            compile(&spec, &TestVocab::new())
+                .unwrap_or_else(|e| panic!("{:?} will not compile: {e}", env.style));
+        }
+    }
+
+    /// The JSON families are untouched — the whole point of the style axis is
+    /// that adding one changes nothing for the others.
+    #[test]
+    fn the_json_tree_is_exactly_what_it_always_was() {
+        let spec = compile_tool_call_tree(&catalog(), &ToolCallEnvelope::qwen3()).unwrap();
+        let all = statics(&spec).join("");
+        assert!(all.contains("<tool_call>\n{\"name\": \""));
+        assert!(all.contains(", \"arguments\": {"));
+        assert!(all.contains("}}\n</tool_call>"));
+        assert!(!all.contains("<parameter="), "{all}");
     }
 
     /// The envelope the action loop uses: `close` carries no turn terminator,

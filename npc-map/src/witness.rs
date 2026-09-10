@@ -225,6 +225,11 @@ fn legible(reach: Reach, what: &Happening) -> Option<Happening> {
         Reach::InSight => match what {
             // Nobody lip-reads across a room.
             Happening::Said { .. } => None,
+            // A building noise belongs to the room it happened in. Carrying it
+            // through a doorway would put the same fan, the same rat and the
+            // same failing tube in two rooms at once, and a character that
+            // walked next door to look would find nothing there.
+            Happening::Stirred { .. } => None,
             // A console lighting up is visible; what is on it is not.
             Happening::TookStation { .. } => Some(Happening::TookStation { subject: None }),
             Happening::LeftStation { .. } => Some(Happening::LeftStation { subject: None }),
@@ -250,8 +255,26 @@ pub fn narrate(world: &World, seen: &[Witnessed]) -> Option<String> {
     let mut run: Vec<String> = Vec::new();
     let mut whose: Option<String> = None;
     let mut named: BTreeSet<String> = BTreeSet::new();
+    // What the room you have just walked into is, held until the sentence
+    // saying you walked in is finished — see [`crate::perceive::what_it_is_like`]
+    // for why arriving is the one moment it is worth saying.
+    let mut arrived_in: Option<String> = None;
 
     for w in seen {
+        // **A stirring has no subject to group under.** It is already a whole
+        // sentence about the building, so it closes whatever run was open and
+        // stands on its own — *Maker-04 came in. The lights in the ceiling
+        // flicker and steady.* Attributing it would put the vent's doing in
+        // somebody's hands.
+        if let Happening::Stirred { text, .. } = &w.what {
+            if let Some(name) = whose.take() {
+                sentences.push(format!("{name} {}.", crate::text::list(&run)));
+            }
+            run.clear();
+            named.clear();
+            sentences.push(text.clone());
+            continue;
+        }
         // You are "you", and you are never in a run with anybody else, so
         // *you got to the command room* stands as its own sentence beside
         // whatever the room was doing while you arrived in it.
@@ -268,12 +291,22 @@ pub fn narrate(world: &World, seen: &[Witnessed]) -> Option<String> {
             named.clear();
             whose = Some(subject);
         }
+        // **Your own arrival is when the room is worth describing.** Only your
+        // own: watching somebody else walk into a room tells you nothing new
+        // about the room, and `GotThere` is private to the walker anyway.
+        if let (true, Happening::GotThere { toward }) = (w.mine(), &w.what) {
+            arrived_in = crate::perceive::what_it_is_like(world, toward);
+        }
         if let Some(verb) = verb_phrase(world, w, &mut named) {
             run.push(verb);
         }
     }
     if let Some(name) = whose {
         sentences.push(format!("{name} {}.", crate::text::list(&run)));
+    }
+    // After the sentence that says you got there, never before it.
+    if let Some(room) = arrived_in {
+        sentences.push(room);
     }
     (!sentences.is_empty()).then(|| sentences.join(" "))
 }
@@ -395,6 +428,11 @@ fn verb_phrase(world: &World, w: &Witnessed, named: &mut BTreeSet<String>) -> Op
         Happening::LostTheWay { toward, why } => {
             format!("never got to {}, {why}", place_of(world, toward))
         }
+        // Never reached: `narrate` takes a stirring out before it gets here,
+        // because a sentence with no actor cannot be a clause in a run that is
+        // grouped by actor. Classified rather than wildcarded so a new
+        // happening still cannot be added without a phrasing being chosen.
+        Happening::Stirred { .. } => return None,
     })
 }
 

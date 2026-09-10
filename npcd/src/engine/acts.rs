@@ -15,7 +15,7 @@
 //! > because code cannot read a sentence, and a string nothing reads is written
 //! > every turn and costs a decode to produce.
 //!
-//! So `touch` takes an intent, because a narrator renders it into prose. And
+//! So `act` takes an intent, because a narrator renders it into prose. And
 //! `engage` takes a posture, a priority and a filter, because a simulator
 //! branches on them. A `guidance` string on `engage` would look exactly like
 //! control and do nothing at all, which is worse than a missing parameter:
@@ -60,57 +60,96 @@ use super::tools::{Availability, Example, Param, Plane, Tool};
 /// can represent the difference — a target who experiences the act against an
 /// audience who observes one — and everything that hangs on it is material:
 /// consent, resistance, and what the other party does next.
-pub const TOUCH: Tool = Tool {
-    name: "touch",
+///
+/// # Why it is `act` and not `touch`
+///
+/// It was `touch`, and the name was doing damage in two directions.
+///
+/// It read as *gentle contact* — steadying an elbow, a hand on a shoulder — in
+/// a game about a war. This is the act a character reaches for to break a jaw,
+/// take a weapon off somebody or hold them against a wall, and a model choosing
+/// between named tools reads the name first. A character with no way to name
+/// what it was doing did not do it.
+///
+/// And it did not match the console. The person standing in the room does the
+/// same thing with `/act` (`engine::slash`), so the two halves of one exchange —
+/// what you do to a character and what it does back — had different names for
+/// one idea. One concept, one word, whichever side of the room it comes from.
+pub const ACT: Tool = Tool {
+    name: "act",
     at: &[],
     category: "Contact",
     plane: Plane::World,
-    // You cannot put a hand on somebody down a voice line, and being invited to
-    // is what makes a character try.
+    // You cannot put a hand on somebody down a line, and being invited to is
+    // what makes a character try.
+    //
+    // **Reachable while alone, on purpose.** `yourself` is a real target — a
+    // character binding its own wound, getting its own weapon clear or dragging
+    // itself up off the floor — so the tool stays even with nobody to touch.
+    // What that cost is *frequency*: a solitary cast chose it fifty-three times
+    // out of fifty-three, and the answer to that is the cooldown a self-act
+    // serves, not taking the act away. See `cooldown::SELF_ACT`.
     availability: Availability::PhysicalOnly,
-    description: "Do something physical to one person here — steady them, block their way, take \
-                  something from their hand, put yourself between them and something else. Like \
-                  `say`, you give what you MEAN by it and not the choreography; the narrator \
-                  renders the movement. They feel it, they may refuse it, and what they do next \
-                  is theirs.",
+    description: "Do something physical to one person here. Anything your body can do to \
+                  theirs: steady them, block their way, take something out of their hand, put \
+                  yourself between them and something else — or put them on the floor, break \
+                  their grip, hurt them. Like `say`, you give what you MEAN by it and not the \
+                  choreography; the narrator renders the movement. They feel it, they may \
+                  refuse it, and what they do next is theirs.",
     params: &[
         Param {
-            name: "to",
+            name: "on",
             ty: "string",
             required: true,
             description: "Who you are doing it to, exactly as their name appears where you are. \
-                          They must be here.",
+                          They must be here. `yourself` to do it to your own body.",
         },
         Param {
             name: "intent",
             ty: "string",
             required: true,
             description: "What you mean by it. Substance, not movement: \"steady her before she \
-                          goes over\" — never \"I put my hand under her elbow\".",
+                          goes over\" or \"put him down before he reaches the door\" — never \
+                          \"I put my hand under her elbow\".",
         },
     ],
     examples: &[
         Example {
             situation: "Someone you have been arguing with turns for the door, and the thing you \
                         actually needed to say is still unsaid.",
-            call: r#"{"to":"Perrin Vastwood","intent":"stop him leaving, without making it a hold"}"#,
+            call: r#"{"on":"Perrin Vastwood","intent":"stop him leaving, without making it a hold"}"#,
             because: "The act is aimed at one person and they can refuse it, which `gesture` \
                       cannot express — a gesture would only have been seen.",
         },
         Example {
             situation: "The one who came back from the ridge is on their feet and should not be.",
-            call: r#"{"to":"Wren","intent":"take the weight off her before she stands on it again"}"#,
+            call: r#"{"on":"Wren","intent":"take the weight off her before she stands on it again"}"#,
             because: "Contact, not signal. Telling her to sit down is `tell`; this is doing it.",
+        },
+        Example {
+            situation: "He has a knife out and is between you and the only way down.",
+            call: r#"{"on":"Hess","intent":"take the knife off him, and put him down if he keeps hold of it"}"#,
+            because: "The same act as steadying somebody, and the intent is what makes it \
+                      violence. There is no separate tool for a blow — a body does one kind of \
+                      thing to another body, and what it means is the argument.",
+        },
+        Example {
+            situation: "The bleeding has not stopped and there is nobody here to do it for you.",
+            call: r#"{"on":"yourself","intent":"get the wound closed before it costs me the arm"}"#,
+            because: "A body is a thing you can act on, including your own. Everybody in the \
+                      room sees it and nobody else feels it, which is exactly what `yourself` \
+                      means here.",
         },
     ],
 };
 
 /// Stop, for a stretch of the world's time.
 ///
-/// **Not `wait_for`.** Waiting attends one named event and stays responsive to
-/// everything else; sleeping is unresponsive by design, which is exactly why
-/// something has to be able to break through it. Being woken is a perception,
-/// not a failure — the duration is an intention the world may end early.
+/// **Not `pause`.** A pause is a moment and stays responsive to everything —
+/// anything at all brings the character straight back. Sleeping is a stretch of
+/// the day and is unresponsive by design, which is exactly why something has to
+/// be able to break through it. Being woken is a perception, not a failure —
+/// the duration is an intention the world may end early.
 ///
 /// It is also what makes a day mean anything. Two clusters of the repertoire
 /// open and close one, and a character with nothing to do that sleeps until
@@ -119,7 +158,12 @@ pub const TOUCH: Tool = Tool {
 pub const SLEEP: Tool = Tool {
     name: "sleep",
     at: &[],
-    category: "Attention",
+    // **Meta, which is what its own plane has always said.** Filed under
+    // `Attention` while declaring `Plane::Meta`, which is a disagreement about
+    // what the act *is*: attention is turning towards something, and this is
+    // the act of turning away from everything until a named hour. `reflect` is
+    // the one that attends.
+    category: "Meta",
     plane: Plane::Meta,
     availability: Availability::Embodied,
     description: "Stop, and stay stopped until a time you name. You will not answer what happens \
@@ -209,9 +253,11 @@ pub const GIVE: Tool = Tool {
 /// is for, and a named tool per readable thing would make the model choose among
 /// names it must remember rather than among things that are actually there.
 ///
-/// It does not absorb `observe`, which attends the physical situation and comes
-/// back with a percept. This attends recorded content. The world can represent
-/// that difference: one goes through the map, the other through the record.
+/// **This is the only act for attending to anything**, now that `observe` is
+/// gone. The two were never the same: looking around a room returned what the
+/// percept had already handed over, where this returns *recorded content* —
+/// what is actually written on the board, which nothing else in the engine
+/// delivers and which the character cannot know until it reads it.
 pub const READ: Tool = Tool {
     name: "read",
     at: &[],
@@ -220,8 +266,8 @@ pub const READ: Tool = Tool {
     availability: Availability::Always,
     description: "Read something the place you are standing holds — a board, a panel, a page, a \
                   terminal's subject. What comes back is its contents, not a description of it. \
-                  Use `observe` for the room and the people in it; this is for what is written \
-                  down.",
+                  You are already told what is in the room and who is in it; this is for what is \
+                  written down, which you cannot know until you read it.",
     params: &[Param {
         name: "what",
         ty: "string",
@@ -233,6 +279,75 @@ pub const READ: Tool = Tool {
         call: r#"{"what":"the muster board"}"#,
         because: "Spending a step finding out beats acting on what you assume is still true.",
     }],
+};
+
+/// Leave words on something, for whoever comes by.
+///
+/// # The other half of `read`
+///
+/// A world where things can be read and not written is one where everything
+/// readable had to be authored before anybody arrived. This is what lets the
+/// people living in a place leave something in it — and what makes a board a
+/// board rather than a decorated wall.
+///
+/// # Why it is not `say` written down
+///
+/// Speech reaches whoever is standing there, now, and is gone. This reaches
+/// whoever comes to this spot afterwards, and keeps. That is a different act
+/// with a different audience — the character writing it is addressing people
+/// who are not in the room and may not be born yet, which is the whole
+/// difference between telling somebody and posting a notice.
+///
+/// # Why the surface is enumerated
+///
+/// `on` binds to [`crate::engine::tools::Choices::Postable`], which is the
+/// fixtures actually standing here. A character cannot invent a board, and
+/// where there is nothing to write on the act leaves the grammar — the same
+/// empty-set rule the phone acts run on, rather than an `AtPart` list that
+/// would have to name every board id in every map for ever.
+pub const POST_NOTICE: Tool = Tool {
+    name: "post_notice",
+    at: &[],
+    category: "Attention",
+    plane: Plane::World,
+    availability: Availability::Always,
+    description: "Write something on a board, a panel or a page here, for whoever comes to it \
+                  next. It stays until it is pushed off the bottom by newer things, and everybody \
+                  who reads it is told you wrote it. Use this when what you have to say outlives \
+                  the people currently in the room — `say` reaches whoever is standing here now \
+                  and is gone.",
+    params: &[
+        Param {
+            name: "on",
+            ty: "string",
+            required: true,
+            description: "What you are writing on, named exactly as it stands here.",
+        },
+        Param {
+            name: "what",
+            ty: "string",
+            required: true,
+            description: "What you are leaving, in one line somebody arriving cold can act on. \
+                          Substance, not a finished sentence — the wording follows.",
+        },
+    ],
+    examples: &[
+        Example {
+            situation: "You have just found that the lift on five is not answering, and you are \
+                        the only one who knows.",
+            call: r#"{"on":"the muster board","what":"that the lift on five is not answering and the stairwell is the only way up until somebody looks at it"}"#,
+            because: "It matters to people who are not here, and will still matter in an hour. \
+                      Saying it to an empty room reaches nobody and keeps nothing.",
+        },
+        Example {
+            situation: "You are leaving a subject half-finished and somebody else will pick it \
+                        up before you are back.",
+            call: r#"{"on":"the accession desk","what":"that the third era is written up twice and I have not settled which is right — do not file either yet"}"#,
+            because:
+                "A handover is exactly the thing that has to outlast the handshake. The next \
+                      person to stand here reads it whether or not anybody remembered to tell them.",
+        },
+    ],
 };
 
 /// Take something on, and hold it.
@@ -503,7 +618,18 @@ pub const RECALL: Tool = Tool {
     at: &[],
     category: "Movement",
     plane: Plane::World,
-    availability: Availability::Embodied,
+    // **Absent while you are already home, not refused there.**
+    //
+    // It was `Embodied`, which is true and not enough: a body standing at its
+    // own muster point was still offered the journey back to it, `World::place`
+    // accepted the move to the room it was already in, and the act reported
+    // "the ground goes out from under you" having done nothing. Twenty-four of
+    // sixty acts across a live cast, and the characters could see the loop
+    // without being able to leave it.
+    //
+    // Being embodied is implied — a body is what has somewhere to be called
+    // back from — so nothing is lost by naming the stricter condition.
+    availability: Availability::AwayFromHome,
     description: "Go straight back to where you muster from. It crosses nothing on the way, it \
                   always goes to the same place, and it can fail — there may not be the power for \
                   it, or something may be in the way of it.",
@@ -528,42 +654,41 @@ pub const SCAN: Tool = Tool {
     category: "Attention",
     plane: Plane::Internal,
     availability: Availability::Always,
-    description: "Look at somewhere you are not, through instruments. Give a place by name if it \
-                  has one, or a grid reference if it does not. This is not looking around the \
-                  room — that is `observe` — and it will tell you nothing about anywhere off the \
-                  map.",
-    params: &[
-        Param {
-            name: "at",
-            ty: "string",
-            required: false,
-            description: "A place by name, when the place has one.",
-        },
-        Param {
-            name: "x",
-            ty: "string",
-            required: false,
-            description: "The east-west grid reference, when you are giving a coordinate.",
-        },
-        Param {
-            name: "y",
-            ty: "string",
-            required: false,
-            description: "The north-south grid reference.",
-        },
-    ],
+    description: "Look at somewhere you are not, through instruments. Name the place you want \
+                  looked at. It tells you nothing about the room you are standing in — you are \
+                  told that already.",
+    // **`at` is required, and it was the whole bug that it was not.**
+    //
+    // This act takes a place *or* a pair of coordinates, and every one of the
+    // three was optional — a disjunction the flat grammar has no way to state,
+    // so what it actually said was "all three may be absent". A character
+    // emitted `scan` with nothing in it and `enact::scan` refused it, every
+    // time, unavoidably: measured live, twelve of one character's sixteen acts
+    // were that refusal.
+    //
+    // So the grammar offers the shape that cannot be wrong — a place, from the
+    // live set of places there are — and the coordinate form stays reachable
+    // through the API and the harness, which are not grammar-constrained. That
+    // is the same split `operate` already makes for a mode a device does not
+    // admit.
+    params: &[Param {
+        name: "at",
+        ty: "string",
+        required: true,
+        description: "The place you want looked at, named exactly as it is written.",
+    }],
     examples: &[
-        Example {
-            situation: "The watch reported movement on a bearing and nobody has eyes on it.",
-            call: r#"{"x":140,"y":-52}"#,
-            because: "A coordinate is a number and means nothing as a category. It is also the \
-                      one argument here that can be well-formed and still off the map.",
-        },
         Example {
             situation: "You want to know whether the ridge is clear before anybody walks it.",
             call: r#"{"at":"the east ridge"}"#,
-            because: "A named place when there is one, because a name is harder to get wrong \
-                      than a pair of numbers.",
+            because: "A named place, because a name is harder to get wrong than a pair of \
+                      numbers — and because the name is one the world handed you.",
+        },
+        Example {
+            situation: "The watch reported movement somewhere nobody has eyes on.",
+            call: r#"{"at":"the gatehouse"}"#,
+            because: "Looking somewhere you are not is the whole act. Where you are standing \
+                      is already in front of you and is never worth a scan.",
         },
     ],
 };
@@ -900,6 +1025,35 @@ pub const REACH_OUT: Tool = Tool {
 // anybody has to remember to set.
 
 /// Say something on one of your threads.
+///
+/// # The one act that can reach somebody you cannot see
+///
+/// Every world here gives its cast a standing channel — `sim::phone::CHANNEL` —
+/// which every character joins on arrival without choosing to. This is the act
+/// that speaks on it, and it needed no changes to become that: a channel is a
+/// thread with everybody on it, so it arrives in `Choices::Threads` beside the
+/// private ones and binds the same way.
+///
+/// That matters more than it sounds. A character alone could previously reach
+/// nobody it could not already see: the percept names who is in this room, and
+/// `move_to` offers rooms with no indication of who is in any of them, so the
+/// building was a list of identical doors. A character that says where it is
+/// has handed everybody else a room name with a person in it, which is the
+/// fact that was missing — and it is why the channel is left general rather
+/// than made into a find-people feature. Finding people is downstream of
+/// ordinary talk, not a separate mechanism.
+///
+/// # Why the description insists on speaking first
+///
+/// A handset that reaches everybody, offered on every turn, is an invitation to
+/// stop walking anywhere — and this catalogue has the scars to prove that a
+/// model takes the cheapest act that looks social. Two characters standing in
+/// one room texting each other is worse than either of them saying nothing.
+///
+/// So the rule is in the description, in the examples, and in
+/// `prompt::frame`: if they are here, speak. The grammar cannot enforce it —
+/// `say` and `tell` appear only in company, but `message` is `Always`, and it
+/// has to be, because the whole point is reaching people who are not here.
 pub const MESSAGE: Tool = Tool {
     name: "message",
     at: &[],
@@ -909,7 +1063,21 @@ pub const MESSAGE: Tool = Tool {
     description: "Send something on one of your conversations. It reaches everybody on that \
                   thread and nobody else — not the room you are standing in, and not people on \
                   your other threads. They will see it whenever they next look, which may not be \
-                  now. As with speaking, you give what you MEAN and the wording follows.",
+                  now. As with speaking, you give what you MEAN and the wording follows.\n\
+                  \n\
+                  **For people who are not here.** If the person you want is standing in front of \
+                  you, `say` or `ask` — texting somebody in the same room is a worse version of \
+                  talking to them. The channel reaches everyone at once, so it is for anything \
+                  that concerns whoever happens to be listening: a question you need an answer \
+                  to, something the others need to know before they act, a decision that is not \
+                  yours alone.\n\
+                  \n\
+                  **Ask rather than announce.** A message that reports your own status — where \
+                  you are, that you are ready, that you are standing by — gives nobody a reason \
+                  to reply and nothing to do about it, and a channel full of those is a room of \
+                  people talking past each other. A question obliges an answer. If you want to \
+                  be with somebody, ask where they are and go there; do not announce that you \
+                  are ready and wait.",
     params: &[
         Param {
             name: "to",
@@ -939,6 +1107,34 @@ pub const MESSAGE: Tool = Tool {
             call: r#"{"to":"the eastern sweep","intent":"stop dating anything until we have settled the boundary"}"#,
             because: "One send, everybody on the thread. A group is a thread with more people on \
                       it, not a different kind of act.",
+        },
+        // **The case a solitary character had no answer to.** Nobody here, and
+        // no way to learn that anybody exists anywhere — the percept names who
+        // is in this room, and `move_to` offers rooms with no sign of who is in
+        // any of them, so the building is a list of identical doors. The
+        // question is the act that was missing.
+        Example {
+            situation: "You have been alone in the chronicle for an hour and you do not know \
+                        where anybody else is.",
+            call: r#"{"to":"the channel","intent":"where each of you is working, because I want to bring the third era to whoever is nearest"}"#,
+            because: "**Asking is what finds people.** Nothing else tells you which of seventy \
+                      rooms has somebody in it, and an answer names one you can walk to. \
+                      Reporting your own position instead leaves everybody informed and \
+                      stationary.",
+        },
+        // **The failure this example is here to prevent**, taken from a live
+        // feed: two characters spent an afternoon agreeing to meet and never
+        // met. Seven of twenty-seven messages were the words "I'm standing by",
+        // and the pair oscillated between the same two rooms, each walking to
+        // where it guessed the other was. Nothing they sent each other named a
+        // place, because none of them ever asked.
+        Example {
+            situation: "Somebody has said they want to work through something with you, and you \
+                        do not know which room they are in.",
+            call: r#"{"to":"the channel","intent":"which room you are in, so I can come to you rather than both of us moving"}"#,
+            because: "One of you has to name a place or you will cross. \"I am ready\" from both \
+                      sides is two people waiting; a question has an answer, and the answer is \
+                      somewhere to walk.",
         },
     ],
 };
@@ -1033,10 +1229,11 @@ pub const WORLD_ACTS: &[Tool] = &[
     MESSAGE,
     INVITE,
     OPEN_GROUP,
-    TOUCH,
+    ACT,
     SLEEP,
     GIVE,
     READ,
+    POST_NOTICE,
     CLAIM,
     RELEASE,
     EQUIP,

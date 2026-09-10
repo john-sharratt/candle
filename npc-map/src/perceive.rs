@@ -76,6 +76,38 @@ pub fn percept(world: &World, id: &str) -> String {
     paragraphs.join("\n\n") + "\n"
 }
 
+/// What a place is, in the words whoever built it wrote down.
+///
+/// **A character that walks into a room should meet the room.** Without this a
+/// body arriving somewhere new is told only its name and who is in it, which is
+/// the same thing it was told about the last four rooms — so every room in the
+/// vault reads alike and there is nothing to have an opinion about. The lift
+/// being a car and a stairwell sharing one shaft is the difference between a
+/// place and a label.
+///
+/// **Said on arrival and not in the percept**, which is where it started. A
+/// percept is what is true *now*, and it is re-sent whenever any of it changes
+/// — so a character that had been standing in one room for an hour was handed
+/// the room's description again every time somebody walked past. Walking in is
+/// the moment the description is news; after that it is furniture.
+///
+/// Authored, never generated: [`crate::schema::Node::character`] is filled once,
+/// offline, and stored, so every reader gets the same room. `None` for a node
+/// nobody has described yet, which is the honest answer and reads as a plainer
+/// room rather than as a gap.
+pub fn what_it_is_like(world: &World, at: &Where) -> Option<String> {
+    let said: Vec<&str> = world
+        .node(at)?
+        .character
+        .as_deref()?
+        .split_whitespace()
+        .collect();
+    match said.is_empty() {
+        true => None,
+        false => Some(said.join(" ")),
+    }
+}
+
 /// Where you are and what is in your hands.
 ///
 /// The one thing a percept says about what anybody holds, because it is the

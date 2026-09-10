@@ -74,10 +74,19 @@ pub struct PathStats {
     /// Exit-token heals applied (the model merged a value's closing char with
     /// the next delimiter and was steered back).
     pub heals: u32,
-    /// Suppressed thinking-block close tokens dropped (each one is a steering
-    /// continuation retry: the model emitted `</think>` and was re-steered back
-    /// into the reasoning block with a continuation phrase).
-    pub think_continuations: u32,
+    /// Close signals intercepted and dropped inside a span, of either kind.
+    ///
+    /// Two things land here and they are the same event to the driver: a
+    /// thinking block's `</think>`, dropped so the successor can re-steer the
+    /// model back into reasoning with a continuation phrase; and an **EOS
+    /// sampled inside a tool-call value**, dropped so it never reaches the
+    /// sequence and never seals the turn while the tree still has structure to
+    /// emit.
+    ///
+    /// It was `think_continuations` and counted only the first, which stopped
+    /// being true when EOS interception was extended to every span — the
+    /// counter kept its name and quietly began totalling both.
+    pub intercepted_closes: u32,
     /// An out-of-grammar token escaped the mask and forced the bail failsafe.
     pub bailed: bool,
 }
@@ -198,10 +207,12 @@ impl StencilDriver {
                     consumed: bytes.len() - leftover,
                 }
             }
-            // A suppressed token close: drop the token, count the continuation,
-            // and let the successor prefill the steering phrase.
+            // A close signal the span keeps to itself: drop the token so it
+            // never reaches the sequence, and let the successor prefill
+            // whatever the tree owes — a steering phrase, or the structure the
+            // EOS would otherwise have cut short.
             Ok(Observe::TokenClosedDrop) => {
-                self.stats.think_continuations += 1;
+                self.stats.intercepted_closes += 1;
                 Healed::Drop
             }
             // A kept token close (the real, final close): commit it normally.
@@ -287,6 +298,34 @@ mod tests {
             "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>";
         let out = follow(Arc::clone(&tree), target, &v);
         assert_eq!(out, target);
+    }
+
+    /// **The closing tag is the delimiter; the newline around it is not.**
+    ///
+    /// A character does not put `</parameter>` on its own line reliably. Live,
+    /// one wrote `…to pass again.</parameter>` — tag hard against the prose —
+    /// and against a `"\n</parameter>\n"` marker that closed nothing: the span
+    /// stayed open, ate the elements that followed, and the call arrived
+    /// carrying the *next* act's arguments while missing its own.
+    ///
+    /// Here the whole block is followed byte for byte with no newline before a
+    /// single closing tag, and it round-trips.
+    #[test]
+    fn a_value_closes_on_the_tag_alone_with_no_newline_before_it() {
+        let v = TestVocab::new();
+        let tools = parse_tools(
+            r#"[{"name":"say","params":[
+                 {"name":"to","type":"string","required":true},
+                 {"name":"words","type":"string","required":true}]}]"#,
+        )
+        .unwrap();
+        let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen35()).unwrap();
+        let tree = Arc::new(compile(&spec, &v).unwrap());
+
+        let target = "<tool_call>\n<function=say>\n<parameter=to>\nMira</parameter>\
+                      \n<parameter=words>\nyou take the order now.</parameter>\
+                      \n</function>\n</tool_call>";
+        assert_eq!(follow(tree, target, &v), target);
     }
 
     #[test]
@@ -461,6 +500,147 @@ mod tests {
         );
     }
 
+    /// **EOS inside a value does not end the turn — the stencil closes the
+    /// call.**
+    ///
+    /// The hole this closes. A free-text span is the one place the stencil hands
+    /// the sampler the whole vocabulary, so EOS is samplable there; and until
+    /// this, a span with neither `eos_ends` nor a `close_token` had no reaction
+    /// to it — the token fell through to a byte terminator that could never
+    /// match it, the cursor stayed parked in the value, and the decode loop
+    /// sealed the turn on the EOS it had just sampled. The structural statics
+    /// after the span were never injected.
+    ///
+    /// Measured on the persisted substrate before the fix: **244 of 259 turns**
+    /// wrote a complete, correct function block and never closed it. Every one
+    /// was discarded as narration, so the character read as doing nothing at
+    /// all.
+    ///
+    /// A stencil is a guarantee about what may be emitted. A token that ends
+    /// the turn from inside one is a hole in that guarantee, not a style of
+    /// ending.
+    #[test]
+    fn eos_inside_a_value_is_swallowed_and_the_call_still_closes() {
+        let v = TestVocab::new();
+        let tree = tool_tree(
+            r#"[{"name":"read_file","params":[{"name":"path","type":"string","required":true}]}]"#,
+        );
+        let mut driver = StencilDriver::new(Arc::clone(&tree));
+        let mut out: Vec<u8> = Vec::new();
+
+        // Walk to the value span, writing whatever the grammar asks for.
+        let value = b"a.rs";
+        let mut wrote = 0usize;
+        let mut dropped = false;
+        loop {
+            match driver.step() {
+                StepMask::Prefill(run) => out.extend_from_slice(&v.decode(&run)),
+                StepMask::Branch(_) => {
+                    // The one-tool catalog still branches on the name; follow it.
+                    let b = b"read_file\""[wrote.min(9)];
+                    out.push(b);
+                    driver.accept(b as TokenId, &[b]);
+                    wrote += 1;
+                }
+                StepMask::Free { .. } => {
+                    // Part of the value, then stop mid-string with EOS — the
+                    // model deciding it has said enough.
+                    if let Some(&b) = value.get(out.len() % value.len()) {
+                        if !dropped && out.last() != Some(&b'"') && wrote < 40 {
+                            out.push(b);
+                            driver.accept(b as TokenId, &[b]);
+                            wrote += 1;
+                            continue;
+                        }
+                    }
+                    let eos = tree.eos();
+                    dropped = matches!(driver.accept(eos, b""), Healed::Drop);
+                    assert!(dropped, "EOS in a byte-terminated span was not intercepted");
+                }
+                StepMask::Done => break,
+            }
+        }
+
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            text.ends_with("</tool_call>"),
+            "the stencil did not close the call after EOS: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{0}'),
+            "the EOS was committed into the output: {text:?}"
+        );
+        assert!(driver.is_done());
+    }
+
+    /// **An intercepted EOS moves to the next argument, it does not end the
+    /// call.**
+    ///
+    /// The cursor goes to the span's own `next`, which for anything but the
+    /// last argument is the following `<parameter=…>` static. So a model that
+    /// stops early does not truncate the call — the tree walks on and emits
+    /// every remaining argument's scaffold, then closes.
+    ///
+    /// Asserted on a three-argument act because a one-argument one cannot tell
+    /// "moved on" from "closed": they are the same node.
+    #[test]
+    fn eos_moves_to_the_next_argument_rather_than_ending_the_call() {
+        let v = TestVocab::new();
+        let tree = tool_tree(
+            r#"[{"name":"reflect","params":[
+                 {"name":"inner_thoughts","type":"string","required":true},
+                 {"name":"feeling","type":"string","required":true},
+                 {"name":"my_reflections","type":"string","required":true}]}]"#,
+        );
+        let mut driver = StencilDriver::new(Arc::clone(&tree));
+        let mut out: Vec<u8> = Vec::new();
+        let mut name = b"reflect\"".iter();
+        // Stop dead on the very first thing the model gets to choose freely.
+        loop {
+            match driver.step() {
+                StepMask::Prefill(run) => out.extend_from_slice(&v.decode(&run)),
+                StepMask::Branch(_) => match name.next() {
+                    Some(&b) => {
+                        out.push(b);
+                        driver.accept(b as TokenId, &[b]);
+                    }
+                    None => panic!("branch after the name was exhausted: {out:?}"),
+                },
+                StepMask::Free { .. } => {
+                    driver.accept(tree.eos(), b"");
+                }
+                StepMask::Done => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&out).to_string();
+        // Every argument's scaffold was still written, in order.
+        for arg in ["inner_thoughts", "feeling", "my_reflections"] {
+            assert!(
+                text.contains(arg),
+                "EOS in the first value dropped `{arg}`: {text:?}"
+            );
+        }
+        assert!(
+            text.ends_with("</tool_call>"),
+            "the call was not closed: {text:?}"
+        );
+        // **And what came out is a readable call.** The terminator never fired
+        // — the model wrote nothing at all — so every closing delimiter here
+        // was injected by the tree. Without them the values ran on unquoted and
+        // the JSON was malformed, which loses the whole call rather than the one
+        // argument the model stopped inside.
+        let body = text
+            .trim_start_matches("<tool_call>\n")
+            .trim_end_matches("</tool_call>")
+            .trim();
+        let v: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("the interrupted call is not valid JSON ({e}): {body:?}"));
+        let args = &v["arguments"];
+        for arg in ["inner_thoughts", "feeling", "my_reflections"] {
+            assert_eq!(args[arg], "", "`{arg}` did not survive as an empty value");
+        }
+    }
+
     #[test]
     fn path_stats_track_a_clean_call() {
         let v = TestVocab::new();
@@ -517,7 +697,10 @@ mod tests {
         let StepMask::Branch(set) = action else {
             panic!("the tool name must be a masked branch, got {action:?}");
         };
-        assert!(set.contains(b'r' as TokenId), "`read_file` is in the catalog");
+        assert!(
+            set.contains(b'r' as TokenId),
+            "`read_file` is in the catalog"
+        );
         assert!(set.contains(b's' as TokenId), "`say` is in the catalog");
         assert!(
             !set.contains(b'l' as TokenId),

@@ -22,6 +22,7 @@ use crate::sim::device::{Device, Devices, Kind as DeviceKind};
 use crate::sim::field::{Breed, Deposit, Field, Hostile, Resource};
 use crate::sim::item::{Item as PackItem, Kind as ItemKind};
 use crate::sim::phone;
+use crate::sim::posting;
 use crate::sim::record::{Item, Kind as RecordKind, State as RecordState};
 use crate::sim::tower::{Coord, Recipe, Tower};
 use crate::sim::Sim;
@@ -128,11 +129,50 @@ pub fn devices_and_tools(map: &MapSet) -> (Devices, Vec<(String, Vec<String>)>) 
     (out, tools)
 }
 
+/// Every surface in a map that words can be left on.
+///
+/// **A fixture, by the map's own definition, is "something read or consulted,
+/// fixed in place"** — see [`npc_map::part::PartKind::Fixture`]. That is a
+/// readable surface described in as many words, and until now nothing in the
+/// engine treated it as one: a fixture declares no modes, so it never became a
+/// [`Device`], so the boards in the vault were furniture that could be walked
+/// past and nothing else. Meanwhile `read` was bound to the *machines*, which
+/// hold no text at all.
+///
+/// So each fixture is stood up as an empty [`posting::Postings`] entry. Empty is
+/// the right starting state and costs nothing: a board with nothing on it is
+/// offered to nobody, because `readable_at` asks for what a body has not read
+/// and there is nothing to have not read. It becomes real the moment anybody
+/// writes on it.
+fn postings_from_map(map: &MapSet) -> posting::Postings {
+    let mut out = posting::Postings::new();
+    for area in map.areas() {
+        for node in &area.nodes {
+            let at = format!("{}/{}", area.id, node.id);
+            for (part, _) in map.parts_at(node) {
+                if part.kind != PartKind::Fixture {
+                    continue;
+                }
+                // The article the part carries, or one supplied — the same rule
+                // a device's name follows, because a character has to name it
+                // back exactly as it is written.
+                let name = match part.name.starts_with("the ") {
+                    true => part.name.clone(),
+                    false => format!("the {}", part.name),
+                };
+                out.stand_up(&at, &name);
+            }
+        }
+    }
+    out
+}
+
 /// Fill a world's map-derived facts: what stands in each room, what its parts
 /// let a body do there, and where a recall lands.
 fn from_map(sim: &mut Sim, map: &MapSet, home_area: &str) {
     let (devices, tools) = devices_and_tools(map);
     sim.devices = devices;
+    sim.postings = postings_from_map(map);
     for (at, ts) in tools {
         sim.set_part_tools(at, ts);
     }
@@ -175,11 +215,19 @@ pub fn vault(map: Option<&MapSet>) -> Sim {
         Item::new("era_third", "the third era", RecordKind::Era).in_state(RecordState::Filed),
         Item::new("era_fourth", "the fourth era", RecordKind::Era).in_state(RecordState::Filed),
         Item::new("gap_third", "the third silence", RecordKind::Gap),
-        Item::new("face_unmade", "a face nobody has drawn", RecordKind::Portrait),
+        Item::new(
+            "face_unmade",
+            "a face nobody has drawn",
+            RecordKind::Portrait,
+        ),
         Item::new("place_flats", "the eastern flats", RecordKind::Place),
         Item::new("char_courier", "the courier", RecordKind::Character),
         Item::new("intake_west", "the western intake", RecordKind::Accession),
-        Item::new("enq_gate", "the question about the eastern gate", RecordKind::Enquiry),
+        Item::new(
+            "enq_gate",
+            "the question about the eastern gate",
+            RecordKind::Enquiry,
+        ),
     ] {
         sim.record.put(item);
     }
@@ -262,33 +310,47 @@ pub fn battle_cities(map: Option<&MapSet>) -> Sim {
     let mut shooter = Hostile::new("shooter_a", "a shooter", Breed::Shooter, "the-waste/ruins");
     shooter.firing = true;
     f.seed_hostile(shooter);
-    f.seed_hostile(Hostile::new("mech_a", "a mech", Breed::Mech, "the-waste/ruins"));
+    f.seed_hostile(Hostile::new(
+        "mech_a",
+        "a mech",
+        Breed::Mech,
+        "the-waste/ruins",
+    ));
     sim.field = f;
 
     sim
 }
 
-/// Issue a handset, and put somebody on the roster a phone can reach.
+/// Issue a handset, put somebody on the roster a phone can reach, and join them
+/// to the world's standing channel.
 ///
-/// Two halves of one thing: carrying the handset is what makes the messaging
-/// acts reachable, and being on the roster is what makes *you* reachable. A
-/// character with a phone and an empty roster has nobody to call; one on the
-/// roster with no phone can be called and cannot answer.
+/// Three halves of one thing: carrying the handset is what makes the messaging
+/// acts reachable, being on the roster is what makes *you* reachable, and being
+/// on the channel is what makes you reachable by everybody at once. A character
+/// with a phone and an empty roster has nobody to call; one on the roster with
+/// no phone can be called and cannot answer.
+///
+/// **The channel is joined here rather than chosen**, which is the whole of
+/// what makes it a capability rather than an option. See [`phone::CHANNEL`] for
+/// why a cast that had to opt in would spend its isolated hours not opting in.
+///
+/// Idempotent in all three, because this runs on every arrival and a character
+/// re-entering a world it was already in is the ordinary case, not an error.
 pub fn issue_handset(sim: &mut Sim, body: &str, name: &str) {
     sim.pack_mut(body)
         .add(PackItem::new(phone::PHONE, "handset", ItemKind::Gear, 1));
-    let mut roster: Vec<String> = sim.contacts_roster();
-    if !roster.iter().any(|n| n == name) {
-        roster.push(name.to_string());
-        roster.sort();
-        sim.set_roster(roster);
-    }
+    sim.enrol(name);
 }
 
 /// Kit a body out. What a companion walks out of the tower carrying.
 pub fn outfit(sim: &mut Sim, body: &str) {
     let pack = sim.pack_mut(body);
-    pack.add(PackItem::new("mono_sword", "mono sword", ItemKind::Weapon, 1));
+    pack.add(PackItem::new(
+        "mono_sword",
+        "mono sword",
+        ItemKind::Weapon,
+        1,
+    ));
     pack.add(PackItem::new(
         "plasma_rifle",
         "plasma rifle",
@@ -301,7 +363,12 @@ pub fn outfit(sim: &mut Sim, body: &str) {
         ItemKind::Armour,
         1,
     ));
-    pack.add(PackItem::new("bolt", "bolt rounds", ItemKind::Ammunition, 60));
+    pack.add(PackItem::new(
+        "bolt",
+        "bolt rounds",
+        ItemKind::Ammunition,
+        60,
+    ));
     pack.add(PackItem::new("stimpak", "stimpak", ItemKind::Consumable, 3));
     pack.add(PackItem::new(
         "scanner",
@@ -385,7 +452,11 @@ mod tests {
     fn a_counted_part_becomes_that_many_machines_and_a_lone_one_is_the_only_one() {
         let s = vault(Some(&maps()));
         let one = s.operable("vault-command/plant");
-        assert_eq!(one.len(), 0, "the plant panel declares no modes, so it is read");
+        assert_eq!(
+            one.len(),
+            0,
+            "the plant panel declares no modes, so it is read"
+        );
 
         let many = s.operable("vault-chronicle/catalogue-room");
         // The catalogue plus two terminals, all three of them machines.

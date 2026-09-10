@@ -5,7 +5,7 @@ import { API } from '../lib/api.js';
 import { h } from '../lib/dom.js';
 import { toast, modal, only, empty } from '../lib/ui.js';
 
-const MODE_SHORT = { physical: 'phys', video_call: 'video', voice_call: 'voice', instant_message: 'im' };
+const MODE_SHORT = { physical: 'phys', instant_message: 'im' };
 
 export async function render() {
   const el = h('div', { class: 'page', style: 'max-width:1100px' });

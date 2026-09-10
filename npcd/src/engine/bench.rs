@@ -100,7 +100,8 @@ macro_rules! bench_on {
     };
 }
 
-pub const BENCH_BRANCH: Tool = bench_on!(
+pub const BENCH_BRANCH: Tool =
+    bench_on!(
     "bench_branch", BENCHES,
     "Start changing something. Your work is yours alone until you offer it, and while you have it \
      open nobody else can commit over you.",
@@ -112,7 +113,8 @@ pub const BENCH_BRANCH: Tool = bench_on!(
 );
 
 pub const BENCH_DIFF: Tool = bench!(
-    "bench_diff", BENCHES,
+    "bench_diff",
+    BENCHES,
     "See what you have actually changed against what stands. Not what you meant to change — what \
      is different.",
     "You have been working for a while and are no longer certain what you have touched.",
@@ -120,7 +122,8 @@ pub const BENCH_DIFF: Tool = bench!(
 );
 
 pub const BENCH_STASH: Tool = bench!(
-    "bench_stash", BENCHES,
+    "bench_stash",
+    BENCHES,
     "Set your changes aside without giving them up. The thing goes back to what it was and your \
      work waits for you.",
     "Something more urgent has come up and you are in the middle of a change you do not want to \
@@ -129,7 +132,8 @@ pub const BENCH_STASH: Tool = bench!(
 );
 
 pub const BENCH_STASH_POP: Tool = bench!(
-    "bench_stash_pop", BENCHES,
+    "bench_stash_pop",
+    BENCHES,
     "Pick your own set-aside work back up, exactly where you left it. Only yours, and only what \
      `bench_stash` put down — this is the other half of setting aside rather than a way into \
      anybody else's unfinished change.",
@@ -138,7 +142,8 @@ pub const BENCH_STASH_POP: Tool = bench!(
 );
 
 pub const BENCH_RESTORE: Tool = bench!(
-    "bench_restore", BENCHES,
+    "bench_restore",
+    BENCHES,
     "Throw your changes away and put the thing back to what it was. This does not ask twice.",
     "You have taken a change a long way and it is wrong from the start, not wrong in the details.",
     "Starting again from the other end is sometimes the cheapest thing there is. Knowing that is \
@@ -146,7 +151,8 @@ pub const BENCH_RESTORE: Tool = bench!(
 );
 
 pub const BENCH_STAGE: Tool = bench!(
-    "bench_stage", BENCHES,
+    "bench_stage",
+    BENCHES,
     "Put your change up as done, for it to be looked at. It stops being private and is not yet \
      part of what stands.",
     "You have finished, you have read it back, and you would not change anything else without \
@@ -155,13 +161,15 @@ pub const BENCH_STAGE: Tool = bench!(
 );
 
 pub const BENCH_UNSTAGE: Tool = bench!(
-    "bench_unstage", BENCHES,
+    "bench_unstage",
+    BENCHES,
     "Take your offered change back, because you are not finished after all.",
     "Somebody has said something about your change and they are right.",
     "Withdrawing is cheap and taking back a bad merge is not."
 );
 
-pub const BENCH_COMMIT: Tool = bench_on!(
+pub const BENCH_COMMIT: Tool =
+    bench_on!(
     "bench_commit", BENCHES,
     "Merge your change into what stands. **It can fail**: if somebody else has changed the same \
      ground while you were working, it comes back with their name on it and the two of you have \
@@ -175,7 +183,8 @@ pub const BENCH_COMMIT: Tool = bench_on!(
 );
 
 pub const BENCH_STATUS: Tool = bench!(
-    "bench_status", BENCHES,
+    "bench_status",
+    BENCHES,
     "See what you have open, what is offered, and — when a merge has come back — exactly what it \
      collided with and whose it was.",
     "Your commit came back and you do not yet know what it ran into.",
@@ -183,7 +192,8 @@ pub const BENCH_STATUS: Tool = bench!(
      conversation."
 );
 
-pub const BENCH_BLAME: Tool = bench_on!(
+pub const BENCH_BLAME: Tool =
+    bench_on!(
     "bench_blame", BENCHES,
     "Trace a thing back through everyone who has held it, and find the point where the chain goes \
      quiet.",
@@ -194,7 +204,8 @@ pub const BENCH_BLAME: Tool = bench_on!(
      describing their own work."
 );
 
-pub const BENCH_LOG: Tool = bench_on!(
+pub const BENCH_LOG: Tool =
+    bench_on!(
     "bench_log", BENCHES,
     "See what has actually been done to a thing, and when. The history is not written by whoever \
      produced it, which is what makes it worth reading back.",
@@ -258,7 +269,8 @@ pub const FILE_WRITE: Tool = Tool {
     category: "Bench",
     plane: Plane::World,
     availability: Availability::AtPart,
-    description: "Write a document whole — for something new, or for a rewrite that keeps nothing. \
+    description:
+        "Write a document whole — for something new, or for a rewrite that keeps nothing. \
                   What you write is yours and unseen until you commit.",
     params: &[
         Param {
@@ -324,18 +336,21 @@ pub const FILE_EDIT: Tool = Tool {
 };
 
 pub const FILE_LIST: Tool = bench_on!(
-    "file_list", SCRATCH,
+    "file_list",
+    SCRATCH,
     "See what documents are actually in a place — including the ones you have made and not \
      committed, and without the ones you have taken out. What exists, rather than what anything \
      says exists.",
-    "path", "Which directory to look in — `eras`, or nothing at all for the top.",
+    "path",
+    "Which directory to look in — `eras`, or nothing at all for the top.",
     "You are looking for something and are not certain what it is called.",
     r#"{"path":"eras"}"#,
     "What exists, rather than what the index says exists — the two drift, and that drift is a \
      thing worth finding."
 );
 
-pub const FILE_DELETE: Tool = bench_on!(
+pub const FILE_DELETE: Tool =
+    bench_on!(
     "file_delete", SCRATCH,
     "Remove a document. Retiring something from the record is `record_let_go`, which keeps the \
      reason; this is for a thing that should never have been a document at all.",

@@ -520,7 +520,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     #[test]
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     /// `balanced_closes_on_eos_too`: an EOS sample closes the span exactly like
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 3);
+        assert_eq!(d.stats().intercepted_closes, 3);
     }
 
     /// `deep_phrases_have_leading_newlines`: the prefilled continuation runs decode
@@ -651,7 +651,7 @@ mod tests {
 
     /// `deep_intercepts_close_and_eos`: close one span with `</think>` and the next
     /// with EOS — both `Healed::Drop`, both produce the next phrase;
-    /// `think_continuations == 2` after two intercepts.
+    /// `intercepted_closes == 2` after two intercepts.
     #[test]
     fn deep_intercepts_close_and_eos() {
         let v = vocab();
@@ -677,7 +677,7 @@ mod tests {
         let (_, phrase2) = step_to_decode(&mut d, &v);
         assert_eq!(phrase2, "\n\nSo, where I land: ");
 
-        assert_eq!(d.stats().think_continuations, 2);
+        assert_eq!(d.stats().intercepted_closes, 2);
     }
 
     #[test]
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 4);
+        assert_eq!(d.stats().intercepted_closes, 4);
     }
 
     // ── Invariant: every produced tree compiles cleanly and reaches End ──────

@@ -1805,12 +1805,8 @@ impl Sequence {
             let (scaffold, _) = StencilDriver::new(tree).opening();
             // Specials kept: `<tool_call>` and friends are part of the syntax
             // the caller is going to parse, not decoration around it.
-            assistant_written.push_str(
-                &self
-                    .tokenizer
-                    .decode(&scaffold, false)
-                    .unwrap_or_default(),
-            );
+            assistant_written
+                .push_str(&self.tokenizer.decode(&scaffold, false).unwrap_or_default());
             prefill_tokens.extend_from_slice(&scaffold);
         }
 

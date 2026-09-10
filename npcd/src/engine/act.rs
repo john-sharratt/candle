@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! {"tool":"say","intent":"that he will not get the ledger"}
-//! {"tool":"observe","target":"the door"}
+//! {"tool":"read","what":"the muster board"}
 //! ```
 //!
 //! Not a function-calling API, and not XML. Three reasons, in order of how much
@@ -54,22 +54,43 @@ impl Act {
     /// Not the narrator's rendering — that is a separate concern and needs the
     /// character's voice. This is the act as an act: what was done, and with
     /// what intent, in a form a person reading the feed can scan.
+    /// # The arguments are named when there is more than one
+    ///
+    /// A single value needs no label — `say — the redoubt burned twice` reads
+    /// as what it is. Several bare values do not: `ask — Yaelis Vayne; where
+    /// the data chips are` leaves a reader to infer which half is the person
+    /// and which is the question, and for `act — steady them; Soren` or
+    /// `post_notice — the muster board; the third era is written twice` the
+    /// guess can go either way.
+    ///
+    /// So a multi-argument act carries `name: value` pairs, which the console
+    /// splits to set the label and the value in different faces
+    /// (`pulse.js::splitAct`). Single-argument acts stay bare, because a label
+    /// there is noise standing in front of the only thing worth reading.
     pub fn summary(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
+        let mut parts: Vec<(&str, String)> = Vec::new();
         // Ordered by the tool's own parameter list rather than by the map's
         // iteration order — `serde_json::Map` is a BTreeMap, so it would
         // otherwise render alphabetically and `manner` would precede `intent`.
         if let Some(t) = tools::by_name(self.tool) {
             for p in t.params {
                 if let Some(v) = self.args.get(p.name) {
-                    parts.push(render(v));
+                    parts.push((p.name, render(v)));
                 }
             }
         }
-        if parts.is_empty() {
-            self.tool.to_string()
-        } else {
-            format!("{} — {}", self.tool, parts.join("; "))
+        match parts.len() {
+            0 => self.tool.to_string(),
+            1 => format!("{} — {}", self.tool, parts[0].1),
+            _ => format!(
+                "{} — {}",
+                self.tool,
+                parts
+                    .iter()
+                    .map(|(name, v)| format!("{name}: {v}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
         }
     }
 }
@@ -169,6 +190,97 @@ fn looks_like_call(line: &str) -> bool {
 const CALL_OPEN: &str = "<tool_call>";
 const CALL_CLOSE: &str = "</tool_call>";
 
+/// Escape raw control characters that appear **inside** a JSON string.
+///
+/// # The failure this exists for
+///
+/// The grammar's free-text span ends at the first unescaped `"`
+/// (`stencil::Terminator::JsonString`) and excludes nothing else, so a model
+/// filling a string argument may emit a literal newline. JSON forbids that —
+/// a control character in a string must be escaped — so `serde_json` refuses
+/// the object, and because [`parse`] walks *lines* (the `<tool_call>` envelope
+/// spans them) the object arrives cut in two as well.
+///
+/// One character did this every turn for hours. The grammar had steered it
+/// correctly — right tool, right addressee — and the first byte of its `about`
+/// was a newline, so what came back was *"That did not come out as a call. One
+/// JSON object on a line, nothing else"*, which it could not act on because it
+/// had done exactly that. Each rejection then became another event in its
+/// window: 947 seen against its neighbours' 506.
+///
+/// # Why repairing here is not papering over it
+///
+/// The model's **content** is right and only its encoding is wrong, and the
+/// repair is exact rather than a guess: JSON defines the escape for every
+/// control character, so a raw one has one correct reading and no other. This
+/// recovers what was meant, byte for byte, and it is the same leniency any
+/// parser applies to a producer it does not control.
+///
+/// It is not the whole answer. The span should not be able to emit an
+/// unescapable byte in the first place, and that lives in the stencil's
+/// free-text mask — a shared change with its own blast radius. This makes the
+/// engine correct today and does not depend on that landing.
+///
+/// Outside a string a newline is structural — it is what separates one call
+/// from the next — so only the inside is touched. Borrowed and untouched when
+/// there is nothing to escape, which is every ordinary decode.
+fn escape_control_in_strings(s: &str) -> std::borrow::Cow<'_, str> {
+    if !needs_repair(s) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        if escaped {
+            escaped = false;
+            out.push(c);
+            continue;
+        }
+        match c {
+            '\\' if in_string => {
+                escaped = true;
+                out.push(c);
+            }
+            '"' => {
+                in_string = !in_string;
+                out.push(c);
+            }
+            // The whole point: a control character inside a string, written as
+            // the escape JSON requires.
+            c if in_string && (c as u32) < 0x20 => match c {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                other => out.push_str(&format!("\\u{:04x}", other as u32)),
+            },
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether any control character actually sits inside a string.
+///
+/// The scan above rewrites nothing when this is false, so an ordinary decode —
+/// which is all of them — pays one pass and no allocation.
+fn needs_repair(s: &str) -> bool {
+    let (mut in_string, mut escaped) = (false, false);
+    for c in s.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            c if in_string && (c as u32) < 0x20 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// One call's JSON, from either shape a character may emit.
 ///
 /// Both are one object naming a tool and its arguments; they differ in where the
@@ -191,10 +303,131 @@ fn flatten(obj: serde_json::Map<String, Value>) -> serde_json::Map<String, Value
     flat
 }
 
+/// The function-block markers — see [`function_blocks_to_lines`].
+const FN_OPEN: &str = "<function=";
+const FN_CLOSE: &str = "</function>";
+const PARAM_OPEN: &str = "<parameter=";
+const PARAM_CLOSE: &str = "</parameter>";
+
+/// Rewrite Qwen3.5's function-block calls into the flat one-object-per-line
+/// form the rest of this module already understands.
+///
+/// # Why translate rather than parse twice
+///
+/// A call arrives in one of two syntaxes now — see
+/// `candle_transformers::models::dialect::CallStyle` — and only the *surface*
+/// differs. Both name an act and give it named arguments; everything after
+/// that is identical, and all of it is the part with the teeth: unknown act,
+/// missing required parameter, a value that is not a string. Parsing each
+/// shape end to end would mean two copies of those checks, free to disagree,
+/// and the disagreement would show up as one syntax quietly accepting a call
+/// the other rejects.
+///
+/// So the block shape is normalised into the line shape and handed to the one
+/// walk. What comes out the far end is the same `Parsed`, with the same
+/// rejections, whichever syntax the model used.
+///
+/// # The values are raw, and stay raw
+///
+/// A `<parameter>` body is unescaped text that may hold quotes and newlines —
+/// that is the whole point of the syntax. `serde_json` does the escaping when
+/// the object is written, so a value survives the round trip intact rather
+/// than being cut at its first quote.
+///
+/// `None` when the text holds no function block at all, so the ordinary path
+/// costs one `find` and allocates nothing.
+fn function_blocks_to_lines(s: &str) -> Option<String> {
+    if !s.contains(FN_OPEN) {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find(FN_OPEN) {
+        // Anything before the block is narration, and is kept — a character
+        // that wrote a sentence before its call still wrote it.
+        out.push_str(&rest[..at]);
+        let after = &rest[at + FN_OPEN.len()..];
+        // An unterminated block is left as text rather than guessed at: a
+        // truncated decode is narration, not a call whose arguments we invent.
+        let (Some(name_end), Some(body_end)) = (after.find('>'), after.find(FN_CLOSE)) else {
+            out.push_str(rest);
+            return Some(out);
+        };
+        if name_end > body_end {
+            out.push_str(rest);
+            return Some(out);
+        }
+        let name = after[..name_end].trim();
+        let body = &after[name_end + 1..body_end];
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("tool".to_string(), Value::String(name.to_string()));
+        let mut scan = body;
+        while let Some(p) = scan.find(PARAM_OPEN) {
+            let tail = &scan[p + PARAM_OPEN.len()..];
+            let Some(key_end) = tail.find('>') else {
+                break;
+            };
+            // **`</function>` closes an open parameter.** The body is already
+            // bounded by it, so a value with no `</parameter>` of its own runs
+            // to the end of the body rather than being thrown away.
+            //
+            // Not tolerance for sloppiness — it is the shape the grammar
+            // actually produces when a value span ends on an intercepted EOS.
+            // The closing tag is *consumed by the span's terminator* rather
+            // than injected by the tree, so a span that ends any other way
+            // never writes one, and the parameter list is closed by
+            // `</function>` instead. Dropping the value there cost the whole
+            // act: a `reflect` whose last argument was cut short came back as
+            // "needed `my_reflections` and did not have it", and the two
+            // arguments the character had written were discarded with it.
+            let val_end = tail.find(PARAM_CLOSE).unwrap_or(tail.len());
+            if key_end > val_end {
+                break;
+            }
+            let key = tail[..key_end].trim();
+            // The element's own newlines are framing rather than content: the
+            // template writes `<parameter=k>\n` before the value and `\n` after
+            // it. Trimming exactly those keeps a value that deliberately ends
+            // in a blank line, which `trim()` would eat.
+            let value = tail[key_end + 1..val_end]
+                .strip_prefix('\n')
+                .unwrap_or(&tail[key_end + 1..val_end]);
+            let value = value.strip_suffix('\n').unwrap_or(value);
+            if !key.is_empty() {
+                obj.insert(key.to_string(), Value::String(value.to_string()));
+            }
+            scan = &tail[(val_end + PARAM_CLOSE.len()).min(tail.len())..];
+        }
+        out.push('\n');
+        out.push_str(&Value::Object(obj).to_string());
+        out.push('\n');
+        rest = &after[body_end + FN_CLOSE.len()..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// Parse a decode into acts.
 pub fn parse(output: &str) -> Parsed {
     let mut out = Parsed::default();
     let mut narration: Vec<&str> = Vec::new();
+
+    // **Repair before anything splits on a newline.** A raw control character
+    // inside a string argument is both invalid JSON and — because the walk
+    // below is line-based — enough to cut one object into two unparseable
+    // halves. Escaping it first puts the object back on one line, so everything
+    // downstream sees the ordinary shape. See [`escape_control_in_strings`].
+    // **Function blocks first, before anything assumes a line is JSON.** Their
+    // values are raw text and may hold newlines, so a line-based repair run
+    // over them would be working on fragments of a value. Translated here, the
+    // rest of this function sees the one shape it has always seen. See
+    // [`function_blocks_to_lines`].
+    let output = match function_blocks_to_lines(output) {
+        Some(translated) => translated,
+        None => output.to_string(),
+    };
+    let output = escape_control_in_strings(&output);
 
     // The envelope is stripped before the line walk rather than inside it,
     // because a `<tool_call>` block spans lines: the markers and the object sit
@@ -270,6 +503,255 @@ pub fn parse(output: &str) -> Parsed {
 mod tests {
     use super::*;
 
+    // ── the function-block syntax ───────────────────────────────────────────
+
+    /// **The shape Qwen3.5 actually emits**, end to end.
+    ///
+    /// Not a hypothetical: `Dialect::qwen35` is what the shipped checkpoint
+    /// resolves to, so this is the only syntax a live decode produces. Until
+    /// this existed the parser stripped `<tool_call>` and looked for JSON,
+    /// found an element instead, and every act became narration.
+    #[test]
+    fn a_function_block_is_read_as_an_act() {
+        let p = parse(
+            "<tool_call>\n<function=ask>\n<parameter=to>\nYaelis Vayne\n</parameter>\n\
+             <parameter=about>\nwhich of the two versions she has been working from\n\
+             </parameter>\n</function>\n</tool_call>",
+        );
+        assert_eq!(p.acts.len(), 1, "{:?} / {:?}", p.rejected, p.narration);
+        assert_eq!(p.acts[0].tool, "ask");
+        assert_eq!(p.acts[0].args["to"], "Yaelis Vayne");
+        assert_eq!(
+            p.acts[0].args["about"],
+            "which of the two versions she has been working from"
+        );
+    }
+
+    /// **Several calls in one turn**, which is the whole reason the family's
+    /// template loops over `tool_calls`. `ACTS_PER_TURN` is 2, and a character
+    /// turning as it speaks has to be expressible.
+    #[test]
+    fn several_function_blocks_in_one_turn_are_several_acts() {
+        let p = parse(
+            "<tool_call>\n<function=gesture>\n<parameter=intent>\nstop talking\n</parameter>\n\
+             </function>\n</tool_call>\n\
+             <tool_call>\n<function=move_to>\n<parameter=destination>\nthe green room\n\
+             </parameter>\n</function>\n</tool_call>",
+        );
+        assert_eq!(p.acts.len(), 2, "{:?}", p.rejected);
+        assert_eq!(p.acts[0].tool, "gesture");
+        assert_eq!(p.acts[1].tool, "move_to");
+        assert_eq!(p.acts[1].args["destination"], "the green room");
+    }
+
+    /// **A raw value keeps its quotes and its newlines.**
+    ///
+    /// The gain the syntax exists for, and the thing the JSON shapes cannot do:
+    /// `inner_thoughts` is prose, and prose has punctuation in it. The
+    /// equivalent JSON call is the live failure recorded below — a newline in a
+    /// value cut the object in half.
+    #[test]
+    fn a_function_block_value_survives_quotes_and_newlines() {
+        let p = parse(
+            "<tool_call>\n<function=reflect>\n<parameter=inner_thoughts>\n\
+             it heard me. It said \"no\" and meant it.\nI am not going to ask twice.\n\
+             </parameter>\n<parameter=feeling>\nwary\n</parameter>\n\
+             <parameter=my_reflections>\nnothing has settled\n</parameter>\n\
+             </function>\n</tool_call>",
+        );
+        assert_eq!(p.acts.len(), 1, "{:?}", p.rejected);
+        assert_eq!(
+            p.acts[0].args["inner_thoughts"],
+            "it heard me. It said \"no\" and meant it.\nI am not going to ask twice."
+        );
+        assert_eq!(p.acts[0].args["feeling"], "wary");
+    }
+
+    /// The checks with teeth run on both syntaxes, because there is one walk.
+    /// A block naming no real act, or missing a required argument, is rejected
+    /// exactly as its JSON twin would be.
+    #[test]
+    fn a_function_block_faces_the_same_checks_as_a_json_call() {
+        let unknown = parse(
+            "<tool_call>\n<function=teleport>\n<parameter=to>\nthe moon\n</parameter>\n\
+             </function>\n</tool_call>",
+        );
+        assert!(unknown.acts.is_empty());
+        assert!(
+            matches!(&unknown.rejected[..], [Rejected::UnknownTool { tool }] if tool == "teleport"),
+            "{:?}",
+            unknown.rejected
+        );
+
+        // `tell` needs both `to` and `intent`; one of them is not a quieter
+        // `tell`, it is a call the character did not finish making.
+        let short = parse(
+            "<tool_call>\n<function=tell>\n<parameter=to>\nMaker-02\n</parameter>\n\
+             </function>\n</tool_call>",
+        );
+        assert!(short.acts.is_empty());
+        assert!(
+            matches!(&short.rejected[..], [Rejected::MissingParam { .. }]),
+            "{:?}",
+            short.rejected
+        );
+    }
+
+    /// **A value cut short by an intercepted EOS still lands.**
+    ///
+    /// The shape the grammar actually emits when the model stops mid-argument:
+    /// the stencil swallows the EOS and injects `</function></tool_call>`, but
+    /// the value span's own `</parameter>` is *consumed by its terminator*
+    /// rather than injected by the tree — so a span that ended any other way
+    /// never writes one, and the parameter list is closed by `</function>`.
+    ///
+    /// Dropping that argument cost the whole act. A live cast produced
+    /// *"Your `reflect` needed `my_reflections` and did not have it"* on turn
+    /// after turn, discarding two arguments the character had written in full
+    /// along with the third.
+    #[test]
+    fn a_last_argument_closed_by_the_function_tag_is_still_read() {
+        let p = parse(
+            "<tool_call>\n<function=reflect>\n<parameter=inner_thoughts>\n\
+             the box has given up a fold\n</parameter>\n<parameter=feeling>\nweary\n</parameter>\n\
+             <parameter=my_reflections>\nnothing here is being kept</function>\n</tool_call>",
+        );
+        assert_eq!(p.acts.len(), 1, "{:?} / {:?}", p.rejected, p.narration);
+        assert_eq!(p.acts[0].tool, "reflect");
+        assert_eq!(p.acts[0].args["feeling"], "weary");
+        assert_eq!(
+            p.acts[0].args["my_reflections"], "nothing here is being kept",
+            "the argument the function tag closed was dropped"
+        );
+    }
+
+    /// A truncated block is narration, not a call with invented arguments. A
+    /// decode that ran out of budget mid-element has not said anything the
+    /// world should act on.
+    #[test]
+    fn an_unterminated_function_block_is_not_guessed_at() {
+        let p = parse("<tool_call>\n<function=say>\n<parameter=intent>\nhalf a thoug");
+        assert!(p.acts.is_empty(), "{:?}", p.acts);
+        assert!(p.rejected.is_empty(), "{:?}", p.rejected);
+    }
+
+    /// Prose before a call is still prose, and the call still lands — the two
+    /// are separated rather than one swallowing the other.
+    #[test]
+    fn narration_around_a_function_block_is_kept_apart_from_it() {
+        let p = parse(
+            "I should say something.\n\
+             <tool_call>\n<function=say>\n<parameter=intent>\nthat I am here\n</parameter>\n\
+             </function>\n</tool_call>",
+        );
+        assert_eq!(p.acts.len(), 1, "{:?}", p.rejected);
+        assert!(
+            p.narration.contains("I should say something"),
+            "{:?}",
+            p.narration
+        );
+    }
+
+    /// **The JSON syntax still parses.** Other families are on it, and the
+    /// translation must not have become the only path.
+    #[test]
+    fn the_json_syntax_is_untouched_by_the_block_translation() {
+        let p = parse("{\"tool\":\"move_to\",\"destination\":\"the green room\"}");
+        assert_eq!(p.acts.len(), 1, "{:?}", p.rejected);
+        assert_eq!(p.acts[0].tool, "move_to");
+
+        let wrapped = parse(
+            "<tool_call>\n{\"name\": \"say\", \"arguments\": {\"intent\": \"that I am here\"}}\n\
+             </tool_call>",
+        );
+        assert_eq!(wrapped.acts.len(), 1, "{:?}", wrapped.rejected);
+        assert_eq!(wrapped.acts[0].args["intent"], "that I am here");
+    }
+
+    /// **A newline inside a string argument halves the call.**
+    ///
+    /// This is the live failure, reproduced. One character emitted this every
+    /// turn for hours: the grammar steered it correctly — right tool, right
+    /// addressee off the company list — and then the free-text span took a raw
+    /// newline as its first byte. `parse` walks *lines*, so the object arrived
+    /// cut in two, and what reached the character was a rejection telling it to
+    /// put "one JSON object on a line" when it had done exactly that.
+    ///
+    /// It cannot recover from that advice, so it repeats, and every rejection is
+    /// another event in its window: the failing character had seen 947 events
+    /// against its neighbours' 506.
+    ///
+    /// A raw control character is not legal in a JSON string either — `serde_json`
+    /// refuses it on one line as readily as across two — so this is malformed at
+    /// the source and the span is what has to stop producing it.
+    #[test]
+    fn a_newline_inside_a_string_argument_still_lands() {
+        let p = parse(
+            "<tool_call>\n{\"name\": \"ask\", \"arguments\": {\"to\": \"Yaelis Vayne\", \
+             \"about\": \"\nwhat the remaining duration is\"}}\n</tool_call>",
+        );
+        assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
+        assert_eq!(p.acts.len(), 1);
+        assert_eq!(p.acts[0].tool, "ask");
+        assert_eq!(p.acts[0].args["to"], "Yaelis Vayne");
+        // The newline was content, and it is kept as content — the repair is an
+        // encoding fix, not a rewrite of what the character said.
+        assert_eq!(p.acts[0].args["about"], "\nwhat the remaining duration is");
+    }
+
+    /// Every control character JSON forbids raw, not only the newline that
+    /// happened to be live. A tab and a `\0` are the same defect.
+    #[test]
+    fn every_raw_control_character_is_escaped_rather_than_rejected() {
+        for (raw, want) in [
+            ("\ttabbed", "\ttabbed"),
+            ("\rcarriage", "\rcarriage"),
+            ("\u{1}start of heading", "\u{1}start of heading"),
+        ] {
+            let p = parse(&format!(
+                "{{\"name\": \"say\", \"arguments\": {{\"intent\": \"{raw}\"}}}}"
+            ));
+            assert_eq!(p.rejected, Vec::new(), "{raw:?}: {:?}", p.rejected);
+            assert_eq!(p.acts.len(), 1, "{raw:?}");
+            assert_eq!(p.acts[0].args["intent"], want, "{raw:?}");
+        }
+    }
+
+    /// **Outside a string a newline is structural** — it is what separates one
+    /// call from the next — so the repair must not touch it. Two calls on two
+    /// lines have to stay two calls.
+    #[test]
+    fn a_newline_between_calls_is_left_alone() {
+        let p = parse(
+            "{\"name\": \"say\", \"arguments\": {\"intent\": \"one\"}}\n\
+             {\"name\": \"say\", \"arguments\": {\"intent\": \"two\"}}",
+        );
+        assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
+        assert_eq!(p.acts.len(), 2);
+    }
+
+    /// An escaped quote does not end the string, so the scan must track it —
+    /// otherwise everything after `\"` is read as being outside a string and a
+    /// later newline goes unrepaired.
+    #[test]
+    fn an_escaped_quote_does_not_end_the_string() {
+        let p = parse(
+            "{\"name\": \"say\", \"arguments\": {\"intent\": \"he said \\\"go\\\"\nand went\"}}",
+        );
+        assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
+        assert_eq!(p.acts[0].args["intent"], "he said \"go\"\nand went");
+    }
+
+    /// The ordinary decode — every one of them — pays a scan and no allocation.
+    #[test]
+    fn a_clean_decode_is_not_rewritten() {
+        let clean = "{\"name\": \"say\", \"arguments\": {\"intent\": \"nothing to repair\"}}";
+        assert!(matches!(
+            escape_control_in_strings(clean),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     /// **The shape the stencil emits parses.**
     ///
     /// The constrained decode writes this envelope itself — `<tool_call>`, then
@@ -296,20 +778,20 @@ mod tests {
     /// never mistaken for malformed JSON.
     ///
     /// The distinction is the whole reason `rejected` carries a reason: the
-    /// character is told "your `observe` needed `target`", which it can act on,
+    /// character is told "your `read` needed `what`", which it can act on,
     /// rather than "that did not come out as a call", which it cannot. No act
     /// in the catalog takes no arguments any more — `wait` was the last, and
     /// every act now makes the character name something — so this is the shape
     /// an empty envelope actually has.
     #[test]
     fn an_envelope_with_no_arguments_is_still_a_call() {
-        let p = parse("<tool_call>\n{\"name\": \"observe\", \"arguments\": {}}\n</tool_call>");
+        let p = parse("<tool_call>\n{\"name\": \"read\", \"arguments\": {}}\n</tool_call>");
         assert!(p.acts.is_empty(), "{:?}", p.acts);
         assert_eq!(
             p.rejected,
             vec![Rejected::MissingParam {
-                tool: "observe",
-                param: "target"
+                tool: "read",
+                param: "what"
             }],
             "an empty call must be refused for its parameter, not for its shape"
         );
@@ -320,12 +802,12 @@ mod tests {
     #[test]
     fn the_bare_line_and_the_envelope_both_still_work() {
         let p = parse(
-            "{\"tool\":\"observe\",\"target\":\"the door\"}\n\
+            "{\"tool\":\"read\",\"what\":\"the muster board\"}\n\
              <tool_call>\n{\"name\": \"say\", \"arguments\": {\"intent\": \"that I heard it\"}}\n</tool_call>",
         );
         assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
         let tools: Vec<&str> = p.acts.iter().map(|a| a.tool).collect();
-        assert_eq!(tools, vec!["observe", "say"]);
+        assert_eq!(tools, vec!["read", "say"]);
     }
 
     /// A required parameter is still required in the envelope — the grammar
@@ -363,12 +845,12 @@ mod tests {
     #[test]
     fn several_calls_keep_their_order() {
         let p = parse(
-            "{\"tool\":\"observe\",\"target\":\"the door\"}\n\
+            "{\"tool\":\"read\",\"what\":\"the muster board\"}\n\
              {\"tool\":\"say\",\"intent\":\"that someone is coming\"}",
         );
         assert_eq!(
             p.acts.iter().map(|a| a.tool).collect::<Vec<_>>(),
-            vec!["observe", "say"]
+            vec!["read", "say"]
         );
     }
 
@@ -394,9 +876,9 @@ mod tests {
     /// neither an act nor narration.
     #[test]
     fn a_fenced_block_is_unwrapped() {
-        let p = parse("```json\n{\"tool\":\"observe\",\"target\":\"the door\"}\n```");
+        let p = parse("```json\n{\"tool\":\"read\",\"what\":\"the muster board\"}\n```");
         assert_eq!(p.acts.len(), 1);
-        assert_eq!(p.acts[0].tool, "observe");
+        assert_eq!(p.acts[0].tool, "read");
         assert!(
             p.narration.is_empty(),
             "the fence became narration: {:?}",
@@ -533,11 +1015,11 @@ mod tests {
     #[test]
     fn a_truncated_last_line_costs_only_itself() {
         let p = parse(
-            "{\"tool\":\"observe\",\"target\":\"the ridge\"}\n\
+            "{\"tool\":\"read\",\"what\":\"the ridge survey\"}\n\
              {\"tool\":\"spea",
         );
         assert_eq!(p.acts.len(), 1);
-        assert_eq!(p.acts[0].tool, "observe");
+        assert_eq!(p.acts[0].tool, "read");
         assert_eq!(p.rejected.len(), 1);
     }
 
@@ -550,13 +1032,23 @@ mod tests {
         // the order under test is the tool's, not the map's.
         let p = parse(r#"{"tool":"tell","manner":"flatly","to":"Hess","intent":"that I refuse"}"#);
         let s = p.acts[0].summary();
-        assert_eq!(s, "tell — Hess; that I refuse; flatly");
+        // Named, because three bare values leave a reader guessing which is
+        // which — see [`Act::summary`].
+        assert_eq!(s, "tell — to: Hess; intent: that I refuse; manner: flatly");
         let intent = s.find("that I refuse").unwrap();
         let manner = s.find("flatly").unwrap();
         assert!(
             intent < manner,
             "alphabetical order leaked into the summary: {s}"
         );
+    }
+
+    /// **One argument stays bare.** A label in front of the only thing worth
+    /// reading is noise, and most acts a character takes have exactly one.
+    #[test]
+    fn a_single_argument_needs_no_label_to_be_understood() {
+        let p = parse(r#"{"tool":"say","intent":"the redoubt burned twice"}"#);
+        assert_eq!(p.acts[0].summary(), "say — the redoubt burned twice");
     }
 
     /// Built directly rather than parsed: no act in the catalog takes no
@@ -566,10 +1058,10 @@ mod tests {
     #[test]
     fn an_argumentless_act_summarises_as_its_name() {
         let a = Act {
-            tool: "observe",
+            tool: "read",
             args: serde_json::Map::new(),
         };
-        assert_eq!(a.summary(), "observe");
+        assert_eq!(a.summary(), "read");
     }
 
     /// A decode with nothing in it is not an error — a character can be handed

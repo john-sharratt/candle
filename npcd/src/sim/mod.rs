@@ -38,6 +38,7 @@ pub mod field;
 pub mod item;
 pub mod ledger;
 pub mod phone;
+pub mod posting;
 pub mod record;
 pub mod seed;
 pub mod tower;
@@ -66,6 +67,13 @@ pub struct Sim {
     pub record: record::Record,
     /// Every conversation carried on a handset — see [`phone`].
     pub threads: phone::Threads,
+    /// Words left at a place for whoever comes by — see [`posting`].
+    ///
+    /// `serde(default)` because saved worlds predate it, and a world that loads
+    /// with no postings is a world where nobody has written anything yet, which
+    /// is the correct reading of an absent field rather than a migration.
+    #[serde(default)]
+    pub postings: posting::Postings,
     /// Everybody a phone could reach, by the name the world writes down.
     ///
     /// Not derived from who is standing where: the point of a handset is that
@@ -176,10 +184,33 @@ impl Sim {
     /// a body on the rampart may write "locked" and be refused by the turret
     /// rather than by the tree — and the honest half of a dependent binding the
     /// trie could express and the current front end does not.
+    ///
+    /// # A machine is not offered the state it is already in
+    ///
+    /// [`crate::sim::device::Device::set`] accepts any mode the machine admits,
+    /// including the one it currently holds — so setting the accession desk to
+    /// `reading` while it is already `reading` succeeds, changes nothing, and
+    /// reports *"You set the accession desk to reading."* A character has no
+    /// way to see it was already there, so nothing discourages a fourth attempt:
+    /// measured live, three in a row.
+    ///
+    /// That is the same defect as `read` above and as the channel `invite`
+    /// (see [`Self::invitable_for`]) — an act the grammar offers that cannot
+    /// accomplish anything — and it leaves the same way. A mode is offered only
+    /// while some machine here both admits it *and* is not already in it.
+    ///
+    /// Still a narrowing rather than a guarantee, for the reason above: the
+    /// branch is per situation, not per device, so a room holding a desk in
+    /// `reading` and a door in `open` still offers both words and the act
+    /// checks the pairing. What it can no longer do is offer a state nothing
+    /// here could move into.
     pub fn modes_here(&self, place: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for d in self.devices.at(place) {
             for m in &d.modes {
+                if m.eq_ignore_ascii_case(&d.mode) {
+                    continue;
+                }
                 if !out.contains(m) {
                     out.push(m.clone());
                 }
@@ -188,23 +219,55 @@ impl Sim {
         out
     }
 
-    /// `read.what` — everything here with contents rather than a surface.
+    /// `read.what` — what there is here with something on it this body has not
+    /// seen.
     ///
-    /// Every machine, plus the boards that are not machines at all. A panel is
-    /// read and never set, which is why it declares no modes and still appears
-    /// here: reading is not operating, and a thing with one state is not a thing
-    /// with a switch on it.
-    pub fn readable_at(&self, place: &str) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .devices
-            .at(place)
-            .into_iter()
-            .map(|d| d.name.clone())
-            .collect();
-        if !self.ledger.unheld().is_empty() && !out.iter().any(|n| n.contains("board")) {
+    /// # Machines are not readable, and offering them was the whole bug
+    ///
+    /// This returned every device in the room. A `Device` holds no text — its
+    /// only content is the mode it is switched to — so `read` answered with
+    /// that, and *"You read the accession desk. It stands at `reading`."* was
+    /// forty-seven of fifty acts in a live feed. The act reported success,
+    /// returned nothing a character could use, and `body::ANSWERS` brought the
+    /// character straight back to use it, so it read the same thing again.
+    ///
+    /// Nothing about that was fixable in the prose. A machine is *operated*,
+    /// and what a station is holding belongs to the body holding it; neither is
+    /// a text. So machines are gone from here, and what is left is the store
+    /// that actually holds words at a place — see [`posting`].
+    ///
+    /// # Bound to the reader, so the act can run out
+    ///
+    /// The set is what this body has **not read**, not what is here. A board
+    /// somebody has already read offers them nothing, so the empty-set rule
+    /// takes `read` out of the grammar rather than leaving an act that can be
+    /// re-emitted for the same answer for ever. That is the same discipline
+    /// every other closed set here follows, and it is what makes the loop
+    /// unrepresentable instead of merely discouraged.
+    pub fn readable_at(&self, place: &str, who: &str) -> Vec<String> {
+        let mut out = self.postings.unread_names_at(place, who);
+        // The orders keep their own cursor, for the same reason a board does:
+        // they read the same every time, so offering them unconditionally is
+        // the same act-that-returns-nothing loop in a different costume. See
+        // [`ledger::Ledger::unheld_unseen_by`].
+        if self.ledger.unheld_unseen_by(who).is_some() && !out.iter().any(|n| n.contains("board")) {
             out.push("the standing orders".to_string());
         }
         out
+    }
+
+    /// `post_notice.on` — the surfaces here words can be left on.
+    ///
+    /// Everything standing here regardless of what is on it, unlike
+    /// [`Sim::readable_at`]: a blank board is the one you most want to write on
+    /// and the one there is nothing to read on.
+    pub fn postable_at(&self, place: &str) -> Vec<String> {
+        self.postings.postable_names_at(place)
+    }
+
+    /// Leave words on a surface, standing it up if the map never named one.
+    pub fn post(&mut self, at: &str, name: &str, by: &str, text: &str) {
+        self.postings.post(at, name, by, text);
     }
 
     /// `claim.what` — what a body standing here can take and hold.
@@ -269,25 +332,124 @@ impl Sim {
         }
     }
 
-    /// `reach_out.to`, `invite.who`, `open_group.with` — who could be reached
-    /// and is not already on a thread with this character.
+    /// `sign_off.to` — the conversations this character can actually leave.
+    ///
+    /// Its own threads, less the world's standing channels. Leaving a
+    /// conversation is a real decision and belongs to the character; leaving
+    /// the open channel is not one, because there is no way back to it and
+    /// nothing in the world would report that somebody had gone. See
+    /// [`crate::engine::tools::Choices::Leavable`].
+    pub fn leavable_for(&self, me: &str, body: &str) -> Vec<String> {
+        if !self.has_phone(body) {
+            return Vec::new();
+        }
+        self.threads
+            .of(me)
+            .into_iter()
+            .filter(|t| !t.permanent)
+            .map(|t| t.as_named_to(me))
+            .collect()
+    }
+
+    /// `invite.to` — the conversations somebody could actually be brought into.
+    ///
+    /// Its own threads, less the ones every invitable person is **already on**.
+    ///
+    /// # Why this is not [`Self::threads_for`]
+    ///
+    /// [`phone::CHANNEL`] holds the entire cast, permanently, by construction —
+    /// so there is nobody alive who could be invited to it, and `invite` against
+    /// it fails the same way every time: `"X is already on it."` Offered the
+    /// whole thread list, a character picks the one thread it shares with
+    /// everybody, is refused, and picks it again.
+    ///
+    /// Measured over 48 turns of three characters: 17 invites, every one of
+    /// them to the channel, 16 refused. It was the second-most-called act in
+    /// the cast and it could never once have worked.
+    ///
+    /// A refusal a character cannot avoid is a defect in the branch, not a
+    /// lesson — so the thread leaves the set. Empty for a character whose only
+    /// thread is the channel, which takes `invite` out of the grammar entirely:
+    /// correct, because there is then nowhere to invite anybody.
+    pub fn invitable_for(&self, me: &str, body: &str) -> Vec<String> {
+        if !self.has_phone(body) {
+            return Vec::new();
+        }
+        let who = self.contacts_for(me, body);
+        self.threads
+            .of(me)
+            .into_iter()
+            .filter(|t| who.iter().any(|w| !t.has(w)))
+            .map(|t| t.as_named_to(me))
+            .collect()
+    }
+
+    /// `invite.who` — who could be brought into **any** conversation this
+    /// character could bring somebody into.
+    ///
+    /// # Why this is not [`Self::contacts_for`]
+    ///
+    /// `invite` takes two arguments and they are not independent: a thread, and
+    /// somebody to put on it. A flat grammar states each arm on its own, so
+    /// narrowing them separately says "these threads have room" and "these
+    /// people are reachable" — and lets the character pick a thread and a
+    /// person already on it. Measured after the thread set was narrowed: five
+    /// more `"X is already on it."`, from the pairing rather than from either
+    /// half.
+    ///
+    /// The conservative intersection is what a flat grammar can state
+    /// truthfully: offer only people who are on **none** of the threads on
+    /// offer, and every pair the character can name is a pair that works. It
+    /// gives up some legal combinations — somebody on one of two threads could
+    /// have been invited to the other — and that is the right trade here, where
+    /// a refusal a character cannot foresee is worth more than a call it never
+    /// gets to make.
+    pub fn invitees_for(&self, me: &str, body: &str) -> Vec<String> {
+        let threads = self.invitable_for(me, body);
+        if threads.is_empty() {
+            return Vec::new();
+        }
+        self.contacts_for(me, body)
+            .into_iter()
+            .filter(|who| {
+                self.threads
+                    .of(me)
+                    .into_iter()
+                    .filter(|t| threads.contains(&t.as_named_to(me)))
+                    .all(|t| !t.has(who))
+            })
+            .collect()
+    }
+
+    /// `reach_out.to`, `open_group.with` — who could be reached and has no
+    /// conversation of their own with this character yet.
     ///
     /// **Everybody the world writes down, less the people already reachable a
     /// shorter way.** Offering somebody you are already talking to under
     /// `reach_out` is offering a choice whose right answer is the other act.
+    ///
+    /// # "Already talking to" means a *direct* thread, not any thread
+    ///
+    /// This asked whether the two shared any conversation at all, which was the
+    /// same question while the only way to share one was to have started it.
+    /// [`phone::CHANNEL`] made every character share a thread with every other
+    /// character on arrival — so the answer became "everybody", this returned
+    /// empty for the whole cast, and the ordinary empty-set rule took
+    /// `reach_out`, `invite` and `open_group` out of the grammar completely.
+    /// The cast would have gained a channel and lost the ability to say
+    /// anything to one person in private.
+    ///
+    /// A direct thread is the right test because it is exactly what
+    /// [`phone::Threads::reach`] would find: being on a channel with fifty
+    /// people is not having a conversation with any of them.
     pub fn contacts_for(&self, me: &str, body: &str) -> Vec<String> {
         if !self.has_phone(body) {
             return Vec::new();
         }
-        let known: Vec<String> = self
-            .threads
-            .of(me)
-            .into_iter()
-            .flat_map(|t| t.others(me))
-            .collect();
         self.roster
             .iter()
-            .filter(|n| n.as_str() != me && !known.contains(n))
+            .filter(|n| n.as_str() != me)
+            .filter(|n| self.threads.direct_between(me, n).is_none())
             .cloned()
             .collect()
     }
@@ -295,6 +457,26 @@ impl Sim {
     /// Everybody a phone could reach, by the name the world writes down.
     pub fn set_roster(&mut self, names: Vec<String>) {
         self.roster = names;
+    }
+
+    /// Make somebody known to this world's phones: on the roster, and on the
+    /// standing channel.
+    ///
+    /// **One place, because the two must not drift.** Being on the roster is
+    /// what lets a character `reach_out` to you; being on the channel is what
+    /// lets it hear you at all. Somebody with one and not the other is a
+    /// half-present person — reachable but silent, or audible and impossible to
+    /// answer — and both halves were being written by hand at every site that
+    /// introduced somebody.
+    ///
+    /// Idempotent, and called on every arrival and every message from outside
+    /// the world, because neither of those is a one-off event.
+    pub fn enrol(&mut self, name: &str) {
+        if !self.roster.iter().any(|n| n == name) {
+            self.roster.push(name.to_string());
+            self.roster.sort();
+        }
+        self.threads.join_channel(phone::CHANNEL, name);
     }
 
     /// Who is on the roster now.
@@ -413,12 +595,8 @@ mod tests {
             .add(Item::new("stimpak", "stimpak", Kind::Consumable, 2));
         s.pack_mut("c1")
             .add(Item::new("mono_sword", "mono sword", Kind::Weapon, 1));
-        s.pack_mut("c2").add(Item::new(
-            "bolt",
-            "bolt rounds",
-            Kind::Ammunition,
-            30,
-        ));
+        s.pack_mut("c2")
+            .add(Item::new("bolt", "bolt rounds", Kind::Ammunition, 30));
         s
     }
 
@@ -427,6 +605,165 @@ mod tests {
         let s = Sim::new();
         assert!(s.pack("nobody").is_empty());
         assert!(s.carried("nobody").is_empty());
+    }
+
+    /// A cast whose phones are on the channel and nothing else.
+    fn on_the_channel(names: &[&str]) -> Sim {
+        let mut s = Sim::new();
+        for n in names {
+            s.pack_mut(n)
+                .add(Item::new(phone::PHONE, "handset", Kind::Gear, 1));
+            s.enrol(n);
+        }
+        s
+    }
+
+    /// **A machine is not offered the state it is already in.**
+    ///
+    /// `Device::set` accepts the current mode, so the act succeeded and changed
+    /// nothing — three identical `operate` calls in a row, live, with the
+    /// character told "You set the accession desk to reading" each time.
+    #[test]
+    fn the_state_a_machine_is_already_in_is_not_offered() {
+        let mut s = Sim::new();
+        s.devices.install(device::Device::new(
+            "desk",
+            "the accession desk",
+            device::Kind::Terminal,
+            "receiving",
+            &["reading", "idle"],
+        ));
+        // It starts in the first of its modes.
+        let modes = s.modes_here("receiving");
+        assert!(
+            !modes.iter().any(|m| m == "reading"),
+            "the desk was offered the state it is already in: {modes:?}"
+        );
+        assert!(
+            modes.iter().any(|m| m == "idle"),
+            "the state it could move to was dropped: {modes:?}"
+        );
+    }
+
+    /// And moving it makes the state it left available again — the narrowing
+    /// tracks the world rather than blacklisting a word.
+    #[test]
+    fn the_state_a_machine_has_left_becomes_offerable_again() {
+        let mut s = Sim::new();
+        s.devices.install(device::Device::new(
+            "desk",
+            "the accession desk",
+            device::Kind::Terminal,
+            "receiving",
+            &["reading", "idle"],
+        ));
+        s.devices
+            .by_name_at_mut("receiving", "the accession desk")
+            .unwrap()
+            .set("idle");
+        let modes = s.modes_here("receiving");
+        assert!(modes.iter().any(|m| m == "reading"), "{modes:?}");
+        assert!(!modes.iter().any(|m| m == "idle"), "{modes:?}");
+    }
+
+    /// **The channel is never somewhere anybody can be invited.**
+    ///
+    /// Everybody is on it by construction, so `invite` against it is refused
+    /// every time — measured live at 16 refusals out of 17 invites, the
+    /// second-most-called act in the cast. It leaves the branch rather than
+    /// being refused, so the character cannot make the mistake at all.
+    #[test]
+    fn the_channel_is_not_offered_as_somewhere_to_invite_anybody() {
+        let s = on_the_channel(&["Wren", "Wailen Wylde", "Marek"]);
+        assert!(
+            s.threads_for("Wren", "Wren")
+                .iter()
+                .any(|t| t == "the channel"),
+            "the channel should still be a thread Wren can message"
+        );
+        assert!(
+            s.invitable_for("Wren", "Wren").is_empty(),
+            "the channel was offered as an invite target: {:?}",
+            s.invitable_for("Wren", "Wren")
+        );
+    }
+
+    /// And with nowhere to bring anybody, `invite` leaves the grammar by the
+    /// ordinary empty-set rule rather than by a special case — the set steers,
+    /// so an empty one drops the required parameter and the act with it.
+    #[test]
+    fn a_character_with_only_the_channel_is_not_offered_invite_at_all() {
+        use crate::engine::tools::Choices;
+        let s = on_the_channel(&["Wren", "Marek"]);
+        assert!(s.invitable_for("Wren", "Wren").is_empty());
+        assert!(
+            Choices::Invitable.steers(),
+            "an empty set must drop the act"
+        );
+    }
+
+    /// **Every pair the grammar admits is a pair that works.**
+    ///
+    /// The two arms of an `invite` are not independent, and narrowing them
+    /// separately is not enough: the thread set said "these have room" and the
+    /// person set said "these are reachable", and a character picked a thread
+    /// and somebody already on it. Five more refusals, from the pairing rather
+    /// than from either half.
+    #[test]
+    fn nobody_offered_for_an_invite_is_already_on_a_thread_being_offered() {
+        let mut s = on_the_channel(&["Wren", "Wailen Wylde", "Marek"]);
+        // Wren has a private thread with Wailen. Marek is on neither it nor any
+        // other private thread, so he is the only sound answer.
+        s.threads.reach("Wren", "Wailen Wylde");
+
+        let threads = s.invitable_for("Wren", "Wren");
+        let who = s.invitees_for("Wren", "Wren");
+        assert!(!threads.is_empty(), "there was nowhere to invite anybody");
+        assert!(who.iter().any(|w| w == "Marek"), "{who:?}");
+        assert!(
+            !who.iter().any(|w| w == "Wailen Wylde"),
+            "somebody already on the offered thread was offered: {who:?}"
+        );
+
+        // The property, stated directly: no offered person is on any offered
+        // thread, so no combination the character can name is refusable.
+        for t in s.threads.of("Wren") {
+            if !threads.contains(&t.as_named_to("Wren")) {
+                continue;
+            }
+            for w in &who {
+                assert!(!t.has(w), "{w} is already on {}", t.as_named_to("Wren"));
+            }
+        }
+    }
+
+    /// With nobody left to bring in, `invite` leaves the grammar rather than
+    /// offering a thread and no one to put on it.
+    #[test]
+    fn an_invite_with_nobody_to_bring_offers_nobody() {
+        let mut s = on_the_channel(&["Wren", "Wailen Wylde"]);
+        s.threads.reach("Wren", "Wailen Wylde");
+        assert!(
+            s.invitees_for("Wren", "Wren").is_empty(),
+            "the only other person is already on the only thread"
+        );
+    }
+
+    /// A private thread still takes people — the fix removes the impossible
+    /// target, not the act.
+    #[test]
+    fn a_private_thread_is_still_somewhere_to_bring_somebody() {
+        let mut s = on_the_channel(&["Wren", "Wailen Wylde", "Marek"]);
+        s.threads.reach("Wren", "Wailen Wylde");
+        let invitable = s.invitable_for("Wren", "Wren");
+        assert!(
+            invitable.iter().any(|t| t == "Wailen Wylde"),
+            "the private thread should accept Marek: {invitable:?}"
+        );
+        assert!(
+            !invitable.iter().any(|t| t == "the channel"),
+            "the channel is still not invitable: {invitable:?}"
+        );
     }
 
     #[test]
@@ -444,7 +781,10 @@ mod tests {
         let err = s.hand_over("c2", "c1", "bolt rounds", 99).unwrap_err();
         assert!(err.contains("30"), "the real count was not named: {err}");
         assert_eq!(s.pack("c2").get("bolt").unwrap().count, 30);
-        assert!(!s.pack("c1").has("bolt"), "a refused hand-over still arrived");
+        assert!(
+            !s.pack("c1").has("bolt"),
+            "a refused hand-over still arrived"
+        );
     }
 
     #[test]
@@ -474,7 +814,10 @@ mod tests {
         assert!(s.makeable().is_empty());
         assert!(s.free_queues().is_empty());
         assert!(s.tower_actions().is_empty());
-        assert!(!s.bank(Resource::Ore, 10), "banked into a world with no tower");
+        assert!(
+            !s.bank(Resource::Ore, 10),
+            "banked into a world with no tower"
+        );
     }
 
     #[test]

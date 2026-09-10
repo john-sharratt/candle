@@ -10,8 +10,13 @@ import { h, mount, fmtNum, fmtK, ago, worldTime } from '../lib/dom.js';
 import { go, link } from '../lib/router.js';
 import {
   avatar, stateDot, bandChip, pending, empty, toast, kv, bar, lineChart,
-  layerColor, LAYERS, MODE_LABEL, MODE_ICON, idBadge, confirmDialog,
+  // `modal` was missing, and `authorBelief` calls it — so "Author a belief"
+  // threw a ReferenceError instead of opening. It went unnoticed because the
+  // only other caller on this page reached it through a dynamic import.
+  layerColor, LAYERS, idBadge, confirmDialog, modal,
 } from '../lib/ui.js';
+import * as sessions from '../lib/sessions.js';
+import { scene, actParts } from '../lib/scene.js';
 
 export async function render(params) {
   const id = params.id;
@@ -59,10 +64,12 @@ export async function render(params) {
     // question anybody has about a character and there was previously nowhere on
     // this page to answer it — the loop was only visible from the global view.
     railItem('pulse', 'Pulse', npc.tick?.ticks),
-    // Above Interactions deliberately: this is the one that works, and it is
-    // the thing anybody opening a character's page actually wants to do.
+    /* The two ways to be present to a character, side by side, because the
+     * choice between them is one question: are you standing with them, or
+     * reaching them from somewhere else. Both used to sit behind an "Open
+     * interaction" button that navigated away to a console of its own. */
     railItem('messages', 'Messages'),
-    railItem('interactions', 'Interactions', npc.live_interactions),
+    railItem('presence', 'In the room', npc.live_interactions),
 
     h('div', { class: 'rail-sec' }, 'layers'),
     LAYERS.map((l) => railItem(l, l[0].toUpperCase() + l.slice(1),
@@ -93,8 +100,13 @@ export async function render(params) {
       h('div', { class: 'sub row', style: 'gap:8px' },
         idBadge(npc.npc_id), '·', pending(npc.tick?.pending_events || 0),
         h('span', {}, `${npc.tick?.pending_events || 0} pending`))),
-    h('div', { class: 'row' },
-      h('button', { class: 'btn primary', onClick: openInteraction }, '▶ Open interaction')));
+    /* Talking to a character is two rail tabs, not a button here. It used to be
+     * "▶ Open interaction", which asked for a mode in a modal and then
+     * navigated away to a console — three decisions and a page change to do the
+     * one thing this page is for. */
+    h('div', { class: 'row', style: 'gap:8px' },
+      link(`/npc/${id}/messages`, { class: 'btn' }, '▤ Message'),
+      link(`/npc/${id}/presence`, { class: 'btn primary' }, '◍ In the room')));
   paintHead();
   el.appendChild(head);
 
@@ -112,7 +124,7 @@ export async function render(params) {
   // ── tabs ──────────────────────────────────────────────────────────────────
 
   const TABS = {
-    overview, messages, interactions, beliefs, relationships, agency, projection, monitor, manage,
+    overview, messages, presence, beliefs, relationships, agency, projection, monitor, manage,
     environment: environmentTab,
     pulse: pulseTab,
   };
@@ -143,7 +155,7 @@ export async function render(params) {
 
     const input = h('input', {
       class: 'input mono', style: 'flex:1',
-      placeholder: 'say something, or /hurt a bolt through the shoulder',
+      placeholder: 'say something, or /act shakes your hand',
       onKeydown: (e) => { if (e.key === 'Enter') send(); },
     });
 
@@ -544,77 +556,278 @@ export async function render(params) {
    * because it is deciding to answer rather than being queried. There is no
    * event to stream — the thread simply has one more line on it.
    */
+  /* **The frame is built once and only its contents change.**
+   *
+   * It used to rebuild everything on each repaint — including the composer —
+   * and a repaint happens on every reply. So sending a message destroyed the
+   * box you had just typed into and took the caret with it: you sent one line
+   * and then had to click back into the field to send another. Removing an
+   * element from the document blurs it, so keeping the same node and re-mounting
+   * it would not have helped either; the fix is not to touch it at all.
+   *
+   * Only `thread` and `actsInner` are repainted now, and neither can hold
+   * focus. */
   async function messages() {
-    const paint = (r, pending) => mount(bodyHost,
-      h('div', { class: 'tiny dim', style: 'margin-bottom:11px' },
-        r.in_a_world
-          ? `On ${r.with}’s handset, as ${r.as}. It answers on its own schedule — when its next turn comes round.`
-          : 'This character has no body in a world, so there is nothing to reach it on.'),
-      h('div', { class: 'msg-thread' },
-        (r.messages || []).length
-          ? (r.messages || []).map((m) => h('div', {
-            class: 'msg' + (m.from === r.as ? ' mine' : ''),
-          },
-            h('div', { class: 'npc-meta' }, m.from),
-            h('div', {}, m.text)))
-          : empty('◍', 'Nothing said yet', 'Send something and it will reach their handset.')),
-      pending ? h('div', { class: 'tiny dim' }, 'waiting for them to look…') : null,
-      r.in_a_world
-        ? h('form', {
-          class: 'row', style: 'gap:8px;margin-top:11px',
-          onSubmit: async (e) => {
-            e.preventDefault();
-            const box = e.target.querySelector('input');
-            const text = (box.value || '').trim();
-            if (!text) return;
-            box.value = '';
-            await API.sendMessage(id, text).catch(() => {});
-            await messages();
-          },
+    // The lane is the scroller, not the thread inside it — see `.msg-thread`.
+    const toTheEnd = () => {
+      const lane = thread.parentElement;
+      if (lane) lane.scrollTop = lane.scrollHeight;
+    };
+    /* **What it does, beside what reached you** — the front page's sample, and
+     * on a thread it is the only way to see it at all.
+     *
+     * A message reaches somebody who is nowhere near, so the character goes on
+     * living the whole time you are texting it: walking somewhere, reading a
+     * bench, deciding something. None of that arrives on the thread, which is
+     * correct — you cannot see it — and it left this tab a chat window with a
+     * character at the other end doing nothing visible.
+     *
+     * Polled off the character's own tick feed rather than streamed, for the
+     * reason the thread is: there is no session here, and a reply lands when
+     * its next turn comes round. */
+    const actsInner = h('div', { class: 'acts-inner' });
+    const thread = h('div', { class: 'msg-thread' });
+
+    /* What the lane last showed.
+     *
+     * **Repainting an unchanged lane is visible**, because `.act-item` animates
+     * in — so a poll that found nothing new replayed the rise on every row and
+     * the whole pane blinked every four seconds, hardest for a character that
+     * was doing nothing at all. Nothing here diffs rows, so the cheap and
+     * complete answer is not to touch the DOM when the answer has not moved. */
+    let shown = '';
+
+    async function paintActs() {
+      const p = await API.pulse({ limit: 40, npc_id: id }).catch(() => null);
+      if (!p) return;
+      const mine = (p.ticks || []).filter((t) => String(t.npc_id) === String(id));
+      /* `\0` as an escape rather than a literal NUL byte. The value is
+       * identical; what changes is that this file is no longer *binary* to
+       * ripgrep, which was silently excluding all 61KB of it from every
+       * content search in the repo. */
+      const sig = mine.map((t) => t.tick + ':' + (t.acts || []).join('\0')).join('|');
+      if (sig === shown) return;
+      shown = sig;
+      mount(actsInner, mine.length
+        ? mine.flatMap((t) => (t.acts || []).map((a) => {
+          // Same split the scene uses, so an act reads identically in both.
+          const p = actParts(a, '');
+          return h('div', { class: 'act-item' },
+            h('div', { class: 'row' },
+              h('span', { class: 'tk' }, 't' + t.tick),
+              h('span', { class: 'tool' }, p.tool),
+              h('span', { class: 'intent' }, p.intent)));
+        }))
+        : h('div', { class: 'tiny dim' }, 'nothing yet'));
+      // The lane is the scroller. Guarded because this also runs from the poll,
+      // and a throw inside an interval callback would kill the loop silently.
+      const lane = actsInner.parentElement;
+      if (lane) lane.scrollTop = lane.scrollHeight;
+    }
+
+    /* The thread, repainted whole. It holds no focus and no scroll of its own,
+     * so rebuilding it costs nothing a reader can feel. */
+    const paintThread = (r) => {
+      mount(thread, (r.messages || []).length
+        /* The words in their own node with the speaker under them — the same
+         * bubble the scene uses, so a message from a character looks the same
+         * wherever you read it. The name used to sit above the text as a
+         * `.npc-meta` heading, which read as a label introducing a block rather
+         * than as somebody having said something. */
+        ? (r.messages || []).map((m) => h('div', {
+          class: 'msg' + (m.from === r.as ? ' mine' : ''),
         },
-          h('input', {
-            class: 'in', style: 'flex:1',
-            placeholder: 'Say something to ' + (r.with || 'them') + '…',
-          }),
-          h('button', { class: 'btn sm primary', type: 'submit' }, 'Send'))
-        : null);
+          h('div', { class: 'words' }, m.text),
+          h('div', { class: 'who' }, m.from)))
+        : h('div', { class: 'tiny dim' }, 'Nothing said yet. Send something and it reaches their handset.'));
+      toTheEnd();
+    };
 
-    const r = await API.getMessages(id).catch(() => ({ messages: [], in_a_world: false }));
-    paint(r, false);
+    // A conversation tab fills the page rather than sitting in a box on it —
+    // see `.talk-host`. `bodyHost` is rebuilt per render, so this needs no
+    // clearing when another tab takes over.
+    bodyHost.className = 'talk-host';
 
-    // Poll while this tab is the one showing. Cleared by `show`, so leaving the
-    // tab stops the timer rather than leaving it running against a detached
+    const first = await API.getMessages(id).catch(() => ({ messages: [], in_a_world: false }));
+    let count = (first.messages || []).length;
+
+    const box = h('input', {
+      // `in` is not a class anybody defined, so this was a bare browser input
+      // beside a styled button — the stray underline.
+      class: 'input', style: 'flex:1',
+      placeholder: 'Say something to ' + (first.with || 'them') + '…',
+    });
+
+    async function say(e) {
+      e.preventDefault();
+      const text = (box.value || '').trim();
+      if (!text) return;
+      box.value = '';
+      // Focus stays where it was — nothing here replaces the field.
+      await API.sendMessage(id, text).catch(() => {});
+      const next = await API.getMessages(id).catch(() => null);
+      if (!next) return;
+      count = (next.messages || []).length;
+      paintThread(next);
+    }
+
+    mount(bodyHost,
+      h('div', { class: 'tiny dim', style: 'margin-bottom:11px' },
+        first.in_a_world
+          ? `On ${first.with}’s handset, as ${first.as}. It answers on its own schedule — when its next turn comes round.`
+          : 'This character has no body in a world, so there is nothing to reach it on.'),
+      h('div', { class: 'lane-frame' },
+        h('div', { class: 'lane-body' },
+          h('div', { class: 'lane' }, h('div', { class: 'pane-hd' }, 'the conversation'), thread),
+          h('div', { class: 'lane acts' }, h('div', { class: 'pane-hd' }, 'what they do'), actsInner)),
+        first.in_a_world
+          ? h('form', { class: 'composer', onSubmit: say },
+            h('div', { class: 'composer-inner row' },
+              box,
+              h('button', { class: 'btn primary', type: 'submit' }, 'Send')))
+          : null));
+
+    paintThread(first);
+    paintActs();
+    // After the outlet has the page — `focus` on a detached input does nothing.
+    if (first.in_a_world) requestAnimationFrame(() => box.focus());
+
+    // Poll while this tab is the one showing. Cleared by the tab switch, so
+    // leaving stops the timer rather than leaving it running against a detached
     // node for as long as the console is open.
     clearInterval(messagePoll);
-    if (r.in_a_world) {
+    if (first.in_a_world) {
       messagePoll = setInterval(async () => {
+        // The act lane moves whether or not anything was said to you — that is
+        // the point of it — so it repaints every pass.
+        paintActs();
         const next = await API.getMessages(id).catch(() => null);
         if (!next) return;
-        if ((next.messages || []).length !== (r.messages || []).length) await messages();
+        const n = (next.messages || []).length;
+        if (n === count) return;
+        count = n;
+        paintThread(next);
       }, 4000);
     }
   }
 
   // ── interactions / environment / manage ───────────────────────────────────
 
-  async function interactions() {
-    const r = await API.listInteractions(id).catch(() => ({ interactions: [] }));
-    mount(bodyHost,
-      h('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:11px' },
-        h('div', { class: 'tiny dim' }, 'Each interaction is a fork of this character’s substrate.'),
-        h('button', { class: 'btn sm primary', onClick: openInteraction }, '+ Open')),
-      r.interactions.length
-        ? r.interactions.map((ix) => h('div', {
-          class: 'npc-row', style: 'grid-template-columns:34px 1fr auto',
-          onClick: () => go('/interaction/' + ix.interaction_id),
-        },
-          h('div', { class: 'avatar', style: 'width:34px;height:34px;flex-basis:34px;font-size:1rem' }, MODE_ICON[ix.mode] || '◍'),
-          h('div', {},
-            h('div', { class: 'npc-name' }, MODE_LABEL[ix.mode] || ix.mode),
-            h('div', { class: 'npc-meta' },
-              `as ${ix.interlocutor?.display || '—'} · ${ix.act_count} acts · ${ix.narration_count} narrations`)),
-          h('div', { class: 'tiny mono dim' }, 'idle in ' + Math.round((ix.idle_remaining_secs || 0) / 60) + 'm')))
-        : empty('◍', 'No live interactions', 'Open one to talk to this character.'));
+  /* ── being in the room ─────────────────────────────────────────────────────
+   *
+   * **You are somewhere, and it is not a page you are on.** Either your body is
+   * standing with this character — in which case it follows them about, they
+   * are told they have company, and you can speak — or you are away, in which
+   * case there is nothing to say anything *through*. That is the whole state,
+   * and this tab is the two halves of it plus the control that crosses between.
+   *
+   * It replaced a list of "interactions" behind an Open button that navigated
+   * to a console of its own. That put a session — a thing the world knows about
+   * — behind an object the operator had to manage, when the only question
+   * anybody has is "am I with them or not".
+   *
+   * A conversation is company, not a copy: what is said here goes through the
+   * same door everything else does, the character remembers it afterwards, and
+   * the rest of the world can see that it happened.
+   */
+  async function presence() {
+    const commands = (await API.listCommands().catch(() => ({ commands: [] }))).commands;
+
+    // Not `bar` — that is the progress-bar helper imported at the top of this
+    // file, and shadowing it here would be a trap for the next edit.
+    const control = h('div', { class: 'presence-bar' });
+    const body = h('div', { class: 'presence-body' });
+    let view = null;
+    let busy = false;
+
+    // Detaching the view does not leave the room — see `lib/scene.js`. This is
+    // only the stream being let go when the tab is left.
+    const drop = () => { if (view) { view.teardown(); view = null; } };
+    teardowns.push(drop);
+
+    async function walkIn() {
+      if (busy) return;
+      busy = true;
+      paintControl(null);
+      try {
+        await sessions.open(id, 'physical');
+        await paint();
+      } catch (e) {
+        /* The one refusal worth naming: a character with no body cannot be
+         * stood beside, and the answer is the message thread rather than a
+         * failure the reader has to interpret. */
+        toast(e.error === 'not_in_a_world'
+          ? `${npc.name} has no body in a world — message them instead`
+          : (e.detail || e.message || 'could not walk in'), 'err');
+        busy = false;
+        await paint();
+      }
+    }
+
+    async function leave(session) {
+      if (busy) return;
+      busy = true;
+      paintControl(null);
+      drop();
+      await sessions.close(session.ix);
+      await paint();
+    }
+
+    /** Where you are, and the control that changes it. */
+    function paintControl(session) {
+      if (busy) {
+        return mount(control, h('span', { class: 'tiny dim' }, 'walking…'));
+      }
+      if (!session) {
+        return mount(control,
+          h('div', { class: 'presence-where' },
+            h('span', { class: 'dot idle' }),
+            h('span', {}, 'You are not in the world.'),
+            h('span', { class: 'tiny dim' },
+              'Nothing you type reaches them from here.')),
+          h('button', { class: 'btn primary', onClick: walkIn },
+            '→ Go to ' + npc.name));
+      }
+      mount(control,
+        h('div', { class: 'presence-where' },
+          h('span', { class: 'dot active' }),
+          h('span', {}, 'You are with ' + npc.name + '.'),
+          h('span', { class: 'tiny dim' },
+            'You follow them wherever they go, and they know you are there.')),
+        h('button', {
+          class: 'btn danger', onClick: () => leave(session),
+        }, 'Leave the room'));
+    }
+
+    async function paint() {
+      drop();
+      busy = false;
+      const session = await sessions.where(id, npc);
+      paintControl(session);
+      if (!session) {
+        return mount(body, empty('◍', 'You are somewhere else',
+          `Walk in and ${npc.name} is told they have company. Until then there is no room to speak into — `
+          + 'the message thread is the way to reach somebody you are not standing next to.'));
+      }
+      view = scene({
+        npc,
+        session,
+        who: session.interlocutor?.display || 'You',
+        commands,
+        // The daemon ended it — it went quiet, or another tab walked out. The
+        // scene says so itself; this puts the control back to "not here".
+        onEnded: () => paintControl(null),
+      });
+      mount(body, view.el);
+    }
+
+    // The control last, so it sits at the bottom of the tab: where you are is
+    // the thing you check after reading, and the button that changes it belongs
+    // under the room rather than over it. `talk-host` makes the room above it
+    // fill the page — see `.talk-host`.
+    bodyHost.className = 'talk-host';
+    mount(bodyHost, body, control);
+    await paint();
   }
 
   /* The environment: config that saves, and a record that is empty until
@@ -954,22 +1167,14 @@ export async function render(params) {
     }
   }
 
-  async function openInteraction() {
-    const modes = ['physical', 'video_call', 'voice_call', 'instant_message'];
-    const sel = h('select', { class: 'select' }, modes.map((m) => h('option', { value: m }, MODE_LABEL[m])));
-    const { close } = (await import('../lib/ui.js')).modal({
-      title: 'Open an interaction with ' + npc.name,
-      body: h('div', {},
-        h('label', { class: 'field' }, h('span', {}, 'Mode'), sel),
-        h('div', { class: 'tiny dim' },
-          'Mode is fixed for the life of the interaction — it sets what the interlocutor can observe, and which ' +
-          'tools exist. Changing it later means ending this one and opening another.')),
-      footer: [h('button', { class: 'btn primary', onClick: async () => {
-        const ix = await API.openInteraction(id, { mode: sel.value });
-        close(); go('/interaction/' + ix.interaction_id);
-      } }, 'Open')],
-    });
-  }
+  /* There is no `openInteraction` any more, and its absence is the change.
+   *
+   * It asked which mode you wanted in a modal, opened a session, and navigated
+   * to a console — so being with a character was an object you created and
+   * managed rather than a thing that was true of you. The two modes are now the
+   * two tabs above: `messages` reaches somebody who is nowhere near, and
+   * `presence` is standing in the room, with the walking in and out done by the
+   * control at the bottom of it. */
 
   /* The `teardown` does NOT clear the rail, deliberately.
    *

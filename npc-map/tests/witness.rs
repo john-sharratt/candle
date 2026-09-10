@@ -29,6 +29,57 @@ fn told(world: &World, id: &str) -> String {
 }
 
 // =========================================================================
+// A deed reaches the room as a sentence
+// =========================================================================
+
+/// **`show`'s `what` is a predicate, and the room reads it as one.**
+///
+/// Every other happening gets its verb from `verb_phrase` (`said …`, `came
+/// in`, `took …`); this one is taken as given, because only the caller knows
+/// whether the deed was a gesture, a hand laid on somebody, or a body going
+/// still. A caller that passes a bare fragment therefore reaches the other
+/// characters with the verb missing.
+///
+/// That is not hypothetical: nine gestures arrived live as *"Yaelis Vayne
+/// towards the table, indicating the standing orders"* — a fragment, next to a
+/// pause that read correctly because it passes a predicate.
+#[test]
+fn a_deed_reaches_the_room_with_its_verb_attached() {
+    let mut w = vault();
+    w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+    w.enter("m2", "Maker-02", casting("band-one")).unwrap();
+    w.mark_seen("m2");
+    w.show("m1", None, "gestures towards the table").unwrap();
+
+    let seen = told(&w, "m2");
+    assert!(
+        seen.contains("Maker-01 gestures towards the table"),
+        "the deed lost its verb: {seen}"
+    );
+}
+
+/// The target is named **once**. The aiming belongs to `to`; a caller that also
+/// writes it into `what` gets it twice — which is how one act came to read
+/// "to Wren: steadying her, at Wren".
+#[test]
+fn an_aimed_deed_names_who_it_was_aimed_at_exactly_once() {
+    let mut w = vault();
+    w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+    w.enter("m2", "Maker-02", casting("band-one")).unwrap();
+    w.enter("m3", "Maker-03", casting("band-one")).unwrap();
+    w.mark_seen("m3");
+    w.show("m1", Some("m2"), "does it: steadying her").unwrap();
+
+    let seen = told(&w, "m3");
+    assert_eq!(
+        seen.matches("Maker-02").count(),
+        1,
+        "the target was named more than once: {seen}"
+    );
+    assert!(seen.contains("does it: steadying her"), "{seen}");
+}
+
+// =========================================================================
 // The stream is typed first and prose second
 // =========================================================================
 

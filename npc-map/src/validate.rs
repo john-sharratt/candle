@@ -30,6 +30,7 @@ pub fn check(set: &MapSet) -> Result<()> {
     for area in set.areas() {
         check_area(area)?;
         check_parts(set, area)?;
+        check_announcements(area)?;
     }
     check_joins(set)?;
     Ok(())
@@ -51,6 +52,41 @@ fn check_parts(set: &MapSet, area: &Area) -> Result<()> {
                     placement.part()
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+/// Every standing recording has to be a whole sentence.
+///
+/// It is played quoted inside a framing sentence — *The address system plays
+/// one of the standing recordings: "…"* — so a fragment reads as one, and a
+/// duplicate defeats the shuffled bag that keeps the building from repeating
+/// itself. Neither is visible in the file; both are obvious the moment a
+/// character reads one, which is far too late.
+fn check_announcements(area: &Area) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for said in &area.announcements {
+        if said.trim() != said || said.is_empty() {
+            bail!(
+                "`{}`: an announcement has stray whitespace: {said:?}",
+                area.id
+            );
+        }
+        if !said.ends_with('.') && !said.ends_with('!') && !said.ends_with('?') {
+            bail!(
+                "`{}`: an announcement is not a finished sentence: {said:?}",
+                area.id
+            );
+        }
+        if !said.starts_with(char::is_uppercase) {
+            bail!(
+                "`{}`: an announcement does not start a sentence: {said:?}",
+                area.id
+            );
+        }
+        if !seen.insert(said) {
+            bail!("`{}`: the same announcement twice: {said:?}", area.id);
         }
     }
     Ok(())
@@ -237,6 +273,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_recording_that_is_not_a_sentence_is_refused() {
+        // It is played quoted inside a framing sentence, so a fragment reads as
+        // one and nothing in the file shows it.
+        let mut a = area(vec![]);
+        a.announcements = vec!["mind the gap".into()];
+        assert!(check_announcements(&a).is_err());
+
+        a.announcements = vec!["Mind the gap in the floor plates.".into()];
+        assert!(check_announcements(&a).is_ok());
+    }
+
+    #[test]
+    fn the_same_recording_twice_is_refused() {
+        // They are dealt from a shuffled bag, so a duplicate is a line that
+        // comes round twice as often as the rest for no authored reason.
+        let mut a = area(vec![]);
+        a.announcements = vec!["Mind the gap.".into(), "Mind the gap.".into()];
+        assert!(check_announcements(&a).is_err());
+    }
+
     fn area(nodes: Vec<Node>) -> Area {
         Area {
             id: "a".into(),
@@ -247,6 +304,7 @@ mod tests {
             summary: "s".into(),
             character: None,
             lacks: vec![],
+            announcements: vec![],
             contains: vec![],
             portals: vec![],
             arrival: None,

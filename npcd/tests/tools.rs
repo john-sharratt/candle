@@ -51,8 +51,12 @@ fn act(tool: &'static str, args: Value) -> Act {
 fn vault() -> Hosted {
     let h = Hosted::load("creators-vault", MAPS).expect("the shipped vault must load");
     h.with(|w| {
-        w.enter("m1", "Perrin Vastwood", Where::new("vault-command", "command-room"))
-            .unwrap()
+        w.enter(
+            "m1",
+            "Perrin Vastwood",
+            Where::new("vault-command", "command-room"),
+        )
+        .unwrap()
     });
     h
 }
@@ -150,7 +154,11 @@ fn refused(o: &Outcome) -> &str {
 #[test]
 fn every_act_a_room_offers_is_an_act_that_is_performed() {
     for h in [vault(), waste()] {
-        let body = if h.id() == "creators-vault" { "m1" } else { "c1" };
+        let body = if h.id() == "creators-vault" {
+            "m1"
+        } else {
+            "c1"
+        };
         for name in offered(&h, body) {
             assert!(
                 npcd::engine::body::is_of_the_body(&name),
@@ -246,8 +254,9 @@ const CHANGES_NOTHING_IN_THE_SIM: &[&str] = &[
     "observe",
     // Ports a body home, which is a position and so the map's business.
     "recall",
-    // Armed by the scheduler, outside the world.
-    "wait_for",
+    // Lands in the map like the rest of that group, and its other half — the
+    // deadline — is the scheduler's, outside the world entirely.
+    "reflect",
     // Reads the record and reports; the piece it presents is unchanged by
     // being presented.
     "creator_present",
@@ -316,9 +325,14 @@ fn the_vault_offers_no_act_that_belongs_to_the_battlefield() {
             "the vault offered `{absent}`, which nothing there can answer"
         );
     }
-    // And the things it *does* have are there.
-    for present in ["say", "observe", "move_to", "claim", "read"] {
-        assert!(acts.contains(&present.to_string()), "the vault lost `{present}`");
+    // And the things it *does* have are there. `say` is not among them and is
+    // not missing: this Maker is standing alone, and speech needs somebody to
+    // hear it — see `tools::SAY`.
+    for present in ["move_to", "claim", "read", "reflect"] {
+        assert!(
+            acts.contains(&present.to_string()),
+            "the vault lost `{present}`"
+        );
     }
 }
 
@@ -326,8 +340,11 @@ fn the_vault_offers_no_act_that_belongs_to_the_battlefield() {
 fn the_waste_offers_what_is_actually_out_there() {
     let h = waste();
     let acts = offered(&h, "c1");
-    for present in ["engage", "gather", "give", "equip", "use", "touch"] {
-        assert!(acts.contains(&present.to_string()), "the ruins lost `{present}`");
+    for present in ["engage", "gather", "give", "equip", "use", "act"] {
+        assert!(
+            acts.contains(&present.to_string()),
+            "the ruins lost `{present}`"
+        );
     }
     // No tower on the ground, so nothing that speaks to one.
     assert!(!acts.contains(&"produce".to_string()));
@@ -362,7 +379,12 @@ fn a_worked_out_seam_stops_being_offered_rather_than_refusing() {
     let h = waste();
     // Thirty in the carrier, ten an act.
     for _ in 0..3 {
-        assert!(perform(&h, "c1", &act("gather", json!({"what":"the burnt-out carrier"}))).happened());
+        assert!(perform(
+            &h,
+            "c1",
+            &act("gather", json!({"what":"the burnt-out carrier"}))
+        )
+        .happened());
     }
     assert!(
         admits(&h, "c1", "gather", "what").is_none(),
@@ -370,17 +392,30 @@ fn a_worked_out_seam_stops_being_offered_rather_than_refusing() {
     );
 }
 
+/// A machine offers its own states and not another machine's — **less the one
+/// it is already in.**
+///
+/// `Device::set` accepts the current mode, so setting a thing to where it
+/// already stands succeeds and changes nothing. Measured live, a character set
+/// the accession desk to `reading` three times running while it was already
+/// `reading`, told "You set the accession desk to reading" each time. It leaves
+/// the branch the same way every other impossible act does — see
+/// `Sim::modes_here`.
 #[test]
-fn a_turret_offers_its_own_states_and_a_door_offers_its() {
+fn a_machine_offers_its_own_states_less_the_one_it_is_in() {
     let h = waste();
     stand(&h, "c1", "tower-redoubt", "rampart");
     let turret = admits(&h, "c1", "operate", "mode").expect("a turret stands on the rampart");
     assert!(turret.contains(&"air only".to_string()), "{turret:?}");
-    assert!(turret.contains(&"hold fire".to_string()));
+    assert!(
+        !turret.contains(&"hold fire".to_string()),
+        "the turret was offered the policy it is already on: {turret:?}"
+    );
 
     stand(&h, "c1", "tower-redoubt", "gatehouse");
     let door = admits(&h, "c1", "operate", "mode").expect("a door stands in the gatehouse");
-    assert_eq!(door, vec!["open", "closed", "locked"]);
+    // Open is where it stands, so what is left is what it could be moved to.
+    assert_eq!(door, vec!["closed", "locked"]);
     assert!(
         !door.contains(&"air only".to_string()),
         "a door was offered a turret's firing policy"
@@ -413,7 +448,14 @@ fn only_what_is_carried_may_be_handed_over_readied_or_used() {
 fn a_body_carrying_nothing_is_offered_none_of_the_acts_that_need_a_pack() {
     let h = waste();
     h.with_sim(|s| {
-        for id in ["mono_sword", "plasma_rifle", "combat_armour", "bolt", "stimpak", "scanner"] {
+        for id in [
+            "mono_sword",
+            "plasma_rifle",
+            "combat_armour",
+            "bolt",
+            "stimpak",
+            "scanner",
+        ] {
             let n = s.pack("c1").get(id).map(|i| i.count).unwrap_or(0);
             if n > 0 {
                 s.pack_mut("c1").take(id, n);
@@ -476,7 +518,10 @@ fn a_promise_that_was_never_made_cannot_be_recalled() {
     assert!(perform(
         &h,
         "c2",
-        &act("promise", json!({"to":"Wren","what":"the eastern sweep","by":"dusk"}))
+        &act(
+            "promise",
+            json!({"to":"Wren","what":"the eastern sweep","by":"dusk"})
+        )
     )
     .happened());
     assert_eq!(
@@ -492,22 +537,49 @@ fn a_promise_that_was_never_made_cannot_be_recalled() {
 fn gathering_moves_the_stuff_from_the_ground_into_the_pack() {
     let h = waste();
     let before = h.sim(|s| s.field.deposit("burnt_carrier").unwrap().remaining);
-    let out = perform(&h, "c1", &act("gather", json!({"what":"the burnt-out carrier"})));
+    let out = perform(
+        &h,
+        "c1",
+        &act("gather", json!({"what":"the burnt-out carrier"})),
+    );
     assert!(did(&out).contains("metal"), "{out:?}");
-    assert_eq!(h.sim(|s| s.field.deposit("burnt_carrier").unwrap().remaining), before - 10);
-    assert_eq!(h.sim(|s| s.pack("c1").get("metal").map(|i| i.count)), Some(10));
+    assert_eq!(
+        h.sim(|s| s.field.deposit("burnt_carrier").unwrap().remaining),
+        before - 10
+    );
+    assert_eq!(
+        h.sim(|s| s.pack("c1").get("metal").map(|i| i.count)),
+        Some(10)
+    );
 }
 
 #[test]
 fn giving_is_all_or_nothing() {
     let h = waste();
-    let out = perform(&h, "c1", &act("give", json!({"what":"bolt rounds","to":"Soren","count":"25"})));
+    let out = perform(
+        &h,
+        "c1",
+        &act(
+            "give",
+            json!({"what":"bolt rounds","to":"Soren","count":"25"}),
+        ),
+    );
     assert!(out.happened(), "{out:?}");
     assert_eq!(h.sim(|s| s.pack("c1").get("bolt").unwrap().count), 35);
     assert_eq!(h.sim(|s| s.pack("c2").get("bolt").unwrap().count), 85);
 
-    let over = perform(&h, "c1", &act("give", json!({"what":"bolt rounds","to":"Soren","count":"900"})));
-    assert!(refused(&over).contains("35"), "the real count should be named: {over:?}");
+    let over = perform(
+        &h,
+        "c1",
+        &act(
+            "give",
+            json!({"what":"bolt rounds","to":"Soren","count":"900"}),
+        ),
+    );
+    assert!(
+        refused(&over).contains("35"),
+        "the real count should be named: {over:?}"
+    );
     assert_eq!(
         h.sim(|s| s.pack("c1").get("bolt").unwrap().count),
         35,
@@ -518,7 +590,11 @@ fn giving_is_all_or_nothing() {
 #[test]
 fn a_consumable_is_spent_and_a_piece_of_gear_is_not() {
     let h = waste();
-    perform(&h, "c1", &act("use", json!({"what":"stimpak","on":"Soren"})));
+    perform(
+        &h,
+        "c1",
+        &act("use", json!({"what":"stimpak","on":"Soren"})),
+    );
     assert_eq!(h.sim(|s| s.pack("c1").get("stimpak").unwrap().count), 2);
     perform(&h, "c1", &act("use", json!({"what":"advanced scanner"})));
     assert_eq!(
@@ -534,9 +610,13 @@ fn readying_a_thing_takes_it_out_of_what_may_be_readied_and_leaves_it_carried() 
     perform(&h, "c1", &act("equip", json!({"what":"combat armour"})));
     assert!(h.sim(|s| s.pack("c1").get("combat_armour").unwrap().equipped));
     let again = admits(&h, "c1", "equip", "what").expect("more kit");
-    assert!(!again.contains(&"combat armour".to_string()), "offered to ready it twice");
     assert!(
-        h.sim(|s| s.carried("c1")).contains(&"combat armour".to_string()),
+        !again.contains(&"combat armour".to_string()),
+        "offered to ready it twice"
+    );
+    assert!(
+        h.sim(|s| s.carried("c1"))
+            .contains(&"combat armour".to_string()),
         "readying it lost it"
     );
 }
@@ -544,8 +624,15 @@ fn readying_a_thing_takes_it_out_of_what_may_be_readied_and_leaves_it_carried() 
 #[test]
 fn a_stance_stands_until_it_is_replaced_or_broken_off() {
     let h = waste();
-    perform(&h, "c1", &act("engage", json!({"posture":"press","target":"a mech"})));
-    assert_eq!(h.sim(|s| s.field.stance("c1").unwrap().posture.clone()), "press");
+    perform(
+        &h,
+        "c1",
+        &act("engage", json!({"posture":"press","target":"a mech"})),
+    );
+    assert_eq!(
+        h.sim(|s| s.field.stance("c1").unwrap().posture.clone()),
+        "press"
+    );
     assert_eq!(
         h.sim(|s| s.field.stance("c1").unwrap().target.clone()),
         Some("a mech".into())
@@ -554,7 +641,10 @@ fn a_stance_stands_until_it_is_replaced_or_broken_off() {
     perform(
         &h,
         "c1",
-        &act("engage", json!({"posture":"fall back","priority":"whatever is firing on us"})),
+        &act(
+            "engage",
+            json!({"posture":"fall back","priority":"whatever is firing on us"}),
+        ),
     );
     let s = h.sim(|s| s.field.stance("c1").cloned()).expect("a stance");
     assert_eq!(s.posture, "fall back");
@@ -569,18 +659,44 @@ fn operating_a_thing_puts_it_into_that_state_for_everybody() {
     let h = waste();
     stand(&h, "c1", "tower-redoubt", "gatehouse");
     stand(&h, "c2", "tower-redoubt", "gatehouse");
-    perform(&h, "c1", &act("operate", json!({"what":"the blast door","mode":"locked"})));
+    perform(
+        &h,
+        "c1",
+        &act("operate", json!({"what":"the blast door","mode":"locked"})),
+    );
 
-    // The other body reads the same door in the same state — one world, not two.
-    let seen = perform(&h, "c2", &act("read", json!({"what":"the blast door"})));
-    assert!(did(&seen).contains("locked"), "{seen:?}");
+    // **The other body sees the same door in the same state — one world, not
+    // two.**
+    //
+    // Asserted through the *situation*, which is where the state of a machine
+    // now reaches a character. This used to read the door and check the answer,
+    // which was the only way a body could learn a mode — and it was also the
+    // act that returned nothing else, reported success, and looped: `read` is
+    // in `body::ANSWERS`, so a character was brought straight back to use what
+    // it had learnt and read the same door again. Perception here is pushed the
+    // moment anything changes; a body standing in front of a door does not
+    // spend a turn finding out that it is shut.
+    let seen = h
+        .with_both(|w, s| npcd::engine::reach::line(w, s, "c2"))
+        .expect("the gatehouse holds something");
+    assert!(
+        seen.contains("blast door (locked)"),
+        "the second body was not told the state the first one set: {seen}"
+    );
 }
 
 #[test]
 fn a_refusal_names_what_the_thing_would_have_taken() {
     let h = waste();
     stand(&h, "c1", "tower-redoubt", "gatehouse");
-    let out = perform(&h, "c1", &act("operate", json!({"what":"the blast door","mode":"free fire"})));
+    let out = perform(
+        &h,
+        "c1",
+        &act(
+            "operate",
+            json!({"what":"the blast door","mode":"free fire"}),
+        ),
+    );
     let why = refused(&out);
     assert!(why.contains("open") && why.contains("locked"), "{why}");
 }
@@ -620,15 +736,20 @@ fn a_verdict_stands_against_the_thing_rather_than_evaporating() {
     perform(
         &h,
         "m1",
-        &act("record_verdict", json!({
-            "on": "the third era",
-            "judgement": "it cannot be filed as it stands",
-            "what_would_change_it": "the dates reconciled with the spans either side"
-        })),
+        &act(
+            "record_verdict",
+            json!({
+                "on": "the third era",
+                "judgement": "it cannot be filed as it stands",
+                "what_would_change_it": "the dates reconciled with the spans either side"
+            }),
+        ),
     );
     let v = h.sim(|s| s.ledger.verdicts_on("the third era").len());
     assert_eq!(v, 1);
-    assert!(h.sim(|s| s.ledger.verdicts_on("the third era")[0].what_would_change_it.is_some()));
+    assert!(h.sim(|s| s.ledger.verdicts_on("the third era")[0]
+        .what_would_change_it
+        .is_some()));
 }
 
 #[test]
@@ -639,7 +760,10 @@ fn folding_the_tower_moves_it_and_spends_what_it_costs() {
     let out = perform(
         &h,
         "c1",
-        &act("command_tower", json!({"action":"relocate","x":"-300","y":"180"})),
+        &act(
+            "command_tower",
+            json!({"action":"relocate","x":"-300","y":"180"}),
+        ),
     );
     assert!(out.happened(), "{out:?}");
     h.sim(|s| {
@@ -653,11 +777,18 @@ fn folding_the_tower_moves_it_and_spends_what_it_costs() {
 fn drilling_in_takes_the_fold_away_until_the_tower_surfaces() {
     let h = waste();
     stand(&h, "c1", "tower-redoubt", "bridge");
-    perform(&h, "c1", &act("command_tower", json!({"action":"drill down","depth":"60"})));
+    perform(
+        &h,
+        "c1",
+        &act("command_tower", json!({"action":"drill down","depth":"60"})),
+    );
     assert_eq!(h.sim(|s| s.tower.as_ref().unwrap().depth), 60);
 
     let acts = admits(&h, "c1", "command_tower", "action").expect("a tower");
-    assert!(!acts.contains(&"relocate".to_string()), "a buried tower was offered a fold");
+    assert!(
+        !acts.contains(&"relocate".to_string()),
+        "a buried tower was offered a fold"
+    );
     assert!(acts.contains(&"surface".to_string()));
 
     perform(&h, "c1", &act("command_tower", json!({"action":"surface"})));
@@ -672,7 +803,14 @@ fn a_batch_spends_the_stock_and_takes_a_queue() {
     let h = waste();
     stand(&h, "c1", "tower-redoubt", "foundry");
     let before = h.sim(|s| s.tower.as_ref().unwrap().stock_of(Resource::Metal));
-    let out = perform(&h, "c1", &act("produce", json!({"what":"bolt rounds","count":"3","queue":"2"})));
+    let out = perform(
+        &h,
+        "c1",
+        &act(
+            "produce",
+            json!({"what":"bolt rounds","count":"3","queue":"2"}),
+        ),
+    );
     assert!(out.happened(), "{out:?}");
     h.sim(|s| {
         let t = s.tower.as_ref().unwrap();
@@ -701,25 +839,111 @@ fn a_coordinate_off_the_map_is_refused_and_a_place_on_it_is_read() {
     assert!(refused(&off).contains("off the map"), "{off:?}");
 
     let on = perform(&h, "c1", &act("scan", json!({"at":"the-waste/east-ridge"})));
-    assert!(did(&on).contains("drone"), "the scan missed what is standing there: {on:?}");
+    assert!(
+        did(&on).contains("drone"),
+        "the scan missed what is standing there: {on:?}"
+    );
+}
+
+/// **A scan of a place named the way the grammar names it finds what is there.**
+///
+/// The test above passes a raw `area/node` key, and passed throughout the whole
+/// time this act was broken: `Sim::hostiles` matches on keys, so a key worked
+/// and the *name* the grammar actually offers never did. Live, every scan of
+/// everywhere came back "Nothing moving" — not an empty room, a failed lookup
+/// wearing the same words.
+///
+/// So this drives the path a character drives: a name out of the same list the
+/// `at` arm is built from.
+#[test]
+fn a_scan_by_the_name_the_grammar_offers_finds_what_is_there() {
+    use npcd::engine::body::destinations;
+    let h = waste();
+    let (name, _) = destinations(&h, "c1")
+        .into_iter()
+        .find(|(_, w)| w.node == "east-ridge")
+        .expect("the east ridge is somewhere c1 can see");
+
+    let out = perform(&h, "c1", &act("scan", json!({ "at": name })));
+    assert!(
+        did(&out).contains("drone"),
+        "a scan by name missed what a scan by key finds: {out:?}"
+    );
+}
+
+/// And a scan reports **people**, which is the answer that matters in a
+/// building. Hostiles and deposits are the waste's vocabulary; a vault has
+/// neither, so before this a scan there could only ever say nothing.
+#[test]
+fn a_scan_says_who_is_standing_there() {
+    let h = vault();
+    // Whatever the fixture's first destination is — the point is that somebody
+    // standing in a room this character can see gets reported, not which room.
+    let (name, place) = npcd::engine::body::destinations(&h, "m1")
+        .into_iter()
+        .next()
+        .expect("a vault character can see somewhere");
+    h.with(|w| w.enter("m9", "Maker-09", place).unwrap());
+
+    let out = perform(&h, "m1", &act("scan", json!({ "at": name })));
+    assert!(
+        did(&out).contains("Maker-09"),
+        "a scan of an occupied room did not name who was in it: {out:?}"
+    );
 }
 
 #[test]
 fn sleeping_is_recorded_so_the_world_can_wake_you() {
     let h = vault();
     assert!(perform(&h, "m1", &act("sleep", json!({"until":"dawn"}))).happened());
-    assert_eq!(h.sim(|s| s.ledger.asleep("m1").map(str::to_string)), Some("dawn".into()));
+    assert_eq!(
+        h.sim(|s| s.ledger.asleep("m1").map(str::to_string)),
+        Some("dawn".into())
+    );
     assert!(h.with_sim(|s| s.ledger.wake("m1")));
     assert!(h.sim(|s| s.ledger.asleep("m1").is_none()));
 }
 
 #[test]
-fn touching_somebody_who_is_not_here_is_refused() {
+fn acting_on_somebody_who_is_not_here_is_refused() {
     let h = waste();
-    let out = perform(&h, "c1", &act("touch", json!({"to":"Nobody","intent":"steady them"})));
+    let nobody = act("act", json!({"on":"Nobody","intent":"steady them"}));
+    let out = perform(&h, "c1", &nobody);
     assert!(refused(&out).contains("not here"), "{out:?}");
+
     // And somebody who is here is not.
-    assert!(perform(&h, "c1", &act("touch", json!({"to":"Soren","intent":"steady him"}))).happened());
+    let steady = act("act", json!({"on":"Soren","intent":"steady him"}));
+    assert!(perform(&h, "c1", &steady).happened());
+
+    // The same act covers what it is aimed at doing — there is no separate tool
+    // for a blow, and a world that refused one would be refusing the war.
+    let down = act(
+        "act",
+        json!({"on":"Soren","intent":"put him down before he reaches the ridge"}),
+    );
+    assert!(perform(&h, "c1", &down).happened());
+}
+
+/// **Your own body is a thing you can act on.** Aimed at nobody rather than at
+/// yourself: the world refuses a body that addresses itself, and it is right to
+/// — closing your own wound is seen by everybody standing there and felt by
+/// nobody else, which is what an unaimed showing is.
+#[test]
+fn a_character_can_act_on_itself_even_with_nobody_to_see_it() {
+    let h = waste();
+    let mend = act(
+        "act",
+        json!({"on":"yourself","intent":"get the wound closed before it costs me the arm"}),
+    );
+    assert!(perform(&h, "c1", &mend).happened());
+
+    // The grammar offers `yourself` in lower case; a model that echoes the
+    // capitalisation of a sentence must not be refused for it.
+    let shouted = act(
+        "act",
+        json!({"on":"Yourself","intent":"get my weapon clear"}),
+    );
+    assert!(perform(&h, "c1", &shouted).happened());
 }
 
 // ── the phone ───────────────────────────────────────────────────────────────
@@ -727,7 +951,10 @@ fn touching_somebody_who_is_not_here_is_refused() {
 /// Put two bodies on the roster with handsets, standing well apart.
 fn phones() -> Hosted {
     let h = waste();
-    h.with(|w| w.place("c2", Where::new("tower-redoubt", "bridge")).unwrap());
+    h.with(|w| {
+        w.place("c2", Where::new("tower-redoubt", "bridge"))
+            .unwrap()
+    });
     h.with_sim(|s| {
         seed::issue_handset(s, "c1", "Wren");
         seed::issue_handset(s, "c2", "Soren");
@@ -744,23 +971,38 @@ fn a_character_with_no_handset_is_offered_no_way_to_message_anybody() {
     let h = waste();
     let acts = offered(&h, "c1");
     for gone in ["message", "reach_out", "invite", "open_group", "sign_off"] {
-        assert!(!acts.contains(&gone.to_string()), "`{gone}` without a handset");
+        assert!(
+            !acts.contains(&gone.to_string()),
+            "`{gone}` without a handset"
+        );
     }
 
     let h = phones();
     let acts = offered(&h, "c1");
     assert!(acts.contains(&"reach_out".to_string()), "{acts:?}");
+    // **And with a handset there is always somewhere to send.** This asserted
+    // the opposite — no conversation, no `message` — which was true while the
+    // only threads were ones somebody had started. A handset now arrives with
+    // the world's open channel already on it (`sim::phone::CHANNEL`), because a
+    // character that has to open a conversation before it can reach anybody is
+    // the isolated character the channel exists to stop being.
     assert!(
-        !acts.contains(&"message".to_string()),
-        "`message` was offered with no conversation to send on"
+        acts.contains(&"message".to_string()),
+        "a handset was issued and there was nowhere to send: {acts:?}"
     );
+    let threads = admits(&h, "c1", "message", "to").expect("the channel is a thread");
+    assert_eq!(threads, vec![npcd::sim::phone::CHANNEL], "{threads:?}");
 }
 
 /// Taking the handset off somebody takes the acts with it.
 #[test]
 fn losing_the_handset_is_something_the_world_can_do_to_you() {
     let h = phones();
-    perform(&h, "c1", &act("reach_out", json!({"to":"Soren","intent":"where are you"})));
+    perform(
+        &h,
+        "c1",
+        &act("reach_out", json!({"to":"Soren","intent":"where are you"})),
+    );
     assert!(offered(&h, "c1").contains(&"message".to_string()));
 
     h.with_sim(|s| {
@@ -780,7 +1022,14 @@ fn a_message_reaches_somebody_a_building_away() {
     let h = phones();
     assert_ne!(h.place_of("c1"), h.place_of("c2"), "they must be apart");
 
-    let out = perform(&h, "c1", &act("reach_out", json!({"to":"Soren","intent":"the ridge is clear"})));
+    let out = perform(
+        &h,
+        "c1",
+        &act(
+            "reach_out",
+            json!({"to":"Soren","intent":"the ridge is clear"}),
+        ),
+    );
     assert!(out.happened(), "{out:?}");
     assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
 }
@@ -790,13 +1039,25 @@ fn a_message_reaches_somebody_a_building_away() {
 #[test]
 fn a_message_waits_until_it_is_looked_at() {
     let h = phones();
-    perform(&h, "c1", &act("reach_out", json!({"to":"Soren","intent":"answer me"})));
+    perform(
+        &h,
+        "c1",
+        &act("reach_out", json!({"to":"Soren","intent":"answer me"})),
+    );
     assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
-    assert_eq!(h.sim(|s| s.messages_waiting("Wren")), 0, "your own message waited for you");
+    assert_eq!(
+        h.sim(|s| s.messages_waiting("Wren")),
+        0,
+        "your own message waited for you"
+    );
 
     // Doing something else does not consume it.
     perform(&h, "c2", &act("observe", json!({"target":"the room"})));
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1, "a message was lost");
+    assert_eq!(
+        h.sim(|s| s.messages_waiting("Soren")),
+        1,
+        "a message was lost"
+    );
 
     h.with_sim(|s| {
         s.threads.read("Soren", "Wren").unwrap();
@@ -809,13 +1070,23 @@ fn a_message_waits_until_it_is_looked_at() {
 fn a_character_holds_more_than_one_conversation_at_a_time() {
     let h = phones();
     h.with_sim(|s| seed::issue_handset(s, "c3", "Orion Vance"));
-    perform(&h, "c1", &act("reach_out", json!({"to":"Soren","intent":"one"})));
-    perform(&h, "c1", &act("reach_out", json!({"to":"Orion Vance","intent":"two"})));
+    perform(
+        &h,
+        "c1",
+        &act("reach_out", json!({"to":"Soren","intent":"one"})),
+    );
+    perform(
+        &h,
+        "c1",
+        &act("reach_out", json!({"to":"Orion Vance","intent":"two"})),
+    );
 
+    // Two of its own, beside the channel every handset carries.
     let threads = admits(&h, "c1", "message", "to").expect("two conversations");
-    assert_eq!(threads.len(), 2, "{threads:?}");
+    assert_eq!(threads.len(), 3, "{threads:?}");
     assert!(threads.contains(&"Soren".to_string()));
     assert!(threads.contains(&"Orion Vance".to_string()));
+    assert!(threads.contains(&npcd::sim::phone::CHANNEL.to_string()));
 }
 
 /// A direct thread becomes a group by gaining somebody, and one send then
@@ -824,12 +1095,24 @@ fn a_character_holds_more_than_one_conversation_at_a_time() {
 fn a_conversation_becomes_a_group_and_one_message_reaches_everybody_on_it() {
     let h = phones();
     h.with_sim(|s| seed::issue_handset(s, "c3", "Orion Vance"));
-    perform(&h, "c1", &act("reach_out", json!({"to":"Soren","intent":"start"})));
+    perform(
+        &h,
+        "c1",
+        &act("reach_out", json!({"to":"Soren","intent":"start"})),
+    );
 
-    let out = perform(&h, "c1", &act("invite", json!({"to":"Soren","who":"Orion Vance"})));
+    let out = perform(
+        &h,
+        "c1",
+        &act("invite", json!({"to":"Soren","who":"Orion Vance"})),
+    );
     assert!(out.happened(), "{out:?}");
 
-    perform(&h, "c1", &act("message", json!({"to":"Soren","intent":"both of you"})));
+    perform(
+        &h,
+        "c1",
+        &act("message", json!({"to":"Soren","intent":"both of you"})),
+    );
     assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 2);
     assert_eq!(
         h.sim(|s| s.messages_waiting("Orion Vance")),
@@ -846,11 +1129,14 @@ fn a_group_can_be_opened_with_several_people_at_once() {
     let out = perform(
         &h,
         "c1",
-        &act("open_group", json!({
-            "called":"the boundary",
-            "with":"Soren, Orion Vance",
-            "intent":"nobody date anything yet"
-        })),
+        &act(
+            "open_group",
+            json!({
+                "called":"the boundary",
+                "with":"Soren, Orion Vance",
+                "intent":"nobody date anything yet"
+            }),
+        ),
     );
     assert!(out.happened(), "{out:?}");
     assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
@@ -870,7 +1156,11 @@ fn somebody_you_are_already_talking_to_is_not_offered_for_reaching_out() {
         .unwrap()
         .contains(&"Soren".to_string()));
 
-    perform(&h, "c1", &act("reach_out", json!({"to":"Soren","intent":"hello"})));
+    perform(
+        &h,
+        "c1",
+        &act("reach_out", json!({"to":"Soren","intent":"hello"})),
+    );
     let contacts = admits(&h, "c1", "reach_out", "to").unwrap_or_default();
     assert!(
         !contacts.contains(&"Soren".to_string()),
@@ -895,20 +1185,31 @@ fn a_second_group_of_the_same_name_is_refused() {
     assert!(perform(
         &h,
         "c1",
-        &act("open_group", json!({"called":"none","with":"Soren, Orion Vance"})),
+        &act(
+            "open_group",
+            json!({"called":"none","with":"Soren, Orion Vance"})
+        ),
     )
     .happened());
 
     let again = perform(
         &h,
         "c1",
-        &act("open_group", json!({"called":"none","with":"Soren, Orion Vance"})),
+        &act(
+            "open_group",
+            json!({"called":"none","with":"Soren, Orion Vance"}),
+        ),
     );
     assert!(!again.happened(), "a duplicate name was allowed: {again:?}");
     assert!(again.line().unwrap().contains("none"), "{again:?}");
 
-    // One thread, so one arm, so a grammar that still compiles.
-    h.sim(|s| assert_eq!(s.threads.names_for("Wren"), vec!["none"]));
+    // One group of its own, beside the standing channel — so two arms, not the
+    // three a duplicate would have made.
+    h.sim(|s| {
+        let mut names = s.threads.names_for("Wren");
+        names.sort();
+        assert_eq!(names, vec!["none", npcd::sim::phone::CHANNEL], "{names:?}");
+    });
 }
 
 /// Leaving a group leaves it standing for the others.
@@ -919,18 +1220,37 @@ fn leaving_a_group_does_not_end_it_for_everybody_else() {
     perform(
         &h,
         "c1",
-        &act("open_group", json!({"called":"the boundary","with":"Soren, Orion Vance"})),
+        &act(
+            "open_group",
+            json!({"called":"the boundary","with":"Soren, Orion Vance"}),
+        ),
     );
     let out = perform(
         &h,
         "c1",
-        &act("sign_off", json!({"to":"the boundary","intent":"that I am out of it"})),
+        &act(
+            "sign_off",
+            json!({"to":"the boundary","intent":"that I am out of it"}),
+        ),
     );
     assert!(out.happened(), "{out:?}");
 
-    assert!(admits(&h, "c1", "message", "to").unwrap_or_default().is_empty());
+    // Its own conversations are gone; the standing channel is not something it
+    // was able to sign off from in the first place — see `Choices::Leavable`.
+    assert_eq!(
+        admits(&h, "c1", "message", "to").unwrap_or_default(),
+        vec![npcd::sim::phone::CHANNEL]
+    );
+    assert!(
+        admits(&h, "c1", "sign_off", "to")
+            .unwrap_or_default()
+            .is_empty(),
+        "the open channel was offered as something to leave"
+    );
     h.sim(|s| {
-        assert_eq!(s.threads.names_for("Soren"), vec!["the boundary"]);
+        let mut names = s.threads.names_for("Soren");
+        names.sort();
+        assert_eq!(names, vec!["the boundary", npcd::sim::phone::CHANNEL]);
     });
 }
 
@@ -940,7 +1260,11 @@ fn what_is_said_on_a_thread_does_not_reach_the_room() {
     let h = phones();
     h.with(|w| w.place("c2", Where::new("the-waste", "ruins")).unwrap());
     // Standing together now, and still messaging rather than speaking.
-    perform(&h, "c1", &act("reach_out", json!({"to":"Soren","intent":"quietly"})));
+    perform(
+        &h,
+        "c1",
+        &act("reach_out", json!({"to":"Soren","intent":"quietly"})),
+    );
     // It went to the thread, not to the room: it is waiting to be read rather
     // than having been heard.
     assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
@@ -995,7 +1319,10 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
     perform(
         &waste,
         "c2",
-        &act("promise", json!({"to":"Wren","what":"the sweep","by":"dusk"})),
+        &act(
+            "promise",
+            json!({"to":"Wren","what":"the sweep","by":"dusk"}),
+        ),
     );
     for name in offered(&waste, "c1") {
         if !seen.contains(&name) {
@@ -1023,15 +1350,32 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
 /// Standing somewhere with nothing in it must still leave a character able to
 /// act. A room that offers nothing is a character that can only wait to be
 /// spoken to.
+///
+/// **Speech is not one of them, and that is the point of the test.** An empty
+/// corridor has nobody to speak to, and offering speech there is what produced
+/// a cast standing alone narrating the scenery at itself. What is left has to
+/// be enough to spend a turn on without it.
 #[test]
 fn there_is_always_something_to_do_even_in_an_empty_corridor() {
     let h = vault();
     stand(&h, "m1", "vault-command", "ring-north");
     let acts = offered(&h, "m1");
     assert!(!acts.is_empty(), "a corridor offered nothing at all");
-    for present in ["say", "observe", "move_to"] {
-        assert!(acts.contains(&present.to_string()), "a corridor lost `{present}`");
+    for present in ["move_to", "reflect"] {
+        assert!(
+            acts.contains(&present.to_string()),
+            "a corridor lost `{present}`"
+        );
     }
+    assert!(
+        !acts.contains(&"say".to_string()),
+        "an empty corridor offered speech, which reaches nobody"
+    );
+    assert!(
+        !acts.contains(&"observe".to_string()),
+        "`observe` is back — looking returned what the percept had already \
+         handed over, which is a turn spent to learn nothing"
+    );
 }
 
 /// **Every station affords something, and every attachment names a real part.**

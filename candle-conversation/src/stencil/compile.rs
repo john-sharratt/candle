@@ -256,6 +256,14 @@ fn lower_terminal(
                     // copy it verbatim (never tokenize it in context).
                     close_token: *close_token,
                     suppress_close: *suppress_close,
+                    // What to write if the span is interrupted before its
+                    // terminator fires — see `Terminator::consumed_close`.
+                    // Tokenized from a fresh boundary, like the successor above
+                    // and for the same reason.
+                    close_run: term
+                        .consumed_close()
+                        .map(|c| vocab.encode(&c))
+                        .unwrap_or_default(),
                     next: next_id,
                 }),
             ))

@@ -82,14 +82,11 @@ pub struct Scenario {
     /// describing a room the character cannot act in.
     #[serde(default)]
     pub company: Vec<String>,
-    /// Which of [`Self::company`] are already waiting on this character.
-    ///
-    /// They may still be spoken to — being waited on is the best reason to
-    /// speak to somebody — but they may not be waited on back, so a scenario
-    /// that sets this is testing that the character does something rather than
-    /// returning the stare.
+    /// Acts the character has taken too recently to take again — see
+    /// [`crate::engine::cooldown`]. A scenario that sets this is testing what
+    /// the character reaches for when its first choice is not on offer.
     #[serde(default)]
-    pub waited_on_by: Vec<String>,
+    pub cooling: Vec<String>,
     /// Where the character may walk, never including where it stands.
     ///
     /// Empty takes `move_to` out of the grammar entirely, which is the honest
@@ -174,6 +171,10 @@ pub async fn run(
         .unwrap_or_default()
         .to_string();
     let mission = scenario.mission.clone().unwrap_or_default();
+    // The registers this daemon's mind actually holds — taken from the engine
+    // for the same reason the setting is taken from the world above: a probe
+    // that ran against invented content would be measuring the content.
+    let feelings = rt.feelings();
 
     // Blocking: a decode is seconds and this is an axum worker. Moved off it so
     // a scenario does not stall the console's polling for the length of a
@@ -183,7 +184,13 @@ pub async fn run(
         let within = crate::engine::tools::Within {
             company: scenario.company.clone(),
             places: scenario.places.clone(),
-            waited_on_by: scenario.waited_on_by.clone(),
+            cooling: scenario.cooling.clone(),
+            // **The daemon's own vocabulary, not the scenario's.** Which
+            // registers exist is a fact about the mind this daemon loaded, the
+            // same for every character in it — so a probe that made it up would
+            // be testing a grammar no live character is ever handed, which is
+            // the one thing a probe must not do.
+            feelings: feelings.clone(),
             // A probe stands in no world, so it carries nothing, works nothing
             // and has nothing to shoot. The acts that need those are absent
             // from what it is offered, which is the right answer rather than a

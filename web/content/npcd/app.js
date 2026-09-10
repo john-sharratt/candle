@@ -44,8 +44,14 @@ definePage({ path: '/npc/:id', role: 'user', keepsRail: true, under: '/',
   load: () => import('./pages/npc.js') });
 definePage({ path: '/npc/:id/:tab', role: 'user', keepsRail: true, under: '/',
   load: () => import('./pages/npc.js') });
-definePage({ path: '/interaction/:ix', role: 'user', under: '/',
-  load: () => import('./pages/console.js') });
+/* There is no `/interaction/:ix` page.
+ *
+ * Talking to a character is not somewhere you go — it is two tabs on the
+ * character's own page, beside everything else about them. `messages` reaches
+ * somebody who is nowhere near; `presence` is standing in their room, which is
+ * world state rather than a route (`lib/scene.js`). A console at its own
+ * address made a session into an object an operator had to manage, and put the
+ * one thing this product is for behind a modal and a page change. */
 // Worlds and personalities are READABLE by anyone — the daemon serves their
 // GETs unauthenticated — and the pages render read-only below `admin`.
 definePage({ path: '/worlds', role: 'unauthenticated', nav: { section: 'main', order: 20, label: 'Worlds' },
