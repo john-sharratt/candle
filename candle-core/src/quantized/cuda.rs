@@ -3069,7 +3069,7 @@ impl QCudaStorage {
     ///
     /// The quantized data is copied into a `cudaHostAlloc`-allocated buffer
     /// with `CU_MEMHOSTALLOC_DEVICEMAP`. CUDA kernels access this memory
-    /// transparently over PCIe â€” **no VRAM is consumed**.
+    /// transparently over PCIe — **no VRAM is consumed**.
     ///
     /// Returns `(storage, guard)`. The caller must keep `guard` alive for the
     /// lifetime of the storage; dropping it frees the pinned host buffer.
@@ -3776,8 +3776,8 @@ impl QCudaStorage {
     /// Copy raw quantized VRAM bytes to a pre-existing host buffer on a stream.
     ///
     /// When `dst` is backed by pinned memory (`cuMemAllocHost`), the copy is
-    /// truly asynchronous â€” the CPU returns immediately and the DMA engine
-    /// handles the transfer.  This is the D2H path used for VRAM â†’ pinned
+    /// truly asynchronous — the CPU returns immediately and the DMA engine
+    /// handles the transfer.  This is the D2H path used for VRAM → pinned
     /// eviction in the two-tier expert cache.
     ///
     /// `dst` must be at least `self.storage_size_in_bytes()` bytes.
@@ -4516,7 +4516,7 @@ pub fn load_quantized_on_stream<T: super::GgmlType + Send + Sync + 'static>(
 /// Load pre-repacked K/128 GEMX data from host bytes into a new CUDA buffer.
 ///
 /// Unlike [`load_quantized_on_stream`], this does **not** add
-/// [`MATRIX_ROW_PADDING`] â€” the repacked data is already correctly sized
+/// [`MATRIX_ROW_PADDING`] — the repacked data is already correctly sized
 /// by `get_repacked_size_bytes()`.
 ///
 /// Used when loading experts from a swap file where weights are already in
@@ -4638,7 +4638,7 @@ pub fn load_repacked(
     }))
 }
 
-/// One-shot repack: CPU (GGML bytes) â†’ GPU â†’ repack â†’ GPU â†’ CPU (K/128 bytes).
+/// One-shot repack: CPU (GGML bytes) → GPU → repack → GPU → CPU (K/128 bytes).
 ///
 /// Used during swap file creation.  Not performance-critical (one-time cost).
 /// Allocates scratch VRAM internally and frees on return.
@@ -4731,7 +4731,7 @@ pub fn repack_gemx_to_host(
     let repacked_size = unsafe { get_repacked_size_bytes(nrows as i32, ncols as i32, qtype) };
     if repacked_size < 0 {
         crate::bail!(
-            "Failed to get repacked size for {:?} ({nrows}Ã—{ncols})",
+            "Failed to get repacked size for {:?} ({nrows}×{ncols})",
             dtype
         );
     }
@@ -4741,7 +4741,7 @@ pub fn repack_gemx_to_host(
     let mut src_buf = unsafe { device.alloc::<u8>(ggml_bytes.len())? };
     let dst_buf = device.alloc_zeros::<u8>(repacked_size)?;
 
-    // H2D: GGML bytes â†’ src VRAM.
+    // H2D: GGML bytes → src VRAM.
     device.memcpy_htod(ggml_bytes, &mut src_buf.slice_mut(..ggml_bytes.len()))?;
 
     // GPU repack kernel (includes cudaDeviceSynchronize).
@@ -4759,11 +4759,11 @@ pub fn repack_gemx_to_host(
             )
         };
         if result < 0 {
-            crate::bail!("repack_gemx failed for {:?} ({nrows}Ã—{ncols})", dtype);
+            crate::bail!("repack_gemx failed for {:?} ({nrows}×{ncols})", dtype);
         }
     }
 
-    // D2H: repacked VRAM â†’ host Vec.
+    // D2H: repacked VRAM → host Vec.
     let repacked = device
         .memcpy_dtov(&dst_buf.slice(..repacked_size))
         .map_err(crate::Error::wrap)?;
@@ -4798,7 +4798,7 @@ pub fn repacked_size_bytes(nrows: usize, ncols: usize, dtype: GgmlDType) -> Resu
 /// Builds a `VxSegment` array (one per expert) and makes a single call to
 /// `run_quantized_matmul`. The C dispatcher loops over segments internally,
 /// giving each expert full greedy batch decomposition (TC, iter, bulk, remainder).
-/// No device table allocation or memcpy â€” segment descriptors are host-side.
+/// No device table allocation or memcpy — segment descriptors are host-side.
 ///
 /// # Arguments
 /// * `weight_ptrs` - GPU device pointers to each expert's weight data (K/128 format)
@@ -4843,7 +4843,7 @@ fn grouped_matmul_gemx_impl<'w>(
     }
     let total_batch = *expert_offsets.last().unwrap() as usize;
     if total_batch == 0 {
-        // No tokens to process â€” return zero output
+        // No tokens to process — return zero output
         let out_shape: Shape = vec![0, nrows].into();
         let out_slice = unsafe { device.alloc::<f16>(0)? };
         let out_storage = CudaStorage::wrap_cuda_slice(out_slice, device.clone());
@@ -6561,7 +6561,7 @@ pub fn dense_qmatmul<'w>(
 // These wrap the CUDA kernels in candle-kernels so that compute.rs can call
 // them from Tensor-level code without manually extracting device pointers.
 
-/// Map Candle DType â†’ MoeScatterDType enum value for the CUDA dispatcher.
+/// Map Candle DType → MoeScatterDType enum value for the CUDA dispatcher.
 fn dtype_to_moe_scatter_dtype(dtype: crate::DType) -> Result<i32> {
     use candle_kernels::simple::moe_scatter::MoeScatterDType;
     match dtype {
@@ -6577,10 +6577,10 @@ fn dtype_to_moe_scatter_dtype(dtype: crate::DType) -> Result<i32> {
 /// Single kernel launch replaces `Tensor::new(ids) + xs.index_select`.
 /// Returns a new tensor `[total_rows, hidden_dim]`.
 ///
-/// * `xs` â€” input activations `[num_tokens, hidden_dim]`
-/// * `ids_dev` â€” pre-uploaded GPU u32 index buffer
-/// * `total_rows` â€” number of rows to gather
-/// * `device` â€” CUDA device
+/// * `xs` — input activations `[num_tokens, hidden_dim]`
+/// * `ids_dev` — pre-uploaded GPU u32 index buffer
+/// * `total_rows` — number of rows to gather
+/// * `device` — CUDA device
 pub fn fused_moe_gather(
     xs: &crate::Tensor,
     ids_dev: &CudaSlice<u32>,

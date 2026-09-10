@@ -391,7 +391,11 @@ fn no_forced_opener_control() -> Result<()> {
             &tok,
             &text,
             400,
-            Pick::TopP { temp: TEMP, top_p: 0.9, seed: 0xC0FFEE + r as u64 },
+            Pick::TopP {
+                temp: TEMP,
+                top_p: 0.9,
+                seed: 0xC0FFEE + r as u64,
+            },
             1,
             BatchedConfig::default(),
         )?;
@@ -400,7 +404,10 @@ fn no_forced_opener_control() -> Result<()> {
             opened_think += 1;
         }
         let think = out.split("</think>").next().unwrap_or("");
-        let answer = out.split_once("</think>").map(|(_, a)| a.trim()).unwrap_or(out.trim());
+        let answer = out
+            .split_once("</think>")
+            .map(|(_, a)| a.trim())
+            .unwrap_or(out.trim());
         if answer.len() < 15 {
             empty_ans += 1;
         }
@@ -463,7 +470,9 @@ fn think_open_only_prefill() -> Result<()> {
     // divergence.
     const TEMPS: [f32; 2] = [0.70, 0.75];
     for temp in TEMPS {
-        println!("\n=== OPEN-ONLY: prefill `<think>` + LF, temp {temp}, top_p 0.9, {N} samples ===");
+        println!(
+            "\n=== OPEN-ONLY: prefill `<think>` + LF, temp {temp}, top_p 0.9, {N} samples ==="
+        );
         let mut empty_ans = 0usize;
         for r in 0..N {
             let out = flat_run(
@@ -471,14 +480,21 @@ fn think_open_only_prefill() -> Result<()> {
                 &tok,
                 &text,
                 400,
-                Pick::TopP { temp, top_p: 0.9, seed: 0xC0FFEE + r as u64 },
+                Pick::TopP {
+                    temp,
+                    top_p: 0.9,
+                    seed: 0xC0FFEE + r as u64,
+                },
                 1,
                 BatchedConfig::default(),
             )?;
             // The prompt carried `<think>\n`, so everything up to `</think>` is
             // the model's own thought — no opener to strip.
             let think = out.split("</think>").next().unwrap_or("");
-            let answer = out.split_once("</think>").map(|(_, a)| a.trim()).unwrap_or(out.trim());
+            let answer = out
+                .split_once("</think>")
+                .map(|(_, a)| a.trim())
+                .unwrap_or(out.trim());
             if answer.len() < 15 {
                 empty_ans += 1;
             }
@@ -537,7 +553,12 @@ fn forced_okay_named_failures() -> Result<()> {
     // (label, sample index — the sweep's seed is 0xC0FFEE + index, temp, marker)
     let cases: [(&str, u64, f32, &str); 2] = [
         ("persona-break (expect: NOT 'Qwen')", 1, 0.625, "Qwen"),
-        ("seed-misattribution (expect: NOT 'They said')", 17, 0.625, "They said"),
+        (
+            "seed-misattribution (expect: NOT 'They said')",
+            17,
+            0.625,
+            "They said",
+        ),
     ];
 
     for (label, idx, temp, marker) in cases {
@@ -552,18 +573,36 @@ fn forced_okay_named_failures() -> Result<()> {
                 &tok,
                 &text,
                 400,
-                Pick::TopP { temp, top_p: 0.9, seed: 0xC0FFEE + idx },
+                Pick::TopP {
+                    temp,
+                    top_p: 0.9,
+                    seed: 0xC0FFEE + idx,
+                },
                 1,
                 BatchedConfig::default(),
             )?;
             let think = out.split("</think>").next().unwrap_or(&out);
-            let answer = out.split_once("</think>").map(|(_, a)| a.trim()).unwrap_or("");
+            let answer = out
+                .split_once("</think>")
+                .map(|(_, a)| a.trim())
+                .unwrap_or("");
             let hit = out.contains(marker);
-            let arm = if with_seed { "WITH forced 'Okay,'" } else { "CONTROL (no forced opener)" };
+            let arm = if with_seed {
+                "WITH forced 'Okay,'"
+            } else {
+                "CONTROL (no forced opener)"
+            };
             println!("\n───────────────────────────────────────────────────────────");
             println!("CASE {label}  seed=0xC0FFEE+{idx}  temp={temp}  [{arm}]");
             println!("  marker '{marker}' present: {hit}   <-- true = failure reproduced");
-            println!("  THINK  : {}", if with_seed { format!("Okay,{think}") } else { think.to_string() });
+            println!(
+                "  THINK  : {}",
+                if with_seed {
+                    format!("Okay,{think}")
+                } else {
+                    think.to_string()
+                }
+            );
             println!("  ANSWER : {answer}");
         }
     }
@@ -575,7 +614,10 @@ fn forced_okay_named_failures() -> Result<()> {
 /// `</think>` (the prompt already carried `<think>\nOkay,`).
 fn classify_think(gen_think: &str) -> &'static str {
     let t = gen_think.trim();
-    let cjk = t.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+    let cjk = t
+        .chars()
+        .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+        .count();
     if cjk > 3 {
         "CJK"
     } else if t.len() < 3 {
@@ -636,10 +678,16 @@ fn reproduce_run4_greeting_collapse() -> Result<()> {
     let prompt = daemon_greeting_prompt()?;
     const SEED_TEXT: &str = "<think>\nOkay,";
 
-    let p_ids: Vec<u32> = tok.encode(prompt.as_str(), false)
-        .map_err(|e| candle::Error::Msg(format!("encode prompt: {e}")))?.get_ids().to_vec();
-    let s_ids: Vec<u32> = tok.encode(SEED_TEXT, false)
-        .map_err(|e| candle::Error::Msg(format!("encode seed: {e}")))?.get_ids().to_vec();
+    let p_ids: Vec<u32> = tok
+        .encode(prompt.as_str(), false)
+        .map_err(|e| candle::Error::Msg(format!("encode prompt: {e}")))?
+        .get_ids()
+        .to_vec();
+    let s_ids: Vec<u32> = tok
+        .encode(SEED_TEXT, false)
+        .map_err(|e| candle::Error::Msg(format!("encode seed: {e}")))?
+        .get_ids()
+        .to_vec();
     let n_layers = ManagedBatchedModel::num_layers(&model);
 
     // One sample: prefill `segments` in order (each its own forward — the last
@@ -649,44 +697,106 @@ fn reproduce_run4_greeting_collapse() -> Result<()> {
         let sq = session.create_sequence()?;
         let mut step = None;
         for seg in segments {
-            if seg.is_empty() { continue; }
+            if seg.is_empty() {
+                continue;
+            }
             let t = Tensor::from_vec(seg.to_vec(), (1, seg.len()), &Device::Cpu)?;
-            step = Some(model.forward_wave(&mut session, &[], &[], &[sq],
-                std::slice::from_ref(&t), &[], &[], 0, n_layers, None)?);
+            step = Some(model.forward_wave(
+                &mut session,
+                &[],
+                &[],
+                &[sq],
+                std::slice::from_ref(&t),
+                &[],
+                &[],
+                0,
+                n_layers,
+                None,
+            )?);
             session.advance_sequence(sq, seg.len())?;
         }
         let step = step.expect("non-empty prompt");
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut next = sample_top_p(&step.logits_owned()?[0].i(0)?.to_dtype(candle::DType::F32)?.to_vec1::<f32>()?, 0.7, 0.9, &mut rng);
+        let mut next = sample_top_p(
+            &step.logits_owned()?[0]
+                .i(0)?
+                .to_dtype(candle::DType::F32)?
+                .to_vec1::<f32>()?,
+            0.7,
+            0.9,
+            &mut rng,
+        );
         let mut gen = vec![next];
         for _ in 0..400 {
-            if next == IM_END || next == ENDOFTEXT { break; }
+            if next == IM_END || next == ENDOFTEXT {
+                break;
+            }
             let t = Tensor::from_vec(vec![next], (1, 1), &Device::Cpu)?;
-            let st = model.forward_wave(&mut session, &[sq], std::slice::from_ref(&t),
-                &[], &[], &[], &[], 0, n_layers, None)?;
+            let st = model.forward_wave(
+                &mut session,
+                &[sq],
+                std::slice::from_ref(&t),
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                n_layers,
+                None,
+            )?;
             session.advance_sequence(sq, 1)?;
-            next = sample_top_p(&st.logits_owned()?[0].i(0)?.to_dtype(candle::DType::F32)?.to_vec1::<f32>()?, 0.7, 0.9, &mut rng);
+            next = sample_top_p(
+                &st.logits_owned()?[0]
+                    .i(0)?
+                    .to_dtype(candle::DType::F32)?
+                    .to_vec1::<f32>()?,
+                0.7,
+                0.9,
+                &mut rng,
+            );
             gen.push(next);
         }
-        tok.decode(&gen, false).map_err(|e| candle::Error::Msg(format!("decode: {e}")))
+        tok.decode(&gen, false)
+            .map_err(|e| candle::Error::Msg(format!("decode: {e}")))
     };
 
     let contig: Vec<u32> = p_ids.iter().chain(s_ids.iter()).copied().collect();
     for (label, segs) in [
-        ("CONTIGUOUS (prompt+seed one forward)", vec![contig.as_slice()]),
-        ("SPLIT (prompt | seed, seed its own forward)", vec![p_ids.as_slice(), s_ids.as_slice()]),
+        (
+            "CONTIGUOUS (prompt+seed one forward)",
+            vec![contig.as_slice()],
+        ),
+        (
+            "SPLIT (prompt | seed, seed its own forward)",
+            vec![p_ids.as_slice(), s_ids.as_slice()],
+        ),
     ] {
         println!("\n=== {label} — 10 samples, temp 0.7 top_p 0.9 ===");
         let (mut math, mut empty, mut cjk, mut topic, mut other, mut noans) = (0, 0, 0, 0, 0, 0);
         for r in 0..10u64 {
             let out = run(&segs, 0xD00D + r)?;
             let gen_think = out.split("</think>").next().unwrap_or(&out);
-            let answer = out.split_once("</think>").map(|(_, a)| a.trim()).unwrap_or("");
+            let answer = out
+                .split_once("</think>")
+                .map(|(_, a)| a.trim())
+                .unwrap_or("");
             let v = classify_think(gen_think);
-            match v { "MATH-CONFAB" => math += 1, "EMPTY(closed on Okay,)" => empty += 1,
-                      "CJK" => cjk += 1, "ON-TOPIC" => topic += 1, _ => other += 1 }
-            let ans_ok = answer.len() >= 15 && answer.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count() == 0;
-            if !ans_ok { noans += 1; }
+            match v {
+                "MATH-CONFAB" => math += 1,
+                "EMPTY(closed on Okay,)" => empty += 1,
+                "CJK" => cjk += 1,
+                "ON-TOPIC" => topic += 1,
+                _ => other += 1,
+            }
+            let ans_ok = answer.len() >= 15
+                && answer
+                    .chars()
+                    .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+                    .count()
+                    == 0;
+            if !ans_ok {
+                noans += 1;
+            }
             let th: String = gen_think.replace('\n', " ").chars().take(70).collect();
             let an: String = answer.replace('\n', " ").chars().take(50).collect();
             println!("  #{r} think={v:<20} ans_ok={ans_ok} :: Okay,{th} || {an}");
@@ -728,13 +838,21 @@ fn forced_okay_temperature_sweep() -> Result<()> {
             let pick = if temp == 0.0 {
                 Pick::Argmax
             } else {
-                Pick::TopP { temp, top_p: 0.9, seed: 0xC0FFEE + r as u64 }
+                Pick::TopP {
+                    temp,
+                    top_p: 0.9,
+                    seed: 0xC0FFEE + r as u64,
+                }
             };
             let out = flat_run(&model, &tok, &text, 400, pick, 1, BatchedConfig::default())?;
             // The think block the model produced after the forced `Okay,` (the
             // prompt already carried `<think>\nOkay,`), and the answer after it.
             let gen_think = out.split("</think>").next().unwrap_or(&out);
-            let answer = out.split_once("</think>").map(|(_, a)| a).unwrap_or("").trim();
+            let answer = out
+                .split_once("</think>")
+                .map(|(_, a)| a)
+                .unwrap_or("")
+                .trim();
             let think_verdict = classify_think(gen_think);
             match think_verdict {
                 "MATH-CONFAB" => math += 1,
@@ -743,7 +861,10 @@ fn forced_okay_temperature_sweep() -> Result<()> {
                 "ON-TOPIC" => topic += 1,
                 _ => other += 1,
             }
-            let cjk = answer.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+            let cjk = answer
+                .chars()
+                .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+                .count();
             let ok = answer.len() >= 15 && cjk == 0;
             if ok {
                 proper += 1;
@@ -800,7 +921,11 @@ fn flat_prefill_of_a_refused_prompt() -> Result<()> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crate dir has a parent");
-    for name in ["flat_pinned.txt", "flat_live_time.txt", "flat_live_time_t1.txt"] {
+    for name in [
+        "flat_pinned.txt",
+        "flat_live_time.txt",
+        "flat_live_time_t1.txt",
+    ] {
         let path = workspace.join(name);
         if !path.exists() {
             println!("SKIP {name}: absent (run scratchpad/dump_prompt.ps1)");

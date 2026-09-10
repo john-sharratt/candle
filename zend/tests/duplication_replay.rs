@@ -136,7 +136,6 @@ mod replay {
         rt: &tokio::runtime::Runtime,
         session: &Arc<ZendSession>,
         conv: &str,
-        disable_summariser: bool,
     ) -> Vec<(String, String, String)> {
         let math = ["1 + 1", "2 + 2", "4 + 4", "6 + 6", "8 + 8", "10 + 10"];
         const RECALL_Q: &str = "what question did i ask at the start of the conversation?";
@@ -148,12 +147,6 @@ mod replay {
             )
             .await;
             eprintln!("\n===== start (tour) =====\n{tour}\n");
-            if disable_summariser {
-                // Timeline now exists (first turn submitted); switch its feed off.
-                let ok = session.set_conversation_summarize(conv, false);
-                eprintln!("[summariser DISABLED for {conv}: applied={}]", ok.is_some());
-            }
-
             let mut out = Vec::new();
             for m in math {
                 let ma = ask(session, conv, &format!("what is {m}?")).await;
@@ -220,7 +213,7 @@ mod replay {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let conv = format!("repro-dup-{nonce}");
-        let rounds = drive_escalating_ladder(&rt, &session, &conv, false);
+        let rounds = drive_escalating_ladder(&rt, &session, &conv);
         rt.shutdown_background();
 
         let bad = print_ladder("repro-dup", &rounds);

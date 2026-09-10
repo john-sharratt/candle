@@ -87,9 +87,11 @@ impl TurnHandle {
 /// Events sent from the scheduler to the caller during a turn.
 pub enum TurnEvent {
     /// The formatted text that was actually submitted for prefill.
-    /// Includes user turn markup and the (clean) assistant start — no think
-    /// block is baked in; under `/no_think` the model decodes its own empty
-    /// `<think></think>`. This is the exact string tokenized and sent to the model.
+    /// Includes user turn markup and the assistant start. On a suppressed turn
+    /// it also carries whichever half of `Dialect::thinking_suppression` that
+    /// family uses — the `/no_think` switch in the user turn, or an already-closed
+    /// `<think></think>` block after the assistant header. This is the exact
+    /// string tokenized and sent to the model.
     Prefill(String),
 
     /// Prefill progress (for visibility into long prefills).

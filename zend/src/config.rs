@@ -21,10 +21,6 @@ pub struct DaemonConfig {
     /// Scopes a rebuild to a subtree (e.g. `code_reading=zend/src`) so the
     /// substrate stays small instead of absorbing the whole workspace.
     pub ingest_dirs: HashMap<String, String>,
-    /// Do not spawn the background summariser thread, and do not register new
-    /// conversations for summarisation. Brings the engine up without the AVL
-    /// summary forest running — useful for bulk corpus prefill. Opt-in.
-    pub disable_summariser: bool,
     /// Force a whole-store redo-log compaction once during load, after the
     /// substrate reload and before serving. Normally reclaim is incremental and
     /// background (the persistence-thread maintenance pass); this flag forces

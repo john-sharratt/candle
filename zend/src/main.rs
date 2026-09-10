@@ -85,12 +85,6 @@ struct Cli {
     #[arg(long = "ingest-dir", value_name = "LAYER=PATH")]
     ingest_dir: Vec<String>,
 
-    /// Do not run the background summariser thread (no AVL summary-forest
-    /// extension, no per-conversation summarisation registration). Brings the
-    /// engine up without the summariser — useful for bulk corpus prefill.
-    #[arg(long)]
-    disable_summariser: bool,
-
     /// Force a whole-store redo-log compaction once during load (after the
     /// substrate reload, before serving) instead of leaving reclaim to the
     /// incremental background maintenance pass. Physically rewrites the log,
@@ -337,7 +331,6 @@ async fn main() -> anyhow::Result<()> {
         port: cli.port,
         disabled_layers: disabled_layers.clone(),
         ingest_dirs: ingest_dirs.clone(),
-        disable_summariser: cli.disable_summariser,
         compact_substrate: cli.compact_substrate,
     };
 
@@ -359,9 +352,6 @@ async fn main() -> anyhow::Result<()> {
             overrides = %pairs.join(", "),
             "--ingest-dir: these layers ingest from an overridden content root",
         );
-    }
-    if cli.disable_summariser {
-        tracing::info!("--disable-summariser: background summariser thread is disabled");
     }
     if cli.compact_substrate {
         tracing::info!("--compact-substrate: forcing a whole-store redo-log compaction on load");

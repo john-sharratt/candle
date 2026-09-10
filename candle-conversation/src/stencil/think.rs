@@ -164,10 +164,7 @@ impl ThinkMode {
     pub fn span_count(self) -> i32 {
         match self {
             ThinkMode::Off => 0,
-            ThinkMode::Quick
-            | ThinkMode::Balanced
-            | ThinkMode::Deep
-            | ThinkMode::Exhaustive => 1,
+            ThinkMode::Quick | ThinkMode::Balanced | ThinkMode::Deep | ThinkMode::Exhaustive => 1,
         }
     }
 

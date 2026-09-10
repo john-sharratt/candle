@@ -108,10 +108,6 @@ pub struct ModelBuilder {
     /// Workspace root whose `.substrate/` directory backs the persistence
     /// redo log. `None` falls back to the process working directory.
     workspace_path: Option<PathBuf>,
-    /// When `true`, the engine does not spawn the async summariser thread and
-    /// new conversations are not registered for summarisation (the AVL summary
-    /// forest is left un-extended). Off by default.
-    disable_summariser: bool,
     /// Per-layer corrupt-turn policy (from the projection schema), forwarded to
     /// [`EngineConfig::layer_corrupt_turn`] so the startup reload drops the whole
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
@@ -146,7 +142,6 @@ impl ModelBuilder {
             health_config: DecodeHealthConfig::default(),
             max_hot_turns: 0,
             workspace_path: None,
-            disable_summariser: false,
             layer_corrupt_turn: HashMap::new(),
             expert_pack_dir: None,
             spec,
@@ -182,14 +177,6 @@ impl ModelBuilder {
         policies: HashMap<LayerId, CorruptTurnPolicy>,
     ) -> ModelBuilder {
         self.layer_corrupt_turn = policies;
-        self
-    }
-
-    /// Disable the background summariser thread (and the per-conversation
-    /// summarisation registration). Use to bring the engine up without the
-    /// AVL summary forest running — e.g. for bulk corpus prefill.
-    pub fn disable_summariser(mut self, disable: bool) -> Self {
-        self.disable_summariser = disable;
         self
     }
 
@@ -635,7 +622,6 @@ impl ModelBuilder {
         );
 
         let mut ret = EngineConfig::new(eos_tokens.into());
-        ret.disable_summariser = self.disable_summariser;
         ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
         ret.batched_config.compression_level = Some(self.kv_compression_level);
         // Stress test: uniform-K pin REMOVED — both K and V now use fully

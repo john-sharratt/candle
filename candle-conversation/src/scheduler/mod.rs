@@ -4843,7 +4843,18 @@ impl Scheduler {
         let turn_start = Instant::now();
         // Prefill `assistant_start` to get the first-token logits and frame the
         // model to *answer* rather than continue the prompt.
-        let asst_start = self.boundary_markers.assistant_start.as_ref().clone();
+        //
+        // The already-closed reasoning block follows it, which is how a dialect
+        // with no `/no_think` soft switch suppresses thinking (see
+        // `BoundaryMarkers::no_think_block`); empty on families that use the
+        // switch, which the instruction above already carries. Without it this
+        // probe suppressed nothing on Qwen3.5/3.8 AND had no backstop —
+        // `SamplingConfig::compression()` leaves the segment ids unresolved, so
+        // neither the forced close nor the EOT ramp can fire — and the
+        // compressor reasoned until it hit the response cap, storing the trace
+        // as the summary.
+        let mut asst_start = self.boundary_markers.assistant_start.as_ref().clone();
+        asst_start.extend_from_slice(&self.boundary_markers.no_think_block);
         let prefill_logits = self
             .run_prefill(slot, &asst_start)
             .map_err(|e| format!("SubmitSummaryProbe: prefill assistant_start: {e}"))?;

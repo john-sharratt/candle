@@ -59,7 +59,7 @@ pub fn strip_think_blocks_keep_layout(text: &str) -> String {
 /// matching the turn-layout splitter's own convention.
 pub fn strip_empty_think_blocks(text: &str) -> String {
     if !text.contains("<think>") {
-        return text.to_string();
+        return strip_trailing_orphan_close(text);
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -90,6 +90,51 @@ pub fn strip_empty_think_blocks(text: &str) -> String {
         }
     }
     out
+}
+
+/// Drop a closing think tag left dangling at the END of a turn that never opened
+/// one.
+///
+/// **Why a suppressed turn produces these.** With thinking off the assistant grid
+/// opens on an already-closed block, so the model is outside one — and
+/// `think_close_ban_active` bans the real `</think>` id whenever the sampler is
+/// outside a block. Wanting to close anyway, the model reaches for a spelling
+/// that is not the banned id: measured on the repo_map ingest, 2 of 22 summaries
+/// ended in a bare `</thinking>`. Hence the tolerant tag match — `</think>` plus
+/// any alphabetic tail.
+///
+/// **Deliberately narrow on both axes.** Only the trailing tag, and only when the
+/// text opens no block at all (the caller checks). Sealed text is paired with a
+/// K/V span by offset, so anything removed here shifts that pairing — mid-text
+/// edits would corrupt the mapping `tool_exchange_segments` carves sub-segments
+/// from, to chase a case never observed. A turn carrying real reasoning has an
+/// opener and never reaches this.
+fn strip_trailing_orphan_close(text: &str) -> String {
+    let trimmed = text.trim_end();
+    let lower = trimmed.to_ascii_lowercase();
+    let Some(start) = lower.rfind("</think") else {
+        return text.to_string();
+    };
+    match close_tag_len(&lower[start..]) {
+        // The tag must BE the tail — a `</think>` with prose after it is being
+        // used as text, not as a stray closer.
+        Some(len) if start + len == trimmed.len() => trimmed[..start].trim_end().to_string(),
+        _ => text.to_string(),
+    }
+}
+
+/// Byte length of a closing think tag at the start of `s`, if there is one.
+///
+/// Accepts `</think>` and the alphabetic variants a model invents when the
+/// canonical token is unavailable (`</thinking>`). Lowercase input only — the
+/// callers pass an already-lowered copy whose byte layout matches the original,
+/// since `to_ascii_lowercase` never changes a byte's width.
+fn close_tag_len(s: &str) -> Option<usize> {
+    let rest = s.strip_prefix("</think")?;
+    let extra = rest.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    rest[extra..]
+        .starts_with('>')
+        .then_some("</think".len() + extra + 1)
 }
 
 /// Remove every `<think>…</think>` block (and stray unmatched `</think>` tags),
@@ -233,6 +278,71 @@ mod tests {
         assert_eq!(
             strip_empty_think_blocks("<think></think>A<think>keep me</think>B"),
             "A<think>keep me</think>B"
+        );
+    }
+
+    /// **The suppressed turn's leftover.** With thinking off the model is
+    /// already outside a block and the real `</think>` id is banned, so it
+    /// closes with a spelling of its own. Measured: 2 of 22 ingest summaries
+    /// ended in a bare `</thinking>`. The summary text must survive intact.
+    #[test]
+    fn an_orphan_close_tag_is_dropped_without_touching_the_text() {
+        assert_eq!(
+            strip_empty_think_blocks("The folder defines Qwen presets.</thinking>"),
+            "The folder defines Qwen presets."
+        );
+        assert_eq!(strip_empty_think_blocks("A summary.</think>"), "A summary.");
+        // Trailing whitespace after the tag is still the tail.
+        assert_eq!(
+            strip_empty_think_blocks("A summary.</thinking>\n\n"),
+            "A summary."
+        );
+    }
+
+    /// **Only the TRAILING tag, and only in a turn that opened no block.**
+    ///
+    /// Sealed text is paired with its K/V span by offset, so a mid-text deletion
+    /// would shift that pairing for every consumer that maps text onto tokens.
+    /// A `</think>` with prose after it is being used as text — quoted source,
+    /// an explanation of the markup — and is left alone.
+    #[test]
+    fn a_mid_text_close_tag_is_left_alone() {
+        assert_eq!(
+            strip_empty_think_blocks("Two</thinking> sentences."),
+            "Two</thinking> sentences."
+        );
+        // Prose *about* the tag survives intact — this repo's own sources say
+        // exactly this sort of thing, and the ingest reads them back.
+        let quoted = "The gate holds until </think> arrives, then opens.";
+        assert_eq!(strip_empty_think_blocks(quoted), quoted);
+    }
+
+    /// A turn that opened a block is never touched by the orphan strip — it has
+    /// an opener, so the trailing-tag path is not even reached. Its reasoning is
+    /// preserved verbatim, which is what a client rendering a reasoning pane
+    /// needs.
+    #[test]
+    fn a_turn_that_opened_a_block_is_left_intact() {
+        assert_eq!(
+            strip_empty_think_blocks("<think>real reasoning</think>Answer."),
+            "<think>real reasoning</think>Answer."
+        );
+        // Even a doubled close stays: the turn opened a block, so this is not the
+        // suppressed-turn artifact the strip exists for, and guessing here would
+        // shift the text/K-V offset pairing on a case never observed.
+        assert_eq!(
+            strip_empty_think_blocks("<think>r</think>Answer.</think>"),
+            "<think>r</think>Answer.</think>"
+        );
+    }
+
+    /// Text that merely mentions the tag shape without closing it is left alone
+    /// — no `>` means no tag, so prose about `</think` is not mangled.
+    #[test]
+    fn an_unterminated_tag_shape_is_not_a_tag() {
+        assert_eq!(
+            strip_empty_think_blocks("talking about </think without a close"),
+            "talking about </think without a close"
         );
     }
 

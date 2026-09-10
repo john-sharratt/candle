@@ -52,7 +52,7 @@ impl ChunkedKvBacking {
     /// Scans `state.slots` and returns the index of the first `None` entry,
     /// or `state.slots.len()` when all current slots are occupied (caller must
     /// grow capacity).  This is the backing-level slot allocator used when
-    /// multiple sessions share the same `BackingInner` pool â€” consulting the
+    /// multiple sessions share the same `BackingInner` pool — consulting the
     /// backing ensures sibling sessions get non-overlapping slot indices.
     pub fn first_free_slot(&self) -> Result<usize> {
         let state = self
@@ -666,7 +666,7 @@ impl ChunkedKvBacking {
     /// source slot.  Each `chunk_id` gets a `ChunkGid` entry cloned
     /// from the source.
     ///
-    /// This does NOT allocate new chunks â€” it references existing ones via
+    /// This does NOT allocate new chunks — it references existing ones via
     /// Arc-clone of handles looked up from the source.  The caller must ensure
     /// the chunk IDs are valid and owned by a prototype slot that outlives
     /// all borrowers.
@@ -1285,7 +1285,7 @@ impl ChunkedKvBacking {
                 });
         }
 
-        // block_count() = chunks.len() = total_blocks. âœ“
+        // block_count() = chunks.len() = total_blocks. ✓
 
         drop(state);
 

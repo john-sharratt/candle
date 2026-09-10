@@ -292,10 +292,9 @@ fn run_case(
                 );
             }
         }
-        for (label, test_hdr, prod_hdr) in [
-            ("control", &out_a, &out_ap),
-            ("segmented", &out_b, &out_bp),
-        ] {
+        for (label, test_hdr, prod_hdr) in
+            [("control", &out_a, &out_ap), ("segmented", &out_b, &out_bp)]
+        {
             let c = compare(test_hdr, prod_hdr)?;
             if c.max_abs > 0.0 {
                 candle::bail!(
@@ -781,7 +780,9 @@ fn decode_one_production(
     let mut raw = vec![0u8; n_slices as usize * TokenSliceHost::SLICE_HEADER_SIZE];
     unsafe { memcpy_dtoh_sync(&mut raw, ptr) }.map_err(candle::Error::wrap)?;
     let prod: Vec<(u16, u16, u32)> = raw
-        .chunks_exact(TokenSliceHost::SLICE_HEADER_SIZE)
+        .as_chunks::<{ TokenSliceHost::SLICE_HEADER_SIZE }>()
+        .0
+        .iter()
         .map(|h| {
             (
                 u16::from_le_bytes([h[0], h[1]]),
@@ -790,7 +791,11 @@ fn decode_one_production(
             )
         })
         .collect();
-    let test: Vec<(u16, u16, u32)> = expect.slices.iter().map(|s| (s.offset, s.len, s.rope)).collect();
+    let test: Vec<(u16, u16, u32)> = expect
+        .slices
+        .iter()
+        .map(|s| (s.offset, s.len, s.rope))
+        .collect();
     if prod != test || write_slice != expect.write_slice {
         candle::bail!(
             "production slot header disagrees with the test-side header at seq_offset \

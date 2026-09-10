@@ -17,10 +17,9 @@ use crate::stencil::{
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
 use crate::substrate::{ConvCompression, Substrate};
-use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
+use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
-use candle::Device;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use crossbeam::channel;
@@ -62,23 +61,6 @@ impl ThinkSteering {
             ThinkMode::Exhaustive => &self.exhaustive,
         };
         Arc::new(base.with_trigger(self.think_open, Arc::clone(tree)))
-    }
-}
-
-/// How many summary probes the summariser submits per batch, chosen by total
-/// VRAM at engine init. Their decodes batch in the scheduler's wave loop, so a
-/// bigger card can keep more summaries in flight: 16 above 32 GB, 4 at or below
-/// (and on CPU, where there's no device VRAM to read).
-fn summary_probe_concurrency(device: &Device) -> usize {
-    const VRAM_32_GIB: usize = 32 * 1024 * 1024 * 1024;
-    let total_vram = match device {
-        Device::Cuda(d) => d.mem_get_info().map(|(_free, total)| total).unwrap_or(0),
-        _ => 0,
-    };
-    if total_vram > VRAM_32_GIB {
-        16
-    } else {
-        4
     }
 }
 
@@ -358,18 +340,27 @@ impl ConversationEngine {
         // [`TreeMetadata`] records to the redo log.  Spawned after the
         // persistence thread so its writes flow through the same
         // workspace handle.
-        let summariser_runner = Arc::new(ChannelProbeRunner::new(tx.clone()));
-        let summary_concurrency = summary_probe_concurrency(session.device());
-        tracing::info!(
-            summary_concurrency,
-            "summariser probe-batch concurrency set from total VRAM"
-        );
-        let summariser_thread = if config.disable_summariser {
-            tracing::info!("disable_summariser: summariser thread not spawned");
-            SummariserThread::disabled()
-        } else {
-            SummariserThread::spawn(conversation.clone(), summariser_runner, summary_concurrency)
-        };
+        // **The AVL summariser is disconnected.** It is never spawned, and no
+        // timeline enqueues turns for it (`Timeline::summarize` is false for
+        // every timeline) — so nothing in this engine compresses a conversation
+        // or a layer into summary nodes.
+        //
+        // The decision, deliberately: compression was a persistent source of bad
+        // memory rather than a saving. Measured on a 16-turn conversation, 5 of 9
+        // summary nodes were unfaithful — two echoed the user's question back,
+        // one echoed the compressor's own instruction, and the merge node that
+        // stands for the WHOLE conversation read "I am an AI assistant." Those
+        // nodes are written in the first person, as if they were the reply, and
+        // are what a later projection reads as history: a wrong one is not a
+        // missing summary but a false memory the model cannot distinguish from
+        // something it actually said. Retrieval quality is being pursued through
+        // provenance selection instead, which ranks real turns rather than
+        // manufacturing new text.
+        //
+        // `summary_tree` stays compiled and tested so the machinery — the AVL
+        // shape, the probe protocol, the seal path — is here to build on when
+        // that work resumes. Nothing calls into it.
+        let summariser_thread = SummariserThread::disabled();
         // Hand the trigger to the scheduler so every assistant-turn
         // seal wakes the summariser immediately — design §4 step ③.
         let summariser_trigger = summariser_thread.trigger_handle();
@@ -1052,13 +1043,10 @@ impl ConversationEngine {
         self.conversation
             .set_timeline_compression(timeline, compression);
         // Every layer summarises into its AVL summary tree; provenance scans then
-        // expand the compressed nodes on retrieval. This is independent of
-        // `disable_reprojection` — that flag only gates the per-turn reprojection
-        // for append-only utility layers. The AVL summariser runs on its own
-        // thread (wave-driven compression) and never blocks ingest, so even
-        // high-turn-count utility layers can summarise.
-        self.conversation
-            .set_timeline_summarize(timeline, !self.config.disable_summariser);
+        // No summarisation is registered for the timeline: the AVL summariser is
+        // disconnected (see the `SummariserThread::disabled()` note in `new`), so
+        // a timeline keeps its turns whole and retrieval ranks them by provenance
+        // rather than reading a compressed stand-in.
         let target = ProjectionTarget {
             layer,
             group,
@@ -1199,8 +1187,6 @@ impl ConversationEngine {
                     // failed send leaves only the bare timeline mint, no metadata.
                     self.conversation
                         .set_timeline_compression(timeline, compression);
-                    self.conversation
-                        .set_timeline_summarize(timeline, !self.config.disable_summariser);
                     fired.push(Ok(Fired { target, rx }));
                 }
                 Err(_) => fired.push(Err(ConversationError::SchedulerGone)),

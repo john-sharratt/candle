@@ -1451,7 +1451,7 @@ fn quantize_dequantize_roundtrip_all_dtypes() -> Result<()> {
 
     // All supported quantization types with their expected max RMSE
     // Tolerances based on theoretical quantization error for uniform random [-8, 8]
-    // RMSE â‰ˆ step_size / sqrt(12) where step_size = range / (2^bits - 1)
+    // RMSE ≈ step_size / sqrt(12) where step_size = range / (2^bits - 1)
     // Added margin for rounding differences between GPU and CPU
     let test_configs: Vec<(GgmlDType, f32, &str)> = vec![
         (GgmlDType::Q4_0, 0.35, "Q4_0"), // 4-bit: theoretical ~0.31
@@ -1584,25 +1584,17 @@ fn quantize_dequantize_roundtrip_all_dtypes() -> Result<()> {
     }
 
     // Print summary table
-    println!(
-        "â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”"
-    );
-    println!(
-        "â”‚ DType   â”‚ Valid â”‚ RMSE     â”‚ MeanDiff â”‚ MaxDiff  â”‚ Quant GB/s  â”‚ Dequant GB/sâ”‚"
-    );
-    println!(
-        "â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤"
-    );
+    println!("┌─────────┬───────┬──────────┬──────────┬──────────┬─────────────┬─────────────┐");
+    println!("│ DType   │ Valid │ RMSE     │ MeanDiff │ MaxDiff  │ Quant GB/s  │ Dequant GB/s│");
+    println!("├─────────┼───────┼──────────┼──────────┼──────────┼─────────────┼─────────────┤");
     for r in &results {
-        let valid_str = if r.valid { "âœ“" } else { "âœ—" };
+        let valid_str = if r.valid { "✓" } else { "✗" };
         println!(
-            "â”‚ {:7} â”‚   {}   â”‚ {:8.5} â”‚ {:8.5} â”‚ {:8.4} â”‚ {:10.2}  â”‚ {:10.2}  â”‚",
+            "│ {:7} │   {}   │ {:8.5} │ {:8.5} │ {:8.4} │ {:10.2}  │ {:10.2}  │",
             r.name, valid_str, r.rmse, r.mean_diff, r.max_diff, r.quant_gbps, r.dequant_gbps
         );
     }
-    println!(
-        "â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜"
-    );
+    println!("└─────────┴───────┴──────────┴──────────┴──────────┴─────────────┴─────────────┘");
 
     // Assert all passed
     let all_valid = results.iter().all(|r| r.valid);
@@ -1615,12 +1607,12 @@ fn quantize_dequantize_roundtrip_all_dtypes() -> Result<()> {
 /// by verifying it produces identical bytes when requantizing dequantized values.
 ///
 /// Test flow:
-/// 1. CPU: Generate random f32 data, quantize with CPU (known-good) â†’ cpu_quant_bytes
-/// 2. CPU: Dequantize CPU result â†’ baseline_f32 (this is what the quantized block represents)
+/// 1. CPU: Generate random f32 data, quantize with CPU (known-good) → cpu_quant_bytes
+/// 2. CPU: Dequantize CPU result → baseline_f32 (this is what the quantized block represents)
 /// 3. Upload baseline_f32 to GPU
-/// 4. GPU: Quantize baseline_f32 â†’ gpu_quant_bytes
+/// 4. GPU: Quantize baseline_f32 → gpu_quant_bytes
 /// 5. Compare: gpu_quant_bytes == cpu_quant_bytes (should match exactly!)
-/// 6. GPU: Dequantize gpu_quant_bytes â†’ roundtrip_f32
+/// 6. GPU: Dequantize gpu_quant_bytes → roundtrip_f32
 /// 7. Compare: roundtrip_f32 vs baseline_f32 (RMSE should be ~0)
 ///
 /// This isolates the GPU quantize kernel and verifies byte-level correctness.
@@ -2090,8 +2082,8 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
                 cpu_dmin.to_f32(),
                 gpu_d.to_f32(),
                 gpu_dmin.to_f32(),
-                if d_match { "âœ“" } else { "âœ—" },
-                if dmin_match { "âœ“" } else { "âœ—" }
+                if d_match { "✓" } else { "✗" },
+                if dmin_match { "✓" } else { "✗" }
             );
 
             // Show scales comparison for this block
@@ -2176,8 +2168,8 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
                 cpu_dmin.to_f32(),
                 gpu_d.to_f32(),
                 gpu_dmin.to_f32(),
-                if d_match { "âœ“" } else { "âœ—" },
-                if dmin_match { "âœ“" } else { "âœ—" }
+                if d_match { "✓" } else { "✗" },
+                if dmin_match { "✓" } else { "✗" }
             );
         }
         println!();
@@ -2280,7 +2272,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
 
             // Report
             let byte_match_pct = 100.0 * (quant_size - byte_mismatches) as f64 / quant_size as f64;
-            let status = if byte_mismatches == 0 && rmse < 1e-5 { "âœ“" } else { "âœ—" };
+            let status = if byte_mismatches == 0 && rmse < 1e-5 { "✓" } else { "✗" };
 
             println!("{} {:5}: Bytes: {:6.2}% match ({:6} / {:6} mismatches), RMSE: {:.2e}, MaxDiff: {:.2e}",
                 status, $name, byte_match_pct, byte_mismatches, quant_size, rmse, max_diff);
@@ -2300,7 +2292,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
 
     // Test each dtype
     println!(
-        "Testing Q4_0 ({} blocks Ã— {} elements = {} elements)...",
+        "Testing Q4_0 ({} blocks × {} elements = {} elements)...",
         num_blocks,
         BlockQ4_0::BLCK_SIZE,
         num_blocks * BlockQ4_0::BLCK_SIZE
@@ -2308,7 +2300,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
     let (q4_0_exact, q4_0_rmse) = test_dtype!(BlockQ4_0, GgmlDType::Q4_0, "Q4_0");
 
     println!(
-        "\nTesting Q8_0 ({} blocks Ã— {} elements = {} elements)...",
+        "\nTesting Q8_0 ({} blocks × {} elements = {} elements)...",
         num_blocks,
         BlockQ8_0::BLCK_SIZE,
         num_blocks * BlockQ8_0::BLCK_SIZE
@@ -2316,7 +2308,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
     let (q8_0_exact, q8_0_rmse) = test_dtype!(BlockQ8_0, GgmlDType::Q8_0, "Q8_0");
 
     println!(
-        "\nTesting Q2K ({} blocks Ã— {} elements = {} elements)...",
+        "\nTesting Q2K ({} blocks × {} elements = {} elements)...",
         num_blocks,
         BlockQ2_K::BLCK_SIZE,
         num_blocks * BlockQ2_K::BLCK_SIZE
@@ -2324,7 +2316,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
     let (q2k_exact, q2k_rmse) = test_dtype!(BlockQ2_K, GgmlDType::Q2_K, "Q2K");
 
     println!(
-        "\nTesting Q4K ({} blocks Ã— {} elements = {} elements)...",
+        "\nTesting Q4K ({} blocks × {} elements = {} elements)...",
         num_blocks,
         BlockQ4_K::BLCK_SIZE,
         num_blocks * BlockQ4_K::BLCK_SIZE
@@ -2477,23 +2469,19 @@ fn quantize_direct_comparison() -> Result<()> {
 
     // Print fancy table
     println!();
-    println!("â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”");
-    println!("â”‚ DType  â”‚ Status â”‚ Byte Match â”‚ Mismatches â”‚   RMSE   â”‚ MaxDiff  â”‚");
-    println!("â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤");
+    println!("┌────────┬────────┬────────────┬────────────┬──────────┬──────────┐");
+    println!("│ DType  │ Status │ Byte Match │ Mismatches │   RMSE   │ MaxDiff  │");
+    println!("├────────┼────────┼────────────┼────────────┼──────────┼──────────┤");
 
     for r in &results {
-        let status = if r.passed {
-            "   âœ“    "
-        } else {
-            "   âœ—    "
-        };
+        let status = if r.passed { "   ✓    " } else { "   ✗    " };
         println!(
-            "â”‚ {:>6} â”‚{}â”‚ {:>9.2}% â”‚ {:>10} â”‚ {:>8.2e} â”‚ {:>8.2e} â”‚",
+            "│ {:>6} │{}│ {:>9.2}% │ {:>10} │ {:>8.2e} │ {:>8.2e} │",
             r.name, status, r.byte_match_pct, r.mismatches, r.rmse, r.max_diff
         );
     }
 
-    println!("â””â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜");
+    println!("└────────┴────────┴────────────┴────────────┴──────────┴──────────┘");
     println!(
         "\nThresholds: byte_match >= {:.0}%, RMSE <= {:.1}",
         MIN_BYTE_MATCH_PCT, MAX_RMSE
@@ -2569,7 +2557,7 @@ fn grouped_matmul_matches_direct() -> Result<()> {
         expert_offsets.push(expert_offsets.last().unwrap() + b as i32);
     }
 
-    // â”€â”€ Reference: per-expert matmul_gemx â”€â”€
+    // ── Reference: per-expert matmul_gemx ──
     let mut ref_results: Vec<Vec<bf16>> = Vec::new();
     for e in 0..num_experts {
         let start = expert_offsets[e] as usize;
@@ -2589,7 +2577,7 @@ fn grouped_matmul_matches_direct() -> Result<()> {
         ref_results.push(ref_result);
     }
 
-    // â”€â”€ Test: grouped_matmul_gemx â”€â”€
+    // ── Test: grouped_matmul_gemx ──
     let grouped_result = grouped_matmul_gemx(
         &weight_ptrs,
         GgmlDType::Q4_K,
@@ -4054,9 +4042,13 @@ fn ko_repack_scratch_is_a_bounded_band() -> Result<()> {
     // bands after attempt one, and a later attempt would under-report by
     // exactly the thing the bound is meant to catch.
     let quiet = |dev: &CudaDevice| -> Result<Option<usize>> {
-        dev.cuda_stream().synchronize().map_err(crate::Error::wrap)?;
+        dev.cuda_stream()
+            .synchronize()
+            .map_err(crate::Error::wrap)?;
         let (a, _) = crate::quantized::get_vram_info()?;
-        dev.cuda_stream().synchronize().map_err(crate::Error::wrap)?;
+        dev.cuda_stream()
+            .synchronize()
+            .map_err(crate::Error::wrap)?;
         let (b, _) = crate::quantized::get_vram_info()?;
         Ok((a == b).then_some(a))
     };

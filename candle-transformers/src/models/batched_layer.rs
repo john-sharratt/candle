@@ -740,7 +740,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
         .is_some();
 
     // Apply model-side RoPE only for the non-paged path.
-    // Paged kernel always applies RoPE internally â€” applying it here would double-rotate.
+    // Paged kernel always applies RoPE internally — applying it here would double-rotate.
     let (q, k) = if use_paged {
         // Kernel will rotate; skip model-side rotation.
         (q, k)
@@ -1480,12 +1480,12 @@ fn paged_decode_attention<'w>(
 
     // Mixed-precision handling:
     // - FP8 arenas: Q must be BF16 (for precision), k_new/v_new must also be BF16.
-    //   The decode kernel reads k_new/v_new as BF16* and arena_store_element converts BF16â†’FP8
+    //   The decode kernel reads k_new/v_new as BF16* and arena_store_element converts BF16→FP8
     //   when writing to the arena. Passing FP8 bytes to a BF16* kernel produces garbage.
     // - Other arenas: Q/k_new/v_new must all match arena dtype
     let (q_kernel, k_kernel, v_kernel) = if arena_dtype == DType::F8E4M3 {
         // FP8 KV cache with BF16 compute: Q and new K/V are all BF16.
-        // The kernel writes BF16â†’FP8 to the arena via arena_store_element (correct conversion).
+        // The kernel writes BF16→FP8 to the arena via arena_store_element (correct conversion).
         if q_3d.dtype() != DType::BF16 {
             candle::bail!(
                 "paged-decode: FP8 arenas require BF16 Q, got {:?}",

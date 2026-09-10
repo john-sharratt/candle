@@ -2600,13 +2600,31 @@ impl Scheduler {
         };
 
         // Detect think-mode entry: the model opens its OWN `<think>` as the first
-        // decoded token (we never prefill one). The `work.tokens` check covers a
-        // caller-supplied assistant prefill that itself opens a think block.
+        // decoded token, or the assistant lead this turn was prefilled with
+        // already opens one.
         let initial_inside_think_block = {
             let tid = work.sampling.segment_open_token_id;
             if tid >= 0 {
                 let tok = tid as u32;
-                let prefill_has_think = work.tokens.iter().rev().take(5).any(|&t| t == tok);
+                // **Only the ASSISTANT lead can leave a block open**, so the scan
+                // starts at `assistant_content_start`. The markers are ordinary
+                // vocabulary ids, and the tokenizer emits them for the literal
+                // text too — so a `<tool_response>` carrying source that merely
+                // MENTIONS `<think>` puts the open id in the USER half of the
+                // grid. This repo's own `dialect.rs` does exactly that, and the
+                // code-reading ingest feeds it back in. Scanning the whole grid
+                // would arm `in_segment` off that quoted text before the turn had
+                // decoded anything, and under `ThinkMode::Off` (hard cap of one)
+                // the second decoded token would be rewritten to `</think>`.
+                let assistant_lead = work
+                    .tokens
+                    .get(work.assistant_content_start as usize..)
+                    .unwrap_or(&[]);
+                let prefill_has_think = prefill_leaves_think_open(
+                    assistant_lead,
+                    tid,
+                    work.sampling.segment_close_token_id,
+                );
                 // The block opens either way: the common case is the model
                 // sampling its OWN `<think>` as the first token; the rarer case is
                 // a caller-supplied assistant prefill that already opens one.  In
@@ -3040,6 +3058,119 @@ impl Scheduler {
             .map_err(ConversationError::Model)?;
 
         Ok(logits)
+    }
+}
+
+/// Whether a prefill grid ends **inside an open think block**.
+///
+/// Walks back to the nearest think marker and answers on that one: an open means
+/// the block is still open, a close means the grid already ended it. Anything
+/// else — no marker at all — is not a block.
+///
+/// The distinction is load-bearing because thinking suppression prefills a block
+/// that is already CLOSED (`<think>\n\n</think>`, see
+/// `Dialect::thinking_suppression`). Its last marker is the close, so a check
+/// that merely asked "does `<think>` appear near the end" armed the sampler's
+/// `in_segment` on a block the grid had shut. Under the `ThinkMode::Off` collapse
+/// — where the hard cap is one token — the sampler would then force a second,
+/// spurious `</think>` into the opening words of the answer.
+///
+/// Scanning to the nearest marker also retires the fixed 5-token tail window this
+/// replaces, which was only ever a guess at how far back the opener might sit.
+fn prefill_leaves_think_open(tokens: &[u32], open_id: i32, close_id: i32) -> bool {
+    if open_id < 0 {
+        return false;
+    }
+    tokens
+        .iter()
+        .rev()
+        .find_map(|&t| {
+            if t == open_id as u32 {
+                Some(true)
+            } else if close_id >= 0 && t == close_id as u32 {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod think_prefill_tests {
+    use super::prefill_leaves_think_open;
+
+    const OPEN: u32 = 248068;
+    const CLOSE: u32 = 248069;
+
+    /// The suppression grid: the block is prefilled ALREADY CLOSED, so the turn
+    /// starts outside it. Arming here is what forced a spurious `</think>` into
+    /// the answer's first words on a `ThinkMode::Off` turn.
+    #[test]
+    fn a_prefilled_closed_block_does_not_leave_the_turn_inside_one() {
+        // `…assistant\n` `<think>` `\n\n` `</think>` `\n\n`
+        let grid = [1, 2, OPEN, 3, CLOSE, 4];
+        assert!(!prefill_leaves_think_open(&grid, OPEN as i32, CLOSE as i32));
+    }
+
+    /// A caller-supplied prefill that genuinely opens a block still arms — this
+    /// is the case the original check existed for, and it must not regress.
+    #[test]
+    fn a_prefilled_open_block_leaves_the_turn_inside_one() {
+        let grid = [1, 2, CLOSE, 9, OPEN, 3];
+        assert!(prefill_leaves_think_open(&grid, OPEN as i32, CLOSE as i32));
+    }
+
+    /// No marker anywhere: an ordinary turn is not inside a block, however long
+    /// the grid is. (The old fixed 5-token window also answered this correctly;
+    /// the difference is that scanning finds an opener further back than 5.)
+    #[test]
+    fn a_grid_with_no_markers_is_not_a_block() {
+        assert!(!prefill_leaves_think_open(
+            &[1, 2, 3, 4, 5, 6],
+            OPEN as i32,
+            CLOSE as i32
+        ));
+        // Deep opener: 5 tokens of tail would have missed this one entirely.
+        let mut deep = vec![OPEN];
+        deep.extend(std::iter::repeat_n(7u32, 40));
+        assert!(prefill_leaves_think_open(&deep, OPEN as i32, CLOSE as i32));
+    }
+
+    /// **User content that merely QUOTES `<think>` must not arm the flag.**
+    ///
+    /// The markers are ordinary vocabulary ids and the tokenizer emits them for
+    /// literal text, so a `<tool_response>` carrying source that mentions
+    /// `<think>` puts the open id in the user half of the grid — this repo's own
+    /// `dialect.rs` does, and the code-reading ingest feeds it back. The caller
+    /// slices at `assistant_content_start` for exactly this reason; the scan
+    /// itself must stay honest about what it is handed.
+    #[test]
+    fn only_the_assistant_lead_is_scanned() {
+        // `[user … <think> … ] [assistant lead: closed block]`
+        let grid = [9, OPEN, 9, 9, OPEN, 3, CLOSE, 4];
+        let assistant_content_start = 4;
+        assert!(
+            !prefill_leaves_think_open(&grid[assistant_content_start..], OPEN as i32, CLOSE as i32),
+            "the assistant lead closed its block; quoted user text must not override that"
+        );
+        // Scanning the whole grid is what the slice prevents: the user's quoted
+        // opener is nearer the front, but a reverse scan still reaches it once
+        // the assistant half is stripped away.
+        assert!(prefill_leaves_think_open(
+            &grid[..2],
+            OPEN as i32,
+            CLOSE as i32
+        ));
+    }
+
+    /// Unresolved ids can never arm — `-1` must not be compared as a token.
+    #[test]
+    fn unresolved_ids_never_arm() {
+        assert!(!prefill_leaves_think_open(&[OPEN, 1], -1, CLOSE as i32));
+        // An unresolved CLOSE still lets a real open arm; only the close test is
+        // skipped, which is the conservative direction.
+        assert!(prefill_leaves_think_open(&[OPEN, 1], OPEN as i32, -1));
     }
 }
 

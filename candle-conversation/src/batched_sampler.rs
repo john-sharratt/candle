@@ -472,8 +472,6 @@ impl BatchedSampler {
         // full-vocab device kernel.  When nothing is constrained (the common wave)
         // every row is a kernel row.
         let mut kernel_idx: Vec<usize> = Vec::new();
-        let mut kernel_states: Vec<&mut SequenceSamplingState> = Vec::new();
-        let mut kernel_configs: Vec<&SamplingConfig> = Vec::new();
         for (i, slot) in states.iter_mut().enumerate() {
             let state: &mut SequenceSamplingState = slot;
             let config = configs[i];
@@ -488,14 +486,32 @@ impl BatchedSampler {
                 // Small allow-list: a tiny gather + sample, CPU-side.
                 [_, _, ..] => results[i] = self.sample_allow_list(&logits2d, i, config, state)?,
                 // Unconstrained: defer to the device kernel below.
-                [] => {
-                    kernel_idx.push(i);
-                    kernel_states.push(state);
-                    kernel_configs.push(config);
-                }
+                [] => kernel_idx.push(i),
             }
         }
 
+        // **The kernel's scalar parameters are shared across the launch.**
+        // Temperature, top-k/top-p, the repetition and DRY penalties, the EOS ramp
+        // and the banned-token list are passed once per launch and applied to
+        // every row; `sample_batch_cuda` reads them from `configs[0]`. A wave that
+        // mixes dials — a `ThinkMode::Off` ingest summary at
+        // `SamplingConfig::compression()` beside a dialogue turn — therefore
+        // samples every row at whichever config sorts first.
+        //
+        // That is a real limitation, and it is deliberately NOT worked around by
+        // splitting the wave into one launch per distinct config. `seed` is part
+        // of the config and `zend` randomises it per turn, so "distinct config"
+        // is very nearly "distinct sequence": a 64-session wave would fall back to
+        // ~64 sampler launches plus 64 `index_select` gathers per decode step,
+        // trading a small sampling-fidelity gain for the batching the engine
+        // exists to do. Fixing it properly means per-sequence scalar arrays in the
+        // kernel (the shape `banned_tokens_per_seq` and `segment_suppress_penalty`
+        // already use), not host-side regrouping.
+        //
+        // What must NOT ride on this is anything resolved per row on the host —
+        // the segment-close budget and the EOS failsafes read `configs[i]` in the
+        // post-kernel loop, precisely because that loop visits every row and has
+        // no reason to inherit row 0's limits.
         if !kernel_idx.is_empty() {
             // Gather just the kernel rows — unless they ARE the whole batch, in
             // which case skip the copy and run the kernel over every row.
@@ -509,6 +525,14 @@ impl BatchedSampler {
                 )?;
                 logits2d.index_select(&idx, 0)?
             };
+            let mut kernel_states: Vec<&mut SequenceSamplingState> = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| kernel_idx.contains(i))
+                .map(|(_, s)| &mut **s)
+                .collect();
+            let kernel_configs: Vec<&SamplingConfig> =
+                kernel_idx.iter().map(|&i| configs[i]).collect();
             let tokens =
                 self.sample_full_vocab(&kernel_logits, &mut kernel_states, &kernel_configs)?;
             for (k, &i) in kernel_idx.iter().enumerate() {
@@ -1032,10 +1056,30 @@ impl BatchedSampler {
         // Update states with sampled tokens and new RNG offsets.
         // Apply post-sampler EOS failsafe overrides: if the sequence has exceeded
         // the configured length limits, replace the sampled token with EOS.
+        //
+        // **Each row resolves against ITS OWN config, not the shared `config`.**
+        // The `configs[0]` collapse above is the *kernel's* constraint — one set
+        // of scalar params per launch — and it does not extend to this host-side
+        // loop, which visits every row individually. Reading `config` here made a
+        // wave's row 0 govern every other row's segment-close budget, EOS
+        // failsafes, and think-token ids, so a sequence's own limits applied only
+        // when it happened to sort first.
+        //
+        // That is not hypothetical: it is why a `ThinkMode::Off` ingest summary
+        // (`force_segment_close_after == 1`, a forced empty `<think></think>`)
+        // closed its block only when it led the wave. Measured over one repo_map
+        // pass — 22 summaries opened a block, 7 closed, and all 7 closed at
+        // exactly token 2, the forced close firing. The other 15 shared a wave
+        // with a dialogue-budget row (`force_segment_close_after == 1536`),
+        // inherited its budget, and burned the whole 200-token summary allowance
+        // on reasoning that was then stored as the summary. The CPU path
+        // (`sample_batch_cpu`) always zipped configs per row, so CPU tests could
+        // not see it.
         for (i, state) in states.iter_mut().enumerate() {
+            let row_config = configs[i];
             // Segment close, degenerate-decode abort and the EOS failsafes all
             // resolve in `resolve_final_token`, shared with the CPU path.
-            let token = self.resolve_final_token(i, output_tokens[i], state, config);
+            let token = self.resolve_final_token(i, output_tokens[i], state, row_config);
 
             output_tokens[i] = token;
 
@@ -1044,8 +1088,8 @@ impl BatchedSampler {
             // Detect segment open/close transitions for the segment-close boost.
             state.update_segment_state(
                 token,
-                config.segment_open_token_id,
-                config.segment_close_token_id,
+                row_config.segment_open_token_id,
+                row_config.segment_close_token_id,
             );
         }
 
@@ -1527,6 +1571,23 @@ fn apply_banned(logits: &Tensor, config: &SamplingConfig) -> candle::Result<Tens
 /// block) cannot strand the block, because closing it is the stencil's job and
 /// the hard-cap closer script forces the token rather than sampling it;
 /// wrongly *inside* (ban off after a close) is exactly today's behaviour.
+///
+/// # The cost of the ban, and why it is still the right trade
+///
+/// The "cannot strand" argument above holds only for a block opened with the
+/// open *token*. A model that spells `<think>` out as plain text never arms
+/// `in_segment`, so on an unsteered turn — no stencil, and the hard cap keyed
+/// off a flag that is clear — nothing can end it. Measured on a thinking-off
+/// ingest: rather than stay stuck, the model closed with a spelling that is not
+/// the banned id, and 2 of 22 summaries ended in a bare `</thinking>`.
+///
+/// Lifting the ban for suppressed turns was tried and is **wrong**: any
+/// `</think>` sets `think_close_at` and cuts an index page at a reasoning
+/// boundary (`scheduler::mod`), so a stray close outside a block would carve a
+/// spurious page into the turn's K/V. A leaked tag is cosmetic and
+/// `strip_orphan_close_tags` removes it; a mis-cut index page is not. The ban
+/// stays, and the stripper owns the cleanup.
+///
 fn think_close_ban_active(config: &SamplingConfig, state: &SequenceSamplingState) -> bool {
     config.segment_close_token_id >= 0 && !state.in_segment
 }
@@ -2133,6 +2194,45 @@ mod tests {
         );
     }
 
+    // ── Per-row limits inside one shared launch ───────────────────────
+
+    /// **A row's own segment-close budget applies inside a shared launch.**
+    ///
+    /// The kernel's scalar params come from `configs[0]` for the whole launch,
+    /// which is its contract; the host-side post-kernel loop is not bound by it
+    /// and must read `configs[i]`. Both rows here go through ONE launch: row 0 is
+    /// greedy over a decisive logit row, row 1 is mid-block with a hard cap of 1
+    /// and must still be forced closed on its own config, not row 0's.
+    #[test]
+    fn a_row_obeys_its_own_close_budget_in_a_shared_launch() {
+        let sampler = make_sampler();
+        let greedy = SamplingConfig::argmax();
+        let mut forced = SamplingConfig::argmax();
+        forced.segment_open_token_id = 89;
+        forced.segment_close_token_id = 90;
+        forced.force_segment_close_after = 1;
+
+        let mut plain = make_state();
+        let mut in_block = make_state();
+        in_block.in_segment = true;
+        in_block.segment_len = 5;
+
+        let logits = logits_from_rows(&[&[(42, 100.0), (7, 1.0)], &[(42, 100.0), (7, 1.0)]]);
+        let tokens = sampler
+            .sample_batch(
+                &logits,
+                &mut [&mut plain, &mut in_block],
+                &[&greedy, &forced],
+            )
+            .expect("sample");
+
+        assert_eq!(tokens[0], 42, "the greedy row takes its own argmax");
+        assert_eq!(
+            tokens[1], 90,
+            "the forced-close row closes on ITS config, not row 0's"
+        );
+    }
+
     /// Inside a block the ban is off: the model must stay free to emit the
     /// close (the steering intercepts it — `TokenClosedDrop` — or the hard-cap
     /// closer forces it; the sampler's job is only to not fight either).
@@ -2336,5 +2436,92 @@ mod tests {
         // Re-opening the segment resets the counter
         state.update_segment_state(seg_open as u32, seg_open, seg_close);
         assert_eq!(state.segment_len, 0);
+    }
+
+    // ── Per-row config in a mixed wave ────────────────────────────────────
+
+    /// A row inside a think block, `n` tokens deep, with `force` as its hard
+    /// segment-close cap. Close id 90, open id 80, no closer script and no
+    /// sentence-end ids — so the ONLY thing that can emit 90 is the force cap.
+    fn wave_row(force: i32) -> (SamplingConfig, SequenceSamplingState) {
+        let mut config = SamplingConfig::top_k(1, 1.0);
+        config.segment_close_token_id = 90;
+        config.segment_open_token_id = 80;
+        config.force_segment_close_after = force;
+        config.graceful_segment_close_after = 0;
+        let mut state = make_state();
+        state.in_segment = true;
+        state.segment_len = 5;
+        (config, state)
+    }
+
+    /// **Every row of a wave resolves against its OWN config.**
+    ///
+    /// The kernel takes one set of scalar params per launch, and the CUDA path
+    /// reads them from `configs[0]`. That collapse must NOT reach the host-side
+    /// per-row loop that applies the segment-close and EOS overrides: a wave
+    /// mixes sequences with genuinely different budgets — a 200-token
+    /// `ThinkMode::Off` ingest summary beside a dialogue turn — and each must
+    /// get its own.
+    ///
+    /// Both orderings are asserted because either one alone passes under the
+    /// wrong fix: reading `configs[0]` satisfies the first, reading the last
+    /// row's config satisfies the second.
+    ///
+    /// Runs on CUDA, which is the only path that had the defect —
+    /// `sample_batch_cpu` always zipped configs per row, so a CPU-only test
+    /// could never have caught it.
+    #[test]
+    fn each_row_of_a_wave_honours_its_own_segment_budget() {
+        let Ok(device) = candle::Device::new_cuda(0) else {
+            return; // No CUDA device on this box; the CPU path is covered above.
+        };
+        let sampler = BatchedSampler::new(
+            device.clone(),
+            VOCAB_SIZE,
+            MAX_RECENT,
+            vec![EOS_TOKEN].into(),
+            None,
+        );
+
+        // Logits that make token 42 the argmax and the close token 90 the
+        // least likely, so a row that emits 90 can only have been forced.
+        let mut row = vec![0.0f32; VOCAB_SIZE];
+        row[42] = 10.0;
+        row[90] = -10.0;
+
+        for (label, forces) in [("summary first", [1, 1536]), ("dialogue first", [1536, 1])] {
+            let (cfg_a, mut st_a) = wave_row(forces[0]);
+            let (cfg_b, mut st_b) = wave_row(forces[1]);
+            let configs = [&cfg_a, &cfg_b];
+            let mut states = [&mut st_a, &mut st_b];
+
+            let logits = Tensor::from_vec(
+                row.iter().chain(row.iter()).copied().collect::<Vec<f32>>(),
+                (2, VOCAB_SIZE),
+                &device,
+            )
+            .expect("logits");
+
+            let tokens = sampler
+                .sample_batch(&logits, &mut states, &configs)
+                .expect("sample_batch");
+
+            for (i, &force) in forces.iter().enumerate() {
+                if force == 1 {
+                    assert_eq!(
+                        tokens[i], 90,
+                        "{label}: row {i} is 5 tokens into its block with a hard cap of 1 — \
+                         its close must be forced, whatever the other row's budget is"
+                    );
+                } else {
+                    assert_ne!(
+                        tokens[i], 90,
+                        "{label}: row {i} has a cap of 1536 and is only 5 tokens in — \
+                         it must NOT inherit the other row's forced close"
+                    );
+                }
+            }
+        }
     }
 }

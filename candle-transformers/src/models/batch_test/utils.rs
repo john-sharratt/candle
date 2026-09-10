@@ -1010,8 +1010,8 @@ impl TestParams {
                 // Wake periodically rather than sleeping the whole budget, so a
                 // run that ends early releases the thread promptly instead of
                 // leaving it armed over its successors.
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(timeout_secs);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
                 while std::time::Instant::now() < deadline {
                     if finished.load(Ordering::Relaxed) {
                         return;

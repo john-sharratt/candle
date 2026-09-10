@@ -131,7 +131,10 @@ mod tests {
     /// it had finished thinking.
     #[test]
     fn real_reasoning_opens_the_gate_before_it_closes() {
-        assert_eq!(gate_leading_think("<think>\n\nThe user"), ThinkGate::Open(0));
+        assert_eq!(
+            gate_leading_think("<think>\n\nThe user"),
+            ThinkGate::Open(0)
+        );
         assert_eq!(gate_leading_think("<think>x"), ThinkGate::Open(0));
     }
 

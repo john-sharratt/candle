@@ -2642,9 +2642,9 @@ layers:
             .with_default_tokens(100)
             .with_tokens(sparse_grp, TurnIndex(0), 10);
 
-    // sparse: 1 turn Ã— 10 tokens = 10 (far less than its ~4750 share).
+    // sparse: 1 turn × 10 tokens = 10 (far less than its ~4750 share).
     resolver.append(sparse_grp);
-    // dense: 20 turns Ã— 100 tokens = 2000.
+    // dense: 20 turns × 100 tokens = 2000.
     for _ in 0..20 {
         resolver.append(dense_grp);
     }
@@ -2806,7 +2806,7 @@ layers:
     let layer = b.id_for_layer("layer").unwrap();
     let grp = b.id_for_group("grp").unwrap();
 
-    // 100 turns Ã— 100 tokens each = 10000, far exceeds 4500 budget.
+    // 100 turns × 100 tokens each = 10000, far exceeds 4500 budget.
     let mut resolver = MockResolver::new().with_default_tokens(100);
     for _ in 0..100 {
         resolver.append(grp);

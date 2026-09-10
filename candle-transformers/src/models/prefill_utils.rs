@@ -709,7 +709,7 @@ fn paged_prefill_batched_impl<'w>(
     //
     // After reconcile, float arenas hold only the sparse tail chunks. Consolidate
     // them into the minimum number of arenas and CUDA-free the rest. This is critical
-    // for large batches (e.g. Q4_0Ã—460) where uncompacted tail arenas would exceed
+    // for large batches (e.g. Q4_0×460) where uncompacted tail arenas would exceed
     // the available VRAM budget (each F16 arena is 64 MiB regardless of occupancy).
     // Reconcile and consolidate now happen once after all layers complete,
     // in batched_model.rs. Per-layer reconcile was removed to avoid paying
@@ -2438,7 +2438,7 @@ mod tests {
     /// Gold-standard causal attention via matmul.
     ///
     /// q: (1, n_head, seq_len, head_dim)
-    /// k: (1, n_kv_head, kv_len, head_dim)  ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â full KV including prefix
+    /// k: (1, n_kv_head, kv_len, head_dim)  — full KV including prefix
     /// v: (1, n_kv_head, kv_len, head_dim)
     /// offset: number of prefix tokens (causal mask allows attending to prefix + up to current pos)
     ///
@@ -2520,7 +2520,7 @@ mod tests {
         let scale = 1.0 / (head_dim as f64).sqrt();
         let att = (q.matmul(&k.t()?)? * scale)?;
 
-        // No causal mask needed for decode ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â all KV positions are valid
+        // No causal mask needed for decode — all KV positions are valid
         let att = candle_nn::ops::softmax_last_dim(&att)?;
         let out = att.matmul(&v)?; // (batch, n_head, 1, head_dim)
         let out = out.squeeze(2)?; // (batch, n_head, head_dim)
@@ -2786,7 +2786,7 @@ mod tests {
             let mae = mean_abs_error(&paged_f32, &ref_out)?;
             let max_err = max_abs_error(&paged_f32, &ref_out)?;
 
-            // F16 tolerance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â slightly tighter since F16 has more mantissa bits than BF16
+            // F16 tolerance — slightly tighter since F16 has more mantissa bits than BF16
             assert!(
                 mae < 0.05,
                 "[{label}] F16 prefill mean error too large: {mae}"
@@ -3492,9 +3492,9 @@ mod tests {
         let dtype = DType::BF16;
 
         // These configurations are specifically chosen to trigger the GQA overflow bug:
-        // - 40/8: num_groups=5, with WARPS_TC=2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ head_blocks_per_kv=3, last block has 1 warp active
+        // - 40/8: num_groups=5, with WARPS_TC=2 → head_blocks_per_kv=3, last block has 1 warp active
         // - 28/4: num_groups=7, tricky for WARPS_TC alignment
-        // - 48/8: num_groups=6, with WARPS_TC=2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ head_blocks_per_kv=3, all warps active
+        // - 48/8: num_groups=6, with WARPS_TC=2 → head_blocks_per_kv=3, all warps active
         // - 56/8: num_groups=7, same as 28/4 pattern
         // - 12/4: num_groups=3
         for &(n_head, n_kv_head, head_dim, seq_len, label) in &[
@@ -3731,7 +3731,7 @@ mod tests {
             &rope_zeros,
         )?;
 
-        // Run with rope=offset16 â€” different base offset produces different rotation
+        // Run with rope=offset16 — different base offset produces different rotation
         let rope_offset16 = Tensor::from_vec(vec![16u32], 1, &device)?;
         let out_offset16 = run_prefill_with_rope(
             &q,
@@ -3790,7 +3790,7 @@ mod tests {
     #[test]
     fn rope_offset_prefill_functional() -> candle::Result<()> {
         let _gpu = gpu_serial();
-        // Verifies: reference_attention(rotated_Q, rotated_K, V) â‰ˆ paged_kernel(unrotated_Q, unrotated_K, V, rope=zeros)
+        // Verifies: reference_attention(rotated_Q, rotated_K, V) ≈ paged_kernel(unrotated_Q, unrotated_K, V, rope=zeros)
         // Tolerance < 0.05 for BF16.
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;

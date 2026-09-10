@@ -45,7 +45,11 @@ use crate::tree::ConversationTreeConfig;
 ///     .with_temperature(0.7)
 ///     .with_dry_penalty(0.8, 1.75, 2, 256);
 /// ```
-#[derive(Debug, Clone)]
+// `PartialEq` groups a decode wave's rows by dial before dispatch — the kernel
+// applies one set of scalar parameters per launch, so rows sharing a launch must
+// agree on them (`group_rows_by_config`). Float fields compare bitwise-by-value,
+// which is what "the same dial" means here; no `Eq`, since `f32` has none.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SamplingConfig {
     // ── Core Sampling ──────────────────────────────────────────────────
     /// Sampling temperature. `0.0` = argmax/greedy decoding.
@@ -873,7 +877,7 @@ impl SamplingConfig {
 ///
 /// Example: If the context contains "the cat sat on the mat" and later
 /// "the cat", the DRY penalty will penalize "sat" to prevent repetition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DryConfig {
     /// Base penalty multiplier. `0.0` = disabled.
     /// Applied as: `penalty = multiplier * base^(match_length - allowed_length)`
@@ -1332,12 +1336,6 @@ pub struct EngineConfig {
     /// builders override via `ret.dialect = ...`.
     pub dialect: Dialect,
 
-    /// When `true`, the engine does not spawn the async summariser thread and
-    /// new conversations are not registered for summarisation. The AVL summary
-    /// forest is left un-extended (provenance scans still work on raw turns).
-    /// Off by default; set via `ModelBuilder::disable_summariser`.
-    pub disable_summariser: bool,
-
     /// Per-layer [`CorruptTurnPolicy`] (keyed by `LayerId`), applied when a turn
     /// is unrecoverable during the startup substrate reload. Set on the substrate
     /// in `ConversationEngine::new` *before* the reload thread is spawned, so the
@@ -1371,7 +1369,6 @@ impl EngineConfig {
             model_spec: None,
             tokenizer: None,
             dialect: Dialect::chat_ml(),
-            disable_summariser: false,
             layer_corrupt_turn: HashMap::new(),
         }
     }

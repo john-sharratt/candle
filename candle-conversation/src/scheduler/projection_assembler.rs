@@ -167,6 +167,17 @@ pub(crate) struct BoundaryMarkers {
     /// switch sits in the user turn (where Qwen3 honours it) without being baked
     /// into any sealed turn.
     pub(crate) no_think: Arc<Vec<u32>>,
+    /// The other half of [`Dialect::thinking_suppression`]: the already-closed
+    /// reasoning block a family WITHOUT a soft switch (Qwen3.5 / Qwen3.8) opens
+    /// its assistant turn with, exactly as its template renders
+    /// `enable_thinking=false`. Empty whenever [`Self::no_think`] is non-empty —
+    /// the dialect picks one mechanism, never both.
+    ///
+    /// Kept beside `no_think` because a caller that framed a synthetic exchange
+    /// with only the soft switch silently suppressed nothing at all on that
+    /// family, which is how the tree compressor came to reason unbounded inside
+    /// a summary probe.
+    pub(crate) no_think_block: Arc<Vec<u32>>,
     /// The role-marker strings, kept beside their tokenised forms so the seal
     /// path can locate role boundaries baked into a turn's assistant text (the
     /// code_read tool exchange `<tool_call>…<tool_response>…confirmation`) by a
@@ -198,13 +209,19 @@ impl BoundaryMarkers {
         let assistant_end = Arc::new(tokenize(dialect.assistant_end)?);
         let user_end = Arc::new(tokenize(dialect.user_end)?);
         let assistant_start = Arc::new(tokenize(dialect.assistant_start)?);
-        let no_think = Arc::new(tokenize(dialect.no_think)?);
+        // Both halves come from `thinking_suppression`, which owns the "exactly
+        // one mechanism per family" rule; deriving them separately here is what
+        // would let the two drift apart.
+        let (switch, block) = dialect.thinking_suppression(true);
+        let no_think = Arc::new(tokenize(switch)?);
+        let no_think_block = Arc::new(tokenize(block)?);
         Ok(Self {
             user_start,
             assistant_end,
             user_end,
             assistant_start,
             no_think,
+            no_think_block,
             user_start_str: dialect.user_start.to_string(),
             assistant_end_str: dialect.assistant_end.to_string(),
             user_end_str: dialect.user_end.to_string(),

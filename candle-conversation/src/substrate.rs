@@ -1143,11 +1143,18 @@ pub struct TimelineEntry {
     /// the summariser's `pop_pending_turn` API.
     pub pending_summary_queue: std::collections::VecDeque<TurnIndex>,
     /// Whether this timeline's turns are fed to the summariser at all.
-    /// `true` for dialogue; `false` for append-only utility/reference layers
-    /// (repo_map, code_reading) — they are background reference, summarising
-    /// them is pointless work that storms the summariser during repo
-    /// ingest/scan. When `false`, turns are never pushed onto
-    /// `pending_summary_queue`, so the summariser never touches this timeline.
+    ///
+    /// **Currently `false` for every timeline — the AVL summariser is
+    /// disconnected** (see `Engine::new`). Nothing spawns the thread and nothing
+    /// enqueues, so a turn is never compressed into a summary node. The gate is
+    /// kept at the mechanism, rather than removed, because it is the one place
+    /// every enqueue path already funnels through: re-enabling summarisation is
+    /// a matter of deciding *which* timelines set it, not of re-threading the
+    /// substrate.
+    ///
+    /// It was `true` for dialogue and `false` for append-only utility/reference
+    /// layers (repo_map, code_reading), whose turns are background reference and
+    /// whose summaries the ingest pipeline owns.
     pub summarize: bool,
     /// Set on cold-load (and after the old-AVL migration) to ask the summariser
     /// to reconcile this timeline's persisted forest against the canonical
@@ -1273,7 +1280,8 @@ impl TimelineEntry {
             tree_meta: BTreeMap::new(),
             debug_id: None,
             pending_summary_queue: std::collections::VecDeque::new(),
-            summarize: true,
+            // The summariser is disconnected: no timeline enqueues.
+            summarize: false,
             needs_reconcile: false,
             last_selection: None,
         }
@@ -5372,6 +5380,11 @@ mod tests {
         let timeline = alloc.next();
         let mut sub = Substrate::new();
         sub.register_timeline(timeline, layer, group);
+        // Production leaves every timeline with `summarize` off (the summariser
+        // is disconnected — see `Engine::new`). These tests exercise the enqueue
+        // MECHANISM, which is retained, so they opt in explicitly rather than
+        // riding a default that no longer exists.
+        sub.set_timeline_summarize(timeline, true);
         (layer, group, timeline, sub)
     }
 
@@ -6906,6 +6919,13 @@ mod tests {
 
         let dlg_tl = alloc.next();
         sub.register_timeline(dlg_tl, LayerId::for_test(2), GroupId::for_test(2));
+
+        // Both gates ON, which is the whole point: the append-only refusal must
+        // hold at the mechanism even for a timeline whose own flag says yes. (The
+        // production default is now off for every timeline — the summariser is
+        // disconnected — so this has to be set explicitly to test the refusal.)
+        sub.set_timeline_summarize(ingest_tl, true);
+        sub.set_timeline_summarize(dlg_tl, true);
 
         sub.push_pending_summary(ingest_tl, TurnIndex(0));
         sub.push_pending_summary(dlg_tl, TurnIndex(0));

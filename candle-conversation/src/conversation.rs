@@ -1771,9 +1771,10 @@ impl Sequence {
         // baked immediately after `user_start` by `turn_head_tokens`. Baking it
         // into the turn that carries it is what keeps the dial per-turn: a past
         // suppressed turn cannot put a stale switch on a later thinking-on turn
-        // when each turn's grid holds its own.  The assistant header itself is
-        // never modified: a suppressed turn decodes its own empty
-        // `<think></think>`, a thinking turn opens its own `<think>`.
+        // when each turn's grid holds its own.  That covers the families whose
+        // switch lives in the user turn; one whose `no_think` is empty suppresses
+        // in the assistant header instead, via the closed block appended below.
+        // A thinking turn opens its own `<think>` either way.
         let assistant_start_marker = self.config.dialect.assistant_start;
         // Optional assistant prefill: text seeded as the start of the response so
         // the decode is forced to continue from it (e.g. `<tool_call>` commits to
@@ -1782,11 +1783,36 @@ impl Sequence {
         // decodes the continuation. Empty when unset — the path is then identical
         // to an ordinary turn.
         let assistant_prefill = options.assistant_prefill.as_deref().unwrap_or("");
+        // Whether the composer's thinking dial suppressed this turn.  Decided here
+        // rather than at the seal below because it also selects the dialect's
+        // suppression mechanism, and that mechanism is part of the prefill grid.
+        let no_think = matches!(
+            options
+                .selection
+                .optional(crate::projection::NO_THINK_SELECTOR),
+            Some(crate::projection::OptionalState::Present)
+        );
+        // **How THIS dialect suppresses thinking.** `Dialect::thinking_suppression`
+        // owns the split: a family with a `/no_think` soft switch carries it in the
+        // user opener (`turn_head_text`), and one WITHOUT — Qwen3.5 / Qwen3.8, whose
+        // `no_think` is deliberately empty — suppresses by opening the assistant turn
+        // with the reasoning block already closed, exactly as its own template renders
+        // `enable_thinking=false`.
+        //
+        // Production used to read only the user-turn half, so on this family the
+        // `no_think` node emitted a zero-token segment and "thinking off" was a line
+        // of prose in the system prompt rather than a structural guarantee. Measured
+        // on the repo_map ingest: 22 of 22 summaries opened a block regardless, and
+        // 12 of them stored the model's raw monologue as the summary.
+        let closed_think = self.config.dialect.thinking_suppression(no_think).1;
         let assistant_head = format!(
             "{}{}{}",
             user_message, self.config.dialect.user_end, assistant_start_marker,
         );
-        let formatted = format!("{assistant_head}{assistant_prefill}");
+        // The closed block leads the assistant turn; a caller's own prefill (e.g. a
+        // `<tool_call>` seed) continues from after it.
+        let assistant_lead = format!("{closed_think}{assistant_prefill}");
+        let formatted = format!("{assistant_head}{assistant_lead}");
         let prefill_tokens = self.tokenize(&formatted)?;
 
         // No post-decode tail in the turn layout.  The model's
@@ -1828,11 +1854,21 @@ impl Sequence {
         // prefilled prefix — so the prefix's K/V seals as part of the assistant
         // turn. With no prefill this is exactly `prefill_tokens.len()` (the head
         // IS the whole prefill), preserving the ordinary-turn layout byte-for-byte.
-        let assistant_content_start = if assistant_prefill.is_empty() {
-            prefill_tokens.len()
-        } else {
-            self.tokenize(&assistant_head)?.len()
-        };
+        // **The suppression block is scaffolding, not assistant content.** It is
+        // prefilled, never decoded, and `strip_empty_think_blocks` removes it from
+        // the stored text — so a span that began before it would describe ~4 more
+        // tokens than the text it is paired with, and every consumer that maps
+        // text offsets onto that span (`tool_exchange_segments` carving a code_read
+        // sub-segment, the thinking split) would read shifted K/V.
+        //
+        // A caller's own prefill is the opposite case: a `<tool_call>` seed IS
+        // content, appears in the stored text, and stays inside the span. Hence the
+        // boundary sits between the two — after the block, before the seed. With
+        // neither present this is `prefill_tokens.len()`, the ordinary turn's
+        // "content starts where decoding starts".
+        let assistant_content_start = self
+            .tokenize(&format!("{assistant_head}{closed_think}"))?
+            .len();
         // Clamp to the prefill length and force monotonic so a tokenizer that
         // merges across a join can never invert the windows at seal time.
         let total = prefill_tokens.len();
@@ -1842,15 +1878,6 @@ impl Sequence {
         let assistant_content_start = (assistant_content_start
             .min(total)
             .max(user_content_end as usize)) as u32;
-        // Record whether the composer's `/no_think` dial is active for this
-        // turn, so the projection re-injects the soft-switch into this turn's
-        // user opener when it is later re-rendered as history.
-        let no_think = matches!(
-            options
-                .selection
-                .optional(crate::projection::NO_THINK_SELECTOR),
-            Some(crate::projection::OptionalState::Present)
-        );
         let handle = self.submit_prefill_unit(
             self.id,
             Some(self.projection_inputs()),

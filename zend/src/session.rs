@@ -499,7 +499,6 @@ impl InferenceState {
         workspace: PathBuf,
         disabled_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
-        disable_summariser: bool,
         compact_substrate: bool,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
@@ -680,9 +679,6 @@ impl InferenceState {
             // driven by the section-tree `no_think` selector (the composer
             // effort dial), not this static flag.
             .thinking(true)
-            // `--disable-summariser`: bring the engine up without the AVL
-            // summary-forest thread (e.g. for bulk corpus prefill).
-            .disable_summariser(disable_summariser)
             // Per-layer corrupt-turn policy (from the projection schema): the
             // startup reload drops the whole conversation for ingest layers and
             // only the corrupt turn for dialogue.
@@ -3895,22 +3891,6 @@ impl ZendSession {
         Some(result)
     }
 
-    /// Enable or disable AVL summarisation for `conv_id`'s timeline. Only takes
-    /// effect once the timeline exists (i.e. after its first turn has been
-    /// submitted). Returns `None` if the model isn't loaded. Exercised only by the
-    /// CUDA-gated `duplication_replay` integration test (via the `zend` lib), to
-    /// isolate whether the async summariser's concurrent activity influences a
-    /// conversation's decode — so the `zend` *binary* never calls it and its copy
-    /// of this module reads as dead; the lib copy the test links is public API.
-    #[allow(dead_code)]
-    pub fn set_conversation_summarize(&self, conv_id: &str, summarize: bool) -> Option<()> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let timeline = timeline_for(conv_id);
-        let engine = state.engine.lock().unwrap();
-        engine.set_timeline_summarize(timeline, summarize);
-        Some(())
-    }
-
     /// Decoded turn history for a single recovered conversation — backs
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
@@ -4185,7 +4165,6 @@ impl ZendSession {
         let workspace = self.config.workspace.clone();
         let disabled_layers = self.config.disabled_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
-        let disable_summariser = self.config.disable_summariser;
         let compact_substrate = self.config.compact_substrate;
         // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
         // across the process (and the test binary), so clear any cancel left by a
@@ -4269,7 +4248,6 @@ impl ZendSession {
                     workspace,
                     disabled_layers,
                     ingest_dirs,
-                    disable_summariser,
                     compact_substrate,
                     load_progress_for_blocking,
                     status_tx.clone(),
