@@ -105,9 +105,13 @@ impl Fixture {
             _ => None,
         };
 
+        // A segmented layout is built through one scratch slot past the
+        // active ones: each segment is prefilled there, sealed, and injected
+        // onto its slot.
+        let n_backing_slots = sc.num_slots + usize::from(!sc.segments.is_empty());
         let backing = if let Some(pol) = &policy {
             ChunkedKvBacking::new_with_format_adaptive(
-                sc.num_slots,
+                n_backing_slots,
                 sc.n_kv_head,
                 sc.head_dim,
                 KvFormat::Float(DType::F16),
@@ -119,7 +123,7 @@ impl Fixture {
         } else {
             match fmt.kv_format() {
                 KvFormat::Float(dt) => ChunkedKvBacking::new(
-                    sc.num_slots,
+                    n_backing_slots,
                     sc.n_kv_head,
                     sc.head_dim,
                     dt,
@@ -127,7 +131,7 @@ impl Fixture {
                     max_seq,
                 )?,
                 kf @ KvFormat::Quantized(_) => ChunkedKvBacking::new_with_format(
-                    sc.num_slots,
+                    n_backing_slots,
                     sc.n_kv_head,
                     sc.head_dim,
                     kf,
@@ -149,10 +153,61 @@ impl Fixture {
             cache.set_chunked_backing(&backing, slot, None)?;
             let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
             let (q, k, v) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?;
-            // The prefill writes into the slot's write region, which the
-            // scheduler allocates before the pass; the harness does the same.
-            backing.ensure_for_batch_entries(&[(slot, 0)], sc.ctx_len)?;
-            run_prefill(&mut cache, &q, &k, &v, sc, &rope_cs, &rope_offsets, stager)?;
+            if sc.segments.is_empty() {
+                // The prefill writes into the slot's write region, which the
+                // scheduler allocates before the pass; the harness does the same.
+                backing.ensure_for_batch_entries(&[(slot, 0)], sc.ctx_len)?;
+                run_prefill(
+                    &mut cache,
+                    &q,
+                    &k,
+                    &v,
+                    sc.ctx_len,
+                    sc,
+                    &rope_cs,
+                    &rope_offsets,
+                    stager,
+                )?;
+            } else {
+                // Segment by segment through the scratch slot: prefill it
+                // fresh, drop the empty writer chunk the prefill's decode
+                // priming may have appended, seal, inject onto this slot. The
+                // slot's chunk usages come out exactly as `segments` says, and
+                // every segment after the first starts in a fresh chunk — the
+                // projection's own mechanism. Stored K is unrotated, so the
+                // scratch prefill's positions do not matter; the decode ropes
+                // by the injected position.
+                let scratch = sc.num_slots;
+                let mut scratch_cache = KvCache::new(2, max_seq);
+                scratch_cache.force_dtype(force_dt);
+                scratch_cache.set_chunked_backing(&backing, scratch, None)?;
+                let mut start = 0usize;
+                for &len in sc.segments {
+                    let qs = q.narrow(0, start, len)?.contiguous()?;
+                    let ks = k.narrow(0, start, len)?.contiguous()?;
+                    let vs = v.narrow(0, start, len)?.contiguous()?;
+                    backing.truncate_sequence_to_blocks(scratch, 0)?;
+                    scratch_cache.set_current_seq_len(0)?;
+                    backing.ensure_for_batch_entries(&[(scratch, 0)], len)?;
+                    run_prefill(
+                        &mut scratch_cache,
+                        &qs,
+                        &ks,
+                        &vs,
+                        len,
+                        sc,
+                        &rope_cs,
+                        &rope_offsets,
+                        stager,
+                    )?;
+                    backing.truncate_sequence_to_blocks(scratch, len.div_ceil(CHUNK_SIZE))?;
+                    let sealed = backing.record_turn(scratch)?;
+                    backing.inject_sealed_at_tail(slot, &sealed)?;
+                    start += len;
+                    cache.set_current_seq_len(start)?;
+                }
+                assert_eq!(start, sc.ctx_len, "segments sum to ctx_len");
+            }
 
             // RealQuant: convert the freshly-sealed R16 sequence into genuine
             // palette4-quantized chunks via the production quantize-on-evict
@@ -160,7 +215,14 @@ impl Fixture {
             // adaptive policy yields non-unity palette maps; an override policy
             // yields a uniform format with a unity palette.
             if let Some(pol) = &policy {
-                let real_chunks = sc.ctx_len.div_ceil(CHUNK_SIZE).max(1);
+                // The chunks actually holding tokens — a holed layout has more
+                // of them than `ctx_len / 32` — less the empty writer chunk the
+                // prefill's decode priming may have appended past them.
+                let real_chunks = if sc.segments.is_empty() {
+                    sc.ctx_len.div_ceil(CHUNK_SIZE).max(1)
+                } else {
+                    backing.sequence_block_count(slot).unwrap_or(0).max(1)
+                };
                 backing.truncate_sequence_to_blocks(slot, real_chunks)?;
                 let r16 = backing.record_turn(slot)?;
                 let copy_stream = match device {
@@ -181,6 +243,11 @@ impl Fixture {
                 cache.set_current_seq_len(sc.ctx_len)?;
             }
 
+            // The persistent decode slot buffer's lengths self-increment only
+            // on decode steps; the prefill's tokens sit past its stale tail
+            // until the writer region is re-serialised — once, after the
+            // prefill, as the engine's `refresh_decode_slot_state` does.
+            backing.refresh_decode_writer_slice(&[(slot, cache.current_seq_len())])?;
             caches.push(cache);
         }
 
@@ -487,11 +554,13 @@ fn make_decode_qkv(
 /// Prefill `seq_len` tokens into a single slot's cache.
 // Mirrors the kernel launch's own argument list.
 #[allow(clippy::too_many_arguments)]
+/// Prefill `n_tokens` rows of `q`/`k`/`v` onto `cache` at its current offset.
 fn run_prefill(
     cache: &mut KvCache,
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
+    n_tokens: usize,
     sc: &Scenario,
     rope_cs: &Tensor,
     rope_offsets: &Tensor,
@@ -508,7 +577,7 @@ fn run_prefill(
         k,
         v,
         1,
-        &[sc.ctx_len],
+        &[n_tokens],
         sc.n_q_head,
         sc.n_kv_head,
         sc.head_dim,
@@ -521,6 +590,6 @@ fn run_prefill(
         &std::cell::RefCell::new(None),
         None,
     )?;
-    caches_arr[0].set_current_seq_len(offset + sc.ctx_len)?;
+    caches_arr[0].set_current_seq_len(offset + n_tokens)?;
     Ok(())
 }

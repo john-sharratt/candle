@@ -62,8 +62,8 @@ pub(crate) enum SummarizationReason {
 /// A single turn's contribution to a summarization snapshot.
 ///
 /// Each entry is extracted from a [`ConversationTurnInner`](super::node::ConversationTurnInner)
-/// at snapshot time. TODO: these entries will be assembled into the
-/// summarization inference prompt that the async worker submits to the model.
+/// at snapshot time, and `format_window` assembles the entries into the
+/// summarization prompt that `SummarizationTask::launch` tokenizes and submits.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct SummarizationTurnEntry {
@@ -251,8 +251,6 @@ impl SummarizationTask {
         if scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id: seq_id,
-                // A summary probe is a single turn on a scratch slot.
-                keep_reasoning: false,
                 projection_inputs: None,
                 prefill_tokens,
                 prefill_text: window_text,

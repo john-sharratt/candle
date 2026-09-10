@@ -38,6 +38,8 @@ pub mod model;
 /// assembly that feeds it.
 pub mod mtp;
 pub mod paged_index;
+#[cfg(feature = "cuda")]
+pub mod place;
 pub mod ple;
 pub mod ple_cache;
 pub mod qsa;

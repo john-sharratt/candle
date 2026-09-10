@@ -49,6 +49,7 @@ mod decode_health;
 mod engine;
 mod error;
 mod handle;
+pub mod index_pages;
 pub mod models;
 pub mod narrator;
 pub mod normalization;

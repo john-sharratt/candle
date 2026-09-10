@@ -28,13 +28,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// The compiled thinking-block steering trees, one per non-`Off` effort dial,
-/// built once at engine init (parallel to the tool-call registry).  Each turn
-/// derives its trigger registry by replacing the `<think>` trigger with the
-/// dial's tree — atomic and idempotent via [`TriggerRegistry::with_trigger`].
+/// The compiled thinking-block steering trees, one per effort dial, built once
+/// at engine init (parallel to the tool-call registry).  Each turn derives its
+/// trigger registry by replacing the `<think>` trigger with the dial's tree —
+/// atomic and idempotent via [`TriggerRegistry::with_trigger`].
 pub struct ThinkSteering {
     /// `<think>` id — the trigger the dial's tree is bound to.
     think_open: TokenId,
+    off: Arc<StencilTree>,
     quick: Arc<StencilTree>,
     balanced: Arc<StencilTree>,
     deep: Arc<StencilTree>,
@@ -43,12 +44,18 @@ pub struct ThinkSteering {
 
 impl ThinkSteering {
     /// Derive a per-turn registry from `base` (e.g. the tool-call catalog) for
-    /// `mode`: bind the `<think>` trigger to that dial's steering tree, or clear
-    /// it for [`ThinkMode::Off`] (the `/no_think` glue yields the empty block, so
-    /// no tree steers it).  The base is untouched; the result is a fresh registry.
+    /// `mode`: bind the `<think>` trigger to that dial's steering tree.  The base
+    /// is untouched; the result is a fresh registry.
+    ///
+    /// [`ThinkMode::Off`] binds a tree like every other dial — one that closes
+    /// the block immediately.  It used to clear the trigger instead, on the
+    /// reasoning that the `/no_think` glue had already yielded an empty block;
+    /// the Qwen3.5/3.8 family has no such glue, so that left `Off` unenforced
+    /// and the model reasoned anyway.  Suppression belongs here, where it holds
+    /// regardless of what the dialect's markers do.
     pub fn registry_for(&self, base: &TriggerRegistry, mode: ThinkMode) -> Arc<TriggerRegistry> {
         let tree = match mode {
-            ThinkMode::Off => return Arc::new(base.without_trigger(self.think_open)),
+            ThinkMode::Off => &self.off,
             ThinkMode::Quick => &self.quick,
             ThinkMode::Balanced => &self.balanced,
             ThinkMode::Deep => &self.deep,
@@ -894,8 +901,9 @@ impl ConversationEngine {
         Ok(Arc::new(registry))
     }
 
-    /// Compile the thinking-block steering trees (one per non-`Off` effort dial)
-    /// once, for reuse across turns via [`ThinkSteering::registry_for`].  Like the
+    /// Compile the thinking-block steering trees (one per effort dial, `Off`
+    /// included) once, for reuse across turns via
+    /// [`ThinkSteering::registry_for`].  Like the
     /// tool stencil, this is inactive — `Ok(None)` — when the tokenizer lacks a
     /// single `<think>`/`</think>` token, so the model free-decodes its reasoning.
     pub fn compile_think_steering(&self) -> crate::Result<Option<Arc<ThinkSteering>>> {
@@ -921,8 +929,7 @@ impl ConversationEngine {
             self.config.vocab_size as u64,
         );
         let compile_mode = |mode: ThinkMode| -> crate::Result<Arc<StencilTree>> {
-            let spec = compile_think_tree(mode, &env)
-                .expect("a non-Off mode always yields a steering spec");
+            let spec = compile_think_tree(mode, &env);
             let tree = compile(&spec, &vocab).map_err(|e| {
                 ConversationError::from(candle::Error::Msg(format!("think stencil: {e}")))
             })?;
@@ -930,6 +937,7 @@ impl ConversationEngine {
         };
         Ok(Some(Arc::new(ThinkSteering {
             think_open,
+            off: compile_mode(ThinkMode::Off)?,
             quick: compile_mode(ThinkMode::Quick)?,
             balanced: compile_mode(ThinkMode::Balanced)?,
             deep: compile_mode(ThinkMode::Deep)?,
@@ -1313,8 +1321,6 @@ impl ConversationEngine {
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id,
-                // A bare eval turn has no continuation to seal it.
-                keep_reasoning: false,
                 projection_inputs: None,
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
                 prefill_text: String::new(),

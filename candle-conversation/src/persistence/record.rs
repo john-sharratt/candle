@@ -126,9 +126,16 @@ pub enum RecordType {
     /// `StreamDecl` + `WideQSig` (the belief gallery reads only the sig) but shed
     /// their content (`Tokens` + KV `Chunk`s) on the next compaction pass. Used to
     /// collapse the calibration corpus to sig-only. JSON payload
-    /// [`DistillPayload`]. Idempotent — duplicate markers replay identically. The
-    /// marker itself is **consumed** by that compaction (not re-emitted), so the
-    /// next reload finds none and doesn't re-trigger — see `docs/tool_provenance_distillation.md`.
+    /// [`DistillPayload`]. Idempotent — duplicate markers replay identically.
+    ///
+    /// The marker **survives** the compaction that acts on it, re-emitted with
+    /// its mode from the substrate's live state ([`Survival::Resident`]). It has
+    /// to: the marker is what exempts a distilled turn from the `MissingKv`
+    /// integrity verdict, and a distilled turn has legitimately shed its content
+    /// — so a consumed marker would leave the next reload condemning the very
+    /// corpus the distillation created. See `docs/tool_provenance_distillation.md`.
+    ///
+    /// [`Survival::Resident`]: super::survival::Survival::Resident
     Distilled = 16,
     /// A turn's wide per-token `sign(Q)` window (all heads, all layers) — the decode→decode
     /// (`Q·Q`) consensus substrate. Opaque payload encoded by `provenance::wide_sig`, keyed

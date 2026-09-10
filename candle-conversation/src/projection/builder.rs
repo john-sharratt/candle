@@ -1172,7 +1172,6 @@ impl Builder {
                         max_percent: None,
                         adaptive: None,
                     },
-                    default: None,
                     budget_adaptive: None,
                     locality: None,
                     anchor: None,

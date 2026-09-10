@@ -500,11 +500,34 @@ impl TurnLayout {
         let TurnSegment::Assistant { text, kv } = self.segments[pos].clone() else {
             return self;
         };
-        let tlen = think_len.min(kv.len);
         let (think_kv, answer) = if ethereal {
-            // Reasoning K/V dropped: the answer keeps the whole region.
+            // Reasoning K/V dropped: the answer keeps the whole region. No span
+            // is recorded, so `think_len` is a property of the TEXT only and is
+            // expected to exceed the clean grid's assistant region — nothing
+            // downstream has to align to it.
             (None, kv)
         } else {
+            // **A span that had to be clamped is worse than no span at all.**
+            // The reasoning has to occupy whole index pages for a later
+            // projection to window it out, and the cuts that guarantee that were
+            // made against the real `think_len`. If it does not fit the
+            // assistant region — the answer was empty, or `max_tokens` landed on
+            // the closing marker, so `total` dropped the trailing unforwarded
+            // token and reserved the closing one — then a clamped end is
+            // provably NOT a page boundary, and every later projection selecting
+            // this turn fails permanently. Declining to split leaves the turn
+            // whole: it shows its reasoning, which is visibly imperfect, rather
+            // than poisoning the conversation.
+            if think_len > kv.len {
+                tracing::warn!(
+                    think_len,
+                    assistant_kv_len = kv.len,
+                    "reasoning span exceeds the assistant region — sealing the turn WITHOUT a \
+                     thinking split, because a clamped span cannot fall on index page boundaries"
+                );
+                return self;
+            }
+            let tlen = think_len;
             (
                 Some(KvSpan::new(kv.offset, tlen)),
                 KvSpan::new(kv.offset + tlen, kv.len - tlen),
@@ -786,6 +809,43 @@ mod tests {
         );
     }
 
+    /// **A reasoning span too long for the assistant region seals no split.**
+    ///
+    /// Clamping it to fit produces an end that is provably not an index page
+    /// boundary — the cuts were made against the real length — and every later
+    /// projection selecting the turn then refuses to window it, permanently.
+    /// Whole (reasoning visible) is recoverable; a poisoned conversation is not.
+    ///
+    /// This applies only where a span is actually recorded. The ethereal path
+    /// records none, so an over-long `think_len` is expected there and is
+    /// covered by `clean_grid_seals_thinking_text_without_its_kv`.
+    #[test]
+    fn an_over_long_reasoning_span_declines_to_split() {
+        // [user(3)][im_end(2)][a_start(3)][assistant(2)] = 10.
+        let layout = TurnLayout::from_flat_grid(
+            0,
+            3,
+            8,
+            10,
+            2,
+            3,
+            "u".into(),
+            Some("<think>rrrr</think>a".into()),
+            false,
+        )
+        // 5 reasoning tokens will not fit the 2-token assistant region.
+        .with_thinking_split("<think>rrrr</think>".into(), 5, false);
+
+        assert!(
+            !layout
+                .segments
+                .iter()
+                .any(|s| matches!(s, TurnSegment::Thinking { .. })),
+            "no Thinking segment may be sealed from a span that would need clamping"
+        );
+        assert_eq!(layout.validate_tiling(10), Ok(()), "the turn still tiles");
+    }
+
     /// The clean-reprefill seal contract: the sealed grid physically OMITS the
     /// `<think>…</think>` tokens (they were re-prefilled away), so `realize()`
     /// reproduces a think-free grid and the K/V carries no reasoning — while the
@@ -840,6 +900,121 @@ mod tests {
         );
         // The answer span itself is reasoning-free (answer-only tokens).
         assert_eq!(layout.assistant_span(), KvSpan::new(8, 2));
+    }
+
+    /// **The reasoning span is the assistant body through `</think>`, measured
+    /// from the decode's own boundary.**
+    ///
+    /// The seal records the generated-run index of the `</think>` it decoded
+    /// (`DecodeState::think_close_at`) and passes `index + 1` as `think_len`.
+    /// This pins that arithmetic against a real grid: the `Thinking` span must
+    /// slice back exactly the reasoning tokens — including any preamble the
+    /// model emitted before `<think>`, which is reasoning too — and the answer
+    /// span must start on the first token after the marker.
+    ///
+    /// Asserted against the GRID, never against re-tokenised text. The whole
+    /// point of recording the boundary is that a decode → text → encode round
+    /// trip need not reproduce the token count it started from, so a test that
+    /// re-derived the length from the prose would agree with the bug.
+    #[test]
+    fn thinking_span_covers_the_body_through_the_close_marker() {
+        // Assistant body, as generated-run indices:
+        //   0: "Hmm"  (preamble before the block — reasoning)
+        //   1: <think>
+        //   2: "why"
+        //   3: </think>   ← think_close_at = 3
+        //   4,5: the answer
+        const THINK_OPEN: u32 = 7001;
+        const THINK_CLOSE: u32 = 7002;
+        // [user(2)][im_end(1)][a_start(1)][body(6)][im_end(1)] = 11
+        let grid: Vec<u32> = vec![
+            10,
+            11,
+            /*im_end*/ 90,
+            /*a_start*/ 80,
+            /*body*/ 500,
+            THINK_OPEN,
+            501,
+            THINK_CLOSE,
+            600,
+            601,
+            /*im_end*/ 200,
+        ];
+        let asst_start = 4u32;
+        let think_close_at = 3u32; // index into the generated run
+
+        let layout = TurnLayout::from_flat_grid_with_tail(
+            0,
+            2,
+            asst_start,
+            grid.len() as u32,
+            1,
+            1,
+            1,
+            "u".into(),
+            Some("<think>why</think>answer".into()),
+            false,
+        )
+        .with_thinking_split(
+            "<think>why</think>".into(),
+            think_close_at + 1, // exactly what the seal passes
+            false,
+        );
+        assert_eq!(layout.validate_tiling(grid.len() as u32), Ok(()));
+
+        let think = layout
+            .segments
+            .iter()
+            .find_map(|s| match s {
+                TurnSegment::Thinking { kv, .. } => *kv,
+                _ => None,
+            })
+            .expect("a real thinking span");
+        assert_eq!(
+            think,
+            KvSpan::new(asst_start, 4),
+            "the span must start at the assistant body and run through `</think>`"
+        );
+        // The decisive assertion: the span slices back the reasoning tokens and
+        // stops on the marker.
+        assert_eq!(
+            &grid[think.range()],
+            &[500, THINK_OPEN, 501, THINK_CLOSE],
+            "the reasoning span must cover the preamble, the block, and the \
+             closing marker — and nothing of the answer"
+        );
+        // …and the answer begins on the very next token.
+        assert_eq!(layout.assistant_span(), KvSpan::new(8, 2));
+        assert_eq!(&grid[layout.assistant_span().range()], &[600, 601]);
+    }
+
+    /// A turn that decoded no `</think>` records no boundary, so the seal passes
+    /// no split and the whole assistant body stays the answer. This is the
+    /// prefilled-assistant-half case (repo_map, a `code_read` scope) and the
+    /// no-single-token-tokenizer case, which must behave identically.
+    #[test]
+    fn no_recorded_boundary_leaves_the_body_whole() {
+        let layout = TurnLayout::from_flat_grid_with_tail(
+            0,
+            2,
+            4,
+            11,
+            1,
+            1,
+            1,
+            "u".into(),
+            Some("answer".into()),
+            false,
+        );
+        assert_eq!(layout.validate_tiling(11), Ok(()));
+        assert!(
+            !layout
+                .segments
+                .iter()
+                .any(|s| matches!(s, TurnSegment::Thinking { .. })),
+            "no boundary was recorded, so there must be no Thinking segment"
+        );
+        assert_eq!(layout.assistant_span(), KvSpan::new(4, 6));
     }
 
     /// Dropping the reasoning K/V (ethereal) leaves the answer holding the whole

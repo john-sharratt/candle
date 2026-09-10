@@ -131,8 +131,8 @@ struct ConvState {
 }
 
 /// Map a turn's `thinking_effort` dial to the steering [`ThinkMode`].  Mirrors
-/// `dial_selection` in `api/chat.rs`: effort 0 → `off` (the `/no_think` glue
-/// yields the empty block, so no tree steers it); an unset dial defaults to the
+/// `dial_selection` in `api/chat.rs`: effort 0 → `off`, whose tree closes the
+/// block on the token after `<think>`; an unset dial defaults to the
 /// projection's `balanced` (free flow).
 fn think_mode_from_selection(selection: &candle_conversation::SelectionState) -> ThinkMode {
     match selection.get("thinking_effort") {
@@ -282,7 +282,7 @@ const TITLER_MAX_TOKENS: usize = 24;
 const CALIBRATION_MAX_TOKENS: usize = 2048;
 
 /// Closer phrase the sampler plays (followed by `</think>`) when the think
-/// block's HARD per-span cap fires mid-sentence — the em-dash lead-in reads as
+/// block's HARD token cap fires mid-sentence — the em-dash lead-in reads as
 /// a deliberate self-interruption after any dangling fragment, and the
 /// commitment ("know what to do") primes the answer that follows. Tokenized
 /// once at startup into `InferenceState::think_closer_phrase`.
@@ -697,8 +697,6 @@ impl InferenceState {
         if let Some(dir) = expert_pack_dir {
             builder = builder.expert_pack_dir(dir);
         }
-        let conv_config = builder.conversation_config();
-
         // Per-layer progress callback — the library reports
         // `(layers_loaded, total_layers)` after each transformer block
         // is mounted. We translate that into the LoadProgress fraction
@@ -721,6 +719,29 @@ impl InferenceState {
             elapsed_ms = t_engine.elapsed().as_millis() as u64,
             "load timing: model weights loaded (engine built; substrate reload now running in background)",
         );
+
+        // AFTER the engine build, never before. The builder resolves the
+        // `<think>`/`</think>` ids into its sampling config while loading the
+        // tokenizer, so a config taken earlier is a snapshot with both ids still
+        // at their `-1` placeholder — and every tier of the think-block close
+        // budget is gated on them. Unresolved, `update_segment_state` returns at
+        // its first guard, `in_segment` never opens, `segment_len` never counts,
+        // and the graceful ramp, the force cutoff and the closer script are all
+        // silently unreachable: think blocks then run to the stencil's runaway
+        // span cap and get amputated mid-word instead of closing on a clause.
+        let conv_config = builder.conversation_config();
+        if conv_config.sampling.segment_close_token_id < 0
+            || conv_config.sampling.segment_open_token_id < 0
+        {
+            // Loud, because the failure mode is invisible: generation still
+            // works, it just ignores every thinking budget.
+            anyhow::bail!(
+                "thinking token ids unresolved in the dialogue sampling config \
+                 (open={}, close={}) — the think-block close budget would be inert",
+                conv_config.sampling.segment_open_token_id,
+                conv_config.sampling.segment_close_token_id,
+            );
+        }
 
         // Compile the whole tool catalog into one constrained-decoding stencil,
         // keyed by the `<tool_call>` trigger.  Passed on every user turn so any
@@ -2493,37 +2514,40 @@ fn run_inference_stream(
                 .unwrap_or(sampling.seed);
         }
         // Per-dial thinking budget: the EOT close ramp's graceful/force thresholds
-        // scale with the effort level (exhaustive thinks longest).  `segment_len`
-        // restarts each steered span, so these are per-span — higher dials get more
-        // room per span and, via more spans, far more total.
+        // scale with the effort level (exhaustive thinks longest).  The steering
+        // tree gives every dial ONE span, so `segment_len` runs the length of the
+        // think block and this budget IS the dial — it is the only thing that
+        // separates deep from balanced.
         let (graceful_eot, force_eot) = think_mode.eot_budget();
         sampling.graceful_segment_close_after = graceful_eot;
         sampling.force_segment_close_after = force_eot;
-        // The per-span close boost ramps `</think>`+EOS over this dial's
-        // [graceful, force] thinking-token window (resets each span), so it builds
-        // pressure into the same point the force override hard-closes — and scales
-        // with the dial instead of a fixed global ramp that misses the short dials.
+        // The close boost ramps `</think>`+EOS over this dial's [graceful, force]
+        // thinking-token window, so it builds pressure into the same point the
+        // force override hard-closes — and scales with the dial instead of a fixed
+        // global ramp that misses the short dials.
         sampling.segment_close_ramp_start = graceful_eot;
         sampling.segment_close_ramp_len = force_eot;
         // The EOS (turn-ender) budget is the whole-turn backstop on total length,
-        // derived from BOTH dials: the think budget (spans × per-span cap) fixes
-        // where the answer starts, so the ramp begins as the think block ends and is
-        // dormant during reasoning (the per-span EOT/EOS boost handles that); the
-        // `response_length` dial sets the answer room above it.  So it can't truncate
-        // the thinking budget, and it scales with both knobs.  (Keeps the preset's
-        // eos_boost magnitude/mult; the boost ramps to the graceful threshold.)
+        // derived from BOTH dials: the think budget fixes where the answer starts,
+        // so the ramp begins as the think block ends and is dormant during
+        // reasoning (the EOT/EOS boost handles that); the `response_length` dial
+        // sets the answer room above it.  So it can't truncate the thinking
+        // budget, and it scales with both knobs.  (Keeps the preset's eos_boost
+        // magnitude/mult; the boost ramps to the graceful threshold.)
         let response_tokens = response_budget_from_selection(&selection);
         let (eos_ramp_start, graceful_eos, forced_eos) = think_mode.eos_budget(response_tokens);
         sampling.eos_ramp_start = eos_ramp_start;
         sampling.eos_ramp_len = graceful_eos;
         sampling.graceful_eos_after = graceful_eos;
         sampling.forced_eos_after = forced_eos;
-        // Hard-cap closer: when the per-span force budget amputates the think
-        // block mid-sentence, the sampler plays this phrase and then closes
-        // the block itself, so the reasoning ends as intentional prose with an
-        // explicit commitment. All dials; the sampler skips it in continuation
-        // spans (deep/exhaustive "But wait" retirement) where more reasoning
-        // follows, and at completed sentences, which need no rescue.
+        // Hard-cap closer: when the force budget amputates the think block
+        // mid-sentence, the sampler plays this phrase and then closes the block
+        // itself, so the reasoning ends as intentional prose with an explicit
+        // commitment instead of a dangling fragment. This is the one place the
+        // stencil puts words inside a think block, and it is a rescue rather
+        // than a steer: it fires only at the hard cap, only mid-sentence (a
+        // completed sentence needs none), and only as the block ENDS — so there
+        // is no reasoning left for the model to misread it into.
         sampling.segment_close_script = state.think_closer_phrase.clone();
 
         // The tool loop runs until the model stops emitting tool calls (i.e.
@@ -2539,19 +2563,6 @@ fn run_inference_stream(
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(sampling.clone()),
-                // Seal this turn WITH its reasoning when a tool call could
-                // follow, so the tool result decodes against the thinking that
-                // produced the call. The chat template asks for exactly this: a
-                // `<tool_response>` message is deliberately not counted as a new
-                // query, so reasoning survives the round trip.
-                //
-                // Decided here because it cannot be decided later — the seal
-                // fires before `Done`, so by the time the response is parsed for
-                // tool calls the reasoning is already stripped. Availability of
-                // tools is the closest thing to the answer that is knowable in
-                // time; a turn that calls nothing keeps its reasoning for the
-                // one turn, which the next turn's projection then drops anyway.
-                keep_reasoning: tools_mode != ToolMode::None,
                 // Apply the caller's assistant prefill only on the first tool
                 // iteration — re-prefilling it on every chained iteration would
                 // prevent the model ever reaching a final answer.
@@ -2592,6 +2603,23 @@ fn run_inference_stream(
             // <tool_call> tags at the flush, so the GUI renders a card instead of
             // showing the bare JSON the model emits when it drops the wrapper.
             let mut hold_from: Option<usize> = None;
+            // **A collapsed `<think></think>` must not reach the client.**
+            //
+            // The engine strips empty think blocks from the text it STORES
+            // (`strip_empty_think_blocks`, in `build_turn_layout`), but the
+            // stream is assembled from the raw token events and nothing filtered
+            // it — so an empty block went out verbatim and rendered as leaked
+            // markup. It became the common case with thinking-span projection:
+            // older turns have their reasoning windowed out of the K/V, so the
+            // model reads a history with no visible reasoning and answers with a
+            // collapsed block of its own.
+            //
+            // Classifying a block needs its `</think>`, which is why this holds
+            // rather than filters — but only while the block is still
+            // WHITESPACE-ONLY. Real reasoning trips `resolved` on its first
+            // non-blank token and streams from then on, so a thinking turn is
+            // never held back waiting for its own close.
+            let mut think_resolved = false;
             let mut done_resp = None;
             let mut turn_error: Option<anyhow::Error> = None;
             let mut client_gone = false;
@@ -2613,6 +2641,44 @@ fn run_inference_stream(
                                 let rest = text[answer..].trim_start();
                                 if rest.starts_with('{') {
                                     hold_from = Some(text.len() - rest.len());
+                                }
+                            }
+                            // Resolve a leading think block before anything of it
+                            // is emitted. Three outcomes, checked in order: the
+                            // block closed while empty (skip it entirely), it has
+                            // real content (release and never look again), or it
+                            // is still opening (hold — at most a few whitespace
+                            // tokens).
+                            if !think_resolved {
+                                const OPEN: &str = "<think>";
+                                const CLOSE: &str = "</think>";
+                                match text.find(OPEN) {
+                                    None => think_resolved = !text.trim().is_empty(),
+                                    Some(open) => {
+                                        let inner_at = open + OPEN.len();
+                                        match text[inner_at..].find(CLOSE) {
+                                            Some(rel) => {
+                                                let inner = &text[inner_at..inner_at + rel];
+                                                if inner.trim().is_empty() {
+                                                    // Skip the block and the blank
+                                                    // run after it, so the answer
+                                                    // does not open on a gap.
+                                                    let after = inner_at + rel + CLOSE.len();
+                                                    let tail = text[after..].trim_start();
+                                                    emitted_len = text.len() - tail.len();
+                                                }
+                                                think_resolved = true;
+                                            }
+                                            // Open but unclosed: real reasoning the
+                                            // moment it is not just whitespace.
+                                            None => {
+                                                think_resolved = !text[inner_at..].trim().is_empty()
+                                            }
+                                        }
+                                    }
+                                }
+                                if !think_resolved {
+                                    continue;
                                 }
                             }
                             let emit_to = hold_from.unwrap_or(text.len());
@@ -3808,6 +3874,24 @@ impl ZendSession {
         if result.is_ok() {
             state.conversations.lock().unwrap().remove(conv_id);
         }
+        Some(result)
+    }
+
+    /// Tombstone a timeline by its RAW id — the derived-layer counterpart to
+    /// [`Self::tombstone_conversation`], which can only address timelines whose
+    /// id is `hash(conv_id)`.
+    ///
+    /// Backs `DELETE /v1/substrate/timeline/{tl}`. Nothing is removed from the
+    /// dialogue conversation map, because a derived-layer timeline was never in
+    /// it: these are `repo_map` / `code_reading` ingests, addressed only by the
+    /// id the substrate views print.
+    ///
+    /// `None` when the model is not loaded or `raw` is not a valid timeline id
+    /// (zero) — the same shape the sibling routes return.
+    pub fn tombstone_timeline_raw(&self, raw: u64) -> Option<candle_conversation::Result<()>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = projection::TimelineId::from_raw(raw)?;
+        let result = state.engine.lock().unwrap().tombstone_timeline(timeline);
         Some(result)
     }
 
@@ -5112,10 +5196,15 @@ mod projection_schema_tests {
             SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 folders"),
             other => panic!("structure should be top_k(3), got {other:?}"),
         }
+        // No floor: repo_map contributes only what clears the threshold. The
+        // group carried `default: { tag: "." }`, which re-injected the
+        // workspace-root folder whenever the threshold filtered everything out —
+        // so a cold probe (every folder scoring exactly 0 against the 1.0 gate)
+        // still paid ~4,000 tokens for a folder listing nobody asked for.
         assert_eq!(
-            group.default.as_ref().map(|d| d.tag.as_str()),
-            Some("."),
-            "repo_map default floor is the workspace-root folder",
+            group.score_threshold,
+            Some(1.0),
+            "repo_map gates on score alone, so the threshold must be explicit",
         );
     }
 }

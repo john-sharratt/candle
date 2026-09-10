@@ -2,7 +2,7 @@
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -3261,6 +3261,45 @@ impl<'a> TargetedRead<'a> {
     pub fn new(read: SubstrateRead<'a>, target: ProjectionTarget) -> Self {
         Self { read, target }
     }
+
+    /// Partition one timeline's turns into exchanges — the same partition the
+    /// belief scan scores over, derived the same way.
+    ///
+    /// Couplings address the `Normal` subsequence: summary-forest nodes hold
+    /// turn indices too, so a raw `i → i+1` walk would fuse a coupled call with
+    /// a summary that happens to sit between it and its response. `over_normals`
+    /// projects the couplings onto that subsequence, and the ranges map back
+    /// through it.
+    ///
+    /// Returns `(exchanges, slot_of)` where `slot_of[idx]` names the exchange a
+    /// turn belongs to; a summary node appears in neither.
+    fn exchange_partition(
+        &self,
+        timeline: TimelineId,
+    ) -> (Vec<Vec<TurnIndex>>, HashMap<TurnIndex, usize>) {
+        let total = Substrate::turn_count(&self.read, timeline);
+        let normals: Vec<TurnIndex> = (0..total)
+            .map(TurnIndex)
+            .filter(|idx| {
+                !self
+                    .read
+                    .tree_meta_of(timeline, *idx)
+                    .is_some_and(|m| m.kind.is_summary())
+            })
+            .collect();
+        let couplings = over_normals(&self.read.couplings_of(timeline), &normals);
+        let parts: Vec<Vec<TurnIndex>> = exchanges(&couplings, normals.len())
+            .into_iter()
+            .map(|r| r.map(|pos| normals[pos]).collect())
+            .collect();
+        let mut slot_of = HashMap::new();
+        for (slot, part) in parts.iter().enumerate() {
+            for idx in part {
+                slot_of.insert(*idx, slot);
+            }
+        }
+        (parts, slot_of)
+    }
 }
 
 impl<'a> std::ops::Deref for TargetedRead<'a> {
@@ -3294,6 +3333,37 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             .collect()
     }
 
+    /// Exchange closure over the substrate's `TurnCoupling` records — the same
+    /// partition the belief scan scores over, so a rule ranks exactly the unit
+    /// provenance voted on.
+    fn group_exchanges(&self, keys: &[TurnKey]) -> Vec<Vec<TurnKey>> {
+        let mut partitions: HashMap<TimelineId, (Vec<Vec<TurnIndex>>, HashMap<TurnIndex, usize>)> =
+            HashMap::new();
+        let mut seen: HashSet<(TimelineId, usize)> = HashSet::new();
+        let mut out: Vec<Vec<TurnKey>> = Vec::new();
+        for key in keys {
+            let (parts, slot_of) = partitions
+                .entry(key.timeline)
+                .or_insert_with(|| self.exchange_partition(key.timeline));
+            // A summary-forest node joins no exchange (couplings are written
+            // over Normal turns only), so it stands as its own unit.
+            let Some(&slot) = slot_of.get(&key.index) else {
+                out.push(vec![*key]);
+                continue;
+            };
+            if !seen.insert((key.timeline, slot)) {
+                continue;
+            }
+            out.push(
+                parts[slot]
+                    .iter()
+                    .map(|idx| TurnKey::new(key.timeline, *idx))
+                    .collect(),
+            );
+        }
+        out
+    }
+
     fn turn_token_count(&self, turn: TurnKey) -> usize {
         self.read.turn_token_count_of(turn.timeline, turn.index)
     }
@@ -3323,19 +3393,6 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
     fn target_is_ingest_self(&self) -> bool {
         self.read.is_append_only_layer(self.target.layer)
-    }
-
-    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnKey> {
-        // Call the Substrate inherent method (timeline-keyed) via deref — not the
-        // trait method (group-keyed) on `SubstrateRead`.
-        let find = |tl: TimelineId| {
-            Substrate::turn_with_tag(&self.read, tl, tag).map(|idx| TurnKey::new(tl, idx))
-        };
-        // Self-local on an append-only ingest target — see `group_turns`.
-        if group == self.target.group || self.read.is_append_only_layer(self.target.layer) {
-            return find(self.target.timeline);
-        }
-        self.read.active_timelines_for_group(group).find_map(find)
     }
 
     fn turn_kind(&self, turn: TurnKey) -> TurnKind {

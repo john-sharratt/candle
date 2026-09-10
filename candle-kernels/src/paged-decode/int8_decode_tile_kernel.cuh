@@ -42,8 +42,9 @@
 //
 // The prologue overlaps its own chains the same way: while warps 0–6 stage
 // Q and warp 6 scatters the new token, warp 7 resolves the split's first
-// selection chunk and stages tile 0, so one barrier publishes everything
-// the first tile needs.
+// selection chunk (sparse) or builds the window table (dense); one barrier
+// publishes those, then every thread stages its own item of tile 0 under
+// the tile loop's roles and a second barrier publishes the tile.
 //
 // Decoding is quad-wide: a thread reads FOUR consecutive dims at a time,
 // and a quad that is four consecutive ranks of one dtype palette is one
@@ -103,6 +104,7 @@
 #include <cuda_bf16.h>
 #include <math.h>
 #include <stdint.h>
+#include <type_traits>
 
 #include "../arena_table.cuh"
 #include "../blocks.cuh"
@@ -117,6 +119,7 @@ namespace fused_attn {
 
 using int8_elem::i8_apply_rope;
 using int8_elem::i8_quant;
+using int8_elem::i8_pack2;
 using int8_elem::i8_pack4;
 using int8_elem::i8_with_format;
 using int8_elem::i8_with_dtype_format;
@@ -160,6 +163,14 @@ constexpr float TILE_LN2 = 0.6931471805599453f;
 /// consecutive positions is at most one group.
 constexpr int GROUP_TOK = 1 << QSA_CELL_BITS;
 constexpr int TILE_GROUPS = TILE_TOK / GROUP_TOK;
+/// Group SLOTS a tile carries: the eight quads a whole window is, plus one.
+/// A window off the physical 4-grid — every window after a section sealed
+/// mid-quad, until the next boundary — spans NINE aligned quads (a partial
+/// one at each edge), and the ninth rides in slot TILE_GROUPS: staged,
+/// tabled and decoded by warp 0 as a second round for K, and by the V warps
+/// as one extra token per lane-octet. A window of more than TILE_SLOTS
+/// quads (two holes inside it) is still taken in passes of TILE_GROUPS.
+constexpr int TILE_SLOTS = TILE_GROUPS + 1;
 /// Selection entries per split under QSA. A split's tiles hold its entries'
 /// runs 8 groups per tile, so 8 entries is one full tile when every entry
 /// is a single run; the released checkpoint's ≤ 514-entry rows spread over
@@ -182,17 +193,44 @@ __device__ __forceinline__ int grp_slice(uint32_t d) { return (int)(d >> 9); }
 /// palette's arena base, palette scale and format. Index [g][0] = K,
 /// [g][1] = V.
 struct TileExt {
-    const char* gbase[TILE_GROUPS][2][N_PALETTE];
-    float scl[TILE_GROUPS][2][N_PALETTE];
-    uint8_t fmt[TILE_GROUPS][2][N_PALETTE];
+    const char* gbase[TILE_SLOTS][2][N_PALETTE];
+    float scl[TILE_SLOTS][2][N_PALETTE];
+    uint8_t fmt[TILE_SLOTS][2][N_PALETTE];
 };
 
-/// The tile's groups: descriptor and the logical position of column
-/// 4g (token `within` of slice `slice`), so a column's RoPE position is
-/// rope0[g] + j.
+/// The tile's groups: descriptor, the logical position of the group's
+/// `within` token (so token j of the group sits at position rope0[g] + j),
+/// and the tile COLUMN that token lands on.
+///
+/// **A tile is a logical window, and a column is a logical position.**
+/// Tile t of a dense split covers positions [32t, 32t + 32); column c of it
+/// IS position 32t + c, whichever slice — and whichever physical quad of it
+/// — holds that token. A group is still one aligned physical quad of one
+/// slice (the loaders, the rank tables and the palette metadata are all per
+/// slice, and the block path asserts the alignment), so `col0` is what says
+/// where the quad's four rows go: token j of group g is column col0[g] + j,
+/// and the group's mask has a bit only for tokens inside the window. A quad
+/// straddling the window's edge appears in both windows, each time with the
+/// columns outside that window masked off, so col0 can be as low as
+/// −(GROUP_TOK − 1). A dead group (mask 0) has no columns at all.
+///
+/// This is what makes the attention a function of the tokens rather than of
+/// their chunking: the softmax's running max advances at logical window
+/// boundaries, the int8 codes it produces are taken against a reference that
+/// depends only on positions, and two slots holding the same tokens at the
+/// same positions in different chunk layouts produce the same bytes. Tiling
+/// by physical slice instead — the previous rule, `tok = 4·g + j` — put the
+/// reference at slice boundaries, so a hole (a section sealed mid-chunk, a
+/// tombstoned turn, a skipped thinking block) moved every later token's
+/// reference and changed the output.
 struct TileGroups {
-    uint32_t desc[TILE_GROUPS];
-    int rope0[TILE_GROUPS];
+    uint32_t desc[TILE_SLOTS];
+    int rope0[TILE_SLOTS];
+    int8_t col0[TILE_SLOTS];
+    /// Quads the tile's window spans. Up to TILE_SLOTS they fit one pass (the
+    /// ninth in slot TILE_GROUPS); above that the tile is taken in passes of
+    /// TILE_GROUPS groups that share one softmax and one V scale.
+    int n_groups;
 };
 
 /// What a thread carries from staging the NEXT tile to committing it:
@@ -203,10 +241,19 @@ struct NextTile {
     uint32_t map;
     uint32_t desc;
     int rope0;
+    int col0;
+    int ngroups;
     uint64_t ptr;
     float scl;
     int fmt;
 };
+
+/// The window's column mask from a group: its live bits shifted to its
+/// columns. A negative `col0` is a quad straddling the window's start, whose
+/// leading tokens belong to the previous window and are not in the mask.
+__device__ __forceinline__ uint32_t grp_cols(uint32_t mask, int col0) {
+    return col0 >= 0 ? (mask << col0) : (mask >> (-col0));
+}
 
 /// Byte offset of (row, col) in an MMA slab of ROW_BYTES-byte rows with no
 /// pad: the row's 16-byte chunks are XOR-swizzled by a per-row key so the
@@ -282,6 +329,58 @@ struct GroupSrc {
 /// extra group with dead columns rather than an unaligned block read. A
 /// warp scan numbers the runs so the groups come out packed in ascending
 /// position order. Groups past the last are dead (zero).
+/// The last slice whose rope base is at or below `pos` — the slice holding
+/// position `pos` when one does (a slice's tokens run from its rope base for
+/// its length; an empty slice at the same base sits after the one that holds
+/// the position and is never the answer here, because its base is not
+/// BELOW the position it follows).
+///
+/// Slices fill in position order at CHUNK_SIZE tokens each, so the slice
+/// holding `pos` is almost always pos / CHUNK_SIZE: probe it and its successor
+/// with one pair of loads issued together (the successor's rope is what closes
+/// the bracket on a hit), gallop from there in whichever direction the guess
+/// missed, and binary-search only inside the bracket the gallop closed.
+template <int HEAD_DIM>
+__device__ __forceinline__ int tile_slice_holding(
+    uint64_t slices_ptr, int n_slices, int n_kv_head, int pos)
+{
+    auto rope_of = [&](int i) {
+        return (int)slice_rope(get_slice<HEAD_DIM>(slices_ptr, i, n_kv_head));
+    };
+    const int g = min(max(pos / CHUNK_SIZE, 0), n_slices - 1);
+    const int rg = rope_of(g);
+    const int rg1 = rope_of(min(g + 1, n_slices - 1));
+    int lo_s, hi_s;
+    if (rg <= pos) {
+        lo_s = g;
+        hi_s = g;
+        if (g + 1 < n_slices && rg1 <= pos) {
+            lo_s = g + 1;
+            int probe = g + 2, step = 2;
+            while (probe < n_slices && rope_of(probe) <= pos) {
+                lo_s = probe;
+                probe = lo_s + step;
+                step <<= 1;
+            }
+            hi_s = min(probe, n_slices) - 1;
+        }
+    } else {
+        hi_s = g - 1;
+        int probe = g - 1, step = 1;
+        while (probe > 0 && rope_of(probe) > pos) {
+            hi_s = probe - 1;
+            probe -= step;
+            step <<= 1;
+        }
+        lo_s = max(probe, 0);
+    }
+    while (lo_s < hi_s) {
+        const int mid = (lo_s + hi_s + 1) >> 1;
+        if (rope_of(mid) <= pos) lo_s = mid; else hi_s = mid - 1;
+    }
+    return lo_s;
+}
+
 template <int HEAD_DIM>
 __device__ __forceinline__ void tile_resolve_entries(
     uint32_t ent, bool has, int ratio,
@@ -301,46 +400,7 @@ __device__ __forceinline__ void tile_resolve_entries(
     int cs[GROUP_TOK];
     int cw[GROUP_TOK];
     int s = 0;
-    if (has) {
-        // Slices fill in position order at CHUNK_SIZE tokens each, so the
-        // slice holding pos0 is almost always pos0 / CHUNK_SIZE: probe it
-        // and its successor with one pair of loads issued together (the
-        // successor's rope is what closes the bracket on a hit), gallop
-        // from there in whichever direction the guess missed, and
-        // binary-search only inside the bracket the gallop closed.
-        const int g = min(max(pos0 / CHUNK_SIZE, 0), n_slices - 1);
-        const int rg = rope_of(g);
-        const int rg1 = rope_of(min(g + 1, n_slices - 1));
-        int lo_s, hi_s;
-        if (rg <= pos0) {
-            lo_s = g;
-            hi_s = g;
-            if (g + 1 < n_slices && rg1 <= pos0) {
-                lo_s = g + 1;
-                int probe = g + 2, step = 2;
-                while (probe < n_slices && rope_of(probe) <= pos0) {
-                    lo_s = probe;
-                    probe = lo_s + step;
-                    step <<= 1;
-                }
-                hi_s = min(probe, n_slices) - 1;
-            }
-        } else {
-            hi_s = g - 1;
-            int probe = g - 1, step = 1;
-            while (probe > 0 && rope_of(probe) > pos0) {
-                hi_s = probe - 1;
-                probe -= step;
-                step <<= 1;
-            }
-            lo_s = max(probe, 0);
-        }
-        while (lo_s < hi_s) {
-            const int mid = (lo_s + hi_s + 1) >> 1;
-            if (rope_of(mid) <= pos0) lo_s = mid; else hi_s = mid - 1;
-        }
-        s = lo_s;
-    }
+    if (has) s = tile_slice_holding<HEAD_DIM>(slices_ptr, n_slices, n_kv_head, pos0);
     #pragma unroll
     for (int c = 0; c < GROUP_TOK; ++c) {
         cs[c] = NO_SLICE;
@@ -523,11 +583,17 @@ __device__ __forceinline__ void quad_raw_cvt(
     using E = typename Tag::Elem;
     #pragma unroll
     for (int j = 0; j < GROUP_TOK; ++j) {
-        float o[4];
-        i8_dtype_cvt4<E>(w[j], o);
+        // A dead token is masked on its packed words, before the conversion
+        // (one select per word, not per value): the zero word of every dtype
+        // converts to +0.f, the value the mask used to select.
         const bool l = side == 0 || ((live >> j) & 1u);
+        uint32_t wm[W];
         #pragma unroll
-        for (int k = 0; k < 4; ++k) xi[k][j] = l ? o[k] : 0.f;
+        for (int k = 0; k < W; ++k) wm[k] = l ? w[j][k] : 0u;
+        float o[4];
+        i8_dtype_cvt4<E>(wm, o);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) xi[k][j] = o[k];
     }
     if (inv != 1.f) {
         #pragma unroll
@@ -618,6 +684,39 @@ __device__ __forceinline__ void tile_quads_vec_cvt(
         for (int i = 0; i < 2; ++i)
             if (i >= lo && i <= hi) quad_raw_cvt(tag, raw.w[i], raw.inv[i], live[i], side, x[i]);
     });
+}
+
+/// One token of one quad on the vector path: o[k] is dim d0 + k of group
+/// gi at its token j, converted and scaled; zero for a dead quad or a
+/// masked token. The V warps read the ninth quad's tokens through this, a
+/// token per lane-octet, under the vote that put the tile on the vector
+/// path (every live quad vector-readable, the ninth included).
+template <int HEAD_DIM, int W>
+__device__ __forceinline__ void tile_quad_vec_token(
+    const TileExt& ext, const TileGroups& tg, const uint8_t* s_tbl, int side, int gi, int d0,
+    int j, float (&o)[4])
+{
+    constexpr int SUB = HEAD_DIM / N_PALETTE;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) o[k] = 0.f;
+    const QuadInfo q = tile_quad_info<HEAD_DIM>(ext, tg, s_tbl, side, gi, d0);
+    if (((q.live >> j) & 1u) == 0u) return;
+    const int p = (int)(q.tbw >> 6) & (N_PALETTE - 1);
+    const int rank = (int)(q.tbw & 63u);
+    const float inv = 1.f / ext.scl[gi][side][p];
+    uint32_t w[W];
+    #pragma unroll
+    for (int k = 0; k < W; ++k) w[k] = 0u;
+    quad_raw_dispatch<W>(q.fmt, [&](auto tag) {
+        using E = typename decltype(tag)::Elem;
+        const auto quad = i8_tag_quad(tag, ext.gbase[gi][side][p], rank, SUB, 1.f);
+        quad.raw4(q.within + j, w);
+        i8_dtype_cvt4<E>(w, o);
+    });
+    if (inv != 1.f) {
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) o[k] *= inv;
+    }
 }
 
 /// Two quads of one side: x[i][k][j] is dim d0[i] + k of group gi[i] at
@@ -765,7 +864,7 @@ __device__ __forceinline__ uint32_t half2_bits(float a, float b)
 template <int HEAD_DIM, int NP, typename Tag>
 __device__ __forceinline__ void tile_k_block_decode_palettes(
     Tag tag, const TileExt& ext, const uint8_t* s_inv_g, int g, int within, int lane,
-    uint8_t* stg_lo, uint8_t* stg_hi, int p0)
+    uint8_t* stg_lo, uint8_t* stg_hi, int stage_half, int p0)
 {
     constexpr int SUB = HEAD_DIM / N_PALETTE;
     uint2 hw[NP][2];
@@ -785,7 +884,12 @@ __device__ __forceinline__ void tile_k_block_decode_palettes(
         #pragma unroll
         for (int s = 0; s < 2; ++s) {
             const int d = s_inv_g[(p0 + pi) * SUB + lane + WARP_SIZE * s];
-            *reinterpret_cast<uint2*>(tile_stage_ptr<HEAD_DIM>(stg_lo, stg_hi, d)) = hw[pi][s];
+            if (stage_half < 0) {
+                *reinterpret_cast<uint2*>(tile_stage_ptr<HEAD_DIM>(stg_lo, stg_hi, d)) = hw[pi][s];
+            } else if ((d >= HEAD_DIM / 2) == (stage_half == 1)) {
+                // One half's dims only, all into the private buffer.
+                *reinterpret_cast<uint2*>(stg_lo + (d - stage_half * (HEAD_DIM / 2)) * 8) = hw[pi][s];
+            }
         }
 }
 
@@ -803,10 +907,15 @@ __device__ __forceinline__ void tile_k_block_decode_palettes(
 /// body per format over all four palettes would decode the others'
 /// slots again for nothing, and a palette's loads cannot be hoisted
 /// above the previous palette's format dispatch either way.
+///
+/// `stage_half` −1 stages every dim, the lower half's at `stg_lo` and the
+/// upper's at `stg_hi` (`tile_stage_ptr`); 0 or 1 stages only that half's
+/// dims, all of them into `stg_lo`, for a group whose own K rows cannot serve
+/// as the upper half's stage (see the caller).
 template <int HEAD_DIM>
 __device__ __forceinline__ void tile_k_block_decode(
     const TileExt& ext, const uint8_t* s_inv_g, int g, int within, int lane,
-    uint8_t* stg_lo, uint8_t* stg_hi)
+    uint8_t* stg_lo, uint8_t* stg_hi, int stage_half)
 {
     constexpr int SUB = HEAD_DIM / N_PALETTE;
     static_assert(SUB == 2 * WARP_SIZE, "a lane holds two ranks of each palette");
@@ -819,49 +928,78 @@ __device__ __forceinline__ void tile_k_block_decode(
             #pragma unroll
             for (int pp = 0; pp < N_PALETTE; pp += 2) {
                 if (pp > 0) asm volatile("" ::: "memory");
-                tile_k_block_decode_palettes<HEAD_DIM, 2>(tag, ext, s_inv_g, g, within, lane, stg_lo, stg_hi, pp);
+                tile_k_block_decode_palettes<HEAD_DIM, 2>(tag, ext, s_inv_g, g, within, lane,
+                                                          stg_lo, stg_hi, stage_half, pp);
             }
         });
     } else {
         #pragma unroll
         for (int p = 0; p < N_PALETTE; ++p)
             i8_with_format((int)((f4 >> (8 * p)) & 0xffu), [&](auto tag) {
-                tile_k_block_decode_palettes<HEAD_DIM, 1>(tag, ext, s_inv_g, g, within, lane, stg_lo, stg_hi, p);
+                tile_k_block_decode_palettes<HEAD_DIM, 1>(tag, ext, s_inv_g, g, within, lane,
+                                                          stg_lo, stg_hi, stage_half, p);
             });
     }
 }
 
 /// Read a staged quad back: xi[k][j] is dim d0 + k at token j.
+/// A quad's staged dims, raw: 4 dims × 4 tokens of half, 8 words. Held
+/// this way across a second staging round it is half the registers of the
+/// converted floats.
 template <int HEAD_DIM>
-__device__ __forceinline__ void tile_k_stage_read(
-    uint8_t* stg_lo, uint8_t* stg_hi, int d0, float (&xi)[4][GROUP_TOK])
+__device__ __forceinline__ void tile_k_stage_raw(
+    uint8_t* stg_lo, uint8_t* stg_hi, int d0, uint4 (&w)[2])
 {
     const uint8_t* p = tile_stage_ptr<HEAD_DIM>(stg_lo, stg_hi, d0);
-    const uint4 a = *reinterpret_cast<const uint4*>(p);
-    const uint4 b = *reinterpret_cast<const uint4*>(p + 16);
-    const uint32_t w[4][2] = { { a.x, a.y }, { a.z, a.w }, { b.x, b.y }, { b.z, b.w } };
+    w[0] = *reinterpret_cast<const uint4*>(p);
+    w[1] = *reinterpret_cast<const uint4*>(p + 16);
+}
+
+__device__ __forceinline__ void tile_k_stage_cvt(const uint4 (&w)[2], float (&xi)[4][GROUP_TOK])
+{
+    const uint32_t ww[4][2] = { { w[0].x, w[0].y }, { w[0].z, w[0].w },
+                                { w[1].x, w[1].y }, { w[1].z, w[1].w } };
     #pragma unroll
     for (int k = 0; k < 4; ++k)
         #pragma unroll
         for (int h = 0; h < GROUP_TOK / 2; ++h) {
-            const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&w[k][h]));
+            const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&ww[k][h]));
             xi[k][2 * h] = f2.x;
             xi[k][2 * h + 1] = f2.y;
         }
+}
+
+template <int HEAD_DIM>
+__device__ __forceinline__ void tile_k_stage_read(
+    uint8_t* stg_lo, uint8_t* stg_hi, int d0, float (&xi)[4][GROUP_TOK])
+{
+    uint4 w[2];
+    tile_k_stage_raw<HEAD_DIM>(stg_lo, stg_hi, d0, w);
+    tile_k_stage_cvt(w, xi);
+}
+
+__device__ __forceinline__ uint4 sel4(bool keep, const uint4 a, const uint4 b)
+{
+    return make_uint4(keep ? a.x : b.x, keep ? a.y : b.y, keep ? a.z : b.z, keep ? a.w : b.w);
 }
 
 /// V, block path, one slot (palette p, rank `rank`) across the tile's
 /// groups: w[g][h] holds tokens 4g + 2h, +1 as a half2 pair — zero for a
 /// dead group or a masked token — and each live group's absmax is folded
 /// into the tile absmax of the dim its map gives the slot, in `s_vabs`.
-template <int HEAD_DIM>
+/// `NS` is the slot count decoded: TILE_GROUPS on an eight-quad tile (the
+/// ninth slot is dead and costs nothing), TILE_SLOTS when the ninth is live.
+/// Chosen under a block-uniform branch by the caller, so neither
+/// instantiation carries a runtime predicate over its arrays.
+template <int HEAD_DIM, int NS>
 __device__ __forceinline__ void tile_v_block_decode(
     const TileExt& ext, const TileGroups& tg, const uint8_t* s_inv, int* s_vabs,
-    uint32_t live_g, int p, int rank, uint32_t (&w)[TILE_GROUPS][GROUP_TOK / 2])
+    uint32_t live_g, int p, int rank, uint32_t (&w)[TILE_SLOTS][GROUP_TOK / 2])
 {
+    static_assert(NS == TILE_GROUPS || NS == TILE_SLOTS, "eight quads, or eight and the ninth");
     constexpr int SUB = HEAD_DIM / N_PALETTE;
     #pragma unroll
-    for (int g = 0; g < TILE_GROUPS; ++g)
+    for (int g = 0; g < TILE_SLOTS; ++g)
         #pragma unroll
         for (int h = 0; h < GROUP_TOK / 2; ++h) w[g][h] = 0u;
     uint32_t rem = live_g;
@@ -869,7 +1007,7 @@ __device__ __forceinline__ void tile_v_block_decode(
         const uint32_t f = ext.fmt[__ffs(rem) - 1][1][p];
         uint32_t sel = 0u;
         #pragma unroll
-        for (int g = 0; g < TILE_GROUPS; ++g)
+        for (int g = 0; g < NS; ++g)
             if (((rem >> g) & 1u) != 0u && ext.fmt[g][1][p] == f) sel |= 1u << g;
         // Every group decodes in straight-line code — one that is dead or
         // of another format reads the first selected group's slot again
@@ -886,12 +1024,21 @@ __device__ __forceinline__ void tile_v_block_decode(
             // (the fence between the halves is what stops the compiler
             // hoisting the second half's loads and spilling for them).
             constexpr int IN_FLIGHT = I8IsDtypeTag<decltype(tag)>::value ? TILE_GROUPS / 2 : TILE_GROUPS;
-            float a[TILE_GROUPS];
+            float a[TILE_SLOTS];
+            // The ninth slot (NS == TILE_SLOTS) rides in the LAST round, its
+            // load in flight with that round's: neither an extra round (a
+            // fence and an exposed latency per call) nor a runtime skip
+            // around it (which would put the whole word array under a
+            // predicate, and so in local memory — measured at the gate as
+            // 1.5 KB of spills). `gn` folds at unroll time.
             #pragma unroll
             for (int gb = 0; gb < TILE_GROUPS; gb += IN_FLIGHT) {
                 if (gb > 0) asm volatile("" ::: "memory");
+                const int gn = (NS > TILE_GROUPS && gb + IN_FLIGHT >= TILE_GROUPS) ? IN_FLIGHT + 1
+                                                                                   : IN_FLIGHT;
                 #pragma unroll
-                for (int gi = 0; gi < IN_FLIGHT; ++gi) {
+                for (int gi = 0; gi < IN_FLIGHT + 1; ++gi) {
+                    if (gi >= gn) break;
                     const int g = gb + gi;
                     const bool on = ((sel >> g) & 1u) != 0u;
                     const int gs = on ? g : g0;
@@ -910,7 +1057,7 @@ __device__ __forceinline__ void tile_v_block_decode(
                 }
             }
             #pragma unroll
-            for (int g = 0; g < TILE_GROUPS; ++g) {
+            for (int g = 0; g < NS; ++g) {
                 const bool on = ((sel >> g) & 1u) != 0u;
                 const int gs = on ? g : g0;
                 const int d = s_inv[(gs * 2 + 1) * HEAD_DIM + p * SUB + rank];
@@ -926,17 +1073,28 @@ __device__ __forceinline__ void tile_v_block_decode(
 /// each group's four tokens by their dim's tile scale into that dim's
 /// word of the transposed slab. A dead group's word is zero (its map is
 /// the identity, so the slot's dim is p · SUB + rank there).
-template <int HEAD_DIM>
+template <int HEAD_DIM, int NS>
 __device__ __forceinline__ void tile_v_block_quantise(
-    const uint32_t (&w)[TILE_GROUPS][GROUP_TOK / 2], const uint8_t* s_inv, const int* s_vabs,
-    int8_t* s_v8t, int p, int rank)
+    const uint32_t (&w)[TILE_SLOTS][GROUP_TOK / 2], const TileGroups& tg, const uint8_t* s_inv,
+    const int* s_vabs, int8_t* s_v8t, int p, int rank)
 {
+    static_assert(NS == TILE_GROUPS || NS == TILE_SLOTS, "eight quads, or eight and the ninth");
     constexpr int SUB = HEAD_DIM / N_PALETTE;
     #pragma unroll
-    for (int g = 0; g < TILE_GROUPS; ++g) {
+    for (int g = 0; g < NS; ++g) {
+        // A dead group has no columns; a live one's tokens go to its own,
+        // whole and 4-aligned as one word, otherwise a byte per live token
+        // (its word would cover a neighbouring group's columns).
+        const uint32_t lv = grp_mask(tg.desc[g]);
+        if (lv == 0u) continue;
         const int d = s_inv[(g * 2 + 1) * HEAD_DIM + p * SUB + rank];
         const float a = __int_as_float(s_vabs[d]);
-        const float inv = (a > 0.f) ? 127.f / a : 0.f;
+        // The same arithmetic as the vector path's `v_quantise`, to the
+        // rounding: a token quantises to the same byte whichever path carries
+        // it, which a multi-pass tile — vector-readable chunks taken through
+        // this path — depends on to match its single-pass equivalent.
+        const float scale = a / 127.f;
+        const float inv = (scale > 0.f) ? 1.f / scale : 0.f;
         float v[GROUP_TOK];
         #pragma unroll
         for (int h = 0; h < GROUP_TOK / 2; ++h) {
@@ -944,7 +1102,319 @@ __device__ __forceinline__ void tile_v_block_quantise(
             v[2 * h] = f2.x;
             v[2 * h + 1] = f2.y;
         }
-        *reinterpret_cast<uint32_t*>(s_v8t + sw_off<TILE_TOK>(d, g * GROUP_TOK)) = i8_pack4(v, inv);
+        const int c0 = (int)tg.col0[g];
+        if (lv == 15u && (c0 & 3) == 0) {
+            *reinterpret_cast<uint32_t*>(s_v8t + sw_off<TILE_TOK>(d, c0)) = i8_pack4(v, inv);
+        } else {
+            #pragma unroll
+            for (int j = 0; j < GROUP_TOK; ++j)
+                if ((lv >> j) & 1u) s_v8t[sw_off<TILE_TOK>(d, c0 + j)] = i8_quant(v[j], inv);
+        }
+    }
+}
+
+/// V, block path, one V warp's whole tile: palette p = the warp, a lane the
+/// ranks `lane` and `lane + 32`. The two slots decode through one copy of
+/// the format bodies (the loop is not unrolled), their words kept apart by
+/// a select; the tile absmax is complete once every V warp is at the V
+/// barrier, which orders the atomics before the reads. `NS` as above,
+/// chosen by the caller under a block-uniform branch.
+template <int HEAD_DIM, int NS>
+__device__ __forceinline__ void tile_v_block_path(
+    const TileExt& ext, const TileGroups& tg, const uint8_t* s_inv, int* s_vabs,
+    uint32_t live_g, int p, int lane, int8_t* s_v8t)
+{
+    uint32_t w0[TILE_SLOTS][GROUP_TOK / 2], w1[TILE_SLOTS][GROUP_TOK / 2];
+    #pragma unroll
+    for (int gg = 0; gg < TILE_SLOTS; ++gg)
+        #pragma unroll
+        for (int h = 0; h < GROUP_TOK / 2; ++h) w0[gg][h] = 0u;
+    #pragma unroll 1
+    for (int s = 0; s < 2; ++s) {
+        uint32_t wt[TILE_SLOTS][GROUP_TOK / 2];
+        tile_v_block_decode<HEAD_DIM, NS>(ext, tg, s_inv, s_vabs, live_g, p, lane + WARP_SIZE * s, wt);
+        #pragma unroll
+        for (int gg = 0; gg < TILE_SLOTS; ++gg)
+            #pragma unroll
+            for (int h = 0; h < GROUP_TOK / 2; ++h) {
+                w0[gg][h] = (s == 0) ? wt[gg][h] : w0[gg][h];
+                w1[gg][h] = wt[gg][h];
+            }
+    }
+    asm volatile("bar.sync %0, %1;" :: "n"(TILE_VABS_BARRIER), "n"(TILE_V_WARPS * WARP_SIZE) : "memory");
+    tile_v_block_quantise<HEAD_DIM, NS>(w0, tg, s_inv, s_vabs, s_v8t, p, lane);
+    tile_v_block_quantise<HEAD_DIM, NS>(w1, tg, s_inv, s_vabs, s_v8t, p, lane + WARP_SIZE);
+}
+
+/// One 16-byte global → shared copy through the async proxy, waited for by
+/// `cp_async_wait` (decode_helpers.cuh). `.ca`: small, reread rows.
+__device__ __forceinline__ void tile_cp_async_16(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                 :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))), "l"(src)
+                 : "memory");
+}
+
+/// `tile_quads_vec` with quad A (dims d0..d0+3, in the head's lower half)
+/// read from the group's staged rows — `k_raw` is [token][lower-half dim]
+/// at the palette element width — and quad B loaded from the arena as
+/// usual, issued first so it is in flight while A is read back.
+template <int HEAD_DIM>
+__device__ __forceinline__ void tile_quads_vec_staged(
+    const TileExt& ext, const QuadInfo (&q)[2], const int (&gi)[2],
+    float (&x)[2][4][GROUP_TOK], const uint8_t* k_raw, int d0)
+{
+    QuadRaw<4> raw;
+    const QuadPair pr = tile_quads_vec_resolve<HEAD_DIM>(ext, q, 0, gi, raw);
+    const uint32_t live[2] = { q[0].live, q[1].live };
+    quad_pair_dispatch<4>(pr.fmt[0], pr.fmt[1], [&](auto tag, int lo, int hi) {
+        if (1 >= lo && 1 <= hi) quad_raw_load<HEAD_DIM>(tag, pr, 1, raw.w[1]);
+        if (0 >= lo && 0 <= hi) {
+            if constexpr (I8IsDtypeTag<decltype(tag)>::value) {
+                using E = typename decltype(tag)::Elem;
+                constexpr int ROW = (HEAD_DIM / 2) * (int)sizeof(E);
+                #pragma unroll
+                for (int j = 0; j < GROUP_TOK; ++j) {
+                    const uint8_t* p = k_raw + j * ROW + d0 * (int)sizeof(E);
+                    if constexpr (sizeof(E) == 2) {
+                        const uint2 v = *reinterpret_cast<const uint2*>(p);
+                        raw.w[0][j][0] = v.x;
+                        raw.w[0][j][1] = v.y;
+                    } else if constexpr (sizeof(E) == 1) {
+                        raw.w[0][j][0] = *reinterpret_cast<const uint32_t*>(p);
+                    } else {
+                        const uint4 v = *reinterpret_cast<const uint4*>(p);
+                        raw.w[0][j][0] = v.x; raw.w[0][j][1] = v.y;
+                        raw.w[0][j][2] = v.z; raw.w[0][j][3] = v.w;
+                    }
+                }
+            } else {
+                __trap();   // a staged tile's quads are dtype quads by the vote that staged it
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 2; ++i)
+            if (i >= lo && i <= hi) quad_raw_cvt(tag, raw.w[i], raw.inv[i], live[i], 0, x[i]);
+    });
+}
+
+// ============================================================================
+// K decode
+// ============================================================================
+// One group's K rows into the tile's K slab: warp = group `kg`, lane = quad.
+// A lane's two quads are its four RoPE pairs — half-split: dims 4q..4q+3 with
+// 128+4q..; interleaved: dims 8q..8q+7 as (8q+2i, 8q+2i+1) — and both
+// pairings read the same four frequencies 4q..4q+3. The table gives
+// (cos, sin) of p·θ_d at row p, so row 1 is each frequency's per-position
+// step: the lane reads the row of the group's first live token and row 1
+// (two float4 each), and the later tokens' angles follow by rotating the
+// pair in-register — a token's angle is never further than three steps from
+// a table row, so the drift is a few ulp, far under the int8 quantisation
+// the row is about to take. A pass-through dim's step is (1, 0) and stays
+// exact. On the vector path the rope rows issue ahead of the quad loads so
+// every load of the group is in flight together; on the block path they
+// issue after the decode, so the 16 rope values are not live across its
+// format bodies.
+// Scale windows: half-split, a lane's quad A lies in window q>>3 and quad B
+// in 4 + (q>>3), so the window absmax is a reduce over the 8 lanes sharing
+// q>>3; interleaved, the eight dims lie in window q>>2, a reduce over 4
+// lanes. Each token's quantised quads land as one word each. A dead group
+// is skipped outright (warp-uniform); a masked token inside a live group
+// reads as 0 — its column's score is forced to -inf by the softmax, so its
+// int8 row is never read.
+//
+// A free function over explicit operands, not a lambda over the kernel's
+// scope: a closure of this size is one NVCC outlines into a real call, which
+// puts every captured variable in addressable local memory and spills the
+// caller's live registers around the call. Force-inlined at its one site it
+// is register code, as the kernel body it sits in.
+//
+// `s_kstg` is the K staging slab: `span` is the calling warp's private 4-row
+// span of it (the warp's index — a warp decoding the ninth quad as a second
+// round reuses its own span, its first group's rows already stored); `s_k8`
+// and `s_k_scale` are the tile's K slab and its per-window scales.
+template <int HEAD_DIM, bool ROPE_INTERLEAVED>
+__device__ __forceinline__ void tile_k_decode(
+    const TileExt& ext, const TileGroups& tg, const uint8_t* s_tbl, const uint8_t* s_inv,
+    uint8_t* s_kstg, int span, int8_t* s_k8, __half (*s_k_scale)[HEAD_DIM / 32],
+    const float* __restrict__ rope_cs, int kg, int lane, const uint8_t* k_raw)
+{
+    const uint32_t klive = grp_mask(tg.desc[kg]);
+    if (klive == 0u) return;
+    // The first live token: a group at the head of a slice whose offset
+    // falls inside it has leading masked tokens, and those sit before the
+    // table's first row.
+    const int j0 = __ffs(klive) - 1;
+    const int rope0 = tg.rope0[kg] + j0;
+    const int dA0 = ROPE_INTERLEAVED ? 8 * lane : 4 * lane;
+    const int dB0 = ROPE_INTERLEAVED ? dA0 + 4 : dA0 + HEAD_DIM / 2;
+    float rc[4], rs[4], dc[4], ds[4];
+    auto load_rope = [&]() {
+        const float4* e = reinterpret_cast<const float4*>(
+            rope_cs + (int64_t)rope0 * HEAD_DIM + 8 * lane);
+        const float4* d = reinterpret_cast<const float4*>(rope_cs + HEAD_DIM + 8 * lane);
+        const float4 c0 = __ldg(e), c1 = __ldg(e + 1);
+        const float4 s0 = __ldg(d), s1 = __ldg(d + 1);
+        rc[0] = c0.x; rs[0] = c0.y; rc[1] = c0.z; rs[1] = c0.w;
+        rc[2] = c1.x; rs[2] = c1.y; rc[3] = c1.z; rs[3] = c1.w;
+        dc[0] = s0.x; ds[0] = s0.y; dc[1] = s0.z; ds[1] = s0.w;
+        dc[2] = s1.x; ds[2] = s1.y; dc[3] = s1.z; ds[3] = s1.w;
+    };
+    const int kgi[2] = { kg, kg };
+    const int kd0[2] = { dA0, dB0 };
+    float x[2][4][GROUP_TOK];
+    QuadInfo kq[2];
+    const bool kfast = tile_quads_probe<HEAD_DIM, 4>(ext, tg, s_tbl, 0, kgi, kd0, kq);
+    if (__builtin_expect(__all_sync(0xffffffffu, kfast), 1)) {
+        load_rope();
+        if (k_raw != nullptr) {
+            // The warp's own copies: every lane waits for its groups, then
+            // the warp converges so each lane sees the others' rows.
+            cp_async_wait<0, true>();
+            __syncwarp();
+            tile_quads_vec_staged<HEAD_DIM>(ext, kq, kgi, x, k_raw, dA0);
+        } else {
+            tile_quads_vec<HEAD_DIM>(ext, kq, 0, kgi, x);
+        }
+    } else {
+        // A staged tile is a vector tile by the vote that staged it; the
+        // block path's staging slab is holding the copies.
+        if (k_raw != nullptr) __trap();
+        // The block path stages the group's dims — 8 B per dim, two 4-row
+        // spans — before reading them back by quad. The staging slab's rows
+        // of the group's index are this warp's alone. A group's rows are its
+        // COLUMNS of the K slab, which are its own to scribble on only when
+        // the group is whole and on the 4-grid. A quad at a hole's edge
+        // shares its four rows with a neighbour another warp may be writing,
+        // so it stages one half of the head at a time through the private
+        // span instead — a second decode of the group, paid by the two quads
+        // a hole costs a window.
+        uint8_t* stg_lo = s_kstg + span * 4 * HEAD_DIM;
+        const int kc0 = (int)tg.col0[kg];
+        const uint8_t* s_inv_g = s_inv + (kg * 2) * HEAD_DIM;
+        const int within = grp_within(tg.desc[kg]);
+        if (klive == 15u && (kc0 & 3) == 0) {
+            uint8_t* stg_hi = reinterpret_cast<uint8_t*>(s_k8) + kc0 * HEAD_DIM;
+            tile_k_block_decode<HEAD_DIM>(ext, s_inv_g, kg, within, lane, stg_lo, stg_hi, -1);
+            __syncwarp();
+            load_rope();
+            tile_k_stage_read<HEAD_DIM>(stg_lo, stg_hi, dA0, x[0]);
+            tile_k_stage_read<HEAD_DIM>(stg_lo, stg_hi, dB0, x[1]);
+            __syncwarp();
+        } else {
+            // Half h's dims land at stg_lo + (d − h·HEAD_DIM/2)·8:
+            // `tile_stage_ptr(lo, hi, d)` reads the upper half at
+            // `hi + (d − HEAD_DIM/2)·8`, so `hi = lo` resolves both halves
+            // to the private span.
+            //
+            // What a round stages is read back RAW (8 words a quad) and
+            // converted after both rounds, and the rope rows load after
+            // them too: the second round's decode then carries 8 live words
+            // of the first, not 16 floats and 16 rope values, which is the
+            // difference between this path fitting the register budget and
+            // it parking the PV accumulators in local memory.
+            //
+            // Half-split, quad A is always in the lower half and quad B in
+            // the upper, so each round reads its own quad — the round is
+            // the unrolled loop's index, no runtime predicate. Interleaved,
+            // a lane's two quads share a half that depends on the lane, so
+            // each round reads both and keeps the round that staged their
+            // half by select: written unconditionally on every path, because
+            // an array written under a runtime predicate is one NVCC moves
+            // to local memory for the whole kernel, vector path included.
+            uint4 wa[2] = { make_uint4(0u, 0u, 0u, 0u), make_uint4(0u, 0u, 0u, 0u) };
+            uint4 wb[2] = { make_uint4(0u, 0u, 0u, 0u), make_uint4(0u, 0u, 0u, 0u) };
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                tile_k_block_decode<HEAD_DIM>(ext, s_inv_g, kg, within, lane, stg_lo, stg_lo, h);
+                __syncwarp();
+                if constexpr (ROPE_INTERLEAVED) {
+                    const bool keep = (dA0 >= HEAD_DIM / 2) == (h == 1);
+                    uint4 ta[2], tb[2];
+                    tile_k_stage_raw<HEAD_DIM>(stg_lo, stg_lo, dA0, ta);
+                    tile_k_stage_raw<HEAD_DIM>(stg_lo, stg_lo, dB0, tb);
+                    #pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        wa[i] = sel4(keep, ta[i], wa[i]);
+                        wb[i] = sel4(keep, tb[i], wb[i]);
+                    }
+                } else {
+                    if (h == 0) tile_k_stage_raw<HEAD_DIM>(stg_lo, stg_lo, dA0, wa);
+                    else        tile_k_stage_raw<HEAD_DIM>(stg_lo, stg_lo, dB0, wb);
+                }
+                __syncwarp();
+            }
+            tile_k_stage_cvt(wa, x[0]);
+            tile_k_stage_cvt(wb, x[1]);
+            load_rope();
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < GROUP_TOK; ++j) {
+        // Step the angle past every token from the first live one on,
+        // masked or not, so (rc, rs) is token j's.
+        if (j > 0 && j > j0) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float c = rc[i] * dc[i] - rs[i] * ds[i];
+                rs[i] = rs[i] * dc[i] + rc[i] * ds[i];
+                rc[i] = c;
+            }
+        }
+        if (!((klive >> j) & 1u)) continue;   // warp-uniform
+        // The token's column is its logical position's, not the group's
+        // slot: a masked j is one outside the window.
+        const int tok = (int)tg.col0[kg] + j;
+        // r[0..3] is quad A rotated, r[4..7] quad B.
+        float r[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float c = rc[i], s = rs[i];
+            float lo, hi;
+            if constexpr (ROPE_INTERLEAVED) {
+                lo = (i < 2) ? x[0][2 * i][j] : x[1][2 * i - 4][j];
+                hi = (i < 2) ? x[0][2 * i + 1][j] : x[1][2 * i - 3][j];
+            } else {
+                lo = x[0][i][j];
+                hi = x[1][i][j];
+            }
+            const float ra = lo * c - hi * s;
+            const float rb = lo * s + hi * c;
+            if constexpr (ROPE_INTERLEAVED) { r[2 * i] = ra; r[2 * i + 1] = rb; }
+            else { r[i] = ra; r[4 + i] = rb; }
+        }
+        float aA = fmaxf(fmaxf(fabsf(r[0]), fabsf(r[1])), fmaxf(fabsf(r[2]), fabsf(r[3])));
+        float aB = fmaxf(fmaxf(fabsf(r[4]), fabsf(r[5])), fmaxf(fabsf(r[6]), fabsf(r[7])));
+        if constexpr (ROPE_INTERLEAVED) {
+            aA = fmaxf(aA, aB);
+            aA = fmaxf(aA, __shfl_xor_sync(0xffffffffu, aA, 1));
+            aA = fmaxf(aA, __shfl_xor_sync(0xffffffffu, aA, 2));
+            aB = aA;
+        } else {
+            #pragma unroll
+            for (int off = 1; off < 8; off <<= 1) {
+                aA = fmaxf(aA, __shfl_xor_sync(0xffffffffu, aA, off));
+                aB = fmaxf(aB, __shfl_xor_sync(0xffffffffu, aB, off));
+            }
+        }
+        const float scaleA = aA / 127.f;
+        const float scaleB = aB / 127.f;
+        const float invA = (scaleA > 0.f) ? 1.f / scaleA : 0.f;
+        const float invB = (scaleB > 0.f) ? 1.f / scaleB : 0.f;
+        const float qa[4] = { r[0], r[1], r[2], r[3] };
+        const float qb[4] = { r[4], r[5], r[6], r[7] };
+        const uint32_t wa = i8_pack4(qa, invA);
+        const uint32_t wb = i8_pack4(qb, invB);
+        if constexpr (ROPE_INTERLEAVED) {
+            *(uint2*)(s_k8 + sw_off<HEAD_DIM>(tok, dA0)) = make_uint2(wa, wb);
+            if ((lane & 3) == 0) s_k_scale[tok][lane >> 2] = __float2half(scaleA);
+        } else {
+            *(uint32_t*)(s_k8 + sw_off<HEAD_DIM>(tok, dA0)) = wa;
+            *(uint32_t*)(s_k8 + sw_off<HEAD_DIM>(tok, dB0)) = wb;
+            if ((lane & 7) == 0) {
+                s_k_scale[tok][lane >> 3] = __float2half(scaleA);
+                s_k_scale[tok][(HEAD_DIM / 2 / 32) + (lane >> 3)] = __float2half(scaleB);
+            }
+        }
     }
 }
 
@@ -1013,7 +1483,7 @@ int8_decode_tile_kernel(
     // unpadded and XOR-swizzled (`sw_off`): K and Q rows are HEAD_DIM
     // bytes, the transposed V and the P rows TILE_TOK bytes.
     // ------------------------------------------------------------------
-    constexpr int TBL_BYTES = TILE_GROUPS * 2 * HEAD_DIM;
+    constexpr int TBL_BYTES = TILE_SLOTS * 2 * HEAD_DIM;
 
     constexpr int ALIGN16 = 15;
     constexpr int OFF_K8 = 0;
@@ -1042,14 +1512,32 @@ int8_decode_tile_kernel(
     __shared__ TileGroups s_tg[2];
     // A chunk's tile-0 map words, staged by warp 7 for every thread; from
     // tile 1 on each thread carries its own word in a register.
-    __shared__ uint32_t s_map[TILE_GROUPS][2][16];      // [group][side][word]
+    __shared__ uint32_t s_map[TILE_SLOTS][2][16];       // [group slot][side][word]
     __shared__ uint32_t s_grp[MAX_GROUPS];
     __shared__ GroupSrc s_grp_src[MAX_GROUPS];
     __shared__ int s_n_tiles;
+    // The window's live columns accumulated across a multi-pass tile's
+    // passes (zero at every tile's start; a single-pass tile reads it as 0).
+    __shared__ uint32_t s_colmask;
+    // Dense: the slice holding each of this split's windows' base positions
+    // (0xffff before the sequence starts), built once in the prologue so a
+    // tile's group resolves from one shared read and one independent header
+    // load rather than a walk of dependent loads. A split wider than the
+    // table walks from the cursor instead.
+    constexpr int WIN_TABLE = 256;
+    __shared__ uint16_t s_win_slice[WIN_TABLE];
+    // A window's first slice header, fetched two tiles ahead by one thread
+    // with a 16-byte cp.async: it is the dense walk's first load, which
+    // every thread otherwise waits on at the top of the tile. Slot (t & 1)
+    // is filled at the top of tile t for tile t + 2 and read at the top of
+    // tile t + 1, behind tile t's mid barrier — the fill and the reads never
+    // share a slot. `slice` is the header's slice, -1 for none.
+    __shared__ __align__(16) TokenSliceHdr s_hdr_pre[2];
+    __shared__ int s_hdr_pre_slice[2];
     // Whether group g's side map is a band map (the identity within each
     // palette): the V warps take the vector path only when every live
     // group's V map is.
-    __shared__ uint8_t s_band[TILE_GROUPS][2];
+    __shared__ uint8_t s_band[TILE_SLOTS][2];
 
     int8_t* s_q8 = reinterpret_cast<int8_t*>(s_arena + OFF_Q8);
     int8_t* s_k8 = reinterpret_cast<int8_t*>(s_arena + OFF_K8);
@@ -1100,7 +1588,7 @@ int8_decode_tile_kernel(
     const bool qsa_on = qsa_active(sel) && !qsa_row_dense(sel, slot_idx);
     const int sel_cnt = qsa_on ? (int)sel.cnt[slot_idx] : 0;
     const uint32_t* sel_entries = sel.entries + (int64_t)slot_idx * sel.stride;
-    int s_lo = 0, s_hi = 0, e_lo = 0, e_hi = 0;
+    int w_lo = 0, w_hi = 0, e_lo = 0, e_hi = 0;
     uint32_t ent0 = 0u;
     bool has0 = false;
     if (qsa_on) {
@@ -1128,12 +1616,20 @@ int8_decode_tile_kernel(
     // the scatter below even with no share (the token must land whichever
     // split reads it) before emitting null.
     // ------------------------------------------------------------------
+    // Dense: the split's share is a contiguous range of LOGICAL WINDOWS —
+    // 32-position spans of the token sequence, the new token included — not
+    // of slices. `kv_len` counts every position the query attends, and a
+    // window's tokens are gathered from whichever slices hold them, so the
+    // partition (and everything the softmax derives from it) is the same for
+    // every chunk layout of the same tokens.
+    const int kv_len = ws_rope + ws_len + 1;
+    const int n_windows = (kv_len + TILE_TOK - 1) / TILE_TOK;
     if (!qsa_on) {
-        const int per = (n_slices + num_splits - 1) / num_splits;
-        s_lo = split_idx * per;
-        s_hi = min(n_slices, s_lo + per);
+        const int per = (n_windows + num_splits - 1) / num_splits;
+        w_lo = split_idx * per;
+        w_hi = min(n_windows, w_lo + per);
     }
-    const bool has_share = qsa_on ? (e_lo < e_hi) : (s_lo < s_hi);
+    const bool has_share = qsa_on ? (e_lo < e_hi) : (w_lo < w_hi);
 
     // ------------------------------------------------------------------
     // Fused new-token scatter (warp 6): the step's K/V land in the write
@@ -1160,7 +1656,10 @@ int8_decode_tile_kernel(
                               qb <= (sel_entries[e_hi - 1] >> QSA_CELL_BITS);
                 }
             } else {
-                covers |= s_lo <= write_slice_idx && write_slice_idx < s_hi;
+                // The window holding the new token — its position is the
+                // sequence's last.
+                const int wn = (kv_len - 1) / TILE_TOK;
+                covers |= w_lo <= wn && wn < w_hi;
             }
             if (covers) {
                 // The new rows and the head record do not depend on each
@@ -1217,62 +1716,198 @@ int8_decode_tile_kernel(
     }
 
     if (!has_share) { emit_null(); return; }
-    int n_tiles = qsa_on ? 0 : (s_hi - s_lo);   // sparse: set from the resolve
+    int n_tiles = qsa_on ? 0 : (w_hi - w_lo);   // sparse: set from the resolve
 
     // ------------------------------------------------------------------
     // Tile staging roles.
     //   map word   — every thread: group = warp, side = lane >> 4,
     //                word = lane & 15 (16 dims of the side's palette map).
-    //   descriptor — threads < 64: group = tid >> 3, side = (tid >> 2) & 1,
-    //                palette = tid & 3.
-    // `group_info` names tile t's group g under either walk — descriptor
-    // plus the slice's KvHead pointer and rope base — so a stager reaches
-    // the head record in one global round: the sparse walk's resolve
-    // already published both from the header it read, and the dense walk
-    // reads the header whole here. A tile past the chunk's last is all
-    // dead groups.
+    //   descriptor — lanes < 8 of every warp: group = warp,
+    //                side = (lane >> 2) & 1, palette = lane & 3.
+    // Both roles put a thread on the group of its own warp, so a tile's
+    // group is resolved ONCE per thread (`group_info`, the dense window
+    // walk or the sparse resolve's table) and feeds both its map word and
+    // its descriptor. The resolved group carries the slice's KvHead pointer
+    // and rope base, so a stager reaches the head record in one global
+    // round. A tile past the chunk's last is all dead groups.
     // ------------------------------------------------------------------
-    const int st_g = tid >> 3, st_side = (tid >> 2) & 1, st_p = tid & 3;
+    const int st_g = warp, st_side = (lane >> 2) & 1, st_p = lane & 3;
+    const bool stager = lane < 2 * N_PALETTE;
+    static_assert(TILE_WARPS * 2 * N_PALETTE == N_STAGERS, "a warp's first 8 lanes stage its group");
     const int mw_side = lane >> 4, mw_word = lane & 15;
-    struct GroupInfo { uint32_t desc; GroupSrc src; };
-    auto group_info = [&](int t, int gi) -> GroupInfo {
-        GroupInfo g = {0u, {0u, 0}};
+    struct GroupInfo { uint32_t desc; GroupSrc src; int col0; };
+    // The dense walk's slice cursor: the slice holding the base of the last
+    // window this thread resolved, seated once by the gallop at the split's
+    // first window. A tile asks for its own window and the next one's, and a
+    // multi-pass tile asks for its own again after the lookahead, so the
+    // cursor is a hint the walk corrects in either direction — by the
+    // handful of slices two neighbouring windows can differ by.
+    int cur_slice = -1;
+    // Group `gi` of tile `t`.
+    //
+    // Dense: tile t is window [wb, wb + 32) of positions, and its groups are
+    // the aligned physical quads of the slices holding those positions, in
+    // position order — a whole window inside one slice is 8 full quads exactly
+    // as before; a window a hole falls in has a partial quad on each side of
+    // it. `gi` past the last quad is dead. The walk is register arithmetic
+    // except where it steps to the next slice (one header load).
+    //
+    // Sparse: the resolve's packed groups, 8 per tile, at column 4·gi.
+    // `ahead`: the call is the tile loop's own look-ahead (tile t + 1 from
+    // the top of tile t), whose first slice header was prefetched into
+    // `s_hdr_pre[t & 1]`; any other caller loads the header itself.
+    auto group_info = [&](int t, int gi, bool ahead) -> GroupInfo {
+        GroupInfo g = {0u, {0u, 0}, 0};
         if (t >= n_tiles) return g;
         if (qsa_on) {
             g.desc = s_grp[t * TILE_GROUPS + gi];
             g.src = s_grp_src[t * TILE_GROUPS + gi];
+            g.col0 = gi * GROUP_TOK;
             return g;
         }
-        const int slice = s_lo + t;
-        const TokenSliceHdr h = load_token_slice<HEAD_DIM>(slices_ptr, slice, n_kv_head);
-        const int off = h.offset();
-        const int eff = tile_slice_eff_len(h, slice, write_slice_idx);
-        const uint32_t m32 = (eff >= 32) ? 0xffffffffu : (((1u << eff) - 1u) << off);
-        g.desc = grp_pack(slice, gi * GROUP_TOK, (m32 >> (gi * GROUP_TOK)) & 15u);
+        const int wb = (w_lo + t) * TILE_TOK;
+        const int we = min(wb + TILE_TOK, kv_len);
+        // The slice's rows holding window positions: [row_lo, row_hi).
+        auto rows_of = [&](const TokenSliceHdr& hh, int slice, int& row_lo, int& row_hi) {
+            const int off = hh.offset();
+            const int rb = hh.rope_base();
+            const int eff = tile_slice_eff_len(hh, slice, write_slice_idx);
+            row_lo = off + max(wb - rb, 0);
+            row_hi = off + min(eff, we - rb);
+        };
+        // The window's first slice: the table's, resolved in the prologue.
+        // Past the table, seat on the cursor's slice (the gallop's, at the
+        // split's first window) and step to the slice whose tokens reach the
+        // window: back while the slice begins past it, then forward past any
+        // that ends before it (the cursor's, when the window moved on) or that
+        // the window starts past the end of (an empty writer behind a partial
+        // chunk shares its base).
+        int s;
+        TokenSliceHdr h;
+        if (t < WIN_TABLE) {
+            const int ws = (int)s_win_slice[t];
+            if (ws == 0xffff) return g;
+            s = ws;
+            if (ahead && s == s_hdr_pre_slice[t & 1]) h = s_hdr_pre[t & 1];
+            else h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+        } else {
+            s = cur_slice < 0
+                ? tile_slice_holding<HEAD_DIM>(slices_ptr, n_slices, n_kv_head, wb)
+                : cur_slice;
+            h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+            while (s > 0 && h.rope_base() > wb) {
+                --s;
+                h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+            }
+        }
+        int row_lo, row_hi;
+        rows_of(h, s, row_lo, row_hi);
+        while (row_lo >= row_hi) {
+            if (++s >= n_slices) return g;
+            h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+            if (h.rope_base() >= we) return g;
+            rows_of(h, s, row_lo, row_hi);
+        }
+        cur_slice = s;
+        // Quad gi: skip whole slices' worth of quads, then index into the
+        // slice that holds it — arithmetic per slice crossed, not per quad.
+        int q, rem = gi;
+        for (;;) {
+            const int here = ((row_hi - 1) >> 2) - (row_lo >> 2) + 1;
+            if (rem < here) {
+                q = (row_lo & ~3) + rem * GROUP_TOK;
+                break;
+            }
+            rem -= here;
+            do {
+                if (++s >= n_slices) return g;
+                h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+                if (h.rope_base() >= we) return g;
+                rows_of(h, s, row_lo, row_hi);
+            } while (row_lo >= row_hi);
+        }
+        uint32_t mask = 0u;
+        #pragma unroll
+        for (int j = 0; j < GROUP_TOK; ++j)
+            if (q + j >= row_lo && q + j < row_hi) mask |= 1u << j;
+        g.desc = grp_pack(s, q, mask);
         g.src.kvheads = h.kvheads_ptr();
-        g.src.rope_base = h.rope_base() - off;
+        g.src.rope_base = h.rope_base() - h.offset();
+        g.col0 = (g.src.rope_base + q) - wb;
         return g;
     };
-    // One map word of tile t: group gi's `side` map, 16-dim word `w`
+    // How many quads window `t` spans — the tile's pass count is this over
+    // TILE_GROUPS. Counted in one pass over the window's slices, each
+    // contributing the aligned quads its rows in the window touch: one
+    // header load per slice, arithmetic otherwise. (Asking `group_info` for
+    // groups until a dead one is the same answer at nine walks' cost, every
+    // one of them a chain of dependent loads on a single thread — measured as
+    // a per-launch tax that doubled a one-window decode.)
+    auto window_groups = [&](int t, bool ahead) -> int {
+        if (qsa_on || t >= n_tiles) return 0;
+        const int wb = (w_lo + t) * TILE_TOK;
+        const int we = min(wb + TILE_TOK, kv_len);
+        int s;
+        TokenSliceHdr h;
+        if (t < WIN_TABLE) {
+            const int ws = (int)s_win_slice[t];
+            if (ws == 0xffff) return 0;
+            s = ws;
+            if (ahead && s == s_hdr_pre_slice[t & 1]) h = s_hdr_pre[t & 1];
+            else h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+        } else {
+            s = cur_slice < 0
+                ? tile_slice_holding<HEAD_DIM>(slices_ptr, n_slices, n_kv_head, wb)
+                : cur_slice;
+            h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+            while (s > 0 && h.rope_base() > wb) {
+                --s;
+                h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+            }
+        }
+        int n = 0;
+        for (;;) {
+            const int off = h.offset();
+            const int rb = h.rope_base();
+            const int eff = tile_slice_eff_len(h, s, write_slice_idx);
+            const int row_lo = off + max(wb - rb, 0);
+            const int row_hi = off + min(eff, we - rb);
+            if (row_lo < row_hi) n += ((row_hi - 1) >> 2) - (row_lo >> 2) + 1;
+            // A slice reaching the window's end holds the rest of it: no
+            // probe of the next slice's header (a dependent load on warp 0's
+            // critical path, every tile, for a packed layout).
+            if (rb + eff >= we) break;
+            if (++s >= n_slices) break;
+            h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+            if (h.rope_base() >= we) break;
+        }
+        return n;
+    };
+    // One map word of a resolved group: its `side` map, 16-dim word `w`
     // (0 for a dead group or a word past the map).
-    auto load_map_word = [&](int t, int gi, int side, int w) -> uint32_t {
-        const GroupInfo g = group_info(t, gi);
+    auto map_word_of = [&](const GroupInfo& g, int side, int w) -> uint32_t {
         if (grp_mask(g.desc) == 0u || w >= PAL_U32) return 0u;
         const uint8_t* hd = get_head_at<HEAD_DIM>(g.src.kvheads, kv_head_idx);
         const uint8_t* pm = side ? kvhead_v_pal_map<HEAD_DIM>(hd) : kvhead_k_pal_map<HEAD_DIM>(hd);
         return reinterpret_cast<const uint32_t*>(pm)[w];
     };
-    // One descriptor item of tile t: (group gi, side, palette p).
-    auto load_desc = [&](int t, int gi, int side, int p, NextTile& nx) {
-        const GroupInfo g = group_info(t, gi);
-        nx.desc = g.desc; nx.rope0 = 0; nx.ptr = 0; nx.scl = 1.f; nx.fmt = 0;
+    auto load_map_word = [&](int t, int gi, int side, int w) -> uint32_t {
+        return map_word_of(group_info(t, gi, false), side, w);
+    };
+    // One descriptor item of a resolved group: (side, palette p).
+    auto desc_of = [&](const GroupInfo& g, int side, int p, NextTile& nx) {
+        nx.desc = g.desc; nx.rope0 = 0; nx.col0 = 0; nx.ptr = 0; nx.scl = 1.f; nx.fmt = 0;
         if (grp_mask(g.desc) != 0u) {
             const uint8_t* hd = get_head_at<HEAD_DIM>(g.src.kvheads, kv_head_idx);
             nx.ptr = side ? kvhead_v_ptr<HEAD_DIM>(hd, p) : kvhead_k_ptr<HEAD_DIM>(hd, p);
             nx.fmt = side ? kvhead_v_fmt<HEAD_DIM>(hd, p) : kvhead_k_fmt<HEAD_DIM>(hd, p);
             nx.scl = side ? kvhead_v_scale<HEAD_DIM>(hd, p) : kvhead_k_scale<HEAD_DIM>(hd, p);
             nx.rope0 = g.src.rope_base + grp_within(g.desc);
+            nx.col0 = g.col0;
         }
+    };
+    auto load_desc = [&](int t, int gi, int side, int p, NextTile& nx) {
+        desc_of(group_info(t, gi, false), side, p, nx);
     };
     auto commit_desc = [&](int buf, int gi, int side, int p, const NextTile& nx) {
         s_ext[buf].gbase[gi][side][p] = (const char*)(uintptr_t)nx.ptr;
@@ -1281,16 +1916,25 @@ int8_decode_tile_kernel(
         if (side == 0 && p == 0) {
             s_tg[buf].desc[gi] = nx.desc;
             s_tg[buf].rope0[gi] = nx.rope0;
+            s_tg[buf].col0[gi] = (int8_t)nx.col0;
+            if (gi == 0) s_tg[buf].n_groups = nx.ngroups;
         }
+    };
+    // The tile's pass count comes from its window's quad count: a sparse
+    // tile is the resolve's fixed 8 groups, a dense one is walked.
+    auto tile_groups = [&](int t, bool ahead) -> int {
+        return qsa_on ? TILE_GROUPS : window_groups(t, ahead);
     };
     // Issue tile t's staging loads into registers under the tile-loop
     // roles. Nothing waits on them here: the descriptors are consumed by
     // `stage_prefetch` and `stage_commit`, the map word by the next tile's
     // table build.
-    auto stage_issue = [&](int t, NextTile& nx) {
-        nx.map = load_map_word(t, warp, mw_side, mw_word);
-        nx.desc = 0u; nx.rope0 = 0; nx.ptr = 0; nx.scl = 1.f; nx.fmt = 0;
-        if (tid < N_STAGERS) load_desc(t, st_g, st_side, st_p, nx);
+    auto stage_issue = [&](int t, NextTile& nx, bool ahead) {
+        const GroupInfo g = group_info(t, warp, ahead);
+        nx.map = map_word_of(g, mw_side, mw_word);
+        nx.desc = 0u; nx.rope0 = 0; nx.col0 = 0; nx.ngroups = 0; nx.ptr = 0; nx.scl = 1.f; nx.fmt = 0;
+        if (stager) desc_of(g, st_side, st_p, nx);
+        if (tid == 0) nx.ngroups = (t < n_tiles) ? tile_groups(t, ahead) : 0;
     };
     // L2 prefetch of the staged group's span: a dtype palette's 4 tokens
     // (SUB elements each, contiguous), a quant palette's whole block run
@@ -1311,32 +1955,97 @@ int8_decode_tile_kernel(
         }
     };
     auto stage_prefetch = [&](const NextTile& nx) {
-        if (tid < N_STAGERS) prefetch_span(nx);
+        if (stager) prefetch_span(nx);
     };
     auto stage_commit = [&](int buf, const NextTile& nx) {
-        if (tid < N_STAGERS) commit_desc(buf, st_g, st_side, st_p, nx);
+        if (stager) commit_desc(buf, st_g, st_side, st_p, nx);
     };
-    // A chunk's tile 0 is staged by one warp while the others stage Q: the
-    // 64 descriptor items two per lane, the 256 map words eight per lane,
-    // all loads in flight before the first shared store. Its spans are
-    // prefetched to L2 as soon as the descriptors land, so tile 0's K/V
-    // bytes are in flight under the Q rotation and the barrier rather than
-    // first requested by the tile loop.
+    // Whether the next tile's K lower half is staged through the slab, decided
+    // a tile ahead from the descriptors in registers: a live group whose K is
+    // one narrow dtype across the four palettes under a band map — the
+    // conditions of the vector path, the slab's reader. The decision is the
+    // warp's own (it decodes its own group, and the block path — the slab's
+    // other user — scribbles only in its own group's span) and rides in a
+    // register to the next tile's table phase, where the copies are issued;
+    // it replaces the block-wide vote the decode used to take from shared
+    // state after the table barrier. Returns the element size, 0 for none.
+    //
+    // The copies themselves are NOT issued here. Issuing them at this point —
+    // a tile ahead, with the V decode, softmax and PV to land under — was
+    // measured: fewer instructions, but the stager region's stalls doubled and
+    // the tile loop lost 6–17 % at 32K and above, so they issue where they
+    // always did.
+    auto stage_k_ahead = [&](const NextTile& nx) -> int {
+        if constexpr (ROPE_INTERLEAVED) return 0;
+        static_assert(N_PALETTE == 4, "stager lanes 0..3 hold side 0's four palettes");
+        constexpr int WORDS_PER_BAND = SUB / 16;
+        const uint32_t band = 0x55555555u * (uint32_t)(mw_word / WORDS_PER_BAND);
+        const bool band0 =
+            __all_sync(0xffffffffu, mw_side != 0 || nx.map == 0u || nx.map == band);
+        const uint32_t desc = __shfl_sync(0xffffffffu, nx.desc, 0);
+        const int f0 = __shfl_sync(0xffffffffu, nx.fmt, 0);
+        const bool fmt_ok = __all_sync(0xffffffffu, lane >= N_PALETTE || nx.fmt == f0);
+        if (!band0 || !fmt_ok || grp_mask(desc) == 0u
+            || !i8_is_narrow_dtype_format((uint32_t)f0))
+            return 0;
+        return ArenaFormat::float_elem_size(f0);
+    };
+    // The ninth quad of tile `t` — slot TILE_GROUPS — staged by warp 0 alone
+    // into descriptor buffer `buf`, when the window spans exactly TILE_SLOTS
+    // quads (`ngroups`, block-uniform, from the tile's staging): its eight
+    // descriptor items on the stager lanes, its 32 map words one per lane
+    // into s_map for the table build at the tile's top. Otherwise the slot
+    // is committed dead. The loads are exposed on warp 0, a softmax warp,
+    // between its K decode and the K barrier it waits at anyway.
+    auto stage_slot8 = [&](int t, int buf, int ngroups, bool ahead) {
+        if (ngroups == TILE_SLOTS) {
+            const GroupInfo g = group_info(t, TILE_GROUPS, ahead);
+            if (stager) {
+                NextTile w;
+                desc_of(g, st_side, st_p, w);
+                w.ngroups = ngroups;
+                commit_desc(buf, TILE_GROUPS, st_side, st_p, w);
+            }
+            s_map[TILE_GROUPS][mw_side][mw_word] = map_word_of(g, mw_side, mw_word);
+        } else if (lane == 0) {
+            s_tg[buf].desc[TILE_GROUPS] = 0u;
+        }
+    };
+    // A resolved sparse chunk's tile 0, staged by the resolving warp alone
+    // between chunks: the 64 descriptor items two per lane, the 256 map
+    // words eight per lane, all loads in flight before the first shared
+    // store, and the spans prefetched to L2 as soon as the descriptors
+    // land. (The split's first tile is staged by the whole block under the
+    // tile loop's roles, in the prologue.)
     auto stage_tile0 = [&]() {
+        // Every group of tile 0, resolved up front per lane: the ten items a
+        // lane stages (two descriptors, eight map words) span all eight
+        // groups, and resolving each behind its own item put ten record-load
+        // chains in series. Resolved first (ten walks of one window, its
+        // header hot in L1 after the first), the ten record loads issue
+        // together. The map words' groups are the unrolled index (registers);
+        // the descriptors' two are lane-dependent, so they walk directly
+        // rather than index the array.
+        GroupInfo g0[TILE_GROUPS];
+        #pragma unroll
+        for (int gi = 0; gi < TILE_GROUPS; ++gi) g0[gi] = group_info(0, gi, false);
         NextTile w[2];
         uint32_t mws[8];
         #pragma unroll
         for (int k = 0; k < 2; ++k) {
             const int i = lane + 32 * k;
-            load_desc(0, i >> 3, (i >> 2) & 1, i & 3, w[k]);
+            desc_of(group_info(0, i >> 3, false), (i >> 2) & 1, i & 3, w[k]);
         }
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
             const int i = lane + 32 * k;
-            mws[k] = load_map_word(0, i >> 5, (i >> 4) & 1, i & 15);
+            mws[k] = map_word_of(g0[k], (i >> 4) & 1, i & 15);
         }
         #pragma unroll
         for (int k = 0; k < 2; ++k) prefetch_span(w[k]);
+        // Item 0 — lane 0's first — is the one `commit_desc` takes the pass
+        // count from.
+        if (lane == 0) w[0].ngroups = tile_groups(0, false);
         #pragma unroll
         for (int k = 0; k < 2; ++k) {
             const int i = lane + 32 * k;
@@ -1347,6 +2056,8 @@ int8_decode_tile_kernel(
             const int i = lane + 32 * k;
             s_map[i >> 5][(i >> 4) & 1][i & 15] = mws[k];
         }
+        // A sparse tile is the resolve's fixed TILE_GROUPS groups: no ninth.
+        if (lane == 0) s_tg[0].desc[TILE_GROUPS] = 0u;
     };
     // Rank table of (group = warp, side, word) from the tile's committed
     // map word. A palette holds exactly SUB dims (a rank is 6 bits), so
@@ -1364,22 +2075,22 @@ int8_decode_tile_kernel(
     // The inverse table (dim of slot) is built alongside: the identity is
     // its own inverse, and the scan path scatters each dim's index to its
     // rank byte.
-    auto build_tables = [&](uint32_t mw) {
+    auto build_tables = [&](int g, uint32_t mw) {
         constexpr int WORDS_PER_BAND = SUB / 16;
         static_assert(SUB % 16 == 0, "a palette band is whole map words");
         const uint32_t band = 0x55555555u * (uint32_t)(mw_word / WORDS_PER_BAND);
-        const int tbl_off = (warp * 2 + mw_side) * HEAD_DIM;
+        const int tbl_off = (g * 2 + mw_side) * HEAD_DIM;
         if (__all_sync(0xffffffffu, mw == 0u || mw == band)) {
             if (mw_word < PAL_U32) {
                 const uint32_t w0 = 0x03020100u + 0x10101010u * (uint32_t)mw_word;
                 const uint4 ident = make_uint4(w0, w0 + 0x04040404u, w0 + 0x08080808u, w0 + 0x0c0c0c0cu);
                 *(uint4*)&s_tbl[tbl_off + 16 * mw_word] = ident;
                 *(uint4*)&s_inv[tbl_off + 16 * mw_word] = ident;
-                if (mw_word == 0) s_band[warp][mw_side] = 1;
+                if (mw_word == 0) s_band[g][mw_side] = 1;
             }
             return;
         }
-        if (mw_word == 0) s_band[warp][mw_side] = 0;
+        if (mw_word == 0) s_band[g][mw_side] = 0;
         // Byte p of `cnt` counts the word's dims in palette p; the
         // exclusive prefix over the side's 16 words is the palette's rank
         // base at this word.
@@ -1466,12 +2177,68 @@ int8_decode_tile_kernel(
                                            s_grp, s_grp_src, &s_n_tiles);
             __syncwarp();
             n_tiles = s_n_tiles;
+            if (lane == 0) {
+                s_hdr_pre_slice[0] = -1;
+                s_hdr_pre_slice[1] = -1;
+            }
+        } else {
+            // The window table: a lane per slice, 32 slices a round from the
+            // slice holding the split's first position (one gallop, warp-wide
+            // on the same addresses), each lane claiming the windows whose
+            // base lies in its slice's positions [rb, rb + eff). An empty
+            // slice claims none; a window before the sequence keeps 0xffff.
+            // The round that reaches the split's last position is the last.
+            for (int i = lane; i < WIN_TABLE; i += WARP_SIZE) s_win_slice[i] = 0xffff;
+            __syncwarp();
+            const int pos_lo = w_lo * TILE_TOK;
+            const int pos_hi = min(w_hi * TILE_TOK, kv_len);
+            const int s0 = tile_slice_holding<HEAD_DIM>(slices_ptr, n_slices, n_kv_head, pos_lo);
+            for (int sb = s0; sb < n_slices; sb += WARP_SIZE) {
+                const int s = sb + lane;
+                const bool has = s < n_slices;
+                int rb = 0, eff = 0;
+                if (has) {
+                    const TokenSliceHdr h = load_token_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+                    rb = h.rope_base();
+                    eff = tile_slice_eff_len(h, s, write_slice_idx);
+                }
+                if (has && eff > 0) {
+                    const int wf = max((rb + TILE_TOK - 1) / TILE_TOK, w_lo);
+                    const int wl = min((rb + eff - 1) / TILE_TOK, min(w_hi, w_lo + WIN_TABLE) - 1);
+                    for (int w = wf; w <= wl; ++w) s_win_slice[w - w_lo] = (uint16_t)s;
+                }
+                if (__any_sync(0xffffffffu, has && rb + eff >= pos_hi)) break;
+            }
+            __syncwarp();
+            // Tile 1's first header, for tile 0's look-ahead; tile 0's own
+            // is staged by the whole block below without one.
+            if (lane == 0) {
+                s_hdr_pre_slice[0] = -1;
+                const int s1 = (n_tiles > 1) ? (int)s_win_slice[1] : 0xffff;
+                s_hdr_pre_slice[1] = (s1 != 0xffff) ? s1 : -1;
+                if (s1 != 0xffff) s_hdr_pre[1] = load_token_slice<HEAD_DIM>(slices_ptr, s1, n_kv_head);
+            }
         }
-        stage_tile0();
     }
     if (qsa_on) chunk_lo = min(e_hi, chunk_lo + EPS);
     __syncthreads();
     if (qsa_on) n_tiles = s_n_tiles;
+    // Tile 0 is staged under the tile loop's own roles — one descriptor or
+    // map word per thread, every chain in flight at once across the block —
+    // rather than by one warp staging ten items a lane in series while the
+    // other seven wait at the barrier. (Measured at 8K, three tiles a block:
+    // that serial stage was a tenth of the kernel's stall samples.)
+    int k_stg_esz = 0;   // K lower half staged for the next tile: element size, 0 for none
+    {
+        NextTile nx0;
+        stage_issue(0, nx0, false);
+        stage_prefetch(nx0);
+        stage_commit(0, nx0);
+        s_map[warp][mw_side][mw_word] = nx0.map;
+        k_stg_esz = stage_k_ahead(nx0);
+        if (warp == 0) stage_slot8(0, 0, __shfl_sync(0xffffffffu, nx0.ngroups, 0), false);
+    }
+    __syncthreads();
 
     const int ns = warp & 3;        // QK n-slice (tokens ns*8 .. ns*8+7) on the softmax warps
     NextTile nx;
@@ -1500,157 +2267,185 @@ int8_decode_tile_kernel(
         const int cur = t & 1, nxt = cur ^ 1;
         const TileGroups& tg = s_tg[cur];
         const TileExt& ext = s_ext[cur];
+        // A window of more quads than one pass holds — a hole off the 4-grid
+        // splits a quad in two — is taken in passes that share this tile's
+        // softmax and V scale (the pre-sweep below). Block-uniform: the count
+        // was committed before the previous tile's last barrier.
+        const int n_pass = (tg.n_groups <= TILE_SLOTS)
+                               ? 1
+                               : (tg.n_groups + TILE_GROUPS - 1) / TILE_GROUPS;
 
         // -------------------- STAGE --------------------
         // The next tile's loads go out first; this tile's tables are built
-        // from its map word — tile 0's from warp 7's staging, later tiles'
+        // from its map word — tile 0's from the prologue's staging, later tiles'
         // the word this thread loaded a tile ahead — only for a group whose
         // word differs from the previous tile's (warp-uniform vote; a
         // chunk's tile 0 always builds).
         {
             const uint32_t mw_cur = (t == 0) ? s_map[warp][mw_side][mw_word] : nx.map;
-            stage_issue(t + 1, nx);
-            if (t == 0 || __any_sync(0xffffffffu, mw_cur != mw)) build_tables(mw_cur);
+            stage_issue(t + 1, nx, true);
+            if (t == 0 || __any_sync(0xffffffffu, mw_cur != mw)) build_tables(warp, mw_cur);
             mw = mw_cur;
-        }
-        __syncthreads(); // publishes the rank tables
-
-        // K: warp = group, lane = quad. A lane's two quads are its four
-        // RoPE pairs — half-split: dims 4q..4q+3 with 128+4q..; interleaved:
-        // dims 8q..8q+7 as (8q+2i, 8q+2i+1) — and both pairings read the
-        // same four frequencies 4q..4q+3. The table gives (cos, sin) of
-        // p·θ_d at row p, so row 1 is each frequency's per-position step:
-        // the lane reads the row of the group's first live token and row 1
-        // (two float4 each), and the later tokens' angles follow by
-        // rotating the pair in-register — a token's angle is never further
-        // than three steps from a table row, so the drift is a few ulp,
-        // far under the int8 quantisation the row is about to take. A
-        // pass-through dim's step is (1, 0) and stays exact. On the vector
-        // path the rope rows issue ahead of the quad loads so every load
-        // of the group is in flight together; on the block path they
-        // issue after the decode, so the 16 rope values are not live
-        // across its format bodies.
-        // Scale windows: half-split, a lane's quad A lies in window q>>3
-        // and quad B in 4 + (q>>3), so the window absmax is a reduce over
-        // the 8 lanes sharing q>>3; interleaved, the eight dims lie in
-        // window q>>2, a reduce over 4 lanes. Each token's quantised quads
-        // land as one word each. A dead group is skipped outright
-        // (warp-uniform); a masked token inside a live group reads as 0 —
-        // its column's score is forced to -inf below, so its int8 row is
-        // never read.
-        {
-            const int kg = warp;
-            const uint32_t klive = grp_mask(tg.desc[kg]);
-            if (klive != 0u) {
-                // The first live token: a group at the head of a slice
-                // whose offset falls inside it has leading masked tokens,
-                // and those sit before the table's first row.
-                const int j0 = __ffs(klive) - 1;
-                const int rope0 = tg.rope0[kg] + j0;
-                const int dA0 = ROPE_INTERLEAVED ? 8 * lane : 4 * lane;
-                const int dB0 = ROPE_INTERLEAVED ? dA0 + 4 : dA0 + HEAD_DIM / 2;
-                float rc[4], rs[4], dc[4], ds[4];
-                auto load_rope = [&]() {
-                    const float4* e = reinterpret_cast<const float4*>(
-                        rope_cs + (int64_t)rope0 * HEAD_DIM + 8 * lane);
-                    const float4* d = reinterpret_cast<const float4*>(rope_cs + HEAD_DIM + 8 * lane);
-                    const float4 c0 = __ldg(e), c1 = __ldg(e + 1);
-                    const float4 s0 = __ldg(d), s1 = __ldg(d + 1);
-                    rc[0] = c0.x; rs[0] = c0.y; rc[1] = c0.z; rs[1] = c0.w;
-                    rc[2] = c1.x; rs[2] = c1.y; rc[3] = c1.z; rs[3] = c1.w;
-                    dc[0] = s0.x; ds[0] = s0.y; dc[1] = s0.z; ds[1] = s0.w;
-                    dc[2] = s1.x; ds[2] = s1.y; dc[3] = s1.z; ds[3] = s1.w;
-                };
-                const int kgi[2] = { kg, kg };
-                const int kd0[2] = { dA0, dB0 };
-                float x[2][4][GROUP_TOK];
-                QuadInfo kq[2];
-                const bool kfast = tile_quads_probe<HEAD_DIM, 4>(ext, tg, s_tbl, 0, kgi, kd0, kq);
-                if (__builtin_expect(__all_sync(0xffffffffu, kfast), 1)) {
-                    load_rope();
-                    tile_quads_vec<HEAD_DIM>(ext, kq, 0, kgi, x);
-                } else {
-                    // The block path stages the group's dims over its own
-                    // K rows and the staging slab rows of the same index;
-                    // both are this warp's alone until the K barrier.
-                    uint8_t* stg_lo = s_arena + OFF_K8 + kg * 4 * HEAD_DIM;
-                    uint8_t* stg_hi = s_arena + OFF_KSTG + kg * 4 * HEAD_DIM;
-                    tile_k_block_decode<HEAD_DIM>(ext, s_inv + (kg * 2) * HEAD_DIM, kg,
-                                                  grp_within(tg.desc[kg]), lane, stg_lo, stg_hi);
-                    __syncwarp();
-                    load_rope();
-                    tile_k_stage_read<HEAD_DIM>(stg_lo, stg_hi, dA0, x[0]);
-                    tile_k_stage_read<HEAD_DIM>(stg_lo, stg_hi, dB0, x[1]);
-                    __syncwarp();
+            // The ninth quad's tables, by warp 0 from the words its staging
+            // left in s_map, whenever the slot is live (block-uniform: the
+            // descriptor was committed before the previous tile's last
+            // barrier, or in the prologue).
+            if (warp == 0 && grp_mask(tg.desc[TILE_GROUPS]) != 0u)
+                build_tables(TILE_GROUPS, s_map[TILE_GROUPS][mw_side][mw_word]);
+            if (tid == 0) {
+                s_colmask = 0u;
+                // Two tiles ahead: the slice header tile t + 2's walk starts
+                // from, into the slot tile t + 1's look-ahead reads. Waited
+                // for before this tile's mid barrier, which publishes it.
+                int ps = -1;
+                if (!qsa_on && t + 2 < n_tiles && t + 2 < WIN_TABLE) {
+                    const int ws = (int)s_win_slice[t + 2];
+                    if (ws != 0xffff) ps = ws;
                 }
-                #pragma unroll
-                for (int j = 0; j < GROUP_TOK; ++j) {
-                    // Step the angle past every token from the first live
-                    // one on, masked or not, so (rc, rs) is token j's.
-                    if (j > 0 && j > j0) {
-                        #pragma unroll
-                        for (int i = 0; i < 4; ++i) {
-                            const float c = rc[i] * dc[i] - rs[i] * ds[i];
-                            rs[i] = rs[i] * dc[i] + rc[i] * ds[i];
-                            rc[i] = c;
-                        }
-                    }
-                    if (!((klive >> j) & 1u)) continue;   // warp-uniform
-                    const int tok = kg * GROUP_TOK + j;
-                    // r[0..3] is quad A rotated, r[4..7] quad B.
-                    float r[8];
-                    #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        const float c = rc[i], s = rs[i];
-                        float lo, hi;
-                        if constexpr (ROPE_INTERLEAVED) {
-                            lo = (i < 2) ? x[0][2 * i][j] : x[1][2 * i - 4][j];
-                            hi = (i < 2) ? x[0][2 * i + 1][j] : x[1][2 * i - 3][j];
-                        } else {
-                            lo = x[0][i][j];
-                            hi = x[1][i][j];
-                        }
-                        const float ra = lo * c - hi * s;
-                        const float rb = lo * s + hi * c;
-                        if constexpr (ROPE_INTERLEAVED) { r[2 * i] = ra; r[2 * i + 1] = rb; }
-                        else { r[i] = ra; r[4 + i] = rb; }
-                    }
-                    float aA = fmaxf(fmaxf(fabsf(r[0]), fabsf(r[1])), fmaxf(fabsf(r[2]), fabsf(r[3])));
-                    float aB = fmaxf(fmaxf(fabsf(r[4]), fabsf(r[5])), fmaxf(fabsf(r[6]), fabsf(r[7])));
-                    if constexpr (ROPE_INTERLEAVED) {
-                        aA = fmaxf(aA, aB);
-                        aA = fmaxf(aA, __shfl_xor_sync(0xffffffffu, aA, 1));
-                        aA = fmaxf(aA, __shfl_xor_sync(0xffffffffu, aA, 2));
-                        aB = aA;
-                    } else {
-                        #pragma unroll
-                        for (int off = 1; off < 8; off <<= 1) {
-                            aA = fmaxf(aA, __shfl_xor_sync(0xffffffffu, aA, off));
-                            aB = fmaxf(aB, __shfl_xor_sync(0xffffffffu, aB, off));
-                        }
-                    }
-                    const float scaleA = aA / 127.f;
-                    const float scaleB = aB / 127.f;
-                    const float invA = (scaleA > 0.f) ? 1.f / scaleA : 0.f;
-                    const float invB = (scaleB > 0.f) ? 1.f / scaleB : 0.f;
-                    const float qa[4] = { r[0], r[1], r[2], r[3] };
-                    const float qb[4] = { r[4], r[5], r[6], r[7] };
-                    const uint32_t wa = i8_pack4(qa, invA);
-                    const uint32_t wb = i8_pack4(qb, invB);
-                    if constexpr (ROPE_INTERLEAVED) {
-                        *(uint2*)(s_k8 + sw_off<HEAD_DIM>(tok, dA0)) = make_uint2(wa, wb);
-                        if ((lane & 3) == 0) s_k_scale[tok][lane >> 2] = __float2half(scaleA);
-                    } else {
-                        *(uint32_t*)(s_k8 + sw_off<HEAD_DIM>(tok, dA0)) = wa;
-                        *(uint32_t*)(s_k8 + sw_off<HEAD_DIM>(tok, dB0)) = wb;
-                        if ((lane & 7) == 0) {
-                            s_k_scale[tok][lane >> 3] = __float2half(scaleA);
-                            s_k_scale[tok][(HEAD_DIM / 2 / 32) + (lane >> 3)] = __float2half(scaleB);
-                        }
-                    }
+                s_hdr_pre_slice[t & 1] = ps;
+                if (ps >= 0) {
+                    tile_cp_async_16(&s_hdr_pre[t & 1],
+                                     get_slice<HEAD_DIM>(slices_ptr, ps, n_kv_head));
+                    cp_async_commit<true>();
                 }
             }
         }
+        __syncthreads(); // publishes the rank tables
+        // Whether the ninth slot is live this tile (block-uniform: committed
+        // before the previous tile's last barrier, or in the prologue). The
+        // V side and warp 0's second K round key on it, so an eight-quad
+        // tile runs code with no trace of the slot.
+        const bool has8 = grp_mask(tg.desc[TILE_GROUPS]) != 0u;
+
+        // K lower-half staging: on a single-pass tile whose group's K is a
+        // narrow dtype under a band map (`k_stg_esz`, decided a tile ahead
+        // by `stage_k_ahead` from the descriptors in registers), the warp
+        // copies its group's four rows of dims [0, HEAD_DIM/2) into its span
+        // of the slab now with cp.async, and the decode reads quad A from
+        // them once the rope rows and quad B's global load are in flight.
+        // Half the K bytes' latency then sits under the tile's staging and
+        // table work rather than at the head of the decode.
+        uint8_t* k_raw = nullptr;
+        if (k_stg_esz > 0 && n_pass == 1) {
+            k_raw = s_arena + OFF_KSTG + warp * (GROUP_TOK * HEAD_DIM);
+            const int within = grp_within(tg.desc[warp]);
+            const int row = (HEAD_DIM / 2) * k_stg_esz;   // a token's lower half, bytes
+            const int ch = row / 16;                      // its 16-byte chunks
+            #pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int q = lane + WARP_SIZE * r;
+                if (q < GROUP_TOK * ch) {
+                    const int j = q / ch, cq = q % ch;
+                    const int p = cq / (ch / 2);          // palette 0 or 1
+                    const int off = (cq % (ch / 2)) * 16;
+                    const char* src = ext.gbase[warp][0][p]
+                                      + (int64_t)(within + j) * SUB * k_stg_esz + off;
+                    tile_cp_async_16(k_raw + j * row + cq * 16, src);
+                }
+            }
+            cp_async_commit<true>();
+        }
+
+        // ------------------------------------------------------------------
+        // K decode, and the multi-pass window. A single-pass tile (every
+        // window without a hole off the 4-grid inside it) is one trip of
+        // sweep 1 with its groups already staged: the K decode and nothing
+        // else. A multi-pass window (n_pass > 1) does not fit one set of
+        // group slots, so its passes are published here one at a time, and
+        // the tile's regular body runs the last. What makes the passes ONE
+        // tile numerically is that they share the softmax (the K rows of
+        // every pass sit in their own columns of the K slab when the body's
+        // QK runs, and the column mask accumulates in s_colmask) and the V
+        // scale (every pass's per-dim absmax folds into the tile's absmax
+        // buffer before any pass's V is quantised, so the body's block path
+        // quantises the last pass against the window's maximum and sweep 2
+        // quantises the earlier ones against the same). The V side takes
+        // the block path throughout — its absmax is an atomic fold into
+        // that buffer, which is what lets it span passes.
+        //
+        // Slow, exposed and serial by design: a pass costs a synchronous
+        // stage, and the earlier passes' V rows are decoded twice (absmax,
+        // then quantise). A window off the 4-grid — every window after a
+        // section sealed mid-quad, until the next boundary — spans nine
+        // quads and fits one pass through slot TILE_GROUPS; only a window
+        // with two holes inside it (more than TILE_SLOTS quads) comes here.
+        // ------------------------------------------------------------------
+        int* vabs_mp = s_vabs + (tile_no & 1) * HEAD_DIM;
+        // Publish pass p's groups into this tile's descriptor buffer and
+        // tables, and fold its columns into the tile's mask.
+        auto publish = [&](int p) {
+            const GroupInfo g = group_info(t, p * TILE_GROUPS + warp, false);
+            if (stager) {
+                NextTile w;
+                desc_of(g, st_side, st_p, w);
+                w.ngroups = tg.n_groups;
+                commit_desc(cur, st_g, st_side, st_p, w);
+                if (st_side == 0 && st_p == 0)
+                    atomicOr(&s_colmask, grp_cols(grp_mask(w.desc), w.col0));
+            }
+            const uint32_t word = map_word_of(g, mw_side, mw_word);
+            __syncthreads();   // the previous pass's readers are done with the tables
+            build_tables(warp, word);
+            mw = word;
+            __syncthreads();
+        };
+        auto v_live = [&]() -> uint32_t {
+            const bool l = lane < TILE_SLOTS && grp_mask(tg.desc[lane]) != 0u;
+            return __ballot_sync(0xffffffffu, l);
+        };
+        // Sweep 1: every pass's K rows and V absmax. The K decode's one site.
+        for (int p = 0; p < n_pass; ++p) {
+            if (n_pass > 1) publish(p);
+            tile_k_decode<HEAD_DIM, ROPE_INTERLEAVED>(ext, tg, s_tbl, s_inv, s_arena + OFF_KSTG,
+                                                      warp, s_k8, s_k_scale, rope_cs, warp, lane,
+                                                      k_raw);
+            // The ninth quad (slot TILE_GROUPS, live only on a single-pass
+            // nine-quad window): warp 0's second round, through its own
+            // staging span, from the group's spans — a dead slot returns at
+            // once.
+            if (warp == 0 && n_pass == 1 && has8)
+                tile_k_decode<HEAD_DIM, ROPE_INTERLEAVED>(ext, tg, s_tbl, s_inv, s_arena + OFF_KSTG,
+                                                          0, s_k8, s_k_scale, rope_cs, TILE_GROUPS,
+                                                          lane, nullptr);
+            if (n_pass > 1) {
+                if (warp >= TILE_SM_WARPS) {
+                    const int vw = warp - TILE_SM_WARPS;
+                    const uint32_t live_g = v_live();
+                    uint32_t wt[TILE_SLOTS][GROUP_TOK / 2];
+                    tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw, lane, wt);
+                    tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw,
+                                                  lane + WARP_SIZE, wt);
+                }
+                __syncthreads();
+            }
+        }
+        if (n_pass > 1) {
+            // Sweep 2: the earlier passes' V rows, quantised against the
+            // window's absmax. The last pass is the body's: its groups are
+            // published and go out as the tile's.
+            for (int p = 0; p < n_pass; ++p) {
+                publish(p);
+                if (p + 1 == n_pass) break;
+                if (warp >= TILE_SM_WARPS) {
+                    const int vw = warp - TILE_SM_WARPS;
+                    const uint32_t live_g = v_live();
+                    uint32_t w0[TILE_SLOTS][GROUP_TOK / 2], w1[TILE_SLOTS][GROUP_TOK / 2];
+                    tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw, lane, w0);
+                    tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw,
+                                                  lane + WARP_SIZE, w1);
+                    tile_v_block_quantise<HEAD_DIM, TILE_GROUPS>(w0, tg, s_inv, vabs_mp, s_v8t, vw, lane);
+                    tile_v_block_quantise<HEAD_DIM, TILE_GROUPS>(w1, tg, s_inv, vabs_mp, s_v8t, vw,
+                                                    lane + WARP_SIZE);
+                }
+                __syncthreads();
+            }
+        }
+
+        // The header prefetch has landed by now; wait so the mid barrier
+        // publishes it (the K staging's copies were waited for in the
+        // decode, by the warp that reads them).
+        if (tid == 0) cp_async_wait<0, true>();
+        __syncwarp();
 
         // The group's K rows are stored: the V warps mark them published
         // without waiting (the softmax warps wait below, after their own
@@ -1666,6 +2461,21 @@ int8_decode_tile_kernel(
         // riding through the V decode and the softmax.
         stage_prefetch(nx);
         stage_commit(nxt, nx);
+        // Reconverge before the split. The prefetch and the commit run on
+        // the stager lanes alone, in loops of per-lane length, and the
+        // other lanes are free to run ahead without them: a warp that
+        // arrives here diverged stays diverged through the whole V side,
+        // which has no full-warp barrier before the tile's last one, and
+        // issues every V instruction once per fragment (measured: 16
+        // active lanes per V-side instruction, the phase at twice its
+        // instruction count, every shuffle through the collective slow
+        // path). The softmax warps reconverge at their K barrier below.
+        __syncwarp();
+        // Decide the next tile's K staging from its descriptors, in registers.
+        k_stg_esz = (t + 1 < n_tiles) ? stage_k_ahead(nx) : 0;
+        // The next tile's ninth quad, if it has one, into the buffer this
+        // commit just filled (tid 0 holds the next tile's quad count).
+        if (warp == 0) stage_slot8(t + 1, nxt, __shfl_sync(0xffffffffu, nx.ngroups, 0), true);
 
         // The tile's middle splits the block two ways: warps 0..3 run QK
         // and the softmax, warps 4..7 read and quantise V at the same
@@ -1714,9 +2524,12 @@ int8_decode_tile_kernel(
                 s[1][0] += (float)d_i[2] * qs1 * ks0;
                 s[1][1] += (float)d_i[3] * qs1 * ks1;
             }
-            uint32_t mask = 0u;
+            // The window's live columns. A multi-pass tile's earlier passes
+            // left theirs in s_colmask; this pass's groups add their own.
+            uint32_t mask = s_colmask;
             #pragma unroll
-            for (int gi = 0; gi < TILE_GROUPS; ++gi) mask |= grp_mask(tg.desc[gi]) << (gi * GROUP_TOK);
+            for (int gi = 0; gi < TILE_SLOTS; ++gi)
+                mask |= grp_cols(grp_mask(tg.desc[gi]), (int)tg.col0[gi]);
             const int c = ns * 8 + n0;
             const bool live0 = (mask >> c) & 1u;
             const bool live1 = (mask >> (c + 1)) & 1u;
@@ -1743,11 +2556,7 @@ int8_decode_tile_kernel(
                 float ls = p0 + p1;
                 ls += __shfl_xor_sync(0xffffffffu, ls, 1);
                 ls += __shfl_xor_sync(0xffffffffu, ls, 2);
-                const int q0 = __float2int_rn(p0 * 127.f);
-                const int q1 = __float2int_rn(p1 * 127.f);
-                uint32_t w;
-                asm("cvt.pack.sat.s8.s32.b32 %0, %1, %2, 0;" : "=r"(w) : "r"(q1), "r"(q0));
-                *(uint16_t*)(s_p8 + sw_off<TILE_TOK>(r, c)) = (uint16_t)w;
+                *(uint16_t*)(s_p8 + sw_off<TILE_TOK>(r, c)) = (uint16_t)i8_pack2(p0, p1, 127.f);
                 if ((lane & 3) == 0) {
                     s_lsum[r][ns] = ls;
                     if (warp == 0) s_alpha[r] = alpha;
@@ -1779,7 +2588,25 @@ int8_decode_tile_kernel(
             const int vg0 = 2 * vq;
             const int vgi[2] = { vg0, vg0 + 1 };
             const auto win_d0 = [&](int h) { return (vw * V_WPW + h) * 32 + (lane & 7) * 4; };
-            const auto v_quantise = [&](const float (&v)[2][4][GROUP_TOK], int vd0) {
+            // Every live group of the tile at its slot's columns 4·g — the
+            // packed layout, and every window without a hole inside it. One
+            // vote per tile (lane g judges group g) picks `v_quantise`'s
+            // store path below.
+            bool lane_slotted = true;
+            if (lane < TILE_SLOTS) {
+                const uint32_t lm = grp_mask(tg.desc[lane]);
+                lane_slotted = lm == 0u || (lm == 15u && (int)tg.col0[lane] == lane * GROUP_TOK);
+            }
+            const bool slotted = __all_sync(0xffffffffu, lane_slotted);
+            __syncwarp();
+            // `v8` is this lane-octet's token of the ninth quad (zero when the
+            // slot is dead or the token masked, so an eight-quad window's
+            // arithmetic is untouched); `tok8` says it is live and stores.
+            // `ninth` (a std::bool_constant) selects the nine-slot body: an
+            // eight-quad tile's instantiation never touches v8 or tok8.
+            const auto v_quantise = [&](auto ninth, const float (&v)[2][4][GROUP_TOK],
+                                        const float (&v8)[4], bool tok8, int vd0) {
+                constexpr bool NINTH = decltype(ninth)::value;
                 float scale[4], inv[4];
                 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
@@ -1788,24 +2615,81 @@ int8_decode_tile_kernel(
                     for (int gg = 0; gg < 2; ++gg)
                         #pragma unroll
                         for (int j = 0; j < GROUP_TOK; ++j) a = fmaxf(a, fabsf(v[gg][k][j]));
+                    if constexpr (NINTH) a = fmaxf(a, fabsf(v8[k]));
                     a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 8));
                     a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 16));
                     scale[k] = a / 127.f;
                     inv[k] = (scale[k] > 0.f) ? 1.f / scale[k] : 0.f;
                 }
-                // One swizzled address per lane, the eight words at
-                // immediate offsets from it: vd0 is a multiple of 4, so the
-                // four dim rows share a swizzle key, and the two groups'
-                // columns sit inside one 16-byte chunk. Spelled as eight
-                // sw_off calls the compiler hoists eight loop-invariant
-                // addresses out of the tile loop and spills six of them.
-                int8_t* vrow = s_v8t + sw_off<TILE_TOK>(vd0, vg0 * GROUP_TOK);
+                // A group's four tokens go to its own columns. A whole,
+                // 4-aligned group is one word per dim row — one swizzled
+                // address, the four rows at immediate offsets (vd0 is a
+                // multiple of 4, so they share a swizzle key). A group that is
+                // partial or off the 4-grid — a quad at either side of a hole,
+                // or at the window's edge — stores its live tokens a byte at a
+                // time: its word would cover a neighbour's columns. A dead
+                // group has no columns and stores nothing.
+                //
+                // The eight words are quantised ONCE, before any branch —
+                // the paths below differ only in where they store. (Written
+                // per branch, NVCC materialised the quantisation twice on the
+                // taken path.)
+                uint32_t w[2][4];
                 #pragma unroll
                 for (int gg = 0; gg < 2; ++gg)
                     #pragma unroll
-                    for (int k = 0; k < 4; ++k)
-                        *(uint32_t*)(vrow + k * TILE_TOK + gg * GROUP_TOK) =
-                            i8_pack4(v[gg][k], inv[k]);
+                    for (int k = 0; k < 4; ++k) w[gg][k] = i8_pack4(v[gg][k], inv[k]);
+                // The ninth quad's token: a byte per dim row at its own
+                // column (its quad straddles the window's edge, so it is
+                // never a slotted word). The same code as the packed bytes.
+                if constexpr (NINTH) {
+                    if (tok8) {
+                        const int c8 = (int)tg.col0[TILE_GROUPS] + vq;
+                        #pragma unroll
+                        for (int k = 0; k < 4; ++k)
+                            s_v8t[sw_off<TILE_TOK>(vd0 + k, c8)] = i8_quant(v8[k], inv[k]);
+                    }
+                }
+                // `slotted` (a vote per tile, below) says every live group of
+                // the tile sits at its slot's columns 4·g — the packed layout,
+                // and every window without a hole inside it. That is the
+                // straight-line path: one address per lane and eight words,
+                // no branch per group; a dead group's words land in columns
+                // the mask retires, as they always have.
+                if (slotted) {
+                    int8_t* vrow = s_v8t + sw_off<TILE_TOK>(vd0, vg0 * GROUP_TOK);
+                    #pragma unroll
+                    for (int gg = 0; gg < 2; ++gg)
+                        #pragma unroll
+                        for (int k = 0; k < 4; ++k)
+                            *(uint32_t*)(vrow + k * TILE_TOK + gg * GROUP_TOK) = w[gg][k];
+                } else {
+                    #pragma unroll
+                    for (int gg = 0; gg < 2; ++gg) {
+                        const int g = vg0 + gg;
+                        const uint32_t lv = grp_mask(tg.desc[g]);
+                        if (lv == 0u) continue;
+                        const int c0 = (int)tg.col0[g];
+                        if (lv == 15u && (c0 & 3) == 0) {
+                            int8_t* vrow = s_v8t + sw_off<TILE_TOK>(vd0, c0);
+                            #pragma unroll
+                            for (int k = 0; k < 4; ++k)
+                                *(uint32_t*)(vrow + k * TILE_TOK) = w[gg][k];
+                        } else {
+                            // The live tokens' bytes out of the packed word
+                            // (token j is byte j): its word would cover a
+                            // neighbour's columns.
+                            #pragma unroll
+                            for (int j = 0; j < GROUP_TOK; ++j) {
+                                if (!((lv >> j) & 1u)) continue;
+                                #pragma unroll
+                                for (int k = 0; k < 4; ++k)
+                                    s_v8t[sw_off<TILE_TOK>(vd0 + k, c0 + j)] =
+                                        (int8_t)((w[gg][k] >> (8 * j)) & 0xffu);
+                            }
+                        }
+                    }
+                }
                 if (vq == 0) {
                     const __half2 s01 = __floats2half2_rn(scale[0], scale[1]);
                     const __half2 s23 = __floats2half2_rn(scale[2], scale[3]);
@@ -1831,7 +2715,7 @@ int8_decode_tile_kernel(
             // rather than eight groups' worth per lane.
             static_assert(TILE_GROUPS <= WARP_SIZE, "a lane per group");
             bool lane_live = false, lane_vec = true;
-            if (lane < TILE_GROUPS) {
+            if (lane < TILE_SLOTS) {
                 lane_live = grp_mask(tg.desc[lane]) != 0u;
                 const uint32_t f4 = *reinterpret_cast<const uint32_t*>(&ext.fmt[lane][1][0]);
                 bool narrow = s_band[lane][1] != 0;
@@ -1841,7 +2725,13 @@ int8_decode_tile_kernel(
                 lane_vec = !lane_live || narrow;
             }
             const uint32_t live_g = __ballot_sync(0xffffffffu, lane_live);
-            const bool vec = __all_sync(0xffffffffu, lane_vec);
+            // A multi-pass tile takes the block path whatever its formats:
+            // its V scale is the window's absmax, folded across the passes
+            // through the absmax buffer, and only the block path scales
+            // through that buffer. (The vote runs first — it is collective.)
+            const bool vec_all = __all_sync(0xffffffffu, lane_vec);
+            const bool vec = vec_all && n_pass == 1;
+            __syncwarp();
             if (vec) {
                 // The windows are software-pipelined one deep: window
                 // h+1's loads go out once window h's words are converted
@@ -1859,48 +2749,55 @@ int8_decode_tile_kernel(
                 }
                 QuadRaw<2> raw;
                 if (vw * V_WPW < N_WIN) tile_quads_vec_load<HEAD_DIM>(ext, q[0], 1, vgi, raw);
-                #pragma unroll
-                for (int h = 0; h < V_WPW; ++h) {
-                    if (vw * V_WPW + h < N_WIN) {
-                        float v[2][4][GROUP_TOK];
-                        tile_quads_vec_cvt(raw, 1, v);
-                        if (h + 1 < V_WPW && vw * V_WPW + h + 1 < N_WIN)
-                            tile_quads_vec_load<HEAD_DIM>(ext, q[h + 1], 1, vgi, raw);
-                        v_quantise(v, win_d0(h));
+                // Two instantiations of the window loop under the tile's
+                // block-uniform ninth-slot flag: a nine-quad tile reads this
+                // lane-octet's token of the ninth quad (token vq of slot
+                // TILE_GROUPS) each window; an eight-quad tile runs the loop
+                // with no trace of it. Within each, the ninth-token array is
+                // written on every path (under a runtime predicate it would
+                // go to local memory for the whole kernel — 1.5 KB of spills
+                // at the gate).
+                if (has8) {
+                    const bool tok8 = ((grp_mask(tg.desc[TILE_GROUPS]) >> vq) & 1u) != 0u;
+                    #pragma unroll
+                    for (int h = 0; h < V_WPW; ++h) {
+                        if (vw * V_WPW + h < N_WIN) {
+                            float v8[4];
+                            tile_quad_vec_token<HEAD_DIM, 2>(ext, tg, s_tbl, 1, TILE_GROUPS,
+                                                             win_d0(h), vq, v8);
+                            float v[2][4][GROUP_TOK];
+                            tile_quads_vec_cvt(raw, 1, v);
+                            if (h + 1 < V_WPW && vw * V_WPW + h + 1 < N_WIN)
+                                tile_quads_vec_load<HEAD_DIM>(ext, q[h + 1], 1, vgi, raw);
+                            v_quantise(std::true_type{}, v, v8, tok8, win_d0(h));
+                        }
+                    }
+                } else {
+                    #pragma unroll
+                    for (int h = 0; h < V_WPW; ++h) {
+                        if (vw * V_WPW + h < N_WIN) {
+                            float v[2][4][GROUP_TOK];
+                            tile_quads_vec_cvt(raw, 1, v);
+                            if (h + 1 < V_WPW && vw * V_WPW + h + 1 < N_WIN)
+                                tile_quads_vec_load<HEAD_DIM>(ext, q[h + 1], 1, vgi, raw);
+                            const float v8[4] = { 0.f, 0.f, 0.f, 0.f };
+                            v_quantise(std::false_type{}, v, v8, false, win_d0(h));
+                        }
                     }
                 }
             } else {
-                // Block path: warp = palette vw, a lane the ranks lane and
-                // lane + 32. The two slots decode through one copy of the
-                // format bodies (the loop is not unrolled), their words
-                // kept apart by a select; the tile absmax is complete once
-                // every V warp is at the V barrier, which orders the
-                // atomics before the reads.
+                // Block path (`tile_v_block_path`): the nine-slot or the
+                // eight-slot instantiation under the tile's uniform flag.
                 static_assert(TILE_V_WARPS == N_PALETTE, "a V warp per palette");
                 static_assert(HEAD_DIM / N_PALETTE == 2 * WARP_SIZE, "two ranks per lane");
-                uint32_t w0[TILE_GROUPS][GROUP_TOK / 2], w1[TILE_GROUPS][GROUP_TOK / 2];
+                if (has8) tile_v_block_path<HEAD_DIM, TILE_SLOTS>(ext, tg, s_inv, vabs, live_g, vw, lane, s_v8t);
+                else      tile_v_block_path<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs, live_g, vw, lane, s_v8t);
                 #pragma unroll
-                for (int gg = 0; gg < TILE_GROUPS; ++gg)
-                    #pragma unroll
-                    for (int h = 0; h < GROUP_TOK / 2; ++h) w0[gg][h] = 0u;
-                #pragma unroll 1
-                for (int s = 0; s < 2; ++s) {
-                    uint32_t wt[TILE_GROUPS][GROUP_TOK / 2];
-                    tile_v_block_decode<HEAD_DIM>(ext, tg, s_inv, vabs, live_g, vw, lane + WARP_SIZE * s, wt);
-                    #pragma unroll
-                    for (int gg = 0; gg < TILE_GROUPS; ++gg)
-                        #pragma unroll
-                        for (int h = 0; h < GROUP_TOK / 2; ++h) {
-                            w0[gg][h] = (s == 0) ? wt[gg][h] : w0[gg][h];
-                            w1[gg][h] = wt[gg][h];
-                        }
-                }
-                asm volatile("bar.sync %0, %1;" :: "n"(TILE_VABS_BARRIER), "n"(TILE_V_WARPS * WARP_SIZE) : "memory");
-                tile_v_block_quantise<HEAD_DIM>(w0, s_inv, vabs, s_v8t, vw, lane);
-                tile_v_block_quantise<HEAD_DIM>(w1, s_inv, vabs, s_v8t, vw, lane + WARP_SIZE);
-                #pragma unroll
+                // `a / 127`, as the vector path stores it — not `a · (1/127)`,
+                // which rounds differently and would give a multi-pass tile a
+                // different PV scale from its single-pass equivalent.
                 for (int d = vt; d < HEAD_DIM; d += TILE_V_WARPS * WARP_SIZE)
-                    s_v_scale[d] = __float2half(__int_as_float(vabs[d]) * (1.f / 127.f));
+                    s_v_scale[d] = __float2half(__int_as_float(vabs[d]) / 127.f);
             }
         }
         // Publishes the P and V slabs (and the next tile's descriptors,

@@ -111,14 +111,13 @@ impl StencilSession {
     /// `</think>` as a static), so suppression alone doesn't distinguish the
     /// cases — what does is the walk AFTER the span: a chain of statics
     /// running to `End` means the block is closing here, while any further
-    /// free/branch content means the steering re-opens reasoning (a
-    /// deep/exhaustive "But wait, " continuation) and the injected
-    /// continuation phrase — not a closing statement — is the bridge.
+    /// free/branch content means more decoding follows and a bare close is
+    /// the right forced token.
     ///
-    /// Anywhere else — a continuation span, a span that consumes its own
-    /// close token (tool-call values), or a cursor not in free text at all
-    /// (static prefill, a branch decision) — this is false and a forced close
-    /// stays bare.
+    /// Anywhere else — a span that retires into further content, a span that
+    /// consumes its own close token (tool-call values), or a cursor not in
+    /// free text at all (static prefill, a branch decision) — this is false
+    /// and a forced close stays bare.
     pub fn in_terminal_close_span(&self) -> bool {
         let Cursor::InFreeText { node, .. } = self.cursor else {
             return false;

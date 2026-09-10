@@ -618,9 +618,6 @@ struct YamlGroup {
     /// Selection policy override; inherits the enclosing layer's when absent.
     #[serde(default)]
     policy: Option<YamlPolicy>,
-    /// Fallback member (by tag) when selection is empty.
-    #[serde(default)]
-    default: Option<YamlSelectionDefault>,
     /// Concept B: mass-driven member-budget extension.
     #[serde(default)]
     budget_adaptive: Option<YamlMemberBudgetAdaptive>,
@@ -1010,7 +1007,6 @@ fn build(
                 policy: group_policy,
                 policy_band_declared,
                 budget: group_budget,
-                default: parse_default(yg.default.as_ref()),
                 budget_adaptive: parse_member_budget_adaptive(&yg.id, yg.budget_adaptive.as_ref())?,
                 locality: parse_locality(&yg.id, yg.locality.as_ref())?,
                 anchor: parse_anchor(&yg.id, yg.anchor.as_ref())?,

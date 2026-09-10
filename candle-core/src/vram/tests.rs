@@ -710,7 +710,26 @@ mod real_cuda {
 
     /// Force the full touch-balloon (bypassing run_balloon's fast-path skip) to
     /// measure the real claim throughput and confirm it evicts + recovers.
+    ///
+    /// **`#[ignore]` because it claims the WHOLE card, and `GPU_LOCK` cannot
+    /// protect that.** The lock above is private to this module, so it serializes
+    /// these three tests against each other and against nothing else — while
+    /// `cargo test` runs this crate's ~90 other CUDA tests on parallel threads,
+    /// every one of them free to allocate. A balloon that takes the entire device
+    /// has no coexistence story with any of them: the recovery assertion then
+    /// measures whoever else was holding memory at that instant, and blames the
+    /// balloon. Observed failing at `71395MiB -> 14173MiB` on a run where it had
+    /// passed minutes earlier with nothing changed — the "a different test fails
+    /// each run" signature.
+    ///
+    /// Run it deliberately, where the card is actually idle:
+    ///
+    /// ```text
+    /// cargo test -p candle-core --features cuda --lib -- --ignored --test-threads=1 \
+    ///     real_cuda_full_balloon_throughput
+    /// ```
     #[test]
+    #[ignore = "claims the entire card; needs --test-threads=1 and an otherwise idle device"]
     fn real_cuda_full_balloon_throughput() -> Result<()> {
         let Some(device) = cuda_device() else {
             return Ok(());

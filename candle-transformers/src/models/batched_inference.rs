@@ -2842,6 +2842,7 @@ impl BatchedInferenceSession {
                     .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_per_layer: {e}")))?,
             );
         }
+        assert_sealed_layers_aligned(&out, idx, "snapshot_sequence_per_layer")?;
         Ok(out)
     }
 
@@ -2865,6 +2866,9 @@ impl BatchedInferenceSession {
                     .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_blocks: {e}")))?,
             );
         }
+        // The alignment this method's contract *assumes* of its caller, checked
+        // rather than trusted — see `assert_sealed_layers_aligned`.
+        assert_sealed_layers_aligned(&out, idx, "snapshot_sequence_blocks")?;
         Ok(out)
     }
 
@@ -3915,8 +3919,34 @@ pub trait ManagedBatchedModel {
     /// Unlike [`Self::seal_positional_range`] this spans state that has already
     /// been folded into an injected piece, which is where part of a turn ends
     /// up once a reprojection has re-injected its opening half.
-    fn seal_positional_tail_span(&self, _seq: usize, _tokens: usize) -> Result<Vec<Vec<u8>>> {
+    /// Each blob is paired with the tokens it covers, so a caller can place a
+    /// page in the span without parsing bytes it cannot read.
+    fn seal_positional_tail_span(
+        &self,
+        _seq: usize,
+        _tokens: usize,
+    ) -> Result<Vec<(usize, Vec<u8>)>> {
         Ok(Vec::new())
+    }
+
+    /// Close `seq`'s per-position state on a page boundary, so what it forwards
+    /// next begins a piece the seal can hand over — or drop — on its own.
+    ///
+    /// Called at the edges of a turn's `<think>…</think>` span during decode,
+    /// which is the only moment the cut can be made: the rows for a span are
+    /// pooled by the forward that carries it, and a block pooled across the
+    /// boundary cannot be un-pooled afterwards.
+    ///
+    /// Returns the tokens the closed page covers, `0` when there was nothing to
+    /// close — which is both the no-state case and the already-empty tail. A
+    /// caller that needs to know the boundary actually landed must check it:
+    /// a cut placed after the tokens it was meant to separate closes `0` and
+    /// looks identical to one that was simply not needed.
+    ///
+    /// A no-op for a model that keeps no per-position state, so the caller can
+    /// close unconditionally.
+    fn close_positional_page(&self, _seq: usize) -> Result<usize> {
+        Ok(0)
     }
 
     /// Install a sealed piece ahead of whatever `seq` forwards next — the
@@ -3934,6 +3964,28 @@ pub trait ManagedBatchedModel {
     /// unconditionally.
     fn push_positional_state(&self, _seq: usize, _blob: &[u8]) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Account for `tokens` of injected K/V that carry **no** per-position state.
+    ///
+    /// Advances where the next piece will be placed, and nothing else: the span
+    /// is simply not indexed, which is the truth about it. Queries landing in it
+    /// find no candidates, and every piece after it sits exactly where its K/V
+    /// does.
+    ///
+    /// This used to have to do more. Positions were implied by the widths that
+    /// came before, so a piece injected without its rows slid every later
+    /// piece's start earlier by its own width and queries past it resolved
+    /// through the wrong block — a wrong answer, not a missing one. A zero-row
+    /// page had to stand in to keep the sum honest. Positions are recorded now
+    /// (`IndexPage::roped_base` and the placement it is put at), so there is no
+    /// sum left to keep honest.
+    ///
+    /// Call it wherever [`Self::push_positional_state`] would have been called
+    /// but the piece has nothing to push. A no-op for a model that keeps no
+    /// per-position state, so the caller declares it unconditionally.
+    fn push_positional_gap(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
     }
 
     /// Rebuild any per-sequence index derived from the K/V, after the K/V has
@@ -4761,6 +4813,88 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
     }
 }
 
+/// Refuse a per-layer snapshot whose layers describe different token windows.
+///
+/// **This is the boundary between a recoverable skew and a permanent one.** A
+/// wave that dies mid-sweep leaves the early layers ahead of the rest, and the
+/// engine has repairs for that: `rollback_wave_kv` at the failure,
+/// `heal_tail_divergence` at the next forward entry. Every one of them works on
+/// a *live slot*. Once the skew is sealed it stops being slot state and becomes
+/// substrate state — written per layer, with no cross-layer record — and from
+/// then on every projection that borrows the turn injects the skew into a fresh
+/// slot, on every layer independently. That is why the same divergence appears
+/// at the same chunk index in unrelated sequences: they borrowed the same turn.
+///
+/// It is also past the reach of the repairs. `heal_tail_divergence` covers a
+/// spread of at most one chunk at the tail and clamps at the sealed boundary
+/// besides, so a skew in sealed history reports as unhealable — the forward
+/// fails, the sequence is dropped, and the conversation dies mid-turn with no
+/// way back short of deleting the turn.
+///
+/// Checking here costs one walk of a list the seal has just built, once per
+/// turn, off the hot path. Refusing the seal leaves the live slot intact and
+/// repairable; letting it through does not.
+///
+/// Compares `(offset, token_count)` per chunk — the window geometry, which is
+/// what has to agree. Everything else in a `SealedChunk` (gids, palettes,
+/// scales, formats) is legitimately per-layer.
+fn assert_sealed_layers_aligned(
+    per_layer: &[candle_nn::kv_cache::SealedSequence],
+    idx: usize,
+    site: &str,
+) -> Result<()> {
+    /// One chunk's window geometry: `(offset within the physical chunk, valid
+    /// tokens from it)`. The part of a `SealedChunk` that must agree across
+    /// layers.
+    type Window = (u16, u16);
+
+    let windows = |s: &candle_nn::kv_cache::SealedSequence| -> Vec<Window> {
+        s.chunks.iter().map(|c| (c.offset, c.token_count)).collect()
+    };
+    let Some(first) = per_layer.first().map(windows) else {
+        return Ok(());
+    };
+    let Some(bad) = per_layer.iter().position(|s| windows(s) != first) else {
+        return Ok(());
+    };
+    // Name the chunk and group the layers by what they hold there — a
+    // contiguous prefix means a per-layer loop stopped early, a lone layer
+    // means something special-cases that index, a scatter means an operation
+    // applied per layer under its own predicate. The same legend
+    // `ChunkedKvBacking::first_window_divergence` reports with, because this is
+    // the same fault caught one stage earlier.
+    let other = windows(&per_layer[bad]);
+    let at = (0..first.len().min(other.len()))
+        .find(|&i| first[i] != other[i])
+        .unwrap_or_else(|| first.len().min(other.len()));
+    let mut groups: Vec<(Option<Window>, Vec<usize>)> = Vec::new();
+    for (li, s) in per_layer.iter().enumerate() {
+        let v = windows(s).get(at).copied();
+        match groups.iter_mut().find(|(k, _)| *k == v) {
+            Some((_, ls)) => ls.push(li),
+            None => groups.push((v, vec![li])),
+        }
+    }
+    let split = groups
+        .iter()
+        .map(|(v, ls)| {
+            let held = match v {
+                Some((off, n)) => format!("(offset {off}, {n} tokens)"),
+                None => "no such chunk".to_string(),
+            };
+            format!("{held} on {} layer(s) {:?}", ls.len(), ls)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    candle::bail!(
+        "{site}: refusing to seal sequence {idx} — the layers describe different token \
+         windows, so sealing would persist the skew into the substrate where no repair \
+         can reach it. First difference at chunk {at}: {split}. The live slot is still \
+         intact and repairable; a wave that died mid-sweep is the usual producer, and \
+         its rollback is what should have undone this."
+    )
+}
+
 /// A uniform transformer's half of a wave: the same layer body at every index.
 ///
 /// Everything around it — group assembly, the 1-token reroute, the token
@@ -4785,6 +4919,98 @@ impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
         wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
         self.forward_wave_contexts(session, wave)
+    }
+}
+
+#[cfg(test)]
+mod seal_alignment_tests {
+    use super::assert_sealed_layers_aligned;
+    use candle_nn::kv_cache::{ArenaLocation, HeadGids, SealedChunk, SealedSequence};
+    use std::sync::Arc;
+
+    /// One sealed chunk with the given window geometry; every other field is
+    /// legitimately per-layer and plays no part in the check.
+    fn chunk(offset: u16, token_count: u16) -> SealedChunk {
+        SealedChunk {
+            gids: HeadGids::from_vec(Vec::new()),
+            offset,
+            token_count,
+            k_pal: Arc::new(Vec::new()),
+            v_pal: Arc::new(Vec::new()),
+            k_scale: Arc::new(Vec::new()),
+            v_scale: Arc::new(Vec::new()),
+            k_fmt: Arc::new(Vec::new()),
+            v_fmt: Arc::new(Vec::new()),
+            byte_size: 0,
+            meta: None,
+        }
+    }
+
+    fn layer(windows: &[(u16, u16)]) -> SealedSequence {
+        SealedSequence {
+            chunks: windows.iter().map(|&(o, n)| chunk(o, n)).collect(),
+            token_count: windows.iter().map(|&(_, n)| n as usize).sum(),
+            chunk_size: 32,
+            location: ArenaLocation::Cpu,
+        }
+    }
+
+    /// Layers that agree seal normally — the overwhelmingly common case, and
+    /// the one this must not start refusing.
+    #[test]
+    fn aligned_layers_seal() {
+        let uniform = layer(&[(0, 32), (0, 32), (0, 17)]);
+        let per_layer: Vec<SealedSequence> = (0..13).map(|_| uniform.clone()).collect();
+        assert!(assert_sealed_layers_aligned(&per_layer, 4, "test").is_ok());
+    }
+
+    /// The production signature: a wave died mid-sweep, so a contiguous prefix
+    /// of layers holds a full chunk the rest never got. Sealing this is what
+    /// makes it permanent, so the seal must refuse.
+    #[test]
+    fn a_mid_sweep_skew_is_refused_and_named() {
+        let ahead = layer(&[(0, 32), (0, 32), (0, 32)]);
+        let behind = layer(&[(0, 32), (0, 32), (0, 0)]);
+        let per_layer: Vec<SealedSequence> = (0..13)
+            .map(|li| {
+                if li < 3 {
+                    ahead.clone()
+                } else {
+                    behind.clone()
+                }
+            })
+            .collect();
+
+        let err = assert_sealed_layers_aligned(&per_layer, 18, "test")
+            .expect_err("a per-layer skew must not seal");
+        let msg = err.to_string();
+        // The chunk index and BOTH sides, so the report places the fault
+        // instead of merely asserting one exists.
+        assert!(msg.contains("chunk 2"), "{msg}");
+        assert!(msg.contains("32 tokens"), "{msg}");
+        assert!(msg.contains("0 tokens"), "{msg}");
+        // The layer split is the diagnosis — a contiguous prefix means a
+        // per-layer loop stopped early.
+        assert!(msg.contains("[0, 1, 2]"), "{msg}");
+    }
+
+    /// A layer that is missing the chunk entirely (a shorter list, not just a
+    /// different window) is caught too, and says so rather than panicking on
+    /// the index.
+    #[test]
+    fn a_short_layer_is_refused() {
+        let full = layer(&[(0, 32), (0, 32)]);
+        let short = layer(&[(0, 32)]);
+        let per_layer = vec![full.clone(), full, short];
+        let err = assert_sealed_layers_aligned(&per_layer, 1, "test")
+            .expect_err("a short layer must not seal");
+        assert!(err.to_string().contains("no such chunk"), "{err}");
+    }
+
+    /// No layers at all is not a skew — an empty snapshot seals trivially.
+    #[test]
+    fn an_empty_snapshot_is_fine() {
+        assert!(assert_sealed_layers_aligned(&[], 0, "test").is_ok());
     }
 }
 

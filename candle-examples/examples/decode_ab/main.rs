@@ -34,8 +34,9 @@ use formats::{
 use metrics::Metrics;
 use report::{render_bench, render_golden, BenchRow, GoldenOutcome, GoldenRow};
 use scenarios::{
-    default_scenarios, flash_next_deep_scenarios, flash_next_scenarios, perf_scenarios,
-    select_scenarios, single_decode_scenarios, suite_deep_scenarios, suite_scenarios, Scenario,
+    default_scenarios, flash_next_deep_scenarios, flash_next_holed_scenarios, flash_next_scenarios,
+    perf_scenarios, select_scenarios, single_decode_scenarios, suite_deep_scenarios,
+    suite_scenarios, Scenario,
 };
 
 #[derive(Parser)]
@@ -145,6 +146,7 @@ fn main() -> Result<()> {
                 s.extend(single_decode_scenarios());
                 s.extend(flash_next_scenarios());
                 s.extend(flash_next_deep_scenarios());
+                s.extend(flash_next_holed_scenarios());
                 s
             } else {
                 scenarios.clone()

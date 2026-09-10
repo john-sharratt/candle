@@ -502,10 +502,32 @@ pub fn rewind_row_state(
     // transcription of the pooling — a cache rebuilt by different arithmetic
     // than the one it replaces is a selection that drifts from the wave's. One
     // span, because a rewind restores one sequence.
+    // **The restore is not optional, and appending without it is the bug it
+    // used to hide.** The wave advanced this cache over the WHOLE block; the
+    // re-append then adds the accepted rows on top. Those two are only correct
+    // as a pair — restore first, then append — because the append assumes it is
+    // building on the state the block started from. Skip the restore and the
+    // cache keeps the block's rows *and* gains the accepted ones, so the index
+    // ends exactly `block` tokens past the K/V.
+    //
+    // Measured before this refused: every speculative step left the index 5
+    // ahead of a 5-token block, on a full accept as much as a partial one, and
+    // the surplus rode into the seal as pages covering tokens the turn does not
+    // hold. `qsa_entering` was empty, `get(kv)` returned `None`, and the `if let`
+    // simply moved on. A missing snapshot is a bug in whoever armed the capture,
+    // never something to continue past.
+    let n_caches = caches.len();
     for (kv, cache) in caches.iter_mut().enumerate() {
-        if let Some(snap) = stash.qsa_entering.get(kv) {
-            cache.restore(snap)?;
-        }
+        let snap = stash.qsa_entering.get(kv).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "qwen4exp rewind: no entering index snapshot for KV layer {kv} (the capture \
+                 armed {} of {n_caches} layers) — the wave advanced this cache over the whole \
+                 block and appending the accepted rows without restoring first would leave it \
+                 a block past the K/V",
+                stash.qsa_entering.len(),
+            ))
+        })?;
+        cache.restore(snap)?;
         let ratio = ratios.get(kv).copied().unwrap_or(0);
         if ratio == 0 {
             continue;

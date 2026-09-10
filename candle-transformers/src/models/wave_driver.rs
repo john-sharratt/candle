@@ -201,13 +201,24 @@ pub trait WaveSweep {
                 Ok(())
             };
             if let Err(e) = advance() {
+                // Every layer of every touched row, even past a failure. The
+                // `try_for_each` this replaced stopped at the first error and
+                // discarded it, so an unwind that hit a bad layer left the rows
+                // *before* it truncated and the rest advanced — reproducing, from
+                // the recovery path, the exact per-layer skew the unwind exists to
+                // erase, and saying nothing about it.
                 for c in contexts[..=i].iter_mut() {
                     let off = c.offset;
-                    let _ = c
-                        .kv_caches
-                        .caches
-                        .iter_mut()
-                        .try_for_each(|cache| cache.truncate_to_offset(off));
+                    for (li, cache) in c.kv_caches.caches.iter_mut().enumerate() {
+                        if let Err(te) = cache.truncate_to_offset(off) {
+                            tracing::warn!(
+                                layer = li,
+                                offset = off,
+                                "decode advance unwind: layer truncate failed; continuing \
+                                 so the remaining layers are not left advanced: {te}"
+                            );
+                        }
+                    }
                 }
                 return Err(e);
             }

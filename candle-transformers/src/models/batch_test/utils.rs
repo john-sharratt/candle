@@ -14,6 +14,8 @@ use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::QuantFormat;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
@@ -988,16 +990,53 @@ impl TestParams {
         println!("  - Prompt user length: {} chars", self.prompt_user.len());
         println!("  - Names available: {}", self.names.len());
 
-        // Spawn a background thread that will hard terminate the process after timeout
+        // Hard-terminate the process if this run hangs.
+        //
+        // **The watchdog must be cancellable.** It kills the PROCESS, not the
+        // test, and `#[test]` binaries run many tests in one process — so an
+        // uncancelled timer set by a fast test goes off later and shoots
+        // whichever test happens to be running then. That is not hypothetical:
+        // a whole-suite run of the batched-forward tests died at test 8 of 12
+        // with `exceeded 180 seconds`, which was the budget of test 4 (a 0.5B
+        // model that had long since passed). The report blames the wrong test
+        // and the remaining tests never run at all.
+        //
+        // So the timer checks whether its own run finished before firing.
+        let finished = Arc::new(AtomicBool::new(false));
         let timeout_secs = self.timeout_secs;
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
-            eprintln!(
-                "\n❌ TIMEOUT: Test exceeded {} seconds - forcibly terminating process",
-                timeout_secs
-            );
-            std::process::exit(1);
-        });
+        {
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                // Wake periodically rather than sleeping the whole budget, so a
+                // run that ends early releases the thread promptly instead of
+                // leaving it armed over its successors.
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(timeout_secs);
+                while std::time::Instant::now() < deadline {
+                    if finished.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                if finished.load(Ordering::Relaxed) {
+                    return;
+                }
+                eprintln!(
+                    "\n❌ TIMEOUT: Test exceeded {} seconds - forcibly terminating process",
+                    timeout_secs
+                );
+                std::process::exit(1);
+            });
+        }
+        // Disarms the watchdog however this function leaves — including on the
+        // `?` early-returns below, which a bare set at the end would miss.
+        struct Disarm(Arc<AtomicBool>);
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _disarm = Disarm(Arc::clone(&finished));
 
         let mut results = Vec::new();
 

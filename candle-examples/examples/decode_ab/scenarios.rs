@@ -24,7 +24,19 @@ pub struct Scenario {
     /// Compute dtype of Q / k_new / v_new / output. The kernel typed-dispatch
     /// keys on this (F16 vs BF16/F8E4M3).
     pub compute: DType,
+    /// How the context is laid out in chunks. Empty: one packed prefill —
+    /// every chunk full but the last. Otherwise the segment lengths, summing
+    /// to `ctx_len`: each segment is prefilled on its own, sealed, and injected
+    /// after the previous one, so every segment after the first starts in a
+    /// fresh chunk and a segment that is not a multiple of 32 leaves a hole
+    /// behind it — the layout a projected turn has at every section boundary.
+    /// The FP32 golden is a function of the tokens alone, so a holed layout is
+    /// held to the same reference as the packed one.
+    pub segments: &'static [usize],
 }
+
+/// The packed layout — `segments` of every scenario that does not name one.
+pub const PACKED: &[usize] = &[];
 
 impl Scenario {
     /// Tokens visible to attention after the decode token is scattered.
@@ -44,6 +56,7 @@ impl Scenario {
 pub fn default_scenarios() -> Vec<Scenario> {
     let mut s = all_scenarios();
     s.extend(flash_next_scenarios());
+    s.extend(flash_next_holed_scenarios());
     s
 }
 
@@ -63,6 +76,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── MHA, single partial chunk ───────────────────────────────────
         Scenario {
@@ -74,6 +88,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── GQA 4:1, multi-chunk with partial tail ──────────────────────
         Scenario {
@@ -85,6 +100,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── MQA, deep context ───────────────────────────────────────────
         Scenario {
@@ -96,6 +112,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── GQA 3:1 (Llama-3.2-3B-ish), batched slots ──────────────────
         Scenario {
@@ -107,6 +124,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 8,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── Non-interleaved RoPE (Qwen-style) ───────────────────────────
         Scenario {
@@ -118,6 +136,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: false,
             compute: f16,
+            segments: PACKED,
         },
         // ── head_dim = 256 ─────────────────────────────────────────────
         Scenario {
@@ -129,6 +148,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── BF16 compute path ──────────────────────────────────────────
         Scenario {
@@ -140,6 +160,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: DType::BF16,
+            segments: PACKED,
         },
         // ── Deep context, large batch (throughput-leaning) ─────────────
         Scenario {
@@ -151,6 +172,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 16,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
     ]
 }
@@ -170,7 +192,49 @@ fn flash_next(name: &'static str, ctx: usize, slots: usize) -> Scenario {
         num_slots: slots,
         rope_interleaved: false,
         compute: DType::BF16,
+        segments: PACKED,
     }
+}
+
+/// Flash-Next over a HOLED layout: the same shape, the context laid out as
+/// `segments`, each sealed and injected after the last. See
+/// [`Scenario::segments`].
+fn flash_next_holed(name: &'static str, segments: &'static [usize], slots: usize) -> Scenario {
+    Scenario {
+        segments,
+        ..flash_next(name, segments.iter().sum(), slots)
+    }
+}
+
+/// Flash-Next decode over the layouts a projected turn actually has: sections
+/// sealed mid-chunk, so every boundary leaves a hole — some on the 4-token
+/// quad grid (one pass per window) and some off it (a window taken in passes).
+/// The 1225-token case is the daemon's own system prompt: 38 full chunks and a
+/// 9-token tail, then the user turn in a fresh chunk. These run in the golden
+/// gate against the same FP32 reference as the packed layouts, and in the
+/// bench beside them so a hole's cost is a number.
+pub fn flash_next_holed_scenarios() -> Vec<Scenario> {
+    vec![
+        // One misaligned hole: a window taken in two passes.
+        flash_next_holed("fnh_b1_9_then_500", &[9, 500], 1),
+        // The daemon's split: 1225-token prefix, 14-token user turn.
+        flash_next_holed("fnh_b1_daemon_1225_14", &[1225, 14], 1),
+        // Sections of the sizes a projected prompt carries, holes on and off
+        // the grid.
+        flash_next_holed("fnh_b1_sections", &[480, 9, 320, 7, 96, 25, 1100], 1),
+        // Tiny sections: several holes inside single windows.
+        flash_next_holed("fnh_b1_tiny_sections", &[5, 17, 3, 11, 32, 25, 6, 200], 1),
+        // Batched: eight slots of the daemon's split.
+        flash_next_holed("fnh_b8_daemon_1225_14", &[1225, 14], 8),
+        // Deep, with a hole every ~500 tokens.
+        flash_next_holed(
+            "fnh_b1_8k_holed",
+            &[
+                489, 501, 511, 497, 503, 509, 499, 505, 495, 507, 493, 511, 489, 501, 511, 497, 8,
+            ],
+            1,
+        ),
+    ]
 }
 
 /// Flash-Next at shallow depth: the partial-tail layouts (ctx % 32 ≠ 0), a
@@ -216,6 +280,7 @@ pub fn perf_scenarios() -> Vec<Scenario> {
         num_slots: 8,
         rope_interleaved: true,
         compute: DType::F16,
+        segments: PACKED,
     };
     vec![
         mk("perf_b8_ctx128", 128),
@@ -244,6 +309,7 @@ pub fn single_decode_scenarios() -> Vec<Scenario> {
         num_slots: 1,
         rope_interleaved: true,
         compute: DType::F16,
+        segments: PACKED,
     };
     vec![
         mk("single_ctx4k", 4096),
@@ -271,6 +337,7 @@ pub fn suite_scenarios() -> Vec<Scenario> {
         num_slots: slots,
         rope_interleaved: true,
         compute: DType::F16,
+        segments: PACKED,
     };
     vec![
         // single batch (most grid-starved)
@@ -302,6 +369,7 @@ pub fn suite_deep_scenarios() -> Vec<Scenario> {
         num_slots: slots,
         rope_interleaved: true,
         compute: DType::F16,
+        segments: PACKED,
     };
     vec![
         // deep single-session
@@ -318,6 +386,7 @@ pub fn select_scenarios(filter: &str) -> Result<Vec<Scenario>, String> {
     let mut universe = all_scenarios();
     universe.extend(flash_next_scenarios());
     universe.extend(flash_next_deep_scenarios());
+    universe.extend(flash_next_holed_scenarios());
     universe.extend(perf_scenarios());
     universe.extend(single_decode_scenarios());
     universe.extend(suite_scenarios());

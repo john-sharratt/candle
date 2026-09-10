@@ -79,12 +79,11 @@ pub struct SequenceSamplingState {
     /// the sampler emits the segment-close token itself and clears this.
     pub close_script_pos: Option<usize>,
 
-    /// True while the active steering span SUPPRESSES its close token — a
-    /// forced close here is dropped by the stencil and steered into a
-    /// continuation ("But wait, "), i.e. more reasoning follows, so the
-    /// hard-cap closer script must NOT play (it is a terminal closing
-    /// statement). Synced from the stencil each decode step; false for
-    /// unsteered blocks and terminal spans.
+    /// True while the active steering span retires into further decoding rather
+    /// than into the close — a forced close here is dropped by the stencil and
+    /// more content follows, so the hard-cap closer script must NOT play (it is
+    /// a terminal closing statement). Synced from the stencil each decode step;
+    /// false for unsteered blocks and terminal spans.
     pub close_would_continue: bool,
 
     /// Consecutive emissions of token id 0 this turn. Degenerate logits — all
@@ -308,9 +307,8 @@ impl SequenceSamplingState {
 ///   prose and primes the answer with an explicit commitment). It falls back
 ///   to the bare close token when no script is configured, when the sentence
 ///   happens to already be complete, or when the steering span would drop the
-///   close and continue reasoning ("But wait, ") — the steering's own
-///   continuation phrase is the bridge there, not a terminal closing
-///   statement.
+///   close and carry on decoding — a terminal closing statement does not belong
+///   in the middle of a span that continues.
 ///
 /// When this returns `Some`, the token is authoritative for the step: the EOS
 /// failsafes must not replace it (they fire on a later step, once the segment
@@ -1783,8 +1781,8 @@ mod tests {
     fn continuation_span_gets_the_bare_close_not_the_script() {
         let config = closer_config();
         let mut state = in_segment_state(8, 42);
-        // A deep/exhaustive continuation span: the steering drops the close and
-        // injects "But wait, " — more reasoning follows, so no closing statement.
+        // A span that retires into more content: the steering drops the close
+        // and decoding continues, so no terminal closing statement.
         state.close_would_continue = true;
         assert_eq!(segment_close_override(&config, &mut state), Some(90));
         assert_eq!(state.close_script_pos, None, "no script started");

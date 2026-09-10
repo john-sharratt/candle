@@ -48,6 +48,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
 
 use crate::conversation::window_sealed_tokens;
+use crate::index_pages;
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
@@ -70,6 +71,7 @@ use crate::summary_tree::{
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{TurnLayout, TurnSegment};
+use crate::ConversationError;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -887,6 +889,28 @@ pub trait ContentResolver {
     /// ascending within each.
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey>;
 
+    /// Close `keys` under **exchange** membership: one member list per
+    /// exchange, in first-appearance order, each in ascending turn order.
+    ///
+    /// A tool round-trip is recorded as coupled turns — `user(request) →
+    /// assistant(<tool_call>)`, then `user(<tool_response>) →
+    /// assistant(answer)` — and the run is ONE indivisible projection unit.
+    /// Selection ranks and the budget trims these units, never their halves: a
+    /// projection that seats the call without the response hands the model a
+    /// dangling `<tool_call>`, which it imitates. (Observed: a dialogue answered
+    /// a question by emitting `<tool_call>{"name":"file_list",…}` for a folder
+    /// nobody had asked about, because `top_k` had seated the first turn of a
+    /// `repo_map` folder chain on its own.)
+    ///
+    /// Members absent from `keys` are pulled IN — closure, not just grouping —
+    /// so a rule that ranked one half brings the whole run with it.
+    ///
+    /// Default: every key is its own exchange. A resolver that tracks no
+    /// couplings has no round-trips to keep whole.
+    fn group_exchanges(&self, keys: &[TurnKey]) -> Vec<Vec<TurnKey>> {
+        keys.iter().map(|key| vec![*key]).collect()
+    }
+
     /// Token count for a turn.  Stable across projection calls.
     fn turn_token_count(&self, turn: TurnKey) -> usize;
 
@@ -938,15 +962,6 @@ pub trait ContentResolver {
     /// Default `false` — an ordinary projection retrieves.
     fn target_is_ingest_self(&self) -> bool {
         false
-    }
-
-    /// The turn in `group` whose gather-scope decl tags contain `tag`, if any.
-    /// Used to resolve a group's declared `default` member (a workspace-root
-    /// cluster tagged `"."`, etc.) when normal selection is empty — so the
-    /// group never drops out of the projection. Off the hot path: only consulted
-    /// on an empty selection. Default `None` (mock resolvers carry no tags).
-    fn turn_with_tag(&self, _group: GroupId, _tag: &str) -> Option<TurnKey> {
-        None
     }
 
     /// Forest kind of a projected turn — `Normal` (a raw conversation turn) vs
@@ -3132,6 +3147,29 @@ impl Substrate {
         out
     }
 
+    /// Emit `(timeline_id, from_turn)` for every coupling on every timeline —
+    /// the live `TurnCoupling` set, re-emitted by both rewrite paths.
+    ///
+    /// A coupling is the only durable record that a tool round-trip's two halves
+    /// belong to one exchange. Nothing recomputes it: the fact is known once, in
+    /// the window between the tools returning and the response turn being
+    /// submitted, and never again. So a rewrite that fails to carry it forward
+    /// does not degrade the grouping, it deletes it — the call turn and its
+    /// response become independent exchanges, and provenance can select one
+    /// without the other (a `<tool_call>` with no result, or a `<tool_response>`
+    /// with no call).
+    ///
+    /// Sorted, so a rewrite from identical state produces an identical file.
+    pub fn live_couplings(&self) -> Vec<(u64, u32)> {
+        let mut out: Vec<(u64, u32)> = self
+            .timelines
+            .iter()
+            .flat_map(|(tid, tl)| tl.couplings.iter().map(|from| (tid.raw(), *from)))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Emit `(timeline_id, debug_id)` for every timeline that has one
     /// set.  Used by compaction to re-emit live `DebugId` records.
     pub fn live_debug_ids(&self) -> Vec<(u64, String)> {
@@ -3446,9 +3484,16 @@ impl Substrate {
     /// at its recorded [`DistillMode`]. A later record upgrades the mode
     /// (last-writer-wins), so a conversation distilled provenance-only and then
     /// archived ends up `TextOnly`.
+    /// Replay a persisted [`DistillPayload`].
+    ///
+    /// Routed through [`Self::distill_timeline`] rather than inserting into the
+    /// map directly, so replay retires the recurrent tail exactly as the live
+    /// marking does. Inserting here — which it used to — meant a *reloaded*
+    /// distilled timeline had its tail back in the index, and the incremental
+    /// maintenance that runs against a reloaded store carried it forward again.
     pub fn apply_distill(&mut self, payload: &DistillPayload) {
         if let Some(timeline) = TimelineId::from_raw(payload.timeline_id) {
-            self.distilled_timelines.insert(timeline, payload.mode);
+            self.distill_timeline(timeline, payload.mode);
         }
     }
 
@@ -3456,6 +3501,20 @@ impl Substrate {
     /// matching `Distilled` record so the marker survives reload).
     pub fn distill_timeline(&mut self, timeline: TimelineId, mode: DistillMode) {
         self.distilled_timelines.insert(timeline, mode);
+        // The recurrent-state tail goes with the content, exactly as a timeline
+        // tombstone drops it. The state is derived from the token stream this
+        // marker sheds and is unusable without the K/V it was computed against,
+        // so a distilled timeline's snapshot describes a resume that can never
+        // happen — distillation is for calibration exemplars, which are never
+        // resumed.
+        //
+        // Retiring it at the index, rather than gating each rewrite on the
+        // distilled set, is what keeps the two rewrite paths from disagreeing.
+        // They did: full compaction gated, incremental maintenance did not, and
+        // a production store carried 766 distilled tails of ~116 MiB each —
+        // ~89 GB of a 120 GB log — forward on every pass.
+        self.recurrent_snapshots
+            .remove(&snapshot_stream_id(timeline.raw()));
     }
 
     /// Whether `timeline` is marked for distillation (any mode).
@@ -4189,6 +4248,135 @@ impl Substrate {
         Some(Arc::new(half))
     }
 
+    /// The turn's sealed K/V and index pages with its `<think>…</think>` span
+    /// windowed out — what a projection injects for every turn but the most
+    /// recent.
+    ///
+    /// The K/V is the turn's own chunks either side of the reasoning, as two
+    /// zero-copy [`window_sealed_tokens`] views concatenated per layer. The
+    /// boundary chunks are windowed by `offset` / `token_count`, so a span that
+    /// begins and ends inside one physical chunk yields two views of that same
+    /// chunk sharing one refcounted `HeadGids` — no copy, and no alignment
+    /// requirement on where the reasoning falls.
+    ///
+    /// Positions **compact**: K is stored un-rotated and RoPE is applied at read
+    /// time from cumulative usage of the layout as injected, so omitting a span
+    /// leaves no positional gap. The answer lands exactly where a reasoning-free
+    /// prefill would have put it.
+    ///
+    /// **Both halves are returned by one call and cannot be requested
+    /// separately.** The index pages are filtered to those outside the span in
+    /// the same breath, because a span injected without its rows is silent below
+    /// the QSA identity threshold and a hard refusal above it. They agree by
+    /// construction rather than by two computations happening to match: the page
+    /// boundaries and the `KvSpan` are the same grid positions, recorded once
+    /// during decode.
+    ///
+    /// A turn with no real `Thinking` segment — a prefilled assistant half, or
+    /// one sealed before this build — returns its full sealing and its full page
+    /// list, unchanged.
+    ///
+    /// `pages` is the turn's index-page payload as the caller resolved it —
+    /// resident first, then the stored record — because the projection knows
+    /// which copy it holds and the substrate does not.
+    /// `Ok(None)` when the turn is not held here — the caller's existing
+    /// "skipped turn" path. `Err` when the turn IS held but its reasoning cannot
+    /// be windowed, which is a defect rather than a condition to tolerate.
+    pub fn turn_sealed_without_thinking(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        pages: Option<Vec<u8>>,
+    ) -> Result<Option<(Arc<Vec<SealedSequence>>, Option<Vec<u8>>)>, ConversationError> {
+        let (Some(full), Some(turn)) = (
+            self.turn_sealed_of(timeline, index),
+            self.turn(timeline, index),
+        ) else {
+            return Ok(None);
+        };
+        let layout = &turn.content.layout;
+        // No reasoning recorded: the turn is whole because there is nothing to
+        // take out, which is a different thing from failing to take it out.
+        let Some(span) = layout.segments.iter().find_map(|s| match s {
+            TurnSegment::Thinking { kv, .. } => *kv,
+            _ => None,
+        }) else {
+            return Ok(Some((full, pages)));
+        };
+        // **Both halves or neither.** The rows are filtered to the pages outside
+        // the span, located by POSITION — the page count is not stable, because
+        // a mid-decode reprojection closes an extra one, so an ordinal would
+        // window only the turns that never reprojected and silently leave the
+        // rest whole.
+        //
+        // **A span that does not fall on page boundaries is a FAILURE, not a
+        // fallback.** The cuts exist to guarantee this alignment; if it does not
+        // hold, something upstream did not cut where it said it did.
+        //
+        // This used to hand the turn over WHOLE — "visibly imperfect rather than
+        // quietly inconsistent". It is neither: the turn injects, reads
+        // perfectly, and silently keeps showing reasoning the projection was
+        // asked to remove, forever. The one case it fired on in production was a
+        // live turn, not the legacy data it was written for, so it was masking a
+        // real defect rather than tolerating an old one. Refusing puts the
+        // failure where it can be fixed.
+        // **No pages at all is not a misalignment.** A model whose
+        // `carries_positional_state()` is false seals none — the seal only warns
+        // about their absence for models that do carry it — so there is nothing
+        // to window and nothing that can disagree with the span. Refusing here
+        // failed the projection of every turn after the first on Qwen3-8B,
+        // Qwen3-30B-A3B and Llama-3.2-3B, which is the whole of what those
+        // models do. The turn goes over whole, matching what the assembler
+        // already does for a turn with no index page.
+        // **No pages at all is not a misalignment.** A model whose
+        // `carries_positional_state()` is false seals none — the seal only warns
+        // about their absence for models that DO carry it — so there is nothing
+        // to window and nothing that can disagree with the span. Refusing here
+        // failed the projection of every turn after the first on Qwen3-8B,
+        // Qwen3-30B-A3B and Llama-3.2-3B, which is the whole of what those
+        // models do; the turn goes over whole instead, matching what the
+        // assembler already does for a turn with no index page.
+        let Some(blob) = pages.as_deref() else {
+            return Ok(Some((full, pages)));
+        };
+        let Some(filtered) = index_pages::without_span(blob, span.range()) else {
+            // The boundaries, not just the fact that the span missed them. The
+            // question a refusal always raises is WHICH cut was missing, and
+            // that is read straight off the two positions the span sits between.
+            let bounds = pages
+                .as_deref()
+                .and_then(index_pages::boundaries)
+                .map(|b| format!("{b:?}"))
+                .unwrap_or_else(|| "absent".to_string());
+            return Err(ConversationError::Channel(format!(
+                "turn {}#{} has a reasoning span [{}..{}) that does not fall on its index \
+                 page boundaries {bounds} — the K/V can be windowed but the rows cannot, \
+                 and injecting one beside the other is the divergence the pairing exists to \
+                 prevent. The cuts that make a turn's reasoning occupy whole pages did not \
+                 hold for this turn.",
+                timeline.raw(),
+                index.0,
+                span.offset,
+                span.end(),
+            )));
+        };
+
+        let total = full.first().map_or(0, |s| s.token_count);
+        let head = window_sealed_tokens(&full, 0, span.offset as usize);
+        let tail = window_sealed_tokens(&full, span.end() as usize, total);
+        let windowed: Vec<SealedSequence> = head
+            .into_iter()
+            .zip(tail)
+            .map(|(h, t)| SealedSequence {
+                token_count: h.token_count + t.token_count,
+                chunks: h.chunks.into_iter().chain(t.chunks).collect(),
+                chunk_size: h.chunk_size,
+                location: h.location,
+            })
+            .collect();
+        Ok(Some((Arc::new(windowed), Some(filtered))))
+    }
+
     /// Token ids of the turn's *assistant-response body* `[asst_start, total)`.
     /// The compression path prefills the assistant half as text rather than
     /// injecting it (its assistant-role K/V are incoherent in the
@@ -4238,26 +4426,6 @@ impl Substrate {
         self.timelines
             .get(&timeline)
             .map_or(0, |t| t.turns.len() as u32)
-    }
-
-    /// The turn on `timeline` whose decl gather-scope tags contain `tag`, if any.
-    /// Backs [`ContentResolver::turn_with_tag`] — used to resolve a group's
-    /// declared `default` member (e.g. the repo_map workspace-root cluster,
-    /// tagged `"."`). Scans the stream decls (as `belief_gallery` does); scoped
-    /// to `timeline` because a group is shared across conversations. `tag` is
-    /// expected to identify a unique turn.
-    pub fn turn_with_tag(&self, timeline: TimelineId, tag: &str) -> Option<TurnIndex> {
-        self.all_streams().find_map(|(_sid, e)| {
-            let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
-                return None;
-            };
-            // A tombstoned turn is a dead placeholder whose KV can never
-            // materialise — it must not resolve as a group default.
-            (d.timeline_id == timeline.raw()
-                && !self.is_turn_tombstoned(timeline, d.turn_index)
-                && d.tags.iter().any(|t| t == tag))
-            .then_some(TurnIndex(d.turn_index))
-        })
     }
 
     /// Corpus size for a conversation — `timeline`'s turn tokens plus the
@@ -5137,17 +5305,6 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
         let (layer, _) = self.guard.timeline_target(turn.timeline)?;
         Some(layer)
-    }
-
-    /// Searches every active timeline in the group — a group's declared `default`
-    /// member (e.g. the workspace-root cluster tagged `"."`) can live in any of
-    /// its conversations, not just the first.
-    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnKey> {
-        self.guard.active_timelines_for_group(group).find_map(|tl| {
-            self.guard
-                .turn_with_tag(tl, tag)
-                .map(|idx| TurnKey::new(tl, idx))
-        })
     }
 
     fn section_token_count(&self, section: SectionId) -> usize {
@@ -6869,49 +7026,6 @@ mod tests {
         );
     }
 
-    /// `turn_with_tag` resolves a declared default member to a real turn: it
-    /// matches a `TurnDecl.tags` entry, is scoped to the requested timeline (a
-    /// group is shared across conversations), and returns `None` for an unknown
-    /// tag.
-    #[test]
-    fn turn_with_tag_matches_scoped_to_timeline() {
-        let mut sub = Substrate::new();
-        let decl = |tl: u64, idx: u32, tags: &[&str]| {
-            StreamDecl::Turn(TurnDecl {
-                timeline_id: tl,
-                turn_index: idx,
-                turn_id_day: 0,
-                turn_id_seq: idx + 1,
-                role: 1,
-                block_start: 0,
-                block_end: 1,
-                layer_id: 1,
-                group_id: 1,
-                anchored_prefix: Vec::new(),
-                view: Vec::new(),
-                segments: Vec::new(),
-                tags: tags.iter().map(|t| t.to_string()).collect(),
-            })
-        };
-        // Timeline 1: turn 0 is the repo-root cluster, turn 1 a code chunk.
-        sub.apply_stream_decl(turn_stream_id(1, 0), decl(1, 0, &["repo_map", "."]));
-        sub.apply_stream_decl(turn_stream_id(1, 1), decl(1, 1, &["code", "foo.rs"]));
-        // Timeline 2: its own repo-root cluster at turn 0.
-        sub.apply_stream_decl(turn_stream_id(2, 0), decl(2, 0, &["repo_map", "."]));
-
-        let tl1 = TimelineId::from_raw(1).unwrap();
-        let tl2 = TimelineId::from_raw(2).unwrap();
-
-        assert_eq!(sub.turn_with_tag(tl1, "."), Some(TurnIndex(0)));
-        assert_eq!(sub.turn_with_tag(tl1, "foo.rs"), Some(TurnIndex(1)));
-        // Absent tag ⇒ None.
-        assert_eq!(sub.turn_with_tag(tl1, "missing"), None);
-        // Timeline scoping: tl2 resolves its own root, not tl1's; and tl1's
-        // code tag does not leak into tl2.
-        assert_eq!(sub.turn_with_tag(tl2, "."), Some(TurnIndex(0)));
-        assert_eq!(sub.turn_with_tag(tl2, "foo.rs"), None);
-    }
-
     /// Gather-scope tag semantics, pinned.
     ///
     /// `SelectionPolicy.tags` documents an empty list as "all projections in
@@ -6962,62 +7076,6 @@ mod tests {
         // can belong to two scopes at once.
         assert!(admits(&["ardh"], &["ardh", "battle-cities"]));
         assert!(admits(&["ardh", "low-fen"], &["low-fen"]));
-    }
-
-    /// `turn_with_tag` resolves ONE member — a group's declared default — and
-    /// is not a bulk filter. Two properties make that binding rather than
-    /// stylistic, and both are easy to discover the expensive way:
-    ///
-    /// 1. **It is a linear scan** over every stream decl. Selecting a whole
-    ///    scope through it is a scan per turn, i.e. quadratic in the corpus.
-    /// 2. **With more than one match the winner is arbitrary.** The scan is
-    ///    `all_streams().find_map(..)` over a map, so iteration order is not
-    ///    insertion or index order — this test originally asserted `TurnIndex(0)`
-    ///    and got `TurnIndex(1)`. The doc's "expected to identify a unique turn"
-    ///    is a precondition, not a hint: violate it and the answer is
-    ///    nondeterministic rather than merely surprising.
-    ///
-    /// Anything selecting many turns by tag needs an index built once at ingest.
-    #[test]
-    fn turn_with_tag_finds_one_arbitrary_member_by_scanning() {
-        let mut sub = Substrate::new();
-        let decl = |tl: u64, idx: u32, tags: &[&str]| {
-            StreamDecl::Turn(TurnDecl {
-                timeline_id: tl,
-                turn_index: idx,
-                turn_id_day: 0,
-                turn_id_seq: idx + 1,
-                role: 1,
-                block_start: 0,
-                block_end: 1,
-                layer_id: 1,
-                group_id: 1,
-                anchored_prefix: Vec::new(),
-                view: Vec::new(),
-                segments: Vec::new(),
-                tags: tags.iter().map(|t| t.to_string()).collect(),
-            })
-        };
-        // Three turns sharing one tag — a scope with more than one document in
-        // it, which is the ordinary case for a corpus.
-        for i in 0..3u32 {
-            sub.apply_stream_decl(turn_stream_id(1, i), decl(1, i, &["ardh"]));
-        }
-        let tl = TimelineId::from_raw(1).unwrap();
-
-        // It answers with A member, not THE members — and which one is not
-        // ordered. Asserting a specific index here would be asserting a hash
-        // seed.
-        let got = sub.turn_with_tag(tl, "ardh").expect("some member matches");
-        assert!(
-            (0..3).contains(&got.0),
-            "returned a member of the tagged set, but an arbitrary one: {got:?}"
-        );
-        assert_eq!(sub.turn_with_tag(tl, "absent"), None);
-
-        // Sole match: deterministic, which is the contract it is built for.
-        sub.apply_stream_decl(turn_stream_id(1, 9), decl(1, 9, &["unique"]));
-        assert_eq!(sub.turn_with_tag(tl, "unique"), Some(TurnIndex(9)));
     }
 
     /// The decoded-signature memo serves a stable `Arc` on repeat reads, and

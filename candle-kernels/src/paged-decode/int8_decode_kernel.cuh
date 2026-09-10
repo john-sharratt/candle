@@ -42,6 +42,7 @@
 // Shared decode helpers (vec2_traits, load_vec2, cp_async_*, RoPE, scatter,
 // write-len commit) — formerly inline in the V2 paged_decode_kernel.cuh.
 #include "decode_helpers.cuh"
+#include "int8_decode_emit.cuh"
 #include "../mma/mma_wrappers.cuh"
 // QSA block-sparse selection: `sel.entries == nullptr` for every model whose
 // attention layers read the whole causal prefix, which is all of them but
@@ -2041,81 +2042,13 @@ __global__ void int8_decode_combine_kernel(
     float inv = __fdividef(1.f, fmaxf(L, 1e-10f));
     float val = acc * inv;
 
-    // B2: fused attention → q8a128 context emit. One block is one query head =
-    // HEAD_DIM/128 whole q8a128 128-tiles (a context row for a token is n_q_head
-    // heads × HEAD_DIM = hidden, contiguous), so thread d's tile is
-    // flat_tile = row·(HEAD_DIM/128) + d/128. Reduce amax/Σx per 128-tile — a warp
-    // butterfly, then a pairwise combine of the tile's four warp results — then
-    // thread d writes its quant byte and the tile's first thread the per-128
-    // {scale,sum}. The value is rounded through O first to mirror the unfused FP
-    // store + re-quant; the optional output gate (gated lineages, head_dim 256)
-    // multiplies in as sigmoid(g) computed in F32, with a second O-rounding so the
-    // quantized value matches gating an O-stored context.
-    //
-    // These bytes are MODE-AGNOSTIC: the q8a1024 flat-grouped layout is byte-identical
-    // for the matmul's V (mode-1, Bm=16) and X (mode-2, Bm=32) variants — the mode only
-    // changes how the matmul tiles the SAME bytes. So this kernel never decides V vs X.
-    // That choice rides in the `Q8a128Operand.ytype`, derived from the token count M via
-    // `q8a128_mode_for_m()` when the rust side wraps `q8_out` into the operand (M ≥ 64 →
-    // X). Hard-coding a mode here would be wrong; it is carried in the DynamicTensor.
-    if constexpr (HEAD_DIM % 128 == 0) {
-        if (q8_out != nullptr) {
-            float vr = to_f32<O>(from_f32<O>(val));
-            if (gate != nullptr) {
-                // Sigmoid rounded through O before the multiply — the exact
-                // arithmetic of the unfused chain (sigmoid(gate) stored in O,
-                // then an O-precision elementwise multiply on the O context).
-                // Computed in DOUBLE (this archive's `--use_fast_math` maps
-                // float expf to the approximate intrinsic, whose few-ulp wobble
-                // flips the O rounding exactly when the sigmoid lands on an
-                // O-dtype boundary; double exp's ≤1-ulp error survives the
-                // narrow to F32 only within ~2⁻²⁹ of an F32 boundary, which the
-                // O rounding then absorbs — the CPU byte oracle mirrors the
-                // same f64 chain).
-                const int64_t g_slot = (int64_t)(row / row_heads) * gate_slot_stride;
-                const int64_t g_off = (int64_t)(row % row_heads) * HEAD_DIM + d;
-                const float g = to_f32<O>(gate[g_slot + g_off]);
-                const float sig =
-                    to_f32<O>(from_f32<O>((float)(1.0 / (1.0 + exp((double)(-g))))));
-                vr = to_f32<O>(from_f32<O>(vr * sig));
-            }
-            float amax = fabsf(vr);
-            float s = vr;
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
-                s += __shfl_xor_sync(0xffffffff, s, off, 32);
-            }
-            __shared__ float sh_amax[HEAD_DIM / 32];
-            __shared__ float sh_sum[HEAD_DIM / 32];
-            const int warp = d >> 5;
-            const int lane = d & 31;
-            if (lane == 0) { sh_amax[warp] = amax; sh_sum[warp] = s; }
-            __syncthreads();
-            // Combine the tile's four warp results pairwise — (w0,w2)+(w1,w3) is
-            // the butterfly's summation order, keeping the bytes identical to the
-            // former warp-shuffle combine at HEAD_DIM 128.
-            const int tb = (d >> 7) << 2;
-            const float tile_amax = fmaxf(fmaxf(sh_amax[tb], sh_amax[tb + 2]),
-                                          fmaxf(sh_amax[tb + 1], sh_amax[tb + 3]));
-            const float tile_sum = (sh_sum[tb] + sh_sum[tb + 2]) + (sh_sum[tb + 1] + sh_sum[tb + 3]);
-            // IEEE divisions (`__fdiv_rn`) despite the archive's fast math: the
-            // quant boundary sits at half a code, and the approximate division's
-            // ±2-ulp wobble is exactly what flips a byte there — the CPU byte
-            // oracle mirrors these two ops bit-for-bit.
-            const float id = (tile_amax != 0.f) ? __fdiv_rn(127.f, tile_amax) : 0.f;
-            uint8_t* obytes = q8_out;
-            const int64_t flat = (int64_t)row * (HEAD_DIM / 128) + (d >> 7);
-            obytes[q8a1024_qs_off(flat) + (d & 127)] = (int8_t)__float2int_rn(vr * id);
-            if ((d & 127) == 0) {
-                half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(flat));
-                ds[0] = make_half2(__float2half_rn(__fdiv_rn(tile_amax, 127.f)),
-                                   __float2half_rn(tile_sum));
-            }
-            return;
-        }
-    }
-    out[(int64_t)row * HEAD_DIM + d] = from_f32<O>(val);
+    // The emit — the plain O store, or B2's fused q8a128 context with the
+    // optional output gate — is `int8_decode_emit_row`, shared with the tile
+    // kernel's in-kernel merge so both paths produce the same bytes.
+    __shared__ float sh_amax[HEAD_DIM / 32];
+    __shared__ float sh_sum[HEAD_DIM / 32];
+    int8_decode_emit_row<O, HEAD_DIM>(val, (int64_t)row, d, out, q8_out, gate,
+                                      gate_slot_stride, row_heads, sh_amax, sh_sum);
 }
 
 // SM count (cached) — used to size the split-KV factor to fill the device.
@@ -2264,6 +2197,13 @@ int launch_int8_decode_attn(
             if (pa == nullptr || pm == nullptr) {
                 return 1;
             }
+            // An in-kernel split merge (a pairwise tree over the partial
+            // pool, the last-arriving block of each pair merging) was
+            // measured against this two-launch form: its serial tail — up
+            // to seven levels of device fence, global atomic and dependent
+            // loads on the critical path — cost a constant 36 µs at every
+            // depth, seven times the launch it saved. The combine kernel
+            // stays.
             dim3 grid(num_active_slots, n_kv_head, splits);
             dim3 block(TILE_THREADS);
             if (rope_interleaved) {

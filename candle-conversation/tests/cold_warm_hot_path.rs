@@ -46,6 +46,26 @@ use half::bf16;
 mod common;
 use common::open_conversation;
 
+/// **One persistence pass at a time in this binary.**
+///
+/// The hot→warm drain is not a per-test resource. Every `PersistenceThread`
+/// stages its DtoH through a `MIGRATION_STAGING_CAP_BYTES` pinned buffer and a
+/// span of the persistence domain, and both are process-wide and capped — so a
+/// test whose migration loses that race installs no warm copy and then asserts
+/// on the tier state it did not reach. Observed exactly that way: 21 of 21 green
+/// serially, two of them failing together in parallel with
+/// `TierState { hot: true, warm: false }` — a fixture precondition reporting
+/// contention as a broken transition.
+///
+/// The arena readings themselves are per-backing and safe alongside other tests
+/// (see `gpu_arenas`); it is the drain that has to be exclusive.
+fn persistence_serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 const N_LAYERS: usize = 2;
 const N_KV_HEAD: usize = 2;
 const HEAD_DIM: usize = 16;
@@ -258,6 +278,7 @@ fn section_state(conv: &Conversation, section: SectionId) -> TierState {
 
 #[test]
 fn full_cold_warm_hot_round_trip() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -674,6 +695,7 @@ fn snapshot_bytes_at(
 /// `#[ignore]`d — see that test's doc for the open production bug).
 #[test]
 fn quant_blend_warm_round_trip() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -806,6 +828,7 @@ fn quant_blend_warm_round_trip() {
 /// surfaces with a specific format name rather than getting buried
 /// inside the blend test.
 fn single_format_cold_round_trip(label: &str, target_format: Option<KvFormat>) {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -919,6 +942,7 @@ fn cold_round_trip_q4_0() {
 #[test]
 fn cold_marker_turn_passes_existence_check() {
     use candle_conversation::substrate::TierState;
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -1007,6 +1031,7 @@ fn cold_marker_turn_passes_existence_check() {
 /// regression for the cold→hot Quantized scatter path.
 #[test]
 fn cold_load_q8_single_chunk_diagnostic() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -1149,6 +1174,7 @@ fn cold_load_q8_single_chunk_diagnostic() {
 /// as the projection cycled prior turns through the cold path.
 #[test]
 fn quant_blend_cold_round_trip() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -1271,6 +1297,7 @@ fn quant_blend_cold_round_trip() {
 ///   drops only the unkept turns; kept turns stay hot.
 #[test]
 fn elevate_edge_cases() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -1429,6 +1456,7 @@ fn elevate_edge_cases() {
 /// `StoredSequence` reconstruction.
 #[test]
 fn multi_chunk_turn_round_trip() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -1550,6 +1578,7 @@ fn multi_chunk_turn_round_trip() {
 /// (which goes through the reload) would forget it.
 #[test]
 fn archive_state_survives_restart() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -1663,6 +1692,7 @@ fn make_backings_adaptive(
 /// F16 through.
 #[test]
 fn quantize_on_evict_full_round_trip() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -1718,6 +1748,7 @@ fn quantize_on_evict_full_round_trip() {
 /// tier carries, so it's a faithful proxy for warm byte count).
 #[test]
 fn quantize_on_evict_actually_compresses() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -1791,6 +1822,7 @@ fn quantize_on_evict_actually_compresses() {
 /// reload itself).
 #[test]
 fn quantize_on_evict_cold_reload_round_trip() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -2355,6 +2387,7 @@ fn seed_turn_varied_per_sub_band(
 #[test]
 #[ignore = "heavy 32-layer GPU+disk tier round-trip (~20s); run with --ignored"]
 fn quantize_on_evict_metadata_round_trip() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -2367,6 +2400,7 @@ fn quantize_on_evict_metadata_round_trip() {
 /// `#[ignore]`d.
 #[test]
 fn quantize_on_evict_metadata_round_trip_mini() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -2627,6 +2661,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
 #[test]
 #[ignore = "heavy 32-layer GPU+disk tier round-trip (~10s); run with --ignored"]
 fn no_policy_metadata_round_trip() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -2638,6 +2673,7 @@ fn no_policy_metadata_round_trip() {
 /// above is `#[ignore]`d.
 #[test]
 fn no_policy_metadata_round_trip_mini() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -3006,6 +3042,7 @@ fn drive_section_round_trip<F>(
         SectionId,
     ) -> Vec<SealedSequence>,
 {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -3459,6 +3496,7 @@ fn demote_fixture(device: &Device) -> DemoteFixture {
 /// long run.
 #[test]
 fn demoting_every_turn_returns_its_vram() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -3512,6 +3550,7 @@ fn demoting_every_turn_returns_its_vram() {
 /// otherwise show up only as corruption much later.
 #[test]
 fn a_kept_turn_keeps_its_vram_while_the_rest_comes_back() {
+    let _persist = persistence_serial();
     let Some(device) = cuda_device_or_skip() else {
         return;
     };

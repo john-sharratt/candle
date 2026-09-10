@@ -3942,7 +3942,8 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
     Ok(())
 }
 
-/// The KO repack's scratch is a bounded band, not the whole tensor — and the bytes are the same.
+/// Why the KO repack's scratch has to be a bounded band — the history behind the
+/// two tests below, which check it computationally and end to end.
 ///
 /// **Two assertions, and the first is the point of the change.** `repack_ko` is
 /// dequantize-then-requantize composed through an f32 buffer, and that buffer used to be the
@@ -3952,7 +3953,8 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
 /// third of the card until the process exited. Repacking a row band at a time caps the
 /// intermediate at `REPACK_BAND_BYTES` whatever the tensor's size.
 ///
-/// So this measures free VRAM across the repack and requires the dip to stay near the twin.
+/// So `ko_repack_scratch_is_a_bounded_band` measures free VRAM across the repack and requires
+/// the dip to stay near the twin.
 /// The tensor is deliberately shaped so a whole-tensor f32 (256 MiB) dwarfs both the twin
 /// (34 MiB) and the band (48 MiB) — a regression that reinstated the old buffer could not hide
 /// inside the bound, and one that merely enlarged the band would have to grow it fivefold.
@@ -3961,7 +3963,64 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
 /// over the same dequantized source. Banding rearranges *when* each chunk is written and
 /// scatters the results into place, which is exactly the kind of change that can produce a
 /// correctly-sized, plausibly-valued, wrong tensor — so the comparison is on bytes.
+/// **The band is bounded whatever the tensor — asserted without a device.**
+///
+/// This is the property `ko_repack_scratch_is_a_bounded_band` exists to protect:
+/// the repack's f32 intermediate is one row band, so it does not scale with the
+/// tensor. That test measures it end to end through free VRAM, which is
+/// device-wide and therefore only meaningful on a quiet card; this one computes
+/// the same number the allocation uses and so runs anywhere, every time.
+///
+/// The regression it would catch is the one that motivated the banding: a
+/// whole-tensor f32, which at 8192×8192 is 256 MiB and grows with the model.
 #[test]
+fn ko_repack_band_is_bounded_regardless_of_tensor_size() {
+    use crate::quantized::cuda::{repack_band_bytes, REPACK_BAND_BYTES};
+    // Square, tall-thin and short-wide, across three orders of magnitude.
+    for (nrows, ncols) in [
+        (8192usize, 8192usize),
+        (65536, 8192),
+        (1024, 1024),
+        (8, 32768),
+        (131072, 256),
+    ] {
+        let band = repack_band_bytes(nrows, ncols);
+        let whole = nrows * ncols * std::mem::size_of::<f32>();
+        assert!(
+            band <= REPACK_BAND_BYTES.max(ncols * 8 * std::mem::size_of::<f32>()),
+            "{nrows}x{ncols}: band {band} B exceeds the {REPACK_BAND_BYTES} B bound \
+             (one row-group is the floor, for a tensor too wide to fit even that)"
+        );
+        assert!(
+            band <= whole,
+            "{nrows}x{ncols}: a band may never exceed the whole tensor it is banding"
+        );
+    }
+    // And it does NOT grow with row count: the whole point of banding.
+    assert_eq!(
+        repack_band_bytes(8192, 8192),
+        repack_band_bytes(65536, 8192),
+        "the band must not scale with rows — that is what makes it a band"
+    );
+}
+
+/// End-to-end confirmation that the band is what actually reaches the card.
+///
+/// **`#[ignore]` because it needs an exclusive device.** It measures free VRAM
+/// either side of a repack, and `cuMemGetInfo` reports the whole card — so with
+/// `cargo test`'s default threading a sibling test's allocation lands in the
+/// delta and is blamed on the repack. Measured at 4,640 MiB against a 34 MiB
+/// twin while the suite ran alongside it; 64 MiB alone. The invariant itself is
+/// covered without a device by
+/// [`ko_repack_band_is_bounded_regardless_of_tensor_size`]; this is the
+/// end-to-end check, run deliberately:
+///
+/// ```text
+/// cargo test -p candle-core --features cuda --lib -- --ignored --test-threads=1 \
+///     ko_repack_scratch_is_a_bounded_band
+/// ```
+#[test]
+#[ignore = "measures device-wide free VRAM; needs --test-threads=1 and an otherwise idle card"]
 fn ko_repack_scratch_is_a_bounded_band() -> Result<()> {
     let dev = CudaDevice::new(0)?;
     // Big enough that a whole-tensor f32 dwarfs both the source and the twin, so the bound
@@ -3981,15 +4040,49 @@ fn ko_repack_scratch_is_a_bounded_band() -> Result<()> {
         _ => panic!("expected CUDA storage"),
     };
 
-    dev.cuda_stream()
-        .synchronize()
-        .map_err(crate::Error::wrap)?;
-    let (free_before, _) = crate::quantized::get_vram_info()?;
-    let twin = storage.repack_ko(&shape, GgmlDType::Q4_KO)?;
-    dev.cuda_stream()
-        .synchronize()
-        .map_err(crate::Error::wrap)?;
-    let (free_after, _) = crate::quantized::get_vram_info()?;
+    // **`get_vram_info` is DEVICE-WIDE, so this only measures the repack on a
+    // quiet device.** `cuMemGetInfo` reports the whole card's free bytes; there
+    // is no pool-scoped alternative. `cargo test` runs this file's 94 CUDA tests
+    // across threads by default, so a sibling allocating between the two reads
+    // lands in this delta and is blamed on the repack — measured at **4,640 MiB
+    // against a 34 MiB twin**, which read as "the scratch is back on the card"
+    // and is not remotely what happened. Alone, the same code measures 64 MiB.
+    //
+    // So the device is checked for quiet either side of the window, and the
+    // measurement is retried when it is not. The FIRST quiet attempt is the one
+    // used, because it is the only cold one — the CUDA pool keeps the repack's
+    // bands after attempt one, and a later attempt would under-report by
+    // exactly the thing the bound is meant to catch.
+    let quiet = |dev: &CudaDevice| -> Result<Option<usize>> {
+        dev.cuda_stream().synchronize().map_err(crate::Error::wrap)?;
+        let (a, _) = crate::quantized::get_vram_info()?;
+        dev.cuda_stream().synchronize().map_err(crate::Error::wrap)?;
+        let (b, _) = crate::quantized::get_vram_info()?;
+        Ok((a == b).then_some(a))
+    };
+
+    const ATTEMPTS: usize = 8;
+    let mut measured = None;
+    for _ in 0..ATTEMPTS {
+        let Some(free_before) = quiet(&dev)? else {
+            continue;
+        };
+        // One repack per attempt. A discarded attempt drops its twin, so the
+        // next one starts from the same footing.
+        let twin = storage.repack_ko(&shape, GgmlDType::Q4_KO)?;
+        let Some(free_after) = quiet(&dev)? else {
+            continue;
+        };
+        measured = Some((free_before, free_after, twin));
+        break;
+    }
+    let Some((free_before, free_after, twin)) = measured else {
+        panic!(
+            "could not get a quiet device in {ATTEMPTS} attempts — another test on this \
+             card allocated inside every measurement window, so the VRAM delta would \
+             measure that and not the repack. Re-run with `--test-threads=1`."
+        )
+    };
 
     // What the device is *entitled* to hold across the repack: the twin it produced, plus the
     // f32 band and the KO band that produced it. The source was already resident before the

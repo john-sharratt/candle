@@ -22,6 +22,7 @@
 #![cfg(feature = "cuda")]
 
 use candle::{DType, Device, Result, Tensor};
+use candle_transformers::models::qwen35::attention::RopeTables;
 use candle_transformers::models::qwen4exp::paged_index::{
     decode_page, encode_page, IndexPage, PagedIndex, SealedIndex,
 };
@@ -30,6 +31,8 @@ use candle_transformers::models::qwen4exp::paged_index::{
 const HEAD_DIM: usize = 128;
 const N_HEADS: usize = 4;
 const RATIO: usize = 4;
+const ROPE_DIM: usize = 64;
+const ROPE_THETA: f32 = 10_000.0;
 
 /// Every GPU test in this file shares one device and one process-global lock:
 /// the arenas draw from a process-wide pool, so two tests decoding at once
@@ -71,10 +74,16 @@ fn window(rows_per_page: &[usize], last_cells: usize, seed: u64) -> Result<Paged
     for (i, &r) in rows_per_page.iter().enumerate() {
         let cells = if i + 1 == n { last_cells } else { RATIO };
         let keys = Tensor::from_vec(rng.vec(r * HEAD_DIM), (r, HEAD_DIM), &d)?;
-        pages.push(IndexPage::new(keys, pos, cells));
+        pages.push((IndexPage::new(keys, cells), pos));
         pos += if r == 0 { 0 } else { (r - 1) * RATIO + cells };
     }
     PagedIndex::new(pages, RATIO, &d)
+}
+
+/// The rotation tables the placement uses. Deep enough for every base these
+/// tests place a page at.
+fn rope() -> Result<RopeTables> {
+    RopeTables::new(ROPE_DIM, ROPE_THETA, 1 << 16, &dev()?)
 }
 
 fn queries(t: usize, seed: u64) -> Result<Tensor> {
@@ -90,9 +99,9 @@ fn compare(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize]) -> Result<f32> {
     let n = idx.total_rows();
     let t = qpos.len();
     let out = Tensor::zeros((t, n.max(1)), DType::F32, &d)?;
-    idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n.max(1), 0)?;
+    idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n.max(1), 0, &rope()?)?;
     let got = out.flatten_all()?.to_vec1::<f32>()?;
-    let want = idx.score_reference(q, qpos, N_HEADS, HEAD_DIM)?;
+    let want = idx.score_reference(q, qpos, N_HEADS, HEAD_DIM, &rope()?)?;
 
     let mut worst = 0f32;
     for r in 0..t {
@@ -176,7 +185,7 @@ fn every_page_ragged_matches_the_oracle() -> Result<()> {
         let rows = tokens.div_ceil(RATIO);
         let last = tokens - (rows - 1) * RATIO;
         let keys = Tensor::from_vec(rng.vec(rows * HEAD_DIM), (rows, HEAD_DIM), &d)?;
-        pages.push(IndexPage::new(keys, pos, last));
+        pages.push((IndexPage::new(keys, last), pos));
         pos += tokens;
         let _ = i;
     }
@@ -189,27 +198,41 @@ fn every_page_ragged_matches_the_oracle() -> Result<()> {
     Ok(())
 }
 
-/// A window must refuse a gap: the candidate prefix comes from the running
-/// token total, so a page that does not continue the previous one would shift
-/// every later row's visibility — silently, and in the retrieval rather than in
-/// a crash.
+/// **A gap is legal; an overlap is not.**
+///
+/// A hole between two pages means what it says — that span carries no index
+/// rows — and it has to be expressible, because a piece of K/V injected without
+/// its index is a real thing the projection does. It used to be refused, and had
+/// to be: the candidate prefix came from a running token total, so a page that
+/// did not continue the previous one shifted every later row's visibility.
+/// Positions are read off the page now, so a hole moves nothing.
+///
+/// An overlap is still refused. Two pages claiming the same position is not a
+/// span nobody indexed, it is two rows for one token.
 #[test]
-fn a_gap_between_pages_is_refused() -> Result<()> {
+fn a_gap_between_pages_is_allowed_and_an_overlap_is_not() -> Result<()> {
     let _g = gpu().lock().unwrap();
     let d = dev()?;
     let mut rng = Lcg(5);
-    let mk = |rng: &mut Lcg, r: usize, first_pos: usize| -> Result<IndexPage> {
+    let mut mk = |r: usize| -> Result<IndexPage> {
         Ok(IndexPage::new(
             Tensor::from_vec(rng.vec(r * HEAD_DIM), (r, HEAD_DIM), &d)?,
-            first_pos,
             RATIO,
         ))
     };
-    let a = mk(&mut rng, 4, 0)?;
-    let b = mk(&mut rng, 4, 999)?; // should be 16
+    // Page A covers [0, 16); the hole runs to 999, where B opens.
+    let (a, b) = (mk(4)?, mk(4)?);
+    let idx = PagedIndex::new(vec![(a, 0), (b, 999)], RATIO, &d)?;
+    assert_eq!(idx.total_rows(), 8);
+    // A query inside the hole sees A's rows and none of B's.
+    assert_eq!(idx.candidates_at(500), 4);
+    // One past B's opening block, it sees A's four and B's first.
+    assert_eq!(idx.candidates_at(999 + RATIO), 5);
+
+    let (a, b) = (mk(4)?, mk(4)?);
     assert!(
-        PagedIndex::new(vec![a, b], RATIO, &d).is_err(),
-        "a page starting past the previous page's end was accepted"
+        PagedIndex::new(vec![(a, 0), (b, 8)], RATIO, &d).is_err(),
+        "a page overlapping the previous page's span was accepted"
     );
     Ok(())
 }
@@ -313,10 +336,12 @@ fn per_turn_pages_expose_the_same_candidate_prefix_as_one_page() -> Result<()> {
     let mut pos = 0usize;
     for &t in &turns {
         let rows = t.div_ceil(RATIO);
-        pages.push(IndexPage::new(
-            Tensor::from_vec(rng.vec(rows * HEAD_DIM), (rows, HEAD_DIM), &d)?,
+        pages.push((
+            IndexPage::new(
+                Tensor::from_vec(rng.vec(rows * HEAD_DIM), (rows, HEAD_DIM), &d)?,
+                t - (rows - 1) * RATIO,
+            ),
             pos,
-            t - (rows - 1) * RATIO,
         ));
         pos += t;
     }
@@ -376,7 +401,6 @@ fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
         sealed.push(SealedIndex {
             page: IndexPage::new(
                 Tensor::from_vec(vals, (rows, HEAD_DIM), &d)?,
-                0,
                 1 + (i % RATIO),
             ),
             open: Tensor::from_vec(open_vals, (n_open, HEAD_DIM), &d)?,
@@ -414,7 +438,6 @@ fn a_truncated_aux_container_is_refused() -> Result<()> {
     let sealed = vec![SealedIndex {
         page: IndexPage::new(
             Tensor::from_vec(rng.vec(4 * HEAD_DIM), (4, HEAD_DIM), &d)?,
-            0,
             RATIO,
         ),
         open: Tensor::from_vec(rng.vec(2 * HEAD_DIM), (2, HEAD_DIM), &d)?,
@@ -448,7 +471,7 @@ fn bench_once(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize], iters: usize) ->
     let stream = cuda.cuda_stream();
     // Warm: first launch pays module load and the descriptor upload.
     for _ in 0..5 {
-        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0)?;
+        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope()?)?;
     }
     d.synchronize()?;
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
@@ -456,7 +479,7 @@ fn bench_once(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize], iters: usize) ->
         let start = stream
             .record_event(Some(CU_EVENT_DEFAULT))
             .map_err(|e| candle::Error::Msg(format!("event: {e}")))?;
-        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0)?;
+        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope()?)?;
         let stop = stream
             .record_event(Some(CU_EVENT_DEFAULT))
             .map_err(|e| candle::Error::Msg(format!("event: {e}")))?;

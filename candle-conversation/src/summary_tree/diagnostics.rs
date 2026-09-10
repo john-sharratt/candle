@@ -62,10 +62,6 @@ pub enum SelectionOrigin {
     /// candidate. Only ever set when the projection target is the ingest layer;
     /// dialogue retrieving that same content stays `Belief`.
     IngestSelf,
-    /// A group's declared `default` floor: belief/scores/rule selected nothing,
-    /// so the group's fallback member (by tag) was injected to keep the group —
-    /// and its layer — present. Not relevance, not recency: a guaranteed floor.
-    Fallback,
     /// Concept C turn locality: the turn was dragged into contention by a
     /// scoring neighbor on its timeline (its own organic score was below the
     /// drag) — present because its neighborhood matters, not on its own vote.

@@ -722,6 +722,12 @@ impl Scheduler {
             } else {
                 None
             };
+            // No index cut here. Admission is not a unit boundary — it is the
+            // moment work leaves the queue, which happens once per unit but says
+            // nothing about where that unit's tokens start. The boundary was
+            // taken with the unit's K/V anchor (`Scheduler::close_unit_boundary`),
+            // and a second cut on this slot would close whatever the unit has
+            // already forwarded into a page of its own.
             self.active_prefills.push(ActivePrefill {
                 work,
                 offset: 0,
@@ -2499,30 +2505,6 @@ impl Scheduler {
                 }
                 continue;
             }
-            // A dialogue turn's reasoning-free re-prefill finished on the wave.
-            // Seal the clean K/V + fire the deferred `Done` (no decode, reports to
-            // the caller, not the summariser). On prefill error, surface it on the
-            // caller channel and drop the slot's chunks.
-            if let SealAction::TurnReprefill { pending_id } = &work.seal_action {
-                let pending_id = *pending_id;
-                match error {
-                    Some(e) => {
-                        if let Some(p) = self.pending_turn_seals.remove(&pending_id) {
-                            let _ = p.event_tx.send(TurnEvent::Error(e));
-                            let _ = self.session.truncate_sequence_to_blocks(p.parent_id.0, 0);
-                        }
-                    }
-                    None => {
-                        let t = std::time::Instant::now();
-                        self.complete_turn_reprefill(pending_id);
-                        crate::scheduler::run::note_promote_split(
-                            crate::scheduler::run::PromoteStep::Reprefill,
-                            t.elapsed().as_micros() as u64,
-                        );
-                    }
-                }
-                continue;
-            }
             if let Some(e) = error {
                 let _ = work.event_tx.send(TurnEvent::Error(e));
                 continue;
@@ -2698,54 +2680,63 @@ impl Scheduler {
             // Non-view sequences (raw RULER / summarisation): no parent to
             // finalize and seal=None is correct — use the fast path.
             if self.turn_views.contains_key(&work.sequence_id) {
-                self.active_decodes.insert(
-                    work.sequence_id,
-                    DecodeState {
-                        event_tx: work.event_tx,
-                        generated_tokens: TokenBuffer::from(vec![first_token]),
-                        max_tokens: work.max_decode_tokens,
-                        sampling_config: work.sampling,
-                        seal_action: work.seal_action,
-                        keep_reasoning: work.keep_reasoning,
-                        post_decode_tokens: work.post_decode_tokens,
-                        belief: work.belief,
-                        prefill_tokens: work.tokens,
-                        user_text: work.user_text,
-                        tags: work.tags,
-                        user_content_start: work.user_content_start,
-                        user_content_end: work.user_content_end,
-                        assistant_content_start: work.assistant_content_start,
-                        no_think: work.no_think,
-                        prefill_assistant_text: work.prefill_assistant_text,
-                        finished: true,
-                        decode_start: Instant::now(),
-                        decode_busy_us: 0,
-                        prefill_ms,
-                        prefill_token_count: context_depth,
-                        turn_start,
-                        health: {
-                            let mut hs = crate::decode_health::DecodeHealthState::new(
-                                self.health_config.repetition_window,
-                                self.health_config.health_log_capacity,
-                            );
-                            hs.apply_baseline_config(
-                                self.health_config.entropy_baseline_window,
-                                self.health_config.entropy_trend_relative_factor,
-                                self.health_config.entropy_trend_absolute_min_nats,
-                            );
-                            hs.inside_think_block = initial_inside_think_block;
-                            hs.skip_entropy_checks = sampling_temperature <= 0.01;
-                            hs
-                        },
-                        reprojection: work.reprojection,
-                        non_punct_since_reproject: 0,
-                        last_projection_end: 0,
-                        in_tool_call: false,
-                        triggers: work.triggers,
-                        stencil: None,
-                        pending_mask: None,
+                // Through `push_generated` like every other token, so the
+                // reasoning boundary is seen even on this no-decode path.
+                let mut state = DecodeState {
+                    event_tx: work.event_tx,
+                    generated_tokens: TokenBuffer::default(),
+                    think_close_at: None,
+                    forwarded_generated: 0,
+                    pending_page_cut: false,
+                    pending_page_cut_after: None,
+                    max_tokens: work.max_decode_tokens,
+                    sampling_config: work.sampling,
+                    seal_action: work.seal_action,
+                    post_decode_tokens: work.post_decode_tokens,
+                    belief: work.belief,
+                    prefill_tokens: work.tokens,
+                    user_text: work.user_text,
+                    tags: work.tags,
+                    user_content_start: work.user_content_start,
+                    user_content_end: work.user_content_end,
+                    assistant_content_start: work.assistant_content_start,
+                    no_think: work.no_think,
+                    prefill_assistant_text: work.prefill_assistant_text,
+                    finished: true,
+                    decode_start: Instant::now(),
+                    decode_busy_us: 0,
+                    prefill_ms,
+                    prefill_token_count: context_depth,
+                    turn_start,
+                    health: {
+                        let mut hs = crate::decode_health::DecodeHealthState::new(
+                            self.health_config.repetition_window,
+                            self.health_config.health_log_capacity,
+                        );
+                        hs.apply_baseline_config(
+                            self.health_config.entropy_baseline_window,
+                            self.health_config.entropy_trend_relative_factor,
+                            self.health_config.entropy_trend_absolute_min_nats,
+                        );
+                        hs.inside_think_block = initial_inside_think_block;
+                        hs.skip_entropy_checks = sampling_temperature <= 0.01;
+                        hs
                     },
-                );
+                    reprojection: work.reprojection,
+                    non_punct_since_reproject: 0,
+                    last_projection_end: 0,
+                    in_tool_call: false,
+                    triggers: work.triggers,
+                    stencil: None,
+                    pending_mask: None,
+                };
+                // The turn's first token opens a page at the prefill/decode
+                // boundary, so the reasoning starts one of its own.
+                state.push_committed(first_token, self.think_close, &self.page_break_tokens);
+                // No speculative rewind can be in flight — this turn decodes
+                // nothing — so the cut is taken at once.
+                super::flush_page_cut(self.model.as_ref(), work.sequence_id, &mut state);
+                self.active_decodes.insert(work.sequence_id, state);
             } else {
                 self.finish_immediately(
                     work.sequence_id,
@@ -2797,54 +2788,63 @@ impl Scheduler {
             .as_ref()
             .is_some_and(|p| p.has_belief_collections());
 
-        self.active_decodes.insert(
-            work.sequence_id,
-            DecodeState {
-                event_tx: work.event_tx,
-                generated_tokens: TokenBuffer::from(vec![first_token]),
-                max_tokens: work.max_decode_tokens,
-                sampling_config: work.sampling,
-                seal_action: work.seal_action,
-                keep_reasoning: work.keep_reasoning,
-                post_decode_tokens: work.post_decode_tokens,
-                belief: work.belief,
-                prefill_tokens: work.tokens,
-                user_text: work.user_text,
-                tags: work.tags,
-                user_content_start: work.user_content_start,
-                user_content_end: work.user_content_end,
-                assistant_content_start: work.assistant_content_start,
-                no_think: work.no_think,
-                prefill_assistant_text: work.prefill_assistant_text,
-                finished: false,
-                decode_start: Instant::now(),
-                decode_busy_us: 0,
-                prefill_ms,
-                prefill_token_count: context_depth,
-                turn_start,
-                health: {
-                    let mut hs = crate::decode_health::DecodeHealthState::new(
-                        self.health_config.repetition_window,
-                        self.health_config.health_log_capacity,
-                    );
-                    hs.apply_baseline_config(
-                        self.health_config.entropy_baseline_window,
-                        self.health_config.entropy_trend_relative_factor,
-                        self.health_config.entropy_trend_absolute_min_nats,
-                    );
-                    hs.inside_think_block = initial_inside_think_block;
-                    hs.skip_entropy_checks = sampling_temperature <= 0.01;
-                    hs
-                },
-                reprojection: work.reprojection,
-                non_punct_since_reproject: 0,
-                last_projection_end: 0,
-                in_tool_call: first_token_opens_call,
-                triggers: work.triggers,
-                stencil,
-                pending_mask: None,
+        // Through `push_generated` like every other token, so a `</think>` the
+        // prefill's own logits produced still fixes the reasoning boundary.
+        let mut state = DecodeState {
+            event_tx: work.event_tx,
+            generated_tokens: TokenBuffer::default(),
+            think_close_at: None,
+            forwarded_generated: 0,
+            pending_page_cut: false,
+            pending_page_cut_after: None,
+            max_tokens: work.max_decode_tokens,
+            sampling_config: work.sampling,
+            seal_action: work.seal_action,
+            post_decode_tokens: work.post_decode_tokens,
+            belief: work.belief,
+            prefill_tokens: work.tokens,
+            user_text: work.user_text,
+            tags: work.tags,
+            user_content_start: work.user_content_start,
+            user_content_end: work.user_content_end,
+            assistant_content_start: work.assistant_content_start,
+            no_think: work.no_think,
+            prefill_assistant_text: work.prefill_assistant_text,
+            finished: false,
+            decode_start: Instant::now(),
+            decode_busy_us: 0,
+            prefill_ms,
+            prefill_token_count: context_depth,
+            turn_start,
+            health: {
+                let mut hs = crate::decode_health::DecodeHealthState::new(
+                    self.health_config.repetition_window,
+                    self.health_config.health_log_capacity,
+                );
+                hs.apply_baseline_config(
+                    self.health_config.entropy_baseline_window,
+                    self.health_config.entropy_trend_relative_factor,
+                    self.health_config.entropy_trend_absolute_min_nats,
+                );
+                hs.inside_think_block = initial_inside_think_block;
+                hs.skip_entropy_checks = sampling_temperature <= 0.01;
+                hs
             },
-        );
+            reprojection: work.reprojection,
+            non_punct_since_reproject: 0,
+            last_projection_end: 0,
+            in_tool_call: first_token_opens_call,
+            triggers: work.triggers,
+            stencil,
+            pending_mask: None,
+        };
+        // The turn's first token opens a page at the prefill/decode boundary, so
+        // the reasoning starts one of its own.
+        state.push_committed(first_token, self.think_close, &self.page_break_tokens);
+        // No speculative rewind can be in flight on this path — the turn has not
+        // decoded yet — so the cut is taken at once.
+        super::flush_page_cut(self.model.as_ref(), work.sequence_id, &mut state);
+        self.active_decodes.insert(work.sequence_id, state);
         // Fire the turn's FIRST reprojection immediately (drained right after
         // the next decode step, ~token 1). The prefill just wrote the user
         // query's wide-Q into R16, so the belief scan can score it and
@@ -2860,7 +2860,99 @@ impl Scheduler {
         }
     }
 
+    /// Forward `tokens` on `sequence_id`, splitting the pass at the turn's
+    /// reasoning boundary if it falls inside them.
+    ///
+    /// **A forward must not carry tokens from both sides of `</think>`.** A
+    /// span's index rows are pooled by the forward that carries it, so a block
+    /// pooled across the boundary cannot be un-pooled at seal time and the
+    /// reasoning would not occupy whole pages. Plain decode never straddles —
+    /// one token per sequence per wave — but a static run does: a think-steer
+    /// tree suppresses the model's own `</think>` and injects the closing tag as
+    /// a run, which can carry tokens after it.
+    ///
+    /// Splitting here rather than at the two call sites is what makes the
+    /// invariant structural: this is the one function that forwards an arbitrary
+    /// token span for a single sequence, so a future third caller inherits it.
     pub(super) fn run_prefill(
+        &mut self,
+        sequence_id: SequenceId,
+        tokens: &[u32],
+    ) -> Result<Tensor, ConversationError> {
+        // **Every break token in the span, not just the first.** A prefilled
+        // assistant head carries `<think>` and `</think>` in one pass, and a
+        // multi-turn prefill carries a turn closer as well — splitting once
+        // would leave the later markers pooled across their own boundaries,
+        // which is not correctable afterwards.
+        let mut rest = tokens;
+        let mut last_logits = None;
+        while let Some(at) = self.reasoning_split(rest) {
+            let (head, tail) = rest.split_at(at);
+            last_logits = Some(self.run_prefill_span(sequence_id, head)?);
+            match self.model.close_positional_page(sequence_id.0) {
+                // The head's own token ids when it is short. A surplus page is
+                // identified by what is IN it, and the pages that do not belong
+                // to any turn are consistently 5 and 7 tokens wide — small
+                // enough to name outright rather than infer from their width.
+                Ok(closed) => tracing::info!(
+                    target: "candle_conversation::scheduler::unit_boundary",
+                    seq_id = sequence_id.0,
+                    site = "prefill-break-token",
+                    closed,
+                    at,
+                    span = rest.len(),
+                    head = ?(head.len() <= 16).then_some(head),
+                    break_token = ?head.last(),
+                    "index: closed a page mid-prefill at a break token"
+                ),
+                Err(e) => tracing::warn!(
+                    seq_id = sequence_id.0,
+                    "closing the index page at a prefilled break token failed ({e}); the \
+                     region it bounds will not occupy whole pages and cannot be windowed \
+                     out of a later projection"
+                ),
+            }
+            rest = tail;
+        }
+        if rest.is_empty() {
+            // Every token was consumed by a split, so the last head's logits are
+            // the span's — `reasoning_split` never returns a split at the end,
+            // so this is only reachable for an empty input.
+            return match last_logits {
+                Some(l) => Ok(l),
+                None => self.run_prefill_span(sequence_id, rest),
+            };
+        }
+        self.run_prefill_span(sequence_id, rest)
+    }
+
+    /// Where to cut `tokens` so the reasoning boundary lands on a page edge:
+    /// one past this turn's first `</think>`, or `None` when the span carries no
+    /// boundary that needs one.
+    ///
+    /// `None` when the marker is absent, when it is the last token (nothing
+    /// follows it in this pass, so the next forward is already the edge), or
+    /// when the turn has recorded a close already — `think_close_at` holds the
+    /// first only, and a later `</think>` in the answer body must not move a
+    /// boundary that is fixed.
+    /// **Reads the token stream, not the decode state.** The previous version
+    /// asked `active_decodes` for the turn's `DecodeState` — which does not exist
+    /// yet while the turn is prefilling, because it is built from the prefill's
+    /// own logits afterwards. So for the case this exists to serve, a
+    /// `<think>…</think>` block baked into the prompt, the lookup returned `None`
+    /// and the pass was never split: 0 splits across 822 turns.
+    ///
+    /// One past the first break token, and `None` when that is the end of the
+    /// span — there is nothing on the far side to separate.
+    fn reasoning_split(&self, tokens: &[u32]) -> Option<usize> {
+        let at = tokens
+            .iter()
+            .position(|t| self.page_break_tokens.contains(t))?
+            + 1;
+        (at < tokens.len()).then_some(at)
+    }
+
+    fn run_prefill_span(
         &mut self,
         sequence_id: SequenceId,
         tokens: &[u32],

@@ -108,11 +108,24 @@ __device__ __forceinline__ void i8_cp_async16(void* dst, const void* src) {
                     "l"(src));
 }
 
+/// The int8 code of `v · inv_scale` in the low byte of one FFMA. 1.5·2²³ has
+/// a unit ulp, so `fma(v, inv, MAGIC)` rounds the exact product to the
+/// nearest integer (ties to even, the IEEE default) in the one rounding the
+/// FFMA performs, and the sum's low mantissa byte is that integer in two's
+/// complement for |v · inv| < 2²². One instruction against the FMUL, F2I and
+/// pack of a conversion. Every caller quantises against an absmax scale
+/// (`inv = 127 / absmax`) or a probability (`p · 127`), so |v · inv| ≤ 127
+/// and no saturation is needed. Every int8 code the tile kernel writes — K,
+/// V (both paths), P and Q — comes through here, so the paths agree bit for
+/// bit.
+constexpr float I8_CODE_MAGIC = 12582912.f;   // 1.5 · 2^23
+__device__ __forceinline__ uint32_t i8_code_bits(float v, float inv_scale) {
+    return __float_as_uint(fmaf(v, inv_scale, I8_CODE_MAGIC));
+}
+
 /// Quantize a value against a precomputed window scale (0 ⇒ all-zero window).
 __device__ __forceinline__ int8_t i8_quant(float v, float inv_scale) {
-    float q = rintf(v * inv_scale);
-    q = fminf(127.f, fmaxf(-127.f, q));
-    return (int8_t)q;
+    return (int8_t)(i8_code_bits(v, inv_scale) & 0xffu);
 }
 
 /// Runtime-format single-element FP decode from a token-oriented quant
@@ -600,19 +613,21 @@ __device__ __forceinline__ I8DtypeQuad<E> i8_tag_quad(
     return I8DtypeQuad<E>{ (const E*)base + rank, sub, 1.f / scale };
 }
 
+/// Two values quantised against one scale, packed little-endian in the low
+/// half-word (a in the low byte): two FFMAs (`i8_code_bits`) and one byte
+/// permute gathering their low bytes. The high half-word is unspecified.
+__device__ __forceinline__ uint32_t i8_pack2(float a, float b, float inv_scale) {
+    return __byte_perm(i8_code_bits(a, inv_scale), i8_code_bits(b, inv_scale), 0x0040u);
+}
+
 /// Four values quantised against one window scale (0 ⇒ zeros) and packed
-/// little-endian, v[0] in the low byte: round-to-nearest to s32, then the
-/// PTX pack saturates each to int8 — two instructions for the four bytes.
-/// `cvt.pack.sat.s8.s32.b32 d, a, b, c` is d = {c[15:0], sat8(a), sat8(b)}.
+/// little-endian, v[0] in the low byte: four FFMAs and three byte permutes
+/// for the four bytes, against the FMUL + F2I per value and two saturating
+/// packs of a conversion.
 __device__ __forceinline__ uint32_t i8_pack4(const float (&v)[4], float inv_scale) {
-    const int q0 = __float2int_rn(v[0] * inv_scale);
-    const int q1 = __float2int_rn(v[1] * inv_scale);
-    const int q2 = __float2int_rn(v[2] * inv_scale);
-    const int q3 = __float2int_rn(v[3] * inv_scale);
-    uint32_t hi, w;
-    asm("cvt.pack.sat.s8.s32.b32 %0, %1, %2, 0;" : "=r"(hi) : "r"(q3), "r"(q2));
-    asm("cvt.pack.sat.s8.s32.b32 %0, %1, %2, %3;" : "=r"(w) : "r"(q1), "r"(q0), "r"(hi));
-    return w;
+    const uint32_t lo = i8_pack2(v[0], v[1], inv_scale);
+    const uint32_t hi = i8_pack2(v[2], v[3], inv_scale);
+    return __byte_perm(lo, hi, 0x5410u);
 }
 
 /// Int8 read-through sample of element `within` of dim `rank` under a

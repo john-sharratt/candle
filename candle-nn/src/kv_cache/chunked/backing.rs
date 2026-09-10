@@ -958,12 +958,12 @@ impl ChunkedKvBacking {
         Some(chunks)
     }
 
-    /// Patch each sequence's cached decode slot-state WRITER slice after a
-    /// mid-decode prefill wrote tokens into the writer chunk in place — see
-    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. O(1) per
-    /// sequence per layer; sequences with no cached buffer (never decoded, or
-    /// cleared by a chunk-boundary append) rebuild fully on the next decode
-    /// sync instead.
+    /// Patch each sequence's cached decode slot-state slices from the writer
+    /// boundary to the writer after a prefill wrote tokens into them — see
+    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. O(chunks
+    /// the prefill wrote) per sequence per layer; sequences with no cached
+    /// buffer (never decoded, or cleared by a chunk-boundary append) rebuild
+    /// fully on the next decode sync instead.
     /// Free token capacity of `batch_idx`'s current decode WRITE chunk — how
     /// many appended tokens it can still hold before the next append crosses
     /// into a fresh chunk. The caller that extends a slot by `n` tokens uses

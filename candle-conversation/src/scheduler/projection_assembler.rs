@@ -36,6 +36,7 @@ use candle_transformers::models::batched_inference::{
 
 use crate::conversation::slice_per_layer_sealed;
 use crate::error::ConversationError;
+use crate::index_pages;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::projection::event::{group_name_of, layer_name_of_group, role_str};
 use crate::projection::{
@@ -1198,6 +1199,20 @@ fn inject_sealed_section(
         }
     };
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    // Unconditional, because the interesting case is the one that logs nothing.
+    // A section reaching here with no blob takes the gap branch and says so; a
+    // section that never reaches here at all is invisible, and telling those two
+    // apart is the whole question when a slot ends up holding an unindexed
+    // prefix. `section_positional` is filled by `ingest_section` and by nothing
+    // else, so a RECOVERED section — one the substrate reload brought back
+    // rather than re-ingested — has no entry no matter how sound its K/V is.
+    tracing::debug!(
+        target: "candle_conversation::scheduler::reproject",
+        slot = parent_id.0,
+        section = sid.raw(),
+        has_page = ctx.section_positional.contains_key(&sid),
+        "apply_projection: injecting section K/V",
+    );
     // The rows that go with those chunks. Borrowing the K/V is what makes this
     // path cheap; the index cannot be borrowed the same way, because its keys
     // come from hidden states this slot never computed.
@@ -1210,11 +1225,26 @@ fn inject_sealed_section(
             ),
         }
     } else if ctx.model.carries_positional_state() {
-        tracing::warn!(
-            "apply_projection: section {} has no index page — this slot will select \
-             against a prefix it never indexed",
-            sid.raw()
-        );
+        // The section's K/V goes in either way, so the index has to be told how
+        // far the slot advanced — a page pushed after this one is placed at a
+        // position, and that position is measured from here. The span itself
+        // stays unindexed, which is the truth about it: nothing indexed it, and
+        // a query landing there finds no candidates.
+        let tokens = sealed.first().map_or(0, |s| s.token_count);
+        if let Err(e) = ctx.model.push_positional_gap(parent_id.0, tokens) {
+            tracing::warn!(
+                "apply_projection: section {} has no index page and the slot could not be \
+                 advanced past its {tokens} token(s) ({e}) — pages injected after it will be \
+                 placed short of where their K/V is",
+                sid.raw()
+            );
+        } else {
+            tracing::warn!(
+                "apply_projection: section {} has no index page — its {tokens} token(s) are \
+                 unindexed",
+                sid.raw()
+            );
+        }
     }
 
     let toks = ctx.conversation.read().section_tokens_of(sid);
@@ -1275,7 +1305,46 @@ fn inject_sealed_turn(
     // re-reading it, and the ingest write path (adopt/couple/mint) had a writer
     // queued, so writer-priority refused the second read forever. `turn_sealed_of`
     // returns an owned `Arc`, so the early drop is free.
-    let sealed = ctx.conversation.read().turn_sealed_of(timeline, index);
+    // **The rule: the most recent turn goes in whole, every older one with its
+    // reasoning windowed out.** Positional and nothing else — no mode, no flag,
+    // no tool state. A turn's reasoning is therefore attendable in exactly one
+    // subsequent projection, which is what lets a tool call's follow-up turn
+    // decode against the thinking that produced the call without anything here
+    // knowing a tool was involved.
+    //
+    // **By turn index, not by position in the piece walk.** Groups emit in score
+    // order with the highest last, so a tool-scope or repo_map group can emit
+    // turns after the conversation group's — the last `Turn` piece is not
+    // reliably the most recent turn. The comparison always finds it because the
+    // conversation group's recent window is inviolate.
+    //
+    // (Known and accepted: an async summary appended between a tool call and its
+    // result takes the highest index, and the call turn is then windowed a turn
+    // early. See `docs/thinking_span_projection.md` §6.3 before adding a clause.)
+    //
+    // The rows come from the resident map first, then the turn's stored record:
+    // the map holds only what THIS process sealed, so after a restart every turn
+    // that predates it misses there and the record is the only copy — which is
+    // the whole reason the pages are written to the log rather than kept in RAM.
+    let key = TurnKey { timeline, index };
+    let resident = ctx.turn_positional.get(&key).map(|b| b.to_vec());
+    let (sealed, page) = {
+        let conv = ctx.conversation.read();
+        let stored = resident.or_else(|| conv.index_page_blob(timeline, index).map(|b| b.to_vec()));
+        let newest = conv.turn_indices(timeline).max();
+        if newest == Some(index) {
+            (conv.turn_sealed_of(timeline, index), stored)
+        } else {
+            // An `Err` here is a turn whose reasoning cannot be windowed. It is
+            // propagated rather than skipped: injecting it whole would show the
+            // reasoning the projection was asked to remove, and skipping it would
+            // silently drop a turn the selection chose.
+            match conv.turn_sealed_without_thinking(timeline, index, stored)? {
+                Some((kv, page)) => (Some(kv), page),
+                None => (None, None),
+            }
+        }
+    };
     let sealed = match sealed {
         Some(s) => s,
         None => {
@@ -1340,34 +1409,82 @@ fn inject_sealed_turn(
     // The rows that go with those chunks. Borrowing the K/V is what makes a
     // reprojection cheap; the index cannot be borrowed the same way, because
     // its keys come from hidden states this slot never computed.
-    // Resident first, then the turn's persisted `TurnIndexPage`. The map holds
-    // only what THIS process sealed, so after a restart every turn that predates
-    // it misses here and the stored record is the only copy — which is the whole
-    // reason the page is written to the log rather than kept in RAM.
-    let key = TurnKey { timeline, index };
-    let resident = ctx.turn_positional.get(&key).map(|b| b.to_vec());
-    let page = match resident {
-        Some(b) => Some(b),
-        None => ctx
-            .conversation
-            .read()
-            .index_page_blob(timeline, index)
-            .map(|b| b.to_vec()),
-    };
+    // Resolved above, beside the K/V it belongs to, so a windowed turn's rows
+    // are filtered in the same call that windowed its chunks.
     if let Some(blob) = page {
-        match ctx.model.push_positional_state(parent_id.0, &blob) {
-            Ok(_) => walker.pages_pushed += 1,
-            Err(e) => tracing::warn!(
-                "apply_projection: turn {}/{} index page refused: {e}",
-                timeline,
-                index.0
-            ),
+        // A turn's index is a LIST of pages — one per piece its rows span (see
+        // `index_pages`) — pushed in the order the seal produced them, because
+        // each carries its own ragged width. A malformed payload injects
+        // nothing: half a turn's index is worse than none, since the slot would
+        // then hold K/V that only part of the cache accounts for.
+        // **However this ends, the slot must finish past the K/V just injected.**
+        // `inject_arc_sealed` above put the turn's chunks in unconditionally, so
+        // a page path that gives up early leaves the index short of the cache and
+        // every LATER page is placed at a position its K/V does not occupy — the
+        // slot then selects against a prefix that is silently misaligned, which
+        // is a wrong answer rather than a missing one. The `page.is_none()`
+        // branch below already advances for exactly this reason; these two
+        // failure exits did not.
+        match index_pages::decode(&blob) {
+            Ok(pages) => {
+                let declared: usize = pages.iter().map(|(tokens, _)| *tokens).sum();
+                let mut pushed = 0usize;
+                for (tokens, p) in pages {
+                    match ctx.model.push_positional_state(parent_id.0, p) {
+                        Ok(_) => {
+                            walker.pages_pushed += 1;
+                            pushed += tokens;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "apply_projection: turn {}/{} index page refused: {e}",
+                                timeline,
+                                index.0
+                            );
+                            break;
+                        }
+                    }
+                }
+                // Only the tokens no page covered, so a partial push is not
+                // counted twice.
+                if pushed < declared && ctx.model.carries_positional_state() {
+                    let gap = declared - pushed;
+                    let advanced = ctx.model.push_positional_gap(parent_id.0, gap).is_ok();
+                    tracing::warn!(
+                        timeline = timeline.raw(),
+                        index = index.0,
+                        gap,
+                        advanced,
+                        "apply_projection: index pages stopped short of the turn's K/V; \
+                         advancing the slot over the remainder"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "apply_projection: turn {}/{} index pages unreadable ({e}); injecting none — \
+                     this slot will select against a prefix it never indexed",
+                    timeline,
+                    index.0
+                );
+                if ctx.model.carries_positional_state() {
+                    // Nothing was pushed, so the whole injected width is the gap.
+                    let tokens = sealed.first().map_or(0, |s| s.token_count);
+                    let _ = ctx.model.push_positional_gap(parent_id.0, tokens);
+                }
+            }
         }
     } else if ctx.model.carries_positional_state() {
+        // Same reasoning as the section path: the turn's K/V is injected either
+        // way, so the slot has to be advanced past it or the next page is placed
+        // short of where its K/V actually sits.
+        let tokens = sealed.first().map_or(0, |s| s.token_count);
+        let declared = ctx.model.push_positional_gap(parent_id.0, tokens);
         tracing::warn!(
             stream_id = format!("{:#018x}", turn_stream_id(timeline.raw(), index.0).0),
-            "apply_projection: turn {}/{} has no index page, resident or stored — this \
-             slot will select against a prefix it never indexed",
+            advanced = declared.is_ok(),
+            "apply_projection: turn {}/{} has no index page, resident or stored — its \
+             {tokens} token(s) are unindexed",
             timeline,
             index.0
         );
@@ -1848,6 +1965,30 @@ pub(super) fn apply_segments_finish(
         }
     }
 
+    // **The turn's own tokens begin below, so its index boundary is here.**
+    //
+    // Everything assembled above is prefix: injected turns and sections, and any
+    // of it this slot FORWARDED rather than borrowed has left its rows in the
+    // live index tail. The deferred user message that prefills below is the
+    // turn's own first content, and it extends that same tail — so without a cut
+    // here the two become one run and the seal, which asks for "the last N
+    // tokens", takes a page that starts before the turn does.
+    //
+    // `Scheduler::create_view` closes again at the carve, and that is not a
+    // duplicate: it is the boundary for a slot that reaches the carve having
+    // forwarded nothing (`skip_projection`, the `code_read` ingest), which is
+    // why the cut cannot live at only one of the two. Closing an empty tail is a
+    // no-op, so whichever is the real boundary is the one that closes anything.
+    //
+    // Leaving this out was measured, on turn after turn: `turn_token_count=324`
+    // with `reasoning=(296, 3)` and sealed `widths=[7, 28]` — the 289-token user
+    // message swallowed into the prefix's page, leaving a 7-token assistant
+    // header as the whole of the turn's "prefill".
+    if deferred_user.is_some() {
+        let held = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
+        super::close_unit_boundary(&**ctx.model, parent_id, "turn user half", held);
+    }
+
     // The in-flight user message prefills last, after the now-filled gaps. The
     // slot always ends in a complete region (a reserved gap chunk, or a sealed
     // inject when there is no glue), so the user message must push a fresh writer
@@ -1875,7 +2016,14 @@ pub(super) fn apply_segments_finish(
     // LONG is reported too. The rebuild is supposed to reproduce the slot, and
     // a slot that grew has injected something twice — a piece restored both
     // from the substrate and from the tail.
-    if let Some(before) = held_before {
+    // **An empty slot is not a rebuild, so it is not compared.** `held_before`
+    // is what the slot held before this pass took it apart; a slot holding
+    // nothing had nothing taken apart, and what follows is an initial
+    // population, not a reproduction. Comparing there reports the whole
+    // projection as "duplicated" — measured at 19 warns per startup, every one
+    // of them `before=0`, which is precisely the volume of false alarm that
+    // makes a real divergence in this check unreadable.
+    if let Some(before) = held_before.filter(|b| *b > 0) {
         let after = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
         if after != before {
             tracing::warn!(
@@ -1898,6 +2046,16 @@ pub(super) fn apply_segments_finish(
     // positions this slot does not hold — which selects against them without
     // erroring at all. This is the same invariant `handle_memory_catch_up`
     // asserts after its own rebuild, on the same pair of quantities.
+    //
+    // **Reported, not refused — and that is a measured decision, not caution.**
+    // Promoting this to an `Err` was tried and reverted: a live run showed the
+    // repo_map section-ingest path arriving here already diverged by exactly one
+    // ingest turn's width (323 tokens, 408 times, always the same number), which
+    // predates the thinking-span work. Refusing aborted 120 of 355 directory
+    // ingests and killed every conversation with it. The invariant is right; the
+    // system does not satisfy it yet on that path, so the check reports until it
+    // does. Promote it when a run is silent here — that run is the evidence, and
+    // this comment is the record that it has not happened.
     if let Some(cov) = ctx.model.positional_coverage(parent_id.0) {
         let held = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
         if cov != held {
@@ -1905,10 +2063,14 @@ pub(super) fn apply_segments_finish(
                 slot = parent_id.0,
                 held,
                 coverage = cov,
-                "apply_segments_finish: the assembled slot's index is {} token(s) {} its \
-                 K/V",
+                "apply_segments_finish: the assembled slot's index is {} token(s) {} its K/V — {}",
                 cov.abs_diff(held),
-                if cov < held { "short of" } else { "past" }
+                if cov < held { "short of" } else { "past" },
+                if cov < held {
+                    "a source injected K/V without its index pages"
+                } else {
+                    "pages were installed twice, claiming positions this slot does not hold"
+                }
             );
         }
     }

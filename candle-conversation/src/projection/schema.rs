@@ -961,10 +961,6 @@ pub struct GroupSchema {
     /// turn group that simply omitted both fields.
     pub policy_band_declared: bool,
     pub budget: Budget,
-    /// Fallback turn (by decl tag) brought in when belief/scores select nothing,
-    /// so the group — and its layer — never drops out of the projection. `None`
-    /// = no fallback (today's behaviour).
-    pub default: Option<SelectionDefault>,
     /// Concept B: mass-driven member-budget extension. `None` = static budget.
     pub budget_adaptive: Option<MemberBudgetAdaptive>,
     /// Concept C: a hit drags its timeline neighbors into contention. `None` =
@@ -1158,16 +1154,24 @@ pub enum SelectionRule {
     },
 }
 
-/// A fallback member injected when a group's or collection's normal selection
-/// (belief + challenger + rule) yields nothing. Identified by a single string:
-/// a turn's gather-scope decl tag for groups (e.g. `"."` for the repo_map
-/// workspace-root cluster), or a section name for collections. Guarantees the
-/// group/collection contributes at least one member so its layer never vanishes
-/// from the projection when scores are cold.
+/// A fallback section injected when a **collection's** normal selection
+/// (belief + challenger + rule) yields nothing, named by section name.
+///
+/// Collections only. A collection is a set of mutually exclusive variants of
+/// one dial — a persona, a thinking effort, a response length — so exactly one
+/// must always be present and "none qualified" has no valid rendering; the
+/// default names which variant that is.
+///
+/// Turn **groups** deliberately have no equivalent. Their members are content,
+/// not dial settings, and an empty selection there is a real answer: nothing in
+/// the corpus was relevant. A group-level default was tried and removed — it
+/// injected its member with a score synthesised to clear the threshold that
+/// member had just failed, which put thousands of tokens of unrelated content
+/// in front of the model on a cold probe.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectionDefault {
-    /// The turn-decl tag (groups) or section name (collections) that identifies
-    /// the fallback member. Must uniquely name one member.
+    /// The section name identifying the fallback member. Must uniquely name one
+    /// section of the collection.
     pub tag: String,
 }
 
@@ -1294,7 +1298,6 @@ mod belief_config_tests {
                 scan: ScanPolicy::default(),
             },
             budget: Budget::default(),
-            default: None,
             budget_adaptive: None,
             locality: None,
             anchor: None,

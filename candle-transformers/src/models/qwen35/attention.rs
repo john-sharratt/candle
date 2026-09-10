@@ -107,6 +107,17 @@ impl RopeTables {
         Ok((table_ptr(&self.cos)?, table_ptr(&self.sin)?))
     }
 
+    /// The `cos` and `sin` tables themselves, `[max_pos, rope_dim / 2]` each.
+    ///
+    /// For asking what the tables *say*, rather than rotating with them: the
+    /// angle a row stores is `pos · inv_freq` rounded to `f32`, so a caller
+    /// checking a trigonometric identity across rows needs the entries to
+    /// derive the identity's own floor from — see
+    /// `tests/qsa_page_place_bench.rs`'s composition gate.
+    pub fn tables(&self) -> (&Tensor, &Tensor) {
+        (&self.cos, &self.sin)
+    }
+
     /// Apply to `x [T, n_heads, head_dim]` for absolute positions
     /// `offset..offset + T`. Dims `[rope_dim, head_dim)` pass through.
     pub fn apply(&self, x: &Tensor, offset: usize) -> Result<Tensor> {

@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::paged_index::IndexPage;
 
 use super::config::IndexerConfig;
+use super::place::{PlacePage, Placement, PLACE_TILE_R};
 use super::qsa::{rms_norm_last, IndexerWeights};
 use super::qsa_select::{max_entries, max_keep, selected_width, MAX_RATIO};
 use super::spec::SpecCapture;
@@ -97,12 +98,57 @@ pub struct IndexCache {
     /// Empty for a sequence that forwarded everything it holds, which is every
     /// sequence the gates run — there the walk reduces to the uniform formula
     /// and the scorer sees a single page.
-    pages: Vec<IndexPage>,
-    /// Exclusive prefix sum of [`Self::pages`] token spans; `page_tokens.last()`
-    /// is the position the live tail begins at.
-    page_tokens: Vec<usize>,
+    pages: Vec<PlacedPage>,
     /// Exclusive prefix sum of [`Self::pages`] row counts.
+    ///
+    /// Rows stay ordinal, and only rows: the scorer's candidate axis is a dense
+    /// concatenation of every page's rows, so row `k` of page `p` is candidate
+    /// `page_rows[p] + k` however the pages are positioned. Positions are the
+    /// other thing entirely — see [`PlacedPage::base`].
     page_rows: Vec<usize>,
+    /// Absolute position the live tail opens at.
+    ///
+    /// **Recorded, not accumulated.** It used to be the running sum of the page
+    /// widths, which made every position downstream of an unindexed span wrong
+    /// by that span's width; it is now whatever the last placement said, so a
+    /// span nothing indexed is a hole and nothing else.
+    tail_base: usize,
+    /// The placement staging every page in [`Self::pages`] is scored from —
+    /// each page rotated into the frame of the position it sits at, channel-
+    /// blocked, in one buffer.
+    ///
+    /// **One placement per batch of pages, appended — never rebuilt.** A cache
+    /// gains pages a few at a time (a projection injects a run of them; a decode
+    /// closes one at every break token), and re-planning the whole set on each
+    /// arrival would allocate and abandon a staging arena per page: O(pages²)
+    /// bytes through a pool that does not hand memory back. Placing only what is
+    /// pending keeps it linear, and the batched arena still does its job on the
+    /// path it was measured for — a projection placing every page at once is one
+    /// plan and one launch.
+    ///
+    /// Covers `pages[..placed_pages]`, in order. [`Self::place_pending`] extends
+    /// it; [`Self::score_pages`] refuses to score a cache it does not cover
+    /// rather than extending it itself, because the rotation needs the rope
+    /// tables and a scorer that reached for them would be hiding a caller that
+    /// forgot to place.
+    placed: Vec<Placement>,
+    /// Pages [`Self::placed`] accounts for.
+    placed_pages: usize,
+}
+
+/// One injected page and where it sits.
+#[derive(Debug, Clone)]
+struct PlacedPage {
+    page: IndexPage,
+    /// Absolute position this page's first row occupies **in this cache**.
+    ///
+    /// The authority. A page's rows carry the rotation of the frame they were
+    /// prepared in, and this is the frame they are being read in; the difference
+    /// is the rotation [`Placement`] applies once when the page is placed.
+    base: usize,
+    /// Tokens the page covers, resolved at push where `ratio` is in hand — so
+    /// nothing downstream needs a `ratio` to say how wide a page is.
+    tokens: usize,
 }
 
 /// What a wave must put back if it fails.
@@ -126,8 +172,10 @@ impl IndexCache {
             raw: Tensor::zeros((MAX_RATIO, head_dim), DType::F32, device)?,
             n_open: 0,
             pages: Vec::new(),
-            page_tokens: vec![0],
             page_rows: vec![0],
+            tail_base: 0,
+            placed: Vec::new(),
+            placed_pages: 0,
         })
     }
 
@@ -161,16 +209,20 @@ impl IndexCache {
 
     /// The first position of `block`, through this cache's page layout — the
     /// inverse of [`Self::candidates_at`].
+    ///
+    /// Read off the page's own [`base`](PlacedPage::base), never accumulated
+    /// from the widths before it, which is what makes an unindexed span harmless
+    /// here: it contributes no rows and moves no page.
     pub fn block_start(&self, block: usize, ratio: usize) -> usize {
         let rows = self.page_row_span();
         if block >= rows {
-            return self.page_token_span() + (block - rows) * ratio;
+            return self.tail_base + (block - rows) * ratio;
         }
         let p = match self.page_rows.binary_search(&block) {
-            Ok(i) => return self.page_tokens[i],
+            Ok(i) => return self.pages[i].base,
             Err(i) => i - 1,
         };
-        self.page_tokens[p] + (block - self.page_rows[p]) * ratio
+        self.pages[p].base + (block - self.page_rows[p]) * ratio
     }
 
     /// Cells of its own block the query at `pos` has, `1..=ratio`.
@@ -191,10 +243,12 @@ impl IndexCache {
     /// live tail's own arithmetic, so the kernels need no special case for it.
     pub fn page_prefixes(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity((self.pages.len() + 1) * 2);
-        for i in 0..=self.pages.len() {
-            out.push(self.page_tokens[i] as u32);
+        for (i, p) in self.pages.iter().enumerate() {
+            out.push(p.base as u32);
             out.push(self.page_rows[i] as u32);
         }
+        out.push(self.tail_base as u32);
+        out.push(self.page_row_span() as u32);
         out
     }
 
@@ -256,7 +310,14 @@ impl IndexCache {
         self.ensure_capacity((self.n_blocks + 1) * ratio, ratio)?;
         let dst = self.keys_ptr()? + (self.n_blocks as u64) * (d * 4) as u64;
         let src = self.raw_ptr()?;
-        let jobs: Vec<i64> = vec![dst as i64, src as i64, cells as i64, self.n_blocks as i64];
+        // The block's ABSOLUTE first position, not its ordinal in the tail. The
+        // queries this key is scored against are roped at their absolute slot
+        // position, so a tail that roped from zero put every one of its blocks
+        // `tail_base` tokens away from the frame it is read in — invisible below
+        // the identity threshold, and a silently wrong relative distance above
+        // it.
+        let pos = self.tail_base + self.n_blocks * ratio;
+        let jobs: Vec<i64> = vec![dst as i64, src as i64, cells as i64, pos as i64];
 
         let device = self.keys.device().clone();
         let candle::Device::Cuda(cuda) = &device else {
@@ -282,6 +343,64 @@ impl IndexCache {
         self.n_blocks += 1;
         self.n_open = 0;
         Ok(Some(cells))
+    }
+
+    /// Close the live tail into a page, so what follows it starts a new one.
+    ///
+    /// **A page is the only place a ragged width can live.** The live tail's
+    /// arithmetic is a uniform division in three places — [`Self::candidates_at`],
+    /// [`Self::block_start`], and [`Self::indexed_tokens`] all read
+    /// `n_blocks · ratio` — so a short block left *inside* it puts every later
+    /// position on the wrong block and makes the cache over-report its own token
+    /// count by `ratio − cells`, for the rest of the sequence, internally
+    /// consistent and wrong against the K/V. [`Self::flush_open_block`] alone
+    /// therefore cannot be used mid-sequence; lifting the flushed rows out into a
+    /// page, whose `last_cells` records the short width, is what makes the cut
+    /// expressible.
+    ///
+    /// Composed rather than reimplemented: the flush pools the carried rows into
+    /// one short block, and [`Self::push_page`] does the prefix-sum bookkeeping.
+    /// The reset between them *satisfies* `push_page`'s guard ("injected prefixes
+    /// must precede anything this sequence forwarded") rather than bypassing it —
+    /// once the tail has been lifted out there is nothing forwarded left to
+    /// precede.
+    ///
+    /// A no-op on an empty tail, so a caller may close unconditionally at a
+    /// boundary without asking whether one is needed.
+    ///
+    /// Returns the tokens the new page covers — `0` when the tail was already
+    /// empty. **The caller needs this to know the cut fired**: a boundary that
+    /// silently closes nothing is indistinguishable from one placed after the
+    /// tokens it was meant to separate, and that distinction cost several live
+    /// runs to make by inference.
+    #[cfg(feature = "cuda")]
+    pub fn close_tail_into_page(
+        &mut self,
+        w: &IndexerWeights,
+        rope: &RopeTables,
+        ratio: usize,
+        rms_eps: f64,
+    ) -> Result<usize> {
+        let cells = self.flush_open_block(w, rope, ratio, rms_eps)?;
+        if self.n_blocks == 0 {
+            return Ok(0);
+        }
+        // Owned: the page outlives the buffer, which the next append overwrites
+        // from row 0 once `n_blocks` is reset below.
+        let rows = self.live_rows()?.to_owned_tensor()?;
+        let last = cells.unwrap_or(ratio);
+        let tokens = (self.n_blocks - 1) * ratio + last;
+        // The tail was roped at its absolute positions, so the page it becomes
+        // is already in the frame it is about to be read in: it records
+        // `tail_base` as the frame it was roped in AND is placed there, so the
+        // rotation is the identity. This is the live decode path, and it is what
+        // makes a unit boundary free.
+        let base = self.tail_base;
+        self.n_blocks = 0;
+        self.n_open = 0;
+        self.push_page(IndexPage::at_frame(rows, base, last), base, ratio)?;
+        self.place_pending(rope)?;
+        Ok(tokens)
     }
 
     /// A cache holding `rows` as its live prefix and `open` as its carried,
@@ -320,8 +439,10 @@ impl IndexCache {
             raw,
             n_open,
             pages: Vec::new(),
-            page_tokens: vec![0],
             page_rows: vec![0],
+            tail_base: 0,
+            placed: Vec::new(),
+            placed_pages: 0,
         })
     }
 
@@ -335,7 +456,17 @@ impl IndexCache {
     /// Refused once the sequence has forwarded anything, because a page landing
     /// after live rows would sit at the wrong positions: pages describe a
     /// prefix, and the live tail is what follows them.
-    pub fn push_page(&mut self, page: IndexPage, ratio: usize) -> Result<()> {
+    ///
+    /// `base` is the absolute position the page's first row occupies here, and
+    /// it is the whole of what makes a sealed page injectable: the rows arrive
+    /// carrying `page.roped_base`'s rotation, and the difference between the two
+    /// is what [`Self::place_pending`] turns through. A caller that knows only
+    /// "after the last one" passes [`Self::next_base`].
+    ///
+    /// Recording only — the staging is built by `place_pending`, so a caller
+    /// pushing a page onto every layer pays one launch per layer rather than one
+    /// per page per layer.
+    pub fn push_page(&mut self, page: IndexPage, base: usize, ratio: usize) -> Result<()> {
         if self.n_blocks != 0 || self.n_open != 0 {
             candle::bail!(
                 "qsa index: a page arrived after {} live block(s) and {} carried row(s) — \
@@ -344,18 +475,91 @@ impl IndexCache {
                 self.n_open,
             );
         }
+        if base < self.tail_base {
+            candle::bail!(
+                "qsa index: a page placed at {base} would overlap the {} token(s) already \
+                 placed — pages must ascend and may not overlap",
+                self.tail_base,
+            );
+        }
         let rows = page.rows()?;
         let tokens = page.tokens(ratio)?;
         self.page_rows.push(self.page_rows.last().unwrap() + rows);
-        self.page_tokens
-            .push(self.page_tokens.last().unwrap() + tokens);
-        self.pages.push(page);
+        self.pages.push(PlacedPage { page, base, tokens });
+        self.tail_base = base + tokens;
+        // The placement is not invalidated — it still covers the pages it
+        // covered, and this one joins the pending set. See `Self::placed`.
         Ok(())
     }
 
-    /// Tokens covered by injected pages — the position the live tail starts at.
+    /// The position a page pushed now would sit at if it abuts the last one —
+    /// what a caller injecting a contiguous run passes to [`Self::push_page`].
+    pub fn next_base(&self) -> usize {
+        self.tail_base
+    }
+
+    /// Move the live tail's opening position to `base` without pushing rows.
+    ///
+    /// For K/V injected with no index rows at all — a piece sealed before pages
+    /// existed. Under the accumulating layout this had to be a zero-row *page*
+    /// (`push_gap`), because a span that advanced the token sum without
+    /// advancing it would have slid every later page's implied start earlier by
+    /// its width. Positions are now recorded rather than summed, so the span is
+    /// simply not indexed: no page moves, nothing needs to stand in for it, and
+    /// all that is left to say is where the tail resumes.
+    pub fn skip_to(&mut self, base: usize) -> Result<()> {
+        if self.n_blocks != 0 || self.n_open != 0 {
+            candle::bail!(
+                "qsa index: the tail was moved to {base} after {} live block(s) and {} carried \
+                 row(s) — an injected prefix must precede anything this sequence forwarded",
+                self.n_blocks,
+                self.n_open,
+            );
+        }
+        if base < self.tail_base {
+            candle::bail!(
+                "qsa index: the tail cannot move back to {base} from {}",
+                self.tail_base,
+            );
+        }
+        self.tail_base = base;
+        Ok(())
+    }
+
+    /// Rotate every page into the frame of the position it sits at and build the
+    /// scorer's staging — **one launch for all of this cache's pages**.
+    ///
+    /// Idempotent and cheap when nothing changed: a cache whose pages have not
+    /// moved since the last call returns without launching.
+    #[cfg(feature = "cuda")]
+    pub fn place_pending(&mut self, rope: &RopeTables) -> Result<()> {
+        if self.placed_pages == self.pages.len() {
+            return Ok(());
+        }
+        // Only what is pending. The pages already placed keep the staging they
+        // were given — re-planning them would abandon a live arena per push.
+        let jobs: Vec<PlacePage<'_>> = self.pages[self.placed_pages..]
+            .iter()
+            .map(|p| {
+                // A sealed page is normalised to zero, so its delta is its base;
+                // one closed in this cache sits where it was roped, so its delta
+                // is zero and the placement is a pure transpose.
+                PlacePage {
+                    keys: &p.page.keys,
+                    delta: p.base as isize - p.page.roped_base as isize,
+                }
+            })
+            .collect();
+        let placement = Placement::plan(&jobs)?;
+        placement.run(rope, PLACE_TILE_R)?;
+        self.placed.push(placement);
+        self.placed_pages = self.pages.len();
+        Ok(())
+    }
+
+    /// The position the live tail starts at — everything placed ahead of it.
     pub fn page_token_span(&self) -> usize {
-        *self.page_tokens.last().unwrap_or(&0)
+        self.tail_base
     }
 
     /// Injected pages held, oldest first.
@@ -372,11 +576,12 @@ impl IndexCache {
     /// therefore takes whole pages and stops when it has covered enough.
     pub fn page_at(&self, i: usize) -> Option<(&IndexPage, usize)> {
         let p = self.pages.get(i)?;
-        let tokens = self
-            .page_tokens
-            .get(i + 1)?
-            .saturating_sub(self.page_tokens[i]);
-        Some((p, tokens))
+        Some((&p.page, p.tokens))
+    }
+
+    /// Page `i`'s absolute position in this cache.
+    pub fn page_base(&self, i: usize) -> Option<usize> {
+        self.pages.get(i).map(|p| p.base)
     }
 
     /// Rows held in injected pages.
@@ -403,22 +608,33 @@ impl IndexCache {
     /// with no pages, which is every sequence that forwarded its whole prefix.
     pub fn candidates_at(&self, pos: usize, ratio: usize) -> usize {
         let limit = pos + 1;
-        let span = self.page_token_span();
-        if limit > span {
+        if limit > self.tail_base {
             // Inside the live tail: the pages are wholly below, and the tail
-            // pools uniformly from its own first position.
-            return self.page_row_span() + (limit - span) / ratio;
+            // pools uniformly from its own opening position.
+            return self.page_row_span() + (limit - self.tail_base) / ratio;
         }
-        // Inside the pages. Take whole pages while they fit, then the whole
-        // rows of the page the position lands in — its last row is short, so it
-        // only counts once the position reaches the page's full span.
-        let p = match self.page_tokens.binary_search(&limit) {
+        // Inside the placed pages: the last one that starts at or before `pos`.
+        // Searched by BASE rather than by a running width sum, so a position
+        // that falls in a hole between two pages resolves to the page before it
+        // with all of that page's rows below — which is the truth, and what the
+        // width sum could not express.
+        let p = match self.pages.binary_search_by_key(&limit, |p| p.base) {
+            // A page opening exactly at `limit` opens after `pos`, so it and
+            // everything above it are not below.
             Ok(i) => return self.page_rows[i],
+            Err(0) => return 0,
             Err(i) => i - 1,
         };
-        let inside = limit - self.page_tokens[p];
-        let page_rows = self.pages[p].rows().unwrap_or(0);
-        let whole = (inside / ratio).min(page_rows.saturating_sub(1));
+        let placed = &self.pages[p];
+        let rows = placed.page.rows().unwrap_or(0);
+        let inside = limit - placed.base;
+        // The last row is short — it covers `last_cells`, not `ratio` — so it
+        // only counts once the position has reached the page's full width.
+        let whole = if inside >= placed.tokens {
+            rows
+        } else {
+            (inside / ratio).min(rows.saturating_sub(1))
+        };
         self.page_rows[p] + whole
     }
 
@@ -473,8 +689,14 @@ impl IndexCache {
             // nothing appends to, so parent and child read the same rows. Only
             // the live tail above them is written, and that is copied.
             pages: self.pages.clone(),
-            page_tokens: self.page_tokens.clone(),
             page_rows: self.page_rows.clone(),
+            tail_base: self.tail_base,
+            // The staging is NOT shared. It is the child's to rebuild: the pages
+            // sit at the same places, so the rebuild reproduces it exactly, and
+            // sharing a buffer between two caches that each believe they own it
+            // is the kind of aliasing this design exists to remove.
+            placed: Vec::new(),
+            placed_pages: 0,
         })
     }
 
@@ -514,8 +736,10 @@ impl IndexCache {
         self.n_blocks = 0;
         self.n_open = 0;
         self.pages.clear();
-        self.page_tokens.truncate(1);
         self.page_rows.truncate(1);
+        self.tail_base = 0;
+        self.placed.clear();
+        self.placed_pages = 0;
     }
 
     /// Blocks this span would complete, and the rows it would leave open.
@@ -709,9 +933,34 @@ impl IndexCache {
         use candle_kernels::simple::qsa_score_paged::run_qsa_score_paged;
 
         let device = self.keys.device().clone();
+        // The staging, not the pages: each page's rows rotated into the frame of
+        // the position it sits at. A cache that has pages but no placement is a
+        // caller that pushed and did not call `place_pending` — refused rather
+        // than silently scored in the wrong frame, which is the failure this
+        // whole design exists to remove.
+        if self.placed_pages != self.pages.len() {
+            candle::bail!(
+                "qsa index: scoring {} page(s) of which only {} have been placed — \
+                 `place_pending` must run after a push and before a score",
+                self.pages.len(),
+                self.placed_pages,
+            );
+        }
+        // The placements in order, each covering the batch it was planned for,
+        // so the flattened pointers are the pages' own order.
         let mut ptrs: Vec<i64> = Vec::with_capacity(self.pages.len());
-        for p in &self.pages {
-            ptrs.push(tensor_ptr(p.blocked()?)? as i64);
+        for placement in &self.placed {
+            for t in placement.staged() {
+                ptrs.push(tensor_ptr(t)? as i64);
+            }
+        }
+        if ptrs.len() != self.pages.len() {
+            candle::bail!(
+                "qsa index: {} staging buffer(s) against {} page(s) — the placements do \
+                 not tile the pages they claim to cover",
+                ptrs.len(),
+                self.pages.len(),
+            );
         }
         let first: Vec<u32> = self.page_rows.iter().map(|&r| r as u32).collect();
         let keys_tbl = Tensor::from_vec(ptrs, (self.pages.len(),), &device)?;
@@ -1112,7 +1361,8 @@ pub fn append_wave(
             jobs.push(if n0 > 0 { raw as i64 } else { 0 });
             jobs.push(n0 as i64);
             jobs.push((k_base + src1 as u64 * row) as i64);
-            jobs.push(((n_blocks + i) * ratio) as i64);
+            // Absolute, not the tail's own ordinal — see `flush_open_block`.
+            jobs.push((span.cache.tail_base + (n_blocks + i) * ratio) as i64);
         }
 
         if left > 0 {
@@ -1351,6 +1601,28 @@ pub fn select_layer(
     }
     append_wave(&mut work, &k_all, indexer, rope, compress_ratio, eps)?;
 
+    // **Place any page that is carrying no staging, before anything scores.**
+    //
+    // A cache can hold pages that have never been through `place_pending`, and
+    // the way in is not the push — `push_positional_state` places as it goes —
+    // but [`IndexCache::fork`]. A fork shares the parent's pages and
+    // deliberately does NOT share its staging (two caches each believing they
+    // own one buffer is the aliasing this design removes), so the child arrives
+    // with pages and nothing to score them from. Every view carve does this, and
+    // a `repo_map` ingest carves one per directory: measured as 27 directories
+    // failing with `scoring 17 page(s) that have not been placed`.
+    //
+    // Here rather than inside the scorer because this is where the rope tables
+    // are: placing needs them, and a scorer that reached for them would be
+    // taking a dependency it has no other use for. Idempotent and branch-cheap —
+    // a cache whose pages are already placed returns without launching, which is
+    // every wave after the first.
+    for span in spans {
+        if let Some(cache) = idx_map.get_mut(&span.seq).and_then(|c| c.get_mut(kv)) {
+            cache.place_pending(rope)?;
+        }
+    }
+
     if let (Some(table), Some(q_all)) = (table.as_mut(), q_all.as_ref()) {
         // The widest row in the wave sets the score buffer's stride, so every
         // span writes into one buffer and the top-k covers all of it in a
@@ -1475,6 +1747,273 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// An index cache holding `pages` (by token width) and `open` carried rows,
+    /// built on the CPU.
+    ///
+    /// The page bookkeeping — prefix sums, the ragged walk, the token count — is
+    /// pure arithmetic over widths, so it needs no device. Only the flush
+    /// kernel does, which is why these tests can pin the contract the page cuts
+    /// depend on without a GPU in the loop.
+    fn caged(widths: &[usize], ratio: usize) -> IndexCache {
+        let d = 4usize;
+        let mut c = IndexCache::new(d, &Device::Cpu).expect("cpu cache");
+        for &w in widths {
+            // A page of `w` tokens is `ceil(w / ratio)` rows whose last one
+            // covers the remainder — the shape a real seal produces.
+            let rows = w.div_ceil(ratio);
+            let last = w - (rows - 1) * ratio;
+            let keys = Tensor::zeros((rows, d), DType::F32, &Device::Cpu).unwrap();
+            let base = c.next_base();
+            c.push_page(IndexPage::new(keys, last), base, ratio)
+                .expect("push");
+        }
+        c
+    }
+
+    /// **An unindexed span moves nothing but where the next page opens.**
+    ///
+    /// This is the property the whole placement design buys. Positions used to
+    /// be the running sum of the page widths, so a piece injected without its
+    /// rows did not merely leave a span unindexed — it dragged every later page
+    /// earlier by its own width, and every query past it resolved through a
+    /// block describing different tokens. Measured live as 328 tokens of section
+    /// K/V against zero indexed tokens on all thirteen layers.
+    #[test]
+    fn an_unindexed_span_leaves_later_pages_where_their_kv_is() {
+        const RATIO: usize = 4;
+        // 40 tokens of K/V with no rows, then a real 20-token page.
+        let mut c = caged(&[], RATIO);
+        c.skip_to(40).expect("skip");
+        let rows = 20usize.div_ceil(RATIO);
+        let keys = Tensor::zeros((rows, 4), DType::F32, &Device::Cpu).unwrap();
+        let base = c.next_base();
+        c.push_page(IndexPage::new(keys, 20 - (rows - 1) * RATIO), base, RATIO)
+            .expect("page after the span");
+
+        assert_eq!(
+            c.indexed_tokens(RATIO),
+            60,
+            "the skipped 40 tokens are accounted for even though nothing indexed \
+             them — without that the cache claims 20 while the K/V holds 60"
+        );
+        assert_eq!(
+            c.block_start(0, RATIO),
+            40,
+            "the first REAL row begins where its K/V does, past the span"
+        );
+        // The span itself offers nothing: a position inside it resolves to the
+        // row count before it, which is zero.
+        assert_eq!(
+            c.candidates_at(20, RATIO),
+            0,
+            "a query inside the span has no candidates — nothing indexed it"
+        );
+        // And one inside the real page resolves through THAT page.
+        assert_eq!(
+            c.candidates_at(43, RATIO),
+            1,
+            "a query four tokens into the page sees the page's first row"
+        );
+    }
+
+    /// Moving the tail adds no rows and no candidates — only distance.
+    #[test]
+    fn skipping_adds_tokens_but_no_rows() {
+        const RATIO: usize = 4;
+        let mut c = caged(&[12], RATIO);
+        let rows_before = c.page_row_span();
+        let tokens_before = c.page_token_span();
+        c.skip_to(tokens_before + 17).expect("skip");
+        assert_eq!(
+            c.page_row_span(),
+            rows_before,
+            "an unindexed span contributes no candidate rows"
+        );
+        assert_eq!(
+            c.page_token_span(),
+            tokens_before + 17,
+            "but it does move the position the next page opens at"
+        );
+        // Standing still is a no-op, so a caller may declare unconditionally.
+        c.skip_to(tokens_before + 17).expect("no-op skip");
+        assert_eq!(c.page_token_span(), tokens_before + 17);
+    }
+
+    /// Moving the tail obeys the same ordering rule as a page: injected prefix
+    /// state must precede anything the sequence forwarded, or the live tail's
+    /// own rows would sit before content that came earlier.
+    #[test]
+    fn a_skip_is_refused_after_live_rows() {
+        const RATIO: usize = 4;
+        let mut c = caged(&[8], RATIO);
+        c.n_blocks = 1;
+        assert!(
+            c.skip_to(c.next_base() + 4).is_err(),
+            "moving the tail after live rows must be refused, exactly as a page is"
+        );
+    }
+
+    /// **Pages ascend and may not overlap.** A hole is a span nobody indexed; an
+    /// overlap is two rows claiming one token, which no placement can mean.
+    #[test]
+    fn a_page_may_not_overlap_the_one_before_it() {
+        const RATIO: usize = 4;
+        let mut c = caged(&[12], RATIO);
+        let keys = Tensor::zeros((2, 4), DType::F32, &Device::Cpu).unwrap();
+        assert!(
+            c.push_page(IndexPage::new(keys, RATIO), 4, RATIO).is_err(),
+            "a page placed inside the previous page's span was accepted"
+        );
+    }
+
+    /// **The ragged-page contract, which every thinking-span cut relies on.**
+    ///
+    /// A page records the tokens its last row covers, and the scorer walks those
+    /// widths instead of dividing by `ratio`. These pin that a position resolves
+    /// to the same block whether the pages are uniform, ragged, or a mix — the
+    /// property that makes dropping a whole page renumber everything downstream
+    /// by construction.
+    #[test]
+    fn ragged_pages_resolve_positions_by_walking_widths() {
+        let ratio = 4;
+        // Uniform pages: the walk must agree with the plain division.
+        let c = caged(&[8, 8], ratio);
+        assert_eq!(c.indexed_tokens(ratio), 16);
+        for pos in 0..16 {
+            assert_eq!(
+                c.candidates_at(pos, ratio),
+                (pos + 1) / ratio,
+                "uniform pages must match the uniform formula at {pos}"
+            );
+        }
+
+        // Ragged: 5 tokens (rows [4,1]) then 6 (rows [4,2]).
+        let c = caged(&[5, 6], ratio);
+        assert_eq!(c.indexed_tokens(ratio), 11);
+        // Inside page 0: its short last row only counts once the position
+        // reaches the page's full span.
+        assert_eq!(c.candidates_at(0, ratio), 0);
+        assert_eq!(c.candidates_at(3, ratio), 1);
+        assert_eq!(
+            c.candidates_at(4, ratio),
+            2,
+            "page 0 complete at its 5th token"
+        );
+        // Inside page 1, which starts at token 5.
+        assert_eq!(c.candidates_at(8, ratio), 3);
+        assert_eq!(c.candidates_at(10, ratio), 4, "page 1 complete at token 11");
+    }
+
+    /// A cut leaves a SHORT page, and the pages either side of it must still
+    /// resolve exactly — this is the shape a thinking turn seals
+    /// (`[prefill][reasoning][answer]`, none of them a multiple of `ratio`).
+    #[test]
+    fn a_short_page_between_two_others_keeps_the_walk_exact() {
+        let ratio = 4;
+        let c = caged(&[7, 3, 9], ratio);
+        assert_eq!(
+            c.indexed_tokens(ratio),
+            19,
+            "the cache spans its pages exactly"
+        );
+
+        // Every position must map to a block whose start is at or below it, and
+        // the count must be monotone — the two properties the scorer needs.
+        let mut prev = 0;
+        for pos in 0..19 {
+            let n = c.candidates_at(pos, ratio);
+            assert!(n >= prev, "candidate count went backwards at {pos}");
+            prev = n;
+            if n > 0 {
+                assert!(
+                    c.block_start(n - 1, ratio) <= pos,
+                    "block {} starts after the position that counts it",
+                    n - 1
+                );
+            }
+        }
+        // A page boundary is exactly where the previous page's rows all count.
+        assert_eq!(c.candidates_at(6, ratio), 2, "page 0 = rows [4,3]");
+        assert_eq!(c.candidates_at(9, ratio), 3, "page 1 = one 3-token row");
+    }
+
+    /// **Dropping the reasoning page renumbers by construction.** The whole
+    /// design rests on this: a cache built from `[pre][answer]` must resolve
+    /// positions exactly as one built from `[pre][reasoning][answer]` does for
+    /// the tokens that survive — because the projection compacts the K/V the
+    /// same way.
+    #[test]
+    fn dropping_a_page_compacts_the_walk() {
+        let ratio = 4;
+        let with = caged(&[7, 3, 9], ratio);
+        let without = caged(&[7, 9], ratio);
+
+        assert_eq!(with.indexed_tokens(ratio), 19);
+        assert_eq!(
+            without.indexed_tokens(ratio),
+            16,
+            "the 3-token page is gone"
+        );
+
+        // The retained pages keep their own row counts, so every position in the
+        // compacted cache sees exactly the rows of `[pre] ++ [answer]`.
+        let pre_rows = with.candidates_at(6, ratio);
+        assert_eq!(without.candidates_at(6, ratio), pre_rows);
+        // The answer's last token: all rows of both retained pages.
+        assert_eq!(without.candidates_at(15, ratio), without.page_row_span());
+    }
+
+    /// An empty cache, a single page, and a page narrower than `ratio` — the
+    /// degenerate shapes a suppressed turn or a one-token answer produces.
+    #[test]
+    fn degenerate_page_shapes_are_expressible() {
+        let ratio = 4;
+        let empty = caged(&[], ratio);
+        assert_eq!(empty.indexed_tokens(ratio), 0);
+        assert_eq!(empty.candidates_at(0, ratio), 0);
+
+        // A single 1-token page — a collapsed `<think></think>`.
+        let one = caged(&[1], ratio);
+        assert_eq!(one.indexed_tokens(ratio), 1);
+        assert_eq!(one.candidates_at(0, ratio), 1, "its only row is complete");
+
+        // Exactly one full block.
+        let full = caged(&[4], ratio);
+        assert_eq!(full.indexed_tokens(ratio), 4);
+        assert_eq!(full.candidates_at(2, ratio), 0);
+        assert_eq!(full.candidates_at(3, ratio), 1);
+    }
+
+    /// The push guard, from the CUT's side: `close_tail_into_page` resets the
+    /// tail before pushing precisely because a page may not land after live
+    /// rows. This pins both halves — refused with a tail, accepted without —
+    /// so the reset in the cut cannot be dropped as redundant.
+    #[test]
+    fn a_page_is_refused_after_live_rows_and_accepted_once_the_tail_is_reset() {
+        let ratio = 4;
+        let d = 4usize;
+        let rows = Tensor::zeros((2, d), DType::F32, &Device::Cpu).unwrap();
+        let open = Tensor::zeros((0, d), DType::F32, &Device::Cpu).unwrap();
+
+        let mut forwarded = IndexCache::from_rows(&rows, &open, d).unwrap();
+        assert_eq!(forwarded.live_blocks(), 2);
+        let keys = Tensor::zeros((1, d), DType::F32, &Device::Cpu).unwrap();
+        let base = forwarded.next_base();
+        assert!(
+            forwarded
+                .push_page(IndexPage::new(keys, 1), base, ratio)
+                .is_err(),
+            "a page landing after live rows would sit at the wrong positions"
+        );
+
+        // A cache whose tail is empty — what the cut leaves behind — accepts it.
+        let mut c = caged(&[8], ratio);
+        let keys = Tensor::zeros((1, d), DType::F32, &Device::Cpu).unwrap();
+        let base = c.next_base();
+        assert!(c.push_page(IndexPage::new(keys, 1), base, ratio).is_ok());
+        assert_eq!(c.indexed_tokens(ratio), 9);
     }
 
     fn lcg(n: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -1689,9 +2228,14 @@ mod tests {
         }
 
         /// Every row's selection, as the model would compute it.
-        fn select(&self, cache: &IndexCache, qpos: &[usize]) -> Result<Vec<Option<Vec<u32>>>> {
+        ///
+        /// Takes `&mut` because a cache holding pages has to be placed before it
+        /// can be scored — the scorer refuses a cache whose pages carry no
+        /// staging rather than reading them in the frame they were sealed in.
+        fn select(&self, cache: &mut IndexCache, qpos: &[usize]) -> Result<Vec<Option<Vec<u32>>>> {
+            cache.place_pending(&self.rope)?;
             let t = qpos.len();
-            let widest = cache.n_blocks.max(1);
+            let widest = (cache.page_row_span() + cache.n_blocks).max(1);
             let x = Tensor::from_vec(
                 lcg(t * self.w.q_proj.dim(1)?, 0x76, 1.0),
                 (t, self.w.q_proj.dim(1)?),
@@ -1817,10 +2361,273 @@ mod tests {
         // pre-seal blocks, only post-seal ones, and both are all represented.
         let qpos: Vec<usize> = (40..64).collect();
         assert_eq!(
-            rig.select(&resumed, &qpos)?,
-            rig.select(&live, &qpos)?,
+            rig.select(&mut resumed, &qpos)?,
+            rig.select(&mut live, &qpos)?,
             "the resumed cache selects different blocks than the live one — the \
              conversation would attend to different history after a restart"
+        );
+        Ok(())
+    }
+
+    /// **A cache populated only by INJECTION still forks.**
+    ///
+    /// The three carried classes are populated by different things: the
+    /// recurrent store and the PLE state come from running a wave, the index
+    /// also from a projection installing pages into a slot that has never
+    /// decoded a token. `fork_recurrent` used to return early when the parent
+    /// had no recurrent store — true reasoning for the recurrence, false for the
+    /// index, and it took all three out together.
+    ///
+    /// That is exactly the base conversation's shape: an Arc-injected prefix of
+    /// sections, never decoded. Every conversation forked from it got the base's
+    /// K/V and none of the index describing it, which is silent until the prefix
+    /// passes the QSA identity threshold and then fails every first turn.
+    #[test]
+    fn a_cache_holding_only_injected_pages_forks_them() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device.clone(), 128)?;
+        let ratio = rig.ratio;
+
+        // Injected only: pages pushed, nothing ever appended — no `n_blocks`,
+        // no open rows, which is what "has not run a wave" looks like here.
+        let mut injected = IndexCache::new(rig.cfg.head_dim, &device)?;
+        let mut at = 0usize;
+        for &w in &[16usize, 12, 20] {
+            let rows = w.div_ceil(ratio);
+            let keys = Tensor::zeros((rows, rig.cfg.head_dim), DType::F32, &device)?;
+            injected.push_page(IndexPage::new(keys, w - (rows - 1) * ratio), at, ratio)?;
+            at += w;
+        }
+        assert_eq!(injected.live_blocks(), 0, "the fixture forwarded something");
+        assert_eq!(injected.indexed_tokens(ratio), 48);
+
+        let child = injected.fork()?;
+        assert_eq!(
+            child.indexed_tokens(ratio),
+            injected.indexed_tokens(ratio),
+            "a fork of an injection-only cache lost its pages — the child would \
+             hold the parent's borrowed K/V and no index describing it"
+        );
+        assert_eq!(child.page_count(), injected.page_count());
+        Ok(())
+    }
+
+    /// **Placing incrementally is placing once.**
+    ///
+    /// Pages arrive a few at a time — a decode closes one at every break token —
+    /// and the placement extends rather than rebuilds, because re-planning the
+    /// whole set per arrival abandons a staging arena per page: O(pages²) bytes
+    /// through a pool that does not hand memory back. That is an allocation
+    /// argument, and this is the correctness half of it: the pages must score
+    /// the same either way, or the optimisation has changed the answer.
+    #[test]
+    fn placing_page_by_page_scores_the_same_as_placing_them_together() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device.clone(), 256)?;
+        let ratio = rig.ratio;
+        let widths = [12usize, 8, 20, 4];
+
+        // The pages themselves, built once and shared by both caches so the only
+        // difference is WHEN each was placed.
+        let mut made = Vec::new();
+        let mut at = 0usize;
+        for &w in &widths {
+            let rows = w.div_ceil(ratio);
+            let keys = Tensor::zeros((rows, rig.cfg.head_dim), DType::F32, &device)?;
+            made.push((IndexPage::new(keys, w - (rows - 1) * ratio), at));
+            at += w;
+        }
+
+        // One at a time, placed after each push — the decode shape.
+        let mut incremental = IndexCache::new(rig.cfg.head_dim, &device)?;
+        for (page, base) in &made {
+            incremental.push_page(page.clone(), *base, ratio)?;
+            incremental.place_pending(&rig.rope)?;
+        }
+        assert_eq!(
+            incremental.placed.len(),
+            widths.len(),
+            "placing after every push should leave one placement per page — a \
+             single placement means the set was re-planned each time"
+        );
+
+        // All at once, placed once — the projection shape.
+        let mut batched = IndexCache::new(rig.cfg.head_dim, &device)?;
+        for (page, base) in &made {
+            batched.push_page(page.clone(), *base, ratio)?;
+        }
+        batched.place_pending(&rig.rope)?;
+        assert_eq!(
+            batched.placed.len(),
+            1,
+            "a projection placing every page at once must still be ONE plan and \
+             one launch — that is the shape the batched arena was measured for"
+        );
+
+        let total: usize = widths.iter().sum();
+        let qpos: Vec<usize> = (0..total).collect();
+        assert_eq!(
+            rig.select(&mut incremental, &qpos)?,
+            rig.select(&mut batched, &qpos)?,
+            "the same pages selected differently depending on when they were \
+             placed — the incremental path is not equivalent to the batched one"
+        );
+        Ok(())
+    }
+
+    /// **A FORK arrives with pages and no staging, and must be placed before it
+    /// scores.**
+    ///
+    /// The child shares the parent's pages but deliberately not its placement
+    /// buffer — two caches each believing they own one buffer is the aliasing
+    /// this design exists to remove — so a fork is the one way a cache reaches
+    /// the scorer holding pages it cannot read. Nothing rebuilds it implicitly;
+    /// `select_layer` does it explicitly, where the rope tables are.
+    ///
+    /// This went to production before it was gated: every view carve forks, a
+    /// `repo_map` ingest carves one per directory, and 27 directories failed
+    /// with `scoring 17 page(s) that have not been placed` on a fresh substrate.
+    /// The refusal was right — the alternative is scoring pages in the frame
+    /// they were sealed in — but nothing had asked a fork to score.
+    #[test]
+    fn a_forked_cache_must_be_placed_before_it_scores_and_then_matches_its_parent() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device.clone(), 256)?;
+        let ratio = rig.ratio;
+
+        // A parent holding one closed page plus a live tail — the shape a view
+        // is carved from mid-conversation.
+        let mut parent = IndexCache::new(rig.cfg.head_dim, &device)?;
+        rig.append(&mut parent, 0, 40)?;
+        parent.close_tail_into_page(&rig.w, &rig.rope, ratio, rig.eps)?;
+        rig.append(&mut parent, 40, 24)?;
+        assert!(parent.has_pages(), "the fixture carved no page to inherit");
+
+        let mut child = parent.fork()?;
+        assert!(
+            child.has_pages(),
+            "the fork lost the parent's pages — it would score against a prefix \
+             its K/V still holds"
+        );
+
+        // Unplaced, the scorer must refuse rather than read the pages in the
+        // frame they were sealed in.
+        let qpos: Vec<usize> = (0..64).step_by(7).collect();
+        let widest = (child.page_row_span() + child.live_blocks()).max(1);
+        let scores = Tensor::empty((qpos.len(), widest), DType::F32, &device)?;
+        let x = Tensor::from_vec(
+            lcg(qpos.len() * rig.w.q_proj.dim(1)?, 0x9A, 1.0),
+            (qpos.len(), rig.w.q_proj.dim(1)?),
+            &device,
+        )?;
+        let q = project_queries(&x, &rig.w, &rig.cfg, &rig.rope, &qpos, rig.eps)?;
+        let refused = child.score_rows(&q, &qpos, &rig.cfg, ratio, &scores, widest, 0);
+        assert!(
+            refused.is_err(),
+            "an unplaced fork scored without complaint — its pages carry the \
+             frame they were sealed in, so the scores are silently wrong"
+        );
+
+        // Placed, it must select exactly what the parent selects: same pages,
+        // same positions, so the staging it builds is the parent's.
+        child.place_pending(&rig.rope)?;
+        assert_eq!(
+            rig.select(&mut child, &qpos)?,
+            rig.select(&mut parent, &qpos)?,
+            "a placed fork selected differently than the parent it was carved \
+             from — the child's rebuilt staging is not the parent's"
+        );
+        Ok(())
+    }
+
+    /// **The gate the placement design exists for: a page scores where it is
+    /// PUT, not where it was made.**
+    ///
+    /// Forward the same tokens at two different offsets. Seal the first into a
+    /// position-free page and inject it at the second's offset; it must select
+    /// exactly what the sequence that actually forwarded those tokens there
+    /// selects.
+    ///
+    /// This did not hold before. Index rows carried the rotation of the frame
+    /// they were prepared in and nothing recorded what that frame was, so a page
+    /// borrowed into a projection scored at the relative distance it had in the
+    /// conversation it came from. It is invisible below the identity threshold
+    /// (`selection_engages`) and, above it, a plausible score for the wrong
+    /// block.
+    #[test]
+    fn a_sealed_page_selects_the_same_wherever_it_is_placed() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device.clone(), 512)?;
+        let ratio = rig.ratio;
+        // A whole number of blocks, so the pooling is identical on both sides —
+        // a short trailing block is a different summary by design, and this
+        // gate is about position, not about raggedness.
+        let (made_at, placed_at, tokens) = (64usize, 320usize, 48usize);
+
+        // The page, made at one offset and normalised to carry none.
+        let mut origin = IndexCache::new(rig.cfg.head_dim, &device)?;
+        origin.skip_to(made_at)?;
+        rig.append(&mut origin, 0, tokens)?;
+        let page = IndexPage::new(
+            super::super::place::rotate_rows(&origin.live_rows()?, -(made_at as isize), &rig.rope)?,
+            ratio,
+        );
+
+        // Injected at a different offset.
+        let mut injected = IndexCache::new(rig.cfg.head_dim, &device)?;
+        injected.skip_to(placed_at)?;
+        injected.push_page(page, placed_at, ratio)?;
+
+        // What that offset's own tokens would have produced.
+        let mut forwarded = IndexCache::new(rig.cfg.head_dim, &device)?;
+        forwarded.skip_to(placed_at)?;
+        rig.append(&mut forwarded, 0, tokens)?;
+
+        assert_eq!(
+            injected.indexed_tokens(ratio),
+            forwarded.indexed_tokens(ratio),
+            "the two caches do not even cover the same span"
+        );
+        let qpos: Vec<usize> = (placed_at..placed_at + tokens).step_by(3).collect();
+        assert_eq!(
+            rig.select(&mut injected, &qpos)?,
+            rig.select(&mut forwarded, &qpos)?,
+            "an injected page selected differently than the same tokens forwarded at \
+             that position — its rows are being read in the frame they were made in"
+        );
+        Ok(())
+    }
+
+    /// **Closing a page mid-sequence changes nothing.** The live decode path: a
+    /// unit boundary lifts the tail into a page that is placed exactly where it
+    /// already sat, so the placement rotation is the identity and the selection
+    /// is untouched.
+    ///
+    /// Block-aligned deliberately — `close_tail_into_page` flushes a SHORT
+    /// trailing block, which is a different summary on purpose, so a boundary
+    /// off a block would be testing raggedness rather than position.
+    #[test]
+    fn closing_a_page_at_a_block_boundary_leaves_the_selection_alone() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device.clone(), 512)?;
+        let ratio = rig.ratio;
+        let (cut, total) = (40usize, 96usize);
+
+        let mut whole = IndexCache::new(rig.cfg.head_dim, &device)?;
+        rig.append(&mut whole, 0, total)?;
+
+        let mut split = IndexCache::new(rig.cfg.head_dim, &device)?;
+        rig.append(&mut split, 0, cut)?;
+        let closed = split.close_tail_into_page(&rig.w, &rig.rope, ratio, rig.eps)?;
+        assert_eq!(closed, cut, "the cut did not close the tokens it was given");
+        rig.append(&mut split, cut, total - cut)?;
+
+        assert_eq!(split.indexed_tokens(ratio), whole.indexed_tokens(ratio));
+        let qpos: Vec<usize> = (0..total).step_by(5).collect();
+        assert_eq!(
+            rig.select(&mut split, &qpos)?,
+            rig.select(&mut whole, &qpos)?,
+            "closing a page at a block boundary moved the selection"
         );
         Ok(())
     }
@@ -1846,7 +2653,7 @@ mod tests {
         for &t in &sections {
             let rows = t.div_ceil(ratio);
             let keys = Tensor::zeros((rows, head_dim), DType::F32, &device)?;
-            cache.push_page(IndexPage::new(keys, pos, t - (rows - 1) * ratio), ratio)?;
+            cache.push_page(IndexPage::new(keys, t - (rows - 1) * ratio), pos, ratio)?;
             pos += t;
         }
         let total: usize = sections.iter().sum();
@@ -1894,9 +2701,9 @@ mod tests {
         cache.push_page(
             IndexPage::new(
                 Tensor::zeros((page_rows, rig.cfg.head_dim), DType::F32, &device)?,
-                0,
                 page_tokens - (page_rows - 1) * rig.ratio,
             ),
+            0,
             rig.ratio,
         )?;
 
@@ -1935,10 +2742,10 @@ mod tests {
         rig.append(&mut cache, 0, 8)?;
         let page = IndexPage::new(
             Tensor::zeros((2, rig.cfg.head_dim), DType::F32, &device)?,
-            0,
             rig.ratio,
         );
-        let err = cache.push_page(page, rig.ratio).unwrap_err();
+        let base = cache.next_base();
+        let err = cache.push_page(page, base, rig.ratio).unwrap_err();
         assert!(err.to_string().contains("must precede"), "{err}");
         Ok(())
     }

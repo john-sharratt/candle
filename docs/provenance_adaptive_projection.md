@@ -110,17 +110,42 @@ This section is the ground truth the design builds on. File:line refs are to the
 ### 2.2 Linked turns (already shipped)
 
 Exchange coupling (`TurnCoupling` record, `summary_tree/exchange.rs`): a tool-call
-turn and its response turn score as **one case** and are selected/carried together
-(`resolver.rs:942-979, 1108-1118`). This is the existing "directly linked turns drag
-each other in". Concepts C and D extend the same idea outward: C to *neighboring*
-exchanges, D to the *file-head* exchange.
+turn and its response turn score as **one case** and are selected/carried together.
+This is the existing "directly linked turns drag each other in". Concepts C and D
+extend the same idea outward: C to *neighboring* exchanges, D to the *file-head*
+exchange.
+
+The coupling holds on **both** sides of the pipeline, and for a long time it held
+only on the first:
+
+- **Scoring** (`resolver.rs`, `belief_scores`): the scan aggregates every
+  sub-window of every member into one case and stamps each member with the
+  shared score.
+- **Selection** (`project.rs`, `ContentResolver::group_exchanges`): a group's
+  candidates ARE exchanges. `exchange_candidates` collapses the turn list to one
+  representative per run, priced at the sum of its members; the rules
+  (`top_k`, `single`, `always_visible`, `conversation`), the belief step, and the
+  token trim all operate on those representatives; `push_exchange` expands them
+  back at emit. `k: 3` therefore means three *runs*, which is what the schema
+  comments always assumed.
+
+Without the second half the first was defeated by the trim: `select_top_k`
+truncated a flat turn list, and `trim_to_budget_low_score_first` dropped members
+individually — cheapest-last, so the ~50-token `<tool_call>` half outlived the
+`<tool_response>` halves carrying the listing and the excerpt. A `repo_map`
+folder chain reached the model as `user: Summarize the …/ folder` /
+`assistant: <tool_call>{"name":"file_list",…}` with nothing answering it, and the
+model imitated both halves — reasoning about summarising a folder in one
+conversation and emitting a `file_list` call for an unrelated directory in
+another.
 
 ### 2.3 What the YAML can express today
 
 `layer.budget {priority, min_percent, max_percent}`; group `selection`
 (`always_visible | top_k | single | named | conversation`); `policy` blocks
 (preset, β, min/evict, early-window, budget min/max, tags, layer_weights);
-group `default {tag}` (empty-selection fallback, used by repo_map's root cluster).
+collection `default {name}` (empty-selection fallback — collections only; turn
+groups have none, see F19).
 Nothing expresses: normalization applicability, adaptive budgets, locality, anchors,
 momentum, probe composition, or fusion mode. All seven get YAML surface in §10.
 
@@ -162,7 +187,8 @@ E1–E7 and R2a–R2d over the captured probes and galleries):
 | F11 | **Offline Q-window reconstruction pitfall:** recorded event `start_token`s count *view* tokens and exceed the sealed sig length on long turns, so deriving the user-prefix length from them degenerates to a 1-token window. The fixture approximates the Q-window as the turn's head 64 sig tokens; production must read the persisted boundary, never derive it. | Concept F, §11 harness |
 | F12 | **The question boundary is ALREADY persisted.** `TurnDecl.segments` carries `User { kv: KvSpan }` — the user half's exact span in the turn's real-KV grid — and `gather_wide_sigs`' contract is one sig per real token, 1:1 with that grid. The Q-window is `sigs[user_span.range()]`; no new record or field is needed, and `export-replay` now emits `user_spans` so offline replay reconstructs the exact window. | Concept F (F.1) |
 | F13 | **Momentum is rejected by measurement.** Simulating the per-event selection sequence under the full pipeline with a velocity term: μ > 0 never raises target-top1 (tour 16/18 unchanged), *lowers* it on the ModelBuilder turn (4/7 → 3/7 — velocity locks in an early junk riser), and amplifies top-1 churn on a no-target turn (1 → 4 distinct winners). The rising-interest-lost pattern does not exist once F + G + A stabilize the target; no momentum plumbing is built. | Concept E (closed) |
-| F14 | **The root cluster never wins organically** — across all 30 dialogue turns its within-structure rank is 2–22 (median ~10); topic-specific clusters win, which is correct for specific questions. `default {tag "."}` is therefore the *load-bearing* mechanism for root presence, not a backstop, and the tour composition is floor + `k = 2` organic picks. | §13, repo_map config |
+| F14 | **The root cluster never wins organically** — across all 30 dialogue turns its within-structure rank is 2–22 (median ~10); topic-specific clusters win, which is correct for specific questions. This was read as making `default {tag "."}` the *load-bearing* mechanism for root presence; **superseded by F19**, which reads the same measurement the other way — a cluster that never wins is a cluster the probe never wanted, and forcing it in is the defect, not the feature. | §13, repo_map config |
+| F19 | **The group-level `default` fallback is REMOVED.** It injected its member with a score synthesised as `max(layer.score_threshold, group.score_threshold)` — a sentinel built to clear the exact bar the member had just failed — so a turn group could never be empty. repo_map sets `score_threshold: 1.0` precisely so a cold probe (every folder scoring 0) selects nothing; the fallback then put the root exchange back anyway. Measured live on a bare `"Hi, how are you?"`: 8 repo_map exchanges injected, every one either `reason: fallback` or scoring `0.0`, at ~4,160 tokens per exchange (47 + 1,262 + 2,851). A second copy of the same defeat sat in the phase-2 budget trim, re-injecting a member the budget had just rejected. Both are gone, along with `resolve_default_turn`, `ContentResolver::turn_with_tag`, and `SelectionOrigin::Fallback`. **Turn groups are now gated on score alone, exactly like the tool catalog: an empty selection stays empty, Step 7 drops the group, and the layer goes with it if no sibling survived.** Collections keep their `default` — a collection is a set of mutually exclusive variants of one dial (persona, thinking effort, response length), so "none qualified" has no valid rendering; a turn group's members are content, where it does. The dialogue layer is unaffected: `Sequence`'s recency window is inviolate regardless of score. | Concept D, repo_map config |
 | F15 | **The short-probe promotions are tool-shaped questions** ("what time is it?", 24–28 sig tokens): no code slot is right for them, so the code-axis top is arbitrary — and their absolute offline scores overlap genuine code hits, so within-axis gating alone cannot close it. The production discriminators are cross-axis (the tools collection wins the mass for these probes — the guards prove the signal) and the real 0–1000 band (levels learned from strong self-matches separate one-off spurious matches). Verification is a Phase-1 harness acceptance criterion, not a new mechanism. | Concept B, §11 harness |
 | F16 | **The multi-segment `belief-*` port is built and confirms everything at full-corpus scale** (snapshot, 745 tagged tool turns / 93 tools — the corpus doubled since the 372-turn baseline): additive reproduces the baseline at **Top-1 97.3 % / Top-5 100 % / MRR 0.985**; `content_gated` collapses to **32.9 %** with **66.7 % of probes scoring 0 for their own tool** (tool identity has literally no content-group agreement — the per-axis fusion split is proven, not provisional); **normalization holds ranking exactly** (Top-1 97.3 %) while improving selection at the same nominal gate (exact-1 1.2 % → 35.3 %, mean set 2.95 → 2.04). The normalized `belief-sweep` derived Concept A's threshold table: true-tool scores sit at p25 ≈ 949 / p50 ≈ 1394 on the band; at budget 3, `min ≈ 60–80` holds the 99.2 % recall ceiling at ~50 % exact-1, `min ≈ 949` trades to 97.2 % recall at 94.8 % exact-1 / 0.06 FP; the budget-3 recall ceiling is 99.2 % at this corpus size (budget 5 → 100 %). | Concepts A + G, §12 Phase 1 |
 | F18 | **The implementation round (R5 + acceptance, 2026-08-03) locked the shipping chain and overturned three v2 details.** (a) `ContentGated`'s law is the **grouped sum** (per-group needle-gated tallies, gate on the content group, `Σ_g w_g·t_g`); the full-additive-gated-by-one-hot variant collapsed the target to the pool bottom and is rejected. (b) Gated-fusion axes normalize **traffic-relative**: the A.4 floored path divides by the child's observed-traffic **peak** (floored by size), and `warm_ingest` self-match warming is skipped for non-additive-fusion groups (config-keyed) — self-levels would erase the quiet-child standout the design requires. (c) Concept B's mass keys on the **ungated** additive sum with `k = 1, ρ = 2` — the gate deliberately removes the concentrated spike mass must see, and the normalized band compresses it. Acceptance through the production chain: tour → structure **#1**; ModelBuilder → builder.rs **#3 = inside the top_k 4 selection budget + anchor** (vs absent entirely live; the two slots above are same-repo test fixtures sharing the probe's vocabulary — strict rank-1 relaxed to the selection-level criterion); recall-vs-code mass contrast 0.72× on the ungated formula. | Concepts A.4 + B + G as shipped |
@@ -354,8 +380,10 @@ no selector change.
 
 ### B.4 What adaptivity is *not*
 
-- Not a gate: a layer whose mass is zero keeps its `min_percent` floor and its
-  `default` fallback; adaptivity can only shrink toward the floor, never below.
+- Not a gate: a layer whose mass is zero keeps its `min_percent` floor;
+  adaptivity can only shrink toward that floor, never below. (It is not a
+  *presence* floor — a group that qualifies no member still emits nothing and is
+  dropped, F19.)
 - Not stateful: mass is recomputed from the current probe each reprojection.
   Persistence of interest across reprojections is the belief carry's job (and
   Concept E's).
@@ -431,8 +459,7 @@ a real regularity, not a heuristic hope.
 
 ### D.1 Mechanism
 
-Post-selection injection in the phase-1 group loop, structurally parallel to the
-existing `default` fallback (`project.rs:1237-1244`):
+Post-selection injection in the phase-1 group loop:
 
 - for each timeline T with ≥ 1 selected exchange in an anchored group, if T's first
   exchange is not already selected, inject it with score = the max score among T's
@@ -448,8 +475,9 @@ existing `default` fallback (`project.rs:1237-1244`):
 ### D.2 Non-goals
 
 - Not a summary substitute: the anchor is the real header exchange, full fidelity.
-- Not unconditional: a timeline with zero selected exchanges gets no anchor
-  (that is `default {tag}`'s job, which stays as-is for repo_map).
+- Not unconditional: a timeline with zero selected exchanges gets no anchor. The
+  anchor travels *with* a hit; absent a hit there is nothing for it to ride, and
+  nothing injects a timeline that qualified none (F19).
 
 ---
 
@@ -867,12 +895,12 @@ Concept E ships nothing (measured-rejected, §7/F13); there is no phase 6.
 - **Momentum** — rejected (F13, §7). The pattern it would fix does not occur
   under the pipeline; μ > 0 is neutral-to-harmful on every measured sequence.
   Nothing ships.
-- **Root cluster / structure composition** — answered (F14): the root never
-  wins organically (within-structure rank 2–22 across all 30 turns; topical
-  clusters win, correctly). `default {tag "."}` is the load-bearing root
-  mechanism; the tour composition is the default floor + `k = 2` organic
-  picks. Concept B's adaptive rail sizes the layer; presence is the floor's
-  job.
+- **Root cluster / structure composition** — answered (F14), then reversed
+  (F19): the root never wins organically (within-structure rank 2–22 across all
+  30 turns; topical clusters win, correctly). The floor that forced it in is
+  removed — a cluster the probe never wants is not a cluster to guarantee — so
+  structure composition is `k = 3` organic picks and nothing else. Concept B's
+  adaptive rail sizes the layer; presence is earned per turn or not at all.
 - **Q-window boundary** — answered better than designed (F12): already
   persisted as the turn layout's user `KvSpan`, 1:1 with the sig grid. No new
   record; `export-replay` emits `user_spans` for exact offline windows.

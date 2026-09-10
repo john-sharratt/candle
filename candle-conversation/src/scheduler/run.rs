@@ -18,12 +18,10 @@ static HOUSE_GPUDRAIN_US: AtomicU64 = AtomicU64::new(0);
 /// belongs to — that step dominates housekeeping, so it is decomposed further.
 pub(super) enum PromoteStep {
     Finalise,
-    Reprefill,
     Compression,
 }
 
 static PROMOTE_FINALISE_US: AtomicU64 = AtomicU64::new(0);
-static PROMOTE_REPREFILL_US: AtomicU64 = AtomicU64::new(0);
 static PROMOTE_COMPRESSION_US: AtomicU64 = AtomicU64::new(0);
 
 /// Record one completion-path span (microseconds).
@@ -31,38 +29,15 @@ pub(super) fn note_promote_split(step: PromoteStep, us: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     match step {
         PromoteStep::Finalise => PROMOTE_FINALISE_US.fetch_add(us, Relaxed),
-        PromoteStep::Reprefill => PROMOTE_REPREFILL_US.fetch_add(us, Relaxed),
         PromoteStep::Compression => PROMOTE_COMPRESSION_US.fetch_add(us, Relaxed),
     };
 }
 
-static REPREFILL_WRITE_US: AtomicU64 = AtomicU64::new(0);
-static REPREFILL_TRUNC_US: AtomicU64 = AtomicU64::new(0);
-
-/// Record one turn-reprefill seal's split: the substrate write vs the slot
-/// truncate that follows it.
-pub(super) fn note_reprefill_split(write_us: u64, trunc_us: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    REPREFILL_WRITE_US.fetch_add(write_us, Relaxed);
-    REPREFILL_TRUNC_US.fetch_add(trunc_us, Relaxed);
-}
-
-/// Drain the reprefill-seal split, in ms, as `(write, truncate)`.
-pub(super) fn take_reprefill_split() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (
-        REPREFILL_WRITE_US.swap(0, Relaxed) / 1000,
-        REPREFILL_TRUNC_US.swap(0, Relaxed) / 1000,
-    )
-}
-
-/// Drain the promote-path sub-timers, in ms, as
-/// `(finalise, reprefill, compression)`.
-pub(super) fn take_promote_split() -> (u64, u64, u64) {
+/// Drain the promote-path sub-timers, in ms, as `(finalise, compression)`.
+pub(super) fn take_promote_split() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         PROMOTE_FINALISE_US.swap(0, Relaxed) / 1000,
-        PROMOTE_REPREFILL_US.swap(0, Relaxed) / 1000,
         PROMOTE_COMPRESSION_US.swap(0, Relaxed) / 1000,
     )
 }

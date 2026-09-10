@@ -171,6 +171,31 @@ system_prompt:
             When the conversation holds the specifics — the actual files, code, and
             decisions — reason from those, not from how things usually look.
 
+        # Thinking depth, in the checkpoint's OWN reasoning-effort vocabulary.
+        # Qwen3.8's chat template carries three trained levels — `low`,
+        # `medium`, `xhigh` — and each is a SYSTEM-PROMPT instruction placed
+        # ahead of the turn, never text written into the `<think>` block. These
+        # options reuse those strings verbatim, so the dial pulls the lever the
+        # checkpoint was tuned for instead of a paraphrase of it.
+        #
+        # `balanced` is the template's `medium`, which emits NOTHING: an option
+        # with no content seals no variant and contributes no segment at all
+        # (`project.rs` — "Empty options emit nothing"), so the default path
+        # carries no reasoning instruction, exactly as the vendor template
+        # renders it. The dial still reports `balanced` in the resolved
+        # selections, so the GUI and the section-tree dims are unaffected.
+        #
+        # `off` is the one rung with no vendor counterpart. The template
+        # suppresses thinking structurally (`enable_thinking: false` renders
+        # `<think>\n\n</think>`) and emits no instruction at all. This family
+        # has no `/no_think` soft switch — `Dialect::qwen35` leaves `no_think`
+        # empty — so nothing suppresses the block structurally on our path and
+        # this prose is the only mechanism. It must not be emptied.
+        #
+        # `deep` and `exhaustive` share the `xhigh` anchor because the model has
+        # three trained levels and this dial exposes five; they separate on the
+        # extra directive here plus their per-block token budgets
+        # (`ThinkMode::eot_budget`, 2048 vs 4096).
         - kind: selector
           id: thinking_effort
           default: balanced
@@ -180,16 +205,16 @@ system_prompt:
                 Answer directly, without deliberating first.
             - id: quick
               content: |+
-                Think briefly — a sentence or three to pin down the one thing that decides the answer, then stop thinking.
+                Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.
+            # `medium`: the vendor emits no instruction here, and neither do we.
             - id: balanced
-              content: |+
-                Think to the depth the question warrants, usually a short paragraph: the specific facts and trade-offs that determine the answer, without re-deriving what you are already certain of.
             - id: deep
               content: |+
-                Think carefully: take the problem from more than one angle, weigh the trade-offs, and check your conclusion against the specifics before committing.
+                Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
             - id: exhaustive
               content: |+
-                Think exhaustively: enumerate the relevant cases, weigh each alternative and its trade-offs, and stress-test your conclusion against edge cases. Leave nothing decision-relevant unthought.
+                Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+                Where the task has distinct cases or failure modes, enumerate them and check your conclusion against each before committing.
 
         - kind: selector
           id: response_length
@@ -537,19 +562,25 @@ layers:
     groups:
       - id: structure
         # Cap the reconstructed repo map at the three most-relevant folders.
-        # `default` is the floor: if the threshold filters every folder out, the
-        # workspace-root folder is re-injected so repo_map never vanishes from the
-        # projection.
+        # There is no floor: if the threshold filters every folder out, the group
+        # contributes nothing and repo_map drops out of the projection for that
+        # turn. That is the correct answer to "no folder is relevant" — a question
+        # the repo map cannot help with should not pay for it. Injection is by
+        # score here, on the same terms as the tool catalog.
         # k: 3 — the workspace-root folder reliably wins one slot on belief (its
         # listing names every crate, so it matches most repo questions), so 2
         # leaves only a single content slot that a specific dir (candle-core/src)
         # narrowly loses to generic prose folders (docs/). 3 = root + 2 content;
         # the queried dir ranks top-3 across every probed query. See §83.
+        #
+        # `k` counts EXCHANGES, not turns: a folder's chain is
+        # `request → <tool_call>` / `<tool_response> → <tool_call>` /
+        # `<tool_response> → summary`, coupled into one run, and a seat buys the
+        # whole run. So 3 is three folders, as the note above assumes.
         selection: { kind: top_k, k: 3 }
         # Cuts the zero floor so the pre-belief path (fork/startup, no probe:
-        # every folder scores exactly 0) selects nothing and the `default`
-        # below re-injects the workspace root alone. Without this the group
-        # inherited the layer's 0.0 placeholder, zero-score folders stayed
+        # every folder scores exactly 0) selects nothing at all. Without this the
+        # group inherited the layer's 0.0 placeholder, zero-score folders stayed
         # eligible, and TopK's tie-break (ascending key = ingestion order)
         # seeded the SAME arbitrary leaf folders into every conversation's
         # view — which the model, reading dialogue-shaped ingest turns under
@@ -558,7 +589,6 @@ layers:
         # `zend/scripts/` and "a project with 11 members" unprompted. The live
         # belief loop is untouched (its own min/evict of 250 governs there).
         score_threshold: 1.0
-        default: { tag: "." }
         # Concept B: strong structural attention buys extra cluster slots.
         budget_adaptive: { per_extra: 800, absolute_max: 5 }
         policy:

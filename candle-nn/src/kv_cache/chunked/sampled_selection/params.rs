@@ -489,27 +489,35 @@ pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFact
 /// compression. A hi-tight/low-loose redistribution at the same geometric
 /// means measured strictly worse than the symmetric split.
 ///
-/// **Re-derived 2026-08-28, k 1.1 → 1.09**, after the dense weights moved into
-/// the device reservation. That change shifts wave widths and therefore
-/// accumulation order, which is exactly the drift the rows below warn about:
-/// C10×10 had gone red at k 1.1 with nothing else altered.
+/// **Re-derived 2026-09-10, k 1.09 → 1.07 and v 1.9 → 1.85**, after the wave
+/// admission and driver rework. Same cause as the re-derivation before it: wave
+/// widths move, accumulation order moves with them, and the top rung — which
+/// this row deliberately parks one notch under its break — goes red. C10×10 had
+/// fallen to 9/10 sessions with nothing else altered. Both axes were stepped
+/// together and the first step passed, so the new edges are **not** bracketed;
+/// the pair below is a passing point, not a measured boundary.
 ///
-/// Each axis was walked separately and both edges are now bracketed, so a
-/// future retune starts from measurements rather than a sweep:
+/// Cost of the step: C10×10 6.30× → 6.19×, about 1.7% of ratio.
 ///
-/// * **K edge 1.09 ✓ / 1.1 ✗** at v 1.9. The margin is one hundredth — this row
-///   sits as close to the break as the lineage target asks for, and is
-///   correspondingly fragile.
-/// * **V edge 1.9 ✓ / 2.0 ✗** at k 1.075. V is no longer the inert axis the
-///   earlier note claimed: it breaks the top rung one notch above its current
-///   value, so probe both axes here rather than K alone.
+/// The 2026-08-28 measurements, for whoever brackets this next — they were taken
+/// on the previous wave geometry, so treat them as the shape of the surface
+/// rather than as live numbers:
 ///
-/// C10×10 at 6.30×, identical across two confirmation runs.
+/// * **K edge 1.09 ✓ / 1.1 ✗** at v 1.9 — a margin of one hundredth.
+/// * **V edge 1.9 ✓ / 2.0 ✗** at k 1.075. V is not the inert axis an earlier
+///   note claimed: it broke the top rung one notch above its value, so probe
+///   both axes here rather than K alone.
+///
+/// **This row will drift again.** Twice now it has gone red on a change that
+/// touched neither quantization nor this model — only the width of a wave. A
+/// row tuned to sit one notch under the break cannot survive that, by
+/// construction; if the re-derivations become tiresome, the fix is to buy
+/// standing margin rather than to keep re-finding the edge.
 pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.09,
-    k_low: 1.09,
-    v_hi: 1.9,
-    v_low: 1.9,
+    k_hi: 1.07,
+    k_low: 1.07,
+    v_hi: 1.85,
+    v_low: 1.85,
 };
 
 /// Qwen3.5-35B-A3B (routed hybrid).
@@ -575,11 +583,20 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// the other — so re-verify this row after a ladder change, exactly as after an
 /// admission or width change.
 ///
-/// **Re-derived 2026-08-28, K 1.2 → 1.1 and V 2.5 → 2.35**, after the dense
-/// weights moved into the device reservation — the width/accumulation drift
-/// this row has now been caught by three times. C10×64 had gone red.
+/// **Re-derived 2026-09-10, K 1.1 → 1.08 and V 2.35 → 2.30**, after the wave
+/// admission and driver rework — the width/accumulation drift this row has now
+/// been caught by four times. C10×64 had gone red at 63/64 sessions. Both axes
+/// were stepped together and the first step passed, so these are a passing
+/// point, not bracketed edges. Cost: C10 7.10× → 6.98×, about 1.7% of ratio,
+/// now 7.02/6.97/6.98/6.98× (×8/16/32/64).
 ///
-/// Both axes walked separately, both edges bracketed:
+/// **Four re-derivations, none of them provoked by a quantization or model
+/// change.** Every one followed a change to wave width. A row parked one notch
+/// under its break cannot survive that; buying standing margin would end the
+/// cycle more cheaply than continuing to re-find the edge.
+///
+/// The 2026-08-28 measurements, taken on the previous wave geometry — the shape
+/// of the surface rather than live numbers:
 ///
 /// * **K edge 1.1 ✓ / 1.15 ✗** at v 2.35.
 /// * **V edge 2.35 ✓ / 2.43 ✗** at k 1.1.
@@ -599,10 +616,10 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// C10 at 7.13/7.08/7.09/7.10× (×8/16/32/64), identical across two
 /// confirmation runs.
 pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.1,
-    k_low: 1.1,
-    v_hi: 2.35,
-    v_low: 2.35,
+    k_hi: 1.08,
+    k_low: 1.08,
+    v_hi: 2.30,
+    v_low: 2.30,
 };
 
 /// Qwen3.6-35B-A3B (routed hybrid point release).

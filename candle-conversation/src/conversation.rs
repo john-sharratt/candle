@@ -1873,7 +1873,6 @@ impl Sequence {
             sampling,
             reprojection,
             options.triggers,
-            options.keep_reasoning,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -1996,8 +1995,6 @@ impl Sequence {
             None,
             // No tool stencils on a calibration prefill.
             Arc::new(TriggerRegistry::new()),
-            // A prefilled turn is not a tool loop; it seals when it finishes.
-            false,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2043,7 +2040,6 @@ impl Sequence {
         sampling: SamplingConfig,
         reprojection: Option<ReprojectionPolicy>,
         triggers: Arc<TriggerRegistry>,
-        keep_reasoning: bool,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2119,7 +2115,6 @@ impl Sequence {
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id,
-                keep_reasoning,
                 projection_inputs,
                 prefill_tokens,
                 prefill_text,
@@ -2357,8 +2352,6 @@ impl Sequence {
             None,
             // A no-decode insert never samples, so no stencil can fire.
             Arc::new(TriggerRegistry::new()),
-            // An inserted turn has no decode and nothing to continue into.
-            false,
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -4223,8 +4216,6 @@ impl ProbeCtx {
             .scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id: slot,
-                // A probe turn ends where it ends; nothing follows to seal it.
-                keep_reasoning: false,
                 projection_inputs: Some(ProjectionInputs {
                     projection: Arc::clone(&self.projection),
                     selection: self.selection.clone(),
@@ -4494,6 +4485,152 @@ mod window_sealed_tokens_tests {
         assert_eq!(win[0].token_count, 42);
         assert_eq!(win[0].chunks[0].token_count, 32);
         assert_eq!(win[0].chunks[1].token_count, 10);
+    }
+
+    /// **The reasoning hole, as the projection cuts it.** A turn is windowed to
+    /// `[0, span.offset) ++ [span.end(), total)` and the two halves are
+    /// concatenated per layer — so a span that begins and ends INSIDE one
+    /// physical chunk emits that chunk twice, as two disjoint windows sharing
+    /// one refcounted gid.
+    ///
+    /// The gid identity is the assertion that matters: it is what makes the
+    /// hole free. Copying the chunk would pass every token-count check here and
+    /// silently double a turn's arena footprint on every projection.
+    #[test]
+    fn windowing_out_a_span_inside_one_chunk_emits_that_chunk_twice() {
+        // Three chunks [32, 32, 20] = 84. Reasoning at [40, 50) sits wholly
+        // inside chunk-1 (which spans [32, 64)).
+        let sealed = one_layer(&[32, 32, 20]);
+        let mid_gid = sealed[0].chunks[1].gids.as_slice()[0].raw();
+        let head = window_sealed_tokens(&sealed, 0, 40);
+        let tail = window_sealed_tokens(&sealed, 50, 84);
+
+        // Head: chunk-0 whole, chunk-1 cut at local 8.
+        assert_eq!(head[0].token_count, 40);
+        assert_eq!(head[0].chunks.len(), 2);
+        assert_eq!(head[0].chunks[1].offset, 0);
+        assert_eq!(head[0].chunks[1].token_count, 8);
+        // Tail: chunk-1 from local 18, then chunk-2 whole.
+        assert_eq!(tail[0].token_count, 34);
+        assert_eq!(tail[0].chunks.len(), 2);
+        assert_eq!(tail[0].chunks[0].offset, 18);
+        assert_eq!(tail[0].chunks[0].token_count, 14);
+        assert_eq!(tail[0].chunks[1].token_count, 20);
+
+        // The same physical chunk, twice, with disjoint windows — shared, not
+        // copied.
+        assert_eq!(head[0].chunks[1].gids.as_slice()[0].raw(), mid_gid);
+        assert_eq!(tail[0].chunks[0].gids.as_slice()[0].raw(), mid_gid);
+
+        // The concatenation the projection injects covers the turn minus the
+        // reasoning, exactly.
+        let width = head[0].token_count + tail[0].token_count;
+        assert_eq!(width, 84 - 10);
+    }
+
+    /// A span abutting the end of the turn leaves an empty tail, and a span
+    /// abutting the start an empty head — both must contribute zero chunks
+    /// rather than a zero-length window, which would put a chunk with no valid
+    /// tokens into the slot's block list.
+    #[test]
+    fn a_span_at_either_edge_leaves_no_empty_chunk() {
+        let sealed = one_layer(&[32, 32]);
+        // Reasoning runs to the end.
+        let tail = window_sealed_tokens(&sealed, 64, 64);
+        assert_eq!(tail[0].token_count, 0);
+        assert!(tail[0].chunks.is_empty());
+        // Reasoning starts at the very beginning.
+        let head = window_sealed_tokens(&sealed, 0, 0);
+        assert_eq!(head[0].token_count, 0);
+        assert!(head[0].chunks.is_empty());
+    }
+
+    /// **The two halves must describe the same tokens, checked against each
+    /// other rather than each against an expectation.**
+    ///
+    /// A windowed turn injects K/V from [`window_sealed_tokens`] and rows from
+    /// [`index_pages::without_span`]. Nothing downstream compares them — a
+    /// mismatch is silent below the QSA identity threshold and a refused select
+    /// above it — so the comparison belongs here, over the real functions on
+    /// both sides.
+    ///
+    /// This is the composition that failed on the daemon: the K/V half was right
+    /// and the page half spanned an extra 323 tokens, and no unit test looked at
+    /// the two together.
+    #[test]
+    fn a_windowed_turns_kv_and_its_retained_pages_span_the_same_tokens() {
+        use crate::index_pages;
+
+        // A turn of 84 tokens across chunks [32, 32, 20], sealed as three pages
+        // — the shape the cuts produce: [prefill][reasoning][answer].
+        let sealed = one_layer(&[32, 32, 20]);
+        let total = 84usize;
+        let cases: [(usize, usize, &[usize]); 3] = [
+            // (span start, span end, page widths)
+            (40, 50, &[40, 10, 34]), // reasoning in the middle
+            (0, 12, &[12, 72]),      // reasoning abutting the start
+            (60, 84, &[60, 24]),     // reasoning running to the end
+        ];
+
+        for (start, end, widths) in cases {
+            let pages: Vec<(usize, Vec<u8>)> = widths.iter().map(|w| (*w, vec![0u8; 4])).collect();
+            let blob = index_pages::encode(&pages);
+
+            // The K/V half: everything either side of the span.
+            let head = window_sealed_tokens(&sealed, 0, start);
+            let tail = window_sealed_tokens(&sealed, end, total);
+            let kv_tokens = head[0].token_count + tail[0].token_count;
+
+            // The index half, from the same span.
+            let kept = index_pages::without_span(&blob, start..end)
+                .unwrap_or_else(|| panic!("pages must align for span {start}..{end}"));
+            let page_tokens: usize = index_pages::decode(&kept)
+                .expect("kept pages decode")
+                .iter()
+                .map(|(w, _)| *w)
+                .sum();
+
+            assert_eq!(
+                kv_tokens, page_tokens,
+                "span {start}..{end}: the windowed K/V spans {kv_tokens} token(s) but its \
+                 retained pages span {page_tokens}"
+            );
+            assert_eq!(
+                kv_tokens,
+                total - (end - start),
+                "and both equal the turn minus its span"
+            );
+        }
+    }
+
+    /// When the pages do NOT line up with the span, both halves must stay whole
+    /// together — the refusal in `without_span` is what the caller keys off, and
+    /// a turn injected whole is consistent where a half-windowed one is not.
+    #[test]
+    fn a_misaligned_span_leaves_both_halves_whole() {
+        use crate::index_pages;
+
+        let sealed = one_layer(&[32, 32, 20]);
+        let total = 84usize;
+        // Pages [40, 44]: the span 40..50 ends inside the second page.
+        let pages: Vec<(usize, Vec<u8>)> =
+            [40usize, 44].iter().map(|w| (*w, vec![0u8; 4])).collect();
+        let blob = index_pages::encode(&pages);
+
+        assert!(
+            index_pages::without_span(&blob, 40..50).is_none(),
+            "a span ending inside a page must be refused, not guessed at"
+        );
+
+        // The caller's response is to inject the turn whole: full K/V, full pages.
+        let whole = window_sealed_tokens(&sealed, 0, total);
+        let page_tokens: usize = index_pages::decode(&blob)
+            .unwrap()
+            .iter()
+            .map(|(w, _)| *w)
+            .sum();
+        assert_eq!(whole[0].token_count, total);
+        assert_eq!(page_tokens, total, "whole means whole on both sides");
     }
 
     #[test]

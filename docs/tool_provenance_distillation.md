@@ -53,33 +53,33 @@ stop persisting the content behind it. There is no re-capture, no clean-vs-dirty
 context question — the turn is identical, minus its (unused, redundantly-stored)
 trajectory.
 
-## Load-cycle behaviour (auto-compaction, no loop)
+## Load-cycle behaviour (no loop)
 
-Compaction is where distillation is *realised*, so the loader runs it
-automatically — but only when there's something to reclaim, and in a way that
-provably terminates:
+Compaction is where distillation is *realised*. Two properties keep that from
+looping — and neither is "the marker goes away", which is the opposite of what
+happens:
 
-- **Auto-trigger** — after the substrate is loaded, compaction runs when it's
-  enabled (on by default; opt out with `--no-compact-substrate`) **and**
-  `engine.substrate_has_reclaimable()` (the loaded substrate holds tombstoned or
-  distilled timelines). A clean reload with no markers skips it entirely.
-- **Markers are consumed** — `collect_live_records` never re-emits `Tombstone` or
-  `Distilled` records, so after a compaction pass those sets are empty on the next
-  reload → the auto-trigger doesn't fire again.
+- **Markers SURVIVE the compaction that acts on them.** Both `Tombstone` and
+  `Distilled` are re-emitted from the substrate's live state by
+  `collect_live_records` and by the incremental `gather_resident_set`, and they
+  have to be: the `Distilled` marker is what exempts a distilled turn from the
+  `MissingKv` integrity verdict. A distilled turn has legitimately shed its
+  content, so a *consumed* marker would leave the next reload condemning the
+  very corpus the distillation created. See `persistence/survival.rs` for the
+  full record-type contract.
+- **The trigger is dead weight, not markers.** `should_compact` fires on
+  `total_record_bytes >= COMPACTION_MIN_LOG_BYTES` **and** `dead_ratio >=
+  COMPACTION_DEAD_RATIO_THRESHOLD` — a liveness-derived fraction that *falls* as
+  the pass reclaims. So a pass that reclaims makes the next one less likely,
+  regardless of how many markers are standing.
 - **Marking is KV-gated** — a calibration timeline is distill-marked only if it
   `timeline_has_kv()` (content still present) and isn't already marked. Once
-  compaction has reclaimed a timeline's KV, it's never re-marked — so no new
-  `Distilled` record is written, and compaction won't re-trigger.
+  compaction has reclaimed a timeline's KV, it's never re-marked, so no new
+  `Distilled` record is written.
 
-Together these give a self-terminating cycle:
-
-| Startup | Loaded state | Compact? | Calibration marks |
-|--------|--------------|----------|-------------------|
-| 1 (fresh) | no markers | skip | marks each case (has KV) |
-| 2 | has `Distilled` markers | **yes** → reclaims KV, consumes markers | cases now have no KV → no marks |
-| 3+ | no markers | skip | no KV → no marks |
-
-Reaches steady sig-only state after one reclaim pass; never loops.
+Together: the marker set is monotonic (it only grows, and only while there is KV
+left to reclaim), and the trigger is a ratio that the reclaim itself drives down.
+Reaches a steady sig-only state after one reclaim pass; never loops.
 
 - **Reload after compaction** — compaction rewrites the log, and while
   `p.compact` rebuilds the stream index, the scheduler-side KV residence is not

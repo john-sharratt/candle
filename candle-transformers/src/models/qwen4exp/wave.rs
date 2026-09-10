@@ -66,6 +66,42 @@ use crate::models::verify_wave::VerifyPlan;
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
 
+/// Seal `rows`, taken at absolute `frame`, into a **position-free** page.
+///
+/// A live cache ropes its blocks at their absolute positions, so rows lifted
+/// straight out of one carry the place they came from and would score correctly
+/// only if they were put back exactly there. Rotating by `-frame` takes them to
+/// zero, which is what makes the record injectable at any offset in any
+/// conversation — the index's half of "compute once, inject anywhere".
+///
+/// Rows already in the zero frame come back untouched.
+fn seal_page(
+    rows: &Tensor,
+    frame: usize,
+    last_cells: usize,
+    rope: &RopeTables,
+) -> Result<IndexPage> {
+    let keys = super::place::rotate_rows(rows, -(frame as isize), rope)?;
+    Ok(IndexPage::new(keys, last_cells))
+}
+
+/// Positions the indexer's rope tables must span for `caches`.
+///
+/// **The whole sequence, not the tail.** Blocks used to rope at their ordinal
+/// within the live tail, so a table sized to the tail was exactly right; they
+/// now rope at their absolute position, and a seal turns pages back through the
+/// same magnitude in the other direction. The deepest of the two is one block
+/// past whatever the deepest cache accounts for.
+fn index_rope_depth(caches: &[IndexCache], ratios: &[usize]) -> usize {
+    caches
+        .iter()
+        .zip(ratios.iter())
+        .map(|(c, &r)| c.indexed_tokens(r).checked_div(r).map_or(0, |b| b + 1))
+        .max()
+        .unwrap_or(0)
+        .max(1)
+}
+
 /// The deepest KV compression the draft head's own layer seals at, whatever
 /// the trunk runs. A ceiling: a session below it is untouched.
 ///
@@ -165,6 +201,28 @@ pub struct Qwen4ExpBatched {
 ///   sequence simply drafts nothing until its first wave seeds it, which costs
 ///   one step of speculation and no correctness.
 impl Qwen4ExpBatched {
+    /// The QSA selection budget, in positions.
+    ///
+    /// The checkpoint's own value is what production runs; this exists so a
+    /// caller can widen it past the prompt and get the **same engine reading
+    /// densely**. `selection_engages` is a comparison against this number, so a
+    /// budget above the depth makes the selection the identity — the same code
+    /// path over every cell, rather than a second build with the feature
+    /// removed.
+    ///
+    /// That control is what makes a retrieval claim falsifiable. A needle the
+    /// selected read loses says nothing on its own: it could be lost to the
+    /// selection, or the checkpoint could simply not answer that prompt. Run
+    /// both and the difference names which.
+    pub fn set_selection_budget(&mut self, top_k: usize) {
+        self.model.cfg.indexer.top_k = top_k;
+    }
+
+    /// The budget [`Self::set_selection_budget`] is currently at.
+    pub fn selection_budget(&self) -> usize {
+        self.model.cfg.indexer.top_k
+    }
+
     /// Whether `seq` carries any of the recurrent classes yet.
     ///
     /// The fork and move sites consult this rather than erroring, because a
@@ -197,17 +255,30 @@ impl Qwen4ExpBatched {
     /// one holding the index but a zero PLE would inject an n-gram embedding
     /// computed from a window it never saw. Both read as a plausible answer.
     pub fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
+        // **Each carried class is forked on its own terms.** They are populated
+        // by different things and a parent can hold one without the others:
+        // the recurrent store comes from running a wave, the PLE state from the
+        // same, but the QSA index also comes from INJECTION — a projection
+        // installs pages into a slot that has never decoded a token.
+        //
+        // This used to `return Ok(())` when the parent had no recurrent store,
+        // on the reasoning that a parent which has not run a wave has nothing to
+        // copy. True of the recurrence, false of the index, and the early return
+        // took all three out together. The base conversation is exactly that
+        // shape — an Arc-injected prefix of sections, never decoded — so every
+        // conversation forked from it inherited a slot holding the base's K/V
+        // and none of the index describing it. Silent until the prefix passed
+        // the QSA identity threshold, at which point every first turn failed
+        // with `a query at position N needs M blocks but the index cache holds
+        // 0 in injected pages`.
         let forked = {
             let map = self
                 .recurrent
                 .read()
                 .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
-            match map.get(&parent) {
-                Some(store) => store.fork_from()?,
-                // Nothing to copy — the parent has not run a wave, so the
-                // child's own lazy init gives it the same sequence-start value.
-                None => return Ok(()),
-            }
+            map.get(&parent)
+                .map(|store| store.fork_from())
+                .transpose()?
         };
         let ple = {
             let map = self
@@ -231,21 +302,52 @@ impl Qwen4ExpBatched {
                 None => None,
             }
         };
-        self.recurrent
-            .write()
-            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
-            .insert(child, forked);
+        if let Some(f) = forked {
+            self.recurrent
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
+                .insert(child, f);
+        }
         if let Some(p) = ple {
             self.ple
                 .write()
                 .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?
                 .insert(child, p);
         }
-        if let Some(i) = index {
-            self.index
-                .write()
-                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?
-                .insert(child, i);
+        match index {
+            Some(i) => {
+                // What the child actually inherited, per layer. A carve that
+                // silently hands over nothing looks identical downstream to a
+                // model that keeps no index at all, and the difference decides
+                // whether to look at the fork or at the parent's prefix.
+                let inherited: Vec<usize> = i
+                    .iter()
+                    .zip(self.attention_ratios())
+                    .filter(|(_, r)| *r > 0)
+                    .map(|(c, r)| c.indexed_tokens(r))
+                    .collect();
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::reproject",
+                    parent,
+                    child,
+                    layers = i.len(),
+                    inherited_min = inherited.iter().copied().min().unwrap_or(0),
+                    inherited_max = inherited.iter().copied().max().unwrap_or(0),
+                    "qwen4exp: forked index caches to the view",
+                );
+                self.index
+                    .write()
+                    .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?
+                    .insert(child, i);
+            }
+            // The parent had no caches at all — the child starts empty and every
+            // token the view borrows is unindexed from birth.
+            None => tracing::warn!(
+                parent,
+                child,
+                "qwen4exp: the view's parent holds no index caches, so the carve \
+                 inherits none — the borrowed K/V is unindexed from the start",
+            ),
         }
         self.mark_seeded(child)?;
         Ok(())
@@ -316,10 +418,71 @@ impl Qwen4ExpBatched {
             .write()
             .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
         let Some(caches) = map.get_mut(&seq) else {
+            // Named, not silent. A slot with no index caches at seal time seals
+            // a piece with no page, and the caller has no way to tell that from
+            // "this model keeps no per-position state" — which is the confusion
+            // that let an unindexed system prompt through.
+            tracing::warn!(
+                seq,
+                live_slots = map.len(),
+                "qsa seal: slot has no index caches, so this piece seals with no page — \
+                 nothing ever appended to it, or its state was reset since",
+            );
             return Ok(None);
         };
-        // The flush ropes its block at position `n_blocks`, so the table has to
-        // span one past the deepest cache here.
+        // The flush ropes its block at its ABSOLUTE position, so the tables have
+        // to span the whole sequence, not just the tail. The normalisation below
+        // turns through the same magnitude in the other direction, so one span
+        // covers both.
+        let depth = index_rope_depth(caches, &ratios);
+        let rope = self.index_rope_for(depth)?;
+        let mut pages = Vec::with_capacity(caches.len());
+        for ((c, &ratio), w) in caches.iter_mut().zip(ratios.iter()).zip(indexers.iter()) {
+            if ratio == 0 {
+                pages.push(SealedIndex {
+                    page: IndexPage::new(c.live_rows()?, 1),
+                    open: c.open_rows()?,
+                });
+                continue;
+            }
+            let frame = c.page_token_span();
+            let cells = c.flush_open_block(w, &rope, ratio, cfg.rms_norm_eps)?;
+            pages.push(SealedIndex {
+                page: seal_page(&c.live_rows()?, frame, cells.unwrap_or(ratio), &rope)?,
+                // The flush consumed the carried rows, so the page IS the whole
+                // piece and there is no open block to carry with it.
+                open: c.open_rows()?,
+            });
+        }
+        Ok(Some(paged_index::encode_aux(&[], &pages)?))
+    }
+
+    /// Close `seq`'s index on a page boundary, on every attention layer.
+    ///
+    /// Called at a reasoning boundary during decode, so a turn's
+    /// `<think>…</think>` occupies whole pages and can be dropped exactly when
+    /// the turn is projected as history. Every layer closes together — they
+    /// index one stream, so a cut on some of them would leave the rest
+    /// addressing different blocks for the same position.
+    ///
+    /// The flush ropes its block at position `n_blocks`, so the RoPE table has
+    /// to span one past the deepest cache here — the same reach
+    /// [`Self::seal_positional_state`] needs, for the same reason.
+    ///
+    /// Returns the tokens the closed page covers — `0` when the tail was already
+    /// empty, which is the common case and a legitimate no-op.
+    #[cfg(feature = "cuda")]
+    pub fn close_positional_page(&self, seq: usize) -> Result<usize> {
+        let cfg = &self.model.cfg;
+        let ratios = self.attention_ratios();
+        let indexers = self.attention_indexers();
+        let mut map = self
+            .index
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        let Some(caches) = map.get_mut(&seq) else {
+            return Ok(0);
+        };
         let depth = caches
             .iter()
             .map(|c| c.live_blocks() + 1)
@@ -327,24 +490,16 @@ impl Qwen4ExpBatched {
             .unwrap_or(0)
             .max(1);
         let rope = self.index_rope_for(depth)?;
-        let mut pages = Vec::with_capacity(caches.len());
+        // Every layer indexes the same stream, so they close the same width;
+        // taken from whichever is walked last.
+        let mut closed = 0usize;
         for ((c, &ratio), w) in caches.iter_mut().zip(ratios.iter()).zip(indexers.iter()) {
             if ratio == 0 {
-                pages.push(SealedIndex {
-                    page: IndexPage::new(c.live_rows()?, 0, 1),
-                    open: c.open_rows()?,
-                });
                 continue;
             }
-            let cells = c.flush_open_block(w, &rope, ratio, cfg.rms_norm_eps)?;
-            pages.push(SealedIndex {
-                page: IndexPage::new(c.live_rows()?, 0, cells.unwrap_or(ratio)),
-                // The flush consumed the carried rows, so the page IS the whole
-                // piece and there is no open block to carry with it.
-                open: c.open_rows()?,
-            });
+            closed = c.close_tail_into_page(w, &rope, ratio, cfg.rms_norm_eps)?;
         }
-        Ok(Some(paged_index::encode_aux(&[], &pages)?))
+        Ok(closed)
     }
 
     /// The page covering `seq`'s tokens from `start_pos` onward.
@@ -373,18 +528,13 @@ impl Qwen4ExpBatched {
         let Some(caches) = map.get(&seq) else {
             return Ok(None);
         };
-        let depth = caches
-            .iter()
-            .map(|c| c.live_blocks() + 1)
-            .max()
-            .unwrap_or(0)
-            .max(1);
+        let depth = index_rope_depth(caches, &ratios);
         let rope = self.index_rope_for(depth)?;
         let mut pages = Vec::with_capacity(caches.len());
         for ((c, &ratio), w) in caches.iter().zip(ratios.iter()).zip(indexers.iter()) {
             if ratio == 0 {
                 pages.push(SealedIndex {
-                    page: IndexPage::new(c.live_rows()?, 0, 1),
+                    page: IndexPage::new(c.live_rows()?, 1),
                     open: c.open_rows()?,
                 });
                 continue;
@@ -425,8 +575,17 @@ impl Qwen4ExpBatched {
                 );
             }
             let take = n - first;
+            // Row `first` of the tail sits at `tail_base + first · ratio`; that
+            // is the frame these rows carry and the one they are normalised out
+            // of.
+            let frame = c.page_token_span() + first * ratio;
             pages.push(SealedIndex {
-                page: IndexPage::new(rows.narrow(0, first, take)?, 0, cells.unwrap_or(ratio)),
+                page: seal_page(
+                    &rows.narrow(0, first, take)?,
+                    frame,
+                    cells.unwrap_or(ratio),
+                    &rope,
+                )?,
                 open: fork.open_rows()?,
             });
         }
@@ -449,7 +608,11 @@ impl Qwen4ExpBatched {
     /// last. They are pushed in that order, which preserves each piece's own
     /// ragged width — merging them into one page would re-pool rows across
     /// boundaries the pieces ended at.
-    pub fn seal_positional_tail_span(&self, seq: usize, tokens: usize) -> Result<Vec<Vec<u8>>> {
+    pub fn seal_positional_tail_span(
+        &self,
+        seq: usize,
+        tokens: usize,
+    ) -> Result<Vec<(usize, Vec<u8>)>> {
         if tokens == 0 {
             return Ok(Vec::new());
         }
@@ -471,59 +634,120 @@ impl Qwen4ExpBatched {
         };
         let (blocks, open) = probe.seal_shape();
         let tail_tokens = blocks * probe_ratio + open;
-        // Whole trailing pages, until the span is covered.
-        let mut need = tokens.saturating_sub(tail_tokens);
-        let mut first_page = probe.page_count();
-        while need > 0 && first_page > 0 {
-            let Some((_, width)) = probe.page_at(first_page - 1) else {
-                break;
-            };
-            first_page -= 1;
-            need = need.saturating_sub(width);
+        // Whole trailing pages, until the span is covered — but never a page
+        // that would reach back past the span's own start. The decision is
+        // [`paged_index::tail_span_pages`], a free function so the boundary
+        // arithmetic is pinned by unit tests rather than by a live daemon; see
+        // its notes for the regression that shaped it.
+        let widths: Vec<usize> = (0..probe.page_count())
+            .map(|i| probe.page_at(i).map_or(0, |(_, w)| w))
+            .collect();
+        let (first_page, covered) = paged_index::tail_span_pages(&widths, tail_tokens, tokens);
+        if covered != tokens {
+            // **This is an alarm, not a mode.** The walk's refusal of an
+            // over-wide page is a backstop: a unit's rows begin on a page
+            // boundary because the scheduler closes one when the unit's K/V
+            // anchor is taken (`Scheduler::begin_unit`), so reaching here means
+            // some path opened a unit without passing that boundary. The
+            // shortfall is the width of what this turn shares a page with.
+            //
+            // The AVAILABLE page widths, not just the taken ones, and the width
+            // of the page the walk stopped at. Without those two the caller can
+            // see only that the span does not line up, which is the question
+            // rather than the answer: the refused page's width is what names the
+            // piece this turn's rows share a page with.
+            let refused = first_page.checked_sub(1).map(|i| widths[i]);
+            tracing::warn!(
+                seq,
+                tokens,
+                covered,
+                tail_tokens,
+                first_page,
+                refused_page_width = ?refused,
+                all_page_widths = ?widths,
+                "qsa seal: a turn's pages cover {} token(s) {} the turn — its rows do not \
+                 begin on a page boundary, so a unit began without one being closed",
+                covered.abs_diff(tokens),
+                if covered > tokens {
+                    "more than"
+                } else {
+                    "less than"
+                },
+            );
         }
 
-        let mut blobs = Vec::new();
+        // Each blob carries the tokens it covers. The caller cannot read a page
+        // — the bytes are this model's — so the width is the only handle it has
+        // on where a page sits in the span, and it needs one: the projection
+        // drops the pages covering a turn's reasoning, and the page COUNT is not
+        // stable (a mid-decode reprojection closes an extra one). Position is.
+        let mut blobs: Vec<(usize, Vec<u8>)> = Vec::new();
+        let seal_rope = self.index_rope_for(index_rope_depth(caches, &ratios))?;
         for pi in first_page..probe.page_count() {
             let mut layer_pages = Vec::with_capacity(caches.len());
+            // Two descriptions of the same page travel together from here: the
+            // width, which the caller uses to place the page in the span, and
+            // the rows the blob carries, which only this model can read. They
+            // are the one thing nothing downstream can cross-check — so they are
+            // checked here, where both are in hand.
+            let mut width: Option<usize> = None;
             for c in caches.iter() {
-                let (p, _) = c
+                let (p, w) = c
                     .page_at(pi)
                     .ok_or_else(|| candle::Error::Msg(format!("qsa seal: page {pi} vanished")))?;
+                // Every layer indexes one stream, so a page spans the same
+                // tokens on all of them. A layer that disagrees would ship rows
+                // for a different span than the width the caller places them by,
+                // and the projection would window out the wrong tokens on that
+                // layer alone — visible only as degraded retrieval.
+                match width {
+                    None => width = Some(w),
+                    Some(first) if first != w => candle::bail!(
+                        "qsa seal: page {pi} is {first} token(s) wide on the first layer and {w} \
+                         on another — the layers have diverged and the seal cannot say which \
+                         span this page covers"
+                    ),
+                    Some(_) => {}
+                }
+                // A closed page carries the frame it was roped in; the record
+                // must carry none, so it is normalised on the way out.
                 layer_pages.push(SealedIndex {
-                    page: IndexPage::new(p.keys.clone(), 0, p.last_cells),
+                    page: seal_page(&p.keys, p.roped_base, p.last_cells, &seal_rope)?,
                     // A page is already closed; only the live tail carries an
                     // open block.
                     open: p.keys.narrow(0, 0, 0)?,
                 });
             }
-            blobs.push(paged_index::encode_aux(&[], &layer_pages)?);
+            blobs.push((
+                width.unwrap_or(0),
+                paged_index::encode_aux(&[], &layer_pages)?,
+            ));
         }
 
         if tail_tokens > 0 {
-            let depth = caches
-                .iter()
-                .map(|c| c.live_blocks() + 1)
-                .max()
-                .unwrap_or(1)
-                .max(1);
-            let rope = self.index_rope_for(depth)?;
             let mut layer_pages = Vec::with_capacity(caches.len());
             for ((c, &ratio), w) in caches.iter().zip(ratios.iter()).zip(indexers.iter()) {
                 if ratio == 0 {
                     layer_pages.push(SealedIndex {
-                        page: IndexPage::new(c.live_rows()?, 0, 1),
+                        page: IndexPage::new(c.live_rows()?, 1),
                         open: c.open_rows()?,
                     });
                     continue;
                 }
+                let frame = c.page_token_span();
                 let mut fork = c.fork()?;
-                let cells = fork.flush_open_block(w, &rope, ratio, cfg.rms_norm_eps)?;
+                let cells = fork.flush_open_block(w, &seal_rope, ratio, cfg.rms_norm_eps)?;
                 layer_pages.push(SealedIndex {
-                    page: IndexPage::new(fork.live_rows()?, 0, cells.unwrap_or(ratio)),
+                    page: seal_page(
+                        &fork.live_rows()?,
+                        frame,
+                        cells.unwrap_or(ratio),
+                        &seal_rope,
+                    )?,
                     open: fork.open_rows()?,
                 });
             }
-            blobs.push(paged_index::encode_aux(&[], &layer_pages)?);
+            blobs.push((tail_tokens, paged_index::encode_aux(&[], &layer_pages)?));
         }
         Ok(blobs)
     }
@@ -553,11 +777,84 @@ impl Qwen4ExpBatched {
                 caches.push(IndexCache::new(cfg.indexer.head_dim, &self.model.device)?);
             }
         }
+        let mut pushed = 0usize;
+        let mut had_open_tail = None;
+        // The tables must span the placement, which is deeper than anything the
+        // caches hold yet — the page is about to be put at `next_base`.
+        let place_depth = caches
+            .iter()
+            .zip(ratios.iter())
+            .map(|(c, &r)| c.next_base().checked_div(r).map_or(0, |b| b + 1))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let rope = self.index_rope_for(place_depth)?;
         for ((c, s), &ratio) in caches.iter_mut().zip(sealed.iter()).zip(ratios.iter()) {
             if ratio == 0 {
                 continue;
             }
-            c.push_page(s.page.clone(), ratio)?;
+            if had_open_tail.is_none() {
+                let (blocks, open) = c.seal_shape();
+                had_open_tail = Some(blocks * ratio + open);
+            }
+            pushed = s.page.tokens(ratio)?;
+            // Abutting the last placement. The base is what the page is rotated
+            // to, so this is the one line that decides where the piece's rows
+            // actually sit — and, since it is recorded rather than accumulated,
+            // a preceding piece that carried no rows moves it and nothing else.
+            let base = c.next_base();
+            c.push_page(s.page.clone(), base, ratio)?;
+            c.place_pending(&rope)?;
+        }
+        // **Only the pathological case is reported.** A page installed onto an
+        // empty tail is the ordinary path and happens once per injected piece —
+        // 1902 times in one startup sweep, which is noise, not evidence. A page
+        // installed while the tail still holds live rows is the opposite: the
+        // page lands *after* rows that chronologically precede it, so every
+        // position past it resolves through the wrong block.
+        if had_open_tail.is_some_and(|t| t > 0) {
+            tracing::warn!(
+                seq_id = seq,
+                pushed,
+                open_tail = had_open_tail.unwrap_or(0),
+                "index: an injected page landed on a live tail — its rows sit before \
+                 rows that precede them, so positions past it resolve through the wrong \
+                 block"
+            );
+        }
+        Ok(())
+    }
+
+    /// Account for injected K/V that carries no index rows, on every layer.
+    ///
+    /// Every layer indexes one stream, so they all move the same distance —
+    /// moving some of them would leave the rest addressing different blocks for
+    /// the same position, which is the divergence this exists to prevent.
+    ///
+    /// All this does is advance where the next page opens. It used to have to do
+    /// more: positions were the running sum of the page widths, so a span that
+    /// contributed none slid every later page's implied start earlier by its
+    /// width, and a zero-row page had to stand in to keep the sum honest.
+    /// Positions are recorded now, so an unindexed span is simply not indexed.
+    pub fn push_positional_gap(&self, seq: usize, tokens: usize) -> Result<()> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        let cfg = &self.model.cfg;
+        let want = cfg.kv_layers().total();
+        let mut map = self
+            .index
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        let caches = map.entry(seq).or_default();
+        if caches.is_empty() {
+            for _ in 0..want {
+                caches.push(IndexCache::new(cfg.indexer.head_dim, &self.model.device)?);
+            }
+        }
+        for c in caches.iter_mut() {
+            let to = c.next_base() + tokens;
+            c.skip_to(to)?;
         }
         Ok(())
     }
@@ -708,10 +1005,24 @@ impl Qwen4ExpBatched {
                 .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
             match map.get(&seq) {
                 Some(caches) => {
+                    let ratios = self.attention_ratios();
+                    let rope = self.index_rope_for(index_rope_depth(caches, &ratios))?;
                     let mut v = Vec::with_capacity(caches.len());
-                    for (c, ratio) in caches.iter().zip(self.attention_ratios()) {
+                    for (c, ratio) in caches.iter().zip(ratios.iter()) {
+                        // Normalised like every other index artifact: the rows
+                        // are roped at their absolute positions here, and
+                        // `import_aux_state` restores them into a cache whose
+                        // tail opens at zero. (The injected pages ahead of the
+                        // tail are not exported at all — a resume rebuilds them
+                        // from the projection, and `indexed_tokens` is what
+                        // reports the shortfall if one does not.)
                         v.push(SealedIndex {
-                            page: IndexPage::new(c.live_rows()?, 0, ratio.max(1)),
+                            page: seal_page(
+                                &c.live_rows()?,
+                                c.page_token_span(),
+                                (*ratio).max(1),
+                                &rope,
+                            )?,
                             open: c.open_rows()?,
                         });
                     }
@@ -1250,8 +1561,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::seal_positional_range(self, seq, start_pos)
     }
 
-    fn seal_positional_tail_span(&self, seq: usize, tokens: usize) -> Result<Vec<Vec<u8>>> {
+    fn seal_positional_tail_span(
+        &self,
+        seq: usize,
+        tokens: usize,
+    ) -> Result<Vec<(usize, Vec<u8>)>> {
         Qwen4ExpBatched::seal_positional_tail_span(self, seq, tokens)
+    }
+
+    fn close_positional_page(&self, seq: usize) -> Result<usize> {
+        Qwen4ExpBatched::close_positional_page(self, seq)
     }
 
     fn positional_coverage(&self, seq: usize) -> Option<usize> {
@@ -1278,6 +1597,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     fn push_positional_state(&self, seq: usize, blob: &[u8]) -> Result<bool> {
         Qwen4ExpBatched::push_positional_state(self, seq, blob)?;
         Ok(true)
+    }
+
+    fn push_positional_gap(&self, seq: usize, tokens: usize) -> Result<()> {
+        Qwen4ExpBatched::push_positional_gap(self, seq, tokens)
     }
 
     fn restore_aux_state(&self, seq: usize, blob: &[u8]) -> Result<bool> {
@@ -1899,7 +2222,20 @@ impl WaveSweep for Qwen4ExpBatched {
                 let mut idx_snaps: HashMap<usize, Vec<IndexSnapshot>> =
                     index_snapshot.into_iter().collect();
                 for (s, ple) in ple_snapshot {
-                    let qsa = idx_snaps.remove(&s).unwrap_or_default();
+                    // **Never an empty stand-in.** Both snapshots are built from
+                    // this wave's `seq_ids`, so a sequence present in one and
+                    // absent from the other is an inconsistency — and defaulting
+                    // it to an empty vector does not paper over the gap, it
+                    // silently disarms the rewind's QSA restore while leaving its
+                    // re-append running, which puts the index a whole block past
+                    // the K/V for the rest of the sequence.
+                    let qsa = idx_snaps.remove(&s).ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "qwen4exp: sequence {s} has a PLE entering snapshot but no index \
+                             one — the rewind would re-append the accepted rows onto a cache \
+                             it never rolled back"
+                        ))
+                    })?;
                     cap.take_entering(s, ple, qsa);
                 }
             }

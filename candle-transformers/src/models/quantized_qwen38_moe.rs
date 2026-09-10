@@ -797,17 +797,29 @@ mod tests {
     /// 1. **The indexer engaged.** `qsa_rows_selected` counts rows a
     ///    selection was built for; zero would mean the whole run took the
     ///    identity path and the rest of the test proved nothing.
-    /// 2. **The answer is right.** The needle sits in the FIRST sentence,
-    ///    thousands of tokens behind the query, so it survives only if the
-    ///    indexer scores that block highly and the attention actually reads
-    ///    the winners. A selection that is subtly wrong — an off-by-one in the
-    ///    block arithmetic, a mis-indexed row — loses the needle rather than
-    ///    producing a plausible alternative.
-    /// 3. **It is deterministic**, run to run, which a race in the streaming
+    /// 2. **Narrowing is free.** The same engine runs the same prompt with the
+    ///    budget widened past the depth, which makes `selection_engages` false
+    ///    and the read dense. The selected run must produce the **same tokens**
+    ///    — not merely an answer that still mentions the needle. This is the
+    ///    claim QSA makes, and it is the one a subtly wrong selection (an
+    ///    off-by-one in the block arithmetic, a mis-indexed row) fails.
+    /// 3. **The read reached the needle at all.** It sits in the FIRST
+    ///    sentence, thousands of tokens behind the query, and its distinctive
+    ///    prefix appears in both answers. Without this, two identically broken
+    ///    reads would agree and pass (2).
+    /// 4. **It is deterministic**, run to run, which a race in the streaming
     ///    top-k or in the per-sequence cache would break.
-    /// 4. **Decode carries it.** The continuation is generated one token at a
+    /// 5. **Decode carries it.** The continuation is generated one token at a
     ///    time, so the decode path's selection (one row per slot, built
     ///    against a cache the prefill filled) is exercised too.
+    ///
+    /// **The dense control is load-bearing, and its absence made this test
+    /// wrong.** Asserting the needle alone conflates two failures: a selection
+    /// that dropped the block, and a prompt the checkpoint does not answer. It
+    /// was the second — the prompt was a bare continuation ("Answer: the label
+    /// was"), which an instruct model answers by switching into assistant mode
+    /// rather than finishing the sentence, and the dense read failed it exactly
+    /// as the selected one did.
     ///
     /// The selection ITSELF is pinned against the CPU oracle's
     /// `qsa_selection_mask` in `qwen4exp::indexer` and the attention's
@@ -831,13 +843,22 @@ mod tests {
         }
         let device = Device::new_cuda(0)?;
         let t0 = std::time::Instant::now();
-        let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
-        let width = gpu.cfg.indexer.top_k + 4 - 1;
+        let mut gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
+        let released_top_k = gpu.cfg.indexer.top_k;
+        let width = released_top_k + 4 - 1;
         println!(
             "✓ engine loaded in {:.0}s (selection width {width})",
             t0.elapsed().as_secs_f32()
         );
-        let model = Qwen4ExpBatched::new(gpu)?;
+        // **The DENSE control, on the same model and the same prompt.** A needle
+        // that the selected read loses says nothing on its own: the continuation
+        // could be lost to the selection, or the checkpoint could simply not
+        // answer this prompt. Widening the budget past the prompt makes
+        // `selection_engages` false — the same code path, reading every cell —
+        // so the two runs differ in exactly one thing.
+        let dense_top_k = 1 << 20;
+        gpu.cfg.indexer.top_k = dense_top_k;
+        let mut model = Qwen4ExpBatched::new(gpu)?;
         let tok = tokenizer()?;
 
         // The needle first, then filler until the query is far past the
@@ -858,8 +879,19 @@ mod tests {
         {
             text.push_str(filler);
         }
-        text.push_str(
-            "\n\nQuestion: what label was written on the sample from the northern ridge?\nAnswer: the label was",
+        // **In the shape the checkpoint was trained on**, with thinking
+        // suppressed — the same framing `test_engine_stops_on_end_of_turn`
+        // uses. Asked as a bare continuation ("Answer: the label was"), this
+        // is an instruct model handed something that is not a turn: it
+        // recovers the first token of the needle and then switches into
+        // assistant mode, emitting `\n\n<think>` instead of finishing the
+        // word. Measured — the DENSE read did it too, so the shape was
+        // failing the test, not the selection. The empty `<think></think>`
+        // keeps the answer inside the seven decode steps this measures.
+        let text = format!(
+            "<|im_start|>user\n{text}\n\nWhat label was written on the sample from the \
+             northern ridge? Answer with the label alone.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
         let ids: Vec<u32> = tok
             .encode(text.as_str(), false)
@@ -875,7 +907,7 @@ mod tests {
         println!("prompt: {} tokens", ids.len());
 
         let n_layers = ManagedBatchedModel::num_layers(&model);
-        let run = || -> Result<(String, u64)> {
+        let run = |model: &Qwen4ExpBatched| -> Result<(String, u64)> {
             let before = model.qsa_rows_selected();
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let seq = session.create_sequence()?;
@@ -898,6 +930,20 @@ mod tests {
             let logits = step.logits_owned()?;
             let m = logits[0].abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
             assert!(m.is_finite(), "non-finite logits under QSA selection");
+            // **The turn's stop tokens, and the decode honours them.**
+            // `<|im_end|>` ends an assistant turn and `<|endoftext|>` ends a
+            // document; past either, the model is continuing something it
+            // already finished and what it emits is not a claim about
+            // anything. Decoding through it made this test compare that
+            // garbage: two runs answered `AMBER` identically and then filled
+            // the remaining steps differently — one with `<|endoftext|>` then
+            // `<|im_start|>` repeats, the other with `<|im_end|>` then an
+            // invented user turn — and the determinism assertion read that as
+            // a race in the selection.
+            const IM_END: u32 = 248_046;
+            const ENDOFTEXT: u32 = 248_044;
+            let stop = |t: u32| t == IM_END || t == ENDOFTEXT;
+
             let mut next = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
             let mut gen = vec![next];
             // Decode is timed on its own: with the read capped at 2051 cells
@@ -906,6 +952,9 @@ mod tests {
             let t_dec = std::time::Instant::now();
             const DECODE_STEPS: usize = 7;
             for _ in 0..DECODE_STEPS {
+                if stop(next) {
+                    break;
+                }
                 let t = Tensor::from_vec(vec![next], (1, 1), &Device::Cpu)?;
                 let step = model.forward_wave(
                     &mut session,
@@ -934,13 +983,34 @@ mod tests {
                 1000.0 * dec / DECODE_STEPS as f64
             );
             model.release_sequence(seq)?;
+            // **The answer, without the marker that ends it.** `<|im_end|>` and
+            // `<|endoftext|>` both mean the model chose to finish, and which of
+            // the two wins is a coin-flip between near-tied logits that a
+            // selection reading 2,051 of 2,444 cells is entitled to move.
+            // Comparing it would be asserting bit-identical logits, which
+            // narrowing does not promise and does not need to: what has to
+            // survive the narrowing is the answer.
+            let body: Vec<u32> = gen.iter().copied().take_while(|&t| !stop(t)).collect();
             let out = tok
-                .decode(&gen, false)
+                .decode(&body, false)
                 .map_err(|e| candle::Error::Msg(format!("decode: {e}")))?;
             Ok((out, model.qsa_rows_selected() - before))
         };
 
-        let (first, rows) = run()?;
+        // ── The dense control first ──────────────────────────────────────────
+        // Same engine, same prompt, budget above the depth so the selection is
+        // the identity. What this run recovers is the ceiling; what the selected
+        // run recovers is measured against it, and only the DIFFERENCE is QSA's.
+        let (dense, dense_rows) = run(&model)?;
+        println!("dense control: {dense:?}  (QSA rows selected: {dense_rows})");
+        assert_eq!(
+            dense_rows, 0,
+            "the dense control narrowed {dense_rows} row(s) — a budget of {dense_top_k} was \
+             supposed to put every cell inside it, so this is not a control at all"
+        );
+
+        model.set_selection_budget(released_top_k);
+        let (first, rows) = run(&model)?;
         println!("continuation: {first:?}  (QSA rows selected: {rows})");
         // §6.2: what the decode kernel's share actually is at a QSA-capped
         // read, on the geometry the stale kernel comment calls exotic (hpg 12
@@ -968,13 +1038,39 @@ mod tests {
             "no row was ever narrowed — the indexer never engaged, so nothing here \
              tested the selection"
         );
+        // **The needle's distinctive prefix, not the whole label.** Greedy
+        // decode answers this prompt with the single token `AMBER` and then
+        // ends the turn — the DENSE read does exactly the same, so the rest of
+        // `AMBERGRIS-7` is this checkpoint's terseness and not something a read
+        // can recover. `AMBER` still only comes from the needle: nothing in the
+        // filler resembles it, so this remains a retrieval claim rather than a
+        // formatting one, which is what the "plausible alternative" the doc
+        // above worries about would fail.
+        const NEEDLE: &str = "AMBER";
         assert!(
-            first.to_uppercase().contains("AMBERGRIS"),
-            "the needle did not survive the selected read: {first:?}"
+            dense.to_uppercase().contains(NEEDLE),
+            "the DENSE read lost the needle: {dense:?} — nothing below is about the \
+             selection, because reading every cell did not answer this prompt"
         );
-        let (second, _) = run()?;
+        assert!(
+            first.to_uppercase().contains(NEEDLE),
+            "the needle did not survive the SELECTED read: {first:?} — the dense control \
+             recovered it ({dense:?}), so the selection dropped the block that held it"
+        );
+        // **The claim QSA actually makes, and the strongest one available
+        // here.** Reading 2,051 of 2,444 cells produced the same answer as
+        // reading all of them — not merely an answer that still mentions the
+        // needle, but the same tokens. A selection that dropped the needle's
+        // block, or kept it and reordered the rest, fails here while a
+        // `contains` check would pass.
+        assert_eq!(
+            first, dense,
+            "the selected read diverged from the dense one: {first:?} against {dense:?} — \
+             {rows} row(s) were narrowed, and narrowing is supposed to leave the answer alone"
+        );
+        let (second, _) = run(&model)?;
         assert_eq!(first, second, "selection at depth is nondeterministic");
-        println!("✓ QSA engaged, needle recovered, deterministic");
+        println!("✓ QSA engaged, dense-identical, needle recovered, deterministic");
         Ok(())
     }
 

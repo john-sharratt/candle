@@ -110,6 +110,44 @@ pub async fn timeline(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// `DELETE /v1/substrate/timeline/{tl}` — tombstone one timeline by its RAW id.
+///
+/// The conversation-scoped `DELETE /v1/conversations/{id}` cannot reach these.
+/// It derives the timeline as `hash(conv_id)`, which only addresses dialogue
+/// conversations; a derived-layer timeline (`repo_map`, `code_reading`) is
+/// created with its own id and carries an empty `conv_id`, so there is no string
+/// that hashes to it. This route takes the id the inspection views already
+/// print.
+///
+/// Tombstoning is the supported repair for a conversation whose *records* are
+/// intact but whose *content* is wrong — a directory ingest that sealed its
+/// turns and lost the couplings joining them, a turn whose chunk count says its
+/// seal was interrupted. The marker makes the timeline invisible to the resume
+/// probe (`metadata_values_for_key` and `timelines_with_metadata_key` both skip
+/// tombstoned timelines), so the next ingest pass no longer counts the
+/// directory as done and rebuilds it properly; a following compaction then
+/// reclaims the dead records.
+///
+/// Idempotent — tombstoning an already-dead or unknown timeline is a no-op that
+/// still reports success, so a bulk repair pass can be re-run without
+/// bookkeeping.
+pub async fn delete_timeline(
+    State(session): State<Arc<ZendSession>>,
+    Path(tl): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let raw: u64 = tl.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    match session.tombstone_timeline_raw(raw) {
+        Some(Ok(())) => Ok(StatusCode::NO_CONTENT),
+        Some(Err(e)) => {
+            tracing::warn!(timeline = raw, "tombstone_timeline_raw failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        // Model not loaded yet, or the id is not a valid timeline — the same
+        // shape the sibling conversation routes return.
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
 /// `GET /v1/substrate` — the lightweight top of the tree. No conversations,
 /// section text, or tool catalog: those are fetched per-expansion so init and
 /// the periodic refresh stay cheap regardless of corpus size.

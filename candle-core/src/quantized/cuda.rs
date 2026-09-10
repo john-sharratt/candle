@@ -4238,11 +4238,7 @@ impl QCudaStorage {
         let row_groups = nrows / 8;
         let k_blocks = ncols / 128;
         let chunk_bytes = crate::quantized::ko_quant::ko_chunk_bytes(ko_dtype);
-        // A band is whole row-groups, and at least one however wide the tensor is.
-        let band_rows = ((REPACK_BAND_BYTES / (ncols * std::mem::size_of::<f32>())) / 8)
-            .max(1)
-            .min(row_groups)
-            * 8;
+        let band_rows = repack_band_rows(ncols, row_groups);
         if !ncols.is_multiple_of(bs) {
             crate::bail!(
                 "repack_ko: {ncols} columns is not a whole number of {:?} blocks ({bs})",
@@ -4406,6 +4402,32 @@ pub fn gemx_repacking_supported(dtype: GgmlDType) -> bool {
 /// `dense_span::peak_load_pool_bytes` adds it to the largest source tensor, and a budget that
 /// forgets the band OOMs on the first weight rather than at a boundary anyone can read.
 pub const REPACK_BAND_BYTES: usize = 48 * 1024 * 1024;
+
+/// Rows in one repack band: whole row-groups, at least one however wide the
+/// tensor, never more than the tensor has.
+///
+/// Extracted from `repack_ko_into` so the bound can be asserted **without a
+/// device**. The property that matters — the f32 intermediate is a band and not
+/// a whole-tensor buffer — used to be checked by measuring free VRAM across a
+/// repack, and `cuMemGetInfo` is device-wide: with `cargo test` running this
+/// crate's CUDA tests across threads, a sibling's allocation landed in the delta
+/// and was reported as the repack putting its scratch back on the card. It read
+/// 4,640 MiB against a 34 MiB twin; the same code alone measures 64 MiB. A
+/// number computed here is immune to that, and is the same number the
+/// allocation uses.
+pub fn repack_band_rows(ncols: usize, row_groups: usize) -> usize {
+    ((REPACK_BAND_BYTES / (ncols * std::mem::size_of::<f32>())) / 8)
+        .max(1)
+        .min(row_groups)
+        * 8
+}
+
+/// Bytes the f32 intermediate takes for a repack of `nrows × ncols` — the figure
+/// [`REPACK_BAND_BYTES`] bounds. See [`repack_band_rows`].
+pub fn repack_band_bytes(nrows: usize, ncols: usize) -> usize {
+    let row_groups = nrows.div_ceil(8);
+    repack_band_rows(ncols, row_groups) * ncols * std::mem::size_of::<f32>()
+}
 
 /// Bytes the KO twin of a `shape` weight occupies.
 ///
