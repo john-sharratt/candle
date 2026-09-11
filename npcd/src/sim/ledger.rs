@@ -145,16 +145,20 @@ impl Ledger {
     /// and never return one, because by its next turn there is nothing left
     /// saying anybody is waiting.
     ///
-    /// Idempotent per pair-and-question: asking the same thing twice does not
-    /// stack up two debts.
+    /// **One outstanding question per pair — the latest.**
+    ///
+    /// A new question from the same person replaces whatever they were waiting
+    /// on, because that is what waiting on somebody means: the thing they most
+    /// recently asked and have not had answered.
+    ///
+    /// This appended instead, deduplicating only on the exact wording, so a
+    /// character asking a hundred different things of somebody who never
+    /// replied accumulated a hundred debts — and [`Self::awaiting_from`] feeds
+    /// the percept, so the situation a character reads would have grown without
+    /// bound along with it. Bounded now by the size of the cast, not by how
+    /// talkative anybody is.
     pub fn asked(&mut self, by: &str, of: &str, what: &str) {
-        let already = self
-            .questions
-            .iter()
-            .any(|q| q.by == by && q.of == of && q.what == what);
-        if already {
-            return;
-        }
+        self.questions.retain(|q| !(q.by == by && q.of == of));
         self.questions.push(Asked {
             by: by.to_string(),
             of: of.to_string(),
@@ -495,6 +499,35 @@ mod tests {
         l.asked("m1", "m2", "what orders have changed");
         l.asked("m1", "m2", "what orders have changed");
         assert_eq!(l.awaiting_from("m2").len(), 1);
+    }
+
+    /// **And asking something *different* replaces it rather than stacking.**
+    ///
+    /// What somebody is waiting on is the last thing they asked. Appending
+    /// instead meant a character talking to somebody who never replies built an
+    /// unbounded list — and the percept renders every entry, so the situation
+    /// it reads would grow without bound too.
+    #[test]
+    fn a_new_question_replaces_what_they_were_waiting_on() {
+        let mut l = Ledger::new();
+        l.asked("m1", "m2", "where the chips are");
+        l.asked("m1", "m2", "who came through the door");
+        assert_eq!(
+            l.awaiting_from("m2"),
+            vec![("m1".to_string(), "who came through the door".to_string())]
+        );
+    }
+
+    /// Bounded by the cast, not by how talkative it is: several askers each
+    /// keep their own one outstanding question.
+    #[test]
+    fn each_asker_keeps_exactly_one_outstanding_question() {
+        let mut l = Ledger::new();
+        for i in 0..50 {
+            l.asked("m1", "m2", &format!("question {i}"));
+            l.asked("m3", "m2", &format!("other {i}"));
+        }
+        assert_eq!(l.awaiting_from("m2").len(), 2);
     }
 
     /// **Every way of speaking to somebody discharges it, not just the one in

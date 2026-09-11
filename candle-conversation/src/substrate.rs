@@ -3531,10 +3531,22 @@ impl Substrate {
         // the whole timeline.
         match payload.turn_index {
             Some(turn) => {
-                self.tombstoned_turns.insert((timeline, turn));
+                // Not if the whole timeline is already dead: that tombstone
+                // says strictly more, and re-adding the turn here would make
+                // the in-RAM set depend on the order the log happened to be
+                // replayed in.
+                if !self.tombstoned_timelines.contains(&timeline) {
+                    self.tombstoned_turns.insert((timeline, turn));
+                }
             }
             None => {
                 self.tombstoned_timelines.insert(timeline);
+                // The same subsumption the live path applies — see
+                // [`Self::tombstone_timeline`]. Replay order is arbitrary, so a
+                // turn tombstone read after its timeline's must not resurrect
+                // an entry the timeline tombstone already covers; `retain` here
+                // plus the guard in the `Some` arm keeps both orders equal.
+                self.tombstoned_turns.retain(|(tl, _)| *tl != timeline);
                 // A dead conversation's recurrent-state snapshot dies with it:
                 // dropping the index entry here means compaction (which walks
                 // this map) never carries the record forward. A snapshot of a
@@ -3552,6 +3564,19 @@ impl Substrate {
     /// the corrupt turn is dropped during reload before its (partial) KV is ever
     /// materialized, so there is nothing resident to free.
     pub fn tombstone_turn(&mut self, timeline: TimelineId, turn_index: u32) {
+        // **Not onto a timeline that is already wholly dead.** Its tombstone
+        // says strictly more, and [`Self::tombstone_timeline`] has just dropped
+        // every turn mark it covers — so inserting one here would put back an
+        // entry nothing will ever read and leave this set disagreeing with the
+        // one a replay of the same log rebuilds. The replay path guards the
+        // same way for the same reason; both orders have to land in one place.
+        //
+        // Reachable: a character deleted mid-decode is tombstoned by
+        // `retire_npc` while the tick that is still running goes on to retire
+        // that conversation's tail.
+        if self.tombstoned_timelines.contains(&timeline) {
+            return;
+        }
         self.tombstoned_turns.insert((timeline, turn_index));
     }
 
@@ -3581,6 +3606,18 @@ impl Substrate {
     /// deletion would only take effect on the next reload.
     pub fn tombstone_timeline(&mut self, timeline: TimelineId) {
         self.tombstoned_timelines.insert(timeline);
+        // **A wholesale tombstone subsumes every turn-scoped one it covers.**
+        //
+        // `tombstoned_turns` only ever grew, so a conversation that retired a
+        // long tail and was then retired itself left one entry per turn behind
+        // for the life of the process — invisible while nothing read the set,
+        // and no longer so now that maintenance re-emits it: those entries
+        // would be walked on every sweep to be skipped, forever.
+        //
+        // Dropping them here is safe precisely because the timeline tombstone
+        // says more than they do: its records go wholesale, so nothing needs to
+        // know which of its turns were retired first.
+        self.tombstoned_turns.retain(|(tl, _)| *tl != timeline);
         // A tombstoned timeline's KV is dead — release its resident VRAM NOW rather
         // than wait for compaction. Its chunks survive for any other holder: a
         // code_read scope fork's two turns are spliced onto the file timeline
@@ -4743,6 +4780,30 @@ impl Substrate {
                 let conv_id = entry.conv_id.clone()?;
                 let label = entry.label.clone().unwrap_or_default();
                 Some((*tl, conv_id, label, entry.archived, entry.order))
+            })
+            .collect()
+    }
+
+    /// Live timelines whose `conv_id` starts with `prefix`, as
+    /// `(timeline, conv_id)`.
+    ///
+    /// [`Self::known_conversations`] answers the same question by materialising
+    /// every conversation the workspace has *ever* held — tombstoned ones
+    /// included, since the sidebar lists them — and cloning two strings for
+    /// each. A caller that wants one character's handful out of that pays for
+    /// the whole history of the log, and that history only grows: retirement
+    /// bounds the live set, not the registry.
+    ///
+    /// Filtering inside the read lock allocates for the matches alone, and
+    /// dropping tombstoned entries here means the caller is not handed
+    /// conversations whose only remaining use is to be skipped.
+    pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
+        self.timelines
+            .iter()
+            .filter(|(tl, _)| !self.tombstoned_timelines.contains(tl))
+            .filter_map(|(tl, entry)| {
+                let conv_id = entry.conv_id.as_ref()?;
+                conv_id.starts_with(prefix).then(|| (*tl, conv_id.clone()))
             })
             .collect()
     }
@@ -7788,6 +7849,50 @@ mod tests {
         assert_eq!(conv_id, "abc");
         assert_eq!(label, "tour");
         assert!(*archived);
+    }
+
+    /// **A prefix lookup answers "which are this scheme's?" without the
+    /// registry.**
+    ///
+    /// `known_conversations` materialises every conversation the workspace has
+    /// ever held, tombstoned ones included, because it feeds a sidebar.
+    /// Retirement bounds the live set and not the registry, so a caller that
+    /// wants one naming scheme's members — npcd's `npc-<id>-day-*` — would pay
+    /// for the whole history of the log on every open, forever.
+    ///
+    /// Two properties, and the second is the one with teeth: a tombstoned
+    /// conversation is not returned, which is what lets the caller treat
+    /// "retired" and "absent" as one answer instead of re-checking each row.
+    #[test]
+    fn a_conv_id_prefix_lookup_finds_only_live_matches() {
+        let (layer, group, first, mut sub) = make_timeline();
+        sub.set_conv_id(first, "npc-7-day-1");
+
+        let alloc = TimelineAllocator::new();
+        let add = |sub: &mut Substrate, conv_id: &str| {
+            let tl = alloc.next();
+            sub.register_timeline(tl, layer, group);
+            sub.set_conv_id(tl, conv_id);
+            tl
+        };
+        add(&mut sub, "npc-7-day-2");
+        // Shares the `npc-7` stem, so the trailing `-day-` is doing real work.
+        add(&mut sub, "npc-70-day-1");
+        add(&mut sub, "chat-1");
+        let retired = add(&mut sub, "npc-7-day-0");
+        sub.tombstone_timeline(retired);
+
+        let mut found: Vec<String> = sub
+            .conversations_with_conv_id_prefix("npc-7-day-")
+            .into_iter()
+            .map(|(_, conv)| conv)
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["npc-7-day-1".to_string(), "npc-7-day-2".to_string()],
+            "the lookup took a neighbour, a stranger, or a retired conversation"
+        );
     }
 
     /// Regression: zend's redo log writes the `Label` record carrying

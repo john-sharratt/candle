@@ -151,7 +151,10 @@ pub(crate) enum SchedulerRequest {
     /// [`Self::NewSequence`].
     ///
     /// Returns `Err(...)` if the timeline is not registered.
-    #[allow(dead_code)] // public scheduler API; used by Phase 2 resume callers
+    ///
+    /// Reached through [`crate::ConversationEngine::resume_conversation_with_projection`],
+    /// which is what a mind that never stops living opens its conversation with
+    /// after a restart.
     ResumeSequence {
         conversation: Conversation,
         timeline: TimelineId,

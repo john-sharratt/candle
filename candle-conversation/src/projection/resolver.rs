@@ -2789,6 +2789,12 @@ impl Conversation {
         self.read().known_conversations()
     }
 
+    /// Live conversations whose `conv_id` starts with `prefix` — see
+    /// [`crate::substrate::Substrate::conversations_with_conv_id_prefix`].
+    pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
+        self.read().conversations_with_conv_id_prefix(prefix)
+    }
+
     /// Set a conversation's `archived` lifecycle flag and persist it
     /// as a `RecordType::ConvState` record. Idempotent: if the
     /// substrate already holds the requested state, the record is

@@ -1063,10 +1063,37 @@ canvas { width: 100%; display: block; }
    died there instead of reaching the stage. The history could not be scrolled at
    all. A small pane inside a card inside a long grid must never capture the
    wheel — so the overflow is clamped, and the full text stays in the DOM and in
-   the element's `title` so nothing is actually lost. */
+   the element's `title` so nothing is actually lost.
+
+   **The cut fades rather than slicing.** Clamping alone read as a rendering
+   fault: the per-block `line-clamp` ellipsises cleanly, but it is the
+   *container* that runs out of room first when a verbose act takes the floor,
+   and a container clip lands wherever it lands — through the middle of a line
+   of glyphs, so the last thing visible is a row of letter-tops. A fade says
+   "there is more here" in the one vocabulary that needs no scrollbar to capture
+   the wheel for it.
+
+   Always on, and that is safe because the content is top-aligned
+   (`align-content: start`): a perception short enough to fit ends above the
+   fade band, so there is nothing under the gradient to dim. It bites only when
+   something is actually being cut off, which is exactly when it should.
+
+   The band is `min(22px, 25%)` and the cap is the load-bearing half. This is a
+   flex child that shrinks, so a verbose act can drive it below one line — and a
+   fixed 22px band on a 16px pane means `calc(100% - 22px)` is negative, which
+   the browser clamps to a stop at 0%. The gradient would then run across the
+   whole element and dim the perception away entirely, precisely in the case
+   where it is already down to its last line and least able to lose one. */
 .tick-perceived {
   display: grid; gap: 5px; align-content: start;
   flex: 1 1 auto; min-height: 0; overflow: hidden;
+  --fade: min(22px, 25%);
+  -webkit-mask-image: linear-gradient(
+    to bottom, #000 calc(100% - var(--fade)), transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom, #000 calc(100% - var(--fade)), transparent 100%
+  );
 }
 .perceive {
   margin: 0; font-size: .82rem; line-height: 1.58; color: var(--ink-dim);

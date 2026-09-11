@@ -120,11 +120,12 @@ impl DayTracker {
 /// The conversation id a character uses for a given day.
 ///
 /// Derived rather than allocated, and recorded against the timeline by
-/// [`crate::engine::mind::Minds::think`], so every timeline a character opens
-/// during one day carries that day's name in the redo log. A restart mid-day
-/// opens a fresh timeline — the sequence is GPU state — but it is named the same
-/// day, so the morning's turns stay attributable to the character that lived
-/// them rather than sitting in the log anonymous.
+/// [`crate::engine::mind::Minds::open_conversation`], so a character's day is
+/// identifiable as its own from the log alone.
+///
+/// Being derived is what makes a restart able to *find* the conversation it left
+/// — the name is recomputed from `(npc_id, day)` rather than remembered — so a
+/// character rejoins its morning rather than starting the day again beside it.
 ///
 /// Determinism alone is not the property: this function was correct and its
 /// result was never handed to the substrate, which made every timeline

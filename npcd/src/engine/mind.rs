@@ -6,12 +6,22 @@
 //! Each character holds a [`Sequence`] — a conversation on the substrate — for
 //! the day it is living in. Its id is *derived* from `(npc_id, day)` rather than
 //! allocated, and recorded against the timeline in the redo log, so the day's
-//! turns are identifiable as that character's day from the log alone. A daemon
-//! restarted at noon opens a fresh timeline for the rest of the day: the
-//! sequence is GPU state and does not survive the process. What the derived id
-//! buys is that both halves of the day carry the same name, so the morning's
-//! turns are still the character's own history rather than an anonymous
-//! timeline nothing can attribute.
+//! turns are identifiable as that character's day from the log alone.
+//!
+//! # A restart rejoins rather than starts over
+//!
+//! The sequence is GPU state and does not survive the process, but the
+//! conversation it was writing into does. A daemon restarted at noon looks for
+//! the timeline carrying this character's derived id — tagged with a fingerprint
+//! of the frame it was opened under — and, finding one written under the frame
+//! this process is running, opens a fresh slot onto it and carries on. The
+//! turns, the recurrent state and the carried selection belief all come back.
+//!
+//! It used to mint a new timeline unconditionally, which made the derived id a
+//! name and nothing more: a character that had lived all morning woke with no
+//! memory of it beyond what the gather happened to retrieve, and the morning's
+//! conversation was left live and unreadable for good. See
+//! [`Minds::open_conversation`].
 //!
 //! At the day boundary the conversation is retired and a new one opened. Retired
 //! means **tombstoned**, not deleted: the turns stay in the redo log and stay
@@ -39,13 +49,14 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use candle_conversation::projection::{Builder, GroupId, LayerId};
+use candle_conversation::projection::{Builder, GroupId, LayerId, TimelineId};
 use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
     ToolCallEnvelope,
 };
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::engine::act::{self, Parsed};
 use crate::engine::event::Event;
@@ -58,16 +69,29 @@ use crate::engine::window::{Speaker, Window};
 
 /// How many completed exchanges the GPU sequence carries per turn.
 ///
-/// Matches [`crate::engine::window::DEFAULT_TURNS`] in intent — a short verbatim
-/// tail, with continuity coming from the gather — but counts exchanges rather
-/// than turns, so it is half the number.
-pub const CONTEXT_WINDOW_TURNS: usize = 12;
+/// Matches [`crate::engine::window::DEFAULT_TURNS`] in intent — a bounded
+/// verbatim tail, with continuity coming from the gather — but counts exchanges
+/// rather than turns, so it is half the number.
+pub const CONTEXT_WINDOW_TURNS: usize = 32;
 
 /// The GPU tail and the perception window are two bounds with one intent,
 /// counted in different units — exchanges here, turns there. Held at compile
 /// time rather than by a test, so a change to either constant has to reckon with
 /// the other even in a build nobody runs the tests for.
 const _: () = assert!(CONTEXT_WINDOW_TURNS * 2 <= crate::engine::window::DEFAULT_TURNS);
+
+/// The metadata key carrying a conversation's `npc-<id>-day-<n>` name.
+///
+/// The same string as its `conv_id`, deliberately duplicated into the free-form
+/// bag: `conv_id` is a display name and answering "which timeline is this?" from
+/// it means walking every conversation the workspace knows, where the metadata
+/// side is an indexed lookup that already excludes tombstones. Resume runs on
+/// every character's first tick, so which of those it is matters.
+const META_CONVERSATION: &str = "npc_conversation";
+
+/// The metadata key carrying the fingerprint of the frame a conversation was
+/// opened under — see [`frame_fingerprint`].
+const META_FRAME: &str = "frame_sha256";
 
 /// A character's live conversation.
 struct Live {
@@ -78,10 +102,12 @@ struct Live {
     id: String,
     /// The first turn retention has **not** yet retired.
     ///
-    /// Zero for a conversation just opened, which is always safe: a turn already
-    /// tombstoned costs a lookup and no write, so a daemon restarted against an
-    /// existing conversation walks its watermark forward over the first few
-    /// inserts without rewriting anything. See [`retention::retire_expired`].
+    /// Zero for a conversation just minted, and [`retention::resume_watermark`]
+    /// for one rejoined — the first turn that conversation has not already
+    /// retired. Zero would still be *safe* there, since an already-tombstoned
+    /// turn costs a lookup and no write, but a conversation that never ends gets
+    /// deep enough that walking up from the bottom is the whole first minute of
+    /// a restart. See [`retention::retire_expired`].
     retired_through: u32,
     /// What became of the acts this conversation's **last** decode called for,
     /// waiting to be handed back on the next turn.
@@ -700,6 +726,187 @@ impl Minds {
         self.live.lock().unwrap().len()
     }
 
+    /// Rejoin this character's conversation, or open it a new one.
+    ///
+    /// # Rejoin before mint
+    ///
+    /// A character's conversation is named for `(npc_id, day)` and tagged with a
+    /// fingerprint of the frame it was opened under. So the question a restart
+    /// asks is answerable from the log alone: *is there a live conversation with
+    /// this name, written under this frame?* If there is, the character carries
+    /// on inside it — its turns, its recurrent state and its carried selection
+    /// belief all come back — and if there is not, one is minted and tagged so
+    /// the next restart can ask the same question.
+    ///
+    /// Before this, the answer was always no, because nothing was ever asked: a
+    /// conversation open always minted a fresh timeline, so the one a previous
+    /// process was using was abandoned the moment this one started, and a
+    /// character that had lived all morning woke with no memory of it beyond
+    /// what the gather happened to retrieve. Measured: 128 timelines for three
+    /// characters on one day — roughly forty abandoned generations, each a full
+    /// conversation's K/V left live and unreachable, which was the bulk of a
+    /// 132 GB log.
+    ///
+    /// # Why the frame is checked and not just the name
+    ///
+    /// A conversation is only worth continuing under the frame that wrote it.
+    /// Change the prompt, the act catalog or the call syntax and the history on
+    /// disk is a history *this* character would never have produced — the model
+    /// reads its own past making calls in a shape it can no longer make, which
+    /// is worse than reading nothing. So a name match with a frame mismatch is
+    /// superseded rather than rejoined, and says so. This is the same discipline
+    /// zend's ingest cache runs on its `content_sha256` tag.
+    ///
+    /// # Order
+    ///
+    /// The rejoin is attempted **before** anything is retired, so what gets
+    /// superseded is decided by the conversation we are actually holding rather
+    /// than the one we hoped to hold. A resume that fails is therefore retired
+    /// along with the rest, instead of being left live to fail again on every
+    /// restart forever.
+    fn open_conversation(
+        &self,
+        npc_id: u64,
+        day: u64,
+        persona: &Persona<'_>,
+        mode: Mode,
+    ) -> anyhow::Result<Live> {
+        let id = conversation_id(npc_id, day);
+        let mut cfg = self.base_config.clone();
+        cfg.context_window_turns = CONTEXT_WINDOW_TURNS;
+        // **The rendered prompt, until the reasoning block closes.**
+        //
+        // Everything for the projection path is built and installed — the acts,
+        // the identities, the world and the building are in the schema's
+        // collections and selected per turn, and `Projected` is handed over at
+        // boot. What is not solved is the decode: under the mind's schema the
+        // checkpoint opens `<think>` and never closes it, so the turn runs to
+        // `max_response_tokens` and is discarded whole as reasoning. Every tick
+        // then produces no acts and logs no error, because a decode that reasons
+        // forever is a successful decode.
+        //
+        // Suppressing it three ways did not: the `no_think` glue present,
+        // `thinking_effort` off, and the `ThinkMode::Off` close budget
+        // programmed into the sampling config. So the remaining fault is below
+        // the prompt, and a character that cannot act is worse than one whose
+        // prompt is a rendered copy — which is what this is until that is found.
+        //
+        // The same envelope `compile_act_loop` compiles, so what the prompt
+        // shows a character is what the grammar will hold it to.
+        let system = prompt::build(
+            persona,
+            mode,
+            &for_mode(mode),
+            &ToolCallEnvelope::for_dialect(&self.base_config.dialect),
+        );
+        let frame = frame_fingerprint(&system);
+
+        let rejoined = resumable(&self.engine, &id, &frame).and_then(|timeline| {
+            let engine = self.engine.lock().ok()?;
+            match engine.resume_conversation(timeline, &system, cfg.clone()) {
+                Ok(sequence) => {
+                    // Both read the substrate, so both are answered while the
+                    // lock the resume needed is still in hand.
+                    let depth = engine.timeline_turn_count(timeline);
+                    let watermark = retention::resume_watermark(&engine, timeline, depth);
+                    drop(engine);
+                    tracing::info!(
+                        depth,
+                        watermark,
+                        "conversation {id} rejoined — the character carries on from where it \
+                         stopped rather than starting over beside its own history"
+                    );
+                    Some((sequence, watermark))
+                }
+                Err(e) => {
+                    drop(engine);
+                    tracing::warn!(
+                        "conversation {id} could not be rejoined: {e:?} — it is superseded below \
+                         and a fresh one is opened in its place"
+                    );
+                    None
+                }
+            }
+        });
+
+        // **Retire everything else this character left behind.**
+        //
+        // Its conversations are all named `npc-<id>-day-<n>`, so its whole
+        // history in the log is exactly the timelines carrying that prefix —
+        // yesterday's, and every generation a previous process abandoned. None
+        // of them will be read again now that today's is in hand.
+        //
+        // The same move zend makes when it re-ingests a file and supersedes the
+        // old conversation (`code_read`): tombstone it, and compaction drops its
+        // records wholesale.
+        retire_superseded(
+            &self.engine,
+            npc_id,
+            rejoined.as_ref().map(|(s, _)| s.timeline_id()),
+        );
+
+        if let Some((sequence, watermark)) = rejoined {
+            return Ok(Live {
+                sequence,
+                day,
+                id,
+                // Not zero: a conversation this deep has already retired its
+                // tail, and re-walking it from the bottom would cost the first
+                // few hundred turns of the restart. See
+                // [`retention::resume_watermark`].
+                retired_through: watermark,
+                pending: Vec::new(),
+            });
+        }
+
+        let sequence = self.engine.lock().unwrap().new_conversation(&system, cfg)?;
+        let timeline = sequence.timeline_id();
+        {
+            let engine = self.engine.lock().unwrap();
+            // **The derived id, given to the substrate.** Minting it and keeping
+            // it in this struct made it a log label and nothing else: the
+            // timeline went into the redo log anonymous, so nothing downstream
+            // could attribute a day's turns to the character that lived them.
+            if let Err(e) = engine.set_conversation_conv_id(timeline, &id) {
+                tracing::warn!(
+                    "conversation {id} could not be named in the log: {e:?} — its turns will not \
+                     be attributable to this character"
+                );
+            }
+            // **What makes the next restart able to find this again.**
+            //
+            // The fingerprint is the shape and the name is what is searched on,
+            // and they are written in that order deliberately: the name is the
+            // commit marker, so a conversation `resumable` can find is one whose
+            // fingerprint is already down. Written the other way, a crash
+            // between the two writes would leave a conversation findable by name
+            // with nothing to check it against — which is the one state that
+            // would have to be guessed about rather than decided.
+            //
+            // A conversation missing either tag is simply never rejoined, which
+            // is the behaviour there was before this. A failed tag therefore
+            // costs continuity, not correctness.
+            for (key, value) in [
+                (META_FRAME, frame.as_str()),
+                (META_CONVERSATION, id.as_str()),
+            ] {
+                if let Err(e) = engine.set_conversation_metadata(timeline, key, value) {
+                    tracing::warn!(
+                        "conversation {id} could not be tagged {key}: {e:?} — a restart will open \
+                         a new conversation rather than rejoining this one"
+                    );
+                }
+            }
+        }
+        Ok(Live {
+            sequence,
+            day,
+            id,
+            retired_through: 0,
+            pending: Vec::new(),
+        })
+    }
+
     /// Run one thinking step: perception in, acts out.
     ///
     /// Errors are returned rather than swallowed. A decode that failed and a
@@ -749,63 +956,9 @@ impl Minds {
             // so the map is probed once and the borrow below cannot miss.
             match live.entry(npc_id) {
                 Entry::Occupied(e) => Arc::clone(e.get()),
-                Entry::Vacant(slot) => {
-                    let id = conversation_id(npc_id, day);
-                    let mut cfg = self.base_config.clone();
-                    cfg.context_window_turns = CONTEXT_WINDOW_TURNS;
-                    // **The rendered prompt, until the reasoning block closes.**
-                    //
-                    // Everything for the projection path is built and installed
-                    // — the acts, the identities, the world and the building are
-                    // in the schema's collections and selected per turn, and
-                    // `Projected` is handed over at boot. What is not solved is
-                    // the decode: under the mind's schema the checkpoint opens
-                    // `<think>` and never closes it, so the turn runs to
-                    // `max_response_tokens` and is discarded whole as reasoning.
-                    // Every tick then produces no acts and logs no error,
-                    // because a decode that reasons forever is a successful one.
-                    //
-                    // Suppressing it three ways did not: the `no_think` glue
-                    // present, `thinking_effort` off, and the `ThinkMode::Off`
-                    // close budget programmed into the sampling config. So the
-                    // remaining fault is below the prompt, and a character that
-                    // cannot act is worse than one whose prompt is a rendered
-                    // copy — which is what this is until that is found.
-                    // The same envelope `compile_act_loop` compiles, so what the prompt
-                    // shows a character is what the grammar will hold it to.
-                    let system = prompt::build(
-                        persona,
-                        mode,
-                        &for_mode(mode),
-                        &ToolCallEnvelope::for_dialect(&self.base_config.dialect),
-                    );
-                    let sequence = self.engine.lock().unwrap().new_conversation(&system, cfg)?;
-                    // **The derived id, given to the substrate.** Minting it and keeping it
-                    // in this struct made it a log label and nothing else: the timeline went
-                    // into the redo log anonymous, so nothing downstream could attribute a
-                    // day's turns to the character that lived them, and the two doc comments
-                    // promising a stable per-day identity described a string that never left
-                    // the process. Failure is logged rather than propagated — an unnamed
-                    // timeline is worse reporting, not a character that cannot think.
-                    if let Err(e) = self
-                        .engine
-                        .lock()
-                        .unwrap()
-                        .set_conversation_conv_id(sequence.timeline_id(), &id)
-                    {
-                        tracing::warn!(
-                            "conversation {id} could not be named in the log: {e:?} — its turns \
-                             will not be attributable to this character"
-                        );
-                    }
-                    Arc::clone(slot.insert(Arc::new(Mutex::new(Live {
-                        sequence,
-                        day,
-                        id,
-                        retired_through: 0,
-                        pending: Vec::new(),
-                    }))))
-                }
+                Entry::Vacant(slot) => Arc::clone(slot.insert(Arc::new(Mutex::new(
+                    self.open_conversation(npc_id, day, persona, mode)?,
+                )))),
             }
         };
 
@@ -864,15 +1017,10 @@ impl Minds {
             assistant_prefill: self.opening(identity::Deliberation::default()),
             ..Default::default()
         };
-        let (response, timeline, depth, watermark) = {
+        let (response, timeline, watermark) = {
             let mut live = conversation.lock().unwrap();
             let response = live.sequence.send_turn_with_options(&perception, options)?;
-            (
-                response,
-                live.sequence.timeline_id(),
-                live.sequence.turn_count(),
-                live.retired_through,
-            )
+            (response, live.sequence.timeline_id(), live.retired_through)
         };
         // **Retire whatever now sits below the horizon.**
         //
@@ -888,6 +1036,17 @@ impl Minds {
         // character's decode behind this one's bookkeeping.
         if let Some(keep) = self.keep_turns {
             if let Ok(engine) = self.engine.lock() {
+                // **The substrate's count, not the sequence's.**
+                //
+                // `Sequence::turn_count` counts a user and an assistant message
+                // separately and starts from zero whenever a process opens a
+                // fresh sequence; turn *indices* advance once per exchange. A
+                // horizon from that counter therefore runs at twice the rate of
+                // the turns it indexes — measured live, `turn_count=65` gave
+                // `horizon=0` and by 65 exchanges the horizon had passed the
+                // last real turn, retiring the whole conversation. `keep_turns:
+                // 64` came to mean keep nothing.
+                let depth = engine.timeline_turn_count(timeline);
                 let (through, retired) =
                     retention::retire_expired(&engine, timeline, depth, keep, watermark);
                 drop(engine);
@@ -922,7 +1081,13 @@ impl Minds {
         }
     }
 
-    /// Retire a character's conversation — on delete, or on shutdown.
+    /// Retire a character's conversation, because the character is gone.
+    ///
+    /// **On delete only, and deliberately not on shutdown.** A tombstone is the
+    /// record that a conversation is finished, and a daemon stopping is not that
+    /// — the cast is meant to still be there when it starts again. Retiring here
+    /// would make [`Minds::open_conversation`]'s rejoin unreachable, since the
+    /// lookup it runs on excludes tombstoned timelines by design.
     pub fn retire_npc(&self, npc_id: u64) {
         // Taken out of the map first, then locked: a character mid-decode is
         // waited on rather than tombstoned underneath, and the map is free for
@@ -931,6 +1096,144 @@ impl Minds {
         if let Some(l) = gone {
             retire(&self.engine, &l.lock().unwrap());
         }
+    }
+}
+
+/// A fingerprint of the frame a character thinks under.
+///
+/// The whole rendered system prompt, which is everything that decides what a
+/// turn in this conversation looks like: who the character is, which acts exist,
+/// what a call to one is spelled as. Change any of them and a history written
+/// before the change is a history the character can no longer produce — see
+/// [`Minds::open_conversation`] for why that is a reason not to rejoin it.
+///
+/// Content-addressed rather than versioned, so nothing has to remember to bump a
+/// number when it edits a prompt. That is the property zend's ingest cache
+/// relies on for the same job.
+fn frame_fingerprint(system: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(system.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// The live conversation named `id` and written under `frame`, if there is one.
+///
+/// The lookup is indexed and already excludes tombstoned timelines, so "a
+/// conversation that was retired" and "no conversation" are the same answer
+/// here — which is what makes retiring one the way to refuse a resume.
+///
+/// A name match under a *different* frame is passed over and logged, because
+/// that is the case an operator needs to see: it looks identical from outside to
+/// a character that simply had no history, and the reason it had none is
+/// something they just changed.
+///
+/// More than one candidate should not happen — the name is derived from
+/// `(npc_id, day)` and every open supersedes the rest — so the deepest is taken
+/// rather than the first, which makes the choice deterministic instead of
+/// dependent on lookup order. The others are retired by
+/// [`retire_superseded`] on the way past.
+fn resumable(engine: &Arc<Mutex<ConversationEngine>>, id: &str, frame: &str) -> Option<TimelineId> {
+    let engine = engine.lock().ok()?;
+    let mut best: Option<(u64, TimelineId)> = None;
+    for timeline in engine.find_conversations_by_metadata(META_CONVERSATION, id) {
+        match engine
+            .conversation_metadata(timeline)
+            .and_then(|m| m.get(META_FRAME).cloned())
+        {
+            Some(under) if under == frame => {}
+            Some(_) => {
+                tracing::info!(
+                    "conversation {id} was written under a different frame — superseded rather \
+                     than rejoined, because a history this character could no longer produce \
+                     reads worse than no history at all"
+                );
+                continue;
+            }
+            // Named but never fingerprinted, which the tag order makes
+            // unreachable: the name is written second precisely so that finding
+            // one means the fingerprint is already down. Reported rather than
+            // folded in with a mismatch, because the two mean different things —
+            // a mismatch is a prompt that changed, this is a write that tore.
+            None => {
+                tracing::warn!(
+                    "conversation {id} carries a name but no frame fingerprint — superseded, \
+                     since there is nothing to decide against"
+                );
+                continue;
+            }
+        }
+        let depth = engine.timeline_turn_count(timeline);
+        if best.is_none_or(|(deepest, _)| depth > deepest) {
+            best = Some((depth, timeline));
+        }
+    }
+    best.map(|(_, timeline)| timeline)
+}
+
+/// Retire every conversation this character has left behind, except `keep`.
+///
+/// **A character's conversations are named `npc-<id>-day-<n>`** by
+/// [`conversation_id`], so its whole history in the log is exactly the
+/// timelines carrying that prefix. Opening today's supersedes all of them —
+/// yesterday's, and every generation a previous process abandoned.
+///
+/// `keep` is the one this process just rejoined, and is the only conversation
+/// that survives. It is passed as the timeline rather than looked up by name
+/// because the two can disagree: a resume that *failed* has a matching name and
+/// must still be retired, or it stays live and fails again on every restart.
+///
+/// The prefix, rather than the metadata tag [`resumable`] searches on: every
+/// conversation ever opened has a `conv_id`, where only those opened since the
+/// tag existed carry the tag. Sweeping on the name is what lets this retire a
+/// backlog it did not write.
+///
+/// The lookup is prefix-scoped in the substrate rather than a filter over
+/// [`ConversationEngine::known_conversations`], which materialises every
+/// conversation the workspace has ever held — tombstoned included, since that
+/// call feeds a sidebar. Retirement bounds the live set, not the registry, so
+/// that list only grows; this one is the size of one character's history.
+///
+/// Already-tombstoned timelines are excluded by the lookup, which is what makes
+/// this affordable to run on every conversation open rather than once at boot:
+/// a character woken for the first time today retires the whole backlog, and
+/// every wake after that finds nothing to do.
+///
+/// Failure is logged, never propagated — a tombstone that did not land leaves
+/// bulk on disk, and refusing to let a character think over its bookkeeping
+/// would be far worse.
+fn retire_superseded(
+    engine: &Arc<Mutex<ConversationEngine>>,
+    npc_id: u64,
+    keep: Option<TimelineId>,
+) {
+    let prefix = format!("npc-{npc_id}-day-");
+    let Ok(engine) = engine.lock() else {
+        return;
+    };
+    let stale: Vec<(TimelineId, String)> = engine
+        .conversations_with_conv_id_prefix(&prefix)
+        .into_iter()
+        .filter(|(tl, _)| Some(*tl) != keep)
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    let mut retired = 0;
+    for (tl, conv) in &stale {
+        match engine.tombstone_timeline(*tl) {
+            Ok(()) => retired += 1,
+            Err(e) => tracing::warn!(
+                "superseded conversation {conv} could not be retired: {e:?} — its turns stay \
+                 live in the log and nothing will ever read them"
+            ),
+        }
+    }
+    if retired > 0 {
+        tracing::info!(
+            retired,
+            "retired conversations this character had left behind; their turns are now \
+             reclaimable"
+        );
     }
 }
 
@@ -1026,6 +1329,44 @@ pub fn render_turn(speaker: Speaker, text: &str) -> String {
 mod tests {
     use super::*;
     use crate::engine::event::{EventKind, Salience};
+
+    /// The fingerprint is what decides whether a conversation on disk is still
+    /// this character's to continue, so the same frame has to produce the same
+    /// answer in a process that never saw the one that wrote it. A hash of the
+    /// text does; anything carrying a pointer, an ordering or a timestamp would
+    /// not, and would fail by quietly never resuming.
+    #[test]
+    fn the_same_frame_fingerprints_the_same_in_any_process() {
+        let frame = "You are Ada. You may move_to, say, ask.";
+        assert_eq!(frame_fingerprint(frame), frame_fingerprint(frame));
+        assert_eq!(
+            frame_fingerprint(frame).len(),
+            64,
+            "not a sha256 hex digest"
+        );
+    }
+
+    /// **Every difference has to count.** A character rejoining a conversation
+    /// written under a prompt it no longer has reads its own past making calls
+    /// in a shape it can no longer make. The cases below are the ones that
+    /// actually change between builds: who the character is, and which acts
+    /// exist.
+    #[test]
+    fn a_changed_frame_fingerprints_differently() {
+        let base = "You are Ada. You may move_to, say, ask.";
+        for changed in [
+            "You are Bram. You may move_to, say, ask.",
+            "You are Ada. You may move_to, say, ask, gesture.",
+            "You are Ada. You may move_to, say, ask. ",
+            "",
+        ] {
+            assert_ne!(
+                frame_fingerprint(base),
+                frame_fingerprint(changed),
+                "{changed:?} fingerprinted the same as the frame it differs from"
+            );
+        }
+    }
 
     fn ev(text: &str) -> Event {
         Event::new(

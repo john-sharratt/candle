@@ -279,15 +279,23 @@ impl Due {
         self.0 = w.since_start + gap;
     }
 
-    /// Bring it forward — for a fixture that has just heard something it wants
-    /// to react to sooner than its own clock would have let it.
+    /// Bring it forward, never back — for a fixture that has just heard
+    /// something it wants to react to sooner than its own clock would have let
+    /// it.
+    ///
+    /// **The earlier of the two, for the same reason [`Due::defer`] takes the
+    /// later.** This delegated to [`Due::again`], which *sets*: a fixture
+    /// already due in three seconds that heard something and asked to react
+    /// "within twenty" was pushed out to twenty and reacted *later* than if it
+    /// had heard nothing at all. Every caller is a reaction handler and every
+    /// one of them means sooner.
     pub fn hold(&mut self, w: &Watch, gap: Duration) {
-        self.again(w, gap);
+        self.0 = self.0.min(w.since_start + gap);
     }
 
     /// Push it back, never forward.
     ///
-    /// The distinction from [`Due::hold`] is not cosmetic. `hold` *sets* the
+    /// The distinction from [`Due::again`] is not cosmetic. `again` *sets* the
     /// deadline, so a fixture using it to say "not for a while yet" will
     /// happily pull a distant deadline nearer and get the opposite of what it
     /// asked for. This takes the later of the two, which is what "wait at least

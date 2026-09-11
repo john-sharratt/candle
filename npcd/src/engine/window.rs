@@ -35,15 +35,23 @@ use serde::Serialize;
 ///
 /// Counts *turns*, not exchanges: an event and the act it produced are two.
 ///
-/// Deliberately short. A character's continuity is supposed to come from the
-/// gather, and a long verbatim tail is precisely the crutch that would hide a
-/// gather that is not working — a character only coherent with a hundred turns
-/// pasted in has broken retrieval and a window concealing it. Held at compile
-/// time so a future "just bump it" has to argue with this paragraph first.
-pub const DEFAULT_TURNS: usize = 24;
+/// A character's continuity is supposed to come from the gather, and a long
+/// verbatim tail is the crutch that would hide a gather that is not working — a
+/// character only coherent with a hundred turns pasted in has broken retrieval
+/// and a window concealing it. So the ceiling below is not a formality; it is
+/// the thing that keeps that crutch from being reached for quietly.
+///
+/// It was 24 while the act loop was still being closed, and the gather was not
+/// the only thing that had to be proved. Now it is 64, matching
+/// [`crate::engine::mind::CONTEXT_WINDOW_TURNS`]'s 32 exchanges: a character
+/// gets the better part of an hour of its own conduct in front of it, which is
+/// what a cast that has to remember a conversation across a dozen interruptions
+/// needs. The ceiling moved with it rather than being deleted, because the
+/// reason for having one did not change.
+pub const DEFAULT_TURNS: usize = 64;
 
 const _: () = assert!(
-    DEFAULT_TURNS <= 32,
+    DEFAULT_TURNS <= 64,
     "a long verbatim tail lets a broken gather look like a working one"
 );
 

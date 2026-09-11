@@ -128,6 +128,18 @@ impl SubstrateReloadStatus {
     }
 }
 
+/// Whether a slot is being opened onto a conversation that already has turns.
+///
+/// A `bool` would read as `open(…, true)` at the two call sites that pick it,
+/// and the two cases differ in what they *mean* rather than in a setting: one
+/// mints a timeline and one continues one. See
+/// [`ConversationEngine::resume_conversation_with_projection`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resumed {
+    No,
+    Yes,
+}
+
 /// The entry point for the conversation engine.
 ///
 /// Owns the scheduler thread and provides factory methods for creating
@@ -802,6 +814,19 @@ impl ConversationEngine {
         self.conversation.known_conversations()
     }
 
+    /// Live conversations whose `conv_id` starts with `prefix`, as
+    /// `(timeline, conv_id)` — tombstoned ones excluded.
+    ///
+    /// For a caller that names its conversations by a scheme rather than
+    /// listing them, and wants one scheme's members without paying for the
+    /// whole registry: [`Self::known_conversations`] materialises every
+    /// conversation the workspace has ever held, and that grows for the life of
+    /// the log while the live set stays bounded. `npcd` finds one character's
+    /// `npc-<id>-day-*` conversations this way.
+    pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
+        self.conversation.conversations_with_conv_id_prefix(prefix)
+    }
+
     /// Toggle the archived lifecycle flag for a conversation. Persists
     /// to the redo log as `RecordType::ConvState` (last-writer-wins)
     /// and updates the in-RAM substrate. Drives the daemon's
@@ -843,6 +868,32 @@ impl ConversationEngine {
     /// tombstone.
     pub fn is_turn_tombstoned(&self, timeline: TimelineId, turn_index: u32) -> bool {
         self.conversation.is_turn_tombstoned(timeline, turn_index)
+    }
+
+    /// Whether the whole of `timeline` has been tombstoned.
+    ///
+    /// The companion to [`Self::is_turn_tombstoned`], and what a caller about
+    /// to retire a conversation consults so an already-dead one costs a lookup
+    /// rather than another record.
+    pub fn is_timeline_tombstoned(&self, timeline: TimelineId) -> bool {
+        self.conversation.is_timeline_tombstoned(timeline)
+    }
+
+    /// How many turns `timeline` actually holds — the substrate's own count.
+    ///
+    /// **The number a retention sweep must reckon against.** `Sequence::turn_count`
+    /// is a different quantity: it is a per-sequence diagnostic that counts a
+    /// user and an assistant message separately (`+= 2` an exchange) and resets
+    /// whenever a process opens a fresh sequence. Turn *indices* advance once
+    /// per exchange, so a horizon computed from that counter runs at twice the
+    /// rate of the turns it indexes — past ~65 exchanges it exceeds the last
+    /// real turn and retires the entire conversation, which is `keep_turns`
+    /// meaning its own opposite.
+    ///
+    /// This counts turns the way the index does, so a horizon derived from it
+    /// names a turn that exists.
+    pub fn timeline_turn_count(&self, timeline: TimelineId) -> u64 {
+        self.conversation.read().turn_count(timeline) as u64
     }
 
     /// Mark `timeline` for distillation at `mode` (shed content at compaction) —
@@ -1198,6 +1249,131 @@ impl ConversationEngine {
         // `(layer, group)` so the seal path can write turns into the
         // right timeline without consulting the schema.
         let timeline = self.conversation.mint_timeline(layer, group);
+        self.bind_slot_to_timeline(
+            timeline,
+            Resumed::No,
+            system_prompt,
+            builder,
+            layer,
+            group,
+            config,
+            section_progress,
+        )
+    }
+
+    /// Open a **new GPU slot onto a conversation that already exists** in the
+    /// substrate, and carry on appending to it.
+    ///
+    /// # What this is for
+    ///
+    /// Every other constructor mints a fresh `TimelineId`, so a process restart
+    /// abandons whatever conversation the last one was using — the turns stay in
+    /// the log, reachable by the gather, but nothing appends to them again. For
+    /// an assistant that is right: a session ends. For a mind that never stops
+    /// living it is not. Its conversation is *the* conversation, and a restart
+    /// should rejoin it rather than start the day over with a stranger's history
+    /// filed beside it.
+    ///
+    /// # What actually resumes
+    ///
+    /// The turns, the recurrent state and the carried selection belief — the
+    /// three durable things a timeline owns. The first two are restored by
+    /// [`crate::scheduler`]'s slot-creation funnel, which reads them from the
+    /// timeline; the third is refolded from the persisted per-turn projection
+    /// events. What does not resume is GPU residence: the slot starts empty and
+    /// the next turn's projection materialises what it needs out of the
+    /// substrate, exactly as it would after any eviction.
+    ///
+    /// # What the caller still owes
+    ///
+    /// **That this timeline is the right one to continue.** Nothing here can
+    /// tell whether the schema, the prompt or the dialect has changed underneath
+    /// it since it was written, and resuming into a conversation shaped by a
+    /// different frame is worse than starting a new one — the model reads a
+    /// history it would never have produced. Tag the conversation with a
+    /// fingerprint of the frame it was opened under and check it before calling
+    /// this; `npcd`'s character loop and zend's `content_sha256` ingest cache
+    /// are both that pattern.
+    ///
+    /// Refuses an unregistered timeline, and refuses a tombstoned one — a
+    /// tombstone is the record that something decided this conversation was
+    /// finished, and silently reviving it would make that decision meaningless.
+    pub fn resume_conversation_with_projection(
+        &self,
+        timeline: TimelineId,
+        system_prompt: &str,
+        builder: Builder,
+        config: SequenceConfig,
+    ) -> crate::Result<Sequence> {
+        if self.is_timeline_tombstoned(timeline) {
+            return Err(ConversationError::Channel(format!(
+                "cannot resume conversation on timeline {timeline}: it is tombstoned",
+            )));
+        }
+        let Some((layer, group)) = self.conversation.timeline_target(timeline) else {
+            return Err(ConversationError::Channel(format!(
+                "cannot resume conversation on timeline {timeline}: not registered in the substrate",
+            )));
+        };
+        if let Some(yaml) = builder.source_yaml() {
+            if let Err(e) = self.conversation.set_template(yaml.as_bytes()) {
+                tracing::warn!("persist projection template failed: {e}");
+            }
+        }
+        self.bind_slot_to_timeline(
+            timeline,
+            Resumed::Yes,
+            system_prompt,
+            builder,
+            layer,
+            group,
+            config,
+            None,
+        )
+    }
+
+    /// [`Self::resume_conversation_with_projection`] for a conversation that
+    /// was opened from a raw prompt string.
+    ///
+    /// The synthetic single-layer schema is rebuilt from `system_prompt` the
+    /// same way [`Self::new_conversation`] builds it, so the frame the resumed
+    /// conversation projects under is the frame it was created under — provided
+    /// the caller hands over the same prompt. It cannot check that for you; see
+    /// the fingerprint note on [`Self::resume_conversation_with_projection`].
+    pub fn resume_conversation(
+        &self,
+        timeline: TimelineId,
+        system_prompt: &str,
+        config: SequenceConfig,
+    ) -> crate::Result<Sequence> {
+        let inner_prompt = {
+            let s = system_prompt
+                .strip_prefix(config.dialect.system_start)
+                .unwrap_or(system_prompt);
+            s.strip_suffix(config.dialect.system_end).unwrap_or(s)
+        };
+        let builder = Builder::for_plain_prompt(inner_prompt);
+        self.resume_conversation_with_projection(timeline, system_prompt, builder, config)
+    }
+
+    /// Allocate a slot for `timeline` and build the [`Sequence`] over it.
+    ///
+    /// The shared tail of [`Self::new_conversation_with_projection_progress`]
+    /// and [`Self::resume_conversation_with_projection`] — everything from
+    /// "the timeline exists" onwards is identical, and `resumed` chooses only
+    /// which scheduler entry point allocates the slot.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_slot_to_timeline(
+        &self,
+        timeline: TimelineId,
+        resumed: Resumed,
+        system_prompt: &str,
+        builder: Builder,
+        layer: LayerId,
+        group: GroupId,
+        config: SequenceConfig,
+        section_progress: Option<&dyn Fn(u64, u64)>,
+    ) -> crate::Result<Sequence> {
         // Register this conversation's per-conversation KV-compression
         // override (if any) before the first turn seals, so each turn
         // residence inherits it at alloc time. Utility layers set a
@@ -1235,21 +1411,53 @@ impl ConversationEngine {
         };
 
         let (response_tx, response_rx) = channel::bounded(1);
-        self.scheduler_tx
-            .send(SchedulerRequest::NewSequence {
+        let request = match resumed {
+            // A fresh conversation: any state comes from the timeline's own
+            // snapshot, which `create_sequence` reads.
+            Resumed::No => SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
                 target: Some(target),
-                // A fresh conversation: any state comes from the timeline's own
-                // snapshot, which `create_sequence` reads.
                 parent: None,
                 response_tx,
-            })
+            },
+            // The same funnel, entered by the door that says so. Both end in
+            // `create_sequence(conversation, Some(target))` and restore the
+            // timeline's recurrent state and carried belief; what differs is
+            // that this one re-derives `(layer, group)` from the substrate
+            // registry and fails loudly if the timeline was never registered.
+            Resumed::Yes => SchedulerRequest::ResumeSequence {
+                conversation: self.conversation.clone(),
+                timeline,
+                response_tx,
+            },
+        };
+        self.scheduler_tx
+            .send(request)
             .map_err(|_| ConversationError::SchedulerGone)?;
 
         let sequence_id = response_rx
             .recv()
             .map_err(|_| ConversationError::SchedulerGone)??;
 
+        // **Everything past the slot allocation has to hand the slot back.**
+        //
+        // A built [`Sequence`] frees its slot on drop, so the only window where
+        // one can be stranded is between the scheduler handing out `sequence_id`
+        // and a `Sequence` existing to own it. A `?` here would return through
+        // that window and leave a GPU slot allocated, its sampling state
+        // registered and its conversation handle held, with nothing left that
+        // knows the id — leaked until the process ends.
+        //
+        // Rare, and rarer still to notice: the surviving symptom is a slot count
+        // that never comes back down, which reads as a busy engine rather than
+        // as an error. Resume widens the window — a conversation whose tree
+        // rebuild fails is a new way in — so it is closed rather than reasoned
+        // about.
+        let free_slot = || {
+            let _ = self
+                .scheduler_tx
+                .send(SchedulerRequest::FreeSequence { sequence_id });
+        };
         let (conv, pending) = Sequence::new_with_projection(
             self.scheduler_tx.clone(),
             sequence_id,
@@ -1262,12 +1470,23 @@ impl ConversationEngine {
             self.model_core,
             self.conversation.clone(),
             section_progress,
-            // Single-create path keeps the first-turn priming optimization.
+            // **Primed on both paths, resume included.** Priming injects the
+            // schema's prelude *sections* and explicitly no turns, and the
+            // per-turn `apply_projection` at submit materialises the real
+            // projection regardless — so a resumed slot is warmed by this and
+            // its history still arrives the ordinary way.
             true,
-        )?;
+        )
+        .inspect_err(|_| free_slot())?;
         // A group of one — the same install path the batch create takes.
         let pending: Vec<_> = pending.into_iter().collect();
-        install_branch_states(&self.scheduler_tx, &pending, &self.conversation)?;
+        if let Err(e) = install_branch_states(&self.scheduler_tx, &pending, &self.conversation) {
+            // `conv` owns the slot by now and would free it on drop, but it is
+            // dropped here without being returned, so say what happened rather
+            // than letting a silent drop stand in for an error.
+            drop(conv);
+            return Err(e);
+        }
 
         Ok(conv)
     }

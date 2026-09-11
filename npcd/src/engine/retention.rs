@@ -49,9 +49,11 @@
 //! Going up from the watermark keeps the tombstoned run contiguous from turn
 //! zero, which is the invariant that makes stopping early safe at all.
 //!
-//! The watermark is per conversation and starts at zero, so a daemon restarted
-//! mid-conversation closes the whole gap over its first few inserts rather than
-//! stranding it.
+//! The watermark is per conversation. A conversation this process opened starts
+//! at zero; one it **rejoined** starts at the first turn still live, found by
+//! [`resume_watermark`] — the sweep would otherwise spend the first few hundred
+//! turns of every restart re-walking ground it retired before the process
+//! started, which a conversation that never ends only makes worse.
 //!
 //! # Opt-in, because most conversations are finite
 //!
@@ -65,11 +67,13 @@ use candle_conversation::ConversationEngine;
 /// How many turns of a character's conversation stay verbatim on disk.
 ///
 /// **Chosen to sit above every other bound with room to spare.** The perception
-/// window carries 24 turns and the GPU tail 12 exchanges; at 64 a turn is
-/// retired only once it is more than twice as old as anything that would still
-/// read it. The margin is the point — retention is the one bound whose mistake
-/// is unrecoverable, since a dropped turn does not come back.
-pub const KEEP_TURNS: u64 = 64;
+/// window carries 64 turns and the GPU tail 32 exchanges — the same 64 turns
+/// counted the other way — so at 160 a turn is retired only once it is more
+/// than twice as old as anything that would still read it. The margin is the
+/// point, and it is what moves when either window does: retention is the one
+/// bound whose mistake is unrecoverable, since a dropped turn does not come
+/// back.
+pub const KEEP_TURNS: u64 = 160;
 
 /// Retention must stay clear of both live windows, or a turn is retired out
 /// from under something still reading it. Held at compile time for the same
@@ -97,6 +101,64 @@ pub fn horizon(turn_count: u64, keep: u64) -> Option<u32> {
         .map(|i| i as u32)
 }
 
+/// Where the sweep should start on a conversation this process did not open.
+///
+/// Zero is always *correct* — an already-tombstoned turn costs a lookup and no
+/// write, so a sweep from the bottom converges on the truth. What it is not is
+/// affordable forever. [`retire_expired`] looks back at most [`LOOK_BACK`] turns
+/// per insert, so a resumed conversation a million turns deep would spend four
+/// thousand of its turns walking ground that was already retired before it could
+/// reach the ground that was not — and a mind that never stops living is exactly
+/// the conversation that gets that deep. Resume is what makes this reachable at
+/// all: before it, every restart began at turn zero of a brand-new timeline.
+///
+/// A binary search is available because [`retire_expired`] sweeps **oldest-first
+/// and stops on failure**, which makes the tombstoned turns a contiguous run
+/// from turn zero — the same invariant that lets the sweep stop early. So the
+/// watermark is the partition point, and finding it costs `log2(turns)` lookups
+/// instead of one per turn.
+///
+/// If the invariant were ever broken — a gap left by something other than this
+/// module — the search lands inside the run rather than at its top, and the
+/// ordinary oldest-first sweep closes the rest over the next few inserts. The
+/// bad case is slow, not wrong.
+pub fn resume_watermark(engine: &ConversationEngine, timeline: TimelineId, turn_count: u64) -> u32 {
+    let at = first_live_turn(turn_count, |turn| engine.is_turn_tombstoned(timeline, turn));
+    if at > 0 {
+        tracing::info!(
+            watermark = at,
+            turn_count,
+            "resumed conversation is already retired up to here; the sweep starts above it"
+        );
+    }
+    at
+}
+
+/// The search itself, over the answer rather than over an engine.
+///
+/// Separated so the walk is testable without a model on a GPU behind it — the
+/// property being checked is arithmetic, and arranging a real conversation of a
+/// million turns to check it is not.
+fn first_live_turn(turn_count: u64, tombstoned: impl Fn(u32) -> bool) -> u32 {
+    // Turn indices are `u32`; a conversation deeper than that is not a case this
+    // saturates into wrongly — it clamps to the top of the index space, which is
+    // past every turn, and the sweep then has nothing to do.
+    let mut lo = 0u32;
+    let mut hi = u32::try_from(turn_count).unwrap_or(u32::MAX);
+    while lo < hi {
+        // Halfway *between*, not `(lo + hi) / 2`: the sum of two indices near
+        // the top of the space overflows, and a conversation that deep is the
+        // one this exists for.
+        let mid = lo + (hi - lo) / 2;
+        if tombstoned(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// Tombstone everything from `watermark` up to the horizon, oldest first.
 ///
 /// `watermark` is the first turn this conversation has *not* yet retired; it is
@@ -118,9 +180,30 @@ pub fn retire_expired(
     keep: u64,
     watermark: u32,
 ) -> (u32, u32) {
+    // **Say so when there is nothing to do.**
+    //
+    // Retention's failure mode is silence: it only spoke when it retired
+    // something, so "the horizon has never opened" and "working perfectly" were
+    // the same empty log. A live daemon ran for days that way — 37,705 turn
+    // streams on disk, 70 tombstones between them, and not one line saying the
+    // sweep had considered anything. The counts are cheap and they are the
+    // whole diagnosis.
     let Some(horizon) = horizon(turn_count, keep) else {
+        tracing::debug!(
+            turn_count,
+            keep,
+            "nothing below the retention horizon yet — the conversation is still \
+             shorter than what it keeps"
+        );
         return (watermark, 0);
     };
+    tracing::debug!(
+        turn_count,
+        keep,
+        horizon,
+        watermark,
+        "retiring the tail below the horizon"
+    );
     let mut at = watermark;
     let mut retired = 0;
     let mut budget = LOOK_BACK;
@@ -172,7 +255,7 @@ mod tests {
 
     #[test]
     fn the_first_turn_past_the_horizon_is_the_very_first_turn() {
-        // 65 turns held, 64 kept: turn 0 is the one that fell out.
+        // One turn more than it keeps: turn 0 is the one that fell out.
         assert_eq!(horizon(KEEP_TURNS + 1, KEEP_TURNS), Some(0));
     }
 
@@ -184,6 +267,33 @@ mod tests {
         }
         let expected: Vec<u32> = (0..19).collect();
         assert_eq!(seen, expected);
+    }
+
+    /// **The horizon must name a turn that exists.**
+    ///
+    /// It is an index into turns numbered `0..turn_count`, so it can never
+    /// reach the newest turn and can never run past the end. That held only
+    /// while the count it is given advances at the same rate as the indices,
+    /// and for a long time it did not: the caller passed
+    /// `Sequence::turn_count`, which counts a user and an assistant message
+    /// separately, so the horizon moved two turns for every one that existed.
+    ///
+    /// Measured live: `turn_count=65 → horizon=0`, and by 65 real exchanges the
+    /// horizon had passed the last turn — every turn retired, `keep_turns: 64`
+    /// keeping nothing. The count now comes from the substrate
+    /// (`ConversationEngine::timeline_turn_count`), which counts the way the
+    /// indices do.
+    #[test]
+    fn the_horizon_never_names_a_turn_the_conversation_does_not_have() {
+        for turns in KEEP_TURNS + 1..KEEP_TURNS + 500 {
+            let h = horizon(turns, KEEP_TURNS).expect("past the horizon") as u64;
+            assert!(
+                h < turns,
+                "horizon {h} is not a turn of a {turns}-turn conversation"
+            );
+            // And it always leaves exactly `keep` turns standing.
+            assert_eq!(turns - (h + 1), KEEP_TURNS, "at {turns} turns");
+        }
     }
 
     #[test]
@@ -218,6 +328,71 @@ mod tests {
             KEEP_TURNS > crate::engine::mind::CONTEXT_WINDOW_TURNS as u64 * 2,
             "a turn would be retired while the GPU tail still prefills it"
         );
+    }
+
+    /// A resumed conversation starts its sweep above what it already retired.
+    ///
+    /// The whole point: without it, [`retire_expired`]'s [`LOOK_BACK`] budget
+    /// means a conversation a million turns deep spends ~4,000 inserts walking
+    /// ground that was retired before the process started.
+    #[test]
+    fn a_resumed_sweep_starts_at_the_first_turn_still_live() {
+        for retired in [0u32, 1, 63, 64, 1_000, 999_999] {
+            let at = first_live_turn(1_000_000, |turn| turn < retired);
+            assert_eq!(at, retired, "with {retired} turns already retired");
+        }
+    }
+
+    /// A conversation whose every turn is retired has nothing above the
+    /// watermark, and must say so rather than pointing at a turn that is not
+    /// there — the sweep would then re-tombstone from the top forever.
+    #[test]
+    fn a_wholly_retired_conversation_puts_the_watermark_past_its_last_turn() {
+        assert_eq!(first_live_turn(500, |_| true), 500);
+    }
+
+    /// Nothing retired — the ordinary first run — starts at zero, which is what
+    /// every conversation opened by this process gets.
+    #[test]
+    fn a_conversation_with_nothing_retired_starts_at_zero() {
+        assert_eq!(first_live_turn(500, |_| false), 0);
+        assert_eq!(first_live_turn(0, |_| false), 0);
+    }
+
+    /// **The search must not need the invariant to be sound.**
+    ///
+    /// It is only a binary search because [`retire_expired`] sweeps oldest-first
+    /// and stops on failure, which keeps the tombstoned turns contiguous from
+    /// zero. If something ever broke that, landing inside the run is acceptable
+    /// — the oldest-first sweep closes the rest over the next few inserts — but
+    /// landing *past* a live turn is not, because everything below the horizon
+    /// is then stranded for good. So: whatever it returns, no live turn sits
+    /// below it.
+    #[test]
+    fn a_gap_in_the_retired_run_never_strands_a_live_turn_below_the_watermark() {
+        // Retired 0..40 and 60..100, live in between — the shape a failed write
+        // followed by a later catch-up would leave.
+        let holey = |turn: u32| turn < 40 || (60..100).contains(&turn);
+        let at = first_live_turn(100, holey);
+        assert!(
+            !holey(at) || at == 100,
+            "the watermark names a turn that is already retired"
+        );
+        assert!(at <= 40, "live turns 40..60 were skipped over");
+    }
+
+    /// The midpoint is taken *between* the bounds, not as their sum. A
+    /// conversation near the top of the index space is exactly the one a mind
+    /// that never stops living produces, and `(lo + hi) / 2` overflows there.
+    #[test]
+    fn a_conversation_at_the_top_of_the_index_space_does_not_overflow() {
+        let count = u32::MAX as u64;
+        assert_eq!(
+            first_live_turn(count, |turn| turn < u32::MAX - 1),
+            u32::MAX - 1
+        );
+        // And a count past what an index can name clamps rather than wrapping.
+        assert_eq!(first_live_turn(u64::MAX, |_| false), 0);
     }
 
     /// The sweep's own logic, over a fake in place of an engine.
