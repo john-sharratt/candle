@@ -792,6 +792,115 @@ pub(crate) mod tests {
         )
     }
 
+    /// **The wave transient tier must be reserved for exactly what it uses.**
+    ///
+    /// # What this is for
+    ///
+    /// The span is `| persist | KV regions | tier | expert weights |` with
+    /// `weight_floor` — "the leftmost byte the weight side occupies" — as the
+    /// elastic boundary. A tier is placed at the arena frontier and must fit
+    /// below that floor, so `weight_floor − live_end` is the entire budget a
+    /// wave's activations get.
+    ///
+    /// That budget is defended by three constants, and every one is a rounded-up
+    /// guess: `WAVE_ATTN_BYTES` is 384 MiB from a measured 297 MiB at ten
+    /// contexts; `WAVE_FFN_BYTES` is 512 MiB from a peak that sat at 99.87% of a
+    /// 64 MiB span, so its true demand was unknown until the cap came off; and
+    /// `MIN_FIRST_WAVE_KV` is 384 MiB from the 27B at width 4.
+    /// `MIN_ELASTIC_RESERVE` is their sum, so the floor's promise — "a 912 MiB
+    /// tier can always be placed" — rests on three guesses at once.
+    ///
+    /// When one is wrong the symptom is not a wrong number, it is a refusal deep
+    /// inside a forward. Measured on `quantized_qwen3_moe` at ten contexts: a
+    /// 896 MiB tier against an 816 MiB gap, refused five regions short.
+    ///
+    /// # What it asserts
+    ///
+    /// **Slack must be zero**, on every forward and not merely on the widest.
+    /// Every byte reserved and not touched is ground the weight side gave up for
+    /// nothing, and it is exactly what turns an estimate into a refusal one
+    /// width later. An *overrun* is checked too, because a span sized under its
+    /// demand is how `WAVE_FFN_BYTES` hid its real need.
+    ///
+    /// **The assertion itself lives in the harness**
+    /// ([`batch_test::utils::assert_tier_exact`], run for every batched gate via
+    /// `TestParams::exact_tier`), so this test is now just the fastest way to
+    /// ask the question: the smallest checkpoint that exercises the whole
+    /// hybrid, two narrow configs, a few seconds. What makes it worth keeping as
+    /// its own test is the *speed* — every sibling gate asserts the same thing,
+    /// but none of them in four seconds.
+    ///
+    /// It was expected to fail until the spans were derived from the wave plan's
+    /// own geometry rather than guessed, and it drove exactly that: 251.0 MiB of
+    /// slack to zero, in seven steps, each one deleting a constant rather than
+    /// tuning it. See `docs/wave_feeder.md` §4.11.12.
+    #[test]
+    #[ignore = "Tier 2: loads the pinned Qwen3.5-0.8B GGUF and runs two narrow \
+                batched forwards (~1 min, GPU-exclusive). Run with: cargo test \
+                --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35::tests::tier_is_reserved_for_exactly_what_it_uses \
+                -- --ignored --nocapture --test-threads=1"]
+    fn tier_is_reserved_for_exactly_what_it_uses() -> Result<()> {
+        println!("\n=== tier exactness: Qwen3.5-0.8B ===\n");
+        let model_path = pinned(QWEN35_0_8B)?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+
+        // Ten tokens and two narrow rows — enough to place a tier and run every
+        // phase, and nothing more. The point is the reservation, not the output,
+        // so `TestMode::Skip` keeps the validation pass out of the timing.
+        let params = TestParams::new(10, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_print_outputs(false)
+            .with_int8mode(int8mode)
+            .with_timeout_secs(600);
+        let configs = vec![
+            TestConfig {
+                mode: InferenceMode::BF16,
+                use_batched: true,
+                num_contexts: 1,
+                num_repeats: 1,
+                test_mode: Some(TestMode::Skip),
+            },
+            // A second, wider row: the phase spans scale with wave width, so a
+            // single context would measure the narrowest tier the engine ever
+            // places and call its slack representative.
+            TestConfig {
+                mode: InferenceMode::BF16,
+                use_batched: true,
+                num_contexts: 4,
+                num_repeats: 1,
+                test_mode: Some(TestMode::Skip),
+            },
+        ];
+
+        let load = || {
+            let m = from_gguf_path(
+                &model_path,
+                &device,
+                Qwen35LoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: None,
+                    mtp_path: None,
+                    gate_donor_path: None,
+                },
+            )?;
+            // The geometry the plan prices from, printed because the fixtures
+            // in `wave_plan`'s own tests are hand-written against these numbers
+            // and a checkpoint is the only place they are authoritative.
+            println!(
+                "✓ Model loaded — vocab {} — {:?}\n",
+                m.model().cfg.vocab_size,
+                m.wave_geometry(candle::DType::BF16)
+            );
+            Ok(m)
+        };
+        params.run(configs, load)?;
+
+        Ok(())
+    }
+
     /// **Speculative decode on the dense 9B, measured against itself.**
     ///
     /// The lineage's smallest checkpoint that can speculate at all, and the

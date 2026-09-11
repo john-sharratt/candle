@@ -107,6 +107,15 @@ pub struct TestParams {
     pub skip_validation: bool,
     pub disable_session_isolation: bool,
     pub majority_pass_threshold: Option<usize>,
+    /// Per-rung overrides of [`Self::majority_pass_threshold`], keyed by
+    /// `(mode, num_contexts)` — the pair that names one row of a sweep.
+    ///
+    /// **So a relaxation lands on the rung whose evidence justifies it, and
+    /// nowhere else.** A sweep runs a dozen configs against one threshold, so
+    /// loosening the gate for the single hardest rung loosens every other rung
+    /// with it, and the ones passing at 100% today are then free to decay to
+    /// the same mark unremarked. Set via [`Self::with_pass_threshold_for`].
+    pub pass_threshold_overrides: Vec<(InferenceMode, usize, usize)>,
     pub test_mode: TestMode,
     pub suppress_thinking: bool,
     pub prompt_system: String, // System prompt text
@@ -154,6 +163,23 @@ pub struct TestParams {
     /// you what the level did on average, never which member did it. Pinning
     /// one at a time turns that into an answerable question.
     pub override_k_quant: Option<QuantFormat>,
+    /// Whether the run asserts that the transient tier reserved **exactly** what
+    /// it spent, on every forward.
+    ///
+    /// **On by default, because an inexact tier is a defect in every model.**
+    /// Slack is ground the weight side conceded and the wave never touched, and
+    /// it is what makes the floor's guarantee fail one width later; an overrun
+    /// is worse, and hides — the bump allocator refuses at the margin rather
+    /// than reporting how much was really wanted. Both are a property of the
+    /// model's `wave_geometry` against its own forward, which is exactly what a
+    /// batched gate exercises.
+    ///
+    /// Turn it off ([`Self::with_exact_tier`]) only for a forward that does not
+    /// take its transients from the span at all — DeepSeek-V4 is the one such
+    /// model, and it allocates from the CUDA pool. A run that places no tier
+    /// trips nothing either way, so the flag is about intent, not about
+    /// silencing a failure.
+    pub exact_tier: bool,
 }
 
 impl TestParams {
@@ -175,6 +201,7 @@ impl TestParams {
             skip_validation: false,
             disable_session_isolation: false,
             majority_pass_threshold: None,
+            pass_threshold_overrides: Vec::new(),
             test_mode: TestMode::StoryRewrite,
             suppress_thinking: false,
             prompt_system: include_str!("system.md")
@@ -197,6 +224,7 @@ impl TestParams {
             lora: None,
             speculative_max_draft: DraftBudget::Adaptive,
             override_k_quant: None,
+            exact_tier: true,
         })
     }
 
@@ -234,6 +262,13 @@ impl TestParams {
     /// simply fail the forward.
     pub fn with_lora(mut self, name: impl Into<String>) -> Self {
         self.lora = Some(name.into());
+        self
+    }
+
+    /// Whether this run asserts an exact transient tier — see
+    /// [`Self::exact_tier`]. Pass `false` only with a reason worth writing down.
+    pub fn with_exact_tier(mut self, exact: bool) -> Self {
+        self.exact_tier = exact;
         self
     }
 
@@ -295,6 +330,20 @@ impl TestParams {
     /// When unset, validation remains strict and requires 100% success.
     pub fn with_majority_pass_threshold(mut self, pct: usize) -> Self {
         self.majority_pass_threshold = Some(pct.clamp(1, 100));
+        self
+    }
+
+    /// Relax the threshold for **one rung only**, named by its mode and context
+    /// count — see [`Self::pass_threshold_overrides`] for why a sweep-wide
+    /// relaxation is the wrong instrument.
+    pub fn with_pass_threshold_for(
+        mut self,
+        mode: InferenceMode,
+        num_contexts: usize,
+        pct: usize,
+    ) -> Self {
+        self.pass_threshold_overrides
+            .push((mode, num_contexts, pct.clamp(1, 100)));
         self
     }
 
@@ -952,6 +1001,151 @@ pub fn account_model_load<M>(device: &Device, load: impl FnOnce() -> Result<M>) 
     Ok(model)
 }
 
+/// Assert the transient tier reserved **exactly** what it spent, and print the
+/// per-phase table either way.
+///
+/// Three verdicts, and each is a different defect:
+///
+/// * **Overrun** — a phase reached more than its span. The bump allocator
+///   refuses at the margin rather than reporting how much was really wanted, so
+///   this is the failure that hides; it is checked first and named loudest.
+/// * **Slack at the widest wave** — the plan's maximum against the arenas'
+///   peak. Ground the weight side conceded and the tier never touched.
+/// * **Slack on any single forward** — `wave_max_slack`, which pairs each
+///   forward's own plan with its own peak. The check above is blind to every
+///   wave but the widest: on a prefill-dominated run both its sides come from
+///   the same wide forward, so a decode wave priced at ten times what it used
+///   sits underneath and never appears.
+///
+/// A run that placed no tier (no CUDA, or a forward that takes its transients
+/// from the pool) has no domain and passes silently — see
+/// [`TestParams::exact_tier`] for why that is intent rather than a hole.
+#[cfg(feature = "cuda")]
+pub fn assert_tier_exact(device: &Device) -> Result<()> {
+    use candle_nn::kv_cache::{
+        wave_domain_stats, wave_max_planned, wave_max_slack, wave_worst_slack, BUMP_ALIGNMENT,
+    };
+
+    let candle::DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return Ok(());
+    };
+    let (Some(stats), Some(reserved)) = (wave_domain_stats(gpu_id), wave_max_planned(gpu_id))
+    else {
+        // No wave domain: nothing priced a tier on this device.
+        return Ok(());
+    };
+    const PHASE: [&str; 3] = ["attention", "ffn", "forward"];
+    let mib = |b: usize| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0));
+
+    println!(
+        "\n{:<10} {:>12} {:>12} {:>12}",
+        "phase", "reserved", "peak used", "slack"
+    );
+    // **The floor is one alignment unit per phase, and it is the layout's, not
+    // the plan's.** `align_phase_plan` rounds each phase's extent up to
+    // `BUMP_ALIGNMENT` so the next phase starts aligned, so a chain whose
+    // buffers do not happen to sum to a multiple of 256 leaves that remainder
+    // standing however exactly it was priced. Measured on the 9B's replay: the
+    // chain prices to 741,648 B, the cursor reaches 741,648 B, and the arena is
+    // given 741,888. Demanding zero there would be demanding the allocator
+    // reserve a fraction of its own quantum.
+    let granularity = |slack: usize| slack < BUMP_ALIGNMENT;
+    let mut slack_total = 0usize;
+    for (i, (_cursor, peak, _cap_between_forwards)) in stats.iter().enumerate() {
+        // **Against `max_planned`, not `capacity`.** A tier is placed per forward
+        // and released with it, so between forwards the arenas report
+        // `capacity == 0` while `peak` — a process-lifetime mark — survives.
+        let reserved_i = reserved[i];
+        let slack_i = reserved_i.saturating_sub(*peak);
+        if !granularity(slack_i) {
+            slack_total += slack_i;
+        }
+        println!(
+            "{:<10} {:>12} {:>12} {:>12}",
+            PHASE[i],
+            mib(reserved_i),
+            mib(*peak),
+            mib(reserved_i.saturating_sub(*peak))
+        );
+        if *peak > reserved_i {
+            candle::bail!(
+                "the {} phase reached {} against a {} span — the reservation is \
+                 under its demand, and the allocator refuses at the margin rather \
+                 than reporting how much was really wanted",
+                PHASE[i],
+                mib(*peak),
+                mib(reserved_i),
+            );
+        }
+    }
+    if slack_total > 0 {
+        candle::bail!(
+            "the tier reserved {} it never used (attention {}, ffn {}, forward {}). \
+             Price every phase from the wave's own width so the reservation IS the \
+             demand — every slack byte is ground the weight side conceded and the \
+             tier never touched. See `docs/wave_feeder.md` §4.11.12.",
+            mib(slack_total),
+            mib(reserved[0].saturating_sub(stats[0].1)),
+            mib(reserved[1].saturating_sub(stats[1].1)),
+            mib(reserved[2].saturating_sub(stats[2].1)),
+        );
+    }
+
+    let per_forward = wave_max_slack(gpu_id).unwrap_or([0; 3]);
+    println!(
+        "worst single forward: attention {}, ffn {}, forward {}",
+        mib(per_forward[0]),
+        mib(per_forward[1]),
+        mib(per_forward[2])
+    );
+    let worst: usize = per_forward.iter().filter(|&&s| !granularity(s)).sum();
+    if worst > 0 {
+        // **Name the pair, not just the gap.** The census reports a generation
+        // only when it sets a new mark for its arena, so the forward this is
+        // about is invisible to it. A plan and a usage are each a sum of
+        // declared shapes, and on a known geometry that is enough to say which
+        // chain was charged and which was carved.
+        let detail = match wave_worst_slack(gpu_id) {
+            Some(w) => (0..3)
+                .filter(|&i| !granularity(per_forward[i]))
+                .map(|i| {
+                    let (width, planned, used) = w[i];
+                    format!(
+                        "\n    {}: planned {} B, used {} B, over by {} B — \
+                         at {} prefill + {} decode rows, {} scored, {} staged over {} spans",
+                        PHASE[i],
+                        planned,
+                        used,
+                        planned.saturating_sub(used),
+                        width.prefill_rows,
+                        width.decode_rows,
+                        width.scored_rows,
+                        width.staged_rows,
+                        width.staged_spans,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+            None => String::new(),
+        };
+        candle::bail!(
+            "some forward reserved {} it never used (attention {}, ffn {}, forward {}) \
+             even though the widest one was exact. A wave is priced from its own \
+             width, so every wave has to be exact — and the decode chain is the one \
+             a prefill-dominated maximum hides.\n  worst forward:{detail}",
+            mib(worst),
+            mib(per_forward[0]),
+            mib(per_forward[1]),
+            mib(per_forward[2]),
+        );
+    }
+    println!(
+        "tier is exact: no reserved byte went unused on any forward, \
+         beyond the allocator's {BUMP_ALIGNMENT} B alignment quantum\n"
+    );
+    Ok(())
+}
+
 impl TestParams {
     /// Load a model and run `configs` against it.
     ///
@@ -1000,6 +1194,14 @@ impl TestParams {
                 .with_env_filter(filter)
                 .compact()
                 .try_init();
+        }
+        // **This run's verdict has to be about this run.** The wave domain is
+        // keyed by device ordinal and outlives any one test, so a harness that
+        // loads a second model in the same process would judge its plan against
+        // the first's usage. Cleared here, before anything prices a tier.
+        #[cfg(feature = "cuda")]
+        if let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() {
+            candle_nn::kv_cache::wave_reset_observations(gpu_id);
         }
         println!("✓ TestParams created successfully");
         println!("  - Dialect: {:?}", self.dialect.dialect_type);
@@ -1192,6 +1394,16 @@ impl TestParams {
             );
         }
 
+        // **The tier is judged before the outputs are.** A reservation defect is
+        // a property of this model's `wave_geometry` against its own forward,
+        // and it is invisible in generated text — a wave that over-reserves
+        // produces exactly the right tokens while conceding ground the weight
+        // side needed.
+        #[cfg(feature = "cuda")]
+        if self.exact_tier {
+            assert_tier_exact(&self.device)?;
+        }
+
         // Validate and print results
         self.validate_and_print_results(&mut results)
     }
@@ -1242,6 +1454,32 @@ impl TestParams {
             }
         }
         let mut arena_guard = ArenaErrGuard { fire: true };
+
+        // **This harness is the admission stage.** The scheduler buys weight-side
+        // ground for every sequence it admits before the wave that carries it
+        // opens; a bare gate has no scheduler, and the claims it is about to make
+        // land on the wave path, where the floor may not move. So the gate does
+        // the one thing admission does that it cannot do without: it buys.
+        //
+        // Without this the 27B's twenty contexts hit a 32-region KV zone with the
+        // layer zone whole at 10,498 MiB, and the refusal reads as a full span.
+        //
+        // **The whole turn, priced before any of it runs.** A gate writes a
+        // system prompt, a user prompt and `generate_token_count` tokens into
+        // every context, and every one of those tokens claims K/V from the same
+        // free list the stores come off. Buying for the prompts alone leaves the
+        // generate phase to claim into a span its own prefill has just filled.
+        let widest_turn = (0..config.num_contexts)
+            .map(|n| self.system_prompt_tokens(n).len() + self.user_prompt_tokens(n).len())
+            .max()
+            .unwrap_or(0)
+            + self.generate_token_count;
+        let bought = model.buy_ground_for_sequences(
+            config.num_contexts,
+            widest_turn,
+            session.activation_dtype(),
+        );
+        println!("  [ground] {bought}");
 
         // Allocate all sequences first
         let mut sequence_indices = Vec::with_capacity(config.num_contexts);
@@ -2055,7 +2293,14 @@ impl TestParams {
             let mut config_valid = true;
             let mut validation_checked = 0usize;
             let mut validation_failed = 0usize;
-            let required_pass_percent = self.majority_pass_threshold.unwrap_or(100);
+            // This rung's own override first, then the sweep's, then strict.
+            let required_pass_percent = self
+                .pass_threshold_overrides
+                .iter()
+                .find(|(m, n, _)| *m == result.config.mode && *n == result.config.num_contexts)
+                .map(|(_, _, pct)| *pct)
+                .or(self.majority_pass_threshold)
+                .unwrap_or(100);
 
             if result.sessions.is_empty() {
                 println!("❌ No sessions found for this config");
@@ -2855,8 +3100,15 @@ impl TestParams {
             Some(d) => {
                 let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
                 println!(
-                    "  Wave arenas (used/peak/cap MiB): fwd {:.1}/{:.1}/{:.1} | attn {:.1}/{:.1}/{:.1} \
-                     | ffn {:.1}/{:.1}/{:.1}",
+                    // **Indices are `[attention, ffn, forward]`**, the order
+                    // `wave_domain_stats` returns and `LayerPhase` declares.
+                    // These labels read `fwd | attn | ffn`, one place rotated,
+                    // so every phase's cost was reported against the wrong
+                    // phase: an 84 MiB attention peak printed as `fwd`, and the
+                    // 1.9 MiB forward span printed as `ffn`. Anyone sizing a
+                    // span from this line sized the wrong one.
+                    "  Wave arenas (used/peak/cap MiB): attn {:.1}/{:.1}/{:.1} | ffn {:.1}/{:.1}/{:.1} \
+                     | fwd {:.1}/{:.1}/{:.1}",
                     mib(d[0].0), mib(d[0].1), mib(d[0].2),
                     mib(d[1].0), mib(d[1].1), mib(d[1].2),
                     mib(d[2].0), mib(d[2].1), mib(d[2].2),
