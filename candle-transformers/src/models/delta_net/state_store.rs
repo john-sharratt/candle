@@ -64,7 +64,7 @@
 #[cfg(feature = "cuda")]
 use candle::DType;
 #[cfg(feature = "cuda")]
-use candle::{cuda_backend::cudarc::driver::result::memcpy_dtod_sync, CudaDevice, Storage};
+use candle::{cuda_backend::cudarc::driver::result::memcpy_dtod_async, CudaDevice, Storage};
 use candle::{Device, Error, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{span_region_refusal, SpanClaims, SpanRegion};
@@ -346,15 +346,21 @@ pub struct RecurrentStateStore {
 
 /// Copy one state's two buffers into another's, device to device.
 ///
-/// The fork path's replacement for `DeltaNetState::snapshot`, which allocates.
-/// Here the destination already exists — it is a view into the child's own
-/// regions — so the copy writes into it rather than producing a new buffer
-/// somewhere the reservation does not cover.
+/// Originally the fork path's replacement for `DeltaNetState::snapshot`, which
+/// allocates. Here the destination already exists — a view into the receiving
+/// store's own regions — so the copy writes into it rather than producing a new
+/// buffer somewhere the reservation does not cover.
+///
+/// Also how [`RecurrentStateStore::relocate_down`] moves a store, and there it
+/// is load-bearing rather than convenient: addressing each buffer through the
+/// slot that owns it is what makes a relocation independent of how either side's
+/// regions happen to be packed.
 #[cfg(feature = "cuda")]
 fn copy_state_into(device: &Device, src: &DeltaNetState, dst: &DeltaNetState) -> Result<()> {
     let Device::Cuda(cuda) = device else {
         candle::bail!("copy_state_into: expected a CUDA device");
     };
+    let stream = cuda.cuda_stream();
     for (s, d) in [(&src.s, &dst.s), (&src.conv_tail, &dst.conv_tail)] {
         let bytes = s.elem_count() * s.dtype().size_in_bytes();
         let src_ptr = tensor_device_ptr(cuda, s)?;
@@ -363,51 +369,83 @@ fn copy_state_into(device: &Device, src: &DeltaNetState, dst: &DeltaNetState) ->
         // destination belongs to a store being built, which nothing else has
         // yet seen.
         unsafe {
-            memcpy_dtod_sync(dst_ptr, src_ptr, bytes)
-                .map_err(|e| Error::Msg(format!("recurrent fork copy: {e}")))?;
+            memcpy_dtod_async(dst_ptr, src_ptr, bytes, stream.cu_stream())
+                .map_err(|e| Error::Msg(format!("recurrent state copy: {e}")))?;
         }
     }
     Ok(())
 }
 
-/// Copy a store's regions wholesale, one 16 MiB transfer each.
+/// Wait for the copies [`copy_state_into`] queued, before the **source** ground
+/// is released.
 ///
-/// **The layouts are identical, so the bytes can move as blocks.** A
-/// [`RegionBump`] lays buffers down in one fixed order at a 256-byte-aligned
-/// cursor and spills to a new region on the same rule, so two bumps handed the
-/// same sequence of sizes place every buffer at the same offset in the same
-/// region index. Copying region-for-region therefore reproduces each buffer
-/// exactly where the destination's own `take_state` already put it.
+/// **Stream-ordered, then drained once per caller — not once per buffer.** A
+/// whole store is 30 layers × 2 buffers, so a blocking `cuMemcpyDtoD` per buffer
+/// is 60 stream drains for one relocation, and both callers here move a whole
+/// store at a time. Measured on the 35B ingest: 579 relocations in seven
+/// minutes, i.e. ~35,000 drains, against a pipeline this codebase already
+/// records as sensitive to fencing.
 ///
-/// Per buffer instead would be ~60 synchronous transfers for a 30-layer store
-/// against four here — the copies are ~2 MiB and overhead-dominated, so the
-/// call count is the cost, not the bytes.
-///
-/// Refuses unless the region lists match in length, which they do by
-/// construction; a mismatch means the layout rule changed under this and the
-/// block copy would silently place buffers wrong.
+/// Correctness does not rest on this call — the copies and every later reader
+/// are on the same stream, so they are already ordered, and a region arriving
+/// from the free list is cleaned on that stream too. It is here for the one
+/// thing ordering does not cover: a caller that drops the source regions is
+/// handing that ground back to an allocator whose next tenant may not be
+/// stream-ordered against these copies at all.
 #[cfg(feature = "cuda")]
-fn copy_regions_into(device: &Device, src: &[SpanRegion], dst: &[SpanRegion]) -> Result<()> {
-    let Device::Cuda(_) = device else {
-        candle::bail!("copy_regions_into: expected a CUDA device");
+fn await_state_copies(device: &Device) -> Result<()> {
+    let Device::Cuda(cuda) = device else {
+        candle::bail!("await_state_copies: expected a CUDA device");
     };
-    if src.len() != dst.len() {
-        candle::bail!(
-            "recurrent relocate: {} source regions against {} destination — the bump \
-             layout is no longer deterministic",
-            src.len(),
-            dst.len()
-        );
-    }
-    for (s, d) in src.iter().zip(dst) {
-        // SAFETY: both name a whole region of the reservation, the same length,
-        // and the destination belongs to a bump nothing else has seen yet.
-        unsafe {
-            memcpy_dtod_sync(d.base(), s.base(), SpanRegion::bytes())
-                .map_err(|e| Error::Msg(format!("recurrent relocate copy: {e}")))?;
+    cuda.cuda_stream()
+        .synchronize()
+        .map_err(|e| Error::Msg(format!("recurrent state copy drain: {e}")))
+}
+
+/// The buffer sizes one store lays down, in the order [`RegionBump::take_state`]
+/// takes them: `s` then the conv tail, per recurrent layer.
+fn state_sizes(layer_kinds: &[LayerKind], dims: &DeltaNetDims) -> Vec<usize> {
+    let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(dims);
+    layer_kinds
+        .iter()
+        .filter(|k| **k == LayerKind::DeltaNet)
+        .flat_map(|_| [s_bytes, conv_bytes])
+        .collect()
+}
+
+/// Where a [`RegionBump`] puts each buffer: `(region index, byte offset)`.
+///
+/// [`RegionBump::take`]'s rule, restated as arithmetic so it can be reasoned
+/// about without a device — the cursor is 256-aligned, and a buffer that would
+/// cross the region's end starts a fresh region rather than splitting.
+///
+/// **This is the premise a region-for-region block copy would rest on**, and
+/// `a_write_half_taken_in_two_passes_is_not_laid_out_like_one_pass` is here to
+/// keep anyone from resting on it again: two bumps handed the *same* sizes do
+/// agree, but the write half is not built by one bump, so they do not.
+fn bump_placements(sizes: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
+    let cap = candle_nn::kv_cache::REGION_BYTES;
+    // `cap` rather than 0, for the reason `RegionBump::new` sets it there: the
+    // first take must claim, so there is no empty-region case.
+    let mut cursor = cap;
+    let mut region = 0usize;
+    let mut first = true;
+    let mut out = Vec::new();
+    for bytes in sizes {
+        let aligned = cursor.next_multiple_of(256);
+        if aligned + bytes > cap {
+            if !first {
+                region += 1;
+            }
+            first = false;
+            out.push((region, 0));
+            cursor = bytes;
+        } else {
+            out.push((region, aligned));
+            cursor = aligned + bytes;
         }
     }
-    Ok(())
+    out
 }
 
 /// Base device address of a contiguous CUDA tensor.
@@ -1138,11 +1176,43 @@ impl RecurrentStateStore {
                 _ => return Ok(false),
             }
 
-            // Block copies, not per-buffer: see `copy_regions_into`.
-            copy_regions_into(&self.device, &self.regions, &live_bump.regions)?;
-            if let Some((bump, _)) = backup_bump.as_ref() {
-                copy_regions_into(&self.device, &self.backup_regions, &bump.regions)?;
+            // **Per buffer, to its own destination — not region-for-region.**
+            //
+            // The block copy this replaces was sound only while both bumps put
+            // every buffer at the same offset in the same region index, and that
+            // holds for the live half (one bump, always) but not for the write
+            // half. `try_ensure_backups` starts a **fresh** `RegionBump` on each
+            // call and `extend`s what it got, so a store the span refused
+            // part-way through is laid out by two bumps: the first stops early,
+            // wasting the tail of its last region, and the second opens a new
+            // region at offset 0. The destination here is one bump over all the
+            // slots, which packs them densely.
+            //
+            // The length guard did not catch it, because the counts coincide as
+            // readily as they differ — measured on the 35B's geometry, 11 layers
+            // then 19 comes to five regions and so does thirty in one pass,
+            // while the offsets part company at layer 11. Everything after the
+            // split was then copied to the wrong place: whole buffers of
+            // garbage from one layer onward, swapped into live by the next
+            // commit, surfacing as `PERSISTENT recurrent state is non-finite …
+            // first_bad_layer=16` on a live ingest.
+            //
+            // Copying each buffer into the destination `take_state` already
+            // chose for it cannot express that bug — there is no layout premise
+            // left to be wrong about. It costs two transfers per layer against
+            // one per region; the copies are ~2 MiB and overhead-dominated, and
+            // this runs between forwards over a handful of stores.
+            for (slot, state) in self.slots.iter().zip(&fresh_live) {
+                copy_state_into(&self.device, &slot.live, state)?;
             }
+            if let Some((_, fresh_backup)) = backup_bump.as_ref() {
+                for (slot, state) in self.slots.iter().zip(fresh_backup) {
+                    copy_state_into(&self.device, Self::backup_of(slot)?, state)?;
+                }
+            }
+            // The old regions are released a few lines below; nothing may be
+            // reading them by then.
+            await_state_copies(&self.device)?;
 
             for (slot, state) in self.slots.iter_mut().zip(fresh_live) {
                 slot.live = state;
@@ -1217,6 +1287,14 @@ impl RecurrentStateStore {
                 advanced: false,
             });
         }
+        // One drain for the whole fork, not one per layer. The parent's ground
+        // is not released here, so ordering on the shared stream would already
+        // cover a reader — this is so the child is never handed to a caller with
+        // its state still in flight.
+        #[cfg(feature = "cuda")]
+        if matches!(self.device, Device::Cuda(_)) {
+            await_state_copies(&self.device)?;
+        }
         Ok(Self {
             dims: self.dims,
             hash: self.hash,
@@ -1237,6 +1315,44 @@ impl RecurrentStateStore {
     /// rather than merely held so a whole-card accounting can name it: this is
     /// several GiB across a wide wave, and memory nothing can total is memory
     /// that goes missing (`AccountingSection`).
+    /// What one sequence's store **will** reserve, from the geometry alone —
+    /// [`Self::reserved_bytes`] for a store that does not exist yet.
+    ///
+    /// **This is the figure admission needs, and it is the one a live store
+    /// cannot give.** A store is priced before it is built, and at that moment
+    /// there may be none in the process to measure: the first sequence of a
+    /// session, the first after a turn seal evicted every store. Answering from
+    /// residency there gives zero, and zero prices a 126 MiB claim as free —
+    /// which is how twenty contexts reached the wave path having bought nothing
+    /// and found a span with 114 regions standing above the ceiling and a layer
+    /// zone that would have conceded on contact.
+    ///
+    /// Both halves, like [`Self::reserved_bytes`]: the write buffers are taken
+    /// on the first wave, from a second bump with the same packing, so a store's
+    /// settled cost is two identical runs of regions rather than one.
+    ///
+    /// **A floor, not always the exact figure.** `try_ensure_backups` starts a
+    /// fresh bump on each call and `extend`s, so a store whose write half was
+    /// refused part-way holds the tail of the first bump's last region as waste
+    /// — up to one region more per extra pass than this predicts. The gap is
+    /// bounded and self-healing: [`Self::relocate_down`] repacks both halves
+    /// through a single bump, so the first compaction that moves the store
+    /// brings it back to this figure. Admission under-prices such a store by at
+    /// most a region until then, which is the safe direction here — the claim
+    /// that follows is the thing that actually refuses.
+    ///
+    /// The packing is [`RegionBump::take`]'s, restated as arithmetic: each
+    /// layer lays `s` then its conv tail, each 256-aligned, and a buffer that
+    /// would cross the region's end starts a fresh region rather than splitting
+    /// across two. Nothing here reads the device, so it answers on any backend
+    /// and at any moment.
+    pub fn reserved_bytes_for(layer_kinds: &[LayerKind], dims: &DeltaNetDims) -> usize {
+        let regions = bump_placements(state_sizes(layer_kinds, dims))
+            .last()
+            .map_or(0, |(region, _)| region + 1);
+        2 * regions * candle_nn::kv_cache::REGION_BYTES
+    }
+
     pub fn reserved_bytes(&self) -> usize {
         #[cfg(feature = "cuda")]
         {
@@ -1428,6 +1544,148 @@ mod tests {
         // raw store precisely to see the state before this call.
         store.ensure_backups().unwrap();
         store
+    }
+
+    /// **A store is priced before one exists, so the price cannot come from
+    /// one.** The figure this replaces was a max over the live store map, which
+    /// is empty for the first sequence of a session and again after a turn seal
+    /// evicts every store — so the claim that was about to be made was priced at
+    /// nothing, exactly when it mattered.
+    #[test]
+    fn a_store_is_priced_with_none_resident() {
+        assert!(
+            RecurrentStateStore::reserved_bytes_for(&kinds(), &dims()) > 0,
+            "the price of a store must not depend on a store existing"
+        );
+    }
+
+    /// The whole state fits one region, and both halves are taken: two regions.
+    #[test]
+    fn a_small_state_is_two_regions_one_per_half() {
+        let region = candle_nn::kv_cache::REGION_BYTES;
+        assert_eq!(
+            RecurrentStateStore::reserved_bytes_for(&kinds(), &dims()),
+            2 * region,
+        );
+    }
+
+    /// Attention layers hold no recurrent state and must not be charged for
+    /// one — `kinds()` is three DeltaNet layers and one attention layer, and
+    /// adding more attention layers may not move the price.
+    #[test]
+    fn attention_layers_cost_nothing() {
+        let mut padded = kinds();
+        padded.extend([LayerKind::Attention; 40]);
+        assert_eq!(
+            RecurrentStateStore::reserved_bytes_for(&padded, &dims()),
+            RecurrentStateStore::reserved_bytes_for(&kinds(), &dims()),
+        );
+    }
+
+    /// **A state that would cross the region's end starts a fresh region, and
+    /// the waste is real ground.** Dividing the total by the region size gets
+    /// this wrong whenever the state does not tile the region — here by a
+    /// quarter — and under-pricing a claim is what leaves it refused on the wave
+    /// path with no way left to buy.
+    #[test]
+    fn a_state_that_would_straddle_a_region_takes_a_whole_new_one() {
+        let region = candle_nn::kv_cache::REGION_BYTES;
+        // 9 MiB of matrix state per layer: two layers cannot share a 16 MiB
+        // region, so each takes one and leaves ~7 MiB standing unused.
+        let d = DeltaNetDims {
+            head_dim: 256,
+            n_k_heads: 12,
+            n_v_heads: 36,
+            conv_kernel: 2,
+        };
+        let (s, conv) = DeltaNetState::byte_sizes(&d);
+        assert_eq!(s, 9 << 20, "the case only bites at this state width");
+        let layers = vec![LayerKind::DeltaNet; 4];
+
+        assert_eq!(
+            RecurrentStateStore::reserved_bytes_for(&layers, &d),
+            2 * 4 * region,
+            "four layers, one region each, both halves",
+        );
+        let naive = (4 * (s + conv)).div_ceil(region);
+        assert_eq!(naive, 3, "and the figure a naive division would have given");
+    }
+
+    /// **Why `relocate_down` copies per buffer and must never go back to a
+    /// region-for-region block copy.**
+    ///
+    /// The block copy that used to live there rested on: two bumps handed the
+    /// same sizes "place every buffer at the same offset in the same region
+    /// index… Refuses unless the region lists match in length, *which they do by
+    /// construction*". The live half is built by one bump and does satisfy that.
+    /// The write half does not:
+    /// `try_ensure_backups` starts a **fresh** `RegionBump` on every call and
+    /// `extend`s what it got, so a store the span refused part-way through is
+    /// laid out by two bumps — the first stops early, wasting the tail of its
+    /// last region, and the second begins a new region at offset 0.
+    ///
+    /// `relocate_down` then allocates **one** bump for all the slots and block
+    /// copies region-for-region. The length guard catches the case where the
+    /// counts differ; when they coincide the copy proceeds and every buffer
+    /// after the split lands at the wrong offset — which is whole buffers of
+    /// garbage from one layer onward, not drift.
+    ///
+    /// Measured on a live 35B ingest before this was understood:
+    /// `PERSISTENT recurrent state is non-finite seq=5 bad_layers=18/30
+    /// first_bad_layer=16` and `seq=107 bad_layers=21/30 first_bad_layer=12` —
+    /// two stores, two different split points, `state_non_finite=524288` being
+    /// the *entire* `s` buffer each time. A committed wave swaps the write half
+    /// into live, so a corrupt backup becomes the sequence's state.
+    #[test]
+    fn a_write_half_taken_in_two_passes_is_not_laid_out_like_one_pass() {
+        // A geometry where a store spans several regions, so a split has room
+        // to put the two bumps out of step.
+        let d = DeltaNetDims {
+            head_dim: 128,
+            n_k_heads: 16,
+            n_v_heads: 32,
+            conv_kernel: 4,
+        };
+        let layers = vec![LayerKind::DeltaNet; 30];
+        let sizes = state_sizes(&layers, &d);
+
+        // One bump, as `relocate_down` allocates the destination.
+        let whole = bump_placements(sizes.clone());
+
+        // Two bumps, as `try_ensure_backups` produces after a part-way refusal:
+        // the first stops after `split` layers, the second starts a new region.
+        let split = 11 * 2; // buffers, i.e. `s` + conv tail per layer
+        let mut in_two = bump_placements(sizes[..split].to_vec());
+        let used = in_two.last().map_or(0, |(r, _)| r + 1);
+        for (r, off) in bump_placements(sizes[split..].to_vec()) {
+            in_two.push((r + used, off));
+        }
+
+        assert_eq!(whole.len(), in_two.len(), "same buffers either way");
+        let whole_regions = whole.last().unwrap().0 + 1;
+        let two_regions = in_two.last().unwrap().0 + 1;
+
+        // The premise the block copy needs.
+        let diverges_at = whole.iter().zip(&in_two).position(|(a, b)| a != b);
+        assert!(
+            diverges_at.is_some(),
+            "if the two layouts agreed there would be no defect to fix"
+        );
+        let at_layer = diverges_at.unwrap() / 2;
+        assert!(
+            at_layer <= 11,
+            "the layouts must part company at the split, not later: layer {at_layer}"
+        );
+
+        // And a length check is no defence, because the counts coincide as
+        // readily as they differ. On this geometry they are equal — which is
+        // precisely the case that used to pass the guard and corrupt.
+        assert_eq!(
+            whole_regions, two_regions,
+            "this geometry is chosen because the counts MATCH while the offsets do \
+             not; if that ever stops holding, pick another split — the point is that \
+             a length check cannot separate the two layouts"
+        );
     }
 
     #[test]
