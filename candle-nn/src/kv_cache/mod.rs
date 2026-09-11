@@ -103,6 +103,11 @@ pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 pub use chunked::vram_budget_available;
 pub(crate) use chunked::Arena; // Internal use only
+/// Owner-down relocation: which arenas to drain, and the transform that drains
+/// them. The plan is pure arithmetic and available on any machine; the transform
+/// needs a device.
+#[cfg(feature = "cuda")]
+pub use chunked::RelocationOutcome;
 pub use chunked::MIGRATION_STAGING_CAP_BYTES;
 pub use chunked::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
@@ -113,12 +118,15 @@ pub use chunked::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
-pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
+pub use chunked::{
+    global_arena_gpu_bytes, global_arena_map, global_arena_memory_report, global_print_arena_table,
+};
 pub use chunked::{is_device_oom, is_tier_refusal, KV_DEVICE_OOM_MARKER, TIER_REFUSAL_MARKER};
 pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
+pub use chunked::{plan_relocation_class, RelocationPlan, MIN_RELOCATION_GAIN};
 pub use chunked::{
-    production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
-    ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
+    production_adaptive_candidates, ArenaOccupancy, BlockAllocSpec, ChunkGid, ChunkGidPool,
+    ChunkMeta, ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
     KvErrorThresholdFactors, LLAMA2_KV_FACTOR, LLAMA3_KV_FACTOR, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN35_0_8B_KV_FACTORS,

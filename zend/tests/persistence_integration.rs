@@ -36,7 +36,19 @@ mod persistence {
     use zend::session::{StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
-    const TIMEOUT_SECS: u64 = 600;
+    /// Budget for the whole session: model load plus two short turns.
+    ///
+    /// **This was 600 s and the test still timed out**, because it was paying
+    /// for two startup phases it has no use for. `install_tool_catalog` seals a
+    /// section per tool (~108 s) and "Calibrating sections" then free-decodes
+    /// every authored example in the catalog — 2,998 exemplars across 859
+    /// submissions, the same ~15-minute phase a real daemon boot runs. Neither
+    /// has anything to do with whether turns reach the substrate durably, and
+    /// together they made the budget unreachable at any value.
+    ///
+    /// With both skipped the session is a model load and two 64-token turns, so
+    /// this is sized to catch a genuine hang rather than to accommodate startup.
+    const TIMEOUT_SECS: u64 = 240;
 
     /// The bundled production schema, written into the throwaway workspace so
     /// the boot runs the real projection while the empty `tools/` beside it

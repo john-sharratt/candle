@@ -45,6 +45,124 @@ pub struct MemoryReport {
     pub weights: WeightSection,
     pub gallery: GallerySection,
     pub accounting: AccountingSection,
+    /// What the wave throughput planner currently believes, and the budget the
+    /// next fill will open with.
+    pub planner: PlannerSection,
+    /// Who is holding the span and why — `None` until the first census, which
+    /// is taken only when the engine is actually short of ground.
+    pub holdings: Option<super::holdings::Holdings>,
+    /// What the waves in the last window actually spent their time on, and
+    /// which of the three regimes the engine is in.
+    pub latency: LatencySection,
+}
+
+/// Which resource the waves in the last window were actually waiting on.
+///
+/// **The three are different problems with different fixes**, and two of them
+/// look identical from throughput alone. A wave whose forward time rises with
+/// the sequence count is either doing more arithmetic (compute) or waiting on
+/// more separate expert loads (latency) — the same curve, opposite remedies.
+/// More residency helps the second and does nothing for the first; a wider wave
+/// helps the first and makes the second worse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bound {
+    /// The bus was busy most of the window: expert bytes are the cost, and
+    /// residency or wider waves are the levers.
+    Bandwidth,
+    /// Little crossed the bus, but the engine waited on it — many separate
+    /// misses, each a round trip that cannot be amortised across the wave.
+    /// Widening makes this worse: more sequences route to more distinct
+    /// experts, and the working set outgrows what the cache holds and the
+    /// predictor anticipates.
+    Latency,
+    /// Neither: the time went into arithmetic.
+    Compute,
+    /// Nothing ran in the window.
+    Idle,
+}
+
+/// Where a window's wave time went, in the domains the budget can act on.
+///
+/// Deliberately **not** a generic span dump. The profiler already provides one,
+/// behind a feature that is off in production builds, and a hundred span names
+/// do not answer "what is the engine waiting on". These are the domains a
+/// budget decision can actually move — bytes over the bus, waits on those
+/// bytes, and everything else — read from counters that are always on.
+#[derive(Debug, Clone, Serialize)]
+pub struct LatencySection {
+    /// Wall-clock the window covers.
+    pub window_ms: u64,
+    /// Expert bytes that crossed the bus in it, and what that implies about
+    /// the achieved rate.
+    pub transfer_bytes: u64,
+    pub achieved_bytes_per_s: f64,
+    /// The rate the planner believes the bus can do, for the ratio below.
+    pub link_bytes_per_s: f64,
+    /// Achieved over link. **The bandwidth question**: near 1 and the bus is
+    /// the wall; near 0 and it is not, whatever else is slow.
+    pub bus_utilisation: f64,
+    /// Expert loads and how they went. `misses` is the count of round trips —
+    /// the quantity latency is paid per, where bandwidth is paid per byte.
+    pub expert_hits: u64,
+    pub expert_misses: u64,
+    pub cold_loads: u64,
+    pub warm_loads: u64,
+    /// Times the forward blocked on a transfer that had not landed, and
+    /// prefetches that were issued but arrived late. **The latency question**:
+    /// these rise when the working set outgrows what the predictor can stay
+    /// ahead of, and they rise with the number of distinct experts routed —
+    /// which is to say, with the width of the decode wave.
+    pub fence_stalls: u64,
+    pub late_loads: u64,
+    /// Misses per second of window — the round-trip rate the engine is paying.
+    pub misses_per_s: f64,
+    /// The fraction of loads that arrived too late to be used when wanted.
+    pub late_fraction: f64,
+    /// Which regime the numbers above put the window in.
+    pub bound: Bound,
+}
+
+/// The admission planner's internal state — the estimates it decides with, and
+/// the budget it would open a wave against right now.
+///
+/// **Published because a decision is not reviewable from its outcome.** A fill
+/// that admits nothing looks identical whether the model refused on the floor,
+/// refused on throughput, or was never offered anything; and a model that has
+/// learned a wrong copy rate produces perfectly reasonable-looking refusals
+/// from it. The estimates are the state that makes a refusal legible, and they
+/// move slowly enough that sampling them at the report cadence catches
+/// everything that matters.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannerSection {
+    /// Bytes a second the planner believes expert weights cross the bus at,
+    /// and the link it is bounded by.
+    pub copy_bytes_per_s: f64,
+    pub link_bytes_per_s: f64,
+    /// Seconds a MoE layer takes when the bus is not the limit.
+    pub layer_secs: f64,
+    /// The coefficient on the resident fraction that gives the expert hit rate.
+    pub hit_coefficient: f64,
+    /// Observations folded into each estimate so far. Zero samples with a
+    /// confident-looking estimate means the seed, not a measurement.
+    pub copy_samples: u64,
+    pub layer_samples: u64,
+    pub hit_samples: u64,
+    /// The model's whole expert footprint, for the resident fraction.
+    pub expert_total_bytes: u64,
+    /// The narrowest forward the copy rate may learn from — below this a wave
+    /// has not routed across a layer and its implied rate is nonsense.
+    pub min_learn_rows: usize,
+    /// The budget a fill opening now would reset the planner with.
+    pub budget_resident_bytes: u64,
+    pub budget_floor_bytes: u64,
+    pub budget_max_rows: usize,
+    pub budget_max_decodes: usize,
+    /// The frontier gap the wave's transient tier is placed in, what the weight
+    /// side is owed of it, and what is left to size a wave against.
+    pub tier_gap_bytes: u64,
+    pub tier_owed_bytes: u64,
+    pub tier_budget_bytes: u64,
 }
 
 /// Model weights resident in VRAM, split into the two parts that behave
@@ -452,6 +570,49 @@ pub struct ExpertSection {
     pub vram_reserved_bytes: u64,
 }
 
+impl LatencySection {
+    /// The share of the window the bus must have been busy for bandwidth to be
+    /// the binding cost.
+    ///
+    /// Half. Below it the bus spent most of the window idle, so whatever the
+    /// engine was waiting on, it was not the width of the pipe — and calling it
+    /// bandwidth-bound sends the next fix (more residency, wider waves) in a
+    /// direction that cannot help. Above it the transfers alone account for
+    /// most of the elapsed time and nothing else needs to be true.
+    const BANDWIDTH_SHARE: f64 = 0.5;
+
+    /// Round trips per second past which the engine is paying more in
+    /// per-miss latency than the bytes can explain.
+    ///
+    /// Derived rather than picked: a miss costs at least one PCIe round trip,
+    /// and at the ~10 µs order that a small transfer's launch-and-fence costs
+    /// on this class of link, 20,000 of them is 0.2 s of every second spent in
+    /// round trips regardless of how few bytes moved. That is the point where
+    /// the count, not the volume, is the thing to fix.
+    const LATENCY_MISSES_PER_S: f64 = 20_000.0;
+
+    /// Classify the window.
+    ///
+    /// Order matters: bandwidth is checked first because a saturated bus also
+    /// produces stalls — everything waits when the pipe is full — and reporting
+    /// that as latency would point at the predictor when the answer is the
+    /// link. Latency is only claimed when the bus was demonstrably *not* busy.
+    fn classify(bus_utilisation: f64, misses_per_s: f64, late_fraction: f64, ran: bool) -> Bound {
+        if !ran {
+            return Bound::Idle;
+        }
+        if bus_utilisation >= Self::BANDWIDTH_SHARE {
+            return Bound::Bandwidth;
+        }
+        // A high round-trip rate, or prefetches that keep arriving late, with
+        // the bus idle: the engine is waiting on the *number* of transfers.
+        if misses_per_s >= Self::LATENCY_MISSES_PER_S || late_fraction >= 0.25 {
+            return Bound::Latency;
+        }
+        Bound::Compute
+    }
+}
+
 /// Latest published report plus its capture `Instant` (for age).
 static LATEST: OnceLock<Mutex<Option<(MemoryReport, Instant)>>> = OnceLock::new();
 
@@ -739,6 +900,106 @@ impl Scheduler {
                 - driver_baseline_bytes.unwrap_or(0) as i64,
         };
 
+        // ── the planner ─────────────────────────────────────────────────────
+        // Read through the same `Ground` the fill uses, so what is published is
+        // what the next admission pass will actually open with rather than a
+        // reconstruction of it.
+        let optimal = super::interleave::optimal_weight_bytes().unwrap_or(0);
+        let budget = {
+            use super::admit::Ground;
+            super::prefill::WaveFill::new(self, optimal).budget()
+        };
+        let (tier_gap, tier_owed, tier_budget) = self.tier_budget_now();
+        let r = &self.wave_rate;
+        let planner = PlannerSection {
+            copy_bytes_per_s: r.effective_bytes_per_s(),
+            link_bytes_per_s: r.link_bytes_per_s(),
+            layer_secs: r.layer_secs(),
+            hit_coefficient: r.hit_rate(),
+            copy_samples: r.samples(),
+            layer_samples: r.decode_samples(),
+            hit_samples: r.hit_samples(),
+            expert_total_bytes: r.expert_total_bytes(),
+            min_learn_rows: r.min_learn_rows(),
+            budget_resident_bytes: budget.resident,
+            budget_floor_bytes: budget.floor,
+            budget_max_rows: budget.max_rows,
+            budget_max_decodes: budget.max_decodes,
+            tier_gap_bytes: tier_gap as u64,
+            tier_owed_bytes: tier_owed as u64,
+            tier_budget_bytes: tier_budget as u64,
+        };
+
+        // ── what the window waited on ───────────────────────────────────────
+        // Deltas against the last report, so the section describes the interval
+        // rather than an average since process start that buries the moment a
+        // regime changed.
+        let now = std::time::Instant::now();
+        let window_ms = self
+            .last_latency_at
+            .map(|t| now.duration_since(t).as_millis() as u64)
+            .unwrap_or(0);
+        self.last_latency_at = Some(now);
+        let stats = self.model.expert_stats();
+        let slot_bytes = stats.as_ref().map_or(0, |s| s.slot_bytes) as u64;
+        let d = |now: usize, was: &mut usize| -> u64 {
+            let delta = now.saturating_sub(*was) as u64;
+            *was = now;
+            delta
+        };
+        let (hits, misses, cold, warm_loads, fences, late) = match stats.as_ref() {
+            Some(s) => (
+                d(s.expert_hits, &mut self.latency_prev.hits),
+                d(s.expert_misses, &mut self.latency_prev.misses),
+                d(s.cold_loads, &mut self.latency_prev.cold),
+                d(s.warm_loads, &mut self.latency_prev.warm),
+                d(s.fence_stalls, &mut self.latency_prev.fences),
+                d(s.late_loads, &mut self.latency_prev.late),
+            ),
+            None => (0, 0, 0, 0, 0, 0),
+        };
+        // A miss is one expert slot crossing the bus.
+        let transfer_bytes = misses.saturating_mul(slot_bytes);
+        let secs = (window_ms as f64) / 1000.0;
+        let achieved = if secs > 0.0 {
+            transfer_bytes as f64 / secs
+        } else {
+            0.0
+        };
+        let link = self.wave_rate.link_bytes_per_s();
+        let bus_utilisation = if link > 0.0 { achieved / link } else { 0.0 };
+        let misses_per_s = if secs > 0.0 {
+            misses as f64 / secs
+        } else {
+            0.0
+        };
+        let late_fraction = if misses > 0 {
+            late as f64 / misses as f64
+        } else {
+            0.0
+        };
+        let latency = LatencySection {
+            window_ms,
+            transfer_bytes,
+            achieved_bytes_per_s: achieved,
+            link_bytes_per_s: link,
+            bus_utilisation,
+            expert_hits: hits,
+            expert_misses: misses,
+            cold_loads: cold,
+            warm_loads,
+            fence_stalls: fences,
+            late_loads: late,
+            misses_per_s,
+            late_fraction,
+            bound: LatencySection::classify(
+                bus_utilisation,
+                misses_per_s,
+                late_fraction,
+                secs > 0.0 && (hits + misses) > 0,
+            ),
+        };
+
         MemoryReport {
             captured_unix_ms,
             vram,
@@ -750,6 +1011,9 @@ impl Scheduler {
             weights,
             gallery,
             accounting,
+            planner,
+            holdings: super::holdings::latest(),
+            latency,
         }
     }
 }
@@ -757,6 +1021,76 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A saturated bus is reported as bandwidth even though it also stalls.**
+    /// Everything waits when the pipe is full, so a classifier that checked
+    /// stalls first would blame the predictor for a link that is simply busy —
+    /// and send the next fix at prefetch depth instead of at residency.
+    #[test]
+    fn a_busy_bus_is_bandwidth_bound_whatever_else_it_looks_like() {
+        // Bus at 80%, and stalling hard on top of it.
+        assert_eq!(
+            LatencySection::classify(0.80, 500_000.0, 0.9, true),
+            Bound::Bandwidth,
+        );
+        // Exactly at the share is still bandwidth.
+        assert_eq!(
+            LatencySection::classify(LatencySection::BANDWIDTH_SHARE, 0.0, 0.0, true),
+            Bound::Bandwidth,
+        );
+    }
+
+    /// **Latency is an idle bus that is nonetheless waited on.** Many small
+    /// round trips, few bytes — the signature of a working set that has
+    /// outgrown what the cache holds and the predictor stays ahead of.
+    #[test]
+    fn many_round_trips_over_an_idle_bus_is_latency_bound() {
+        assert_eq!(
+            LatencySection::classify(0.05, LatencySection::LATENCY_MISSES_PER_S, 0.0, true),
+            Bound::Latency,
+        );
+        // Or prefetches that keep arriving too late to use, at any miss rate.
+        assert_eq!(
+            LatencySection::classify(0.05, 100.0, 0.30, true),
+            Bound::Latency,
+        );
+    }
+
+    /// **Neither** — the bus is quiet and nothing is waiting on it, so the time
+    /// went into arithmetic. The regime widening a wave actually helps.
+    #[test]
+    fn a_quiet_bus_with_few_misses_is_compute_bound() {
+        assert_eq!(
+            LatencySection::classify(0.10, 2_000.0, 0.01, true),
+            Bound::Compute,
+        );
+    }
+
+    /// A window in which nothing routed says so, rather than reporting the
+    /// regime of an engine that was not running.
+    #[test]
+    fn a_window_with_no_work_is_idle() {
+        assert_eq!(LatencySection::classify(0.0, 0.0, 0.0, false), Bound::Idle);
+    }
+
+    /// The three working regimes are genuinely distinguishable from the same
+    /// two axes — which is the whole point, since throughput alone cannot tell
+    /// compute from latency.
+    #[test]
+    fn the_three_regimes_are_separable() {
+        let cases = [
+            (0.9, 1_000.0, 0.0, Bound::Bandwidth),
+            (0.02, 80_000.0, 0.5, Bound::Latency),
+            (0.02, 100.0, 0.0, Bound::Compute),
+        ];
+        for (bus, misses, late, want) in cases {
+            assert_eq!(
+                LatencySection::classify(bus, misses, late, true),
+                want,
+                "bus={bus} misses/s={misses} late={late}",
+            );
+        }
+    }
 
     fn sample() -> MemoryReport {
         MemoryReport {
@@ -843,6 +1177,47 @@ mod tests {
             gallery: GallerySection {
                 resident_bytes: 268_435_456,
                 resident_turns: 42,
+            },
+            // The planner as run 22 had learned it: a ~15 GB/s effective copy
+            // rate under a 25 GB/s link, an 18 ms layer, and the hit
+            // coefficient the expert cache's counters imply at ~39% residency.
+            planner: PlannerSection {
+                copy_bytes_per_s: 15.0e9,
+                link_bytes_per_s: 25.0e9,
+                layer_secs: 18.5e-3,
+                hit_coefficient: 1.65,
+                copy_samples: 120,
+                layer_samples: 40,
+                hit_samples: 300,
+                expert_total_bytes: 20_292_042_752,
+                min_learn_rows: 126,
+                budget_resident_bytes: 5_600 << 20,
+                budget_floor_bytes: 5_385 << 20,
+                budget_max_rows: 450,
+                budget_max_decodes: 10,
+                tier_gap_bytes: 366 << 20,
+                tier_owed_bytes: 0,
+                tier_budget_bytes: 302 << 20,
+            },
+            holdings: None,
+            // A window that saw a busy bus: 8 GB of expert traffic in 2 s
+            // against a 25 GB/s link is 16% utilisation, which with a low
+            // round-trip rate is the compute regime.
+            latency: LatencySection {
+                window_ms: 2_000,
+                transfer_bytes: 8_000_000_000,
+                achieved_bytes_per_s: 4.0e9,
+                link_bytes_per_s: 25.0e9,
+                bus_utilisation: 0.16,
+                expert_hits: 120_000,
+                expert_misses: 4_138,
+                cold_loads: 12,
+                warm_loads: 4_126,
+                fence_stalls: 30,
+                late_loads: 40,
+                misses_per_s: 2_069.0,
+                late_fraction: 0.0097,
+                bound: Bound::Compute,
             },
             // Shaped like the measured 3.6-35B so the sums mean something: a
             // 64 GiB span holding the model, a pool reduced to per-wave churn,

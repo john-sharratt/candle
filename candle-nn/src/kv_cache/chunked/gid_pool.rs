@@ -460,6 +460,13 @@ impl ArenaRefcounts {
         self.counts[chunk_idx].load(Ordering::Relaxed)
     }
 
+    /// Slots this arena holds in total — the denominator of its occupancy.
+    /// One `counts` word exists per slot, so the vector's length is the count.
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.counts.len()
+    }
+
     /// Number of currently-allocated slots in this arena.
     #[inline]
     fn live_count(&self) -> usize {
@@ -1254,6 +1261,56 @@ pub struct ClassOccupancy {
     pub live_bytes: usize,
 }
 
+/// One GPU arena's slot occupancy — the unit fragmentation is measured in.
+///
+/// **Per arena, because a class row cannot see fragmentation.** A class reports
+/// one live figure for every arena it holds, so "one arena half full" and "two
+/// arenas a quarter full each" read identically — and only the second strands
+/// ground. The distinction is the whole diagnosis: measured on run 39, class
+/// 8192 held 74 MiB live across 37 arenas at 12% apiece, which the class row
+/// showed only as `592 MiB reserved / 74 live`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaOccupancy {
+    /// Index into the arena registry — the identity `ChunkGid` encodes.
+    pub arena_idx: usize,
+    /// Slot stride, i.e. which size class this arena belongs to.
+    pub slot_bytes: usize,
+    /// Slots the arena holds in total.
+    pub capacity: usize,
+    /// Slots currently occupied. `0` means `try_tombstone` can take it.
+    pub live: usize,
+    /// Where the arena sits in **span-address order** — its region index, so
+    /// `rank` is monotonic in the arena's base address.
+    ///
+    /// Carried because occupancy alone cannot answer the question the span
+    /// actually asks. What the weight zone and the wave tier grow into is
+    /// `weight_floor − live_end()`, and `live_end` is the *highest* live
+    /// region — so emptying a low-ranked arena returns nothing at all, however
+    /// sparse it was. Only rank distinguishes the arenas whose removal moves
+    /// the frontier from the ones whose removal is bookkeeping.
+    pub rank: usize,
+}
+
+impl ArenaOccupancy {
+    /// Bytes the arena's slab holds that its live slots are not using.
+    ///
+    /// **Maximal when the arena is empty, zero when it is full** — the opposite
+    /// of what this said. An empty arena strands its whole slab right up until
+    /// `release_empty_arenas` takes it, which is precisely the moment it is
+    /// *most* reclaimable.
+    ///
+    /// So a sum of this across a class is unused capacity, **not**
+    /// defragmentation headroom: the empty arenas in it need no copies at all,
+    /// and the full ones contribute nothing while still pinning a region. What
+    /// a relocation pass could actually return is counted in arenas, by
+    /// [`relocate_plan`](super::relocate_plan).
+    pub fn stranded_bytes(&self) -> usize {
+        self.capacity
+            .saturating_sub(self.live)
+            .saturating_mul(self.slot_bytes)
+    }
+}
+
 /// GPU arena occupancy per size class — the diagnostic the compress-to-free
 /// relief rung is judged by.
 ///
@@ -1678,6 +1735,37 @@ impl ChunkGidPool {
             .sum()
     }
 
+    /// Per-arena occupancy across every GPU class — see [`ArenaOccupancy`].
+    ///
+    /// Ordered by class then arena index so a dump reads as the ladder does,
+    /// and so two dumps of the same span diff line for line.
+    pub(crate) fn gpu_arena_map(&self) -> Vec<ArenaOccupancy> {
+        let mut out: Vec<ArenaOccupancy> = Vec::new();
+        for (key, pool) in self.inner.pools.iter() {
+            if key.location != ArenaLocation::Gpu {
+                continue;
+            }
+            let stride = key.slot_stride();
+            let tables = match pool.tables.read() {
+                Ok(t) => t,
+                // A poisoned registry is a reporting failure, not a reason to
+                // fail the caller: the map is a diagnostic.
+                Err(_) => continue,
+            };
+            for (&arena_idx, table) in tables.iter() {
+                out.push(ArenaOccupancy {
+                    arena_idx,
+                    slot_bytes: stride,
+                    capacity: table.capacity(),
+                    live: table.live_count(),
+                    rank: table.rank(),
+                });
+            }
+        }
+        out.sort_unstable_by_key(|a| (a.slot_bytes, a.arena_idx));
+        out
+    }
+
     /// GPU arena occupancy per size class. Reads the lock-free per-pool
     /// atomics (`O(classes × locations)` = 14 entries, most empty) — cheap
     /// enough for the per-wave `kv-pool` diagnostic. See
@@ -2088,6 +2176,62 @@ mod tests {
             stats.total_live_bytes(),
             3 * small.slot_stride() + 5 * large.slot_stride()
         );
+    }
+
+    /// **The fragmentation map is per ARENA, not per class.** A class row
+    /// reports one occupancy figure for the whole class, which cannot tell
+    /// "one arena half full" from "two arenas a quarter full each" — and only
+    /// the second is fragmentation. Measured on run 39: class 8192 held 74 MiB
+    /// live across 37 arenas, 12% each, and the class row alone could not say
+    /// so.
+    #[test]
+    fn the_arena_map_reports_each_arena_separately() {
+        let pool = ChunkGidPool::new();
+        let small = ArenaKey::new(SizeClass::at(0), ArenaLocation::Gpu);
+        let large = ArenaKey::new(SizeClass::at(6), ArenaLocation::Gpu);
+
+        pool.register_arena(small);
+        pool.register_arena(small);
+        pool.register_arena(large);
+        // Fill the first small arena, so the second takes the remainder — the
+        // allocator's own order decides which, so assert on the multiset.
+        let _s: Vec<_> = (0..3).map(|_| pool.allocate_for(small).unwrap()).collect();
+        let _l: Vec<_> = (0..5).map(|_| pool.allocate_for(large).unwrap()).collect();
+
+        let map = pool.gpu_arena_map();
+        assert_eq!(map.len(), 3, "one row per arena, not per class");
+
+        let mut small_live: Vec<usize> = map
+            .iter()
+            .filter(|a| a.slot_bytes == small.slot_stride())
+            .map(|a| a.live)
+            .collect();
+        small_live.sort_unstable();
+        assert_eq!(small_live.iter().sum::<usize>(), 3);
+        assert_eq!(small_live.len(), 2);
+
+        let big: Vec<&ArenaOccupancy> = map
+            .iter()
+            .filter(|a| a.slot_bytes == large.slot_stride())
+            .collect();
+        assert_eq!(big.len(), 1);
+        assert_eq!(big[0].live, 5);
+        assert!(big[0].capacity > 5, "capacity is the arena's slot count");
+    }
+
+    /// An arena with no live slots still appears. It is the population
+    /// `try_tombstone` takes, and a map that hid it would make "nothing to
+    /// reclaim" and "reclaim is not running" look identical.
+    #[test]
+    fn an_empty_arena_still_appears_in_the_map() {
+        let pool = ChunkGidPool::new();
+        let key = ArenaKey::new(SizeClass::at(2), ArenaLocation::Gpu);
+        pool.register_arena(key);
+
+        let map = pool.gpu_arena_map();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].live, 0);
+        assert_eq!(map[0].slot_bytes, key.slot_stride());
     }
 
     /// **Two formats sharing a class share a pool.** This is the property the

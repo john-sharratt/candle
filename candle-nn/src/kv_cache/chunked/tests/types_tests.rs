@@ -1,4 +1,4 @@
-﻿//! Tests for chunked KV cache types: ChunkGid, SlotState, ChunkedState.
+//! Tests for chunked KV cache types: ChunkGid, SlotState, ChunkedState.
 
 // Test code: `.clone()` on Copy handles is kept where the test is about the
 // handle's identity semantics.

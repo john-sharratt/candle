@@ -1574,6 +1574,71 @@ now price themselves for their own rows before opening: the draft loop
 (`draft_cohort`, `n` rows a step, after every arena it may create) and the
 verify replay (`replay_accepted_prefixes`, the stash rows it stages).
 
+### 4.11.7 KV arena reclamation, and why the first design could not be made safe
+
+Two defects, found together because the second was hiding behind the first.
+
+**The corruption.** A generation would come back as exactly eight `!` characters
+— `chars=8`, no `<think>` block — and nothing faulted. Attribution came from the
+run logs rather than from reasoning: across twenty runs, **every run with zero
+chunk-defrag passes had zero such failures** (runs 36–39, 44 — 261 directories
+between them), and every run with the pass enabled and real ingest had some.
+Slab compaction was exonerated outright in the same table: run 44 compacted
+1,015 slabs across 94 directories with none.
+
+The cause is **loop direction**, not any single bug. A chunk's gid *is* its
+physical location, so relocating bytes changes identity and every holder of that
+identity must be found and rewritten. There is no index from a gid back to its
+holders, so the pass walked block tables and proved completeness by comparing an
+Arc-deduplicated count against a refcount — a proof that silently fails for a
+holder that shares an `Arc` instead of cloning a gid, and `SealedChunk { gids:
+cw.gids.clone() }` creates exactly such a holder.
+
+Sealing and hot→warm migration move KV between arenas 1,000–3,000 times per run
+and have never corrupted anything, because they run the other way round:
+`quantize_sealed_in_place` and `migrate_sealed_to_cpu_batch_async` take
+`&[SealedSequence]` and **return replacements**. They never edit a holder, so
+they never need to find one. `relocate.rs` takes that shape and spends it on a
+device copy. It also builds a **fresh** `MetaGid` per relocated chunk rather than
+rewriting one in place, which removes the remaining race rather than narrowing
+it: a reader sees the old chunk — old record, old slot, both live — or the new
+one, never a half-updated state.
+
+Three attempts that did *not* work are worth recording, because each looked
+sufficient: deferred slot reclamation (a grace period before a vacated slot may
+be re-let), moving the copies onto the forward's stream, and rebuilding records
+under the layer's own lock. The first two were aimed at races that do not exist —
+production takes the context's default stream for everything, so the copies were
+always ordered against the forward kernels.
+
+**The arena growth.** With the corruption gone, arena count still climbed —
+class 8192 (R16, the active unsealed K format) sat at **6.3% occupancy across 46
+arenas**, growing 79 → 130 in four minutes of ingest. This is the allocator, not
+the reclamation. `try_claim_run` claims from the **high-water tail only** —
+"recycled singleton slots are never consecutive-by-contract" — and `hwm` never
+retreats, so an arena that once filled and then had its turns evicted sits at 88
+live against a 2,048 mark with 1,960 slots no run can reach.
+`alloc_chunk_run_for_key` went straight from "no tail fits" to registering a
+fresh arena, and relocation could not answer it: relocation claims *singletons*,
+so it consolidates into exactly the space runs are forbidden to use while every
+new turn stamps another arena.
+
+The fix is the tier the function's own header already promised and the code never
+did — **scattered singleton slots before a fresh arena**. Contiguity is a
+locality optimization, not correctness: each band is addressed through its own
+gid. Measured, class 8192 went from 6.3% to a peak of **84.7%** and total
+stranded space more than halved.
+
+**What this did not fix, and the measurement is unambiguous about it.** Run 60
+ingested the full 354-directory corpus in 228 minutes at 1.50 dirs/min and 10.4
+tok/s, with fragmentation *improving* throughout. Throughput tracked recurrent
+stores, not arenas: they ran at a median of 2,400 MiB and peaked at 4,000 MiB —
+25 concurrent sequences × 160 MiB flat — against 395–950 MiB of stranded arena,
+while the weight side made **574 concessions totalling 105,746 MiB and evicted
+57,487 expert slots**, roughly ten times its own ceiling. That is §4.9's lever
+again, measured from the other side: the per-sequence store price is what bounds
+wave width, and no allocator or reclamation change reaches it.
+
 ## 5. Plan
 
 | phase | deliverable | gate | status |
@@ -1606,6 +1671,8 @@ verify replay (`replay_accepted_prefixes`, the stash rows it stages).
 | 26 | relief does not concede; KV pressure does not close admission; `room` counts running prefills only | KV side grows by claims, never bought by the setpoint | ✅ §4.11.4 runs AZ–BC |
 | 27 | per-model, per-card rows for ceiling / knee / floor, derived from the gate on each machine | the same code runs the 3090 and the PRO 5000 without retuning | open — §4.11.4 last paragraph |
 | 28 | delete the byte-budget admission path, the AIMD budget and the wave trace built to fit them | one admission path, on every machine; nothing computed that nothing reads | ✅ §4.11.6 |
+| 29 | KV arena reclamation that cannot corrupt: relocation driven from the owner, not the arena | a full-corpus ingest with relocation active and zero corrupted generations | ✅ §4.11.7 — run 60, 352 dirs, 0 |
+| 30 | stop the arena count growing: a run that finds no tail reuses recycled slots before stamping a new arena | class 8192 occupancy stays high under ingest instead of collapsing | ✅ §4.11.7 — 6.3% → 84.7% |
 
 Phase 8 was planned as a *reclamation* term. There is nothing to reclaim, so the
 missing term is the one §4.6.3 names: how many regions each additional concurrent

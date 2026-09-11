@@ -26,7 +26,7 @@
 //! `active_kv_formats`, and the distinction is the whole reason the function
 //! takes them as an argument rather than reading config.
 
-use candle_nn::kv_cache::{KvFormat, CHUNK_SIZE};
+use candle_nn::kv_cache::{KvFormat, CHUNK_SIZE, REGION_BYTES};
 
 /// What one admission would take, split by tenant so a refusal can say which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -38,6 +38,15 @@ pub(crate) struct Cost {
     pub recurrent: u64,
     /// The wave transient tier this admission's rows would need.
     pub activations: u64,
+    /// Rows this admission puts in the forward — the prefill chunk that rides
+    /// this wave, or a decode's verify block of `1 + draft`.
+    ///
+    /// Distinct from every byte term above, and the only one the throughput
+    /// model reads directly: bytes say what the admission *costs*, rows say
+    /// what it *earns*. `activations` is this row count priced through the
+    /// wave planner; the two must move together or the tier is sized for a
+    /// wave the rate was never judged on.
+    pub rows: usize,
 }
 
 impl Cost {
@@ -45,6 +54,28 @@ impl Cost {
         self.kv
             .saturating_add(self.recurrent)
             .saturating_add(self.activations)
+    }
+
+    /// Ground this admission takes **off the free list**, at the granularity
+    /// the allocator actually claims it — which is what the weight side loses.
+    ///
+    /// By the span identity (`interleave::achievable_weight_bytes`) the
+    /// residency the weight side can reach is the span less the live regions,
+    /// so claiming a region lowers it by exactly that region: the free list is
+    /// not headroom standing *beside* the weight zone, it is the same ground
+    /// seen from the other end. That is why the tier is not in this sum — it is
+    /// transient, released at phase 0 of the forward it was placed for, and
+    /// makes no region live.
+    ///
+    /// Region-granular, and rounded the same way [`super::super::prefill`]'s
+    /// `buy_kv_ground` rounds the claim it buys for, so the figure admission is
+    /// judged on and the figure admission purchases cannot drift.
+    pub(crate) fn claimed_bytes(&self) -> u64 {
+        let region = REGION_BYTES as u64;
+        self.kv
+            .saturating_add(self.recurrent)
+            .div_ceil(region)
+            .saturating_mul(region)
     }
 }
 
@@ -144,8 +175,50 @@ mod tests {
             kv: 10,
             recurrent: 200,
             activations: 3_000,
+            rows: 128,
         };
         assert_eq!(c.total(), 3_210);
         assert_eq!(Cost::default().total(), 0);
+    }
+
+    /// **The claim is the K/V and the store, rounded to regions — and not the
+    /// tier.** The tier is transient: the forward this admits for releases it
+    /// at phase 0, so it never makes a region live and never costs the weight
+    /// side residency. Charging it here would refuse admissions twice for the
+    /// same ground, once at the gate and once at the purchase.
+    #[test]
+    fn the_claim_is_the_ground_that_goes_live_rounded_to_regions() {
+        let region = REGION_BYTES as u64;
+        let c = Cost {
+            kv: region + 1,
+            recurrent: 0,
+            activations: 64 * region,
+            rows: 128,
+        };
+        assert_eq!(c.claimed_bytes(), 2 * region, "rounded up, tier excluded");
+        assert_eq!(Cost::default().claimed_bytes(), 0);
+        assert_eq!(
+            Cost {
+                kv: region,
+                recurrent: region,
+                ..Default::default()
+            }
+            .claimed_bytes(),
+            2 * region,
+            "the store is claimed ground like the K/V",
+        );
+    }
+
+    /// A decode step claims nothing — its lease was reserved when its slot was
+    /// admitted — so it dislodges no weights however many rows it carries.
+    #[test]
+    fn a_decode_steps_rows_cost_the_weight_side_nothing() {
+        let step = Cost {
+            kv: 0,
+            recurrent: 0,
+            activations: 128 << 20,
+            rows: 3,
+        };
+        assert_eq!(step.claimed_bytes(), 0);
     }
 }

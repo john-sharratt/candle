@@ -458,6 +458,67 @@ mod tests {
     mod pool_integration_tests {
         use super::*;
 
+        /// **A run must spend recycled space before stamping a new arena.**
+        ///
+        /// A run is claimed from the high-water tail only — `try_claim_run` is
+        /// explicit that "recycled singleton slots are never
+        /// consecutive-by-contract" — and `hwm` never retreats. So an arena
+        /// whose tail is exhausted but whose slots have since been freed holds
+        /// room a run cannot see. Going straight to a fresh arena there means
+        /// the workload only ever consumes never-used ground while the recycled
+        /// space piles up: measured on run 59's class 8192, 46 arenas holding
+        /// 6.3% of their slots, growing 79 → 130 arenas in four minutes.
+        ///
+        /// Contiguity is a locality optimization, not correctness (each band is
+        /// addressed through its own gid), so the fallback is scattered slots.
+        #[test]
+        fn a_run_reuses_recycled_slots_rather_than_registering_an_arena() {
+            use crate::kv_cache::chunked::arena::ArenaKey;
+            use crate::kv_cache::chunked::size_class::SizeClass;
+            use crate::kv_cache::ArenaLocation;
+
+            let pool = crate::kv_cache::chunked::gid_pool::ChunkGidPool::new();
+            let key = ArenaKey::new(SizeClass::at(0), ArenaLocation::Gpu);
+            pool.register_arena(key);
+            let capacity = key.chunks();
+
+            // Exhaust the tail, so `run_fits` is false from here on.
+            let all = pool.allocate_n_for(key, capacity);
+            assert_eq!(
+                all.len(),
+                capacity,
+                "the fresh arena hands out its whole tail"
+            );
+            assert_eq!(
+                pool.allocate_run_for(key, 8),
+                None,
+                "with the high-water mark spent, no run fits — this is the premise",
+            );
+
+            // Free half of them: real room, invisible to a run.
+            all.into_iter().take(capacity / 2).for_each(drop);
+            assert_eq!(
+                pool.allocate_run_for(key, 8),
+                None,
+                "recycled slots are still not consecutive-by-contract",
+            );
+
+            // The scattered path is what can reach that space.
+            let scattered = pool.allocate_n_for(key, 8);
+            assert_eq!(
+                scattered.len(),
+                8,
+                "recycled slots are claimable one by one"
+            );
+            let arenas: std::collections::HashSet<usize> =
+                scattered.iter().map(|g| g.arena_idx()).collect();
+            assert_eq!(
+                arenas.len(),
+                1,
+                "and they came from the existing arena, not a newly registered one",
+            );
+        }
+
         /// After allocating N chunks they must have contiguous GIDs 0..N-1
         /// (min-heap packs into lowest arenas first).
         #[test]

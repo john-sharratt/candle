@@ -17,11 +17,12 @@
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admit;
+pub use admit::rate as wave_rate;
 mod decode;
 pub mod exported_state;
 mod guest_room;
+pub mod holdings;
 mod interleave;
-mod lease;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
@@ -80,7 +81,7 @@ use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
 use crate::{SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
-use candle::{Device, Tensor};
+use candle::{DType, Device, Tensor};
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
@@ -1194,9 +1195,15 @@ struct DecodeState {
     /// engine's exposure to one conversation is its prompt plus this, whatever
     /// the conversation turns out to cost.
     lease_left: usize,
-    /// The lease ran out with the turn unfinished, so the slot is to be parked
-    /// and requeued rather than completed. Distinct from [`Self::finished`],
-    /// which means the turn is genuinely done (EOS or `max_tokens`).
+    /// The lease ran out with the turn unfinished, so the slot is offered to
+    /// [`renew_expired_leases`](super::prefill) rather than completed. Distinct
+    /// from [`Self::finished`], which means the turn is genuinely done (EOS or
+    /// `max_tokens`).
+    ///
+    /// The turn is **not** parked and requeued — that design is gone. A
+    /// continuation is never re-judged, so the renewal either buys the next
+    /// lease in place or seals the turn where it stands; parking cost 4–8 parks
+    /// per directory at ~445 ms each, every one resumed inside 40 ms.
     lease_expired: bool,
     /// Maximum tokens to generate.
     max_tokens: usize,
@@ -1670,37 +1677,6 @@ struct PendingCompressionSeal {
     response_tx: Sender<Result<TurnIndex, ProbeError>>,
 }
 
-/// A turn whose decode lease ran out before its answer did: its K/V moved to the
-/// warm tier, its slot's ground handed back, waiting its turn to resume.
-struct ParkedTurn {
-    /// The slot it will resume on — **the same one it parked from.**
-    ///
-    /// The slot is truncated, not freed. Freeing recycles the id immediately and
-    /// the engine hands it to another conversation while this one still believes
-    /// it owns it, which is precisely how a shedding attempt produced 31
-    /// `sequence appears in more than one group` failures. Keeping the id also
-    /// means every per-slot map — `slot_targets`, `sampling_states`,
-    /// `turn_views`, `slot_tokens` — stays correctly keyed and nothing has to be
-    /// re-keyed on the way back.
-    slot: SequenceId,
-    /// Per-layer K/V on the warm tier. The migration compresses it, so a parked
-    /// turn holds less than it did resident.
-    ///
-    /// **Its K/V leaves the card; its recurrent state does not.** A model
-    /// carrying per-sequence recurrent memory keeps that on the device, because
-    /// the store *is* the turn's memory and releasing it at the lease boundary
-    /// would destroy what the resume needs. What ends its residency is the turn
-    /// seal, which drops it once the substrate snapshot is durable. So the
-    /// ground a park returns is the K/V, not quite all of it.
-    warm: Vec<SealedSequence>,
-    /// Generation state, resumed with a fresh lease.
-    state: DecodeState,
-    /// Consecutive failed resume attempts. A turn that cannot be restored is
-    /// retried at the head of the queue, but not forever — see
-    /// [`Scheduler::PARK_RESUME_ATTEMPTS`].
-    resume_failures: usize,
-}
-
 /// What the scheduler does after a [`SubmitTurn`] decode completes,
 /// just before sending `Done`.
 ///
@@ -1878,6 +1854,48 @@ pub(super) struct PrefillWork {
     /// while a tool call is emitted — see
     /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
     pub(super) free_tool_calls_from_penalties: bool,
+    /// The projection this turn's slot was materialised from, kept so the
+    /// materialisation can be **dropped while the turn waits and rebuilt when
+    /// it is admitted**.
+    ///
+    /// A turn's projection is applied to its parent at submit and the view
+    /// carved from it there and then, so a queued turn holds arena chunks for
+    /// work that has not started — measured on a repo ingest at 152 slots and
+    /// 7.6 GB, against a frontier gap of 758 MiB. Those chunks are rebuildable:
+    /// every segment is either substrate-pinned or a generated template, so the
+    /// list below is all it takes to put the slot back exactly as it was.
+    ///
+    /// Cheap to hold: every variant carries its tokens behind an `Arc`, so this
+    /// is a handful of pointers per segment, not the K/V.
+    ///
+    /// Empty for paths that materialise nothing through a projection (resume,
+    /// compression, sections), which are consequently never demoted.
+    pub(super) projection: Vec<crate::projection::ProjectionSegment>,
+    /// Set when [`Scheduler::demote_unadmitted_slots`] has truncated this
+    /// turn's block tables. The admission path re-applies [`Self::projection`]
+    /// and re-carves the view before the prefill runs.
+    pub(super) demoted: bool,
+    /// The live decode count this turn was refused at, for a turn the decode
+    /// side turned away at the prefill→decode boundary. It is not offered again
+    /// until fewer decodes than that are running.
+    ///
+    /// **The retry has to wait for the thing that would change the answer.** A
+    /// boundary refusal means the decode side cannot carry another turn at this
+    /// width; only a decode finishing changes that. Re-offering sooner
+    /// re-prefills the whole prompt to re-ask a question whose answer has not
+    /// moved — run 32 measured 55 rebuilds and 59 evictions across 25 slots for
+    /// a single directory, one slot re-prefilled nine times.
+    ///
+    /// **Not [`Scheduler::completions`], which was tried and is far too loose.**
+    /// That counter moves on every reaped slot — sections, calibration turns,
+    /// idle demotes — and run 33 logged 639 such events against 502 section
+    /// batches in a few minutes, so a hold of "one completion" expired almost
+    /// immediately and the churn was unchanged (5 evictions across 2 slots).
+    /// The live decode count is the quantity the refusal was actually about.
+    ///
+    /// `None` for every other path — this is not a general backpressure knob,
+    /// and nothing but the boundary sets it.
+    pub(super) held_until_decodes_below: Option<usize>,
     /// Whether this turn's opening [`TurnEvent::Prefill`] +
     /// [`TurnEvent::PrefillProgress`] pair has already been sent.
     ///
@@ -1889,6 +1907,18 @@ pub(super) struct PrefillWork {
     /// client a second time and rewound its progress bar to zero, which reads
     /// as the turn restarting when in fact it had never begun.
     pub(super) announced: bool,
+}
+
+/// The expert pipeline's cumulative counters, held so a report can difference
+/// them into an interval. Every field mirrors one on `PipelineStats`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct ExpertCounters {
+    pub(super) hits: usize,
+    pub(super) misses: usize,
+    pub(super) cold: usize,
+    pub(super) warm: usize,
+    pub(super) fences: usize,
+    pub(super) late: usize,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -3152,6 +3182,40 @@ pub(crate) struct Scheduler {
     /// per fill while the rate stands under the knee, one wider while it
     /// stands clear above it, never past the ceiling and never under two.
     wave_width: usize,
+    /// Expert-pipeline counters as of the last memory report, so the latency
+    /// section describes the **interval** rather than the process. The counters
+    /// are cumulative; only their differences say what a window waited on.
+    latency_prev: ExpertCounters,
+    /// When that report was taken — the window's other end.
+    last_latency_at: Option<Instant>,
+
+    /// When the tier-refusal state dump last fired — see
+    /// [`Scheduler::dump_on_tier_refusal`]. `None` until the first refusal, so
+    /// the first one in a run always dumps.
+    last_tier_refusal_dump: Option<Instant>,
+
+    /// The speculative draft width the last wave carrying decodes actually ran,
+    /// as `observe_wave_rate` measured it.
+    ///
+    /// Read by the prefill→decode promotion decision, which has to price a
+    /// decode before that decode has stepped and so cannot derive the width
+    /// itself. Zero until the first decode wave, which is correct: with nothing
+    /// decoding there is no speculation to price.
+    last_observed_draft: usize,
+    /// How the last fill ended, so the next pass's census knows whether the
+    /// engine is throttled. A fill that stopped on the tier's width cap leaves
+    /// the head fitting comfortably, so nothing else in the scheduler records
+    /// that admission is stuck.
+    last_fill_stopped_on_weights: bool,
+    last_fill_stopped_on_rate: bool,
+    /// The wave throughput planner — what admission decides with.
+    ///
+    /// Carried on the scheduler rather than built per fill because what it
+    /// holds is a property of the machine, learned from forwards: the effective
+    /// rate expert bytes cross the bus at, and the time a MoE layer takes when
+    /// the bus is not the limit. A fill borrows it, spends its wave budget, and
+    /// hands it back with whatever it learned.
+    wave_rate: admit::WaveRate,
     /// When the memory report was last published, so the next one can carry
     /// the cadence (`AdmissionSection::publish_interval_ms`).
     last_report_publish: Option<Instant>,
@@ -3190,18 +3254,6 @@ pub(crate) struct Scheduler {
 
     /// Monotonic id source for `compression_jobs`.
     next_compression_job_id: u64,
-
-    /// Turns whose lease ran out, oldest first — the back of this queue is where
-    /// a parked turn goes, so the others get the engine before it comes round
-    /// again.
-    ///
-    /// **Bounded**, because parking moves a turn's K/V from the card to the
-    /// host: an unbounded queue converts VRAM pressure into host pressure, and
-    /// this engine's characteristic hang is the daemon sitting on tens of
-    /// gigabytes of host RAM with VRAM reading healthy. Past
-    /// [`Scheduler::PARKED_TURNS_MAX`] the engine stops parking and lets the
-    /// turns already open finish instead — see `park_expired_leases`.
-    parked: VecDeque<ParkedTurn>,
 
     /// Slots that have finished and been reaped, monotonically.
     ///
@@ -3306,6 +3358,89 @@ pub(crate) struct Scheduler {
     /// reloaded timeline's reconcile would fail "no projection/summary" and disarm
     /// that timeline's summary tree forever.
     workspace_projection: Option<Arc<Builder>>,
+}
+
+/// The copy rate the planner is seeded with when the device's own link probe
+/// fails: PCIe 3.0 ×16, the slowest host in the fleet.
+///
+/// Seeding low is the safe direction. The planner learns the effective rate
+/// upward from forwards it has actually measured, so an under-estimate composes
+/// a few narrow waves and corrects; an over-estimate composes waves whose copy
+/// it cannot pay for.
+const FALLBACK_LINK_BYTES_PER_S: f64 = 12e9;
+
+/// The planner's nominal link on a model with no experts to stream. Every byte
+/// figure it divides is zero there, so no decision can reach it; a rate simply
+/// has to be positive and finite.
+const NO_EXPERT_BUS: f64 = 1.0;
+
+/// Build the wave throughput planner for this machine and this model.
+///
+/// The expert geometry comes from the cache's own gauges and the model's wave
+/// geometry, so it follows the checkpoint rather than a per-model row, and the
+/// copy rate is measured with one pinned transfer on this device's stream — the
+/// same path the expert cache streams through. The 4090 Mobile, the 3090 behind
+/// its PCIe 3.0 host and the Blackwell workstation each seed correctly with no
+/// per-machine constant.
+///
+/// **A model with no expert cache has nothing to trade.** A dense stack pays no
+/// expert copy, so a wave's rate is flat in its width: every row costs exactly
+/// its own compute and earns exactly that back. Built with a zero-byte slot —
+/// which makes every copy term identically zero whatever the link reads — and
+/// with no minimum gain, so a flat rate is admitted and the wave is bounded by
+/// the floor and the caps alone. That is the right answer there, through the
+/// same code path rather than beside it.
+fn build_wave_rate(
+    device: &Device,
+    model: &dyn ManagedBatchedModel,
+    act_dtype: DType,
+) -> admit::WaveRate {
+    use admit::rate::{DecodeModel, ExpertGeometry, RateModel, WaveRate};
+    let wave = model.wave_geometry(act_dtype);
+    let (moe_layers, slot_bytes) = model
+        .expert_stats()
+        .map_or((0, 0), |s| (s.moe_layers, s.slot_bytes));
+    let geometry = ExpertGeometry {
+        moe_layers: moe_layers.max(1),
+        experts_per_layer: wave.n_experts.max(1),
+        slot_bytes: slot_bytes as u64,
+    };
+    let decode = DecodeModel {
+        experts_per_token: wave.experts_per_tok.max(1),
+        ..DecodeModel::default()
+    };
+    let planner = if geometry.total_bytes() == 0 {
+        WaveRate::with_link_rate(NO_EXPERT_BUS, geometry, RateModel::default(), decode)
+            .with_min_gain(0.0)
+    } else {
+        match WaveRate::measure(device, geometry, RateModel::default(), decode) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    target: "candle_conversation::scheduler::interleave",
+                    "wave rate: the link probe failed, seeding from PCIe 3.0: {e}",
+                );
+                WaveRate::with_link_rate(
+                    FALLBACK_LINK_BYTES_PER_S,
+                    geometry,
+                    RateModel::default(),
+                    decode,
+                )
+            }
+        }
+    };
+    tracing::info!(
+        target: "candle_conversation::scheduler::interleave",
+        moe_layers = geometry.moe_layers,
+        experts_per_layer = geometry.experts_per_layer,
+        experts_per_token = decode.experts_per_token,
+        expert_gb = (geometry.total_bytes() as f64 / 1e9 * 100.0).round() / 100.0,
+        link_gb_per_s = (planner.link_bytes_per_s() / 1e9 * 100.0).round() / 100.0,
+        seed_gb_per_s = (planner.effective_bytes_per_s() / 1e9 * 100.0).round() / 100.0,
+        layer_ms = (planner.layer_secs() * 1e5).round() / 100.0,
+        "wave rate planner opened",
+    );
+    planner
 }
 
 impl Scheduler {
@@ -3452,6 +3587,7 @@ impl Scheduler {
             "index page breaks resolved by name (<think>, </think>, turn closer)"
         );
         let wave_width = model.decode_width_target();
+        let wave_rate = build_wave_rate(&device, model.as_ref(), session.activation_dtype());
         Self {
             rx,
             model,
@@ -3465,7 +3601,6 @@ impl Scheduler {
             active_decodes: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
-            parked: VecDeque::new(),
             active_prefills: Vec::new(),
             active_section_ingests: Vec::new(),
             section_positional: HashMap::new(),
@@ -3508,6 +3643,13 @@ impl Scheduler {
             expert_hits_seen: 0,
             expert_misses_seen: 0,
             expert_hit_rate: None,
+            latency_prev: ExpertCounters::default(),
+            last_latency_at: None,
+            last_tier_refusal_dump: None,
+            last_observed_draft: 0,
+            last_fill_stopped_on_weights: false,
+            last_fill_stopped_on_rate: false,
+            wave_rate,
             wave_width,
             last_report_publish: None,
             last_width_adjust: None,
@@ -3587,12 +3729,7 @@ impl Scheduler {
             .section_queue
             .iter()
             .map(|s| (s.tokens.token_count(), 0));
-        sum_pending_prefill_tokens(
-            queued
-                .chain(active)
-                .chain(sections)
-                .chain(queued_sections),
-        )
+        sum_pending_prefill_tokens(queued.chain(active).chain(sections).chain(queued_sections))
     }
 
     fn drain_submissions(&mut self) -> bool {
@@ -3626,7 +3763,7 @@ impl Scheduler {
                 parent,
                 response_tx,
             } => {
-                let result = self.create_sequence(conversation, target).map(|slot| {
+                let result = self.create_sequence(conversation, target).inspect(|&slot| {
                     // A fork's state is its parent's, taken when the fork is
                     // admitted (`claim_recurrent`) — not here, where it would
                     // hold a store for as long as the fork waits in the queue.
@@ -3642,7 +3779,6 @@ impl Scheduler {
                         self.recurrent_seeds
                             .insert(slot, RecurrentSeed::Parent(parent_id));
                     }
-                    slot
                 });
                 let _ = response_tx.send(result);
                 true
@@ -4157,6 +4293,18 @@ impl Scheduler {
                 // reprojection policy through to DecodeState.
                 self.prefill_queue.push_back(PrefillWork {
                     announced: false,
+                    // What this slot was materialised from, so the
+                    // materialisation can be given back while the turn waits.
+                    // Empty when the projection was skipped — a seeded slot the
+                    // prefill appends onto has no segment list to rebuild from,
+                    // and must not be demoted.
+                    projection: if skip_projection {
+                        Vec::new()
+                    } else {
+                        projected_segments.clone()
+                    },
+                    demoted: false,
+                    held_until_decodes_below: None,
                     sequence_id: view_id,
                     tokens: prefill_tokens,
                     prefill_text,
@@ -5530,6 +5678,12 @@ impl Scheduler {
         );
         self.prefill_queue.push_back(PrefillWork {
             announced: false,
+            // A compression re-prefill materialises no projection of its own —
+            // it writes marker-framed text onto a slot the caller prepared — so
+            // there is nothing to rebuild from and it is never demoted.
+            projection: Vec::new(),
+            demoted: false,
+            held_until_decodes_below: None,
             sequence_id: slot,
             tokens: TokenBuffer::from(token_ids),
             prefill_text: String::new(),
@@ -5998,6 +6152,139 @@ impl Scheduler {
         {
             self.ingest_timelines.remove(&tgt.timeline);
         }
+    }
+
+    /// Give back **all** of a slot's ground: its block table and the recurrent
+    /// store derived alongside it.
+    ///
+    /// **These are one operation, not two.** A recurrent position is only
+    /// meaningful against the K/V it was advanced over, so a slot truncated to
+    /// zero blocks cannot continue from its store under any circumstances — the
+    /// turn must replay from its projection, and the replay re-derives the
+    /// state. Leaving the store behind therefore strands 160 MiB that nothing
+    /// can ever read: against a block table in the tens, it is the larger half
+    /// of what the slot was holding.
+    ///
+    /// The pairing was written out by hand at each site and forgotten at two of
+    /// them. `evict_finished_prefill` did both; `demote_idle_slots` and
+    /// `demote_unadmitted_slots` truncated only. Measured on run 37 mid-stall:
+    /// seven view parents at `tok=0 kv=0` holding 1,120 MiB, with
+    /// `evictable=0MiB` everywhere else and prefills refused at the weight floor
+    /// for want of ~100 MiB — the stall was that shortfall, and this was the
+    /// ground. Made one call so a future site cannot do half of it.
+    ///
+    /// Answers whether a store was actually handed back, for the caller's log.
+    pub(super) fn release_slot_ground(&mut self, slot: SequenceId) -> bool {
+        if let Err(e) = self.session.truncate_sequence_to_blocks(slot.0, 0) {
+            tracing::warn!(
+                target: "candle_conversation::persistence::tier",
+                slot = slot.0,
+                "could not release the slot's blocks: {e}",
+            );
+            return false;
+        }
+        if !self.model.recurrent_resident(slot.0) {
+            return false;
+        }
+        match self.model.release_sequence(slot.0) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    target: "candle_conversation::persistence::tier",
+                    slot = slot.0,
+                    "blocks released but the recurrent store did not go with them: {e}",
+                );
+                false
+            }
+        }
+    }
+
+    /// Stores that no live turn can account for — the leak
+    /// [`Self::release_slot_ground`] exists to prevent, reported rather than
+    /// swept.
+    ///
+    /// A resident store belongs to a slot the engine is running, or to a slot
+    /// holding the K/V that store was advanced over. A store on a slot with
+    /// neither is unreachable: nothing will read it and nothing will free it
+    /// until the conversation ends. Counting them turns a silent 160-MiB-at-a-
+    /// time leak into a number a run can be judged by — the census read
+    /// `idle_stores` for a week before it was clear which half of that figure
+    /// was waste (turns awaiting decode hold their stores legitimately, and
+    /// they dominated it).
+    pub(super) fn orphaned_store_slots(&self) -> Vec<SequenceId> {
+        let mut running: HashSet<SequenceId> = HashSet::new();
+        running.extend(self.active_decodes.keys().copied());
+        running.extend(self.active_prefills.iter().map(|p| p.work.sequence_id));
+        running.extend(self.active_section_ingests.iter().map(|s| s.sequence_id));
+        running.extend(self.prefill_queue.iter().map(|w| w.sequence_id));
+        running.extend(self.section_queue.iter().map(|s| s.sequence_id));
+        for (view, st) in &self.turn_views {
+            running.insert(*view);
+            running.insert(st.parent_id);
+        }
+        self.slot_conversations
+            .keys()
+            .copied()
+            .filter(|id| self.model.recurrent_resident(id.0))
+            .filter(|id| !running.contains(id))
+            .filter(|id| self.session.sequence_offset(id.0).unwrap_or(0) == 0)
+            .collect()
+    }
+
+    /// Quantize and seal every full chunk these slots hold, leaving a fresh
+    /// writer chunk for what they write next.
+    ///
+    /// **Seal as we go, rather than at the turn boundary.** A turn's K/V sits
+    /// in the *active* formats until it seals — `R16` for K at 128 B per 32
+    /// elements and `F16` for V at 64, against roughly 52 B for the same block
+    /// once quantized. Those live in the two widest size classes, and holding a
+    /// whole turn's worth of them is what squeezes the weight zone onto its
+    /// floor: measured, classes 4096 and 8192 reserved 3,488 MiB between them
+    /// to hold 956 MiB live, while prefill was refused for want of ~100 MiB and
+    /// decode ground on alone. Sealing at completed-chunk granularity bounds
+    /// the active footprint to the unsealed tail instead of the whole turn.
+    ///
+    /// Safe to call repeatedly and at either cadence:
+    /// `quantize_and_seal_sequences` passes already-quantized chunks through
+    /// its preserve bucket unchanged, so a re-run costs a walk and changes
+    /// nothing — which is also what makes it safe against a wave that rolls
+    /// back behind it. `start_new_chunk` pushes the fresh writer chunk, so the
+    /// next write opens a block rather than extending the now-immutable
+    /// quantized tail — the rule `tail_needs_new_block` enforces from the other
+    /// side.
+    ///
+    /// Batched over `slots` because the quantizer works per layer across every
+    /// sequence handed to it; one call for eight renewals beats eight calls.
+    ///
+    /// Called unconditionally. This crate takes `candle-transformers` with
+    /// `cuda` always on, so the entry point is always present, and it makes
+    /// itself a no-op where it cannot apply — an uncompressed mode, a non-CUDA
+    /// device, or a shape the palette quantizer does not cover. There is no
+    /// second path here to keep in step.
+    pub(super) fn seal_completed_chunks(&mut self, slots: &[SequenceId]) {
+        if slots.is_empty() {
+            return;
+        }
+        let ids: Vec<usize> = slots.iter().map(|s| s.0).collect();
+        let t = std::time::Instant::now();
+        if let Err(e) = self.session.quantize_and_seal_sequences(&ids, true) {
+            // Not fatal: the turn's K/V is intact and simply stays in the
+            // active formats until its turn-boundary seal. The cost is ground,
+            // not correctness, so it is warned rather than raised.
+            tracing::warn!(
+                target: "candle_conversation::persistence::tier",
+                slots = ?ids,
+                "mid-turn seal failed; the turn's K/V stays in the active \
+                 formats until its boundary seal: {e}",
+            );
+            return;
+        }
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            slots = ids.len(),
+            ms = t.elapsed().as_millis() as u64,
+            "sealed completed chunks mid-turn",
+        );
     }
 
     // —— Sequence creation ——————————————————————————————————————————
@@ -8346,11 +8633,20 @@ impl Scheduler {
                         // is now in the substrate and the next turn's admission
                         // restores it (`materialise_recurrent`).
                         //
-                        // Only on this branch. `Ok(None)` is an ephemeral
-                        // timeline whose payload is deliberately dropped, and
+                        // Only on this branch, for two different reasons.
                         // `Err` already warns that resume will recompute from
-                        // zeros — evicting either would turn "cannot resume"
-                        // into "resumed, fluent, and forgotten".
+                        // zeros, and evicting there would turn "cannot resume"
+                        // into "resumed, fluent, and forgotten". `Ok(None)` is
+                        // an ephemeral timeline with no snapshot to restore
+                        // from, so evicting here would cut the state out from
+                        // under the *next* turn of a fork that has several —
+                        // there is nothing to put back. Its store is instead
+                        // reclaimed when the slot's blocks go, by
+                        // `Scheduler::release_slot_ground`: a state whose K/V
+                        // has been truncated away is unreachable, which is the
+                        // moment it becomes safe to take. Measured before that
+                        // pairing existed: seven such slots holding 1,120 MiB
+                        // while prefill was refused at the weight floor.
                         if let Err(e) = self.model.evict_recurrent(seal_slot.0) {
                             tracing::warn!(
                                 "recurrent evict after seal failed for turn {}: {e}",
@@ -10239,6 +10535,7 @@ mod tests {
     // visible in the assertion.
     #![allow(clippy::identity_op)]
 
+    use super::prefill::WaveFill;
     use super::*;
     use candle::{DType, Tensor};
     use candle_transformers::models::speculative_choice::GreedyChooser;
@@ -11686,7 +11983,10 @@ mod tests {
         assert_eq!(probe.len(), 0, "nothing is on the device before admission");
 
         assert!(sched.claim_recurrent(slots[1].0));
-        assert!(probe.get(slots[1].0).is_some(), "the admitted slot has its state");
+        assert!(
+            probe.get(slots[1].0).is_some(),
+            "the admitted slot has its state"
+        );
         assert_eq!(probe.len(), 1, "and only the admitted slot");
         for slot in [slots[0], slots[2]] {
             assert!(sched.claim_recurrent(slot.0));
@@ -11857,7 +12157,11 @@ mod tests {
             scheduler.admission_passes, before,
             "a head that fits sheds nothing"
         );
-        assert_eq!(scheduler.active_section_ingests.len(), 1, "and was admitted");
+        assert_eq!(
+            scheduler.active_section_ingests.len(),
+            1,
+            "and was admitted"
+        );
 
         // Drain the section so the engine is idle, then the pass sheds.
         scheduler.active_section_ingests.clear();
@@ -11876,8 +12180,8 @@ mod tests {
     /// had admission buy 1.0–1.8 GiB of weight ground per prefill on run 6.
     #[test]
     fn an_admission_prices_the_tier_of_its_least_chunk_only() {
-        use admit::{Ground, Kind};
         use crate::projection::DecodePriority;
+        use admit::{Ground, Kind};
         let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
         let slot = SequenceId(scheduler.session.create_sequence().unwrap());
         let (tx, _rx) = crossbeam::channel::bounded(1);
@@ -11898,14 +12202,23 @@ mod tests {
         let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
         let least = (plan.tier_bytes(prefill::PREFILL_MIN_ADVANCE) - plan.tier_bytes(0)) as u64;
         let whole = (plan.tier_bytes(100_000) - plan.tier_bytes(0)) as u64;
-        assert!(whole > least, "the test only means something if the two differ");
+        assert!(
+            whole > least,
+            "the test only means something if the two differ"
+        );
 
         let mut fill = prefill::WaveFill::new(&mut scheduler, 0);
         let cost = fill
             .peek(Kind::Section, DecodePriority::Low)
             .expect("a queued section is offered");
-        assert_eq!(cost.activations, least, "the least chunk's tier, not the whole's");
-        assert!(cost.kv > 0, "the whole section's K/V is still the K/V price");
+        assert_eq!(
+            cost.activations, least,
+            "the least chunk's tier, not the whole's"
+        );
+        assert!(
+            cost.kv > 0,
+            "the whole section's K/V is still the K/V price"
+        );
     }
 
     /// **The section batch is bounded by the tier the fill left it.** With no
@@ -11954,6 +12267,9 @@ mod tests {
         let (event_tx, _rx) = crossbeam::channel::bounded(1);
         PrefillWork {
             announced: true,
+            projection: Vec::new(),
+            demoted: false,
+            held_until_decodes_below: None,
             sequence_id,
             tokens: TokenBuffer::from(vec![1u32; tokens]),
             prefill_text: String::new(),
@@ -11992,6 +12308,158 @@ mod tests {
         }
     }
 
+    /// **The census attributes real scheduler state, not just its own set.**
+    /// The whole value of it is that the reason it names is the reason
+    /// `demote_idle_slots` acted on, so the wiring from each collection to each
+    /// [`holdings::Holder`] is what has to be right — a builder that is correct
+    /// in isolation and mis-wired here would report confident, wrong answers.
+    #[test]
+    fn the_census_names_why_each_slot_is_held() {
+        use holdings::Holder;
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let queued = SequenceId(scheduler.session.create_sequence().unwrap());
+        let running = SequenceId(scheduler.session.create_sequence().unwrap());
+
+        // One turn submitted and waiting; one admitted and prefilling.
+        scheduler
+            .prefill_queue
+            .push_back(test_prefill_work(queued, 300));
+        scheduler
+            .active_prefills
+            .push(active_prefill(running, 300, 0));
+
+        let census = scheduler.census();
+        let of = |id: SequenceId| {
+            census
+                .slots
+                .iter()
+                .find(|s| s.slot == id.0)
+                .expect("slot in census")
+        };
+        assert_eq!(of(queued).holders, vec![Holder::PrefillQueued]);
+        assert_eq!(of(running).holders, vec![Holder::ActivePrefill]);
+
+        // And the split that the eviction pass selects on.
+        assert!(of(queued).is_waiting_only(), "submitted, never started");
+        assert!(of(running).is_running());
+        assert_eq!(holdings::waiting_only_slots(&census), vec![queued]);
+        assert!(holdings::running_slots(&census).contains(&running));
+    }
+
+    /// A slot held for several reasons reports all of them, and a view holds
+    /// **both** itself and its parent — which is what makes a queued turn pin
+    /// two slots rather than one.
+    #[test]
+    fn a_view_holds_itself_and_its_parent() {
+        use holdings::Holder;
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let parent = SequenceId(scheduler.session.create_sequence().unwrap());
+        let view = SequenceId(scheduler.session.create_sequence().unwrap());
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: BlockCount(0),
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+            },
+        );
+        scheduler
+            .prefill_queue
+            .push_back(test_prefill_work(view, 10));
+
+        let census = scheduler.census();
+        let of = |id: SequenceId| {
+            census
+                .slots
+                .iter()
+                .find(|s| s.slot == id.0)
+                .expect("slot in census")
+        };
+        assert_eq!(
+            of(view).holders,
+            vec![Holder::PrefillQueued, Holder::TurnView],
+            "a queued view is held twice over",
+        );
+        assert_eq!(of(parent).holders, vec![Holder::ViewParent]);
+        // Neither is running, so both are ground the queue is sitting on.
+        assert_eq!(census.waiting_only.slots, 2);
+    }
+
+    /// **Blocks and store go back together, or the larger half is stranded.**
+    ///
+    /// A recurrent position is only meaningful against the K/V it was advanced
+    /// over, so a slot truncated to zero cannot continue from its store under
+    /// any circumstances. Leaving it behind strands 160 MiB nothing can read —
+    /// measured on run 37 mid-stall as seven slots at `tok=0 kv=0` holding
+    /// 1,120 MiB, with `evictable=0MiB` everywhere else and prefills refused at
+    /// the weight floor for want of ~100 MiB.
+    #[test]
+    fn releasing_a_slots_ground_takes_the_store_with_the_blocks() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = SequenceId(sched.session.create_sequence().unwrap());
+        sched.session.advance_sequence(slot.0, 128).expect("prefix");
+        probe.set(slot.0, ZERO_STATE);
+        assert!(sched.model.recurrent_resident(slot.0));
+
+        assert!(sched.release_slot_ground(slot), "a store was handed back");
+
+        assert_eq!(sched.session.sequence_offset(slot.0).unwrap_or(0), 0);
+        assert!(!sched.model.recurrent_resident(slot.0));
+        assert_eq!(probe.get(slot.0), None);
+    }
+
+    /// A slot carrying no store gives its blocks back and reports nothing —
+    /// the caller's counter must not tick for a slot that had nothing to hand
+    /// over, or the log reads as reclamation that did not happen.
+    #[test]
+    fn releasing_ground_without_a_store_reports_nothing() {
+        let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let slot = SequenceId(sched.session.create_sequence().unwrap());
+        sched.session.advance_sequence(slot.0, 64).expect("prefix");
+
+        assert!(!sched.release_slot_ground(slot), "there was no store");
+        assert_eq!(sched.session.sequence_offset(slot.0).unwrap_or(0), 0);
+    }
+
+    /// **The census names a store nothing can reach.** A store on a slot that
+    /// is neither running nor holding the K/V it was advanced over is
+    /// unreachable — nothing reads it and nothing frees it until the
+    /// conversation ends. That is the leak, and it is reported rather than
+    /// swept so a regression is loud instead of absorbed.
+    #[test]
+    fn an_unreachable_store_is_named_as_orphaned() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let orphan = sched
+            .create_sequence(crate::projection::Conversation::new(), None)
+            .expect("slot");
+        probe.set(orphan.0, ZERO_STATE);
+
+        assert_eq!(
+            sched.orphaned_store_slots(),
+            vec![orphan],
+            "no holder, no blocks — nothing will ever read it",
+        );
+    }
+
+    /// A store held by a slot the engine is working on is not orphaned, however
+    /// idle the slot looks from outside. The counter that conflated these two
+    /// read 1,120 MiB of live turns as waste.
+    #[test]
+    fn a_store_behind_live_work_is_not_orphaned() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = sched
+            .create_sequence(crate::projection::Conversation::new(), None)
+            .expect("slot");
+        probe.set(slot.0, ZERO_STATE);
+        sched.prefill_queue.push_back(test_prefill_work(slot, 10));
+
+        assert!(
+            sched.orphaned_store_slots().is_empty(),
+            "a queued turn's store is spoken for",
+        );
+    }
+
     /// Hold a creep group of one prefill member across waves: a layer cursor
     /// past zero is what the wave builder reads as "a group is standing".
     fn hold_creep(scheduler: &mut Scheduler, seq: SequenceId, advance: usize) {
@@ -12017,8 +12485,14 @@ mod tests {
 
         scheduler.note_tier_refusal(&candle::Error::Msg("refused".into()));
 
-        assert!(scheduler.wave_prefill_members.is_empty(), "the group is dropped");
-        assert_eq!(scheduler.wave_prefill_cursor, 0, "and its creep restarts from layer 0");
+        assert!(
+            scheduler.wave_prefill_members.is_empty(),
+            "the group is dropped"
+        );
+        assert_eq!(
+            scheduler.wave_prefill_cursor, 0,
+            "and its creep restarts from layer 0"
+        );
         assert_eq!(scheduler.held_creep_rows(), 0);
         assert!(
             scheduler.active_prefills.is_empty(),
@@ -12026,6 +12500,89 @@ mod tests {
         );
         assert_eq!(scheduler.prefill_queue.len(), 1);
         assert_eq!(scheduler.prefill_queue[0].sequence_id, seq);
+    }
+
+    /// **A boundary-evicted turn waits for the decode side to narrow.** The
+    /// refusal was about carrying another turn at that width, so only a decode
+    /// departing changes the answer. Without the hold the turn is re-prefilled
+    /// immediately to re-ask a question that has not moved: run 32 measured 55
+    /// rebuilds and 59 evictions across 25 slots for one directory, with a
+    /// single slot re-prefilled nine times.
+    ///
+    /// The first attempt held on `Scheduler::completions` and did nothing —
+    /// that counter moves on every reaped slot, so the hold expired at once and
+    /// run 33 still churned 5 evictions across 2 slots.
+    #[test]
+    fn a_boundary_evicted_turn_is_held_until_a_decode_departs() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (event_tx, _rx) = crossbeam::channel::bounded(4);
+        // Two decodes running; the turn was refused against exactly that width.
+        for _ in 0..2 {
+            let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+            let st = test_decode_state(&scheduler, event_tx.clone());
+            scheduler.active_decodes.insert(slot, st);
+        }
+        let mut work = test_prefill_work(seq, 64);
+        work.held_until_decodes_below = Some(2);
+        scheduler.prefill_queue.push_back(work);
+
+        assert_eq!(
+            peek_any_band(&mut scheduler),
+            None,
+            "still two decodes wide — the answer has not changed"
+        );
+
+        // One finishes and is reaped.
+        let done = *scheduler.active_decodes.keys().next().unwrap();
+        scheduler.active_decodes.remove(&done);
+
+        assert_eq!(
+            peek_any_band(&mut scheduler),
+            Some(seq),
+            "a departed decode makes it a candidate again"
+        );
+    }
+
+    /// A *finished* decode still occupying `active_decodes` does not count
+    /// against the hold — it is the drain's to remove, and the seat it holds is
+    /// already conceptually free.
+    #[test]
+    fn a_finished_decode_does_not_hold_a_turn_out() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (event_tx, _rx) = crossbeam::channel::bounded(4);
+        let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+        let mut st = test_decode_state(&scheduler, event_tx);
+        st.finished = true;
+        scheduler.active_decodes.insert(slot, st);
+        let mut work = test_prefill_work(seq, 64);
+        work.held_until_decodes_below = Some(1);
+        scheduler.prefill_queue.push_back(work);
+
+        assert_eq!(peek_any_band(&mut scheduler), Some(seq));
+    }
+
+    /// The first prefill candidate in any priority band, so a test does not have
+    /// to know which band a slot resolves to.
+    fn peek_any_band(scheduler: &mut Scheduler) -> Option<SequenceId> {
+        (0..3).find_map(|band| {
+            WaveFill::new(scheduler, 0)
+                .peek_prefill(band)
+                .map(|(_, id, _, _)| id)
+        })
+    }
+
+    /// The hold is only ever set by the boundary; an ordinary queued turn is
+    /// offered on the first pass that reaches it.
+    #[test]
+    fn an_unheld_turn_is_offered_immediately() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().unwrap());
+        scheduler
+            .prefill_queue
+            .push_back(test_prefill_work(seq, 64));
+        assert_eq!(peek_any_band(&mut scheduler), Some(seq));
     }
 
     /// **The fill's head is every row the next wave already carries**: the
@@ -12058,8 +12615,8 @@ mod tests {
     /// refusals took eight regions off a gap a 300-row creep needed.
     #[test]
     fn an_admission_guards_the_tier_of_the_wave_it_joins_not_its_own_rows() {
-        use admit::{Ground, Kind};
         use crate::projection::DecodePriority;
+        use admit::{Ground, Kind};
         let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
         let slot = SequenceId(scheduler.session.create_sequence().unwrap());
         let (tx, _rx) = crossbeam::channel::bounded(1);
@@ -12082,7 +12639,10 @@ mod tests {
         let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
         let head = plan.tier_bytes(held_rows) as u64;
         let whole = plan.tier_bytes(held_rows + prefill::PREFILL_MIN_ADVANCE) as u64;
-        assert!(head > 0, "the test only means something if the head has a tier");
+        assert!(
+            head > 0,
+            "the test only means something if the head has a tier"
+        );
 
         let mut fill = prefill::WaveFill::new(&mut scheduler, 0);
         let cost = fill
@@ -12107,8 +12667,20 @@ mod tests {
     /// **The fill buys the least wave into the budget, not the gap.** The
     /// group former reads the budget — the gap less the margin — so a purchase
     /// that stopped at the gap left the least chunk one margin short of every
-    /// wave with a decode in it. On a device with no reservation the gap reads
-    /// zero, so the ask is the least wave plus the margin, whole regions.
+    /// wave with a decode in it (run 11: `budget=141..190 MiB` against a 192 MiB
+    /// least wave, eight prefills admitted and unstarted while seven decodes
+    /// stepped).
+    ///
+    /// **The device's own frontier gap is not the test's to choose.** The
+    /// reservation is process-global, so whether one exists here depends on
+    /// what else has run in this binary — this used to assume none and read a
+    /// zero gap, which held only until a CUDA test elsewhere in the suite made
+    /// a real one. So the ask is checked against the arithmetic *for the gap
+    /// the fill actually sees*, and the "no reservation" case is pinned
+    /// separately on the pure function, where it is a statement about the
+    /// formula rather than about test ordering. What this still proves is the
+    /// wiring: that the fill asks for `least + margin` rather than `least`, and
+    /// asks at most once.
     #[test]
     fn the_fill_buys_the_least_wave_and_the_margin_into_the_budget() {
         let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
@@ -12118,14 +12690,33 @@ mod tests {
         let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
         let least = plan.tier_bytes(prefill::PREFILL_MIN_ADVANCE);
         let margin = prefill::TIER_MARGIN_REGIONS * candle_nn::kv_cache::REGION_BYTES;
-        let want = (least + margin).div_ceil(candle_nn::kv_cache::REGION_BYTES);
+
+        // On an empty device the whole of it has to be bought.
+        assert_eq!(
+            prefill::least_wave_purchase_regions(least + margin, 0, u64::MAX),
+            (least + margin).div_ceil(candle_nn::kv_cache::REGION_BYTES),
+            "with no gap, the ask is the least wave and the margin, whole regions",
+        );
+
+        let gap = candle_nn::kv_cache::transient_headroom_bytes(0).unwrap_or(0);
+        let room = admit::Ground::headroom(&prefill::WaveFill::new(&mut scheduler, 0));
+        let affordable = room.zone.saturating_sub(room.floor());
+        let want = prefill::least_wave_purchase_regions(least + margin, gap, affordable);
 
         prefill::WaveFill::new(&mut scheduler, 0).publish_tier_budget();
 
+        let asked = probe.ground_requests();
         assert_eq!(
-            probe.ground_requests(),
-            vec![want],
-            "one ask: the least wave and the margin, in regions"
+            asked,
+            if want > 0 { vec![want] } else { Vec::new() },
+            "one ask, for what the least wave and the margin lack of the gap. \
+             least={least} margin={margin} gap={gap} affordable={affordable}",
+        );
+        // The margin is the half a purchase keyed on the gap alone would miss,
+        // so a gap that covers the least wave but not the margin must still buy.
+        assert!(
+            prefill::least_wave_purchase_regions(least + margin, least, u64::MAX) > 0,
+            "a gap holding exactly the least wave is still one margin short",
         );
     }
 
@@ -12138,7 +12729,9 @@ mod tests {
     fn a_run_of_refusals_fails_the_started_prefills_and_a_placed_wave_ends_the_run() {
         let (mut scheduler, _tx) = make_test_scheduler();
         let seq = SequenceId(scheduler.session.create_sequence().unwrap());
-        scheduler.active_prefills.push(active_prefill(seq, 300, 128));
+        scheduler
+            .active_prefills
+            .push(active_prefill(seq, 300, 128));
         let err = candle::Error::Msg("refused".into());
 
         for _ in 0..prefill::TIER_REFUSALS_BEFORE_FAIL - 1 {
@@ -12149,7 +12742,11 @@ mod tests {
                 "a started prefill rides the next group while the run is short"
             );
         }
-        assert_eq!(scheduler.active_prefills.len(), 1, "started: never requeued");
+        assert_eq!(
+            scheduler.active_prefills.len(),
+            1,
+            "started: never requeued"
+        );
 
         scheduler.note_wave_placed();
         hold_creep(&mut scheduler, seq, 128);
@@ -12214,12 +12811,14 @@ mod tests {
         }
     }
 
-    /// **A spent lease is offered to the gate before it is parked.** With the
-    /// zone able to afford another lease's K/V, the turn keeps its slot and its
-    /// decode state, its lease is whole again, and nothing is parked — the
-    /// warm-tier round trip is for a gate that refuses.
+    /// **A spent lease is a ground claim, not a decision.** The turn keeps its
+    /// slot and its decode state and its lease comes back whole — the only
+    /// question the pass asks is whether the allocator can hand over the next
+    /// chunk. Re-judging a running decode here is what wedged 40/40 waves in
+    /// runs CB/CD, and parking one is what produced 4–8 parks per directory at
+    /// ~445 ms each, every one resumed within 40 ms.
     #[test]
-    fn a_spent_lease_renews_through_the_gate_instead_of_parking() {
+    fn a_spent_lease_renews_in_place_and_the_turn_keeps_decoding() {
         let (mut scheduler, _tx) = make_test_scheduler();
         let seq = SequenceId(scheduler.session.create_sequence().unwrap());
         let (event_tx, _rx) = crossbeam::channel::bounded(4);
@@ -12228,7 +12827,7 @@ mod tests {
         state.lease_expired = true;
         scheduler.active_decodes.insert(seq, state);
 
-        scheduler.park_expired_leases();
+        scheduler.renew_expired_leases();
 
         let renewed = scheduler
             .active_decodes
@@ -12236,13 +12835,16 @@ mod tests {
             .expect("the turn stays active on its slot");
         assert!(!renewed.lease_expired, "the lease is whole again");
         assert_eq!(renewed.lease_left, Scheduler::DECODE_LEASE_TOKENS);
-        assert!(scheduler.parked.is_empty(), "nothing went to the warm tier");
+        assert!(
+            !renewed.finished,
+            "a renewed turn keeps decoding — it is not sealed short"
+        );
     }
 
     /// A turn whose lease has not run out is not the pass's business, and a
     /// finished one is the drain's.
     #[test]
-    fn only_a_spent_unfinished_lease_is_renewed_or_parked() {
+    fn only_a_spent_unfinished_lease_is_renewed() {
         let (mut scheduler, _tx) = make_test_scheduler();
         let live = SequenceId(scheduler.session.create_sequence().unwrap());
         let done = SequenceId(scheduler.session.create_sequence().unwrap());
@@ -12256,11 +12858,13 @@ mod tests {
         finished.finished = true;
         scheduler.active_decodes.insert(done, finished);
 
-        scheduler.park_expired_leases();
+        scheduler.renew_expired_leases();
 
         assert_eq!(scheduler.active_decodes[&live].lease_left, 3, "untouched");
-        assert!(scheduler.active_decodes[&done].lease_expired, "left for the drain");
-        assert!(scheduler.parked.is_empty());
+        assert!(
+            scheduler.active_decodes[&done].lease_expired,
+            "left for the drain"
+        );
     }
 
     /// **A scratch slot bound to a timeline stays at zeros at admission.**
@@ -12295,6 +12899,57 @@ mod tests {
         probe.ensure(slot.0, 0);
         assert_eq!(probe.get(slot.0), Some(ZERO_STATE));
         assert!(!probe.is_seeded(slot.0));
+    }
+
+    /// **A demoted slot hands back its recurrent store, which is the larger
+    /// half of what it holds.**
+    ///
+    /// The pass truncates the slot's block table to zero and drops the
+    /// substrate's hot copies; the store it left standing is 160 MiB against a
+    /// whole turn's K/V in the tens. Run 36 measured the consequence directly:
+    /// seven idle slots held 1,120 MiB of stores unchanged for thirteen
+    /// minutes while prefill admission was refused 384 times at the weight
+    /// floor, short by 81 MiB, with nothing else in the census evictable.
+    #[test]
+    fn a_demoted_idle_slot_gives_back_its_recurrent_store() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = sched
+            .create_sequence(crate::projection::Conversation::new(), None)
+            .expect("slot");
+        assert!(sched.claim_recurrent(slot.0));
+        probe.ensure(slot.0, 0);
+        assert!(
+            sched.model.recurrent_resident(slot.0),
+            "the slot holds a store to give back"
+        );
+
+        assert_eq!(sched.demote_idle_slots(), 1, "nothing is touching the slot");
+        assert!(
+            !sched.model.recurrent_resident(slot.0),
+            "and the store goes back with the blocks"
+        );
+        assert_eq!(probe.get(slot.0), None);
+    }
+
+    /// **The pass takes a store only from a slot it actually demoted.** A slot
+    /// the engine is working on keeps everything, so the release cannot cut a
+    /// live turn's state out from under it.
+    #[test]
+    fn a_busy_slot_keeps_its_recurrent_store() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = sched
+            .create_sequence(crate::projection::Conversation::new(), None)
+            .expect("slot");
+        assert!(sched.claim_recurrent(slot.0));
+        probe.ensure(slot.0, 0);
+        sched.pending_reprojections.push(slot);
+
+        assert_eq!(sched.demote_idle_slots(), 0, "the slot is busy");
+        assert!(
+            sched.model.recurrent_resident(slot.0),
+            "so its store stands"
+        );
+        assert_eq!(probe.get(slot.0), Some(ZERO_STATE));
     }
 
     /// **T7.3 — a snapshot newer than the recovered history is rejected.**

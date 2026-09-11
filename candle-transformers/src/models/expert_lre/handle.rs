@@ -886,6 +886,8 @@ impl ExpertCache {
                 // addresses move, so the device tables cannot be captured and
                 // every layer reads its routing back to schedule uploads.
                 s.device_dispatch = all_resident;
+                s.moe_layers = num_moe_layers;
+                s.slot_bytes = slot_bytes;
             }
         }
 

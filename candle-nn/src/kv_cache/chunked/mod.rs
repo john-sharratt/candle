@@ -63,6 +63,13 @@ pub mod migrate;
 pub mod migrate_flight;
 #[cfg(feature = "cuda")]
 pub(crate) mod region_pool;
+/// Owner-down chunk relocation: the transform that actually moves bytes.
+#[cfg(feature = "cuda")]
+pub mod relocate;
+/// Which arenas a relocation pass should empty. Pure arithmetic over the arena
+/// census, and outside the `cuda` gate for the reason the span geometry is: the
+/// policy's defects are trajectory defects, provable with no device in reach.
+pub mod relocate_plan;
 #[cfg(feature = "cuda")]
 pub(crate) mod reservation;
 pub mod sampled_selection;
@@ -92,7 +99,9 @@ mod tests;
 
 // Re-export public types
 pub use backing::ChunkedKvBacking;
-pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
+pub use backing::{
+    global_arena_gpu_bytes, global_arena_map, global_arena_memory_report, global_print_arena_table,
+};
 pub use backing::{is_device_oom, is_tier_refusal, KV_DEVICE_OOM_MARKER, TIER_REFUSAL_MARKER};
 pub use chunk_ops::BlockAllocSpec;
 pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
@@ -109,10 +118,13 @@ pub use compression_policy::{
     QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS,
 };
-pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
+pub use gid_pool::{ArenaOccupancy, ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
 pub use migrate_flight::{migrate_flight, migrate_in_flight, MigrateFlight};
+#[cfg(feature = "cuda")]
+pub use relocate::RelocationOutcome;
+pub use relocate_plan::{plan_class as plan_relocation_class, RelocationPlan, MIN_RELOCATION_GAIN};
 pub use size_class::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
     payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,

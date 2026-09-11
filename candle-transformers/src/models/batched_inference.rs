@@ -1820,6 +1820,17 @@ impl BatchedInferenceSession {
         self.backings.first().map(|b| b.gpu_arena_class_stats())
     }
 
+    /// Per-arena occupancy across every GPU size class — the fragmentation map.
+    ///
+    /// One layer's backing, like the class stats above: every layer shares the
+    /// one gid pool, so each reports the same arenas.
+    pub fn kv_gpu_arena_map(&self) -> Vec<candle_nn::kv_cache::ArenaOccupancy> {
+        self.backings
+            .first()
+            .map(|b| b.gpu_arena_map())
+            .unwrap_or_default()
+    }
+
     /// Create a view sequence that borrows KV blocks from a parent.
     ///
     /// Allocates a new sequence slot and populates it with Arc-shared refs to
@@ -3056,7 +3067,8 @@ impl BatchedInferenceSession {
                     .pop()
                     .ok_or_else(|| {
                         candle::Error::Msg(
-                            "sealed_to_cpu: the batched migrate answered nothing for a layer".into(),
+                            "sealed_to_cpu: the batched migrate answered nothing for a layer"
+                                .into(),
                         )
                     })
             })
@@ -3083,7 +3095,8 @@ impl BatchedInferenceSession {
                     .pop()
                     .ok_or_else(|| {
                         candle::Error::Msg(
-                            "sealed_to_gpu: the batched migrate answered nothing for a layer".into(),
+                            "sealed_to_gpu: the batched migrate answered nothing for a layer"
+                                .into(),
                         )
                     })
             })
