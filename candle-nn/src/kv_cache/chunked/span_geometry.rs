@@ -23,8 +23,38 @@
 
 use super::types::TARGET_ARENA_BYTES;
 
-/// One region of the reservation.
-const REGION_BYTES: usize = TARGET_ARENA_BYTES;
+/// One region of the reservation, and the unit every claim against it is
+/// rounded to.
+///
+/// Public and **not** behind `cuda`, like the rest of this module and for the
+/// same reason its header gives: a caller pricing what a claim will cost is
+/// doing arithmetic, and gating the quantum behind the backend strands that
+/// arithmetic on a GPU. `region_pool` re-exports it for the cuda-only callers
+/// that also need the pool itself.
+pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
+
+/// Regions held back from a wave's tier budget, for what moves between the
+/// wave's build and its placement: an arena the persistence thread creates in
+/// that window, and the rounding the placement applies.
+///
+/// Fixed. It used to double on every refusal and decay one region per fill, and
+/// that ratchet was a second loop on the same budget as the fill's purchase: at
+/// its 1 GiB cap the budget read zero and no prefill could join a wave for the
+/// sixty fills the decay took, and at its base the fill bought the least wave
+/// into the *gap* while the group former read the *budget*, so the least chunk
+/// never fit beside a decode and the prefills sat admitted and unstarted (run
+/// 11: seven decodes stepping, eight prefills waiting, `budget=141..190 MiB`
+/// against a 192 MiB least wave, for a minute). A refused wave is dropped and
+/// re-formed against the gap as it stands; the margin covers only the movers.
+///
+/// Here rather than in the scheduler because the scheduler is not the only
+/// composer: a driver with no admission stage sizes waves against the same gap
+/// and must hold back the same movers, and two definitions of one margin is how
+/// the two ends of a partition drift apart.
+pub const TIER_MARGIN_REGIONS: usize = 4;
+
+/// [`TIER_MARGIN_REGIONS`] in bytes.
+pub const TIER_MARGIN_BYTES: usize = TIER_MARGIN_REGIONS * REGION_BYTES;
 
 /// Regions `claim_region` can hand out: the free ones below the ceiling, plus
 /// the fresh ones the ceiling still leaves ahead of `next`.

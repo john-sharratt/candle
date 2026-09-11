@@ -89,11 +89,13 @@ use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::growth_policy::{kv_grow_step, GrowthPolicy, Occupancy, Refusal};
 use super::reservation::Reservation;
 use super::span_geometry::{blocked, ceiling_regions, claimable, tier_fits};
-use super::types::TARGET_ARENA_BYTES;
 use super::weight_zone::{INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE};
 
 /// One region of the KV side. Every size class carves its arenas at this size.
-pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
+///
+/// Defined in [`super::span_geometry`], which is not behind `cuda`, so a caller
+/// pricing a claim can reach the quantum without reaching the pool.
+pub use super::span_geometry::REGION_BYTES;
 
 /// The widest the wave transient tier can ever be — the old fixed reservation,
 /// kept only as the worst case the elastic middle must be able to *reach*.
@@ -2213,6 +2215,24 @@ pub fn set_least_tier_bytes(ordinal: usize, bytes: usize) {
     if let Some(pool) = map.get_mut(&ordinal) {
         pool.least_tier_bytes = bytes;
     }
+}
+
+/// The tier last published for `ordinal` — the ground the weight side's growth
+/// leaves standing, read back.
+///
+/// **Ground the weight side does not have.** The residency a rate model is
+/// taught from, or judges against, is the span less the live regions *and less
+/// this*; reading it as the flat `MIN_ELASTIC_RESERVE` tier term credits the
+/// weight side with room the tier has already taken.
+///
+/// `0` before the first fill publishes one, which reads as "no wave in flight"
+/// and leaves the constant binding.
+pub fn least_tier_bytes(ordinal: usize) -> usize {
+    pools()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&ordinal)
+        .map_or(0, |pool| pool.least_tier_bytes)
 }
 
 pub fn weight_capacity_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {

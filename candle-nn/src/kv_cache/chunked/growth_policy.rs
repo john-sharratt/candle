@@ -110,6 +110,43 @@ pub fn kv_grow_step(spare: usize, min_grant: usize) -> usize {
     (spare / 2).max(min_grant).min(spare)
 }
 
+/// Regions the KV side must buy from the weight side so that, after its
+/// `claims` regions of K/V and recurrent store are taken, `tier` regions still
+/// stand contiguous at the arena frontier — given the KV side holds `free`
+/// regions anywhere and `gap` of those lie between the frontier and the weight
+/// floor.
+///
+/// The mirror of [`kv_grow_step`]: that one answers what the weight side may
+/// take, this one what it must give back.
+///
+/// Claims recycle the free list lowest-first, so they spend the regions
+/// scattered below the frontier before they reach into the gap; the tier stands
+/// only in the gap, so what the claims eat of it has to be bought back. Buying
+/// moves the floor right, which adds to the gap and the free list at once.
+///
+/// The first shape of this — the larger of `claims + tier − free` and
+/// `tier − gap` — let an admission's own claims consume the gap it had just
+/// checked: run 5 admitted 42 sections, each measured the gap as sufficient,
+/// each then claimed its store from the top of the span, and the wave's tier
+/// found the gap three regions short with twelve regions free below it. No
+/// forward ran for the rest of the run.
+///
+/// **Both buyers reach this.** The scheduler's admission is one
+/// (`Scheduler::buy_kv_ground`); a driver that has no admission stage is the
+/// other, and the batched forward gate is exactly that. A harness that creates
+/// twenty recurrent stores without buying their ground finds the span full with
+/// the layer zone whole and 10.5 GiB it would have conceded on contact — which
+/// reads identically to a span that is genuinely out of room.
+///
+/// Pure, so the arithmetic is tested without a device.
+pub fn kv_ground_shortfall(claims: usize, tier: usize, free: usize, gap: usize) -> usize {
+    let scattered = free.saturating_sub(gap);
+    let gap_eaten = claims.saturating_sub(scattered);
+    claims
+        .saturating_sub(free)
+        .max(tier.saturating_add(gap_eaten).saturating_sub(gap))
+}
+
 /// What the pool measures for one negotiation.
 ///
 /// Gathered at phase 0, where the present is knowable exactly: the tier has been
@@ -290,6 +327,64 @@ impl GrowthPolicy {
             0 => Err(Refusal::Occupied),
             n => Ok(n),
         }
+    }
+}
+
+#[cfg(test)]
+mod ground_shortfall_tests {
+    use super::kv_ground_shortfall;
+
+    /// Enough free ground everywhere it is needed: nothing is bought. The
+    /// claims fit in the regions scattered below the frontier, so the gap is
+    /// untouched and already holds the tier.
+    #[test]
+    fn nothing_is_bought_when_the_claims_fit_below_the_gap_and_the_gap_holds_the_tier() {
+        assert_eq!(kv_ground_shortfall(10, 4, 20, 6), 0);
+        assert_eq!(
+            kv_ground_shortfall(0, 0, 0, 0),
+            0,
+            "a free admission buys nothing"
+        );
+    }
+
+    /// Claims past the whole free list: the difference is bought, and with no
+    /// tier to stand that is all.
+    #[test]
+    fn claims_past_the_free_list_buy_the_difference() {
+        assert_eq!(kv_ground_shortfall(10, 0, 7, 0), 3);
+    }
+
+    /// **The tier needs the gap, not the free list.** Plenty of free regions
+    /// scattered below the frontier do not place a tier; the gap decides.
+    #[test]
+    fn a_tier_wider_than_the_gap_is_bought_even_with_free_regions_elsewhere() {
+        assert_eq!(kv_ground_shortfall(4, 4, 40, 1), 3);
+    }
+
+    /// **Claims that reach into the gap are bought back for the tier.** Run 5:
+    /// each of 42 admissions saw a gap that held its tier, then claimed its
+    /// store from the top of the span and left the next wave's tier three
+    /// regions short with twelve regions free below it.
+    #[test]
+    fn claims_that_would_eat_the_gap_are_bought_back() {
+        // 5 free, 2 of them the gap: 10 claims spend the 3 scattered, then eat
+        // the gap, then need 5 more — and the tier of 6 must still stand after.
+        assert_eq!(kv_ground_shortfall(10, 6, 5, 2), 11);
+        // 3 claims fit in the 3 scattered: only the tier's own shortfall.
+        assert_eq!(kv_ground_shortfall(3, 6, 5, 2), 4);
+        // 4 claims take the 3 scattered and one of the gap's 2: the tier of 2
+        // needs that one back.
+        assert_eq!(kv_ground_shortfall(4, 2, 5, 2), 1);
+    }
+
+    /// **The batched forward gate's case**, which has no admission stage: the
+    /// KV side holds a 32-region zone whole, twenty recurrent stores want 158
+    /// regions, and a 550 MiB tier must still stand. Nothing here is
+    /// satisfiable from the free list, so the whole demand is a purchase — and
+    /// a driver that never makes it reads the refusal as a full span.
+    #[test]
+    fn a_driver_with_no_admission_buys_its_whole_demand() {
+        assert_eq!(kv_ground_shortfall(158, 35, 32, 32), 161);
     }
 }
 
