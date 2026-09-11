@@ -1109,11 +1109,16 @@ Two things worth keeping:
   It reads identically to a phase whose chain was never seeded. The
   `wave arenas:` line and the forbidden-allocation report answer different
   halves of the question and neither is sufficient alone.
-* **`WaveBuffer::AttnNorm`/`FfnNorm` are priced dense, not q8a128.** The two
-  encodings are alternatives fixed at session creation, and the plan has to
-  bound whichever runs. Pricing the smaller would under-size a float session's
-  span, and what gets squeezed out at the end of a phase is a buffer a *kernel
-  wrapper* allocates — which refuses rather than falling back to the pool.
+* **`WaveBuffer::AttnNorm`/`FfnNorm` are priced in the encoding the session
+  actually emits** — `ModelGeometry::packed_norm`, set from the int8 mode.
+  They were priced dense for both, on the reasoning that the two encodings are
+  alternatives fixed at session creation and the plan has to bound whichever
+  runs. True, but an upper bound is not a reservation: an int8 session's fused
+  norm emits q8a128, about 1.8× smaller, and charging the dense figure cost
+  1.8 MiB a phase on the 0.8B — the entire remaining gap in the FFN span once
+  its chain was right. The mode is a *fact* the geometry can carry, so it does,
+  and the plan prices what the session emits rather than the larger of what it
+  might.
 
 Still on the pool, deliberately: `l2_norm`'s `maximum(eps)` uploads its scalar
 per call (`softplus`'s became `relu`, which is the same function without the
@@ -1452,14 +1457,31 @@ dequantized GEMM there, cast the result back. Six buffers, 68.8 MB at this
 width, none of them declared — the whole gap between the planned span and the
 carved one, absorbed until now by the 16 MiB `REGION_BYTES` pad.
 
-`WaveBuffer::QkvProjOperand` and `QkvProjAccum` price it, mirroring what
-`GateGemm`/`UpGemm`/`DownGemm` already do for the FFN. They are **conditional
-on `ModelGeometry::projection_accum_roundtrip`**, because a packed session's
-projections consume the norm's q8a128 output and emit `act_dtype` directly —
-charging both unconditionally is a 95% over-bound on Qwen3-30B-A3B's attention
-span, against a chain whose census shows no upcast at all. Only this stack sets
-the flag, so no other model's reservation moves by a byte; the 30B's pinned
-union margin is unchanged at 17–19%.
+`WaveBuffer::QkvProjOperand` and `QkvProjAccum` priced it, mirroring what
+`GateGemm`/`UpGemm`/`DownGemm` do for the FFN, conditional on
+`ModelGeometry::projection_accum_roundtrip`.
+
+> **Superseded 2026-09-11 — the round trip is gone, and so is its pricing.**
+> `project_qkv` reaches the weights through `QMatMul::forward_dynamic`, whose
+> float arm (`dense_qmatmul_float`) converts the activation only for a dtype
+> outside `{F16, BF16, F32}` and otherwise stores at the activation's own
+> width; the int8 arm's MMA converts on the store out of registers. So neither
+> mode upcasts, and a fresh `KV_WAVE_CENSUS=labels` on the same checkpoint
+> shows three projection carves — 17,203,200 / 2,150,400 / 2,150,400 at 2100
+> rows — summing to exactly `qkv_cols × BF16`, which `QkvProjection` already
+> charged. No F32 carve appears anywhere in the generation.
+>
+> The four declarations therefore priced 90.2 MiB of a 219.9 MiB attention span
+> for buffers nothing allocates, and have been removed. **What the original
+> census had actually caught was a DeltaNet layer** — a different layer kind
+> sharing the same arena, whose mixer really does keep `S` in F32 and whose
+> `forward_live_as` float arm really does upcast its operand. It is priced
+> there now, at its own widths, as `Chain::DeltaNet`.
+>
+> The lesson is the one this document keeps re-learning: a charge whose *size*
+> is right and whose *reason* is wrong survives every change that should have
+> corrected it. See `docs/wave_feeder.md` §4.11.12, where it happened twice
+> more.
 
 Two instruments were sharpened in the process, both permanent:
 `wave_census`'s `ALLOCATOR_FRAMES` now skips `CudaStorage`, which was
@@ -1876,12 +1898,16 @@ chain carried five allocation classes the plan never priced — the gate half
 of the QKV projection (`qkv_cols` didn't know `[q|gate]`), the two
 partial-rotary permute gathers, the gate split/sigmoid/apply, and
 `o_proj`'s float-session round trip. `ModelGeometry` gained `gated_qkv` +
-`partial_rotary`; eight `WaveBuffer` variants price them conditionally
-(~216 MB at the failing width), pinned byte-for-byte against the census in
-`the_projection_round_trip_prices_the_measured_carves`. The census also
-corrected the fixture geometry: the 0.8B attends with **8** Q heads — the
-old 16-ungated fixture priced the same `qkv_cols` by accident and hid the
-gate's whole chain.
+`partial_rotary`; `WaveBuffer` variants price them conditionally (~216 MB at
+the failing width), pinned byte-for-byte against the census in
+`the_gated_chain_prices_the_measured_carves`. The census also corrected the
+fixture geometry: the 0.8B attends with **8** Q heads — the old 16-ungated
+fixture priced the same `qkv_cols` by accident and hid the gate's whole chain.
+
+> **Amended 2026-09-11.** The four round-trip variants among those eight were
+> removed — see the superseding note in §7.14. `partial_rotary` is no longer
+> asserted either: it is derived from `rope_dim < attn_head_dim`, which
+> reproduces the value it replaced on every checkpoint in the lineage.
 
 **Ladder result (0.8B, identity `QWEN35_0_8B_KV_FACTORS`):** F16/BF16/Q8_0 and
 C0–C9 all pass 100% at 100% quantized KV — compression 1.94× (C0) to 4.64×

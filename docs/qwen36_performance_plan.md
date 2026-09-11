@@ -113,25 +113,49 @@ the likely term; measure a per-step layer profile (a MoE-capable
 `profile_layers` — the dense helper exists in `quantized_qwen35.rs`) before
 attacking. Lower priority: T1/T4/T6 likely move this too.
 
-## T8 — Price the wave-plan norms by session encoding (batch with a re-derivation)
+## T8 — Price the wave-plan norms by session encoding — **DONE 2026-09-11**
 
-**Evidence.** `WaveBuffer::AttnNorm`/`FfnNorm` price dense for every session
+**Evidence.** `WaveBuffer::AttnNorm`/`FfnNorm` priced dense for every session
 even though an int8 session's norm output is q8a128 — a deliberate,
 documented over-bound ("the two encodings are alternatives and the plan has
 to bound both"), worth 1,792 B/row ≈ 3 points of the attention union margin,
 which directly narrows admissible wave width on the production int8 mode.
 
-**Attack.** Thread the encoding into `ModelGeometry` (an
-`int8_projections` flag = `is_int8 && hidden % 128 == 0 && hidden ≤ 8192`,
-set by each model's `wave_geometry` — the same pattern as
-`projection_accum_roundtrip`/`gated_qkv`), price q8 when set, re-pin the
-margin tests.
+**What landed.** `ModelGeometry::packed_norm`, set from the session's
+`Int8Mode` by each model's `wave_geometry` — simpler than the proposed
+`int8_projections` predicate, because the q8a128 packing is the *norm
+epilogue's* choice and follows the mode alone. All three norms
+(`AttnNorm`, `FfnNorm`, `DenseFfnNorm`) route through one `norm()` helper.
+The attention union margin moved 17.9% → 14.8%, exactly the 3.1 points this
+item predicted.
 
-**Sequencing constraint — do NOT land this alone:** changing transient
-pricing changes admitted wave widths, which changes accumulation order and
-moves every marginal KV-factor calibration session (measured when the
-VRAM-governor fix did exactly this). Land it in the same change set as the
-next factor re-derivation, never between derivations.
+**The remaining 14.8% then went to zero as well**, by the change this item's
+own text said could not do it: *"that one is not closable by passing more
+context"* was true of the norm and false of the rest, which was the decode
+chain's buffers charged at the whole wave's width. `WaveWidth` passes the
+prefill/decode split, so each chain is sized by its own group's rows and a
+pure-prefill wave prices the prefill chain **exactly**. The margin test became
+an equality (`each_group_pays_for_its_own_chain_and_not_the_others`); there is
+no band left to pin.
+
+It landed as one step of the wider tier-exactness work, which took the 0.8B's
+reserved-but-unused tier from 251.0 MiB to **0**. See `docs/wave_feeder.md`
+§4.11.12.
+
+> ⚠️ **The sequencing constraint below was NOT met.** It said: *"do NOT land
+> this alone: changing transient pricing changes admitted wave widths, which
+> changes accumulation order and moves every marginal KV-factor calibration
+> session (measured when the VRAM-governor fix did exactly this). Land it in
+> the same change set as the next factor re-derivation, never between
+> derivations."*
+>
+> This landed between derivations, and not alone but alongside *seven other*
+> changes to transient pricing — a strictly larger perturbation than the one
+> the constraint was written about. **Every marginal KV-factor calibration is
+> therefore suspect**, C10 on the 0.8B first (it was already failing 4/5
+> sessions at 5.14×, i.e. exactly at the edge this moves). Re-derive before
+> trusting any marginal rung; the identity rungs and the C0–C9 ladder are not
+> at risk, only the calibration sitting on the boundary.
 
 ## Tooling debt discovered while measuring
 

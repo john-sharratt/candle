@@ -185,6 +185,14 @@ fragmentation and no compaction.
 phase spans plus a first wave's KV, so a change to the wave tier moves the floor
 with it.
 
+> **It is the floor's *guarantee*, not any wave's reservation** — two roles the
+> same constant used to serve and no longer does. A wave's tier is computed
+> from its own width (`WavePlan::tier_bytes`, `docs/wave_feeder.md` §4.11.12)
+> and is routinely larger than the 912 MiB of phase spans this constant
+> carries. What E4 asserts is only that the weight side may never cross the
+> position; it says nothing about how much tier a given wave takes, and a
+> reading that conflates the two will size a wave from a constant again.
+
 **E5 — Expert and dense zones answer the same broker.** A model is one or the
 other; both must satisfy §B identically.
 

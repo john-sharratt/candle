@@ -685,17 +685,27 @@ weight zone is not consulted for decodes.
 that never starts new work makes no progress once the decodes drain — and every
 one after it is admitted only while the real weight zone stands above the hold
 point. Each prefill also claims its recurrent state, and **the co-batched wave is
-bounded in tokens**: `prefill_width_cap(act_dtype, head_rows)` now takes the
-rows already in the wave (decodes, and their verify blocks at `1 + draft` rows
-each) and returns what the tier has left; the fill subtracts the prefills already
+bounded in tokens**: `prefill_width_cap(act_dtype, head, tier_budget)` takes the
+wave already in flight — as a `WaveWidth`, not a row count, because its decode
+rows price the decode chain and its scored rows price the head, and neither is
+something the prefill's own rows could stand in for — and returns the prefill
+rows the tier has left *beside* it. The fill subtracts the prefills already
 in flight and refuses a prefill that would exceed it, unless it is the only one
 (a lone oversized prefill still travels, as in the slab packer). A refusal here
 is a quiet `false`, never a wave-time fault. The tier budget the cap prices
 against is the **measured gap** between the arena frontier and the weight floor
-less a four-region margin, never below the 912 MiB guarantee — the guarantee
-alone prices to ~1,000 tokens on this geometry (run R sliced two-sequence
-calibration waves into two forwards on it), where the gap is several GiB and is
-what the placement actually measures against. The fill's claims are already in
+less a four-region margin.
+
+> **Not floored at the 912 MiB guarantee** — this said it was, and the flooring
+> is exactly the defect recorded later in this section. The guarantee is what
+> `MIN_ELASTIC_RESERVE` keeps the weight *floor* from taking; it is not ground
+> the placement can use while live arenas stand inside it. A caller that
+> measured the gap at 150 MiB was handed ~1,000 rows by the floor, and the same
+> wave was refused 1,641 times, re-formed to the same width every time. A budget
+> that holds nothing prices to one row, and the placement is the judge of that
+> row.
+
+The fill's claims are already in
 the frontier the gap reads, and the growth policy withholds the last tier's
 ground from the weight side, so the margin only has to cover an arena the
 compressor creates between forwards.
@@ -729,9 +739,29 @@ calibration — a phase with no decodes at all — ran with the zone 2% under th
 mark and the prefill side at one a wave (135 of 200 fills). Now
 `reseed_achievable_weight` runs at entry and whenever the engine falls idle,
 when everything resident is by definition permanent, and computes
-`span − live_kv − MIN_ELASTIC_RESERVE` rather than reading the zone, which lags
+`span − live_kv − reserve` rather than reading the zone, which lags
 because the boundary only grows back between forwards. `HOLD` is 0.70 of that:
 a wave's own working set is 1–2 GiB and four fifths left no room for it.
+
+> **The reserve is no longer `MIN_ELASTIC_RESERVE` flat (2026-09-11).** That
+> constant carries a *912 MiB* tier term (`WAVE_SPAN_BYTES`), so the residency
+> figure every admission's rate trade is judged against modelled the tier as
+> fixed whatever the wave's width — while measured tiers reach gigabytes. The
+> model was shown room the published tier had already taken, kept admitting,
+> and the zone collapsed under it.
+>
+> `interleave::reserve_for(standing_tier)` now adds the **excess** over that
+> 912 MiB and nothing more, so a wave inside the guarantee reads exactly as it
+> always did and the figure only ever tightens. The `standing_tier` is the wave
+> already committed — its decodes and its held creep — deliberately **not** the
+> previous wave's published tier, which would make the bound its own decision's
+> output and close the loop `WaveFill::budget` warns about: a bound taken from
+> the standing gap has one fixed point, the narrowest wave that works. The tier each
+> *new* admission adds is charged separately, as `admit::Cost::dislodged_bytes`;
+> between them they cover the wave's tier exactly once.
+>
+> The idle reseed itself still passes `0` — at idle there is no wave, and the
+> constant is the right reserve.
 
 **Run T (2026-09-04) found three more things, each fixed in place.**
 (1) *The burst.* All 96 workers passed the gate in the first second of the
@@ -1574,7 +1604,7 @@ now price themselves for their own rows before opening: the draft loop
 (`draft_cohort`, `n` rows a step, after every arena it may create) and the
 verify replay (`replay_accepted_prefixes`, the stash rows it stages).
 
-### 4.11.7 KV arena reclamation, and why the first design could not be made safe
+### 4.11.11 KV arena reclamation, and why the first design could not be made safe
 
 Two defects, found together because the second was hiding behind the first.
 
@@ -1639,6 +1669,174 @@ while the weight side made **574 concessions totalling 105,746 MiB and evicted
 again, measured from the other side: the per-sequence store price is what bounds
 wave width, and no allocator or reclamation change reaches it.
 
+### 4.11.12 The tier reserves exactly what it spends (2026-09-11)
+
+The transient tier was reserved from estimates. On Qwen3.5-0.8B it took
+**251.0 MiB it never touched** — ground the weight side conceded for nothing,
+and the reason the floor's guarantee failed one width later.
+
+It is now exact. `quantized_qwen35::tests::tier_is_reserved_for_exactly_what_it_uses`
+asserts zero slack in every phase and fails the run otherwise:
+
+```
+phase          reserved    peak used        slack
+attention      84.3 MiB     84.3 MiB      0.0 MiB
+ffn            59.7 MiB     59.7 MiB      0.0 MiB
+forward         1.9 MiB      1.9 MiB      0.0 MiB
+```
+
+**Every step was deleting a guess, not tuning one.**
+
+| removed | slack left |
+|---|---|
+| `+ REGION_BYTES` pad at the four placement sites — alignment was already charged per buffer | 219.0 |
+| `projection_accum_roundtrip` — an F32 round trip no dtype takes (§7.15 of the lineage doc) | 128.8 |
+| `priced_intermediate`'s `.max(conv_dim())` — the DeltaNet width, in the FFN phase | 82.0 |
+| the dense-FFN chain declared — a dense model was priced as a MoE one | 51.0 |
+| `packed_norm` — norms priced in the session's real encoding | 47.4 |
+| `fused_qkv` / `head_qk_norm` / `head_norm_reshapes` — three real dispatch forks | 22.8 |
+| `WaveWidth` — the plan given the wave's real width | **0.0** |
+
+**The structural rule.** A phase can be opened by more than one `Chain`, and
+they combine two different ways:
+
+* **Two kinds of layer are a `max`.** A hybrid's layer has an attention mixer or
+  a DeltaNet one; a layer's FFN dispatches to the expert pipeline or to a dense
+  MLP. A generation is one layer's phase, so the span is sized by the larger.
+  Summing them prices a wave for a layer that does not exist.
+* **Two groups of one kind are a `sum`, each at its own width.** One attention
+  generation holds the decode group's buffers and the prefill group's at once —
+  but each sized by *its* group's rows, which one row count cannot say.
+
+**`WaveWidth` carries the three units a wave actually has**: `prefill_rows`,
+`decode_rows`, and `scored_rows`. The third is the head's, and it is neither of
+the others — the head scores every decode row, the last token of each prefill
+sequence, and *all* rows of a verifying span. `qwen35::forward::wave_width`
+states that rule once and the head `debug_assert`s its own selection against it,
+because the two sites are a thousand lines apart.
+
+**A latent ceiling, not just slack.** `WAVE_FORWARD_BYTES` is 16 MiB and the
+forward phase costs ~498 KB per scored row (vocab × act dtype, plus the packed
+head norm). That covers **33 sequences**; this engine composes 64. Past 33 the
+span exhausts *after every layer has launched* — a refusal with nothing in it
+naming the head. Pinned in
+`the_forward_phase_prices_its_measured_generation_and_outgrows_the_old_constant`.
+
+**Proving it needed a better instrument.** The first assertion compared
+`max(plan)` against `max(peak)` — both process-lifetime maxima, and on this run
+both from the same 2100-row prefill. A four-row decode wave priced at ten times
+what it used sits under it on both sides and never appears. `wave_max_slack`
+pairs each forward's own plan with its own peak, so the test now says *every*
+forward was exact rather than that the widest one was.
+
+**The trap this keeps setting.** Twice now, a charge whose *size* was right and
+whose *reason* was wrong survived every change that should have corrected it:
+the F32 round trip was covering the DeltaNet chain, and `FfnResidualCast` — an
+`to_dtype_mut`, which is in-place and allocates nothing — was covering the
+threaded pipeline's combine target. Both were found by removing the wrong reason
+and watching a *different* assertion fail. When a buffer's justification does not
+survive reading the code, re-derive the number; do not keep it because the total
+looks right.
+
+**And admission was not charging it at all.** Pricing the tier exactly is worth
+nothing if the thing that decides wave width never sees it. Two defects, one
+audit:
+
+* **The rate model was blind to an offer's tier.** It judged every offer on
+  `before − Cost::claimed_bytes()`, and `claimed_bytes` excludes `activations`
+  because the tier "makes no region live". True of the allocator's *claim*;
+  false of what the weight side *loses*. The fill publishes the tier and
+  `RegionPool::spare` then bounds growth by "the gap above the live watermark
+  less the slack **and the least forward's tier**" — so a wave that widens holds
+  that ground wave after wave. The one model whose job is *"do these rows earn
+  back the weights they dislodge"* saw the rows and the K/V and not the tier,
+  while `Cost::total()` — which always included it — was consulted only for the
+  first-decode warm-cache rule. Two judges of one admission, disagreeing about
+  its cost. `Cost::dislodged_bytes()` = claim + tier is what the rate model is
+  judged on now; `claimed_bytes` is unchanged, because the *purchase* really is
+  region-granular and tier-free.
+* **The residency figure itself was a constant.** `resident_weights()` →
+  `effective_weight_zone_bytes()` subtracted `MIN_ELASTIC_RESERVE` flat — and
+  that constant carries a 912 MiB tier term. So every rate trade was judged
+  against a residency computed as though the tier were fixed, whatever the
+  wave's width, while measured tiers reach gigabytes (§4.11.2's 6.3 GiB). The
+  model was shown room the tier had already taken. See the note on the hold
+  point in §4.11.4 for the fix, and for why the *standing* tier — not the
+  previously published one — is what it reads.
+
+Neither is validated on a live ingest yet. Both only ever *tighten* admission,
+which is the safe direction for a failure mode that has always been the weight
+zone collapsing, but the effect on directories/minute is unmeasured.
+
+**What is still a constant, deliberately.** `MIN_ELASTIC_RESERVE` is the floor's
+*guarantee* — the position the weight side may never cross — which is a
+different quantity from a wave's reservation, and the one role it keeps.
+
+**Known consequence.** Changing transient pricing changes admitted wave widths,
+which changes accumulation order. `docs/qwen36_performance_plan.md` T8 carried
+an explicit constraint against landing that alone, between KV-factor
+derivations; this landed between derivations and alongside seven sibling
+changes. Marginal KV-factor calibrations are suspect until re-derived — C10 on
+the 0.8B first.
+
+### 4.11.13 The eleven lines between pricing a tier and owning it (2026-09-11)
+
+§4.11.10's fix is *"a plan is cleared with the tier it priced"* — `end_wave_transient`
+and `enter_arena_window` set `planned = None` when they release, so no guard can
+inherit another forward's plan. That is right. Its window was too wide.
+
+A forward prices and **places** its tier (`plan_wave_transient`), then opens its
+claim on the partition (`begin_forward`). Between those two calls sits about a
+dozen lines, and in them the tier is real and `planned` describes it while
+*neither* flag `enter_arena_window` consults — `forward_open`, `live_generations`
+— is set. A sealing pass arriving there did exactly what it is built to do:
+took the tier as idle ground, released it, and cleared the plan with it.
+
+The forward's first `begin_wave` then found no plan and reserved `fallback_plan`
+— 384 + 512 + 16 MiB of fixed constants. Every symptom followed from that one
+substitution:
+
+```text
+wave transient tier needs 956301312 B below the weight floor and is 45 regions
+into ground live KV arenas hold … gap_mib=318 least_mib=32 requeued=10
+```
+
+`least_mib=32` against a 912 MiB request is the signature, and 956,301,312 B is
+`WAVE_SPAN_BYTES` to the byte. Measured on a live Qwen3.6-35B ingest: three lost
+post-decode prefills and, once the span filled, waves dropped and requeued on the
+main fill — six fallback placements in eighteen minutes.
+
+It is intermittent by construction (it needs another thread inside a dozen lines)
+and **no batched gate can reach it**, because the gates have no persistence
+thread. That is why it survived §4.11.12's exactness work: the tier was exact on
+every forward that priced itself, and this is a forward whose pricing was thrown
+away.
+
+**The design as built.** `reserved_by_forward` cannot answer "has this forward
+started?" — it stays set after the forward ends, which is precisely when handing
+the tier back is correct and is pinned by
+`an_idle_tier_does_not_block_an_arena_window`. So the narrower question gets its
+own bit, `WaveDomain::awaiting_forward`: set when `plan_wave_transient` places,
+and cleared the moment the forward actually starts — by `begin_forward`, by
+`begin_wave` (the drafter and the verify replay price their own tier and go
+straight to a guard, never opening a forward), and by `ForwardOpen::drop` and
+`end_wave_transient` so a forward that dies between pricing and opening cannot
+wedge arena creation for the life of the process. `enter_arena_window` refuses
+while it is set, *retryably* (`KV_ARENA_MID_WAVE`) — the caller is the same
+sealing pass as the mid-wave case and the window closes within a few lines.
+
+Pinned by `a_tier_priced_for_a_forward_that_has_not_opened_is_not_handed_back`,
+which reproduces the production order — price, stop before `begin_forward`, have
+a second thread try the window — and asserts both the retryable refusal and that
+`planned` survives. The surviving plan is the property that matters; the refusal
+is only how it is kept.
+
+**The general lesson, and it is the one §4.11.12 is about.** A constant kept "as
+the worst case" is not inert. `fallback_plan` was documented as covering *"tests,
+the migration helpers"*, and a production forward reached it through a race —
+where it did not merely waste 912 MiB, it refused the wave outright. A fallback
+that no correct path should reach wants an assertion, not a plausible number.
+
 ## 5. Plan
 
 | phase | deliverable | gate | status |
@@ -1656,7 +1854,7 @@ wave width, and no allocator or reclamation change reaches it.
 | 11 | throttle at admission on the store price | weight zone holds while the queue stays fat | ❌ §4.10 — the queue already holds the stores |
 | 12 | park idle recurrent stores to host RAM; claim on admission | stores track in-flight width, not backlog | ✅ §4.11 — 5,120 → 640 MiB, span refusals 140 → 0 |
 | 13 | decode-first fill, decodes gated by the real allocators only | no fill stops at one decode while decodes are eligible | ✅ §4.11.1, §4.11.4 |
-| 14 | bound the co-batched wave in tokens through `prefill_width_cap(dtype, head_rows)` | no tier refusal on a wave the fill composed | ✅ §4.11.2 |
+| 14 | bound the co-batched wave in tokens through `prefill_width_cap(dtype, head, tier_budget)` | no tier refusal on a wave the fill composed | ✅ §4.11.2 |
 | 15 | producer paces on `decode_starved` + backlog; controller, estimate and wait cap deleted | open conversations never exceed what the engine steps | ✅ §4.11.3, §4.11.4 |
 | 16 | demote a live idle sequence's block table to warm; re-elevate on admission | idle ingest K/V leaves the device | open — §4.11.5 |
 | 17 | chunked dialogue prefill: a wave carries `[offset, offset+advance)` of a turn, priced per chunk | no turn fails as too wide; long turns ingest beside decodes | ✅ built — §4.11.4 run AH |
@@ -1671,8 +1869,11 @@ wave width, and no allocator or reclamation change reaches it.
 | 26 | relief does not concede; KV pressure does not close admission; `room` counts running prefills only | KV side grows by claims, never bought by the setpoint | ✅ §4.11.4 runs AZ–BC |
 | 27 | per-model, per-card rows for ceiling / knee / floor, derived from the gate on each machine | the same code runs the 3090 and the PRO 5000 without retuning | open — §4.11.4 last paragraph |
 | 28 | delete the byte-budget admission path, the AIMD budget and the wave trace built to fit them | one admission path, on every machine; nothing computed that nothing reads | ✅ §4.11.6 |
-| 29 | KV arena reclamation that cannot corrupt: relocation driven from the owner, not the arena | a full-corpus ingest with relocation active and zero corrupted generations | ✅ §4.11.7 — run 60, 352 dirs, 0 |
-| 30 | stop the arena count growing: a run that finds no tail reuses recycled slots before stamping a new arena | class 8192 occupancy stays high under ingest instead of collapsing | ✅ §4.11.7 — 6.3% → 84.7% |
+| 29 | KV arena reclamation that cannot corrupt: relocation driven from the owner, not the arena | a full-corpus ingest with relocation active and zero corrupted generations | ✅ §4.11.11 — run 60, 352 dirs, 0 |
+| 30 | stop the arena count growing: a run that finds no tail reuses recycled slots before stamping a new arena | class 8192 occupancy stays high under ingest instead of collapsing | ✅ §4.11.11 — 6.3% → 84.7% |
+| 31 | the tier reserves what it spends: every phase priced from the wave's own width, no constants and no pads | zero reserved-and-unused bytes, on **every** forward and not just the widest | ✅ §4.11.12 — 0.8B 251.0 MiB → 0 |
+| 32 | admission charges an offer's tier: the rate model judges the claim **and** the tier it dislodges | the two judges of one admission agree about its cost | ✅ §4.11.12 — `Cost::dislodged_bytes` |
+| 33 | the residency identity's reserve follows the standing tier instead of a 1,296 MiB constant | the rate model is not shown weight ground the tier has already taken | ✅ §4.11.12 — `interleave::reserve_for`; **unvalidated on a live ingest** |
 
 Phase 8 was planned as a *reclamation* term. There is nothing to reclaim, so the
 missing term is the one §4.6.3 names: how many regions each additional concurrent
