@@ -53,7 +53,7 @@ use crate::models::wave_buffers::wave_empty;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::{plan_wave_transient, WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES};
+use candle_nn::kv_cache::{plan_wave_transient, WavePlan, WaveWidth};
 use candle_nn::kv_cache::ModelGeometry;
 
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
@@ -375,16 +375,37 @@ pub fn replay_accepted_prefixes(
     // forward's rows. See `WaveDomain::planned`.
     #[cfg(feature = "cuda")]
     if let (Device::Cuda(d), Some(first)) = (device, stash.layers.first()) {
-        let rows: usize = short.iter().map(|(span, _, _)| span.len).sum();
+        // **The stash's capacity, not the rows being replayed.** `stage_on_wave`
+        // stages `SpanOperands` whole — they are `[cap, ·]` buffers the sequence
+        // owns across waves — so the staged copy is `cap` rows however few of
+        // them this accept actually re-runs. Summing the accepted spans priced
+        // 10 rows against 20 staged on the 27B, and the very first carve
+        // overran.
+        let rows = first.qkv.dim(0)?;
         let plan = WavePlan::new(geometry(first.qkv.dtype()));
-        let pad = |b: usize| b + REGION_BYTES;
+        // **A replay is priced as a replay, not as a wave.**
+        //
+        // It re-runs the mixer to advance the recurrent state to the accepted
+        // prefix, and it recomputes no logits — those were produced by the
+        // verify wave. So it opens no attention chain, no FFN and no head, and
+        // pricing it with `prefill_rows` charged it for all three: on the 9B
+        // that was 1.5 MiB of attention and 3.5 MiB of FFN over what the
+        // forward actually carved.
+        //
+        // What it *does* carve is the four operands `stage_on_wave` copies onto
+        // the wave, plus the two span tables built beside them — and those were
+        // declared nowhere. They fit underneath the over-charge on the 9B and
+        // did not on the 27B, where the replay exhausted the span mid-flight.
+        // `WaveWidth::replay` prices exactly them.
+        let width = WaveWidth::replay(rows, short.len());
         plan_wave_transient(
             &d.cuda_stream(),
             [
-                pad(plan.phase_bytes(LayerPhase::Attention, rows)),
-                pad(plan.phase_bytes(LayerPhase::Ffn, rows)),
-                WAVE_FORWARD_BYTES,
+                plan.phase_bytes(LayerPhase::Attention, width),
+                plan.phase_bytes(LayerPhase::Ffn, width),
+                plan.phase_bytes(LayerPhase::Forward, width),
             ],
+            width,
         )?;
     }
 

@@ -661,22 +661,23 @@ impl HybridBatched {
             .unwrap_or(0)
     }
 
-    /// What one sequence's state costs — the widest store standing, or zero
-    /// when none is.
+    /// What one sequence's state costs, whether or not one is standing.
     ///
-    /// Every store has the same geometry, so any of them answers for all; the
-    /// widest is taken because a store that has released its write buffers
-    /// (`release_backups`, after sitting out enough waves) reports the read
-    /// half only, and admission is pricing a store that will need both.
+    /// **Priced from the geometry, never from residency.** Every store this
+    /// model builds has the same shape, so the config answers for all of them —
+    /// and it answers at the one moment residency cannot, which is the moment
+    /// admission actually asks. The map is empty before the session's first
+    /// sequence and again after a turn seal evicts every store
+    /// (`evict_recurrent`), and a max over an empty map is zero: a 126 MiB
+    /// claim priced as free, for exactly the sequences whose claims are about
+    /// to arrive on the wave path where the weight floor may not move.
     ///
-    /// Zero before the first store exists is not a gap: with nothing resident
-    /// the engine has nothing active, and admission at that point is
-    /// unconditional by design — see `admit::gate::may_admit`.
+    /// Both halves, because `reserved_bytes_for` counts both. A live store that
+    /// has released its write buffers (`release_backups`, after sitting out
+    /// enough waves) holds only the read half, but it takes the other back on
+    /// its next wave — so the settled cost is what admission must reserve.
     pub fn recurrent_store_bytes(&self) -> usize {
-        self.recurrent
-            .lock()
-            .map(|m| m.values().map(|s| s.reserved_bytes()).max().unwrap_or(0))
-            .unwrap_or(0)
+        RecurrentStateStore::reserved_bytes_for(&self.model.cfg.layer_kinds, &self.model.cfg.delta_net)
     }
 
     /// The turn loop carves a child slot per turn and decodes on it, borrowing
@@ -1407,7 +1408,7 @@ impl HybridBatched {
     }
 
     pub fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
-        wave_geometry(&self.model.cfg, act_dtype)
+        wave_geometry(&self.model.cfg, act_dtype, self.int8mode())
     }
 
     /// Re-materialise every norm weight in the session's activation dtype.

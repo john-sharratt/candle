@@ -46,31 +46,38 @@
 //! attention or FFN chain is a change to this list**, and `KV_WAVE_CENSUS=1`
 //! over the gate is how to find out what it should say.
 //!
-//! # A phase at a time, and the union of the chains that can run in it
+//! # A phase at a time, and the chains that can run in it
 //!
 //! A layer opens two generations — one spanning attention → `o_proj`, one
 //! spanning the FFN — and each drops before the next opens, resetting its span.
 //! So a span holds **one layer phase**, never a whole wave, and each phase gets
 //! its own arena ([`super::bump_arena`]) sized from its own peak rather than
-//! both from the larger.
+//! both from the larger. A third, the forward phase, holds what the head needs
+//! after the last layer.
 //!
-//! Within a phase more than one chain can run, and the plan charges their
-//! **union** rather than their maximum. That is not conservatism, it is the
-//! shape of a mixed wave: `forward_layer_batched_mixed` opens **one** attention
-//! generation and runs every group inside it, so a wave carrying both a decode
-//! group and a prefill group allocates the decode chain's buffers *and* the
-//! prefill chain's, into the same span, before either guard drops. The prefill
-//! chain is the wider of the two per row, so a wave that is entirely prefill
-//! pays for the decode chain's two extra buffers it never allocates — about 15%
-//! of the attention phase, which is the price of the plan being given a total
-//! row count rather than a per-group split.
+//! Within a phase more than one [`Chain`] can run, and they combine two
+//! different ways depending on *why* there is more than one:
 //!
-//! The same holds for the FFN's two expert-dispatch paths, except that the
-//! GPU-native path's buffers are a subset of the pipeline path's, so the union
-//! costs nothing there.
+//! * **Two kinds of layer are a `max`.** A hybrid stack's layer has an
+//!   attention mixer or a DeltaNet one, never both, and a generation is one
+//!   layer's phase — so the span is sized by the larger. The same holds one
+//!   phase down, where a layer's FFN dispatches to the expert pipeline or to a
+//!   dense MLP. Summing those would price a wave for a layer that does not
+//!   exist.
+//! * **Two groups of one kind are a `sum`, each at its own width.**
+//!   `forward_layer_batched_mixed` opens **one** attention generation and runs
+//!   every group inside it, so a wave carrying a decode group and a prefill
+//!   group holds both chains' buffers before either guard drops. Each is sized
+//!   by the rows *its* group contributed, which is what [`WaveWidth`] carries
+//!   and a single row count could not say.
+//!
+//! That second point used to be a bound rather than a measurement: handed one
+//! total, the plan charged the decode chain at the whole wave's width and a
+//! pure-prefill wave paid about 15% of its attention span for buffers it never
+//! allocated. Passing the split closed it, and the plan now prices every phase
+//! to the byte of what the census measures it carving.
 
 use super::types::TARGET_ARENA_BYTES;
-use super::wave_spans::WAVE_FORWARD_BYTES;
 use candle::DType;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -125,6 +132,154 @@ impl BufferShape {
     }
 }
 
+/// How wide a wave is, in the three units its buffers actually scale with.
+///
+/// A single row count cannot price a wave, and the two places it fails are not
+/// small:
+///
+/// * **A phase runs more than one chain.** `forward_layer_batched_mixed` opens
+///   one attention generation and runs the decode group and the prefill group
+///   inside it, so both chains' buffers are live at once — but each is sized by
+///   *its own* group's rows. Handed one total, the plan charged the decode
+///   chain's context and `o_proj` output at the whole wave's width: 8.7 MiB of
+///   a 119.5 MiB span on a wave with no decode rows at all.
+/// * **The forward phase does not scale with tokens.** Its head runs once per
+///   *sequence*, so its cost is set by how many conversations the wave carries
+///   and not by how long their prompts are. Priced at a row count it would be
+///   absurd; priced at a constant — which is what `WAVE_FORWARD_BYTES` did —
+///   it fits until the session count passes what the constant was measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WaveWidth {
+    /// Tokens contributed by prefill groups.
+    pub prefill_rows: usize,
+    /// Tokens contributed by decode groups — one per sequence stepping, plus
+    /// whatever a speculative block stages.
+    pub decode_rows: usize,
+    /// Rows the head produces logits for, which is what the forward phase
+    /// scales with.
+    ///
+    /// Not the row count and not quite the sequence count: the head scores
+    /// every decode row, the **last** token of each prefill sequence, and every
+    /// row of a *verifying* span (each is a prediction to compare a proposal
+    /// against). So an ordinary wave scores one row per sequence, and a
+    /// speculative one scores a block per verifying sequence.
+    pub scored_rows: usize,
+    /// Rows a speculative **replay** stages onto the wave, and the spans it
+    /// stages them for.
+    ///
+    /// A replay is not a wave in the ordinary sense: it re-runs the DeltaNet
+    /// mixer to advance the recurrent state to an accepted prefix, and the
+    /// tokens' logits were produced by the verify wave and are not recomputed.
+    /// So it carves neither layer chain and no head — what it *does* carve is
+    /// four staged operands and the two span tables built beside them, which is
+    /// [`Chain::DeltaNetReplay`].
+    ///
+    /// Zero on every ordinary forward, which is what keeps that chain out of
+    /// the attention phase's `max` everywhere but a replay.
+    pub staged_rows: usize,
+    /// Spans the replay stages — see [`Self::staged_rows`]. The span tables are
+    /// per span, not per row.
+    pub staged_spans: usize,
+}
+
+impl WaveWidth {
+    /// Every token in the wave, whichever group contributed it.
+    pub const fn rows(&self) -> usize {
+        self.prefill_rows + self.decode_rows
+    }
+
+    /// A wave that is all prefill: `rows` tokens over `sequences` sequences,
+    /// none of them verifying, so the head scores one row each.
+    pub const fn prefill(rows: usize, sequences: usize) -> Self {
+        Self {
+            prefill_rows: rows,
+            decode_rows: 0,
+            scored_rows: sequences,
+            staged_rows: 0,
+            staged_spans: 0,
+        }
+    }
+
+    /// A wave that is all decode: one row per sequence, every one of them
+    /// scored.
+    pub const fn decode(sequences: usize) -> Self {
+        Self {
+            prefill_rows: 0,
+            decode_rows: sequences,
+            scored_rows: sequences,
+            staged_rows: 0,
+            staged_spans: 0,
+        }
+    }
+
+    /// A speculative **replay**: `rows` staged operand rows over `spans` spans,
+    /// and nothing else.
+    ///
+    /// Every other unit is zero on purpose. A replay re-runs the mixer to
+    /// advance the recurrent state and recomputes no logits, so it carves no
+    /// attention chain, no FFN and no head — pricing those charged it for three
+    /// phases it never touches. See [`Self::staged_rows`].
+    pub const fn replay(rows: usize, spans: usize) -> Self {
+        Self {
+            prefill_rows: 0,
+            decode_rows: 0,
+            scored_rows: 0,
+            staged_rows: rows,
+            staged_spans: spans,
+        }
+    }
+
+    /// `rows` more prefill tokens on top of this wave.
+    pub const fn with_prefill(self, rows: usize) -> Self {
+        Self {
+            prefill_rows: self.prefill_rows + rows,
+            ..self
+        }
+    }
+}
+
+/// The width the FFN carries its intermediates in, for activations of `act`.
+///
+/// An F16 activation is widened to BF16 for the SwiGLU, whose range can exceed
+/// F16's; every other dtype is left alone. **The one definition** —
+/// `forward_layer_batched_mixed` picks the FFN's dtype with it, and the plan
+/// prices the casts around it with it, so the two cannot disagree about which
+/// sessions have a cast at all.
+pub fn ffn_work_dtype(act: DType) -> DType {
+    if act == DType::F16 {
+        DType::BF16
+    } else {
+        act
+    }
+}
+
+/// A DeltaNet mixer's widths, as [`ModelGeometry::delta_net`] carries them.
+///
+/// Everything the mixer holds is F32 and stays F32: `S` is a running sum over
+/// every token of a sequence, the one value in the stack with no bound on how
+/// many additions it accumulates, and half precision drifts without bound in
+/// context length — the opposite of what the O(1)-error design is for. So the
+/// four projections ask the KO kernel to store F32 out of the accumulator it
+/// already has, and the output projection reads that F32 directly. Only the
+/// final `w_out` result narrows, to whatever the residual stream carries.
+/// A **live** mixer's projections are downstream of a provenance break and
+/// allocate from the CUDA pool, so none of these price a buffer on an ordinary
+/// wave — see the note on the `DeltaNet*` variants. They price the
+/// [`Chain::DeltaNetReplay`] instead: a speculative replay *stages* the same
+/// four operands onto the wave deliberately (`spec::stage_on_wave`), because
+/// the staged copy is the provenance root that keeps the replayed mixer off the
+/// pool. So the widths are unused by the live chain and load-bearing for the
+/// replayed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaNetWidths {
+    /// `2 · key_dim + value_dim` — the fused `[Q|K|V]` projection's width.
+    pub conv_dim: usize,
+    /// `head_dim × n_v_heads` — `z`'s width, and the mixer's output.
+    pub value_dim: usize,
+    /// V heads. `beta` and `alpha` are one F32 scalar per head per row.
+    pub n_v_heads: usize,
+}
+
 /// Which generation a buffer lives in.
 ///
 /// Named `LayerPhase` rather than `WavePhase` because
@@ -145,10 +300,10 @@ pub enum LayerPhase {
     /// 0's guard drops, and layer 1 would overwrite the tables it is still
     /// reading.
     ///
-    /// Carries no [`WaveBuffer`] variants, so it prices as zero. That is
-    /// deliberate — the plan sizes what scales with wave *width*, and this holds
-    /// a few kilobytes of per-forward metadata whose size is set by the sequence
-    /// count, not by the token count.
+    /// Its width is [`WaveWidth::scored_rows`], not the wave's rows: the head
+    /// produces logits for one row per sequence, not one per token. That is the
+    /// whole reason this phase is separate rather than folded into the layer
+    /// phases, which scale with tokens.
     Forward,
 }
 
@@ -162,6 +317,10 @@ pub enum LayerPhase {
 pub struct ModelGeometry {
     /// Model hidden size.
     pub hidden: usize,
+    /// Tokens the LM head scores over. The head's logits are the whole of the
+    /// forward phase's cost that scales with anything, and they are one row per
+    /// sequence — see [`WaveBuffer::HeadLogits`].
+    pub vocab: usize,
     /// FFN intermediate size. On a MoE model this is the *per-expert*
     /// intermediate, not the dense equivalent.
     pub intermediate: usize,
@@ -176,27 +335,43 @@ pub struct ModelGeometry {
     /// term degenerates to a column the router never allocates and costs two
     /// bytes a row.
     pub n_experts: usize,
+    /// The mixer widths of a **DeltaNet** layer, on a hybrid stack where only
+    /// some layers attend. `None` where every layer attends.
+    ///
+    /// A DeltaNet layer's mixer carves from the *attention* arena — it is the
+    /// other thing a layer can open that generation for — so its widths belong
+    /// here and not in the FFN phase. Both kinds run an ordinary FFN, so the
+    /// FFN phase is uniform and takes no term from this.
+    pub delta_net: Option<DeltaNetWidths>,
     /// The compute dtype activations are carried in.
     pub act_dtype: DType,
     /// What the int8 tensor-core kernels emit before the cast back to
     /// `act_dtype`. Both are live at once, so both are planned.
     pub accum_dtype: DType,
-    /// Whether the Q/K/V projections round-trip through [`Self::accum_dtype`].
+    /// Whether the layer norms emit **q8a128** rather than the compute dtype.
     ///
-    /// A packed session's projections consume the norm's q8a128 output and the
-    /// tensor-core epilogue emits `act_dtype`, so the projection costs what
-    /// [`WaveBuffer::QkvProjection`] says and nothing more. A **float** session
-    /// runs the dequantized GEMM in `accum_dtype` instead: it upcasts its
-    /// operand, computes there, and casts the result back down — three extra
-    /// full-width buffers per projection, none of which the packed path
-    /// allocates.
+    /// An int8 session's RMSNorm fuses its quantize into the norm's epilogue,
+    /// so the buffer the projections consume is packed — about 1.8× smaller
+    /// than the same rows in BF16. A float session's norm emits `act_dtype`.
     ///
-    /// A flag rather than an unconditional charge because the two are
-    /// alternatives fixed at session creation, and charging both would price
-    /// every packed model for a round trip it never runs — on Qwen3-30B-A3B
-    /// that is a 95% over-bound on the attention span, against a chain whose
-    /// census shows no upcast at all.
-    pub projection_accum_roundtrip: bool,
+    /// This is fixed when the session is created, so it is a fact the plan can
+    /// be told rather than a case it has to bound. It used to be bounded: both
+    /// norms were priced dense "because the two encodings are alternatives and
+    /// pricing the larger keeps the plan an upper bound", which cost 1.8 MiB a
+    /// phase on the 0.8B — the entire remaining gap in the FFN span once its
+    /// chain was right. An upper bound that nobody can spend is ground the
+    /// weight side conceded for nothing.
+    pub packed_norm: bool,
+    /// The same question asked of the **head**, whose answer can differ.
+    ///
+    /// The final norm is handed `output_proj().int8mode()` — the head weight's
+    /// own mode — not a layer's, and a weight that could not be KO-repacked
+    /// stays on the dequant path while every layer around it runs int8.
+    /// Measured: Qwen2's layers are packed and its head is not, so the head
+    /// carves a float norm and its F32 working copy while the logits leave the
+    /// span. Priced from `packed_norm`, that phase was 98% slack — 17.1 MiB of
+    /// a 17.4 MiB span, all of it logits that were never there.
+    pub packed_head: bool,
     /// The Q projection emits `2 × head_dim` per head — interleaved
     /// `[q | gate]` — and the gate travels the whole attention block: split
     /// out contiguously, sigmoided, and multiplied into the context. Widens
@@ -204,6 +379,48 @@ pub struct ModelGeometry {
     /// (Qwen3.5/3.8) set it; classic attention leaves it false and pays
     /// nothing.
     pub gated_qkv: bool,
+    /// Whether Q, K and V come out of **one** segmented projection and are
+    /// narrowed out of it, rather than from three separate matmuls.
+    ///
+    /// A fused projection writes one `qkv_cols`-wide row, so each of the three
+    /// is a strided view and reaching it costs a copy — `QSplit`, `KSplit`,
+    /// `VContiguous`. Three separate `forward_dynamic` calls write three
+    /// contiguous buffers and none of those copies happens; the widths are
+    /// identical either way, which is why [`WaveBuffer::QkvProjection`] prices
+    /// both with one charge and only the splits turn on this.
+    ///
+    /// **Usually a property of the session, not the model.** Every model on the
+    /// generic path forks on the operand it is handed: `DynamicActs::Int8` takes
+    /// `QMatMul::qkv_segmented` (one launch, three narrows), `DynamicActs::Float`
+    /// takes three separate `forward_dynamic` calls and narrows nothing. So it
+    /// is derived from the int8 mode there, exactly as [`Self::packed_norm`] is.
+    /// The Qwen3.5 lineage is the exception and is `false` in both modes — its Q
+    /// weight is the interleaved `[q | gate]` and does not pack with K and V.
+    pub fused_qkv: bool,
+    /// Whether the model applies a **per-head RMSNorm to Q and K** at all.
+    ///
+    /// Qwen3 and later carry one; Llama and Qwen2 do not, and charging them for
+    /// `QNormOut`/`KNormOut` — plus the four reshape copies below — priced six
+    /// buffers those stacks never allocate, two of them `attn_cols` wide.
+    ///
+    /// Separate from [`Self::head_norm_reshapes`] because they are different
+    /// questions: this is whether the norm exists, that is whether reaching it
+    /// costs copies.
+    pub head_qk_norm: bool,
+    /// Whether the per-head Q/K RMSNorms need a flatten in and a transpose out.
+    /// Meaningless, and ignored, when [`Self::head_qk_norm`] is false.
+    ///
+    /// The norm reduces over the head dim, so it wants `[.., heads · seq, dim]`.
+    /// A wave carried as `[batch, seq, heads · dim]` cannot reach that by
+    /// reshaping — the transpose is not contiguous — so it copies in and copies
+    /// back: `QNormIn`, `QHeadsPacked`, `KNormIn`, `KHeadsPacked`, four buffers
+    /// and the two widest of them `attn_cols` wide. A wave already packed as
+    /// `[total_rows, cols]` reshapes for free and carves none of them.
+    ///
+    /// Set by the shape the forward hands the layer, not by the model's
+    /// weights: the Qwen3.5 wave flattens to `[rows, hidden]` before the layer
+    /// sweep and so leaves this false.
+    pub head_norm_reshapes: bool,
     /// Only part of the head width rotates, and the paged kernels only know
     /// full-width RoPE, so Q and K are re-ordered through a gather
     /// (`RotaryLayout::permute_last_dim_live`) — one `attn_cols`-wide and one
@@ -239,6 +456,32 @@ impl ModelGeometry {
     pub const fn kv_cols(&self) -> usize {
         self.n_kv_head * self.head_dim
     }
+
+    /// The width the FFN's intermediates are carried in.
+    ///
+    /// `forward_layer_batched_mixed` widens an F16 activation to BF16 for the
+    /// SwiGLU, whose range can exceed F16's, and leaves every other dtype
+    /// alone. Derived rather than carried, because it is one rule stated in one
+    /// place in the forward and a second copy of it would drift.
+    ///
+    /// The width is the same two bytes either way, so this changes no buffer's
+    /// *size* — what it decides is whether [`WaveBuffer::FfnNormOperand`] is an
+    /// allocation or a no-op. (The cast on the way *back* out is
+    /// `to_dtype_mut`, which is in place and allocates nothing either way.)
+    pub fn work_dtype(&self) -> DType {
+        ffn_work_dtype(self.act_dtype)
+    }
+
+    /// Whether a layer's FFN dispatches to the expert pipeline or to a single
+    /// dense MLP — which of [`Chain::Ffn`] and [`Chain::DenseFfn`] runs.
+    ///
+    /// Read from the router's width rather than carried as its own flag: a
+    /// model with one expert has no router to score and no fan-out to apply, so
+    /// `n_experts > 1` is the same question asked of the geometry that is
+    /// already here.
+    pub const fn is_moe(&self) -> bool {
+        self.n_experts > 1
+    }
 }
 
 /// How many u32 of routing metadata the expert pipeline uploads per assignment.
@@ -268,41 +511,28 @@ const ROUTING_U32_PER_ASSIGNMENT: usize = 8;
 /// reader can check the list against the code that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub enum WaveBuffer {
-    /// Attention RMSNorm, in whatever encoding the QKV matmul consumes. Both
-    /// chains.
-    ///
-    /// **Priced dense even though an int8 session's norm emits q8a128.** The
-    /// two encodings are alternatives — int8 mode is fixed when the session is
-    /// created — so a phase holds one or the other, and dense is the larger by
-    /// about 1.8×. Pricing the larger keeps the plan an upper bound for either
-    /// mode, which is what [`WavePlan::ensure_fits`] needs; pricing the smaller
-    /// would under-size a float session's span, and the buffer squeezed out at
-    /// the end of the phase is one a kernel wrapper allocates, which *refuses*
-    /// rather than falling back to the pool.
+    /// Attention RMSNorm, in the encoding the QKV matmul consumes — q8a128 on
+    /// an int8 session, `act_dtype` on a float one, per
+    /// [`ModelGeometry::packed_norm`]. Both chains.
     AttnNorm,
-    /// Fused Q/K/V projection output — one segmented launch over the three KO
-    /// weights, narrowed into q/k/v afterwards. Both chains.
+    /// Q/K/V projection output, in the compute dtype.
+    ///
+    /// `qkv_cols` wide, which prices either dispatch: one segmented launch over
+    /// the three KO weights narrowed afterwards, or three separate
+    /// `forward_dynamic` calls whose widths sum to the same number.
+    ///
+    /// **There is no accumulate-dtype round trip to charge on either side of
+    /// it.** The int8 path's MMA converts on the store out of registers, and the
+    /// float path (`dense_qmatmul_float`) converts its activation only for a
+    /// dtype outside `{F16, BF16, F32}` and otherwise stores at the activation's
+    /// own width — so no session upcasts a compute-dtype operand to F32 and
+    /// casts back. A pair of operand/accum charges modelling that round trip
+    /// used to stand here and on `o_proj`, priced at `3 × hidden` and
+    /// `qkv_cols` in F32: 90.2 MiB of a 219.9 MiB attention span on the 0.8B,
+    /// for four buffers the census shows are never carved. What the census
+    /// actually caught was a *DeltaNet* layer's F32 projections — a different
+    /// layer kind sharing this arena, priced below at its own widths.
     QkvProjection,
-    /// The projection's operand, upcast to the GEMM's accumulate dtype.
-    ///
-    /// A float-path projection runs in `accum_dtype`: the norm's `act_dtype`
-    /// output is upcast, the GEMM emits in `accum_dtype`, and the result is
-    /// cast back down. Both ends stay live for the whole phase — the bump
-    /// cursor does not rewind — so both are priced, the same round trip
-    /// [`Self::GateGemm`] / [`Self::UpGemm`] / [`Self::DownGemm`] are priced
-    /// for on the FFN side.
-    ///
-    /// Charged for **three** `hidden`-wide operands, which is the upper bound
-    /// over both chains: a model that projects Q, K and V separately upcasts
-    /// the norm output once per projection, and a fused projection upcasts it
-    /// once.
-    QkvProjOperand,
-    /// The projection's result in `accum_dtype`, before the cast to
-    /// `act_dtype`.
-    ///
-    /// `qkv_cols` wide, which again bounds both chains: a fused projection
-    /// emits exactly that, and separate Q/K/V results sum to it.
-    QkvProjAccum,
     /// Q, copied out of the fused QKV buffer.
     ///
     /// The narrow is a strided view over a `qkv_cols`-wide row, so reshaping it
@@ -335,14 +565,6 @@ pub enum WaveBuffer {
     QRotaryPermute,
     /// K's half of the same re-ordering. Partial-rotary models only.
     KRotaryPermute,
-    /// `o_proj`'s operand upcast to `accum_dtype` — the output projection's
-    /// half of the float-session round trip
-    /// ([`ModelGeometry::projection_accum_roundtrip`]), which the plan models
-    /// for Q/K/V and must model for O the same way.
-    OProjOperand,
-    /// `o_proj`'s result in `accum_dtype`, before the cast back to
-    /// `act_dtype`. Same condition as [`Self::OProjOperand`].
-    OProjAccum,
     /// K, copied out of the fused QKV buffer. Both chains.
     KSplit,
     /// K flattened for the head-wise RMSNorm. Prefill only, as [`Self::QNormIn`].
@@ -365,13 +587,63 @@ pub enum WaveBuffer {
     DecodeContext,
     /// `o_proj`'s result, in the compute dtype.
     ///
-    /// On an **int8** session prefill's `o_proj` takes a `Float` context, the
-    /// override quantizes it at the matmul, and that quantize breaks the
-    /// provenance chain — the output lands on the pool, and only decode
-    /// carves here. On a **float** session (`projection_accum_roundtrip`)
-    /// prefill's `o_proj` result rides the span like everything else, so the
-    /// charge covers both.
+    /// Prefill's `o_proj` takes a `Float` context, the override quantizes it at
+    /// the matmul, and that quantize breaks the provenance chain — the output
+    /// lands on the pool. So this is a decode-chain carve, and a pure-prefill
+    /// wave pays for it as part of the union.
     OProjOutput,
+
+    // ── The DeltaNet mixer ──────────────────────────────────────────────────
+    // The other thing a layer can open the attention generation for, on a
+    // hybrid stack. Priced as its own chain and compared against attention's
+    // with a `max`, not summed into it — see `Chain`.
+    //
+    // **Only part of this mixer is on the span, and the list below is that
+    // part.** `QMatMul::forward_live_as` forks on the weight's int8 mode: the
+    // int8 arm reaches the KO kernel through a standalone `to_dynamic`
+    // quantize, and that quantize breaks the operand's provenance, so the
+    // projection's result is allocated from the CUDA pool rather than from the
+    // generation — and everything downstream of it (the causal conv, the
+    // mixer's output, the norm-gate result, `w_out`) inherits the pool from its
+    // operand and follows it off the span. The non-int8 arm has no quantize and
+    // stays on the generation, paying one F32 upcast of its operand.
+    //
+    // So a DeltaNet layer's span cost is: the layer norm, plus one upcast and
+    // one result for each projection whose weight is too small to have been
+    // KO-repacked. Measured on the 0.8B at 2100 rows: five carves totalling
+    // 21,772,800 B, which is what these five variants price to the byte.
+    /// The DeltaNet layer's input norm — `ln1` over the packed buffer, which is
+    /// where this chain is seeded on the span.
+    DeltaNetNorm,
+    /// `beta`'s operand, upcast to F32 by the float arm of `forward_live_as`.
+    DeltaNetBetaOperand,
+    /// `beta` itself: one F32 per V head per row.
+    DeltaNetBetaProj,
+    /// `alpha`'s operand upcast, a separate carve from [`Self::DeltaNetBetaOperand`]
+    /// because the two projections each upcast the norm output for themselves.
+    DeltaNetAlphaOperand,
+    /// `alpha`, the same shape as [`Self::DeltaNetBetaProj`].
+    DeltaNetAlphaProj,
+
+    // ── A speculative replay's staged operands ──────────────────────────────
+    // Measured on the 9B at 30 staged rows over 6 spans: six carves totalling
+    // 1,482,480 B, every one of them `wave_empty` or a table built beside it.
+    // The 27B is where leaving them undeclared stopped being survivable — 20
+    // rows of `conv_dim` 10240 and `value_dim` 6144 come to 1,318,400 B against
+    // a span priced at 1,216,768, and the replay exhausted it mid-flight.
+    /// The stashed `[Q|K|V]` projection, staged onto the wave in F32.
+    ReplayQkv,
+    /// The stashed `z`, staged likewise.
+    ReplayZ,
+    /// The stashed `beta`, one F32 per V head per staged row.
+    ReplayBeta,
+    /// The stashed `alpha`, the same shape as [`Self::ReplayBeta`].
+    ReplayAlpha,
+    /// The span table's pointer block: four device pointers per span.
+    ReplaySpanPtrs,
+    /// The span table's extents: two `u32` per span.
+    ReplaySpanExtents,
+
     /// FFN RMSNorm, in whatever encoding the expert GEMMs consume. Both
     /// dispatch paths, and priced dense for the reason given on
     /// [`Self::AttnNorm`].
@@ -402,24 +674,191 @@ pub enum WaveBuffer {
     DownCast,
     /// The MoE combine target the scatter accumulates into. Both paths.
     MoeCombine,
-    /// The FFN result cast to the residual's dtype before the second residual
-    /// add.
+
+    // ── The dense FFN ───────────────────────────────────────────────────────
+    // Four carves, measured on the 0.8B at 2100 rows: 62,630,400 B. No router,
+    // no gather, no expert replication, and every intermediate in the compute
+    // dtype — the down projection's own result is downstream of a quantize and
+    // lands off the span, like the DeltaNet projections.
+    /// The dense FFN's input norm.
+    DenseFfnNorm,
+    /// The fused `[gate | up]` projection: one GEMM, `2 × intermediate` wide.
+    DenseGateUp,
+    /// `silu(gate)`.
+    DenseSilu,
+    /// `silu(gate) ⊙ up` — the SwiGLU result the down projection consumes.
+    DenseSwiglu,
+
+    // ── The head, after the last layer ──────────────────────────────────────
+    // The forward phase's whole content, and the reason it is sized in
+    // sequences. Measured on the 0.8B: two carves, 497,920 B **per sequence**
+    // — so `WAVE_FORWARD_BYTES`, at 16 MiB, covered 33 of them. This engine
+    // composes waves of up to 64, where the phase needs 31.9 MiB and the
+    // reservation would have been overrun by a forward that had already
+    // launched every layer.
+    /// The final norm, in the encoding the head's matmul consumes.
+    HeadNorm,
+    /// The float head-norm's F32 working copy, beside its `act_dtype` result.
     ///
-    /// A no-op when the two already agree, which is every BF16 configuration —
-    /// but an F16 session carries its residual in F16 and its MoE in BF16, and
-    /// then this is a full `rows × hidden` buffer at the very end of the phase,
-    /// when the span is at its fullest.
-    FfnResidualCast,
+    /// **Float sessions only.** An int8 session's `RmsNorm::forward_dynamic`
+    /// emits q8a128 from one fused kernel and carves nothing else; the float arm
+    /// goes through `forward_with_ticket`, whose RMSNorm materialises the row in
+    /// F32 as well. Measured on Qwen2 at 60 scored rows, hidden 896: two carves,
+    /// `60 × 896 × 2` and `60 × 896 × 4`, summing to the 322,560 B the arena
+    /// peaked at.
+    HeadNormF32,
+    /// The head's logits: one row per scored row, `vocab` wide, in the compute
+    /// dtype.
+    ///
+    /// **Int8 sessions only**, because only there do they land on the span. The
+    /// int8 matmul carves its output from the operand's arena and converts on
+    /// the store; the float arm reaches the dequantized-weight path through
+    /// `to_owned_tensor`, which breaks provenance, so the logits come off the
+    /// CUDA pool. Both were measured: Qwen3.5-0.8B (int8) carves
+    /// `4 × 248,320 × 2` here, and Qwen2 (float) carves no logits at all.
+    ///
+    /// Being *returned* from the forward is not what decides it — the head's
+    /// span is reset per forward precisely so the logits may outlive the layer
+    /// guards — which is why this follows the session's mode and not the
+    /// lifetime.
+    HeadLogits,
+
+    /// The **threaded expert pipeline's** combine target, the twin of
+    /// [`Self::MoeCombine`].
+    ///
+    /// The two dispatch paths each scatter into their own `rows × hidden`
+    /// buffer, and the plan charges their union for the reason the module
+    /// header gives: a phase is sized for whichever chain runs, and the
+    /// pipeline path's buffers are a superset of the GPU-native path's
+    /// ([`Self::DownGemm`] and [`Self::DownCast`] are the others it adds).
+    ///
+    /// Named, because it used to be charged as an "FFN result cast to the
+    /// residual's dtype" that does not exist: `ffn_forward`'s
+    /// `out.to_dtype_mut(out_dtype)` is an **in-place** cast — it allocates
+    /// nothing even when the dtypes differ, and returns early when they agree.
+    /// The two happened to be the same number of bytes, so the span was right
+    /// and the reason was wrong, which is the state in which a number survives
+    /// every change that should have corrected it.
+    MoePipelineCombine,
+    /// The FFN norm's operand widened to `work_dtype` — the other half of the
+    /// same F16 stability cast, on the MoE arm's **float** path.
+    ///
+    /// A packed operand is range-safe and skips it (`q8a128` carries its own
+    /// scales), and a session whose `act_dtype` is already the work dtype has
+    /// nothing to widen. So this is the one buffer that needs *both* a float
+    /// session and an F16 activation.
+    FfnNormOperand,
+}
+
+/// A run of buffers that one layer can allocate inside one generation.
+///
+/// The distinction a phase alone cannot make. Within a phase the plan charges
+/// the **union** of the chains that can run — a mixed wave opens one attention
+/// generation and runs its decode group and its prefill group inside it, so
+/// both chains' buffers are live at once. That reasoning does not extend to a
+/// hybrid's two *layer kinds*: a layer is an attention layer or a DeltaNet
+/// layer, never both, and a generation is one layer's phase. Summing them would
+/// price a wave for a layer that does not exist.
+///
+/// So a phase costs the **largest** of the chains that can open it, and each
+/// chain costs the **sum** of its own buffers.
+///
+/// This was wrong in the other direction before it was named: the DeltaNet
+/// chain was undeclared and `priced_intermediate` folded its conv width into
+/// the *FFN* phase — which a DeltaNet layer runs identically to an attention
+/// layer, and where its mixer carves nothing. That is 49.1 MiB of a 139.3 MiB
+/// FFN span on the 0.8B, charged in a phase the buffer never appears in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
+pub enum Chain {
+    /// An attention layer's mixer: norm through `o_proj`.
+    Attention,
+    /// A DeltaNet layer's mixer: the four projections through `w_out`. Shares
+    /// the attention generation, because it is the same scope — the thing a
+    /// layer opens before its FFN.
+    DeltaNet,
+    /// A speculative **replay's** staged operands, in that same generation.
+    ///
+    /// The one chain that is not a *layer's*. `spec::stage_on_wave` copies the
+    /// stashed `qkv`/`z`/`beta`/`alpha` onto the wave before replaying the
+    /// mixer, deliberately: the staged copy is the provenance root that keeps
+    /// the replayed chain off the pool. The two span tables are built
+    /// `from_vec_beside` that copy, so they follow it onto the arena — which is
+    /// also why they do **not** appear on an ordinary wave, where the anchor
+    /// (`qkv`) is itself on the pool.
+    DeltaNetReplay,
+    /// The **MoE** FFN: the router, the expert gather, the grouped GEMMs and
+    /// the combine.
+    Ffn,
+    /// The **dense** FFN: norm, one fused `[gate|up]` GEMM, SiLU, multiply.
+    ///
+    /// The same `max` relationship the two mixers have, one phase down. A layer
+    /// dispatches to `QuantFfn::Dense` or `QuantFfn::Moe`, never both, and the
+    /// two chains have almost nothing in common — the dense one has no router,
+    /// no gather, no expert replication, and carries its intermediates in the
+    /// compute dtype rather than the accumulate one. Pricing a dense model
+    /// against the MoE list is not a margin, it is a different chain: on the
+    /// 0.8B it over-charged `[gate|up]` by 30.1 MiB and *under*-charged the
+    /// SwiGLU output by 21.6 MiB, and only passed because the two errors
+    /// partly cancelled.
+    DenseFfn,
+    /// Per-forward setup, read from every layer.
+    Forward,
+}
+
+impl Chain {
+    /// The generation this chain allocates from.
+    pub fn phase(&self) -> LayerPhase {
+        match self {
+            Self::Attention | Self::DeltaNet | Self::DeltaNetReplay => LayerPhase::Attention,
+            Self::Ffn | Self::DenseFfn => LayerPhase::Ffn,
+            Self::Forward => LayerPhase::Forward,
+        }
+    }
 }
 
 impl WaveBuffer {
+    /// Which run of buffers this one belongs to.
+    pub fn chain(&self) -> Chain {
+        match self {
+            Self::DeltaNetNorm
+            | Self::DeltaNetBetaOperand
+            | Self::DeltaNetBetaProj
+            | Self::DeltaNetAlphaOperand
+            | Self::DeltaNetAlphaProj => Chain::DeltaNet,
+            Self::ReplayQkv
+            | Self::ReplayZ
+            | Self::ReplayBeta
+            | Self::ReplayAlpha
+            | Self::ReplaySpanPtrs
+            | Self::ReplaySpanExtents => Chain::DeltaNetReplay,
+            Self::DenseFfnNorm | Self::DenseGateUp | Self::DenseSilu | Self::DenseSwiglu => {
+                Chain::DenseFfn
+            }
+            Self::HeadNorm | Self::HeadNormF32 | Self::HeadLogits => Chain::Forward,
+            other => match other.phase() {
+                LayerPhase::Attention => Chain::Attention,
+                LayerPhase::Ffn => Chain::Ffn,
+                LayerPhase::Forward => Chain::Forward,
+            },
+        }
+    }
+
     /// When this buffer is live within its phase.
     pub fn phase(&self) -> LayerPhase {
         match self {
+            Self::DeltaNetNorm
+            | Self::DeltaNetBetaOperand
+            | Self::DeltaNetBetaProj
+            | Self::DeltaNetAlphaOperand
+            | Self::DeltaNetAlphaProj
+            | Self::ReplayQkv
+            | Self::ReplayZ
+            | Self::ReplayBeta
+            | Self::ReplayAlpha
+            | Self::ReplaySpanPtrs
+            | Self::ReplaySpanExtents => LayerPhase::Attention,
             Self::AttnNorm
             | Self::QkvProjection
-            | Self::QkvProjOperand
-            | Self::QkvProjAccum
             | Self::QSplit
             | Self::QNormIn
             | Self::QNormOut
@@ -436,8 +875,6 @@ impl WaveBuffer {
             | Self::VContiguous
             | Self::AttnOutput
             | Self::DecodeContext
-            | Self::OProjOperand
-            | Self::OProjAccum
             | Self::OProjOutput => LayerPhase::Attention,
             Self::FfnNorm
             | Self::RouterLogits
@@ -451,17 +888,28 @@ impl WaveBuffer {
             | Self::DownGemm
             | Self::DownCast
             | Self::MoeCombine
-            | Self::FfnResidualCast => LayerPhase::Ffn,
+            | Self::MoePipelineCombine
+            | Self::FfnNormOperand
+            | Self::DenseFfnNorm
+            | Self::DenseGateUp
+            | Self::DenseSilu
+            | Self::DenseSwiglu => LayerPhase::Ffn,
+            Self::HeadNorm | Self::HeadNormF32 | Self::HeadLogits => LayerPhase::Forward,
         }
     }
 
-    /// This buffer's shape for a wave of `rows` tokens — the declaration the
-    /// call site and the admission gate both size from.
+    /// This buffer's shape for a wave of width `w` — the declaration the call
+    /// site and the admission gate both size from.
+    ///
+    /// **Each buffer names the unit it scales with**, which is the whole point
+    /// of taking a [`WaveWidth`] rather than a row count: a decode-chain buffer
+    /// is sized by the decode group, a prefill-chain one by the prefill group,
+    /// and the head by the sequence count.
     ///
     /// Also exhaustive: a new variant must state its shape here, and takes its
     /// byte count from [`BufferShape::bytes`] rather than writing arithmetic of
     /// its own.
-    pub fn shape(&self, g: &ModelGeometry, rows: usize) -> BufferShape {
+    pub fn shape(&self, g: &ModelGeometry, w: WaveWidth) -> BufferShape {
         let dense = |rows, cols, dtype| BufferShape {
             rows,
             cols,
@@ -472,43 +920,142 @@ impl WaveBuffer {
             cols,
             encoding: Encoding::Q8a128,
         };
+        // Every row of the wave, which is what a buffer both chains allocate is
+        // sized by. The two groups' own counts are named where they are used.
+        let rows = w.rows();
         let er = g.expert_rows(rows);
+        // A layer norm's output encoding is the session's, not the buffer's —
+        // the same fork for the attention norm, the FFN norm and the dense
+        // FFN's norm.
+        let norm = |rows: usize| {
+            if g.packed_norm {
+                q8(rows, g.hidden)
+            } else {
+                dense(rows, g.hidden, g.act_dtype)
+            }
+        };
         match self {
-            Self::AttnNorm => dense(rows, g.hidden, g.act_dtype),
+            Self::AttnNorm => norm(rows),
             Self::QkvProjection => dense(rows, g.qkv_cols(), g.act_dtype),
-            Self::QkvProjOperand if g.projection_accum_roundtrip => {
-                dense(rows, 3 * g.hidden, g.accum_dtype)
+            // Q is narrowed out of a wider buffer whenever there *is* one: a
+            // fused projection's `qkv_cols` row, or a gated lineage's
+            // interleaved `[q | gate]`. With neither, `wq`'s output is already
+            // the tensor Q wants.
+            Self::QSplit if g.fused_qkv || g.gated_qkv => dense(rows, g.attn_cols(), g.act_dtype),
+            Self::QSplit => dense(0, 0, g.act_dtype),
+            Self::QNormOut if g.head_qk_norm => dense(rows, g.attn_cols(), g.act_dtype),
+            Self::QNormOut => dense(0, 0, g.act_dtype),
+            // **Prefill's rows, not the wave's.** The reshapes exist because a
+            // `[batch, seq, ..]` view cannot be transposed contiguously — which
+            // `seq == 1` makes moot, so the decode chain carves none of them.
+            // The decode census confirms it: nine carves, and these four are
+            // not among them.
+            Self::QNormIn | Self::QHeadsPacked if g.head_qk_norm && g.head_norm_reshapes => {
+                dense(w.prefill_rows, g.attn_cols(), g.act_dtype)
             }
-            Self::QkvProjAccum if g.projection_accum_roundtrip => {
-                dense(rows, g.qkv_cols(), g.accum_dtype)
+            Self::QNormIn | Self::QHeadsPacked => dense(0, 0, g.act_dtype),
+            // The split happens on both chains — the gate is a strided narrow
+            // out of the interleaved `[q | gate]` however the context is
+            // computed.
+            Self::GateSplit if g.gated_qkv => dense(rows, g.attn_cols(), g.act_dtype),
+            // **The sigmoid and the apply are prefill's, on an int8 session.**
+            // The fused q8 decode context folds the gate into the kernel, so a
+            // decode row carves neither; the FP decode path computes them as
+            // ordinary ops and does. This was the union the plan used to charge
+            // at the whole wave's width — measured on the 9B at 20 decode rows,
+            // exactly the 327,680 B its attention span went unused by.
+            Self::GateSigmoid | Self::GatedContext if g.gated_qkv && g.packed_norm => {
+                dense(w.prefill_rows, g.attn_cols(), g.act_dtype)
             }
-            Self::QkvProjOperand | Self::QkvProjAccum => dense(0, 0, g.accum_dtype),
-            Self::QSplit | Self::QNormIn | Self::QNormOut | Self::QHeadsPacked => {
-                dense(rows, g.attn_cols(), g.act_dtype)
-            }
-            Self::GateSplit | Self::GateSigmoid | Self::GatedContext if g.gated_qkv => {
+            Self::GateSigmoid | Self::GatedContext if g.gated_qkv => {
                 dense(rows, g.attn_cols(), g.act_dtype)
             }
             Self::GateSplit | Self::GateSigmoid | Self::GatedContext => dense(0, 0, g.act_dtype),
             Self::QRotaryPermute if g.partial_rotary => dense(rows, g.attn_cols(), g.act_dtype),
             Self::KRotaryPermute if g.partial_rotary => dense(rows, g.kv_cols(), g.act_dtype),
             Self::QRotaryPermute | Self::KRotaryPermute => dense(0, 0, g.act_dtype),
-            Self::KSplit
-            | Self::KNormIn
-            | Self::KNormOut
-            | Self::KHeadsPacked
-            | Self::VContiguous => dense(rows, g.kv_cols(), g.act_dtype),
-            Self::AttnOutput => dense(rows, g.attn_cols(), g.act_dtype),
-            Self::DecodeContext => q8(rows, g.attn_cols()),
-            Self::OProjOperand if g.projection_accum_roundtrip => {
-                dense(rows, g.attn_cols(), g.accum_dtype)
+            // K and V are copied out of the fused row; separate projections
+            // write them contiguous and neither copy exists.
+            Self::KSplit | Self::VContiguous if g.fused_qkv => {
+                dense(rows, g.kv_cols(), g.act_dtype)
             }
-            Self::OProjAccum if g.projection_accum_roundtrip => {
-                dense(rows, g.hidden, g.accum_dtype)
+            Self::KSplit | Self::VContiguous => dense(0, 0, g.act_dtype),
+            Self::KNormIn | Self::KHeadsPacked if g.head_qk_norm && g.head_norm_reshapes => {
+                dense(w.prefill_rows, g.kv_cols(), g.act_dtype)
             }
-            Self::OProjOperand | Self::OProjAccum => dense(0, 0, g.accum_dtype),
-            Self::OProjOutput => dense(rows, g.hidden, g.act_dtype),
-            Self::FfnNorm => dense(rows, g.hidden, g.act_dtype),
+            Self::KNormIn | Self::KHeadsPacked => dense(0, 0, g.act_dtype),
+            Self::KNormOut if g.head_qk_norm => dense(rows, g.kv_cols(), g.act_dtype),
+            Self::KNormOut => dense(0, 0, g.act_dtype),
+            // The dense context is what the paged *prefill* kernel writes; the
+            // decode kernel emits q8a1024 into `DecodeContext` instead. Two
+            // buffers because a mixed wave carves both into one generation —
+            // each at its own group's width, which is what a single row count
+            // could not say.
+            Self::AttnOutput => dense(w.prefill_rows, g.attn_cols(), g.act_dtype),
+            Self::DecodeContext => q8(w.decode_rows, g.attn_cols()),
+            Self::OProjOutput => dense(w.decode_rows, g.hidden, g.act_dtype),
+            // The DeltaNet chain prices zero on a stack with no DeltaNet
+            // layers, which makes `Chain::DeltaNet` sum to zero and drop out of
+            // the phase's max — no all-attention model's span moves.
+            Self::DeltaNetNorm => {
+                let cols = if g.delta_net.is_some() { g.hidden } else { 0 };
+                dense(rows, cols, g.act_dtype)
+            }
+            Self::DeltaNetBetaOperand | Self::DeltaNetAlphaOperand => {
+                let cols = if g.delta_net.is_some() { g.hidden } else { 0 };
+                dense(rows, cols, DType::F32)
+            }
+            Self::DeltaNetBetaProj | Self::DeltaNetAlphaProj => {
+                dense(rows, g.delta_net.map_or(0, |d| d.n_v_heads), DType::F32)
+            }
+            // Sized by the **staged** rows and spans, which are zero on every
+            // forward but a replay — so this chain drops out of the attention
+            // phase's `max` everywhere else.
+            Self::ReplayQkv => dense(
+                w.staged_rows,
+                g.delta_net.map_or(0, |d| d.conv_dim),
+                DType::F32,
+            ),
+            Self::ReplayZ => dense(
+                w.staged_rows,
+                g.delta_net.map_or(0, |d| d.value_dim),
+                DType::F32,
+            ),
+            Self::ReplayBeta | Self::ReplayAlpha => dense(
+                w.staged_rows,
+                g.delta_net.map_or(0, |d| d.n_v_heads),
+                DType::F32,
+            ),
+            // Four device pointers and two extents per span — and nothing at
+            // all on a stack with no mixer, which has no recurrent state, so no
+            // rewind stash and no replay to build a table for.
+            Self::ReplaySpanPtrs | Self::ReplaySpanExtents if g.delta_net.is_none() => {
+                dense(0, 0, DType::U32)
+            }
+            Self::ReplaySpanPtrs => dense(w.staged_spans, 4, DType::I64),
+            Self::ReplaySpanExtents => dense(w.staged_spans, 2, DType::U32),
+            // The two FFN chains are alternatives a layer dispatches between,
+            // so each prices zero on the geometry that does not run it and the
+            // phase's `max` takes whichever is live.
+            Self::FfnNorm
+            | Self::MoeCombine
+            | Self::MoePipelineCombine
+            | Self::FfnNormOperand
+            | Self::DownGemm
+            | Self::DownCast
+            | Self::MoeGather
+            | Self::RouterLogits
+            | Self::RouteWeights
+            | Self::RouteIndices
+            | Self::RoutingTables
+            | Self::GateGemm
+            | Self::UpGemm
+            | Self::SwigluAct
+                if !g.is_moe() =>
+            {
+                dense(0, 0, g.act_dtype)
+            }
+            Self::FfnNorm => norm(rows),
             Self::RouterLogits => dense(rows, g.n_experts, g.act_dtype),
             Self::RouteWeights => dense(rows, g.experts_per_tok, DType::F32),
             Self::RouteIndices => dense(rows, g.experts_per_tok, DType::U32),
@@ -519,14 +1066,41 @@ impl WaveBuffer {
             Self::SwigluAct => q8(er, g.intermediate),
             Self::DownGemm => dense(er, g.hidden, g.accum_dtype),
             Self::DownCast => dense(er, g.hidden, g.act_dtype),
-            Self::MoeCombine => dense(rows, g.hidden, g.act_dtype),
-            Self::FfnResidualCast => dense(rows, g.hidden, g.act_dtype),
+            // One combine target per dispatch path, charged as a union — see
+            // the variant's note and the module header.
+            Self::MoeCombine | Self::MoePipelineCombine => dense(rows, g.hidden, g.act_dtype),
+            // The F16 stability cast's operand, which does not exist without
+            // it: the experts run in `work_dtype`, which equals `act_dtype`
+            // unless the session is F16. A packed operand skips it outright.
+            Self::FfnNormOperand if g.work_dtype() != g.act_dtype && !g.packed_norm => {
+                dense(rows, g.hidden, g.work_dtype())
+            }
+            Self::FfnNormOperand => dense(0, 0, g.act_dtype),
+            Self::DenseFfnNorm | Self::DenseGateUp | Self::DenseSilu | Self::DenseSwiglu
+                if g.is_moe() =>
+            {
+                dense(0, 0, g.act_dtype)
+            }
+            Self::DenseFfnNorm => norm(rows),
+            Self::DenseGateUp => dense(rows, 2 * g.intermediate, g.act_dtype),
+            Self::DenseSilu | Self::DenseSwiglu => dense(rows, g.intermediate, g.act_dtype),
+            // One row per sequence, both of them — the head scores the last
+            // token of each.
+            // All three follow the **head's** mode, not a layer's — see
+            // `packed_head`. A packed head carves a q8a128 norm and its logits;
+            // a float one carves a dense norm and an F32 working copy, and its
+            // logits leave the span.
+            Self::HeadNorm if g.packed_head => q8(w.scored_rows, g.hidden),
+            Self::HeadNorm => dense(w.scored_rows, g.hidden, g.act_dtype),
+            Self::HeadNormF32 if !g.packed_head => dense(w.scored_rows, g.hidden, DType::F32),
+            Self::HeadLogits if g.packed_head => dense(w.scored_rows, g.vocab, g.act_dtype),
+            Self::HeadNormF32 | Self::HeadLogits => dense(0, 0, g.act_dtype),
         }
     }
 
-    /// Bytes this buffer needs for a wave of `rows` tokens.
-    pub fn bytes(&self, g: &ModelGeometry, rows: usize) -> usize {
-        self.shape(g, rows).bytes()
+    /// Bytes this buffer needs for a wave of width `w`.
+    pub fn bytes(&self, g: &ModelGeometry, w: WaveWidth) -> usize {
+        self.shape(g, w).bytes()
     }
 }
 
@@ -562,8 +1136,8 @@ impl WavePlan {
 
     /// Bytes for one named buffer — what a call site asks before allocating, so
     /// that what it takes is what it was priced for.
-    pub fn bytes(&self, buffer: WaveBuffer, rows: usize) -> usize {
-        buffer.bytes(&self.geometry, rows)
+    pub fn bytes(&self, buffer: WaveBuffer, w: WaveWidth) -> usize {
+        buffer.bytes(&self.geometry, w)
     }
 
     /// What one phase needs: the **sum** of every buffer it allocates.
@@ -583,16 +1157,50 @@ impl WavePlan {
     ///
     /// Each buffer is charged one alignment, since each is a separately aligned
     /// range.
-    pub fn phase_bytes(&self, phase: LayerPhase, rows: usize) -> usize {
-        WaveBuffer::iter()
-            .filter(|b| b.phase() == phase)
-            .map(|b| b.bytes(&self.geometry, rows) + BUMP_ALIGNMENT)
-            .sum()
+    ///
+    /// **Summed within a chain, maximised across them.** A phase can be opened
+    /// by more than one kind of layer — on a hybrid, an attention mixer or a
+    /// DeltaNet one — and a generation holds exactly one of them, so the span is
+    /// sized by the largest rather than by their total. See [`Chain`].
+    pub fn phase_bytes(&self, phase: LayerPhase, w: WaveWidth) -> usize {
+        Chain::iter()
+            .filter(|c| c.phase() == phase)
+            .map(|c| self.chain_bytes(c, w))
+            .max()
+            .unwrap_or(0)
     }
 
-    pub fn wave_bytes(&self, rows: usize) -> usize {
+    /// What one chain's buffers cost, summed — see [`Self::phase_bytes`] for
+    /// why a chain sums and a phase maximises.
+    ///
+    /// A buffer the geometry prices at zero is one this stack never allocates,
+    /// so it takes no aligned range either and is charged nothing at all.
+    ///
+    /// **Walked as the cursor walks, not summed with each buffer rounded up.**
+    /// A bump range starts at `aligned_start(base, cursor, align)` and then
+    /// advances by its own length, so the alignment is paid on a buffer's
+    /// *start* — which means the last buffer in a chain never pays for its
+    /// tail, and a buffer whose length is already a multiple costs nothing
+    /// extra at all.
+    ///
+    /// Rounding each length up instead is right for every chain whose shapes
+    /// are 256-multiples — which is most of them, and why the census reports
+    /// `0 B lost to alignment` there — and wrong wherever one is not. The
+    /// replay's two span tables are 64 B and 16 B: charged rounded they cost
+    /// 512, and the cursor spends 272.
+    pub fn chain_bytes(&self, chain: Chain, w: WaveWidth) -> usize {
+        WaveBuffer::iter()
+            .filter(|b| b.chain() == chain)
+            .map(|b| b.bytes(&self.geometry, w))
+            .filter(|&len| len > 0)
+            .fold(0usize, |cursor, len| {
+                cursor.div_ceil(BUMP_ALIGNMENT) * BUMP_ALIGNMENT + len
+            })
+    }
+
+    pub fn wave_bytes(&self, w: WaveWidth) -> usize {
         LayerPhase::iter()
-            .map(|p| self.phase_bytes(p, rows))
+            .map(|p| self.phase_bytes(p, w))
             .max()
             .unwrap_or(0)
     }
@@ -609,8 +1217,12 @@ impl WavePlan {
     /// wrong quantity: measured, waves were composed whose tier wanted 6.5 GiB
     /// against a 912 MiB guarantee, and were refused 62 times in one run.
     ///
-    /// Mirrors the arithmetic in the forward exactly, padding included — the
-    /// two must agree or the wave admitted is not the wave priced.
+    /// **Mirrors the arithmetic in the forward exactly** — the two must agree
+    /// or the wave admitted is not the wave priced. That includes the absence
+    /// of padding: the forward buys `phase_bytes` for each of the three phases
+    /// and nothing more, so a `TARGET_ARENA_BYTES` pad here (there were two,
+    /// matching a `+ REGION_BYTES` the forward has since dropped) would refuse
+    /// 32 MiB of waves the placement would have taken.
     ///
     /// **Rounded up to a whole region, because the placement is.** The tier is
     /// carved in regions (`place_transient` rounds its length to one), so a
@@ -619,37 +1231,40 @@ impl WavePlan {
     /// nothing, and the placement was refused by one region — on every wave,
     /// 29,000 times in seven minutes, the same wave re-formed each time because
     /// nothing in its price had changed.
-    pub fn tier_bytes(&self, rows: usize) -> usize {
-        // The forward pads each phase by one region; `TARGET_ARENA_BYTES` is
-        // that size read from the ungated source, as `span_geometry` does —
-        // `region_pool::REGION_BYTES` is CUDA-only and this plan is not.
-        let raw = self.phase_bytes(LayerPhase::Attention, rows)
-            + TARGET_ARENA_BYTES
-            + self.phase_bytes(LayerPhase::Ffn, rows)
-            + TARGET_ARENA_BYTES
-            + WAVE_FORWARD_BYTES;
+    pub fn tier_bytes(&self, w: WaveWidth) -> usize {
+        // `TARGET_ARENA_BYTES` is the region size read from the ungated source,
+        // as `span_geometry` does — `region_pool::REGION_BYTES` is CUDA-only and
+        // this plan is not.
+        let raw = self.phase_bytes(LayerPhase::Attention, w)
+            + self.phase_bytes(LayerPhase::Ffn, w)
+            + self.phase_bytes(LayerPhase::Forward, w);
         raw.div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES
     }
 
-    /// The widest wave whose **tier** fits in `budget` bytes.
+    /// The most **prefill** rows that can ride on top of `head` and still leave
+    /// the whole tier inside `budget`.
     ///
-    /// The bound a wave is actually composed against. Same bisection as
-    /// [`Self::max_rows_within`] and for the same reason — the `div_ceil` steps
-    /// make the cost a staircase, so dividing the budget by a per-row average
-    /// lands inside a step and over-admits.
-    pub fn max_rows_for_tier(&self, budget: usize) -> usize {
-        if self.tier_bytes(1) > budget {
+    /// The bound a wave is actually composed against. `head` is what the caller
+    /// has already put in the wave — its decode rows and its sequence count —
+    /// because those price the tier too, and a search that ignored them handed
+    /// back a width the placement then refused by the head.
+    ///
+    /// Bisected rather than divided: the `div_ceil` steps make the cost a
+    /// staircase, so dividing the budget by a per-row average lands inside a
+    /// step and over-admits.
+    pub fn max_prefill_rows_for_tier(&self, budget: usize, head: WaveWidth) -> usize {
+        if self.tier_bytes(head.with_prefill(1)) > budget {
             return 0;
         }
         let mut lo = 1usize;
         let mut hi = 2usize;
-        while hi < ROW_SEARCH_CEILING && self.tier_bytes(hi) <= budget {
+        while hi < ROW_SEARCH_CEILING && self.tier_bytes(head.with_prefill(hi)) <= budget {
             lo = hi;
             hi = hi.saturating_mul(2);
         }
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.tier_bytes(mid) <= budget {
+            if self.tier_bytes(head.with_prefill(mid)) <= budget {
                 lo = mid;
             } else {
                 hi = mid;
@@ -661,8 +1276,8 @@ impl WavePlan {
     /// The widest wave that fits in `budget` bytes — a **single phase's** bound.
     ///
     /// Not what a wave is sized by: the tier costs every phase together, which
-    /// is [`Self::max_rows_for_tier`]. Kept for callers asking the narrower
-    /// question of whether one phase's span holds a given width.
+    /// is [`Self::max_prefill_rows_for_tier`]. Kept for callers asking the
+    /// narrower question of whether one phase's span holds a given width.
     ///
     /// Returns `0` when not even a single row fits, which admission must treat
     /// as a configuration error rather than as an empty wave: a budget that
@@ -675,19 +1290,19 @@ impl WavePlan {
     /// closed form because the `div_ceil` steps make the cost a staircase, and
     /// dividing the budget by a per-row average would land inside a step and
     /// over-admit.
-    pub fn max_rows_within(&self, budget: usize) -> usize {
-        if self.wave_bytes(1) > budget {
+    pub fn max_rows_within(&self, budget: usize, head: WaveWidth) -> usize {
+        if self.wave_bytes(head.with_prefill(1)) > budget {
             return 0;
         }
         let mut lo = 1usize;
         let mut hi = 2usize;
-        while hi < ROW_SEARCH_CEILING && self.wave_bytes(hi) <= budget {
+        while hi < ROW_SEARCH_CEILING && self.wave_bytes(head.with_prefill(hi)) <= budget {
             lo = hi;
             hi = hi.saturating_mul(2);
         }
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.wave_bytes(mid) <= budget {
+            if self.wave_bytes(head.with_prefill(mid)) <= budget {
                 lo = mid;
             } else {
                 hi = mid;
@@ -696,9 +1311,9 @@ impl WavePlan {
         lo
     }
 
-    /// Whether a wave of `rows` fits in `budget`.
-    pub fn fits(&self, rows: usize, budget: usize) -> bool {
-        self.wave_bytes(rows) <= budget
+    /// Whether a wave of width `w` fits in `budget`.
+    pub fn fits(&self, w: WaveWidth, budget: usize) -> bool {
+        self.wave_bytes(w) <= budget
     }
 
     /// Refuse a wave that does not fit, before any of it is assembled.
@@ -715,36 +1330,56 @@ impl WavePlan {
     /// priced this wave against the same budget, so reaching here means the two
     /// disagree, and silently running a narrower wave would hide that
     /// disagreement for as long as it took to become a correctness bug.
-    pub fn ensure_fits(&self, rows: usize, budget: usize) -> candle::Result<()> {
-        let cost = self.wave_bytes(rows);
+    pub fn ensure_fits(&self, w: WaveWidth, budget: usize) -> candle::Result<()> {
+        let cost = self.wave_bytes(w);
         if cost <= budget {
             return Ok(());
         }
-        let widest = self.max_rows_within(budget);
+        let head = WaveWidth {
+            prefill_rows: 0,
+            ..w
+        };
+        let widest = self.max_rows_within(budget, head);
         candle::bail!(
-            "wave over budget: {rows} rows need {cost} B of transient span but the \
-             half holds {budget} B (over by {} B). The widest wave this budget \
-             admits is {widest} rows. Admission priced this wave against the same \
-             plan, so this is an accounting disagreement, not a wave to trim.\n{}",
+            "wave over budget: {} rows ({} prefill + {} decode, {} scored) need \
+             {cost} B of transient span but the half holds {budget} B (over by {} B). \
+             The widest prefill this budget admits beside that head is {widest} rows. \
+             Admission priced this wave against the same plan, so this is an \
+             accounting disagreement, not a wave to trim.\n{}",
+            w.rows(),
+            w.prefill_rows,
+            w.decode_rows,
+            w.scored_rows,
             cost - budget,
-            self.describe(rows)
+            self.describe(w)
         )
     }
 
     /// One line per phase and one per buffer within it — what to print when a
     /// span refuses, so an overflow names a shape rather than a number.
-    pub fn describe(&self, rows: usize) -> String {
-        let mut out = format!("wave plan @ {rows} rows: {} B\n", self.wave_bytes(rows));
+    pub fn describe(&self, w: WaveWidth) -> String {
+        let mut out = format!(
+            "wave plan @ {} prefill + {} decode rows, {} scored: {} B\n",
+            w.prefill_rows,
+            w.decode_rows,
+            w.scored_rows,
+            self.wave_bytes(w)
+        );
+        // Grouped by chain within the phase, because the phase is their max and
+        // a flat list of buffers would not say which of them are alternatives.
         for phase in LayerPhase::iter() {
-            out.push_str(&format!(
-                "  {phase:?}: {} B\n",
-                self.phase_bytes(phase, rows)
-            ));
-            for buffer in WaveBuffer::iter().filter(|b| b.phase() == phase) {
+            out.push_str(&format!("  {phase:?}: {} B\n", self.phase_bytes(phase, w)));
+            for chain in Chain::iter().filter(|c| c.phase() == phase) {
                 out.push_str(&format!(
-                    "    {buffer:?}: {} B (+{BUMP_ALIGNMENT} B alignment)\n",
-                    buffer.bytes(&self.geometry, rows)
+                    "    {chain:?}: {} B\n",
+                    self.chain_bytes(chain, w)
                 ));
+                for buffer in WaveBuffer::iter().filter(|b| b.chain() == chain) {
+                    out.push_str(&format!(
+                        "      {buffer:?}: {} B\n",
+                        buffer.bytes(&self.geometry, w)
+                    ));
+                }
             }
         }
         out
@@ -755,6 +1390,22 @@ impl WavePlan {
 mod tests {
     use super::*;
     use crate::kv_cache::WAVE_SPAN_BYTES;
+
+    /// A prefill wave of `rows` tokens over one sequence.
+    ///
+    /// The shape most of these cases want: they vary one number and ask how the
+    /// cost moves, and the prefill chain is the wider of the two. The cases that
+    /// are *about* the split — the decode chain, the head — build their widths
+    /// explicitly.
+    fn w(rows: usize) -> WaveWidth {
+        WaveWidth::prefill(rows, 1)
+    }
+
+    /// An empty wave, for the bounds that ask "how much prefill fits at all".
+    /// The one sequence is the one the prefill rows will belong to.
+    fn empty_head() -> WaveWidth {
+        WaveWidth::prefill(0, 1)
+    }
 
     /// **The tier costs the SUM of the phases, not the largest of them.**
     ///
@@ -767,10 +1418,10 @@ mod tests {
         let p = WavePlan::new(moe());
         for rows in [1usize, 64, 512, 4096] {
             assert!(
-                p.tier_bytes(rows) > p.wave_bytes(rows),
+                p.tier_bytes(w(rows)) > p.wave_bytes(w(rows)),
                 "rows {rows}: tier {} must exceed the largest single phase {}",
-                p.tier_bytes(rows),
-                p.wave_bytes(rows),
+                p.tier_bytes(w(rows)),
+                p.wave_bytes(w(rows)),
             );
         }
     }
@@ -783,10 +1434,10 @@ mod tests {
         let p = WavePlan::new(moe());
         for rows in [1usize, 64, 128, 512, 4096] {
             assert_eq!(
-                p.tier_bytes(rows) % TARGET_ARENA_BYTES,
+                p.tier_bytes(w(rows)) % TARGET_ARENA_BYTES,
                 0,
                 "rows {rows}: {} is not region-aligned",
-                p.tier_bytes(rows),
+                p.tier_bytes(w(rows)),
             );
         }
     }
@@ -794,15 +1445,34 @@ mod tests {
     /// The bound is the inverse of the cost, and it must not overshoot: the
     /// widest accepted width fits, and one row more does not.
     #[test]
-    fn max_rows_for_tier_is_exact_on_the_staircase() {
+    fn max_prefill_rows_for_tier_is_exact_on_the_staircase() {
         let p = WavePlan::new(moe());
         let budget = WAVE_SPAN_BYTES;
-        let rows = p.max_rows_for_tier(budget);
+        let head = WaveWidth::prefill(0, 1);
+        let rows = p.max_prefill_rows_for_tier(budget, head);
         assert!(rows > 0, "the guaranteed span must price at least one row");
-        assert!(p.tier_bytes(rows) <= budget, "the accepted width must fit");
         assert!(
-            p.tier_bytes(rows + 1) > budget,
+            p.tier_bytes(head.with_prefill(rows)) <= budget,
+            "the accepted width must fit"
+        );
+        assert!(
+            p.tier_bytes(head.with_prefill(rows + 1)) > budget,
             "one row more must not fit — otherwise the bound is leaving ground unused",
+        );
+    }
+
+    /// **The head is charged, so a wave already carrying one gets less prefill.**
+    /// A bound that ignored it handed back a width the placement then refused by
+    /// exactly the head it had not been told about.
+    #[test]
+    fn a_standing_head_narrows_the_prefill_the_tier_admits() {
+        let p = WavePlan::new(moe());
+        let budget = WAVE_SPAN_BYTES;
+        let empty = p.max_prefill_rows_for_tier(budget, WaveWidth::prefill(0, 1));
+        let loaded = p.max_prefill_rows_for_tier(budget, WaveWidth::decode(32));
+        assert!(
+            loaded < empty,
+            "32 decode rows must cost prefill width: {loaded} vs {empty}"
         );
     }
 
@@ -811,65 +1481,106 @@ mod tests {
     #[test]
     fn a_budget_below_one_row_prices_nothing() {
         let p = WavePlan::new(moe());
-        assert_eq!(p.max_rows_for_tier(1), 0);
+        assert_eq!(p.max_prefill_rows_for_tier(1, WaveWidth::default()), 0);
     }
 
     /// Qwen3-30B-A3B's real shapes.
     fn moe() -> ModelGeometry {
         ModelGeometry {
             hidden: 2048,
+            vocab: 151_936,
             intermediate: 768,
             n_head: 32,
             n_kv_head: 4,
             head_dim: 128,
             experts_per_tok: 8,
             n_experts: 128,
+            // Every layer attends, so there is no mixer chain to compare
+            // against and the attention chain sizes the phase alone.
+            delta_net: None,
             act_dtype: DType::BF16,
             accum_dtype: DType::F32,
-            // Its census shows packed projections — no upcast, no cast back.
-            projection_accum_roundtrip: false,
+            // Every census these fixtures are pinned against was taken on an
+            // int8 session, where the norm's fused epilogue emits q8a128.
+            packed_norm: true,
+            packed_head: true,
             gated_qkv: false,
             partial_rotary: false,
+            // The fused segmented projection and a `[batch, seq, ..]` wave —
+            // the twelve carves `MEASURED_ATTN_PREFILL_PER_ROW` itemises.
+            fused_qkv: true,
+            head_qk_norm: true,
+            head_norm_reshapes: true,
         }
     }
 
-    /// A float-projection stack: Qwen3.5-0.8B's real shapes, whose dequantized
-    /// Q/K/V GEMMs run in F32 and round-trip through it. Gated `[q | gate]`
-    /// projection and 64-of-256 partial rotary. The head count is 8, read off
-    /// the census (the q matmul emits `2 · 8 · 256` accum columns; an earlier
-    /// fixture said 16 ungated — which priced the same `qkv_cols` by accident
-    /// and hid the gate's whole downstream chain).
-    fn float_projection() -> ModelGeometry {
+    /// Qwen3.5-0.8B's real shapes: gated `[q | gate]` projection and 64-of-256
+    /// partial rotary. The head count is 8, read off the census (the q matmul
+    /// emits `2 · 8 · 256` columns; an earlier fixture said 16 ungated — which
+    /// priced the same `qkv_cols` by accident and hid the gate's whole
+    /// downstream chain). The FFN width is the real one, 3584; the DeltaNet
+    /// half of this hybrid is priced by its own widths, not folded in here.
+    fn gated_partial_rotary() -> ModelGeometry {
         ModelGeometry {
             hidden: 1024,
-            intermediate: 3072,
+            // The 0.8B's real vocabulary, read off the loaded checkpoint.
+            vocab: 248_320,
+            intermediate: 3584,
             n_head: 8,
             n_kv_head: 2,
             head_dim: 256,
             experts_per_tok: 1,
             n_experts: 1,
+            // Three layers in four are DeltaNet on this lineage.
+            delta_net: Some(DeltaNetWidths {
+                conv_dim: 6144,
+                value_dim: 2048,
+                n_v_heads: 16,
+            }),
             act_dtype: DType::BF16,
             accum_dtype: DType::F32,
-            projection_accum_roundtrip: true,
+            // Every census these fixtures are pinned against was taken on an
+            // int8 session, where the norm's fused epilogue emits q8a128.
+            packed_norm: true,
+            packed_head: true,
             gated_qkv: true,
             partial_rotary: true,
+            // Three separate projections, and a wave already packed `[rows, ..]`
+            // — so neither the K/V narrows nor the head-norm reshapes exist.
+            fused_qkv: false,
+            head_qk_norm: true,
+            head_norm_reshapes: false,
         }
     }
 
+    /// **Llama-3-8B's shapes, and the no-per-head-norm case.**
+    ///
+    /// Kept deliberately unlike the two above: Llama and Qwen2 have no
+    /// `attn_q_norm`/`attn_k_norm` weight at all, so six attention buffers must
+    /// price zero here. Charging them was six buffers those stacks never
+    /// allocate, two of them `attn_cols` wide.
     fn dense() -> ModelGeometry {
         ModelGeometry {
             hidden: 4096,
+            vocab: 128_256,
             intermediate: 12288,
             n_head: 32,
             n_kv_head: 8,
             head_dim: 128,
             experts_per_tok: 1,
             n_experts: 1,
+            delta_net: None,
             act_dtype: DType::BF16,
             accum_dtype: DType::F32,
-            projection_accum_roundtrip: false,
+            // Every census these fixtures are pinned against was taken on an
+            // int8 session, where the norm's fused epilogue emits q8a128.
+            packed_norm: true,
+            packed_head: true,
             gated_qkv: false,
             partial_rotary: false,
+            fused_qkv: true,
+            head_qk_norm: false,
+            head_norm_reshapes: true,
         }
     }
 
@@ -910,36 +1621,61 @@ mod tests {
     /// rather than lists, so a variant added later is covered untouched.
     #[test]
     fn every_buffer_has_a_phase_and_a_non_zero_size() {
-        for g in [float_projection(), moe(), dense()] {
+        for g in [gated_partial_rotary(), moe(), dense()] {
             for rows in [1usize, 64, 4096] {
                 for b in WaveBuffer::iter() {
-                    // The projection round-trip pair is the one conditional
-                    // shape in the list: it prices zero exactly when the
-                    // geometry says the chain does not run it, and is charged
-                    // in full whenever it does. Every other variant is
-                    // unconditional, and a zero there is a variant nobody will
-                    // notice is wrong.
+                    // The gate chain, the rotary permutes and the DeltaNet
+                    // mixer are the conditional shapes: each prices zero
+                    // exactly when the geometry says the stack does not run it,
+                    // and is charged in full whenever it does. Every other
+                    // variant is unconditional, and a zero there is a variant
+                    // nobody will notice is wrong.
                     let conditional = (matches!(
                         b,
-                        WaveBuffer::QkvProjOperand
-                            | WaveBuffer::QkvProjAccum
-                            | WaveBuffer::OProjOperand
-                            | WaveBuffer::OProjAccum
-                    ) && !g.projection_accum_roundtrip)
+                        WaveBuffer::GateSplit | WaveBuffer::GateSigmoid | WaveBuffer::GatedContext
+                    ) && !g.gated_qkv)
+                        || (matches!(b, WaveBuffer::QRotaryPermute | WaveBuffer::KRotaryPermute)
+                            && !g.partial_rotary)
+                        || (matches!(b, WaveBuffer::KSplit | WaveBuffer::VContiguous)
+                            && !g.fused_qkv)
+                        || (matches!(b, WaveBuffer::QSplit) && !g.fused_qkv && !g.gated_qkv)
                         || (matches!(
                             b,
-                            WaveBuffer::GateSplit
-                                | WaveBuffer::GateSigmoid
-                                | WaveBuffer::GatedContext
-                        ) && !g.gated_qkv)
-                        || (matches!(b, WaveBuffer::QRotaryPermute | WaveBuffer::KRotaryPermute)
-                            && !g.partial_rotary);
-                    let s = b.shape(&g, rows);
+                            WaveBuffer::QNormIn
+                                | WaveBuffer::QHeadsPacked
+                                | WaveBuffer::KNormIn
+                                | WaveBuffer::KHeadsPacked
+                        ) && !(g.head_qk_norm && g.head_norm_reshapes))
+                        || (matches!(b, WaveBuffer::QNormOut | WaveBuffer::KNormOut)
+                            && !g.head_qk_norm)
+                        || (matches!(b, WaveBuffer::FfnNormOperand)
+                            && (g.work_dtype() == g.act_dtype || g.packed_norm))
+                        // The head's two alternatives: a packed session carves
+                        // its logits on the span, a float one carries an F32
+                        // working copy of the norm instead.
+                        || (matches!(b, WaveBuffer::HeadNormF32) && g.packed_head)
+                        || (matches!(b, WaveBuffer::HeadLogits) && !g.packed_head)
+                        || ((b.chain() == Chain::DeltaNet
+                            || b.chain() == Chain::DeltaNetReplay)
+                            && g.delta_net.is_none())
+                        || (b.chain() == Chain::Ffn && !g.is_moe())
+                        || (b.chain() == Chain::DenseFfn && g.is_moe());
+                    // Every unit non-zero, so a buffer sized by any of the three
+                    // is exercised and a zero is a defect rather than a width
+                    // this case happened not to supply.
+                    let width = WaveWidth {
+                        prefill_rows: rows,
+                        decode_rows: rows,
+                        scored_rows: rows,
+                        staged_rows: rows,
+                        staged_spans: rows,
+                    };
+                    let s = b.shape(&g, width);
                     if conditional {
-                        assert_eq!(b.bytes(&g, rows), 0, "{b:?} priced while disabled");
+                        assert_eq!(b.bytes(&g, width), 0, "{b:?} priced while disabled");
                         continue;
                     }
-                    assert!(b.bytes(&g, rows) > 0, "{b:?} sized zero at {rows} rows");
+                    assert!(b.bytes(&g, width) > 0, "{b:?} sized zero at {rows} rows");
                     assert!(s.rows > 0 && s.cols > 0, "{b:?} has an empty shape");
                     let _ = b.phase();
                 }
@@ -947,74 +1683,93 @@ mod tests {
         }
     }
 
-    /// The float-session attention chain, pinned against the measured carve
-    /// sizes of the 0.8B census (a C8 ×10-context wave, 5190 rows) rather
-    /// than against itself. That census is the one that caught the span
-    /// exhaustion: the gate's projection width, the two rotary-permute
-    /// gathers, the gate split/sigmoid/apply, and `o_proj`'s round trip were
-    /// all carved and none were priced.
+    /// The gated attention chain, pinned **carve for carve** against
+    /// `KV_WAVE_CENSUS=labels` on the 0.8B at its peak attention generation —
+    /// 2100 rows, thirteen carves totalling 88,435,200 B.
+    ///
+    /// Stated as the measurement rather than as the plan's own arithmetic,
+    /// which is the only form that can catch the error it replaces: four
+    /// buffers modelling an F32 projection round trip used to be declared here,
+    /// pinned at a different census, and they priced 90.2 MiB of a 219.9 MiB
+    /// span against a generation that carves no F32 at all. The eleven
+    /// assertions below are the eleven carves the census actually shows.
     #[test]
-    fn the_projection_round_trip_prices_the_measured_carves() {
-        let g = float_projection();
-        let rows = 5190;
-        assert_eq!(
-            WaveBuffer::QkvProjOperand.bytes(&g, rows),
-            3 * 21_258_240,
-            "the three hidden-wide F32 upcasts"
-        );
-        assert_eq!(
-            WaveBuffer::QkvProjAccum.bytes(&g, rows),
-            85_032_960 + 10_629_120 + 10_629_120,
-            "the F32 [q|gate], K and V projection results"
-        );
+    fn the_gated_chain_prices_the_measured_carves() {
+        let g = gated_partial_rotary();
+        let plan = WavePlan::new(g);
+        // The census's wave was all prefill over four contexts.
+        let rows = WaveWidth::prefill(2100, 4);
+        // The three projections — `[q|gate]`, K, V — dispatched separately but
+        // summing to the one `qkv_cols` charge.
         assert_eq!(
             WaveBuffer::QkvProjection.bytes(&g, rows),
-            42_516_480 + 5_314_560 + 5_314_560,
-            "the act-dtype casts back down, gate width included"
+            17_203_200 + 2_150_400 + 2_150_400,
+            "the gate-widened Q projection plus K and V, all in the compute dtype"
         );
+        for (b, want) in [
+            (WaveBuffer::QSplit, 8_601_600),
+            (WaveBuffer::QNormOut, 8_601_600),
+            (WaveBuffer::KNormOut, 2_150_400),
+            (WaveBuffer::QRotaryPermute, 8_601_600),
+            (WaveBuffer::KRotaryPermute, 2_150_400),
+            (WaveBuffer::GateSplit, 8_601_600),
+            (WaveBuffer::GateSigmoid, 8_601_600),
+            (WaveBuffer::GatedContext, 8_601_600),
+            (WaveBuffer::AttnOutput, 8_601_600),
+        ] {
+            assert_eq!(b.bytes(&g, rows), want, "{b:?} against its measured carve");
+        }
+        // The six copies a fused projection and a `[batch, seq, ..]` wave force,
+        // and that this chain has neither of. They are not "margin" — they are
+        // buffers another model allocates and this one does not, and charging
+        // them here was 25.8 MiB of a 119.5 MiB span.
+        for b in [
+            WaveBuffer::KSplit,
+            WaveBuffer::VContiguous,
+            WaveBuffer::QNormIn,
+            WaveBuffer::QHeadsPacked,
+            WaveBuffer::KNormIn,
+            WaveBuffer::KHeadsPacked,
+        ] {
+            assert_eq!(b.bytes(&g, rows), 0, "{b:?} is not carved on this chain");
+        }
+        // **The whole chain, to the byte**, against the thirteen carves the
+        // census itemises — and this is the assertion the width split exists
+        // for. `DecodeContext` and `OProjOutput` are the decode group's; a wave
+        // with no decode rows carves neither, and priced at one total row count
+        // they cost this span 8.7 MiB it could never spend.
         assert_eq!(
-            WaveBuffer::GateSplit.bytes(&g, rows),
-            21_258_240,
-            "the gate's contiguous copy off the strided narrow"
+            plan.chain_bytes(Chain::Attention, rows),
+            88_435_200,
+            "a pure-prefill wave must price its measured generation exactly"
         );
-        assert_eq!(WaveBuffer::GateSigmoid.bytes(&g, rows), 21_258_240);
-        assert_eq!(WaveBuffer::GatedContext.bytes(&g, rows), 21_258_240);
-        assert_eq!(
-            WaveBuffer::QRotaryPermute.bytes(&g, rows),
-            21_258_240,
-            "Q re-ordered for the full-width rotary kernels"
-        );
-        assert_eq!(WaveBuffer::KRotaryPermute.bytes(&g, rows), 5_314_560);
-        assert_eq!(
-            WaveBuffer::OProjOperand.bytes(&g, rows),
-            42_516_480,
-            "o_proj's F32 operand upcast"
-        );
-        assert_eq!(
-            WaveBuffer::OProjAccum.bytes(&g, rows),
-            21_258_240,
-            "o_proj's F32 result before the cast back"
-        );
-        // And a geometry with none of the flags is charged nothing for any of
-        // them, so no packed model's span moves.
-        let packed = ModelGeometry {
-            projection_accum_roundtrip: false,
+        for b in [WaveBuffer::DecodeContext, WaveBuffer::OProjOutput] {
+            assert_eq!(
+                b.bytes(&g, rows),
+                0,
+                "{b:?} charged on a wave with no decode rows"
+            );
+            assert!(
+                b.bytes(&g, WaveWidth::decode(2100)) > 0,
+                "{b:?} must still be charged when there ARE decode rows"
+            );
+        }
+
+        // A geometry with neither flag is charged nothing for the gate chain or
+        // the permutes, so no ungated model's span moves.
+        let plain = ModelGeometry {
             gated_qkv: false,
             partial_rotary: false,
             ..g
         };
         for b in [
-            WaveBuffer::QkvProjOperand,
-            WaveBuffer::QkvProjAccum,
             WaveBuffer::GateSplit,
             WaveBuffer::GateSigmoid,
             WaveBuffer::GatedContext,
             WaveBuffer::QRotaryPermute,
             WaveBuffer::KRotaryPermute,
-            WaveBuffer::OProjOperand,
-            WaveBuffer::OProjAccum,
         ] {
-            assert_eq!(b.bytes(&packed, rows), 0, "{b:?} priced while disabled");
+            assert_eq!(b.bytes(&plain, rows), 0, "{b:?} priced while disabled");
         }
     }
 
@@ -1026,6 +1781,423 @@ mod tests {
             .map(|p| WaveBuffer::iter().filter(|b| b.phase() == p).count())
             .sum();
         assert_eq!(counted, WaveBuffer::iter().count());
+    }
+
+    /// The same for chains, and additionally that the two agree: a buffer's
+    /// phase must be its chain's phase, or `phase_bytes` maximises over a
+    /// partition that does not cover the phase it is asked about.
+    #[test]
+    fn the_chains_partition_every_buffer_and_agree_with_its_phase() {
+        let counted: usize = Chain::iter()
+            .map(|c| WaveBuffer::iter().filter(|b| b.chain() == c).count())
+            .sum();
+        assert_eq!(counted, WaveBuffer::iter().count());
+        for b in WaveBuffer::iter() {
+            assert_eq!(
+                b.chain().phase(),
+                b.phase(),
+                "{b:?} is in chain {:?} (phase {:?}) but reports phase {:?}",
+                b.chain(),
+                b.chain().phase(),
+                b.phase()
+            );
+        }
+    }
+
+    /// **The DeltaNet chain against its measured generation, to the byte.**
+    ///
+    /// `KV_WAVE_CENSUS=labels` on the 0.8B at 2100 rows: five carves, 21,772,800
+    /// B, `0 B lost to alignment`. That total is the assertion — a chain priced
+    /// from a list of shapes is only as good as the list, and the sum is what
+    /// says nothing was left off it and nothing imagined onto it.
+    ///
+    /// It is five carves and not eleven because `forward_live_as` sends the two
+    /// KO-repacked projections through a standalone quantize that breaks
+    /// provenance, taking them and everything downstream off the span — see the
+    /// note on the DeltaNet variants.
+    #[test]
+    fn the_delta_net_chain_prices_its_measured_generation() {
+        let g = gated_partial_rotary();
+        let plan = WavePlan::new(g);
+        let rows = WaveWidth::prefill(2100, 4);
+        for (b, want) in [
+            (WaveBuffer::DeltaNetNorm, 4_300_800),
+            (WaveBuffer::DeltaNetBetaOperand, 8_601_600),
+            (WaveBuffer::DeltaNetBetaProj, 134_400),
+            (WaveBuffer::DeltaNetAlphaOperand, 8_601_600),
+            (WaveBuffer::DeltaNetAlphaProj, 134_400),
+        ] {
+            assert_eq!(b.bytes(&g, rows), want, "{b:?} against its measured carve");
+        }
+        assert_eq!(
+            plan.chain_bytes(Chain::DeltaNet, rows),
+            21_772_800,
+            "the whole generation, alignment included — the census measured no \
+             alignment loss at all, so the chain must price the bare sum"
+        );
+    }
+
+    /// **The dense FFN chain against its measured generation, to the byte.**
+    ///
+    /// Four carves on the 0.8B at 2100 rows, `0 B lost to alignment`:
+    /// `62,630,400 B` against an intermediate of 3584. The `[gate|up]` GEMM is
+    /// one fused launch `2 × intermediate` wide, and everything after the norm
+    /// stays in the compute dtype.
+    #[test]
+    fn the_dense_ffn_chain_prices_its_measured_generation() {
+        let g = gated_partial_rotary();
+        let plan = WavePlan::new(g);
+        let rows = WaveWidth::prefill(2100, 4);
+        for (b, want) in [
+            (WaveBuffer::DenseGateUp, 30_105_600),
+            (WaveBuffer::DenseSilu, 15_052_800),
+            (WaveBuffer::DenseSwiglu, 15_052_800),
+        ] {
+            assert_eq!(b.bytes(&g, rows), want, "{b:?} against its measured carve");
+        }
+        // The norm is packed, because this census was taken on an int8 session
+        // and its RMSNorm fuses the quantize into its epilogue. A float
+        // session's norm is the compute dtype and 1.8× larger — a real
+        // difference in what the span holds, which is why the geometry carries
+        // the mode rather than pricing the larger of the two.
+        assert_eq!(WaveBuffer::DenseFfnNorm.bytes(&g, rows), 2_419_200);
+        assert_eq!(
+            WaveBuffer::DenseFfnNorm.bytes(
+                &ModelGeometry {
+                    packed_norm: false,
+                    ..g
+                },
+                rows
+            ),
+            4_300_800,
+            "a float session's norm is dense"
+        );
+        assert_eq!(
+            plan.chain_bytes(Chain::DenseFfn, rows),
+            62_630_400,
+            "the measured generation, to the byte"
+        );
+        // A MoE geometry prices the dense chain at nothing, and a dense one
+        // prices the expert pipeline at nothing — they never both run.
+        assert_eq!(WavePlan::new(moe()).chain_bytes(Chain::DenseFfn, rows), 0);
+        assert_eq!(plan.chain_bytes(Chain::Ffn, rows), 0);
+    }
+
+    /// **A stack with no per-head Q/K norm is charged for none of it.**
+    ///
+    /// Llama and Qwen2 have no `attn_q_norm`/`attn_k_norm` weight, so six
+    /// attention buffers — the two norm outputs and the four reshape copies
+    /// around them — must price zero. They were charged unconditionally, which
+    /// on Llama-3-8B's shapes is `rows × (attn_cols + kv_cols) × 2` of span
+    /// those stacks can never spend.
+    #[test]
+    fn a_stack_without_per_head_norms_pays_for_none_of_them() {
+        let rows = WaveWidth::prefill(1000, 1);
+        let without = dense();
+        assert!(!without.head_qk_norm);
+        for b in [
+            WaveBuffer::QNormIn,
+            WaveBuffer::QNormOut,
+            WaveBuffer::QHeadsPacked,
+            WaveBuffer::KNormIn,
+            WaveBuffer::KNormOut,
+            WaveBuffer::KHeadsPacked,
+        ] {
+            assert_eq!(b.bytes(&without, rows), 0, "{b:?} charged without a norm");
+        }
+        // And the same geometry *with* one pays for all six, so the flag is
+        // doing the work rather than some other term happening to be zero.
+        let with = ModelGeometry {
+            head_qk_norm: true,
+            ..without
+        };
+        for b in [
+            WaveBuffer::QNormIn,
+            WaveBuffer::QNormOut,
+            WaveBuffer::QHeadsPacked,
+            WaveBuffer::KNormIn,
+            WaveBuffer::KNormOut,
+            WaveBuffer::KHeadsPacked,
+        ] {
+            assert!(b.bytes(&with, rows) > 0, "{b:?} not charged with a norm");
+        }
+    }
+
+    /// **A float session narrows nothing out of a fused projection, because it
+    /// has no fused projection.**
+    ///
+    /// `project_qkv` forks on the operand: `Int8` takes `qkv_segmented` and
+    /// three narrows that copy; `Float` takes three separate matmuls whose
+    /// outputs are already contiguous. Hard-coding the fused case charged every
+    /// float session three copies it never makes — and `QkvProjection` already
+    /// prices the widths, which are identical either way.
+    #[test]
+    fn a_float_session_is_not_charged_the_fused_projections_narrows() {
+        let rows = WaveWidth::prefill(1000, 1);
+        let packed = moe();
+        let float = ModelGeometry {
+            packed_norm: false,
+            fused_qkv: false,
+            ..packed
+        };
+        for b in [
+            WaveBuffer::QSplit,
+            WaveBuffer::KSplit,
+            WaveBuffer::VContiguous,
+        ] {
+            assert!(b.bytes(&packed, rows) > 0, "{b:?} missing when fused");
+            assert_eq!(b.bytes(&float, rows), 0, "{b:?} charged when not fused");
+        }
+        // The projection widths themselves do not move — one launch or three,
+        // the same columns are written.
+        assert_eq!(
+            WaveBuffer::QkvProjection.bytes(&packed, rows),
+            WaveBuffer::QkvProjection.bytes(&float, rows),
+        );
+    }
+
+    /// **The F16 stability cast's operand is charged only where it exists.**
+    ///
+    /// The MoE experts run in `work_dtype`, which is `act_dtype` everywhere
+    /// except F16 — where the SwiGLU intermediates are widened to BF16 for
+    /// range. That widening is a real `to_dtype` on the float arm and nothing
+    /// at all on the packed arm, where q8a128 carries its own scales.
+    ///
+    /// The cast on the way *back* out is `to_dtype_mut`, which is in place: it
+    /// returns early when the dtypes agree and casts the buffer where it
+    /// stands when they do not, so it is never an allocation. It was charged as
+    /// one for a long time, at a size that happened to match
+    /// [`WaveBuffer::MoePipelineCombine`] — which is why the FFN span was right
+    /// while its reason was wrong.
+    #[test]
+    fn the_f16_stability_cast_is_charged_only_where_it_exists() {
+        let rows = WaveWidth::prefill(1000, 1);
+        let bf16 = moe();
+        assert_eq!(bf16.work_dtype(), bf16.act_dtype);
+        assert_eq!(WaveBuffer::FfnNormOperand.bytes(&bf16, rows), 0);
+
+        let f16 = ModelGeometry {
+            act_dtype: DType::F16,
+            ..bf16
+        };
+        assert_eq!(f16.work_dtype(), DType::BF16);
+        // Still nothing: a packed operand is range-safe and skips the widening.
+        assert_eq!(WaveBuffer::FfnNormOperand.bytes(&f16, rows), 0);
+        let f16_float = ModelGeometry {
+            packed_norm: false,
+            ..f16
+        };
+        assert!(WaveBuffer::FfnNormOperand.bytes(&f16_float, rows) > 0);
+    }
+
+    /// **Each expert-dispatch path scatters into its own combine target, and
+    /// the phase charges both.**
+    ///
+    /// The union rule the module header states for the FFN: the GPU-native path
+    /// scatters straight out of the down GEMM into one `rows × hidden` buffer,
+    /// the threaded pipeline into its own, and the plan has to hold whichever
+    /// runs. Pinned as a pair because the second used to be declared as a cast
+    /// that does not allocate, and a rename that dropped it would have taken
+    /// 4,096 B a row off the 30B's span with every existing test still green.
+    #[test]
+    fn both_expert_dispatch_paths_get_a_combine_target() {
+        let rows = WaveWidth::prefill(1000, 1);
+        let g = moe();
+        let one = WaveBuffer::MoeCombine.bytes(&g, rows);
+        assert_eq!(one, 1000 * 2048 * 2);
+        assert_eq!(WaveBuffer::MoePipelineCombine.bytes(&g, rows), one);
+        // Neither exists on a dense stack, which has no expert dispatch at all.
+        for b in [WaveBuffer::MoeCombine, WaveBuffer::MoePipelineCombine] {
+            assert_eq!(b.bytes(&dense(), rows), 0);
+        }
+    }
+
+    /// **The forward phase against its measured generation, and against the
+    /// constant it replaces.**
+    ///
+    /// Two carves on the 0.8B, `0 B lost to alignment`: the packed head norm at
+    /// 1,152 B a scored row and the logits at 496,640 B (248,320 vocab × BF16).
+    /// 1,991,168 B at four scored rows, and 497,920 B at one.
+    ///
+    /// The second half is the reason this matters beyond slack.
+    /// `WAVE_FORWARD_BYTES` is 16 MiB, which covers 33 scored rows — and this
+    /// engine composes waves of 64 sessions. Past that the phase needed more
+    /// than its reservation, and the span would have exhausted *after* every
+    /// layer had launched, as a refusal with nothing in it naming the head.
+    #[test]
+    fn the_forward_phase_prices_its_measured_generation_and_outgrows_the_old_constant() {
+        let g = gated_partial_rotary();
+        let plan = WavePlan::new(g);
+        assert_eq!(
+            plan.chain_bytes(Chain::Forward, WaveWidth::prefill(2100, 4)),
+            1_991_168,
+            "the measured generation at four scored rows, to the byte"
+        );
+        assert_eq!(
+            plan.chain_bytes(Chain::Forward, WaveWidth::prefill(2100, 1)),
+            497_920,
+            "and at one"
+        );
+        // It scales with scored rows and not with tokens — the whole reason the
+        // forward phase is sized separately from the layer phases.
+        assert_eq!(
+            plan.chain_bytes(Chain::Forward, WaveWidth::prefill(8192, 4)),
+            plan.chain_bytes(Chain::Forward, WaveWidth::prefill(2100, 4)),
+        );
+        // The constant this replaces, and the width at which it stopped being a
+        // reservation and started being a ceiling.
+        const OLD_CONSTANT: usize = 16 << 20;
+        let at_33 = plan.chain_bytes(Chain::Forward, WaveWidth::prefill(1, 33));
+        let at_64 = plan.chain_bytes(Chain::Forward, WaveWidth::prefill(1, 64));
+        assert!(at_33 <= OLD_CONSTANT, "33 sessions fitted the constant");
+        assert!(
+            at_64 > OLD_CONSTANT,
+            "64 sessions need {at_64} B against the {OLD_CONSTANT} B the constant reserved"
+        );
+    }
+
+    /// **The head is two different chains, and the session's mode picks one.**
+    ///
+    /// Both measured. An **int8** session carves a packed norm and its logits:
+    /// Qwen3.5-0.8B at 4 scored rows, `4 × 1,152 + 4 × 248,320 × 2`. A **float**
+    /// session carves a dense norm and its F32 working copy, and no logits at
+    /// all — the dequantized-weight path reaches the matmul through
+    /// `to_owned_tensor`, which breaks provenance and puts the result on the
+    /// pool. Qwen2 at 60 scored rows, hidden 896: `60 × 896 × 2 + 60 × 896 × 4`
+    /// = 322,560 B, which is exactly what its forward arena peaked at.
+    ///
+    /// Charging the int8 shape to a float session was 17.1 MiB of a 17.4 MiB
+    /// span — the phase was 98% slack, and every byte of it logits that were
+    /// never there.
+    #[test]
+    fn the_head_is_priced_for_the_session_it_runs_in() {
+        let int8 = gated_partial_rotary();
+        assert!(int8.packed_norm);
+        let plan = WavePlan::new(int8);
+        let w = WaveWidth::prefill(2100, 4);
+        assert_eq!(WaveBuffer::HeadNormF32.bytes(&int8, w), 0);
+        assert_eq!(WaveBuffer::HeadLogits.bytes(&int8, w), 4 * 248_320 * 2);
+        assert_eq!(plan.chain_bytes(Chain::Forward, w), 1_991_168);
+
+        // Qwen2's shapes, on the float path its gate actually runs — and note
+        // `packed_norm` stays **true**. That is the measured case: its layers
+        // are packed and its head is not, so the head follows `packed_head`
+        // alone. Pricing it from the layers' flag was the whole 17.1 MiB.
+        let float = ModelGeometry {
+            packed_head: false,
+            hidden: 896,
+            vocab: 151_936,
+            act_dtype: DType::F16,
+            ..int8
+        };
+        assert!(float.packed_norm, "the layers stay packed");
+        let w60 = WaveWidth::prefill(4096, 60);
+        assert_eq!(
+            WaveBuffer::HeadLogits.bytes(&float, w60),
+            0,
+            "a float session's logits leave the span"
+        );
+        assert_eq!(WaveBuffer::HeadNorm.bytes(&float, w60), 60 * 896 * 2);
+        assert_eq!(WaveBuffer::HeadNormF32.bytes(&float, w60), 60 * 896 * 4);
+        assert_eq!(
+            WavePlan::new(float).chain_bytes(Chain::Forward, w60),
+            322_560,
+            "the measured generation, to the byte"
+        );
+    }
+
+    /// **A speculative replay's staged operands, against its measured
+    /// generation.**
+    ///
+    /// `KV_WAVE_CENSUS=labels` on Qwen3.5-9B: six carves, 1,482,480 B, at 30
+    /// staged rows over 6 spans — `conv_dim` 8192 and `value_dim` 4096 in F32,
+    /// two `n_v_heads`-wide scalars, and the span table's 4 pointers and 2
+    /// extents per span.
+    ///
+    /// **And it is charged to nothing else.** The chain is sized by
+    /// `staged_rows`/`staged_spans`, which are zero on every ordinary forward,
+    /// so it drops out of the attention phase's `max` everywhere but a replay.
+    /// Left undeclared it fit under the over-charge on the 9B and did not on
+    /// the 27B, where the replay exhausted the span mid-flight.
+    #[test]
+    fn the_replay_chain_prices_its_measured_generation() {
+        let g = ModelGeometry {
+            delta_net: Some(DeltaNetWidths {
+                conv_dim: 8192,
+                value_dim: 4096,
+                n_v_heads: 32,
+            }),
+            ..gated_partial_rotary()
+        };
+        let plan = WavePlan::new(g);
+        let replay = WaveWidth::replay(30, 6);
+        for (b, want) in [
+            (WaveBuffer::ReplayQkv, 30 * 8192 * 4),
+            (WaveBuffer::ReplayZ, 30 * 4096 * 4),
+            (WaveBuffer::ReplayBeta, 30 * 32 * 4),
+            (WaveBuffer::ReplayAlpha, 30 * 32 * 4),
+            (WaveBuffer::ReplaySpanPtrs, 6 * 4 * 8),
+            (WaveBuffer::ReplaySpanExtents, 6 * 2 * 4),
+        ] {
+            assert_eq!(
+                b.bytes(&g, replay),
+                want,
+                "{b:?} against its measured carve"
+            );
+        }
+        // A replay prices *only* that chain: no attention, no FFN, no head.
+        assert_eq!(
+            plan.phase_bytes(LayerPhase::Attention, replay),
+            plan.chain_bytes(Chain::DeltaNetReplay, replay)
+        );
+        assert_eq!(plan.phase_bytes(LayerPhase::Ffn, replay), 0);
+        assert_eq!(plan.phase_bytes(LayerPhase::Forward, replay), 0);
+        // And an ordinary wave is charged nothing for it, however wide.
+        let ordinary = WaveWidth::prefill(8192, 64);
+        assert_eq!(plan.chain_bytes(Chain::DeltaNetReplay, ordinary), 0);
+    }
+
+    /// **A wave that stops short of the last layer runs no head**, so it
+    /// reserves none of the forward phase. A segmented sweep prices one window
+    /// per layer range, and charging the head's full width to each was 17.4 MiB
+    /// a window on a 60-session Qwen2.
+    #[test]
+    fn a_wave_that_runs_no_head_prices_no_forward_phase() {
+        let plan = WavePlan::new(gated_partial_rotary());
+        let no_head = WaveWidth {
+            prefill_rows: 2100,
+            ..WaveWidth::default()
+        };
+        assert_eq!(plan.phase_bytes(LayerPhase::Forward, no_head), 0);
+        // The layer phases are untouched — the window still runs its layers.
+        assert!(plan.phase_bytes(LayerPhase::Attention, no_head) > 0);
+        assert!(plan.phase_bytes(LayerPhase::Ffn, no_head) > 0);
+    }
+
+    /// **A hybrid's two mixers are a max, never a sum.** A layer runs one of
+    /// them, so charging both prices a wave for a layer that does not exist —
+    /// and charging neither under-sizes the arena the other one carves from.
+    #[test]
+    fn the_attention_phase_takes_the_larger_mixer_chain() {
+        let g = gated_partial_rotary();
+        let plan = WavePlan::new(g);
+        let rows = WaveWidth::prefill(2100, 4);
+        let attn = plan.chain_bytes(Chain::Attention, rows);
+        let dn = plan.chain_bytes(Chain::DeltaNet, rows);
+        assert!(dn > 0, "a hybrid geometry must price its mixer chain");
+        assert_eq!(
+            plan.phase_bytes(LayerPhase::Attention, rows),
+            attn.max(dn),
+            "the phase must be the larger chain, not their sum ({attn} + {dn})"
+        );
+        // And an all-attention stack prices its mixer chain at nothing at all,
+        // alignment included, so no such model's span moves.
+        let plain = WavePlan::new(moe());
+        assert_eq!(plain.chain_bytes(Chain::DeltaNet, rows), 0);
+        assert_eq!(
+            plain.phase_bytes(LayerPhase::Attention, rows),
+            plain.chain_bytes(Chain::Attention, rows)
+        );
     }
 
     /// Per-row cost of the attention chain a **prefill** group runs, as
@@ -1087,26 +2259,39 @@ mod tests {
     fn the_plan_covers_every_measured_chain() {
         let plan = WavePlan::new(moe());
         for rows in [1usize, 20, 124, 744, 3936] {
-            let attn = plan.phase_bytes(LayerPhase::Attention, rows);
-            for (name, rate) in [
-                ("prefill", MEASURED_ATTN_PREFILL_PER_ROW),
-                ("decode", MEASURED_ATTN_DECODE_PER_ROW),
+            // **Each group against its own width**, which is what the split
+            // buys: a wave of `rows` prefill tokens must cover the prefill
+            // chain at `rows`, and a wave of `rows` decode tokens the decode
+            // chain at `rows` — but neither is asked to cover the other's.
+            for (name, rate, width) in [
+                (
+                    "prefill",
+                    MEASURED_ATTN_PREFILL_PER_ROW,
+                    WaveWidth::prefill(rows, 1),
+                ),
+                (
+                    "decode",
+                    MEASURED_ATTN_DECODE_PER_ROW,
+                    WaveWidth::decode(rows),
+                ),
             ] {
+                let attn = plan.phase_bytes(LayerPhase::Attention, width);
                 assert!(
                     attn >= rate * rows,
-                    "attention at {rows} rows prices {attn} B but the measured \
-                     {name} chain takes {} B\n{}",
+                    "attention at {rows} {name} rows prices {attn} B but the \
+                     measured chain takes {} B\n{}",
                     rate * rows,
-                    plan.describe(rows)
+                    plan.describe(width)
                 );
             }
-            let ffn = plan.phase_bytes(LayerPhase::Ffn, rows);
+            let width = WaveWidth::prefill(rows, 1);
+            let ffn = plan.phase_bytes(LayerPhase::Ffn, width);
             assert!(
                 ffn >= MEASURED_FFN_PIPELINE_PER_ROW * rows,
                 "FFN at {rows} rows prices {ffn} B but the measured pipeline \
                  chain takes {} B\n{}",
                 MEASURED_FFN_PIPELINE_PER_ROW * rows,
-                plan.describe(rows)
+                plan.describe(width)
             );
         }
     }
@@ -1114,38 +2299,60 @@ mod tests {
     /// What the union costs over the widest single chain, recorded so the
     /// over-bound is a number someone chose rather than one nobody noticed.
     ///
-    /// A pure-prefill wave pays for `DecodeContext` and `OProjOutput` it never
-    /// allocates; a pure-decode wave pays for four reshape copies that `seq == 1`
-    /// makes free. Both are the price of the plan being handed a total row count
-    /// instead of a per-group split, and closing it means passing the split.
+    /// **A pure-prefill wave pays nothing for the decode chain, and vice
+    /// versa** — the margin this used to record is gone, and its absence is the
+    /// assertion.
     ///
-    /// The third contribution is [`WaveBuffer::AttnNorm`] priced dense against a
-    /// census taken on an int8 run, where it was q8a128: 1792 B/row of the
-    /// 58,624 the chain measured, or 3.1 points of the margin below. That one is
-    /// not closable by passing more context — the two encodings are alternatives
-    /// and the plan has to bound both.
+    /// It was 17.9%, then 14.8% once the norm was priced in the session's real
+    /// encoding ([`ModelGeometry::packed_norm`]), and it is zero now that each
+    /// buffer is sized by its own group's rows rather than by the wave's total.
+    /// The doc here used to say "closing it means passing the split"; this is
+    /// what that looked like.
+    ///
+    /// A **mixed** wave still pays for both, and must — one attention
+    /// generation holds the decode group's buffers and the prefill group's at
+    /// once — but each at its own width, which is a sum of two measurements
+    /// rather than a bound over the larger.
     #[test]
-    fn the_attention_union_costs_a_recorded_margin() {
+    fn each_group_pays_for_its_own_chain_and_not_the_others() {
         let plan = WavePlan::new(moe());
         let rows = 1000;
-        let priced = plan.phase_bytes(LayerPhase::Attention, rows);
-        let widest = MEASURED_ATTN_PREFILL_PER_ROW * rows;
-        let margin = (priced as f64 / widest as f64 - 1.0) * 100.0;
-        println!("attention union over the prefill chain: {margin:.1}%");
-        assert!(
-            (17.0..19.0).contains(&margin),
-            "the union's margin over the widest chain moved to {margin:.1}% — \
-             either a buffer was added to one chain only, or the shapes changed"
+
+        let prefill_only = plan.phase_bytes(LayerPhase::Attention, WaveWidth::prefill(rows, 1));
+        assert_eq!(
+            prefill_only,
+            MEASURED_ATTN_PREFILL_PER_ROW * rows,
+            "a wave with no decode rows must price the prefill chain exactly"
         );
+
+        let decode_only = plan.phase_bytes(LayerPhase::Attention, WaveWidth::decode(rows));
+        assert_eq!(
+            decode_only,
+            MEASURED_ATTN_DECODE_PER_ROW * rows,
+            "a wave with no prefill rows must price the decode chain exactly"
+        );
+
+        // Mixed: both chains live in one generation, each at its own width.
+        let mixed = plan.phase_bytes(
+            LayerPhase::Attention,
+            WaveWidth {
+                prefill_rows: rows,
+                decode_rows: rows,
+                scored_rows: rows + 1,
+                ..WaveWidth::default()
+            },
+        );
+        assert_eq!(mixed, prefill_only + decode_only);
     }
 
     #[test]
     fn the_ffn_phase_dominates_a_moe_layer() {
         let plan = WavePlan::new(moe());
         assert!(
-            plan.phase_bytes(LayerPhase::Ffn, 64) > plan.phase_bytes(LayerPhase::Attention, 64),
+            plan.phase_bytes(LayerPhase::Ffn, w(64))
+                > plan.phase_bytes(LayerPhase::Attention, w(64)),
             "expert replication should make the FFN the sizing phase:\n{}",
-            plan.describe(64)
+            plan.describe(w(64))
         );
     }
 
@@ -1154,10 +2361,10 @@ mod tests {
     #[test]
     fn a_wave_costs_the_larger_phase_not_the_sum() {
         let plan = WavePlan::new(moe());
-        let sum =
-            plan.phase_bytes(LayerPhase::Attention, 64) + plan.phase_bytes(LayerPhase::Ffn, 64);
-        assert!(plan.wave_bytes(64) < sum);
-        assert!(plan.wave_bytes(64) >= plan.phase_bytes(LayerPhase::Ffn, 64));
+        let sum = plan.phase_bytes(LayerPhase::Attention, w(64))
+            + plan.phase_bytes(LayerPhase::Ffn, w(64));
+        assert!(plan.wave_bytes(w(64)) < sum);
+        assert!(plan.wave_bytes(w(64)) >= plan.phase_bytes(LayerPhase::Ffn, w(64)));
     }
 
     /// The bisection in `max_rows_within` is only valid if cost never decreases
@@ -1168,7 +2375,7 @@ mod tests {
             let plan = WavePlan::new(g);
             let mut prev = 0;
             for rows in 1..600 {
-                let cost = plan.wave_bytes(rows);
+                let cost = plan.wave_bytes(w(rows));
                 assert!(cost >= prev, "cost fell from {prev} at {rows} rows");
                 prev = cost;
             }
@@ -1183,14 +2390,14 @@ mod tests {
         for g in [moe(), dense()] {
             let plan = WavePlan::new(g);
             for budget in [4 * MIB, 16 * MIB, 64 * MIB, 256 * MIB] {
-                let rows = plan.max_rows_within(budget);
+                let rows = plan.max_rows_within(budget, empty_head());
                 assert!(rows > 0, "budget {budget} should fit at least one row");
                 assert!(
-                    plan.fits(rows, budget),
+                    plan.fits(w(rows), budget),
                     "{rows} rows must fit in {budget} B"
                 );
                 assert!(
-                    !plan.fits(rows + 1, budget),
+                    !plan.fits(w(rows + 1), budget),
                     "{} rows must NOT fit in {budget} B",
                     rows + 1
                 );
@@ -1206,9 +2413,9 @@ mod tests {
     fn ensure_fits_agrees_with_the_admission_bound() {
         let plan = WavePlan::new(moe());
         let budget = 32 * MIB;
-        let widest = plan.max_rows_within(budget);
-        assert!(plan.ensure_fits(widest, budget).is_ok());
-        assert!(plan.ensure_fits(widest + 1, budget).is_err());
+        let widest = plan.max_rows_within(budget, empty_head());
+        assert!(plan.ensure_fits(w(widest), budget).is_ok());
+        assert!(plan.ensure_fits(w(widest + 1), budget).is_err());
     }
 
     /// An over-budget refusal has to say enough to act on: how wide the wave
@@ -1217,15 +2424,19 @@ mod tests {
     fn the_over_budget_error_names_the_width_and_the_overage() {
         let plan = WavePlan::new(moe());
         let budget = 8 * MIB;
-        let rows = plan.max_rows_within(budget) + 64;
+        let rows = plan.max_rows_within(budget, empty_head()) + 64;
         let err = plan
-            .ensure_fits(rows, budget)
+            .ensure_fits(w(rows), budget)
             .expect_err("must refuse")
             .to_string();
         assert!(err.contains("wave over budget"), "{err}");
         assert!(err.contains(&rows.to_string()), "names the width: {err}");
         assert!(err.contains("over by"), "names the overage: {err}");
-        assert!(err.contains("widest wave"), "names what would fit: {err}");
+        assert!(
+            err.contains("widest prefill"),
+            "names what would fit: {err}"
+        );
+        assert!(err.contains("scored"), "names the scored rows: {err}");
     }
 
     /// A budget too small to price a single token is a misconfiguration, and
@@ -1234,9 +2445,9 @@ mod tests {
     #[test]
     fn a_budget_below_one_row_admits_nothing() {
         let plan = WavePlan::new(moe());
-        let one_row = plan.wave_bytes(1);
-        assert_eq!(plan.max_rows_within(one_row - 1), 0);
-        assert_eq!(plan.max_rows_within(one_row), 1);
+        let one_row = plan.wave_bytes(w(1));
+        assert_eq!(plan.max_rows_within(one_row - 1, empty_head()), 0);
+        assert_eq!(plan.max_rows_within(one_row, empty_head()), 1);
     }
 
     /// Halving the budget must roughly halve the admitted width — the property
@@ -1244,8 +2455,8 @@ mod tests {
     #[test]
     fn the_admitted_width_tracks_the_budget() {
         let plan = WavePlan::new(moe());
-        let wide = plan.max_rows_within(64 * MIB);
-        let narrow = plan.max_rows_within(32 * MIB);
+        let wide = plan.max_rows_within(64 * MIB, empty_head());
+        let narrow = plan.max_rows_within(32 * MIB, empty_head());
         let ratio = wide as f64 / narrow as f64;
         assert!(
             (1.8..=2.2).contains(&ratio),
@@ -1263,7 +2474,8 @@ mod tests {
             ..moe()
         });
         assert!(
-            single.max_rows_within(64 * MIB) > routed.max_rows_within(64 * MIB),
+            single.max_rows_within(64 * MIB, empty_head())
+                > routed.max_rows_within(64 * MIB, empty_head()),
             "routing to 8 experts must narrow the wave"
         );
     }
@@ -1277,7 +2489,10 @@ mod tests {
             accum_dtype: DType::BF16,
             ..moe()
         });
-        assert!(bf16_accum.max_rows_within(64 * MIB) > f32_accum.max_rows_within(64 * MIB));
+        assert!(
+            bf16_accum.max_rows_within(64 * MIB, empty_head())
+                > f32_accum.max_rows_within(64 * MIB, empty_head())
+        );
     }
 
     /// What the FFN span actually admits on the production model, recorded so a
@@ -1290,17 +2505,17 @@ mod tests {
     fn the_ffn_span_admits_a_recorded_width() {
         use super::super::wave_spans::WAVE_FFN_BYTES;
         let plan = WavePlan::new(moe());
-        let rows = plan.max_rows_within(WAVE_FFN_BYTES);
+        let rows = plan.max_rows_within(WAVE_FFN_BYTES, empty_head());
         println!(
             "FFN span {} B admits {rows} rows; one row costs {} B",
             WAVE_FFN_BYTES,
-            plan.phase_bytes(LayerPhase::Ffn, 1),
+            plan.phase_bytes(LayerPhase::Ffn, w(1)),
         );
         assert!(
             rows > 0,
             "a span that cannot price one row would stall every wave"
         );
         // Monotonic in the budget: halving the span must not admit more rows.
-        assert!(plan.max_rows_within(WAVE_FFN_BYTES / 2) <= rows);
+        assert!(plan.max_rows_within(WAVE_FFN_BYTES / 2, empty_head()) <= rows);
     }
 }

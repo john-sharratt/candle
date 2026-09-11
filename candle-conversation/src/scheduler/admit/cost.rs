@@ -57,25 +57,52 @@ impl Cost {
     }
 
     /// Ground this admission takes **off the free list**, at the granularity
-    /// the allocator actually claims it — which is what the weight side loses.
+    /// the allocator actually claims it.
     ///
-    /// By the span identity (`interleave::achievable_weight_bytes`) the
-    /// residency the weight side can reach is the span less the live regions,
-    /// so claiming a region lowers it by exactly that region: the free list is
-    /// not headroom standing *beside* the weight zone, it is the same ground
-    /// seen from the other end. That is why the tier is not in this sum — it is
-    /// transient, released at phase 0 of the forward it was placed for, and
-    /// makes no region live.
-    ///
-    /// Region-granular, and rounded the same way [`super::super::prefill`]'s
-    /// `buy_kv_ground` rounds the claim it buys for, so the figure admission is
+    /// The tier is not in this sum, and that is right *for this question*: it
+    /// makes no region live, and it is released at phase 0 of the forward it
+    /// was placed for. What this answers is "what does the allocator claim",
+    /// which is what [`super::super::prefill`]'s `buy_kv_ground` purchases —
+    /// region-granular, and rounded the same way, so the figure admission is
     /// judged on and the figure admission purchases cannot drift.
+    ///
+    /// It is **not** the answer to "what does the weight side lose": see
+    /// [`Self::dislodged_bytes`].
     pub(crate) fn claimed_bytes(&self) -> u64 {
         let region = REGION_BYTES as u64;
         self.kv
             .saturating_add(self.recurrent)
             .div_ceil(region)
             .saturating_mul(region)
+    }
+
+    /// Residency the weight side actually loses to this admission — its claim
+    /// **and its tier**.
+    ///
+    /// The figure the throughput model is judged on, because the trade it
+    /// exists to weigh is "do these rows earn back the weights they dislodge",
+    /// and the tier dislodges weights exactly as a region claim does.
+    ///
+    /// **The tier being transient does not make it free.** It is released
+    /// between forwards, but the fill publishes it
+    /// (`set_least_tier_bytes`) and the weight side's growth is then bounded by
+    /// "the gap above the live watermark less the slack **and the least
+    /// forward's tier**" (`RegionPool::spare`). So a wave that widens holds
+    /// that ground against the weight side for as long as it stays that wide —
+    /// wave after wave, not for one forward.
+    ///
+    /// Charging only [`Self::claimed_bytes`] made a prefill chunk's tier free
+    /// to the rate model: it saw the rows the chunk earns and the K/V it
+    /// claims, and none of the expert residency its tier concedes. The two
+    /// judges of one admission then disagreed about its cost — the first-decode
+    /// gate is handed [`Self::total`], which has always included the tier.
+    ///
+    /// Not region-rounded: the tier is placed in whole regions, but the
+    /// rounding is the *placement's* and applies to the wave's whole tier, not
+    /// to each admission's slice of it. Rounding here would charge a region per
+    /// admission for ground the wave takes once.
+    pub(crate) fn dislodged_bytes(&self) -> u64 {
+        self.claimed_bytes().saturating_add(self.activations)
     }
 }
 
@@ -197,6 +224,36 @@ mod tests {
         };
         assert_eq!(c.claimed_bytes(), 2 * region, "rounded up, tier excluded");
         assert_eq!(Cost::default().claimed_bytes(), 0);
+        // **And the tier is exactly what separates the two questions.** The
+        // allocator claims `claimed_bytes`; the weight side loses that plus the
+        // tier, because the fill publishes the tier and the growth term is
+        // bounded by it. The rate model is judged on the second — charging it
+        // the first made a prefill chunk's tier free to the one model whose job
+        // is weighing what an admission dislodges.
+        assert_eq!(
+            c.dislodged_bytes(),
+            2 * region + 64 * region,
+            "the claim, rounded, plus the tier, not rounded"
+        );
+        assert_eq!(
+            Cost {
+                activations: 0,
+                ..c
+            }
+            .dislodged_bytes(),
+            c.claimed_bytes(),
+            "with no tier the two questions have the same answer"
+        );
+        // A decode step claims nothing and still moves the tier, which is the
+        // case the omission hid completely.
+        let step = Cost {
+            kv: 0,
+            recurrent: 0,
+            activations: 3 * region,
+            rows: 8,
+        };
+        assert_eq!(step.claimed_bytes(), 0);
+        assert_eq!(step.dislodged_bytes(), 3 * region);
         assert_eq!(
             Cost {
                 kv: region,

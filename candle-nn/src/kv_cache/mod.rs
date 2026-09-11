@@ -48,11 +48,18 @@ pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, Gold
 /// defects are trajectory defects, so the decision has to be runnable over a
 /// simulated workload with no device in reach
 /// (`docs/vram_partition_behavioural_tests.md`).
-pub use chunked::growth_policy::{kv_grow_step, GrowthPolicy, Occupancy, Refusal};
+pub use chunked::growth_policy::{
+    kv_grow_step, kv_ground_shortfall, GrowthPolicy, Occupancy, Refusal,
+};
 /// A guest's pipeline stage. Defined in both configurations — `f(x)` when there
 /// is no GPU backend, since no guest arena can exist without one — because the
 /// model code that marks its stages is built in both.
 pub use chunked::guest_stage;
+/// The region quantum, and the margin a wave's tier budget holds back for what
+/// moves between the wave's build and its placement. Arithmetic rather than
+/// device facts — a caller pricing a claim or composing a wave needs both on
+/// every backend, and every composer must hold back the same margin.
+pub use chunked::span_geometry::{REGION_BYTES, TIER_MARGIN_BYTES, TIER_MARGIN_REGIONS};
 #[cfg(feature = "cuda")]
 pub use chunked::persistence_domain_stats;
 #[cfg(feature = "cuda")]
@@ -62,12 +69,14 @@ pub use chunked::slot_state_stats;
 /// worst defects were geometry, and none of them needed a GPU to find.
 pub use chunked::span_geometry;
 pub use chunked::wave_plan::{
-    BufferShape, Encoding, LayerPhase, ModelGeometry, WaveBuffer, WavePlan, BUMP_ALIGNMENT,
+    ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, LayerPhase, ModelGeometry,
+    WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, end_wave_transient,
     guest_domain_stats, open_guest_arena, plan_wave_transient, wave_domain_stats, wave_is_live,
+    wave_max_planned, wave_max_slack, wave_reset_observations, wave_worst_slack,
     BumpRange, ForwardOpen, WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
@@ -78,13 +87,14 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    empty_sweep_stats, reclaim_empty_arenas, region_stats, spare_tally, RegionStats, REGION_BYTES,
+    empty_sweep_stats, reclaim_empty_arenas, region_stats, spare_tally, RegionStats,
 };
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    initial_weight_bytes, kv_spare_regions, set_least_tier_bytes, set_weight_floor, span_end,
-    transient_headroom_bytes, weight_capacity_bytes, weight_floor_after,
+    initial_weight_bytes, kv_spare_regions, least_tier_bytes, set_least_tier_bytes,
+    set_weight_floor, span_end, transient_headroom_bytes, weight_capacity_bytes,
+    weight_floor_after,
 };
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.

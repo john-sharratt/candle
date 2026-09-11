@@ -29,10 +29,10 @@
 
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
+use candle_nn::kv_cache::WaveWidth;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
     begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, WavePlan,
-    REGION_BYTES, WAVE_FORWARD_BYTES,
 };
 
 use super::batched::HybridBatched;
@@ -757,8 +757,8 @@ impl WaveSweep for HybridBatched {
         HybridBatched::num_layers(self)
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
-        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head_rows, tier_budget)
+    fn prefill_width_cap(&self, act_dtype: DType, head: WaveWidth, tier_budget: usize) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head, tier_budget)
     }
 
     fn kv_layer_range(&self, layer_start: usize, layer_end: usize) -> (usize, usize) {
@@ -798,7 +798,6 @@ impl WaveSweep for HybridBatched {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(d) = HybridBatched::device(self) {
             end_wave_transient(&d.cuda_stream());
-            self.reclaim_spare_ground();
         }
 
         // Offsets in `seq_ids` order, read from the session by id — a sequence
@@ -811,6 +810,30 @@ impl WaveSweep for HybridBatched {
             .map(|&s| session.sequence_offset(s).unwrap_or(0))
             .collect();
         self.ensure_recurrent(&seqs, &offsets)?;
+
+        // **The growth direction measures spare ground AFTER this wave's stores
+        // have claimed theirs.** It used to run above, beside the tier release,
+        // and that put it a few lines ahead of the one claim it was competing
+        // with: `ensure_recurrent` creates a store for every sequence joining
+        // the wave — 320 MiB apiece on the 27B — out of the same free list
+        // `spare_regions` had just called spare and handed to the weight side.
+        //
+        // The measured shape, on the 27B at ten contexts: the driver bought 151
+        // regions so the stores would fit, the wave opened, the growth direction
+        // took half of them straight back as spare, and the stores then refused.
+        // Ground bought for a claim and given away before the claim runs is
+        // worse than not buying it, because the purchase reports success.
+        //
+        // This is the same correction `Occupancy::least_tier_bytes` is: a demand
+        // the next moment is certain to make is not spare, however free it looks
+        // right now. Still between forwards — `begin_recurrent_wave` is the next
+        // line, and nothing above it opens a generation — so the boundary may
+        // still move, which is the only thing the old position bought.
+        #[cfg(feature = "cuda")]
+        if matches!(HybridBatched::device(self), Device::Cuda(_)) {
+            self.reclaim_spare_ground();
+        }
+
         self.begin_recurrent_wave(&seqs)?;
         let mut stores = match self.take_recurrent(&seqs) {
             Ok(s) => s,
@@ -837,6 +860,44 @@ impl WaveSweep for HybridBatched {
 }
 
 /// The layer sweep proper.
+/// This wave's width, in the three units the plan prices from.
+///
+/// **The scored-row rule lives here and is asserted against the head**, which
+/// is the only thing stopping the tier from being sized by one rule and spent
+/// by another: the head selects its rows a thousand lines below, long after the
+/// reservation has been bought, and a disagreement between the two would show
+/// up as a span exhausting mid-forward rather than as a number anyone could
+/// read. Every decode row is scored, the last token of each prefill sequence
+/// is, and a *verifying* span scores all of its rows — each is a prediction to
+/// compare a proposal against.
+fn wave_width(
+    n_decode: usize,
+    pre_rows: usize,
+    pre_q: &[usize],
+    seq_ids: &[usize],
+    verify_seqs: &[usize],
+) -> WaveWidth {
+    let scored_prefill: usize = pre_q
+        .iter()
+        .enumerate()
+        .map(|(k, &l)| {
+            if verify_seqs.contains(&seq_ids[n_decode + k]) {
+                l
+            } else {
+                1
+            }
+        })
+        .sum();
+    WaveWidth {
+        prefill_rows: pre_rows,
+        decode_rows: n_decode,
+        scored_rows: n_decode + scored_prefill,
+        // A forward stages nothing; only the verify *replay* does, and it
+        // prices itself through `WaveWidth::replay`.
+        ..WaveWidth::default()
+    }
+}
+
 fn sweep_layers(
     model: &HybridBatched,
     session: &mut BatchedInferenceSession,
@@ -898,6 +959,12 @@ fn sweep_layers(
     let (dec_q, pre_q) = q_lens.split_at(n_decode);
     let pre_rows: usize = pre_q.iter().sum();
     let total_rows = n_decode + pre_rows;
+    // **Read before the tier is priced, not at the head.** The forward phase is
+    // sized by the rows the head will score, and a verifying span scores all of
+    // its rows rather than one — so the tier cannot be bought without this. It
+    // is model state that holds for the whole speculative step, so reading it
+    // here and at the head gives the same answer; the head asserts as much.
+    let verify_seqs = model.verify_row_seqs()?;
 
     // Attention metadata, from the session's shared borrow — the hybrid's arena
     // state does not move before the layer loop reads it, so building here
@@ -961,13 +1028,39 @@ fn sweep_layers(
     if total_rows > 0 {
         if let Device::Cuda(d) = dev {
             let plan = WavePlan::new(model.wave_geometry(embed_dtype));
-            let pad = |b: usize| b + REGION_BYTES;
+            // **No padding, and no constants.** Each phase is bought at exactly
+            // what this wave's own width prices it to.
+            //
+            // This carried `+ REGION_BYTES` on the two layer phases and
+            // `WAVE_FORWARD_BYTES` outright on the third. The pad was justified
+            // by "a phase pays one alignment per range and the count is not in
+            // the plan" — but the count is in the plan, and the shapes are all
+            // multiples of the alignment anyway, so it bought 16 MiB a phase
+            // against a few kilobytes already charged. The constant was worse
+            // than slack: the forward phase costs ~498 KB per scored row, so
+            // 16 MiB covers 33 of them and this engine composes waves of 64.
+            //
+            // A reservation is either the demand or it is a guess; padding one
+            // to be safe is what makes the weight floor's guarantee fail a
+            // width later, and capping one is what makes a wide wave exhaust
+            // the span after every layer has already launched.
+            // A wave that stops short of the last layer returns its residual and
+            // runs no head, so it reserves none of the forward phase.
+            let width = if layer_end == num_layers {
+                wave_width(n_decode, pre_rows, pre_q, seq_ids, &verify_seqs)
+            } else {
+                WaveWidth {
+                    prefill_rows: pre_rows,
+                    decode_rows: n_decode,
+                    ..WaveWidth::default()
+                }
+            };
             let per_phase = [
-                pad(plan.phase_bytes(LayerPhase::Attention, total_rows)),
-                pad(plan.phase_bytes(LayerPhase::Ffn, total_rows)),
-                WAVE_FORWARD_BYTES,
+                plan.phase_bytes(LayerPhase::Attention, width),
+                plan.phase_bytes(LayerPhase::Ffn, width),
+                plan.phase_bytes(LayerPhase::Forward, width),
             ];
-            plan_wave_transient(&d.cuda_stream(), per_phase)?;
+            plan_wave_transient(&d.cuda_stream(), per_phase, width)?;
         }
     }
 
@@ -1109,7 +1202,6 @@ fn sweep_layers(
     // captures nothing into it, and lose it outright if that sweep then failed.
     // Every armed sequence rides the same `decode_forward_cobatched` call, so a
     // wave carries all of them or none.
-    let verify_seqs = model.verify_row_seqs()?;
     // Any armed sequence in this window is reason to take the stash: a
     // segmented sweep carries a subset per window and each stamps the spans it
     // holds, which is what lets the windows accumulate into the one complete
@@ -1457,6 +1549,28 @@ fn sweep_layers(
             idx.push(acc + l as u32 - 1);
         }
         acc += l as u32;
+    }
+    // **The tier's forward phase was bought for exactly this many rows.** The
+    // reservation was made before layer 0 launched, from `wave_width`'s reading
+    // of the same rule; if the two ever disagree the span would exhaust here,
+    // with every layer's work already spent and nothing in the error naming
+    // why. Checked rather than trusted, because the two sites are a thousand
+    // lines apart and only one of them is the one people edit.
+    //
+    // **A real check, not a `debug_assert`.** Everything here runs `--release`,
+    // where a `debug_assert` compiles to nothing — so the invariant that reads
+    // as guarded had never once executed. The cost is a comparison and one walk
+    // of `pre_q`, against a forward that has just run every layer.
+    let priced = wave_width(n_decode, pre_rows, pre_q, seq_ids, &verify_seqs).scored_rows;
+    if idx.len() != priced {
+        candle::bail!(
+            "the head scores {} rows but the tier's forward phase was bought for {priced}. \
+             These come from one rule read at two sites a thousand lines apart \
+             (`wave_width`, and the row selection here); they have diverged, and \
+             continuing would exhaust the forward span with every layer's work \
+             already spent.",
+            idx.len(),
+        )
     }
     if idx.is_empty() {
         return Ok((WavePhase::Residual(x), None));

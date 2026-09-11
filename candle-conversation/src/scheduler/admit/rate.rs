@@ -789,7 +789,7 @@ impl WaveRate {
     /// **The caller must hand over the counterfactual.** The slot is already
     /// resident — its K/V and store were claimed at prefill admission — so
     /// `weights_before` is residency *as if this turn were not there*
-    /// (`resident_now + Cost::claimed_bytes()`) and `weights_after` is residency
+    /// (`resident_now + Cost::dislodged_bytes()`) and `weights_after` is residency
     /// as it actually stands. Offering it any other way asks the model whether
     /// to admit something already admitted, which double-counts its ground and
     /// can only answer yes.

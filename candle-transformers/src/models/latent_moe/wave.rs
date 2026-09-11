@@ -27,8 +27,8 @@ use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_driver::{drive_wave, WaveGroups, WaveSweep};
-use candle_nn::kv_cache::ModelGeometry;
 use candle_nn::kv_cache::CHUNK_SIZE;
+use candle_nn::kv_cache::{ModelGeometry, WaveWidth};
 
 use crate::models::verify_wave::VerifyPlan;
 
@@ -882,7 +882,10 @@ impl ManagedBatchedModel for BatchedEngine {
     fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
         let cfg = self.engine.cfg();
         ModelGeometry {
+            // Latent attention on every layer — no second mixer chain.
+            delta_net: None,
             hidden: cfg.dim,
+            vocab: cfg.vocab_size,
             // Per-expert intermediate — the MoE FFN phase is priced per routed
             // expert row, exactly like the qwen3 geometry.
             intermediate: cfg.moe_inter_dim,
@@ -893,19 +896,28 @@ impl ManagedBatchedModel for BatchedEngine {
             experts_per_tok: cfg.n_activated_experts.max(1),
             n_experts: cfg.n_routed_experts.max(1),
             act_dtype,
+            // The int8-KO path quantizes in the norm's epilogue. Read off the
+            // head, which is loaded with the same mode as every other weight.
+            packed_norm: self.engine.lm_head_is_int8(),
+            packed_head: self.engine.lm_head_is_int8(),
+            // Moot: this forward takes its transients from the CUDA pool rather
+            // than the span (see `prefill_width_cap` below), so no attention
+            // buffer is carved from a wave arena for these to price. Single-
+            // latent MLA has no Q/K/V narrow and no per-head norm reshape
+            // either, which is what they would say if it did.
+            fused_qkv: false,
+            head_qk_norm: false,
+            head_norm_reshapes: false,
             // The int8 tensor-core kernels emit F32 before the cast back to
             // `act_dtype`; both buffers are live at once, so both are planned.
             accum_dtype: DType::F32,
-            // Moot here — this forward takes its transients from the CUDA pool
-            // rather than the span (see `prefill_width_cap` below), so no
-            // projection buffer is carved from a wave arena at all.
-            projection_accum_roundtrip: false,
             gated_qkv: false,
             partial_rotary: false,
         }
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, _tier_budget: usize) -> usize {
+    fn prefill_width_cap(&self, act_dtype: DType, head: WaveWidth, _tier_budget: usize) -> usize {
+        let head_rows = head.rows();
         // DeepSeek's forward takes its transients from the CUDA pool (it has
         // not adopted the span's wave arenas), so the default cap's FFN-span
         // pricing bounds a tier this model never allocates from — and at the
@@ -1247,8 +1259,8 @@ impl WaveSweep for BatchedEngine {
         self.engine.layer_count()
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
-        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head_rows, tier_budget)
+    fn prefill_width_cap(&self, act_dtype: DType, head: WaveWidth, tier_budget: usize) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head, tier_budget)
     }
 
     /// No reconciliation: this model's session offsets are ABSOLUTE while

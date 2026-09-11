@@ -12,7 +12,7 @@
 
 use std::sync::atomic::AtomicU64;
 
-use candle_nn::kv_cache::{MIN_ELASTIC_RESERVE, REGION_BYTES};
+use candle_nn::kv_cache::{MIN_ELASTIC_RESERVE, REGION_BYTES, WAVE_SPAN_BYTES};
 
 /// The weight zone's permitted extent, in bytes.
 pub(super) fn weight_zone_bytes() -> Option<u64> {
@@ -31,15 +31,47 @@ pub(super) fn weight_zone_bytes() -> Option<u64> {
 /// caught up later, when the tier had to buy ground, and the zone fell 2 GiB
 /// under the mark in one step. Counting live regions charges each claim the
 /// instant it is made.
-pub(super) fn effective_weight_zone_bytes() -> Option<u64> {
+/// **`standing_tier` is what the wave already in flight reserves**, and the
+/// reason this takes an argument at all.
+///
+/// The reserve used to be `MIN_ELASTIC_RESERVE` flat — and that constant carries
+/// a *912 MiB* tier term ([`WAVE_SPAN_BYTES`], the three phase spans). So the
+/// figure every admission's rate trade is judged against modelled the tier as
+/// fixed, whatever the wave's width. Measured tiers reach gigabytes, and the
+/// overstatement is the difference: the model saw residency the published tier
+/// had already taken, kept admitting, and the weight zone collapsed under it.
+///
+/// Only the **excess** over the constant's own tier term is added, so a wave
+/// inside the guarantee reads exactly as it did before and nothing narrow moves.
+///
+/// **Not the previous wave's published tier**, which is what would close the
+/// loop `prefill::WaveFill::budget` warns about — a bound that is its own
+/// decision's output has one fixed point, the narrowest wave that works. The
+/// standing tier is the wave already committed (its decodes and its held creep),
+/// a fact rather than a choice; the tier each *new* admission adds is charged
+/// separately, as `admit::Cost::dislodged_bytes`. Between them they cover the
+/// whole wave's tier exactly once.
+///
+/// Pass `0` where there is no wave in flight — the idle reseed, the reports —
+/// and the constant binds as it always did.
+pub(super) fn effective_weight_zone_bytes(standing_tier: usize) -> Option<u64> {
     let r = candle_nn::kv_cache::region_stats(0)?;
     Some(achievable_weight_bytes(
         r.total,
         r.live,
         r.weight_bytes,
         REGION_BYTES,
-        MIN_ELASTIC_RESERVE,
+        reserve_for(standing_tier),
     ))
+}
+
+/// The floor's reserve, raised by whatever a standing tier needs beyond the
+/// tier term [`MIN_ELASTIC_RESERVE`] already carries.
+///
+/// Pure and separate so the identity is testable without a device — the
+/// partition's defects have all been trajectory defects.
+pub(super) fn reserve_for(standing_tier: usize) -> usize {
+    MIN_ELASTIC_RESERVE.saturating_add(standing_tier.saturating_sub(WAVE_SPAN_BYTES))
 }
 
 /// The residency the weight side could reach if nothing but what is resident
@@ -172,6 +204,47 @@ mod tests {
         // 256 MiB reserve leave the weight side 1,632 MiB.
         let got = achievable_weight_bytes(100, 40, 1 << 30, 16 << 20, 256 << 20);
         assert_eq!(got, (1 << 30) + (60 * (16 << 20)) - (256 << 20));
+    }
+
+    /// **A standing tier is ground the weight side does not have**, and the
+    /// reserve says so.
+    ///
+    /// The floor's constant carries a flat `WAVE_SPAN_BYTES` tier term, so a
+    /// wave inside that guarantee must read exactly as it did before — nothing
+    /// narrow moves — while a wave beyond it raises the reserve by the excess
+    /// and by nothing more. Charging the whole tier on top of the constant
+    /// would count that first 912 MiB twice.
+    ///
+    /// This only ever *tightens*: the reserve is monotone in the tier and never
+    /// falls below the constant, so no wave is told it has more room than the
+    /// old figure promised.
+    #[test]
+    fn a_standing_tier_raises_the_reserve_by_its_excess_over_the_guarantee() {
+        assert_eq!(reserve_for(0), MIN_ELASTIC_RESERVE, "no wave, no change");
+        assert_eq!(
+            reserve_for(WAVE_SPAN_BYTES),
+            MIN_ELASTIC_RESERVE,
+            "a wave inside the guarantee reads as it always did"
+        );
+        assert_eq!(
+            reserve_for(WAVE_SPAN_BYTES / 2),
+            MIN_ELASTIC_RESERVE,
+            "and so does a narrower one"
+        );
+        let over = 3 * WAVE_SPAN_BYTES;
+        assert_eq!(
+            reserve_for(over),
+            MIN_ELASTIC_RESERVE + 2 * WAVE_SPAN_BYTES,
+            "beyond it, the excess and only the excess"
+        );
+        // Monotone, and never below the constant — the two properties that make
+        // this safe to apply everywhere the old figure was read.
+        let mut prev = 0;
+        for mult in 0..8 {
+            let r = reserve_for(mult * WAVE_SPAN_BYTES);
+            assert!(r >= MIN_ELASTIC_RESERVE && r >= prev);
+            prev = r;
+        }
     }
 
     /// **The effective zone already counts every free region**, so a caller may

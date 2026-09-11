@@ -31,7 +31,9 @@ use std::sync::{Mutex, RwLock};
 
 use candle::quantized::cuda::to_dynamic;
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::kv_cache::{KvCache, ModelGeometry, QWEN4EXP_KV_FACTORS};
+use candle_nn::kv_cache::{
+    ffn_work_dtype, DeltaNetWidths, KvCache, ModelGeometry, WaveWidth, QWEN4EXP_KV_FACTORS,
+};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::carried_move::move_entry;
@@ -1413,19 +1415,43 @@ impl Qwen4ExpBatched {
 impl ManagedBatchedModel for Qwen4ExpBatched {
     fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
         let cfg = &self.model.cfg;
+        let int8 = self.model.lm_head.int8mode().is_int8();
         ModelGeometry {
             hidden: cfg.hidden_size,
+            vocab: cfg.vocab_size,
             intermediate: cfg.moe.expert_ffn_size,
             n_head: cfg.num_attention_heads,
             n_kv_head: cfg.num_kv_heads,
             head_dim: cfg.attn_head_dim,
             experts_per_tok: cfg.moe.n_experts_used.max(1),
             n_experts: cfg.moe.n_experts.max(1),
+            // The 3:1 hybrid's DeltaNet mixer carves from the attention arena,
+            // so its widths are priced beside the attention chain.
+            delta_net: cfg
+                .layer_kinds
+                .iter()
+                .any(|k| matches!(k, LayerKind::DeltaNet))
+                .then_some(DeltaNetWidths {
+                    conv_dim: cfg.delta_net.conv_dim(),
+                    value_dim: cfg.delta_net.value_dim(),
+                    n_v_heads: cfg.delta_net.n_v_heads,
+                }),
             act_dtype,
-            accum_dtype: DType::F32,
-            projection_accum_roundtrip: false,
+            accum_dtype: if int8 {
+                DType::F32
+            } else {
+                ffn_work_dtype(act_dtype)
+            },
+            packed_norm: int8,
+            packed_head: int8,
+            // The Qwen3.5 lineage's attention: an interleaved `[q | gate]` Q
+            // weight that does not pack with K and V, per-head Q/K norms, and a
+            // wave flattened to `[rows, hidden]` before the sweep.
             gated_qkv: true,
-            partial_rotary: true,
+            fused_qkv: false,
+            head_qk_norm: true,
+            head_norm_reshapes: false,
+            partial_rotary: cfg.rope_dim < cfg.attn_head_dim,
         }
     }
 
@@ -1440,8 +1466,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// opens). Bounding one forward's rows keeps the peak inside it; the
     /// pure-prefill slab slicer turns a wider fleet into sequential slabs.
     /// Fusing the GR (the §0.4 work the design doc records) removes this term.
-    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, _tier_budget: usize) -> usize {
+    fn prefill_width_cap(&self, act_dtype: DType, head: WaveWidth, _tier_budget: usize) -> usize {
         const GR_EAGER_ROW_CAP: usize = 2048;
+        let head_rows = head.rows();
         // The rows already in the wave ride the same forward: they count
         // against the eager peak and write KV too, so they come off both
         // bounds, never leaving less than one row. The span tier budget is not
@@ -1949,8 +1976,8 @@ impl WaveSweep for Qwen4ExpBatched {
         self.model.cfg.num_layers
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
-        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head_rows, tier_budget)
+    fn prefill_width_cap(&self, act_dtype: DType, head: WaveWidth, tier_budget: usize) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head, tier_budget)
     }
 
     /// Caches are indexed by KV layer: three quarters of the trunk owns no

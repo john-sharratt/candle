@@ -185,6 +185,11 @@ fn log_refusal(
         recurrent_mib = cost.recurrent >> 20,
         tier_mib = cost.activations >> 20,
         claimed_mib = cost.claimed_bytes() >> 20,
+        // What the judgement was actually made on — the claim plus the tier.
+        // Logged beside `claimed_mib` because the two differ by exactly the
+        // term that used to be missing, and a run that refuses unexpectedly
+        // wants to see which of them moved.
+        dislodged_mib = cost.dislodged_bytes() >> 20,
         resident_before_mib = before >> 20,
         resident_after_mib = after >> 20,
         floor_mib = budget.floor >> 20,
@@ -268,11 +273,14 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
         // size and may still be worth carrying.
         while let Some(cost) = ground.peek(kind, prio) {
             let total = cost.total();
-            // The truth as of this offer, and what this offer's claims would
-            // leave of it. The claim is region-granular and the tier is not in
-            // it — see `Cost::claimed_bytes`.
+            // The truth as of this offer, and what this offer would leave of
+            // it — its region claim **and its tier**, which the weight side
+            // loses alike. See `Cost::dislodged_bytes`: the tier is transient
+            // per forward but published per wave, and the growth term is
+            // bounded by it, so a wave that widens holds that ground against
+            // the weight side for as long as it stays that wide.
             let before = ground.resident_weights();
-            let after = before.saturating_sub(cost.claimed_bytes());
+            let after = before.saturating_sub(cost.dislodged_bytes());
             let allowed = match kind {
                 // A decode when none is running is the one case with its own
                 // rule — it keeps the expert cache warm. It is also the only
@@ -520,7 +528,9 @@ mod tests {
             }
             let priced = self.queue(kind).remove(0);
             assert_eq!(cost.kv, priced, "admit is handed the price peek quoted");
-            self.resident = self.resident.saturating_sub(cost.claimed_bytes());
+            // The engine's own residency moves by what the weight side loses,
+            // which is the claim *and* the tier — see `Cost::dislodged_bytes`.
+            self.resident = self.resident.saturating_sub(cost.dislodged_bytes());
             self.active += 1;
             if kind == Kind::Decode {
                 self.decodes_active += 1;

@@ -683,6 +683,15 @@ mod tests {
             // int8-KO expert/attention matmuls), not the harness default (`Off`).
             .with_int8mode(Int8Mode::Performance)
             .with_speculative(5)
+            // **This forward does not take its transients from the span.** The
+            // latent-MoE engine allocates them from the CUDA pool — see
+            // `latent_moe::wave::prefill_width_cap`, whose whole reason for
+            // existing is that the default cap prices a tier this model never
+            // places. There is therefore no reservation to hold to its demand,
+            // and the geometry it reports is priced for nobody. Stated here
+            // rather than left to the no-domain fast path, so that adopting the
+            // wave arenas is a deliberate flip of this flag.
+            .with_exact_tier(false)
             .with_timeout_secs(1800);
 
         // `16` is the wide-wave amortization config: at 8 contexts the fixed

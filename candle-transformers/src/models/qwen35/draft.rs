@@ -49,8 +49,7 @@ use candle::{DType, Device, Result, Tensor};
 
 use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
 use candle_nn::kv_cache::{
-    begin_wave, plan_wave_transient, KvCache, LayerPhase, WavePlan, REGION_BYTES,
-    WAVE_FORWARD_BYTES,
+    begin_wave, plan_wave_transient, KvCache, LayerPhase, WavePlan, WaveWidth,
 };
 
 use super::batched::HybridBatched;
@@ -423,14 +422,18 @@ pub fn draft_cohort(
         || -> Result<()> {
             if let Device::Cuda(d) = dev {
                 let plan = WavePlan::new(model.wave_geometry(act_dtype));
-                let pad = |b: usize| b + REGION_BYTES;
+                // One row per sequence and every one of them scored: this steps
+                // `n` drafts forward a token at a time, so it is decode-shaped
+                // throughout.
+                let width = WaveWidth::decode(n);
                 plan_wave_transient(
                     &d.cuda_stream(),
                     [
-                        pad(plan.phase_bytes(LayerPhase::Attention, n)),
-                        pad(plan.phase_bytes(LayerPhase::Ffn, n)),
-                        WAVE_FORWARD_BYTES,
+                        plan.phase_bytes(LayerPhase::Attention, width),
+                        plan.phase_bytes(LayerPhase::Ffn, width),
+                        plan.phase_bytes(LayerPhase::Forward, width),
                     ],
+                    width,
                 )?;
             }
             Ok(())

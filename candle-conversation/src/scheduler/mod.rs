@@ -82,6 +82,8 @@ use crate::{SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{DType, Device, Tensor};
+#[cfg(test)]
+use candle_nn::kv_cache::WaveWidth;
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
@@ -10922,16 +10924,22 @@ mod tests {
         fn wave_geometry(&self, act_dtype: DType) -> candle_nn::kv_cache::ModelGeometry {
             candle_nn::kv_cache::ModelGeometry {
                 hidden: 16,
+                vocab: 64,
                 intermediate: 32,
                 n_head: 1,
                 n_kv_head: 1,
                 head_dim: 16,
                 experts_per_tok: 1,
                 n_experts: 1,
+                delta_net: None,
                 act_dtype,
                 accum_dtype: DType::F32,
-                projection_accum_roundtrip: false,
+                packed_norm: false,
+                packed_head: false,
                 gated_qkv: false,
+                fused_qkv: false,
+                head_qk_norm: false,
+                head_norm_reshapes: false,
                 partial_rotary: false,
             }
         }
@@ -12200,8 +12208,13 @@ mod tests {
         });
         let dtype = scheduler.session.activation_dtype();
         let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
-        let least = (plan.tier_bytes(prefill::PREFILL_MIN_ADVANCE) - plan.tier_bytes(0)) as u64;
-        let whole = (plan.tier_bytes(100_000) - plan.tier_bytes(0)) as u64;
+        // One sequence advancing, priced as the fill prices an admission: the
+        // tier it would add over an empty wave.
+        let empty = WaveWidth::default();
+        let least = (plan.tier_bytes(WaveWidth::prefill(prefill::PREFILL_MIN_ADVANCE, 1))
+            - plan.tier_bytes(empty)) as u64;
+        let whole =
+            (plan.tier_bytes(WaveWidth::prefill(100_000, 1)) - plan.tier_bytes(empty)) as u64;
         assert!(
             whole > least,
             "the test only means something if the two differ"
@@ -12637,8 +12650,13 @@ mod tests {
         hold_creep(&mut scheduler, held, held_rows);
         let dtype = scheduler.session.activation_dtype();
         let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
-        let head = plan.tier_bytes(held_rows) as u64;
-        let whole = plan.tier_bytes(held_rows + prefill::PREFILL_MIN_ADVANCE) as u64;
+        // The creep is one prefill sequence; the admission adds a second.
+        let head_width = WaveWidth::prefill(held_rows, 1);
+        let head = plan.tier_bytes(head_width) as u64;
+        let whole = plan.tier_bytes(WaveWidth::prefill(
+            held_rows + prefill::PREFILL_MIN_ADVANCE,
+            2,
+        )) as u64;
         assert!(
             head > 0,
             "the test only means something if the head has a tier"
@@ -12661,6 +12679,29 @@ mod tests {
         assert!(
             fill.wave_tier_after(&cost) > cost.activations,
             "the whole wave, not this admission's increment"
+        );
+
+        // **`rows` and `activations` are the same admission seen twice**, and
+        // `admit::Cost` says so: bytes are what it costs, rows are what it
+        // earns, and the throughput model is handed the rows while the gate is
+        // handed the bytes. If they ever describe different widths the tier is
+        // sized for a wave the rate was never judged on — so recompute one from
+        // the other rather than trusting that they were written together.
+        assert_eq!(
+            cost.rows,
+            prefill::PREFILL_MIN_ADVANCE,
+            "a section advances its least chunk"
+        );
+        let from_rows = WaveWidth {
+            prefill_rows: head_width.prefill_rows + cost.rows,
+            scored_rows: head_width.scored_rows + 1,
+            ..head_width
+        };
+        assert_eq!(
+            plan.tier_bytes(from_rows) as u64 - head,
+            cost.activations,
+            "the bytes the gate is charged must be this row count priced through \
+             the same planner that places the tier"
         );
     }
 
@@ -12688,8 +12729,8 @@ mod tests {
         scheduler.active_prefills.push(active_prefill(seq, 300, 0));
         let dtype = scheduler.session.activation_dtype();
         let plan = candle_nn::kv_cache::WavePlan::new(scheduler.model.wave_geometry(dtype));
-        let least = plan.tier_bytes(prefill::PREFILL_MIN_ADVANCE);
-        let margin = prefill::TIER_MARGIN_REGIONS * candle_nn::kv_cache::REGION_BYTES;
+        let least = plan.tier_bytes(WaveWidth::prefill(prefill::PREFILL_MIN_ADVANCE, 1));
+        let margin = candle_nn::kv_cache::TIER_MARGIN_BYTES;
 
         // On an empty device the whole of it has to be bought.
         assert_eq!(

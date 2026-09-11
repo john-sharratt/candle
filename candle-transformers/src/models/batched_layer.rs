@@ -12,6 +12,7 @@ use candle::quantized::cuda::{DynamicActs, Q8a128Operand};
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
+use candle_nn::kv_cache::ffn_work_dtype;
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
@@ -560,11 +561,9 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
 
     // ── Shared FFN/MoE over the WHOLE combined buffer — one grouped GEMM whose
     // per-layer expert load serves every row-type at once. ──
-    let mlp_dtype = if act_dtype == DType::F16 {
-        DType::BF16
-    } else {
-        act_dtype
-    };
+    // The one definition, shared with the plan — which prices the cast this
+    // choice creates, and must therefore agree about when there is one.
+    let mlp_dtype = ffn_work_dtype(act_dtype);
     // The layer's other transient scope, and the same shape as the attention
     // one: it spans the FFN through the residual add that consumes its result,
     // after which nothing the expert forward produced is live. The MoE combine

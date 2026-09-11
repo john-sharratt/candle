@@ -617,6 +617,15 @@ impl Engine {
     pub(super) fn engine_device(&self) -> &Device {
         &self.device
     }
+    /// Whether this model's weights are int8-KO twins, which is what decides
+    /// the encoding a norm's fused epilogue emits — see
+    /// [`ModelGeometry::packed_norm`](candle_nn::kv_cache::ModelGeometry::packed_norm).
+    ///
+    /// Read off the head because the mode is a load-time choice applied to
+    /// every weight, and the head is the one this struct keeps by name.
+    pub(super) fn lm_head_is_int8(&self) -> bool {
+        self.lm_head.is_int8()
+    }
     pub(super) fn layer_count(&self) -> usize {
         self.layers.len()
     }

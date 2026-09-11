@@ -14,67 +14,106 @@
 //! These are computed from the config so they can be tested without a
 //! loaded checkpoint, and the model methods delegate to them.
 
+use candle::quantized::Int8Mode;
 use candle::{DType, Device};
-use candle_nn::kv_cache::ModelGeometry;
+use candle_nn::kv_cache::{ffn_work_dtype, DeltaNetWidths, ModelGeometry};
 
-use super::config::Qwen35Config;
+use super::config::{LayerKind, Qwen35Config};
 use super::quantized_weights::QuantModel;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, KvLayers, ProvenanceLayerIndices,
 };
 use crate::models::delta_net::KvLayerMap;
 
-/// The widest per-row intermediate activation a layer of this model produces.
+/// The per-row intermediate activation the **FFN phase** carries.
 ///
-/// The wave plan sizes its FFN span from one "intermediate" width, but a
-/// hybrid has two kinds of layer with unrelated widths: a dense FFN carries
-/// `intermediate` per row, while a DeltaNet layer carries its fused
-/// `[Q|K|V]` projection, `2·key_dim + value_dim`. The span has to hold
-/// whichever is larger, or the wave is admitted wider than its transients
-/// fit. On the 9B the FFN wins (12288 against 8192); on a stack with a
-/// narrow FFN and wide heads it would not, and pricing on the FFN alone
-/// would silently under-reserve.
+/// Both kinds of layer in this hybrid run the same FFN, so this is one width
+/// and not a maximum over the stack. It used to take
+/// `.max(cfg.delta_net.conv_dim())` on the reasoning that the plan sizes its
+/// FFN span from one intermediate and a DeltaNet layer's fused `[Q|K|V]`
+/// projection can be wider than one. The projection is real, but it is not in
+/// this phase: a DeltaNet mixer carves from the *attention* generation, which
+/// is what a layer opens before its FFN whichever mixer it has. On the 0.8B
+/// that `max` raised the FFN span from 3584 to 6144 columns — 49.1 MiB of a
+/// 139.3 MiB span — to cover a buffer that never appears in it. The mixer is
+/// priced where it allocates, through [`ModelGeometry::delta_net`].
 pub fn priced_intermediate(cfg: &Qwen35Config) -> usize {
-    let ffn = match &cfg.moe {
+    match &cfg.moe {
         // MoE prices the *per-expert* intermediate; `expert_rows` applies the
         // fan-out separately.
         Some(moe) => moe.expert_ffn_size.max(moe.shared_expert_ffn_size),
         None => cfg.intermediate_size,
-    };
-    ffn.max(cfg.delta_net.conv_dim())
+    }
 }
 
 /// The geometry admission prices a wave from.
-pub fn wave_geometry(cfg: &Qwen35Config, act_dtype: DType) -> ModelGeometry {
+///
+/// `int8mode` is the session's, not the config's: the weights' KO twins are
+/// chosen at load, and whether they were decides the encoding each norm's fused
+/// epilogue emits — a real difference in what the span holds, not a rounding.
+pub fn wave_geometry(cfg: &Qwen35Config, act_dtype: DType, int8mode: Int8Mode) -> ModelGeometry {
     let (experts_per_tok, n_experts) = match &cfg.moe {
         Some(moe) => (moe.n_experts_used.max(1), moe.n_experts.max(1)),
         None => (1, 1),
     };
     ModelGeometry {
         hidden: cfg.hidden_size,
+        vocab: cfg.vocab_size,
         intermediate: priced_intermediate(cfg),
         n_head: cfg.num_attention_heads,
         n_kv_head: cfg.num_kv_heads,
         head_dim: cfg.attn_head_dim,
         experts_per_tok,
         n_experts,
+        // **Asked of the stack, not assumed of the lineage.** Every checkpoint
+        // in this family so far is a 3:1 hybrid, but a stack with no DeltaNet
+        // layer has no mixer chain to compare the attention one against, and
+        // pricing one would put a chain in the `max` that no layer can run.
+        delta_net: cfg
+            .layer_kinds
+            .iter()
+            .any(|k| matches!(k, LayerKind::DeltaNet))
+            .then_some(DeltaNetWidths {
+                conv_dim: cfg.delta_net.conv_dim(),
+                value_dim: cfg.delta_net.value_dim(),
+                n_v_heads: cfg.delta_net.n_v_heads,
+            }),
         act_dtype,
-        // The int8 kernels accumulate in F32 before the cast back to
-        // `act_dtype`; both buffers are live at once, so both are planned.
-        accum_dtype: DType::F32,
-        // This stack's Q/K/V projections run the dequantized GEMM in F32: the
-        // norm's `act_dtype` output is upcast, the matmul emits F32, and the
-        // result is cast back. Read off `KV_WAVE_CENSUS=labels` on the 0.8B,
-        // where the six round-trip buffers are 43 MB of a 96 MB attention
-        // generation — the whole gap between the priced span and the carved
-        // one, which the region pad was absorbing until the attention phase
-        // gained one more buffer.
-        projection_accum_roundtrip: true,
-        // [q|gate] interleaved projection + 64-of-256 partial rotary — the
-        // gate's downstream buffers and the two permute gathers are real
-        // carves on every attention layer of this lineage.
+        packed_norm: int8mode.is_int8(),
+        // This lineage's callers read `int8mode` off the head itself
+        // (`HybridBatched::int8mode` is `lm_head.int8mode()`), so the two are
+        // the same fact here — stated separately because on the generic path
+        // they are not.
+        packed_head: int8mode.is_int8(),
+        // Three separate projections in **both** modes, unlike the generic
+        // path: this lineage's Q weight is the interleaved `[q | gate]` and does
+        // not pack with K and V, so `project_qkv` never reaches
+        // `qkv_segmented`. K and V arrive contiguous and neither is copied out
+        // of anything.
+        fused_qkv: false,
+        // Per-head RMSNorm on Q and K, as every Qwen3-and-later stack has.
+        head_qk_norm: true,
+        // The wave is flattened to `[rows, hidden]` before the layer sweep, so
+        // the head-wise norms reshape for free.
+        head_norm_reshapes: false,
+        // The expert GEMMs' output width. The int8 grouped matmul is typed
+        // `f32`; the FP path it is guarded against emits the work dtype
+        // instead, so this follows the session like `packed_norm` does. Moot on
+        // a dense checkpoint, where `Chain::Ffn` prices zero either way.
+        accum_dtype: if int8mode.is_int8() {
+            DType::F32
+        } else {
+            ffn_work_dtype(act_dtype)
+        },
+        // The `[q | gate]` interleaved projection — a lineage fact, and the one
+        // flag here that is a weight shape rather than a config field.
         gated_qkv: true,
-        partial_rotary: true,
+        // **Derived.** The paged kernels only know full-width RoPE, so a stack
+        // whose rotary is narrower than its head dim pays two gather copies to
+        // re-order Q and K; one where they are equal pays nothing. That is what
+        // `rope_dim` says (`rope.dimension_count`, ggml's `n_rot`), so ask it
+        // rather than assert this lineage's 64-of-256.
+        partial_rotary: cfg.rope_dim < cfg.attn_head_dim,
     }
 }
 
@@ -253,28 +292,44 @@ mod tests {
     #[test]
     fn geometry_reports_the_hybrid_shapes() {
         let cfg = nine_b();
-        let g = wave_geometry(&cfg, DType::BF16);
+        let g = wave_geometry(&cfg, DType::BF16, Int8Mode::Performance);
         assert_eq!(g.hidden, 4096);
         assert_eq!((g.n_head, g.n_kv_head, g.head_dim), (16, 4, 256));
         // Dense: the MoE terms collapse rather than needing a second branch.
         assert_eq!((g.experts_per_tok, g.n_experts), (1, 1));
         assert_eq!(g.accum_dtype, DType::F32);
-        // conv_dim = 2·(16·128) + 32·128 = 8192, so the FFN's 12288 wins.
+        // **The FFN width is the FFN's, full stop.** The DeltaNet projection is
+        // wider per row on some stacks (here 2·(16·128) + 32·128 = 8192 against
+        // 12288, so it would not have shown), but it is not in this phase: the
+        // mixer carves from the attention generation, whichever mixer a layer
+        // has. Folding it in here priced a buffer where it never appears.
         assert_eq!(cfg.delta_net.conv_dim(), 8192);
         assert_eq!(g.intermediate, 12_288);
+        // The mixer chain is priced, at the one width of it that is on the span.
+        assert_eq!(g.delta_net.map(|d| d.n_v_heads), Some(32));
+        // An int8 session's norms emit q8a128; a float session's do not.
+        assert!(g.packed_norm);
+        assert!(!wave_geometry(&cfg, DType::BF16, Int8Mode::Off).packed_norm);
     }
 
+    /// **The FFN width is the FFN's, even when the mixer is wider.**
+    ///
+    /// This used to assert the opposite — that a stack whose DeltaNet
+    /// projection exceeds its FFN is priced by the projection — and the
+    /// reasoning was that the span "must hold the widest per-row buffer of
+    /// either layer kind". True of the *attention* span, which is the one both
+    /// mixers carve from; false of the FFN span, which every layer runs
+    /// identically whichever mixer it has. Pricing it here put a buffer in a
+    /// phase it never appears in: 49.1 MiB of a 139.3 MiB span on the 0.8B.
     #[test]
-    fn a_narrow_ffn_is_priced_by_the_deltanet_projections_instead() {
-        // The case the FFN-only pricing would get wrong: heads wide enough
-        // that the fused [Q|K|V] projection exceeds the FFN.
+    fn the_ffn_width_is_the_ffns_even_when_the_mixer_is_wider() {
         let mut cfg = nine_b();
         cfg.intermediate_size = 4096;
-        assert_eq!(
-            priced_intermediate(&cfg),
-            8192,
-            "the span must hold the widest per-row buffer of EITHER layer kind"
+        assert!(
+            cfg.delta_net.conv_dim() > cfg.intermediate_size,
+            "the case worth pinning is the one where the mixer is the wider"
         );
+        assert_eq!(priced_intermediate(&cfg), 4096);
     }
 
     #[test]
@@ -287,11 +342,11 @@ mod tests {
             shared_expert_ffn_size: 512,
             norm_topk_prob: true,
         });
-        let g = wave_geometry(&cfg, DType::BF16);
+        let g = wave_geometry(&cfg, DType::BF16, Int8Mode::Performance);
         assert_eq!((g.experts_per_tok, g.n_experts), (8, 256));
-        // 512 per expert is narrower than the DeltaNet projection, which is
-        // still carried per row — so the projection sets the floor.
-        assert_eq!(g.intermediate, 8192);
+        // The per-expert width, and only that: the FFN phase prices the FFN,
+        // and `expert_rows` applies the fan-out separately.
+        assert_eq!(g.intermediate, 512);
     }
 
     #[test]

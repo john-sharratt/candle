@@ -35,7 +35,7 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
-    ModelGeometry, QuantFormat, WavePlan, WAVE_SPAN_BYTES,
+    ModelGeometry, QuantFormat, WavePlan, WaveWidth, WAVE_SPAN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -620,15 +620,29 @@ pub struct BatchedInferenceSession {
     /// `seq_indices` order). Taken + cleared inside `forward_batched`, which
     /// routes HD128 glue to the paged-glue kernel.
     pending_glue: Option<Vec<PendingGlue>>,
-    /// Ground the next wave's transient tier may be priced against, in bytes.
+    /// Ground the next wave's transient tier may be priced against, in bytes —
+    /// **`None` when no composer priced this wave at all.**
     ///
     /// Set by the scheduler's fill, which knows both halves of it — the gap
     /// between the arena frontier and the weight floor, and how far the weight
     /// zone stands above the residency it defends — and read by every path
     /// that sizes a prefill (`prefill_width_cap`), so the fill's bound and the
-    /// slab packer's bound are one number. Never priced below
-    /// `WAVE_SPAN_BYTES`, the ground the floor guarantees a wave.
-    tier_budget_bytes: usize,
+    /// slab packer's bound are one number.
+    ///
+    /// **`None` rather than a constant, because a constant here is a wave sized
+    /// against ground that may not exist.** It used to start at
+    /// `WAVE_SPAN_BYTES` — the floor's guarantee — and a driver with no
+    /// scheduler never replaced it, so every wave it ran was priced against
+    /// ~912 MiB however little the frontier actually held. That guarantee is
+    /// what `MIN_ELASTIC_RESERVE` keeps the weight floor from taking; it is not
+    /// ground a placement can use while live arenas stand inside it, which is
+    /// the distinction `prefill_width_cap` spells out at length and the 35B gate
+    /// then demonstrated: a 992 MiB tier asked for, three regions into ground
+    /// live KV arenas held, on a wave nothing had measured.
+    ///
+    /// So an unset budget is answered by measuring
+    /// ([`Self::tier_budget_bytes`]) rather than by guessing.
+    tier_budget_bytes: Option<usize>,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -706,7 +720,7 @@ impl BatchedInferenceSession {
             layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
-            tier_budget_bytes: WAVE_SPAN_BYTES,
+            tier_budget_bytes: None,
         })
     }
 
@@ -775,7 +789,7 @@ impl BatchedInferenceSession {
             layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
-            tier_budget_bytes: WAVE_SPAN_BYTES,
+            tier_budget_bytes: None,
         }
     }
 
@@ -2137,12 +2151,45 @@ impl BatchedInferenceSession {
     /// Ground the next wave's transient tier may be priced against — see the
     /// field.
     pub fn tier_budget_bytes(&self) -> usize {
-        self.tier_budget_bytes
+        if let Some(bytes) = self.tier_budget_bytes {
+            return bytes;
+        }
+        // **Nobody composed this wave, so measure the ground it has.** The
+        // frontier gap is what the placement itself measures against
+        // (`transient_headroom_bytes`), less the margin for what moves between
+        // sizing a wave and placing its tier — a section seal and the
+        // persistence thread's deferred arena creation both land in that window
+        // and both claim regions off the top of the gap.
+        //
+        // The scheduler's `tier_budget_now` is this plus one term a driver does
+        // not have: what the weight side is owed when residency stands under its
+        // hold. A driver defends no residency, so it owes nothing and the term
+        // is zero rather than missing.
+        #[cfg(feature = "cuda")]
+        {
+            use candle_nn::kv_cache::{transient_headroom_bytes, TIER_MARGIN_BYTES};
+            if let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() {
+                return transient_headroom_bytes(gpu_id)
+                    .unwrap_or(0)
+                    .saturating_sub(TIER_MARGIN_BYTES);
+            }
+        }
+        // **A device with no span has no tier to bound, which is not the same
+        // as a budget of nothing.** `prefill_width_cap` reads this and floors
+        // its answer at one row, so returning zero here caps every CPU prefill
+        // at a single token — a silent throttle rather than an absent
+        // constraint. The reservation only exists on CUDA; off it the wave is
+        // bounded by `MAX_PREFILL_TOKENS` and the plan's own row pricing, which
+        // is what this hands back.
+        WAVE_SPAN_BYTES
     }
 
     /// Record the ground the next wave's tier may be priced against.
+    ///
+    /// For a composer that has measured it. A driver that has not should leave
+    /// it unset and let [`Self::tier_budget_bytes`] measure — see the field.
     pub fn set_tier_budget_bytes(&mut self, bytes: usize) {
-        self.tier_budget_bytes = bytes;
+        self.tier_budget_bytes = Some(bytes);
     }
 
     pub fn activation_dtype(&self) -> DType {
@@ -3528,6 +3575,73 @@ impl std::ops::Deref for WaveResult {
 /// **You don't need to implement this trait manually.** Any type that implements
 /// [`BatchedModel`] automatically gets a `ManagedBatchedModel` implementation
 /// via the blanket impl.
+/// Every term of one [`ManagedBatchedModel::buy_ground_for_sequences`], so a
+/// caller can tell a purchase that was not needed from one that was refused.
+///
+/// **The whole reason this is a struct and not a byte count.** "Bought nothing"
+/// has three causes that want opposite fixes: the KV side already held the
+/// ground (`short == 0`), the demand priced at nothing (`store_bytes == 0` —
+/// which is the bug that hid here, a store priced from a residency map that is
+/// empty at exactly the moment a store is first priced), or the weight side is
+/// on its own floor (`short > 0` with `conceded` short of it). Returning the
+/// outcome alone makes all three read the same, and the one that matters is
+/// silent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroundPurchase {
+    /// Sequences the purchase was made for.
+    pub sequences: usize,
+    /// What one sequence's recurrent state reserves, from the geometry.
+    pub store_bytes: usize,
+    /// K/V those sequences will write, at the live width.
+    pub kv_bytes: usize,
+    /// Regions the stores and that K/V will claim between them.
+    pub claims: usize,
+    /// The tier a decode over every sequence needs standing.
+    pub tier_bytes: usize,
+    /// Regions the KV side holds, free or blocked by a standing tier.
+    pub free: usize,
+    /// Of those, the ones between the arena frontier and the weight floor —
+    /// the only ground a tier can stand in.
+    pub gap: usize,
+    /// Regions asked of the weight side.
+    pub short: usize,
+    /// Bytes it actually conceded. Less than `short * REGION_BYTES` means the
+    /// weight zone reached its own floor.
+    pub conceded: u64,
+}
+
+impl GroundPurchase {
+    /// Whether the weight side gave less than was asked — the one outcome that
+    /// means the work ahead will not fit however it is driven.
+    pub fn refused(&self) -> bool {
+        self.conceded < (self.short as u64) * (candle_nn::kv_cache::REGION_BYTES as u64)
+    }
+}
+
+impl std::fmt::Display for GroundPurchase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} contexts × ({} MiB state + {} MiB K/V) = {} regions, tier {} MiB, \
+             against {} free ({} in the gap): asked {} regions, got {} MiB{}",
+            self.sequences,
+            self.store_bytes >> 20,
+            (self.kv_bytes / self.sequences.max(1)) >> 20,
+            self.claims,
+            self.tier_bytes >> 20,
+            self.free,
+            self.gap,
+            self.short,
+            self.conceded >> 20,
+            if self.refused() {
+                " — the weight side is on its floor"
+            } else {
+                ""
+            },
+        )
+    }
+}
+
 pub trait ManagedBatchedModel {
     /// The geometry [`candle_nn::kv_cache::WavePlan`] prices a wave from.
     ///
@@ -3560,7 +3674,8 @@ pub trait ManagedBatchedModel {
     /// answer — no reservation yet, or a plan that cannot price a single row —
     /// because a zero-width wave makes no progress, and refusing here would abort
     /// a forward that can still run.
-    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
+    fn prefill_width_cap(&self, act_dtype: DType, head: WaveWidth, tier_budget: usize) -> usize {
+        let head_rows = head.rows();
         let mut cap = MAX_PREFILL_TOKENS;
         // **Price the whole tier against the ground it may actually have.**
         //
@@ -3602,8 +3717,16 @@ pub trait ManagedBatchedModel {
         // refusals of one wave, re-formed to the same width every time. A
         // budget that holds nothing prices to one row, and the placement is
         // the judge of that row.
-        let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_for_tier(tier_budget);
-        cap = cap.min(fits.saturating_sub(head_rows).max(1));
+        //
+        // **The head is priced as the wave it is, not as a row count.** The
+        // plan bisects prefill rows *on top of* this head, so the decode rows
+        // and the scored rows it already carries are charged at their own
+        // widths rather than at the prefill's — which is the difference between
+        // asking "how wide a wave fits" and "how much prefill fits beside what
+        // I have already committed".
+        let fits = WavePlan::new(self.wave_geometry(act_dtype))
+            .max_prefill_rows_for_tier(tier_budget, head);
+        cap = cap.min(fits.max(1));
         if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
             cap = cap.min(kv_fits.saturating_sub(head_rows).max(1));
         }
@@ -4981,6 +5104,124 @@ pub trait ManagedBatchedModel {
     /// model runs with a smaller expert working set for no reason.
     fn reclaim_spare_ground(&self) {}
 
+    /// Buy the ground `sequences` concurrent sequences will need, so their
+    /// recurrent stores and the wave tier all have somewhere to stand.
+    ///
+    /// **A driver with no admission stage has to do this itself, and there is no
+    /// later chance to.** A store is claimed on the wave path
+    /// (`ensure_recurrent`), which runs *inside* a forward, and the weight floor
+    /// may not move while a wave generation is open — so a claim that arrives
+    /// there and finds nothing free cannot buy its way out, however much ground
+    /// the weight side would have conceded a moment earlier. The refusal then
+    /// reads as a full span: measured on Qwen3.8-27B at twenty contexts, the
+    /// layer zone was whole at 10,498 MiB with 114 regions above the ceiling and
+    /// gave up none of it, because nothing asked.
+    ///
+    /// The scheduler's equivalent is `Scheduler::buy_kv_ground`, which prices a
+    /// `Cost` it is holding; both reach the same arithmetic
+    /// ([`candle_nn::kv_cache::kv_ground_shortfall`]) so a driver and an
+    /// admission cannot disagree about what a wave's ground costs.
+    ///
+    /// Answers every term, not just the outcome. "Bought nothing" has three
+    /// causes — nothing was needed, the store priced at zero, the weight side is
+    /// on its own floor — and they want opposite fixes; a caller handed one
+    /// number cannot tell them apart. See [`GroundPurchase`].
+    fn buy_ground_for_sequences(
+        &self,
+        sequences: usize,
+        tokens: usize,
+        act_dtype: DType,
+    ) -> GroundPurchase {
+        use candle_nn::kv_cache::{
+            kv_ground_shortfall, region_stats, transient_headroom_bytes, WavePlan, WaveWidth,
+            REGION_BYTES,
+        };
+        // **The model's own device, not device 0.** Every other reader of the
+        // pool takes the ordinal from the device it is acting for; hardcoding
+        // zero reads another card's partition on a multi-GPU host and prices the
+        // purchase against ground this model does not own.
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device().location() else {
+            return GroundPurchase::default();
+        };
+        let store = self.recurrent_store_bytes();
+        let Some(stats) = region_stats(gpu_id) else {
+            return GroundPurchase::default();
+        };
+        // **The tier is the widest forward this driver will run, not the
+        // narrowest.** Two reasons, and the second is the one that bit.
+        //
+        // A decode over every sequence is the forward that *must* be placeable —
+        // there is no narrower one that still makes progress. But it is also
+        // tiny (16 MiB on the 27B at twenty rows), and this term is the only
+        // margin in the purchase: `claims` prices K/V by the byte where the
+        // allocator hands it out by the region, so a sequence's chunks open a
+        // fresh arena in every layer that has no room in its current one, each a
+        // whole region off the top of the free list. Priced at the decode width
+        // the purchase came to exactly `claims` with nothing over, and the run
+        // refused a few regions in — the same few regions run 6 lost thirteen
+        // waves to.
+        //
+        // So the prefill width is priced too. It over-buys, and that is
+        // self-correcting in the direction that matters: `reclaim_spare_ground`
+        // takes the unused ground back between forwards (measured across this
+        // gate's own configs, the layer zone went 4,213 MiB back up to 9,978),
+        // whereas ground the driver did not buy is not available at all once a
+        // wave is open.
+        // `WaveWidth::prefill` takes the wave's TOTAL rows, not one sequence's:
+        // a co-batched prefill carries every sequence at once, and pricing one
+        // sequence's turn priced the 35B's five-context wave at 160 MiB against
+        // the 624 MiB it then asked the placement for.
+        let plan = WavePlan::new(self.wave_geometry(act_dtype));
+        let prefill_rows = tokens.saturating_mul(sequences).min(MAX_PREFILL_TOKENS);
+        let tier = plan
+            .tier_bytes(WaveWidth::decode(sequences))
+            .max(plan.tier_bytes(WaveWidth::prefill(prefill_rows, sequences)));
+        // Regions a standing tier blocks count as free, for the reason
+        // `buy_kv_ground` gives: phase 0 of the next forward releases that tier
+        // before any of these claims run.
+        let free = stats.free + stats.blocked;
+        let gap = transient_headroom_bytes(gpu_id)
+            .unwrap_or(0)
+            .div_ceil(REGION_BYTES);
+        // **K/V is a claim too, and the larger one.** A store is fixed per
+        // sequence; its chunks grow with every token, and they come off the same
+        // free list. Pricing only the stores buys ground for a fifth of what the
+        // run then claims, which fails in exactly the same place and looks
+        // exactly the same — the purchase succeeded, so nothing reports a
+        // refusal.
+        //
+        // Priced at the **live** width, which is what a running sequence
+        // actually occupies: K sits in R16 and V uncompressed until the chunk
+        // seals, so the compressed format the config names is what the bytes
+        // become, not what they cost while the wave is writing them.
+        let kv_per_row = 2 * self.n_kv_head() * self.head_dim() * act_dtype.size_in_bytes();
+        let kv = kv_per_row
+            .saturating_mul(self.num_layers())
+            .saturating_mul(tokens)
+            .saturating_mul(sequences);
+        let claims = store
+            .saturating_mul(sequences)
+            .saturating_add(kv)
+            .div_ceil(REGION_BYTES);
+        let short = kv_ground_shortfall(claims, tier.div_ceil(REGION_BYTES), free, gap);
+        let conceded = if short == 0 {
+            0
+        } else {
+            self.request_kv_ground(short)
+        };
+        GroundPurchase {
+            sequences,
+            store_bytes: store,
+            kv_bytes: kv,
+            claims,
+            tier_bytes: tier,
+            free,
+            gap,
+            short,
+            conceded,
+        }
+    }
+
     /// Live VRAM held by the model's weights (fixed base + time-varying resident
     /// experts), for the whole-card VRAM decomposition. `None` if unavailable.
     fn resident_weight_bytes(&self) -> Option<usize> {
@@ -5329,8 +5570,8 @@ impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
         self.model().num_layers()
     }
 
-    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize {
-        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head_rows, tier_budget)
+    fn prefill_width_cap(&self, act_dtype: DType, head: WaveWidth, tier_budget: usize) -> usize {
+        <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype, head, tier_budget)
     }
 
     fn sweep(

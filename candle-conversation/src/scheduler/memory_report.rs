@@ -776,7 +776,10 @@ impl Scheduler {
             // The live-region view, which is what the fill's own residency stop
             // reads — not the extent, which includes ground a standing tier has
             // already bought and would read as headroom that is not there.
-            weight_zone_bytes: super::interleave::effective_weight_zone_bytes().unwrap_or(0),
+            // The reported zone is the identity at its floor reserve — what the
+            // weight side could hold with no wave standing. A report of the
+            // partition, not of one wave's moment.
+            weight_zone_bytes: super::interleave::effective_weight_zone_bytes(0).unwrap_or(0),
             weight_hold_bytes: super::interleave::optimal_weight_bytes().unwrap_or(0),
         };
 

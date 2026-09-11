@@ -152,7 +152,8 @@ pub use alloc::class_promotion_count;
 pub use bump_arena::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, end_wave_transient,
     guest_domain_stats, guest_stage, open_guest_arena, persistence_domain_stats,
-    plan_wave_transient, wave_domain_stats, wave_is_live, BumpRange, ForwardOpen,
+    plan_wave_transient, wave_domain_stats, wave_is_live, wave_max_planned, wave_max_slack,
+    wave_reset_observations, wave_worst_slack, BumpRange, ForwardOpen,
     Generation as WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
@@ -162,7 +163,7 @@ pub use guest_stage_cpu::guest_stage;
 #[cfg(feature = "cuda")]
 pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
-    freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas,
+    freeze_dense, initial_weight_bytes, kv_spare_regions, least_tier_bytes, reclaim_empty_arenas,
     reclaim_load_headroom, region_stats, set_least_tier_bytes, set_weight_floor, span_end,
     span_layout, span_region_refusal, spare_tally, transient_headroom_bytes, weight_capacity_bytes,
     weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,

@@ -42,8 +42,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, ModelGeometry,
-    WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES,
+    begin_forward, begin_wave, end_wave_transient, ffn_work_dtype, plan_wave_transient, LayerPhase,
+    ModelGeometry, WavePlan, WaveWidth,
 };
 use candle_nn::Module;
 
@@ -164,6 +164,13 @@ pub struct WaveShapes {
     /// Experts the router scores over — the width of the per-token logits the
     /// FFN phase carries. `1` on a dense model, which has no router.
     pub n_experts: usize,
+    /// Tokens the LM head scores over. Sizes the forward phase, which holds the
+    /// head's logits — one row per scored row, `vocab` wide.
+    pub vocab: usize,
+    /// Whether this stack applies a per-head RMSNorm to Q and K. Qwen3 and
+    /// later do; Llama and Qwen2 have no such weight, and pricing one charged
+    /// them for six buffers they never allocate.
+    pub head_qk_norm: bool,
 }
 
 /// The dtype activations are carried in, for a KV cache stored as `cache_dtype`.
@@ -213,7 +220,11 @@ pub trait BatchedModelCore {
     fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
         let shapes = self.wave_shapes();
         ModelGeometry {
+            // Every layer of these stacks attends, so the attention chain sizes
+            // the phase on its own — there is no second mixer to compare it to.
+            delta_net: None,
             hidden: shapes.hidden,
+            vocab: shapes.vocab,
             intermediate: shapes.intermediate,
             n_head: self.layer(0).n_head(),
             n_kv_head: self.n_kv_head(),
@@ -221,21 +232,47 @@ pub trait BatchedModelCore {
             experts_per_tok: shapes.experts_per_tok,
             n_experts: shapes.n_experts,
             act_dtype,
-            // The int8 tensor-core kernels emit **F32** and the cast back to
-            // `act_dtype` is a second buffer, so the plan charges for both
-            // rather than for the wider of the two.
+            // An int8 session's RMSNorm fuses its quantize into the epilogue,
+            // so the norms emit q8a128 and the projections consume it directly.
+            // Read from layer 0 for the same reason the head geometry is: the
+            // mode is fixed at load and every layer shares it.
+            packed_norm: self.layer(0).int8mode().is_int8(),
+            // **The head's own weight decides the head's encoding.** The final
+            // norm is handed `output_proj().int8mode()`, and a head that could
+            // not be KO-repacked stays on the dequant path while every layer
+            // around it runs int8 — which is Qwen2's case, measured.
+            packed_head: self.output_proj().int8mode().is_int8(),
+            // **The same question, and so the same answer.** `project_qkv` on
+            // every model of this path forks on the operand it is handed: an
+            // `Int8` one takes `QMatMul::qkv_segmented` — one launch over the
+            // three KO weights, then three narrows that copy — and a `Float` one
+            // takes three separate `forward_dynamic` calls whose outputs are
+            // already contiguous. So the splits exist exactly when the norm is
+            // packed, and hard-coding `true` charged three copies to every float
+            // session.
+            fused_qkv: self.layer(0).int8mode().is_int8(),
+            head_qk_norm: shapes.head_qk_norm,
+            // The wave is carried as `[batch, seq, heads · dim]`, so where there
+            // IS a per-head norm it copies in and transposes back: the census
+            // shows `QNormIn`/`QHeadsPacked` and their K twins.
+            head_norm_reshapes: true,
+            // The expert GEMMs' output width, and a **session** fact like the
+            // two above it.
             //
-            // This said BF16 until the census measured it: the expert GEMM
-            // outputs came back at four bytes an element, not two, so every
-            // accumulate-dtype term in the FFN phase — gate, up and down, the
-            // three largest buffers a MoE layer allocates — was priced at half
-            // its size.
-            accum_dtype: DType::F32,
-            // The census this plan was read off (Qwen3-30B-A3B) shows the
-            // projections consuming the norm's packed output and emitting
-            // `act_dtype` directly — no upcast, no cast back. See
-            // `ModelGeometry::projection_accum_roundtrip`.
-            projection_accum_roundtrip: false,
+            // An int8 session reaches `forward_gpu_native`, whose grouped
+            // matmul is typed `resolve_typed_out::<f32>` — the census caught
+            // this when the expert GEMM outputs came back at four bytes an
+            // element, not two, and every accumulate-dtype term in the FFN
+            // phase was priced at half its size. But that path is *guarded* on
+            // an `Int8` operand (`let DynamicActs::Int8(op) = acts else
+            // unreachable`), so a float session takes the FP experts instead
+            // and they emit the work dtype. Hard-coding F32 doubled the three
+            // largest buffers of a MoE layer on every such session.
+            accum_dtype: if self.layer(0).int8mode().is_int8() {
+                DType::F32
+            } else {
+                ffn_work_dtype(act_dtype)
+            },
             gated_qkv: false,
             partial_rotary: false,
         }
@@ -733,19 +770,39 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             if rows > 0 {
                 if let Device::Cuda(d) = self.model.device() {
                     let plan = WavePlan::new(self.model.wave_geometry(embed_dtype));
-                    // One region of slack per layer phase. The plan enumerates
-                    // every declared buffer, but a phase pays one alignment per
-                    // range and the count is not in the plan, so this covers the
-                    // rounding rather than an unknown.
-                    let pad = |b: usize| b + REGION_BYTES;
+                    // **No padding, and no constants.** This carried one region
+                    // of slack on each layer phase and `WAVE_FORWARD_BYTES`
+                    // outright on the third. The pad was justified by "a phase
+                    // pays one alignment per range and the count is not in the
+                    // plan" — but the count is in the plan, and every shape is
+                    // a multiple of the alignment anyway. The constant was the
+                    // worse of the two: the forward phase holds the head's
+                    // logits, one row per scored row, so it scales with the
+                    // session count and 16 MiB is a ceiling rather than a
+                    // reservation.
+                    //
+                    // Glue rows carry no logits — they only scattered K/V — so
+                    // they widen the layer phases and not this one, which is
+                    // exactly what the head's own selection does below.
+                    //
+                    // **And a wave that stops short of the last layer runs no
+                    // head at all**, returning its residual instead. Pricing the
+                    // forward phase for it reserves the head's whole width for a
+                    // sweep that never carves a byte of it — on a 60-session
+                    // Qwen2 that is 17.4 MiB a window, every window.
+                    let runs_head = layer_end == num_layers;
+                    let width = WaveWidth {
+                        prefill_rows: pre_rows + glue_rows,
+                        decode_rows: n_decode,
+                        scored_rows: if runs_head { n_decode + n_prefill } else { 0 },
+                        // Nothing staged: these stacks have no recurrent state
+                        // and so no rewind stash to replay from.
+                        ..WaveWidth::default()
+                    };
                     let per_phase = [
-                        pad(plan.phase_bytes(LayerPhase::Attention, rows)),
-                        pad(plan.phase_bytes(LayerPhase::Ffn, rows)),
-                        // The forward phase carries per-*sequence* metadata —
-                        // ragged offsets, RoPE tables — which the plan prices as
-                        // zero because it sizes what scales with width. One
-                        // region is the floor the tier is carved in anyway.
-                        WAVE_FORWARD_BYTES,
+                        plan.phase_bytes(LayerPhase::Attention, width),
+                        plan.phase_bytes(LayerPhase::Ffn, width),
+                        plan.phase_bytes(LayerPhase::Forward, width),
                     ];
                     // The tier packs directly against the arena frontier, with no
                     // room reserved above it. Nothing claims a region after this
@@ -755,7 +812,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     // in turn waits on before it reads the frontier. The
                     // compressor keeps running through the forward — it fills
                     // arenas that already exist, which moves nothing.
-                    plan_wave_transient(&d.cuda_stream(), per_phase)?;
+                    plan_wave_transient(&d.cuda_stream(), per_phase, width)?;
                 }
             }
         }

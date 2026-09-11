@@ -13,7 +13,7 @@
 use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::kv_cache::QuantFormat;
+use candle_nn::kv_cache::{QuantFormat, WaveWidth};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1467,7 +1467,11 @@ impl TestParams {
             // that predict the first generated token. Each slice is a
             // prefill-only wave, so nothing rides ahead of it in the tier.
             let cap = model
-                .prefill_width_cap(session.activation_dtype(), 0, session.tier_budget_bytes())
+                .prefill_width_cap(
+                    session.activation_dtype(),
+                    WaveWidth::default(),
+                    session.tier_budget_bytes(),
+                )
                 .max(1);
             let longest = user_tensors
                 .iter()

@@ -59,6 +59,7 @@ use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::region_pool::{carve_persist, place_transient, release_transient};
 use super::wave_census::{self, Carve};
 use super::wave_plan::LayerPhase;
+use super::wave_plan::WaveWidth;
 use super::wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
 
 /// A range handed out by a [`Generation`].
@@ -115,6 +116,16 @@ struct Inner {
     dirty: bool,
     /// High-water mark of `cursor`, for the watermark that sizes the span.
     peak: usize,
+    /// The same mark, but **since the current forward was priced**.
+    ///
+    /// `peak` is process-lifetime, so comparing it to a process-lifetime
+    /// maximum plan answers "was the widest plan the widest wave needed" — and
+    /// nothing else. A narrow forward priced ten times what it used is invisible
+    /// in that comparison, because both its plan and its usage sit under the
+    /// wide forward's. Reset by [`take_forward_peak`](BumpArena::take_forward_peak)
+    /// at each pricing, so the difference against *that* forward's plan is its
+    /// own slack.
+    forward_peak: usize,
     /// The largest generation the census has already itemised, **per carve
     /// count**.
     ///
@@ -195,6 +206,7 @@ impl BumpArena {
                 live: 0,
                 dirty: false,
                 peak: 0,
+                forward_peak: 0,
                 reported_peak: HashMap::new(),
                 census: Vec::new(),
                 epoch: 0,
@@ -234,6 +246,7 @@ impl BumpArena {
                 live: 0,
                 dirty: false,
                 peak: 0,
+                forward_peak: 0,
                 reported_peak: HashMap::new(),
                 census: Vec::new(),
                 epoch: 0,
@@ -257,6 +270,7 @@ impl BumpArena {
             inner.peak = inner.cursor;
         }
         let entry_cursor = inner.cursor;
+        inner.forward_peak = inner.forward_peak.max(inner.cursor);
         inner.live += 1;
         drop(inner);
         Ok(Generation {
@@ -284,6 +298,7 @@ impl BumpArena {
                 live: 0,
                 dirty: false,
                 peak: 0,
+                forward_peak: 0,
                 reported_peak: HashMap::new(),
                 census: Vec::new(),
                 epoch: 0,
@@ -379,6 +394,24 @@ impl BumpArena {
         let inner = self.inner.lock().unwrap();
         (inner.cursor, inner.peak, inner.capacity)
     }
+
+    /// The high-water mark since the last pricing, and reset it for the next.
+    ///
+    /// Read once per [`plan_wave_transient`], which is what makes the value the
+    /// *previous* forward's usage — and so comparable against the plan that
+    /// forward was given rather than against a maximum over all of them.
+    pub(crate) fn take_forward_peak(&self) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        std::mem::take(&mut inner.forward_peak)
+    }
+
+    /// Forget both high-water marks — see [`wave_reset_observations`].
+    pub(crate) fn reset_observations(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.peak = 0;
+        inner.forward_peak = 0;
+        inner.reported_peak.clear();
+    }
 }
 
 /// Bump `len` bytes aligned to `align` from the arena behind `inner`.
@@ -451,6 +484,7 @@ fn bump<'a>(
             label: wave_census::label(),
         });
     }
+    inner.forward_peak = inner.forward_peak.max(end);
     if end > inner.peak {
         inner.peak = end;
         // Only on a new high-water mark, so this is quiet in steady state
@@ -502,6 +536,7 @@ fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) 
             label: wave_census::label(),
         });
     }
+    inner.forward_peak = inner.forward_peak.max(end);
     if end > inner.peak {
         inner.peak = end;
         log::debug!("{}: transient peak {} B of {} B", name, end, inner.capacity);
@@ -754,6 +789,53 @@ struct WaveDomain {
     /// (run 14) — nothing in that loop ever re-priced, because the forward that
     /// would have never got to run.
     planned: Option<[usize; 3]>,
+    /// The **largest** per-phase reservation this domain has been asked for,
+    /// element-wise, kept past every release.
+    ///
+    /// [`Self::planned`] is cleared with the tier it priced, and the arenas'
+    /// `capacity` goes to zero with it, so between forwards nothing records what
+    /// the tier was sized at — only `peak`, which is what it *used*.
+    ///
+    /// A **maximum** rather than the last value, because the figure it is
+    /// compared against is one: `BumpArena::peak` is a process-lifetime
+    /// high-water mark. Pairing a max against a last compares two different
+    /// waves — a wide forward's usage against a narrow one's plan — and reports
+    /// an overrun that never happened. Both sides describe the worst moment the
+    /// process has seen, so the difference between them is the real slack.
+    ///
+    /// Observational only: nothing places, prices or refuses on this.
+    max_planned: Option<[usize; 3]>,
+    /// The **worst single forward's** slack: `max` over forwards of that
+    /// forward's plan minus that forward's own peak.
+    ///
+    /// [`Self::max_planned`] against `BumpArena::peak` compares the widest plan
+    /// to the widest usage, and both come from the same wide forward — so it
+    /// answers "was the widest wave priced right" and is blind to every
+    /// narrower one. A decode wave priced at ten times what it used sits under
+    /// the prefill wave on both sides of that comparison and never appears.
+    ///
+    /// This is the figure that says *every* forward was exact, which is the
+    /// property the tier is supposed to have. Folded in
+    /// [`plan_wave_transient`], where the previous forward's plan is still in
+    /// hand and its usage can be taken off the arenas.
+    ///
+    /// Observational only, like its neighbour.
+    max_slack: [usize; 3],
+    /// The `(planned, used)` pair that produced [`Self::max_slack`], per phase.
+    ///
+    /// **The slack alone cannot be attributed.** The census reports a
+    /// generation only when it sets a new high-water mark for its arena, so a
+    /// forward that over-prices without ever being the widest is invisible to
+    /// it — which is exactly the forward this figure is about. The two numbers
+    /// name it: a plan and a usage are each a sum of declared shapes, and on a
+    /// known geometry that is enough to say which chain was charged and which
+    /// was carved.
+    worst_slack: [(usize, usize); 3],
+    /// The width the current forward was priced at, and the widths behind
+    /// [`Self::worst_slack`] — carried so a slack report names the wave that
+    /// produced it rather than only the bytes.
+    planned_width: WaveWidth,
+    worst_width: [WaveWidth; 3],
     /// Where the tier currently sits, while it exists.
     placed_at: Option<u64>,
     /// **How much ground that placement bought**, which is the only figure the
@@ -784,6 +866,31 @@ struct WaveDomain {
     /// Without the distinction a single unplanned `begin_wave` at load pins the
     /// tier at whatever the frontier was then, for the life of the process.
     reserved_by_forward: bool,
+    /// A forward has **placed** its tier and has not opened yet.
+    ///
+    /// The eleven lines between [`plan_wave_transient`] returning and
+    /// [`begin_forward`] setting `forward_open`, during which the tier is real,
+    /// the plan that priced it is recorded, and *neither* of the flags
+    /// [`enter_arena_window`] consults is set. A sealing pass arriving in that
+    /// window took the tier for its own ground, released it, and cleared
+    /// `planned` with it — all of which is correct for a tier whose forward has
+    /// **finished**, and none of which is correct here.
+    ///
+    /// What the forward then found was no plan, so its first guard reserved
+    /// [`fallback_plan`] — 912 MiB of fixed constants — and the placement
+    /// refused it against a gap of a few hundred. Measured on a live 35B ingest:
+    /// `wave transient tier needs 956301312 B … is 20 regions into ground live
+    /// KV arenas hold`, twice in twelve minutes, each one a lost post-decode
+    /// prefill. Intermittent by construction — it needs the persistence thread
+    /// inside an eleven-line window — and invisible in any test without one.
+    ///
+    /// `reserved_by_forward` cannot answer this. It stays set after the forward
+    /// ends, because a tier deliberately stands until the *next* forward's phase
+    /// 0 returns it, and refusing the window then would starve the sealing pass
+    /// of the one moment it is allowed to create an arena. The question here is
+    /// narrower and has its own answer: *has the forward that reserved this
+    /// actually started?*
+    awaiting_forward: bool,
     /// Callers currently creating KV arenas outside a wave — see
     /// [`enter_arena_window`].
     ///
@@ -1116,9 +1223,15 @@ fn domain_entry<'a>(
             ],
             live_generations: 0,
             planned: None,
+            max_planned: None,
+            max_slack: [0; 3],
+            worst_slack: [(0, 0); 3],
+            planned_width: WaveWidth::prefill(0, 0),
+            worst_width: [WaveWidth::prefill(0, 0); 3],
             placed_at: None,
             placed_bytes: None,
             reserved_by_forward: false,
+            awaiting_forward: false,
             arena_windows: 0,
             forward_open: false,
             forward_thread: None,
@@ -1254,6 +1367,22 @@ pub fn enter_arena_window(stream: &Arc<CudaStream>) -> Result<ArenaWindow> {
                  opens, so nothing it needs depends on this."
             )
         }
+        // **A placed tier whose forward has not started yet is not spare
+        // ground.** Neither flag above is set between `plan_wave_transient`
+        // returning and `begin_forward`, and taking the tier there strips a
+        // forward of a reservation it has already bought — see
+        // [`WaveDomain::awaiting_forward`] for what that cost on a live ingest.
+        // Retryable, like the case above and for the same reason: the caller is
+        // a sealing pass that comes back, and the window closes within the
+        // forward's next few lines.
+        if domain.awaiting_forward {
+            candle::bail!(
+                "{KV_ARENA_MID_WAVE}: a forward has placed its transient tier and is about \
+                 to open. Its ground and the plan that priced it are already bought, so \
+                 taking them here would leave it to reserve the fixed fallback instead. \
+                 Retry — this window is a few lines long."
+            )
+        }
         // The partition is ours: nothing is running on it and nothing is holding
         // a span. A tier still standing belongs to a forward that has finished
         // with it, and the ground under it is the ground this arena is about to
@@ -1301,6 +1430,12 @@ impl Drop for ForwardOpen {
             if let Some(domain) = map.get_mut(&self.ordinal) {
                 domain.forward_open = false;
                 domain.forward_thread = None;
+                // **A forward that has ended leaves an idle tier, whatever order
+                // it did things in.** A caller that priced after opening — the
+                // gate tests do exactly that — would otherwise leave
+                // `awaiting_forward` set with no forward left to clear it, and
+                // an idle tier must never refuse an arena window.
+                domain.awaiting_forward = false;
             }
         }
         wave_gate().notify_all();
@@ -1318,6 +1453,9 @@ pub fn begin_forward(stream: &Arc<CudaStream>) -> ForwardOpen {
     let (ordinal, domain) = domain_entry(&mut map, stream);
     domain.forward_open = true;
     domain.forward_thread = Some(current().id());
+    // The forward has started, so `forward_open` is now the flag that protects
+    // its tier and the narrower one has done its job.
+    domain.awaiting_forward = false;
     ForwardOpen { ordinal }
 }
 
@@ -1420,6 +1558,12 @@ pub fn end_wave_transient(stream: &Arc<CudaStream>) {
         if domain.live_generations > 0 {
             return Ok(());
         }
+        // **Cleared whether or not a tier stood.** This is phase 0 of a new
+        // forward, so any earlier forward's claim on the partition is over by
+        // definition — including one that priced a tier and then failed before
+        // opening. Leaving the flag set there would refuse every arena creation
+        // for the rest of the process.
+        domain.awaiting_forward = false;
         if domain.placed_at.take().is_some() {
             domain.placed_bytes = None;
             release_transient(&stream);
@@ -1449,7 +1593,16 @@ pub fn end_wave_transient(stream: &Arc<CudaStream>) {
 /// window is a **new arena**, which does move the frontier — hence the wait on
 /// [`enter_arena_window`] below, taken before the frontier is read and held
 /// until the tier is recorded.
-pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
+/// `width` is carried for **diagnosis only** — nothing places or refuses on it.
+/// A slack report that names bytes alone cannot be acted on: the reader has to
+/// guess which wave produced them. Recording the width the caller priced makes
+/// the failure self-contained, because a plan, a usage and a width together
+/// identify the chain without a second run.
+pub fn plan_wave_transient(
+    stream: &Arc<CudaStream>,
+    per_phase: [usize; 3],
+    width: WaveWidth,
+) -> Result<()> {
     // Normalised once, here, so the recorded plan, the tier purchase below, and
     // the span layout in `begin_wave` all see the same rounded figures — a raw
     // sum against a rounded layout would place a tier the last span overruns.
@@ -1464,7 +1617,41 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
         // move it after the read.
         let mut map = await_arena_windows(lock_domains(), &stream);
         let (_, domain) = domain_entry(&mut map, &stream);
+        // **Close the books on the forward that just ended.** Its plan is still
+        // in `planned` and its usage is still on the arenas, so this is the one
+        // moment the two can be compared *as a pair* rather than as two
+        // process-lifetime maxima — see `max_slack`.
+        //
+        // Unconditional on the arenas, so the marks are reset even for the
+        // first forward, which has no previous plan to judge.
+        let used = [
+            domain.arenas[0].take_forward_peak(),
+            domain.arenas[1].take_forward_peak(),
+            domain.arenas[2].take_forward_peak(),
+        ];
+        if let Some(prev) = domain.planned {
+            for i in 0..3 {
+                let slack = prev[i].saturating_sub(used[i]);
+                if slack > domain.max_slack[i] {
+                    domain.max_slack[i] = slack;
+                    domain.worst_slack[i] = (prev[i], used[i]);
+                    domain.worst_width[i] = domain.planned_width;
+                }
+            }
+        }
+        domain.planned_width = width;
         domain.planned = Some(per_phase);
+        // Element-wise max, kept past the release, so the reservation can be
+        // compared against the arenas' process-lifetime peaks — see
+        // `max_planned`.
+        domain.max_planned = Some(match domain.max_planned {
+            Some(prev) => [
+                prev[0].max(per_phase[0]),
+                prev[1].max(per_phase[1]),
+                prev[2].max(per_phase[2]),
+            ],
+            None => per_phase,
+        });
         if domain.live_generations > 0 {
             false
         } else {
@@ -1488,6 +1675,11 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
         domain.placed_at = Some(base);
         domain.placed_bytes = Some(bought);
         domain.reserved_by_forward = true;
+        // **Closed here, held until the forward opens.** From this line the tier
+        // exists and `planned` describes it, but nothing yet tells
+        // `enter_arena_window` that both belong to a forward — see
+        // [`WaveDomain::awaiting_forward`].
+        domain.awaiting_forward = true;
         Ok(())
     })
 }
@@ -1716,6 +1908,13 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
         // to drop and nothing to bring the count back down.
         let generation = arena.generation(ordinal, arena_idx)?;
         domain.live_generations += 1;
+        // The wave is open, so `live_generations` now protects the tier and the
+        // narrower flag has done its job. Cleared here as well as in
+        // [`begin_forward`] because not every caller that prices a tier opens a
+        // forward around it — the drafter and the verify replay price their own
+        // and go straight to a guard — and a flag left set by one of those would
+        // refuse arena creation until the next forward's phase 0.
+        domain.awaiting_forward = false;
         Ok(generation)
     })
 }
@@ -1882,8 +2081,73 @@ pub fn wave_is_live(ordinal: usize) -> bool {
 /// because a span has to be sized for the worst moment it ever sees, not the
 /// most recent one. Reading it as "how full is the arena now" is wrong — that is
 /// `cursor`, and between waves it is zero.
+/// The largest per-phase tier reservation this device has been asked for,
+/// `[attention, ffn, forward]`, surviving every release.
+///
+/// Pair with [`wave_domain_stats`]'s `peak` to compare what the widest wave
+/// *reserved* against what it *used*. The arenas' own `capacity` cannot serve:
+/// it is zero between forwards, because the tier is placed per forward and torn
+/// down with it, while `peak` persists — so the two describe different instants.
+pub fn wave_max_planned(ordinal: usize) -> Option<[usize; 3]> {
+    lock_domains().get(&ordinal).and_then(|d| d.max_planned)
+}
+
+/// The worst single forward's per-phase slack — see `WaveDomain::max_slack`.
+///
+/// **The figure that says every forward was exact**, as opposed to
+/// [`wave_max_planned`] against `peak`, which only says the widest one was.
+/// A forward's own slack is folded in when the *next* one prices, so the last
+/// forward of a run is not counted until another follows it.
+pub fn wave_max_slack(ordinal: usize) -> Option<[usize; 3]> {
+    lock_domains().get(&ordinal).map(|d| d.max_slack)
+}
+
+/// Everything known about the worst forward, per phase: the width it was priced
+/// at, what that priced to, and what it actually spent.
+///
+/// The three together are what makes a slack report actionable without a second
+/// run — a plan and a usage are sums of declared shapes, and the width says
+/// which shapes were summed.
+pub fn wave_worst_slack(ordinal: usize) -> Option<[(WaveWidth, usize, usize); 3]> {
+    lock_domains().get(&ordinal).map(|d| {
+        [
+            (d.worst_width[0], d.worst_slack[0].0, d.worst_slack[0].1),
+            (d.worst_width[1], d.worst_slack[1].0, d.worst_slack[1].1),
+            (d.worst_width[2], d.worst_slack[2].0, d.worst_slack[2].1),
+        ]
+    })
+}
+
+/// Forget every observation on `ordinal`: the planned maxima, the worst
+/// per-forward slack, and the arenas' peaks.
+///
+/// **For a harness that runs more than one model in one process.** The wave
+/// domain is keyed by device ordinal and outlives any single test, so a second
+/// run would be judged against the first's widest wave — a 27B's plan against a
+/// 0.8B's usage reads as enormous slack that belongs to neither. Resetting at
+/// the start of a run makes the verdict that run's own.
+///
+/// Observational state only. The tier, the plan the *current* forward is using
+/// and every live generation are untouched, so this is safe to call between
+/// forwards but says nothing about whether one is open.
+pub fn wave_reset_observations(ordinal: usize) {
+    if let Some(d) = lock_domains().get_mut(&ordinal) {
+        d.max_planned = None;
+        d.max_slack = [0; 3];
+        d.worst_slack = [(0, 0); 3];
+        d.worst_width = [WaveWidth::prefill(0, 0); 3];
+        for a in &d.arenas {
+            a.reset_observations();
+        }
+    }
+}
+
+/// **Poison-tolerant, like every other reader of this map.** These are the
+/// diagnostic paths, read *after* something has gone wrong — and a panic while
+/// the domain lock was held is exactly what poisons it. An accessor that
+/// panicked on the poison would take out the report of the fault that caused it.
 pub fn wave_domain_stats(ordinal: usize) -> Option<[(usize, usize, usize); 3]> {
-    wave_domains().lock().unwrap().get(&ordinal).map(|d| {
+    lock_domains().get(&ordinal).map(|d| {
         [
             d.arenas[0].stats(),
             d.arenas[1].stats(),
@@ -2240,7 +2504,11 @@ mod wave_tests {
         // A forward places its tier and returns; nothing releases it.
         {
             let _open = begin_forward(&s);
-            plan_wave_transient(&s, [1 << 20, 1 << 20, 1 << 20])?;
+            plan_wave_transient(
+                &s,
+                [1 << 20, 1 << 20, 1 << 20],
+                crate::kv_cache::WaveWidth::prefill(1, 1),
+            )?;
         }
         let placed = super::super::region_pool::region_stats(ordinal)
             .map(|r| r.transient_bytes)
@@ -2258,6 +2526,73 @@ mod wave_tests {
              is about to carve an arena from is still spoken for"
         );
         drop(window);
+        Ok(())
+    }
+
+    /// **A tier placed by a forward that has not opened yet is not idle ground.**
+    ///
+    /// The mirror of the test above, and the distinction between them is the
+    /// whole of `awaiting_forward`. A forward prices its tier
+    /// (`plan_wave_transient`) a few lines before it opens (`begin_forward`), and
+    /// in between neither `forward_open` nor `live_generations` is set — so a
+    /// sealing pass arriving there used to take the tier, release it, and clear
+    /// `planned` with it. The forward then found no plan, its first guard
+    /// reserved the 912 MiB fallback constant, and the placement refused it:
+    /// `needs 956301312 B … is 20 regions into ground live KV arenas hold`, twice
+    /// in twelve minutes of a live 35B ingest, each a lost post-decode prefill.
+    ///
+    /// Refused *retryably*, because the caller is the same sealing pass as above
+    /// and the window is a few lines long.
+    #[test]
+    fn a_tier_priced_for_a_forward_that_has_not_opened_is_not_handed_back() -> Result<()> {
+        use std::sync::mpsc;
+
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let ordinal = s.context().ordinal();
+
+        // Exactly the production order: price, and stop before `begin_forward`.
+        plan_wave_transient(
+            &s,
+            [1 << 20, 1 << 20, 1 << 20],
+            crate::kv_cache::WaveWidth::prefill(1, 1),
+        )?;
+        assert!(
+            super::super::region_pool::region_stats(ordinal)
+                .map(|r| r.transient_bytes)
+                .unwrap_or(0)
+                > 0,
+            "the pricing should have placed a tier"
+        );
+
+        // The sealing thread arrives in the window.
+        let (tx, rx) = mpsc::channel();
+        let s2 = s.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(enter_arena_window(&s2).err().map(|e| e.to_string()));
+        })
+        .join()
+        .expect("prober panicked");
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the prober must answer immediately, never park")
+            .expect("a tier bought by a forward that is about to open must not be taken");
+        assert!(
+            err.contains(super::KV_ARENA_MID_WAVE),
+            "the refusal must be retryable — the window closes in a few lines: {err}"
+        );
+
+        // The plan survived, which is the property that actually matters: the
+        // forward that bought this tier must not fall back to the constants.
+        let planned = super::with_wave_domain(&s, |d| Ok(d.planned))?;
+        assert!(
+            planned.is_some(),
+            "the plan must outlive the window, or the forward reserves `fallback_plan`"
+        );
+
+        // And once that forward has run, the tier is ordinary idle ground again.
+        drop(begin_wave(&s, LayerPhase::Attention)?);
+        drop(enter_arena_window(&s)?);
         Ok(())
     }
 

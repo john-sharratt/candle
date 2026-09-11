@@ -1608,6 +1608,8 @@ impl ModelWeights {
             Err(_) => gg.tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
+        // Read before the head is moved into the struct: `[out_features, ..]`.
+        let vocab = lm_head.weight_dims().first().copied().unwrap_or(0);
 
         Ok(Self {
             embeddings: Some(embeddings),
@@ -1627,6 +1629,11 @@ impl ModelWeights {
                 intermediate: expert_ffn_size,
                 experts_per_tok: n_expert_used,
                 n_experts: n_expert,
+                // Read off the head's own weight, `[out_features, in_features]`,
+                // so the forward phase is sized by what the kernel emits.
+                vocab,
+                // `self_attn.q_norm` / `k_norm` — Qwen3 carries both.
+                head_qk_norm: true,
             },
             device: device.clone(),
             // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
@@ -2184,6 +2191,8 @@ impl ModelWeights {
             Err(_) => load_tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights_with_mode(lm_head_tensor.into(), int8mode)?;
+        // Read before the head is moved into the struct: `[out_features, ..]`.
+        let vocab = lm_head.weight_dims().first().copied().unwrap_or(0);
 
         // ── Reserve the span, then build the expert cache into it ──
         //
@@ -2389,6 +2398,11 @@ impl ModelWeights {
                 intermediate: expert_ffn_size,
                 experts_per_tok: n_expert_used,
                 n_experts: n_expert,
+                // Read off the head's own weight, `[out_features, in_features]`,
+                // so the forward phase is sized by what the kernel emits.
+                vocab,
+                // `self_attn.q_norm` / `k_norm` — Qwen3 carries both.
+                head_qk_norm: true,
             },
             device: device.clone(),
             int8mode,

@@ -49,21 +49,6 @@ pub(super) struct WaveFill<'a> {
     admitted_rows: usize,
 }
 
-/// Regions the fill holds back from a wave's tier budget, for what moves
-/// between the wave's build and its placement: an arena the persistence thread
-/// creates in that window, and the rounding the placement applies. Fixed. It
-/// used to double on every refusal and decay one region per fill, and that
-/// ratchet was a second loop on the same budget as the fill's purchase: at its
-/// 1 GiB cap the budget read zero and no prefill could join a wave for the
-/// sixty fills the decay took, and at its base the fill bought the least wave
-/// into the *gap* while the group former read the *budget*, so the least chunk
-/// never fit beside a decode and the prefills sat admitted and unstarted (run
-/// 11: seven decodes stepping, eight prefills waiting, `budget=141..190 MiB`
-/// against a 192 MiB least wave, for a minute). A refused wave is now dropped
-/// and re-formed against the gap as it stands ([`Scheduler::note_tier_refusal`]),
-/// which is what a refusal means; the margin covers only the movers.
-pub(super) const TIER_MARGIN_REGIONS: usize = 4;
-
 /// Consecutive placement refusals after which the refused wave's **started**
 /// prefills are failed. Each refusal drops the wave and re-forms it against the
 /// fresh gap, so a wave refused this many times running is one the partition
@@ -396,6 +381,15 @@ impl Scheduler {
             })
             .sum()
     }
+
+    /// Sequences in that creep group, which is what the head scores it at —
+    /// one row of logits each, however many tokens the member advances.
+    pub(super) fn held_creep_seqs(&self) -> usize {
+        if self.wave_prefill_cursor == 0 && self.wave_prefill_residual.is_none() {
+            return 0;
+        }
+        self.wave_prefill_members.len()
+    }
 }
 
 /// Rows the fill reserves tier for: the wave it actually composed, floored at a
@@ -416,6 +410,37 @@ fn published_tier_rows(head_rows: usize, admitted_rows: usize, next_chunk: usize
     head_rows
         .saturating_add(admitted_rows)
         .max(head_rows.saturating_add(next_chunk))
+}
+
+/// The same wave, in the three units the plan prices from.
+///
+/// The rows [`published_tier_rows`] adds are all **prefill** rows — an
+/// admission's advance, or the floor chunk standing in for one — so they widen
+/// the prefill chain and add one scored row per sequence, not per token. Pure
+/// for the same reason its row-count twin is.
+fn published_tier_width(
+    head: WaveWidth,
+    admitted_rows: usize,
+    admitted_seqs: usize,
+    next_chunk: usize,
+) -> WaveWidth {
+    let extra_rows = published_tier_rows(0, admitted_rows, next_chunk);
+    // Which of the two the `max` took decides how many sequences those rows
+    // belong to: the admissions' own count, or the single sequence the floor
+    // chunk is reserved for.
+    let extra_seqs = if extra_rows == 0 {
+        0
+    } else if admitted_rows >= next_chunk {
+        admitted_seqs
+    } else {
+        1
+    };
+    WaveWidth {
+        prefill_rows: head.prefill_rows.saturating_add(extra_rows),
+        decode_rows: head.decode_rows,
+        scored_rows: head.scored_rows.saturating_add(extra_seqs),
+        ..head
+    }
 }
 
 /// Regions the fill buys so the least wave fits the tier **budget**: what
@@ -501,7 +526,47 @@ impl<'a> WaveFill<'a> {
     /// every row of the wave, so every admission is priced as an increment over
     /// this, and every purchase guards the whole of it.
     pub(super) fn head_rows(&self) -> usize {
-        self.decode_rows(self.decodes_taken.len()) + self.sched.held_creep_rows()
+        self.head_width().rows()
+    }
+
+    /// The same head, in the three units the plan prices from.
+    ///
+    /// A row count cannot say what the tier costs, because the phases these
+    /// rows widen are not the same ones a prefill's rows widen. The decode
+    /// group's rows price the decode chain and the head; a creep member's price
+    /// the prefill chain but score only one row of logits however many tokens
+    /// it advances.
+    ///
+    /// Every decode row is scored, speculative blocks included: a verify block
+    /// scores all of its rows, because each is a prediction to compare a
+    /// proposal against.
+    /// The tier the wave **already in flight** reserves — its decodes and its
+    /// held creep, before this fill admits anything.
+    ///
+    /// What `interleave::effective_weight_zone_bytes` raises the floor's
+    /// reserve by, so the residency every admission is judged against reflects
+    /// the tier the standing wave has actually taken rather than the flat 912
+    /// MiB `MIN_ELASTIC_RESERVE` assumes. The tier each *new* admission adds is
+    /// charged separately, through `admit::Cost::dislodged_bytes`.
+    ///
+    /// Deliberately the head and not the wave-so-far: the head is committed
+    /// work, so it is a fact this decision reads, not an output it feeds back
+    /// into itself.
+    pub(super) fn standing_tier_bytes(&self) -> usize {
+        let dtype = self.sched.session.activation_dtype();
+        WavePlan::new(self.sched.model.wave_geometry(dtype)).tier_bytes(self.head_width())
+    }
+
+    pub(super) fn head_width(&self) -> WaveWidth {
+        let decodes = self.decode_rows(self.decodes_taken.len());
+        WaveWidth {
+            prefill_rows: self.sched.held_creep_rows(),
+            decode_rows: decodes,
+            scored_rows: decodes + self.sched.held_creep_seqs(),
+            // The scheduler composes waves, never replays: a verify replay is
+            // the speculative driver's, priced where it stages.
+            ..WaveWidth::default()
+        }
     }
 
     /// The tier of the wave `cost` would be admitted into — the head as it
@@ -511,7 +576,7 @@ impl<'a> WaveFill<'a> {
     pub(super) fn wave_tier_after(&self, cost: &admit::Cost) -> u64 {
         let dtype = self.sched.session.activation_dtype();
         let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
-        (plan.tier_bytes(self.head_rows()) as u64).saturating_add(cost.activations)
+        (plan.tier_bytes(self.head_width()) as u64).saturating_add(cost.activations)
     }
 
     /// Tier bytes a forward worth running needs, held back from admission.
@@ -626,8 +691,13 @@ impl<'a> WaveFill<'a> {
             };
             // The wave as composed: the head, plus every row this fill admitted,
             // and never narrower than a forward worth running.
-            let rows = published_tier_rows(self.head_rows(), self.admitted_rows, next_chunk);
-            let least = plan.tier_bytes(rows);
+            let width = published_tier_width(
+                self.head_width(),
+                self.admitted_rows,
+                self.prefill_admitted.len(),
+                next_chunk,
+            );
+            let least = plan.tier_bytes(width);
             // The same figure is what the weight side's growth leaves standing
             // in the gap, so the two sides agree on what the next wave needs.
             if let candle::DeviceLocation::Cuda { gpu_id } = self.sched.device.location() {
@@ -826,12 +896,16 @@ impl WaveFill<'_> {
         // The rows this admission adds to the forward, priced through the same
         // planner that places the tier — so this is the tier's cost, not an
         // estimate of it.
-        let rows = self.head_rows() + advance;
+        // One more sequence, scored once however many tokens it advances.
+        let head = self.head_width();
+        let after = WaveWidth {
+            prefill_rows: head.prefill_rows + advance,
+            scored_rows: head.scored_rows + 1,
+            ..head
+        };
         let dtype = self.sched.session.activation_dtype();
         let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
-        let activations = plan
-            .tier_bytes(rows)
-            .saturating_sub(plan.tier_bytes(self.head_rows())) as u64;
+        let activations = plan.tier_bytes(after).saturating_sub(plan.tier_bytes(head)) as u64;
         admit::Cost {
             kv,
             recurrent,
@@ -872,7 +946,8 @@ impl admit::Ground for WaveFill<'_> {
         // boundary's *extent* is deliberately not consulted here — it lags,
         // moving only between forwards, and every attempt to combine the two
         // has ended up counting the same ground twice (see below).
-        let zone = interleave::effective_weight_zone_bytes().unwrap_or(u64::MAX);
+        let zone =
+            interleave::effective_weight_zone_bytes(self.standing_tier_bytes()).unwrap_or(u64::MAX);
         // The KV side and the weight side share one elastic span: an admission
         // whose price exceeds the free regions buys the rest from the weight
         // zone (`Scheduler::buy_kv_ground`), and that is legitimate all the way
@@ -962,7 +1037,7 @@ impl admit::Ground for WaveFill<'_> {
     /// dislodge and the floor are all read in one currency and the model cannot
     /// be shown ground twice. Runs BV and CA are what mixing the two costs.
     fn resident_weights(&self) -> u64 {
-        interleave::effective_weight_zone_bytes().unwrap_or(u64::MAX)
+        interleave::effective_weight_zone_bytes(self.standing_tier_bytes()).unwrap_or(u64::MAX)
     }
 
     /// The creep group held from the last wave: rows the next forward carries
@@ -1016,7 +1091,7 @@ impl admit::Ground for WaveFill<'_> {
             max_rows: self.sched.held_creep_rows().saturating_add(
                 self.sched.model.prefill_width_cap(
                     dtype,
-                    self.head_rows(),
+                    self.head_width(),
                     placeable.min(usize::MAX as u64) as usize,
                 ),
             ),
@@ -1073,13 +1148,20 @@ impl admit::Ground for WaveFill<'_> {
                 // for a quarter of an hour with sixteen decodes admitted.
                 let step = Scheduler::DECODE_CLAIM_TOKENS;
                 let taken = self.decodes_taken.len();
-                let rows_after = self.decode_rows(taken + 1) + self.sched.held_creep_rows();
+                let head = self.head_width();
+                // Every row of the block is a decode row and every one is
+                // scored — a verify block compares a proposal per row.
+                let decodes_after = self.decode_rows(taken + 1);
+                let added = decodes_after.saturating_sub(head.decode_rows);
+                let after = WaveWidth {
+                    decode_rows: decodes_after,
+                    scored_rows: head.scored_rows + added,
+                    ..head
+                };
                 let dtype = self.sched.session.activation_dtype();
                 let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
-                let activations = plan
-                    .tier_bytes(rows_after)
-                    .saturating_sub(plan.tier_bytes(self.head_rows()))
-                    as u64;
+                let activations =
+                    plan.tier_bytes(after).saturating_sub(plan.tier_bytes(head)) as u64;
                 // The verify block this decode rides as, `1 + draft` rows — the
                 // same width the tier above was priced for, and what the
                 // throughput model reads its routed expert count from.
@@ -1216,7 +1298,8 @@ impl admit::Ground for WaveFill<'_> {
 
 use crate::token_buffer::TokenBuffer;
 use candle_nn::kv_cache::{
-    is_tier_refusal, set_least_tier_bytes, transient_headroom_bytes, WavePlan, REGION_BYTES,
+    is_tier_refusal, kv_ground_shortfall, least_tier_bytes, set_least_tier_bytes,
+    transient_headroom_bytes, WavePlan, WaveWidth, REGION_BYTES, TIER_MARGIN_REGIONS,
 };
 use candle_transformers::models::batched_inference::PendingGlue;
 use std::collections::{HashMap, HashSet};
@@ -1224,32 +1307,6 @@ use std::collections::{HashMap, HashSet};
 /// The region quantum in bytes.
 fn region_bytes() -> u64 {
     candle_nn::kv_cache::REGION_BYTES as u64
-}
-
-/// Regions an admission must buy from the weight side so that, after its
-/// `claims` regions of K/V and store are taken, `tier` regions still stand
-/// contiguous at the arena frontier — given the K/V side holds `free` regions
-/// anywhere and `gap` of those lie between the frontier and the weight floor.
-///
-/// Claims recycle the free list lowest-first, so they spend the regions
-/// scattered below the frontier before they reach into the gap; the tier stands
-/// only in the gap, so what the claims eat of it has to be bought back. Buying
-/// moves the floor right, which adds to the gap and the free list at once.
-///
-/// The first shape of this — the larger of `claims + tier − free` and
-/// `tier − gap` — let an admission's own claims consume the gap it had just
-/// checked: run 5 admitted 42 sections, each measured the gap as sufficient,
-/// each then claimed its store from the top of the span, and the wave's tier
-/// found the gap three regions short with twelve regions free below it. No
-/// forward ran for the rest of the run.
-///
-/// Pure, so the arithmetic is tested without a device.
-fn ground_shortfall_regions(claims: usize, tier: usize, free: usize, gap: usize) -> usize {
-    let scattered = free.saturating_sub(gap);
-    let gap_eaten = claims.saturating_sub(scattered);
-    claims
-        .saturating_sub(free)
-        .max(tier.saturating_add(gap_eaten).saturating_sub(gap))
 }
 
 /// Backlog (as a % of resident capacity) above which the wave loop blocks on a
@@ -1513,10 +1570,25 @@ impl Scheduler {
     /// gap it found — 73 refused placements in twenty minutes of run 7 — while
     /// the same wave sized against the figure at build time simply packs two
     /// regions narrower.
+    /// The tier this scheduler last published, or `0` off CUDA and before the
+    /// first fill — which reads as "no wave in flight" and leaves the floor's
+    /// constant binding.
+    pub(super) fn published_tier_bytes(&self) -> usize {
+        match self.device.location() {
+            candle::DeviceLocation::Cuda { gpu_id } => least_tier_bytes(gpu_id),
+            _ => 0,
+        }
+    }
+
     pub(super) fn tier_budget_now(&self) -> (usize, usize, usize) {
         let margin = TIER_MARGIN_REGIONS * REGION_BYTES;
         let optimal = interleave::optimal_weight_bytes().unwrap_or(0);
-        let owed = interleave::effective_weight_zone_bytes()
+        // **Zero, deliberately.** This computes the tier budget, so raising the
+        // reserve by the tier here would make the budget a function of itself —
+        // the loop with one fixed point that this function's own note is about.
+        // What a *new* admission's tier costs is charged where it belongs, in
+        // `admit::Cost::dislodged_bytes`.
+        let owed = interleave::effective_weight_zone_bytes(0)
             .map_or(0, |zone| optimal.saturating_sub(zone)) as usize;
         let gap = transient_headroom_bytes(0).unwrap_or(0);
         (gap, owed, gap.saturating_sub(margin).saturating_sub(owed))
@@ -1533,12 +1605,13 @@ impl Scheduler {
     /// growth: run 9, `tier budget published gap=882`, `weight side took free
     /// KV regions gained=69 spare=8` four hundred microseconds later, and the
     /// 816 MiB tier refused by four regions. So the wave, once composed, is
-    /// what the growth must leave — `rows` is every row it carries.
-    fn hold_wave_tier(&self, rows: usize) {
+    /// what the growth must leave — `width` is every row it carries, in the
+    /// units each phase is priced from.
+    fn hold_wave_tier(&self, width: WaveWidth) {
         let dtype = self.session.activation_dtype();
         let plan = WavePlan::new(self.model.wave_geometry(dtype));
         let tier = plan
-            .tier_bytes(rows)
+            .tier_bytes(width)
             .max(self.min_forward_tier_bytes() as usize);
         if let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() {
             set_least_tier_bytes(gpu_id, tier);
@@ -1552,7 +1625,9 @@ impl Scheduler {
     pub(super) fn min_forward_tier_bytes(&self) -> u64 {
         let dtype = self.session.activation_dtype();
         let plan = WavePlan::new(self.model.wave_geometry(dtype));
-        plan.tier_bytes(PREFILL_MIN_ADVANCE) as u64
+        // The least forward is one sequence advancing `PREFILL_MIN_ADVANCE`
+        // tokens, scored once.
+        plan.tier_bytes(WaveWidth::prefill(PREFILL_MIN_ADVANCE, 1)) as u64
     }
 
     /// One 32-token K/V block across the model, in the formats a **live**
@@ -1581,7 +1656,7 @@ impl Scheduler {
     /// K/V blocks and a recurrent store take regions from anywhere on the free
     /// list; the wave transient tier stands only in the gap between the arena
     /// frontier and the weight floor, and the claims eat into that gap once the
-    /// scattered free regions are spent — see [`ground_shortfall_regions`].
+    /// scattered free regions are spent — see [`kv_ground_shortfall`].
     ///
     /// **`wave_tier` is the tier of the whole wave this admission joins**, not
     /// the increment `cost.activations` charges the gate: the tier is one
@@ -1613,7 +1688,7 @@ impl Scheduler {
         let gap = regions(transient_headroom_bytes(gpu_id).unwrap_or(0) as u64);
         let claims = regions(cost.kv.saturating_add(cost.recurrent));
         let tier = regions(wave_tier.max(self.min_forward_tier_bytes()));
-        let short = ground_shortfall_regions(claims, tier, free, gap);
+        let short = kv_ground_shortfall(claims, tier, free, gap);
         if short == 0 {
             return 0;
         }
@@ -1755,7 +1830,14 @@ impl Scheduler {
         draft: usize,
         elapsed: std::time::Duration,
     ) {
-        let Some(resident) = interleave::effective_weight_zone_bytes() else {
+        // **What the residency actually was while that wave ran**, which is the
+        // span less the live regions and less the tier the wave held. Teaching
+        // the model the figure with a flat 912 MiB tier term credits the run
+        // with residency it did not have, and every rate learned from it is a
+        // rate at the wrong operating point. An observation, not a decision, so
+        // reading the published tier here is a record of fact.
+        let Some(resident) = interleave::effective_weight_zone_bytes(self.published_tier_bytes())
+        else {
             return;
         };
         let secs = elapsed.as_secs_f64();
@@ -1806,7 +1888,9 @@ impl Scheduler {
         // rather than the smoothed one: the planner does its own dampening, and
         // stacking two averages would make it answer a width change a dozen
         // waves after the residency that caused it.
-        if let Some(resident) = interleave::effective_weight_zone_bytes() {
+        // The residency that hit rate was achieved at, same as above.
+        if let Some(resident) = interleave::effective_weight_zone_bytes(self.published_tier_bytes())
+        {
             self.wave_rate.observe_hit_rate(rate, resident);
         }
         // **The width follows the hit rate.** Under the knee the wave is
@@ -2045,7 +2129,7 @@ impl Scheduler {
                 target: "candle_conversation::scheduler::interleave",
                 optimal_mib = optimal >> 20,
                 weights_mib = interleave::weight_zone_bytes().unwrap_or(0) >> 20,
-                effective_mib = interleave::effective_weight_zone_bytes().unwrap_or(0) >> 20,
+                effective_mib = interleave::effective_weight_zone_bytes(0).unwrap_or(0) >> 20,
                 decodes = decodes.len(),
                 decodes_refused = refused,
                 prefills = filled.prefills,
@@ -3051,9 +3135,10 @@ impl Scheduler {
             return None;
         }
         let cap = self.max_prefill_pass_tokens;
+        // The head is decode and verify rows, every one of them scored.
         let mut rows_left = self.model.prefill_width_cap(
             self.session.activation_dtype(),
-            head_rows,
+            WaveWidth::decode(head_rows),
             self.session.tier_budget_bytes(),
         );
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
@@ -3760,7 +3845,7 @@ impl Scheduler {
                 // The prefill rows the tier holds beside this wave's head.
                 let prefill_rows = self.model.prefill_width_cap(
                     self.session.activation_dtype(),
-                    head_rows,
+                    WaveWidth::decode(head_rows),
                     tier_budget,
                 );
                 self.form_wave_group(!self.wave_section_advanced, prefill_rows, head_rows == 0);
@@ -3804,7 +3889,15 @@ impl Scheduler {
                 .iter()
                 .map(|t| t.dims().get(1).copied().unwrap_or(0))
                 .sum();
-            self.hold_wave_tier(head_rows + sec_tok + glue_tok);
+            // Decode and verify rows are all scored; each section scores one
+            // row however many tokens it advances, and glue scores none — it
+            // only scattered K/V.
+            self.hold_wave_tier(WaveWidth {
+                prefill_rows: sec_tok + glue_tok,
+                decode_rows: head_rows,
+                scored_rows: head_rows + sec_seqs.len(),
+                ..WaveWidth::default()
+            });
             let out = self.model.forward_wave(
                 &mut self.session,
                 decode_seqs,
@@ -3915,7 +4008,14 @@ impl Scheduler {
         // Every segment of this wave places a tier for the rows it carries; the
         // widest — head, creep and glue together — is what the growth must
         // leave standing across all of them.
-        self.hold_wave_tier(head_rows + creep_tok + glue_tok);
+        self.hold_wave_tier(WaveWidth {
+            prefill_rows: creep_tok + glue_tok,
+            decode_rows: head_rows,
+            // Every decode and verify row is scored; each creep member scores
+            // one row however many tokens it advances, and glue scores none.
+            scored_rows: head_rows + inputs.len(),
+            ..WaveWidth::default()
+        });
 
         // Segment 1 — full-sweep members only over [0, cursor). Runs when there is
         // any full-sweep member (decode or glue) and cursor > 0; the creep resumes
@@ -4298,7 +4398,11 @@ impl Scheduler {
         }
         .claimed_bytes();
 
-        let after = interleave::effective_weight_zone_bytes().unwrap_or(u64::MAX);
+        // Residency as it actually stands, the standing wave's tier included —
+        // this is a rate judgement, and the tier is ground the weight side does
+        // not have while the wave holds it.
+        let after = interleave::effective_weight_zone_bytes(self.published_tier_bytes())
+            .unwrap_or(u64::MAX);
         let before = after.saturating_add(held);
         let decodes = self.active_decodes.values().filter(|s| !s.finished).count();
         let draft = self.last_observed_draft;
@@ -5304,54 +5408,6 @@ mod idle_demote_tests {
             vec![(SequenceId(1), 100), (SequenceId(3), 300)],
             "the busy slot is skipped, the quiet ones go together",
         );
-    }
-}
-
-#[cfg(test)]
-mod ground_shortfall_tests {
-    use super::ground_shortfall_regions;
-
-    /// Enough free ground everywhere it is needed: nothing is bought. The
-    /// claims fit in the regions scattered below the frontier, so the gap is
-    /// untouched and already holds the tier.
-    #[test]
-    fn nothing_is_bought_when_the_claims_fit_below_the_gap_and_the_gap_holds_the_tier() {
-        assert_eq!(ground_shortfall_regions(10, 4, 20, 6), 0);
-        assert_eq!(
-            ground_shortfall_regions(0, 0, 0, 0),
-            0,
-            "a free admission buys nothing"
-        );
-    }
-
-    /// Claims past the whole free list: the difference is bought, and with no
-    /// tier to stand that is all.
-    #[test]
-    fn claims_past_the_free_list_buy_the_difference() {
-        assert_eq!(ground_shortfall_regions(10, 0, 7, 0), 3);
-    }
-
-    /// **The tier needs the gap, not the free list.** Plenty of free regions
-    /// scattered below the frontier do not place a tier; the gap decides.
-    #[test]
-    fn a_tier_wider_than_the_gap_is_bought_even_with_free_regions_elsewhere() {
-        assert_eq!(ground_shortfall_regions(4, 4, 40, 1), 3);
-    }
-
-    /// **Claims that reach into the gap are bought back for the tier.** Run 5:
-    /// each of 42 admissions saw a gap that held its tier, then claimed its
-    /// store from the top of the span and left the next wave's tier three
-    /// regions short with twelve regions free below it.
-    #[test]
-    fn claims_that_would_eat_the_gap_are_bought_back() {
-        // 5 free, 2 of them the gap: 10 claims spend the 3 scattered, then eat
-        // the gap, then need 5 more — and the tier of 6 must still stand after.
-        assert_eq!(ground_shortfall_regions(10, 6, 5, 2), 11);
-        // 3 claims fit in the 3 scattered: only the tier's own shortfall.
-        assert_eq!(ground_shortfall_regions(3, 6, 5, 2), 4);
-        // 4 claims take the 3 scattered and one of the gap's 2: the tier of 2
-        // needs that one back.
-        assert_eq!(ground_shortfall_regions(4, 2, 5, 2), 1);
     }
 }
 

@@ -566,6 +566,11 @@ impl BatchedModelCore for ModelWeights {
             intermediate,
             experts_per_tok: 1,
             n_experts: 1,
+            // Read off the head's own weight, `[out_features, in_features]`, so
+            // the forward phase is sized by what the kernel will actually emit.
+            vocab: self.lm_head.weight_dims().first().copied().unwrap_or(0),
+            // `self_attn.q_norm` / `k_norm` — Qwen3 carries both.
+            head_qk_norm: true,
         }
     }
 

@@ -30,6 +30,7 @@
 //! model that drives a wave.
 
 use candle::{DType, Device, Result, Tensor};
+use candle_nn::kv_cache::WaveWidth;
 
 use super::batched_inference::{
     pack_prefill_slabs, prefill_slack_cap, BatchedInferenceSession, PendingGlue, WaveResult,
@@ -124,11 +125,16 @@ pub trait WaveSweep {
     /// is the trunk depth, not the KV-layer count.
     fn num_layers(&self) -> usize;
 
-    /// Widest prefill this model runs in one forward, in tokens, with
-    /// `head_rows` already in the wave ahead of it (decode rows and verify
-    /// blocks, which share the same transient tier) and `tier_budget` bytes of
-    /// ground the tier may be priced against.
-    fn prefill_width_cap(&self, act_dtype: DType, head_rows: usize, tier_budget: usize) -> usize;
+    /// Widest prefill this model runs in one forward, in tokens, with `head`
+    /// already in the wave ahead of it (decode rows and verify blocks, which
+    /// share the same transient tier) and `tier_budget` bytes of ground the
+    /// tier may be priced against.
+    ///
+    /// `head` is a whole [`WaveWidth`] rather than a row count because the
+    /// phases it widens are not the same ones the prefill widens: its decode
+    /// rows price the decode chain, its scored rows price the head, and neither
+    /// is a number the prefill's own rows could stand in for.
+    fn prefill_width_cap(&self, act_dtype: DType, head: WaveWidth, tier_budget: usize) -> usize;
 
     /// The **KV-cache** index range a trunk-layer range writes to.
     ///
@@ -396,8 +402,11 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
         // decode or glue rows, so the whole tier is the prefill's. The budget
         // is the one the fill that admitted these prefills priced them against,
         // so a group the fill composed is not re-sliced here.
-        let width_cap =
-            model.prefill_width_cap(session.activation_dtype(), 0, session.tier_budget_bytes());
+        let width_cap = model.prefill_width_cap(
+            session.activation_dtype(),
+            WaveWidth::default(),
+            session.tier_budget_bytes(),
+        );
         // The entry check uses the SLACK ceiling, not the bare cap: a fleet
         // within 25% of the cap runs as a single wave (the straggler a
         // bare-cap split would produce costs the full fixed per-wave sweep for
